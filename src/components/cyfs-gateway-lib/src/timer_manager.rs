@@ -60,7 +60,7 @@ impl TimerManager {
             let global_collection_manager = global_collection_manager.clone();
             let js_externals = js_externals.clone();
 
-            let task = tokio::task::spawn_local(async move {
+            let task = tokio::task::spawn(async move {
                 let external_commands = Some(get_external_commands(server_manager.clone()));
                 let (executor, _) = match create_process_chain_executor(
                     &process_chains,

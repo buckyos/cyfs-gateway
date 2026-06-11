@@ -1782,6 +1782,22 @@ impl Gateway {
         uri.to_string()
     }
 
+    fn escape_process_chain_string_arg(value: &str) -> String {
+        let mut escaped = String::with_capacity(value.len());
+        for ch in value.chars() {
+            match ch {
+                '\\' => escaped.push_str("\\\\"),
+                '"' => escaped.push_str("\\\""),
+                '$' => escaped.push_str("\\$"),
+                '\n' => escaped.push_str("\\n"),
+                '\r' => escaped.push_str("\\r"),
+                '\t' => escaped.push_str("\\t"),
+                _ => escaped.push(ch),
+            }
+        }
+        escaped
+    }
+
     fn build_router_rule(
         raw_config: &mut Value,
         uri: &str,
@@ -1793,13 +1809,14 @@ impl Gateway {
         } else {
             uri_value.clone()
         };
+        let regex_arg = Self::escape_process_chain_string_arg(&regex_value);
         let block_id = Self::router_block_id(uri, target);
         let priority = Self::router_priority(uri);
 
         // match part
         let match_cmd = match kind.as_str() {
             "exact" => format!(r#"eq ${{REQ.path}} "{}""#, uri_value),
-            "regex" => format!(r#"match-reg ${{REQ.path}} "{}""#, regex_value),
+            "regex" => format!(r#"match-reg ${{REQ.path}} "{}""#, regex_arg),
             "wildcard" => format!(r#"match ${{REQ.path}} "{}*""#, uri_value),
             _ => format!(r#"starts-with ${{REQ.path}} "{}""#, uri_value),
         };
@@ -1829,9 +1846,10 @@ impl Gateway {
                     let placeholder = target_trim[idx..].trim_start_matches('/');
                     if !placeholder.is_empty() {
                         let replace = format!("/{}", placeholder);
+                        let replace = Self::escape_process_chain_string_arg(&replace);
                         rewrite = Some(format!(
-                            r#"rewrite ${{REQ.path}} "{}" "{}""#,
-                            regex_value, replace
+                            r#"rewrite-reg ${{REQ.path}} "{}" "{}""#,
+                            regex_arg, replace
                         ));
                     }
                 }
@@ -1875,9 +1893,10 @@ impl Gateway {
                 let path = url.path().to_string();
                 if kind == "regex" {
                     if let Some(_) = path.find('$') {
+                        let path = Self::escape_process_chain_string_arg(&path);
                         rewrite = Some(format!(
-                            r#"rewrite ${{REQ.path}} "{}" "{}""#,
-                            regex_value, path
+                            r#"rewrite-reg ${{REQ.path}} "{}" "{}""#,
+                            regex_arg, path
                         ));
                     } else if path.len() > 1 {
                         if path.ends_with('/') {
@@ -1914,9 +1933,10 @@ impl Gateway {
                             format!("{}*", p.trim_end_matches('*'))
                         };
                         if kind == "regex" {
+                            let replace = Self::escape_process_chain_string_arg(&replace);
                             rewrite = Some(format!(
                                 r#"rewrite-reg ${{REQ.path}} "{}" "{}""#,
-                                regex_value, replace
+                                regex_arg, replace
                             ));
                         } else {
                             rewrite = Some(format!(
@@ -5057,7 +5077,7 @@ mod tests {
             .unwrap()
             .to_string();
         println!("{}", rule);
-        assert!(rule.starts_with(r#"match-reg ${REQ.path} "^/static/(.*)$" && rewrite ${REQ.path} "^/static/(.*)$" "/$1" && forward "http://127.0.0.1:9000";"#));
+        assert!(rule.starts_with("match-reg ${REQ.path} \"^/static/(.*)\\$\" && rewrite-reg ${REQ.path} \"^/static/(.*)\\$\" \"/\\$1\" && forward \"http://127.0.0.1:9000\";"));
 
         let (updated, sid2, _) = Gateway::add_router_to_config(
             raw_config.clone(),
@@ -5074,7 +5094,7 @@ mod tests {
             .unwrap()
             .to_string();
         println!("{}", rule);
-        assert!(rule.starts_with(r#"match-reg ${REQ.path} "^/static/(.*)$" && rewrite ${REQ.path} "^/static/(.*)$" "/api/$1" && forward "http://127.0.0.1:9000";"#));
+        assert!(rule.starts_with("match-reg ${REQ.path} \"^/static/(.*)\\$\" && rewrite-reg ${REQ.path} \"^/static/(.*)\\$\" \"/api/\\$1\" && forward \"http://127.0.0.1:9000\";"));
 
         let (updated, sid2, _) = Gateway::add_router_to_config(
             raw_config.clone(),
@@ -5093,7 +5113,7 @@ mod tests {
         println!("{}", rule);
         assert_eq!(
             rule,
-            r#"match-reg ${REQ.path} "^/static/(.*)$" && rewrite ${REQ.path} "/*" "/api/*" && forward "http://127.0.0.1:9000";"#
+            "match-reg ${REQ.path} \"^/static/(.*)\\$\" && rewrite ${REQ.path} \"/*\" \"/api/*\" && forward \"http://127.0.0.1:9000\";"
         );
 
         let (updated, sid2, _) = Gateway::add_router_to_config(
@@ -5113,7 +5133,7 @@ mod tests {
         println!("{}", rule);
         assert_eq!(
             rule,
-            r#"match-reg ${REQ.path} "^/static/(.*)$" && forward "http://127.0.0.1:9000";"#
+            "match-reg ${REQ.path} \"^/static/(.*)\\$\" && forward \"http://127.0.0.1:9000\";"
         );
 
         // create with local dir target and explicit server id
@@ -5235,7 +5255,7 @@ mod tests {
             .unwrap()
             .to_string();
         println!("{}", rule);
-        assert!(rule.starts_with(r#"match-reg ${REQ.path} "^/static/(.*)$" && rewrite ${REQ.path} "^/static/(.*)$" "/$1" && call-server"#));
+        assert!(rule.starts_with("match-reg ${REQ.path} \"^/static/(.*)\\$\" && rewrite-reg ${REQ.path} \"^/static/(.*)\\$\" \"/\\$1\" && call-server"));
         let (updated, removed_id) = Gateway::remove_router_from_config(
             updated,
             Some("router_test"),
@@ -5262,7 +5282,7 @@ mod tests {
             .unwrap()
             .to_string();
         println!("{}", rule);
-        assert!(rule.starts_with(r#"match-reg ${REQ.path} "^/static/(.*)$" && call-server"#));
+        assert!(rule.starts_with("match-reg ${REQ.path} \"^/static/(.*)\\$\" && call-server"));
     }
 
     #[tokio::test]
