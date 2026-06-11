@@ -532,9 +532,45 @@ async fn load_user_config_from_file(config_file: &Path) -> Result<serde_json::Va
         anyhow::anyhow!(msg)
     })?;
     debug!("Apply params to gateway config.");
+    apply_control_port_config(&mut config_json)?;
     normalize_all_path_value_config(&mut config_json, config_dir);
     debug!("normalize_all_path_value_config for gateway config.");
     Ok(config_json)
+}
+
+fn parse_control_port_value(value: &Value) -> Result<u16> {
+    let port = if let Some(port) = value.as_u64() {
+        u16::try_from(port).map_err(|_| anyhow!("control_port must be between 1 and 65535"))?
+    } else if let Some(port) = value.as_str() {
+        port.parse::<u16>()
+            .map_err(|_| anyhow!("control_port must be between 1 and 65535"))?
+    } else {
+        return Err(anyhow!("control_port must be between 1 and 65535"));
+    };
+
+    if port == 0 {
+        return Err(anyhow!("control_port must be between 1 and 65535"));
+    }
+
+    Ok(port)
+}
+
+fn apply_control_port_config(config_json: &mut Value) -> Result<()> {
+    let Some(control_port) = config_json.get("control_port") else {
+        return Ok(());
+    };
+    let port = parse_control_port_value(control_port)?;
+    let bind = format!("127.0.0.1:{port}");
+
+    let control_stack = config_json
+        .get_mut("stacks")
+        .and_then(Value::as_object_mut)
+        .and_then(|stacks| stacks.get_mut(GATEWAY_CONTROL_SERVER_KEY))
+        .and_then(Value::as_object_mut)
+        .ok_or_else(|| anyhow!("control server stack config missing"))?;
+    control_stack.insert("bind".to_string(), Value::String(bind));
+
+    Ok(())
 }
 
 pub(crate) async fn run_server_tempalte_pkg(
@@ -4174,6 +4210,51 @@ mod tests {
         pub async fn new_key(&self) {
             let (sign_key, public_key_value) = generate_ed25519_key_pair();
             self.save_key(sign_key, public_key_value).await.unwrap();
+        }
+    }
+
+    fn control_server_bind(config: &Value) -> &str {
+        config["stacks"][GATEWAY_CONTROL_SERVER_KEY]["bind"]
+            .as_str()
+            .unwrap()
+    }
+
+    #[test]
+    fn test_apply_control_port_config_uses_loopback_bind() {
+        let mut config: Value = serde_yaml_ng::from_str(GATEWAY_CONTROL_SERVER_CONFIG).unwrap();
+        config["control_port"] = json!(23456);
+
+        apply_control_port_config(&mut config).unwrap();
+
+        assert_eq!(control_server_bind(&config), "127.0.0.1:23456");
+    }
+
+    #[test]
+    fn test_apply_control_port_config_accepts_numeric_string() {
+        let mut config: Value = serde_yaml_ng::from_str(GATEWAY_CONTROL_SERVER_CONFIG).unwrap();
+        config["control_port"] = json!("23457");
+
+        apply_control_port_config(&mut config).unwrap();
+
+        assert_eq!(control_server_bind(&config), "127.0.0.1:23457");
+    }
+
+    #[test]
+    fn test_apply_control_port_config_preserves_default_when_absent() {
+        let mut config: Value = serde_yaml_ng::from_str(GATEWAY_CONTROL_SERVER_CONFIG).unwrap();
+
+        apply_control_port_config(&mut config).unwrap();
+
+        assert_eq!(control_server_bind(&config), "127.0.0.1:13451");
+    }
+
+    #[test]
+    fn test_apply_control_port_config_rejects_invalid_values() {
+        for invalid in [json!(0), json!(65536), json!(-1), json!("bad"), json!({})] {
+            let mut config: Value = serde_yaml_ng::from_str(GATEWAY_CONTROL_SERVER_CONFIG).unwrap();
+            config["control_port"] = invalid;
+
+            assert!(apply_control_port_config(&mut config).is_err());
         }
     }
 

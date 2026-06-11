@@ -30,6 +30,7 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use tokio::net::TcpStream;
+use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::oneshot;
 
 const DEFAULT_TCP_CONCURRENCY: u32 = 0;
@@ -408,6 +409,7 @@ pub struct TcpStack {
     prepare_handler: Arc<RwLock<Option<Arc<TcpConnectionHandler>>>>,
     transparent: bool,
     reuse_address: bool,
+    start_lock: AsyncMutex<()>,
     server: Mutex<Option<TcpServer>>,
 }
 
@@ -482,6 +484,7 @@ impl TcpStack {
             prepare_handler: Arc::new(Default::default()),
             transparent: config.transparent,
             reuse_address: config.reuse_address,
+            start_lock: AsyncMutex::new(()),
             server: Mutex::new(None),
         })
     }
@@ -523,7 +526,14 @@ impl TcpStack {
                 Ok(())
             }
         })
-        .map_err(|e| stack_err!(StackErrorCode::BindFailed, "start tcp server error: {e}"))?;
+        .map_err(|e| {
+            stack_err!(
+                StackErrorCode::BindFailed,
+                "start tcp server {} on {} error: {e}",
+                self.id,
+                self.bind_addr
+            )
+        })?;
         Ok(server)
     }
 }
@@ -630,6 +640,7 @@ impl Stack for TcpStack {
     }
 
     async fn start(&self) -> StackResult<()> {
+        let _start_guard = self.start_lock.lock().await;
         {
             if self.server.lock().unwrap().is_some() {
                 return Ok(());
@@ -989,6 +1000,7 @@ mod tests {
     };
     use buckyos_kit::AsyncStream;
     use sfo_reuseport::ServerRuntimeConfig;
+    use std::net::TcpListener as StdTcpListener;
     use std::path::Path;
     use std::sync::Arc;
     use std::time::Instant;
@@ -997,6 +1009,11 @@ mod tests {
 
     fn test_server_runtime() -> sfo_reuseport::ServerRuntime {
         sfo_reuseport::ServerRuntime::start(ServerRuntimeConfig::new().with_workers(1)).unwrap()
+    }
+
+    fn unused_tcp_addr() -> String {
+        let listener = StdTcpListener::bind("127.0.0.1:0").unwrap();
+        listener.local_addr().unwrap().to_string()
     }
 
     fn build_handler_env(
@@ -1138,10 +1155,11 @@ mod tests {
             StatManager::new(),
             Some(Arc::new(GlobalProcessChains::new())),
         );
+        let bind_addr = unused_tcp_addr();
         let result = TcpStack::builder()
             .server_runtime(test_server_runtime())
             .id("test")
-            .bind("127.0.0.1:8080")
+            .bind(bind_addr.clone())
             .hook_point(chains)
             .connection_manager(connection_manager.clone())
             .stack_context(handler_env)
@@ -1153,7 +1171,7 @@ mod tests {
         assert!(result.is_ok());
 
         {
-            let mut stream = TcpStream::connect("127.0.0.1:8080").await.unwrap();
+            let mut stream = TcpStream::connect(bind_addr.as_str()).await.unwrap();
             let result = stream
                 .write_all(b"GET / HTTP/1.1\r\nHost: httpbin.org\r\n\r\n")
                 .await;
@@ -1185,10 +1203,11 @@ mod tests {
             StatManager::new(),
             Some(Arc::new(GlobalProcessChains::new())),
         );
+        let bind_addr = unused_tcp_addr();
         let result = TcpStack::builder()
             .server_runtime(test_server_runtime())
             .id("test")
-            .bind("127.0.0.1:8081")
+            .bind(bind_addr.clone())
             .hook_point(chains)
             .stack_context(handler_env)
             .build()
@@ -1198,7 +1217,7 @@ mod tests {
         let result = stack.start().await;
         assert!(result.is_ok());
 
-        let mut stream = TcpStream::connect("127.0.0.1:8081").await.unwrap();
+        let mut stream = TcpStream::connect(bind_addr.as_str()).await.unwrap();
         let result = stream
             .write_all(b"GET / HTTP/1.1\r\nHost: httpbin.org\r\n\r\n")
             .await;
@@ -1209,16 +1228,19 @@ mod tests {
 
     #[tokio::test]
     async fn test_tcp_stack_forward() {
-        let chains = r#"
+        let target_addr = unused_tcp_addr();
+        let chains = format!(
+            r#"
 - id: main
   priority: 1
   blocks:
     - id: main
       block: |
-        forward tcp:///127.0.0.1:8083;
-        "#;
+        forward tcp:///{target_addr};
+        "#
+        );
 
-        let chains: ProcessChainConfigs = serde_yaml_ng::from_str(chains).unwrap();
+        let chains: ProcessChainConfigs = serde_yaml_ng::from_str(&chains).unwrap();
 
         let connection_manager = ConnectionManager::new();
         let handler_env = build_handler_env(
@@ -1228,10 +1250,11 @@ mod tests {
             StatManager::new(),
             Some(Arc::new(GlobalProcessChains::new())),
         );
+        let bind_addr = unused_tcp_addr();
         let result = TcpStack::builder()
             .server_runtime(test_server_runtime())
             .id("test")
-            .bind("127.0.0.1:8082")
+            .bind(bind_addr.clone())
             .hook_point(chains)
             .connection_manager(connection_manager.clone())
             .stack_context(handler_env)
@@ -1243,7 +1266,7 @@ mod tests {
         assert!(result.is_ok());
 
         tokio::spawn(async move {
-            let tcp_listener = TcpListener::bind("127.0.0.1:8083").await.unwrap();
+            let tcp_listener = TcpListener::bind(target_addr.as_str()).await.unwrap();
             if let Ok((mut tcp_stream, _)) = tcp_listener.accept().await {
                 let mut buf = [0u8; 4];
                 tcp_stream.read_exact(&mut buf).await.unwrap();
@@ -1256,7 +1279,7 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
 
         {
-            let mut stream = TcpStream::connect("127.0.0.1:8082").await.unwrap();
+            let mut stream = TcpStream::connect(bind_addr.as_str()).await.unwrap();
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             assert_eq!(connection_manager.get_all_connection_info().len(), 1);
             let result = stream.write_all(b"test").await;
@@ -1293,10 +1316,11 @@ mod tests {
             StatManager::new(),
             Some(Arc::new(GlobalProcessChains::new())),
         );
+        let bind_addr = unused_tcp_addr();
         let result = TcpStack::builder()
             .server_runtime(test_server_runtime())
             .id("test")
-            .bind("127.0.0.1:8084")
+            .bind(bind_addr.clone())
             .hook_point(chains)
             .stack_context(handler_env)
             .build()
@@ -1308,7 +1332,7 @@ mod tests {
 
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
 
-        let mut stream = TcpStream::connect("127.0.0.1:8084").await.unwrap();
+        let mut stream = TcpStream::connect(bind_addr.as_str()).await.unwrap();
         let result = stream.write_all(b"test").await;
         assert!(result.is_ok());
 
@@ -1373,10 +1397,11 @@ mod tests {
             StatManager::new(),
             Some(Arc::new(GlobalProcessChains::new())),
         );
+        let bind_addr = unused_tcp_addr();
         let result = TcpStack::builder()
             .server_runtime(test_server_runtime())
             .id("test")
-            .bind("127.0.0.1:8085")
+            .bind(bind_addr.clone())
             .hook_point(chains)
             .stack_context(handler_env)
             .build()
@@ -1388,7 +1413,7 @@ mod tests {
 
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
 
-        let mut stream = TcpStream::connect("127.0.0.1:8085").await.unwrap();
+        let mut stream = TcpStream::connect(bind_addr.as_str()).await.unwrap();
         let result = stream.write_all(b"test").await;
         assert!(result.is_ok());
 
@@ -1426,10 +1451,11 @@ mod tests {
             stat_manager.clone(),
             Some(Arc::new(GlobalProcessChains::new())),
         );
+        let bind_addr = unused_tcp_addr();
         let result = TcpStack::builder()
             .server_runtime(test_server_runtime())
             .id("test")
-            .bind("127.0.0.1:8086")
+            .bind(bind_addr.clone())
             .hook_point(chains)
             .stack_context(handler_env)
             .build()
@@ -1441,7 +1467,7 @@ mod tests {
 
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
 
-        let mut stream = TcpStream::connect("127.0.0.1:8086").await.unwrap();
+        let mut stream = TcpStream::connect(bind_addr.as_str()).await.unwrap();
         let result = stream.write_all(b"test").await;
         assert!(result.is_ok());
 
@@ -1485,10 +1511,11 @@ mod tests {
             stat_manager.clone(),
             Some(Arc::new(GlobalProcessChains::new())),
         );
+        let bind_addr = unused_tcp_addr();
         let result = TcpStack::builder()
             .server_runtime(test_server_runtime())
             .id("test")
-            .bind("127.0.0.1:8087")
+            .bind(bind_addr.clone())
             .hook_point(chains)
             .stack_context(handler_env)
             .build()
@@ -1500,7 +1527,7 @@ mod tests {
 
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
 
-        let mut stream = TcpStream::connect("127.0.0.1:8087").await.unwrap();
+        let mut stream = TcpStream::connect(bind_addr.as_str()).await.unwrap();
         let start = Instant::now();
         let result = stream.write_all(b"test").await;
         assert!(result.is_ok());
@@ -1556,10 +1583,11 @@ mod tests {
             stat_manager.clone(),
             Some(Arc::new(GlobalProcessChains::new())),
         );
+        let bind_addr = unused_tcp_addr();
         let result = TcpStack::builder()
             .server_runtime(test_server_runtime())
             .id("test")
-            .bind("127.0.0.1:8088")
+            .bind(bind_addr.clone())
             .hook_point(chains)
             .stack_context(handler_env)
             .build()
@@ -1571,7 +1599,7 @@ mod tests {
 
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
 
-        let mut stream = TcpStream::connect("127.0.0.1:8088").await.unwrap();
+        let mut stream = TcpStream::connect(bind_addr.as_str()).await.unwrap();
         let start = Instant::now();
         let result = stream.write_all(b"test").await;
         assert!(result.is_ok());
@@ -1627,10 +1655,11 @@ mod tests {
             stat_manager.clone(),
             Some(Arc::new(GlobalProcessChains::new())),
         );
+        let bind_addr = unused_tcp_addr();
         let result = TcpStack::builder()
             .server_runtime(test_server_runtime())
             .id("test")
-            .bind("127.0.0.1:8089")
+            .bind(bind_addr.clone())
             .hook_point(chains)
             .stack_context(handler_env)
             .build()
@@ -1642,7 +1671,7 @@ mod tests {
 
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
 
-        let mut stream = TcpStream::connect("127.0.0.1:8089").await.unwrap();
+        let mut stream = TcpStream::connect(bind_addr.as_str()).await.unwrap();
         let start = Instant::now();
         let result = stream.write_all(b"test").await;
         assert!(result.is_ok());
@@ -1691,10 +1720,11 @@ mod tests {
         )
         .await
         .unwrap();
+        let bind_addr = unused_tcp_addr();
         let stack = TcpStack::builder()
             .server_runtime(test_server_runtime())
             .id("tcp-raw")
-            .bind("127.0.0.1:8091")
+            .bind(bind_addr.clone())
             .hook_point(chains)
             .stack_context(env)
             .io_dump(io_dump)
@@ -1703,7 +1733,7 @@ mod tests {
             .unwrap();
         stack.start().await.unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        let mut stream = TcpStream::connect("127.0.0.1:8091").await.unwrap();
+        let mut stream = TcpStream::connect(bind_addr.as_str()).await.unwrap();
         stream.write_all(b"test").await.unwrap();
         let mut buf = [0u8; 4];
         stream.read_exact(&mut buf).await.unwrap();
@@ -1749,10 +1779,11 @@ mod tests {
         )
         .await
         .unwrap();
+        let bind_addr = unused_tcp_addr();
         let stack = TcpStack::builder()
             .server_runtime(test_server_runtime())
             .id("tcp-raw-limit")
-            .bind("127.0.0.1:8093")
+            .bind(bind_addr.clone())
             .hook_point(chains)
             .stack_context(env)
             .io_dump(io_dump)
@@ -1762,7 +1793,7 @@ mod tests {
         stack.start().await.unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
-        let mut stream = TcpStream::connect("127.0.0.1:8093").await.unwrap();
+        let mut stream = TcpStream::connect(bind_addr.as_str()).await.unwrap();
         stream.write_all(b"test").await.unwrap();
         let mut buf = [0u8; 4];
         stream.read_exact(&mut buf).await.unwrap();
@@ -1848,10 +1879,11 @@ mod tests {
         )
         .await
         .unwrap();
+        let bind_addr = unused_tcp_addr();
         let stack = TcpStack::builder()
             .server_runtime(test_server_runtime())
             .id("tcp-http")
-            .bind("127.0.0.1:8092")
+            .bind(bind_addr.clone())
             .hook_point(chains)
             .stack_context(env)
             .io_dump(io_dump)
@@ -1861,7 +1893,7 @@ mod tests {
         stack.start().await.unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
-        let mut stream = TcpStream::connect("127.0.0.1:8092").await.unwrap();
+        let mut stream = TcpStream::connect(bind_addr.as_str()).await.unwrap();
         stream
             .write_all(b"GET /a HTTP/1.1\r\nHost: www.buckyos.com\r\n\r\n")
             .await
@@ -1920,10 +1952,11 @@ mod tests {
         )
         .await
         .unwrap();
+        let bind_addr = unused_tcp_addr();
         let stack = TcpStack::builder()
             .server_runtime(test_server_runtime())
             .id("tcp-http-limit")
-            .bind("127.0.0.1:8094")
+            .bind(bind_addr.clone())
             .hook_point(chains)
             .stack_context(env)
             .io_dump(io_dump)
@@ -1933,7 +1966,7 @@ mod tests {
         stack.start().await.unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
-        let mut stream = TcpStream::connect("127.0.0.1:8094").await.unwrap();
+        let mut stream = TcpStream::connect(bind_addr.as_str()).await.unwrap();
         stream
             .write_all(b"GET /a HTTP/1.1\r\nHost: www.buckyos.com\r\n\r\n")
             .await

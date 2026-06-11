@@ -10,6 +10,7 @@ levels:
     mode: enabled
     summary: 共享库中的聚焦运行时核心 smoke 与 TCP/TLS/UDP/QUIC reuseport 单测
     test_targets:
+      - src/apps/cyfs_gateway/src/gateway.rs
       - src/components/cyfs-gateway-lib/src/connection_manager.rs
       - src/components/cyfs-gateway-lib/src/stack/tcp_stack.rs
       - src/components/cyfs-gateway-lib/src/stack/tls_stack.rs
@@ -28,22 +29,27 @@ levels:
     steps:
       - id: gateway-runtime-unit
         name: 执行聚焦运行时单测 smoke
+        change_ids: ["P-base-1"]
         run: ["bash", "-lc", "cd src && cargo test -p cyfs-gateway-lib test_connection_manager_add_and_get_connection -- --test-threads=1"]
+      - id: gateway-runtime-control-port-config
+        name: 执行 control_port 配置单测
+        change_ids: ["P-control-server-port-config-1"]
+        run: ["bash", "-lc", "cd src && cargo test -p cyfs_gateway test_apply_control_port_config -- --test-threads=1"]
       - id: gateway-runtime-tcp-stack
         name: 执行 TCP stack reuseport 聚焦单测
-        change_ids: [P-tcp-reuseport-1]
+        change_ids: ["P-tcp-reuseport-1"]
         run: ["bash", "-lc", "cd src && cargo test -p cyfs-gateway-lib test_tcp_stack -- --test-threads=1"]
       - id: gateway-runtime-tls-stack
         name: 执行 TLS stack reuseport 聚焦单测
-        change_ids: [P-tls-reuseport-1]
+        change_ids: ["P-tls-reuseport-1"]
         run: ["bash", "-lc", "cd src && cargo test -p cyfs-gateway-lib test_tls_stack -- --test-threads=1"]
       - id: gateway-runtime-udp-stack
         name: 执行 UDP stack reuseport 聚焦单测
-        change_ids: [P-udp-reuseport-1]
+        change_ids: ["P-udp-reuseport-1"]
         run: ["bash", "-lc", "cd src && cargo test -p cyfs-gateway-lib test_udp_stack -- --test-threads=1"]
       - id: gateway-runtime-quic-stack
         name: 执行 QUIC stack reuseport 聚焦单测
-        change_ids: [P-quic-reuseport-1]
+        change_ids: ["P-quic-reuseport-1"]
         run: ["bash", "-lc", "cd src && cargo test -p cyfs-gateway-lib test_quic_stack -- --test-threads=1"]
 
   dv:
@@ -64,6 +70,7 @@ levels:
     steps:
       - id: gateway-runtime-dv
         name: 执行控制平面 DV 测试
+        change_ids: ["P-base-1"]
         run: ["bash", "-lc", "cd src && cargo test -p cyfs_gateway --test test_control_server -- --test-threads=1"]
 
   integration:
@@ -83,13 +90,15 @@ levels:
       notes:
         - 这是成本更高的运行时验证层，适合在本地低成本回路收敛后执行。
         - app 进程级 Python 测试覆盖真实 binary、临时业务配置、内置 control server 注入、control RPC reload、HTTP/DNS/SOCKS/PROXY protocol 客户端调用、TLS self-cert smoke、timer/json_set 持久化，以及 multi-gateway tcp/ptcp/udp/socks/rtcp 通信。
-        - 普通测试配置不得声明 __control_server__；multi-gateway 同时启动两个 app 进程时，仅覆盖已注入 stacks.__control_server__.bind 来隔离控制端口，不复制 control server hook/server 定义。
+        - 普通测试配置不得声明 __control_server__；multi-gateway 同时启动两个 app 进程时，使用顶层 control_port 隔离控制端口，不复制 control server hook/server 定义。
         - quic/tun 的 app 级 multi-gateway 通信需要 QUIC/HTTP3 客户端或宿主机 TUN 权限夹具，当前默认 integration 先记录为专项夹具缺口；TLS 已由 self-cert smoke 覆盖。
         - app case 矩阵记录在 docs/versions/v0.6/modules/gateway-runtime/testing/app-process-integration-python-plan.md；需要专项夹具的条目不作为本 testplan 的默认必跑步骤。
     steps:
       - id: gateway-runtime-integration
         name: 执行完整网关集成测试
+        change_ids: ["P-base-1", "P-control-server-port-config-1"]
         run: ["bash", "-lc", "cd src && cargo test -p cyfs_gateway --test test_cyfs_gateway -- --test-threads=1"]
       - id: gateway-runtime-app-process-integration
         name: 执行 cyfs_gateway app 进程级 Python 集成测试
+        change_ids: ["P-base-1", "P-control-server-port-config-1"]
         run: ["bash", "-lc", "python3 tests/integration/cyfs_gateway_app/run.py"]

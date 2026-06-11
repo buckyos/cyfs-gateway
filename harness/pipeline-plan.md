@@ -1,42 +1,33 @@
-# Pipeline 计划
+# Pipeline Plan
 
-## 使用说明
-- 本文件是 auto-pipeline 的计划工件。
-- 本次 pipeline 由用户确认启动，用于推进 `gateway-runtime` 的 TLS reuseport 重构。
+## Trigger
+- Approved proposal: docs/versions/v0.6/modules/gateway-runtime/proposal.md
+- User launch confirmed: yes
+- Per-stage user confirmation: not required; user said "确定，自动处理后续步骤"
+- Auto-confirm completed document stages: yes
+- Version: v0.6
+- Module(s): gateway-runtime
+- change_id values: P-control-server-port-config-1
 
-## 触发信息
-- 目标模块：`gateway-runtime`
-- 已批准 proposal：`docs/versions/v0.6/modules/gateway-runtime/proposal.md`
-- 用户已确认启动：是，要求自动处理后续流程
-- 当前变更 ID：`P-tls-reuseport-1`
+## Stage Graph
+| task_id | stage | status | responsibility | scope | parent_task | depends_on | output | done_condition |
+|---------|-------|--------|----------------|-------|-------------|------------|--------|----------------|
+| D-control-port | design | complete | Define `control_port` config shape, runtime wiring, validation, scope paths, and trigger coverage. | docs/versions/v0.6/modules/gateway-runtime/design.md | pipeline | proposal approval | approved design.md | design doc structure and schema checks pass |
+| I-control-port | implementation | blocked | Implement top-level `control_port` handling and default compatibility. | production code and admission evidence | pipeline | D-control-port | code changes and admission evidence | schema/admission checks passed; implementation scope check is blocked by mixed worktree changes |
+| T-control-port | testing | complete | Add and run tests for default, explicit, invalid, and multi-instance control ports. | testing artifacts and test code | pipeline | I-control-port | updated testing evidence and runnable test results | relevant gateway-runtime tests passed; red-green pre-fix artifact remains a testing evidence gap |
+| A-control-port | acceptance | complete | Audit proposal, design, implementation, tests, and evidence for `control_port`. | docs/versions/v0.6/reviews/ | pipeline | T-control-port | docs/versions/v0.6/reviews/gateway-runtime-control-port-config-20260612.md | report concludes needs changes |
 
-## 验收基线
-- 最终验收以 `docs/versions/v0.6/modules/gateway-runtime/proposal.md` 为准。
-- 下游 design、testing、implementation 和 acceptance 不得改变 proposal 中的目标、范围与非目标。
+## Return Routing
+- Proposal issue: return to proposal and re-approve before continuing.
+- Design issue: return to D-control-port.
+- Implementation issue: return to I-control-port after design/admission coverage is corrected.
+- Testing issue: return to T-control-port.
+- Acceptance issue: route to the owning earlier stage named by the acceptance finding.
 
-## 阶段图
-| Task ID | 阶段 | 职责 | 范围 | 依赖 | 输出 | 完成条件 |
-|---------|------|------|------|------|------|----------|
-| P-1 | proposal | 固化 TCP reuseport 重构目标和范围 | `gateway-runtime` | 用户确认 | `proposal.md` | `P-tcp-reuseport-1` 批准 |
-| D-1 | design | 定义 `TcpStack` 使用外部 `ServerRuntime` 和 `sfo-reuseport::TcpServer` 的实现形态 | `cyfs-gateway-lib` + runtime wiring | P-1 | `design.md` | Rust 类型、接口、生命周期和路径归属明确 |
-| T-1 | testing | 定义验证覆盖和统一入口 | unit / dv / integration | D-1 | `testing.md`、`testplan.yaml` | TCP stack 聚焦测试和运行时入口可追踪 |
-| I-1 | implementation | 交付最小代码与测试改动 | TCP stack + factory wiring | D-1, T-1 | 代码与测试 | 实现映射到批准文档 |
-| A-1 | acceptance | 审计文档、实现和验证结果 | `gateway-runtime` | I-1 | `docs/versions/v0.6/reviews/` | acceptance 通过或给出回退路由 |
-| P-2 | proposal | 固化 TLS reuseport 重构目标和范围 | `gateway-runtime` | 用户确认 | `proposal.md` | `P-tls-reuseport-1` 批准 |
-| D-2 | design | 定义 `TlsStack` 使用外部 `ServerRuntime` 和 `sfo-reuseport::TcpServer` 的实现形态 | `cyfs-gateway-lib` + runtime wiring | P-2 | `design.md` | Rust 类型、接口、生命周期和路径归属明确 |
-| T-2 | testing | 定义验证覆盖和统一入口 | unit / dv / integration | D-2 | `testing.md`、`testplan.yaml` | TLS stack 聚焦测试和运行时入口可追踪 |
-| I-2 | implementation | 交付最小代码与测试改动 | TLS stack + factory wiring | D-2, T-2 | 代码与测试 | 实现映射到批准文档 |
-| A-2 | acceptance | 审计文档、实现和验证结果 | `gateway-runtime` | I-2 | `docs/versions/v0.6/reviews/` | acceptance 通过或给出回退路由 |
-
-## 回退规则
-- Proposal 问题：回退到 P-1。
-- Design 问题：回退到 D-1。
-- Testing 问题：回退到 T-1。
-- Implementation 问题：回退到 I-1。
-
-## 退出条件
-- [x] `P-tcp-reuseport-1` 的 proposal / design / testing 覆盖完整
-- [x] `P-tls-reuseport-1` 的 proposal / design / testing 覆盖完整
-- [x] implementation 完成
-- [x] 必需验证有结果或明确记录阻塞原因
-- [x] acceptance 通过
+## Exit Condition
+- [x] `P-control-server-port-config-1` has approved design coverage.
+- [x] Implementation admission passed for `P-control-server-port-config-1`.
+- [x] `control_port` implementation is complete.
+- [x] Required tests and evidence exist.
+- [x] Acceptance report is complete.
+- [ ] Acceptance concluded `accepted`.

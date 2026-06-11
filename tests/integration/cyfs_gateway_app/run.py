@@ -5,6 +5,7 @@ import hashlib
 import http.client
 import json
 import os
+import re
 import shutil
 import socket
 import ssl
@@ -24,6 +25,9 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 SRC_DIR = REPO_ROOT / "src"
 BIN_PATH = SRC_DIR / "target" / "debug" / "cyfs_gateway"
 BUILTIN_CONTROL_PORT = 13451
+ACTIVE_CONTROL_PORT = None
+YAML_CONTROL_PORT_RE = re.compile(r"(?m)^control_port:\s*(\d+)\s*$")
+TOML_CONTROL_PORT_RE = re.compile(r"(?m)^control_port\s*=\s*(\d+)\s*$")
 
 
 class TestFailure(Exception):
@@ -76,6 +80,12 @@ def free_udp_port():
         return sock.getsockname()[1]
 
 
+def effective_control_port(port):
+    if port == BUILTIN_CONTROL_PORT and ACTIVE_CONTROL_PORT is not None:
+        return ACTIVE_CONTROL_PORT
+    return port
+
+
 def build_gateway():
     if os.environ.get("CYFS_GATEWAY_APP_SKIP_BUILD") == "1":
         print("[cyfs-gateway-app] skipping cargo build via CYFS_GATEWAY_APP_SKIP_BUILD=1")
@@ -98,10 +108,11 @@ def build_gateway():
 
 
 class GatewayProcess:
-    def __init__(self, case_dir, config_path, buckyos_root):
+    def __init__(self, case_dir, config_path, buckyos_root, control_port=None):
         self.case_dir = Path(case_dir)
         self.config_path = Path(config_path)
         self.buckyos_root = Path(buckyos_root)
+        self.control_port = control_port or free_port()
         self.stdout_path = self.case_dir / "gateway.stdout.log"
         self.stderr_path = self.case_dir / "gateway.stderr.log"
         self._stdout = None
@@ -109,6 +120,7 @@ class GatewayProcess:
         self.proc = None
 
     def start(self):
+        self._ensure_config_control_port()
         self._stdout = self.stdout_path.open("w", encoding="utf-8")
         self._stderr = self.stderr_path.open("w", encoding="utf-8")
         env = os.environ.copy()
@@ -121,6 +133,8 @@ class GatewayProcess:
             stderr=self._stderr,
             text=True,
         )
+        global ACTIVE_CONTROL_PORT
+        ACTIVE_CONTROL_PORT = self.control_port
 
     def stop(self):
         if self.proc is not None and self.proc.poll() is None:
@@ -130,6 +144,9 @@ class GatewayProcess:
             except subprocess.TimeoutExpired:
                 self.proc.kill()
                 self.proc.wait(timeout=5)
+        global ACTIVE_CONTROL_PORT
+        if ACTIVE_CONTROL_PORT == self.control_port:
+            ACTIVE_CONTROL_PORT = None
         if self._stdout is not None:
             self._stdout.close()
         if self._stderr is not None:
@@ -139,6 +156,32 @@ class GatewayProcess:
         stdout = self.stdout_path.read_text(encoding="utf-8", errors="replace")
         stderr = self.stderr_path.read_text(encoding="utf-8", errors="replace")
         return stdout + "\n" + stderr
+
+    def _ensure_config_control_port(self):
+        suffix = self.config_path.suffix.lower()
+        if suffix == ".json":
+            data = json.loads(self.config_path.read_text(encoding="utf-8"))
+            if "control_port" in data:
+                self.control_port = int(data["control_port"])
+                return
+            data["control_port"] = self.control_port
+            write_file(self.config_path, json.dumps(data))
+            return
+
+        text = self.config_path.read_text(encoding="utf-8")
+        if suffix == ".toml":
+            match = TOML_CONTROL_PORT_RE.search(text)
+            if match:
+                self.control_port = int(match.group(1))
+                return
+            write_file(self.config_path, f"control_port = {self.control_port}\n{text}")
+            return
+
+        match = YAML_CONTROL_PORT_RE.search(text)
+        if match:
+            self.control_port = int(match.group(1))
+            return
+        write_file(self.config_path, f"control_port: {self.control_port}\n{text}")
 
 
 class UpstreamServer:
@@ -315,6 +358,7 @@ def raw_http_get_with_bound_source(port, host, path="/"):
 
 
 def control_get_system_info(port):
+    port = effective_control_port(port)
     payload = json.dumps({"method": "get_system_info", "params": {}, "sys": [1]}).encode("utf-8")
     conn = http.client.HTTPConnection("127.0.0.1", port, timeout=2)
     try:
@@ -334,6 +378,7 @@ def control_get_system_info(port):
 
 
 def control_rpc(port, method, params=None, token=None):
+    port = effective_control_port(port)
     seq = int(time.time() * 1000)
     sys_values = [seq] if token is None else [seq, token]
     payload = json.dumps(
@@ -360,6 +405,7 @@ def control_rpc(port, method, params=None, token=None):
 
 
 def control_rpc_raw(port, method, params=None, token=None):
+    port = effective_control_port(port)
     seq = int(time.time() * 1000)
     sys_values = [seq] if token is None else [seq, token]
     payload = json.dumps(
@@ -795,6 +841,7 @@ def render_full_runtime_config(
     config = f"""
 user_name: app_user
 password: app_pass
+control_port: {ports['control']}
 
 collections:
   test_set:
@@ -1082,13 +1129,9 @@ def render_multi_gateway_remote_config(case_dir, ports, udp_echo_port):
     write_file(roots["socks"] / "index.html", "REMOTE_SOCKS")
 
     config = f"""
-stacks:
-  # The control server stack/server are injected by cyfs_gateway itself.
-  # Multi-process tests only override the injected stack bind to avoid
-  # control port conflicts between the remote and client app processes.
-  __control_server__:
-    bind: 127.0.0.1:{ports['control']}
+control_port: {ports['control']}
 
+stacks:
   remote_http:
     bind: 127.0.0.1:{ports['http']}
     protocol: tcp
@@ -1218,13 +1261,9 @@ servers:
 
 def render_multi_gateway_client_config(case_dir, ports, remote_ports):
     config = f"""
-stacks:
-  # The control server stack/server are injected by cyfs_gateway itself.
-  # Multi-process tests only override the injected stack bind to avoid
-  # control port conflicts between the remote and client app processes.
-  __control_server__:
-    bind: 127.0.0.1:{ports['control']}
+control_port: {ports['control']}
 
+stacks:
   client_http:
     bind: 127.0.0.1:{ports['http']}
     protocol: tcp
@@ -1327,13 +1366,9 @@ def render_rtcp_remote_config(case_dir, ports, remote_device):
     root = case_dir / "remote_www" / "rtcp"
     write_file(root / "index.html", "REMOTE_RTCP")
     config = f"""
-stacks:
-  # The control server stack/server are injected by cyfs_gateway itself.
-  # This app-process pair only overrides the injected stack bind to avoid
-  # control port conflicts between the remote and client app processes.
-  __control_server__:
-    bind: 127.0.0.1:{ports['control']}
+control_port: {ports['control']}
 
+stacks:
   remote_rtcp:
     bind: 127.0.0.1:{ports['rtcp']}
     protocol: rtcp
@@ -1386,13 +1421,9 @@ def render_rtcp_client_config(case_dir, ports, client_device, remote_device, rem
     bootstrap = quote(f"tcp:///127.0.0.1:{remote_ports['rtcp']}", safe="")
     rtcp_url = f"rtcp://{bootstrap}@{remote_device['host']}:{remote_ports['rtcp']}/rtcp-via.test:80"
     config = f"""
-stacks:
-  # The control server stack/server are injected by cyfs_gateway itself.
-  # This app-process pair only overrides the injected stack bind to avoid
-  # control port conflicts between the remote and client app processes.
-  __control_server__:
-    bind: 127.0.0.1:{ports['control']}
+control_port: {ports['control']}
 
+stacks:
   client_http:
     bind: 127.0.0.1:{ports['http']}
     protocol: tcp
@@ -1558,7 +1589,7 @@ def test_minimal_startup_and_dir_routing(case_dir):
         config_path = render_runtime_config(case_dir, entry_port, upstream.port)
         gateway = GatewayProcess(case_dir, config_path, case_dir / "buckyos-root")
         gateway.start()
-        wait_gateway_ready(gateway, BUILTIN_CONTROL_PORT)
+        wait_gateway_ready(gateway, gateway.control_port)
 
         status, headers, body = http_text(entry_port, "dir.test", "/")
         assert_eq(status, 200, "dir route status")
@@ -1578,7 +1609,7 @@ def test_process_chain_runtime_routes(case_dir):
         config_path = render_runtime_config(case_dir, entry_port, upstream.port)
         gateway = GatewayProcess(case_dir, config_path, case_dir / "buckyos-root")
         gateway.start()
-        wait_gateway_ready(gateway, BUILTIN_CONTROL_PORT)
+        wait_gateway_ready(gateway, gateway.control_port)
 
         status, headers, body = http_text(entry_port, "pc.test", "/if/dir")
         assert_eq(status, 200, "if dir status")
@@ -1681,7 +1712,7 @@ def start_full_gateway(case_dir):
     direct_echo.start()
     proxy_echo.start()
     ports = {
-        "control": BUILTIN_CONTROL_PORT,
+        "control": free_port(),
         "entry": free_port(),
         "proxy": free_port(),
         "dns": free_udp_port(),
@@ -2013,10 +2044,15 @@ def test_cli_against_running_app(case_dir):
     resources = start_full_gateway(case_dir)
     gateway, upstream, direct_echo, proxy_echo, ports, _dump_file = resources
     root = case_dir / "buckyos-root"
+    server = f"http://127.0.0.1:{ports['control']}"
     try:
         status, _, body = http_text(ports["entry"], "complex.test", "/shared")
         assert_eq(status, 200, "cli collection seed status")
         assert_eq(body, "SHARED", "cli collection seed body")
+
+        token = control_login(ports["control"])
+        token_path = root / "data" / "var" / "cyfs_gateway" / "cli_token" / server.lower().encode("utf-8").hex()
+        write_file(token_path, token)
 
         doc = run_cli(["process_chain", "call-server"], case_dir, root)
         assert_process_ok(doc, "cli process_chain help exit code")
@@ -2026,7 +2062,12 @@ def test_cli_against_running_app(case_dir):
         assert_process_ok(all_doc, "cli process_chain all exit code")
         assert_in("proxy-protocol-probe", all_doc.stdout, "cli process_chain all output")
 
-        show_config = run_cli(["show", "config", "--format", "yaml"], case_dir, root, timeout=20)
+        show_config = run_cli(
+            ["show", "config", "--format", "yaml", "--server", server],
+            case_dir,
+            root,
+            timeout=20,
+        )
         assert_process_ok(show_config, "cli show config exit code")
         assert_in("complex.test", show_config.stdout, "cli show config user server")
         if "__control_server__" in show_config.stdout:

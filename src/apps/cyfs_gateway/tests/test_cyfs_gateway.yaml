@@ -36,7 +36,7 @@ limiters:
 
 stacks:
   test1:
-    bind: 0.0.0.0:18080
+    bind: 127.0.0.1:{{test1_port}}
     protocol: tcp
     io_dump_file: {{test_io_dump}}
     hook_point:
@@ -57,7 +57,7 @@ stacks:
               reject;
 
   test2:
-    bind: 0.0.0.0:18081
+    bind: 127.0.0.1:{{test2_port}}
     protocol: tcp
     hook_point:
       main:
@@ -95,7 +95,7 @@ stacks:
               call-server upstream_socks;
 
   test3:
-    bind: 0.0.0.0:9545
+    bind: 127.0.0.1:{{test3_port}}
     protocol: udp
     transparent: false
     hook_point:
@@ -108,7 +108,7 @@ stacks:
               call-server main_dns;
 
   test_ptcp_entry:
-    bind: 0.0.0.0:18082
+    bind: 127.0.0.1:{{test_ptcp_entry_port}}
     protocol: tcp
     hook_point:
       main:
@@ -117,11 +117,11 @@ stacks:
           default:
             priority: 1
             block: |
-              http-probe && forward "ptcp://${REQ.source_addr}/127.0.0.1:18084";
+              http-probe && forward "ptcp://${REQ.source_addr}/127.0.0.1:{{test_ptcp_mix_port}}";
               reject;
 
   test_ptcp_mix:
-    bind: 0.0.0.0:18084
+    bind: 127.0.0.1:{{test_ptcp_mix_port}}
     protocol: tcp
     hook_point:
       main:
@@ -144,14 +144,14 @@ servers:
           default:
             priority: 1
             block: |
-              starts-with ${REQ.path} "/api" && rewrite ${REQ.path} "/api*" "*" && map-add REQ host www.buckyos.com && forward http://127.0.0.1:18081;
+              starts-with ${REQ.path} "/api" && rewrite ${REQ.path} "/api*" "/*" && map-add REQ host www.buckyos.com && forward http://127.0.0.1:{{test2_port}};
       main1:
         priority: 1
         blocks:
           default:
             priority: 1
             block: |
-              starts-with ${REQ.path} "/test_return" && rewrite ${REQ.path} "/test_return*" "*" && map-add REQ host www.buckyos.com && return "forward http://127.0.0.1:18081";
+              starts-with ${REQ.path} "/test_return" && rewrite ${REQ.path} "/test_return*" "/*" && map-add REQ host www.buckyos.com && return "forward http://127.0.0.1:{{test2_port}}";
               starts-with ${REQ.path} "/sn" && rewrite ${REQ.path} "/sn*" "/*" && call-server sn.http;
 
           default1:

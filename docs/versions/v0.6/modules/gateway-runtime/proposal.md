@@ -1,83 +1,125 @@
+---
+module: gateway-runtime
+version: v0.6
+status: approved
+approved_by: user
+approved_at: 2026-06-11T23:55:57+08:00
+approved_content_sha256: ee536cc030047b0bdec8f280e212e18db1f6c273a1e40de693b2d46caf0ad141
+---
+
 # gateway-runtime Proposal
 
-## 元数据
+## Metadata
 - version: v0.6
 - module: gateway-runtime
 - stage: proposal
 - status: approved
-- approved_by: auto-pipeline
-- approved_at: 2026-05-31T00:00:00+08:00
+- approved_by: user
+- approved_at: 2026-06-11T23:55:57+08:00
 
-## 状态
-- 人类可读状态：已批准
+## Background and Goal
+`gateway-runtime` owns gateway startup, config loading, stack and server registration, the built-in control plane, and integration behavior. The current built-in control server defaults to `127.0.0.1:13451`; tests that start more than one `cyfs_gateway` process need a stable way to assign a distinct control server port per instance.
 
-## 背景与目标
-网关运行时负责配置加载、stack 与 server 注册、控制平面接线以及网络栈集成行为。TCP stack 当前已经迁移到 `sfo-reuseport`；TLS stack 仍在 `TlsStack` 内部手写 socket 创建、bind/listen、accept loop 和本地并发控制。UDP stack 仍在 `UdpStackInner` 内部手写 UDP socket 创建、bind、recv loop 和本地并发控制。QUIC stack 仍在 `QuicStackInner` 内部手写 UDP socket bind、quinn endpoint accept loop 和本地连接数限制。仓库已引入并更新 `sfo-reuseport`，该库能够提供 TCP/UDP/QUIC reuse-port worker listener 和 per-worker concurrency。
+The existing runtime can already override the injected internal stack through `stacks.__control_server__.bind`, but that is an internal stack key and is easy to miss. This proposal adds a user-facing top-level `control_port` setting so multi-instance tests and local development can avoid fixed-port conflicts without duplicating the built-in control server stack or server definitions.
 
-本次变更目标是让 TCP、TLS、UDP 与 QUIC stack 都使用 `sfo-reuseport` 提供的 server 能力，并让 `ServerRuntime` 由运行时组装层外部传入，避免 stack 自行创建或管理全局 worker runtime。
+This proposal also preserves the previously planned TCP/TLS/UDP/QUIC reuseport work for the module packet.
 
-## 范围
-### 范围内
-- 将 `TcpStack` 的监听实现从手写 `tokio::net::TcpListener` accept loop 迁移到 `sfo_reuseport::TcpServer`。
-- `TcpStackFactory`、`TcpStackBuilder` 和 `TcpStack` 接收外部传入的 `sfo_reuseport::ServerRuntime`。
-- 保持 `TcpStackConfig.concurrency` 的当前目标语义：作为每个 reuseport worker 的并发上限。
-- 将 `TlsStack` 的监听实现从手写 `tokio::net::TcpListener` accept loop 迁移到 `sfo_reuseport::TcpServer`。
-- `TlsStackFactory`、`TlsStackBuilder` 和 `TlsStack` 接收外部传入的 `sfo_reuseport::ServerRuntime`。
-- 保持 `TlsStackConfig.concurrency` 的当前目标语义：作为每个 reuseport worker 的并发上限。
-- 将 `UdpStack` 的监听实现从手写 `socket2`/`tokio::net::UdpSocket` bind 和 recv loop 迁移到 `sfo_reuseport::UdpServer`。
-- `UdpStackFactory`、`UdpStackBuilder` 和 `UdpStackInner` 接收外部传入的 `sfo_reuseport::ServerRuntime`。
-- 保持 `UdpStackConfig.concurrency` 的当前目标语义：作为每个 reuseport worker 的 datagram handler 并发上限。
-- 将 `QuicStack` 的监听实现从手写 `socket2`/`quinn::Endpoint` 单 listener accept loop 迁移到 `sfo_reuseport::QuicServer` worker socket。
-- `QuicStackFactory`、`QuicStackBuilder` 和 `QuicStackInner` 接收外部传入的 `sfo_reuseport::ServerRuntime`。
-- 保持 `QuicStackConfig.concurrency` 的当前目标语义：作为每个 reuseport worker 的 QUIC open connection 上限。
-- 将 `concurrency = 0` 继续解释为不限制并发。
-- 保持现有 process-chain、connection manager、统计、io dump、transparent、reuse_address、timeout 和热更新语义。
-- 更新聚焦测试入口，使 TCP stack 重构有可追踪证据。
-- 更新聚焦测试入口，使 TLS stack listener 重构有可追踪证据。
-- 更新聚焦测试入口，使 UDP stack listener 重构有可追踪证据。
-- 更新聚焦测试入口，使 QUIC stack listener 重构有可追踪证据。
+## Scope
+### In Scope
+- Add a top-level `control_port` config setting for the built-in control server port.
+- Keep the default control server endpoint equivalent to `127.0.0.1:13451` when the new setting is absent.
+- Map the setting to the injected `__control_server__` TCP stack bind address during config loading.
+- Use the setting in tests that start multiple `cyfs_gateway` instances or otherwise need isolated control ports.
+- Preserve the built-in control server stack/server definitions; user configs must not need to copy the hook point or server definition.
+- Keep existing TCP/TLS/UDP/QUIC reuseport proposal items in this module packet.
 
-### 范围外
-- 不重构 RTCP 或 TUN stack。
-- 不新增用户可见配置字段。
-- 不改变控制平面 API。
-- 不把总并发平均分配到 worker；`concurrency` 不除以 worker 数。
-- 不引入新的 runtime 配置文件或 CLI 参数。
+### Out of Scope
+- Do not expose a remote control-plane bind host in this change; the new setting controls the port only and remains loopback-bound.
+- Do not change control-plane RPC methods, authentication, token behavior, or response schemas.
+- Do not require existing configs to add the new setting.
+- Do not remove the existing internal `stacks.__control_server__.bind` override path until compatibility is separately designed.
+- Do not redesign stack, server, process-chain, RTCP, or TUN behavior.
 
-### 与相邻模块的边界
-- `gateway-runtime` 负责创建和注入 `ServerRuntime`，并注册 TCP/TLS/UDP/QUIC stack factory。
-- `cyfs-gateway-lib` 负责 TCP/TLS/UDP/QUIC stack 实现和 factory。
-- `runtime-configs` 不在本次范围内，因为配置结构和默认模板不新增字段。
+### Adjacent Module Boundaries
+- `gateway-runtime` owns config loading, built-in control server injection, and runtime startup behavior.
+- `runtime-configs` owns shipped templates/default examples; design must decide whether any rootfs examples should show the new setting.
+- `web-dashboard` consumes the control plane but does not define the runtime port setting in this proposal.
 
-## 约束
-- `ServerRuntime` 必须由外部组装层创建并传入，`TcpStack` 和 `TlsStack` 不得自行启动新的 `ServerRuntime`。
-- `TcpStackConfig.concurrency` 和 `TlsStackConfig.concurrency` 映射为 `ServiceConfig::with_max_concurrency_per_worker(concurrency)`。
-- `UdpStackConfig.concurrency` 映射为 `UdpServiceConfig::with_max_concurrency_per_worker(concurrency)`。
-- `QuicStackConfig.concurrency` 映射为每个 worker endpoint 的 open connection 上限；`concurrency = 0` 不限流。
-- `concurrency = 0` 仍通过现有 normalize 逻辑表示不限流，并且不设置 `max_concurrency_per_worker`。
-- `bind`、`transparent`、`reuse_address`、`concurrency` 仍然是 listener 启动参数，热更新时必须保持不变。
-- 代码改动保持小范围，不顺带重构 process-chain 或 connection manager 行为。
+## Assumptions and Ambiguities
+- The requested setting is for selecting the local control server port for test and local multi-instance startup, not for exposing the control server on a non-loopback interface.
+- The external shape is the top-level runtime config field `control_port`, rather than a nested object or the internal `__control_server__` stack id.
+- If both `control_port` and `stacks.__control_server__.bind` are present, design must define precedence or conflict handling before implementation.
+- The exact YAML shape, parser location, and validation error messages belong in design.
 
-## 高层结果
-- TCP/TLS/UDP/QUIC stack 由 `sfo-reuseport` 管理 reuse-port worker listener。
-- `ServerRuntime` 生命周期由运行时组装层统一持有。
-- TCP/TLS/QUIC 连接处理行为、UDP datagram/session 处理行为和现有配置契约保持兼容。
-- 统一测试入口能覆盖 TCP/TLS/UDP/QUIC stack 创建、启动和基本转发行为。
+## Constraints
+- Default behavior must remain backward compatible: no setting means port `13451`.
+- The control server must remain loopback-only unless a separate approved proposal expands the trust boundary.
+- Port values must be validated before stack startup, with invalid or out-of-range values reported as config errors.
+- Multi-instance tests must not duplicate the built-in control server hook/server definition.
+- Config-template synchronization rules apply if shipped examples or templates expose the new setting.
 
-## 实现准入覆盖
-| 条目 ID | 当前批准内容 | 可直接支持的实现任务 | 需要先补充的情况 |
-|---------|--------------|----------------------|------------------|
-| P-base-1 | 建立 `gateway-runtime` 的 harness 基线模块包与验证入口 | 维护 harness 基线文档、模板和测试入口本身 | 其他未覆盖的运行时行为、契约或配置变更 |
-| P-tcp-reuseport-1 | TCP stack 使用外部传入的 `sfo_reuseport::ServerRuntime` 和 `sfo_reuseport::TcpServer`，并把 `concurrency` 作为 per-worker concurrency | 修改 `TcpStack`、`TcpStackFactory`、运行时 factory 注册和相关聚焦测试 | 新增用户配置字段、改变控制平面 API、改变 UDP/QUIC 等其他 stack 行为 |
-| P-tls-reuseport-1 | TLS stack 使用外部传入的 `sfo_reuseport::ServerRuntime` 和 `sfo_reuseport::TcpServer`，并把 `concurrency` 作为 per-worker concurrency | 修改 `TlsStack`、`TlsStackFactory`、运行时 factory 注册和相关聚焦测试 | 新增用户配置字段、改变控制平面 API、改变 UDP/QUIC/RTCP/TUN 等其他 stack 行为 |
-| P-udp-reuseport-1 | UDP stack 使用外部传入的 `sfo_reuseport::ServerRuntime` 和 `sfo_reuseport::UdpServer`，并把 `concurrency` 作为 per-worker datagram handler concurrency | 修改 `UdpStack`、`UdpStackFactory`、运行时 factory 注册和相关聚焦测试 | 新增用户配置字段、改变控制平面 API、改变 QUIC/RTCP/TUN 等其他 stack 行为 |
-| P-quic-reuseport-1 | QUIC stack 使用外部传入的 `sfo_reuseport::ServerRuntime` 和 `sfo_reuseport::QuicServer`，并把 `concurrency` 作为 per-worker open connection 上限 | 修改 `QuicStack`、`QuicStackFactory`、运行时 factory 注册和相关聚焦测试 | 新增用户配置字段、改变控制平面 API、改变 RTCP/TUN 等其他 stack 行为 |
+## Requirement Challenge
+| question | evaluation | risk_or_tradeoff | decision |
+|----------|------------|------------------|----------|
+| Should tests keep using `stacks.__control_server__.bind` instead of a new setting? | It already works, but it exposes an internal injected stack id and makes test configs depend on built-in wiring details. | Keeping only the internal override avoids code changes but leaves the recurring fixed-port problem easy to reintroduce. | Add a user-facing port setting while preserving the internal override path for compatibility. |
+| Should the setting be nested or top-level? | The requested purpose is a simple global runtime startup knob used by tests and local multi-instance runs. | A nested object leaves more room for future control-plane settings but adds shape complexity that is not needed for port-only configuration. | Use top-level `control_port`. |
+| Should the new setting accept a full bind address or only a port? | The user asked for a port, and remote control-plane exposure would alter the security boundary. | A full bind address is more flexible but risks accidental non-loopback control-plane exposure. | Support port-only in this change; keep loopback binding. |
+| Should this be implemented directly from chat context? | The approved proposal currently excludes new user-visible config fields. | Direct implementation would bypass proposal/design admission. | Return to proposal first and record downstream design, implementation, and testing follow-up. |
 
-## 风险
-- TCP listener 生命周期从 `JoinHandle` 切换到 `TcpServer`，drop/close 路径必须释放端口。
-- TLS listener 生命周期从 `JoinHandle` 切换到 `TcpServer`，drop/close 路径必须释放端口。
-- UDP listener 生命周期从 `JoinHandle` 切换到 `UdpServer`，drop/close 路径必须释放端口。
-- QUIC listener 生命周期从 `JoinHandle` 切换到 `QuicServer`，drop/close 路径必须关闭 worker endpoint 并释放端口。
-- 并发限制从本地 `Semaphore` 迁移到 `sfo-reuseport` 的 worker limit，必须保持 `concurrency = 0` 不限流。
-- transparent socket option 需要正确映射到 `sfo-reuseport::SocketOptions`。
-- factory 构造签名变化会影响运行时注册和测试注册点。
+## Large Module Submodule Decision
+| submodule | new_or_existing | responsibility | proposal_packet | reason |
+|-----------|-----------------|----------------|-----------------|--------|
+| gateway-runtime/control-plane-config | existing module scope | Built-in control server startup configuration and multi-instance control port isolation | docs/versions/v0.6/modules/gateway-runtime/proposal.md | The change is a small config surface inside gateway runtime startup and does not justify a new direct submodule packet. |
+
+## Trigger Matrix
+| trigger_category | applies | evidence | required_checks | deferred_checks_and_reason |
+|------------------|---------|----------|-----------------|----------------------------|
+| contract/protocol | yes | Adds top-level runtime config key `control_port` for control server port. | Design must specify config shape, compatibility, conflict handling, and validation errors; tests must cover default and explicit port config. | owner: gateway-runtime design/testing; risk: config contract ambiguity; acceptance impact: implementation cannot be accepted without compatibility evidence |
+| data/schema | no | No persisted data, database schema, migration, cache key, or serialized state shape changes are required. | none | none |
+| security/privacy/permission | yes | The control server is an authenticated local control plane; changing its endpoint can affect access boundaries. | Design must state loopback-only binding and negative handling for attempts to configure a host or invalid port. | owner: gateway-runtime design/testing; risk: accidental control-plane exposure; acceptance impact: acceptance must reject missing loopback/negative validation |
+| runtime/integration | yes | Startup binds the built-in `__control_server__` TCP stack and multi-instance tests need distinct ports. | DV or integration tests must start with an explicit control port and verify control RPC login/system info works. | owner: gateway-runtime testing; risk: multi-instance startup still races or binds the default port; acceptance impact: integration evidence is required |
+| build/dependency/config/deployment | yes | Adds top-level `control_port` config key/default behavior and may affect shipped examples/templates. | Design must list touched config surfaces; implementation must update or justify rootfs/template docs and run relevant module tests. | owner: gateway-runtime design/testing; risk: template/docs drift; acceptance impact: config-template sync must be reviewed |
+| ui/datamodel/workflow | no | No web dashboard UI state or frontend/backend dashboard data contract changes are requested. | none | none |
+| harness/process | no | No harness scripts, rules, testplan schema, or CI entrypoint behavior changes are requested by this proposal. | none | none |
+
+## High-Level Outcomes
+- A config can select a non-default control server port for a `cyfs_gateway` instance without copying built-in control server definitions.
+- Multiple gateway instances can run in tests with isolated control ports.
+- Existing configs keep using `127.0.0.1:13451` by default.
+- The control plane remains loopback-only and authenticated.
+
+## Proposal Items
+| proposal_id | change_id | outcome | success_evidence |
+|-------------|-----------|---------|------------------|
+| gateway-runtime-baseline | P-base-1 | Establish the `gateway-runtime` harness baseline module packet and validation entrypoints. | Maintain harness baseline docs, templates, and unified test entry itself. |
+| gateway-runtime-tcp-reuseport | P-tcp-reuseport-1 | TCP stack uses external `sfo_reuseport::ServerRuntime` and `sfo_reuseport::TcpServer`, with `concurrency` interpreted as per-worker concurrency. | Modify `TcpStack`, `TcpStackFactory`, runtime factory registration, and focused tests. |
+| gateway-runtime-tls-reuseport | P-tls-reuseport-1 | TLS stack uses external `sfo_reuseport::ServerRuntime` and `sfo_reuseport::TcpServer`, with `concurrency` interpreted as per-worker concurrency. | Modify `TlsStack`, `TlsStackFactory`, runtime factory registration, and focused tests. |
+| gateway-runtime-udp-reuseport | P-udp-reuseport-1 | UDP stack uses external `sfo_reuseport::ServerRuntime` and `sfo_reuseport::UdpServer`, with `concurrency` interpreted as per-worker datagram handler concurrency. | Modify `UdpStack`, `UdpStackFactory`, runtime factory registration, and focused tests. |
+| gateway-runtime-quic-reuseport | P-quic-reuseport-1 | QUIC stack uses external `sfo_reuseport::ServerRuntime` and `sfo_reuseport::QuicServer`, with `concurrency` interpreted as per-worker open connection limit. | Modify `QuicStack`, `QuicStackFactory`, runtime factory registration, and focused tests. |
+| gateway-runtime-control-port-config | P-control-server-port-config-1 | Top-level `control_port` config can set the built-in control server port while preserving loopback binding and default port compatibility. | Design, implementation, and tests cover explicit port, default port, multi-instance startup, and invalid/conflicting config. |
+
+## Success Criteria
+- Top-level `control_port` can set the built-in control server port for one gateway instance.
+- Two gateway instances in test can use different control ports and both answer control RPC requests.
+- Absence of the new setting preserves the existing default port behavior.
+- Invalid ports and unsafe host-style configuration are rejected before runtime bind attempts.
+- Shipped config examples/templates are updated or explicitly documented as intentionally unchanged.
+
+## Risks
+- Introducing a new config key creates compatibility and documentation obligations.
+- Ambiguous precedence between the new setting and `stacks.__control_server__.bind` could produce surprising startup behavior.
+- Allowing a full bind address would expand the control-plane trust boundary, so this proposal keeps the setting port-only.
+- Tests that allocate ports before process startup can still race with other processes; test design should use per-case allocation and clear diagnostics.
+
+## Downstream Follow-Up
+| stage | required_follow_up | reason |
+|-------|--------------------|--------|
+| design | Add `P-control-server-port-config-1` design coverage with config shape, precedence/conflict behavior, scope paths, validation, and template synchronization decision. | Implementation cannot start until the new config contract and affected paths are admitted. |
+| testing | Add direct coverage for default port behavior, explicit control port behavior, invalid port handling, and multi-instance startup. | Triggered runtime/config/security checks require concrete validation. |
+| implementation | Implement only after proposal/design approval and admission evidence for `P-control-server-port-config-1`. | Current approved design does not cover this new config field. |
+| acceptance | Review docs, code defaults, templates, and test evidence for consistency. | Config-template sync and control-plane boundary risks need independent review. |
+
+## Approval Record
+- approver: user
+- approval_date: 2026-06-11T23:55:57+08:00
+- user_statement: "确定，自动处理后续步骤"

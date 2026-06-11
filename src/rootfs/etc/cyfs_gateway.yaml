@@ -9,6 +9,7 @@
 
 # user_name: "root"    # console login username, optional
 # password: "123456"   # console login password, optional (plain text, hashed on login)
+# control_port: 13451  # local control server port, optional; binds to 127.0.0.1:<port>
 
 # js_externals:         # external JS commands (optional)
 #   geo_block: ./scripts/geo_block.js
