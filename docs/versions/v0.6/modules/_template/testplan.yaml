@@ -1,0 +1,55 @@
+schema_version: 1
+version: v0.6
+module: example-module
+defaults:
+  workdir: .
+  timeout_sec: 600
+  env: {}
+levels:
+  unit:
+    mode: enabled
+    summary: 核心逻辑与子模块单元测试
+    test_targets:
+      - src/components/<component>/src
+    preconditions:
+      tools: []
+      env: []
+      services: []
+      notes: []
+    steps:
+      - id: example-unit
+        name: 执行单元测试
+        change_ids: ["P-example-change"]
+        run: ["bash", "-lc", "cd src && cargo test -p <crate> <filter> -- --test-threads=1"]
+
+  dv:
+    mode: enabled
+    summary: 单模块可运行验证
+    test_targets:
+      - src/apps/<app>/tests
+    preconditions:
+      tools: []
+      env: []
+      services: []
+      notes: []
+    steps:
+      - id: example-dv
+        name: 执行 DV 测试
+        change_ids: ["P-example-change"]
+        run: ["bash", "-lc", "cd src && cargo test -p <crate> --test <test-target> -- --test-threads=1"]
+
+  integration:
+    mode: enabled
+    summary: 邻接模块集成验证
+    test_targets:
+      - src/apps/<app>/tests
+    preconditions:
+      tools: []
+      env: []
+      services: []
+      notes: []
+    steps:
+      - id: example-integration
+        name: 执行集成测试
+        change_ids: ["P-example-change"]
+        run: ["bash", "-lc", "cd src && cargo test -p <crate> --test <test-target> -- --test-threads=1"]

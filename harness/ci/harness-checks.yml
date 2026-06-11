@@ -1,0 +1,32 @@
+# Generated harness CI workflow.
+#
+# Install for GitHub Actions:
+#   cp harness/ci/harness-checks.yml .github/workflows/harness-checks.yml
+# For other CI systems, run the same single command:
+#   python harness/scripts/check-all.py
+#
+# The harness scripts are dependency-free standard-library Python, so no
+# package installation is required.
+
+name: harness-checks
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  harness-checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Run repo-wide harness checks
+        run: python harness/scripts/check-all.py
+      - name: Run declared quality gates
+        run: python harness/scripts/quality-check.py
+      # Uncomment to run the whole registered test suite in CI as well.
+      # Test commands may need repo-specific dependency setup before this step.
+      # - name: Run all registered tests
+      #   run: python harness/scripts/test-run.py all all

@@ -1,0 +1,160 @@
+schema_version: 1
+version: v0.6
+module: cert-manager
+defaults:
+  workdir: .
+  timeout_sec: 1800
+  env: {}
+levels:
+  unit:
+    mode: enabled
+    summary: tunnel client cert 校验、SNI wildcard 匹配与 js_extend params_path 的聚焦单测
+    test_targets:
+      - src/components/cyfs-gateway-lib/src/tunnel_client_cert_manager.rs
+      - src/components/cyfs-gateway-lib/src/stack/tls_cert_resolver.rs
+      - src/components/cyfs-gateway-lib/src/stack/tls_stack.rs
+      - src/components/cyfs-acme/src/js_extend_cert_provider.rs
+      - src/apps/cyfs_gateway/src/config_loader.rs
+    preconditions:
+      tools:
+        - cargo
+        - cc
+        - perl
+        - make
+      env: []
+      services: []
+      notes:
+        - 证书相关单测会使用临时目录并共享构建缓存，默认保持单线程执行。
+    steps:
+      - id: cert-manager-unit-prepare-reload
+        name: 执行 tunnel client cert snapshot 聚焦单测
+        run:
+          [
+            "bash",
+            "-lc",
+            "cd src && cargo test -p cyfs-gateway-lib test_prepare_reload --lib -- --test-threads=1",
+          ]
+      - id: cert-manager-unit-validate-acme-entry
+        name: 执行 tunnel client ACME 条目校验单测
+        run:
+          [
+            "bash",
+            "-lc",
+            "cd src && cargo test -p cyfs-gateway-lib test_validate_acme_entry_rules --lib -- --test-threads=1",
+          ]
+      - id: cert-manager-unit-mismatched-key
+        name: 执行本地证书与私钥不匹配单测
+        run:
+          [
+            "bash",
+            "-lc",
+            "cd src && cargo test -p cyfs-gateway-lib test_load_local_material_rejects_mismatched_key --lib -- --test-threads=1",
+          ]
+      - id: cert-manager-unit-wildcard
+        name: 执行 SNI wildcard 解析单测
+        run:
+          [
+            "bash",
+            "-lc",
+            "cd src && cargo test -p cyfs-gateway-lib test_matches_wildcard --lib -- --test-threads=1",
+          ]
+      - id: cert-manager-unit-default-acme-provider
+        name: 执行 TLS 旧格式默认 ACME provider 兼容单测
+        run:
+          [
+            "bash",
+            "-lc",
+            "cd src && cargo test -p cyfs-gateway-lib test_tls_acme_type_without_cert_provider_uses_default_provider --lib -- --test-threads=1",
+          ]
+      - id: cert-manager-unit-js_extend_cert_provider
+        name: 执行 js_extend_cert_provider 聚焦单测
+        run:
+          [
+            "bash",
+            "-lc",
+            "cd src && cargo test -p cyfs-acme js_extend_cert_provider --lib -- --test-threads=1",
+          ]
+      - id: cert-manager-unit-parse-js_extend_cert_provider
+        name: 执行 js_extend_cert_provider 配置解析与 params_path 装载单测
+        run:
+          [
+            "bash",
+            "-lc",
+            "cd src && cargo test -p cyfs_gateway js_extend_cert_provider_config --lib -- --test-threads=1",
+          ]
+
+  dv:
+    mode: enabled
+    summary: 服务端 fallback、自签证书与 gateway wiring 的单模块可运行验证
+    test_targets:
+      - src/components/cyfs-gateway-lib/src/stack/tls_stack.rs
+      - src/components/cyfs-gateway-lib/src/stack/quic_stack.rs
+      - src/apps/cyfs_gateway/tests/test_control_server.rs
+    preconditions:
+      tools:
+        - cargo
+        - cc
+        - perl
+        - make
+      env: []
+      services: []
+      notes:
+        - TLS / QUIC stack 测试会占用本地端口并启动实际 runtime 路径，因此默认单线程执行。
+    steps:
+      - id: cert-manager-dv-tls-self-cert
+        name: 执行 TLS 自签 fallback DV 测试
+        run:
+          [
+            "bash",
+            "-lc",
+            "cd src && cargo test -p cyfs-gateway-lib test_tls_stack_self_cert --lib -- --test-threads=1",
+          ]
+      - id: cert-manager-dv-quic-self-cert
+        name: 执行 QUIC 自签 fallback DV 测试
+        run:
+          [
+            "bash",
+            "-lc",
+            "cd src && cargo test -p cyfs-gateway-lib test_quic_stack_self_cert --lib -- --test-threads=1",
+          ]
+      - id: cert-manager-dv-tls-client-auth
+        name: 执行 TLS client auth 证书策略 DV 测试
+        run:
+          [
+            "bash",
+            "-lc",
+            "cd src && cargo test -p cyfs-gateway-lib test_tls_stack_client_auth_on_requires_valid_cert --lib -- --test-threads=1",
+          ]
+      - id: cert-manager-dv-control-server
+        name: 执行 gateway 证书 wiring smoke
+        run:
+          [
+            "bash",
+            "-lc",
+            "cd src && cargo test -p cyfs_gateway --test test_control_server test_cmd_server -- --test-threads=1",
+          ]
+
+  integration:
+    mode: enabled
+    summary: 覆盖 tunnel_client_certs、TLS stack 与 client cert policy 的 gateway 集成验证
+    test_targets:
+      - src/apps/cyfs_gateway/tests/test_cyfs_gateway.rs
+    preconditions:
+      tools:
+        - cargo
+        - cc
+        - perl
+        - make
+      env: []
+      services: []
+      notes:
+        - 集成测试会同时启动多个本地监听端口与临时文件，成本高于 DV，适合在前两级稳定后执行。
+    steps:
+      - id: cert-manager-integration-mtls-policy
+        name: 执行 tunnel client cert policy 集成测试
+        run:
+          [
+            "bash",
+            "-lc",
+            "cd src && cargo test -p cyfs_gateway --test test_cyfs_gateway test_socks5_to_tls_stack_with_client_cert_policy -- --test-threads=1",
+          ]

@@ -1,0 +1,53 @@
+schema_version: 1
+version: v0.6
+module: cyfs-tun
+defaults:
+  workdir: .
+  timeout_sec: 1200
+  env: {}
+levels:
+  unit:
+    mode: enabled
+    summary: "'tuntunnel' 解析与 TCP / UDP client 的 crate 单测 smoke"
+    test_targets:
+      - src/components/cyfs-tun/src/tun_tunnel.rs
+    preconditions:
+      tools:
+        - cargo
+      env: []
+      services: []
+      notes:
+        - "当前 unit 级别只覆盖不依赖真实 TUN 设备权限的 'tuntunnel' crate 单测。"
+    steps:
+      - id: cyfs-tun-unit
+        name: "执行 'tuntunnel' crate 单测 smoke"
+        run: ["bash", "-lc", "cd src && cargo test -p cyfs-tun test_tuntunnel_ -- --test-threads=1"]
+
+  dv:
+    mode: disabled
+    summary: 缺少独立的 tun stack 单模块可运行验证
+    test_targets:
+      - src/components/cyfs-tun/src/tun_stack.rs
+      - src/apps/cyfs_gateway/src/config_loader.rs
+    preconditions:
+      tools: []
+      env: []
+      services: []
+      notes:
+        - 仓库中尚无专门面向 `TunStack` 的单模块 DV 测试入口。
+        - 真实 TUN 设备行为依赖操作系统与权限条件，当前模块包只记录该缺口，不伪造自动化覆盖。
+
+  integration:
+    mode: disabled
+    summary: "缺少独立的 'cyfs-tun' 邻接模块集成验证"
+    test_targets:
+      - src/apps/cyfs_gateway/src/lib.rs
+      - src/apps/cyfs_gateway/src/gateway.rs
+      - src/rootfs/etc/cyfs_gateway.yaml
+    preconditions:
+      tools: []
+      env: []
+      services: []
+      notes:
+        - "现有 'gateway-runtime' 集成测试没有形成可直接归属于 'cyfs-tun' 的独立证据路径。"
+        - "后续若新增 tun 场景，应先补 'testing.md' 与对应 integration step，再启用该级别。"
