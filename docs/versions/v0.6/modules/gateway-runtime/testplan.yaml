@@ -16,6 +16,7 @@ levels:
       - src/components/cyfs-gateway-lib/src/stack/tls_stack.rs
       - src/components/cyfs-gateway-lib/src/stack/udp_stack.rs
       - src/components/cyfs-gateway-lib/src/stack/quic_stack.rs
+      - src/components/cyfs-gateway-lib/src/server/dir_server.rs
     preconditions:
       tools:
         - cargo
@@ -47,6 +48,10 @@ levels:
         name: 执行 UDP stack reuseport 聚焦单测
         change_ids: ["P-udp-reuseport-1"]
         run: ["bash", "-lc", "cd src && cargo test -p cyfs-gateway-lib test_udp_stack -- --test-threads=1"]
+      - id: gateway-runtime-dir-server-range
+        name: 执行 DirServer Range 回归单测
+        change_ids: ["P-dir-server-range-1"]
+        run: ["bash", "-lc", "cd src && cargo test -p cyfs-gateway-lib test_dir_server_range_parses_supported_forms_and_rejects_invalid_ranges -- --test-threads=1"]
       - id: gateway-runtime-quic-stack
         name: 执行 QUIC stack reuseport 聚焦单测
         change_ids: ["P-quic-reuseport-1"]

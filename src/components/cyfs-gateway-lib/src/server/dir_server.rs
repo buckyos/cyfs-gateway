@@ -9,7 +9,7 @@ use http::{StatusCode, Version};
 use http_body_util::combinators::UnsyncBoxBody;
 use http_body_util::{BodyExt, Full, StreamBody};
 use hyper::body::{Bytes, Frame};
-use hyper::header::{ETAG, IF_MODIFIED_SINCE, IF_NONE_MATCH, LAST_MODIFIED, RANGE};
+use hyper::header::{ETAG, IF_MODIFIED_SINCE, IF_NONE_MATCH, IF_RANGE, LAST_MODIFIED, RANGE};
 use mini_moka::sync::Cache;
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use serde::de::{self, Visitor};
@@ -241,18 +241,42 @@ struct CachedPathMetadata {
 
 struct DirFileRequestInfo {
     is_head: bool,
+    is_get: bool,
+    range_header_count: usize,
     range_header: Option<String>,
+    invalid_range_header: bool,
+    if_range: Option<String>,
     if_none_match: Option<String>,
     if_modified_since: Option<String>,
 }
 
 impl DirFileRequestInfo {
     fn from_request(req: &http::Request<UnsyncBoxBody<Bytes, ServerError>>) -> Self {
+        let range_headers = req.headers().get_all(RANGE);
+        let range_header_count = range_headers.iter().count();
+        let mut invalid_range_header = false;
+        let range_header = if range_header_count == 1 {
+            match range_headers.iter().next().map(|value| value.to_str()) {
+                Some(Ok(value)) => Some(value.to_owned()),
+                Some(Err(_)) => {
+                    invalid_range_header = true;
+                    None
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
+
         Self {
             is_head: req.method() == hyper::Method::HEAD,
-            range_header: req
+            is_get: req.method() == hyper::Method::GET,
+            range_header_count,
+            range_header,
+            invalid_range_header,
+            if_range: req
                 .headers()
-                .get(RANGE)
+                .get(IF_RANGE)
                 .and_then(|value| value.to_str().ok())
                 .map(|value| value.to_owned()),
             if_none_match: req
@@ -297,6 +321,13 @@ struct OpenedDirFile {
 enum DirReadFile {
     Tokio(tokio::fs::File),
     Sync(std::fs::File),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DirRangeRequest {
+    Apply { start: u64, end: u64 },
+    Ignore,
+    Reject,
 }
 
 struct SyncFileBodyStream {
@@ -838,6 +869,30 @@ impl DirServer {
         false
     }
 
+    fn if_range_matches(if_range: &str, current_etag: Option<&str>) -> bool {
+        let if_range = if_range.trim();
+        if if_range.is_empty() || if_range.starts_with("W/") {
+            return false;
+        }
+
+        if if_range.starts_with('"') {
+            return matches!(current_etag, Some(etag) if etag == if_range);
+        }
+
+        // Last-Modified has one-second HTTP-date granularity and is not a
+        // strong validator for local files here; date-form If-Range therefore
+        // cannot safely authorize a partial response.
+        false
+    }
+
+    fn can_apply_if_range(req_info: &DirFileRequestInfo, current_etag: Option<&str>) -> bool {
+        req_info
+            .if_range
+            .as_deref()
+            .map(|if_range| Self::if_range_matches(if_range, current_etag))
+            .unwrap_or(true)
+    }
+
     fn build_etag(file_meta: &std::fs::Metadata) -> Option<String> {
         let modified = file_meta.modified().ok()?;
         let dur = modified.duration_since(UNIX_EPOCH).ok()?;
@@ -1206,27 +1261,120 @@ impl DirServer {
         .boxed_unsync()
     }
 
-    /// Parse Range header (e.g., "bytes=start-end")
-    fn parse_range(&self, range: &str, file_size: u64) -> ServerResult<(u64, u64)> {
-        let range = range.trim_start_matches("bytes=");
-        let mut parts = range.split('-');
+    /// Classify a single Range header (e.g., "bytes=start-end", "bytes=start-", "bytes=-suffix").
+    fn classify_range(&self, range: &str, file_size: u64) -> DirRangeRequest {
+        let Some((unit, range)) = range.split_once('=') else {
+            return if range
+                .trim_ascii_start()
+                .as_bytes()
+                .get(..5)
+                .map(|prefix| prefix.eq_ignore_ascii_case(b"bytes"))
+                .unwrap_or(false)
+            {
+                DirRangeRequest::Reject
+            } else {
+                DirRangeRequest::Ignore
+            };
+        };
+        if !unit.eq_ignore_ascii_case("bytes") {
+            return if unit.trim_ascii().eq_ignore_ascii_case("bytes") {
+                DirRangeRequest::Reject
+            } else {
+                DirRangeRequest::Ignore
+            };
+        };
 
-        let start = parts
-            .next()
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(0);
-
-        let end = parts
-            .next()
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(file_size - 1);
-
-        // Validate range
-        if start >= file_size || end >= file_size || start > end {
-            return Err(server_err!(ServerErrorCode::InvalidParam, "Invalid range"));
+        let range = range.trim_ascii();
+        if range.is_empty() {
+            return DirRangeRequest::Reject;
         }
 
-        Ok((start, end))
+        if file_size == 0 {
+            return DirRangeRequest::Ignore;
+        }
+
+        if range.contains(',') {
+            return if range
+                .split(',')
+                .map(str::trim_ascii)
+                .all(Self::byte_range_part_is_well_formed)
+            {
+                DirRangeRequest::Ignore
+            } else {
+                DirRangeRequest::Reject
+            };
+        }
+
+        if range.bytes().any(|b| b.is_ascii_whitespace()) {
+            return DirRangeRequest::Reject;
+        }
+
+        let Some((start_part, end_part)) = range.split_once('-') else {
+            return DirRangeRequest::Reject;
+        };
+
+        if start_part.is_empty() {
+            let Ok(suffix_len) = end_part.parse::<u64>() else {
+                return DirRangeRequest::Reject;
+            };
+            if suffix_len == 0 {
+                return DirRangeRequest::Reject;
+            }
+
+            let start = file_size.saturating_sub(suffix_len);
+            return DirRangeRequest::Apply {
+                start,
+                end: file_size - 1,
+            };
+        }
+
+        let Ok(start) = start_part.parse::<u64>() else {
+            return DirRangeRequest::Reject;
+        };
+        if start >= file_size {
+            return DirRangeRequest::Reject;
+        }
+
+        let end = if end_part.is_empty() {
+            file_size - 1
+        } else {
+            let Ok(end) = end_part.parse::<u64>() else {
+                return DirRangeRequest::Reject;
+            };
+            end.min(file_size - 1)
+        };
+
+        if start > end {
+            return DirRangeRequest::Reject;
+        }
+
+        DirRangeRequest::Apply { start, end }
+    }
+
+    fn byte_range_part_is_well_formed(range: &str) -> bool {
+        if range.is_empty() || range.bytes().any(|b| b.is_ascii_whitespace()) {
+            return false;
+        }
+
+        let Some((start_part, end_part)) = range.split_once('-') else {
+            return false;
+        };
+        if end_part.contains('-') {
+            return false;
+        }
+
+        if start_part.is_empty() {
+            return end_part.parse::<u64>().is_ok();
+        }
+
+        let Ok(start) = start_part.parse::<u64>() else {
+            return false;
+        };
+        if end_part.is_empty() {
+            return true;
+        }
+
+        matches!(end_part.parse::<u64>(), Ok(end) if start <= end)
     }
 
     /// Serve a file from the local directory
@@ -1305,37 +1453,80 @@ impl DirServer {
             });
         }
 
-        // Handle Range requests
-        if let Some(range_str) = req_info.range_header.as_deref() {
-            if let Ok((start, end)) = self.parse_range(range_str, file_size) {
-                let content_length = end - start + 1;
-                let mut response_builder = http::Response::builder()
-                    .status(StatusCode::PARTIAL_CONTENT)
-                    .header("Content-Type", mime_type.as_ref())
-                    .header("Content-Length", content_length)
-                    .header(
-                        "Content-Range",
-                        format!("bytes {}-{}/{}", start, end, file_size),
-                    )
-                    .header("Accept-Ranges", "bytes");
-
-                if let Some(etag) = etag.as_ref() {
-                    response_builder = response_builder.header(ETAG, etag.as_str());
+        let applied_range = if req_info.is_get {
+            if req_info.range_header_count > 1 {
+                None
+            } else if req_info.invalid_range_header {
+                return http::Response::builder()
+                    .status(StatusCode::RANGE_NOT_SATISFIABLE)
+                    .header("Content-Range", format!("bytes */{}", file_size))
+                    .header("Accept-Ranges", "bytes")
+                    .body(Self::empty_body())
+                    .map_err(|e| {
+                        server_err!(ServerErrorCode::IOError, "Failed to build response: {}", e)
+                    });
+            } else {
+                match req_info.range_header.as_deref() {
+                    Some(range_str) => {
+                        if !Self::can_apply_if_range(req_info, etag.as_deref()) {
+                            None
+                        } else {
+                            match self.classify_range(range_str, file_size) {
+                                DirRangeRequest::Apply { start, end } => Some((start, end)),
+                                DirRangeRequest::Ignore => None,
+                                DirRangeRequest::Reject => {
+                                    return http::Response::builder()
+                                        .status(StatusCode::RANGE_NOT_SATISFIABLE)
+                                        .header("Content-Range", format!("bytes */{}", file_size))
+                                        .header("Accept-Ranges", "bytes")
+                                        .body(Self::empty_body())
+                                        .map_err(|e| {
+                                            server_err!(
+                                                ServerErrorCode::IOError,
+                                                "Failed to build response: {}",
+                                                e
+                                            )
+                                        });
+                                }
+                            }
+                        }
+                    }
+                    None => None,
                 }
-                if let Some(last_modified) = last_modified {
-                    let formatted = Self::format_http_date(last_modified);
-                    response_builder = response_builder.header(LAST_MODIFIED, formatted);
-                }
-
-                let body = if req_info.is_head {
-                    Self::empty_body()
-                } else {
-                    self.range_body(file, start, content_length).await?
-                };
-                return response_builder.body(body).map_err(|e| {
-                    server_err!(ServerErrorCode::IOError, "Failed to build response: {}", e)
-                });
             }
+        } else {
+            None
+        };
+
+        // Handle applicable Range requests
+        if let Some((start, end)) = applied_range {
+            let content_length = end - start + 1;
+            let mut response_builder = http::Response::builder()
+                .status(StatusCode::PARTIAL_CONTENT)
+                .header("Content-Type", mime_type.as_ref())
+                .header("Content-Length", content_length)
+                .header(
+                    "Content-Range",
+                    format!("bytes {}-{}/{}", start, end, file_size),
+                )
+                .header("Accept-Ranges", "bytes");
+
+            if let Some(etag) = etag.as_ref() {
+                response_builder = response_builder.header(ETAG, etag.as_str());
+            }
+            if let Some(last_modified) = last_modified {
+                let formatted = Self::format_http_date(last_modified);
+                response_builder = response_builder.header(LAST_MODIFIED, formatted);
+            }
+
+            let body = if req_info.is_head {
+                Self::empty_body()
+            } else {
+                self.range_body(file, start, content_length).await?
+            };
+            return response_builder.body(body).map_err(|e| {
+                server_err!(ServerErrorCode::IOError, "Failed to build response: {}", e)
+            });
         }
 
         let mut response_builder = http::Response::builder()
@@ -2406,6 +2597,266 @@ mod tests {
         assert_eq!(resp.headers().get("Content-Length").unwrap(), "16");
         let body = resp.into_body().collect().await.unwrap().to_bytes();
         assert!(body.is_empty());
+    }
+
+    async fn serve_range_request(
+        server: &DirServer,
+        file_path: &Path,
+        range: &str,
+    ) -> http::Response<UnsyncBoxBody<Bytes, ServerError>> {
+        serve_range_request_with(server, file_path, "GET", Some(range), None).await
+    }
+
+    async fn serve_range_request_with(
+        server: &DirServer,
+        file_path: &Path,
+        method: &str,
+        range: Option<&str>,
+        if_range: Option<&str>,
+    ) -> http::Response<UnsyncBoxBody<Bytes, ServerError>> {
+        let mut builder = http::Request::builder()
+            .method(method)
+            .uri("http://localhost/range.txt");
+        if let Some(range) = range {
+            builder = builder.header(RANGE, range);
+        }
+        if let Some(if_range) = if_range {
+            builder = builder.header(IF_RANGE, if_range);
+        }
+        let req = builder
+            .body(
+                Full::new(Bytes::new())
+                    .map_err(|e| match e {})
+                    .boxed_unsync(),
+            )
+            .unwrap();
+        let req_info = DirFileRequestInfo::from_request(&req);
+        server.serve_file(file_path, &req_info).await.unwrap()
+    }
+
+    async fn serve_duplicate_range_request(
+        server: &DirServer,
+        file_path: &Path,
+    ) -> http::Response<UnsyncBoxBody<Bytes, ServerError>> {
+        let mut req = http::Request::builder()
+            .method("GET")
+            .uri("http://localhost/range.txt")
+            .body(
+                Full::new(Bytes::new())
+                    .map_err(|e| match e {})
+                    .boxed_unsync(),
+            )
+            .unwrap();
+        req.headers_mut()
+            .append(RANGE, http::HeaderValue::from_static("bytes=0-1"));
+        req.headers_mut()
+            .append(RANGE, http::HeaderValue::from_static("bytes=4-5"));
+
+        let req_info = DirFileRequestInfo::from_request(&req);
+        server.serve_file(file_path, &req_info).await.unwrap()
+    }
+
+    async fn serve_invalid_range_header_request(
+        server: &DirServer,
+        file_path: &Path,
+    ) -> http::Response<UnsyncBoxBody<Bytes, ServerError>> {
+        let mut req = http::Request::builder()
+            .method("GET")
+            .uri("http://localhost/range.txt")
+            .body(
+                Full::new(Bytes::new())
+                    .map_err(|e| match e {})
+                    .boxed_unsync(),
+            )
+            .unwrap();
+        req.headers_mut()
+            .insert(RANGE, http::HeaderValue::from_bytes(b"bytes=\xff").unwrap());
+
+        let req_info = DirFileRequestInfo::from_request(&req);
+        server.serve_file(file_path, &req_info).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_dir_server_range_parses_supported_forms_and_rejects_invalid_ranges() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file_path = temp_dir.path().join("range.txt");
+        tokio::fs::write(&file_path, b"0123456789abcdef")
+            .await
+            .unwrap();
+
+        let server = DirServer::builder()
+            .id("test")
+            .root_path(temp_dir.path().to_path_buf())
+            .file_read_buffer_size(4)
+            .build()
+            .await
+            .unwrap();
+
+        let resp = serve_range_request(&server, &file_path, "bytes=4-9").await;
+        assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(resp.headers().get("Content-Range").unwrap(), "bytes 4-9/16");
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(body.as_ref(), b"456789");
+
+        let resp = serve_range_request(&server, &file_path, "bytes=4-").await;
+        assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            resp.headers().get("Content-Range").unwrap(),
+            "bytes 4-15/16"
+        );
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(body.as_ref(), b"456789abcdef");
+
+        let resp = serve_range_request(&server, &file_path, "bytes=-4").await;
+        assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            resp.headers().get("Content-Range").unwrap(),
+            "bytes 12-15/16"
+        );
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(body.as_ref(), b"cdef");
+
+        for (range, content_range, expected_body) in [
+            ("Bytes=4-9", "bytes 4-9/16", b"456789".as_slice()),
+            ("BYTES=-4", "bytes 12-15/16", b"cdef".as_slice()),
+            ("bytes= 4-9", "bytes 4-9/16", b"456789".as_slice()),
+            ("bytes=4-9 ", "bytes 4-9/16", b"456789".as_slice()),
+            ("bytes=\t4-9\t", "bytes 4-9/16", b"456789".as_slice()),
+        ] {
+            let resp = serve_range_request(&server, &file_path, range).await;
+            assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
+            assert_eq!(resp.headers().get("Content-Range").unwrap(), content_range);
+            let body = resp.into_body().collect().await.unwrap().to_bytes();
+            assert_eq!(body.as_ref(), expected_body);
+        }
+
+        for range in [
+            "bytes",
+            "bytes 4-9",
+            "bytes=4 -9",
+            "bytes=4- 9",
+            "bytes=16-",
+            "bytes=abc",
+            "bytes=0-1,abc",
+        ] {
+            let resp = serve_range_request(&server, &file_path, range).await;
+            assert_eq!(resp.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+            assert_eq!(resp.headers().get("Content-Range").unwrap(), "bytes */16");
+            let body = resp.into_body().collect().await.unwrap().to_bytes();
+            assert!(body.is_empty());
+        }
+
+        let resp = serve_invalid_range_header_request(&server, &file_path).await;
+        assert_eq!(resp.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+        assert_eq!(resp.headers().get("Content-Range").unwrap(), "bytes */16");
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        assert!(body.is_empty());
+
+        for range in ["items=4-9", "bytes=0-1,4-5", "bytes=0-1, 4-5"] {
+            let resp = serve_range_request(&server, &file_path, range).await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert_eq!(resp.headers().get("Content-Length").unwrap(), "16");
+            assert!(resp.headers().get("Content-Range").is_none());
+            let body = resp.into_body().collect().await.unwrap().to_bytes();
+            assert_eq!(body.as_ref(), b"0123456789abcdef");
+        }
+
+        let resp = serve_duplicate_range_request(&server, &file_path).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers().get("Content-Length").unwrap(), "16");
+        assert!(resp.headers().get("Content-Range").is_none());
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(body.as_ref(), b"0123456789abcdef");
+
+        let resp =
+            serve_range_request_with(&server, &file_path, "HEAD", Some("bytes=4-9"), None).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers().get("Content-Length").unwrap(), "16");
+        assert!(resp.headers().get("Content-Range").is_none());
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        assert!(body.is_empty());
+
+        let resp = serve_range_request_with(&server, &file_path, "GET", None, None).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let etag = resp
+            .headers()
+            .get(ETAG)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let last_modified = resp
+            .headers()
+            .get(LAST_MODIFIED)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(body.as_ref(), b"0123456789abcdef");
+
+        let resp =
+            serve_range_request_with(&server, &file_path, "GET", Some("bytes=4-9"), Some(&etag))
+                .await;
+        assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(resp.headers().get("Content-Range").unwrap(), "bytes 4-9/16");
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(body.as_ref(), b"456789");
+
+        let resp = serve_range_request_with(
+            &server,
+            &file_path,
+            "GET",
+            Some("bytes=4-9"),
+            Some(&last_modified),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers().get("Content-Length").unwrap(), "16");
+        assert!(resp.headers().get("Content-Range").is_none());
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(body.as_ref(), b"0123456789abcdef");
+
+        for if_range in ["\"not-matching-etag\"", "Wed, 21 Oct 2015 07:28:00 GMT"] {
+            let resp = serve_range_request_with(
+                &server,
+                &file_path,
+                "GET",
+                Some("bytes=4-9"),
+                Some(if_range),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert_eq!(resp.headers().get("Content-Length").unwrap(), "16");
+            assert!(resp.headers().get("Content-Range").is_none());
+            let body = resp.into_body().collect().await.unwrap().to_bytes();
+            assert_eq!(body.as_ref(), b"0123456789abcdef");
+        }
+
+        let resp = serve_range_request_with(
+            &server,
+            &file_path,
+            "GET",
+            Some("bytes=abc"),
+            Some("\"not-matching-etag\""),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers().get("Content-Length").unwrap(), "16");
+        assert!(resp.headers().get("Content-Range").is_none());
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(body.as_ref(), b"0123456789abcdef");
+
+        let empty_file_path = temp_dir.path().join("empty-range.txt");
+        tokio::fs::write(&empty_file_path, b"").await.unwrap();
+        for range in ["bytes=0-", "bytes=-1", "bytes=abc"] {
+            let resp = serve_range_request(&server, &empty_file_path, range).await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert_eq!(resp.headers().get("Content-Length").unwrap(), "0");
+            assert!(resp.headers().get("Content-Range").is_none());
+            let body = resp.into_body().collect().await.unwrap().to_bytes();
+            assert!(body.is_empty());
+        }
     }
 
     #[tokio::test]

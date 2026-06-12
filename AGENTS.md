@@ -85,6 +85,7 @@
 - 质量门规则：`harness/rules/quality-gate-rules.md`
 - 配置模板同步：`harness/custom-rules/config-template-sync-rules.md`
 - 禁止全局 Rust 格式化：`harness/custom-rules/no-global-cargo-fmt-rules.md`
+- 任务后聚焦测试：`harness/custom-rules/focused-post-task-test-rules.md`
 - 统一测试入口：`harness/rules/unified-test-entry-rules.md`
 - Auto-pipeline：`harness/rules/auto-pipeline-rules.md`
 - 模块交付循环：`harness/process_rules/module-delivery-loop.md`
@@ -109,6 +110,7 @@
 - 优先做小而局部的改动，不把 bugfix 和重构混在一起。
 - Rust 测试默认使用单线程，尤其是涉及端口、共享状态或运行时启动时。
 - agent 不执行全局 `cargo fmt`；详见 `harness/custom-rules/no-global-cargo-fmt-rules.md`。
+- 任务完成后的验证默认只运行与本次修改直接相关的聚焦测试或检查；不要把全量测试作为普通任务收尾动作，详见 `harness/custom-rules/focused-post-task-test-rules.md`。
 - 配置、控制平面、运行时组装、process-chain、SN/DNS/RTCP 和 UI 契约改动，先看 `trigger-rules.md` 再决定附加验证。
 - `doc/` 是历史资料和参考资料层；harness 事实来源是 `docs/` 和 `harness/`。历史资料可作为输入引用，但不能单独作为 implementation admission 证据。
 - `harness/rules/` 是 skill-managed generated rules；项目自定义规则只放在 `harness/custom-rules/`，刷新 harness 时不得修改 custom rules，除非用户明确要求。
