@@ -3,8 +3,8 @@ module: gateway-runtime
 version: v0.6
 status: approved
 approved_by: auto-pipeline
-approved_at: 2026-06-11T23:55:57+08:00
-approved_content_sha256: 39282daa57e79fccde0e0819a028d807fe1aee62bd265ee3b750f92386f1d69c
+approved_at: 2026-06-12T10:58:43+08:00
+approved_content_sha256: 783d0a8984012053cbe690687cf9df2424bdd8b19c47d0dbfe0ae776757789fc
 ---
 
 # gateway-runtime Design
@@ -23,6 +23,8 @@ This design adds implementation coverage for `P-control-server-port-config-1`: a
 
 The existing TCP/TLS/UDP/QUIC reuseport design mappings remain in this module packet so earlier approved change ids continue to have direct mapping rows.
 
+This design also adds implementation coverage for `P-test-server-local-runner-1`: the `test_server` helper app must provide the Tokio local task context required by `cyfs_gateway_lib::Runner`.
+
 ## Overall Approach
 During config loading, `cyfs_gateway` continues to start from the embedded `gateway_control_server.yaml`, then merges the user config. After parameter substitution, the loader checks top-level `control_port`. When present, it validates the value as an integer TCP port in `1..=65535` and writes `stacks.__control_server__.bind = "127.0.0.1:<control_port>"` into the effective config before parsing stacks.
 
@@ -35,12 +37,14 @@ The user-visible config returned by control APIs may retain `control_port`, whil
 |----------|------------------|-----------------|--------|
 | Apply `control_port` in config loading | Existing `serde_json::Value` merge and embedded control server config injection | none | A small helper around the existing raw config value is enough; no new config subsystem is needed. |
 | Keep loopback host fixed | Existing built-in `__control_server__` TCP stack | none | The proposal approves port-only behavior and avoids expanding the control-plane trust boundary. |
+| Wrap `test_server` runtime | Existing Tokio `current_thread` runtime and `LocalSet` | none | The helper only needs to satisfy `Runner`'s local-task requirement; changing shared `Runner` behavior would widen the fix unnecessarily. |
 
 ## Current Structure
 - `src/apps/cyfs_gateway/src/gateway.rs::load_user_config_from_file` loads user config, merges it onto `GATEWAY_CONTROL_SERVER_CONFIG`, applies params, and normalizes paths.
 - The embedded control stack lives in `src/apps/cyfs_gateway/src/gateway_control_server.yaml` with default bind `127.0.0.1:13451`.
 - Tests currently override `stacks.__control_server__.bind` directly when they need isolated control ports.
 - `src/rootfs/etc/cyfs_gateway.yaml` is the shipped rootfs example/default config surface.
+- `src/apps/test_server/src/main.rs` currently uses the default `#[tokio::main]` runtime while `cyfs_gateway_lib::Runner` dispatches local tasks through `tokio::task::spawn_local`.
 
 ## Submodules
 | submodule | type | responsibility | depends_on |
@@ -48,6 +52,7 @@ The user-visible config returned by control APIs may retain `control_port`, whil
 | control-plane-config | runtime/config | Interpret top-level `control_port` and update the built-in control stack bind before stack parsing. | config loader, embedded control server config |
 | control-plane-tests | testing | Validate default, explicit, invalid, and multi-instance control port behavior. | control-plane-config |
 | reuseport-stack-listeners | runtime/stack | Existing TCP/TLS/UDP/QUIC reuseport listener design mappings. | sfo-reuseport |
+| test-server-helper | runtime/helper-app | Run the helper HTTP app in a Tokio local task context compatible with `Runner`. | cyfs-gateway-lib server runner |
 
 ## Boundary Rationale
 `control_port` belongs in `gateway-runtime` because it affects how the runtime injects and starts the built-in control plane. It does not belong in `cyfs-gateway-lib` because the library only starts stacks from already-parsed stack configs, and it does not belong in `web-dashboard` because no frontend contract changes are required.
@@ -58,6 +63,7 @@ The user-visible config returned by control APIs may retain `control_port`, whil
 | control port config loading | technical area inside gateway-runtime | Start a gateway instance with an isolated local control endpoint. | Config merge and built-in control stack injection. | Keep in `src/apps/cyfs_gateway/src/gateway.rs`. |
 | shipped config example | adjacent runtime-configs surface | Show supported startup config knobs. | Rootfs example/default config. | Update `src/rootfs/etc/cyfs_gateway.yaml` with commented `control_port`. |
 | tests | validation area | Prove multi-instance and invalid config behavior. | Rust integration/DV tests. | Add or update tests under `src/apps/cyfs_gateway/tests/` in testing stage. |
+| test_server helper runtime | technical area inside gateway-runtime | Keep the helper app usable as a local HTTP server for gateway-runtime development and smoke checks. | Tokio runtime setup for a binary that consumes `cyfs_gateway_lib::Runner`. | Keep the fix in `src/apps/test_server/src/main.rs`; do not change shared `Runner` APIs. |
 
 ## Dependency Graph
 | source | depends_on | reason | cycle_check |
@@ -65,6 +71,7 @@ The user-visible config returned by control APIs may retain `control_port`, whil
 | control-plane-config | embedded control server config | It rewrites the injected stack bind. | acyclic |
 | control-plane-tests | control-plane-config | Tests exercise the new config behavior through runtime startup. | acyclic |
 | rootfs config example | control-plane-config | Example documents the supported key. | acyclic |
+| test-server-helper | cyfs-gateway-lib Runner | The helper delegates HTTP serving to the shared runner and must provide its local task context. | acyclic |
 
 ## Key Call Flows
 1. `gateway_service_main(config_file, params)` calls `load_config_from_file`.
@@ -73,6 +80,12 @@ The user-visible config returned by control APIs may retain `control_port`, whil
 4. `apply_params_to_json` resolves params in the merged config.
 5. `apply_control_port_config` reads top-level `control_port`; if present, it validates the port and writes `stacks.__control_server__.bind`.
 6. `GatewayConfigParser::parse` parses the effective config and starts the control stack on the selected loopback port.
+
+`test_server` helper flow:
+1. `main` starts a Tokio current-thread runtime.
+2. `main` creates a `tokio::task::LocalSet`.
+3. The existing setup and `runner.run().await` execute inside `LocalSet::run_until`.
+4. `Runner` can use `spawn_local` for accepted HTTP connections without a missing-local-context panic.
 
 ## Large Module Submodule Decision
 | submodule | source_proposal | decision | design_packet | reason |
@@ -85,7 +98,7 @@ The user-visible config returned by control APIs may retain `control_port`, whil
 | contract/protocol | yes | Top-level config key `control_port` is added. | `Overall Approach`, `Interfaces and Dependencies` | Test explicit `control_port`, default behavior, and conflict behavior. | none |
 | data/schema | no | No persisted data or database schema changes. | `Data and State` | none | none |
 | security/privacy/permission | yes | Control server endpoint remains an authenticated local control plane. | `Overall Approach`, `Key Decisions` | Verify host stays `127.0.0.1`; reject invalid non-port values. | none |
-| runtime/integration | yes | Startup bind of `__control_server__` changes when `control_port` is present. | `Key Call Flows`, `Implementation Order` | DV/integration test startup with explicit control port and control RPC. | none |
+| runtime/integration | yes | Startup bind of `__control_server__` changes when `control_port` is present; `test_server` startup must provide a local task context for `Runner`. | `Key Call Flows`, `Implementation Order` | DV/integration test startup with explicit control port and control RPC; focused `test_server` request smoke. | none |
 | build/dependency/config/deployment | yes | Rootfs config example gains `control_port`. | `Boundary Decision Matrix`, `Document Index` | Inspect/update `src/rootfs/etc/cyfs_gateway.yaml`; run relevant tests. | none |
 | ui/datamodel/workflow | no | No web dashboard data model or UI workflow changes. | `Design Scope` | none | none |
 | harness/process | no | No harness rule, script, schema, or CI behavior changes. | `Design Scope` | none | none |
@@ -95,6 +108,7 @@ The user-visible config returned by control APIs may retain `control_port`, whil
 |-----------|-------------|-----------------|-------------|
 | P-base-1 | gateway-runtime-baseline | `Document Index` and `Implementation Order` preserve the module baseline entrypoints and module packet wiring. | `docs/versions/v0.6/modules/gateway-runtime/testplan.yaml`, `harness/scripts/test-run.py`, `test-run.sh` |
 | P-control-server-port-config-1 | gateway-runtime-control-port-config | `Overall Approach`, `Key Call Flows`, `Interfaces and Dependencies`, and `Key Decisions` cover top-level `control_port` config loading and loopback control bind behavior. | `src/apps/cyfs_gateway/src/gateway.rs`, `src/rootfs/etc/cyfs_gateway.yaml` |
+| P-test-server-local-runner-1 | gateway-runtime-test-server-local-runner | `Current Structure`, `Key Call Flows`, `Interfaces and Dependencies`, and `Key Decisions` cover wrapping the helper app in a Tokio local task context for `Runner`. | `src/apps/test_server/src/main.rs` |
 | P-tcp-reuseport-1 | gateway-runtime-tcp-reuseport | Existing reuseport listener design covers TCP stack external `ServerRuntime` and `TcpServer` behavior. | `src/components/cyfs-gateway-lib/src/stack/tcp_stack.rs`, `src/apps/cyfs_gateway/src/lib.rs` |
 | P-tls-reuseport-1 | gateway-runtime-tls-reuseport | Existing reuseport listener design covers TLS stack external `ServerRuntime` and `TcpServer` behavior. | `src/components/cyfs-gateway-lib/src/stack/tls_stack.rs`, `src/apps/cyfs_gateway/src/lib.rs` |
 | P-udp-reuseport-1 | gateway-runtime-udp-reuseport | Existing reuseport listener design covers UDP stack external `ServerRuntime` and `UdpServer` behavior. | `src/components/cyfs-gateway-lib/src/stack/udp_stack.rs`, `src/apps/cyfs_gateway/src/lib.rs` |
@@ -106,6 +120,7 @@ The user-visible config returned by control APIs may retain `control_port`, whil
 | 1 | P-control-server-port-config-1 | Add config-loading helper in `gateway.rs` that validates and applies `control_port`. | Effective config rewrites `__control_server__` bind to `127.0.0.1:<port>`. |
 | 2 | P-control-server-port-config-1 | Update rootfs example with commented `control_port`. | Template/example documents the supported field without changing default behavior. |
 | 3 | P-control-server-port-config-1 | Add testing-stage cases for explicit, invalid, and multi-instance ports. | Test evidence for triggered checks. |
+| 4 | P-test-server-local-runner-1 | Change `test_server` main to a current-thread Tokio runtime and run existing setup plus `runner.run()` inside a `LocalSet`. | Helper app supplies the local task context required by `Runner` without changing shared runner behavior. |
 
 ## Key Decisions
 - `control_port` is a top-level field.
@@ -114,6 +129,8 @@ The user-visible config returned by control APIs may retain `control_port`, whil
 - Runtime bind is always `127.0.0.1:<control_port>`.
 - If `control_port` and `stacks.__control_server__.bind` are both present, `control_port` wins.
 - Existing configs with no `control_port` keep the embedded default `127.0.0.1:13451`.
+- `test_server` uses `#[tokio::main(flavor = "current_thread")]` and `LocalSet::run_until` around the existing async body.
+- `Runner` remains unchanged for this helper bugfix.
 
 ## Data and State
 No durable data, database, token, certificate, cache, or serialized state changes are required. The effective in-memory config gains/retains `control_port` and updates the injected control stack bind before parsing.
@@ -123,6 +140,8 @@ No durable data, database, token, certificate, cache, or serialized state change
 - Internal effective config: `stacks.__control_server__.bind` is set to `127.0.0.1:<control_port>` when `control_port` exists.
 - Existing control RPC, login token, and server implementation remain unchanged.
 - Dependency on `runtime-configs`: `src/rootfs/etc/cyfs_gateway.yaml` must document the new field or explicitly omit it; this design chooses to document it as a commented example.
+- `test_server` binary interface remains unchanged: `TEST_SERVER_PORT` and the default port are preserved.
+- `cyfs_gateway_lib::Runner` API and local-task behavior remain unchanged.
 
 ## Document Index
 | path | purpose |
@@ -133,12 +152,15 @@ No durable data, database, token, certificate, cache, or serialized state change
 | `docs/versions/v0.6/modules/gateway-runtime/testplan.yaml` | Unified test entry to be updated if new test commands are added. |
 | `src/apps/cyfs_gateway/src/gateway.rs` | Config loading and built-in control server injection. |
 | `src/rootfs/etc/cyfs_gateway.yaml` | Shipped rootfs config example/default surface. |
+| `src/apps/test_server/src/main.rs` | Helper app Tokio runtime setup for `cyfs_gateway_lib::Runner`. |
 
 ## Risks and Rollback
 - Risk: invalid precedence between `control_port` and internal bind could surprise tests. Mitigation: `control_port` explicitly wins and tests cover it.
 - Risk: accepting a host would expand the control-plane trust boundary. Mitigation: only port values are accepted and host remains loopback.
 - Risk: port allocation races in tests. Mitigation: tests allocate ports per case and report selected ports.
+- Risk: changing the shared runner to self-manage local context could alter other runtime users. Mitigation: keep this bugfix scoped to `test_server` runtime setup.
 - Rollback: remove `control_port` helper and rootfs example line; existing internal `stacks.__control_server__.bind` override remains available.
+- Rollback for `test_server`: revert the helper main wrapper to the previous `#[tokio::main]` form.
 
 ## Approval Record
 Auto-pipeline confirmed this design after `doc-structure-check.py --docs design` passed. Launch evidence is recorded in `harness/pipeline-plan.md`.

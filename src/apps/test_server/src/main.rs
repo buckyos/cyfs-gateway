@@ -14,20 +14,25 @@ fn default_port() -> u16 {
         .unwrap_or(DEFAULT_PORT)
 }
 
-#[tokio::main]
+#[tokio::main(flavor = "current_thread")]
 async fn main() -> ServerResult<()> {
-    buckyos_kit::init_logging("test_server", true);
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            buckyos_kit::init_logging("test_server", true);
 
-    let port = default_port();
-    let runner = Runner::new(port);
-    runner.add_http_server("/server/".to_string(), Arc::new(SimpleHttpServer::new()))?;
+            let port = default_port();
+            let runner = Runner::new(port);
+            runner.add_http_server("/server/".to_string(), Arc::new(SimpleHttpServer::new()))?;
 
-    // Add a dir handler for demo
-    let current_dir = std::path::PathBuf::from(".");
-    runner
-        .add_dir_handler("/files/".to_string(), current_dir)
-        .await?;
+            // Add a dir handler for demo
+            let current_dir = std::path::PathBuf::from(".");
+            runner
+                .add_dir_handler("/files/".to_string(), current_dir)
+                .await?;
 
-    info!("test_server listening on http://127.0.0.1:{port}");
-    runner.run().await
+            info!("test_server listening on http://127.0.0.1:{port}");
+            runner.run().await
+        })
+        .await
 }

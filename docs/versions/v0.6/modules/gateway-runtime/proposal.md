@@ -3,8 +3,8 @@ module: gateway-runtime
 version: v0.6
 status: approved
 approved_by: user
-approved_at: 2026-06-11T23:55:57+08:00
-approved_content_sha256: ee536cc030047b0bdec8f280e212e18db1f6c273a1e40de693b2d46caf0ad141
+approved_at: 2026-06-12T10:58:43+08:00
+approved_content_sha256: 43f0c9ef1f6f1172917d1817385cc52c6d24eea57a86f94f4e8b155e39d1bec6
 ---
 
 # gateway-runtime Proposal
@@ -24,6 +24,8 @@ The existing runtime can already override the injected internal stack through `s
 
 This proposal also preserves the previously planned TCP/TLS/UDP/QUIC reuseport work for the module packet.
 
+The `src/apps/test_server` helper app now uses `cyfs_gateway_lib::Runner`. That runner serves HTTP streams through local tasks, so the helper must run inside a Tokio local task context instead of the default multi-thread runtime.
+
 ## Scope
 ### In Scope
 - Add a top-level `control_port` config setting for the built-in control server port.
@@ -32,6 +34,7 @@ This proposal also preserves the previously planned TCP/TLS/UDP/QUIC reuseport w
 - Use the setting in tests that start multiple `cyfs_gateway` instances or otherwise need isolated control ports.
 - Preserve the built-in control server stack/server definitions; user configs must not need to copy the hook point or server definition.
 - Keep existing TCP/TLS/UDP/QUIC reuseport proposal items in this module packet.
+- Run `src/apps/test_server` with an explicit local Tokio context compatible with `cyfs_gateway_lib::Runner`.
 
 ### Out of Scope
 - Do not expose a remote control-plane bind host in this change; the new setting controls the port only and remains loopback-bound.
@@ -39,6 +42,7 @@ This proposal also preserves the previously planned TCP/TLS/UDP/QUIC reuseport w
 - Do not require existing configs to add the new setting.
 - Do not remove the existing internal `stacks.__control_server__.bind` override path until compatibility is separately designed.
 - Do not redesign stack, server, process-chain, RTCP, or TUN behavior.
+- Do not change `Runner` public APIs or shared server dispatch behavior for the `test_server` helper fix.
 
 ### Adjacent Module Boundaries
 - `gateway-runtime` owns config loading, built-in control server injection, and runtime startup behavior.
@@ -65,6 +69,7 @@ This proposal also preserves the previously planned TCP/TLS/UDP/QUIC reuseport w
 | Should the setting be nested or top-level? | The requested purpose is a simple global runtime startup knob used by tests and local multi-instance runs. | A nested object leaves more room for future control-plane settings but adds shape complexity that is not needed for port-only configuration. | Use top-level `control_port`. |
 | Should the new setting accept a full bind address or only a port? | The user asked for a port, and remote control-plane exposure would alter the security boundary. | A full bind address is more flexible but risks accidental non-loopback control-plane exposure. | Support port-only in this change; keep loopback binding. |
 | Should this be implemented directly from chat context? | The approved proposal currently excludes new user-visible config fields. | Direct implementation would bypass proposal/design admission. | Return to proposal first and record downstream design, implementation, and testing follow-up. |
+| Should the `test_server` bug be fixed by changing `Runner` or by changing the helper runtime? | The reported risk is isolated to `src/apps/test_server` using a local-task runner from a default Tokio runtime. | Changing `Runner` would affect all shared server users and could alter local-task assumptions across the gateway library. | Keep the fix in `test_server`: use a current-thread runtime with `LocalSet` around server setup and `runner.run()`. |
 
 ## Large Module Submodule Decision
 | submodule | new_or_existing | responsibility | proposal_packet | reason |
@@ -97,6 +102,7 @@ This proposal also preserves the previously planned TCP/TLS/UDP/QUIC reuseport w
 | gateway-runtime-udp-reuseport | P-udp-reuseport-1 | UDP stack uses external `sfo_reuseport::ServerRuntime` and `sfo_reuseport::UdpServer`, with `concurrency` interpreted as per-worker datagram handler concurrency. | Modify `UdpStack`, `UdpStackFactory`, runtime factory registration, and focused tests. |
 | gateway-runtime-quic-reuseport | P-quic-reuseport-1 | QUIC stack uses external `sfo_reuseport::ServerRuntime` and `sfo_reuseport::QuicServer`, with `concurrency` interpreted as per-worker open connection limit. | Modify `QuicStack`, `QuicStackFactory`, runtime factory registration, and focused tests. |
 | gateway-runtime-control-port-config | P-control-server-port-config-1 | Top-level `control_port` config can set the built-in control server port while preserving loopback binding and default port compatibility. | Design, implementation, and tests cover explicit port, default port, multi-instance startup, and invalid/conflicting config. |
+| gateway-runtime-test-server-local-runner | P-test-server-local-runner-1 | `src/apps/test_server` runs `cyfs_gateway_lib::Runner` inside an explicit Tokio local task context. | Design, implementation, and focused validation cover startup with `LocalSet` and request handling without `spawn_local` runtime panic. |
 
 ## Success Criteria
 - Top-level `control_port` can set the built-in control server port for one gateway instance.
@@ -104,12 +110,14 @@ This proposal also preserves the previously planned TCP/TLS/UDP/QUIC reuseport w
 - Absence of the new setting preserves the existing default port behavior.
 - Invalid ports and unsafe host-style configuration are rejected before runtime bind attempts.
 - Shipped config examples/templates are updated or explicitly documented as intentionally unchanged.
+- `test_server` can accept an HTTP request through `cyfs_gateway_lib::Runner` without panicking due to missing `LocalSet`.
 
 ## Risks
 - Introducing a new config key creates compatibility and documentation obligations.
 - Ambiguous precedence between the new setting and `stacks.__control_server__.bind` could produce surprising startup behavior.
 - Allowing a full bind address would expand the control-plane trust boundary, so this proposal keeps the setting port-only.
 - Tests that allocate ports before process startup can still race with other processes; test design should use per-case allocation and clear diagnostics.
+- Leaving the shared `Runner` unchanged means other callers remain responsible for providing a local task context when they call local-task entrypoints directly.
 
 ## Downstream Follow-Up
 | stage | required_follow_up | reason |
@@ -118,8 +126,10 @@ This proposal also preserves the previously planned TCP/TLS/UDP/QUIC reuseport w
 | testing | Add direct coverage for default port behavior, explicit control port behavior, invalid port handling, and multi-instance startup. | Triggered runtime/config/security checks require concrete validation. |
 | implementation | Implement only after proposal/design approval and admission evidence for `P-control-server-port-config-1`. | Current approved design does not cover this new config field. |
 | acceptance | Review docs, code defaults, templates, and test evidence for consistency. | Config-template sync and control-plane boundary risks need independent review. |
+| design | Add `P-test-server-local-runner-1` design coverage for the helper app runtime wrapper and path scope. | Implementation admission requires a path-scoped mapping before editing `src/apps/test_server`. |
+| testing | Add focused validation that starts `test_server` and performs an HTTP request. | Bugfix work requires regression evidence or a documented reproduction constraint. |
 
 ## Approval Record
 - approver: user
-- approval_date: 2026-06-11T23:55:57+08:00
-- user_statement: "确定，自动处理后续步骤"
+- approval_date: 2026-06-12T10:58:43+08:00
+- user_statement: "确认"

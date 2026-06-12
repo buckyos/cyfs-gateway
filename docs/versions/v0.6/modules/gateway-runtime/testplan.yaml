@@ -79,6 +79,7 @@ levels:
     test_targets:
       - src/apps/cyfs_gateway/tests/test_cyfs_gateway.rs
       - tests/integration/cyfs_gateway_app/run.py
+      - src/apps/test_server/src/main.rs
     preconditions:
       tools:
         - cargo
@@ -102,3 +103,7 @@ levels:
         name: 执行 cyfs_gateway app 进程级 Python 集成测试
         change_ids: ["P-base-1", "P-control-server-port-config-1"]
         run: ["bash", "-lc", "python3 tests/integration/cyfs_gateway_app/run.py"]
+      - id: gateway-runtime-test-server-local-runner
+        name: 执行 test_server LocalSet smoke
+        change_ids: ["P-test-server-local-runner-1"]
+        run: ["bash", "-lc", "cd src && cargo build -p test_server --bin test_server && port=$(python3 -c 'import socket; s=socket.socket(); s.bind((\"127.0.0.1\", 0)); print(s.getsockname()[1]); s.close()'); rm -f /tmp/cyfs-test-server-local-runner.log /tmp/cyfs-test-server-local-runner.response; TEST_SERVER_PORT=$port ./target/debug/test_server > /tmp/cyfs-test-server-local-runner.log 2>&1 & pid=$!; ok=0; for i in $(seq 1 80); do if curl --noproxy '*' -fsS http://127.0.0.1:$port/server/ >/tmp/cyfs-test-server-local-runner.response; then ok=1; break; fi; if ! kill -0 $pid >/dev/null 2>&1; then break; fi; sleep 0.25; done; kill $pid >/dev/null 2>&1 || true; wait $pid >/dev/null 2>&1 || true; test \"$ok\" -eq 1 && grep -q 'test_server says hello' /tmp/cyfs-test-server-local-runner.response"]
