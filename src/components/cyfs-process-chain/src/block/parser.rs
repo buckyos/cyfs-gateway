@@ -1225,7 +1225,8 @@ impl BlockParser {
     */
 
     /// Parse assign expression with = or without value
-    /// This supports both `export KEY=VALUE` and `export KEY`
+    /// This supports `export KEY=VALUE`, `export KEY`, and collection-path
+    /// assignment like `${REQ.host} = example.com`.
     fn parse_assign(input: &str) -> IResult<&str, Expression> {
         debug!("Parsing assign: {}", input);
         let (input, kind) = opt(terminated(
@@ -1242,16 +1243,27 @@ impl BlockParser {
 
         debug!("Parsed assign kind: {}, {:?}", input, kind);
 
-        let (input, key) = recognize(pair(
-            alt((alpha1, tag("_"))),
-            many0(alt((alphanumeric1, tag("_")))),
-        ))
-        .parse(input)?;
+        let (input, key) = Self::parse_assign_key(input)?;
 
         debug!("Parsed assign key: {}, {:?}", input, key);
 
         let (input, _) = space0(input)?;
-        let (input, value) = opt(preceded(char('='), Self::parse_arg)).parse(input)?;
+        let (input, value) = if input.starts_with('=') {
+            // Let comparison sugar handle `==` / `===` instead of treating the
+            // first '=' as an assignment operator.
+            if input.starts_with("==") {
+                return Err(nom::Err::Error(nom::error::Error::from_error_kind(
+                    input,
+                    ErrorKind::Tag,
+                )));
+            }
+
+            let (input, _) = char('=').parse(input)?;
+            let (input, value) = Self::parse_arg(input)?;
+            (input, Some(value))
+        } else {
+            (input, None)
+        };
 
         debug!("Parsed assign value: {}, {:?}", input, value);
 
@@ -1266,7 +1278,7 @@ impl BlockParser {
         let kind = kind.unwrap_or_default();
         let mut args = vec![
             CommandArg::Literal(kind.as_str().to_string()),
-            CommandArg::Literal(key.to_string()),
+            CommandArg::Literal(key),
         ];
 
         if let Some(value) = value {
@@ -1276,6 +1288,30 @@ impl BlockParser {
         let args = CommandArgs::new(args);
         let cmd = CommandItem::new("assign".to_string(), args);
         Ok((input, Expression::Command(cmd)))
+    }
+
+    fn parse_assign_key(input: &str) -> IResult<&str, String> {
+        preceded(
+            space0,
+            alt((
+                map(Self::parse_var_braced, |arg| match arg {
+                    CommandArg::Var(key) => key,
+                    _ => unreachable!("parse_var_braced only returns CommandArg::Var"),
+                }),
+                map(Self::parse_var_dollar, |arg| match arg {
+                    CommandArg::Var(key) => key,
+                    _ => unreachable!("parse_var_dollar only returns CommandArg::Var"),
+                }),
+                map(
+                    recognize(pair(
+                        alt((alpha1, tag("_"))),
+                        many0(alt((alphanumeric1, tag("_")))),
+                    )),
+                    |s: &str| s.to_string(),
+                ),
+            )),
+        )
+        .parse(input)
     }
 
     // Parse infix comparison sugar:
@@ -2353,6 +2389,22 @@ mod tests {
         assert_eq!(cmd.command.args[1].as_literal_str(), Some("--loose"));
         assert!(matches!(cmd.command.args[2], CommandArg::Var(_)));
         assert!(matches!(cmd.command.args[3], CommandArg::StringLiteral(_)));
+    }
+
+    #[test]
+    fn test_parse_var_path_assignment_sugar() {
+        let (rest, expr) = BlockParser::parse_expression("${REQ.host} = www.buckyos.com").unwrap();
+        assert_eq!(rest, "");
+
+        let cmd = expr.as_command().unwrap();
+        assert_eq!(cmd.command.name, "assign");
+        assert_eq!(cmd.command.args.len(), 3);
+        assert_eq!(cmd.command.args[0].as_literal_str(), Some("chain"));
+        assert_eq!(cmd.command.args[1].as_literal_str(), Some("REQ.host"));
+        assert_eq!(
+            cmd.command.args[2].as_literal_str(),
+            Some("www.buckyos.com")
+        );
     }
 
     #[test]

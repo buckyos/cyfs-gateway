@@ -18,16 +18,18 @@ use async_trait::async_trait;
 use buckyos_kit::{AsyncStream, buckyos_get_unix_timestamp};
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use hex::ToHex;
+use hkdf::Hkdf;
 use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, encode};
 use log::*;
 use name_client::*;
 use name_lib::*;
 use percent_encoding::percent_decode_str;
-use hkdf::Hkdf;
 use rand::Rng;
 use sha2::Sha256;
 use std::fmt;
 use std::net::{IpAddr, SocketAddr};
+use std::io::ErrorKind;
+
 #[cfg(unix)]
 use std::os::fd::{FromRawFd, IntoRawFd};
 #[cfg(windows)]
@@ -276,12 +278,16 @@ struct InitiatorHandshakeState {
     responder_did: String,
 }
 
+struct ResolvedHandshakeIdentity {
+    did: DID,
+    ed25519_pk_der: [u8; 32],
+}
+
 // Decode a hex-encoded 32-byte X25519 public key. Used by both Hello and
 // HelloAck JWT verification paths.
 fn decode_x25519_pub_hex(hex_str: &str) -> Result<[u8; 32], TunnelError> {
-    let bytes = hex::decode(hex_str).map_err(|e| {
-        TunnelError::ReasonError(format!("decode x25519 pub hex error:{}", e))
-    })?;
+    let bytes = hex::decode(hex_str)
+        .map_err(|e| TunnelError::ReasonError(format!("decode x25519 pub hex error:{}", e)))?;
     bytes.try_into().map_err(|_| {
         TunnelError::ReasonError("x25519 pub key must be exactly 32 bytes".to_string())
     })
@@ -351,9 +357,9 @@ impl RTcpInner {
         None
     }
 
-    async fn resolve_exchange_key_by_web_name_info(
+    async fn resolve_handshake_identity_by_web_name_info(
         remote_did: &DID,
-    ) -> Result<Option<[u8; 32]>, String> {
+    ) -> Result<Option<ResolvedHandshakeIdentity>, String> {
         if remote_did.method != "web" {
             return Ok(None);
         }
@@ -416,11 +422,15 @@ impl RTcpInner {
                 let dev_did = DID::new("dev", x);
                 if let Some(exchange_key) = dev_did.get_ed25519_auth_key() {
                     debug!(
-                        "resolve remote device {} exchange key by {} TXT DEV",
+                        "resolve remote device {} handshake identity as {} by {} TXT DEV",
                         remote_did.to_string(),
+                        dev_did.to_string(),
                         web_host
                     );
-                    return Ok(Some(exchange_key));
+                    return Ok(Some(ResolvedHandshakeIdentity {
+                        did: dev_did,
+                        ed25519_pk_der: exchange_key,
+                    }));
                 }
             }
         }
@@ -432,11 +442,15 @@ impl RTcpInner {
                     let dev_did = DID::new("dev", x);
                     if let Some(exchange_key) = dev_did.get_ed25519_auth_key() {
                         debug!(
-                            "resolve remote device {} exchange key by {} TXT PKX",
+                            "resolve remote device {} handshake identity as {} by {} TXT PKX",
                             remote_did.to_string(),
+                            dev_did.to_string(),
                             web_host
                         );
-                        return Ok(Some(exchange_key));
+                        return Ok(Some(ResolvedHandshakeIdentity {
+                            did: dev_did,
+                            ed25519_pk_der: exchange_key,
+                        }));
                     }
                 } else if parse_errors.len() < 6 {
                     parse_errors.push(format!("TXT[{}] PKX is empty", idx));
@@ -451,11 +465,39 @@ impl RTcpInner {
         Ok(None)
     }
 
-    async fn resolve_exchange_key(remote_did: &DID) -> Result<[u8; 32], String> {
+    async fn resolve_handshake_identity(
+        remote_did: &DID,
+    ) -> Result<ResolvedHandshakeIdentity, String> {
         debug!(
-            "resolve exchange key for remote device {}",
+            "resolve handshake identity for remote device {}",
             remote_did.to_string()
         );
+
+        if remote_did.method == "web" {
+            debug!(
+                "try resolve handshake identity for {} by web TXT records",
+                remote_did.to_string()
+            );
+
+            match Self::resolve_handshake_identity_by_web_name_info(remote_did).await {
+                Ok(Some(identity)) => {
+                    debug!(
+                        "resolve handshake identity for {} as {} by web TXT records success",
+                        remote_did.to_string(),
+                        identity.did.to_string()
+                    );
+                    return Ok(identity);
+                }
+                Ok(None) => {}
+                Err(fallback_err) => {
+                    warn!(
+                        "resolve handshake identity for {} by web TXT records failed: {}",
+                        remote_did.to_string(),
+                        fallback_err
+                    );
+                }
+            }
+        }
 
         match resolve_ed25519_exchange_key(remote_did).await {
             Ok(exchange_key) => {
@@ -463,7 +505,10 @@ impl RTcpInner {
                     "resolve exchange key for {} by DID doc success",
                     remote_did.to_string()
                 );
-                Ok(exchange_key)
+                Ok(ResolvedHandshakeIdentity {
+                    did: remote_did.clone(),
+                    ed25519_pk_der: exchange_key,
+                })
             }
             Err(primary_err) => {
                 let primary_err_str = primary_err.to_string();
@@ -487,13 +532,13 @@ impl RTcpInner {
                         remote_did.to_string()
                     );
 
-                    match Self::resolve_exchange_key_by_web_name_info(remote_did).await {
-                        Ok(Some(exchange_key)) => {
+                    match Self::resolve_handshake_identity_by_web_name_info(remote_did).await {
+                        Ok(Some(identity)) => {
                             debug!(
                                 "resolve exchange key for {} by web TXT fallback success",
                                 remote_did.to_string()
                             );
-                            return Ok(exchange_key);
+                            return Ok(identity);
                         }
                         Ok(None) => {
                             return Err(format!(
@@ -512,6 +557,32 @@ impl RTcpInner {
 
                 Err(primary_err_str)
             }
+        }
+    }
+
+    async fn validate_hello_target(token_to: &str, this_host: &str) -> Result<(), String> {
+        if token_to == this_host {
+            return Ok(());
+        }
+
+        let target_did = DID::from_str(token_to)
+            .map_err(|e| format!("token.to {} is not a valid DID: {}", token_to, e))?;
+        if target_did.method != "web" {
+            return Err(format!(
+                "token.to {} is not this device {} and is not a web alias",
+                token_to, this_host
+            ));
+        }
+
+        let resolved_identity = Self::resolve_handshake_identity(&target_did).await?;
+        let resolved_host = resolved_identity.did.to_host_name();
+        if resolved_host == this_host {
+            Ok(())
+        } else {
+            Err(format!(
+                "token.to {} resolves to {}, not this device {}",
+                token_to, resolved_host, this_host
+            ))
         }
     }
 
@@ -726,7 +797,7 @@ impl RTcpInner {
             TunnelError::DocumentError(format!("invalid remote device is not did: {}", op))
         })?;
 
-        let responder_ed25519_pk_der = Self::resolve_exchange_key(&remote_did)
+        let responder_identity = Self::resolve_handshake_identity(&remote_did)
             .await
             .map_err(|op| {
                 let msg = format!(
@@ -736,8 +807,9 @@ impl RTcpInner {
                 );
                 error!("{}", msg);
                 TunnelError::DocumentError(msg)
-            })?
-            .to_vec();
+            })?;
+        let responder_did = responder_identity.did.to_host_name();
+        let responder_ed25519_pk_der = responder_identity.ed25519_pk_der.to_vec();
 
         let (my_secret, my_public_bytes, my_public_hex) = Self::fresh_ephemeral();
 
@@ -751,7 +823,7 @@ impl RTcpInner {
 
         let tunnel_token_payload = TunnelTokenPayload {
             aud: RTCP_HELLO_AUD.to_string(),
-            to: remote_did.to_host_name(),
+            to: responder_did.clone(),
             from: self.this_device_did.to_host_name(),
             xpub: my_public_hex.clone(),
             exp: buckyos_get_unix_timestamp() + TUNNEL_TOKEN_EXP_SECS,
@@ -770,7 +842,7 @@ impl RTcpInner {
             my_xpub_hex: my_public_hex,
             my_nonce_hex: nonce_hex,
             responder_ed25519_pk_der,
-            responder_did: remote_did.to_host_name(),
+            responder_did,
         })
     }
 
@@ -1144,14 +1216,29 @@ impl RTcpInner {
     }
 
     async fn on_new_tunnel(&self, stream: TcpStream, hello_package: RTcpHelloPackage) {
+        let source_addr = match stream.peer_addr() {
+            Ok(addr) => Some(addr),
+            Err(e) => {
+                warn!("get tunnel peer addr before validation failed: {}", e);
+                None
+            }
+        };
+        let source_addr_log = source_addr
+            .map(|addr| addr.to_string())
+            .unwrap_or_else(|| "<unknown>".to_string());
+
         if hello_package.body.tunnel_token.is_none() {
-            error!("hello.body.tunnel_token is none");
+            warn!(
+                "reject rtcp tunnel from {}: hello.body.tunnel_token is none",
+                source_addr_log
+            );
             return;
         }
         let source_device = RTcpInner::resolve_source_device_info(&hello_package.body).await;
         if source_device.is_err() {
-            error!(
-                "resolve source device info error:{}",
+            warn!(
+                "reject rtcp tunnel from {}: resolve source device info error:{}",
+                source_addr_log,
                 source_device.err().unwrap()
             );
             return;
@@ -1161,7 +1248,10 @@ impl RTcpInner {
         let source_did = match DID::from_str(source_device_id.as_str()) {
             Ok(did) => did,
             Err(e) => {
-                error!("parser remote did error:{}", e);
+                warn!(
+                    "reject rtcp tunnel from {} {}: parser remote did error:{}",
+                    source_device_id, source_addr_log, e
+                );
                 return;
             }
         };
@@ -1172,7 +1262,10 @@ impl RTcpInner {
         ) {
             Ok(v) => v,
             Err(e) => {
-                error!("verify hello token error:{}", e);
+                warn!(
+                    "reject rtcp tunnel from {} {}: verify hello token error:{}",
+                    source_device_id, source_addr_log, e
+                );
                 return;
             }
         };
@@ -1180,10 +1273,10 @@ impl RTcpInner {
         // §14.2 anti-replay: every Hello token must bind this responder
         // and must not be replayed within its exp window.
         let this_host = self.this_device_did.to_host_name();
-        if hello_payload.to != this_host {
+        if let Err(e) = Self::validate_hello_target(&hello_payload.to, &this_host).await {
             warn!(
-                "reject rtcp tunnel: token.to {} not for this device {}",
-                hello_payload.to, this_host
+                "reject rtcp tunnel from {} {}: token.to {} not accepted for this device {}: {}",
+                source_device_id, source_addr_log, hello_payload.to, this_host, e
             );
             return;
         }
@@ -1198,20 +1291,28 @@ impl RTcpInner {
         let retain_until = hello_payload.exp.saturating_add(JWT_LEEWAY_SECS);
         let fresh = self
             .nonce_cache
-            .insert_if_fresh(&source_device_id, &hello_payload.nonce, retain_until, now_ts)
+            .insert_if_fresh(
+                &source_device_id,
+                &hello_payload.nonce,
+                retain_until,
+                now_ts,
+            )
             .await;
         if !fresh {
             warn!(
-                "reject rtcp tunnel: replayed Hello nonce {} from {}",
-                hello_payload.nonce, source_device_id
+                "reject rtcp tunnel from {} {}: replayed Hello nonce {}",
+                source_device_id, source_addr_log, hello_payload.nonce
             );
             return;
         }
 
-        let source_addr = match stream.peer_addr() {
-            Ok(addr) => addr,
-            Err(e) => {
-                error!("get tunnel peer addr error:{}", e);
+        let source_addr = match source_addr {
+            Some(addr) => addr,
+            None => {
+                warn!(
+                    "reject rtcp tunnel from {}: peer addr unavailable",
+                    source_device_id
+                );
                 return;
             }
         };
@@ -1241,7 +1342,10 @@ impl RTcpInner {
         {
             Ok(v) => v,
             Err(e) => {
-                error!("generate ack token error:{}", e);
+                warn!(
+                    "reject rtcp tunnel from {} {}: generate ack token error:{}",
+                    source_device_id, source_addr, e
+                );
                 return;
             }
         };
@@ -1253,20 +1357,17 @@ impl RTcpInner {
         let challenge_hex: String = challenge_bytes.encode_hex();
 
         let mut bearing: RTcpBearingStream = Box::new(stream);
-        let ack_pkg = RTcpHelloAckPackage::new(
-            0,
-            ack_token,
-            challenge_hex.clone(),
-            this_host.clone(),
-        );
+        let ack_pkg =
+            RTcpHelloAckPackage::new(0, ack_token, challenge_hex.clone(), this_host.clone());
         if let Err(e) = timeout(
             HELLO_HANDSHAKE_TIMEOUT,
             RTcpTunnelPackage::send_package(Pin::new(&mut bearing), ack_pkg),
         )
         .await
         .map_err(|_| TunnelError::ReasonError("HelloAck send timed out".to_string()))
-        .and_then(|r| r.map_err(|e| TunnelError::ReasonError(format!("HelloAck send error: {}", e))))
-        {
+        .and_then(|r| {
+            r.map_err(|e| TunnelError::ReasonError(format!("HelloAck send error: {}", e)))
+        }) {
             warn!(
                 "reject rtcp tunnel from {} {}: {}",
                 source_device_id, source_addr, e
@@ -1287,9 +1388,7 @@ impl RTcpInner {
         let mut encrypted_stream =
             EncryptedStream::new(bearing, &aes_key, &iv, EncryptionRole::Responder);
 
-        if let Err(e) =
-            responder_key_confirmation(&mut encrypted_stream, &challenge_hex).await
-        {
+        if let Err(e) = responder_key_confirmation(&mut encrypted_stream, &challenge_hex).await {
             warn!(
                 "reject rtcp tunnel from {} {}: key confirmation failed: {}",
                 source_device_id, source_addr, e
@@ -1862,9 +1961,17 @@ async fn initiator_complete_handshake(
         ))
     })?
     .map_err(|e| {
+        let detail = if e.kind() == ErrorKind::UnexpectedEof {
+            format!(
+                "{}; peer closed before sending HelloAck, likely because it rejected the Hello or uses an incompatible RTCP handshake",
+                e
+            )
+        } else {
+            e.to_string()
+        };
         InitiatorKeyConfirmationError::Failed(TunnelError::ReasonError(format!(
             "HelloAck read error: {}",
-            e
+            detail
         )))
     })?;
 
@@ -2248,8 +2355,7 @@ impl RTcpTunnel {
         // the cached `peer_addr` if it fails, so we never lose the fast path
         // when DNS hiccups.
         let last_addr = *peer_addr_handle.lock().unwrap();
-        let candidates =
-            self.collect_reconnect_candidates(last_addr).await;
+        let candidates = self.collect_reconnect_candidates(last_addr).await;
 
         self.race_reconnect_candidates(peer_addr_handle, candidates)
             .await
@@ -2376,8 +2482,7 @@ impl RTcpTunnel {
         addr: SocketAddr,
     ) -> Result<(TcpStream, SocketAddr, SocketAddr, Duration), (SocketAddr, std::io::Error)> {
         let started_at = Instant::now();
-        let connect_result =
-            timeout(DIRECT_TCP_CONNECT_TIMEOUT, TcpStream::connect(addr)).await;
+        let connect_result = timeout(DIRECT_TCP_CONNECT_TIMEOUT, TcpStream::connect(addr)).await;
         let tcp_stream = match connect_result {
             Ok(Ok(stream)) => stream,
             Ok(Err(e)) => {
@@ -2399,7 +2504,10 @@ impl RTcpTunnel {
                     addr,
                     std::io::Error::new(
                         std::io::ErrorKind::TimedOut,
-                        format!("tcp connect timed out after {:?}", DIRECT_TCP_CONNECT_TIMEOUT),
+                        format!(
+                            "tcp connect timed out after {:?}",
+                            DIRECT_TCP_CONNECT_TIMEOUT
+                        ),
                     ),
                 ));
             }
@@ -3382,6 +3490,51 @@ mod tests {
                 .await,
             "after retain window, the same nonce bundled with a fresh token should be admissible"
         );
+    }
+
+    #[tokio::test]
+    async fn web_target_token_uses_resolved_dev_identity() {
+        let _ = init_name_lib_for_test(&HashMap::new()).await;
+
+        let (client_signing_key, client_pkcs8_bytes) = generate_ed25519_key();
+        let client_jwk = encode_ed25519_sk_to_pk_jwk(&client_signing_key);
+        let client_device_config =
+            DeviceConfig::new_by_jwk("client", serde_json::from_value(client_jwk).unwrap());
+
+        let (server_signing_key, _server_pkcs8_bytes) = generate_ed25519_key();
+        let server_jwk = encode_ed25519_sk_to_pk_jwk(&server_signing_key);
+        let server_device_config =
+            DeviceConfig::new_by_jwk("server", serde_json::from_value(server_jwk).unwrap());
+        let server_id = server_device_config.id.clone();
+
+        let mut name_info = NameInfo::new("sn.devtests.org");
+        name_info.txt.push(format!("PKX={};", server_id.id));
+        add_nameinfo_cache("sn.devtests.org", name_info)
+            .await
+            .unwrap();
+
+        let client_inner = RTcpInner::new(
+            client_device_config.id,
+            "127.0.0.1:19083".to_string(),
+            Some(client_pkcs8_bytes),
+            None,
+            Arc::new(MockRTcpListener::new()),
+        );
+
+        let state = client_inner
+            .generate_tunnel_token("did:web:sn.devtests.org".to_string())
+            .await
+            .unwrap();
+        let claims = decode_jwt_claim_without_verify(&state.token).unwrap();
+
+        assert_eq!(
+            claims.get("to").and_then(|v| v.as_str()),
+            Some(server_id.to_host_name().as_str())
+        );
+        assert_eq!(state.responder_did, server_id.to_host_name());
+        RTcpInner::validate_hello_target("sn.devtests.org", server_id.to_host_name().as_str())
+            .await
+            .unwrap();
     }
 
     #[test]

@@ -139,6 +139,20 @@ const PROCESS_CHAIN_LIB_VAR_COLLECTION_ASSIGN: &str = r#"
 </process_chain_lib>
 "#;
 
+const PROCESS_CHAIN_LIB_VAR_HTTP_HEADER_ASSIGN: &str = r#"
+<process_chain_lib id="test_var_http_header_assign_lib" priority="100">
+    <process_chain id="http_header_assign_chain">
+        <block id="route">
+            <![CDATA[
+                ${REQ.host} = www.buckyos.com;
+                ${REQ.x-added} = "yes";
+                return --from lib $(append $REQ.host "|" $REQ.x-added);
+            ]]>
+        </block>
+    </process_chain>
+</process_chain_lib>
+"#;
+
 const PROCESS_CHAIN_LIB_VAR_LIST_ACCESS: &str = r#"
 <process_chain_lib id="test_var_list_access_lib" priority="100">
     <process_chain id="list_access_chain">
@@ -355,6 +369,59 @@ async fn test_collection_assignment_supports_map_and_set() {
         .await
         .unwrap();
     assert_eq!(ret.value(), "CN");
+}
+
+#[tokio::test]
+async fn test_var_path_assignment_can_update_http_header_map() {
+    TermLogger::init(
+        LevelFilter::Debug,
+        Config::default(),
+        TerminalMode::Mixed,
+        ColorChoice::Auto,
+    )
+    .unwrap_or_else(|_| {
+        let _ = SimpleLogger::init(LevelFilter::Debug, Config::default());
+    });
+
+    let hook_point = HookPoint::new("test_var_http_header_assign");
+    hook_point
+        .load_process_chain_lib(
+            "test_var_http_header_assign_lib",
+            0,
+            PROCESS_CHAIN_LIB_VAR_HTTP_HEADER_ASSIGN,
+        )
+        .await
+        .unwrap();
+
+    let data_dir = std::env::temp_dir().join("cyfs-process-chain-test-var-http-header-assign");
+    std::fs::create_dir_all(&data_dir).unwrap();
+    let hook_point_env = HookPointEnv::new("test-var-http-header-assign", data_dir);
+
+    let req = Arc::new(Box::new(MemoryMapCollection::new()) as Box<dyn MapCollection>);
+    req.insert("host", CollectionValue::String("old.example".to_string()))
+        .await
+        .unwrap();
+
+    hook_point_env
+        .hook_point_env()
+        .create("REQ", CollectionValue::Map(req.clone()))
+        .await
+        .unwrap();
+
+    let exec = hook_point_env.link_hook_point(&hook_point).await.unwrap();
+    let ret = exec
+        .execute_lib("test_var_http_header_assign_lib")
+        .await
+        .unwrap();
+    assert_eq!(ret.value(), "www.buckyos.com|yes");
+    assert_eq!(
+        req.get("host").await.unwrap(),
+        Some(CollectionValue::String("www.buckyos.com".to_string()))
+    );
+    assert_eq!(
+        req.get("x-added").await.unwrap(),
+        Some(CollectionValue::String("yes".to_string()))
+    );
 }
 
 #[tokio::test]
