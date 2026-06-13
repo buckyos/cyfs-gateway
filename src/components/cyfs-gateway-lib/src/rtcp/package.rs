@@ -2,6 +2,7 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::convert::TryInto;
 use std::fmt::Debug;
+use std::io::ErrorKind;
 use std::pin::Pin;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -577,7 +578,11 @@ impl RTcpTunnelPackage {
         let mut buf = [0; 2];
         //info!("try read 2 bytes package len");
         stream.read_exact(&mut buf).await.map_err(|e| {
-            error!("Read tunnel package len error: {}, {}", source_info, e);
+            if e.kind() == ErrorKind::UnexpectedEof {
+                warn!("Read tunnel package len eof: {}, {}", source_info, e);
+            } else {
+                error!("Read tunnel package len error: {}, {}", source_info, e);
+            }
             e
         })?;
 
