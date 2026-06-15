@@ -4,7 +4,9 @@ use crate::global_process_chains::{
 };
 use crate::self_cert_mgr::SelfCertMgrRef;
 use crate::stack::limiter::Limiter;
-use crate::stack::tls_cert_resolver::ResolvesServerCertUsingSni;
+use crate::stack::tls_cert_resolver::{
+    IdentityCertResolver, ResolvesServerCertUsingSni, TlsIdentityCertConfig, TlsIdentityHost,
+};
 use crate::stack::{
     TlsCertResolver, get_limit_info, get_source_addr_from_req_env, probe_proxy_protocol_stream,
     stream_forward, stream_forward_group,
@@ -13,12 +15,13 @@ use crate::{
     ConnectionInfo, ConnectionManagerRef, DumpStream, GlobalCollectionManagerRef,
     HandleConnectionController, IoDumpStackConfig, JsExternalsManagerRef, LimiterManagerRef,
     MutComposedSpeedStat, MutComposedSpeedStatRef, ProcessChainConfigs, Server, ServerManagerRef,
-    Stack, StackCertConfig, StackConfig, StackContext, StackErrorCode, StackProtocol, StackResult,
-    StatManagerRef, StreamInfo, TunnelManager, create_io_dump_stack_config, get_external_commands,
-    get_stat_info, hyper_serve_http, into_stack_err, stack_err,
+    Stack, StackConfig, StackContext, StackErrorCode, StackProtocol, StackResult, StatManagerRef,
+    StreamInfo, TunnelManager, create_io_dump_stack_config, get_external_commands, get_stat_info,
+    hyper_serve_http, into_stack_err, stack_err,
 };
 use cyfs_acme::{ACME_TLS_ALPN_NAME, AcmeCertManagerRef, AcmeItem, ChallengeType};
 use cyfs_process_chain::{CollectionValue, CommandControl, ProcessChainLibExecutor, StreamRequest};
+use name_client::IdentityRoots;
 use rustls::ServerConfig;
 use rustls::pki_types::pem::PemObject;
 pub use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
@@ -32,9 +35,12 @@ use std::os::fd::{FromRawFd, IntoRawFd};
 #[cfg(windows)]
 use std::os::windows::io::{FromRawSocket, IntoRawSocket};
 use std::sync::{Arc, Mutex, RwLock};
+use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio::task::JoinHandle;
 use tokio_rustls::TlsAcceptor;
+
+const DEFAULT_IDENTITY_CERT_REFRESH_INTERVAL_SECS: u64 = 60;
 
 pub async fn load_certs(path: &str) -> StackResult<Vec<CertificateDer<'static>>> {
     let certs = CertificateDer::pem_file_iter(path)
@@ -68,32 +74,6 @@ pub async fn create_server_config(
             .with_single_cert(certs, key)
             .map_err(|e| stack_err!(StackErrorCode::InvalidTlsCert, "{}", e))?,
     ))
-}
-
-async fn build_tls_domain_configs(certs: &[StackCertConfig]) -> StackResult<Vec<TlsDomainConfig>> {
-    let mut cert_list = Vec::with_capacity(certs.len());
-    for cert_config in certs.iter() {
-        if cert_config.cert_path.is_some() && cert_config.key_path.is_some() {
-            let certs = load_certs(cert_config.cert_path.as_deref().unwrap()).await?;
-            let key = load_key(cert_config.key_path.as_deref().unwrap()).await?;
-            cert_list.push(TlsDomainConfig {
-                domain: cert_config.domain.clone(),
-                acme_type: None,
-                certs: Some(certs),
-                key: Some(key),
-                data: None,
-            });
-        } else {
-            cert_list.push(TlsDomainConfig {
-                domain: cert_config.domain.clone(),
-                acme_type: cert_config.acme_type,
-                certs: None,
-                key: None,
-                data: cert_config.data.clone(),
-            });
-        }
-    }
-    Ok(cert_list)
 }
 
 #[derive(Clone)]
@@ -154,6 +134,7 @@ impl TlsConnectionHandler {
     async fn create(
         hook_point: ProcessChainConfigs,
         certs: Vec<TlsDomainConfig>,
+        identity_certs: Option<TlsIdentityCertConfig>,
         alpn_protocols: Vec<Vec<u8>>,
         env: Arc<TlsStackContext>,
         connection_manager: Option<ConnectionManagerRef>,
@@ -168,7 +149,7 @@ impl TlsConnectionHandler {
         )
         .await
         .map_err(into_stack_err!(StackErrorCode::ProcessChainError))?;
-        let certs = Self::build_cert_resolver(certs, env.as_ref())?;
+        let certs = Self::build_cert_resolver(certs, identity_certs, env.as_ref())?;
         Ok(Self {
             env,
             executor,
@@ -201,6 +182,7 @@ impl TlsConnectionHandler {
 
     fn build_cert_resolver(
         certs: Vec<TlsDomainConfig>,
+        identity_certs: Option<TlsIdentityCertConfig>,
         env: &TlsStackContext,
     ) -> StackResult<Arc<dyn ResolvesServerCert>> {
         let crypto_provider = rustls::crypto::ring::default_provider();
@@ -240,13 +222,15 @@ impl TlsConnectionHandler {
                     .map_err(|e| stack_err!(StackErrorCode::InvalidConfig, "{e}"))?;
             }
         }
+        let mut cert: Arc<dyn ResolvesServerCert> = cert_resolver;
+        if let Some(identity_certs) = identity_certs {
+            cert = IdentityCertResolver::new(identity_certs, Some(cert));
+        }
+
         let cert: Arc<dyn ResolvesServerCert> = if self_cert {
-            Arc::new(TlsCertResolver::new(
-                cert_resolver,
-                Some(env.self_cert_mgr.clone()),
-            ))
+            Arc::new(TlsCertResolver::new(cert, Some(env.self_cert_mgr.clone())))
         } else {
-            cert_resolver
+            cert
         };
         Ok(cert)
     }
@@ -582,6 +566,7 @@ impl TlsStack {
         let handler = TlsConnectionHandler::create(
             config.hook_point.unwrap(),
             config.certs,
+            config.identity_certs,
             config.alpn_protocols,
             env,
             config.connection_manager.clone(),
@@ -768,7 +753,6 @@ impl Stack for TlsStack {
             None => self.handler.read().unwrap().env.clone(),
         };
 
-        let certs = build_tls_domain_configs(&config.certs).await?;
         let alpn_protocols = config
             .alpn_protocols
             .clone()
@@ -779,7 +763,8 @@ impl Stack for TlsStack {
 
         let new_handler = TlsConnectionHandler::create(
             config.hook_point.clone(),
-            certs,
+            vec![],
+            build_identity_cert_config(&config.hosts, config.identity_manager.as_ref())?,
             alpn_protocols,
             env,
             self.connection_manager.clone(),
@@ -839,12 +824,33 @@ impl Clone for TlsDomainConfig {
 }
 
 #[derive(Serialize, Deserialize, Clone)]
+pub struct TlsIdentityManagerConfig {
+    #[serde(
+        default,
+        alias = "public_root",
+        alias = "public_identity_root",
+        alias = "public_identity_root_path",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub public_root_path: Option<String>,
+    #[serde(
+        default,
+        alias = "security_root",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub security_root_path: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
 pub struct TlsStackConfig {
     pub id: String,
     pub protocol: StackProtocol,
     pub bind: std::net::SocketAddr,
     pub hook_point: Vec<crate::ProcessChainConfig>,
-    pub certs: Vec<StackCertConfig>,
+    #[serde(default)]
+    pub hosts: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub identity_manager: Option<TlsIdentityManagerConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub concurrency: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -876,6 +882,54 @@ impl crate::StackConfig for TlsStackConfig {
     }
 }
 
+fn build_identity_cert_config(
+    hosts: &[String],
+    identity_manager: Option<&TlsIdentityManagerConfig>,
+) -> StackResult<Option<TlsIdentityCertConfig>> {
+    let hosts = hosts
+        .iter()
+        .map(|host| host.trim())
+        .filter(|host| !host.is_empty())
+        .collect::<Vec<_>>();
+    if hosts.is_empty() {
+        return Ok(None);
+    }
+
+    let mut roots = IdentityRoots::from_env_or_buckyos_root().map_err(|e| {
+        stack_err!(
+            StackErrorCode::InvalidConfig,
+            "load identity manager roots failed: {}",
+            e
+        )
+    })?;
+    if let Some(identity_manager) = identity_manager {
+        if let Some(public_root_path) = identity_manager.public_root_path.as_ref() {
+            roots.public_root = public_root_path.into();
+        }
+        if let Some(security_root_path) = identity_manager.security_root_path.as_ref() {
+            roots.security_root = security_root_path.into();
+        }
+    }
+
+    let mut identity_hosts = Vec::with_capacity(hosts.len());
+    for host in hosts {
+        identity_hosts.push(TlsIdentityHost::new(&roots, host).map_err(|e| {
+            stack_err!(
+                StackErrorCode::InvalidConfig,
+                "invalid TLS identity host {}: {}",
+                host,
+                e
+            )
+        })?);
+    }
+
+    Ok(Some(TlsIdentityCertConfig {
+        roots,
+        hosts: identity_hosts,
+        refresh_interval: Duration::from_secs(DEFAULT_IDENTITY_CERT_REFRESH_INTERVAL_SECS),
+    }))
+}
+
 pub struct TlsStackFactory {
     connection_manager: ConnectionManagerRef,
 }
@@ -901,7 +955,8 @@ impl crate::StackFactory for TlsStackFactory {
                 "invalid tls stack config"
             ))?;
 
-        let cert_list = build_tls_domain_configs(&config.certs).await?;
+        let identity_certs =
+            build_identity_cert_config(&config.hosts, config.identity_manager.as_ref())?;
 
         let stack_context = context
             .as_ref()
@@ -928,7 +983,7 @@ impl crate::StackFactory for TlsStackFactory {
             .bind(config.bind.to_string())
             .connection_manager(self.connection_manager.clone())
             .hook_point(config.hook_point.clone())
-            .add_certs(cert_list)
+            .identity_certs(identity_certs)
             .concurrency(config.concurrency.unwrap_or(0))
             .alpn_protocols(
                 config
@@ -953,6 +1008,7 @@ pub struct TlsStackBuilder {
     bind: Option<String>,
     hook_point: Option<ProcessChainConfigs>,
     certs: Vec<TlsDomainConfig>,
+    identity_certs: Option<TlsIdentityCertConfig>,
     concurrency: u32,
     connection_manager: Option<ConnectionManagerRef>,
     alpn_protocols: Vec<Vec<u8>>,
@@ -968,6 +1024,7 @@ impl TlsStackBuilder {
             bind: None,
             hook_point: None,
             certs: vec![],
+            identity_certs: None,
             concurrency: 0,
             connection_manager: None,
             alpn_protocols: vec![],
@@ -989,6 +1046,11 @@ impl TlsStackBuilder {
 
     pub fn add_certs(mut self, certs: Vec<TlsDomainConfig>) -> Self {
         self.certs.extend(certs);
+        self
+    }
+
+    pub(crate) fn identity_certs(mut self, identity_certs: Option<TlsIdentityCertConfig>) -> Self {
+        self.identity_certs = identity_certs;
         self
     }
 
@@ -1040,7 +1102,7 @@ impl TlsStackBuilder {
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
-    use super::{load_certs, load_key};
+    use super::{TlsIdentityManagerConfig, build_identity_cert_config, load_certs, load_key};
     use crate::global_process_chains::GlobalProcessChains;
     use crate::self_cert_mgr::{SelfCertConfig, SelfCertMgr, SelfCertMgrRef};
     use crate::{
@@ -2428,7 +2490,8 @@ mod tests {
             protocol: StackProtocol::Tls,
             bind: "127.0.0.1:343".parse().unwrap(),
             hook_point: vec![],
-            certs: vec![],
+            hosts: vec![],
+            identity_manager: None,
             concurrency: None,
             alpn_protocols: None,
             io_dump_file: None,
@@ -2451,6 +2514,62 @@ mod tests {
         ));
         let ret = factory.create(Arc::new(config), stack_context).await;
         assert!(ret.is_ok());
+    }
+
+    #[test]
+    fn test_tls_stack_config_uses_identity_hosts() {
+        let config: TlsStackConfig = serde_yaml_ng::from_str(
+            r#"
+id: tls_test
+protocol: tls
+bind: 127.0.0.1:443
+hosts:
+  - example.com
+  - "*.example.org"
+identity_manager:
+  public_root_path: /tmp/identity
+  security_root_path: /tmp/security
+hook_point: []
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.hosts, vec!["example.com", "*.example.org"]);
+        let identity_manager = config.identity_manager.unwrap();
+        assert_eq!(
+            identity_manager.public_root_path.as_deref(),
+            Some("/tmp/identity")
+        );
+        assert_eq!(
+            identity_manager.security_root_path.as_deref(),
+            Some("/tmp/security")
+        );
+    }
+
+    #[test]
+    fn test_tls_identity_config_normalizes_supported_hosts() {
+        let tmp_dir = tempdir().unwrap();
+        let public_root = tmp_dir.path().join("identity");
+        let security_root = tmp_dir.path().join("security");
+        let identity_manager = TlsIdentityManagerConfig {
+            public_root_path: Some(public_root.to_string_lossy().to_string()),
+            security_root_path: Some(security_root.to_string_lossy().to_string()),
+        };
+
+        let hosts = vec![
+            "*.example.com".to_string(),
+            "did:web:example.org:user:alice".to_string(),
+        ];
+        let config = build_identity_cert_config(&hosts, Some(&identity_manager))
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(config.roots.public_root, public_root);
+        assert_eq!(config.roots.security_root, security_root);
+        assert_eq!(config.hosts[0].identity, "*.example.com");
+        assert_eq!(config.hosts[0].tls_host, "*.example.com");
+        assert_eq!(config.hosts[1].identity, "did:web:example.org:user:alice");
+        assert_eq!(config.hosts[1].tls_host, "example.org");
     }
 
     #[tokio::test]
