@@ -41,7 +41,10 @@
 #      key_path: ***
 #      device_config_path: ***
 #   check_interval: 43200          # certificate check interval (seconds), default 12h
-#   renew_before_expiry: 2592000   # renew ahead of expiry (seconds), default 30d
+#   renew_before_expiry: 604800    # renew ahead of expiry (seconds), default 7d
+#   identity_manager:              # optional; defaults to BUCKYOS_IDENTITY_ROOT/BUCKYOS_SECURITY_ROOT or $BUCKYOS_ROOT/local/identity and $BUCKYOS_ROOT/security
+#     public_root_path: ./identity
+#     security_root_path: ./security
 
 # tls_ca:             # self-signed/CA certificate config (optional)
 #   cert_path: ./ca.crt
@@ -157,6 +160,10 @@ stacks:
     #       cert_path: ./cert.pem
     #       key_path: ./key.pem
     #     - domain: example.org # ACME certificate
+    #       identity: example.org # optional DID/host identity path; defaults to domain
+    #       identity_manager: # optional per-certificate override
+    #         public_root_path: ./identity
+    #         security_root_path: ./security
     #       acme_type: optional, default tls-alpn-01, supports dns-01 | http-01 | tls-alpn-01
     #     - domain: * # local default certificate; all connections through this stack use certs generated from the local root, configured via tls_ca
     #   hook_point: { }

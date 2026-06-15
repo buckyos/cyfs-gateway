@@ -1,10 +1,10 @@
 use buckyos_kit::get_buckyos_service_data_dir;
 use cyfs_dns::{DnsServerConfig, LocalDnsConfig};
 use cyfs_gateway_lib::{
-    AcmeHttpChallengeServerConfig, BlockConfig, CollectionConfig, ConfigErrorCode, ConfigResult,
-    CyfsDirServerConfig, DirServerConfig, ProcessChainConfig, ProcessChainConfigs,
-    ProcessChainHttpServerConfig, QuicStackConfig, RtcpStackConfig, ServerConfig, StackConfig,
-    TcpStackConfig, UdpStackConfig, config_err,
+    AcmeHttpChallengeServerConfig, AcmeIdentityConfig, BlockConfig, CollectionConfig,
+    ConfigErrorCode, ConfigResult, CyfsDirServerConfig, DirServerConfig, ProcessChainConfig,
+    ProcessChainConfigs, ProcessChainHttpServerConfig, QuicStackConfig, RtcpStackConfig,
+    ServerConfig, StackConfig, TcpStackConfig, UdpStackConfig, config_err,
 };
 use cyfs_sn::*;
 use cyfs_socks::SocksServerConfig;
@@ -953,6 +953,7 @@ pub struct AcmeConfig {
     pub account: Option<String>,
     pub issuer: Option<String>,
     pub dns_providers: Option<HashMap<String, serde_json::Value>>,
+    pub identity_manager: Option<AcmeIdentityConfig>,
     pub check_interval: Option<u64>,
     pub renew_before_expiry: Option<u64>,
 }

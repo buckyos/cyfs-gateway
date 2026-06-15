@@ -578,6 +578,7 @@ async fn build_acme_mgr_from_config(
             cert_config.acme_server = acme_config.issuer.unwrap();
         }
         cert_config.dns_providers = acme_config.dns_providers;
+        cert_config.identity_manager = acme_config.identity_manager;
         if acme_config.check_interval.is_some() {
             if let Some(check_interval) =
                 chrono::Duration::new(acme_config.check_interval.unwrap() as i64, 0)

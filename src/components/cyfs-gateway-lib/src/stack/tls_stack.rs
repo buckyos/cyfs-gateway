@@ -214,11 +214,14 @@ impl TlsConnectionHandler {
                     })?;
             } else {
                 env.acme_manager
-                    .add_acme_item(AcmeItem::new(
-                        cert_config.domain,
-                        cert_config.acme_type.unwrap_or(ChallengeType::TlsAlpn01),
-                        cert_config.data,
-                    ))
+                    .add_acme_item(
+                        AcmeItem::new(
+                            cert_config.domain,
+                            cert_config.acme_type.unwrap_or(ChallengeType::TlsAlpn01),
+                            cert_config.data,
+                        )
+                        .with_identity(cert_config.identity, cert_config.identity_manager),
+                    )
                     .map_err(|e| stack_err!(StackErrorCode::InvalidConfig, "{e}"))?;
             }
         }
@@ -798,6 +801,8 @@ impl Stack for TlsStack {
 
 pub struct TlsDomainConfig {
     pub domain: String,
+    pub identity: Option<String>,
+    pub identity_manager: Option<cyfs_acme::AcmeIdentityConfig>,
     pub acme_type: Option<ChallengeType>,
     pub certs: Option<Vec<CertificateDer<'static>>>,
     pub key: Option<PrivateKeyDer<'static>>,
@@ -809,6 +814,8 @@ impl Clone for TlsDomainConfig {
     fn clone(&self) -> Self {
         Self {
             domain: self.domain.clone(),
+            identity: self.identity.clone(),
+            identity_manager: self.identity_manager.clone(),
             acme_type: self.acme_type.clone(),
             certs: self.certs.clone(),
             key: match &self.key {
@@ -1231,6 +1238,8 @@ mod tests {
             .hook_point(vec![])
             .add_certs(vec![TlsDomainConfig {
                 domain: "www.buckyos.com".to_string(),
+                identity: None,
+                identity_manager: None,
                 acme_type: None,
                 certs: Some(vec![cert_key.cert.der().clone()]),
                 key: Some(PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
@@ -1277,6 +1286,8 @@ mod tests {
             .hook_point(chains)
             .add_certs(vec![TlsDomainConfig {
                 domain: "www.buckyos.com".to_string(),
+                identity: None,
+                identity_manager: None,
                 acme_type: None,
                 certs: Some(vec![cert_key.cert.der().clone()]),
                 key: Some(PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
@@ -1348,6 +1359,8 @@ mod tests {
             .hook_point(chains)
             .add_certs(vec![TlsDomainConfig {
                 domain: "www.buckyos.com".to_string(),
+                identity: None,
+                identity_manager: None,
                 acme_type: None,
                 certs: Some(vec![cert_key.cert.der().clone()]),
                 key: Some(PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
@@ -1421,6 +1434,8 @@ mod tests {
             .connection_manager(connection_manager.clone())
             .add_certs(vec![TlsDomainConfig {
                 domain: "www.buckyos.com".to_string(),
+                identity: None,
+                identity_manager: None,
                 acme_type: None,
                 certs: Some(vec![cert_key.cert.der().clone()]),
                 key: Some(PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
@@ -1513,6 +1528,8 @@ mod tests {
             .connection_manager(connection_manager.clone())
             .add_certs(vec![TlsDomainConfig {
                 domain: "www.buckyos.com".to_string(),
+                identity: None,
+                identity_manager: None,
                 acme_type: None,
                 certs: Some(vec![cert_key.cert.der().clone()]),
                 key: Some(PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
@@ -1593,6 +1610,8 @@ mod tests {
             .connection_manager(connection_manager.clone())
             .add_certs(vec![TlsDomainConfig {
                 domain: "*".to_string(),
+                identity: None,
+                identity_manager: None,
                 acme_type: None,
                 certs: None,
                 key: None,
@@ -1768,6 +1787,8 @@ mod tests {
             .hook_point(chains)
             .add_certs(vec![TlsDomainConfig {
                 domain: "www.buckyos.com".to_string(),
+                identity: None,
+                identity_manager: None,
                 acme_type: None,
                 certs: Some(vec![cert_key.cert.der().clone()]),
                 key: Some(PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
@@ -1868,6 +1889,8 @@ mod tests {
             .hook_point(chains)
             .add_certs(vec![TlsDomainConfig {
                 domain: "www.buckyos.com".to_string(),
+                identity: None,
+                identity_manager: None,
                 acme_type: None,
                 certs: Some(vec![cert_key.cert.der().clone()]),
                 key: Some(PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
@@ -1985,6 +2008,8 @@ mod tests {
             .hook_point(chains)
             .add_certs(vec![TlsDomainConfig {
                 domain: "www.buckyos.com".to_string(),
+                identity: None,
+                identity_manager: None,
                 acme_type: None,
                 certs: Some(vec![cert_key.cert.der().clone()]),
                 key: Some(PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
@@ -2087,6 +2112,8 @@ mod tests {
             .hook_point(chains)
             .add_certs(vec![TlsDomainConfig {
                 domain: "www.buckyos.com".to_string(),
+                identity: None,
+                identity_manager: None,
                 acme_type: None,
                 certs: Some(vec![cert_key.cert.der().clone()]),
                 key: Some(PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
@@ -2173,6 +2200,8 @@ mod tests {
             .hook_point(chains)
             .add_certs(vec![TlsDomainConfig {
                 domain: "www.buckyos.com".to_string(),
+                identity: None,
+                identity_manager: None,
                 acme_type: None,
                 certs: Some(vec![cert_key.cert.der().clone()]),
                 key: Some(PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
@@ -2278,6 +2307,8 @@ mod tests {
             .hook_point(chains)
             .add_certs(vec![TlsDomainConfig {
                 domain: "www.buckyos.com".to_string(),
+                identity: None,
+                identity_manager: None,
                 acme_type: None,
                 certs: Some(vec![cert_key.cert.der().clone()]),
                 key: Some(PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
@@ -2403,6 +2434,8 @@ mod tests {
             .hook_point(chains)
             .add_certs(vec![TlsDomainConfig {
                 domain: "www.buckyos.com".to_string(),
+                identity: None,
+                identity_manager: None,
                 acme_type: None,
                 certs: Some(vec![cert_key.cert.der().clone()]),
                 key: Some(PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
@@ -2601,6 +2634,8 @@ hook_point: []
             .hook_point(chains)
             .add_certs(vec![TlsDomainConfig {
                 domain: "www.buckyos.com".to_string(),
+                identity: None,
+                identity_manager: None,
                 acme_type: None,
                 certs: Some(vec![cert_key.cert.der().clone()]),
                 key: Some(PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
@@ -2689,6 +2724,8 @@ hook_point: []
             .hook_point(chains)
             .add_certs(vec![TlsDomainConfig {
                 domain: "www.buckyos.com".to_string(),
+                identity: None,
+                identity_manager: None,
                 acme_type: None,
                 certs: Some(vec![cert_key.cert.der().clone()]),
                 key: Some(PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
@@ -2789,6 +2826,8 @@ hook_point: []
             .hook_point(chains)
             .add_certs(vec![TlsDomainConfig {
                 domain: "www.buckyos.com".to_string(),
+                identity: None,
+                identity_manager: None,
                 acme_type: None,
                 certs: Some(vec![cert_key.cert.der().clone()]),
                 key: Some(PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
@@ -2889,6 +2928,8 @@ hook_point: []
             .hook_point(chains)
             .add_certs(vec![TlsDomainConfig {
                 domain: "www.buckyos.com".to_string(),
+                identity: None,
+                identity_manager: None,
                 acme_type: None,
                 certs: Some(vec![cert_key.cert.der().clone()]),
                 key: Some(PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(

@@ -216,7 +216,7 @@ pub enum ConfigErrorCode {
 pub type ConfigResult<T> = sfo_result::Result<T, ConfigErrorCode>;
 pub type ConfigError = sfo_result::Error<ConfigErrorCode>;
 use crate::StackProtocol;
-use cyfs_acme::ChallengeType;
+use cyfs_acme::{AcmeIdentityConfig, ChallengeType};
 use cyfs_process_chain::{Block, BlockParser, ProcessChain};
 pub use sfo_result::err as config_err;
 pub use sfo_result::into_err as into_config_err;
@@ -238,6 +238,10 @@ pub struct UdpConfig {
 #[derive(Serialize, Deserialize, Clone)]
 pub struct StackCertConfig {
     pub domain: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub identity: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub identity_manager: Option<AcmeIdentityConfig>,
     pub acme_type: Option<ChallengeType>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cert_path: Option<String>,
