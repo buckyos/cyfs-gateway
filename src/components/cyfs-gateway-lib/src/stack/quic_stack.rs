@@ -10,7 +10,10 @@ use crate::global_process_chains::{
     GlobalProcessChainsRef, create_process_chain_executor, execute_chain,
 };
 use crate::stack::limiter::Limiter;
-use crate::stack::tls_cert_resolver::ResolvesServerCertUsingSni;
+use crate::stack::tls_cert_resolver::{
+    IdentityCertResolver, ResolvesServerCertUsingSni, TlsIdentityCertConfig,
+};
+use crate::stack::tls_stack::build_identity_cert_config;
 use crate::stack::{
     TlsCertResolver, get_limit_info, probe_proxy_protocol_stream, stream_forward,
     stream_forward_group,
@@ -21,9 +24,9 @@ use crate::{
     JsExternalsManagerRef, LimiterManagerRef, ProcessChainConfig, ProcessChainConfigs,
     SelfCertMgrRef, Server, ServerError, ServerErrorCode, ServerManagerRef, Stack, StackCertConfig,
     StackConfig, StackContext, StackErrorCode, StackFactory, StackProtocol, StackRef, StackResult,
-    StatManagerRef, StreamInfo, TlsDomainConfig, TunnelManager, create_io_dump_stack_config,
-    get_external_commands, get_stat_info, into_stack_err, load_certs, load_key, server_err,
-    stack_err,
+    StatManagerRef, StreamInfo, TlsDomainConfig, TlsIdentityManagerConfig, TunnelManager,
+    create_io_dump_stack_config, get_external_commands, get_stat_info, into_stack_err, load_certs,
+    load_key, server_err, stack_err,
 };
 use buckyos_kit::AsyncStream;
 use cyfs_acme::{AcmeCertManagerRef, AcmeItem, ChallengeType};
@@ -141,6 +144,7 @@ impl QuicConnectionHandler {
 
     fn build_cert_resolver(
         certs: Vec<TlsDomainConfig>,
+        identity_certs: Option<TlsIdentityCertConfig>,
         env: &QuicStackContext,
     ) -> StackResult<Arc<dyn ResolvesServerCert>> {
         let crypto_provider = rustls::crypto::ring::default_provider();
@@ -183,13 +187,15 @@ impl QuicConnectionHandler {
                     .map_err(|e| stack_err!(StackErrorCode::InvalidConfig, "{e}"))?;
             }
         }
+        let mut cert: Arc<dyn ResolvesServerCert> = cert_resolver;
+        if let Some(identity_certs) = identity_certs {
+            cert = IdentityCertResolver::new(identity_certs, Some(cert));
+        }
+
         let cert: Arc<dyn ResolvesServerCert> = if self_cert {
-            Arc::new(TlsCertResolver::new(
-                cert_resolver,
-                Some(env.self_cert_mgr.clone()),
-            ))
+            Arc::new(TlsCertResolver::new(cert, Some(env.self_cert_mgr.clone())))
         } else {
-            cert_resolver
+            cert
         };
         Ok(cert)
     }
@@ -1581,8 +1587,11 @@ impl QuicStack {
         )
         .await?;
         let handler = Arc::new(RwLock::new(Arc::new(handler)));
-        let certs =
-            QuicConnectionHandler::build_cert_resolver(builder.certs, stack_context.as_ref())?;
+        let certs = QuicConnectionHandler::build_cert_resolver(
+            builder.certs,
+            builder.identity_certs,
+            stack_context.as_ref(),
+        )?;
 
         Ok(QuicStack {
             inner: Arc::new(QuicStackInner {
@@ -1706,6 +1715,7 @@ pub struct QuicStackBuilder {
     bind: Option<String>,
     hook_point: Option<ProcessChainConfigs>,
     certs: Vec<TlsDomainConfig>,
+    identity_certs: Option<TlsIdentityCertConfig>,
     alpn_protocols: Vec<Vec<u8>>,
     concurrency: u32,
     reuse_address: bool,
@@ -1721,6 +1731,7 @@ impl QuicStackBuilder {
             bind: None,
             hook_point: None,
             certs: vec![],
+            identity_certs: None,
             concurrency: 1024,
             alpn_protocols: vec![],
             reuse_address: false,
@@ -1746,6 +1757,11 @@ impl QuicStackBuilder {
 
     pub fn add_certs(mut self, certs: Vec<TlsDomainConfig>) -> Self {
         self.certs = certs;
+        self
+    }
+
+    pub(crate) fn identity_certs(mut self, identity_certs: Option<TlsIdentityCertConfig>) -> Self {
+        self.identity_certs = identity_certs;
         self
     }
 
@@ -1795,6 +1811,11 @@ pub struct QuicStackConfig {
     pub bind: SocketAddr,
     pub concurrency: Option<u32>,
     pub hook_point: Vec<ProcessChainConfig>,
+    #[serde(default)]
+    pub hosts: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub identity_manager: Option<TlsIdentityManagerConfig>,
+    #[serde(default)]
     pub certs: Vec<StackCertConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub alpn_protocols: Option<Vec<String>>,
@@ -1850,6 +1871,8 @@ impl StackFactory for QuicStackFactory {
                 "invalid quic stack config"
             ))?;
         let cert_list = build_tls_domain_configs(&config.certs).await?;
+        let identity_certs =
+            build_identity_cert_config(&config.hosts, config.identity_manager.as_ref())?;
         let stack_context = context
             .as_ref()
             .as_any()
@@ -1875,6 +1898,7 @@ impl StackFactory for QuicStackFactory {
             .connection_manager(self.connection_manager.clone())
             .hook_point(config.hook_point.clone())
             .add_certs(cert_list)
+            .identity_certs(identity_certs)
             .alpn_protocols(
                 config
                     .alpn_protocols
@@ -3652,6 +3676,8 @@ mod tests {
             bind: "127.0.0.1:3345".parse().unwrap(),
             concurrency: None,
             hook_point: vec![],
+            hosts: vec![],
+            identity_manager: None,
             certs: vec![],
             alpn_protocols: None,
             io_dump_file: None,
@@ -3674,5 +3700,36 @@ mod tests {
         ));
         let ret = factory.create(Arc::new(config), stack_context).await;
         assert!(ret.is_ok());
+    }
+
+    #[test]
+    fn test_quic_stack_config_uses_identity_hosts() {
+        let config: QuicStackConfig = serde_yaml_ng::from_str(
+            r#"
+id: quic_test
+protocol: quic
+bind: 127.0.0.1:4433
+hosts:
+  - example.com
+  - "*.example.org"
+identity_manager:
+  public_root_path: /tmp/identity
+  security_root_path: /tmp/security
+hook_point: []
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.hosts, vec!["example.com", "*.example.org"]);
+        assert!(config.certs.is_empty());
+        let identity_manager = config.identity_manager.unwrap();
+        assert_eq!(
+            identity_manager.public_root_path.as_deref(),
+            Some("/tmp/identity")
+        );
+        assert_eq!(
+            identity_manager.security_root_path.as_deref(),
+            Some("/tmp/security")
+        );
     }
 }

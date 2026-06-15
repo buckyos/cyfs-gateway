@@ -889,7 +889,7 @@ impl crate::StackConfig for TlsStackConfig {
     }
 }
 
-fn build_identity_cert_config(
+pub(crate) fn build_identity_cert_config(
     hosts: &[String],
     identity_manager: Option<&TlsIdentityManagerConfig>,
 ) -> StackResult<Option<TlsIdentityCertConfig>> {

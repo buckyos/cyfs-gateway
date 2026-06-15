@@ -155,17 +155,14 @@ stacks:
     #   alpn_protocols: ["h3"] # supports h2/h3
     #   reuse_address: false
     #   io_dump_file: quic.dump
+    #   hosts: # QUIC identities supported by this stack; certs are loaded through the identity manager path protocol
+    #     - example.com
+    #     - "*.example.org"
+    #   identity_manager: # optional; defaults to BUCKYOS_IDENTITY_ROOT/BUCKYOS_SECURITY_ROOT or $BUCKYOS_ROOT/local/identity and $BUCKYOS_ROOT/security
+    #     public_root_path: ./identity
+    #     security_root_path: ./security
     #   certs:
-    #     - domain: example.com # local certificate
-    #       cert_path: ./cert.pem
-    #       key_path: ./key.pem
-    #     - domain: example.org # ACME certificate
-    #       identity: example.org # optional DID/host identity path; defaults to domain
-    #       identity_manager: # optional per-certificate override
-    #         public_root_path: ./identity
-    #         security_root_path: ./security
-    #       acme_type: optional, default tls-alpn-01, supports dns-01 | http-01 | tls-alpn-01
-    #     - domain: * # local default certificate; all connections through this stack use certs generated from the local root, configured via tls_ca
+    #     - domain: * # optional local default certificate; all connections through this stack use certs generated from the local root, configured via tls_ca
     #   hook_point: { }
 
     # rtcp_example:
