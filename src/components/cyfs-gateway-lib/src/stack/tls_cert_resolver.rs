@@ -5,7 +5,7 @@ use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{DnsName, ServerName};
 use rustls::server::{ClientHello, ParsedCertificate, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
-use rustls::{Error, server, sign};
+use rustls::{Error, sign};
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::path::{Path, PathBuf};
@@ -16,14 +16,12 @@ use tokio::task::JoinHandle;
 #[derive(Debug)]
 pub(crate) struct ResolvesServerCertUsingSni {
     by_name: Mutex<HashMap<String, Arc<sign::CertifiedKey>>>,
-    external_resolver: Option<Arc<dyn server::ResolvesServerCert>>,
 }
 
 impl ResolvesServerCertUsingSni {
-    pub fn new(external_resolver: Option<Arc<dyn server::ResolvesServerCert>>) -> Self {
+    pub fn new() -> Self {
         Self {
             by_name: Mutex::new(HashMap::new()),
-            external_resolver,
         }
     }
 
@@ -80,38 +78,26 @@ impl ResolvesServerCertUsingSni {
     }
 }
 
-impl server::ResolvesServerCert for ResolvesServerCertUsingSni {
+impl ResolvesServerCert for ResolvesServerCertUsingSni {
     fn resolve(&self, client_hello: ClientHello<'_>) -> Option<Arc<sign::CertifiedKey>> {
         if let Some(name) = client_hello.server_name() {
-            {
-                let certs = self.by_name.lock().unwrap();
+            let certs = self.by_name.lock().unwrap();
 
-                let name = name.to_lowercase();
-                // 首先尝试精确匹配
-                if let Some(cert) = certs.get(name.as_str()).cloned() {
-                    return Some(cert);
-                }
-
-                // 然后尝试通配符匹配
-                for (cert_name, cert) in certs.iter() {
-                    if cert_name.starts_with("*.")
-                        && Self::matches_wildcard(name.as_str(), cert_name)
-                    {
-                        return Some(cert.clone());
-                    }
-                }
+            let name = name.to_lowercase();
+            // 首先尝试精确匹配
+            if let Some(cert) = certs.get(name.as_str()).cloned() {
+                return Some(cert);
             }
 
-            if self.external_resolver.is_none() {
-                return None;
+            // 然后尝试通配符匹配
+            for (cert_name, cert) in certs.iter() {
+                if cert_name.starts_with("*.") && Self::matches_wildcard(name.as_str(), cert_name) {
+                    return Some(cert.clone());
+                }
             }
-            self.external_resolver
-                .as_ref()
-                .unwrap()
-                .resolve(client_hello)
-        } else {
-            None
         }
+
+        None
     }
 }
 

@@ -10,7 +10,7 @@
 # password: "123456"   # 控制台登录密码，可选（明文，会在登录时做哈希）
 
 # acme:               # ACME 证书配置（可选）
-#   account: "mailto:admin@example.com"  # ACME 账户
+#   account: "admin@example.com"  # ACME 账户
 #   issuer: "https://acme-v02.api.letsencrypt.org/directory"  # ACME 服务地址
 #   dns_providers:     # DNS 校验配置
 #     aliyun: // 阿里云
@@ -20,8 +20,18 @@
 #      sn: https://sn.buckyos.ai
 #      key_path: ***
 #      device_config_path: ***
+#   hosts:             # ACME 负责签发和维护的证书
+#     - host: example.com
+#       challenge_type: dns-01     # dns-01 | http-01 | tls-alpn-01，默认 tls-alpn-01
+#       dns_provider: sn-dns       # dns-01 必填
+#     - host: "*.example.org"
+#       challenge_type: dns-01
+#       dns_provider: sn-dns
+#   identity_manager:  # 可选；证书安装到该 identity store，TLS/QUIC stack 再从这里加载
+#     public_root_path: ./identity
+#     security_root_path: ./security
 #   check_interval: 43200          # 证书检查周期（秒），默认 12h
-#   renew_before_expiry: 2592000   # 提前续期时间（秒），默认 30d
+#   renew_before_expiry: 604800    # 提前续期时间（秒），默认 7d
 
 # tls_ca:             # 自签名/CA 证书配置（可选）
 #   cert_path: ./ca.crt
@@ -107,12 +117,10 @@ stacks:
   #   bind: 0.0.0.0:443
   #   concurrency: 0              # 默认 0（不限制）
   #   alpn_protocols: ["http/1.1"] # 默认为http/1.1,支持 h2、h3
+  #   hosts: # TLS 只声明可响应的证书身份；证书由 acme.hosts 或 identity store 提供
+  #     - example.com
+  #     - "*.example.org"
   #   certs:
-  #     - domain: example.com #配置本地证书
-  #       cert_path: ./cert.pem
-  #       key_path: ./key.pem
-  #     - domain: example.org #配置 acme证书
-  #       acme_type: 可缺省，默认使用tls-alpn-01，支持dns-01 | http-01 | tls-alpn-01
   #     - domain: * #本地缺省证书，所有通过该stack的连接都会使用本地根证书生成对应的证书，根证书可以通过tls_ca字段配置
   #   hook_point: { }
 
@@ -121,12 +129,10 @@ stacks:
   #   bind: 0.0.0.0:4433
   #   concurrency: 1024           # 默认 1024
   #   alpn_protocols: ["h3"] # 支持h2、h3
+  #   hosts: # QUIC 只声明可响应的证书身份；证书由 acme.hosts 或 identity store 提供
+  #     - example.com
+  #     - "*.example.org"
   #   certs:
-  #     - domain: example.com #配置本地证书
-  #       cert_path: ./cert.pem
-  #       key_path: ./key.pem
-  #     - domain: example.org #配置 acme证书
-  #       acme_type: 可缺省，默认使用tls-alpn-01，支持dns-01 | http-01 | tls-alpn-01
   #     - domain: * #本地缺省证书，所有通过该stack的连接都会使用本地根证书生成对应的证书，根证书可以通过tls_ca字段配置
   #   hook_point: { }
 

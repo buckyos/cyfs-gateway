@@ -40,6 +40,13 @@
 #      sn: https://sn.buckyos.ai
 #      key_path: ***
 #      device_config_path: ***
+#   hosts:                         # certificates ACME should obtain and maintain
+#     - host: example.com
+#       challenge_type: dns-01     # dns-01 | http-01 | tls-alpn-01; default tls-alpn-01
+#       dns_provider: sn-dns       # required for dns-01
+#     - host: "*.example.org"
+#       challenge_type: dns-01
+#       dns_provider: sn-dns
 #   check_interval: 43200          # certificate check interval (seconds), default 12h
 #   renew_before_expiry: 604800    # renew ahead of expiry (seconds), default 7d
 #   identity_manager:              # optional; defaults to BUCKYOS_IDENTITY_ROOT/BUCKYOS_SECURITY_ROOT or $BUCKYOS_ROOT/local/identity and $BUCKYOS_ROOT/security

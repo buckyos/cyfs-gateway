@@ -72,7 +72,6 @@ pub struct QuicStackContext {
     pub tunnel_manager: TunnelManager,
     pub limiter_manager: LimiterManagerRef,
     pub stat_manager: StatManagerRef,
-    pub cert_resolver: Option<Arc<dyn ResolvesServerCert>>,
     pub self_cert_mgr: SelfCertMgrRef,
     pub global_process_chains: Option<GlobalProcessChainsRef>,
     pub global_collection_manager: Option<GlobalCollectionManagerRef>,
@@ -85,7 +84,6 @@ impl QuicStackContext {
         tunnel_manager: TunnelManager,
         limiter_manager: LimiterManagerRef,
         stat_manager: StatManagerRef,
-        cert_resolver: Option<Arc<dyn ResolvesServerCert>>,
         self_cert_mgr: SelfCertMgrRef,
         global_process_chains: Option<GlobalProcessChainsRef>,
         global_collection_manager: Option<GlobalCollectionManagerRef>,
@@ -96,7 +94,6 @@ impl QuicStackContext {
             tunnel_manager,
             limiter_manager,
             stat_manager,
-            cert_resolver,
             self_cert_mgr,
             global_process_chains,
             global_collection_manager,
@@ -170,7 +167,7 @@ impl QuicConnectionHandler {
         env: &QuicStackContext,
     ) -> StackResult<Arc<dyn ResolvesServerCert>> {
         let crypto_provider = rustls::crypto::ring::default_provider();
-        let cert_resolver = Arc::new(ResolvesServerCertUsingSni::new(env.cert_resolver.clone()));
+        let cert_resolver = Arc::new(ResolvesServerCertUsingSni::new());
         let mut self_cert = false;
         for cert_config in certs.into_iter() {
             if cert_config.domain == "*" {
@@ -1964,7 +1961,6 @@ mod tests {
         tunnel_manager: TunnelManager,
         limiter_manager: LimiterManagerRef,
         stat_manager: StatManagerRef,
-        cert_resolver: Option<Arc<dyn rustls::server::ResolvesServerCert>>,
         self_cert_mgr: SelfCertMgrRef,
         global_process_chains: Option<GlobalProcessChainsRef>,
         global_collection_manager: Option<GlobalCollectionManagerRef>,
@@ -1974,7 +1970,6 @@ mod tests {
             tunnel_manager,
             limiter_manager,
             stat_manager,
-            cert_resolver,
             self_cert_mgr,
             global_process_chains,
             global_collection_manager,
@@ -2032,7 +2027,6 @@ mod tests {
             tunnel_manager.clone(),
             limiter_manager.clone(),
             stat_manager.clone(),
-            None,
             self_cert_mgr.clone(),
             None,
             None,
@@ -2050,7 +2044,6 @@ mod tests {
             tunnel_manager.clone(),
             limiter_manager.clone(),
             stat_manager.clone(),
-            None,
             self_cert_mgr.clone(),
             Some(Arc::new(GlobalProcessChains::new())),
             None,
@@ -2092,7 +2085,6 @@ mod tests {
             TunnelManager::new(),
             Arc::new(DefaultLimiterManager::new()),
             StatManager::new(),
-            None,
             SelfCertMgr::create(SelfCertConfig::default())
                 .await
                 .unwrap(),
@@ -2164,7 +2156,6 @@ mod tests {
             TunnelManager::new(),
             Arc::new(DefaultLimiterManager::new()),
             StatManager::new(),
-            None,
             SelfCertMgr::create(SelfCertConfig::default())
                 .await
                 .unwrap(),
@@ -2242,7 +2233,6 @@ mod tests {
             TunnelManager::new(),
             Arc::new(DefaultLimiterManager::new()),
             StatManager::new(),
-            None,
             SelfCertMgr::create(self_cert_config).await.unwrap(),
             Some(Arc::new(GlobalProcessChains::new())),
             None,
@@ -2402,7 +2392,6 @@ mod tests {
             tunnel_manager,
             Arc::new(DefaultLimiterManager::new()),
             StatManager::new(),
-            None,
             SelfCertMgr::create(SelfCertConfig::default())
                 .await
                 .unwrap(),
@@ -2518,7 +2507,6 @@ mod tests {
             tunnel_manager,
             Arc::new(DefaultLimiterManager::new()),
             StatManager::new(),
-            None,
             SelfCertMgr::create(SelfCertConfig::default())
                 .await
                 .unwrap(),
@@ -2643,7 +2631,6 @@ mod tests {
             TunnelManager::new(),
             Arc::new(DefaultLimiterManager::new()),
             StatManager::new(),
-            None,
             SelfCertMgr::create(SelfCertConfig::default())
                 .await
                 .unwrap(),
@@ -2734,7 +2721,6 @@ mod tests {
             TunnelManager::new(),
             Arc::new(DefaultLimiterManager::new()),
             StatManager::new(),
-            None,
             SelfCertMgr::create(SelfCertConfig::default())
                 .await
                 .unwrap(),
@@ -2861,7 +2847,6 @@ mod tests {
             TunnelManager::new(),
             Arc::new(DefaultLimiterManager::new()),
             StatManager::new(),
-            None,
             SelfCertMgr::create(SelfCertConfig::default())
                 .await
                 .unwrap(),
@@ -2961,7 +2946,6 @@ mod tests {
             TunnelManager::new(),
             Arc::new(DefaultLimiterManager::new()),
             StatManager::new(),
-            None,
             SelfCertMgr::create(SelfCertConfig::default())
                 .await
                 .unwrap(),
@@ -3053,7 +3037,6 @@ mod tests {
             tunnel_manager,
             Arc::new(DefaultLimiterManager::new()),
             StatManager::new(),
-            None,
             SelfCertMgr::create(SelfCertConfig::default())
                 .await
                 .unwrap(),
@@ -3146,7 +3129,6 @@ mod tests {
             tunnel_manager,
             Arc::new(DefaultLimiterManager::new()),
             stat_manager.clone(),
-            None,
             SelfCertMgr::create(SelfCertConfig::default())
                 .await
                 .unwrap(),
@@ -3252,7 +3234,6 @@ mod tests {
             tunnel_manager,
             Arc::new(DefaultLimiterManager::new()),
             stat_manager.clone(),
-            None,
             SelfCertMgr::create(SelfCertConfig::default())
                 .await
                 .unwrap(),
@@ -3373,7 +3354,6 @@ mod tests {
             tunnel_manager,
             limiter_manager,
             stat_manager.clone(),
-            None,
             SelfCertMgr::create(SelfCertConfig::default())
                 .await
                 .unwrap(),
@@ -3494,7 +3474,6 @@ mod tests {
             tunnel_manager,
             limiter_manager,
             stat_manager.clone(),
-            None,
             SelfCertMgr::create(SelfCertConfig::default())
                 .await
                 .unwrap(),
@@ -3611,7 +3590,6 @@ mod tests {
             tunnel_manager,
             limiter_manager,
             stat_manager,
-            None,
             self_cert_mgr,
             Some(global_process_chains),
             Some(collection_manager),
