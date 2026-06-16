@@ -133,6 +133,7 @@ struct TlsConnectionHandler {
     connection_manager: Option<ConnectionManagerRef>,
     certs: Arc<dyn ResolvesServerCert>,
     alpn_protocols: Vec<Vec<u8>>,
+    server_config: Arc<ServerConfig>,
     io_dump: Option<IoDumpStackConfig>,
 }
 
@@ -156,12 +157,15 @@ impl TlsConnectionHandler {
         .await
         .map_err(into_stack_err!(StackErrorCode::ProcessChainError))?;
         let certs = Self::build_cert_resolver(certs, identity_certs, env.as_ref())?;
+        let server_config =
+            Self::build_server_config(certs.clone(), &alpn_protocols, env.as_ref())?;
         Ok(Self {
             env,
             executor,
             connection_manager,
             certs,
             alpn_protocols,
+            server_config,
             io_dump,
         })
     }
@@ -182,6 +186,7 @@ impl TlsConnectionHandler {
             connection_manager: self.connection_manager.clone(),
             certs: self.certs.clone(),
             alpn_protocols: self.alpn_protocols.clone(),
+            server_config: self.server_config.clone(),
             io_dump: self.io_dump.clone(),
         })
     }
@@ -242,6 +247,25 @@ impl TlsConnectionHandler {
         Ok(cert)
     }
 
+    fn build_server_config(
+        certs: Arc<dyn ResolvesServerCert>,
+        alpn_protocols: &[Vec<u8>],
+        env: &TlsStackContext,
+    ) -> StackResult<Arc<ServerConfig>> {
+        let mut server_config =
+            ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+                .with_protocol_versions(rustls::DEFAULT_VERSIONS)
+                .unwrap()
+                .with_no_client_auth()
+                .with_cert_resolver(certs);
+        server_config.alpn_protocols = alpn_protocols.to_vec();
+        server_config
+            .alpn_protocols
+            .extend(env.cert_resolver_alpn_protocols.clone());
+
+        Ok(Arc::new(server_config))
+    }
+
     async fn handle_connect(
         &self,
         mut stream: StatStream<TcpStream>,
@@ -257,18 +281,7 @@ impl TlsConnectionHandler {
         let (stream, proxy_source_addr) = probe_proxy_protocol_stream(Box::new(stream)).await?;
         let request_source_addr = proxy_source_addr.unwrap_or(remote_addr);
 
-        let mut server_config =
-            ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
-                .with_protocol_versions(rustls::DEFAULT_VERSIONS)
-                .unwrap()
-                .with_no_client_auth()
-                .with_cert_resolver(self.certs.clone());
-        server_config.alpn_protocols = self.alpn_protocols.clone();
-        server_config
-            .alpn_protocols
-            .extend(self.env.cert_resolver_alpn_protocols.clone());
-
-        let tls_acceptor = TlsAcceptor::from(Arc::new(server_config));
+        let tls_acceptor = TlsAcceptor::from(self.server_config.clone());
         let tls_stream = tls_acceptor
             .accept(stream)
             .await
@@ -1110,14 +1123,17 @@ impl TlsStackBuilder {
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
-    use super::{TlsIdentityManagerConfig, build_identity_cert_config, load_certs, load_key};
+    use super::{
+        TlsConnectionHandler, TlsIdentityManagerConfig, build_identity_cert_config, load_certs,
+        load_key,
+    };
     use crate::global_process_chains::GlobalProcessChains;
     use crate::self_cert_mgr::{SelfCertConfig, SelfCertMgr, SelfCertMgrRef};
     use crate::{
-        ConnectionManager, DefaultLimiterManager, GlobalCollectionManager, ProcessChainConfigs,
-        ProcessChainHttpServer, Server, ServerManager, ServerResult, Stack, StackFactory,
-        StackProtocol, StatManager, StreamInfo, StreamServer, TlsStackConfig, TlsStackFactory,
-        TunnelManager, create_io_dump_stack_config, decode_io_dump_frames,
+        ConnectionManager, DefaultLimiterManager, GlobalCollectionManager, MutComposedSpeedStat,
+        ProcessChainConfigs, ProcessChainHttpServer, Server, ServerManager, ServerResult, Stack,
+        StackFactory, StackProtocol, StatManager, StreamInfo, StreamServer, TlsStackConfig,
+        TlsStackFactory, TunnelManager, create_io_dump_stack_config, decode_io_dump_frames,
     };
     use crate::{
         LimiterManagerRef, ServerManagerRef, StackContext, StatManagerRef, TlsDomainConfig,
@@ -1135,10 +1151,15 @@ mod tests {
     use rustls::pki_types::{
         CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime,
     };
+    use rustls::server::StoresServerSessions;
     use rustls::{
-        ClientConfig, DigitallySignedStruct, Error, RootCertStore, ServerConfig, SignatureScheme,
+        ClientConfig, DigitallySignedStruct, Error, HandshakeKind, RootCertStore, ServerConfig,
+        SignatureScheme,
     };
+    use sfo_io::StatStream;
+    use std::net::SocketAddr;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
     use tempfile::tempdir;
     use tokio::fs;
@@ -1720,6 +1741,192 @@ mod tests {
                 SignatureScheme::ED448,
             ]
         }
+    }
+
+    #[derive(Debug)]
+    struct CountingServerSessionStorage {
+        inner: Arc<dyn StoresServerSessions>,
+        puts: AtomicUsize,
+        gets: AtomicUsize,
+        takes: AtomicUsize,
+    }
+
+    impl CountingServerSessionStorage {
+        fn new(size: usize) -> Arc<Self> {
+            Arc::new(Self {
+                inner: rustls::server::ServerSessionMemoryCache::new(size),
+                puts: AtomicUsize::new(0),
+                gets: AtomicUsize::new(0),
+                takes: AtomicUsize::new(0),
+            })
+        }
+
+        fn puts(&self) -> usize {
+            self.puts.load(Ordering::SeqCst)
+        }
+
+        fn takes(&self) -> usize {
+            self.takes.load(Ordering::SeqCst)
+        }
+    }
+
+    impl StoresServerSessions for CountingServerSessionStorage {
+        fn put(&self, key: Vec<u8>, value: Vec<u8>) -> bool {
+            self.puts.fetch_add(1, Ordering::SeqCst);
+            self.inner.put(key, value)
+        }
+
+        fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
+            self.gets.fetch_add(1, Ordering::SeqCst);
+            self.inner.get(key)
+        }
+
+        fn take(&self, key: &[u8]) -> Option<Vec<u8>> {
+            self.takes.fetch_add(1, Ordering::SeqCst);
+            self.inner.take(key)
+        }
+
+        fn can_cache(&self) -> bool {
+            self.inner.can_cache()
+        }
+    }
+
+    async fn connect_tls_and_exchange(connector: &TlsConnector, addr: SocketAddr) -> HandshakeKind {
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let mut stream = connector
+            .connect(ServerName::try_from("www.buckyos.com").unwrap(), stream)
+            .await
+            .unwrap();
+        stream.write_all(b"ping").await.unwrap();
+        let mut buf = [0u8; 4];
+        stream.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"pong");
+        let handshake_kind = stream.get_ref().1.handshake_kind().unwrap();
+        stream.shutdown().await.unwrap();
+        handshake_kind
+    }
+
+    #[tokio::test]
+    async fn test_tls_connection_handler_resumes_tls13_sessions() {
+        let subject_alt_names = vec!["www.buckyos.com".to_string(), "127.0.0.1".to_string()];
+        let cert_key = generate_simple_self_signed(subject_alt_names).unwrap();
+
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let upstream_handle = tokio::spawn(async move {
+            let mut tasks = Vec::new();
+            for _ in 0..2 {
+                let (mut stream, _) = upstream_listener.accept().await.unwrap();
+                tasks.push(tokio::spawn(async move {
+                    let mut buf = [0u8; 4];
+                    stream.read_exact(&mut buf).await.unwrap();
+                    assert_eq!(&buf, b"ping");
+                    stream.write_all(b"pong").await.unwrap();
+                }));
+            }
+            for task in tasks {
+                task.await.unwrap();
+            }
+        });
+
+        let chains = format!(
+            r#"
+- id: main
+  priority: 1
+  blocks:
+    - id: main
+      block: |
+        return "forward tcp:///{upstream_addr}";
+        "#
+        );
+        let chains: ProcessChainConfigs = serde_yaml_ng::from_str(&chains).unwrap();
+        let stack_context = build_stack_context(
+            Arc::new(ServerManager::new()),
+            TunnelManager::new(),
+            Arc::new(DefaultLimiterManager::new()),
+            StatManager::new(),
+            None,
+            SelfCertMgr::create(SelfCertConfig::default())
+                .await
+                .unwrap(),
+            Some(Arc::new(GlobalProcessChains::new())),
+        );
+        let mut handler = TlsConnectionHandler::create(
+            chains,
+            vec![TlsDomainConfig {
+                domain: "www.buckyos.com".to_string(),
+                certs: Some(vec![cert_key.cert.der().clone()]),
+                key: Some(PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
+                    cert_key.signing_key.serialize_der(),
+                ))),
+            }],
+            None,
+            vec![b"http/1.1".to_vec()],
+            stack_context,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let session_storage = CountingServerSessionStorage::new(16);
+        Arc::get_mut(&mut handler.server_config)
+            .unwrap()
+            .session_storage = session_storage.clone();
+
+        let handler = Arc::new(handler);
+        let tls_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let tls_addr = tls_listener.local_addr().unwrap();
+        let server_handle = {
+            let handler = handler.clone();
+            tokio::spawn(async move {
+                let mut tasks = Vec::new();
+                for _ in 0..2 {
+                    let (stream, _) = tls_listener.accept().await.unwrap();
+                    let local_addr = stream.local_addr().unwrap();
+                    let compose_stat = MutComposedSpeedStat::new();
+                    let stat_stream = StatStream::new_with_tracker(stream, compose_stat.clone());
+                    let handler = handler.clone();
+                    tasks.push(tokio::spawn(async move {
+                        handler
+                            .handle_connect(stat_stream, local_addr, compose_stat)
+                            .await
+                            .unwrap();
+                    }));
+                }
+                for task in tasks {
+                    task.await.unwrap();
+                }
+            })
+        };
+
+        let client_config =
+            ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+                .with_protocol_versions(&[&rustls::version::TLS13])
+                .unwrap()
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(NoVerifier))
+                .with_no_client_auth();
+        let connector = TlsConnector::from(Arc::new(client_config));
+
+        let first = connect_tls_and_exchange(&connector, tls_addr).await;
+        assert!(matches!(
+            first,
+            HandshakeKind::Full | HandshakeKind::FullWithHelloRetryRequest
+        ));
+        for _ in 0..50 {
+            if session_storage.puts() > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(session_storage.puts() > 0);
+
+        let second = connect_tls_and_exchange(&connector, tls_addr).await;
+        assert_eq!(second, HandshakeKind::Resumed);
+        assert!(session_storage.takes() > 0);
+
+        server_handle.await.unwrap();
+        upstream_handle.await.unwrap();
     }
 
     #[tokio::test]
