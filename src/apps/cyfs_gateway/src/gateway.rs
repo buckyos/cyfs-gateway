@@ -17,7 +17,10 @@ use crate::{AcmeConfig, TlsCA, merge};
 use anyhow::{Result, anyhow};
 use buckyos_kit::*;
 use chrono::Utc;
-use cyfs_acme::{AcmeCertManager, AcmeCertManagerRef, CertManagerConfig, ACME_TLS_ALPN_NAME};
+use cyfs_acme::{
+    AcmeCertManager, AcmeCertManagerRef, AcmeItem, CertManagerConfig, ChallengeType,
+    ACME_TLS_ALPN_NAME,
+};
 use cyfs_dns::{
     DnsServerContext, InnerDnsRecordManager, InnerDnsRecordManagerRef, LocalDnsServerContext,
 };
@@ -348,7 +351,7 @@ fn build_stack_context(
             tunnel_manager.clone(),
             limiter_manager.clone(),
             stat_manager.clone(),
-            acme_manager,
+            Some(acme_manager),
             self_cert_mgr,
             global_process_chains.clone(),
             global_collection_manager.clone(),
@@ -371,6 +374,39 @@ fn build_stack_context(
             )),
         },
     }
+}
+
+fn register_quic_acme_items(
+    cert_manager: &AcmeCertManagerRef,
+    stack_config: &Arc<dyn StackConfig>,
+) -> StackResult<()> {
+    let Some(config) = stack_config.as_any().downcast_ref::<QuicStackConfig>() else {
+        return Ok(());
+    };
+
+    for cert_config in config.certs.iter() {
+        if cert_config.domain == "*"
+            || (cert_config.cert_path.is_some() && cert_config.key_path.is_some())
+        {
+            continue;
+        }
+
+        cert_manager
+            .add_acme_item(
+                AcmeItem::new(
+                    cert_config.domain.clone(),
+                    cert_config.acme_type.unwrap_or(ChallengeType::TlsAlpn01),
+                    cert_config.data.clone(),
+                )
+                .with_identity(
+                    cert_config.identity.clone(),
+                    cert_config.identity_manager.clone(),
+                ),
+            )
+            .map_err(|e| stack_err!(StackErrorCode::InvalidConfig, "{e}"))?;
+    }
+
+    Ok(())
 }
 fn read_config_value(path: &Path) -> Result<Value> {
     let content = std::fs::read_to_string(path)
@@ -848,6 +884,7 @@ impl GatewayFactory {
 
         let stack_manager = StackManager::new();
         for stack_config in config.stacks.iter() {
+            register_quic_acme_items(&cert_manager, stack_config)?;
             let stack_context = build_stack_context(
                 stack_config.stack_protocol(),
                 server_manager.clone(),
@@ -2881,6 +2918,7 @@ impl Gateway {
         let mut new_stacks = Vec::new();
         let mut changed_stacks = Vec::new();
         for stack_config in config.stacks.iter() {
+            register_quic_acme_items(&cert_manager, stack_config)?;
             let stack_context = build_stack_context(
                 stack_config.stack_protocol(),
                 server_manager.clone(),
