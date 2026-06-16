@@ -17,6 +17,7 @@ use crate::{AcmeConfig, TlsCA, merge};
 use anyhow::{Result, anyhow};
 use buckyos_kit::*;
 use chrono::Utc;
+use cyfs_acme::{AcmeCertManager, AcmeCertManagerRef, CertManagerConfig, ACME_TLS_ALPN_NAME};
 use cyfs_dns::{
     DnsServerContext, InnerDnsRecordManager, InnerDnsRecordManagerRef, LocalDnsServerContext,
 };
@@ -328,17 +329,20 @@ fn build_stack_context(
             global_collection_manager.clone(),
             js_externals.clone(),
         ))),
-        StackProtocol::Tls => Ok(Arc::new(TlsStackContext::new(
-            servers.clone(),
-            tunnel_manager.clone(),
-            limiter_manager.clone(),
-            stat_manager.clone(),
-            acme_manager.clone(),
-            self_cert_mgr.clone(),
-            global_process_chains.clone(),
-            global_collection_manager.clone(),
-            js_externals.clone(),
-        ))),
+        StackProtocol::Tls => Ok(Arc::new(
+            TlsStackContext::new(
+                servers.clone(),
+                tunnel_manager.clone(),
+                limiter_manager.clone(),
+                stat_manager.clone(),
+                Some(acme_manager.clone()),
+                self_cert_mgr.clone(),
+                global_process_chains.clone(),
+                global_collection_manager.clone(),
+                js_externals.clone(),
+            )
+            .with_cert_resolver_alpn_protocols(vec![ACME_TLS_ALPN_NAME.to_vec()]),
+        )),
         StackProtocol::Quic => Ok(Arc::new(QuicStackContext::new(
             servers.clone(),
             tunnel_manager.clone(),

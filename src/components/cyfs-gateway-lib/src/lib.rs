@@ -42,7 +42,6 @@ pub use server::*;
 pub use cmds::*;
 pub use collections::*;
 pub use connection_manager::*;
-pub use cyfs_acme::*;
 pub use cyfs_gateway_api::*;
 pub use device_manager::*;
 pub use forward::*;

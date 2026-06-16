@@ -1,6 +1,7 @@
 #[cfg(test)]
 mod tests {
     use buckyos_kit::init_logging;
+    use cyfs_acme::{AcmeCertManager, CertManagerConfig};
     use cyfs_gateway::*;
     use cyfs_gateway_lib::*;
     use jsonwebtoken::jwk::Jwk;

@@ -24,12 +24,12 @@ use crate::{
     JsExternalsManagerRef, LimiterManagerRef, ProcessChainConfig, ProcessChainConfigs,
     SelfCertMgrRef, Server, ServerError, ServerErrorCode, ServerManagerRef, Stack, StackCertConfig,
     StackConfig, StackContext, StackErrorCode, StackFactory, StackProtocol, StackRef, StackResult,
-    StatManagerRef, StreamInfo, TlsDomainConfig, TlsIdentityManagerConfig, TunnelManager,
+    StatManagerRef, StreamInfo, TlsIdentityManagerConfig, TunnelManager,
     create_io_dump_stack_config, get_external_commands, get_stat_info, into_stack_err, load_certs,
     load_key, server_err, stack_err,
 };
 use buckyos_kit::AsyncStream;
-use cyfs_acme::{AcmeCertManagerRef, AcmeItem, ChallengeType};
+use cyfs_acme::{AcmeCertManagerRef, AcmeIdentityConfig, AcmeItem, ChallengeType};
 use cyfs_process_chain::{
     CollectionValue, CommandControl, MemoryMapCollection, ProcessChainLibExecutor,
 };
@@ -47,6 +47,7 @@ use pin_project::pin_project;
 use quinn::Incoming;
 use quinn::crypto::rustls::{HandshakeData, QuicServerConfig};
 use rustls::ServerConfig;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::ResolvesServerCert;
 use rustls::sign::CertifiedKey;
 use sfo_io::{
@@ -111,6 +112,36 @@ impl StackContext for QuicStackContext {
     }
 }
 
+pub struct QuicDomainConfig {
+    pub domain: String,
+    pub identity: Option<String>,
+    pub identity_manager: Option<AcmeIdentityConfig>,
+    pub acme_type: Option<ChallengeType>,
+    pub certs: Option<Vec<CertificateDer<'static>>>,
+    pub key: Option<PrivateKeyDer<'static>>,
+    pub data: Option<serde_json::Value>,
+}
+
+impl Clone for QuicDomainConfig {
+    fn clone(&self) -> Self {
+        Self {
+            domain: self.domain.clone(),
+            identity: self.identity.clone(),
+            identity_manager: self.identity_manager.clone(),
+            acme_type: self.acme_type.clone(),
+            certs: self.certs.clone(),
+            key: match &self.key {
+                None => None,
+                Some(PrivateKeyDer::Pkcs8(key)) => Some(PrivateKeyDer::Pkcs8(key.clone_key())),
+                Some(PrivateKeyDer::Pkcs1(key)) => Some(PrivateKeyDer::Pkcs1(key.clone_key())),
+                Some(PrivateKeyDer::Sec1(key)) => Some(PrivateKeyDer::Sec1(key.clone_key())),
+                Some(_) => panic!("Unsupported key type"),
+            },
+            data: self.data.clone(),
+        }
+    }
+}
+
 struct QuicConnectionHandler {
     env: Arc<QuicStackContext>,
     executor: ProcessChainLibExecutor,
@@ -143,7 +174,7 @@ impl QuicConnectionHandler {
     }
 
     fn build_cert_resolver(
-        certs: Vec<TlsDomainConfig>,
+        certs: Vec<QuicDomainConfig>,
         identity_certs: Option<TlsIdentityCertConfig>,
         env: &QuicStackContext,
     ) -> StackResult<Arc<dyn ResolvesServerCert>> {
@@ -710,13 +741,15 @@ impl QuicConnectionHandler {
     }
 }
 
-async fn build_tls_domain_configs(certs: &[StackCertConfig]) -> StackResult<Vec<TlsDomainConfig>> {
+async fn build_quic_domain_configs(
+    certs: &[StackCertConfig],
+) -> StackResult<Vec<QuicDomainConfig>> {
     let mut cert_list = Vec::with_capacity(certs.len());
     for cert_config in certs.iter() {
         if cert_config.cert_path.is_some() && cert_config.key_path.is_some() {
             let certs = load_certs(cert_config.cert_path.as_deref().unwrap()).await?;
             let key = load_key(cert_config.key_path.as_deref().unwrap()).await?;
-            cert_list.push(TlsDomainConfig {
+            cert_list.push(QuicDomainConfig {
                 domain: cert_config.domain.clone(),
                 identity: cert_config.identity.clone(),
                 identity_manager: cert_config.identity_manager.clone(),
@@ -726,7 +759,7 @@ async fn build_tls_domain_configs(certs: &[StackCertConfig]) -> StackResult<Vec<
                 data: None,
             });
         } else {
-            cert_list.push(TlsDomainConfig {
+            cert_list.push(QuicDomainConfig {
                 domain: cert_config.domain.clone(),
                 identity: cert_config.identity.clone(),
                 identity_manager: cert_config.identity_manager.clone(),
@@ -1714,7 +1747,7 @@ pub struct QuicStackBuilder {
     id: Option<String>,
     bind: Option<String>,
     hook_point: Option<ProcessChainConfigs>,
-    certs: Vec<TlsDomainConfig>,
+    certs: Vec<QuicDomainConfig>,
     identity_certs: Option<TlsIdentityCertConfig>,
     alpn_protocols: Vec<Vec<u8>>,
     concurrency: u32,
@@ -1755,7 +1788,7 @@ impl QuicStackBuilder {
         self
     }
 
-    pub fn add_certs(mut self, certs: Vec<TlsDomainConfig>) -> Self {
+    pub fn add_certs(mut self, certs: Vec<QuicDomainConfig>) -> Self {
         self.certs = certs;
         self
     }
@@ -1870,7 +1903,7 @@ impl StackFactory for QuicStackFactory {
                 StackErrorCode::InvalidConfig,
                 "invalid quic stack config"
             ))?;
-        let cert_list = build_tls_domain_configs(&config.certs).await?;
+        let cert_list = build_quic_domain_configs(&config.certs).await?;
         let identity_certs =
             build_identity_cert_config(&config.hosts, config.identity_manager.as_ref())?;
         let stack_context = context
@@ -1922,15 +1955,16 @@ impl StackFactory for QuicStackFactory {
 mod tests {
     use crate::global_process_chains::{GlobalProcessChains, GlobalProcessChainsRef};
     use crate::{
-        AcmeCertManager, AcmeCertManagerRef, CertManagerConfig, ConnectionManager,
-        DefaultLimiterManager, GlobalCollectionManager, GlobalCollectionManagerRef,
-        LimiterManagerRef, ProcessChainConfigs, ProcessChainHttpServer, QuicStack, QuicStackConfig,
-        QuicStackContext, QuicStackFactory, SelfCertConfig, SelfCertMgr, SelfCertMgrRef, Server,
-        ServerManager, ServerManagerRef, ServerResult, Stack, StackContext, StackFactory,
-        StackProtocol, StatManager, StatManagerRef, StreamInfo, StreamServer, TlsDomainConfig,
-        TunnelManager, create_io_dump_stack_config, decode_io_dump_frames,
+        ConnectionManager, DefaultLimiterManager, GlobalCollectionManager,
+        GlobalCollectionManagerRef, LimiterManagerRef, ProcessChainConfigs, ProcessChainHttpServer,
+        QuicDomainConfig, QuicStack, QuicStackConfig, QuicStackContext, QuicStackFactory,
+        SelfCertConfig, SelfCertMgr, SelfCertMgrRef, Server, ServerManager, ServerManagerRef,
+        ServerResult, Stack, StackContext, StackFactory, StackProtocol, StatManager,
+        StatManagerRef, StreamInfo, StreamServer, TunnelManager, create_io_dump_stack_config,
+        decode_io_dump_frames,
     };
     use buckyos_kit::AsyncStream;
+    use cyfs_acme::{AcmeCertManager, AcmeCertManagerRef, CertManagerConfig};
     use h3::error::{ConnectionError, StreamError};
     use quinn::Endpoint;
     use quinn::crypto::rustls::QuicClientConfig;
@@ -2048,7 +2082,7 @@ mod tests {
             .id("test")
             .bind("127.0.0.1:9080")
             .hook_point(vec![])
-            .add_certs(vec![TlsDomainConfig {
+            .add_certs(vec![QuicDomainConfig {
                 domain: "www.buckyos.com".to_string(),
                 identity: None,
                 identity_manager: None,
@@ -2098,7 +2132,7 @@ mod tests {
             .id("test")
             .bind("127.0.0.1:9180")
             .hook_point(chains)
-            .add_certs(vec![TlsDomainConfig {
+            .add_certs(vec![QuicDomainConfig {
                 domain: "www.buckyos.com".to_string(),
                 identity: None,
                 identity_manager: None,
@@ -2176,7 +2210,7 @@ mod tests {
             .id("test")
             .bind("127.0.0.1:9181")
             .hook_point(chains)
-            .add_certs(vec![TlsDomainConfig {
+            .add_certs(vec![QuicDomainConfig {
                 domain: "www.buckyos.com".to_string(),
                 identity: None,
                 identity_manager: None,
@@ -2258,7 +2292,7 @@ mod tests {
             .id("test")
             .bind("127.0.0.1:9193")
             .hook_point(chains)
-            .add_certs(vec![TlsDomainConfig {
+            .add_certs(vec![QuicDomainConfig {
                 domain: "*".to_string(),
                 identity: None,
                 identity_manager: None,
@@ -2426,7 +2460,7 @@ mod tests {
             .id("test")
             .bind("127.0.0.1:9185")
             .hook_point(chains)
-            .add_certs(vec![TlsDomainConfig {
+            .add_certs(vec![QuicDomainConfig {
                 domain: "www.buckyos.com".to_string(),
                 identity: None,
                 identity_manager: None,
@@ -2548,7 +2582,7 @@ mod tests {
             .id("test")
             .bind("127.0.0.1:9186")
             .hook_point(chains)
-            .add_certs(vec![TlsDomainConfig {
+            .add_certs(vec![QuicDomainConfig {
                 domain: "www.buckyos.com".to_string(),
                 identity: None,
                 identity_manager: None,
@@ -2691,7 +2725,7 @@ mod tests {
             .id("quic-raw")
             .bind("127.0.0.1:9197")
             .hook_point(chains)
-            .add_certs(vec![TlsDomainConfig {
+            .add_certs(vec![QuicDomainConfig {
                 domain: "www.buckyos.com".to_string(),
                 identity: None,
                 identity_manager: None,
@@ -2788,7 +2822,7 @@ mod tests {
             .id("quic-raw-limit")
             .bind("127.0.0.1:9199")
             .hook_point(chains)
-            .add_certs(vec![TlsDomainConfig {
+            .add_certs(vec![QuicDomainConfig {
                 domain: "www.buckyos.com".to_string(),
                 identity: None,
                 identity_manager: None,
@@ -2921,7 +2955,7 @@ mod tests {
             .id("quic-http")
             .bind("127.0.0.1:9198")
             .hook_point(chains)
-            .add_certs(vec![TlsDomainConfig {
+            .add_certs(vec![QuicDomainConfig {
                 domain: "www.buckyos.com".to_string(),
                 identity: None,
                 identity_manager: None,
@@ -3027,7 +3061,7 @@ mod tests {
             .id("quic-http-limit")
             .bind("127.0.0.1:9200")
             .hook_point(chains)
-            .add_certs(vec![TlsDomainConfig {
+            .add_certs(vec![QuicDomainConfig {
                 domain: "www.buckyos.com".to_string(),
                 identity: None,
                 identity_manager: None,
@@ -3113,7 +3147,7 @@ mod tests {
             .id("test")
             .bind("127.0.0.1:9188")
             .hook_point(chains)
-            .add_certs(vec![TlsDomainConfig {
+            .add_certs(vec![QuicDomainConfig {
                 domain: "www.buckyos.com".to_string(),
                 identity: None,
                 identity_manager: None,
@@ -3212,7 +3246,7 @@ mod tests {
             .id("test")
             .bind("127.0.0.1:9189")
             .hook_point(chains)
-            .add_certs(vec![TlsDomainConfig {
+            .add_certs(vec![QuicDomainConfig {
                 domain: "www.buckyos.com".to_string(),
                 identity: None,
                 identity_manager: None,
@@ -3324,7 +3358,7 @@ mod tests {
             .id("test")
             .bind("127.0.0.1:9190")
             .hook_point(chains)
-            .add_certs(vec![TlsDomainConfig {
+            .add_certs(vec![QuicDomainConfig {
                 domain: "www.buckyos.com".to_string(),
                 identity: None,
                 identity_manager: None,
@@ -3451,7 +3485,7 @@ mod tests {
             .id("test")
             .bind("127.0.0.1:9191")
             .hook_point(chains)
-            .add_certs(vec![TlsDomainConfig {
+            .add_certs(vec![QuicDomainConfig {
                 domain: "www.buckyos.com".to_string(),
                 identity: None,
                 identity_manager: None,
@@ -3578,7 +3612,7 @@ mod tests {
             .id("test")
             .bind("127.0.0.1:9192")
             .hook_point(chains)
-            .add_certs(vec![TlsDomainConfig {
+            .add_certs(vec![QuicDomainConfig {
                 domain: "www.buckyos.com".to_string(),
                 identity: None,
                 identity_manager: None,
