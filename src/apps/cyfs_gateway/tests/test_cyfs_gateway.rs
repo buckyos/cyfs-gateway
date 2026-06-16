@@ -4,10 +4,10 @@ mod tests {
     use buckyos_kit::init_logging;
     use bytes::Bytes;
     use cyfs_gateway::{
-        gateway_service_main, read_login_token, GatewayControlClient, GatewayParams, CONTROL_SERVER,
+        CONTROL_SERVER, GatewayControlClient, GatewayParams, gateway_service_main, read_login_token,
     };
-    use hickory_resolver::config::{NameServerConfig, Protocol, ResolverConfig, ResolverOpts};
     use hickory_resolver::TokioAsyncResolver;
+    use hickory_resolver::config::{NameServerConfig, Protocol, ResolverConfig, ResolverOpts};
     use http_body_util::BodyExt;
     use http_body_util::Full;
     use hyper_util::rt::TokioIo;
@@ -143,6 +143,16 @@ mod tests {
     async fn allocate_free_port() -> u16 {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         listener.local_addr().unwrap().port()
+    }
+
+    async fn allocate_distinct_free_port(used_ports: &mut HashSet<u16>) -> u16 {
+        for _ in 0..128 {
+            let port = allocate_free_port().await;
+            if used_ports.insert(port) {
+                return port;
+            }
+        }
+        panic!("failed to allocate a distinct free TCP port");
     }
 
     async fn allocate_free_udp_port() -> u16 {
@@ -298,19 +308,22 @@ mod tests {
         let upstream_socks_user = "upstream_user";
         let upstream_socks_pass = "upstream_pass";
 
+        let mut used_tcp_ports = HashSet::new();
         let echo_direct_port = start_echo_server().await;
+        assert!(used_tcp_ports.insert(echo_direct_port));
         let echo_proxy_port = start_echo_server().await;
-        let reject_port = allocate_free_port().await;
-        let socks_stack_port = allocate_free_port().await;
-        let upstream_socks_stack_port = allocate_free_port().await;
-        let control_port = allocate_free_port().await;
+        assert!(used_tcp_ports.insert(echo_proxy_port));
+        let reject_port = allocate_distinct_free_port(&mut used_tcp_ports).await;
+        let socks_stack_port = allocate_distinct_free_port(&mut used_tcp_ports).await;
+        let upstream_socks_stack_port = allocate_distinct_free_port(&mut used_tcp_ports).await;
+        let control_port = allocate_distinct_free_port(&mut used_tcp_ports).await;
         let control_server = format!("http://127.0.0.1:{control_port}");
-        let test1_port = allocate_free_port().await;
-        let test2_port = allocate_free_port().await;
+        let test1_port = allocate_distinct_free_port(&mut used_tcp_ports).await;
+        let test2_port = allocate_distinct_free_port(&mut used_tcp_ports).await;
         let test3_port = allocate_free_udp_port().await;
-        let test_ptcp_entry_port = allocate_free_port().await;
-        let test_ptcp_mix_port = allocate_free_port().await;
-        let dispatch_port = allocate_free_port().await;
+        let test_ptcp_entry_port = allocate_distinct_free_port(&mut used_tcp_ports).await;
+        let test_ptcp_mix_port = allocate_distinct_free_port(&mut used_tcp_ports).await;
+        let dispatch_port = allocate_distinct_free_port(&mut used_tcp_ports).await;
         let test1_addr = format!("127.0.0.1:{test1_port}");
         let test2_addr = format!("127.0.0.1:{test2_port}");
         let test3_addr = format!("127.0.0.1:{test3_port}");

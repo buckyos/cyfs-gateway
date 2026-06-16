@@ -108,11 +108,21 @@ def build_gateway():
 
 
 class GatewayProcess:
-    def __init__(self, case_dir, config_path, buckyos_root, control_port=None):
+    def __init__(
+        self,
+        case_dir,
+        config_path,
+        buckyos_root,
+        control_port=None,
+        extra_args=None,
+        extra_env=None,
+    ):
         self.case_dir = Path(case_dir)
         self.config_path = Path(config_path)
         self.buckyos_root = Path(buckyos_root)
         self.control_port = control_port or free_port()
+        self.extra_args = list(extra_args or [])
+        self.extra_env = dict(extra_env or {})
         self.stdout_path = self.case_dir / "gateway.stdout.log"
         self.stderr_path = self.case_dir / "gateway.stderr.log"
         self._stdout = None
@@ -125,8 +135,9 @@ class GatewayProcess:
         self._stderr = self.stderr_path.open("w", encoding="utf-8")
         env = os.environ.copy()
         env["BUCKYOS_ROOT"] = str(self.buckyos_root)
+        env.update(self.extra_env)
         self.proc = subprocess.Popen(
-            [str(BIN_PATH), "--config_file", str(self.config_path)],
+            [str(BIN_PATH), "--config_file", str(self.config_path), *self.extra_args],
             cwd=self.case_dir,
             env=env,
             stdout=self._stdout,
@@ -320,6 +331,32 @@ def http_request(port, host, path, headers=None, method="GET"):
 def http_text(port, host, path, headers=None, method="GET"):
     status, resp_headers, body = http_request(port, host, path, headers=headers, method=method)
     return status, resp_headers, body.decode("utf-8", errors="replace")
+
+
+def http_json_rpc(port, host, path, method, params=None, token=None):
+    seq = int(time.time() * 1000)
+    sys_values = [seq] if token is None else [seq, token]
+    payload = json.dumps(
+        {"method": method, "params": params if params is not None else {}, "sys": sys_values}
+    ).encode("utf-8")
+    headers = {
+        "Host": host,
+        "content-type": "application/json",
+        "content-length": str(len(payload)),
+    }
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+    try:
+        conn.request("POST", path, body=payload, headers=headers)
+        resp = conn.getresponse()
+        body = resp.read().decode("utf-8", errors="replace")
+        if resp.status != 200:
+            fail(f"http json rpc {method} status: expected 200, got {resp.status}: {body}")
+        data = json.loads(body)
+        if data.get("error") is not None:
+            fail(f"http json rpc {method} error: {data['error']}")
+        return data
+    finally:
+        conn.close()
 
 
 def raw_http_get_with_bound_source(port, host, path="/"):
@@ -654,6 +691,34 @@ def wait_tcp_port(gateway, port, name, timeout_sec=15):
             last_error = exc
         time.sleep(0.1)
     fail(f"{name} port {port} did not become ready: {last_error}\n{gateway.output()}")
+
+
+def wait_process_output_contains(gateway, needle, message, timeout_sec=5):
+    deadline = time.monotonic() + timeout_sec
+    while time.monotonic() < deadline:
+        if gateway.proc.poll() is not None:
+            fail(
+                f"gateway exited before {message}; "
+                f"code={gateway.proc.returncode}\n{gateway.output()}"
+            )
+        output = gateway.output()
+        if needle in output:
+            return
+        time.sleep(0.1)
+    fail(f"{message}: missing {needle!r}\n{gateway.output()}")
+
+
+def print_process_output_matches(gateway, label, needles):
+    print(f"[cyfs-gateway-app] {label} logs:")
+    matched = False
+    seen = set()
+    for line in gateway.output().splitlines():
+        if any(needle in line for needle in needles) and line not in seen:
+            print(f"[cyfs-gateway-app]   {line}")
+            seen.add(line)
+            matched = True
+    if not matched:
+        print("[cyfs-gateway-app]   <no matching log lines>")
 
 
 def write_file(path, content):
@@ -1362,9 +1427,32 @@ def generate_rtcp_device(case_dir, name):
     }
 
 
-def render_rtcp_remote_config(case_dir, ports, remote_device):
+def rtcp_stack_authority(device, port):
+    bootstrap = quote(f"tcp:///127.0.0.1:{port}", safe="")
+    return f"{bootstrap}@{device['host']}:{port}"
+
+
+def load_rtcp_fixture_device(config_path):
+    config_path = Path(config_path)
+    data = json.loads(config_path.read_text(encoding="utf-8"))
+    did = data.get("id")
+    if not isinstance(did, str) or not did.startswith("did:dev:"):
+        fail(f"invalid fixture RTCP device id in {config_path}: {did!r}")
+    return {
+        "doc": config_path,
+        "did": did,
+        "host": did.replace("did:dev:", "", 1) + ".dev.did",
+    }
+
+
+def render_rtcp_remote_config(case_dir, ports, remote_device, keep_tunnel_targets=None):
     root = case_dir / "remote_www" / "rtcp"
     write_file(root / "index.html", "REMOTE_RTCP")
+    keep_tunnel_targets = keep_tunnel_targets or []
+    keep_tunnel_config = ""
+    if keep_tunnel_targets:
+        keep_tunnel_lines = "\n".join(f"      - {target}" for target in keep_tunnel_targets)
+        keep_tunnel_config = f"    keep_tunnel:\n{keep_tunnel_lines}\n"
     config = f"""
 control_port: {ports['control']}
 
@@ -1374,6 +1462,7 @@ stacks:
     protocol: rtcp
     key_path: {remote_device['key']}
     device_config_path: {remote_device['doc']}
+{keep_tunnel_config.rstrip()}
     hook_point:
       main:
         priority: 1
@@ -1417,9 +1506,23 @@ servers:
     return config_path
 
 
-def render_rtcp_client_config(case_dir, ports, client_device, remote_device, remote_ports):
-    bootstrap = quote(f"tcp:///127.0.0.1:{remote_ports['rtcp']}", safe="")
-    rtcp_url = f"rtcp://{bootstrap}@{remote_device['host']}:{remote_ports['rtcp']}/rtcp-via.test:80"
+def render_rtcp_client_config(
+    case_dir,
+    ports,
+    client_device,
+    remote_device,
+    remote_ports,
+    client_http_stack_forward_to_remote=False,
+    use_bootstrap_rtcp_url=True,
+):
+    remote_authority = rtcp_stack_authority(remote_device, remote_ports["rtcp"])
+    if not use_bootstrap_rtcp_url:
+        remote_authority = f"{remote_device['host']}:{remote_ports['rtcp']}"
+    remote_rtcp_url = f"rtcp://{remote_authority}/rtcp-via.test:80"
+    client_http_rule = f"""http-probe && call-server ${{REQ.dest_host}};
+              reject;"""
+    if client_http_stack_forward_to_remote:
+        client_http_rule = f'return "forward {remote_rtcp_url}";'
     config = f"""
 control_port: {ports['control']}
 
@@ -1434,8 +1537,7 @@ stacks:
           default:
             priority: 1
             block: |
-              http-probe && call-server ${{REQ.dest_host}};
-              reject;
+              {client_http_rule}
 
   client_rtcp:
     bind: 127.0.0.1:{ports['rtcp']}
@@ -1461,14 +1563,20 @@ servers:
           default:
             priority: 1
             block: |
-              forward "{rtcp_url}";
+              forward "{remote_rtcp_url}";
 """
     config_path = case_dir / "client_rtcp_gateway.yaml"
     write_file(config_path, textwrap.dedent(config).strip() + "\n")
     return config_path
 
 
-def start_rtcp_gateway_pair(case_dir):
+def start_rtcp_gateway_pair(
+    case_dir,
+    remote_keep_tunnel_to_client=False,
+    client_http_stack_forward_to_remote=False,
+    debug_rtcp_logs=False,
+    client_uses_bootstrap_rtcp_url=True,
+):
     remote_device = generate_rtcp_device(case_dir / "devices", "remote-rtcp")
     client_device = generate_rtcp_device(case_dir / "devices", "client-rtcp")
     remote_ports = {
@@ -1481,10 +1589,16 @@ def start_rtcp_gateway_pair(case_dir):
         "http": free_port(),
         "rtcp": free_port(),
     }
+    keep_tunnel_targets = []
+    if remote_keep_tunnel_to_client:
+        keep_tunnel_target = rtcp_stack_authority(client_device, client_ports["rtcp"])
+        keep_tunnel_targets.append(keep_tunnel_target)
+        remote_ports["keep_tunnel_url"] = f"rtcp://{keep_tunnel_target}"
     remote_config = render_rtcp_remote_config(
         case_dir / "remote",
         remote_ports,
         remote_device,
+        keep_tunnel_targets=keep_tunnel_targets,
     )
     client_config = render_rtcp_client_config(
         case_dir / "client",
@@ -1492,18 +1606,41 @@ def start_rtcp_gateway_pair(case_dir):
         client_device,
         remote_device,
         remote_ports,
+        client_http_stack_forward_to_remote=client_http_stack_forward_to_remote,
+        use_bootstrap_rtcp_url=client_uses_bootstrap_rtcp_url,
     )
-    remote = GatewayProcess(case_dir / "remote", remote_config, case_dir / "remote-root")
-    client = GatewayProcess(case_dir / "client", client_config, case_dir / "client-root")
-    remote.start()
+    extra_env = {"BUCKY_LOG": "debug"} if debug_rtcp_logs else None
+    remote = GatewayProcess(
+        case_dir / "remote",
+        remote_config,
+        case_dir / "remote-root",
+        extra_env=extra_env,
+    )
+    client = GatewayProcess(
+        case_dir / "client",
+        client_config,
+        case_dir / "client-root",
+        extra_env=extra_env,
+    )
     try:
-        wait_gateway_ready(remote, remote_ports["control"])
-        wait_tcp_port(remote, remote_ports["http"], "remote rtcp http")
-        wait_tcp_port(remote, remote_ports["rtcp"], "remote rtcp")
-        client.start()
-        wait_gateway_ready(client, client_ports["control"])
-        wait_tcp_port(client, client_ports["http"], "client http")
-        wait_tcp_port(client, client_ports["rtcp"], "client rtcp")
+        if remote_keep_tunnel_to_client:
+            client.start()
+            wait_gateway_ready(client, client_ports["control"])
+            wait_tcp_port(client, client_ports["http"], "client http")
+            wait_tcp_port(client, client_ports["rtcp"], "client rtcp")
+            remote.start()
+            wait_gateway_ready(remote, remote_ports["control"])
+            wait_tcp_port(remote, remote_ports["http"], "remote rtcp http")
+            wait_tcp_port(remote, remote_ports["rtcp"], "remote rtcp")
+        else:
+            remote.start()
+            wait_gateway_ready(remote, remote_ports["control"])
+            wait_tcp_port(remote, remote_ports["http"], "remote rtcp http")
+            wait_tcp_port(remote, remote_ports["rtcp"], "remote rtcp")
+            client.start()
+            wait_gateway_ready(client, client_ports["control"])
+            wait_tcp_port(client, client_ports["http"], "client http")
+            wait_tcp_port(client, client_ports["rtcp"], "client rtcp")
     except Exception:
         client.stop()
         remote.stop()
@@ -1567,6 +1704,275 @@ def stop_multi_gateway_pair(resources):
     client.stop()
     remote.stop()
     udp_echo.stop()
+
+
+def generate_self_signed_cert(cert_path, key_path, common_name):
+    cert_path = Path(cert_path)
+    key_path = Path(key_path)
+    cert_path.parent.mkdir(parents=True, exist_ok=True)
+    key_path.parent.mkdir(parents=True, exist_ok=True)
+    result = subprocess.run(
+        [
+            "openssl",
+            "req",
+            "-x509",
+            "-newkey",
+            "rsa:2048",
+            "-nodes",
+            "-days",
+            "30",
+            "-subj",
+            f"/CN={common_name}",
+            "-keyout",
+            str(key_path),
+            "-out",
+            str(cert_path),
+        ],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        timeout=20,
+        check=False,
+    )
+    assert_process_ok(result, f"generate self-signed cert for {common_name}")
+
+
+def generate_named_rtcp_files(target_dir, name, key_name, doc_name):
+    key_dir = Path(target_dir) / f"_{name}_rtcp_key"
+    result = subprocess.run(
+        [str(BIN_PATH), "gen_rtcp_key", "-n", name, "-p", str(key_dir)],
+        cwd=target_dir,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        timeout=10,
+        check=False,
+    )
+    assert_process_ok(result, f"gen_rtcp_key {name}")
+    key_path = key_dir / "device.key.pem"
+    doc_path = key_dir / "device.doc.json"
+    if not key_path.exists() or not doc_path.exists():
+        fail(f"gen_rtcp_key {name} did not create expected files")
+    target_key = Path(target_dir) / key_name
+    target_doc = Path(target_dir) / doc_name
+    shutil.copyfile(key_path, target_key)
+    shutil.copyfile(doc_path, target_doc)
+    return target_key, target_doc
+
+
+def generate_buckyos_config_gen_files(runtime_dir):
+    node_root = Path(runtime_dir) / "buckyos-node"
+    node_etc = node_root / "etc"
+    web3_dir = Path(runtime_dir) / "web3-gateway"
+    node_etc.mkdir(parents=True, exist_ok=True)
+    web3_dir.mkdir(parents=True, exist_ok=True)
+
+    _node_key, node_doc = generate_named_rtcp_files(
+        node_etc,
+        "ood1",
+        "node_private_key.pem",
+        "node_device_config.json",
+    )
+    generate_named_rtcp_files(
+        web3_dir,
+        "sn",
+        "sn_private_key.pem",
+        "sn_device_config.json",
+    )
+
+    node_device = json.loads(node_doc.read_text(encoding="utf-8"))
+    node_public_key = node_device["verificationMethod"][0]["publicKeyJwk"]
+    write_file(
+        node_etc / "node_identity.json",
+        json.dumps(
+            {
+                "zone_did": "did:bns:alice",
+                "owner_public_key": node_public_key,
+                "owner_did": "did:bns:alice",
+                "device_doc_jwt": "",
+                "device_mini_doc_jwt": "",
+                "zone_iat": int(time.time()),
+            },
+            indent=2,
+        ),
+    )
+    write_file(
+        node_etc / "node_gateway_info.json",
+        json.dumps(
+            {
+                "node_info": {},
+                "app_info": {},
+                "service_info": {},
+                "node_route_map": {},
+                "routes": {},
+                "trust_key": {},
+            },
+            indent=2,
+        ),
+    )
+    write_file(node_etc / "node_gateway.json", "{}\n")
+    write_file(node_etc / "user_gateway.yaml", "# generated user gateway config\n--- {}\n")
+    write_file(node_etc / "boot_gateway.yaml", "# generated by cyfs_gateway_app integration test\n--- {}\n")
+    write_file(node_etc / "post_gateway.yaml", "# generated post gateway config\n--- {}\n")
+    write_file(node_etc / "cyfs_gateway.yaml", "includes:\n- path: user_gateway.yaml\n- path: boot_gateway.yaml\n- path: node_gateway.json\n- path: post_gateway.yaml\n")
+    generate_self_signed_cert(
+        node_etc / "zone_cert.cert",
+        node_etc / "zone_cert_key.pem",
+        "alice.web3.devtests.org",
+    )
+
+    params = {
+        "params": {
+            "sn_boot_jwt": "",
+            "sn_cer": "fullchain.cert",
+            "sn_device_jwt": "",
+            "sn_host": "devtests.org",
+            "sn_ip": "127.0.0.1",
+            "sn_owner_pk": "",
+            "sn_pem": "fullchain.pem",
+            "web3_cer": "fullchain.cert",
+            "web3_pem": "fullchain.pem",
+        }
+    }
+    write_file(web3_dir / "params.json", json.dumps(params, indent=2))
+    write_file(web3_dir / "sn_db.sqlite3", "")
+    generate_self_signed_cert(
+        web3_dir / "fullchain.cert",
+        web3_dir / "fullchain.pem",
+        "devtests.org",
+    )
+    return node_root, node_etc, web3_dir
+
+
+def render_buckyos_fixture_node_config(case_dir, fixture_node_etc, ports, upstream_port):
+    config = f"""
+control_port: {ports['control']}
+
+stacks:
+  node_rtcp:
+    protocol: rtcp
+    bind: 127.0.0.1:{ports['rtcp']}
+    key_path: {fixture_node_etc / "node_private_key.pem"}
+    device_config_path: {fixture_node_etc / "node_device_config.json"}
+    keep_tunnel: []
+    hook_point:
+      main:
+        priority: 1
+        blocks:
+          default:
+            priority: 1
+            block: |
+              return "forward tcp:///127.0.0.1:{upstream_port}";
+
+  node_http:
+    protocol: tcp
+    bind: 127.0.0.1:{ports['http']}
+    hook_point:
+      main:
+        priority: 1
+        blocks:
+          default:
+            priority: 1
+            block: |
+              http-probe && call-server node_http_api;
+              reject;
+
+servers:
+  node_http_api:
+    type: http
+    hook_point:
+      main:
+        priority: 1
+        blocks:
+          default:
+            priority: 1
+            block: |
+              map-add REQ path "/";
+              forward "http://127.0.0.1:{upstream_port}";
+"""
+    config_path = case_dir / "cyfs_gateway.yaml"
+    write_file(config_path, textwrap.dedent(config).strip() + "\n")
+    return config_path
+
+
+def render_web3_fixture_gateway_config(case_dir, fixture_web3_dir, ports, node_rtcp_target):
+    params = json.loads((fixture_web3_dir / "params.json").read_text(encoding="utf-8"))["params"]
+    sn_db = case_dir / "sn_db.sqlite3"
+    config = f"""
+control_port: {ports['control']}
+
+stacks:
+  web3_rtcp:
+    protocol: rtcp
+    bind: 127.0.0.1:{ports['rtcp']}
+    key_path: {fixture_web3_dir / "sn_private_key.pem"}
+    device_config_path: {fixture_web3_dir / "sn_device_config.json"}
+    hook_point:
+      main:
+        priority: 1
+        blocks:
+          default:
+            priority: 1
+            block: |
+              reject;
+
+  web3_http:
+    protocol: tcp
+    bind: 127.0.0.1:{ports['http']}
+    hook_point:
+      main:
+        priority: 1
+        blocks:
+          default:
+            priority: 1
+            block: |
+              http-probe && call-server web3-export.test;
+              reject;
+
+servers:
+  web3-export.test:
+    type: http
+    hook_point:
+      main:
+        priority: 1
+        blocks:
+          default:
+            priority: 1
+            block: |
+              if starts-with ${{REQ.path}} "/sn" then
+                rewrite ${{REQ.path}} "/sn*" "/*" && call-server sn;
+              else
+                forward "rtcp://{node_rtcp_target}/buckyos-node.test:80";
+              end
+
+  sn:
+    type: sn
+    host: {json.dumps(params["sn_host"])}
+    ip: {json.dumps(params["sn_ip"])}
+    boot_jwt: {json.dumps(params["sn_boot_jwt"])}
+    owner_pkx: {json.dumps(params["sn_owner_pk"])}
+    device_jwt:
+      - {json.dumps(params["sn_device_jwt"])}
+    db_type: sqlite
+    db_path: {sn_db}
+"""
+    config_path = case_dir / "web3_gateway.yaml"
+    write_file(config_path, textwrap.dedent(config).strip() + "\n")
+    return config_path
+
+
+def assert_web3_to_buckyos_node_roundtrip(web3_ports):
+    last_error = None
+    for _ in range(80):
+        try:
+            status, _, body = http_text(web3_ports["http"], "web3-export.test", "/")
+            if status == 200 and body.startswith("upstream:"):
+                return
+            last_error = f"status={status}, body={body!r}"
+        except Exception as exc:
+            last_error = exc
+        time.sleep(0.25)
+    fail(f"web3 gateway did not reach buckyos node http via rtcp: {last_error}")
 
 
 def run_gateway_case(name, case_func):
@@ -2019,25 +2425,208 @@ def test_multi_gateway_tunnel_protocols(case_dir):
         stop_multi_gateway_pair(resources)
 
 
+def assert_rtcp_app_tunnel_roundtrip(client_ports):
+    deadline = time.monotonic() + 15
+    last_error = None
+    while True:
+        try:
+            status, _, body = http_text(client_ports["http"], "rtcp-via.test", "/")
+            if status == 200 and body == "REMOTE_RTCP":
+                break
+            last_error = f"status={status}, body={body!r}"
+        except Exception as exc:
+            last_error = str(exc)
+        if time.monotonic() >= deadline:
+            fail(f"rtcp app tunnel did not become ready: {last_error}")
+        time.sleep(0.2)
+
+
 def test_rtcp_app_tunnel_roundtrip(case_dir):
     resources = start_rtcp_gateway_pair(case_dir)
     _remote, _client, _remote_ports, client_ports = resources
     try:
-        deadline = time.monotonic() + 15
-        last_error = None
-        while True:
-            try:
-                status, _, body = http_text(client_ports["http"], "rtcp-via.test", "/")
-                if status == 200 and body == "REMOTE_RTCP":
-                    break
-                last_error = f"status={status}, body={body!r}"
-            except Exception as exc:
-                last_error = str(exc)
-            if time.monotonic() >= deadline:
-                fail(f"rtcp app tunnel did not become ready: {last_error}")
-            time.sleep(0.2)
+        assert_rtcp_app_tunnel_roundtrip(client_ports)
     finally:
         stop_rtcp_gateway_pair(resources)
+
+
+def test_rtcp_app_tunnel_roundtrip_with_remote_keep_tunnel_ropen(case_dir):
+    resources = start_rtcp_gateway_pair(
+        case_dir,
+        remote_keep_tunnel_to_client=True,
+        client_http_stack_forward_to_remote=True,
+        debug_rtcp_logs=True,
+        client_uses_bootstrap_rtcp_url=False,
+    )
+    remote, client, remote_ports, client_ports = resources
+    try:
+        wait_process_output_contains(
+            remote,
+            f"Will keep tunnel: {remote_ports['keep_tunnel_url']}",
+            "remote rtcp keep_tunnel to client",
+        )
+        assert_rtcp_app_tunnel_roundtrip(client_ports)
+        print(
+            "[cyfs-gateway-app] rtcp ropen roundtrip: "
+            "client http -> remote rtcp dir returned REMOTE_RTCP"
+        )
+        wait_process_output_contains(
+            client,
+            "post ropen sent:",
+            "client sent RTCP ROpen while reusing remote keep_tunnel",
+        )
+        wait_process_output_contains(
+            remote,
+            "RTcp tunnel ropen request:",
+            "remote handled RTCP ROpen command",
+        )
+        # print_process_output_matches(
+        #     client,
+        #     "rtcp ropen client",
+        #     [
+        #         "Reuse tunnel",
+        #         "can_direct:false",
+        #         "post ropen",
+        #         "wait ropen stream",
+        #     ],
+        # )
+        # print_process_output_matches(
+        #     remote,
+        #     "rtcp ropen remote",
+        #     [
+        #         "Will keep tunnel:",
+        #         "RTcp tunnel ropen request:",
+        #         "ropen ack sent:",
+        #         "accept new stream:",
+        #     ],
+        # )
+    finally:
+        stop_rtcp_gateway_pair(resources)
+
+
+def test_rtcp_app_tunnel_roundtrip_with_remote_keep_tunnel(case_dir):
+    resources = start_rtcp_gateway_pair(case_dir, remote_keep_tunnel_to_client=True)
+    _remote, _client, remote_ports, client_ports = resources
+    try:
+        wait_process_output_contains(
+            _remote,
+            f"Will keep tunnel: {remote_ports['keep_tunnel_url']}",
+            "remote rtcp keep_tunnel to client",
+        )
+        assert_rtcp_app_tunnel_roundtrip(client_ports)
+    finally:
+        stop_rtcp_gateway_pair(resources)
+
+
+def test_rtcp_app_tunnel_roundtrip_with_client_http_stack_forward(case_dir):
+    resources = start_rtcp_gateway_pair(case_dir, client_http_stack_forward_to_remote=True)
+    _remote, _client, _remote_ports, client_ports = resources
+    try:
+        assert_rtcp_app_tunnel_roundtrip(client_ports)
+    finally:
+        stop_rtcp_gateway_pair(resources)
+
+
+def test_rtcp_app_tunnel_roundtrip_with_client_http_stack_forward_and_remote_keep_tunnel(case_dir):
+    resources = start_rtcp_gateway_pair(
+        case_dir,
+        remote_keep_tunnel_to_client=True,
+        client_http_stack_forward_to_remote=True,
+    )
+    _remote, _client, remote_ports, client_ports = resources
+    try:
+        wait_process_output_contains(
+            _remote,
+            f"Will keep tunnel: {remote_ports['keep_tunnel_url']}",
+            "remote rtcp keep_tunnel to client",
+        )
+        assert_rtcp_app_tunnel_roundtrip(client_ports)
+    finally:
+        stop_rtcp_gateway_pair(resources)
+
+
+def test_buckyos_config_gen_web3_exported_http_reaches_node(case_dir):
+    upstream = UpstreamServer()
+    upstream.start()
+    runtime_dir = case_dir / "buckyos-config-gen"
+    web3_gateway = None
+    node_gateway = None
+    try:
+        if runtime_dir.exists():
+            shutil.rmtree(runtime_dir)
+        node_root, node_etc, web3_dir = generate_buckyos_config_gen_files(runtime_dir)
+
+        node_device = load_rtcp_fixture_device(node_etc / "node_device_config.json")
+        web3_device = load_rtcp_fixture_device(web3_dir / "sn_device_config.json")
+        node_ports = {
+            "control": free_port(),
+            "http": free_port(),
+            "rtcp": free_port(),
+        }
+        web3_ports = {
+            "control": free_port(),
+            "http": free_port(),
+            "rtcp": free_port(),
+        }
+        node_rtcp_target = rtcp_stack_authority(node_device, node_ports["rtcp"])
+        web3_rtcp_target = rtcp_stack_authority(web3_device, web3_ports["rtcp"])
+
+        node_config = render_buckyos_fixture_node_config(
+            node_etc,
+            node_etc,
+            node_ports,
+            upstream.port,
+        )
+        web3_config = render_web3_fixture_gateway_config(
+            web3_dir,
+            web3_dir,
+            web3_ports,
+            node_rtcp_target,
+        )
+        web3_gateway = GatewayProcess(web3_dir, web3_config, runtime_dir / "web3-root")
+        node_gateway = GatewayProcess(
+            node_root,
+            node_config,
+            node_root,
+            extra_args=["--keep_tunnel", web3_rtcp_target],
+        )
+        web3_gateway.start()
+        wait_gateway_ready(web3_gateway, web3_ports["control"])
+        wait_tcp_port(web3_gateway, web3_ports["http"], "web3 exported http")
+        wait_tcp_port(web3_gateway, web3_ports["rtcp"], "web3 rtcp")
+        sn_resp = http_json_rpc(
+            web3_ports["http"],
+            "web3-export.test",
+            "/sn",
+            "check_username",
+            {"username": "itestaliceconfig"},
+        )
+        assert_true(sn_resp.get("result", {}).get("valid"), "web3 sn check_username result")
+
+        node_gateway.start()
+        wait_gateway_ready(node_gateway, node_ports["control"])
+        wait_tcp_port(node_gateway, node_ports["http"], "buckyos node http")
+        wait_tcp_port(node_gateway, node_ports["rtcp"], "buckyos node rtcp")
+        wait_process_output_contains(
+            node_gateway,
+            f"Will keep tunnel: rtcp://{web3_rtcp_target}",
+            "buckyos node keep_tunnel to web3 gateway",
+            timeout_sec=10,
+        )
+
+        assert_web3_to_buckyos_node_roundtrip(web3_ports)
+        assert_true(upstream.requests, "buckyos node http service received request")
+        assert_eq(
+            upstream.requests[-1]["method"],
+            "GET",
+            "buckyos node http service method",
+        )
+    finally:
+        if node_gateway is not None:
+            node_gateway.stop()
+        if web3_gateway is not None:
+            web3_gateway.stop()
+        upstream.stop()
 
 
 def test_cli_against_running_app(case_dir):
@@ -3376,6 +3965,26 @@ CASES = [
     ("reload_runtime_workloads", test_reload_runtime_workloads),
     ("multi_gateway_tunnel_protocols", test_multi_gateway_tunnel_protocols),
     ("rtcp_app_tunnel_roundtrip", test_rtcp_app_tunnel_roundtrip),
+    (
+        "rtcp_app_tunnel_roundtrip_with_remote_keep_tunnel_ropen",
+        test_rtcp_app_tunnel_roundtrip_with_remote_keep_tunnel_ropen,
+    ),
+    (
+        "rtcp_app_tunnel_roundtrip_with_remote_keep_tunnel",
+        test_rtcp_app_tunnel_roundtrip_with_remote_keep_tunnel,
+    ),
+    (
+        "rtcp_app_tunnel_roundtrip_with_client_http_stack_forward",
+        test_rtcp_app_tunnel_roundtrip_with_client_http_stack_forward,
+    ),
+    (
+        "rtcp_app_tunnel_roundtrip_with_client_http_stack_forward_and_remote_keep_tunnel",
+        test_rtcp_app_tunnel_roundtrip_with_client_http_stack_forward_and_remote_keep_tunnel,
+    ),
+    (
+        "buckyos_config_gen_web3_exported_http_reaches_node",
+        test_buckyos_config_gen_web3_exported_http_reaches_node,
+    ),
     ("cli_against_running_app", test_cli_against_running_app),
     ("config_loading_formats_and_paths", test_config_loading_formats_and_paths),
     ("config_include_merge_and_remote_cache", test_config_include_merge_and_remote_cache),

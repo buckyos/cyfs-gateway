@@ -13,7 +13,9 @@ use name_lib::{
 };
 use serde::{Deserialize, Serialize};
 use sfo_io::{LimitStream, StatStream};
-use sfo_reuseport::{ServerRuntime, SocketOptions, TcpServer, TcpServiceConfig, TransparentMode};
+use sfo_reuseport::{
+    ServerRuntime, SocketOptions, TaskHandle, TcpServer, TcpServiceConfig, TransparentMode,
+};
 use url::Url;
 
 use crate::forward::ForwardPlan;
@@ -1078,6 +1080,7 @@ pub struct RtcpStack {
     reuse_address: bool,
     server_runtime: ServerRuntime,
     server: Mutex<Option<TcpServer>>,
+    keep_tunnel_handles: Mutex<Vec<TaskHandle>>,
     rtcp: Mutex<Option<RTcp>>,
     rtcp_ref: Mutex<Option<Arc<RTcp>>>,
     connection_manager: Option<ConnectionManagerRef>,
@@ -1088,6 +1091,9 @@ pub struct RtcpStack {
 
 impl Drop for RtcpStack {
     fn drop(&mut self) {
+        for handle in self.keep_tunnel_handles.lock().unwrap().drain(..) {
+            handle.cancel();
+        }
         if let Some(server) = self.server.lock().unwrap().take() {
             if let Err(e) = server.close() {
                 log::error!("close rtcp server failed: {}", e);
@@ -1174,7 +1180,7 @@ impl RtcpStack {
         };
 
         let tunnel_manager = self.tunnel_manager.clone();
-        tokio::task::spawn(async move {
+        let handle = self.server_runtime.spawn_task(|| async move {
             // Pin the keep_tunnel URL so its URL history is never evicted
             // by LRU pressure -- it is a configured, long-lived URL.
             tunnel_manager.pin_tunnel_url(&tunnel_url).await;
@@ -1233,6 +1239,10 @@ impl RtcpStack {
                 }
             }
         });
+        match handle {
+            Ok(handle) => self.keep_tunnel_handles.lock().unwrap().push(handle),
+            Err(err) => warn!("start rtcp keep_tunnel task failed: {}", err),
+        }
     }
 
     async fn create(mut builder: RtcpStackBuilder) -> StackResult<Self> {
@@ -1317,6 +1327,7 @@ impl RtcpStack {
             reuse_address: builder.reuse_address,
             server_runtime,
             server: Mutex::new(None),
+            keep_tunnel_handles: Mutex::new(Vec::new()),
             rtcp: Mutex::new(Some(rtcp)),
             rtcp_ref: Mutex::new(None),
             connection_manager,
