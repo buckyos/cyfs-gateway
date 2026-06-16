@@ -24,7 +24,7 @@ use sha2::Digest;
 use std::collections::HashMap;
 use std::fmt::{Debug, Formatter};
 use std::fs::OpenOptions;
-use std::io::Write;
+use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::RwLock;
@@ -281,71 +281,119 @@ impl CertStub {
 
     fn load_identity_cert_info(&self) -> Result<Option<CertInfo>> {
         let identity = self.inner.acme_item.identity();
-        let status = match self
-            .inner
-            .identity_roots
-            .check_x509_local_status(identity, IdentityUsage::Server)
-        {
-            Ok(status) => status,
+        let cert_match = match self.inner.identity_roots.find_public_file(
+            identity,
+            IdentityUsage::Server,
+            IdentityMaterial::Fullchain,
+        ) {
+            Ok(cert_match) => cert_match,
             Err(e) => {
                 debug!(
-                    "check identity cert status failed, stub: {}, identity: {}, {}",
+                    "find identity fullchain failed, stub: {}, identity: {}, {}",
                     self, identity, e
                 );
                 return Ok(None);
             }
         };
-
-        if !status.locally_usable {
+        let key_path = identity_private_key_path(&self.inner.identity_roots, &cert_match.dir_name);
+        let cert_data = match std::fs::read(&cert_match.path) {
+            Ok(cert_data) => cert_data,
+            Err(e) => {
+                debug!(
+                    "read identity fullchain failed, stub: {}, path: {}, {}",
+                    self,
+                    cert_match.path.display(),
+                    e
+                );
+                return Ok(None);
+            }
+        };
+        let key_data = match std::fs::read(&key_path) {
+            Ok(key_data) => key_data,
+            Err(e) => {
+                debug!(
+                    "read identity private key failed, stub: {}, path: {}, {}",
+                    self,
+                    key_path.display(),
+                    e
+                );
+                return Ok(None);
+            }
+        };
+        let certificates = match X509::stack_from_pem(&cert_data) {
+            Ok(certificates) => certificates,
+            Err(e) => {
+                debug!(
+                    "parse identity fullchain failed, stub: {}, path: {}, {}",
+                    self,
+                    cert_match.path.display(),
+                    e
+                );
+                return Ok(None);
+            }
+        };
+        let Some(leaf) = certificates.first() else {
             debug!(
-                "identity cert is not locally usable, stub: {}, identity: {}, installed: {}, expired: {}",
-                self, identity, status.installed, status.expired
+                "identity fullchain is empty, stub: {}, path: {}",
+                self,
+                cert_match.path.display()
+            );
+            return Ok(None);
+        };
+        let private_key = match PKey::private_key_from_pem(&key_data) {
+            Ok(private_key) => private_key,
+            Err(e) => {
+                debug!(
+                    "parse identity private key failed, stub: {}, path: {}, {}",
+                    self,
+                    key_path.display(),
+                    e
+                );
+                return Ok(None);
+            }
+        };
+        if let Err(e) = validate_identity_certificate(
+            &self.inner.identity_roots,
+            identity,
+            &self.inner.acme_item.domain,
+            leaf,
+            &private_key,
+        ) {
+            debug!(
+                "identity certificate validation failed, stub: {}, identity: {}, fullchain: {}, key: {}, {}",
+                self,
+                identity,
+                cert_match.path.display(),
+                key_path.display(),
+                e
             );
             return Ok(None);
         }
-
-        let cert_match = self
-            .inner
-            .identity_roots
-            .find_public_file(identity, IdentityUsage::Server, IdentityMaterial::Fullchain)
-            .map_err(|e| {
-                anyhow::anyhow!(
-                    "find identity fullchain failed, stub: {}, identity: {}, {}",
+        let certified_key = match Self::create_certified_key(&cert_data, &key_data) {
+            Ok(certified_key) => certified_key,
+            Err(e) => {
+                debug!(
+                    "parse identity certificate/key failed, stub: {}, fullchain: {}, key: {}, {}",
                     self,
-                    identity,
+                    cert_match.path.display(),
+                    key_path.display(),
                     e
-                )
-            })?;
-        let key_path = self
-            .inner
-            .identity_roots
-            .private_key_file_for_legacy_tool(identity, IdentityUsage::Server)
-            .map_err(|e| {
-                anyhow::anyhow!(
-                    "find identity private key failed, stub: {}, identity: {}, {}",
+                );
+                return Ok(None);
+            }
+        };
+        let expires = match Self::get_cert_expiry(&cert_data) {
+            Ok(expires) => expires,
+            Err(e) => {
+                debug!(
+                    "read identity certificate expiry failed, stub: {}, fullchain: {}, {}",
                     self,
-                    identity,
+                    cert_match.path.display(),
                     e
-                )
-            })?;
-        let cert_data = std::fs::read(&cert_match.path).map_err(|e| {
-            anyhow::anyhow!(
-                "read identity fullchain failed, stub: {}, path: {}, {}",
-                self,
-                cert_match.path.display(),
-                e
-            )
-        })?;
-        let key_data = std::fs::read(&key_path).map_err(|e| {
-            anyhow::anyhow!(
-                "read identity private key failed, stub: {}, path: {}, {}",
-                self,
-                key_path.display(),
-                e
-            )
-        })?;
-        let certified_key = Self::create_certified_key(&cert_data, &key_data)?;
-        let expires = Self::get_cert_expiry(&cert_data)?;
+                );
+                return Ok(None);
+            }
+        };
 
         info!(
             "load identity cert success, stub: {}, identity: {}, fullchain: {}, key: {}, expires: {}",
@@ -446,7 +494,6 @@ struct PreparedIdentityCertificate {
     chain_pem: Vec<u8>,
     fullchain_pem: Vec<u8>,
     key_pem: Vec<u8>,
-    keyref_json: Vec<u8>,
     metadata_json: Vec<u8>,
 }
 
@@ -492,7 +539,6 @@ fn install_identity_certificate(
         )?);
         staged.push(stage_file(&paths.metadata, &prepared.metadata_json, false)?);
         staged.push(stage_file(private_key_path, &prepared.key_pem, true)?);
-        staged.push(stage_file(&paths.keyref, &prepared.keyref_json, true)?);
         Ok(())
     })();
 
@@ -512,8 +558,9 @@ fn install_identity_certificate(
         })?;
     }
 
+    remove_legacy_keyref(&paths.keyref)?;
     sync_parent_dir(&paths.fullchain)?;
-    sync_parent_dir(&paths.keyref)?;
+    sync_parent_dir(private_key_path)?;
     Ok(())
 }
 
@@ -548,13 +595,6 @@ fn prepare_identity_certificate(
     normalized_fullchain.extend(chain_pem.iter());
 
     let public_key_fingerprint = public_key_fingerprint(leaf)?;
-    let paths = roots
-        .x509_paths(identity, IdentityUsage::Server)
-        .map_err(|e| anyhow::anyhow!("calculate identity x509 paths failed: {}", e))?;
-    let private_key_path = paths
-        .private_key
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("server private key path is not available"))?;
     let raw_host_uri = roots
         .raw_host_uri(identity)
         .map_err(|e| anyhow::anyhow!("calculate raw host uri failed: {}", e))?;
@@ -563,21 +603,6 @@ fn prepare_identity_certificate(
         .map_err(|e| anyhow::anyhow!("calculate identity dir name failed: {}", e))?;
     let did = canonical_did(identity, &raw_host_uri);
     let updated_at = chrono::Utc::now().to_rfc3339();
-    let keyref = serde_json::json!({
-        "schema": "buckyos.identity.keyref.v1",
-        "kind": "key",
-        "did": did,
-        "usage": IdentityUsage::Server,
-        "algorithm": private_key_algorithm(&private_key),
-        "public_key_fingerprint": public_key_fingerprint,
-        "mode": "file",
-        "exportable": true,
-        "ref": {
-            "type": "file",
-            "path": private_key_path.to_string_lossy(),
-            "format": "pkcs8-pem"
-        }
-    });
 
     let metadata = build_x509_metadata(
         roots,
@@ -598,7 +623,6 @@ fn prepare_identity_certificate(
         chain_pem,
         fullchain_pem: normalized_fullchain,
         key_pem: key_pem.to_vec(),
-        keyref_json: serde_json::to_vec_pretty(&keyref)?,
         metadata_json: serde_json::to_vec_pretty(&metadata)?,
     })
 }
@@ -672,9 +696,6 @@ fn build_x509_metadata(
         .and_then(|bn| bn.to_hex_str())
         .map(|s| s.to_string())
         .ok();
-    let paths = roots
-        .x509_paths(identity, IdentityUsage::Server)
-        .map_err(|e| anyhow::anyhow!("calculate identity x509 paths failed: {}", e))?;
     let match_info = if domain.starts_with("*.") {
         X509MatchMetadata::Wildcard {
             host_pattern: domain.to_string(),
@@ -715,7 +736,7 @@ fn build_x509_metadata(
             chain: Some("server.chain.pem".to_string()),
             fullchain: Some("server.fullchain.pem".to_string()),
             ca: None,
-            key_ref: Some(paths.keyref.to_string_lossy().to_string()),
+            key_ref: None,
         }),
         did_binding: roots
             .did_web_document_url(identity)
@@ -792,16 +813,6 @@ fn public_key_fingerprint(cert: &X509) -> Result<String> {
         "sha256:{}",
         hex::encode(sha2::Sha256::digest(&der))
     ))
-}
-
-fn private_key_algorithm(private_key: &PKey<Private>) -> &'static str {
-    match private_key.id() {
-        openssl::pkey::Id::RSA => "RSA",
-        openssl::pkey::Id::EC => "EC",
-        openssl::pkey::Id::ED25519 => "Ed25519",
-        openssl::pkey::Id::ED448 => "Ed448",
-        _ => "unknown",
-    }
 }
 
 fn asn1_time_to_utc(time: &Asn1TimeRef) -> Result<chrono::DateTime<chrono::Utc>> {
@@ -905,6 +916,32 @@ fn sync_parent_dir(path: &Path) -> Result<()> {
             .map_err(|e| anyhow::anyhow!("sync identity dir {} failed: {}", parent.display(), e))?;
     }
     Ok(())
+}
+
+fn remove_legacy_keyref(path: &Path) -> Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => {
+            info!("removed legacy identity keyref {}", path.display());
+            sync_parent_dir(path)?;
+        }
+        Err(e) if e.kind() == ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(anyhow::anyhow!(
+                "remove legacy identity keyref {} failed: {}",
+                path.display(),
+                e
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn identity_private_key_path(roots: &IdentityRoots, dir_name: &str) -> PathBuf {
+    roots
+        .security_root
+        .join(dir_name)
+        .join("server.private.pem")
 }
 
 #[derive(Clone, Debug)]
@@ -1542,6 +1579,11 @@ mod tests {
         let roots = IdentityRoots::new(temp.path().join("identity"), temp.path().join("security"));
         let work_dir = temp.path().join("state").join("acme").join("example.com");
         let (cert, key) = generate_test_cert("example.com", 90);
+        let paths = roots
+            .x509_paths("example.com", IdentityUsage::Server)
+            .unwrap();
+        std::fs::create_dir_all(paths.keyref.parent().unwrap()).unwrap();
+        std::fs::write(&paths.keyref, "stale keyref").unwrap();
 
         install_identity_certificate(
             &roots,
@@ -1554,22 +1596,12 @@ mod tests {
         )
         .unwrap();
 
-        let paths = roots
-            .x509_paths("example.com", IdentityUsage::Server)
-            .unwrap();
         assert!(paths.cert.exists());
         assert!(paths.chain.exists());
         assert!(paths.fullchain.exists());
         assert!(paths.metadata.exists());
-        assert!(paths.keyref.exists());
         assert!(paths.private_key.unwrap().exists());
-
-        let status = roots
-            .check_x509_local_status("example.com", IdentityUsage::Server)
-            .unwrap();
-        assert!(status.installed);
-        assert!(status.locally_usable);
-        assert!(!status.expired);
+        assert!(!paths.keyref.exists());
     }
 
     #[test]

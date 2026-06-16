@@ -8,7 +8,7 @@ use rustls::sign::CertifiedKey;
 use rustls::{Error, server, sign};
 use std::collections::HashMap;
 use std::fmt::Debug;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 use tokio::task::JoinHandle;
@@ -241,10 +241,7 @@ impl IdentityCertResolver {
                 IdentityMaterial::Fullchain,
             )
             .map_err(|e| format!("find server fullchain failed: {e}"))?;
-        let key_path = self
-            .roots
-            .private_key_file_for_legacy_tool(&host.identity, IdentityUsage::Server)
-            .map_err(|e| format!("find server private key failed: {e}"))?;
+        let key_path = identity_private_key_path(&self.roots, &cert_match.dir_name);
         log::debug!(
             "TLS identity certificate files selected for {}: fullchain={} (match_type={}, raw_host_uri={}, dir_name={}), private_key={}",
             host.identity,
@@ -364,12 +361,11 @@ fn describe_identity_cert_candidate(
             .map(|paths| (raw_host_uri, paths))
     }) {
         Ok((raw_host_uri, paths)) => format!(
-            "match_type={}, input={}, raw_host_uri={}, fullchain={}, keyref={}, default_private_key={}",
+            "match_type={}, input={}, raw_host_uri={}, fullchain={}, private_key={}",
             match_type,
             identity,
             raw_host_uri,
             describe_path(&paths.fullchain),
-            describe_path(&paths.keyref),
             paths
                 .private_key
                 .as_ref()
@@ -399,6 +395,13 @@ fn wildcard_identity_input(raw_host_uri: &str) -> Option<String> {
     }
 
     Some(format!("*.{}", labels[1..].join(".")))
+}
+
+fn identity_private_key_path(roots: &IdentityRoots, dir_name: &str) -> PathBuf {
+    roots
+        .security_root
+        .join(dir_name)
+        .join("server.private.pem")
 }
 
 fn identity_to_tls_host(roots: &IdentityRoots, identity: &str) -> Result<String, String> {
@@ -501,7 +504,6 @@ mod tests {
     use super::{IdentityCertResolver, TlsIdentityHost};
     use name_client::IdentityRoots;
     use rcgen::generate_simple_self_signed;
-    use serde_json::json;
     use std::collections::HashMap;
     use std::sync::{Mutex, RwLock};
 
@@ -541,26 +543,6 @@ mod tests {
         std::fs::write(
             security_dir.join("server.private.pem"),
             cert_key.signing_key.serialize_pem(),
-        )
-        .unwrap();
-        std::fs::write(
-            security_dir.join("server.keyref.json"),
-            json!({
-                "schema": "buckyos.identity.keyref.v1",
-                "kind": "key",
-                "did": "did:web:example.com",
-                "usage": "server",
-                "algorithm": "P-256",
-                "public_key_fingerprint": "sha256:test",
-                "mode": "file",
-                "exportable": true,
-                "ref": {
-                    "type": "file",
-                    "path": "server.private.pem",
-                    "format": "pkcs8-pem"
-                }
-            })
-            .to_string(),
         )
         .unwrap();
 
