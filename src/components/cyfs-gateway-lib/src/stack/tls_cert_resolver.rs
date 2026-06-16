@@ -160,6 +160,19 @@ impl IdentityCertResolver {
             refresh_handle: Mutex::new(None),
         });
 
+        log::info!(
+            "TLS identity certificate resolver enabled: public_root={}, security_root={}, refresh_interval={:?}, hosts=[{}]",
+            resolver.roots.public_root.display(),
+            resolver.roots.security_root.display(),
+            config.refresh_interval,
+            resolver
+                .hosts
+                .iter()
+                .map(|host| format!("{}=>{}", host.identity, host.tls_host))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+
         resolver.refresh_all();
         resolver.start_refresh(config.refresh_interval);
         resolver
@@ -204,9 +217,10 @@ impl IdentityCertResolver {
                 let mut errors = self.errors.lock().unwrap();
                 if errors.get(&host.identity) != Some(&err) {
                     log::warn!(
-                        "TLS identity certificate for {} is unavailable: {}",
+                        "TLS identity certificate for {} is unavailable: {}; lookup: {}",
                         host.identity,
-                        err
+                        err,
+                        describe_identity_cert_lookup(&self.roots, host)
                     );
                     errors.insert(host.identity.clone(), err);
                 }
@@ -215,6 +229,10 @@ impl IdentityCertResolver {
     }
 
     fn load_host_cert(&self, host: &TlsIdentityHost) -> Result<Arc<CertifiedKey>, String> {
+        log::debug!(
+            "loading TLS identity certificate: {}",
+            describe_identity_cert_lookup(&self.roots, host)
+        );
         let cert_match = self
             .roots
             .find_public_file(
@@ -227,6 +245,15 @@ impl IdentityCertResolver {
             .roots
             .private_key_file_for_legacy_tool(&host.identity, IdentityUsage::Server)
             .map_err(|e| format!("find server private key failed: {e}"))?;
+        log::debug!(
+            "TLS identity certificate files selected for {}: fullchain={} (match_type={}, raw_host_uri={}, dir_name={}), private_key={}",
+            host.identity,
+            cert_match.path.display(),
+            cert_match.match_type,
+            cert_match.raw_host_uri,
+            cert_match.dir_name,
+            key_path.display()
+        );
 
         let certs = load_cert_file(&cert_match.path)?;
         let key = load_key_file(&key_path)?;
@@ -294,6 +321,84 @@ impl ResolvesServerCert for IdentityCertResolver {
             .as_ref()
             .and_then(|resolver| resolver.resolve(client_hello))
     }
+}
+
+fn describe_identity_cert_lookup(roots: &IdentityRoots, host: &TlsIdentityHost) -> String {
+    let mut parts = vec![
+        format!("identity={}", host.identity),
+        format!("tls_host={}", host.tls_host),
+        format!("public_root={}", roots.public_root.display()),
+        format!("security_root={}", roots.security_root.display()),
+    ];
+
+    match roots.raw_host_uri(&host.identity) {
+        Ok(raw_host_uri) => {
+            parts.push(format!("raw_host_uri={raw_host_uri}"));
+            parts.push(format!(
+                "candidate_exact={}",
+                describe_identity_cert_candidate(roots, "exact", &host.identity)
+            ));
+            if let Some(wildcard_input) = wildcard_identity_input(&raw_host_uri) {
+                parts.push(format!(
+                    "candidate_wildcard={}",
+                    describe_identity_cert_candidate(roots, "wildcard", &wildcard_input)
+                ));
+            }
+        }
+        Err(err) => {
+            parts.push(format!("raw_host_uri_error={err}"));
+        }
+    }
+
+    parts.join("; ")
+}
+
+fn describe_identity_cert_candidate(
+    roots: &IdentityRoots,
+    match_type: &str,
+    identity: &str,
+) -> String {
+    match roots.raw_host_uri(identity).and_then(|raw_host_uri| {
+        roots
+            .x509_paths(identity, IdentityUsage::Server)
+            .map(|paths| (raw_host_uri, paths))
+    }) {
+        Ok((raw_host_uri, paths)) => format!(
+            "match_type={}, input={}, raw_host_uri={}, fullchain={}, keyref={}, default_private_key={}",
+            match_type,
+            identity,
+            raw_host_uri,
+            describe_path(&paths.fullchain),
+            describe_path(&paths.keyref),
+            paths
+                .private_key
+                .as_ref()
+                .map(|path| describe_path(path))
+                .unwrap_or_else(|| "none".to_string())
+        ),
+        Err(err) => format!("match_type={match_type}, input={identity}, error={err}"),
+    }
+}
+
+fn describe_path(path: &Path) -> String {
+    format!(
+        "{} ({})",
+        path.display(),
+        if path.exists() { "exists" } else { "missing" }
+    )
+}
+
+fn wildcard_identity_input(raw_host_uri: &str) -> Option<String> {
+    if raw_host_uri.contains('/') {
+        return None;
+    }
+
+    let labels = raw_host_uri.split('.').collect::<Vec<_>>();
+    if labels.len() < 3 || labels.first() == Some(&"_") || labels.first() == Some(&"*") {
+        return None;
+    }
+
+    Some(format!("*.{}", labels[1..].join(".")))
 }
 
 fn identity_to_tls_host(roots: &IdentityRoots, identity: &str) -> Result<String, String> {
