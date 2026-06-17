@@ -909,6 +909,13 @@ fn cleanup_staged_files(staged: &[StagedFile]) {
 }
 
 fn sync_parent_dir(path: &Path) -> Result<()> {
+    #[cfg(windows)]
+    {
+        let _ = path;
+        return Ok(());
+    }
+
+    #[cfg(not(windows))]
     if let Some(parent) = path.parent() {
         let dir = std::fs::File::open(parent)
             .map_err(|e| anyhow::anyhow!("open identity dir {} failed: {}", parent.display(), e))?;

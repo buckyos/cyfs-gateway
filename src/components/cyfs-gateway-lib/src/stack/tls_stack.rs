@@ -1069,7 +1069,6 @@ impl crate::StackFactory for TlsStackFactory {
             .server_runtime(self.server_runtime.clone())
             .connection_manager(self.connection_manager.clone())
             .hook_point(config.hook_point.clone())
-            .add_certs(cert_list)
             .identity_certs(identity_certs)
             .concurrency(config.concurrency.unwrap_or(DEFAULT_TLS_CONCURRENCY))
             .alpn_protocols(
@@ -1218,7 +1217,8 @@ mod tests {
         ConnectionManager, DefaultLimiterManager, GlobalCollectionManager, MutComposedSpeedStat,
         ProcessChainConfigs, ProcessChainHttpServer, Server, ServerManager, ServerResult, Stack,
         StackFactory, StackProtocol, StatManager, StreamInfo, StreamServer, TlsStackConfig,
-        TlsStackFactory, TunnelManager, create_io_dump_stack_config, decode_io_dump_frames,
+        TlsStackFactory, TunnelManager, connect_timeout_from_secs, create_io_dump_stack_config,
+        decode_io_dump_frames, stream_idle_timeout_from_secs,
     };
     use crate::{
         LimiterManagerRef, ServerManagerRef, StackContext, StatManagerRef, TlsDomainConfig,
@@ -1950,6 +1950,8 @@ mod tests {
             stack_context,
             None,
             None,
+            stream_idle_timeout_from_secs(None),
+            connect_timeout_from_secs(None),
         )
         .await
         .unwrap();
@@ -1961,27 +1963,27 @@ mod tests {
         let handler = Arc::new(handler);
         let tls_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let tls_addr = tls_listener.local_addr().unwrap();
-        let server_handle = {
+        let server = {
             let handler = handler.clone();
-            tokio::spawn(async move {
-                let mut tasks = Vec::new();
-                for _ in 0..2 {
-                    let (stream, _) = tls_listener.accept().await.unwrap();
+            async move {
+                let handle_stream = |stream: TcpStream, handler: Arc<TlsConnectionHandler>| async move {
                     let local_addr = stream.local_addr().unwrap();
                     let compose_stat = MutComposedSpeedStat::new();
                     let stat_stream = StatStream::new_with_tracker(stream, compose_stat.clone());
-                    let handler = handler.clone();
-                    tasks.push(tokio::spawn(async move {
-                        handler
-                            .handle_connect(stat_stream, local_addr, compose_stat)
-                            .await
-                            .unwrap();
-                    }));
-                }
-                for task in tasks {
-                    task.await.unwrap();
-                }
-            })
+                    handler
+                        .handle_connect(stat_stream, local_addr, compose_stat)
+                        .await
+                        .unwrap();
+                };
+
+                let (first_stream, _) = tls_listener.accept().await.unwrap();
+                let first = handle_stream(first_stream, handler.clone());
+                let second = async {
+                    let (stream, _) = tls_listener.accept().await.unwrap();
+                    handle_stream(stream, handler).await;
+                };
+                tokio::join!(first, second);
+            }
         };
 
         let client_config =
@@ -1993,24 +1995,30 @@ mod tests {
                 .with_no_client_auth();
         let connector = TlsConnector::from(Arc::new(client_config));
 
-        let first = connect_tls_and_exchange(&connector, tls_addr).await;
-        assert!(matches!(
-            first,
-            HandshakeKind::Full | HandshakeKind::FullWithHelloRetryRequest
-        ));
-        for _ in 0..50 {
-            if session_storage.puts() > 0 {
-                break;
+        let client = async {
+            let first = connect_tls_and_exchange(&connector, tls_addr).await;
+            assert!(matches!(
+                first,
+                HandshakeKind::Full | HandshakeKind::FullWithHelloRetryRequest
+            ));
+            for _ in 0..50 {
+                if session_storage.puts() > 0 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        assert!(session_storage.puts() > 0);
+            assert!(session_storage.puts() > 0);
 
-        let second = connect_tls_and_exchange(&connector, tls_addr).await;
-        assert_eq!(second, HandshakeKind::Resumed);
-        assert!(session_storage.takes() > 0);
+            let second = connect_tls_and_exchange(&connector, tls_addr).await;
+            assert_eq!(second, HandshakeKind::Resumed);
+            assert!(session_storage.takes() > 0);
+        };
 
-        server_handle.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::join!(server, client);
+        })
+        .await
+        .unwrap();
         upstream_handle.await.unwrap();
     }
 

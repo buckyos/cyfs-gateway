@@ -154,13 +154,6 @@ stacks:
     #   io_dump_file: tls.dump
     #   stream_idle_timeout: 600    # stream forwarding idle timeout (seconds), default 600
     #   connect_timeout: 60        # forward target connection timeout (seconds), default 60
-    #   certs:
-    #     - domain: example.com # local certificate
-    #       cert_path: ./cert.pem
-    #       key_path: ./key.pem
-    #     - domain: example.org # ACME certificate
-    #       acme_type: optional, default tls-alpn-01, supports dns-01 | http-01 | tls-alpn-01
-    #     - domain: * # local default certificate; all connections through this stack use certs generated from the local root, configured via tls_ca
     #   hosts: # TLS identities supported by this stack; certs are loaded through the identity manager path protocol
     #     - example.com
     #     - "*.example.org"

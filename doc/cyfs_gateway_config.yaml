@@ -122,8 +122,6 @@ stacks:
   #   hosts: # TLS 只声明可响应的证书身份；证书由 acme.hosts 或 identity store 提供
   #     - example.com
   #     - "*.example.org"
-  #   certs:
-  #     - domain: * #本地缺省证书，所有通过该stack的连接都会使用本地根证书生成对应的证书，根证书可以通过tls_ca字段配置
   #   hook_point: { }
 
   # quic_example:
