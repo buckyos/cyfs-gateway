@@ -9,14 +9,15 @@ use std::time::Instant;
 use crate::acme_sn_provider::AcmeSnProviderFactory;
 use crate::config_loader::GatewayConfigParserRef;
 use crate::gateway_control_server::{
-    GATEWAY_CONTROL_SERVER_CONFIG, GATEWAY_CONTROL_SERVER_KEY, GatewayControlServerConfigParser,
-    GatewayControlServerContext,
+    GatewayControlServerConfigParser, GatewayControlServerContext, GATEWAY_CONTROL_SERVER_CONFIG,
+    GATEWAY_CONTROL_SERVER_KEY,
 };
 use crate::socks::SocksTunnelBuilder;
-use crate::{AcmeConfig, TlsCA, merge};
-use anyhow::{Result, anyhow};
+use crate::{merge, AcmeConfig, AcmeHostConfig, TlsCA};
+use anyhow::{anyhow, Result};
 use buckyos_kit::*;
 use chrono::Utc;
+use cyfs_acme::{AcmeCertManager, AcmeCertManagerRef, AcmeItem, CertManagerConfig, ChallengeType};
 use cyfs_dns::{
     DnsServerContext, InnerDnsRecordManager, InnerDnsRecordManagerRef, LocalDnsServerContext,
 };
@@ -29,11 +30,11 @@ use kRPC::RPCSessionToken;
 use log::*;
 use name_client::*;
 use name_lib::*;
-use rand::Rng;
 use rand::distr::Alphanumeric;
 use rand::rng;
+use rand::Rng;
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value, json};
+use serde_json::{json, Map, Value};
 use sfo_js::object::builtins::JsArray;
 use sfo_js::{JsEngine, JsPkg, JsPkgManager, JsPkgManagerRef, JsString, JsValue, NativeFunction};
 use sha2::Digest;
@@ -297,7 +298,6 @@ fn build_stack_context(
     global_process_chains: Option<GlobalProcessChainsRef>,
     global_collection_manager: Option<GlobalCollectionManagerRef>,
     js_externals: Option<JsExternalsManagerRef>,
-    acme_manager: AcmeCertManagerRef,
     self_cert_mgr: SelfCertMgrRef,
 ) -> StackResult<Arc<dyn StackContext>> {
     match protocol {
@@ -333,7 +333,6 @@ fn build_stack_context(
             tunnel_manager.clone(),
             limiter_manager.clone(),
             stat_manager.clone(),
-            acme_manager.clone(),
             self_cert_mgr.clone(),
             global_process_chains.clone(),
             global_collection_manager.clone(),
@@ -344,7 +343,6 @@ fn build_stack_context(
             tunnel_manager.clone(),
             limiter_manager.clone(),
             stat_manager.clone(),
-            acme_manager,
             self_cert_mgr,
             global_process_chains.clone(),
             global_collection_manager.clone(),
@@ -367,6 +365,86 @@ fn build_stack_context(
             )),
         },
     }
+}
+
+fn build_acme_host_data(host_config: &AcmeHostConfig) -> Result<Option<Value>> {
+    let mut data = match host_config.data.clone() {
+        Some(Value::Object(data)) => data,
+        Some(Value::Null) | None => Map::new(),
+        Some(data) => {
+            return Err(anyhow!(
+                "acme host {} has invalid extra data, expected object, got {}",
+                host_config.host,
+                data
+            ));
+        }
+    };
+
+    if let Some(dns_provider) = host_config.dns_provider.as_ref() {
+        data.insert(
+            "dns_provider".to_string(),
+            Value::String(dns_provider.clone()),
+        );
+    }
+
+    if data.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(Value::Object(data)))
+    }
+}
+
+fn register_acme_hosts(
+    cert_manager: &AcmeCertManagerRef,
+    acme_config: &Option<AcmeConfig>,
+) -> Result<()> {
+    let Some(acme_config) = acme_config.as_ref() else {
+        return Ok(());
+    };
+
+    for host_config in acme_config.hosts.iter() {
+        let host = host_config.host.trim();
+        if host.is_empty() {
+            return Err(anyhow!("acme host cannot be empty"));
+        }
+        if host == "*" {
+            return Err(anyhow!(
+                "acme host '*' is not a valid ACME certificate domain"
+            ));
+        }
+
+        let challenge_type = host_config
+            .challenge_type
+            .unwrap_or(ChallengeType::TlsAlpn01);
+        if challenge_type == ChallengeType::Unknown {
+            return Err(anyhow!("acme host {} has unknown challenge_type", host));
+        }
+
+        let data = build_acme_host_data(host_config)?;
+        if challenge_type == ChallengeType::Dns01 {
+            let has_dns_provider = data
+                .as_ref()
+                .and_then(|data| data.get("dns_provider"))
+                .and_then(|provider| provider.as_str())
+                .map(|provider| !provider.trim().is_empty())
+                .unwrap_or(false);
+            if !has_dns_provider {
+                return Err(anyhow!(
+                    "acme host {} uses dns-01 but dns_provider is not configured",
+                    host
+                ));
+            }
+        }
+
+        cert_manager.add_acme_item(
+            AcmeItem::new(host.to_string(), challenge_type, data).with_identity(
+                host_config.identity.clone(),
+                host_config.identity_manager.clone(),
+            ),
+        )?;
+    }
+
+    Ok(())
 }
 fn read_config_value(path: &Path) -> Result<Value> {
     let content = std::fs::read_to_string(path)
@@ -614,6 +692,7 @@ async fn build_acme_mgr_from_config(
             cert_config.acme_server = acme_config.issuer.unwrap();
         }
         cert_config.dns_providers = acme_config.dns_providers;
+        cert_config.identity_manager = acme_config.identity_manager;
         if acme_config.check_interval.is_some() {
             if let Some(check_interval) =
                 chrono::Duration::new(acme_config.check_interval.unwrap() as i64, 0)
@@ -812,6 +891,7 @@ impl GatewayFactory {
                 }
             },
         );
+        register_acme_hosts(&cert_manager, &config.acme_config)?;
 
         let self_cert_manager = build_self_cert_mgr_from_config(&config.tls_ca).await?;
 
@@ -888,7 +968,6 @@ impl GatewayFactory {
                 Some(global_process_chains.clone()),
                 Some(global_collections.clone()),
                 Some(js_externals.clone()),
-                cert_manager.clone(),
                 self_cert_manager.clone(),
             )?;
             let stack = self
@@ -2880,6 +2959,7 @@ impl Gateway {
                 }
             },
         );
+        register_acme_hosts(&cert_manager, &config.acme_config)?;
 
         let self_cert_manager = build_self_cert_mgr_from_config(&config.tls_ca).await?;
 
@@ -2941,7 +3021,6 @@ impl Gateway {
                 Some(global_process_chains.clone()),
                 Some(global_collections.clone()),
                 Some(js_externals.clone()),
-                cert_manager.clone(),
                 self_cert_manager.clone(),
             )?;
             exist_stacks.insert(stack_config.id().clone());

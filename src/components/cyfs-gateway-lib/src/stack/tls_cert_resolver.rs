@@ -1,24 +1,27 @@
 use crate::SelfCertMgrRef;
+use name_client::{IdentityMaterial, IdentityRoots, IdentityUsage};
 use rustls::client::verify_server_name;
+use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{DnsName, ServerName};
 use rustls::server::{ClientHello, ParsedCertificate, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
-use rustls::{Error, server, sign};
+use rustls::{Error, sign};
 use std::collections::HashMap;
 use std::fmt::Debug;
-use std::sync::{Arc, Mutex};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::Duration;
+use tokio::task::JoinHandle;
 
 #[derive(Debug)]
 pub(crate) struct ResolvesServerCertUsingSni {
     by_name: Mutex<HashMap<String, Arc<sign::CertifiedKey>>>,
-    external_resolver: Option<Arc<dyn server::ResolvesServerCert>>,
 }
 
 impl ResolvesServerCertUsingSni {
-    pub fn new(external_resolver: Option<Arc<dyn server::ResolvesServerCert>>) -> Self {
+    pub fn new() -> Self {
         Self {
             by_name: Mutex::new(HashMap::new()),
-            external_resolver,
         }
     }
 
@@ -75,39 +78,371 @@ impl ResolvesServerCertUsingSni {
     }
 }
 
-impl server::ResolvesServerCert for ResolvesServerCertUsingSni {
+impl ResolvesServerCert for ResolvesServerCertUsingSni {
     fn resolve(&self, client_hello: ClientHello<'_>) -> Option<Arc<sign::CertifiedKey>> {
         if let Some(name) = client_hello.server_name() {
-            {
-                let certs = self.by_name.lock().unwrap();
+            let certs = self.by_name.lock().unwrap();
 
-                let name = name.to_lowercase();
-                // 首先尝试精确匹配
-                if let Some(cert) = certs.get(name.as_str()).cloned() {
-                    return Some(cert);
-                }
-
-                // 然后尝试通配符匹配
-                for (cert_name, cert) in certs.iter() {
-                    if cert_name.starts_with("*.")
-                        && Self::matches_wildcard(name.as_str(), cert_name)
-                    {
-                        return Some(cert.clone());
-                    }
-                }
+            let name = name.to_lowercase();
+            // 首先尝试精确匹配
+            if let Some(cert) = certs.get(name.as_str()).cloned() {
+                return Some(cert);
             }
 
-            if self.external_resolver.is_none() {
-                return None;
+            // 然后尝试通配符匹配
+            for (cert_name, cert) in certs.iter() {
+                if cert_name.starts_with("*.") && Self::matches_wildcard(name.as_str(), cert_name) {
+                    return Some(cert.clone());
+                }
             }
-            self.external_resolver
-                .as_ref()
-                .unwrap()
-                .resolve(client_hello)
-        } else {
-            None
+        }
+
+        None
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct TlsIdentityHost {
+    pub identity: String,
+    pub tls_host: String,
+}
+
+impl TlsIdentityHost {
+    pub fn new(roots: &IdentityRoots, identity: impl Into<String>) -> Result<Self, String> {
+        let identity = identity.into();
+        let tls_host = identity_to_tls_host(roots, &identity)?;
+        Ok(Self { identity, tls_host })
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct TlsIdentityCertConfig {
+    pub roots: IdentityRoots,
+    pub hosts: Vec<TlsIdentityHost>,
+    pub refresh_interval: Duration,
+}
+
+#[derive(Debug)]
+pub(crate) struct IdentityCertResolver {
+    roots: IdentityRoots,
+    hosts: Vec<TlsIdentityHost>,
+    by_name: RwLock<HashMap<String, Arc<CertifiedKey>>>,
+    errors: Mutex<HashMap<String, String>>,
+    external_resolver: Option<Arc<dyn ResolvesServerCert>>,
+    refresh_handle: Mutex<Option<JoinHandle<()>>>,
+}
+
+impl IdentityCertResolver {
+    pub fn new(
+        config: TlsIdentityCertConfig,
+        external_resolver: Option<Arc<dyn ResolvesServerCert>>,
+    ) -> Arc<Self> {
+        let resolver = Arc::new(Self {
+            roots: config.roots,
+            hosts: config.hosts,
+            by_name: RwLock::new(HashMap::new()),
+            errors: Mutex::new(HashMap::new()),
+            external_resolver,
+            refresh_handle: Mutex::new(None),
+        });
+
+        log::info!(
+            "TLS identity certificate resolver enabled: public_root={}, security_root={}, refresh_interval={:?}, hosts=[{}]",
+            resolver.roots.public_root.display(),
+            resolver.roots.security_root.display(),
+            config.refresh_interval,
+            resolver
+                .hosts
+                .iter()
+                .map(|host| format!("{}=>{}", host.identity, host.tls_host))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+
+        resolver.refresh_all();
+        resolver.start_refresh(config.refresh_interval);
+        resolver
+    }
+
+    fn start_refresh(self: &Arc<Self>, interval: Duration) {
+        if interval.is_zero() {
+            return;
+        }
+
+        let weak = Arc::downgrade(self);
+        let handle = tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            loop {
+                ticker.tick().await;
+                let Some(resolver) = weak.upgrade() else {
+                    break;
+                };
+                resolver.refresh_all();
+            }
+        });
+        *self.refresh_handle.lock().unwrap() = Some(handle);
+    }
+
+    fn refresh_all(&self) {
+        for host in self.hosts.iter() {
+            self.refresh_host(host);
         }
     }
+
+    fn refresh_host(&self, host: &TlsIdentityHost) {
+        let cache_key = host.tls_host.to_lowercase();
+        match self.load_host_cert(host) {
+            Ok(cert) => {
+                self.by_name.write().unwrap().insert(cache_key, cert);
+                if self.errors.lock().unwrap().remove(&host.identity).is_some() {
+                    log::info!("loaded TLS identity certificate for {}", host.identity);
+                }
+            }
+            Err(err) => {
+                self.by_name.write().unwrap().remove(&cache_key);
+                let mut errors = self.errors.lock().unwrap();
+                if errors.get(&host.identity) != Some(&err) {
+                    log::warn!(
+                        "TLS identity certificate for {} is unavailable: {}; lookup: {}",
+                        host.identity,
+                        err,
+                        describe_identity_cert_lookup(&self.roots, host)
+                    );
+                    errors.insert(host.identity.clone(), err);
+                }
+            }
+        }
+    }
+
+    fn load_host_cert(&self, host: &TlsIdentityHost) -> Result<Arc<CertifiedKey>, String> {
+        log::debug!(
+            "loading TLS identity certificate: {}",
+            describe_identity_cert_lookup(&self.roots, host)
+        );
+        let cert_match = self
+            .roots
+            .find_public_file(
+                &host.identity,
+                IdentityUsage::Server,
+                IdentityMaterial::Fullchain,
+            )
+            .map_err(|e| format!("find server fullchain failed: {e}"))?;
+        let key_path = identity_private_key_path(&self.roots, &cert_match.dir_name);
+        log::debug!(
+            "TLS identity certificate files selected for {}: fullchain={} (match_type={}, raw_host_uri={}, dir_name={}), private_key={}",
+            host.identity,
+            cert_match.path.display(),
+            cert_match.match_type,
+            cert_match.raw_host_uri,
+            cert_match.dir_name,
+            key_path.display()
+        );
+
+        let certs = load_cert_file(&cert_match.path)?;
+        let key = load_key_file(&key_path)?;
+        let crypto_provider = rustls::crypto::ring::default_provider();
+        let cert_key = CertifiedKey::from_der(certs, key, &crypto_provider)
+            .map_err(|e| format!("parse certificate/key failed: {e}"))?;
+        verify_cert_name(&host.tls_host, &cert_key)?;
+        Ok(Arc::new(cert_key))
+    }
+
+    fn resolve_cached(&self, name: &str) -> Option<Arc<CertifiedKey>> {
+        let certs = self.by_name.read().unwrap();
+
+        if let Some(cert) = certs.get(name).cloned() {
+            return Some(cert);
+        }
+
+        for (cert_name, cert) in certs.iter() {
+            if cert_name.starts_with("*.")
+                && ResolvesServerCertUsingSni::matches_wildcard(name, cert_name)
+            {
+                return Some(cert.clone());
+            }
+        }
+
+        None
+    }
+
+    fn refresh_matching_hosts(&self, name: &str) {
+        for host in self.hosts.iter() {
+            let configured = host.tls_host.to_lowercase();
+            if configured == name
+                || (configured.starts_with("*.")
+                    && ResolvesServerCertUsingSni::matches_wildcard(name, &configured))
+            {
+                self.refresh_host(host);
+            }
+        }
+    }
+}
+
+impl Drop for IdentityCertResolver {
+    fn drop(&mut self) {
+        if let Some(handle) = self.refresh_handle.lock().unwrap().take() {
+            handle.abort();
+        }
+    }
+}
+
+impl ResolvesServerCert for IdentityCertResolver {
+    fn resolve(&self, client_hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
+        let server_name = client_hello.server_name().map(|name| name.to_lowercase());
+        if let Some(name) = server_name.as_deref() {
+            if let Some(cert) = self.resolve_cached(name) {
+                return Some(cert);
+            }
+
+            self.refresh_matching_hosts(name);
+            if let Some(cert) = self.resolve_cached(name) {
+                return Some(cert);
+            }
+        }
+
+        self.external_resolver
+            .as_ref()
+            .and_then(|resolver| resolver.resolve(client_hello))
+    }
+}
+
+fn describe_identity_cert_lookup(roots: &IdentityRoots, host: &TlsIdentityHost) -> String {
+    let mut parts = vec![
+        format!("identity={}", host.identity),
+        format!("tls_host={}", host.tls_host),
+        format!("public_root={}", roots.public_root.display()),
+        format!("security_root={}", roots.security_root.display()),
+    ];
+
+    match roots.raw_host_uri(&host.identity) {
+        Ok(raw_host_uri) => {
+            parts.push(format!("raw_host_uri={raw_host_uri}"));
+            parts.push(format!(
+                "candidate_exact={}",
+                describe_identity_cert_candidate(roots, "exact", &host.identity)
+            ));
+            if let Some(wildcard_input) = wildcard_identity_input(&raw_host_uri) {
+                parts.push(format!(
+                    "candidate_wildcard={}",
+                    describe_identity_cert_candidate(roots, "wildcard", &wildcard_input)
+                ));
+            }
+        }
+        Err(err) => {
+            parts.push(format!("raw_host_uri_error={err}"));
+        }
+    }
+
+    parts.join("; ")
+}
+
+fn describe_identity_cert_candidate(
+    roots: &IdentityRoots,
+    match_type: &str,
+    identity: &str,
+) -> String {
+    match roots.raw_host_uri(identity).and_then(|raw_host_uri| {
+        roots
+            .x509_paths(identity, IdentityUsage::Server)
+            .map(|paths| (raw_host_uri, paths))
+    }) {
+        Ok((raw_host_uri, paths)) => format!(
+            "match_type={}, input={}, raw_host_uri={}, fullchain={}, private_key={}",
+            match_type,
+            identity,
+            raw_host_uri,
+            describe_path(&paths.fullchain),
+            paths
+                .private_key
+                .as_ref()
+                .map(|path| describe_path(path))
+                .unwrap_or_else(|| "none".to_string())
+        ),
+        Err(err) => format!("match_type={match_type}, input={identity}, error={err}"),
+    }
+}
+
+fn describe_path(path: &Path) -> String {
+    format!(
+        "{} ({})",
+        path.display(),
+        if path.exists() { "exists" } else { "missing" }
+    )
+}
+
+fn wildcard_identity_input(raw_host_uri: &str) -> Option<String> {
+    if raw_host_uri.contains('/') {
+        return None;
+    }
+
+    let labels = raw_host_uri.split('.').collect::<Vec<_>>();
+    if labels.len() < 3 || labels.first() == Some(&"_") || labels.first() == Some(&"*") {
+        return None;
+    }
+
+    Some(format!("*.{}", labels[1..].join(".")))
+}
+
+fn identity_private_key_path(roots: &IdentityRoots, dir_name: &str) -> PathBuf {
+    roots
+        .security_root
+        .join(dir_name)
+        .join("server.private.pem")
+}
+
+fn identity_to_tls_host(roots: &IdentityRoots, identity: &str) -> Result<String, String> {
+    match name_client::did_web_dns_san(identity) {
+        Ok(host) => return Ok(host.to_lowercase()),
+        Err(err) => {
+            log::debug!(
+                "identity {} is not did:web for TLS DNS SAN: {}",
+                identity,
+                err
+            );
+        }
+    }
+
+    let raw_host_uri = roots
+        .raw_host_uri(identity)
+        .map_err(|e| format!("invalid identity host {identity}: {e}"))?;
+    let raw_host = raw_host_uri
+        .split_once('/')
+        .map(|(host, _)| host)
+        .unwrap_or(raw_host_uri.as_str());
+    let tls_host = raw_host
+        .strip_prefix("_.")
+        .map(|suffix| format!("*.{suffix}"))
+        .unwrap_or_else(|| raw_host.to_string());
+    Ok(tls_host.to_lowercase())
+}
+
+fn load_cert_file(path: &Path) -> Result<Vec<rustls::pki_types::CertificateDer<'static>>, String> {
+    rustls::pki_types::CertificateDer::pem_file_iter(path)
+        .map_err(|e| format!("read certificate {} failed: {e}", path.display()))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("parse certificate {} failed: {e}", path.display()))
+}
+
+fn load_key_file(path: &Path) -> Result<rustls::pki_types::PrivateKeyDer<'static>, String> {
+    rustls::pki_types::PrivateKeyDer::from_pem_file(path)
+        .map_err(|e| format!("parse private key {} failed: {e}", path.display()))
+}
+
+fn verify_cert_name(name: &str, cert_key: &CertifiedKey) -> Result<(), String> {
+    let check_name = if let Some(suffix) = name.strip_prefix("*.") {
+        format!("test.{suffix}")
+    } else {
+        name.to_string()
+    };
+    let checked_name = DnsName::try_from(check_name)
+        .map_err(|_| format!("bad DNS name: {name}"))?
+        .to_lowercase_owned();
+    let server_name = ServerName::DnsName(checked_name);
+    cert_key
+        .end_entity_cert()
+        .and_then(ParsedCertificate::try_from)
+        .and_then(|cert| verify_server_name(&cert, &server_name))
+        .map_err(|e| format!("certificate does not match {name}: {e}"))
 }
 
 pub struct TlsCertResolver {
@@ -152,6 +487,12 @@ impl ResolvesServerCert for TlsCertResolver {
 
 #[cfg(test)]
 mod tests {
+    use super::{IdentityCertResolver, TlsIdentityHost};
+    use name_client::IdentityRoots;
+    use rcgen::generate_simple_self_signed;
+    use std::collections::HashMap;
+    use std::sync::{Mutex, RwLock};
+
     #[test]
     fn test_matches_wildcard() {
         assert!(!super::ResolvesServerCertUsingSni::matches_wildcard(
@@ -170,5 +511,37 @@ mod tests {
             "www.example1.com",
             "example.com"
         ));
+    }
+
+    #[test]
+    fn test_identity_resolver_loads_cert_from_identity_roots() {
+        let cert_key = generate_simple_self_signed(vec!["example.com".to_string()]).unwrap();
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let roots = IdentityRoots::new(
+            tmp_dir.path().join("local").join("identity"),
+            tmp_dir.path().join("security"),
+        );
+        let public_dir = roots.public_dir("example.com").unwrap();
+        let security_dir = roots.security_dir("example.com").unwrap();
+        std::fs::create_dir_all(&public_dir).unwrap();
+        std::fs::create_dir_all(&security_dir).unwrap();
+        std::fs::write(public_dir.join("server.fullchain.pem"), cert_key.cert.pem()).unwrap();
+        std::fs::write(
+            security_dir.join("server.private.pem"),
+            cert_key.signing_key.serialize_pem(),
+        )
+        .unwrap();
+
+        let host = TlsIdentityHost::new(&roots, "example.com").unwrap();
+        let resolver = IdentityCertResolver {
+            roots,
+            hosts: vec![host.clone()],
+            by_name: RwLock::new(HashMap::new()),
+            errors: Mutex::new(HashMap::new()),
+            external_resolver: None,
+            refresh_handle: Mutex::new(None),
+        };
+
+        assert!(resolver.load_host_cert(&host).is_ok());
     }
 }

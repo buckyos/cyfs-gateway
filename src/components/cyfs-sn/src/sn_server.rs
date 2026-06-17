@@ -1,19 +1,20 @@
 #![allow(unused)]
+use crate::name_info_cache::{NameInfoCache, NameInfoCacheQueryResult, NameInfoCacheRef};
 use crate::sn_db::{self, *};
 use crate::sqlite_db::SqliteSnDB;
 use crate::v2::{
-    handle_auth, handle_device, handle_did, handle_dns, handle_query, handle_user, handle_zone,
-    parse_params, require_account_username, DeviceUpdateReq, SnV2AuthManager,
+    DeviceUpdateReq, SnV2AuthManager, handle_auth, handle_device, handle_did, handle_dns,
+    handle_query, handle_user, handle_zone, parse_params, require_account_username,
 };
 use ::kRPC::*;
 use async_trait::async_trait;
-use buckyos_kit::{get_buckyos_service_data_dir, is_valid_name, NameType};
-use cyfs_gateway_lib::{into_server_err, server_err};
+use buckyos_kit::{NameType, get_buckyos_service_data_dir, is_valid_name};
 use cyfs_gateway_lib::{
-    qa_json_to_rpc_request, HttpRequestProcessChainVars, HttpServer, NameServer, QAServer, Server,
-    ServerConfig, ServerContextRef, ServerError, ServerErrorCode, ServerFactory, ServerResult,
-    StreamInfo,
+    HttpRequestProcessChainVars, HttpServer, NameServer, QAServer, Server, ServerConfig,
+    ServerContextRef, ServerError, ServerErrorCode, ServerFactory, ServerResult, StreamInfo,
+    qa_json_to_rpc_request,
 };
+use cyfs_gateway_lib::{into_server_err, server_err};
 use http::{Method, Response, StatusCode};
 use http_body_util::combinators::UnsyncBoxBody;
 use http_body_util::{BodyExt, Collected, Full};
@@ -24,7 +25,7 @@ use log::*;
 use name_client::*;
 use name_lib::*;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
@@ -36,15 +37,11 @@ use std::{
     net::{IpAddr, Ipv4Addr},
     result::Result,
 };
-use tokio::sync::{Mutex, RwLock};
-use tokio::time::{Duration, Instant};
+use tokio::sync::Mutex;
 
 const CLEAR_STATE_ACTIVE_CODE: &str = "zX6cV7bN8mK9lJ0hG1fD";
 const RESERVED_USER_NAMES_FILE_ENV: &str = "BUCKYOS_SN_RESERVED_NAMES_FILE";
 const RESERVED_USER_NAMES_FILE: &str = "reserved_user_names.txt";
-const SN_QUERY_POSITIVE_TTL_SECS: u64 = 60;
-const SN_QUERY_NEGATIVE_TTL_SECS: u64 = 15;
-
 fn is_filtered_zonegate_ip(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(ipv4) => {
@@ -158,19 +155,7 @@ pub struct SNServer {
     device_jwt: Vec<String>,
     db: SnDBRef,
     v2_auth: Arc<SnV2AuthManager>,
-    query_cache: Arc<RwLock<HashMap<String, SnQueryCacheEntry>>>,
-}
-
-#[derive(Clone, Debug)]
-enum SnQueryCacheValue {
-    Hit(NameInfo),
-    Miss,
-}
-
-#[derive(Clone, Debug)]
-struct SnQueryCacheEntry {
-    expires_at: Instant,
-    value: SnQueryCacheValue,
+    name_info_cache: NameInfoCacheRef,
 }
 
 impl SNServer {
@@ -228,58 +213,6 @@ impl SNServer {
         name.trim().trim_end_matches('.').to_ascii_lowercase()
     }
 
-    fn build_query_cache_key(name: &str, record_type: RecordType) -> String {
-        format!(
-            "{}|{}",
-            Self::normalize_query_name(name),
-            record_type.to_string()
-        )
-    }
-
-    async fn get_cached_query_result(
-        &self,
-        name: &str,
-        record_type: RecordType,
-    ) -> Option<ServerResult<NameInfo>> {
-        let key = Self::build_query_cache_key(name, record_type);
-        let mut cache = self.query_cache.write().await;
-        let Some(entry) = cache.get(key.as_str()).cloned() else {
-            return None;
-        };
-
-        if Instant::now() >= entry.expires_at {
-            cache.remove(key.as_str());
-            return None;
-        }
-
-        match entry.value {
-            SnQueryCacheValue::Hit(name_info) => Some(Ok(name_info)),
-            SnQueryCacheValue::Miss => Some(Err(server_err!(
-                ServerErrorCode::NotFound,
-                "cached miss for {}",
-                Self::normalize_query_name(name)
-            ))),
-        }
-    }
-
-    async fn cache_query_hit(&self, name: &str, record_type: RecordType, name_info: &NameInfo) {
-        let key = Self::build_query_cache_key(name, record_type);
-        let entry = SnQueryCacheEntry {
-            expires_at: Instant::now() + Duration::from_secs(SN_QUERY_POSITIVE_TTL_SECS),
-            value: SnQueryCacheValue::Hit(name_info.clone()),
-        };
-        self.query_cache.write().await.insert(key, entry);
-    }
-
-    async fn cache_query_miss(&self, name: &str, record_type: RecordType) {
-        let key = Self::build_query_cache_key(name, record_type);
-        let entry = SnQueryCacheEntry {
-            expires_at: Instant::now() + Duration::from_secs(SN_QUERY_NEGATIVE_TTL_SECS),
-            value: SnQueryCacheValue::Miss,
-        };
-        self.query_cache.write().await.insert(key, entry);
-    }
-
     fn build_user_query_cache_domains(
         &self,
         username: &str,
@@ -300,15 +233,7 @@ impl SNServer {
             return;
         }
 
-        let mut cache = self.query_cache.write().await;
-        cache.retain(|key, _| {
-            let Some((cached_domain, _)) = key.split_once('|') else {
-                return true;
-            };
-            !domains.iter().any(|domain| {
-                cached_domain == domain || cached_domain.ends_with(format!(".{}", domain).as_str())
-            })
-        });
+        self.name_info_cache.remove_matching_domains(domains);
     }
 
     pub(crate) async fn invalidate_query_cache_for_username(&self, username: &str) {
@@ -428,8 +353,7 @@ impl SNServer {
 
                 warn!(
                     "[schema_compat] mini_config decode failed in {}: {}; trying jwt-claims compatibility fallback",
-                    context,
-                    primary_err
+                    context, primary_err
                 );
 
                 let mut claims = decode_json_from_jwt_with_pk(mini_config_jwt, user_public_key)
@@ -510,8 +434,45 @@ impl SNServer {
             device_jwt: server_config.device_jwt,
             db,
             v2_auth,
-            query_cache: Arc::new(RwLock::new(HashMap::new())),
+            name_info_cache: NameInfoCache::new_ref(),
         }
+    }
+
+    pub fn name_info_cache(&self) -> NameInfoCacheRef {
+        self.name_info_cache.clone()
+    }
+
+    pub fn add_name_info_cache(
+        &self,
+        name: &str,
+        record_type: RecordType,
+        name_info: NameInfo,
+        cache_ttl_secs: Option<u32>,
+    ) {
+        self.name_info_cache
+            .add(name, record_type, name_info, cache_ttl_secs);
+    }
+
+    pub fn add_name_info_tombstone_cache(
+        &self,
+        name: &str,
+        record_type: RecordType,
+        cache_ttl_secs: Option<u32>,
+    ) {
+        self.name_info_cache
+            .add_tombstone(name, record_type, cache_ttl_secs);
+    }
+
+    fn cache_name_info_result(
+        &self,
+        name: &str,
+        record_type: RecordType,
+        name_info: NameInfo,
+    ) -> NameInfo {
+        let cache_ttl_secs = name_info.ttl;
+        self.name_info_cache
+            .add(name, record_type, name_info.clone(), cache_ttl_secs);
+        name_info
     }
 
     pub async fn check_username(&self, req: RPCRequest) -> Result<RPCResponse, RPCErrors> {
@@ -948,12 +909,12 @@ impl SNServer {
             Some(_) => {
                 return Err(RPCErrors::ParseRequestError(
                     "token user mismatch".to_string(),
-                ))
+                ));
             }
             None => {
                 return Err(RPCErrors::ParseRequestError(
                     "Invalid token: sub is none".to_string(),
-                ))
+                ));
             }
         }
 
@@ -1039,9 +1000,7 @@ impl SNServer {
             Self::verify_legacy_device_update_trusted_token(&rpc_session_token)?;
             warn!(
                 "accept legacy device update with trusted verify-hub token for {}_{} after device signature verify failed: {}",
-                owner_id,
-                device_info.name,
-                verify_err
+                owner_id, device_info.name, verify_err
             );
         }
 
@@ -1086,12 +1045,12 @@ impl SNServer {
                 return Err(RPCErrors::InvalidToken(format!(
                     "legacy device.update token issuer mismatch: {}",
                     other
-                )))
+                )));
             }
             None => {
                 return Err(RPCErrors::InvalidToken(
                     "legacy device.update token issuer missing".to_string(),
-                ))
+                ));
             }
         }
 
@@ -1101,12 +1060,12 @@ impl SNServer {
                 return Err(RPCErrors::InvalidToken(format!(
                     "legacy device.update token appid mismatch: {}",
                     other
-                )))
+                )));
             }
             None => {
                 return Err(RPCErrors::InvalidToken(
                     "legacy device.update token appid missing".to_string(),
-                ))
+                ));
             }
         }
 
@@ -1116,12 +1075,12 @@ impl SNServer {
                 return Err(RPCErrors::InvalidToken(format!(
                     "legacy device.update token aud mismatch: {}",
                     other
-                )))
+                )));
             }
             None => {
                 return Err(RPCErrors::InvalidToken(
                     "legacy device.update token aud missing".to_string(),
-                ))
+                ));
             }
         }
 
@@ -1131,12 +1090,12 @@ impl SNServer {
                 return Err(RPCErrors::InvalidToken(format!(
                     "legacy device.update token sub mismatch: {}",
                     other
-                )))
+                )));
             }
             None => {
                 return Err(RPCErrors::InvalidToken(
                     "legacy device.update token sub missing".to_string(),
-                ))
+                ));
             }
         }
 
@@ -1504,9 +1463,7 @@ impl SNServer {
             if let Some(field) = Self::extract_missing_field_name(parse_err_str.as_str()) {
                 warn!(
                     "[schema_compat] failed to parse device info for {}: missing required field `{}`; raw_error={}; please refresh device registration",
-                    key,
-                    field,
-                    parse_err_str
+                    key, field, parse_err_str
                 );
             }
             warn!(
@@ -2193,12 +2150,12 @@ impl SNServer {
             Some(_) => {
                 return Err(RPCErrors::ParseRequestError(
                     "token user mismatch".to_string(),
-                ))
+                ));
             }
             None => {
                 return Err(RPCErrors::ParseRequestError(
                     "Invalid token: sub is none".to_string(),
-                ))
+                ));
             }
         }
 
@@ -2987,11 +2944,7 @@ impl SNServer {
     ) -> ServerResult<EncodedDocument> {
         let doc_type = doc_type.and_then(|t| {
             let t = t.trim();
-            if t.is_empty() {
-                None
-            } else {
-                Some(t)
-            }
+            if t.is_empty() { None } else { Some(t) }
         });
 
         match did.method.as_str() {
@@ -3254,20 +3207,7 @@ impl NameServer for SNServer {
         from_ip: Option<IpAddr>,
     ) -> ServerResult<NameInfo> {
         let record_type = record_type.unwrap_or_default();
-        if let Some(cached) = self.get_cached_query_result(name, record_type).await {
-            return cached;
-        }
-
-        let result = self.query_uncached(name, record_type, from_ip).await;
-        match &result {
-            Ok(name_info) => self.cache_query_hit(name, record_type, name_info).await,
-            Err(err) if err.code() == ServerErrorCode::NotFound => {
-                self.cache_query_miss(name, record_type).await
-            }
-            Err(_) => {}
-        }
-
-        result
+        self.query_uncached(name, record_type, from_ip).await
     }
 
     async fn query_did(
@@ -3313,6 +3253,31 @@ impl SNServer {
             req_real_name = name.trim_end_matches('.').to_string();
         }
 
+        match self
+            .name_info_cache
+            .query(req_real_name.as_str(), record_type)
+        {
+            Some(NameInfoCacheQueryResult::Hit(name_info)) => {
+                info!(
+                    "sn server name cache hit: {} record_type: {:?}",
+                    req_real_name, record_type
+                );
+                return Ok(name_info);
+            }
+            Some(NameInfoCacheQueryResult::Tombstone) => {
+                info!(
+                    "sn server name cache tombstone hit: {} record_type: {:?}",
+                    req_real_name, record_type
+                );
+                return Err(server_err!(
+                    ServerErrorCode::NotFound,
+                    "no address found for {}",
+                    name.to_string()
+                ));
+            }
+            None => {}
+        }
+
         let sn_full_host = format!("sn.{}", self.server_host);
         if req_real_name == sn_full_host
             || req_real_name == self.server_host
@@ -3323,16 +3288,34 @@ impl SNServer {
                 RecordType::A => {
                     if self.server_ip.is_ipv4() {
                         let result_name_info = NameInfo::from_address(name, self.server_ip);
-                        return Ok(result_name_info);
+                        return Ok(self.cache_name_info_result(
+                            req_real_name.as_str(),
+                            record_type,
+                            result_name_info,
+                        ));
                     }
-                    return Ok(NameInfo::from_address_vec(name, vec![]));
+                    let result_name_info = NameInfo::from_address_vec(name, vec![]);
+                    return Ok(self.cache_name_info_result(
+                        req_real_name.as_str(),
+                        record_type,
+                        result_name_info,
+                    ));
                 }
                 RecordType::AAAA => {
                     if self.server_ip.is_ipv6() {
                         let result_name_info = NameInfo::from_address(name, self.server_ip);
-                        return Ok(result_name_info);
+                        return Ok(self.cache_name_info_result(
+                            req_real_name.as_str(),
+                            record_type,
+                            result_name_info,
+                        ));
                     }
-                    return Ok(NameInfo::from_address_vec(name, vec![]));
+                    let result_name_info = NameInfo::from_address_vec(name, vec![]);
+                    return Ok(self.cache_name_info_result(
+                        req_real_name.as_str(),
+                        record_type,
+                        result_name_info,
+                    ));
                 }
                 RecordType::TXT => {
                     let device_jwt = self.device_jwt.get(0);
@@ -3341,7 +3324,11 @@ impl SNServer {
                         self.owner_pkx.as_str(),
                         device_jwt,
                     );
-                    return Ok(name_info);
+                    return Ok(self.cache_name_info_result(
+                        req_real_name.as_str(),
+                        record_type,
+                        name_info,
+                    ));
                 }
                 _ => {
                     return Err(server_err!(
@@ -3383,7 +3370,11 @@ impl SNServer {
                         let mut name_info = NameInfo::default();
                         name_info.ttl = Some(ttl);
                         name_info.txt.push(record);
-                        return Ok(name_info);
+                        return Ok(self.cache_name_info_result(
+                            req_real_name.as_str(),
+                            record_type,
+                            name_info,
+                        ));
                     }
                     let zone_config = self.get_user_zone_config(username.as_str()).await;
                     if zone_config.is_some() {
@@ -3398,7 +3389,11 @@ impl SNServer {
                             "<={} zone_config:{} public_key:{} device_jwt:{:?} ",
                             name, zone_config, public_key, device_jwt
                         );
-                        Ok(name_info)
+                        Ok(self.cache_name_info_result(
+                            req_real_name.as_str(),
+                            record_type,
+                            name_info,
+                        ))
                     } else {
                         Err(server_err!(
                             ServerErrorCode::NotFound,
@@ -3425,8 +3420,12 @@ impl SNServer {
 
                         let mut result_name_info = NameInfo::from_address_vec(name, address_vec);
                         result_name_info.ttl = Some(ttl);
-                        debug!("=>{} result_name_info: {:?}", name, result_name_info);
-                        return Ok(result_name_info);
+                        info!("=>{} result_name_info: {:?}", name, result_name_info);
+                        return Ok(self.cache_name_info_result(
+                            req_real_name.as_str(),
+                            record_type,
+                            result_name_info,
+                        ));
                     }
                     let address_vec = self
                         .get_user_zonegate_address(username.as_str(), record_type)
@@ -3434,8 +3433,12 @@ impl SNServer {
                     if address_vec.is_some() {
                         let address_vec = address_vec.unwrap();
                         let result_name_info = NameInfo::from_address_vec(name, address_vec);
-                        debug!("=>{} result_name_info: {:?}", name, result_name_info);
-                        Ok(result_name_info)
+                        info!("=>{} result_name_info: {:?}", name, result_name_info);
+                        Ok(self.cache_name_info_result(
+                            req_real_name.as_str(),
+                            record_type,
+                            result_name_info,
+                        ))
                     } else {
                         Err(server_err!(
                             ServerErrorCode::NotFound,
@@ -3453,8 +3456,8 @@ impl SNServer {
                 }
             }
         } else {
-            debug!("get user subhost from host: {} failed", req_real_name);
-            let real_domain_name = name[0..name.len() - 1].to_string();
+            info!("get user subhost from host: {} failed", req_real_name);
+            let real_domain_name = req_real_name.clone();
             match record_type {
                 RecordType::TXT => {
                     let zone_config_info =
@@ -3466,8 +3469,17 @@ impl SNServer {
                             public_key.as_str(),
                             device_jwt.as_ref(),
                         );
-                        return Ok(name_info);
+                        return Ok(self.cache_name_info_result(
+                            req_real_name.as_str(),
+                            record_type,
+                            name_info,
+                        ));
                     } else {
+                        self.name_info_cache.add_tombstone(
+                            req_real_name.as_str(),
+                            record_type,
+                            None,
+                        );
                         return Err(server_err!(
                             ServerErrorCode::NotFound,
                             "{}",
@@ -3482,8 +3494,12 @@ impl SNServer {
                     if address_vec.is_some() {
                         let address_vec = address_vec.unwrap();
                         let result_name_info = NameInfo::from_address_vec(name, address_vec);
-                        debug!("=>{} result_name_info: {:?}", name, result_name_info);
-                        return Ok(result_name_info);
+                        info!("=>{} result_name_info: {:?}", name, result_name_info);
+                        return Ok(self.cache_name_info_result(
+                            req_real_name.as_str(),
+                            record_type,
+                            result_name_info,
+                        ));
                     }
                 }
                 _ => {
@@ -3495,6 +3511,8 @@ impl SNServer {
                 }
             }
 
+            self.name_info_cache
+                .add_tombstone(req_real_name.as_str(), record_type, None);
             return Err(server_err!(
                 ServerErrorCode::NotFound,
                 "no address found for {}",
@@ -3535,7 +3553,9 @@ impl HttpServer for SNServer {
                 )
                 .header("Access-Control-Max-Age", "86400")
                 .body(UnsyncBoxBody::new(
-                    Full::new(Bytes::new()).map_err(|e| match e {}).boxed_unsync(),
+                    Full::new(Bytes::new())
+                        .map_err(|e| match e {})
+                        .boxed_unsync(),
                 ))
                 .unwrap());
         }
@@ -4041,49 +4061,50 @@ mod tests {
         std::env::remove_var(RESERVED_USER_NAMES_FILE_ENV);
     }
 
-    #[test]
-    fn test_query_cache_key_normalizes_domain_and_record_type() {
-        let key =
-            SNServer::build_query_cache_key(" Meteormeta.Web3.Buckyos.Ai. ", RecordType::AAAA);
-        assert_eq!(key, "meteormeta.web3.buckyos.ai|AAAA");
-    }
-
     #[tokio::test]
     async fn test_invalidate_query_cache_domains_removes_matching_domain_and_subdomains() {
         let server = create_test_sn_server().await;
-        let mut cache = server.query_cache.write().await;
-        let expires_at = Instant::now() + Duration::from_secs(60);
-        cache.insert(
-            "meteormeta.web3.buckyos.ai|A".to_string(),
-            SnQueryCacheEntry {
-                expires_at,
-                value: SnQueryCacheValue::Miss,
-            },
+        server
+            .name_info_cache
+            .add_tombstone("meteormeta.web3.buckyos.ai", RecordType::A, Some(60));
+        server.name_info_cache.add_tombstone(
+            "home.meteormeta.web3.buckyos.ai",
+            RecordType::TXT,
+            Some(60),
         );
-        cache.insert(
-            "home.meteormeta.web3.buckyos.ai|TXT".to_string(),
-            SnQueryCacheEntry {
-                expires_at,
-                value: SnQueryCacheValue::Miss,
-            },
+        server
+            .name_info_cache
+            .add_tombstone("other.web3.buckyos.ai", RecordType::A, Some(60));
+
+        assert!(
+            server
+                .name_info_cache
+                .query("meteormeta.web3.buckyos.ai", RecordType::A)
+                .is_some()
         );
-        cache.insert(
-            "other.web3.buckyos.ai|A".to_string(),
-            SnQueryCacheEntry {
-                expires_at,
-                value: SnQueryCacheValue::Miss,
-            },
-        );
-        drop(cache);
 
         server
             .invalidate_query_cache_domains(&vec!["meteormeta.web3.buckyos.ai".to_string()])
             .await;
 
-        let cache = server.query_cache.read().await;
-        assert!(!cache.contains_key("meteormeta.web3.buckyos.ai|A"));
-        assert!(!cache.contains_key("home.meteormeta.web3.buckyos.ai|TXT"));
-        assert!(cache.contains_key("other.web3.buckyos.ai|A"));
+        assert!(
+            server
+                .name_info_cache
+                .query("meteormeta.web3.buckyos.ai", RecordType::A)
+                .is_none()
+        );
+        assert!(
+            server
+                .name_info_cache
+                .query("home.meteormeta.web3.buckyos.ai", RecordType::TXT)
+                .is_none()
+        );
+        assert!(
+            server
+                .name_info_cache
+                .query("other.web3.buckyos.ai", RecordType::A)
+                .is_some()
+        );
     }
 
     #[test]
@@ -4232,367 +4253,384 @@ mod tests {
     async fn test_sn_api() {
         tokio::task::LocalSet::new()
             .run_until(async {
-        init_logging("sn", false);
-        let (user_signing_key, user_pkcs8_bytes) = generate_ed25519_key();
-        let user_public_key = encode_ed25519_sk_to_pk_jwk(&user_signing_key);
-        let user_encoding_key = jsonwebtoken::EncodingKey::from_ed_der(user_pkcs8_bytes.as_slice());
+                init_logging("sn", false);
+                let (user_signing_key, user_pkcs8_bytes) = generate_ed25519_key();
+                let user_public_key = encode_ed25519_sk_to_pk_jwk(&user_signing_key);
+                let user_encoding_key =
+                    jsonwebtoken::EncodingKey::from_ed_der(user_pkcs8_bytes.as_slice());
 
-        let now = SystemTime::now();
-        let zone_boot_config = json!({
-            "oods": ["ood1"],
-            "exp": now.duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs() + 3600,
-            "iat": now.duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs(),
-        });
-        let zone_boot_config: ZoneBootConfig = serde_json::from_value(zone_boot_config).unwrap();
-        let zone_jwt = zone_boot_config
-            .encode(Some(&user_encoding_key))
-            .unwrap()
-            .to_string();
+                let now = SystemTime::now();
+                let zone_boot_config = json!({
+                    "oods": ["ood1"],
+                    "exp": now.duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs() + 3600,
+                    "iat": now.duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs(),
+                });
+                let zone_boot_config: ZoneBootConfig =
+                    serde_json::from_value(zone_boot_config).unwrap();
+                let zone_jwt = zone_boot_config
+                    .encode(Some(&user_encoding_key))
+                    .unwrap()
+                    .to_string();
 
-        let (user_token, mut user_session) = RPCSessionToken::generate_jwt_token(
-            TEST_USER,
-            "active_service",
-            None,
-            &user_encoding_key,
-        )
-        .unwrap();
-        user_session.aud = Some("sn".to_string());
-        let user_token = user_session
-            .generate_jwt(None, &user_encoding_key)
-            .unwrap()
-            .to_string();
-        let (signing_key, pkcs8_bytes) = generate_ed25519_key();
-        let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
-        let device_config = DeviceConfig::new_by_jwk("ood1", serde_json::from_value(jwk).unwrap());
-        let mini_config_jwt = DeviceMiniConfig::new_by_device_config(&device_config);
-        let mini_config_jwt = mini_config_jwt
-            .to_jwt(&user_encoding_key)
-            .unwrap()
-            .to_string();
-        let device_info = DeviceInfo::from_device_doc(&device_config);
-
-        let encoding_key = jsonwebtoken::EncodingKey::from_ed_der(pkcs8_bytes.as_slice());
-        // device signed token: userid is device_name (e.g. "ood1")
-        let (token, mut session) =
-            RPCSessionToken::generate_jwt_token("ood1", "cyfs_gateway", None, &encoding_key)
+                let (user_token, mut user_session) = RPCSessionToken::generate_jwt_token(
+                    TEST_USER,
+                    "active_service",
+                    None,
+                    &user_encoding_key,
+                )
                 .unwrap();
-        session.aud = Some("sn".to_string());
-        let token = session
-            .generate_jwt(None, &encoding_key)
-            .unwrap()
-            .to_string();
+                user_session.aud = Some("sn".to_string());
+                let user_token = user_session
+                    .generate_jwt(None, &user_encoding_key)
+                    .unwrap()
+                    .to_string();
+                let (signing_key, pkcs8_bytes) = generate_ed25519_key();
+                let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
+                let device_config =
+                    DeviceConfig::new_by_jwk("ood1", serde_json::from_value(jwk).unwrap());
+                let mini_config_jwt = DeviceMiniConfig::new_by_device_config(&device_config);
+                let mini_config_jwt = mini_config_jwt
+                    .to_jwt(&user_encoding_key)
+                    .unwrap()
+                    .to_string();
+                let device_info = DeviceInfo::from_device_doc(&device_config);
 
-        // token and user_token are used by different flows below:
-        // - token: used for cyfs_gateway (should NOT be allowed to register device)
-        // - user_token: used for active_service (should be allowed to register device)
-
-        let (signing_key2, pkcs8_bytes2) = generate_ed25519_key();
-        let jwk2 = encode_ed25519_sk_to_pk_jwk(&signing_key2);
-        let device_config2 =
-            DeviceConfig::new_by_jwk("ood2", serde_json::from_value(jwk2).unwrap());
-
-        let encoding_key2 = jsonwebtoken::EncodingKey::from_ed_der(pkcs8_bytes2.as_slice());
-        let (token2, mut session2) =
-            RPCSessionToken::generate_jwt_token(TEST_USER, "cyfs_gateway", None, &encoding_key2)
+                let encoding_key = jsonwebtoken::EncodingKey::from_ed_der(pkcs8_bytes.as_slice());
+                // device signed token: userid is device_name (e.g. "ood1")
+                let (token, mut session) = RPCSessionToken::generate_jwt_token(
+                    "ood1",
+                    "cyfs_gateway",
+                    None,
+                    &encoding_key,
+                )
                 .unwrap();
-        session2.aud = Some("sn".to_string());
-        let token2 = session2
-            .generate_jwt(None, &encoding_key2)
-            .unwrap()
-            .to_string();
+                session.aud = Some("sn".to_string());
+                let token = session
+                    .generate_jwt(None, &encoding_key)
+                    .unwrap()
+                    .to_string();
 
-        let mut sn_factory = SnServerFactory::new();
-        sn_factory.register_db_factory("sqlite", SqliteDBFactory::new());
+                // token and user_token are used by different flows below:
+                // - token: used for cyfs_gateway (should NOT be allowed to register device)
+                // - user_token: used for active_service (should be allowed to register device)
 
-        let db = tempfile::NamedTempFile::with_suffix(".db").unwrap();
+                let (signing_key2, pkcs8_bytes2) = generate_ed25519_key();
+                let jwk2 = encode_ed25519_sk_to_pk_jwk(&signing_key2);
+                let device_config2 =
+                    DeviceConfig::new_by_jwk("ood2", serde_json::from_value(jwk2).unwrap());
 
-        {
-            let db = SqliteSnDB::new_by_path(db.path().to_str().unwrap())
-                .await
+                let encoding_key2 = jsonwebtoken::EncodingKey::from_ed_der(pkcs8_bytes2.as_slice());
+                let (token2, mut session2) = RPCSessionToken::generate_jwt_token(
+                    TEST_USER,
+                    "cyfs_gateway",
+                    None,
+                    &encoding_key2,
+                )
                 .unwrap();
-            db.initialize_database().await.unwrap();
-            db.insert_activation_code(CLEAR_STATE_ACTIVE_CODE)
-                .await
-                .unwrap();
-        }
-        let config = json!({
-            "id": "test",
-            "host": "buckyos.ai",
-            "ip": "127.0.0.1",
-            "boot_jwt": "",
-            "owner_pkx": "",
-            "device_jwt": [],
-            "db_type": "sqlite",
-            "db_path": db.path().to_str().unwrap(),
-        });
-        let config: SNServerConfig = serde_json::from_value(config).unwrap();
-        let servers = sn_factory.create(Arc::new(config), None).await.unwrap();
-        let mut http_server = None;
-        for server in servers.iter() {
-            if let Server::Http(server) = server {
-                http_server = Some(server.clone());
-            }
-        }
-        let http_server = http_server.unwrap();
+                session2.aud = Some("sn".to_string());
+                let token2 = session2
+                    .generate_jwt(None, &encoding_key2)
+                    .unwrap()
+                    .to_string();
 
-        let mut dns_server = None;
-        for server in servers.iter() {
-            if let Server::NameServer(server) = server {
-                dns_server = Some(server.clone());
-            }
-        }
-        let dns_server = dns_server.unwrap();
+                let mut sn_factory = SnServerFactory::new();
+                sn_factory.register_db_factory("sqlite", SqliteDBFactory::new());
 
-        tokio::task::spawn_local(async move {
-            use http_body_util::BodyExt;
-            use tokio::net::TcpListener;
+                let db = tempfile::NamedTempFile::with_suffix(".db").unwrap();
 
-            let listener = TcpListener::bind("127.0.0.1:19091").await.unwrap();
+                {
+                    let db = SqliteSnDB::new_by_path(db.path().to_str().unwrap())
+                        .await
+                        .unwrap();
+                    db.initialize_database().await.unwrap();
+                    db.insert_activation_code(CLEAR_STATE_ACTIVE_CODE)
+                        .await
+                        .unwrap();
+                }
+                let config = json!({
+                    "id": "test",
+                    "host": "buckyos.ai",
+                    "ip": "127.0.0.1",
+                    "boot_jwt": "",
+                    "owner_pkx": "",
+                    "device_jwt": [],
+                    "db_type": "sqlite",
+                    "db_path": db.path().to_str().unwrap(),
+                });
+                let config: SNServerConfig = serde_json::from_value(config).unwrap();
+                let servers = sn_factory.create(Arc::new(config), None).await.unwrap();
+                let mut http_server = None;
+                for server in servers.iter() {
+                    if let Server::Http(server) = server {
+                        http_server = Some(server.clone());
+                    }
+                }
+                let http_server = http_server.unwrap();
 
-            loop {
-                let (stream, _) = listener.accept().await.unwrap();
-                let http_server = http_server.clone();
+                let mut dns_server = None;
+                for server in servers.iter() {
+                    if let Server::NameServer(server) = server {
+                        dns_server = Some(server.clone());
+                    }
+                }
+                let dns_server = dns_server.unwrap();
+
                 tokio::task::spawn_local(async move {
-                    let ret = hyper_serve_http(
-                        Box::new(stream),
-                        http_server,
-                        StreamInfo::new("127.0.0.1:19091".to_string()),
-                    )
-                    .await;
-                    if let Err(e) = ret {
-                        warn!("hyper_serve_http returned error: {}", e);
+                    use http_body_util::BodyExt;
+                    use tokio::net::TcpListener;
+
+                    let listener = TcpListener::bind("127.0.0.1:19091").await.unwrap();
+
+                    loop {
+                        let (stream, _) = listener.accept().await.unwrap();
+                        let http_server = http_server.clone();
+                        tokio::task::spawn_local(async move {
+                            let ret = hyper_serve_http(
+                                Box::new(stream),
+                                http_server,
+                                StreamInfo::new("127.0.0.1:19091".to_string()),
+                            )
+                            .await;
+                            if let Err(e) = ret {
+                                warn!("hyper_serve_http returned error: {}", e);
+                            }
+                        });
                     }
                 });
-            }
-        });
 
-        // 等待服务器启动
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                // 等待服务器启动
+                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
-        let krpc = kRPC::new("http://127.0.0.1:19091", Some(token.clone()));
-        let result = krpc
-            .call(
-                "check_username",
-                json!({
-                    "username": TEST_USER
-                }),
-            )
-            .await
-            .unwrap();
-        assert!(result
-            .as_object()
-            .unwrap()
-            .get("valid")
-            .unwrap()
-            .as_bool()
-            .unwrap());
-        assert_eq!(result["reason"].as_str().unwrap(), "ok");
-        assert_eq!(result["normalized_name"].as_str().unwrap(), TEST_USER);
+                let krpc = kRPC::new("http://127.0.0.1:19091", Some(token.clone()));
+                let result = krpc
+                    .call(
+                        "check_username",
+                        json!({
+                            "username": TEST_USER
+                        }),
+                    )
+                    .await
+                    .unwrap();
+                assert!(
+                    result
+                        .as_object()
+                        .unwrap()
+                        .get("valid")
+                        .unwrap()
+                        .as_bool()
+                        .unwrap()
+                );
+                assert_eq!(result["reason"].as_str().unwrap(), "ok");
+                assert_eq!(result["normalized_name"].as_str().unwrap(), TEST_USER);
 
-        let result = krpc
-            .call(
-                "check_username",
-                json!({
-                    "username": "short"
-                }),
-            )
-            .await
-            .unwrap();
-        assert!(!result["valid"].as_bool().unwrap());
-        assert_eq!(result["reason"].as_str().unwrap(), "invalid_username");
-        assert_eq!(
-            result["message"].as_str().unwrap(),
-            "username does not meet naming rules"
-        );
+                let result = krpc
+                    .call(
+                        "check_username",
+                        json!({
+                            "username": "short"
+                        }),
+                    )
+                    .await
+                    .unwrap();
+                assert!(!result["valid"].as_bool().unwrap());
+                assert_eq!(result["reason"].as_str().unwrap(), "invalid_username");
+                assert_eq!(
+                    result["message"].as_str().unwrap(),
+                    "username does not meet naming rules"
+                );
 
-        let result = krpc
-            .call(
-                "check_username",
-                json!({
-                    "username": "user_name"
-                }),
-            )
-            .await
-            .unwrap();
-        assert!(!result["valid"].as_bool().unwrap());
-        assert_eq!(result["reason"].as_str().unwrap(), "invalid_username");
+                let result = krpc
+                    .call(
+                        "check_username",
+                        json!({
+                            "username": "user_name"
+                        }),
+                    )
+                    .await
+                    .unwrap();
+                assert!(!result["valid"].as_bool().unwrap());
+                assert_eq!(result["reason"].as_str().unwrap(), "invalid_username");
 
-        let result = krpc
-            .call(
-                "check_username",
-                json!({
-                    "username": "sub.domain"
-                }),
-            )
-            .await
-            .unwrap();
-        assert!(!result["valid"].as_bool().unwrap());
-        assert_eq!(result["reason"].as_str().unwrap(), "invalid_username");
+                let result = krpc
+                    .call(
+                        "check_username",
+                        json!({
+                            "username": "sub.domain"
+                        }),
+                    )
+                    .await
+                    .unwrap();
+                assert!(!result["valid"].as_bool().unwrap());
+                assert_eq!(result["reason"].as_str().unwrap(), "invalid_username");
 
-        let invalid_register_result = krpc
-            .call(
-                "register_user",
-                json!({
-                    "user_name": "sub.domain",
-                    "public_key": user_public_key.to_string(),
-                    "active_code": CLEAR_STATE_ACTIVE_CODE,
-                    "zone_config": zone_jwt,
-                    "user_domain": "sub.domain.buckyos.ai",
-                }),
-            )
-            .await;
-        assert!(invalid_register_result.is_err());
-        let invalid_register_err = invalid_register_result.err().unwrap().to_string();
-        assert!(invalid_register_err.contains("username does not meet naming rules"));
+                let invalid_register_result = krpc
+                    .call(
+                        "register_user",
+                        json!({
+                            "user_name": "sub.domain",
+                            "public_key": user_public_key.to_string(),
+                            "active_code": CLEAR_STATE_ACTIVE_CODE,
+                            "zone_config": zone_jwt,
+                            "user_domain": "sub.domain.buckyos.ai",
+                        }),
+                    )
+                    .await;
+                assert!(invalid_register_result.is_err());
+                let invalid_register_err = invalid_register_result.err().unwrap().to_string();
+                assert!(invalid_register_err.contains("username does not meet naming rules"));
 
-        let result = krpc
-            .call(
-                "register_user",
-                json!({
-                    "user_name": TEST_USER,
-                    "public_key": user_public_key.to_string(),
-                    "active_code": CLEAR_STATE_ACTIVE_CODE,
-                    "zone_config": zone_jwt,
-                    "user_domain": format!("{}.buckyos.ai", TEST_USER),
-                }),
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            result
-                .as_object()
-                .unwrap()
-                .get("code")
-                .unwrap()
-                .as_i64()
-                .unwrap(),
-            0
-        );
+                let result = krpc
+                    .call(
+                        "register_user",
+                        json!({
+                            "user_name": TEST_USER,
+                            "public_key": user_public_key.to_string(),
+                            "active_code": CLEAR_STATE_ACTIVE_CODE,
+                            "zone_config": zone_jwt,
+                            "user_domain": format!("{}.buckyos.ai", TEST_USER),
+                        }),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    result
+                        .as_object()
+                        .unwrap()
+                        .get("code")
+                        .unwrap()
+                        .as_i64()
+                        .unwrap(),
+                    0
+                );
 
-        let result = krpc
-            .call(
-                "check_username",
-                json!({
-                    "username": TEST_USER
-                }),
-            )
-            .await
-            .unwrap();
-        assert!(!result
-            .as_object()
-            .unwrap()
-            .get("valid")
-            .unwrap()
-            .as_bool()
-            .unwrap());
-        assert_eq!(result["reason"].as_str().unwrap(), "already_exists");
-        assert!(result["message"]
-            .as_str()
-            .unwrap()
-            .contains("already exists"));
+                let result = krpc
+                    .call(
+                        "check_username",
+                        json!({
+                            "username": TEST_USER
+                        }),
+                    )
+                    .await
+                    .unwrap();
+                assert!(
+                    !result
+                        .as_object()
+                        .unwrap()
+                        .get("valid")
+                        .unwrap()
+                        .as_bool()
+                        .unwrap()
+                );
+                assert_eq!(result["reason"].as_str().unwrap(), "already_exists");
+                assert!(
+                    result["message"]
+                        .as_str()
+                        .unwrap()
+                        .contains("already exists")
+                );
 
-        let result = krpc
-            .call(
-                "check_username",
-                json!({
-                    "username": "security"
-                }),
-            )
-            .await
-            .unwrap();
-        assert!(!result["valid"].as_bool().unwrap());
-        assert_eq!(result["reason"].as_str().unwrap(), "invalid_username");
+                let result = krpc
+                    .call(
+                        "check_username",
+                        json!({
+                            "username": "security"
+                        }),
+                    )
+                    .await
+                    .unwrap();
+                assert!(!result["valid"].as_bool().unwrap());
+                assert_eq!(result["reason"].as_str().unwrap(), "invalid_username");
 
-        let result = krpc
-            .call(
-                "register",
-                json!({
-                    "user_name": TEST_USER,
-                    "device_name": "ood1",
-                    "device_did": device_config.id.clone(),
-                    "mini_config_jwt": mini_config_jwt.clone(),
-                    "device_ip": "127.0.0.1",
-                    "device_info": serde_json::to_string(&device_info).unwrap(),
-                }),
-            )
-            .await;
-        assert!(result.is_err());
+                let result = krpc
+                    .call(
+                        "register",
+                        json!({
+                            "user_name": TEST_USER,
+                            "device_name": "ood1",
+                            "device_did": device_config.id.clone(),
+                            "mini_config_jwt": mini_config_jwt.clone(),
+                            "device_ip": "127.0.0.1",
+                            "device_info": serde_json::to_string(&device_info).unwrap(),
+                        }),
+                    )
+                    .await;
+                assert!(result.is_err());
 
-        let krpc = kRPC::new("http://127.0.0.1:19091", Some(user_token.clone()));
-        let result = krpc
-            .call(
-                "register",
-                json!({
-                    "user_name": TEST_USER,
-                    "device_name": "ood1",
-                    "device_did": device_config.id.clone(),
-                    "mini_config_jwt": mini_config_jwt.clone(),
-                    "device_ip": "127.0.0.1",
-                    "device_info": serde_json::to_string(&device_info).unwrap(),
-                }),
-            )
-            .await;
-        assert!(result.is_ok());
+                let krpc = kRPC::new("http://127.0.0.1:19091", Some(user_token.clone()));
+                let result = krpc
+                    .call(
+                        "register",
+                        json!({
+                            "user_name": TEST_USER,
+                            "device_name": "ood1",
+                            "device_did": device_config.id.clone(),
+                            "mini_config_jwt": mini_config_jwt.clone(),
+                            "device_ip": "127.0.0.1",
+                            "device_info": serde_json::to_string(&device_info).unwrap(),
+                        }),
+                    )
+                    .await;
+                assert!(result.is_ok());
 
-        // --- DID resolve HTTP API ---
-        let client = reqwest::Client::new();
+                // --- DID resolve HTTP API ---
+                let client = reqwest::Client::new();
 
-        // did:bns:username type=boot
-        let resp = client
-            .get(format!(
-                "http://127.0.0.1:19091/1.0/identifiers/did:bns:{}?type=boot",
-                TEST_USER
-            ))
-            .send()
-            .await
-            .unwrap();
-        assert!(resp.status().is_success());
-        let v: serde_json::Value = resp.json().await.unwrap();
-        assert!(v.get("boot").is_some());
+                // did:bns:username type=boot
+                let resp = client
+                    .get(format!(
+                        "http://127.0.0.1:19091/1.0/identifiers/did:bns:{}?type=boot",
+                        TEST_USER
+                    ))
+                    .send()
+                    .await
+                    .unwrap();
+                assert!(resp.status().is_success());
+                let v: serde_json::Value = resp.json().await.unwrap();
+                assert!(v.get("boot").is_some());
 
-        // did:bns:username type=zone (default)
-        let resp = client
-            .get(format!(
-                "http://127.0.0.1:19091/1.0/identifiers/did:bns:{}",
-                TEST_USER
-            ))
-            .send()
-            .await
-            .unwrap();
-        assert!(resp.status().is_success());
-        let v: serde_json::Value = resp.json().await.unwrap();
-        assert_eq!(v.get("user_name").unwrap().as_str().unwrap(), TEST_USER);
-        assert!(v.get("boot").is_some());
+                // did:bns:username type=zone (default)
+                let resp = client
+                    .get(format!(
+                        "http://127.0.0.1:19091/1.0/identifiers/did:bns:{}",
+                        TEST_USER
+                    ))
+                    .send()
+                    .await
+                    .unwrap();
+                assert!(resp.status().is_success());
+                let v: serde_json::Value = resp.json().await.unwrap();
+                assert_eq!(v.get("user_name").unwrap().as_str().unwrap(), TEST_USER);
+                assert!(v.get("boot").is_some());
 
-        // did:web:domain -> routes to did:bns:username
-        let resp = client
-            .get(format!(
-                "http://127.0.0.1:19091/1.0/identifiers/did:web:{}.buckyos.ai",
-                TEST_USER
-            ))
-            .send()
-            .await
-            .unwrap();
-        assert!(resp.status().is_success());
-        let v: serde_json::Value = resp.json().await.unwrap();
-        assert_eq!(v.get("user_name").unwrap().as_str().unwrap(), TEST_USER);
+                // did:web:domain -> routes to did:bns:username
+                let resp = client
+                    .get(format!(
+                        "http://127.0.0.1:19091/1.0/identifiers/did:web:{}.buckyos.ai",
+                        TEST_USER
+                    ))
+                    .send()
+                    .await
+                    .unwrap();
+                assert!(resp.status().is_success());
+                let v: serde_json::Value = resp.json().await.unwrap();
+                assert_eq!(v.get("user_name").unwrap().as_str().unwrap(), TEST_USER);
 
-        // did:bns:device.username type=doc
-        let resp = client
-            .get(format!(
-                "http://127.0.0.1:19091/1.0/identifiers/did:bns:ood1.{}?type=doc",
-                TEST_USER
-            ))
-            .send()
-            .await
-            .unwrap();
-        assert!(resp.status().is_success());
-        let v: serde_json::Value = resp.json().await.unwrap();
-        assert!(v.get("id").is_some());
-        assert!(v.get("device_mini_config_jwt").is_some());
+                // did:bns:device.username type=doc
+                let resp = client
+                    .get(format!(
+                        "http://127.0.0.1:19091/1.0/identifiers/did:bns:ood1.{}?type=doc",
+                        TEST_USER
+                    ))
+                    .send()
+                    .await
+                    .unwrap();
+                assert!(resp.status().is_success());
+                let v: serde_json::Value = resp.json().await.unwrap();
+                assert!(v.get("id").is_some());
+                assert!(v.get("device_mini_config_jwt").is_some());
 
-        // did:bns:device.domain -> routes domain -> username -> device
-        let resp = client
+                // did:bns:device.domain -> routes domain -> username -> device
+                let resp = client
             .get(format!(
                 "http://127.0.0.1:19091/1.0/identifiers/did:bns:ood1.{}.buckyos.ai?type=doc",
                 TEST_USER
@@ -4600,460 +4638,465 @@ mod tests {
             .send()
             .await
             .unwrap();
-        assert!(resp.status().is_success());
-        let v: serde_json::Value = resp.json().await.unwrap();
-        assert!(v.get("id").is_some());
+                assert!(resp.status().is_success());
+                let v: serde_json::Value = resp.json().await.unwrap();
+                assert!(v.get("id").is_some());
 
-        // did:bns:device.username type=info
-        let resp = client
-            .get(format!(
-                "http://127.0.0.1:19091/1.0/identifiers/did:bns:ood1.{}?type=info",
-                TEST_USER
-            ))
-            .send()
-            .await
-            .unwrap();
-        assert!(resp.status().is_success());
-        let v: serde_json::Value = resp.json().await.unwrap();
-        //println!("v: {:?}", v);
-        assert_eq!(v.get("device_name").unwrap().as_str().unwrap(), "ood1");
-        assert_eq!(v.get("owner").unwrap().as_str().unwrap(), TEST_USER);
-        assert!(v.get("ip").is_none());
+                // did:bns:device.username type=info
+                let resp = client
+                    .get(format!(
+                        "http://127.0.0.1:19091/1.0/identifiers/did:bns:ood1.{}?type=info",
+                        TEST_USER
+                    ))
+                    .send()
+                    .await
+                    .unwrap();
+                assert!(resp.status().is_success());
+                let v: serde_json::Value = resp.json().await.unwrap();
+                //println!("v: {:?}", v);
+                assert_eq!(v.get("device_name").unwrap().as_str().unwrap(), "ood1");
+                assert_eq!(v.get("owner").unwrap().as_str().unwrap(), TEST_USER);
+                assert!(v.get("ip").is_none());
 
-        // did:dev:public_key type=doc/info
-        let did_dev = device_config.id.to_string();
-        let resp = client
-            .get(format!(
-                "http://127.0.0.1:19091/1.0/identifiers/{}?type=doc",
-                did_dev
-            ))
-            .send()
-            .await
-            .unwrap();
-        assert!(resp.status().is_success());
-        let v: serde_json::Value = resp.json().await.unwrap();
-        assert!(v.get("id").is_some());
+                // did:dev:public_key type=doc/info
+                let did_dev = device_config.id.to_string();
+                let resp = client
+                    .get(format!(
+                        "http://127.0.0.1:19091/1.0/identifiers/{}?type=doc",
+                        did_dev
+                    ))
+                    .send()
+                    .await
+                    .unwrap();
+                assert!(resp.status().is_success());
+                let v: serde_json::Value = resp.json().await.unwrap();
+                assert!(v.get("id").is_some());
 
-        let resp = client
-            .get(format!(
-                "http://127.0.0.1:19091/1.0/identifiers/{}?type=info",
-                did_dev
-            ))
-            .send()
-            .await
-            .unwrap();
-        assert!(resp.status().is_success());
-        let v: serde_json::Value = resp.json().await.unwrap();
-        assert_eq!(v.get("device_name").unwrap().as_str().unwrap(), "ood1");
-        assert!(v.get("ip").is_none());
+                let resp = client
+                    .get(format!(
+                        "http://127.0.0.1:19091/1.0/identifiers/{}?type=info",
+                        did_dev
+                    ))
+                    .send()
+                    .await
+                    .unwrap();
+                assert!(resp.status().is_success());
+                let v: serde_json::Value = resp.json().await.unwrap();
+                assert_eq!(v.get("device_name").unwrap().as_str().unwrap(), "ood1");
+                assert!(v.get("ip").is_none());
 
-        let krpc = kRPC::new("http://127.0.0.1:19091", Some(token.clone()));
-        let result = krpc
-            .call(
-                "get",
-                json!({
-                    "device_id": device_config.name,
-                    "owner_id": TEST_USER
-                }),
-            )
-            .await;
-        assert!(result.is_ok());
-        let result = result.unwrap();
-        let ret = serde_json::from_value::<DeviceInfo>(result);
-        assert!(ret.is_ok());
+                let krpc = kRPC::new("http://127.0.0.1:19091", Some(token.clone()));
+                let result = krpc
+                    .call(
+                        "get",
+                        json!({
+                            "device_id": device_config.name,
+                            "owner_id": TEST_USER
+                        }),
+                    )
+                    .await;
+                assert!(result.is_ok());
+                let result = result.unwrap();
+                let ret = serde_json::from_value::<DeviceInfo>(result);
+                assert!(ret.is_ok());
 
-        let result = krpc
-            .call(
-                "get_by_pk",
-                json!({
-                    "public_key": user_public_key.to_string()
-                }),
-            )
-            .await;
-        assert!(result.is_ok());
+                let result = krpc
+                    .call(
+                        "get_by_pk",
+                        json!({
+                            "public_key": user_public_key.to_string()
+                        }),
+                    )
+                    .await;
+                assert!(result.is_ok());
 
-        let result = krpc
-            .call(
-                "add_dns_record",
-                json!({
-                    "device_did": device_config2.id.to_string(),
-                    "domain": format!("{}.buckyos.ai", TEST_USER),
-                    "record_type": "A",
-                    "record": "127.0.0.1",
-                }),
-            )
-            .await;
-        assert!(result.is_err());
+                let result = krpc
+                    .call(
+                        "add_dns_record",
+                        json!({
+                            "device_did": device_config2.id.to_string(),
+                            "domain": format!("{}.buckyos.ai", TEST_USER),
+                            "record_type": "A",
+                            "record": "127.0.0.1",
+                        }),
+                    )
+                    .await;
+                assert!(result.is_err());
 
-        let result = krpc
-            .call(
-                "add_dns_record",
-                json!({
-                    "device_did": device_config.id.to_string(),
-                    "domain": format!("test.{}.web3.buckyos.ai", TEST_USER),
-                    "record_type": "A",
-                    "record": "127.0.0.1",
-                    "ttl": 600
-                }),
-            )
-            .await;
-        assert!(result.is_ok());
+                let result = krpc
+                    .call(
+                        "add_dns_record",
+                        json!({
+                            "device_did": device_config.id.to_string(),
+                            "domain": format!("test.{}.web3.buckyos.ai", TEST_USER),
+                            "record_type": "A",
+                            "record": "127.0.0.1",
+                            "ttl": 600
+                        }),
+                    )
+                    .await;
+                assert!(result.is_ok());
 
-        let result = krpc
-            .call(
-                "add_dns_record",
-                json!({
-                    "device_did": device_config.id.to_string(),
-                    "domain": format!("{}.buckyos.ai", TEST_USER),
-                    "record_type": "A",
-                    "record": "127.0.0.1",
-                    "ttl": 600
-                }),
-            )
-            .await;
-        assert!(result.is_err());
+                let result = krpc
+                    .call(
+                        "add_dns_record",
+                        json!({
+                            "device_did": device_config.id.to_string(),
+                            "domain": format!("{}.buckyos.ai", TEST_USER),
+                            "record_type": "A",
+                            "record": "127.0.0.1",
+                            "ttl": 600
+                        }),
+                    )
+                    .await;
+                assert!(result.is_err());
 
-        let result = krpc
-            .call(
-                "add_dns_record",
-                json!({
-                    "device_did": device_config.id.to_string(),
-                    "domain": format!("_acme-challenge.{}.web3.buckyos.ai", TEST_USER),
-                    "record_type": "TXT",
-                    "record": "ERWSSDFERWERSD",
-                    "ttl": 600
-                }),
-            )
-            .await;
-        assert!(result.is_ok());
+                let result = krpc
+                    .call(
+                        "add_dns_record",
+                        json!({
+                            "device_did": device_config.id.to_string(),
+                            "domain": format!("_acme-challenge.{}.web3.buckyos.ai", TEST_USER),
+                            "record_type": "TXT",
+                            "record": "ERWSSDFERWERSD",
+                            "ttl": 600
+                        }),
+                    )
+                    .await;
+                assert!(result.is_ok());
 
-        let result = dns_server
-            .query(
-                &format!("_acme-challenge.{}.web3.buckyos.ai", TEST_USER),
-                Some(RecordType::TXT),
-                None,
-            )
-            .await;
-        assert!(result.is_ok());
-        let name_info = result.unwrap();
-        assert_eq!(name_info.txt.len(), 1);
-        assert_eq!(name_info.txt[0], "ERWSSDFERWERSD");
+                let result = dns_server
+                    .query(
+                        &format!("_acme-challenge.{}.web3.buckyos.ai", TEST_USER),
+                        Some(RecordType::TXT),
+                        None,
+                    )
+                    .await;
+                assert!(result.is_ok());
+                let name_info = result.unwrap();
+                assert_eq!(name_info.txt.len(), 1);
+                assert_eq!(name_info.txt[0], "ERWSSDFERWERSD");
 
-        let result = dns_server
-            .query(
-                format!("test.{}.web3.buckyos.ai", TEST_USER).as_str(),
-                Some(RecordType::A),
-                None,
-            )
-            .await;
-        assert!(result.is_ok());
-        let name_info = result.unwrap();
-        assert_eq!(name_info.address.len(), 1);
-        assert_eq!(name_info.address[0].to_string(), "127.0.0.1");
+                let result = dns_server
+                    .query(
+                        format!("test.{}.web3.buckyos.ai", TEST_USER).as_str(),
+                        Some(RecordType::A),
+                        None,
+                    )
+                    .await;
+                assert!(result.is_ok());
+                let name_info = result.unwrap();
+                assert_eq!(name_info.address.len(), 1);
+                assert_eq!(name_info.address[0].to_string(), "127.0.0.1");
 
-        let result = krpc
-            .call(
-                "query_by_hostname",
-                json!({
-                    "dest_host": format!("test.{}.web3.buckyos.ai", TEST_USER)
-                }),
-            )
-            .await;
-        assert!(result.is_ok());
-        let result = result.unwrap();
-        let ood_info = serde_json::from_value::<OODInfo>(result).unwrap();
-        assert!(!ood_info.self_cert);
+                let result = krpc
+                    .call(
+                        "query_by_hostname",
+                        json!({
+                            "dest_host": format!("test.{}.web3.buckyos.ai", TEST_USER)
+                        }),
+                    )
+                    .await;
+                assert!(result.is_ok());
+                let result = result.unwrap();
+                let ood_info = serde_json::from_value::<OODInfo>(result).unwrap();
+                assert!(!ood_info.self_cert);
 
-        let result = krpc
-            .call(
-                "remove_dns_record",
-                json!({
-                    "device_did": device_config.id.to_string(),
-                    "domain": format!("_acme-challenge.{}.web3.buckyos.ai", TEST_USER),
-                    "record_type": "TXT",
-                    "has_cert": true
-                }),
-            )
-            .await;
-        assert!(result.is_ok());
+                let result = krpc
+                    .call(
+                        "remove_dns_record",
+                        json!({
+                            "device_did": device_config.id.to_string(),
+                            "domain": format!("_acme-challenge.{}.web3.buckyos.ai", TEST_USER),
+                            "record_type": "TXT",
+                            "has_cert": true
+                        }),
+                    )
+                    .await;
+                assert!(result.is_ok());
 
-        let result = dns_server
-            .query(
-                &format!("_acme-challenge.{}.web3.buckyos.ai", TEST_USER),
-                Some(RecordType::TXT),
-                None,
-            )
-            .await;
-        assert!(result.is_ok());
-        let name_info = result.unwrap();
-        assert_eq!(name_info.txt.len(), 3);
+                let result = dns_server
+                    .query(
+                        &format!("_acme-challenge.{}.web3.buckyos.ai", TEST_USER),
+                        Some(RecordType::TXT),
+                        None,
+                    )
+                    .await;
+                assert!(result.is_ok());
+                let name_info = result.unwrap();
+                assert_eq!(name_info.txt.len(), 3);
 
-        let krpc = kRPC::new("http://127.0.0.1:19091", Some(token2.clone()));
-        let device_info2 = DeviceInfo::from_device_doc(&device_config2);
-        let result = krpc
-            .call(
-                "update",
-                json!({
-                    "device_info": device_info2,
-                    "owner_id": TEST_USER
-                }),
-            )
-            .await;
-        assert!(result.is_err());
+                let krpc = kRPC::new("http://127.0.0.1:19091", Some(token2.clone()));
+                let device_info2 = DeviceInfo::from_device_doc(&device_config2);
+                let result = krpc
+                    .call(
+                        "update",
+                        json!({
+                            "device_info": device_info2,
+                            "owner_id": TEST_USER
+                        }),
+                    )
+                    .await;
+                assert!(result.is_err());
 
-        let krpc = kRPC::new("http://127.0.0.1:19091", Some(token.clone()));
-        let mut device_info = DeviceInfo::from_device_doc(&device_config);
-        device_info.cpu_info = Some("AMD".to_string());
-        let result = krpc
-            .call(
-                "update",
-                json!({
-                    "device_info": device_info,
-                    "owner_id": TEST_USER
-                }),
-            )
-            .await;
-        assert!(result.is_ok());
+                let krpc = kRPC::new("http://127.0.0.1:19091", Some(token.clone()));
+                let mut device_info = DeviceInfo::from_device_doc(&device_config);
+                device_info.cpu_info = Some("AMD".to_string());
+                let result = krpc
+                    .call(
+                        "update",
+                        json!({
+                            "device_info": device_info,
+                            "owner_id": TEST_USER
+                        }),
+                    )
+                    .await;
+                assert!(result.is_ok());
 
-        let krpc = kRPC::new("http://127.0.0.1:19091", Some(token.clone()));
-        let result = krpc
-            .call(
-                "get",
-                json!({
-                    "device_id": device_config.name,
-                    "owner_id": TEST_USER
-                }),
-            )
-            .await;
-        assert!(result.is_ok());
-        let result = result.unwrap();
-        let ret = serde_json::from_value::<DeviceInfo>(result);
-        assert!(ret.is_ok());
-        let device_info = ret.unwrap();
-        assert_eq!(device_info.cpu_info.unwrap(), "AMD");
+                let krpc = kRPC::new("http://127.0.0.1:19091", Some(token.clone()));
+                let result = krpc
+                    .call(
+                        "get",
+                        json!({
+                            "device_id": device_config.name,
+                            "owner_id": TEST_USER
+                        }),
+                    )
+                    .await;
+                assert!(result.is_ok());
+                let result = result.unwrap();
+                let ret = serde_json::from_value::<DeviceInfo>(result);
+                assert!(ret.is_ok());
+                let device_info = ret.unwrap();
+                assert_eq!(device_info.cpu_info.unwrap(), "AMD");
 
-        let client = reqwest::Client::new();
-        let resp = client
-            .get(format!(
-                "http://127.0.0.1:19091/1.0/identifiers/{}?type=info",
-                device_config.id.to_string()
-            ))
-            .send()
-            .await
-            .unwrap();
-        assert!(resp.status().is_success());
-        let v: serde_json::Value = resp.json().await.unwrap();
-        assert_eq!(v["cpu_info"].as_str().unwrap(), "AMD");
+                let client = reqwest::Client::new();
+                let resp = client
+                    .get(format!(
+                        "http://127.0.0.1:19091/1.0/identifiers/{}?type=info",
+                        device_config.id.to_string()
+                    ))
+                    .send()
+                    .await
+                    .unwrap();
+                assert!(resp.status().is_success());
+                let v: serde_json::Value = resp.json().await.unwrap();
+                assert_eq!(v["cpu_info"].as_str().unwrap(), "AMD");
 
-        let mut legacy_namespaced_device_info = DeviceInfo::from_device_doc(&device_config);
-        legacy_namespaced_device_info.cpu_info = Some("Zen5".to_string());
-        let mut legacy_namespaced_device_info_json =
-            serde_json::to_value(&legacy_namespaced_device_info).unwrap();
-        legacy_namespaced_device_info_json
-            .as_object_mut()
-            .unwrap()
-            .insert("owner_id".to_string(), Value::String(TEST_USER.to_string()));
-        let result = krpc
-            .call(
-                "device.update",
-                json!({
-                    "device_id": device_config.name,
-                    "device_info": legacy_namespaced_device_info_json
-                }),
-            )
-            .await;
-        assert!(result.is_ok());
-
-        let resp = client
-            .get(format!(
-                "http://127.0.0.1:19091/1.0/identifiers/{}?type=info",
-                device_config.id.to_string()
-            ))
-            .send()
-            .await
-            .unwrap();
-        assert!(resp.status().is_success());
-        let v: serde_json::Value = resp.json().await.unwrap();
-        assert_eq!(v["cpu_info"].as_str().unwrap(), "Zen5");
-
-        let verify_hub_legacy_token = RPCSessionToken {
-            token_type: RPCSessionTokenType::JWT,
-            token: None,
-            aud: Some("node-daemon".to_string()),
-            exp: Some(
-                SystemTime::now()
-                    .duration_since(SystemTime::UNIX_EPOCH)
+                let mut legacy_namespaced_device_info = DeviceInfo::from_device_doc(&device_config);
+                legacy_namespaced_device_info.cpu_info = Some("Zen5".to_string());
+                let mut legacy_namespaced_device_info_json =
+                    serde_json::to_value(&legacy_namespaced_device_info).unwrap();
+                legacy_namespaced_device_info_json
+                    .as_object_mut()
                     .unwrap()
-                    .as_secs()
-                    + 600,
-            ),
-            iss: Some("verify-hub".to_string()),
-            jti: Some("legacy-update-test".to_string()),
-            session: Some(1),
-            sub: Some("kernel".to_string()),
-            appid: Some("node-daemon".to_string()),
-            extra: HashMap::new(),
-        }
-        .generate_jwt(Some("verify-hub".to_string()), &user_encoding_key)
-        .unwrap();
-        let verify_hub_krpc = kRPC::new("http://127.0.0.1:19091", Some(verify_hub_legacy_token));
-        let mut verify_hub_device_info = DeviceInfo::from_device_doc(&device_config);
-        verify_hub_device_info.cpu_info = Some("Zen6".to_string());
-        let result = verify_hub_krpc
-            .call(
-                "device.update",
-                json!({
-                    "device_id": device_config.name,
-                    "owner_id": TEST_USER,
-                    "device_info": verify_hub_device_info
-                }),
-            )
-            .await;
-        assert!(result.is_ok());
+                    .insert("owner_id".to_string(), Value::String(TEST_USER.to_string()));
+                let result = krpc
+                    .call(
+                        "device.update",
+                        json!({
+                            "device_id": device_config.name,
+                            "device_info": legacy_namespaced_device_info_json
+                        }),
+                    )
+                    .await;
+                assert!(result.is_ok());
 
-        let resp = client
-            .get(format!(
-                "http://127.0.0.1:19091/1.0/identifiers/{}?type=info",
-                device_config.id.to_string()
-            ))
-            .send()
-            .await
-            .unwrap();
-        assert!(resp.status().is_success());
-        let v: serde_json::Value = resp.json().await.unwrap();
-        assert_eq!(v["cpu_info"].as_str().unwrap(), "Zen6");
+                let resp = client
+                    .get(format!(
+                        "http://127.0.0.1:19091/1.0/identifiers/{}?type=info",
+                        device_config.id.to_string()
+                    ))
+                    .send()
+                    .await
+                    .unwrap();
+                assert!(resp.status().is_success());
+                let v: serde_json::Value = resp.json().await.unwrap();
+                assert_eq!(v["cpu_info"].as_str().unwrap(), "Zen5");
 
-        let result = verify_hub_krpc
-            .call(
-                "query_by_did",
-                json!({
-                    "source_device_id": device_config.id.to_string(),
-                }),
-            )
-            .await;
-        assert!(result.is_ok());
+                let verify_hub_legacy_token = RPCSessionToken {
+                    token_type: RPCSessionTokenType::JWT,
+                    token: None,
+                    aud: Some("node-daemon".to_string()),
+                    exp: Some(
+                        SystemTime::now()
+                            .duration_since(SystemTime::UNIX_EPOCH)
+                            .unwrap()
+                            .as_secs()
+                            + 600,
+                    ),
+                    iss: Some("verify-hub".to_string()),
+                    jti: Some("legacy-update-test".to_string()),
+                    session: Some(1),
+                    sub: Some("kernel".to_string()),
+                    appid: Some("node-daemon".to_string()),
+                    extra: HashMap::new(),
+                }
+                .generate_jwt(Some("verify-hub".to_string()), &user_encoding_key)
+                .unwrap();
+                let verify_hub_krpc =
+                    kRPC::new("http://127.0.0.1:19091", Some(verify_hub_legacy_token));
+                let mut verify_hub_device_info = DeviceInfo::from_device_doc(&device_config);
+                verify_hub_device_info.cpu_info = Some("Zen6".to_string());
+                let result = verify_hub_krpc
+                    .call(
+                        "device.update",
+                        json!({
+                            "device_id": device_config.name,
+                            "owner_id": TEST_USER,
+                            "device_info": verify_hub_device_info
+                        }),
+                    )
+                    .await;
+                assert!(result.is_ok());
 
-        let result = verify_hub_krpc
-            .call(
-                "query_by_hostname",
-                json!({
-                    "dest_host": format!("test.{}.web3.buckyos.ai", TEST_USER)
-                }),
-            )
-            .await;
-        assert!(result.is_ok());
-        let result = result.unwrap();
-        let ood_info = serde_json::from_value::<OODInfo>(result).unwrap();
-        assert!(ood_info.self_cert);
+                let resp = client
+                    .get(format!(
+                        "http://127.0.0.1:19091/1.0/identifiers/{}?type=info",
+                        device_config.id.to_string()
+                    ))
+                    .send()
+                    .await
+                    .unwrap();
+                assert!(resp.status().is_success());
+                let v: serde_json::Value = resp.json().await.unwrap();
+                assert_eq!(v["cpu_info"].as_str().unwrap(), "Zen6");
 
-        // --- set_user_self_cert (device-signed) ---
-        let result = krpc
-            .call(
-                "set_user_self_cert",
-                json!({
-                    "name": TEST_USER,
-                    "self_cert": false
-                }),
-            )
-            .await;
-        assert!(result.is_ok());
+                let result = verify_hub_krpc
+                    .call(
+                        "query_by_did",
+                        json!({
+                            "source_device_id": device_config.id.to_string(),
+                        }),
+                    )
+                    .await;
+                assert!(result.is_ok());
 
-        let result = krpc
-            .call(
-                "query_by_hostname",
-                json!({
-                    "dest_host": format!("test.{}.web3.buckyos.ai", TEST_USER)
-                }),
-            )
-            .await;
-        assert!(result.is_ok());
-        let result = result.unwrap();
-        let ood_info = serde_json::from_value::<OODInfo>(result).unwrap();
-        assert!(!ood_info.self_cert);
+                let result = verify_hub_krpc
+                    .call(
+                        "query_by_hostname",
+                        json!({
+                            "dest_host": format!("test.{}.web3.buckyos.ai", TEST_USER)
+                        }),
+                    )
+                    .await;
+                assert!(result.is_ok());
+                let result = result.unwrap();
+                let ood_info = serde_json::from_value::<OODInfo>(result).unwrap();
+                assert!(ood_info.self_cert);
 
-        let result = krpc
-            .call(
-                "set_user_self_cert",
-                json!({
-                    "name": TEST_USER,
-                    "self_cert": true
-                }),
-            )
-            .await;
-        assert!(result.is_ok());
+                // --- set_user_self_cert (device-signed) ---
+                let result = krpc
+                    .call(
+                        "set_user_self_cert",
+                        json!({
+                            "name": TEST_USER,
+                            "self_cert": false
+                        }),
+                    )
+                    .await;
+                assert!(result.is_ok());
 
-        let result = krpc
-            .call("clear_state_by_active_code", json!({}))
-            .await
-            .unwrap();
-        assert_eq!(
-            result
-                .as_object()
-                .unwrap()
-                .get("code")
-                .unwrap()
-                .as_i64()
-                .unwrap(),
-            0
-        );
+                let result = krpc
+                    .call(
+                        "query_by_hostname",
+                        json!({
+                            "dest_host": format!("test.{}.web3.buckyos.ai", TEST_USER)
+                        }),
+                    )
+                    .await;
+                assert!(result.is_ok());
+                let result = result.unwrap();
+                let ood_info = serde_json::from_value::<OODInfo>(result).unwrap();
+                assert!(!ood_info.self_cert);
 
-        let result = krpc
-            .call(
-                "check_username",
-                json!({
-                    "username": TEST_USER
-                }),
-            )
-            .await
-            .unwrap();
-        assert!(result
-            .as_object()
-            .unwrap()
-            .get("valid")
-            .unwrap()
-            .as_bool()
-            .unwrap());
+                let result = krpc
+                    .call(
+                        "set_user_self_cert",
+                        json!({
+                            "name": TEST_USER,
+                            "self_cert": true
+                        }),
+                    )
+                    .await;
+                assert!(result.is_ok());
 
-        let result = krpc
-            .call(
-                "check_active_code",
-                json!({
-                    "active_code": CLEAR_STATE_ACTIVE_CODE
-                }),
-            )
-            .await
-            .unwrap();
-        assert!(result
-            .as_object()
-            .unwrap()
-            .get("valid")
-            .unwrap()
-            .as_bool()
-            .unwrap());
+                let result = krpc
+                    .call("clear_state_by_active_code", json!({}))
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    result
+                        .as_object()
+                        .unwrap()
+                        .get("code")
+                        .unwrap()
+                        .as_i64()
+                        .unwrap(),
+                    0
+                );
 
-        let result = krpc
-            .call(
-                "register_user",
-                json!({
-                    "user_name": TEST_USER,
-                    "public_key": user_public_key.to_string(),
-                    "active_code": CLEAR_STATE_ACTIVE_CODE,
-                    "zone_config": zone_jwt,
-                    "user_domain": format!("{}.buckyos.ai", TEST_USER),
-                }),
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            result
-                .as_object()
-                .unwrap()
-                .get("code")
-                .unwrap()
-                .as_i64()
-                .unwrap(),
-            0
-        );
+                let result = krpc
+                    .call(
+                        "check_username",
+                        json!({
+                            "username": TEST_USER
+                        }),
+                    )
+                    .await
+                    .unwrap();
+                assert!(
+                    result
+                        .as_object()
+                        .unwrap()
+                        .get("valid")
+                        .unwrap()
+                        .as_bool()
+                        .unwrap()
+                );
+
+                let result = krpc
+                    .call(
+                        "check_active_code",
+                        json!({
+                            "active_code": CLEAR_STATE_ACTIVE_CODE
+                        }),
+                    )
+                    .await
+                    .unwrap();
+                assert!(
+                    result
+                        .as_object()
+                        .unwrap()
+                        .get("valid")
+                        .unwrap()
+                        .as_bool()
+                        .unwrap()
+                );
+
+                let result = krpc
+                    .call(
+                        "register_user",
+                        json!({
+                            "user_name": TEST_USER,
+                            "public_key": user_public_key.to_string(),
+                            "active_code": CLEAR_STATE_ACTIVE_CODE,
+                            "zone_config": zone_jwt,
+                            "user_domain": format!("{}.buckyos.ai", TEST_USER),
+                        }),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    result
+                        .as_object()
+                        .unwrap()
+                        .get("code")
+                        .unwrap()
+                        .as_i64()
+                        .unwrap(),
+                    0
+                );
             })
             .await;
     }
@@ -5062,585 +5105,590 @@ mod tests {
     async fn test_sn_v2_api() {
         tokio::task::LocalSet::new()
             .run_until(async {
-        init_logging("sn", false);
-        let (user_signing_key, user_pkcs8_bytes) = generate_ed25519_key();
-        let user_public_key = encode_ed25519_sk_to_pk_jwk(&user_signing_key);
-        let user_encoding_key = jsonwebtoken::EncodingKey::from_ed_der(user_pkcs8_bytes.as_slice());
+                init_logging("sn", false);
+                let (user_signing_key, user_pkcs8_bytes) = generate_ed25519_key();
+                let user_public_key = encode_ed25519_sk_to_pk_jwk(&user_signing_key);
+                let user_encoding_key =
+                    jsonwebtoken::EncodingKey::from_ed_der(user_pkcs8_bytes.as_slice());
 
-        let now = SystemTime::now();
-        let zone_boot_config = json!({
-            "oods": ["ood1"],
-            "exp": now.duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs() + 3600,
-            "iat": now.duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs(),
-        });
-        let zone_boot_config: ZoneBootConfig = serde_json::from_value(zone_boot_config).unwrap();
-        let zone_jwt = zone_boot_config
-            .encode(Some(&user_encoding_key))
-            .unwrap()
-            .to_string();
+                let now = SystemTime::now();
+                let zone_boot_config = json!({
+                    "oods": ["ood1"],
+                    "exp": now.duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs() + 3600,
+                    "iat": now.duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs(),
+                });
+                let zone_boot_config: ZoneBootConfig =
+                    serde_json::from_value(zone_boot_config).unwrap();
+                let zone_jwt = zone_boot_config
+                    .encode(Some(&user_encoding_key))
+                    .unwrap()
+                    .to_string();
 
-        let (signing_key, _pkcs8_bytes) = generate_ed25519_key();
-        let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
-        let device_config = DeviceConfig::new_by_jwk("ood1", serde_json::from_value(jwk).unwrap());
-        let mini_config_jwt = DeviceMiniConfig::new_by_device_config(&device_config)
-            .to_jwt(&user_encoding_key)
-            .unwrap()
-            .to_string();
-        let device_info = DeviceInfo::from_device_doc(&device_config);
+                let (signing_key, _pkcs8_bytes) = generate_ed25519_key();
+                let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
+                let device_config =
+                    DeviceConfig::new_by_jwk("ood1", serde_json::from_value(jwk).unwrap());
+                let mini_config_jwt = DeviceMiniConfig::new_by_device_config(&device_config)
+                    .to_jwt(&user_encoding_key)
+                    .unwrap()
+                    .to_string();
+                let device_info = DeviceInfo::from_device_doc(&device_config);
 
-        let mut sn_factory = SnServerFactory::new();
-        sn_factory.register_db_factory("sqlite", SqliteDBFactory::new());
+                let mut sn_factory = SnServerFactory::new();
+                sn_factory.register_db_factory("sqlite", SqliteDBFactory::new());
 
-        let db = tempfile::NamedTempFile::with_suffix(".db").unwrap();
-        let auth_dir = tempfile::tempdir().unwrap();
+                let db = tempfile::NamedTempFile::with_suffix(".db").unwrap();
+                let auth_dir = tempfile::tempdir().unwrap();
 
-        {
-            let db = SqliteSnDB::new_by_path(db.path().to_str().unwrap())
-                .await
-                .unwrap();
-            db.initialize_database().await.unwrap();
-            db.insert_activation_code(CLEAR_STATE_ACTIVE_CODE)
-                .await
-                .unwrap();
-        }
+                {
+                    let db = SqliteSnDB::new_by_path(db.path().to_str().unwrap())
+                        .await
+                        .unwrap();
+                    db.initialize_database().await.unwrap();
+                    db.insert_activation_code(CLEAR_STATE_ACTIVE_CODE)
+                        .await
+                        .unwrap();
+                }
 
-        let config = json!({
-            "id": "test-v2",
-            "host": "buckyos.ai",
-            "ip": "127.0.0.1",
-            "boot_jwt": "",
-            "owner_pkx": "",
-            "device_jwt": [],
-            "db_type": "sqlite",
-            "db_path": db.path().to_str().unwrap(),
-            "v2_auth_data_dir": auth_dir.path().to_str().unwrap(),
-        });
-        let config: SNServerConfig = serde_json::from_value(config).unwrap();
-        let servers = sn_factory.create(Arc::new(config), None).await.unwrap();
-        let mut http_server = None;
-        for server in servers.iter() {
-            if let Server::Http(server) = server {
-                http_server = Some(server.clone());
-            }
-        }
-        let http_server = http_server.unwrap();
+                let config = json!({
+                    "id": "test-v2",
+                    "host": "buckyos.ai",
+                    "ip": "127.0.0.1",
+                    "boot_jwt": "",
+                    "owner_pkx": "",
+                    "device_jwt": [],
+                    "db_type": "sqlite",
+                    "db_path": db.path().to_str().unwrap(),
+                    "v2_auth_data_dir": auth_dir.path().to_str().unwrap(),
+                });
+                let config: SNServerConfig = serde_json::from_value(config).unwrap();
+                let servers = sn_factory.create(Arc::new(config), None).await.unwrap();
+                let mut http_server = None;
+                for server in servers.iter() {
+                    if let Server::Http(server) = server {
+                        http_server = Some(server.clone());
+                    }
+                }
+                let http_server = http_server.unwrap();
 
-        tokio::task::spawn_local(async move {
-            use http_body_util::BodyExt;
-            use tokio::net::TcpListener;
-
-            let listener = TcpListener::bind("127.0.0.1:19092").await.unwrap();
-
-            loop {
-                let (stream, _) = listener.accept().await.unwrap();
-                let http_server = http_server.clone();
                 tokio::task::spawn_local(async move {
-                    let ret = hyper_serve_http(
-                        Box::new(stream),
-                        http_server,
-                        StreamInfo::new("127.0.0.1:19092".to_string()),
-                    )
-                    .await;
-                    if let Err(e) = ret {
-                        warn!("hyper_serve_http returned error: {}", e);
+                    use http_body_util::BodyExt;
+                    use tokio::net::TcpListener;
+
+                    let listener = TcpListener::bind("127.0.0.1:19092").await.unwrap();
+
+                    loop {
+                        let (stream, _) = listener.accept().await.unwrap();
+                        let http_server = http_server.clone();
+                        tokio::task::spawn_local(async move {
+                            let ret = hyper_serve_http(
+                                Box::new(stream),
+                                http_server,
+                                StreamInfo::new("127.0.0.1:19092".to_string()),
+                            )
+                            .await;
+                            if let Err(e) = ret {
+                                warn!("hyper_serve_http returned error: {}", e);
+                            }
+                        });
                     }
                 });
-            }
-        });
 
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
-        let root_krpc = kRPC::new("http://127.0.0.1:19092/kapi/sn", None);
-        let result = root_krpc
-            .call(
-                "auth.check_username",
-                json!({
-                    "name": TEST_ROOT_USER
-                }),
-            )
-            .await
-            .unwrap();
-        assert!(result["valid"].as_bool().unwrap());
-        assert_eq!(result["reason"].as_str().unwrap(), "ok");
-        assert_eq!(result["normalized_name"].as_str().unwrap(), TEST_ROOT_USER);
+                let root_krpc = kRPC::new("http://127.0.0.1:19092/kapi/sn", None);
+                let result = root_krpc
+                    .call(
+                        "auth.check_username",
+                        json!({
+                            "name": TEST_ROOT_USER
+                        }),
+                    )
+                    .await
+                    .unwrap();
+                assert!(result["valid"].as_bool().unwrap());
+                assert_eq!(result["reason"].as_str().unwrap(), "ok");
+                assert_eq!(result["normalized_name"].as_str().unwrap(), TEST_ROOT_USER);
 
-        let result = root_krpc
-            .call(
-                "auth.check_username",
-                json!({
-                    "name": "short"
-                }),
-            )
-            .await
-            .unwrap();
-        assert!(!result["valid"].as_bool().unwrap());
-        assert_eq!(result["reason"].as_str().unwrap(), "invalid_username");
+                let result = root_krpc
+                    .call(
+                        "auth.check_username",
+                        json!({
+                            "name": "short"
+                        }),
+                    )
+                    .await
+                    .unwrap();
+                assert!(!result["valid"].as_bool().unwrap());
+                assert_eq!(result["reason"].as_str().unwrap(), "invalid_username");
 
-        let result = root_krpc
-            .call(
-                "auth.check_username",
-                json!({
-                    "name": "security"
-                }),
-            )
-            .await
-            .unwrap();
-        assert!(!result["valid"].as_bool().unwrap());
-        assert_eq!(result["reason"].as_str().unwrap(), "invalid_username");
+                let result = root_krpc
+                    .call(
+                        "auth.check_username",
+                        json!({
+                            "name": "security"
+                        }),
+                    )
+                    .await
+                    .unwrap();
+                assert!(!result["valid"].as_bool().unwrap());
+                assert_eq!(result["reason"].as_str().unwrap(), "invalid_username");
 
-        let result = root_krpc
-            .call(
-                "check_username",
-                json!({
-                    "username": TEST_LEGACY_USER
-                }),
-            )
-            .await
-            .unwrap();
-        assert!(result["valid"].as_bool().unwrap());
-        assert_eq!(result["reason"].as_str().unwrap(), "ok");
+                let result = root_krpc
+                    .call(
+                        "check_username",
+                        json!({
+                            "username": TEST_LEGACY_USER
+                        }),
+                    )
+                    .await
+                    .unwrap();
+                assert!(result["valid"].as_bool().unwrap());
+                assert_eq!(result["reason"].as_str().unwrap(), "ok");
 
-        let result = root_krpc
-            .call(
-                "check_username",
-                json!({
-                    "username": "1starter"
-                }),
-            )
-            .await
-            .unwrap();
-        assert!(!result["valid"].as_bool().unwrap());
-        assert_eq!(result["reason"].as_str().unwrap(), "invalid_username");
+                let result = root_krpc
+                    .call(
+                        "check_username",
+                        json!({
+                            "username": "1starter"
+                        }),
+                    )
+                    .await
+                    .unwrap();
+                assert!(!result["valid"].as_bool().unwrap());
+                assert_eq!(result["reason"].as_str().unwrap(), "invalid_username");
 
-        let auth_krpc = kRPC::new("http://127.0.0.1:19092/kapi/sn/auth", None);
-        let result = auth_krpc
-            .call(
-                "auth.check_username",
-                json!({
-                    "name": TEST_USER_V2
-                }),
-            )
-            .await
-            .unwrap();
-        assert!(result["valid"].as_bool().unwrap());
-        assert_eq!(result["reason"].as_str().unwrap(), "ok");
+                let auth_krpc = kRPC::new("http://127.0.0.1:19092/kapi/sn/auth", None);
+                let result = auth_krpc
+                    .call(
+                        "auth.check_username",
+                        json!({
+                            "name": TEST_USER_V2
+                        }),
+                    )
+                    .await
+                    .unwrap();
+                assert!(result["valid"].as_bool().unwrap());
+                assert_eq!(result["reason"].as_str().unwrap(), "ok");
 
-        let result = auth_krpc
-            .call(
-                "auth.check_username",
-                json!({
-                    "name": "user_name"
-                }),
-            )
-            .await
-            .unwrap();
-        assert!(!result["valid"].as_bool().unwrap());
-        assert_eq!(result["reason"].as_str().unwrap(), "invalid_username");
+                let result = auth_krpc
+                    .call(
+                        "auth.check_username",
+                        json!({
+                            "name": "user_name"
+                        }),
+                    )
+                    .await
+                    .unwrap();
+                assert!(!result["valid"].as_bool().unwrap());
+                assert_eq!(result["reason"].as_str().unwrap(), "invalid_username");
 
-        let result = auth_krpc
-            .call(
-                "auth.check_username",
-                json!({
-                    "name": "sub.domain"
-                }),
-            )
-            .await
-            .unwrap();
-        assert!(!result["valid"].as_bool().unwrap());
-        assert_eq!(result["reason"].as_str().unwrap(), "invalid_username");
+                let result = auth_krpc
+                    .call(
+                        "auth.check_username",
+                        json!({
+                            "name": "sub.domain"
+                        }),
+                    )
+                    .await
+                    .unwrap();
+                assert!(!result["valid"].as_bool().unwrap());
+                assert_eq!(result["reason"].as_str().unwrap(), "invalid_username");
 
-        let dotted_register_result = auth_krpc
-            .call(
-                "auth.register",
-                json!({
-                    "name": "sub.domain",
-                    "pwd_hash": "12345678",
-                    "active_code": CLEAR_STATE_ACTIVE_CODE
-                }),
-            )
-            .await;
-        assert!(dotted_register_result.is_err());
-        let dotted_register_err = dotted_register_result.err().unwrap().to_string();
-        assert!(dotted_register_err.contains("[SNV2:1001:invalid_username]"));
+                let dotted_register_result = auth_krpc
+                    .call(
+                        "auth.register",
+                        json!({
+                            "name": "sub.domain",
+                            "pwd_hash": "12345678",
+                            "active_code": CLEAR_STATE_ACTIVE_CODE
+                        }),
+                    )
+                    .await;
+                assert!(dotted_register_result.is_err());
+                let dotted_register_err = dotted_register_result.err().unwrap().to_string();
+                assert!(dotted_register_err.contains("[SNV2:1001:invalid_username]"));
 
-        let result = auth_krpc
-            .call(
-                "auth.register",
-                json!({
-                    "name": TEST_USER_V2,
-                    "pwd_hash": "12345678",
-                    "active_code": CLEAR_STATE_ACTIVE_CODE
-                }),
-            )
-            .await
-            .unwrap();
-        assert_eq!(result["code"].as_i64().unwrap(), 0);
-        assert!(result["need_bind_owner_key"].as_bool().unwrap());
-        let access_token = result["access_token"].as_str().unwrap().to_string();
-        let refresh_token = result["refresh_token"].as_str().unwrap().to_string();
+                let result = auth_krpc
+                    .call(
+                        "auth.register",
+                        json!({
+                            "name": TEST_USER_V2,
+                            "pwd_hash": "12345678",
+                            "active_code": CLEAR_STATE_ACTIVE_CODE
+                        }),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(result["code"].as_i64().unwrap(), 0);
+                assert!(result["need_bind_owner_key"].as_bool().unwrap());
+                let access_token = result["access_token"].as_str().unwrap().to_string();
+                let refresh_token = result["refresh_token"].as_str().unwrap().to_string();
 
-        let result = auth_krpc
-            .call(
-                "auth.check_username",
-                json!({
-                    "name": TEST_USER_V2
-                }),
-            )
-            .await
-            .unwrap();
-        assert!(!result["valid"].as_bool().unwrap());
-        assert_eq!(result["reason"].as_str().unwrap(), "already_exists");
-        assert!(result["message"]
-            .as_str()
-            .unwrap()
-            .contains("already exists"));
+                let result = auth_krpc
+                    .call(
+                        "auth.check_username",
+                        json!({
+                            "name": TEST_USER_V2
+                        }),
+                    )
+                    .await
+                    .unwrap();
+                assert!(!result["valid"].as_bool().unwrap());
+                assert_eq!(result["reason"].as_str().unwrap(), "already_exists");
+                assert!(
+                    result["message"]
+                        .as_str()
+                        .unwrap()
+                        .contains("already exists")
+                );
 
-        let auth_me_krpc = kRPC::new(
-            "http://127.0.0.1:19092/kapi/sn/auth",
-            Some(access_token.clone()),
-        );
-        let result = auth_me_krpc.call("auth.me", json!({})).await.unwrap();
-        assert_eq!(result["name"].as_str().unwrap(), TEST_USER_V2);
-        assert!(!result["owner_key_bound"].as_bool().unwrap());
+                let auth_me_krpc = kRPC::new(
+                    "http://127.0.0.1:19092/kapi/sn/auth",
+                    Some(access_token.clone()),
+                );
+                let result = auth_me_krpc.call("auth.me", json!({})).await.unwrap();
+                assert_eq!(result["name"].as_str().unwrap(), TEST_USER_V2);
+                assert!(!result["owner_key_bound"].as_bool().unwrap());
 
-        let login_krpc = kRPC::new("http://127.0.0.1:19092/kapi/sn/auth", None);
-        let result = login_krpc
-            .call(
-                "auth.login",
-                json!({
-                    "name": TEST_USER_V2,
-                    "pwd_hash": "12345678",
-                    "active_code": CLEAR_STATE_ACTIVE_CODE
-                }),
-            )
-            .await
-            .unwrap();
-        let login_access_token = result["access_token"].as_str().unwrap().to_string();
-        assert!(!login_access_token.is_empty());
+                let login_krpc = kRPC::new("http://127.0.0.1:19092/kapi/sn/auth", None);
+                let result = login_krpc
+                    .call(
+                        "auth.login",
+                        json!({
+                            "name": TEST_USER_V2,
+                            "pwd_hash": "12345678",
+                            "active_code": CLEAR_STATE_ACTIVE_CODE
+                        }),
+                    )
+                    .await
+                    .unwrap();
+                let login_access_token = result["access_token"].as_str().unwrap().to_string();
+                assert!(!login_access_token.is_empty());
 
-        let invalid_login_result = login_krpc
-            .call(
-                "auth.login",
-                json!({
-                    "name": TEST_USER_V2,
-                    "pwd_hash": "12345678",
-                    "active_code": "wrong-active-code"
-                }),
-            )
-            .await;
-        assert!(invalid_login_result.is_err());
-        let invalid_login_err = invalid_login_result.err().unwrap().to_string();
-        assert!(invalid_login_err.contains("[SNV2:1003:invalid_active_code]"));
+                let invalid_login_result = login_krpc
+                    .call(
+                        "auth.login",
+                        json!({
+                            "name": TEST_USER_V2,
+                            "pwd_hash": "12345678",
+                            "active_code": "wrong-active-code"
+                        }),
+                    )
+                    .await;
+                assert!(invalid_login_result.is_err());
+                let invalid_login_err = invalid_login_result.err().unwrap().to_string();
+                assert!(invalid_login_err.contains("[SNV2:1003:invalid_active_code]"));
 
-        let invalid_register_result = auth_krpc
-            .call(
-                "auth.register",
-                json!({
-                    "name": "short",
-                    "pwd_hash": "12345678",
-                    "active_code": CLEAR_STATE_ACTIVE_CODE
-                }),
-            )
-            .await;
-        assert!(invalid_register_result.is_err());
-        let invalid_register_err = invalid_register_result.err().unwrap().to_string();
-        assert!(invalid_register_err.contains("[SNV2:1001:invalid_username]"));
+                let invalid_register_result = auth_krpc
+                    .call(
+                        "auth.register",
+                        json!({
+                            "name": "short",
+                            "pwd_hash": "12345678",
+                            "active_code": CLEAR_STATE_ACTIVE_CODE
+                        }),
+                    )
+                    .await;
+                assert!(invalid_register_result.is_err());
+                let invalid_register_err = invalid_register_result.err().unwrap().to_string();
+                assert!(invalid_register_err.contains("[SNV2:1001:invalid_username]"));
 
-        let refresh_krpc = kRPC::new("http://127.0.0.1:19092/kapi/sn/auth", None);
-        let result = refresh_krpc
-            .call(
-                "auth.refresh",
-                json!({
-                    "refresh_token": refresh_token
-                }),
-            )
-            .await
-            .unwrap();
-        assert!(!result["access_token"].as_str().unwrap().is_empty());
+                let refresh_krpc = kRPC::new("http://127.0.0.1:19092/kapi/sn/auth", None);
+                let result = refresh_krpc
+                    .call(
+                        "auth.refresh",
+                        json!({
+                            "refresh_token": refresh_token
+                        }),
+                    )
+                    .await
+                    .unwrap();
+                assert!(!result["access_token"].as_str().unwrap().is_empty());
 
-        let user_krpc = kRPC::new(
-            "http://127.0.0.1:19092/kapi/sn/bns",
-            Some(login_access_token.clone()),
-        );
-        let result = user_krpc
-            .call(
-                "user.bind_owner_key",
-                json!({
-                    "public_key": user_public_key.clone()
-                }),
-            )
-            .await
-            .unwrap();
-        assert_eq!(result["code"].as_i64().unwrap(), 0);
+                let user_krpc = kRPC::new(
+                    "http://127.0.0.1:19092/kapi/sn/bns",
+                    Some(login_access_token.clone()),
+                );
+                let result = user_krpc
+                    .call(
+                        "user.bind_owner_key",
+                        json!({
+                            "public_key": user_public_key.clone()
+                        }),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(result["code"].as_i64().unwrap(), 0);
 
-        let result = user_krpc
-            .call("user.get_owner_key", json!({}))
-            .await
-            .unwrap();
-        assert_eq!(
-            result["public_key"]["x"].as_str().unwrap(),
-            user_public_key["x"].as_str().unwrap()
-        );
+                let result = user_krpc
+                    .call("user.get_owner_key", json!({}))
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    result["public_key"]["x"].as_str().unwrap(),
+                    user_public_key["x"].as_str().unwrap()
+                );
 
-        let (_owner_token, mut owner_session) = RPCSessionToken::generate_jwt_token(
-            TEST_USER_V2,
-            "active_service",
-            None,
-            &user_encoding_key,
-        )
-        .unwrap();
-        owner_session.aud = Some("sn".to_string());
-        let owner_signed_token = owner_session
-            .generate_jwt(None, &user_encoding_key)
-            .unwrap()
-            .to_string();
+                let (_owner_token, mut owner_session) = RPCSessionToken::generate_jwt_token(
+                    TEST_USER_V2,
+                    "active_service",
+                    None,
+                    &user_encoding_key,
+                )
+                .unwrap();
+                owner_session.aud = Some("sn".to_string());
+                let owner_signed_token = owner_session
+                    .generate_jwt(None, &user_encoding_key)
+                    .unwrap()
+                    .to_string();
 
-        let bns_user_krpc = kRPC::new(
-            "http://127.0.0.1:19092/kapi/sn/bns",
-            Some(login_access_token.clone()),
-        );
-        let result = bns_user_krpc
-            .call("user.get_profile", json!({}))
-            .await
-            .unwrap();
-        assert_eq!(result["name"].as_str().unwrap(), TEST_USER_V2);
+                let bns_user_krpc = kRPC::new(
+                    "http://127.0.0.1:19092/kapi/sn/bns",
+                    Some(login_access_token.clone()),
+                );
+                let result = bns_user_krpc
+                    .call("user.get_profile", json!({}))
+                    .await
+                    .unwrap();
+                assert_eq!(result["name"].as_str().unwrap(), TEST_USER_V2);
 
-        let zone_krpc = kRPC::new(
-            "http://127.0.0.1:19092/kapi/sn/bns",
-            Some(login_access_token.clone()),
-        );
-        let result = zone_krpc
-            .call(
-                "zone.bind_config",
-                json!({
-                    "zone_config": zone_jwt,
-                    "user_domain": format!("{}.buckyos.ai", TEST_USER_V2)
-                }),
-            )
-            .await
-            .unwrap();
-        assert_eq!(result["code"].as_i64().unwrap(), 0);
+                let zone_krpc = kRPC::new(
+                    "http://127.0.0.1:19092/kapi/sn/bns",
+                    Some(login_access_token.clone()),
+                );
+                let result = zone_krpc
+                    .call(
+                        "zone.bind_config",
+                        json!({
+                            "zone_config": zone_jwt,
+                            "user_domain": format!("{}.buckyos.ai", TEST_USER_V2)
+                        }),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(result["code"].as_i64().unwrap(), 0);
 
-        let result = zone_krpc.call("zone.get", json!({})).await.unwrap();
-        assert_eq!(result["user_name"].as_str().unwrap(), TEST_USER_V2);
-        assert_eq!(
-            result["user_domain"].as_str().unwrap(),
-            format!("{}.buckyos.ai", TEST_USER_V2)
-        );
+                let result = zone_krpc.call("zone.get", json!({})).await.unwrap();
+                assert_eq!(result["user_name"].as_str().unwrap(), TEST_USER_V2);
+                assert_eq!(
+                    result["user_domain"].as_str().unwrap(),
+                    format!("{}.buckyos.ai", TEST_USER_V2)
+                );
 
-        let device_krpc = kRPC::new(
-            "http://127.0.0.1:19092/kapi/sn/bns",
-            Some(login_access_token.clone()),
-        );
-        let result = device_krpc
-            .call(
-                "device.register",
-                json!({
-                    "device_name": "ood1",
-                    "device_did": device_config.id.clone(),
-                    "mini_config_jwt": mini_config_jwt.clone(),
-                    "device_ip": "127.0.0.1",
-                    "device_info": serde_json::to_string(&device_info).unwrap(),
-                }),
-            )
-            .await
-            .unwrap();
-        assert_eq!(result["code"].as_i64().unwrap(), 0);
+                let device_krpc = kRPC::new(
+                    "http://127.0.0.1:19092/kapi/sn/bns",
+                    Some(login_access_token.clone()),
+                );
+                let result = device_krpc
+                    .call(
+                        "device.register",
+                        json!({
+                            "device_name": "ood1",
+                            "device_did": device_config.id.clone(),
+                            "mini_config_jwt": mini_config_jwt.clone(),
+                            "device_ip": "127.0.0.1",
+                            "device_info": serde_json::to_string(&device_info).unwrap(),
+                        }),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(result["code"].as_i64().unwrap(), 0);
 
-        let mut updated_device_info = DeviceInfo::from_device_doc(&device_config);
-        updated_device_info.cpu_info = Some("Intel".to_string());
-        let result = device_krpc
-            .call(
-                "device.update",
-                json!({
-                    "device_name": "ood1",
-                    "device_ip": "192.168.100.10",
-                    "device_info": serde_json::to_string(&updated_device_info).unwrap(),
-                }),
-            )
-            .await
-            .unwrap();
-        assert_eq!(result["code"].as_i64().unwrap(), 0);
+                let mut updated_device_info = DeviceInfo::from_device_doc(&device_config);
+                updated_device_info.cpu_info = Some("Intel".to_string());
+                let result = device_krpc
+                    .call(
+                        "device.update",
+                        json!({
+                            "device_name": "ood1",
+                            "device_ip": "192.168.100.10",
+                            "device_info": serde_json::to_string(&updated_device_info).unwrap(),
+                        }),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(result["code"].as_i64().unwrap(), 0);
 
-        let client = reqwest::Client::new();
-        let resp = client
-            .get(format!(
-                "http://127.0.0.1:19092/1.0/identifiers/{}?type=info",
-                device_config.id.to_string()
-            ))
-            .send()
-            .await
-            .unwrap();
-        assert!(resp.status().is_success());
-        let v: serde_json::Value = resp.json().await.unwrap();
-        assert_eq!(v["cpu_info"].as_str().unwrap(), "Intel");
-        assert_eq!(v["ip"].as_str().unwrap(), "192.168.100.10");
+                let client = reqwest::Client::new();
+                let resp = client
+                    .get(format!(
+                        "http://127.0.0.1:19092/1.0/identifiers/{}?type=info",
+                        device_config.id.to_string()
+                    ))
+                    .send()
+                    .await
+                    .unwrap();
+                assert!(resp.status().is_success());
+                let v: serde_json::Value = resp.json().await.unwrap();
+                assert_eq!(v["cpu_info"].as_str().unwrap(), "Intel");
+                assert_eq!(v["ip"].as_str().unwrap(), "192.168.100.10");
 
-        let result = device_krpc.call("device.list", json!({})).await.unwrap();
-        assert_eq!(result["items"].as_array().unwrap().len(), 1);
+                let result = device_krpc.call("device.list", json!({})).await.unwrap();
+                assert_eq!(result["items"].as_array().unwrap().len(), 1);
 
-        let dns_krpc = kRPC::new(
-            "http://127.0.0.1:19092/kapi/sn",
-            Some(login_access_token.clone()),
-        );
-        let result = dns_krpc
-            .call(
-                "dns.add_record",
-                json!({
-                    "device_did": device_config.id.to_string(),
-                    "domain": format!("home.{}.buckyos.ai", TEST_USER_V2),
-                    "record_type": "A",
-                    "record": "127.0.0.1",
-                    "ttl": 600,
-                    "has_cert": true
-                }),
-            )
-            .await
-            .unwrap();
-        assert_eq!(result["code"].as_i64().unwrap(), 0);
+                let dns_krpc = kRPC::new(
+                    "http://127.0.0.1:19092/kapi/sn",
+                    Some(login_access_token.clone()),
+                );
+                let result = dns_krpc
+                    .call(
+                        "dns.add_record",
+                        json!({
+                            "device_did": device_config.id.to_string(),
+                            "domain": format!("home.{}.buckyos.ai", TEST_USER_V2),
+                            "record_type": "A",
+                            "record": "127.0.0.1",
+                            "ttl": 600,
+                            "has_cert": true
+                        }),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(result["code"].as_i64().unwrap(), 0);
 
-        let result = dns_krpc
-            .call(
-                "dns.remove_record",
-                json!({
-                    "device_did": device_config.id.to_string(),
-                    "domain": "home.other.buckyos.ai",
-                    "record_type": "A"
-                }),
-            )
-            .await;
-        assert!(result.is_err());
-        let err = result.err().unwrap().to_string();
-        assert!(err.contains("[SNV2:1015:invalid_domain]"));
+                let result = dns_krpc
+                    .call(
+                        "dns.remove_record",
+                        json!({
+                            "device_did": device_config.id.to_string(),
+                            "domain": "home.other.buckyos.ai",
+                            "record_type": "A"
+                        }),
+                    )
+                    .await;
+                assert!(result.is_err());
+                let err = result.err().unwrap().to_string();
+                assert!(err.contains("[SNV2:1015:invalid_domain]"));
 
-        let did_krpc = kRPC::new(
-            "http://127.0.0.1:19092/kapi/sn",
-            Some(login_access_token.clone()),
-        );
-        let result = did_krpc
-            .call(
-                "did.set_document",
-                json!({
-                    "obj_name": "profile",
-                    "did_document": {
-                        "name": TEST_USER_V2,
-                        "version": 2
-                    },
-                    "doc_type": "profile"
-                }),
-            )
-            .await
-            .unwrap();
-        assert!(!result["obj_id"].as_str().unwrap().is_empty());
+                let did_krpc = kRPC::new(
+                    "http://127.0.0.1:19092/kapi/sn",
+                    Some(login_access_token.clone()),
+                );
+                let result = did_krpc
+                    .call(
+                        "did.set_document",
+                        json!({
+                            "obj_name": "profile",
+                            "did_document": {
+                                "name": TEST_USER_V2,
+                                "version": 2
+                            },
+                            "doc_type": "profile"
+                        }),
+                    )
+                    .await
+                    .unwrap();
+                assert!(!result["obj_id"].as_str().unwrap().is_empty());
 
-        let result = did_krpc
-            .call(
-                "did.get_document",
-                json!({
-                    "obj_name": "profile",
-                    "doc_type": "profile"
-                }),
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            result["did_document"]["name"].as_str().unwrap(),
-            TEST_USER_V2
-        );
+                let result = did_krpc
+                    .call(
+                        "did.get_document",
+                        json!({
+                            "obj_name": "profile",
+                            "doc_type": "profile"
+                        }),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    result["did_document"]["name"].as_str().unwrap(),
+                    TEST_USER_V2
+                );
 
-        let query_krpc = kRPC::new(
-            "http://127.0.0.1:19092/kapi/sn",
-            Some(login_access_token.clone()),
-        );
-        let result = query_krpc
-            .call(
-                "query.resolve_hostname",
-                json!({
-                    "host": format!("home.{}.buckyos.ai", TEST_USER_V2)
-                }),
-            )
-            .await
-            .unwrap();
-        let ood_info = serde_json::from_value::<OODInfo>(result).unwrap();
-        assert_eq!(ood_info.owner_id, TEST_USER_V2.to_string());
-        assert!(ood_info.self_cert);
+                let query_krpc = kRPC::new(
+                    "http://127.0.0.1:19092/kapi/sn",
+                    Some(login_access_token.clone()),
+                );
+                let result = query_krpc
+                    .call(
+                        "query.resolve_hostname",
+                        json!({
+                            "host": format!("home.{}.buckyos.ai", TEST_USER_V2)
+                        }),
+                    )
+                    .await
+                    .unwrap();
+                let ood_info = serde_json::from_value::<OODInfo>(result).unwrap();
+                assert_eq!(ood_info.owner_id, TEST_USER_V2.to_string());
+                assert!(ood_info.self_cert);
 
-        let result = root_krpc
-            .call(
-                "query.by_hostname",
-                json!({
-                    "dest_host": format!("home.{}.buckyos.ai", TEST_USER_V2)
-                }),
-            )
-            .await
-            .unwrap();
-        let root_ood_info = serde_json::from_value::<OODInfo>(result).unwrap();
-        assert_eq!(root_ood_info.owner_id, TEST_USER_V2.to_string());
-        assert!(root_ood_info.self_cert);
+                let result = root_krpc
+                    .call(
+                        "query.by_hostname",
+                        json!({
+                            "dest_host": format!("home.{}.buckyos.ai", TEST_USER_V2)
+                        }),
+                    )
+                    .await
+                    .unwrap();
+                let root_ood_info = serde_json::from_value::<OODInfo>(result).unwrap();
+                assert_eq!(root_ood_info.owner_id, TEST_USER_V2.to_string());
+                assert!(root_ood_info.self_cert);
 
-        let result = query_krpc
-            .call(
-                "query.resolve_did",
-                json!({
-                    "did": format!("did:bns:{}", TEST_USER_V2),
-                    "type": "zone"
-                }),
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            result["document"]["user_name"].as_str().unwrap(),
-            TEST_USER_V2
-        );
+                let result = query_krpc
+                    .call(
+                        "query.resolve_did",
+                        json!({
+                            "did": format!("did:bns:{}", TEST_USER_V2),
+                            "type": "zone"
+                        }),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    result["document"]["user_name"].as_str().unwrap(),
+                    TEST_USER_V2
+                );
 
-        let result = query_krpc
-            .call(
-                "query.resolve_device",
-                json!({
-                    "name": TEST_USER_V2,
-                    "device_name": "ood1"
-                }),
-            )
-            .await
-            .unwrap();
-        assert_eq!(result["device_name"].as_str().unwrap(), "ood1");
+                let result = query_krpc
+                    .call(
+                        "query.resolve_device",
+                        json!({
+                            "name": TEST_USER_V2,
+                            "device_name": "ood1"
+                        }),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(result["device_name"].as_str().unwrap(), "ood1");
 
-        let result = dns_krpc
-            .call(
-                "dns.remove_record",
-                json!({
-                    "device_did": device_config.id.to_string(),
-                    "domain": format!("home.{}.buckyos.ai", TEST_USER_V2),
-                    "record_type": "A"
-                }),
-            )
-            .await
-            .unwrap();
-        assert_eq!(result["code"].as_i64().unwrap(), 0);
+                let result = dns_krpc
+                    .call(
+                        "dns.remove_record",
+                        json!({
+                            "device_did": device_config.id.to_string(),
+                            "domain": format!("home.{}.buckyos.ai", TEST_USER_V2),
+                            "record_type": "A"
+                        }),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(result["code"].as_i64().unwrap(), 0);
 
-        let bns_admin_krpc = kRPC::new(
-            "http://127.0.0.1:19092/kapi/sn/bns",
-            Some(login_access_token),
-        );
-        let result = bns_admin_krpc
-            .call("admin.clear_state_by_active_code", json!({}))
-            .await
-            .unwrap();
-        assert_eq!(result["code"].as_i64().unwrap(), 0);
+                let bns_admin_krpc = kRPC::new(
+                    "http://127.0.0.1:19092/kapi/sn/bns",
+                    Some(login_access_token),
+                );
+                let result = bns_admin_krpc
+                    .call("admin.clear_state_by_active_code", json!({}))
+                    .await
+                    .unwrap();
+                assert_eq!(result["code"].as_i64().unwrap(), 0);
 
-        let result = auth_krpc
-            .call(
-                "auth.login",
-                json!({
-                    "name": TEST_USER_V2,
-                    "pwd_hash": "12345678",
-                    "active_code": CLEAR_STATE_ACTIVE_CODE
-                }),
-            )
-            .await;
-        assert!(result.is_err());
-        let err = result.err().unwrap().to_string();
-        assert!(err.contains("[SNV2:1004:user_auth_not_found]"));
+                let result = auth_krpc
+                    .call(
+                        "auth.login",
+                        json!({
+                            "name": TEST_USER_V2,
+                            "pwd_hash": "12345678",
+                            "active_code": CLEAR_STATE_ACTIVE_CODE
+                        }),
+                    )
+                    .await;
+                assert!(result.is_err());
+                let err = result.err().unwrap().to_string();
+                assert!(err.contains("[SNV2:1004:user_auth_not_found]"));
             })
             .await;
     }

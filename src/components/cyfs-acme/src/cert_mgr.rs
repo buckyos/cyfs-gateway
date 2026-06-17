@@ -3,7 +3,14 @@ use crate::default_challenge_responder::DefaultChallengeResponder;
 use crate::{Challenge, ChallengeData, ChallengeType};
 use anyhow::Result;
 use log::*;
-use openssl::x509::X509;
+use name_client::{
+    IdentityMaterial, IdentityRoots, IdentityUsage, X509_METADATA_SCHEMA, X509CertificateMetadata,
+    X509MatchMetadata, X509Metadata, X509PathMetadata, X509SanMetadata,
+};
+use openssl::asn1::Asn1TimeRef;
+use openssl::hash::MessageDigest;
+use openssl::pkey::{PKey, Private};
+use openssl::x509::{X509, X509NameRef};
 use rand::Rng;
 use rustls::crypto::ring::sign::any_supported_type;
 use rustls::pki_types::PrivateKeyDer;
@@ -13,16 +20,22 @@ use rustls::sign::CertifiedKey;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sfo_js::{JsPkgManager, JsPkgManagerRef, JsString, JsValue};
+use sha2::Digest;
 use std::collections::HashMap;
 use std::fmt::{Debug, Formatter};
+use std::fs::OpenOptions;
+use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::RwLock;
 use std::sync::{Arc, Weak};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::fs;
 use tokio::task;
 use tokio::task::JoinHandle;
+
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 
 pub const ACME_TLS_ALPN_NAME: &[u8] = b"acme-tls/1";
 
@@ -54,9 +67,11 @@ struct CertMutPart {
 
 struct CertStubInner {
     acme_item: AcmeItem,
-    keystore_path: String,
+    work_dir: PathBuf,
+    identity_roots: IdentityRoots,
     acme_client: AcmeClient,
     responder: AcmeChallengeResponderRef,
+    renew_before_expiry: chrono::Duration,
     mut_part: Mutex<CertMutPart>,
     handle: Mutex<Option<JoinHandle<()>>>,
 }
@@ -92,16 +107,20 @@ impl std::fmt::Display for CertStub {
 impl CertStub {
     fn new(
         acme_item: AcmeItem,
-        keystore_path: String,
+        work_dir: PathBuf,
+        identity_roots: IdentityRoots,
         acme_client: AcmeClient,
         responder: AcmeChallengeResponderRef,
+        renew_before_expiry: chrono::Duration,
     ) -> Self {
         Self {
             inner: Arc::new(CertStubInner {
                 acme_item,
-                keystore_path,
+                work_dir,
+                identity_roots,
                 acme_client,
                 responder,
+                renew_before_expiry,
                 mut_part: Mutex::new(CertMutPart {
                     state: CertState::None,
                     order: None,
@@ -177,110 +196,51 @@ impl CertStub {
     }
 
     async fn load_cert_inner(&self) -> Result<()> {
-        // 尝试从 keystore_path 加载最新的证书
-        let dir = tokio::fs::read_dir(&self.inner.keystore_path)
-            .await
-            .map_err(|e| {
-                anyhow::anyhow!(
-                    "read keystore dir failed, stub: {}, path: {}, {}",
-                    self,
-                    self.inner.keystore_path,
-                    e
-                )
-            })?;
-
-        let mut entries = Vec::new();
-        tokio::pin!(dir);
-        while let Some(entry) = dir.next_entry().await? {
-            if entry.file_name().to_string_lossy().ends_with(".cert") {
-                entries.push(entry.path());
+        if let Some(info) = self.load_identity_cert_info()? {
+            let should_renew = Self::cert_needs_renewal(&info, self.inner.renew_before_expiry);
+            {
+                let mut mut_part = self.inner.mut_part.lock().unwrap();
+                mut_part.state = if should_renew {
+                    CertState::Renewing(info)
+                } else {
+                    CertState::Ready(info)
+                };
             }
-        }
-
-        if entries.is_empty() {
-            // 如果没有找到证书，启动证书申请流程
-            info!(
-                "no cert found in keystore, start ordering new cert, stub: {}",
-                self
-            );
-            self.start_order().await?;
+            if should_renew {
+                info!(
+                    "identity cert is inside renewal window, start ordering new cert, stub: {}",
+                    self
+                );
+                self.start_order().await?;
+            }
             return Ok(());
         }
 
-        // 按文件名（时间戳）排序，取最新的
-        entries.sort_by(|a, b| b.file_name().unwrap().cmp(a.file_name().unwrap()));
-        let cert_path = entries[0].to_string_lossy().to_string();
-
-        info!("load cert, stub: {}, cert_path: {}", self, cert_path);
-        let key_path = cert_path.replace(".cert", ".key");
-
-        let cert_data = fs::read(&cert_path).await.map_err(|e| {
-            error!(
-                "load cert failed, stub: {}, cert_path: {}, {}",
-                self, cert_path, e
-            );
-            anyhow::anyhow!(
-                "load cert failed, stub: {}, cert_path: {}, {}",
-                self,
-                cert_path,
-                e
-            )
-        })?;
-        let key_data = fs::read(&key_path).await.map_err(|e| {
-            error!(
-                "load cert failed, stub: {}, key_path: {}, {}",
-                self, key_path, e
-            );
-            anyhow::anyhow!(
-                "load cert failed, stub: {}, key_path: {}, {}",
-                self,
-                key_path,
-                e
-            )
-        })?;
-
-        let certified_key = Self::create_certified_key(&cert_data, &key_data).map_err(|e| {
-            error!(
-                "create certified key failed, stub: {}, cert_path: {}, key_path: {}, {}",
-                self, cert_path, key_path, e
-            );
-            anyhow::anyhow!(
-                "create certified key failed, stub: {}, cert_path: {}, key_path: {}, {}",
-                self,
-                cert_path,
-                key_path,
-                e
-            )
-        })?;
-        let expires = Self::get_cert_expiry(&cert_data).map_err(|e| {
-            error!(
-                "get cert expiry failed, stub: {}, cert_path: {}, key_path: {}, {}",
-                self, cert_path, key_path, e
-            );
-            anyhow::anyhow!(
-                "get cert expiry failed, stub: {}, cert_path: {}, key_path: {}, {}",
-                self,
-                cert_path,
-                key_path,
-                e
-            )
-        })?;
-
         info!(
-            "load cert success, stub: {}, cert_path: {}, key_path: {}, expires: {}",
-            self, cert_path, key_path, expires
+            "no valid identity cert found, start ordering new cert, stub: {}",
+            self
         );
-
-        let mut mut_part = self.inner.mut_part.lock().unwrap();
-        mut_part.state = CertState::Ready(CertInfo {
-            key: Arc::new(certified_key),
-            expires,
-        });
-
+        self.start_order().await?;
         Ok(())
     }
 
     fn check_cert(&self, renew_before_expiry: chrono::Duration) -> Result<()> {
+        if let Some(info) = self.load_identity_cert_info()? {
+            let should_renew = Self::cert_needs_renewal(&info, renew_before_expiry);
+            let mut mut_part = self.inner.mut_part.lock().unwrap();
+            mut_part.state = if should_renew {
+                CertState::Renewing(info)
+            } else {
+                CertState::Ready(info)
+            };
+            if !should_renew {
+                return Ok(());
+            }
+        } else {
+            let mut mut_part = self.inner.mut_part.lock().unwrap();
+            mut_part.state = CertState::None;
+        }
+
         let should_order = {
             {
                 let handle = self.inner.handle.lock().unwrap();
@@ -319,6 +279,141 @@ impl CertStub {
         Ok(())
     }
 
+    fn load_identity_cert_info(&self) -> Result<Option<CertInfo>> {
+        let identity = self.inner.acme_item.identity();
+        let cert_match = match self.inner.identity_roots.find_public_file(
+            identity,
+            IdentityUsage::Server,
+            IdentityMaterial::Fullchain,
+        ) {
+            Ok(cert_match) => cert_match,
+            Err(e) => {
+                debug!(
+                    "find identity fullchain failed, stub: {}, identity: {}, {}",
+                    self, identity, e
+                );
+                return Ok(None);
+            }
+        };
+        let key_path = identity_private_key_path(&self.inner.identity_roots, &cert_match.dir_name);
+        let cert_data = match std::fs::read(&cert_match.path) {
+            Ok(cert_data) => cert_data,
+            Err(e) => {
+                debug!(
+                    "read identity fullchain failed, stub: {}, path: {}, {}",
+                    self,
+                    cert_match.path.display(),
+                    e
+                );
+                return Ok(None);
+            }
+        };
+        let key_data = match std::fs::read(&key_path) {
+            Ok(key_data) => key_data,
+            Err(e) => {
+                debug!(
+                    "read identity private key failed, stub: {}, path: {}, {}",
+                    self,
+                    key_path.display(),
+                    e
+                );
+                return Ok(None);
+            }
+        };
+        let certificates = match X509::stack_from_pem(&cert_data) {
+            Ok(certificates) => certificates,
+            Err(e) => {
+                debug!(
+                    "parse identity fullchain failed, stub: {}, path: {}, {}",
+                    self,
+                    cert_match.path.display(),
+                    e
+                );
+                return Ok(None);
+            }
+        };
+        let Some(leaf) = certificates.first() else {
+            debug!(
+                "identity fullchain is empty, stub: {}, path: {}",
+                self,
+                cert_match.path.display()
+            );
+            return Ok(None);
+        };
+        let private_key = match PKey::private_key_from_pem(&key_data) {
+            Ok(private_key) => private_key,
+            Err(e) => {
+                debug!(
+                    "parse identity private key failed, stub: {}, path: {}, {}",
+                    self,
+                    key_path.display(),
+                    e
+                );
+                return Ok(None);
+            }
+        };
+        if let Err(e) = validate_identity_certificate(
+            &self.inner.identity_roots,
+            identity,
+            &self.inner.acme_item.domain,
+            leaf,
+            &private_key,
+        ) {
+            debug!(
+                "identity certificate validation failed, stub: {}, identity: {}, fullchain: {}, key: {}, {}",
+                self,
+                identity,
+                cert_match.path.display(),
+                key_path.display(),
+                e
+            );
+            return Ok(None);
+        }
+        let certified_key = match Self::create_certified_key(&cert_data, &key_data) {
+            Ok(certified_key) => certified_key,
+            Err(e) => {
+                debug!(
+                    "parse identity certificate/key failed, stub: {}, fullchain: {}, key: {}, {}",
+                    self,
+                    cert_match.path.display(),
+                    key_path.display(),
+                    e
+                );
+                return Ok(None);
+            }
+        };
+        let expires = match Self::get_cert_expiry(&cert_data) {
+            Ok(expires) => expires,
+            Err(e) => {
+                debug!(
+                    "read identity certificate expiry failed, stub: {}, fullchain: {}, {}",
+                    self,
+                    cert_match.path.display(),
+                    e
+                );
+                return Ok(None);
+            }
+        };
+
+        info!(
+            "load identity cert success, stub: {}, identity: {}, fullchain: {}, key: {}, expires: {}",
+            self,
+            identity,
+            cert_match.path.display(),
+            key_path.display(),
+            expires
+        );
+        Ok(Some(CertInfo {
+            key: Arc::new(certified_key),
+            expires,
+        }))
+    }
+
+    fn cert_needs_renewal(info: &CertInfo, renew_before_expiry: chrono::Duration) -> bool {
+        let now = chrono::Utc::now();
+        now >= info.expires || now >= info.expires - renew_before_expiry
+    }
+
     async fn order_inner(&self) -> Result<()> {
         let mut order = AcmeOrderSession::new(
             self.inner.acme_item.domain.clone(),
@@ -327,19 +422,24 @@ impl CertStub {
         );
         let (cert_data, key_data) = order.start().await?;
 
-        let timestamp = chrono::Utc::now().timestamp();
-        let cert_path = format!("{}/{}.cert", self.inner.keystore_path, timestamp);
-        let key_path = format!("{}/{}.key", self.inner.keystore_path, timestamp);
-
-        fs::write(&cert_path, &cert_data).await?;
-        fs::write(&key_path, &key_data).await?;
+        install_identity_certificate(
+            &self.inner.identity_roots,
+            self.inner.acme_item.identity(),
+            &self.inner.acme_item.domain,
+            &self.inner.work_dir,
+            &cert_data,
+            &key_data,
+            self.inner.renew_before_expiry,
+        )?;
 
         let certified_key = Self::create_certified_key(&cert_data, &key_data)?;
         let expires = Self::get_cert_expiry(&cert_data)?;
 
         info!(
-            "save cert success, stub: {}, cert_path: {}, key_path: {}, expires: {}",
-            self, cert_path, key_path, expires
+            "install identity cert success, stub: {}, identity: {}, expires: {}",
+            self,
+            self.inner.acme_item.identity(),
+            expires
         );
 
         {
@@ -389,9 +489,466 @@ impl CertStub {
     }
 }
 
+struct PreparedIdentityCertificate {
+    cert_pem: Vec<u8>,
+    chain_pem: Vec<u8>,
+    fullchain_pem: Vec<u8>,
+    key_pem: Vec<u8>,
+    metadata_json: Vec<u8>,
+}
+
+struct StagedFile {
+    tmp_path: PathBuf,
+    final_path: PathBuf,
+}
+
+fn install_identity_certificate(
+    roots: &IdentityRoots,
+    identity: &str,
+    domain: &str,
+    work_dir: &Path,
+    fullchain_pem: &[u8],
+    key_pem: &[u8],
+    renew_before_expiry: chrono::Duration,
+) -> Result<()> {
+    let prepared = prepare_identity_certificate(
+        roots,
+        identity,
+        domain,
+        work_dir,
+        fullchain_pem,
+        key_pem,
+        renew_before_expiry,
+    )?;
+    let paths = roots
+        .x509_paths(identity, IdentityUsage::Server)
+        .map_err(|e| anyhow::anyhow!("calculate identity x509 paths failed: {}", e))?;
+    let private_key_path = paths
+        .private_key
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("server private key path is not available"))?;
+
+    let mut staged = Vec::new();
+    let stage_result = (|| -> Result<()> {
+        staged.push(stage_file(&paths.cert, &prepared.cert_pem, false)?);
+        staged.push(stage_file(&paths.chain, &prepared.chain_pem, false)?);
+        staged.push(stage_file(
+            &paths.fullchain,
+            &prepared.fullchain_pem,
+            false,
+        )?);
+        staged.push(stage_file(&paths.metadata, &prepared.metadata_json, false)?);
+        staged.push(stage_file(private_key_path, &prepared.key_pem, true)?);
+        Ok(())
+    })();
+
+    if let Err(err) = stage_result {
+        cleanup_staged_files(&staged);
+        return Err(err);
+    }
+
+    for staged_file in staged.iter() {
+        std::fs::rename(&staged_file.tmp_path, &staged_file.final_path).map_err(|e| {
+            anyhow::anyhow!(
+                "rename staged identity file {} to {} failed: {}",
+                staged_file.tmp_path.display(),
+                staged_file.final_path.display(),
+                e
+            )
+        })?;
+    }
+
+    remove_legacy_keyref(&paths.keyref)?;
+    sync_parent_dir(&paths.fullchain)?;
+    sync_parent_dir(private_key_path)?;
+    Ok(())
+}
+
+fn prepare_identity_certificate(
+    roots: &IdentityRoots,
+    identity: &str,
+    domain: &str,
+    work_dir: &Path,
+    fullchain_pem: &[u8],
+    key_pem: &[u8],
+    renew_before_expiry: chrono::Duration,
+) -> Result<PreparedIdentityCertificate> {
+    std::fs::create_dir_all(work_dir).map_err(|e| {
+        anyhow::anyhow!("create acme work dir {} failed: {}", work_dir.display(), e)
+    })?;
+
+    let certificates = X509::stack_from_pem(fullchain_pem)
+        .map_err(|e| anyhow::anyhow!("parse acme certificate chain failed: {}", e))?;
+    let leaf = certificates
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("acme certificate chain is empty"))?;
+    let private_key = PKey::private_key_from_pem(key_pem)
+        .map_err(|e| anyhow::anyhow!("parse acme private key failed: {}", e))?;
+    validate_identity_certificate(roots, identity, domain, leaf, &private_key)?;
+
+    let cert_pem = leaf.to_pem()?;
+    let mut chain_pem = Vec::new();
+    for cert in certificates.iter().skip(1) {
+        chain_pem.extend(cert.to_pem()?);
+    }
+    let mut normalized_fullchain = cert_pem.clone();
+    normalized_fullchain.extend(chain_pem.iter());
+
+    let public_key_fingerprint = public_key_fingerprint(leaf)?;
+    let raw_host_uri = roots
+        .raw_host_uri(identity)
+        .map_err(|e| anyhow::anyhow!("calculate raw host uri failed: {}", e))?;
+    let dir_name = roots
+        .dir_name(identity)
+        .map_err(|e| anyhow::anyhow!("calculate identity dir name failed: {}", e))?;
+    let did = canonical_did(identity, &raw_host_uri);
+    let updated_at = chrono::Utc::now().to_rfc3339();
+
+    let metadata = build_x509_metadata(
+        roots,
+        identity,
+        domain,
+        leaf,
+        &did,
+        raw_host_uri,
+        dir_name,
+        public_key_fingerprint,
+        work_dir,
+        renew_before_expiry,
+        updated_at,
+    )?;
+
+    Ok(PreparedIdentityCertificate {
+        cert_pem,
+        chain_pem,
+        fullchain_pem: normalized_fullchain,
+        key_pem: key_pem.to_vec(),
+        metadata_json: serde_json::to_vec_pretty(&metadata)?,
+    })
+}
+
+fn validate_identity_certificate(
+    roots: &IdentityRoots,
+    identity: &str,
+    domain: &str,
+    cert: &X509,
+    private_key: &PKey<Private>,
+) -> Result<()> {
+    let now = chrono::Utc::now();
+    let not_before = asn1_time_to_utc(cert.not_before())?;
+    let not_after = asn1_time_to_utc(cert.not_after())?;
+    if now < not_before {
+        return Err(anyhow::anyhow!(
+            "acme certificate is not valid yet: {}",
+            not_before
+        ));
+    }
+    if now >= not_after {
+        return Err(anyhow::anyhow!(
+            "acme certificate is expired: {}",
+            not_after
+        ));
+    }
+
+    let cert_public_key = cert.public_key()?;
+    if !cert_public_key.public_eq(private_key) {
+        return Err(anyhow::anyhow!(
+            "acme certificate public key does not match private key"
+        ));
+    }
+
+    let dns_names = cert_dns_names(cert);
+    let expected_dns = roots
+        .did_web_dns_san(identity)
+        .unwrap_or_else(|_| domain.to_string());
+    if !dns_names
+        .iter()
+        .any(|dns_name| dns_san_matches(dns_name, &expected_dns))
+    {
+        return Err(anyhow::anyhow!(
+            "acme certificate DNS SAN does not cover identity host: expected {}, got {:?}",
+            expected_dns,
+            dns_names
+        ));
+    }
+
+    Ok(())
+}
+
+fn build_x509_metadata(
+    roots: &IdentityRoots,
+    identity: &str,
+    domain: &str,
+    cert: &X509,
+    did: &str,
+    raw_host_uri: String,
+    dir_name: String,
+    public_key_fingerprint: String,
+    work_dir: &Path,
+    renew_before_expiry: chrono::Duration,
+    updated_at: String,
+) -> Result<X509Metadata> {
+    let not_before = asn1_time_to_utc(cert.not_before())?.to_rfc3339();
+    let not_after = asn1_time_to_utc(cert.not_after())?.to_rfc3339();
+    let serial_number = cert
+        .serial_number()
+        .to_bn()
+        .and_then(|bn| bn.to_hex_str())
+        .map(|s| s.to_string())
+        .ok();
+    let match_info = if domain.starts_with("*.") {
+        X509MatchMetadata::Wildcard {
+            host_pattern: domain.to_string(),
+        }
+    } else {
+        X509MatchMetadata::Exact {
+            host: domain.to_string(),
+        }
+    };
+    let generation = format!(
+        "{}-{}",
+        chrono::Utc::now().format("%Y%m%dT%H%M%SZ"),
+        cert_fingerprint_sha256(cert)?
+    );
+
+    Ok(X509Metadata {
+        schema: Some(X509_METADATA_SCHEMA.to_string()),
+        did: did.to_string(),
+        raw_host_uri,
+        dir_name,
+        usage: IdentityUsage::Server,
+        match_info: Some(match_info),
+        certificate: Some(X509CertificateMetadata {
+            serial_number,
+            issuer: Some(x509_name_to_string(cert.issuer_name())),
+            subject: Some(x509_name_to_string(cert.subject_name())),
+            not_before: Some(not_before),
+            not_after,
+            fingerprint_sha256: Some(cert_fingerprint_sha256(cert)?),
+            public_key_fingerprint: Some(public_key_fingerprint),
+        }),
+        san: Some(X509SanMetadata {
+            dns: cert_dns_names(cert),
+            uri: cert_uri_names(cert),
+        }),
+        paths: Some(X509PathMetadata {
+            cert: Some("server.cert.pem".to_string()),
+            chain: Some("server.chain.pem".to_string()),
+            fullchain: Some("server.fullchain.pem".to_string()),
+            ca: None,
+            key_ref: None,
+        }),
+        did_binding: roots
+            .did_web_document_url(identity)
+            .ok()
+            .map(|did_document_url| {
+                serde_json::json!({
+                    "type": "did-web-domain",
+                    "did": did,
+                    "web_origin": format!("https://{}", domain.trim_start_matches("*.")),
+                    "did_document_url": did_document_url
+                })
+            }),
+        renewal: Some(serde_json::json!({
+            "manager": "acme",
+            "renew_before": format!("PT{}S", renew_before_expiry.num_seconds()),
+            "last_renewed_at": updated_at,
+            "state_ref": work_dir.to_string_lossy()
+        })),
+        updated_at: Some(updated_at),
+        generation: Some(generation),
+    })
+}
+
+fn cert_dns_names(cert: &X509) -> Vec<String> {
+    cert.subject_alt_names()
+        .map(|names| {
+            names
+                .iter()
+                .filter_map(|name| name.dnsname().map(ToOwned::to_owned))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn cert_uri_names(cert: &X509) -> Vec<String> {
+    cert.subject_alt_names()
+        .map(|names| {
+            names
+                .iter()
+                .filter_map(|name| name.uri().map(ToOwned::to_owned))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn dns_san_matches(pattern: &str, host: &str) -> bool {
+    if pattern.eq_ignore_ascii_case(host) {
+        return true;
+    }
+
+    let Some(suffix) = pattern.strip_prefix("*.") else {
+        return false;
+    };
+    let host = host.to_ascii_lowercase();
+    let suffix = suffix.to_ascii_lowercase();
+    if host == suffix || !host.ends_with(&suffix) {
+        return false;
+    }
+    let prefix_len = host.len() - suffix.len();
+    prefix_len > 1
+        && host.as_bytes()[prefix_len - 1] == b'.'
+        && !host[..prefix_len - 1].contains('.')
+}
+
+fn cert_fingerprint_sha256(cert: &X509) -> Result<String> {
+    let digest = cert.digest(MessageDigest::sha256())?;
+    Ok(format!("sha256:{}", hex::encode(digest)))
+}
+
+fn public_key_fingerprint(cert: &X509) -> Result<String> {
+    let public_key = cert.public_key()?;
+    let der = public_key.public_key_to_der()?;
+    Ok(format!(
+        "sha256:{}",
+        hex::encode(sha2::Sha256::digest(&der))
+    ))
+}
+
+fn asn1_time_to_utc(time: &Asn1TimeRef) -> Result<chrono::DateTime<chrono::Utc>> {
+    let raw = time.to_string();
+    let datetime_str = raw
+        .rsplit_once(' ')
+        .map(|(datetime, _)| datetime)
+        .ok_or_else(|| anyhow::anyhow!("Invalid ASN.1 datetime format: {}", raw))?;
+    let expires = chrono::NaiveDateTime::parse_from_str(datetime_str, "%b %e %H:%M:%S %Y")?;
+    Ok(chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(
+        expires,
+        chrono::Utc,
+    ))
+}
+
+fn x509_name_to_string(name: &X509NameRef) -> String {
+    name.entries()
+        .map(|entry| {
+            let key = entry.object().nid().short_name().unwrap_or("OID");
+            let value = entry
+                .data()
+                .to_string()
+                .unwrap_or_else(|_| hex::encode(entry.data().as_slice()));
+            format!("{key}={value}")
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn canonical_did(identity: &str, raw_host_uri: &str) -> String {
+    if identity.trim().starts_with("did:") {
+        identity.trim().to_string()
+    } else {
+        let host_uri = raw_host_uri.replace('/', ":");
+        format!("did:web:{host_uri}")
+    }
+}
+
+fn stage_file(path: &Path, data: &[u8], private: bool) -> Result<StagedFile> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("identity file path has no parent: {}", path.display()))?;
+    std::fs::create_dir_all(parent)
+        .map_err(|e| anyhow::anyhow!("create identity dir {} failed: {}", parent.display(), e))?;
+
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("identity file path has no file name: {}", path.display()))?
+        .to_string_lossy();
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let tmp_path = parent.join(format!(".{file_name}.{unique}.tmp"));
+
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        options.mode(if private { 0o600 } else { 0o644 });
+    }
+    let mut file = options.open(&tmp_path).map_err(|e| {
+        anyhow::anyhow!(
+            "create temp identity file {} failed: {}",
+            tmp_path.display(),
+            e
+        )
+    })?;
+    file.write_all(data).map_err(|e| {
+        anyhow::anyhow!(
+            "write temp identity file {} failed: {}",
+            tmp_path.display(),
+            e
+        )
+    })?;
+    file.sync_all().map_err(|e| {
+        anyhow::anyhow!(
+            "sync temp identity file {} failed: {}",
+            tmp_path.display(),
+            e
+        )
+    })?;
+
+    Ok(StagedFile {
+        tmp_path,
+        final_path: path.to_path_buf(),
+    })
+}
+
+fn cleanup_staged_files(staged: &[StagedFile]) {
+    for staged_file in staged {
+        let _ = std::fs::remove_file(&staged_file.tmp_path);
+    }
+}
+
+fn sync_parent_dir(path: &Path) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        let dir = std::fs::File::open(parent)
+            .map_err(|e| anyhow::anyhow!("open identity dir {} failed: {}", parent.display(), e))?;
+        dir.sync_all()
+            .map_err(|e| anyhow::anyhow!("sync identity dir {} failed: {}", parent.display(), e))?;
+    }
+    Ok(())
+}
+
+fn remove_legacy_keyref(path: &Path) -> Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => {
+            info!("removed legacy identity keyref {}", path.display());
+            sync_parent_dir(path)?;
+        }
+        Err(e) if e.kind() == ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(anyhow::anyhow!(
+                "remove legacy identity keyref {} failed: {}",
+                path.display(),
+                e
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn identity_private_key_path(roots: &IdentityRoots, dir_name: &str) -> PathBuf {
+    roots
+        .security_root
+        .join(dir_name)
+        .join("server.private.pem")
+}
+
 #[derive(Clone, Debug)]
 pub struct AcmeItem {
     domain: String,
+    identity: Option<String>,
+    identity_manager: Option<AcmeIdentityConfig>,
     challenge_type: ChallengeType,
     data: Option<serde_json::Value>,
 }
@@ -404,8 +961,39 @@ impl AcmeItem {
     ) -> Self {
         Self {
             domain,
+            identity: None,
+            identity_manager: None,
             challenge_type,
             data,
+        }
+    }
+
+    pub fn with_identity(
+        mut self,
+        identity: Option<String>,
+        identity_manager: Option<AcmeIdentityConfig>,
+    ) -> Self {
+        self.identity = identity;
+        self.identity_manager = identity_manager;
+        self
+    }
+
+    pub fn identity(&self) -> &str {
+        self.identity.as_deref().unwrap_or(self.domain.as_str())
+    }
+
+    fn identity_roots(
+        &self,
+        default_identity_manager: &Option<AcmeIdentityConfig>,
+    ) -> Result<IdentityRoots> {
+        let config = self
+            .identity_manager
+            .as_ref()
+            .or(default_identity_manager.as_ref());
+        match config {
+            Some(config) => config.to_roots(),
+            None => IdentityRoots::from_env_or_buckyos_root()
+                .map_err(|e| anyhow::anyhow!("load default identity roots failed: {}", e)),
         }
     }
 }
@@ -475,6 +1063,38 @@ struct DnsProviderInfo {
     pub dns_provider: String,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct AcmeIdentityConfig {
+    #[serde(
+        default,
+        alias = "public_root",
+        alias = "public_identity_root",
+        alias = "public_identity_root_path",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub public_root_path: Option<String>,
+    #[serde(
+        default,
+        alias = "security_root",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub security_root_path: Option<String>,
+}
+
+impl AcmeIdentityConfig {
+    fn to_roots(&self) -> Result<IdentityRoots> {
+        let mut roots = IdentityRoots::from_env_or_buckyos_root()
+            .map_err(|e| anyhow::anyhow!("load default identity roots failed: {}", e))?;
+        if let Some(public_root_path) = self.public_root_path.as_ref() {
+            roots.public_root = PathBuf::from(public_root_path);
+        }
+        if let Some(security_root_path) = self.security_root_path.as_ref() {
+            roots.security_root = PathBuf::from(security_root_path);
+        }
+        Ok(roots)
+    }
+}
+
 pub struct AcmeCertManager {
     config: CertManagerConfig,
     acme_client: AcmeClient,
@@ -495,6 +1115,7 @@ pub struct CertManagerConfig {
     pub dns_providers: Option<HashMap<String, serde_json::Value>>,
     pub keystore_path: String,
     pub dns_provider_path: Option<String>,
+    pub identity_manager: Option<AcmeIdentityConfig>,
     #[serde(default = "default_check_interval")]
     pub check_interval: chrono::Duration, // 检查证书的时间间隔
     #[serde(default = "default_renew_before_expiry")]
@@ -506,7 +1127,7 @@ fn default_check_interval() -> chrono::Duration {
 }
 
 fn default_renew_before_expiry() -> chrono::Duration {
-    chrono::Duration::days(30) // 默认过期前30天续期
+    chrono::Duration::days(7) // 默认过期前7天续期
 }
 
 impl Default for CertManagerConfig {
@@ -517,6 +1138,7 @@ impl Default for CertManagerConfig {
             dns_providers: None,
             keystore_path: String::new(),
             dns_provider_path: None,
+            identity_manager: None,
             check_interval: default_check_interval(),
             renew_before_expiry: default_renew_before_expiry(),
         }
@@ -682,16 +1304,16 @@ impl AcmeCertManager {
     }
 
     pub fn add_acme_item(&self, item: AcmeItem) -> Result<()> {
-        let keystore_path = buckyos_kit::path_join(
+        let work_dir = buckyos_kit::path_join(
             &self.config.keystore_path,
             &sanitize_path_component(&item.domain),
         );
-        if !keystore_path.exists() {
-            if let Err(e) = std::fs::create_dir_all(&keystore_path) {
+        if !work_dir.exists() {
+            if let Err(e) = std::fs::create_dir_all(&work_dir) {
                 error!(
                     "Failed to create certificate storage directory: {} {}",
                     e,
-                    keystore_path.to_str().unwrap()
+                    work_dir.to_str().unwrap()
                 );
                 return Err(anyhow::anyhow!(
                     "Failed to create certificate storage directory: {}",
@@ -701,6 +1323,7 @@ impl AcmeCertManager {
         }
 
         let responder = { self.responder.lock().unwrap().clone().unwrap() };
+        let identity_roots = item.identity_roots(&self.config.identity_manager)?;
         let mut certs = self.certs.write().unwrap();
         if certs.contains_key(&item.domain) {
             return Ok(());
@@ -708,9 +1331,11 @@ impl AcmeCertManager {
         let domain = item.domain.clone();
         let cert_stub = CertStub::new(
             item,
-            keystore_path.to_str().unwrap().to_string(),
+            work_dir,
+            identity_roots,
             self.acme_client.clone(),
             responder,
+            self.config.renew_before_expiry,
         );
         certs.insert(domain, cert_stub.clone());
         cert_stub.load_cert();
@@ -938,4 +1563,114 @@ fn sanitize_path_component(s: &str) -> String {
             c => c.to_string(),
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use openssl::asn1::Asn1Time;
+    use openssl::bn::BigNum;
+    use openssl::x509::extension::SubjectAlternativeName;
+    use openssl::x509::{X509Builder, X509NameBuilder};
+
+    #[test]
+    fn install_identity_certificate_writes_active_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let roots = IdentityRoots::new(temp.path().join("identity"), temp.path().join("security"));
+        let work_dir = temp.path().join("state").join("acme").join("example.com");
+        let (cert, key) = generate_test_cert("example.com", 90);
+        let paths = roots
+            .x509_paths("example.com", IdentityUsage::Server)
+            .unwrap();
+        std::fs::create_dir_all(paths.keyref.parent().unwrap()).unwrap();
+        std::fs::write(&paths.keyref, "stale keyref").unwrap();
+
+        install_identity_certificate(
+            &roots,
+            "example.com",
+            "example.com",
+            &work_dir,
+            &cert,
+            &key,
+            chrono::Duration::days(7),
+        )
+        .unwrap();
+
+        assert!(paths.cert.exists());
+        assert!(paths.chain.exists());
+        assert!(paths.fullchain.exists());
+        assert!(paths.metadata.exists());
+        assert!(paths.private_key.unwrap().exists());
+        assert!(!paths.keyref.exists());
+    }
+
+    #[test]
+    fn install_identity_certificate_rejects_san_mismatch_without_overwrite() {
+        let temp = tempfile::tempdir().unwrap();
+        let roots = IdentityRoots::new(temp.path().join("identity"), temp.path().join("security"));
+        let work_dir = temp.path().join("state").join("acme").join("example.com");
+        let (cert, key) = generate_test_cert("example.com", 90);
+
+        install_identity_certificate(
+            &roots,
+            "example.com",
+            "example.com",
+            &work_dir,
+            &cert,
+            &key,
+            chrono::Duration::days(7),
+        )
+        .unwrap();
+        let paths = roots
+            .x509_paths("example.com", IdentityUsage::Server)
+            .unwrap();
+        let old_fullchain = std::fs::read(&paths.fullchain).unwrap();
+
+        let (wrong_cert, wrong_key) = generate_test_cert("other.example.com", 90);
+        let result = install_identity_certificate(
+            &roots,
+            "example.com",
+            "example.com",
+            &work_dir,
+            &wrong_cert,
+            &wrong_key,
+            chrono::Duration::days(7),
+        );
+
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(&paths.fullchain).unwrap(), old_fullchain);
+    }
+
+    fn generate_test_cert(domain: &str, valid_days: u32) -> (Vec<u8>, Vec<u8>) {
+        let rsa = openssl::rsa::Rsa::generate(2048).unwrap();
+        let pkey = PKey::from_rsa(rsa).unwrap();
+        let mut builder = X509Builder::new().unwrap();
+        builder.set_version(2).unwrap();
+
+        let serial = BigNum::from_u32(1).unwrap().to_asn1_integer().unwrap();
+        builder.set_serial_number(&serial).unwrap();
+
+        let mut name = X509NameBuilder::new().unwrap();
+        name.append_entry_by_text("CN", domain).unwrap();
+        let name = name.build();
+        builder.set_subject_name(&name).unwrap();
+        builder.set_issuer_name(&name).unwrap();
+        builder.set_pubkey(&pkey).unwrap();
+
+        let not_before = Asn1Time::days_from_now(0).unwrap();
+        let not_after = Asn1Time::days_from_now(valid_days).unwrap();
+        builder.set_not_before(&not_before).unwrap();
+        builder.set_not_after(&not_after).unwrap();
+
+        let san = SubjectAlternativeName::new()
+            .dns(domain)
+            .build(&builder.x509v3_context(None, None))
+            .unwrap();
+        builder.append_extension(san).unwrap();
+        builder.sign(&pkey, MessageDigest::sha256()).unwrap();
+
+        let cert = builder.build().to_pem().unwrap();
+        let key = pkey.private_key_to_pem_pkcs8().unwrap();
+        (cert, key)
+    }
 }

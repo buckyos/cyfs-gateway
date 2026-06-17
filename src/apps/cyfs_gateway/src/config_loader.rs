@@ -1,10 +1,11 @@
 use buckyos_kit::get_buckyos_service_data_dir;
+use cyfs_acme::{AcmeIdentityConfig, ChallengeType};
 use cyfs_dns::{DnsServerConfig, LocalDnsConfig};
 use cyfs_gateway_lib::{
-    AcmeHttpChallengeServerConfig, BlockConfig, CollectionConfig, ConfigErrorCode, ConfigResult,
-    CyfsDirServerConfig, DirServerConfig, ProcessChainConfig, ProcessChainConfigs,
+    config_err, AcmeHttpChallengeServerConfig, BlockConfig, CollectionConfig, ConfigErrorCode,
+    ConfigResult, CyfsDirServerConfig, DirServerConfig, ProcessChainConfig, ProcessChainConfigs,
     ProcessChainHttpServerConfig, QuicStackConfig, RtcpStackConfig, ServerConfig, StackConfig,
-    TcpStackConfig, UdpStackConfig, config_err,
+    TcpStackConfig, UdpStackConfig,
 };
 use cyfs_sn::*;
 use cyfs_socks::SocksServerConfig;
@@ -949,10 +950,26 @@ impl GatewayConfigParser {
 }
 
 #[derive(Deserialize, Clone, Eq, PartialEq)]
+pub struct AcmeHostConfig {
+    #[serde(alias = "hostname", alias = "domain")]
+    pub host: String,
+    #[serde(alias = "acme_type", alias = "method")]
+    pub challenge_type: Option<ChallengeType>,
+    pub dns_provider: Option<String>,
+    pub identity: Option<String>,
+    pub identity_manager: Option<AcmeIdentityConfig>,
+    #[serde(flatten)]
+    pub data: Option<serde_json::Value>,
+}
+
+#[derive(Deserialize, Clone, Eq, PartialEq)]
 pub struct AcmeConfig {
     pub account: Option<String>,
     pub issuer: Option<String>,
     pub dns_providers: Option<HashMap<String, serde_json::Value>>,
+    #[serde(default)]
+    pub hosts: Vec<AcmeHostConfig>,
+    pub identity_manager: Option<AcmeIdentityConfig>,
     pub check_interval: Option<u64>,
     pub renew_before_expiry: Option<u64>,
 }
@@ -1112,6 +1129,54 @@ mod tests {
             }
         });
         assert!(parser.parse(json).is_err());
+    }
+
+    #[test]
+    fn test_acme_config_hosts_parser() {
+        let parser = super::GatewayConfigParser::new();
+        let config = parser
+            .parse(json!({
+                "acme": {
+                    "account": "admin@example.com",
+                    "dns_providers": {
+                        "sn-dns": {
+                            "sn": "https://sn.devtests.org/kapi/sn",
+                            "key_path": "./node_private_key.pem"
+                        }
+                    },
+                    "hosts": [
+                        {
+                            "host": "gateway.example.com",
+                            "challenge_type": "dns-01",
+                            "dns_provider": "sn-dns"
+                        },
+                        {
+                            "domain": "*.example.com",
+                            "method": "tls-alpn-01",
+                            "identity": "did:web:example.com"
+                        }
+                    ]
+                }
+            }))
+            .unwrap();
+
+        let acme = config.acme_config.unwrap();
+        assert_eq!(acme.hosts.len(), 2);
+        assert_eq!(acme.hosts[0].host, "gateway.example.com");
+        assert_eq!(
+            acme.hosts[0].challenge_type,
+            Some(cyfs_acme::ChallengeType::Dns01)
+        );
+        assert_eq!(acme.hosts[0].dns_provider.as_deref(), Some("sn-dns"));
+        assert_eq!(acme.hosts[1].host, "*.example.com");
+        assert_eq!(
+            acme.hosts[1].challenge_type,
+            Some(cyfs_acme::ChallengeType::TlsAlpn01)
+        );
+        assert_eq!(
+            acme.hosts[1].identity.as_deref(),
+            Some("did:web:example.com")
+        );
     }
 
     #[test]
