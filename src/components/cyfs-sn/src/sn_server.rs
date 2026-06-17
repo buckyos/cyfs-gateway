@@ -159,6 +159,11 @@ pub struct SNServer {
     name_info_cache: NameInfoCacheRef,
 }
 
+enum UncachedNameInfoQueryResult {
+    Found(NameInfo),
+    Tombstone,
+}
+
 impl SNServer {
     fn rewrite_rpc_method(mut req: RPCRequest, method: &str) -> RPCRequest {
         req.method = method.to_string();
@@ -418,16 +423,19 @@ impl SNServer {
             .add_tombstone(name, record_type, cache_ttl_secs);
     }
 
-    fn cache_name_info_result(
-        &self,
-        name: &str,
-        record_type: RecordType,
-        name_info: NameInfo,
-    ) -> NameInfo {
-        let cache_ttl_secs = name_info.ttl;
-        self.name_info_cache
-            .add(name, record_type, name_info.clone(), cache_ttl_secs);
-        name_info
+    fn normalize_query_name(name: &str) -> String {
+        if name.ends_with(".") {
+            name.trim_end_matches('.').to_string()
+        } else {
+            name.to_string()
+        }
+    }
+
+    fn is_supported_name_record_type(record_type: RecordType) -> bool {
+        matches!(
+            record_type,
+            RecordType::A | RecordType::AAAA | RecordType::TXT
+        )
     }
 
     pub async fn check_username(&self, req: RPCRequest) -> Result<RPCResponse, RPCErrors> {
@@ -2849,6 +2857,201 @@ impl SNServer {
         }
     }
 
+    async fn query_name_info_uncached(
+        &self,
+        name: &str,
+        req_real_name: &str,
+        record_type: RecordType,
+        _from_ip: IpAddr,
+    ) -> ServerResult<UncachedNameInfoQueryResult> {
+        if !Self::is_supported_name_record_type(record_type) {
+            return Err(server_err!(
+                ServerErrorCode::NotFound,
+                "sn-server not support record type {}",
+                record_type.to_string()
+            ));
+        }
+
+        let sn_full_host = format!("sn.{}", self.server_host);
+        if req_real_name == sn_full_host
+            || req_real_name == self.server_host
+            || self
+                .server_aliases
+                .iter()
+                .any(|alias| alias == req_real_name)
+        {
+            //返回当前服务器的地址
+            match record_type {
+                RecordType::A => {
+                    if self.server_ip.is_ipv4() {
+                        let result_name_info = NameInfo::from_address(name, self.server_ip);
+                        return Ok(UncachedNameInfoQueryResult::Found(result_name_info));
+                    }
+                    let result_name_info = NameInfo::from_address_vec(name, vec![]);
+                    return Ok(UncachedNameInfoQueryResult::Found(result_name_info));
+                }
+                RecordType::AAAA => {
+                    if self.server_ip.is_ipv6() {
+                        let result_name_info = NameInfo::from_address(name, self.server_ip);
+                        return Ok(UncachedNameInfoQueryResult::Found(result_name_info));
+                    }
+                    let result_name_info = NameInfo::from_address_vec(name, vec![]);
+                    return Ok(UncachedNameInfoQueryResult::Found(result_name_info));
+                }
+                RecordType::TXT => {
+                    let device_jwt = self.device_jwt.get(0);
+                    let name_info = self.create_name_info_from_zone_config(
+                        self.boot_jwt.as_str(),
+                        self.owner_pkx.as_str(),
+                        device_jwt,
+                    );
+                    return Ok(UncachedNameInfoQueryResult::Found(name_info));
+                }
+                _ => {
+                    return Err(server_err!(
+                        ServerErrorCode::NotFound,
+                        "sn-server not support record type {}",
+                        record_type.to_string()
+                    ));
+                }
+            }
+        }
+
+        let get_result = SNServer::get_user_subhost_from_host(req_real_name, &self.server_host);
+        if get_result.is_some() {
+            let (sub_host, username) = get_result.unwrap();
+
+            // if req_real_name.ends_with(&sn_full_host) {
+            //     let sub_name = name[0..name.len() - sn_full_host.len()].to_string();
+            //     //split sub_name by "."
+            //     let subs: Vec<&str> = sub_name.split(".").collect();
+            //     let username = subs.last();
+            //     if username.is_none() {
+            //         return Err(server_err!(
+            //             ServerErrorCode::NotFound,
+            //             "{}",
+            //             name.to_string()
+            //         ));
+            //     }
+            info!(
+                "host {} owner by user {}, sub_host: {}, record_type: {:?}",
+                req_real_name, username, sub_host, record_type
+            );
+            match record_type {
+                RecordType::TXT => {
+                    let ret = self.db.query_domain_record(req_real_name, "TXT").await;
+                    if let Ok(Some((record, ttl))) = ret {
+                        let mut name_info = NameInfo::default();
+                        name_info.ttl = Some(ttl);
+                        name_info.txt.push(record);
+                        return Ok(UncachedNameInfoQueryResult::Found(name_info));
+                    }
+                    let zone_config = self.get_user_zone_config(username.as_str()).await;
+                    if zone_config.is_some() {
+                        let (public_key, zone_config, sn_ips, device_jwt) = zone_config.unwrap();
+                        let name_info = self.create_name_info_from_zone_config(
+                            zone_config.as_str(),
+                            public_key.as_str(),
+                            device_jwt.as_ref(),
+                        );
+                        info!(
+                            "<={} zone_config:{} public_key:{} device_jwt:{:?} ",
+                            name, zone_config, public_key, device_jwt
+                        );
+                        Ok(UncachedNameInfoQueryResult::Found(name_info))
+                    } else {
+                        Err(server_err!(
+                            ServerErrorCode::NotFound,
+                            "{}",
+                            name.to_string()
+                        ))
+                    }
+                }
+                RecordType::A | RecordType::AAAA => {
+                    let ret = self
+                        .db
+                        .query_domain_record(req_real_name, record_type.to_string().as_str())
+                        .await;
+                    if let Ok(Some((record, ttl))) = ret {
+                        let mut address_vec = Vec::new();
+                        record.split(',').for_each(|x| {
+                            if let Ok(ip) = IpAddr::from_str(x) {
+                                address_vec.push(ip);
+                            }
+                        });
+
+                        let mut result_name_info = NameInfo::from_address_vec(name, address_vec);
+                        result_name_info.ttl = Some(ttl);
+                        info!("=>{} result_name_info: {:?}", name, result_name_info);
+                        return Ok(UncachedNameInfoQueryResult::Found(result_name_info));
+                    }
+                    let address_vec = self
+                        .get_user_zonegate_address(username.as_str(), record_type)
+                        .await?;
+                    if address_vec.is_some() {
+                        let address_vec = address_vec.unwrap();
+                        let result_name_info = NameInfo::from_address_vec(name, address_vec);
+                        info!("=>{} result_name_info: {:?}", name, result_name_info);
+                        Ok(UncachedNameInfoQueryResult::Found(result_name_info))
+                    } else {
+                        Err(server_err!(
+                            ServerErrorCode::NotFound,
+                            "no address found for {}",
+                            name.to_string()
+                        ))
+                    }
+                }
+                _ => {
+                    return Err(server_err!(
+                        ServerErrorCode::NotFound,
+                        "sn-server not support record type {}",
+                        record_type.to_string()
+                    ));
+                }
+            }
+        } else {
+            info!("get user subhost from host: {} failed", req_real_name);
+            let real_domain_name = req_real_name.to_string();
+            match record_type {
+                RecordType::TXT => {
+                    let zone_config_info =
+                        self.get_user_zone_config_by_domain(&real_domain_name).await;
+                    if zone_config_info.is_some() {
+                        let (public_key, zone_config, device_jwt) = zone_config_info.unwrap();
+                        let name_info = self.create_name_info_from_zone_config(
+                            zone_config.as_str(),
+                            public_key.as_str(),
+                            device_jwt.as_ref(),
+                        );
+                        return Ok(UncachedNameInfoQueryResult::Found(name_info));
+                    } else {
+                        return Ok(UncachedNameInfoQueryResult::Tombstone);
+                    }
+                }
+                RecordType::A | RecordType::AAAA => {
+                    let address_vec = self
+                        .get_user_zonegate_address_by_domain(&real_domain_name, record_type)
+                        .await?;
+                    if address_vec.is_some() {
+                        let address_vec = address_vec.unwrap();
+                        let result_name_info = NameInfo::from_address_vec(name, address_vec);
+                        info!("=>{} result_name_info: {:?}", name, result_name_info);
+                        return Ok(UncachedNameInfoQueryResult::Found(result_name_info));
+                    }
+                }
+                _ => {
+                    return Err(server_err!(
+                        ServerErrorCode::NotFound,
+                        "sn-server not support record type {}",
+                        record_type.to_string()
+                    ));
+                }
+            }
+
+            Ok(UncachedNameInfoQueryResult::Tombstone)
+        }
+    }
+
     pub(crate) fn db(&self) -> &SnDBRef {
         &self.db
     }
@@ -2920,25 +3123,7 @@ impl NameServer for SNServer {
         );
         let record_type = record_type.unwrap_or_default();
         let from_ip = from_ip.unwrap_or(self.server_ip);
-        let mut is_support = false;
-        if record_type == RecordType::A
-            || record_type == RecordType::AAAA
-            || record_type == RecordType::TXT
-        {
-            is_support = true;
-        }
-
-        if !is_support {
-            return Err(server_err!(
-                ServerErrorCode::NotFound,
-                "sn-server not support record type {}",
-                record_type.to_string()
-            ));
-        }
-        let mut req_real_name: String = name.to_string();
-        if name.ends_with(".") {
-            req_real_name = name.trim_end_matches('.').to_string();
-        }
+        let req_real_name = Self::normalize_query_name(name);
 
         match self
             .name_info_cache
@@ -2965,246 +3150,33 @@ impl NameServer for SNServer {
             None => {}
         }
 
-        let sn_full_host = format!("sn.{}", self.server_host);
-        if req_real_name == sn_full_host
-            || req_real_name == self.server_host
-            || self.server_aliases.contains(&req_real_name)
+        info!(
+            "sn server name cache miss: {} record_type: {:?}",
+            req_real_name, record_type
+        );
+        match self
+            .query_name_info_uncached(name, req_real_name.as_str(), record_type, from_ip)
+            .await?
         {
-            //返回当前服务器的地址
-            match record_type {
-                RecordType::A => {
-                    if self.server_ip.is_ipv4() {
-                        let result_name_info = NameInfo::from_address(name, self.server_ip);
-                        return Ok(self.cache_name_info_result(
-                            req_real_name.as_str(),
-                            record_type,
-                            result_name_info,
-                        ));
-                    }
-                    let result_name_info = NameInfo::from_address_vec(name, vec![]);
-                    return Ok(self.cache_name_info_result(
-                        req_real_name.as_str(),
-                        record_type,
-                        result_name_info,
-                    ));
-                }
-                RecordType::AAAA => {
-                    if self.server_ip.is_ipv6() {
-                        let result_name_info = NameInfo::from_address(name, self.server_ip);
-                        return Ok(self.cache_name_info_result(
-                            req_real_name.as_str(),
-                            record_type,
-                            result_name_info,
-                        ));
-                    }
-                    let result_name_info = NameInfo::from_address_vec(name, vec![]);
-                    return Ok(self.cache_name_info_result(
-                        req_real_name.as_str(),
-                        record_type,
-                        result_name_info,
-                    ));
-                }
-                RecordType::TXT => {
-                    let device_jwt = self.device_jwt.get(0);
-                    let name_info = self.create_name_info_from_zone_config(
-                        self.boot_jwt.as_str(),
-                        self.owner_pkx.as_str(),
-                        device_jwt,
-                    );
-                    return Ok(self.cache_name_info_result(
-                        req_real_name.as_str(),
-                        record_type,
-                        name_info,
-                    ));
-                }
-                _ => {
-                    return Err(server_err!(
-                        ServerErrorCode::NotFound,
-                        "sn-server not support record type {}",
-                        record_type.to_string()
-                    ));
-                }
+            UncachedNameInfoQueryResult::Found(name_info) => {
+                let cache_ttl_secs = name_info.ttl;
+                self.name_info_cache.add(
+                    req_real_name.as_str(),
+                    record_type,
+                    name_info.clone(),
+                    cache_ttl_secs,
+                );
+                Ok(name_info)
             }
-        }
-
-        let get_result = SNServer::get_user_subhost_from_host(&req_real_name, &self.server_host);
-        if get_result.is_some() {
-            let (sub_host, username) = get_result.unwrap();
-
-            // if req_real_name.ends_with(&sn_full_host) {
-            //     let sub_name = name[0..name.len() - sn_full_host.len()].to_string();
-            //     //split sub_name by "."
-            //     let subs: Vec<&str> = sub_name.split(".").collect();
-            //     let username = subs.last();
-            //     if username.is_none() {
-            //         return Err(server_err!(
-            //             ServerErrorCode::NotFound,
-            //             "{}",
-            //             name.to_string()
-            //         ));
-            //     }
-            info!(
-                "host {} owner by user {}, sub_host: {}, record_type: {:?}",
-                req_real_name, username, sub_host, record_type
-            );
-            match record_type {
-                RecordType::TXT => {
-                    let ret = self
-                        .db
-                        .query_domain_record(req_real_name.as_str(), "TXT")
-                        .await;
-                    if let Ok(Some((record, ttl))) = ret {
-                        let mut name_info = NameInfo::default();
-                        name_info.ttl = Some(ttl);
-                        name_info.txt.push(record);
-                        return Ok(self.cache_name_info_result(
-                            req_real_name.as_str(),
-                            record_type,
-                            name_info,
-                        ));
-                    }
-                    let zone_config = self.get_user_zone_config(username.as_str()).await;
-                    if zone_config.is_some() {
-                        let mut name_info = NameInfo::default();
-                        let (public_key, zone_config, sn_ips, device_jwt) = zone_config.unwrap();
-                        let name_info = self.create_name_info_from_zone_config(
-                            zone_config.as_str(),
-                            public_key.as_str(),
-                            device_jwt.as_ref(),
-                        );
-                        info!(
-                            "<={} zone_config:{} public_key:{} device_jwt:{:?} ",
-                            name, zone_config, public_key, device_jwt
-                        );
-                        Ok(self.cache_name_info_result(
-                            req_real_name.as_str(),
-                            record_type,
-                            name_info,
-                        ))
-                    } else {
-                        Err(server_err!(
-                            ServerErrorCode::NotFound,
-                            "{}",
-                            name.to_string()
-                        ))
-                    }
-                }
-                RecordType::A | RecordType::AAAA => {
-                    let ret = self
-                        .db
-                        .query_domain_record(
-                            req_real_name.as_str(),
-                            record_type.to_string().as_str(),
-                        )
-                        .await;
-                    if let Ok(Some((record, ttl))) = ret {
-                        let mut address_vec = Vec::new();
-                        record.split(',').for_each(|x| {
-                            if let Ok(ip) = IpAddr::from_str(x) {
-                                address_vec.push(ip);
-                            }
-                        });
-
-                        let mut result_name_info = NameInfo::from_address_vec(name, address_vec);
-                        result_name_info.ttl = Some(ttl);
-                        info!("=>{} result_name_info: {:?}", name, result_name_info);
-                        return Ok(self.cache_name_info_result(
-                            req_real_name.as_str(),
-                            record_type,
-                            result_name_info,
-                        ));
-                    }
-                    let address_vec = self
-                        .get_user_zonegate_address(username.as_str(), record_type)
-                        .await?;
-                    if address_vec.is_some() {
-                        let address_vec = address_vec.unwrap();
-                        let result_name_info = NameInfo::from_address_vec(name, address_vec);
-                        info!("=>{} result_name_info: {:?}", name, result_name_info);
-                        Ok(self.cache_name_info_result(
-                            req_real_name.as_str(),
-                            record_type,
-                            result_name_info,
-                        ))
-                    } else {
-                        Err(server_err!(
-                            ServerErrorCode::NotFound,
-                            "no address found for {}",
-                            name.to_string()
-                        ))
-                    }
-                }
-                _ => {
-                    return Err(server_err!(
-                        ServerErrorCode::NotFound,
-                        "sn-server not support record type {}",
-                        record_type.to_string()
-                    ));
-                }
+            UncachedNameInfoQueryResult::Tombstone => {
+                self.name_info_cache
+                    .add_tombstone(req_real_name.as_str(), record_type, None);
+                Err(server_err!(
+                    ServerErrorCode::NotFound,
+                    "no address found for {}",
+                    name.to_string()
+                ))
             }
-        } else {
-            info!("get user subhost from host: {} failed", req_real_name);
-            let real_domain_name = req_real_name.clone();
-            match record_type {
-                RecordType::TXT => {
-                    let zone_config_info =
-                        self.get_user_zone_config_by_domain(&real_domain_name).await;
-                    if zone_config_info.is_some() {
-                        let (public_key, zone_config, device_jwt) = zone_config_info.unwrap();
-                        let name_info = self.create_name_info_from_zone_config(
-                            zone_config.as_str(),
-                            public_key.as_str(),
-                            device_jwt.as_ref(),
-                        );
-                        return Ok(self.cache_name_info_result(
-                            req_real_name.as_str(),
-                            record_type,
-                            name_info,
-                        ));
-                    } else {
-                        self.name_info_cache.add_tombstone(
-                            req_real_name.as_str(),
-                            record_type,
-                            None,
-                        );
-                        return Err(server_err!(
-                            ServerErrorCode::NotFound,
-                            "{}",
-                            name.to_string()
-                        ));
-                    }
-                }
-                RecordType::A | RecordType::AAAA => {
-                    let address_vec = self
-                        .get_user_zonegate_address_by_domain(&real_domain_name, record_type)
-                        .await?;
-                    if address_vec.is_some() {
-                        let address_vec = address_vec.unwrap();
-                        let result_name_info = NameInfo::from_address_vec(name, address_vec);
-                        info!("=>{} result_name_info: {:?}", name, result_name_info);
-                        return Ok(self.cache_name_info_result(
-                            req_real_name.as_str(),
-                            record_type,
-                            result_name_info,
-                        ));
-                    }
-                }
-                _ => {
-                    return Err(server_err!(
-                        ServerErrorCode::NotFound,
-                        "sn-server not support record type {}",
-                        record_type.to_string()
-                    ));
-                }
-            }
-
-            self.name_info_cache
-                .add_tombstone(req_real_name.as_str(), record_type, None);
-            return Err(server_err!(
-                ServerErrorCode::NotFound,
-                "no address found for {}",
-                name.to_string()
-            ));
         }
     }
 
@@ -3681,18 +3653,16 @@ mod tests {
 
         assert!(!is_filtered_zonegate_ip("192.168.100.191".parse().unwrap()));
         assert!(!is_filtered_zonegate_ip("207.246.96.13".parse().unwrap()));
-        assert!(!is_filtered_zonegate_ip("240e:3b3:30c0:930::47f".parse().unwrap()));
+        assert!(!is_filtered_zonegate_ip(
+            "240e:3b3:30c0:930::47f".parse().unwrap()
+        ));
     }
 
     #[test]
     fn test_push_zonegate_address_for_a_record_keeps_192_filters_172_and_dedups() {
         let mut addresses = Vec::new();
 
-        push_zonegate_address(
-            &mut addresses,
-            "172.17.0.1".parse().unwrap(),
-            RecordType::A,
-        );
+        push_zonegate_address(&mut addresses, "172.17.0.1".parse().unwrap(), RecordType::A);
         push_zonegate_address(
             &mut addresses,
             "192.168.100.191".parse().unwrap(),
@@ -3808,7 +3778,10 @@ mod tests {
 
         let exported = SNServer::build_device_info_json(&device);
         assert!(exported.get("ip").is_none());
-        assert_eq!(exported.get("ips").and_then(|v| v.as_array()).cloned(), Some(vec![]));
+        assert_eq!(
+            exported.get("ips").and_then(|v| v.as_array()).cloned(),
+            Some(vec![])
+        );
         assert_eq!(
             exported.get("all_ip").and_then(|v| v.as_array()).cloned(),
             Some(vec![])

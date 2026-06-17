@@ -3,49 +3,8 @@
 // 2.提供注册接口，输入激活码，用户名，和一个用户提供的公钥。注册成功激活码会使用
 //    用户名必须是全站唯一的，如果用户名被使用则返回注册失败。
 // 3.提供用户设备信息的注册/更新/查询接口，设备信息包括设备的owner用户名,设备名，设备的did,设备的最新ip,以及字符串描述的设备信息，并保存有设备的创建时间和设备信息最后更新时间
+pub use crate::sn_auth::{SNUserInfo, SnClearStateResult, SnV2AuthInfo};
 use crate::SnResult;
-
-#[derive(Debug, Clone)]
-pub enum UserState {
-    Active,
-    Suspended,
-    Deleted,
-    Banned,
-}
-
-impl ToString for UserState {
-    fn to_string(&self) -> String {
-        match self {
-            UserState::Active => "active".to_string(),
-            UserState::Suspended => "suspended".to_string(),
-            UserState::Deleted => "deleted".to_string(),
-            UserState::Banned => "banned".to_string(),
-        }
-    }
-}
-
-impl UserState {
-    pub fn from_str(s: Option<&str>) -> Self {
-        match s {
-            Some("suspended") => UserState::Suspended,
-            Some("deleted") => UserState::Deleted,
-            Some("banned") => UserState::Banned,
-            _ => UserState::Active, // 默认为 Active
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct SNUserInfo {
-    pub username: Option<String>,
-    pub state: UserState,
-    pub public_key: String,
-    pub activation_code: Option<String>,
-    pub zone_config: String,
-    pub self_cert: bool,
-    pub user_domain: Option<String>,
-    pub sn_ips: Option<String>,
-}
 
 #[derive(Debug, Clone)]
 pub struct SNDeviceInfo {
@@ -57,26 +16,6 @@ pub struct SNDeviceInfo {
     pub description: String,
     pub created_at: u64,
     pub updated_at: u64,
-}
-
-#[derive(Debug, Clone)]
-pub struct SnClearStateResult {
-    pub deleted_users: u64,
-    pub deleted_devices: u64,
-    pub deleted_domain_records: u64,
-    pub deleted_did_documents: u64,
-    pub activation_code_reset: bool,
-}
-
-#[derive(Debug, Clone)]
-pub struct SnV2AuthInfo {
-    pub username: String,
-    pub password_hash: String,
-    pub password_salt: String,
-    pub password_algo: String,
-    pub created_at: u64,
-    pub updated_at: u64,
-    pub last_login_at: Option<u64>,
 }
 
 #[async_trait::async_trait]

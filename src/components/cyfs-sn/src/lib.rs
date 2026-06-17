@@ -1,13 +1,17 @@
 #![allow(dead_code)]
 
 pub mod name_info_cache;
+mod sn_auth;
 mod sn_db;
+mod sn_device_info;
 mod sn_server;
 mod sqlite_db;
 mod v2;
 
 pub use name_info_cache::*;
+pub use sn_auth::*;
 pub use sn_db::*;
+pub use sn_device_info::*;
 pub use sn_server::*;
 pub use sqlite_db::*;
 

@@ -1,0 +1,71 @@
+stacks:
+  main_rtcp:
+    bind: 0.0.0.0:2980
+    protocol: rtcp
+    key_path: ./sn_private_key.pem
+    device_config_path: ./sn_device_config.json
+    hook_point:
+      main:
+        id: main
+        priority: 1
+        blocks:
+          default:
+            id: default
+            priority: 1
+            # REQ里已经有了很多信息，所以直接设置 method 为 query_by_did 并调用 qa 来查询是否是认证设备
+            block: |
+              map-add "REQ" "method" "query_by_did"
+              call qa "web3_sn" "REQ" && eq ${ANSWER.state} "active" && accept;
+              reject;
+
+    on_new_tunnel_hook_point:
+      main:
+        id: main
+        priority: 1
+        blocks:
+          default:
+            id: default
+            priority: 1
+            # 隧道建立时校验 source_device_id 是否为认证设备，只允许认证设备 keep-tunnel
+            # 从转发的角度，也支持所有device.owner是合法用户的连接
+            block: |
+              map-add "REQ" "method" "query_by_did"
+              call qa "web3_sn" "REQ" && eq ${ANSWER.state} "active" && accept;
+              reject;
+
+  main_http_tcp:
+    bind: 0.0.0.0:80
+    protocol: tcp
+    hook_point:
+      main:
+        id: main
+        priority: 1
+        blocks:
+          default:
+            id: default
+            priority: 1
+            block: |
+              return "server main_http";
+
+  tls_raw_forward:
+    bind: 0.0.0.0:443
+    protocol: tcp
+    hook_point:
+      main:
+        id: main
+        priority: 1
+        blocks:
+          default:
+            id: default
+            priority: 1
+            block: |
+              call https-sni-probe || reject; 
+              map-create "REQ.ext";
+              map-add "REQ.ext" "proxy_source_addr" "${REQ.source_addr}";
+              map-create "QUESTION" && map-add "QUESTION" "dest_host" "${REQ.dest_host}" && map-add "QUESTION" "method" "query_by_hostname";
+              call qa "web3_sn" "QUESTION";
+              eq ${ANSWER.self_cert} "true" && return "forward rtcp://${ANSWER.did_hostname}/:443";
+              match ${REQ.dest_host} "*.*.web3.{{sn_host}}" && eq ${ANSWER.self_cert} "false" && error --from chain "self_cert=false for ${REQ.dest_host}; enable self_cert to use nested web3 host over HTTPS";
+              match ${REQ.dest_host} "*.web3.{{sn_host}}" && return "forward tcp:///:3443";
+              reject;
+  
