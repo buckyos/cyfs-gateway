@@ -1,4 +1,5 @@
 #![allow(unused)]
+use crate::name_info_cache::{NameInfoCache, NameInfoCacheQueryResult, NameInfoCacheRef};
 use crate::sn_db::{self, *};
 use crate::sqlite_db::SqliteSnDB;
 use crate::v2::{
@@ -155,6 +156,7 @@ pub struct SNServer {
     device_jwt: Vec<String>,
     db: SnDBRef,
     v2_auth: Arc<SnV2AuthManager>,
+    name_info_cache: NameInfoCacheRef,
 }
 
 impl SNServer {
@@ -387,7 +389,45 @@ impl SNServer {
             device_jwt: server_config.device_jwt,
             db,
             v2_auth,
+            name_info_cache: NameInfoCache::new_ref(),
         }
+    }
+
+    pub fn name_info_cache(&self) -> NameInfoCacheRef {
+        self.name_info_cache.clone()
+    }
+
+    pub fn add_name_info_cache(
+        &self,
+        name: &str,
+        record_type: RecordType,
+        name_info: NameInfo,
+        cache_ttl_secs: Option<u32>,
+    ) {
+        self.name_info_cache
+            .add(name, record_type, name_info, cache_ttl_secs);
+    }
+
+    pub fn add_name_info_tombstone_cache(
+        &self,
+        name: &str,
+        record_type: RecordType,
+        cache_ttl_secs: Option<u32>,
+    ) {
+        self.name_info_cache
+            .add_tombstone(name, record_type, cache_ttl_secs);
+    }
+
+    fn cache_name_info_result(
+        &self,
+        name: &str,
+        record_type: RecordType,
+        name_info: NameInfo,
+    ) -> NameInfo {
+        let cache_ttl_secs = name_info.ttl;
+        self.name_info_cache
+            .add(name, record_type, name_info.clone(), cache_ttl_secs);
+        name_info
     }
 
     pub async fn check_username(&self, req: RPCRequest) -> Result<RPCResponse, RPCErrors> {
@@ -2900,6 +2940,31 @@ impl NameServer for SNServer {
             req_real_name = name.trim_end_matches('.').to_string();
         }
 
+        match self
+            .name_info_cache
+            .query(req_real_name.as_str(), record_type)
+        {
+            Some(NameInfoCacheQueryResult::Hit(name_info)) => {
+                info!(
+                    "sn server name cache hit: {} record_type: {:?}",
+                    req_real_name, record_type
+                );
+                return Ok(name_info);
+            }
+            Some(NameInfoCacheQueryResult::Tombstone) => {
+                info!(
+                    "sn server name cache tombstone hit: {} record_type: {:?}",
+                    req_real_name, record_type
+                );
+                return Err(server_err!(
+                    ServerErrorCode::NotFound,
+                    "no address found for {}",
+                    name.to_string()
+                ));
+            }
+            None => {}
+        }
+
         let sn_full_host = format!("sn.{}", self.server_host);
         if req_real_name == sn_full_host
             || req_real_name == self.server_host
@@ -2910,16 +2975,34 @@ impl NameServer for SNServer {
                 RecordType::A => {
                     if self.server_ip.is_ipv4() {
                         let result_name_info = NameInfo::from_address(name, self.server_ip);
-                        return Ok(result_name_info);
+                        return Ok(self.cache_name_info_result(
+                            req_real_name.as_str(),
+                            record_type,
+                            result_name_info,
+                        ));
                     }
-                    return Ok(NameInfo::from_address_vec(name, vec![]));
+                    let result_name_info = NameInfo::from_address_vec(name, vec![]);
+                    return Ok(self.cache_name_info_result(
+                        req_real_name.as_str(),
+                        record_type,
+                        result_name_info,
+                    ));
                 }
                 RecordType::AAAA => {
                     if self.server_ip.is_ipv6() {
                         let result_name_info = NameInfo::from_address(name, self.server_ip);
-                        return Ok(result_name_info);
+                        return Ok(self.cache_name_info_result(
+                            req_real_name.as_str(),
+                            record_type,
+                            result_name_info,
+                        ));
                     }
-                    return Ok(NameInfo::from_address_vec(name, vec![]));
+                    let result_name_info = NameInfo::from_address_vec(name, vec![]);
+                    return Ok(self.cache_name_info_result(
+                        req_real_name.as_str(),
+                        record_type,
+                        result_name_info,
+                    ));
                 }
                 RecordType::TXT => {
                     let device_jwt = self.device_jwt.get(0);
@@ -2928,7 +3011,11 @@ impl NameServer for SNServer {
                         self.owner_pkx.as_str(),
                         device_jwt,
                     );
-                    return Ok(name_info);
+                    return Ok(self.cache_name_info_result(
+                        req_real_name.as_str(),
+                        record_type,
+                        name_info,
+                    ));
                 }
                 _ => {
                     return Err(server_err!(
@@ -2970,7 +3057,11 @@ impl NameServer for SNServer {
                         let mut name_info = NameInfo::default();
                         name_info.ttl = Some(ttl);
                         name_info.txt.push(record);
-                        return Ok(name_info);
+                        return Ok(self.cache_name_info_result(
+                            req_real_name.as_str(),
+                            record_type,
+                            name_info,
+                        ));
                     }
                     let zone_config = self.get_user_zone_config(username.as_str()).await;
                     if zone_config.is_some() {
@@ -2985,7 +3076,11 @@ impl NameServer for SNServer {
                             "<={} zone_config:{} public_key:{} device_jwt:{:?} ",
                             name, zone_config, public_key, device_jwt
                         );
-                        Ok(name_info)
+                        Ok(self.cache_name_info_result(
+                            req_real_name.as_str(),
+                            record_type,
+                            name_info,
+                        ))
                     } else {
                         Err(server_err!(
                             ServerErrorCode::NotFound,
@@ -3013,7 +3108,11 @@ impl NameServer for SNServer {
                         let mut result_name_info = NameInfo::from_address_vec(name, address_vec);
                         result_name_info.ttl = Some(ttl);
                         info!("=>{} result_name_info: {:?}", name, result_name_info);
-                        return Ok(result_name_info);
+                        return Ok(self.cache_name_info_result(
+                            req_real_name.as_str(),
+                            record_type,
+                            result_name_info,
+                        ));
                     }
                     let address_vec = self
                         .get_user_zonegate_address(username.as_str(), record_type)
@@ -3022,7 +3121,11 @@ impl NameServer for SNServer {
                         let address_vec = address_vec.unwrap();
                         let result_name_info = NameInfo::from_address_vec(name, address_vec);
                         info!("=>{} result_name_info: {:?}", name, result_name_info);
-                        Ok(result_name_info)
+                        Ok(self.cache_name_info_result(
+                            req_real_name.as_str(),
+                            record_type,
+                            result_name_info,
+                        ))
                     } else {
                         Err(server_err!(
                             ServerErrorCode::NotFound,
@@ -3041,7 +3144,7 @@ impl NameServer for SNServer {
             }
         } else {
             info!("get user subhost from host: {} failed", req_real_name);
-            let real_domain_name = name[0..name.len() - 1].to_string();
+            let real_domain_name = req_real_name.clone();
             match record_type {
                 RecordType::TXT => {
                     let zone_config_info =
@@ -3053,8 +3156,17 @@ impl NameServer for SNServer {
                             public_key.as_str(),
                             device_jwt.as_ref(),
                         );
-                        return Ok(name_info);
+                        return Ok(self.cache_name_info_result(
+                            req_real_name.as_str(),
+                            record_type,
+                            name_info,
+                        ));
                     } else {
+                        self.name_info_cache.add_tombstone(
+                            req_real_name.as_str(),
+                            record_type,
+                            None,
+                        );
                         return Err(server_err!(
                             ServerErrorCode::NotFound,
                             "{}",
@@ -3070,7 +3182,11 @@ impl NameServer for SNServer {
                         let address_vec = address_vec.unwrap();
                         let result_name_info = NameInfo::from_address_vec(name, address_vec);
                         info!("=>{} result_name_info: {:?}", name, result_name_info);
-                        return Ok(result_name_info);
+                        return Ok(self.cache_name_info_result(
+                            req_real_name.as_str(),
+                            record_type,
+                            result_name_info,
+                        ));
                     }
                 }
                 _ => {
@@ -3082,6 +3198,8 @@ impl NameServer for SNServer {
                 }
             }
 
+            self.name_info_cache
+                .add_tombstone(req_real_name.as_str(), record_type, None);
             return Err(server_err!(
                 ServerErrorCode::NotFound,
                 "no address found for {}",
