@@ -2,9 +2,10 @@ mod common;
 
 use async_trait::async_trait;
 use bns_indexer::{
-    AliasState, BnsContractView, BnsDb, BnsIndexer, BnsIndexerResult, DocumentState,
-    DocumentStatus, NameState, Principal, PurchaseContext, ReconciliationAction, SqliteBnsDb,
-    ValidationStatus, ValidationTarget, ZERO_HASH,
+    AliasState, BnsContractEventSource, BnsContractView, BnsDb, BnsIndexer, BnsIndexerResult,
+    ContractEvent, ContractEventEnvelope, DocumentState, DocumentStatus, IndexerCursor, NameState,
+    Principal, PurchaseContext, ReconciliationAction, SqliteBnsDb, ValidationStatus,
+    ValidationTarget, ZERO_HASH,
 };
 use common::{sample_alias_state, sample_document_state, sample_name_state};
 use std::collections::HashMap;
@@ -16,6 +17,7 @@ struct MockContract {
     documents: HashMap<(String, String, u64), DocumentState>,
     aliases: HashMap<String, AliasState>,
     purchase_contexts: HashMap<(String, String), PurchaseContext>,
+    events: Vec<ContractEventEnvelope>,
 }
 
 fn sample_purchase_context(
@@ -72,6 +74,44 @@ impl BnsContractView for MockContract {
     }
 }
 
+#[async_trait]
+impl BnsContractEventSource for MockContract {
+    async fn fetch_events(
+        &self,
+        source: &str,
+        cursor: Option<&IndexerCursor>,
+        limit: usize,
+    ) -> BnsIndexerResult<Vec<ContractEventEnvelope>> {
+        let events = self
+            .events
+            .iter()
+            .filter(|event| event.source == source)
+            .filter(|event| {
+                cursor.map_or(true, |cursor| {
+                    event.block_number > cursor.block_number
+                        || (event.block_number == cursor.block_number
+                            && event.log_index > cursor.log_index)
+                })
+            })
+            .take(limit)
+            .cloned()
+            .collect();
+        Ok(events)
+    }
+}
+
+fn contract_event(log_index: u64, event: ContractEvent) -> ContractEventEnvelope {
+    ContractEventEnvelope {
+        source: "bns-testnet".to_string(),
+        block_number: 42,
+        block_hash: Some("0xabc".to_string()),
+        tx_hash: format!("0xtx{log_index}"),
+        log_index,
+        observed_at: 100 + log_index,
+        event,
+    }
+}
+
 #[tokio::test]
 async fn indexer_reports_contract_mismatch_without_changing_db_truth() {
     let db = Arc::new(SqliteBnsDb::open_memory().unwrap());
@@ -100,6 +140,159 @@ async fn indexer_reports_contract_mismatch_without_changing_db_truth() {
         ReconciliationAction::ManualReview
     );
     assert_eq!(db.list_validation_reports(10).unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn indexer_ingests_contract_events_into_local_projection() {
+    let db = Arc::new(SqliteBnsDb::open_memory().unwrap());
+    let name = sample_name_state("book1.alice");
+    let document = sample_document_state("book1.alice", "content", 1);
+    let alias = sample_alias_state("book1.alice", "did:bns:book1");
+    let purchase = sample_purchase_context("book1.alice", "content", 1, "alice");
+
+    let mut contract = MockContract::default();
+    contract.names.insert("book1.alice".to_string(), name);
+    contract.documents.insert(
+        ("book1.alice".to_string(), "content".to_string(), 1),
+        document,
+    );
+    contract.aliases.insert("book1.alice".to_string(), alias);
+    contract
+        .purchase_contexts
+        .insert(("book1.alice".to_string(), "content".to_string()), purchase);
+    contract.events = vec![
+        contract_event(
+            1,
+            ContractEvent::NameRegistered {
+                name: "book1.alice".to_string(),
+                asset_owner: "0x1111111111111111111111111111111111111111".to_string(),
+                expire_at: 1_000,
+                name_seq: 1,
+            },
+        ),
+        contract_event(
+            2,
+            ContractEvent::DocumentPublished {
+                name: "book1.alice".to_string(),
+                doc_type: "content".to_string(),
+                version: 1,
+                content_hash: ZERO_HASH.to_string(),
+                document_state_hash: ZERO_HASH.to_string(),
+            },
+        ),
+        contract_event(
+            3,
+            ContractEvent::DidAliasSet {
+                name: "book1.alice".to_string(),
+                target_did: "did:bns:book1".to_string(),
+                kind: bns_indexer::AliasKind::MigratedTo,
+                proof_hash: ZERO_HASH.to_string(),
+                name_seq: 2,
+            },
+        ),
+        contract_event(
+            4,
+            ContractEvent::PaymentTargetUpdated {
+                name: "book1.alice".to_string(),
+                doc_type: "content".to_string(),
+                payment_target: "0x2222222222222222222222222222222222222222".to_string(),
+                payment_policy_hash: ZERO_HASH.to_string(),
+                version: 1,
+            },
+        ),
+    ];
+
+    let indexer = BnsIndexer::new(db.clone(), Arc::new(contract));
+    let ingested = indexer
+        .ingest_contract_events("bns-testnet", 10)
+        .await
+        .unwrap();
+
+    assert_eq!(ingested.len(), 4);
+    assert!(db.get_name_state("book1.alice").unwrap().is_some());
+    assert_eq!(
+        db.get_current_document_state("book1.alice", "content")
+            .unwrap()
+            .unwrap()
+            .version,
+        1
+    );
+    assert_eq!(
+        db.get_alias_state("book1.alice")
+            .unwrap()
+            .unwrap()
+            .target_did,
+        "did:bns:book1"
+    );
+    assert_eq!(
+        db.get_purchase_context("book1.alice", "content")
+            .unwrap()
+            .unwrap()
+            .document_version,
+        1
+    );
+    assert_eq!(
+        db.get_indexer_cursor("bns-testnet")
+            .unwrap()
+            .unwrap()
+            .log_index,
+        4
+    );
+}
+
+#[tokio::test]
+async fn indexer_projects_document_revoke_events_from_contract_view() {
+    let db = Arc::new(SqliteBnsDb::open_memory().unwrap());
+    let doc_v1 = sample_document_state("alice", "owner", 1);
+    let doc_v2 = sample_document_state("alice", "owner", 2);
+    db.put_document_state(&doc_v1).unwrap();
+    db.put_document_state(&doc_v2).unwrap();
+
+    let mut revoked_v1 = doc_v1.clone();
+    revoked_v1.status = DocumentStatus::Revoked;
+    revoked_v1.revoked_at = 200;
+    let mut revoked_v2 = doc_v2.clone();
+    revoked_v2.status = DocumentStatus::Revoked;
+    revoked_v2.revoked_at = 200;
+
+    let mut contract = MockContract::default();
+    contract
+        .documents
+        .insert(("alice".to_string(), "owner".to_string(), 1), revoked_v1);
+    contract
+        .documents
+        .insert(("alice".to_string(), "owner".to_string(), 2), revoked_v2);
+    contract.events = vec![contract_event(
+        1,
+        ContractEvent::DocumentRevoked {
+            name: "alice".to_string(),
+            doc_type: "owner".to_string(),
+            from_version: 1,
+            to_version: 2,
+            reason_hash: ZERO_HASH.to_string(),
+        },
+    )];
+
+    let indexer = BnsIndexer::new(db.clone(), Arc::new(contract));
+    indexer
+        .ingest_contract_events("bns-testnet", 10)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        db.get_document_state("alice", "owner", 1)
+            .unwrap()
+            .unwrap()
+            .status,
+        DocumentStatus::Revoked
+    );
+    assert_eq!(
+        db.get_document_state("alice", "owner", 2)
+            .unwrap()
+            .unwrap()
+            .revoked_at,
+        200
+    );
 }
 
 #[tokio::test]

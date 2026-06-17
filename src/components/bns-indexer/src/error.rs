@@ -53,4 +53,8 @@ impl BnsIndexerError {
             reason: reason.into(),
         }
     }
+
+    pub fn contract(reason: impl Into<String>) -> Self {
+        Self::Contract(reason.into())
+    }
 }

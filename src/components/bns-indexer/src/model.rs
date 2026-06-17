@@ -376,6 +376,22 @@ impl PurchaseContext {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PaymentTargetResolution {
+    pub beneficiary: Principal,
+    pub payment_target: String,
+    pub split_policy_hash: String,
+    pub proof_root: String,
+}
+
+impl PaymentTargetResolution {
+    pub fn validate(&self) -> BnsIndexerResult<()> {
+        validate_hash(&self.split_policy_hash)?;
+        validate_hash(&self.proof_root)?;
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DocumentUpdate {
     pub doc_type: String,
     pub document: DocumentRef,

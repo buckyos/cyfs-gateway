@@ -24,8 +24,9 @@ pub use model::{
     canonical_bns_name, canonical_doc_type, did_bns_from_name, name_from_did_bns, now_timestamp,
     AliasKind, AliasState, AuthProof, ContractEvent, ContractEventEnvelope, ControllerRule,
     DocumentKey, DocumentRef, DocumentState, DocumentStatus, DocumentUpdate, IndexerCursor,
-    NameState, NameStatus, Principal, PrincipalKind, PurchaseContext, RegisterOptions, ReleaseMode,
-    ResolveResult, TruthSource, DID_BNS_PREFIX, STANDARD_DOC_TYPES, STORAGE_TYPE_INLINE, ZERO_HASH,
+    NameState, NameStatus, PaymentTargetResolution, Principal, PrincipalKind, PurchaseContext,
+    RegisterOptions, ReleaseMode, ResolveResult, TruthSource, DID_BNS_PREFIX, STANDARD_DOC_TYPES,
+    STORAGE_TYPE_INLINE, ZERO_HASH,
 };
 
 pub use validation::{
