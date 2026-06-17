@@ -13,10 +13,24 @@ mod model;
 mod sqlite;
 mod validation;
 
-pub use contract::*;
-pub use db::*;
-pub use error::*;
-pub use indexer::*;
-pub use model::*;
-pub use sqlite::*;
-pub use validation::*;
+pub use indexer::{BnsIndexer, BnsIndexerConfig};
+
+pub use contract::{BnsContractEventSource, BnsContractView, BnsContractWriter};
+pub use db::BnsDb;
+pub use error::{BnsIndexerError, BnsIndexerResult};
+pub use sqlite::SqliteBnsDb;
+
+pub use model::{
+    canonical_bns_name, canonical_doc_type, did_bns_from_name, name_from_did_bns, now_timestamp,
+    AliasKind, AliasState, AuthProof, ContractEvent, ContractEventEnvelope, ControllerRule,
+    DocumentKey, DocumentRef, DocumentState, DocumentStatus, DocumentUpdate, IndexerCursor,
+    NameState, NameStatus, Principal, PrincipalKind, PurchaseContext, RegisterOptions, ReleaseMode,
+    ResolveResult, TruthSource, DID_BNS_PREFIX, STANDARD_DOC_TYPES, STORAGE_TYPE_INLINE, ZERO_HASH,
+};
+
+pub use validation::{
+    ReconciliationAction, ReconciliationPlan, ValidationMismatch, ValidationReport,
+    ValidationSeverity, ValidationStatus, ValidationTarget,
+};
+
+pub(crate) use validation::{compare_optional_projection, reconciliation_plan};
