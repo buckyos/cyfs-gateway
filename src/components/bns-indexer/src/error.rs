@@ -1,7 +1,7 @@
 use thiserror::Error;
 
 #[derive(Debug, Error)]
-pub enum BnsIndexerError {
+pub enum BnsRegistryError {
     #[error("invalid BNS name `{name}`: {reason}")]
     InvalidName { name: String, reason: String },
 
@@ -11,14 +11,78 @@ pub enum BnsIndexerError {
     #[error("invalid BNS hash `{value}`: {reason}")]
     InvalidHash { value: String, reason: String },
 
+    #[error("invalid BNS principal `{value}`: {reason}")]
+    InvalidPrincipal { value: String, reason: String },
+
+    #[error("invalid authority key `{kid}`: {reason}")]
+    InvalidKid { kid: String, reason: String },
+
+    #[error("name `{name}` already exists")]
+    NameAlreadyExists { name: String },
+
+    #[error("name `{name}` was not found")]
+    NameNotFound { name: String },
+
+    #[error("document `{name}/{doc_type}` was not found")]
+    DocumentNotFound { name: String, doc_type: String },
+
+    #[error("stale name sequence for `{name}`: expected {expected}, actual {actual}")]
+    StaleNameSeq {
+        name: String,
+        expected: u64,
+        actual: u64,
+    },
+
+    #[error("stale parent name sequence for `{name}`: expected {expected}, actual {actual}")]
+    StaleParentNameSeq {
+        name: String,
+        expected: u64,
+        actual: u64,
+    },
+
+    #[error(
+        "stale document version for `{name}/{doc_type}`: expected {expected}, actual {actual}"
+    )]
+    StaleDocumentVersion {
+        name: String,
+        doc_type: String,
+        expected: u64,
+        actual: u64,
+    },
+
+    #[error("caller is not the effective owner of `{name}`")]
+    NotEffectiveOwner { name: String },
+
+    #[error("controller is not permitted to perform `{operation}` on `{name}/{doc_type}`")]
+    ControllerScopeDenied {
+        name: String,
+        doc_type: String,
+        operation: &'static str,
+    },
+
+    #[error("standard transfer is disabled for `{name}`")]
+    StandardTransferDisabled { name: String },
+
+    #[error("semantic owner graph would contain a cycle")]
+    OwnerGraphCycle,
+
+    #[error("semantic owner graph has no reachable concrete signer")]
+    NoConcreteSigner,
+
+    #[error("semantic owner graph exceeds max depth {max_depth}")]
+    OwnerGraphTooDeep { max_depth: usize },
+
+    #[error("inline document is {len} bytes, exceeding max {max} bytes")]
+    InlineDocumentTooLarge { len: usize, max: usize },
+
+    #[error("invalid mutation: {0}")]
+    InvalidMutation(String),
+
     #[error("integer value for `{field}` is outside sqlite INTEGER range: {value}")]
     IntegerOutOfRange { field: &'static str, value: u64 },
 
     #[error("BNS sqlite database lock is poisoned")]
     DbLockPoisoned,
-
-    #[error("contract view error: {0}")]
-    Contract(String),
 
     #[error("sqlite error: {0}")]
     Sqlite(#[from] rusqlite::Error),
@@ -30,9 +94,9 @@ pub enum BnsIndexerError {
     Io(#[from] std::io::Error),
 }
 
-pub type BnsIndexerResult<T> = Result<T, BnsIndexerError>;
+pub type BnsRegistryResult<T> = Result<T, BnsRegistryError>;
 
-impl BnsIndexerError {
+impl BnsRegistryError {
     pub fn invalid_name(name: impl Into<String>, reason: impl Into<String>) -> Self {
         Self::InvalidName {
             name: name.into(),
@@ -54,7 +118,46 @@ impl BnsIndexerError {
         }
     }
 
-    pub fn contract(reason: impl Into<String>) -> Self {
-        Self::Contract(reason.into())
+    pub fn invalid_principal(value: impl Into<String>, reason: impl Into<String>) -> Self {
+        Self::InvalidPrincipal {
+            value: value.into(),
+            reason: reason.into(),
+        }
+    }
+
+    pub fn invalid_kid(kid: impl Into<String>, reason: impl Into<String>) -> Self {
+        Self::InvalidKid {
+            kid: kid.into(),
+            reason: reason.into(),
+        }
+    }
+
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::InvalidName { .. } => "INVALID_NAME",
+            Self::InvalidDocType { .. } => "INVALID_DOC_TYPE",
+            Self::InvalidHash { .. } => "INVALID_HASH",
+            Self::InvalidPrincipal { .. } => "INVALID_PRINCIPAL",
+            Self::InvalidKid { .. } => "INVALID_KID",
+            Self::NameAlreadyExists { .. } => "NAME_ALREADY_EXISTS",
+            Self::NameNotFound { .. } => "NAME_NOT_FOUND",
+            Self::DocumentNotFound { .. } => "DOCUMENT_NOT_FOUND",
+            Self::StaleNameSeq { .. } => "STALE_NAME_SEQ",
+            Self::StaleParentNameSeq { .. } => "STALE_PARENT_NAME_SEQ",
+            Self::StaleDocumentVersion { .. } => "STALE_DOCUMENT_VERSION",
+            Self::NotEffectiveOwner { .. } => "NOT_EFFECTIVE_OWNER",
+            Self::ControllerScopeDenied { .. } => "CONTROLLER_SCOPE_DENIED",
+            Self::StandardTransferDisabled { .. } => "STANDARD_TRANSFER_DISABLED",
+            Self::OwnerGraphCycle => "OWNER_GRAPH_CYCLE",
+            Self::NoConcreteSigner => "NO_CONCRETE_SIGNER",
+            Self::OwnerGraphTooDeep { .. } => "OWNER_GRAPH_TOO_DEEP",
+            Self::InlineDocumentTooLarge { .. } => "INLINE_DOCUMENT_TOO_LARGE",
+            Self::InvalidMutation(_) => "INVALID_MUTATION",
+            Self::IntegerOutOfRange { .. } => "INTEGER_OUT_OF_RANGE",
+            Self::DbLockPoisoned => "DB_LOCK_POISONED",
+            Self::Sqlite(_) => "SQLITE_ERROR",
+            Self::Json(_) => "JSON_ERROR",
+            Self::Io(_) => "IO_ERROR",
+        }
     }
 }
