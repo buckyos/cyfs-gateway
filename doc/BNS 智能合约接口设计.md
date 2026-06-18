@@ -15,8 +15,14 @@ BNS 合约的职责不是保存所有 DID Document，也不是替代内容网络
 ### 合约必须负责
 
 - `did:bns:$name` 的全局名字资产状态。
-- 名字资产 owner 与 BuckyOS 语义 owner/controller 的分离表达。
+- 名字资产 owner 与 BuckyOS 语义 owner/controller 的分离表达：
+    - 名字资产 owner 是链上 NFT owner，负责名字资产生命周期。
+    - BuckyOS 语义 owner 拥有名字的最高 BuckyOS 权限，可以不设置或指向另一个 BNS 名字。
+    - controller 只拥有被授权范围内的文档更新权，可以按 `doc_type` 授权。
+    - 合约无法解析 DID Document 内容，因此链上需要识别的 owner、controller、payment 等事实必须作为显式字段提交，不能只藏在文档内容里。
 - DID Document 的 `doc_type` 版本状态、当前指针、吊销状态和历史 proof。
+    - DID Document 可以是引用，也可以是内容本身；内容可以是 JSON、JWT 或其它 codec。
+    - 标准 resolver 会校验文档中的 owner/controller 是否覆盖链上记录。文档内容必须是链上记录的超集；如果与链上记录冲突，则该文档非法。
 - Owner key 轮换、controller policy 更新、别名和迁移。
 - 支付合约可查询的 beneficiary、payment target、split policy hash。
 - 事件日志，供 resolver、indexer、钱包和客户端构造可验证历史。
@@ -25,7 +31,7 @@ BNS 合约的职责不是保存所有 DID Document，也不是替代内容网络
 
 - `did:dev` 自认证设备身份。`did:dev` 由设备公钥和 RTCP 握手证明；合约只可能通过某个 `did:bns` 文档间接引用它。
 - 大型 DID Document、AppDoc、content meta、ZoneConfig、ObjId bytes 的默认托管。合约保存 `DocumentRef` 和 hash，文档本体通常由 Repo、Source、SN、Zone resolver、HTTPS 或缓存提供；如果调用者愿意承担 gas，也允许把文档原文 inline 到链上。
-- 内容购买扣款和 receipt 发行。标准支付合约负责 `purchase(...)`，BNS 只提供当前 purchase context。
+- 内容购买扣款和 receipt 发行。V2 标准支付合约负责 `purchase(...)`，BNS 只提供当前 purchase context。
 - DNS TXT、`.well-known`、SN、local cache 的可信化。它们只能作为候选 provider，最终必须回到 BNS 状态、签名和 hash 校验。
 - 全文搜索、内容排名、信用评分、应用商店和索引推荐。
 
@@ -47,7 +53,7 @@ IBnsResolverView
 IBnsPaymentView
   resolvePaymentTarget(...)
   getPurchaseContext(...)
-  供标准支付合约购买内容、App、服务订阅时调用
+  V2 标准支付合约购买内容、App、服务订阅时调用
 ```
 
 `IBnsRegistry` 是唯一写入面；其它 view 都是从 registry 状态投影出来的只读接口。
@@ -63,11 +69,29 @@ alice
 jarvis.alice
 book1.alice
 filebrowser.buckyos
+$objid.alice
 ```
 
 Resolver 层负责把 `did:bns:alice` 转成 `alice`。合约不接受 `did:web`；`did:web` 只能作为 discovery 入口，并通过文档签名或 BNS alias 绑定到 `did:bns`。
 
 `did:dev` 不进入全局名字资产表。设备文档可由 `did:bns:ood1.alice` 的 `doc` 或 `service` 文档引用 `did:dev:<pkx>`。
+
+名字规则：
+
+- 名字最多两级，不存在三级或更深的全局名字。
+- 合法名字包括一级名字 `alice`，以及二级名字 `abc.alice`、`$objid.alice`。
+- `$objid.$owner` 总是一个合法的二级名字形式，这是鼓励引用任意内容的标准方式。
+- 二级名字的父级必须是一个有效的一级名字；`a.b.alice`、`x.$objid.alice` 这类三级名字非法。
+- 每个已注册 name 都是一份 NFT 名字资产。`tokenId(name)` 由 canonical name 确定，`NameState.assetOwner` 必须等价于该 NFT 的 `ownerOf(tokenId(name))`。
+- NFT 交易可以直接转让名字资产本身，例如 `$content_name.$owner` 可以利用通用 NFT 交易市场交易。
+- 如果业务需要受让方同时获得 BuckyOS 控制权，交易流程必须检查该 name 的 owner 解析结果。owner 显式指向另一个名字，或二级名字 owner 未设置而继承父名字时，单纯 NFT `transferFrom` 只能改变资产 owner，不能完整改变 BuckyOS 语义 owner；此时应改用 BNS `transferName` 并原子更新 owner / controller / payment 记录。
+
+二级名字注册和继承规则：
+
+- 注册二级名字时，默认需要一级名字当前 owner 的签名；调用方可以是 owner 本人，也可以携带 `AuthProof` 由 relayer 提交。
+- 二级名字创建后成为独立 name NFT。后续转让、续期、发布文档和 payment context 都以二级名字自身状态为准。
+- 二级名字创建时可以不设置 BuckyOS 语义 owner 或 controller。未设置时，授权解析默认继承父名字的 owner/controller 权限。
+- 一旦二级名字显式设置了 owner 或某个 `doc_type` 的 controller，对应权限就不再从父名字继承。
 
 ### doc_type
 
@@ -85,7 +109,7 @@ Resolver 层负责把 `did:bns:alice` 转成 `alice`。合约不接受 `did:web`
 
 | doc_type | 语义 |
 | --- | --- |
-| `owner` | OwnerConfig / global profile |
+| `owner` | OwnerConfig / user profile |
 | `boot` | ZoneBootConfig |
 | `zone` | ZoneConfig |
 | `doc` | 通用 DID Document |
@@ -93,8 +117,13 @@ Resolver 层负责把 `did:bns:alice` 转成 `alice`。合约不接受 `did:web`
 | `service` | ServiceInfo |
 | `agent` | AgentDocument |
 | `app` | AppDoc |
-| `content` | content meta |
+| `video` | 视频内容文档 |
+| `music` | 音乐内容文档 |
+| `ebook` | 电子书内容文档 |
+| `content` | 通用内容 meta；不应作为所有内容类型的唯一抽象 |
 | `payment` | 支付策略扩展文档 |
+
+`doc_type` 是权限、解析和 payment context 的维度，不只是一个简单的 `content` 分类。App、video、music、ebook 等内容或应用类型应能独立配置 controller、版本和支付上下文。
 
 `info` 是运行时上报信息，默认不作为链上 `doc_type`。它应由 Zone resolver / system-config 提供，并由上级 `doc` / `device` / `zone` 文档授权。
 
@@ -141,9 +170,9 @@ enum ReleaseMode {
 }
 
 enum PrincipalKind {
+    Unset,
     ChainAddress,
-    Did,
-    PublicKey,
+    BnsName,
     Contract
 }
 
@@ -151,6 +180,12 @@ struct Principal {
     PrincipalKind kind;
     bytes value;
 }
+
+// Principal 是链上可识别的主体引用。
+// - Unset 表示未配置。
+// - ChainAddress / Contract 的 value 是 ABI encoded address；Contract 可用于 Safe / ERC-1271。
+// - BnsName 的 value 是 canonical name 的 UTF-8 bytes。
+// - DID Document 内声明的更多公钥格式只由链下 resolver 校验，合约不解析。
 
 struct DocumentRef {
     // inline, ipfs, cyfs, https, zone-resolver, source, repo 等，由 resolver 理解。
@@ -176,7 +211,14 @@ struct DocumentRef {
 
 struct NameState {
     string name;
+
+    // name 资产 NFT 的 owner。必须等价于 ownerOf(tokenId(name))。
     address assetOwner;
+
+    // BuckyOS 语义 owner。只允许 Unset 或 BnsName。
+    // Unset 时一级名字回落到 assetOwner；二级名字可回落到父名字 owner。
+    Principal owner;
+
     NameStatus status;
 
     uint64 registeredAt;
@@ -206,6 +248,7 @@ struct DocumentState {
     DocumentStatus status;
     DocumentRef document;
 
+    // controller 只允许 Unset、ChainAddress 或 Contract，不能指向另一个名字。
     Principal controller;
     Principal beneficiary;
     address paymentTarget;
@@ -220,6 +263,7 @@ struct DocumentState {
 }
 
 struct ControllerRule {
+    // controller 只允许 ChainAddress 或 Contract。
     Principal controller;
 
     // 空值表示适用于所有 doc_type；否则只适用于指定类型。
@@ -228,7 +272,7 @@ struct ControllerRule {
     // create/update/revoke/set_payment/set_alias/delegate 等位图。
     uint32 permissions;
 
-    // 可选命名空间约束，例如 "*.alice" 或 "content.*.alice" 的 hash。
+    // 可选命名空间约束，例如 "*.alice" 或特定二级名字集合的 hash。
     bytes32 namespaceScopeHash;
 
     uint64 validFrom;
@@ -253,7 +297,12 @@ struct RegisterOptions {
     bool renewable;
     bool transferable;
 
-    // 是否允许未上链子名字回落到父 Zone / Owner resolver。
+    // 初始 BuckyOS 语义 owner。只允许 Unset 或 BnsName。
+    // Unset 时一级名字默认使用 assetOwner；二级名字默认继承父名字权限。
+    Principal initialOwner;
+
+    // 是否允许未上链二级名字回落到一级名字的 Zone / Owner resolver。
+    // 只对一级名字有效，不表示允许三级名字。
     bool allowDelegatedSubnames;
 
     address initialPaymentTarget;
@@ -298,7 +347,7 @@ struct AliasState {
 }
 
 struct PurchaseContext {
-    string contentName;
+    string name;
     string docType;
     uint64 documentVersion;
 
@@ -343,16 +392,19 @@ function registerName(
 ) external payable returns (uint64 nameSeq);
 ```
 
-注册全局名字。`initialDocuments` 建议至少包含 `owner` 文档，也可以同时提交 `boot`、`zone`、`app` 或 `content` 初始文档。
+注册全局名字。`initialDocuments` 建议至少包含 `owner` 文档，也可以同时提交 `boot`、`zone`、`app`、`video`、`music`、`ebook` 或其它初始文档。
 
 规则：
 
-- 注册只接受 canonical name。
-- 二级名字首次注册必须由它的一级名字资产 owner 调用。例如首次注册 `jarvis.alice` 时，调用方必须是 `alice` 的当前 `assetOwner`；后续转让、续期和文档更新按 `jarvis.alice` 自己的状态授权。
+- 注册只接受 canonical name，并且最多两级。
+- 注册成功后必须 mint 或绑定同名 NFT，`assetOwner` 是链上名字资产 owner。
+- 一级名字注册后，若 `options.initialOwner` 为 `Unset`，BuckyOS 语义 owner 默认是 `assetOwner`。
+- 二级名字首次注册默认必须由它的一级名字当前 owner 授权。例如首次注册 `jarvis.alice` 时，需要 `alice` 的当前 owner 签名；如果 owner 未配置，则使用 `alice` 的 `assetOwner`。
+- 二级名字注册后成为独立 name NFT。后续转让、续期和文档更新按 `jarvis.alice` 自己的状态授权。
+- 二级名字注册时如果 `options.initialOwner` 为 `Unset`，且没有给特定 `doc_type` 设置 controller，则默认继承父名字的 owner/controller 权限。
 - 如果一级名字不存在、已过期、已释放或 tombstoned，则不能首次注册它下面的二级名字。
-- 注册成功后 `assetOwner` 是链上名字资产 owner。
 - `owner` 文档里的 owner/controller 是 BuckyOS 语义 owner，不要求等同于 `assetOwner`。
-- 如果设置 `allowDelegatedSubnames = true`，未全局注册的子名字可以回落到父名字授权的 Zone resolver。
+- 如果一级名字设置 `allowDelegatedSubnames = true`，未全局注册的二级名字可以回落到父名字授权的 Zone resolver。
 - exact global name 优先级永远高于 delegated subname。Zone resolver 不能覆盖已上链名字。
 
 ### renewName
@@ -376,19 +428,44 @@ function renewName(string calldata name, uint64 duration)
 function transferName(
     string calldata name,
     address newAssetOwner,
+    Principal calldata newOwner,
     DocumentUpdate[] calldata atomicDocumentUpdates,
     AuthProof calldata proof
 ) external returns (uint64 nameSeq);
 ```
 
-转移名字资产 owner。内容版权出售、App 归属转移、组织接管等场景通常需要同时更新 `owner` / `content` / `app` / `payment` 文档，因此接口允许原子提交 `atomicDocumentUpdates`。
+转移名字资产 owner。内容版权出售、App 归属转移、组织接管等场景通常需要同时更新 BuckyOS 语义 owner、业务文档和 payment context，因此接口允许同时提交 `newOwner` 和 `atomicDocumentUpdates`。
 
 规则：
 
 - 只改变 `assetOwner` 不等于改变 BuckyOS 语义 owner。
+- 普通 NFT `transferFrom` 可以改变 `assetOwner`，但不会自动改变显式配置的 BuckyOS 语义 owner。
+- `newOwner` 只能是 `Unset` 或 `BnsName`。一级名字设为 `Unset` 表示 owner 回落到 `newAssetOwner`；二级名字设为 `Unset` 表示继续继承父名字权限。
+- 如果名字的 BuckyOS 语义 owner 是另一个名字，或二级名字正在继承父名字权限，通用 NFT 市场只能完成资产转让，不能保证受让方获得完整 BuckyOS 控制权；需要通过 `transferName` 原子更新 owner / controller / payment 记录。
 - 如果业务上需要把 `did:bns:book1.alice` 的收益和更新权交给新主体，必须同时发布新的 `content` 或 `owner` 文档。
 - 原子更新的授权仍基于更新前状态。
 - 历史 receipt 继续绑定旧版本 purchase context。
+
+### setNameOwner
+
+```solidity
+function setNameOwner(
+    string calldata name,
+    Principal calldata owner,
+    AuthProof calldata proof
+) external returns (uint64 nameSeq);
+```
+
+更新 BuckyOS 语义 owner，不改变 name NFT 的 `assetOwner`。
+
+规则：
+
+- 一个 name 只有一个 owner 记录。
+- `owner` 只能是 `Unset` 或 `BnsName`。
+- 一级名字设为 `Unset` 时，语义 owner 回落到该 name NFT 的 `assetOwner`。
+- 二级名字设为 `Unset` 时，语义 owner 回落到父名字 owner。
+- owner 指向另一个名字时，会产生 owner 引用链；resolver 必须按 `MAX_OWNER_REF_DEPTH` 和循环检测处理。
+- owner 更新属于高风险操作，默认需要当前 owner 或 recovery policy 授权。
 
 ### releaseName
 
@@ -425,7 +502,8 @@ function setNamespacePolicy(
 规则：
 
 - exact global name 永远优先于 delegated subname。
-- `allowDelegatedSubnames = true` 只表示 resolver 可以回落到父名字授权的 Zone / Owner resolver。
+- `allowDelegatedSubnames = true` 只表示 resolver 可以让未上链二级名字回落到一级名字授权的 Zone / Owner resolver。
+- 该策略不允许三级名字；二级名字即使自己 active，也不能继续授权全局三级名字。
 - 具体 Zone resolver endpoint 不直接写在这个接口里，而是通过 `owner` / `zone` / `service` 文档表达。
 - 关闭委托不会删除历史解析记录，但会阻止未来未上链子名字继续回落。
 
@@ -443,6 +521,7 @@ function resolveDid(string calldata did, string calldata docType)
 规则：
 
 - `did` 必须是 `did:bns:$name`。
+- `$name` 必须是合法 canonical name，最多两级；三级名字直接非法，不进入 delegated fallback。
 - 如果 exact name active，返回该名字的指定 `docType` 当前版本。
 - 如果 exact name 是 alias / migrated，返回 alias 状态和目标 DID，客户端不能静默改写历史记录。
 - 如果 exact name 不存在且父名字允许 delegated subnames，返回 delegated proof anchor；具体文档由父 Zone resolver 提供。
@@ -617,15 +696,23 @@ function setPaymentTarget(
 - 收款目标变更只影响之后的新购买。
 - 历史支付和 receipt 仍按购买时的 purchase context 验证。
 
-## 7. 支付合约查询接口
+## 7. 支付合约查询接口（V2 概念）
 
 BNS 不扣款，不生成购买 receipt。标准支付合约在购买前查询 BNS，拿到当时的 purchase context。
+
+本章保留概念设计，但完整支付分账放到 V2 实现。V1 可以只保存 `paymentTarget`、`beneficiary`、`paymentPolicyHash`、`splitPolicyHash` 等可审计字段和事件，不要求实现标准支付合约、显式分账或内容销售流程。
+
+支付上下文的目标语义：
+
+- 可以针对一个 `name + doc_type` 配置独立 payment context。
+- 内部分账优先通过 Safe Address / ERC-1271 或其它 treasury 合约表达。
+- 显式分账用于内容销售、联合版权和推荐分成，属于 V2 标准支付合约范围。
 
 ### getPurchaseContext
 
 ```solidity
 function getPurchaseContext(
-    string calldata contentName,
+    string calldata name,
     string calldata docType
 ) external view returns (PurchaseContext memory context);
 ```
@@ -633,18 +720,18 @@ function getPurchaseContext(
 标准支付合约调用流程：
 
 ```text
-purchase(content_name, amount, indexer, recommendation_id):
-  context = bns.getPurchaseContext(content_name, "content")
+purchase(name, doc_type, amount, indexer, recommendation_id):
+  context = bns.getPurchaseContext(name, doc_type)
   assert context.status == Active
   assert amount matches price policy
   transfer token to context.paymentTarget or split targets
-  emit receipt with content_name + documentVersion + proofRoot
+  emit receipt with name + doc_type + documentVersion + proofRoot
 ```
 
 购买 receipt 至少应记录：
 
 - buyer。
-- content_name。
+- name。
 - doc_type。
 - BNS document version。
 - paid amount / token。
@@ -694,6 +781,13 @@ event NameTransferred(
     string indexed name,
     address indexed oldAssetOwner,
     address indexed newAssetOwner,
+    uint64 nameSeq
+);
+
+event NameOwnerUpdated(
+    string indexed name,
+    PrincipalKind ownerKind,
+    bytes ownerValue,
     uint64 nameSeq
 );
 
@@ -807,7 +901,44 @@ authorize_update():
 - owner/controller policy 决定谁能更新具体 `doc_type`。
 - payment target 可以由 owner 或被授权的 payment controller 更新。
 - content/app/service 文档的更新权可以下放给特定子身份。
-- release/tombstone/name transfer 属于高风险操作，默认需要 asset owner 或 recovery policy 授权。
+- release/tombstone/name transfer/owner update 属于高风险操作，默认需要 asset owner、当前 owner 或 recovery policy 授权。
+
+### owner/controller 解析规则
+
+一个 name 只有一个 BuckyOS 语义 owner 记录，但可以为不同 `doc_type` 设置不同 controller。
+
+owner 规则：
+
+- owner 只能是 `Unset` 或另一个 BNS name。
+- owner 为 `Unset` 时，一级名字的 owner 回落为该 name NFT 的 `assetOwner`。
+- owner 为 `Unset` 时，二级名字优先继承父名字 owner；如果父名字也未设置 owner，则最终回落到父名字的 `assetOwner`。
+- owner 指向另一个 BNS name 时，resolver 继续解析该名字的 owner 记录，直到得到链地址、合约地址或失败。
+- owner name 引用必须限制深度并检测循环。第一版建议 `MAX_OWNER_REF_DEPTH = 8`；超过深度或出现循环时解析失败。
+- owner 如果最终解析到合约地址，合约签名验证应使用 ERC-1271；这也是组织、多签、DAO 作为 owner 的推荐方式。
+
+controller 规则：
+
+- controller 只能是 `Unset`、链地址或合约地址，不能是另一个 BNS name。
+- controller 可以按 `doc_type` 配置，例如只允许某个地址更新 `video` 或 `app` 文档。
+- 如果某个 `doc_type` 没有显式 controller，则回落到该 name 的 owner 授权；二级名字 owner/controller 都未配置时，再继承父名字权限。
+- Safe Address / ERC-1271 合约地址可作为 controller，用于组织、多签和托管发布流程。
+
+owner public key 查找示例：
+
+```text
+resolve_owner(v.alice):
+  v.alice.owner == Unset
+  -> inherit alice.owner
+
+resolve_owner(alice):
+  if alice.owner is BnsName:
+    resolve_owner(alice.owner) with depth/cycle limit
+  else if alice.owner is Unset:
+    return alice.assetOwner
+  then optionally read alice owner_doc off-chain for additional public keys
+```
+
+链上只认可上述 owner/controller 记录和可验证签名。`owner` 文档可以声明更多公钥、设备、公钥格式或 DID 方法，但这些扩展只能由链下 resolver 使用。标准 resolver 必须校验 DID Document 里的 owner/controller 是链上记录的超集；如果文档声明与合约记录冲突，则该文档非法。
 
 ## 11. 最小闭环接口
 
@@ -819,6 +950,7 @@ queryNameState
 registerName
 renewName
 transferName
+setNameOwner
 releaseName
 setNamespacePolicy
 
@@ -835,7 +967,7 @@ setDidAlias
 getAlias
 setPaymentTarget
 
-// payment view
+// payment view，V2 概念接口；V1 可只保留字段、hash 和事件
 getPurchaseContext
 resolvePaymentTarget
 ```
@@ -847,15 +979,33 @@ resolvePaymentTarget
 - 文档可以更新、吊销、保留历史版本。
 - owner key 和 controller policy 可以轮换。
 - alias / migration 不破坏历史可信。
-- 支付合约能绑定长期内容名和购买发生时的权益状态。
+- V2 支付合约能绑定长期内容名和购买发生时的权益状态。
 - Zone resolver、SN、DNS、HTTPS、Source、Repo 可以作为 provider，但不能获得最终控制权。
 
-## 12. 第一版不解决的问题
+## 12. 信用与经济模型边界
+
+信用系统属于 BNS 之外的设施，不影响本合约接口的最小设计。
+
+规则：
+
+- 信用通常绑定 `name + owner`，而不是绑定某个 `app_doc` 或内容文档。
+- 名字更换 owner 后，该名字对应的信用解释也会变化；信用系统应显式处理 owner 变更历史。
+- `$objid.$owner` 总是合法的二级名字形式，适合作为任意内容、对象或资源的长期引用。
+- BNS 合约只提供可验证的名字、owner、文档版本和历史事件；信用评分、推荐、审核和风控由外部系统完成。
+
+维护成本和交易价格也应解耦：
+
+- name 的维护成本不应由 NFT 市场成交价直接决定。
+- 用户可以利用 name NFT 特性自由交易，交易价格只表达市场成交，不直接改变续期或维护成本。
+- 名字维护成本可以由自动化评估、公共拍卖结果、短名保护和资源占用等因素决定。
+- 公共拍卖通常在名字过期并经过 grace period 后触发。
+
+## 13. 第一版不解决的问题
 
 - 具体定价、拍卖、短名保护、保留字和争议仲裁。
 - Unicode 名字、同形字、大小写和多语言显示策略。第一版建议只接受 lower-case ASCII label。
-- Ed25519 / secp256k1 / 多签 / 社交恢复的具体链上验签实现。接口保留 `Principal` 和 `AuthProof`，具体链可先只支持链原生账户和合约账户。
+- Ed25519 / secp256k1 / 社交恢复的具体链上验签实现。接口保留 `Principal` 和 `AuthProof`，具体链可先只支持链原生账户和 ERC-1271 合约账户。
 - 跨链名字同步和跨链支付。
 - 隐私保护。BNS 是公开状态层，不应保存私有 profile 字段。
-- 标准支付合约的完整 ABI、receipt NFT/SBT 形态和退款/托管规则。
+- 标准支付合约的完整 ABI、显式分账、receipt NFT/SBT 形态和退款/托管规则；这些进入 V2。
 - Source、indexer、review report、信用机构的业务协议。
