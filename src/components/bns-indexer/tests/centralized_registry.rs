@@ -1,9 +1,11 @@
 use bns_indexer::{
     controller_rule, default_document_update, sha256_hex, AliasKind, AuthorityKey,
     AuthorityKeyUpdate, BnsRegistryError, CallAuthority, CentralizedBnsRegistry, DocumentRef,
-    DocumentStatus, MutationGuard, OwnerSource, Principal, PrincipalKind, RegisterOptions,
-    SqliteBnsRegistryStore, PERMISSION_PUBLISH_DOCUMENT, PERMISSION_SET_ALIAS, ZERO_HASH,
+    DocumentStatus, MutationGuard, NameStatus, OwnerSource, Principal, PrincipalKind,
+    RegisterOptions, ReleaseMode, SqliteBnsRegistryStore, PERMISSION_PUBLISH_DOCUMENT,
+    PERMISSION_SET_ALIAS, ZERO_HASH,
 };
+use ndn_lib::{FileObject, NamedObject, ObjId};
 
 const OWNER_A: &str = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const OWNER_B: &str = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
@@ -17,6 +19,13 @@ fn guard(seq: u64) -> MutationGuard {
     MutationGuard {
         expected_name_seq: seq,
         expected_parent_name_seq: 0,
+    }
+}
+
+fn child_guard(parent_seq: u64) -> MutationGuard {
+    MutationGuard {
+        expected_name_seq: 0,
+        expected_parent_name_seq: parent_seq,
     }
 }
 
@@ -45,6 +54,25 @@ fn doc_update(doc_type: &str, expected_version: u64, body: &str) -> bns_indexer:
         DocumentRef::inline(body.as_bytes()),
     )
     .unwrap()
+}
+
+fn payment_doc_update(
+    doc_type: &str,
+    expected_version: u64,
+    body: &str,
+    beneficiary: Principal,
+    payment_target: &str,
+    payment_policy_hash: &str,
+) -> bns_indexer::DocumentUpdate {
+    let mut update = doc_update(doc_type, expected_version, body);
+    update.beneficiary = beneficiary;
+    update.payment_target = payment_target.to_string();
+    update.payment_policy_hash = payment_policy_hash.to_string();
+    update
+}
+
+fn inline_body(result: &bns_indexer::ResolveResult) -> String {
+    String::from_utf8(result.document_state.document.inline_document.clone()).unwrap()
 }
 
 #[test]
@@ -286,6 +314,153 @@ fn semantic_owner_requires_active_authority_set() {
 }
 
 #[test]
+fn released_and_tombstoned_names_reject_state_writes() {
+    let registry = registry();
+
+    for (name, mode, expected_status) in [
+        (
+            "released",
+            ReleaseMode::ReleaseAfterGrace,
+            NameStatus::Released,
+        ),
+        (
+            "tombstoned",
+            ReleaseMode::TombstoneForever,
+            NameStatus::Tombstoned,
+        ),
+    ] {
+        registry
+            .register_name(
+                name,
+                OWNER_A,
+                RegisterOptions::default(),
+                vec![doc_update("owner", 0, r#"{"id":"did:bns:inactive"}"#)],
+                CallAuthority::public(),
+                MutationGuard::default(),
+            )
+            .unwrap();
+        registry
+            .release_name(name, mode, ZERO_HASH, chain_owner(1, OWNER_A).0, guard(1))
+            .unwrap();
+
+        let state = registry.query_name_state(name).unwrap().unwrap();
+        assert_eq!(state.status, expected_status);
+
+        assert!(matches!(
+            registry.publish_document(
+                name,
+                doc_update("owner", 1, r#"{"id":"did:bns:inactive-v2"}"#),
+                chain_owner(2, OWNER_A).0,
+                guard(2),
+            ),
+            Err(BnsRegistryError::InvalidMutation(_))
+        ));
+        assert!(matches!(
+            registry.transfer_name(
+                name,
+                OWNER_B,
+                Principal::unset(),
+                vec![],
+                chain_owner(2, OWNER_A).0,
+                guard(2),
+            ),
+            Err(BnsRegistryError::InvalidMutation(_))
+        ));
+        assert!(matches!(
+            registry.set_did_alias(
+                name,
+                "did:bns:canonical",
+                AliasKind::Alias,
+                ZERO_HASH,
+                chain_owner(2, OWNER_A).0,
+                guard(2),
+            ),
+            Err(BnsRegistryError::InvalidMutation(_))
+        ));
+        assert!(matches!(
+            registry.revoke_document(
+                name,
+                "owner",
+                1,
+                1,
+                ZERO_HASH,
+                chain_owner(2, OWNER_A).0,
+                guard(2),
+            ),
+            Err(BnsRegistryError::InvalidMutation(_))
+        ));
+        assert!(matches!(
+            registry.renew_name(name, 60),
+            Err(BnsRegistryError::InvalidMutation(_))
+        ));
+    }
+}
+
+#[test]
+fn release_name_rejects_breaking_active_semantic_owner_graph() {
+    let registry = registry();
+    registry
+        .register_name(
+            "org",
+            OWNER_A,
+            RegisterOptions::default(),
+            vec![],
+            CallAuthority::public(),
+            MutationGuard::default(),
+        )
+        .unwrap();
+    let org_key = key(b"org-key");
+    registry
+        .update_authority_keys(
+            "org",
+            vec![AuthorityKeyUpdate {
+                key: org_key,
+                active: true,
+            }],
+            chain_owner(1, OWNER_A).0,
+            guard(1),
+        )
+        .unwrap();
+    registry
+        .register_name(
+            "alice",
+            OWNER_B,
+            RegisterOptions::default(),
+            vec![],
+            CallAuthority::public(),
+            MutationGuard::default(),
+        )
+        .unwrap();
+    registry
+        .set_name_owner(
+            "alice",
+            Principal::bns_name("org").unwrap(),
+            chain_owner(1, OWNER_B).0,
+            guard(1),
+        )
+        .unwrap();
+
+    assert!(matches!(
+        registry.release_name(
+            "org",
+            ReleaseMode::ReleaseAfterGrace,
+            ZERO_HASH,
+            chain_owner(1, OWNER_A).0,
+            guard(1),
+        ),
+        Err(BnsRegistryError::NoConcreteSigner)
+    ));
+    assert_eq!(
+        registry.query_name_state("org").unwrap().unwrap().status,
+        NameStatus::Active
+    );
+    assert_eq!(
+        registry.resolve_owner("alice").unwrap().effective_owner,
+        Principal::bns_name("org").unwrap()
+    );
+}
+
+#[test]
 fn semantic_owner_graph_rejects_cross_name_cycle() {
     let registry = registry();
     registry
@@ -412,4 +587,488 @@ fn sqlite_backend_persists_registry_state() {
             .version,
         1
     );
+}
+
+#[test]
+fn did_and_doc_type_resolve_distinct_zone_device_agent_and_app_documents() {
+    let registry = registry();
+    registry
+        .register_name(
+            "alice",
+            OWNER_A,
+            RegisterOptions::default(),
+            vec![
+                doc_update(
+                    "owner",
+                    0,
+                    r#"{"id":"did:bns:alice","default_zone_did":"did:bns:alice"}"#,
+                ),
+                doc_update("boot", 0, r#"{"id":"did:bns:alice","oods":["ood1.alice"]}"#),
+                doc_update(
+                    "zone",
+                    0,
+                    r#"{"id":"did:bns:alice","verify_hub_info":{"public_key":"vh-pk"}}"#,
+                ),
+            ],
+            CallAuthority::public(),
+            MutationGuard::default(),
+        )
+        .unwrap();
+
+    registry
+        .register_name(
+            "ood1.alice",
+            OWNER_A,
+            RegisterOptions::default(),
+            vec![
+                doc_update(
+                    "doc",
+                    0,
+                    r#"{"id":"did:dev:gateway-pkx","owner":"did:bns:alice","zone_did":"did:bns:alice","rtcp_port":5314}"#,
+                ),
+                doc_update(
+                    "info",
+                    0,
+                    r#"{"id":"did:dev:gateway-pkx","all_ip":["10.0.0.2"],"status":"online"}"#,
+                ),
+            ],
+            CallAuthority::owner(Principal::chain_account(OWNER_A), ""),
+            child_guard(1),
+        )
+        .unwrap();
+
+    registry
+        .register_name(
+            "jarvis.alice",
+            OWNER_A,
+            RegisterOptions::default(),
+            vec![doc_update(
+                "agent",
+                0,
+                r#"{"id":"did:bns:jarvis.alice","owner":"did:bns:alice","message_endpoint":"/agent/msg"}"#,
+            )],
+            CallAuthority::owner(Principal::chain_account(OWNER_A), ""),
+            child_guard(1),
+        )
+        .unwrap();
+
+    registry
+        .register_name(
+            "buckyos",
+            OWNER_B,
+            RegisterOptions::default(),
+            vec![],
+            CallAuthority::public(),
+            MutationGuard::default(),
+        )
+        .unwrap();
+    registry
+        .register_name(
+            "filebrowser.buckyos",
+            OWNER_B,
+            RegisterOptions::default(),
+            vec![doc_update(
+                "app",
+                0,
+                r#"{"id":"did:bns:filebrowser.buckyos","package":"obj:filebrowser-v1"}"#,
+            )],
+            CallAuthority::owner(Principal::chain_account(OWNER_B), ""),
+            child_guard(1),
+        )
+        .unwrap();
+
+    let boot = registry.resolve_did("did:bns:alice", "boot").unwrap();
+    let zone = registry.resolve_did("did:bns:alice", "zone").unwrap();
+    assert_eq!(boot.document_state.doc_type, "boot");
+    assert_eq!(zone.document_state.doc_type, "zone");
+    assert_ne!(
+        boot.document_state.document.content_hash,
+        zone.document_state.document.content_hash
+    );
+
+    let device_doc = registry.resolve_did("did:bns:ood1.alice", "doc").unwrap();
+    let device_info = registry.resolve_did("did:bns:ood1.alice", "info").unwrap();
+    assert!(inline_body(&device_doc).contains(r#""rtcp_port":5314"#));
+    assert!(inline_body(&device_info).contains(r#""status":"online""#));
+
+    let agent = registry
+        .resolve_did("did:bns:jarvis.alice", "agent")
+        .unwrap();
+    assert!(inline_body(&agent).contains(r#""message_endpoint":"/agent/msg""#));
+
+    let app = registry
+        .resolve_did("did:bns:filebrowser.buckyos", "app")
+        .unwrap();
+    assert!(inline_body(&app).contains(r#""package":"obj:filebrowser-v1""#));
+
+    assert!(matches!(
+        registry.resolve_did("did:bns:ood1.alice", "zone"),
+        Err(BnsRegistryError::DocumentNotFound { .. })
+    ));
+}
+
+#[test]
+fn content_name_transfer_updates_current_rights_without_rewriting_history() {
+    let registry = registry();
+    registry
+        .register_name(
+            "alice",
+            OWNER_A,
+            RegisterOptions::default(),
+            vec![doc_update("owner", 0, r#"{"id":"did:bns:alice"}"#)],
+            CallAuthority::public(),
+            MutationGuard::default(),
+        )
+        .unwrap();
+
+    let payment_v1 = sha256_hex(b"alice-payment-policy");
+    registry
+        .register_name(
+            "book1.alice",
+            OWNER_A,
+            RegisterOptions::default(),
+            vec![payment_doc_update(
+                "content",
+                0,
+                r#"{"id":"did:bns:book1.alice","owner":"did:bns:alice","current_content_id":"obj:v1"}"#,
+                Principal::bns_name("alice").unwrap(),
+                "wallet:alice",
+                &payment_v1,
+            )],
+            CallAuthority::owner(Principal::chain_account(OWNER_A), ""),
+            child_guard(1),
+        )
+        .unwrap();
+
+    registry
+        .register_name(
+            "publisher-team",
+            OWNER_B,
+            RegisterOptions::default(),
+            vec![doc_update("owner", 0, r#"{"id":"did:bns:publisher-team"}"#)],
+            CallAuthority::public(),
+            MutationGuard::default(),
+        )
+        .unwrap();
+    let publisher_key = key(b"publisher-team-key");
+    registry
+        .update_authority_keys(
+            "publisher-team",
+            vec![AuthorityKeyUpdate {
+                key: publisher_key.clone(),
+                active: true,
+            }],
+            chain_owner(1, OWNER_B).0,
+            chain_owner(1, OWNER_B).1,
+        )
+        .unwrap();
+
+    let payment_v2 = sha256_hex(b"publisher-payment-policy");
+    let seq = registry
+        .transfer_name(
+            "book1.alice",
+            OWNER_B,
+            Principal::bns_name("publisher-team").unwrap(),
+            vec![payment_doc_update(
+                "content",
+                1,
+                r#"{"id":"did:bns:book1.alice","owner":"did:bns:publisher-team","current_content_id":"obj:v2"}"#,
+                Principal::bns_name("publisher-team").unwrap(),
+                "wallet:publisher-team",
+                &payment_v2,
+            )],
+            CallAuthority::owner(Principal::chain_account(OWNER_A), ""),
+            guard(1),
+        )
+        .unwrap();
+    assert_eq!(seq, 2);
+
+    let current = registry
+        .resolve_did("did:bns:book1.alice", "content")
+        .unwrap();
+    assert_eq!(current.document_state.version, 2);
+    assert_eq!(
+        current.owner.effective_owner,
+        Principal::bns_name("publisher-team").unwrap()
+    );
+    assert_eq!(current.owner.source, OwnerSource::ExplicitSemanticOwner);
+    assert!(inline_body(&current).contains(r#""current_content_id":"obj:v2""#));
+
+    let purchase = registry
+        .get_purchase_context("book1.alice", "content")
+        .unwrap();
+    assert_eq!(purchase.document_version, 2);
+    assert_eq!(
+        purchase.beneficiary,
+        Principal::bns_name("publisher-team").unwrap()
+    );
+    assert_eq!(purchase.payment_target, "wallet:publisher-team");
+
+    let before_transfer = registry
+        .resolve_payment_target("book1.alice", "content", 1)
+        .unwrap();
+    assert_eq!(
+        before_transfer.beneficiary,
+        Principal::bns_name("alice").unwrap()
+    );
+    assert_eq!(before_transfer.payment_target, "wallet:alice");
+    assert_eq!(before_transfer.payment_policy_hash, payment_v1);
+
+    let after_transfer = registry
+        .resolve_payment_target("book1.alice", "content", 2)
+        .unwrap();
+    assert_eq!(
+        after_transfer.beneficiary,
+        Principal::bns_name("publisher-team").unwrap()
+    );
+    assert_eq!(after_transfer.payment_policy_hash, payment_v2);
+
+    let historical_doc = registry
+        .get_document_version("book1.alice", "content", 1)
+        .unwrap()
+        .unwrap();
+    assert!(String::from_utf8(historical_doc.document.inline_document)
+        .unwrap()
+        .contains(r#""current_content_id":"obj:v1""#));
+}
+
+#[test]
+fn migrated_alias_keeps_old_name_resolvable_without_silent_rewrite() {
+    let registry = registry();
+    registry
+        .register_name(
+            "alice",
+            OWNER_A,
+            RegisterOptions::default(),
+            vec![doc_update("owner", 0, r#"{"id":"did:bns:alice"}"#)],
+            CallAuthority::public(),
+            MutationGuard::default(),
+        )
+        .unwrap();
+    registry
+        .register_name(
+            "jarvis.alice",
+            OWNER_A,
+            RegisterOptions::default(),
+            vec![doc_update(
+                "agent",
+                0,
+                r#"{"id":"did:bns:jarvis.alice","profile":"old-agent"}"#,
+            )],
+            CallAuthority::owner(Principal::chain_account(OWNER_A), ""),
+            child_guard(1),
+        )
+        .unwrap();
+    registry
+        .register_name(
+            "jarvis",
+            OWNER_A,
+            RegisterOptions::default(),
+            vec![doc_update(
+                "agent",
+                0,
+                r#"{"id":"did:bns:jarvis","profile":"canonical-agent"}"#,
+            )],
+            CallAuthority::public(),
+            MutationGuard::default(),
+        )
+        .unwrap();
+
+    let proof_hash = sha256_hex(b"jarvis migration proof");
+    registry
+        .set_did_alias(
+            "jarvis.alice",
+            "did:bns:jarvis",
+            AliasKind::MigratedTo,
+            &proof_hash,
+            CallAuthority::owner(Principal::chain_account(OWNER_A), ""),
+            guard(1),
+        )
+        .unwrap();
+
+    let old = registry
+        .resolve_did("did:bns:jarvis.alice", "agent")
+        .unwrap();
+    assert_eq!(old.alias_kind, AliasKind::MigratedTo);
+    assert_eq!(old.alias_target_did, "did:bns:jarvis");
+    assert_eq!(old.document_state.name, "jarvis.alice");
+    assert!(inline_body(&old).contains(r#""profile":"old-agent""#));
+
+    let canonical = registry.resolve_did("did:bns:jarvis", "agent").unwrap();
+    assert_eq!(canonical.alias_kind, AliasKind::None);
+    assert_eq!(canonical.document_state.name, "jarvis");
+    assert!(inline_body(&canonical).contains(r#""profile":"canonical-agent""#));
+
+    let alias = registry.get_alias("jarvis.alice").unwrap().unwrap();
+    assert_eq!(alias.kind, AliasKind::MigratedTo);
+    assert_eq!(alias.proof_hash, proof_hash);
+}
+
+#[test]
+fn agent_identity_and_service_capability_use_separate_document_types() {
+    let registry = registry();
+    registry
+        .register_name(
+            "alice",
+            OWNER_A,
+            RegisterOptions::default(),
+            vec![doc_update("owner", 0, r#"{"id":"did:bns:alice"}"#)],
+            CallAuthority::public(),
+            MutationGuard::default(),
+        )
+        .unwrap();
+    registry
+        .register_name(
+            "jarvis.alice",
+            OWNER_A,
+            RegisterOptions::default(),
+            vec![doc_update(
+                "agent",
+                0,
+                r#"{"id":"did:bns:jarvis.alice","public_key":"agent-key"}"#,
+            )],
+            CallAuthority::owner(Principal::chain_account(OWNER_A), ""),
+            child_guard(1),
+        )
+        .unwrap();
+
+    let service_controller = Principal::chain_account(CONTROLLER);
+    registry
+        .set_controller_policy(
+            "jarvis.alice",
+            vec![controller_rule(
+                service_controller.clone(),
+                "service",
+                PERMISSION_PUBLISH_DOCUMENT,
+            )],
+            ZERO_HASH,
+            CallAuthority::owner(Principal::chain_account(OWNER_A), ""),
+            guard(1),
+        )
+        .unwrap();
+
+    let service_version = registry
+        .publish_document(
+            "jarvis.alice",
+            doc_update(
+                "service",
+                0,
+                r#"{"service":"agent-message","endpoint":"/agents/jarvis/msg"}"#,
+            ),
+            CallAuthority::controller(service_controller.clone(), ""),
+            guard(2),
+        )
+        .unwrap();
+    assert_eq!(service_version, 1);
+
+    assert!(matches!(
+        registry.publish_document(
+            "jarvis.alice",
+            doc_update(
+                "agent",
+                1,
+                r#"{"id":"did:bns:jarvis.alice","public_key":"rewritten"}"#,
+            ),
+            CallAuthority::controller(service_controller, ""),
+            guard(3),
+        ),
+        Err(BnsRegistryError::ControllerScopeDenied { .. })
+    ));
+
+    let agent = registry
+        .resolve_did("did:bns:jarvis.alice", "agent")
+        .unwrap();
+    assert_eq!(agent.document_state.version, 1);
+    assert!(inline_body(&agent).contains(r#""public_key":"agent-key""#));
+
+    let service = registry
+        .resolve_did("did:bns:jarvis.alice", "service")
+        .unwrap();
+    assert_eq!(service.document_state.version, 1);
+    assert!(inline_body(&service).contains(r#""service":"agent-message""#));
+}
+
+#[test]
+fn name_labels_allow_full_two_level_name_budget() {
+    let registry = registry();
+    let parent = "a".repeat(126);
+    let child_label = "b".repeat(126);
+    let child = format!("{}.{}", child_label, parent);
+    assert_eq!(child.len(), 253);
+
+    registry
+        .register_name(
+            &parent,
+            OWNER_A,
+            RegisterOptions::default(),
+            vec![],
+            CallAuthority::public(),
+            MutationGuard::default(),
+        )
+        .unwrap();
+
+    registry
+        .register_name(
+            &child,
+            OWNER_A,
+            RegisterOptions::default(),
+            vec![doc_update("owner", 0, r#"{"id":"did:bns:long-name"}"#)],
+            CallAuthority::owner(Principal::chain_account(OWNER_A), ""),
+            child_guard(1),
+        )
+        .unwrap();
+
+    let state = registry.query_name_state(&child).unwrap().unwrap();
+    assert_eq!(state.name, child);
+
+    let too_long_label = "c".repeat(127);
+    assert!(matches!(
+        bns_indexer::canonical_bns_name(&too_long_label),
+        Err(BnsRegistryError::InvalidName { .. })
+    ));
+}
+
+#[test]
+fn real_base32_named_objid_can_be_registered_as_second_level_name() {
+    let registry = registry();
+    registry
+        .register_name(
+            "alice",
+            OWNER_A,
+            RegisterOptions::default(),
+            vec![],
+            CallAuthority::public(),
+            MutationGuard::default(),
+        )
+        .unwrap();
+
+    let content_id =
+        ObjId::new("sha256:000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f")
+            .unwrap();
+    let file = FileObject::new("readme.txt".to_string(), 32, content_id.to_string());
+    let (file_obj_id, _) = file.gen_obj_id();
+    let label = file_obj_id.to_base32();
+    assert_eq!(file_obj_id.obj_type, "cyfile");
+    assert_eq!(label.len(), 63);
+    assert!(label
+        .bytes()
+        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit()));
+
+    let name = format!("{}.alice", label);
+    let doc = format!(r#"{{"id":"did:bns:{}"}}"#, name);
+    registry
+        .register_name(
+            &name,
+            OWNER_A,
+            RegisterOptions::default(),
+            vec![doc_update("owner", 0, &doc)],
+            CallAuthority::owner(Principal::chain_account(OWNER_A), ""),
+            child_guard(1),
+        )
+        .unwrap();
+
+    let did = format!("did:bns:{}", name);
+    let resolved = registry.resolve_did(&did, "owner").unwrap();
+    assert_eq!(resolved.document_state.name, name);
+    assert!(inline_body(&resolved).contains(&did));
 }

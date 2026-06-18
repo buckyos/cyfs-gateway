@@ -43,6 +43,8 @@ macro_rules! string_enum {
 pub const DID_BNS_PREFIX: &str = "did:bns:";
 pub const STORAGE_TYPE_INLINE: &str = "inline";
 pub const ZERO_HASH: &str = "0x0000000000000000000000000000000000000000000000000000000000000000";
+pub const MAX_BNS_NAME_LEN: usize = 253;
+pub const MAX_BNS_LABEL_LEN: usize = 126;
 pub const MAX_INLINE_DOCUMENT: usize = 4 * 1024;
 pub const MAX_OWNER_REF_DEPTH: usize = 8;
 
@@ -877,10 +879,10 @@ pub fn canonical_bns_name(name: &str) -> BnsRegistryResult<String> {
             "contract names must not include did:bns: prefix",
         ));
     }
-    if name.len() > 253 {
+    if name.len() > MAX_BNS_NAME_LEN {
         return Err(BnsRegistryError::invalid_name(
             name,
-            "name must be at most 253 bytes",
+            format!("name must be at most {} bytes", MAX_BNS_NAME_LEN),
         ));
     }
 
@@ -888,10 +890,10 @@ pub fn canonical_bns_name(name: &str) -> BnsRegistryResult<String> {
         if label.is_empty() {
             return Err(BnsRegistryError::invalid_name(name, "empty label"));
         }
-        if label.len() > 63 {
+        if label.len() > MAX_BNS_LABEL_LEN {
             return Err(BnsRegistryError::invalid_name(
                 name,
-                "label must be at most 63 bytes",
+                format!("label must be at most {} bytes", MAX_BNS_LABEL_LEN),
             ));
         }
         if label.starts_with('-') || label.ends_with('-') {

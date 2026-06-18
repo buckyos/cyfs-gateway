@@ -228,11 +228,7 @@ where
             }
 
             if let Some(parent) = parent_name(&name) {
-                let parent_state = self.load_materialized_name(tx, parent)?.ok_or_else(|| {
-                    BnsRegistryError::NameNotFound {
-                        name: parent.to_string(),
-                    }
-                })?;
+                let parent_state = self.required_active_name(tx, parent)?;
                 if guard.expected_parent_name_seq != parent_state.name_seq {
                     return Err(BnsRegistryError::StaleParentNameSeq {
                         name: parent.to_string(),
@@ -306,8 +302,10 @@ where
         }
         self.store.transact(|tx| {
             let now = now_timestamp();
-            let mut state = self.required_name(tx, &name)?;
-            if !state.renewable || state.status == NameStatus::Tombstoned {
+            let mut state = self.required_raw_name(tx, &name)?;
+            if !state.renewable
+                || matches!(state.status, NameStatus::Released | NameStatus::Tombstoned)
+            {
                 return Err(BnsRegistryError::InvalidMutation(format!(
                     "name `{name}` is not renewable"
                 )));
@@ -353,7 +351,7 @@ where
 
         self.store.transact(|tx| {
             let now = now_timestamp();
-            let mut state = self.required_name(tx, &name)?;
+            let mut state = self.required_active_name(tx, &name)?;
             self.check_guard(&state, &guard)?;
             self.authorize_owner_for_loaded(tx, &state, &authority)?;
             self.validate_semantic_owner_target(tx, &new_semantic_owner)?;
@@ -409,7 +407,7 @@ where
         }
         self.store.transact(|tx| {
             let now = now_timestamp();
-            let mut state = self.required_name(tx, &name)?;
+            let mut state = self.required_active_name(tx, &name)?;
             state = self.materialize_name_state(tx, state)?;
             if !state.standard_transfer_enabled {
                 return Err(BnsRegistryError::StandardTransferDisabled { name: name.clone() });
@@ -445,7 +443,7 @@ where
         validate_semantic_owner(&semantic_owner)?;
         self.store.transact(|tx| {
             let now = now_timestamp();
-            let mut state = self.required_name(tx, &name)?;
+            let mut state = self.required_active_name(tx, &name)?;
             self.check_guard(&state, &guard)?;
             self.authorize_owner_for_loaded(tx, &state, &authority)?;
             self.validate_semantic_owner_target(tx, &semantic_owner)?;
@@ -481,7 +479,7 @@ where
         validate_hash(reason_hash)?;
         self.store.transact(|tx| {
             let now = now_timestamp();
-            let mut state = self.required_name(tx, &name)?;
+            let mut state = self.required_active_name(tx, &name)?;
             self.check_guard(&state, &guard)?;
             self.authorize_owner_for_loaded(tx, &state, &authority)?;
             state.status = match mode {
@@ -490,6 +488,7 @@ where
             };
             state.name_seq += 1;
             state.updated_at = now;
+            self.validate_owner_graph_with(tx, Some(&state))?;
             state = self.materialize_name_state(tx, state)?;
             tx.put_name(&state)?;
             tx.append_event(
@@ -517,7 +516,7 @@ where
         validate_hash(namespace_policy_hash)?;
         self.store.transact(|tx| {
             let now = now_timestamp();
-            let mut state = self.required_name(tx, &name)?;
+            let mut state = self.required_active_name(tx, &name)?;
             self.authorize_update(
                 tx,
                 &state,
@@ -559,7 +558,7 @@ where
         }
         self.store.transact(|tx| {
             let now = now_timestamp();
-            let state = self.required_name(tx, &name)?;
+            let state = self.required_active_name(tx, &name)?;
             self.check_guard(&state, &guard)?;
             self.authorize_owner_for_loaded(tx, &state, &authority)?;
             self.apply_authority_updates(tx, &name, updates, now)
@@ -587,7 +586,7 @@ where
 
         self.store.transact(|tx| {
             let now = now_timestamp();
-            let state = self.required_name(tx, &name)?;
+            let state = self.required_active_name(tx, &name)?;
             self.check_guard(&state, &guard)?;
             self.authorize_owner_for_loaded(tx, &state, &authority)?;
             let authority_set = self.apply_authority_updates(tx, &name, updates, now)?;
@@ -608,7 +607,7 @@ where
         update.validate()?;
         self.store.transact(|tx| {
             let now = now_timestamp();
-            let state = self.required_name(tx, &name)?;
+            let state = self.required_active_name(tx, &name)?;
             self.authorize_update(
                 tx,
                 &state,
@@ -643,7 +642,7 @@ where
 
         self.store.transact(|tx| {
             let now = now_timestamp();
-            let mut name_state = self.required_name(tx, &name)?;
+            let mut name_state = self.required_active_name(tx, &name)?;
             self.authorize_update(
                 tx,
                 &name_state,
@@ -714,7 +713,7 @@ where
         }
         self.store.transact(|tx| {
             let now = now_timestamp();
-            let mut state = self.required_name(tx, &name)?;
+            let mut state = self.required_active_name(tx, &name)?;
             self.check_guard(&state, &guard)?;
             self.authorize_owner_for_loaded(tx, &state, &authority)?;
             for rule in &rules {
@@ -755,7 +754,7 @@ where
         validate_hash(proof_hash)?;
         self.store.transact(|tx| {
             let now = now_timestamp();
-            let mut state = self.required_name(tx, &name)?;
+            let mut state = self.required_active_name(tx, &name)?;
             self.authorize_update(
                 tx,
                 &state,
@@ -816,7 +815,7 @@ where
         validate_hash(rights_policy_hash)?;
         self.store.transact(|tx| {
             let now = now_timestamp();
-            let mut name_state = self.required_name(tx, &name)?;
+            let mut name_state = self.required_active_name(tx, &name)?;
             self.authorize_update(
                 tx,
                 &name_state,
@@ -1009,7 +1008,7 @@ where
         document.document_state_hash = document_state_hash(&document)?;
         tx.put_document(&document)?;
 
-        let mut name_state = self.required_name(tx, name)?;
+        let mut name_state = self.required_active_name(tx, name)?;
         if document.doc_type == "owner" {
             name_state.owner_document_version = document.version;
         }
@@ -1133,15 +1132,36 @@ where
         Ok(())
     }
 
-    fn required_name(
+    fn required_raw_name(
         &self,
         tx: &mut dyn BnsRegistryStoreTx,
         name: &str,
     ) -> BnsRegistryResult<NameState> {
-        self.load_materialized_name(tx, name)?
+        tx.get_name(name)?
             .ok_or_else(|| BnsRegistryError::NameNotFound {
                 name: name.to_string(),
             })
+    }
+
+    fn required_active_name(
+        &self,
+        tx: &mut dyn BnsRegistryStoreTx,
+        name: &str,
+    ) -> BnsRegistryResult<NameState> {
+        let state = self.required_raw_name(tx, name)?;
+        self.ensure_active_name(&state)?;
+        self.materialize_name_state(tx, state)
+    }
+
+    fn ensure_active_name(&self, state: &NameState) -> BnsRegistryResult<()> {
+        if state.status == NameStatus::Active {
+            Ok(())
+        } else {
+            Err(BnsRegistryError::InvalidMutation(format!(
+                "name `{}` is not active: {}",
+                state.name, state.status
+            )))
+        }
     }
 
     fn load_materialized_name(
@@ -1187,7 +1207,11 @@ where
         state: &NameState,
     ) -> BnsRegistryResult<OwnerResolution> {
         if state.semantic_owner.kind == PrincipalKind::BnsName {
-            let authority = self.authority_set(tx, &state.semantic_owner.value)?;
+            let authority = if state.status == NameStatus::Active {
+                self.require_active_authority_set(tx, &state.semantic_owner.value)?
+            } else {
+                self.authority_set(tx, &state.semantic_owner.value)?
+            };
             return Ok(OwnerResolution {
                 effective_owner: state.semantic_owner.clone(),
                 source: OwnerSource::ExplicitSemanticOwner,
@@ -1208,7 +1232,17 @@ where
             let parent = parent_name(&state.name).ok_or_else(|| {
                 BnsRegistryError::InvalidMutation("second-level name has no parent".to_string())
             })?;
-            let mut owner = self.resolve_owner_for_name(tx, parent)?;
+            let mut owner = if state.status == NameStatus::Active {
+                let parent_state = self.load_materialized_name(tx, parent)?.ok_or_else(|| {
+                    BnsRegistryError::NameNotFound {
+                        name: parent.to_string(),
+                    }
+                })?;
+                self.ensure_active_name(&parent_state)?;
+                self.resolve_owner_from_state(tx, &parent_state)?
+            } else {
+                self.resolve_owner_for_name(tx, parent)?
+            };
             owner.source = OwnerSource::ParentInherited;
             Ok(owner)
         }
@@ -1240,7 +1274,7 @@ where
         &self,
         tx: &mut dyn BnsRegistryStoreTx,
         name: &str,
-    ) -> BnsRegistryResult<()> {
+    ) -> BnsRegistryResult<AuthoritySetState> {
         let state = tx
             .get_name(name)?
             .ok_or_else(|| BnsRegistryError::NameNotFound {
@@ -1253,7 +1287,7 @@ where
         if set.active_key_count == 0 {
             return Err(BnsRegistryError::NoConcreteSigner);
         }
-        Ok(())
+        Ok(set)
     }
 
     fn current_proof_root(&self, tx: &mut dyn BnsRegistryStoreTx) -> BnsRegistryResult<String> {
@@ -1319,6 +1353,9 @@ where
                 .ok_or_else(|| BnsRegistryError::NameNotFound {
                     name: current.clone(),
                 })?;
+            if state.status != NameStatus::Active {
+                return Err(BnsRegistryError::NoConcreteSigner);
+            }
 
             if state.semantic_owner.kind == PrincipalKind::BnsName {
                 let owner_name = state.semantic_owner.value.clone();
