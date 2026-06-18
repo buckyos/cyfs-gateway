@@ -1,13 +1,13 @@
 # BNS 智能合约接口设计
 
-> 版本：v0.2  
+> 版本：v0.3  
 > 本文定义的是可确定执行的 BNS Registry 状态机接口。当前实现是中心化模拟服务；未来可以在不改变核心业务语义的前提下切换为智能合约实现。
 
 本文基于 `认识BNS.md` 和 `BNS 去中心的名字系统.md`，把 BNS 的协议目标收敛成一组与实现方式无关的接口。
 
 这里的“合约”首先表示一份可验证、可重放、状态转换确定的逻辑合约，不要求第一版立即部署到公链。当前中心化实现负责模拟同一套状态机、权限检查和事件日志；未来的 EVM、Move 或其它链实现只需要替换认证适配器和持久化层，不应改变 owner、controller、document version 等核心语义。
 
-BNS Registry 不保存所有 DID Document，也不替代内容网络、支付合约、DNS、SN 或 Zone resolver。它只保存不能由中心化 provider 单方面覆盖的全局事实：
+BNS Registry 不保存所有 DID Document，也不替代内容网络、支付合约、DNS、SN 或 Zone resolver。它只保存不能由中心化 provider 单方面覆盖的全局事实（中心化阶段，这一不可单方面覆盖性由 §16.2 的防篡改 checkpoint 提供可审计保证，而不是由去中心化提供）：
 
 - 名字是否存在、对应的名字资产归谁、是否过期、是否允许标准 NFT 转移。
 - 名字当前由哪个 BuckyOS 语义 owner 控制，以及该 owner 的可验证 key 状态。
@@ -197,6 +197,24 @@ Document 内部声明
 
 标准 resolver 必须确认文档中的声明覆盖并符合 Registry 记录。如果文档缺少 Registry 要求的 owner/controller，或者与 Registry 状态冲突，则该文档非法。文档可以声明更多链下用途的 key 或 service，但不能借此获得 Registry 权限。
 
+### 3.6 owner 图不变量与防 brick
+
+由于显式 `semanticOwner` 一旦生效，对应名字的 `assetOwner` 权限**立即彻底失效**（见 §3.2），`semanticOwner = BnsName(x)` 会把若干名字串成一张有向图。如果不加约束，这张图可能出现环或不可达，导致名字被永久锁死且无任何恢复路径。
+
+第一版强制以下不变量：
+
+- **有界深度。** 解析任意名字的 effective 控制方时，沿 `semanticOwner = BnsName` 边的跳数不得超过 `MAX_OWNER_REF_DEPTH = 8`。超过即视为非法状态。
+- **无环。** `semanticOwner` 形成的有向图必须无环。
+- **可达具体签名者。** 任意 Active 名字必须能在 `MAX_OWNER_REF_DEPTH` 跳内解析到至少一个具体可用签名者，即某个 `AssetOwnerFallback` 链账户，或某个拥有至少一个当前有效认证 key 的 authority name。
+
+任何会把 `semanticOwner` 设为 `BnsName` 的写操作（`setNameOwner`、`transferName`、带 `initialSemanticOwner` 的 `registerName`）在提交前必须基于更新前状态做一次图检查：
+
+- 若新边会构成环，拒绝，错误码 `OWNER_GRAPH_CYCLE`。
+- 若新状态会使本名字（或图中任何受其影响的名字）失去可达的具体签名者，拒绝，错误码 `NO_CONCRETE_SIGNER`。
+- 若解析深度会超过 `MAX_OWNER_REF_DEPTH`，拒绝，错误码 `OWNER_GRAPH_TOO_DEEP`。
+
+完整的 social recovery 状态机仍属于第一版暂不解决的范围（见 §17），但上述检查是**现在就必须存在**的最小兜底，确保任何单步合法操作都不会把名字变成不可恢复的死状态。`assetOwner` 在显式 semantic owner 模式下不再拥有日常权限，但实现**可以**保留一条受时间锁保护、仅用于「图已无可用签名者」这一极端情形的 recovery-only 通道；该通道的具体设计留待 recovery 状态机一并定义。
+
 ## 4. NFT 转让语义
 
 每个已注册 name 可以对应一份 ERC-721 或等价名字资产。`assetOwner` 必须等价于该名字资产的当前持有人。
@@ -312,6 +330,13 @@ RPC resolver 可以提供 `resolveDid("did:bns:alice", ...)` 便捷接口，但�
 - 名字级变更必须匹配更新前的 `expectedNameSeq`。
 - `expectedVersion` 和 `expectedNameSeq` 是状态并发保护，不是身份认证。
 - 历史版本和事件不删除。
+
+谱系连续性：
+
+- `nameSeq` 在名字的**整个生命周期内单调递增，跨 `Released -> 重新注册` 不重置**。它天然是该名字事件流的连续性指纹。
+- 名字经历 `Released -> 重新注册` 时，`lineageEpoch` 加一，并重新发出 `NameRegistered`（其 `nameSeq` 严格大于该名字此前任何事件）。
+- 跨 `lineageEpoch` 边界的 effective owner 变化属于**信任断点**：客户端、钱包和信用系统不得把新世代的 owner 与旧世代的历史 receipt、签名或信用记录默认视为同一主体。
+- 对已售出内容或有非平凡历史的高价值名字，建议默认采用 `TombstoneForever` 而非 `ReleaseAfterGrace`，从根本上避免名字被重注册后造成身份混淆。
 
 ## 6. 协议级数据类型
 
@@ -481,6 +506,10 @@ struct NameState {
     uint64 nameSeq;
     uint64 ownerDocumentVersion;
 
+    // 谱系世代：每次名字经历 Released -> 重新注册 时 +1，全生命周期单调。
+    // 用于让 resolver、钱包、信用系统检测「同名但已换主」的信任断点。
+    uint64 lineageEpoch;
+
     bool renewable;
     bool transferable;
     bool allowDelegatedSubnames;
@@ -569,6 +598,11 @@ struct DocumentUpdate {
 struct OwnerResolution {
     Principal effectiveOwner;
     OwnerSource source;
+
+    // 注意：authorityRoot/authoritySeq 指向「实际控制方」的 authority set。
+    // 当 effectiveOwner = BnsName(org) 时，这里是 org 的 authority set，
+    // 而不是被解析名字自身的 set。getAuthoritySet(name) 返回的才是该 name 自己的 set，
+    // 两者在 fallback 模式下相同、在显式 semantic owner 模式下通常不同。
     bytes32 authorityRoot;
     uint64 authoritySeq;
 }
@@ -610,6 +644,22 @@ struct PurchaseContext {
 
     DocumentStatus status;
     bytes32 proofRoot;
+}
+
+struct LogCheckpoint {
+    // 截至 lastSeq 为止整个 append-only event log 的承诺，例如事件序列的 Merkle root。
+    bytes32 logRoot;
+
+    // 本 checkpoint 覆盖到的最后一个全局事件序号。
+    uint64 lastSeq;
+
+    uint64 issuedAt;
+
+    // 运营方（中心化阶段）或治理合约（链上阶段）的签名主体。
+    Principal issuer;
+
+    // 可选：把 logRoot 锚定到某条公链时的外部锚点引用 hash。
+    bytes32 externalAnchor;
 }
 ```
 
@@ -721,7 +771,8 @@ function registerName(
 - 二级名字首次注册必须由父名字更新前的 effective owner 授权；此时 `authority.role = Owner`，并校验 `guard.expectedParentNameSeq`。
 - 一级名字 `initialSemanticOwner = Unset` 时，effective owner 为 `assetOwner`。
 - 二级名字 `initialSemanticOwner = Unset` 时，继承父 effective owner。
-- `initialSemanticOwner = BnsName(x)` 时，`x` 必须有有效 authority key set。
+- `initialSemanticOwner = BnsName(x)` 时，`x` 必须有有效 authority key set，并通过 §3.6 的图检查。
+- 重新注册一个已 `Released` 的名字时，`lineageEpoch` 加一，`nameSeq` 续用该名字的历史最大值继续递增（不重置）。
 - 初始文档不能授权本次注册。
 - exact global name 优先于 delegated subname。
 
@@ -770,6 +821,7 @@ function transferName(
 - 新 owner、controller、文档和 payment 字段不能授权本次调用。
 - 一级名字 `newSemanticOwner = Unset` 后，新 `assetOwner` 成为 effective owner。
 - 二级名字 `newSemanticOwner = Unset` 后，重新继承父 effective owner。
+- `newSemanticOwner` 为 `BnsName` 时，同样必须通过 §3.6 的图检查后才能提交。
 
 ### setNameOwner
 
@@ -790,6 +842,7 @@ function setNameOwner(
 - 设置显式 semantic owner 后，asset owner 权限立即失效，标准 NFT transfer 立即禁用。
 - 清回 `Unset` 后，按一级/二级 fallback 规则重新计算 effective owner。
 - 若新 owner 是本 name 自身，应先写入至少一个有效 authority key，再切换 owner，避免名字被锁死。
+- 设置 `semanticOwner = BnsName` 前必须通过 §3.6 的图检查（无环、可达具体签名者、深度不超限），否则按对应错误码拒绝。
 
 ### releaseName
 
@@ -892,6 +945,7 @@ function publishDocument(
 - JSON 文档应先生成 canonical JSON UTF-8 bytes。
 - `contentHash` 必须等于文档原文 hash。
 - 链下 provider 返回的文档也必须匹配同一 `contentHash`。
+- inline 文档应有大小上限（建议 `MAX_INLINE_DOCUMENT = 4 KiB`），仅用于短 OwnerConfig、关键 tombstone 说明等；超限文档必须走 `DocumentRef` 外链。该上限在中心化阶段防止状态膨胀，在未来链上实现里同时也是 gas 保护。
 
 ### revokeDocument
 
@@ -908,6 +962,14 @@ function revokeDocument(
 ```
 
 owner 或具有 revoke permission 的 controller 可以吊销文档。吊销不删除历史。
+
+current 指针语义（防静默降级）：
+
+- 吊销一个**不含**当前版本的历史区间时，current 指针不变。
+- 吊销区间**包含**当前版本时，current 指针**停留在该被吊销的版本**，状态置为 `Revoked`，**绝不自动回滚**到任何更早的 Active 版本。
+- 此后 `resolveDocument` 必须返回 `status = Revoked`，让客户端明确看到「当前版本已被吊销、暂无可信当前文档」，而不是悄悄拿到一个旧版本。
+- 要恢复一个可用的当前版本，必须显式 `publishDocument` 发布新版本；新版本的 `version` 仍单调递增，不复用旧号。
+- `fromVersion`/`toVersion` 必须满足 `fromVersion <= toVersion <= 当前版本`，且不得吊销 `version = 0`。
 
 ### setControllerPolicy
 
@@ -1152,11 +1214,14 @@ function resolvePaymentTarget(
 
 中心化模拟实现和未来智能合约都应产生语义一致的 append-only 事件。
 
+> 编码注意（链上实现）：Solidity 中 `string indexed` 只把字符串的 keccak 哈希写进 topic，原文不可从日志恢复。未来链上实现若要 indexer 同时能按 name 过滤又能读出可读 name，应把 name 以非 indexed 形式放进 data，另加一个 `bytes32 indexed nameHash` 供过滤。中心化阶段 event log 为结构化记录，name 是可读列，不受此限。下文事件签名沿用逻辑形态。
+
 ```solidity
 event NameRegistered(
     string indexed name,
     address indexed assetOwner,
     uint64 expireAt,
+    uint64 lineageEpoch,
     uint64 nameSeq
 );
 
@@ -1240,6 +1305,13 @@ event PaymentTargetUpdated(
     bytes32 paymentPolicyHash,
     uint64 version
 );
+
+event LogCheckpointPublished(
+    bytes32 indexed logRoot,
+    uint64 lastSeq,
+    uint64 issuedAt,
+    bytes32 externalAnchor
+);
 ```
 
 ## 15. 最小闭环接口
@@ -1295,6 +1367,8 @@ resolvePaymentTarget
 
 ## 16. 中心化模拟到智能合约的兼容约束
 
+### 16.1 兼容约束
+
 为了保证未来迁移，中心化实现必须遵守：
 
 - 核心状态中不保存 RPC session、HTTP token 或服务端私有认证字段。
@@ -1303,15 +1377,27 @@ resolvePaymentTarget
 - 所有权限判断必须基于更新前状态。
 - 所有 view 应能仅从 Registry 状态和事件推导。
 - adapter 认证结果与 Registry 授权判断分离。
-- 错误类型应稳定，例如 `STALE_NAME_SEQ`、`STALE_DOCUMENT_VERSION`、`INVALID_KID`、`NOT_EFFECTIVE_OWNER`、`CONTROLLER_SCOPE_DENIED`、`STANDARD_TRANSFER_DISABLED`。
+- 错误类型应稳定，例如 `STALE_NAME_SEQ`、`STALE_DOCUMENT_VERSION`、`INVALID_KID`、`NOT_EFFECTIVE_OWNER`、`CONTROLLER_SCOPE_DENIED`、`STANDARD_TRANSFER_DISABLED`、`OWNER_GRAPH_CYCLE`、`NO_CONCRETE_SIGNER`、`OWNER_GRAPH_TOO_DEEP`、`INLINE_DOCUMENT_TOO_LARGE`。
 - 中心化 event log 应可导出为确定性 snapshot，供未来 genesis import、migration contract 或审计使用。
+- `registerName` / `renewName` 的 `payable` 是面向链上实现的逻辑标记。中心化阶段不通过 `msg.value` 收费，注册与续期费用走业务支付通道，费用处理属于 adapter/业务层，不进入 Registry 核心状态。
+
+### 16.2 中心化阶段的防篡改 checkpoint
+
+本文开头声明 Registry 保存的是「不能由中心化 provider 单方面覆盖的全局事实」。在 V1，实现本身就是那个中心化 provider，因此 append-only 还不足以兑现这一声明——运营方理论上仍能改写历史。为了让该性质在中心化阶段就有**可审计**保证（而非纯信任运营方），实现必须：
+
+- 把整个 event log 组织成可承诺结构（如按全局事件序号累积的 Merkle 树），并周期性发布 `LogCheckpoint`：`{ logRoot, lastSeq, issuedAt, issuer, externalAnchor }`，由运营方 key 签名，并以 `LogCheckpointPublished` 事件公开。
+- 任意客户端、resolver 或第三方都能用最新 checkpoint 验证任一历史事件确实包含在已公开的日志中，从而检测「事后改写历史」。
+- 建议把 `logRoot` 周期性 anchor 到一条公链（填入 `externalAnchor`），使运营方无法在不被发现的情况下回滚或分叉日志。
+- checkpoint 序列本身必须 append-only 且 `lastSeq` 单调递增；运营方一旦发布某个 checkpoint，就不能再发布与之冲突、覆盖更早区间的另一份。
+
+这样，从「信任运营方」降级为「信任运营方 + 任何人可事后审计」。迁移到链上时，这些已公开、已锚定的 checkpoint 可直接作为 genesis import 的 proof，使历史信任跨越迁移点而无需重新锚定。
 
 ## 17. 第一版暂不解决的问题
 
 - 具体定价、拍卖、短名保护、保留字和争议仲裁。
 - Unicode、同形字、大小写和多语言显示策略。
 - 各类 public key/verifier 在具体链上的实现成本和支持范围。
-- recovery/social recovery 的完整状态机。
+- recovery/social recovery 的完整状态机（§3.6 已给出最小防 brick 兜底，完整 recovery 通道留待后续）。
 - 跨链名字同步和跨链支付。
 - 隐私保护；Registry 是公开状态层。
 - 标准支付合约、显式分账、refund、escrow 和 receipt NFT/SBT。
