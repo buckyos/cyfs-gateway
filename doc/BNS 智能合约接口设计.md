@@ -1,68 +1,254 @@
 # BNS 智能合约接口设计
 
-本文基于 `认识BNS.md` 和 `BNS 去中心的名字系统.md`，把 BNS 的协议目标收敛成智能合约接口。
+> 版本：v0.2  
+> 本文定义的是可确定执行的 BNS Registry 状态机接口。当前实现是中心化模拟服务；未来可以在不改变核心业务语义的前提下切换为智能合约实现。
 
-BNS 合约的职责不是保存所有 DID Document，也不是替代内容网络、支付合约、DNS、SN 或 Zone resolver。它只负责保存不可被中心化 provider 覆盖的全局事实：
+本文基于 `认识BNS.md` 和 `BNS 去中心的名字系统.md`，把 BNS 的协议目标收敛成一组与实现方式无关的接口。
 
-- 名字是否存在、由谁拥有、是否过期、是否可转移。
-- `did:bns:$name + doc_type` 当前版本是什么，历史版本是否有效或已吊销。
-- 谁可以更新某个名字或某类文档。
+这里的“合约”首先表示一份可验证、可重放、状态转换确定的逻辑合约，不要求第一版立即部署到公链。当前中心化实现负责模拟同一套状态机、权限检查和事件日志；未来的 EVM、Move 或其它链实现只需要替换认证适配器和持久化层，不应改变 owner、controller、document version 等核心语义。
+
+BNS Registry 不保存所有 DID Document，也不替代内容网络、支付合约、DNS、SN 或 Zone resolver。它只保存不能由中心化 provider 单方面覆盖的全局事实：
+
+- 名字是否存在、对应的名字资产归谁、是否过期、是否允许标准 NFT 转移。
+- 名字当前由哪个 BuckyOS 语义 owner 控制，以及该 owner 的可验证 key 状态。
+- `did:bns:$name + doc_type` 当前版本、历史版本及吊销状态。
+- 哪个 owner 或 controller 可以执行某类状态更新。
 - 名字是否迁移、别名指向哪里、旧状态如何追溯。
-- 收款目标、收益策略和支付合约需要验证的 purchase context。
+- 收款目标、收益策略和支付流程需要绑定的 purchase context。
 
-## 1. 设计边界
+## 1. 实现目标与设计边界
 
-### 合约必须负责
+### 1.1 逻辑接口先于部署形态
 
-- `did:bns:$name` 的全局名字资产状态。
-- 名字资产 owner 与 BuckyOS 语义 owner/controller 的分离表达：
-    - 名字资产 owner 是链上 NFT owner，负责名字资产生命周期。
-    - BuckyOS 语义 owner 拥有名字的最高 BuckyOS 权限，可以不设置或指向另一个 BNS 名字。
-    - controller 只拥有被授权范围内的文档更新权，可以按 `doc_type` 授权。
-    - 合约无法解析 DID Document 内容，因此链上需要识别的 owner、controller、payment 等事实必须作为显式字段提交，不能只藏在文档内容里。
-- DID Document 的 `doc_type` 版本状态、当前指针、吊销状态和历史 proof。
-    - DID Document 可以是引用，也可以是内容本身；内容可以是 JSON、JWT 或其它 codec。
-    - 标准 resolver 会校验文档中的 owner/controller 是否覆盖链上记录。文档内容必须是链上记录的超集；如果与链上记录冲突，则该文档非法。
-- Owner key 轮换、controller policy 更新、别名和迁移。
-- 支付合约可查询的 beneficiary、payment target、split policy hash。
-- 事件日志，供 resolver、indexer、钱包和客户端构造可验证历史。
-
-### 合约不负责
-
-- `did:dev` 自认证设备身份。`did:dev` 由设备公钥和 RTCP 握手证明；合约只可能通过某个 `did:bns` 文档间接引用它。
-- 大型 DID Document、AppDoc、content meta、ZoneConfig、ObjId bytes 的默认托管。合约保存 `DocumentRef` 和 hash，文档本体通常由 Repo、Source、SN、Zone resolver、HTTPS 或缓存提供；如果调用者愿意承担 gas，也允许把文档原文 inline 到链上。
-- 内容购买扣款和 receipt 发行。V2 标准支付合约负责 `purchase(...)`，BNS 只提供当前 purchase context。
-- DNS TXT、`.well-known`、SN、local cache 的可信化。它们只能作为候选 provider，最终必须回到 BNS 状态、签名和 hash 校验。
-- 全文搜索、内容排名、信用评分、应用商店和索引推荐。
-
-## 2. 合约分层
-
-一个部署可以实现全部接口，但协议上按三个接口面理解：
+当前和未来实现共享同一个核心状态机：
 
 ```text
-IBnsRegistry
-  名字资产生命周期
+当前中心化实现
+  BNS RPC / HTTP
+      -> RPC authentication adapter
+      -> IBnsRegistryCore
+      -> centralized state store + append-only event log
+
+未来智能合约实现
+  direct transaction / signed executor
+      -> chain authentication adapter
+      -> IBnsRegistryCore
+      -> contract storage + chain events
+```
+
+核心接口不感知登录 session、HTTP header、RPC request signature、nonce 或 relayer。它只接收已经由执行环境认证过的调用主体，并根据更新前的 BNS 状态判断该主体是 owner 还是 controller。
+
+因此：
+
+- RPC 签名属于传输层或调用适配层，不属于每一个业务接口。
+- 链上直接调用可以从 `msg.sender` 得到认证主体。
+- 链上代理调用可以由独立的 `executeSigned(...)` 验证签名、nonce 和 deadline，再调用同一套核心状态机。
+- 核心接口中的 `CallAuthority` 类似 `kid`/key selector：它说明使用哪个主体、哪个 key、按哪个角色申请授权，但它本身不是签名证明。
+- 中心化实现不得直接相信客户端提交的 `CallAuthority`；必须由认证适配器验证并注入。
+- 链上实现不得直接相信调用者自报的 `role` 或 `actor`；必须从 `msg.sender` 或已验证签名中推导并复核。
+
+### 1.2 Registry 必须负责
+
+- `did:bns:$name` 的全局名字状态和名字资产状态。
+- 名字资产 owner、BuckyOS 语义 owner、controller 三者的明确区分。
+- 语义 owner 和 controller 使用的链上可验证 authority key 状态。
+- DID Document 的 `doc_type` 版本、当前指针、内容 hash、吊销状态和历史 proof anchor。
+- Owner key 轮换、controller policy 更新、alias 和 migration。
+- 支付流程可查询的 beneficiary、payment target 和 policy hash。
+- 确定性的状态序号和事件日志，供 resolver、indexer、钱包和未来链上迁移使用。
+
+### 1.3 Registry 不负责
+
+- `did:dev` 自认证设备身份。`did:dev` 由设备公钥和握手证明；BNS 文档只能引用它。
+- 大型 DID Document、AppDoc、content meta、ZoneConfig、ObjId bytes 的默认托管。Registry 通常只保存 `DocumentRef` 和 hash；调用者也可以选择 inline 保存短文档。
+- 解析或信任 DID Document 内部的 owner/controller 字段。Registry 不依赖文档内容做本次授权。
+- 内容购买扣款和 receipt 发行。标准支付合约或中心化支付模拟器负责 `purchase(...)`。
+- DNS TXT、`.well-known`、SN、Repo、Source、HTTPS 或本地缓存的可信化。它们只能提供候选内容。
+- 全文搜索、排名、信用评分、应用商店和推荐。
+
+### 1.4 逻辑状态与物理存储可以不同
+
+接口层明确暴露 `assetOwner`、`semanticOwner`、`effectiveOwner` 等语义。具体实现可以分表保存，也可以归一化成统一状态，只要所有查询结果、权限判断、状态转换和事件输出与本文一致。
+
+## 2. 核心接口分层
+
+一个实现可以把接口部署在同一个服务或合约中，但协议上分为四个接口面：
+
+```text
+IBnsRegistryCore
+  名字生命周期
+  authority key 生命周期
   文档版本生命周期
   controller / alias / payment policy
 
 IBnsResolverView
-  resolveDid(did, doc_type)
-  queryNameState / getDocumentVersion / getAlias
-  供 resolver、钱包、客户端只读查询
+  queryNameState / resolveOwner / resolveDocument
+  getDocumentVersion / getAlias / getAuthoritySet
 
 IBnsPaymentView
-  resolvePaymentTarget(...)
-  getPurchaseContext(...)
-  V2 标准支付合约购买内容、App、服务订阅时调用
+  resolvePaymentTarget / getPurchaseContext
+
+IBnsInvocationAdapter
+  RPC session / request signature
+  direct chain caller / signed transaction executor
+  生成经过认证的 CallAuthority
 ```
 
-`IBnsRegistry` 是唯一写入面；其它 view 都是从 registry 状态投影出来的只读接口。
+`IBnsRegistryCore` 是唯一改变协议状态的接口。`IBnsInvocationAdapter` 只负责认证、防重放和调用封装，不定义 BNS 权限。
 
-## 3. 基础约定
+## 3. Owner、Controller 与 Document 声明
 
-### name 与 DID
+### 3.1 三种 owner 概念
 
-合约入参使用不带 `did:bns:` 前缀的 canonical name：
+BNS 中存在三种容易混淆但语义不同的 owner：
+
+| 名称 | 含义 | 是否能授权 Registry 状态更新 |
+| --- | --- | --- |
+| `assetOwner` | 名字 NFT 的产权持有人 | 仅在它是当前 fallback owner 时可以 |
+| `semanticOwner` | Registry 显式记录的 BuckyOS owner | 可以，是最高 BuckyOS 权限来源 |
+| `documentOwner` | DID Document 内容里声明的 owner | 不可以，只是链下文档声明 |
+
+其中 `semanticOwner` 对 `assetOwner` 是覆盖关系，不是并列关系。
+
+### 3.2 effective owner
+
+Registry 对每个名字计算唯一的 `effectiveOwner`：
+
+```text
+一级名字：
+  semanticOwner == Unset
+      -> effectiveOwner = assetOwner
+      -> ownerSource = AssetOwnerFallback
+
+  semanticOwner == BnsName(x)
+      -> effectiveOwner = BnsName(x)
+      -> ownerSource = ExplicitSemanticOwner
+
+二级名字：
+  semanticOwner == Unset
+      -> effectiveOwner = parent.effectiveOwner
+      -> ownerSource = ParentInherited
+
+  semanticOwner == BnsName(x)
+      -> effectiveOwner = BnsName(x)
+      -> ownerSource = ExplicitSemanticOwner
+```
+
+只有当前 `effectiveOwner` 能执行 owner 级操作。
+
+因此：
+
+- `assetOwner` 不是一个永远有效的独立授权分支。
+- 一级名字未配置 `semanticOwner` 时，`assetOwner` 才是 owner。
+- 一旦设置显式 `semanticOwner`，该名字的 `assetOwner` 不再拥有更新、释放、owner 变更或标准 NFT 转让权限。
+- 二级名字继承父 owner 时，其自身 `assetOwner` 也不是有效 owner。
+- 将 `semanticOwner` 清回 `Unset` 后，权限才按上述 fallback 规则重新计算。
+
+### 3.3 semantic owner 是 authority name
+
+第一版中，显式 `semanticOwner` 只允许指向一个 BNS name，不直接保存任意公钥：
+
+```text
+semanticOwner = BnsName("org")
+```
+
+这表示名字由 `org` 的链上可验证 authority key set 控制，而不是由 `org` 名字 NFT 的 owner 自动控制。
+
+设置 `semanticOwner = BnsName(x)` 前，`x` 必须：
+
+- 是有效 BNS name；
+- 拥有至少一个当前有效、可用于认证的 authority key；
+- 能被当前实现支持的 verifier 验证。
+
+这样，当 `alice.semanticOwner = BnsName("org")` 后：
+
+- `alice.assetOwner` 的传统 NFT 权限失效；
+- 更新 `alice` 必须使用 `org` authority set 中的有效 key；
+- `org` 轮换 authority key 后，所有由 `org` 控制的名字自动使用新 key；
+- Registry 不需要读取 `org` 的 DID Document 才能完成授权判断。
+
+一个名字可以先由 `assetOwner` 写入初始 authority key，再把 `semanticOwner` 设置为自身或另一个 authority name，从而完成从 NFT fallback 控制到显式 key 控制的迁移。
+
+### 3.4 controller
+
+controller 是低于 owner 的受限授权主体：
+
+- owner 可以更新名字级状态和所有文档。
+- controller 只能执行 policy 允许的操作。
+- controller 可以按 `doc_type`、名字范围、时间和 permission bitmap 限制。
+- controller 可以是链账户，也可以是拥有 authority key set 的 BNS name。
+- 如果一个 `doc_type` 没有匹配的 controller，则回落到当前 effective owner。
+- controller 无权通过提交一份新文档，把自己提升为 owner 或扩大本次调用权限。
+
+### 3.5 Document 内的 owner/controller
+
+DID Document、OwnerConfig 或 AppDoc 中可以声明 owner、controller、verification method 和 payment 信息，但这些字段不参与 Registry 本次状态更新的授权。
+
+正确关系是：
+
+```text
+Registry 显式状态
+  -> 决定谁有权更新
+
+Document 内部声明
+  -> 由有权更新者负责写正确
+  -> 由 resolver 在取回文档后校验
+```
+
+标准 resolver 必须确认文档中的声明覆盖并符合 Registry 记录。如果文档缺少 Registry 要求的 owner/controller，或者与 Registry 状态冲突，则该文档非法。文档可以声明更多链下用途的 key 或 service，但不能借此获得 Registry 权限。
+
+## 4. NFT 转让语义
+
+每个已注册 name 可以对应一份 ERC-721 或等价名字资产。`assetOwner` 必须等价于该名字资产的当前持有人。
+
+但是标准 NFT 转让只在下面条件全部成立时启用：
+
+```text
+name.transferable == true
+AND name.ownerSource == AssetOwnerFallback
+AND name.status == Active
+```
+
+即：
+
+```text
+standardTransferEnabled(name)
+    = transferable
+      && effectiveOwner source is AssetOwnerFallback
+```
+
+所有标准转让路径，包括 `transferFrom`、两个 `safeTransferFrom`、approved address 和 operator，都必须经过同一个底层检查。
+
+### 标准转让启用时
+
+- 当前 `assetOwner` 同时就是 effective owner。
+- 标准 NFT 转让成功后，新的 `assetOwner` 自动成为新的 effective owner。
+- 不需要额外修改 semantic owner，因为它仍然是 `Unset`。
+
+### 标准转让禁用时
+
+以下任一情况都会禁用普通 ERC-721 transfer：
+
+- 名字设置了显式 semantic owner；
+- 二级名字正在继承父 owner；
+- 名字被 policy 标记为不可转让；
+- 名字不处于 Active 状态。
+
+此时只能调用 BNS-aware 的 `transferName(...)`。该接口由更新前的 effective owner 授权，可以原子更新：
+
+- `assetOwner`；
+- `semanticOwner`；
+- controller policy；
+- payment target；
+- 相关文档版本。
+
+因此，通用 NFT 市场只能交易 fallback 模式的名字。显式语义 owner 控制的名字必须通过理解 BNS 状态的市场或交易流程转移。
+
+## 5. name、DID、doc_type 与版本约定
+
+### 5.1 name 与 DID
+
+核心 Registry 接口统一接收不带 `did:bns:` 前缀的 canonical name：
 
 ```text
 alice
@@ -72,40 +258,32 @@ filebrowser.buckyos
 $objid.alice
 ```
 
-Resolver 层负责把 `did:bns:alice` 转成 `alice`。合约不接受 `did:web`；`did:web` 只能作为 discovery 入口，并通过文档签名或 BNS alias 绑定到 `did:bns`。
-
-`did:dev` 不进入全局名字资产表。设备文档可由 `did:bns:ood1.alice` 的 `doc` 或 `service` 文档引用 `did:dev:<pkx>`。
+RPC resolver 可以提供 `resolveDid("did:bns:alice", ...)` 便捷接口，但内部必须先转换为 canonical name，再调用核心 view。
 
 名字规则：
 
 - 名字最多两级，不存在三级或更深的全局名字。
-- 合法名字包括一级名字 `alice`，以及二级名字 `abc.alice`、`$objid.alice`。
-- `$objid.$owner` 总是一个合法的二级名字形式，这是鼓励引用任意内容的标准方式。
-- 二级名字的父级必须是一个有效的一级名字；`a.b.alice`、`x.$objid.alice` 这类三级名字非法。
-- 每个已注册 name 都是一份 NFT 名字资产。`tokenId(name)` 由 canonical name 确定，`NameState.assetOwner` 必须等价于该 NFT 的 `ownerOf(tokenId(name))`。
-- NFT 交易可以直接转让名字资产本身，例如 `$content_name.$owner` 可以利用通用 NFT 交易市场交易。
-- 如果业务需要受让方同时获得 BuckyOS 控制权，交易流程必须检查该 name 的 owner 解析结果。owner 显式指向另一个名字，或二级名字 owner 未设置而继承父名字时，单纯 NFT `transferFrom` 只能改变资产 owner，不能完整改变 BuckyOS 语义 owner；此时应改用 BNS `transferName` 并原子更新 owner / controller / payment 记录。
+- 一级名字示例：`alice`。
+- 二级名字示例：`abc.alice`、`$objid.alice`。
+- 二级名字的父级必须是有效一级名字。
+- exact global name 的优先级永远高于 delegated subname。
+- `did:dev` 不进入全局名字资产表。
+- `did:web` 只能作为 discovery 或 alias 目标，不能覆盖 BNS 状态。
 
-二级名字注册和继承规则：
+### 5.2 二级名字
 
-- 注册二级名字时，默认需要一级名字当前 owner 的签名；调用方可以是 owner 本人，也可以携带 `AuthProof` 由 relayer 提交。
-- 二级名字创建后成为独立 name NFT。后续转让、续期、发布文档和 payment context 都以二级名字自身状态为准。
-- 二级名字创建时可以不设置 BuckyOS 语义 owner 或 controller。未设置时，授权解析默认继承父名字的 owner/controller 权限。
-- 一旦二级名字显式设置了 owner 或某个 `doc_type` 的 controller，对应权限就不再从父名字继承。
+- 注册二级名字默认需要父名字当前 effective owner 授权。
+- 二级名字注册后拥有独立名字资产、状态序号、文档版本和 payment context。
+- 二级名字 `semanticOwner = Unset` 时继承父名字 effective owner。
+- 二级名字显式设置 semantic owner 后，不再继承父 owner。
+- 某个 `doc_type` 显式配置 controller 后，该类型不再继承父 controller。
+- 二级名字继承父 owner 时，标准 NFT transfer 被禁用。
 
-### doc_type
+### 5.3 doc_type
 
-`doc_type` 使用 canonical string 字面量，链上直接保存和传递短字符串，不做 `hash(lowercase(doc_type))` 转换。
+`doc_type` 使用 canonical lower-case ASCII string，建议限制在 32 bytes 以内，按 byte exact match。
 
-第一版规则：
-
-- 只接受 lower-case ASCII。
-- 长度建议限制在 32 bytes 以内。
-- 标准类型走 allow-list，扩展类型可通过治理或 registry 增加。
-- 比较时按 byte exact match，不做大小写折叠。
-- 具体 EVM 实现若需要进一步省 gas，可以在合约内部把标准字符串 intern 成小整数；协议 ABI 仍暴露 `string docType`，不要求调用方传 hash。
-
-第一版保留这些标准类型：
+第一版标准类型：
 
 | doc_type | 语义 |
 | --- | --- |
@@ -120,25 +298,24 @@ Resolver 层负责把 `did:bns:alice` 转成 `alice`。合约不接受 `did:web`
 | `video` | 视频内容文档 |
 | `music` | 音乐内容文档 |
 | `ebook` | 电子书内容文档 |
-| `content` | 通用内容 meta；不应作为所有内容类型的唯一抽象 |
+| `content` | 通用内容 meta |
 | `payment` | 支付策略扩展文档 |
 
-`doc_type` 是权限、解析和 payment context 的维度，不只是一个简单的 `content` 分类。App、video、music、ebook 等内容或应用类型应能独立配置 controller、版本和支付上下文。
+`info` 是运行时上报信息，默认不作为 Registry 文档类型。
 
-`info` 是运行时上报信息，默认不作为链上 `doc_type`。它应由 Zone resolver / system-config 提供，并由上级 `doc` / `device` / `zone` 文档授权。
+### 5.4 版本和并发保护
 
-### 版本
-
-每个 `(name, docType)` 维护单调递增的 `version`。
+每个 `(name, docType)` 维护单调递增的 `version`：
 
 - `version = 0` 表示不存在。
-- 新发布文档必须指定 `expectedVersion`，防止并发覆盖。
-- 历史版本不删除，只改变状态。
-- 当前版本变化不会改写历史 receipt、历史签名、旧 ObjId 或旧 owner 状态。
+- 发布新版本必须匹配更新前的 `expectedVersion`。
+- 名字级变更必须匹配更新前的 `expectedNameSeq`。
+- `expectedVersion` 和 `expectedNameSeq` 是状态并发保护，不是身份认证。
+- 历史版本和事件不删除。
 
-## 4. 数据类型
+## 6. 协议级数据类型
 
-以下是协议级 IDL。具体链实现可以映射成 Solidity、Move 或其它合约语言。
+以下是逻辑 IDL。具体实现可以映射为 Solidity、Move、Rust service types 或其它语言。
 
 ```solidity
 enum NameStatus {
@@ -159,6 +336,7 @@ enum DocumentStatus {
 }
 
 enum AliasKind {
+    None,
     Alias,
     MigratedTo,
     Canonical
@@ -171,9 +349,28 @@ enum ReleaseMode {
 
 enum PrincipalKind {
     Unset,
-    ChainAddress,
-    BnsName,
-    Contract
+    ChainAccount,
+    BnsName
+}
+
+enum OwnerSource {
+    None,
+    AssetOwnerFallback,
+    ExplicitSemanticOwner,
+    ParentInherited
+}
+
+enum AuthorityRole {
+    None,
+    Owner,
+    Controller
+}
+
+enum AuthorityKeyStatus {
+    Missing,
+    Active,
+    Revoked,
+    Expired
 }
 
 struct Principal {
@@ -181,43 +378,98 @@ struct Principal {
     bytes value;
 }
 
-// Principal 是链上可识别的主体引用。
-// - Unset 表示未配置。
-// - ChainAddress / Contract 的 value 是 ABI encoded address；Contract 可用于 Safe / ERC-1271。
-// - BnsName 的 value 是 canonical name 的 UTF-8 bytes。
-// - DID Document 内声明的更多公钥格式只由链下 resolver 校验，合约不解析。
+// Principal 语义：
+// - Unset: 未配置。
+// - ChainAccount: ABI encoded chain account/address；合约账户也使用该类型。
+// - BnsName: canonical BNS name UTF-8 bytes。
+
+struct CallAuthority {
+    // 本次调用走 owner 还是 controller 授权分支。
+    AuthorityRole role;
+
+    // 经过认证的主体。不得直接信任客户端自报值。
+    Principal actor;
+
+    // actor key set 中的 key identifier。
+    // ChainAccount 直接调用时可以为 0 或由 adapter 生成规范值。
+    bytes32 kid;
+}
+
+// CallAuthority 不是签名，不包含 nonce/deadline。
+// 它必须由 RPC/chain invocation adapter 在完成认证后注入。
+
+struct MutationGuard {
+    // 被修改 name 的更新前 nameSeq。
+    uint64 expectedNameSeq;
+
+    // 仅二级名字首次注册或依赖父状态的原子操作使用；其它情况为 0。
+    uint64 expectedParentNameSeq;
+}
+
+struct AuthorityKey {
+    bytes32 kid;
+
+    // eip155-account、erc1271、secp256k1、ed25519、custom-verifier 等。
+    bytes32 verificationMethod;
+
+    // address、public key bytes、contract address 或 verifier-specific material。
+    bytes keyData;
+
+    // authentication/recovery/sign_document 等用途位图。
+    uint32 purposes;
+
+    uint64 validFrom;
+    uint64 validUntil;
+    AuthorityKeyStatus status;
+
+    bytes32 metadataHash;
+}
+
+struct AuthorityKeyUpdate {
+    AuthorityKey key;
+
+    // true 表示添加或替换；false 表示撤销对应 kid。
+    bool active;
+}
+
+struct AuthoritySetState {
+    string name;
+    uint64 authoritySeq;
+    bytes32 authorityRoot;
+    uint32 activeKeyCount;
+}
 
 struct DocumentRef {
-    // inline, ipfs, cyfs, https, zone-resolver, source, repo 等，由 resolver 理解。
+    // inline、ipfs、cyfs、https、zone-resolver、source、repo 等。
     bytes32 storageType;
     string uri;
 
-    // 当 storageType = inline 时保存完整文档原文；其它形态必须为空。
-    // 如果文档是 JSON，这里保存 canonical JSON 的 UTF-8 bytes。
-    // 这是调用者主动选择的高 gas 模式，适合短 OwnerConfig、关键 tombstone 说明等。
+    // storageType = inline 时保存完整文档原文；否则必须为空。
     bytes inlineDocument;
 
-    // 文档本体的内容 hash。provider 返回文档后必须匹配该 hash。
-    // storageType = inline 时必须等于 hash(inlineDocument)。
+    // 文档原文的内容 hash。
     bytes32 contentHash;
 
-    // 文档 schema / codec，例如 OwnerConfig v1、AppDoc v1。
+    // 文档 schema / codec，例如 OwnerConfig v1、AppDoc v1、canonical-json。
     bytes32 schema;
     bytes32 codec;
 
-    // 可选扩展，如压缩算法、mirror 列表、ObjId、版本策略等的 hash。
     bytes32 extraHash;
 }
 
 struct NameState {
     string name;
 
-    // name 资产 NFT 的 owner。必须等价于 ownerOf(tokenId(name))。
+    // 名字资产当前持有人。
     address assetOwner;
 
-    // BuckyOS 语义 owner。只允许 Unset 或 BnsName。
-    // Unset 时一级名字回落到 assetOwner；二级名字可回落到父名字 owner。
-    Principal owner;
+    // 显式 BuckyOS 语义 owner，只允许 Unset 或 BnsName。
+    Principal semanticOwner;
+
+    // 以下三个字段可以由 view 动态计算，不要求物理存储。
+    Principal effectiveOwner;
+    OwnerSource ownerSource;
+    bool standardTransferEnabled;
 
     NameStatus status;
 
@@ -226,16 +478,15 @@ struct NameState {
     uint64 graceUntil;
     uint64 updatedAt;
 
-    // 名字级别单调序号，owner、policy、alias、release 都会递增。
     uint64 nameSeq;
-
-    // owner doc 的当前版本，便于 boot / wallet 快速读取 owner trust root。
     uint64 ownerDocumentVersion;
+
+    bool renewable;
+    bool transferable;
+    bool allowDelegatedSubnames;
 
     bytes32 namespacePolicyHash;
     bytes32 paymentPolicyHash;
-
-    // alias / migrated / canonical 关系的 hash，具体结构通过 getAlias 查询。
     bytes32 aliasStateHash;
 }
 
@@ -248,7 +499,7 @@ struct DocumentState {
     DocumentStatus status;
     DocumentRef document;
 
-    // controller 只允许 Unset、ChainAddress 或 Contract，不能指向另一个名字。
+    // controller 可为 Unset、ChainAccount 或 BnsName。
     Principal controller;
     Principal beneficiary;
     address paymentTarget;
@@ -258,37 +509,27 @@ struct DocumentState {
     uint64 revokedAt;
 
     bytes32 controllerPolicyHash;
+    bytes32 paymentPolicyHash;
     bytes32 splitPolicyHash;
+    bytes32 pricePolicyHash;
+    bytes32 rightsPolicyHash;
     bytes32 documentStateHash;
 }
 
 struct ControllerRule {
-    // controller 只允许 ChainAddress 或 Contract。
+    // ChainAccount 或 BnsName。
     Principal controller;
 
-    // 空值表示适用于所有 doc_type；否则只适用于指定类型。
+    // 空字符串表示全部 doc_type。
     string docType;
 
     // create/update/revoke/set_payment/set_alias/delegate 等位图。
     uint32 permissions;
 
-    // 可选命名空间约束，例如 "*.alice" 或特定二级名字集合的 hash。
     bytes32 namespaceScopeHash;
-
     uint64 validFrom;
     uint64 validUntil;
     bytes32 constraintHash;
-}
-
-struct AuthProof {
-    Principal signer;
-    bytes signature;
-    uint64 nonce;
-    uint64 deadline;
-
-    // 必须匹配更新前状态，不能由新 document 自己授权本次更新。
-    uint64 expectedNameSeq;
-    uint64 expectedDocumentVersion;
 }
 
 struct RegisterOptions {
@@ -297,12 +538,10 @@ struct RegisterOptions {
     bool renewable;
     bool transferable;
 
-    // 初始 BuckyOS 语义 owner。只允许 Unset 或 BnsName。
-    // Unset 时一级名字默认使用 assetOwner；二级名字默认继承父名字权限。
-    Principal initialOwner;
+    // 一级名字 Unset -> assetOwner fallback。
+    // 二级名字 Unset -> 继承父 effective owner。
+    Principal initialSemanticOwner;
 
-    // 是否允许未上链二级名字回落到一级名字的 Zone / Owner resolver。
-    // 只对一级名字有效，不表示允许三级名字。
     bool allowDelegatedSubnames;
 
     address initialPaymentTarget;
@@ -312,28 +551,39 @@ struct RegisterOptions {
 
 struct DocumentUpdate {
     string docType;
+    uint64 expectedVersion;
+
     DocumentRef document;
     Principal controller;
     Principal beneficiary;
     address paymentTarget;
     uint64 expireAt;
+
     bytes32 controllerPolicyHash;
+    bytes32 paymentPolicyHash;
     bytes32 splitPolicyHash;
+    bytes32 pricePolicyHash;
+    bytes32 rightsPolicyHash;
+}
+
+struct OwnerResolution {
+    Principal effectiveOwner;
+    OwnerSource source;
+    bytes32 authorityRoot;
+    uint64 authoritySeq;
 }
 
 struct ResolveResult {
     NameState nameState;
     DocumentState documentState;
+    OwnerResolution owner;
 
-    Principal verifiedOwner;
-    Principal controller;
-    bytes32 trustRoot;
-
+    Principal effectiveController;
     DocumentStatus status;
+
     AliasKind aliasKind;
     string aliasTargetDid;
 
-    // 用于 resolver 输出 provider/cache/warning 前的链上 proof anchor。
     bytes32 proofRoot;
 }
 
@@ -353,6 +603,7 @@ struct PurchaseContext {
 
     Principal beneficiary;
     address paymentTarget;
+    bytes32 paymentPolicyHash;
     bytes32 splitPolicyHash;
     bytes32 pricePolicyHash;
     bytes32 rightsPolicyHash;
@@ -362,7 +613,74 @@ struct PurchaseContext {
 }
 ```
 
-## 5. 名字资产接口
+## 7. Authority key 接口
+
+Authority key 是 Registry 可见、可验证的授权状态。它与 `owner` 文档中的 verification method 可以对应，但不能只存在于文档内。
+
+### getAuthoritySet
+
+```solidity
+function getAuthoritySet(string calldata name)
+    external view returns (AuthoritySetState memory state);
+```
+
+### getAuthorityKey
+
+```solidity
+function getAuthorityKey(string calldata name, bytes32 kid)
+    external view returns (AuthorityKey memory key);
+```
+
+### updateAuthorityKeys
+
+```solidity
+function updateAuthorityKeys(
+    string calldata name,
+    AuthorityKeyUpdate[] calldata updates,
+    CallAuthority calldata authority,
+    MutationGuard calldata guard
+) external returns (
+    uint64 authoritySeq,
+    bytes32 authorityRoot
+);
+```
+
+规则：
+
+- 本次授权依据是 `name` 更新前的 effective owner。
+- `authority.role` 必须是 `Owner`。
+- `authority.actor` 必须等于更新前的 effective owner。
+- 如果 actor 是 BnsName，`kid` 必须是该 actor authority set 中的有效认证 key。
+- 如果 actor 是 ChainAccount，执行适配器必须证明本次调用来自该账户。
+- 新增 key 不能授权其自身所在的本次调用。
+- 删除或撤销 key 后，之后的调用立即不能再使用该 key。
+- authority key 变化会影响所有把该 name 作为 semantic owner 或 controller 的名字。
+- 当一个 authority name 正在控制其它名字时，实现应阻止无恢复路径地删除最后一个有效认证 key，或者要求在同一原子操作中迁移 owner。
+
+### rotateAuthorityAndOwnerDocument
+
+Registry 可以提供一个原子快捷接口，同时更新链上 authority key 和 `owner` 文档：
+
+```solidity
+function rotateAuthorityAndOwnerDocument(
+    string calldata name,
+    AuthorityKeyUpdate[] calldata keyUpdates,
+    DocumentUpdate calldata ownerDocumentUpdate,
+    CallAuthority calldata authority,
+    MutationGuard calldata guard
+) external returns (
+    uint64 authoritySeq,
+    uint64 ownerDocumentVersion
+);
+```
+
+其中：
+
+- authority key 状态决定 Registry 授权。
+- owner document 只负责向 resolver 和客户端声明相同或更丰富的 key 信息。
+- Registry 不解析 owner document 来决定本次调用是否有效。
+
+## 8. 名字资产接口
 
 ### queryNameState
 
@@ -371,15 +689,16 @@ function queryNameState(string calldata name)
     external view returns (NameState memory state);
 ```
 
-回答“这个名字当前是否存在、由谁拥有、是否过期、是否允许后续更新”。
+回答名字是否存在、资产持有人、显式 owner、effective owner、owner 来源及标准 NFT transfer 是否启用。
 
-规则：
+### resolveOwner
 
-- `Available` 可以注册。
-- `Active` 可以解析和更新。
-- `Expired` 不能发布新文档，但历史仍可查询；是否能被别人注册取决于 `graceUntil` 和 tombstone 策略。
-- `Released` 可以进入重新注册流程，但历史事件保留。
-- `Tombstoned` 永久不可重新注册，只能查询历史。
+```solidity
+function resolveOwner(string calldata name)
+    external view returns (OwnerResolution memory result);
+```
+
+该接口必须返回当前 effective owner 和其 authority root。客户端不应仅通过 `assetOwner` 判断控制权。
 
 ### registerName
 
@@ -388,24 +707,23 @@ function registerName(
     string calldata name,
     address assetOwner,
     RegisterOptions calldata options,
-    DocumentUpdate[] calldata initialDocuments
+    DocumentUpdate[] calldata initialDocuments,
+    CallAuthority calldata authority,
+    MutationGuard calldata guard
 ) external payable returns (uint64 nameSeq);
 ```
 
-注册全局名字。`initialDocuments` 建议至少包含 `owner` 文档，也可以同时提交 `boot`、`zone`、`app`、`video`、`music`、`ebook` 或其它初始文档。
-
 规则：
 
-- 注册只接受 canonical name，并且最多两级。
-- 注册成功后必须 mint 或绑定同名 NFT，`assetOwner` 是链上名字资产 owner。
-- 一级名字注册后，若 `options.initialOwner` 为 `Unset`，BuckyOS 语义 owner 默认是 `assetOwner`。
-- 二级名字首次注册默认必须由它的一级名字当前 owner 授权。例如首次注册 `jarvis.alice` 时，需要 `alice` 的当前 owner 签名；如果 owner 未配置，则使用 `alice` 的 `assetOwner`。
-- 二级名字注册后成为独立 name NFT。后续转让、续期和文档更新按 `jarvis.alice` 自己的状态授权。
-- 二级名字注册时如果 `options.initialOwner` 为 `Unset`，且没有给特定 `doc_type` 设置 controller，则默认继承父名字的 owner/controller 权限。
-- 如果一级名字不存在、已过期、已释放或 tombstoned，则不能首次注册它下面的二级名字。
-- `owner` 文档里的 owner/controller 是 BuckyOS 语义 owner，不要求等同于 `assetOwner`。
-- 如果一级名字设置 `allowDelegatedSubnames = true`，未全局注册的二级名字可以回落到父名字授权的 Zone resolver。
-- exact global name 优先级永远高于 delegated subname。Zone resolver 不能覆盖已上链名字。
+- 注册只接受 canonical name，最多两级。
+- 注册成功后 mint 或绑定同名 NFT。
+- 一级名字注册由 registrar policy、公开注册规则、拍卖或其它部署策略决定；此时 `authority.role` 可以为 `None`。
+- 二级名字首次注册必须由父名字更新前的 effective owner 授权；此时 `authority.role = Owner`，并校验 `guard.expectedParentNameSeq`。
+- 一级名字 `initialSemanticOwner = Unset` 时，effective owner 为 `assetOwner`。
+- 二级名字 `initialSemanticOwner = Unset` 时，继承父 effective owner。
+- `initialSemanticOwner = BnsName(x)` 时，`x` 必须有有效 authority key set。
+- 初始文档不能授权本次注册。
+- exact global name 优先于 delegated subname。
 
 ### renewName
 
@@ -414,13 +732,20 @@ function renewName(string calldata name, uint64 duration)
     external payable returns (uint64 expireAt);
 ```
 
-续期只改变名字资产状态，不改变任何 DID Document。
-
 规则：
 
-- 任何人都可以为名字续期付费。
-- 短名字、高价值名字可以强制续期；长名字或 Zone 内子名字可由经济模型设置为无需续期。
-- 过期不会抹除历史 proof。
+- 任何人可以代付续期费用。
+- 续期不改变 owner、controller、authority key 或文档版本。
+- 过期不删除历史。
+
+### isStandardTransferEnabled
+
+```solidity
+function isStandardTransferEnabled(string calldata name)
+    external view returns (bool enabled);
+```
+
+所有 ERC-721 transfer 路径必须调用等价的内部检查。
 
 ### transferName
 
@@ -428,44 +753,43 @@ function renewName(string calldata name, uint64 duration)
 function transferName(
     string calldata name,
     address newAssetOwner,
-    Principal calldata newOwner,
+    Principal calldata newSemanticOwner,
     DocumentUpdate[] calldata atomicDocumentUpdates,
-    AuthProof calldata proof
+    CallAuthority calldata authority,
+    MutationGuard calldata guard
 ) external returns (uint64 nameSeq);
 ```
 
-转移名字资产 owner。内容版权出售、App 归属转移、组织接管等场景通常需要同时更新 BuckyOS 语义 owner、业务文档和 payment context，因此接口允许同时提交 `newOwner` 和 `atomicDocumentUpdates`。
-
 规则：
 
-- 只改变 `assetOwner` 不等于改变 BuckyOS 语义 owner。
-- 普通 NFT `transferFrom` 可以改变 `assetOwner`，但不会自动改变显式配置的 BuckyOS 语义 owner。
-- `newOwner` 只能是 `Unset` 或 `BnsName`。一级名字设为 `Unset` 表示 owner 回落到 `newAssetOwner`；二级名字设为 `Unset` 表示继续继承父名字权限。
-- 如果名字的 BuckyOS 语义 owner 是另一个名字，或二级名字正在继承父名字权限，通用 NFT 市场只能完成资产转让，不能保证受让方获得完整 BuckyOS 控制权；需要通过 `transferName` 原子更新 owner / controller / payment 记录。
-- 如果业务上需要把 `did:bns:book1.alice` 的收益和更新权交给新主体，必须同时发布新的 `content` 或 `owner` 文档。
-- 原子更新的授权仍基于更新前状态。
-- 历史 receipt 继续绑定旧版本 purchase context。
+- 授权主体必须是更新前的 effective owner。
+- `newSemanticOwner` 只允许 `Unset` 或 `BnsName`。
+- 设置为 BnsName 时，目标 authority set 必须有效。
+- 该接口可以在普通 ERC-721 transfer 被禁用时改变 `assetOwner`。
+- 所有原子文档更新分别校验 `DocumentUpdate.expectedVersion`。
+- 新 owner、controller、文档和 payment 字段不能授权本次调用。
+- 一级名字 `newSemanticOwner = Unset` 后，新 `assetOwner` 成为 effective owner。
+- 二级名字 `newSemanticOwner = Unset` 后，重新继承父 effective owner。
 
 ### setNameOwner
 
 ```solidity
 function setNameOwner(
     string calldata name,
-    Principal calldata owner,
-    AuthProof calldata proof
+    Principal calldata semanticOwner,
+    CallAuthority calldata authority,
+    MutationGuard calldata guard
 ) external returns (uint64 nameSeq);
 ```
 
-更新 BuckyOS 语义 owner，不改变 name NFT 的 `assetOwner`。
-
 规则：
 
-- 一个 name 只有一个 owner 记录。
-- `owner` 只能是 `Unset` 或 `BnsName`。
-- 一级名字设为 `Unset` 时，语义 owner 回落到该 name NFT 的 `assetOwner`。
-- 二级名字设为 `Unset` 时，语义 owner 回落到父名字 owner。
-- owner 指向另一个名字时，会产生 owner 引用链；resolver 必须按 `MAX_OWNER_REF_DEPTH` 和循环检测处理。
-- owner 更新属于高风险操作，默认需要当前 owner 或 recovery policy 授权。
+- 只有更新前的 effective owner 可以调用。
+- `semanticOwner` 只允许 `Unset` 或 `BnsName`。
+- `BnsName(x)` 必须存在有效 authority key set。
+- 设置显式 semantic owner 后，asset owner 权限立即失效，标准 NFT transfer 立即禁用。
+- 清回 `Unset` 后，按一级/二级 fallback 规则重新计算 effective owner。
+- 若新 owner 是本 name 自身，应先写入至少一个有效 authority key，再切换 owner，避免名字被锁死。
 
 ### releaseName
 
@@ -474,17 +798,12 @@ function releaseName(
     string calldata name,
     ReleaseMode mode,
     bytes32 reasonHash,
-    AuthProof calldata proof
+    CallAuthority calldata authority,
+    MutationGuard calldata guard
 ) external returns (uint64 nameSeq);
 ```
 
-释放或 tombstone 名字。
-
-规则：
-
-- `ReleaseAfterGrace` 允许名字进入释放/重新注册流程。
-- `TombstoneForever` 表示名字永久不可再注册，适用于高风险、钓鱼、重大迁移或争议名字。
-- release 不删除历史文档、事件和支付记录。
+只有 effective owner 可以释放或永久 tombstone 名字。`assetOwner` 仅在 AssetOwnerFallback 模式下等于 effective owner。
 
 ### setNamespacePolicy
 
@@ -493,39 +812,34 @@ function setNamespacePolicy(
     string calldata name,
     bool allowDelegatedSubnames,
     bytes32 namespacePolicyHash,
-    AuthProof calldata proof
+    CallAuthority calldata authority,
+    MutationGuard calldata guard
 ) external returns (uint64 nameSeq);
 ```
 
-更新子名字委托策略。
+只有 effective owner 或被明确授予该 permission 的 controller 可以调用。
 
-规则：
+## 9. DID 文档接口
 
-- exact global name 永远优先于 delegated subname。
-- `allowDelegatedSubnames = true` 只表示 resolver 可以让未上链二级名字回落到一级名字授权的 Zone / Owner resolver。
-- 该策略不允许三级名字；二级名字即使自己 active，也不能继续授权全局三级名字。
-- 具体 Zone resolver endpoint 不直接写在这个接口里，而是通过 `owner` / `zone` / `service` 文档表达。
-- 关闭委托不会删除历史解析记录，但会阻止未来未上链子名字继续回落。
-
-## 6. DID 文档接口
-
-### resolveDid
+### resolveDocument
 
 ```solidity
-function resolveDid(string calldata did, string calldata docType)
-    external view returns (ResolveResult memory result);
+function resolveDocument(
+    string calldata name,
+    string calldata docType
+) external view returns (ResolveResult memory result);
 ```
 
-链上只解析 `did:bns:$name`。`did:dev`、`did:web` 由 resolver 层处理。
+这是核心 view。RPC resolver 可以额外暴露：
 
-规则：
+```solidity
+function resolveDid(
+    string calldata did,
+    string calldata docType
+) external view returns (ResolveResult memory result);
+```
 
-- `did` 必须是 `did:bns:$name`。
-- `$name` 必须是合法 canonical name，最多两级；三级名字直接非法，不进入 delegated fallback。
-- 如果 exact name active，返回该名字的指定 `docType` 当前版本。
-- 如果 exact name 是 alias / migrated，返回 alias 状态和目标 DID，客户端不能静默改写历史记录。
-- 如果 exact name 不存在且父名字允许 delegated subnames，返回 delegated proof anchor；具体文档由父 Zone resolver 提供。
-- 返回结果不包含 provider/cache 状态；这些由链下 resolver 补充。
+`resolveDid` 只负责把 `did:bns:$name` 转换为 canonical name，再调用 `resolveDocument`。
 
 ### getDocumentVersion
 
@@ -537,7 +851,7 @@ function getDocumentVersion(
 ) external view returns (DocumentState memory state);
 ```
 
-查询历史版本，用于验证旧签名、旧 receipt、旧 ObjId 和审计记录。
+用于验证旧签名、旧 receipt、旧 ObjId 和审计记录。
 
 ### publishDocument
 
@@ -545,36 +859,39 @@ function getDocumentVersion(
 function publishDocument(
     string calldata name,
     string calldata docType,
+    uint64 expectedVersion,
     DocumentRef calldata document,
     Principal calldata controller,
     Principal calldata beneficiary,
     address paymentTarget,
     uint64 expireAt,
     bytes32 controllerPolicyHash,
+    bytes32 paymentPolicyHash,
     bytes32 splitPolicyHash,
-    AuthProof calldata proof
+    bytes32 pricePolicyHash,
+    bytes32 rightsPolicyHash,
+    CallAuthority calldata authority,
+    MutationGuard calldata guard
 ) external returns (uint64 version);
 ```
 
-发布某个 `doc_type` 的新当前版本。
-
 授权规则：
 
-- 必须先读取更新前的 `NameState` 和当前 `DocumentState`。
-- `proof.signer` 必须是更新前状态授权的 `assetOwner`、owner controller 或该 `docType` 的 controller。
-- `proof.expectedDocumentVersion` 必须等于当前版本。
-- 新文档里的 owner/controller/payment 声明只能影响下一状态，不能授权本次更新。
-- `document.contentHash` 是 resolver 验证文档本体的硬约束。
-- `document.storageType = inline` 时，合约直接保存 `inlineDocument` 原文；这是高 gas 写入路径，但允许调用者用成本换取最强可用性。
+- 先读取更新前的 NameState、OwnerResolution、DocumentState 和 controller policy。
+- `expectedVersion` 必须等于当前版本。
+- `guard.expectedNameSeq` 必须匹配更新前状态。
+- `authority.role = Owner` 时，actor 必须是更新前的 effective owner。
+- `authority.role = Controller` 时，actor 和 kid 必须命中一个当前有效且允许本操作的 controller rule。
+- asset owner 只有在 ownerSource 为 AssetOwnerFallback 时才能作为 owner actor。
+- 新文档、新 controller、新 payment target 都不能授权本次调用。
+- Registry 只验证 `DocumentRef`、hash 和显式状态字段，不解析文档内 owner/controller。
 
-完整 JSON document 保存规则：
+完整文档规则：
 
-- `publishDocument` 支持把完整 document 保存进 `DocumentRef.inlineDocument`。
-- JSON document 必须先序列化成 canonical JSON 的 UTF-8 bytes，再作为 `inlineDocument` 提交。
-- 合约不解析 JSON 字段，不根据 JSON 内容做授权判断，只把它作为可验证 bytes 保存。
-- `document.contentHash` 必须等于 `hash(document.inlineDocument)`；resolver 读取链上 `inlineDocument` 后仍按同一 hash 验证。
-- `document.uri` 在 `storageType = inline` 时应为空；需要链下 mirror 时放入 `extraHash` 指向的扩展结构或在文档内部声明。
-- `document.codec` 应标记 JSON codec，`document.schema` 标记具体文档类型和版本，例如 OwnerConfig v1、AppDoc v1。
+- `storageType = inline` 时，`inlineDocument` 保存完整原文，`uri` 应为空。
+- JSON 文档应先生成 canonical JSON UTF-8 bytes。
+- `contentHash` 必须等于文档原文 hash。
+- 链下 provider 返回的文档也必须匹配同一 `contentHash`。
 
 ### revokeDocument
 
@@ -585,18 +902,12 @@ function revokeDocument(
     uint64 fromVersion,
     uint64 toVersion,
     bytes32 reasonHash,
-    AuthProof calldata proof
+    CallAuthority calldata authority,
+    MutationGuard calldata guard
 ) external returns (uint64 nameSeq);
 ```
 
-吊销文档版本范围。
-
-规则：
-
-- 吊销不删除历史，只改变版本状态。
-- 如果吊销当前版本，`resolveDid` 应返回 `Revoked`，除非同时发布了新的当前版本。
-- `reasonHash` 指向链下说明、事故报告或治理决议。
-- key 泄露时应吊销受影响版本，并发布新的 `owner` 或 controller policy。
+owner 或具有 revoke permission 的 controller 可以吊销文档。吊销不删除历史。
 
 ### setControllerPolicy
 
@@ -605,44 +916,17 @@ function setControllerPolicy(
     string calldata name,
     ControllerRule[] calldata rules,
     bytes32 policyHash,
-    AuthProof calldata proof
+    CallAuthority calldata authority,
+    MutationGuard calldata guard
 ) external returns (uint64 nameSeq);
 ```
 
-更新名字级 controller policy。复杂 policy 可以放在链下文档，链上保存 `policyHash` 和事件。
-
 规则：
 
-- owner 不应每天使用最高权限 key 更新 AppDoc、content meta 或设备文档。
-- `content-signer.alice` 这类子身份可以只被授权更新 `content`。
-- `jarvis.alice` 可以只被授权更新 `agent`。
-- policy 生效后只影响未来更新，不改写历史版本。
-
-### changeOwnerKey
-
-```solidity
-function changeOwnerKey(
-    string calldata name,
-    DocumentRef calldata newOwnerDocument,
-    ControllerRule[] calldata newControllerRules,
-    AuthProof calldata proof
-) external returns (uint64 ownerDocumentVersion);
-```
-
-轮换 owner key。它是 `owner` 文档更新的专用快捷接口，不等同于名字资产转让。
-
-典型用途：
-
-- 日常 key 轮换。
-- 私钥泄露后的恢复。
-- 从临时 key 迁移到硬件钱包或多签。
-- 从单 key 迁移到 controller policy。
-
-规则：
-
-- 授权仍基于旧 owner / recovery policy。
-- 成功后 `ownerDocumentVersion` 递增。
-- 旧版本可被标记为 revoked，但历史签名仍可按当时状态解释。
+- 默认只有 effective owner 可以改变 controller policy。
+- controller rule 中的 BnsName controller 必须拥有有效 authority key set。
+- policy 只影响未来调用。
+- 文档内部 controller 声明不能替代该接口。
 
 ### setDidAlias
 
@@ -652,18 +936,12 @@ function setDidAlias(
     string calldata targetDid,
     AliasKind kind,
     bytes32 proofHash,
-    AuthProof calldata proof
+    CallAuthority calldata authority,
+    MutationGuard calldata guard
 ) external returns (uint64 nameSeq);
 ```
 
-设置 alias、migration 或 canonical 关系。
-
-规则：
-
-- `setDidAlias` 不叫 rename，因为旧 DID 不能被直接替换。
-- `MigratedTo` 表示新请求应优先使用目标 DID。
-- 客户端可以提示用户迁移收藏、联系人、安装记录，但不能批量改写历史 receipt、历史签名和旧版本内容。
-- 如果 `did:web` 要继承 BNS 信用，需要在 BNS 或 OwnerConfig 中声明绑定，并验证 Web host 返回文档与 BNS owner/controller 一致。
+只有 effective owner 或具有对应 permission 的 controller 可以调用。alias/migration 不改写历史 DID、receipt 或签名。
 
 ### getAlias
 
@@ -672,41 +950,164 @@ function getAlias(string calldata name)
     external view returns (AliasState memory state);
 ```
 
-查询 alias / migration / canonical 状态。客户端展示迁移提示、钱包确认支付对象、安装器处理旧 App DID 时都应显式读取该状态，而不是只取最终目标 DID。
-
 ### setPaymentTarget
 
 ```solidity
 function setPaymentTarget(
     string calldata name,
     string calldata docType,
+    uint64 expectedVersion,
     address paymentTarget,
     Principal calldata beneficiary,
     bytes32 paymentPolicyHash,
-    AuthProof calldata proof
+    bytes32 splitPolicyHash,
+    bytes32 pricePolicyHash,
+    bytes32 rightsPolicyHash,
+    CallAuthority calldata authority,
+    MutationGuard calldata guard
 ) external returns (uint64 version);
 ```
 
-更新收款目标或收益主体。也可以通过 `publishDocument` 更新，但支付路径需要一个明确接口，方便钱包和支付合约审计。
+owner 或具有 `set_payment` permission 的 controller 可以调用。收益主体不等于控制权 owner。
 
-规则：
+## 10. 调用认证适配器
 
-- `beneficiary` 是收益主体，不等于名字控制权 owner。
-- `paymentTarget` 是链上实际收款地址，可以是普通地址、分账合约或 DAO treasury。
-- 收款目标变更只影响之后的新购买。
-- 历史支付和 receipt 仍按购买时的 purchase context 验证。
+### 10.1 中心化模拟实现
 
-## 7. 支付合约查询接口（V2 概念）
+中心化 BNS service 的建议流程：
 
-BNS 不扣款，不生成购买 receipt。标准支付合约在购买前查询 BNS，拿到当时的 purchase context。
+```text
+1. 接收 RPC request。
+2. 验证 session、request signature 或其它认证凭证。
+3. 根据签名定位 actor 和 kid。
+4. 生成经过认证的 CallAuthority。
+5. 调用 IBnsRegistryCore。
+6. Core 根据更新前状态验证 actor 是 owner 还是 controller。
+7. 原子写入状态并追加事件。
+```
 
-本章保留概念设计，但完整支付分账放到 V2 实现。V1 可以只保存 `paymentTarget`、`beneficiary`、`paymentPolicyHash`、`splitPolicyHash` 等可审计字段和事件，不要求实现标准支付合约、显式分账或内容销售流程。
+RPC 层可以使用自己的 envelope：
 
-支付上下文的目标语义：
+```solidity
+struct RpcSignedInvocation {
+    bytes callData;
+    Principal actor;
+    bytes32 kid;
+    uint64 nonce;
+    uint64 deadline;
+    bytes signature;
+}
+```
 
-- 可以针对一个 `name + doc_type` 配置独立 payment context。
-- 内部分账优先通过 Safe Address / ERC-1271 或其它 treasury 合约表达。
-- 显式分账用于内容销售、联合版权和推荐分成，属于 V2 标准支付合约范围。
+但该结构不进入每个业务接口，也不作为 Registry 持久状态。
+
+### 10.2 未来链上直接调用
+
+```text
+actor = ChainAccount(msg.sender)
+kid   = adapter-defined chain account key id
+```
+
+合约仍必须根据当前 BNS 状态判断 `msg.sender` 是否等于 effective owner 或匹配 controller rule。
+
+### 10.3 未来链上代理调用
+
+链上可以提供独立的：
+
+```solidity
+function executeSigned(SignedInvocation calldata invocation)
+    external returns (bytes memory result);
+```
+
+该层负责：
+
+- 签名验证；
+- nonce；
+- deadline；
+- chain / contract domain separation；
+- 从签名恢复 actor 和 kid；
+- 生成 CallAuthority；
+- 调用同一套 Registry Core。
+
+是否支持 relayer、session key、ERC-1271 或非 EVM key，是 adapter 能力，不改变业务接口。
+
+## 11. 统一授权算法
+
+所有写操作遵循同一原则：
+
+```text
+authorize_update(name, doc_type, operation, callAuthority, guard):
+  1. adapter 已完成调用认证，得到 actor + kid。
+  2. 加载更新前的 NameState。
+  3. 校验 expectedNameSeq / expectedVersion。
+  4. 计算更新前的 effectiveOwner。
+
+  5. if callAuthority.role == Owner:
+       assert actor == effectiveOwner
+       assert kid/account 对 effectiveOwner 当前有效
+       assert operation 属于 owner 权限
+
+     else if callAuthority.role == Controller:
+       找到匹配 actor + kid + doc_type + operation 的有效 controller rule
+
+     else:
+       仅允许无需 owner/controller 的公开操作，例如 root registration 或 renew
+
+  6. 使用更新前状态完成授权。
+  7. 原子应用新状态。
+  8. 增加 nameSeq / document version / authoritySeq。
+  9. 追加事件。
+```
+
+关键约束：
+
+- `CallAuthority.role` 只是授权分支选择，不是调用者自证身份。
+- `kid` 是 key selector，不是权限本身。
+- asset owner 只有在 `ownerSource = AssetOwnerFallback` 时具有 owner 权限。
+- 显式 semantic owner 或父 owner 一旦生效，asset owner 权限消失。
+- 新提交的 owner、key、controller 或文档不能授权本次提交。
+- Document 内容永远不能单独授权 Registry 写操作。
+- 支付目标可以由 owner 或被授权的 payment controller 更新。
+- release、tombstone、transferName、setNameOwner、authority key rotation 默认是 owner 级高风险操作。
+
+## 12. Resolver 映射规则
+
+标准 resolver 的强验证路径：
+
+```text
+resolve(did:bns:$name, doc_type):
+  1. 规范化 DID，得到 canonical name。
+  2. 查询 exact NameState 和 OwnerResolution。
+  3. 查询当前 DocumentState。
+  4. 从 inline 或 DocumentRef provider 获取文档原文。
+  5. 校验 hash(document) == contentHash。
+  6. 查询 effective owner/controller 的 Registry authority 状态。
+  7. 校验文档中的 owner/controller/key 声明覆盖 Registry 状态且不冲突。
+  8. 输出 document、effective owner、controller、proof、provider/cache/warnings。
+```
+
+注意：
+
+- 第 6 步使用 Registry 显式 authority key，不依赖文档自报。
+- 第 7 步是校验文档是否写对，不是反过来让文档决定谁有权限。
+- 文档中看不到、漏写或冲突的 owner/controller 会使文档无效，但不会改变 Registry owner。
+
+二级名字 delegated fallback：
+
+```text
+resolve(did:bns:cam01.alice, doc):
+  1. exact global name 存在 -> 使用 exact state。
+  2. exact name 不存在 -> 查询父名字 alice。
+  3. alice.allowDelegatedSubnames == true -> 获取父 zone/owner resolver。
+  4. provider 返回子名字文档。
+  5. 使用 alice 当前 effective owner/controller authority 校验。
+```
+
+三级名字不进入该 fallback。
+
+## 13. 支付查询接口（V2 概念）
+
+BNS 不扣款，不发行购买 receipt，只提供可绑定的 purchase context。
 
 ### getPurchaseContext
 
@@ -716,31 +1117,6 @@ function getPurchaseContext(
     string calldata docType
 ) external view returns (PurchaseContext memory context);
 ```
-
-标准支付合约调用流程：
-
-```text
-purchase(name, doc_type, amount, indexer, recommendation_id):
-  context = bns.getPurchaseContext(name, doc_type)
-  assert context.status == Active
-  assert amount matches price policy
-  transfer token to context.paymentTarget or split targets
-  emit receipt with name + doc_type + documentVersion + proofRoot
-```
-
-购买 receipt 至少应记录：
-
-- buyer。
-- name。
-- doc_type。
-- BNS document version。
-- paid amount / token。
-- payment target。
-- split policy hash。
-- rights policy hash。
-- tx hash / block number。
-
-这样内容升级、版权转移、收款目标变化后，旧 receipt 仍能回到购买发生时的 BNS 状态。
 
 ### resolvePaymentTarget
 
@@ -752,16 +1128,29 @@ function resolvePaymentTarget(
 ) external view returns (
     Principal memory beneficiary,
     address paymentTarget,
+    bytes32 paymentPolicyHash,
     bytes32 splitPolicyHash,
+    bytes32 pricePolicyHash,
+    bytes32 rightsPolicyHash,
     bytes32 proofRoot
 );
 ```
 
-用于审计历史 payment target，也用于支付合约在指定版本上做复核。
+购买 receipt 至少绑定：
 
-## 8. 事件
+- buyer；
+- name；
+- doc_type；
+- document version；
+- amount / token；
+- payment target；
+- payment/split/price/rights policy hash；
+- proof root；
+- transaction / block 或中心化模拟事件序号。
 
-所有状态变化必须发事件。Resolver、indexer、钱包、Source 和支付合约通过事件构造可验证索引。
+## 14. 事件
+
+中心化模拟实现和未来智能合约都应产生语义一致的 append-only 事件。
 
 ```solidity
 event NameRegistered(
@@ -777,10 +1166,11 @@ event NameRenewed(
     uint64 nameSeq
 );
 
-event NameTransferred(
+event NameAssetTransferred(
     string indexed name,
     address indexed oldAssetOwner,
     address indexed newAssetOwner,
+    bool standardTransfer,
     uint64 nameSeq
 );
 
@@ -788,7 +1178,15 @@ event NameOwnerUpdated(
     string indexed name,
     PrincipalKind ownerKind,
     bytes ownerValue,
+    OwnerSource ownerSource,
+    bool standardTransferEnabled,
     uint64 nameSeq
+);
+
+event AuthorityKeysUpdated(
+    string indexed name,
+    uint64 authoritySeq,
+    bytes32 authorityRoot
 );
 
 event NameReleased(
@@ -827,12 +1225,6 @@ event NamespacePolicyUpdated(
     uint64 nameSeq
 );
 
-event OwnerKeyChanged(
-    string indexed name,
-    uint64 ownerDocumentVersion,
-    bytes32 ownerDocumentHash
-);
-
 event DidAliasSet(
     string indexed name,
     string targetDid,
@@ -850,103 +1242,22 @@ event PaymentTargetUpdated(
 );
 ```
 
-## 9. Resolver 映射规则
+## 15. 最小闭环接口
 
-链下 resolver 的强验证路径应按以下顺序：
-
-```text
-resolve(did:bns:$name, doc_type):
-  1. 查询 BNS exact name state。
-  2. 如果 active，查询当前 doc_type 版本。
-  3. 如果 DocumentRef 是 inline，直接读取 inlineDocument；如果 codec 是 JSON，则按 UTF-8 JSON 解码；否则从 DocumentRef 指定 provider 获取文档本体。
-  4. 校验 hash(document) == contentHash。
-  5. 校验文档签名是否回到 BNS owner/controller policy。
-  6. 输出 document + verified_owner + controller + proof + provider/cache/warnings。
-```
-
-子名字回落规则：
-
-```text
-resolve(did:bns:cam01.alice, doc):
-  1. 如果 cam01.alice 是 exact global name，使用链上状态。
-  2. 如果不存在，查询父名字 alice。
-  3. 如果 alice 允许 delegated subnames，按 alice 的 zone/owner 文档找到 Zone resolver。
-  4. Zone resolver 返回 DeviceConfig / ServiceInfo。
-  5. 用 alice 当前 owner/controller 验证返回文档。
-```
-
-DNS TXT、HTTPS、SN、Repo、Source、local cache 都可以参与第 3 步提供文档本体或候选 boot 材料，但不能跳过第 1、4、5 步。
-
-## 10. 授权规则
-
-所有写接口都遵循同一原则：
-
-```text
-authorize_update():
-  current_name_state = load(name)
-  current_document_state = load(name, doc_type)
-  assert proof.expectedNameSeq == current_name_state.nameSeq
-  assert proof.expectedDocumentVersion == current_document_state.version
-  assert proof.signer is authorized by current state
-  assert proof not expired and nonce not used
-  apply update
-```
-
-关键约束：
-
-- 授权依据必须来自更新前状态。
-- 新提交文档不能授权本次提交。
-- `assetOwner` 可以管理名字资产生命周期。
-- `assetOwner` 直接发起交易时可以不携带签名；由代理、钱包 session 或链下 key 代签时必须携带 `AuthProof`。
-- owner/controller policy 决定谁能更新具体 `doc_type`。
-- payment target 可以由 owner 或被授权的 payment controller 更新。
-- content/app/service 文档的更新权可以下放给特定子身份。
-- release/tombstone/name transfer/owner update 属于高风险操作，默认需要 asset owner、当前 owner 或 recovery policy 授权。
-
-### owner/controller 解析规则
-
-一个 name 只有一个 BuckyOS 语义 owner 记录，但可以为不同 `doc_type` 设置不同 controller。
-
-owner 规则：
-
-- owner 只能是 `Unset` 或另一个 BNS name。
-- owner 为 `Unset` 时，一级名字的 owner 回落为该 name NFT 的 `assetOwner`。
-- owner 为 `Unset` 时，二级名字优先继承父名字 owner；如果父名字也未设置 owner，则最终回落到父名字的 `assetOwner`。
-- owner 指向另一个 BNS name 时，resolver 继续解析该名字的 owner 记录，直到得到链地址、合约地址或失败。
-- owner name 引用必须限制深度并检测循环。第一版建议 `MAX_OWNER_REF_DEPTH = 8`；超过深度或出现循环时解析失败。
-- owner 如果最终解析到合约地址，合约签名验证应使用 ERC-1271；这也是组织、多签、DAO 作为 owner 的推荐方式。
-
-controller 规则：
-
-- controller 只能是 `Unset`、链地址或合约地址，不能是另一个 BNS name。
-- controller 可以按 `doc_type` 配置，例如只允许某个地址更新 `video` 或 `app` 文档。
-- 如果某个 `doc_type` 没有显式 controller，则回落到该 name 的 owner 授权；二级名字 owner/controller 都未配置时，再继承父名字权限。
-- Safe Address / ERC-1271 合约地址可作为 controller，用于组织、多签和托管发布流程。
-
-owner public key 查找示例：
-
-```text
-resolve_owner(v.alice):
-  v.alice.owner == Unset
-  -> inherit alice.owner
-
-resolve_owner(alice):
-  if alice.owner is BnsName:
-    resolve_owner(alice.owner) with depth/cycle limit
-  else if alice.owner is Unset:
-    return alice.assetOwner
-  then optionally read alice owner_doc off-chain for additional public keys
-```
-
-链上只认可上述 owner/controller 记录和可验证签名。`owner` 文档可以声明更多公钥、设备、公钥格式或 DID 方法，但这些扩展只能由链下 resolver 使用。标准 resolver 必须校验 DID Document 里的 owner/controller 是链上记录的超集；如果文档声明与合约记录冲突，则该文档非法。
-
-## 11. 最小闭环接口
-
-如果只保留第一版必须实现的接口，优先级如下：
+第一版优先实现：
 
 ```solidity
-// name asset
+// views
 queryNameState
+resolveOwner
+isStandardTransferEnabled
+getAuthoritySet
+getAuthorityKey
+resolveDocument
+getDocumentVersion
+getAlias
+
+// name
 registerName
 renewName
 transferName
@@ -954,58 +1265,54 @@ setNameOwner
 releaseName
 setNamespacePolicy
 
+// authority
+updateAuthorityKeys
+rotateAuthorityAndOwnerDocument
+setControllerPolicy
+
 // document
-resolveDid
-getDocumentVersion
 publishDocument
 revokeDocument
-
-// control
-setControllerPolicy
-changeOwnerKey
 setDidAlias
-getAlias
 setPaymentTarget
 
-// payment view，V2 概念接口；V1 可只保留字段、hash 和事件
+// payment view，V2 概念
 getPurchaseContext
 resolvePaymentTarget
 ```
 
-这组接口覆盖了两份 BNS 文档要求的最小协议闭环：
+这组接口形成以下闭环：
 
-- 名字可以注册、拥有、续期、释放和转让。
+- 名字可以注册、续期、释放和转让。
+- asset owner 只在 fallback 模式拥有 BuckyOS 权限。
+- 显式 semantic owner 通过 Registry 可见 authority key 控制名字。
+- 设置显式 owner 后，普通 ERC-721 transfer 自动失效。
+- owner/controller 的认证与 RPC 签名格式解耦。
 - `did + doc_type` 可以解析到可验证文档。
-- 文档可以更新、吊销、保留历史版本。
-- owner key 和 controller policy 可以轮换。
-- alias / migration 不破坏历史可信。
-- V2 支付合约能绑定长期内容名和购买发生时的权益状态。
-- Zone resolver、SN、DNS、HTTPS、Source、Repo 可以作为 provider，但不能获得最终控制权。
+- 文档可以更新、吊销并保留历史版本。
+- 文档内部 owner/controller 只能被校验，不能反向授予 Registry 权限。
+- 中心化模拟实现和未来智能合约可以共享同一套状态转换语义。
 
-## 12. 信用与经济模型边界
+## 16. 中心化模拟到智能合约的兼容约束
 
-信用系统属于 BNS 之外的设施，不影响本合约接口的最小设计。
+为了保证未来迁移，中心化实现必须遵守：
 
-规则：
+- 核心状态中不保存 RPC session、HTTP token 或服务端私有认证字段。
+- name、doc_type、kid、hash 和事件字段使用稳定的 canonical encoding。
+- 所有写操作必须原子执行并产生单调序号。
+- 所有权限判断必须基于更新前状态。
+- 所有 view 应能仅从 Registry 状态和事件推导。
+- adapter 认证结果与 Registry 授权判断分离。
+- 错误类型应稳定，例如 `STALE_NAME_SEQ`、`STALE_DOCUMENT_VERSION`、`INVALID_KID`、`NOT_EFFECTIVE_OWNER`、`CONTROLLER_SCOPE_DENIED`、`STANDARD_TRANSFER_DISABLED`。
+- 中心化 event log 应可导出为确定性 snapshot，供未来 genesis import、migration contract 或审计使用。
 
-- 信用通常绑定 `name + owner`，而不是绑定某个 `app_doc` 或内容文档。
-- 名字更换 owner 后，该名字对应的信用解释也会变化；信用系统应显式处理 owner 变更历史。
-- `$objid.$owner` 总是合法的二级名字形式，适合作为任意内容、对象或资源的长期引用。
-- BNS 合约只提供可验证的名字、owner、文档版本和历史事件；信用评分、推荐、审核和风控由外部系统完成。
-
-维护成本和交易价格也应解耦：
-
-- name 的维护成本不应由 NFT 市场成交价直接决定。
-- 用户可以利用 name NFT 特性自由交易，交易价格只表达市场成交，不直接改变续期或维护成本。
-- 名字维护成本可以由自动化评估、公共拍卖结果、短名保护和资源占用等因素决定。
-- 公共拍卖通常在名字过期并经过 grace period 后触发。
-
-## 13. 第一版不解决的问题
+## 17. 第一版暂不解决的问题
 
 - 具体定价、拍卖、短名保护、保留字和争议仲裁。
-- Unicode 名字、同形字、大小写和多语言显示策略。第一版建议只接受 lower-case ASCII label。
-- Ed25519 / secp256k1 / 社交恢复的具体链上验签实现。接口保留 `Principal` 和 `AuthProof`，具体链可先只支持链原生账户和 ERC-1271 合约账户。
+- Unicode、同形字、大小写和多语言显示策略。
+- 各类 public key/verifier 在具体链上的实现成本和支持范围。
+- recovery/social recovery 的完整状态机。
 - 跨链名字同步和跨链支付。
-- 隐私保护。BNS 是公开状态层，不应保存私有 profile 字段。
-- 标准支付合约的完整 ABI、显式分账、receipt NFT/SBT 形态和退款/托管规则；这些进入 V2。
-- Source、indexer、review report、信用机构的业务协议。
+- 隐私保护；Registry 是公开状态层。
+- 标准支付合约、显式分账、refund、escrow 和 receipt NFT/SBT。
+- Source、indexer、review report 和信用机构的业务协议。
