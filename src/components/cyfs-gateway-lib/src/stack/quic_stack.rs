@@ -18,11 +18,11 @@ use crate::{
     ComposedSpeedStat, ConnectionController, ConnectionInfo, ConnectionManagerRef, DumpStream,
     GlobalCollectionManagerRef, HandleConnectionController, IoDumpStackConfig,
     JsExternalsManagerRef, LimiterManagerRef, ProcessChainConfig, ProcessChainConfigs,
-    SelfCertMgrRef, Server, ServerError, ServerErrorCode, ServerManagerRef, Stack, StackCertConfig,
-    StackConfig, StackContext, StackErrorCode, StackFactory, StackProtocol, StackRef, StackResult,
+    SelfCertMgrRef, Server, ServerError, ServerErrorCode, ServerManagerRef, Stack, StackConfig,
+    StackContext, StackErrorCode, StackFactory, StackProtocol, StackRef, StackResult,
     StatManagerRef, StreamInfo, TlsIdentityManagerConfig, TunnelManager,
-    create_io_dump_stack_config, get_external_commands, get_stat_info, into_stack_err, load_certs,
-    load_key, server_err, stack_err,
+    create_io_dump_stack_config, get_external_commands, get_stat_info, into_stack_err, server_err,
+    stack_err,
 };
 use buckyos_kit::AsyncStream;
 use cyfs_process_chain::{
@@ -981,30 +981,6 @@ impl QuicConnectionHandler {
         }
         Ok(())
     }
-}
-
-async fn build_quic_domain_configs(
-    certs: &[StackCertConfig],
-) -> StackResult<Vec<QuicDomainConfig>> {
-    let mut cert_list = Vec::with_capacity(certs.len());
-    for cert_config in certs.iter() {
-        if cert_config.cert_path.is_some() && cert_config.key_path.is_some() {
-            let certs = load_certs(cert_config.cert_path.as_deref().unwrap()).await?;
-            let key = load_key(cert_config.key_path.as_deref().unwrap()).await?;
-            cert_list.push(QuicDomainConfig {
-                domain: cert_config.domain.clone(),
-                certs: Some(certs),
-                key: Some(key),
-            });
-        } else {
-            cert_list.push(QuicDomainConfig {
-                domain: cert_config.domain.clone(),
-                certs: None,
-                key: None,
-            });
-        }
-    }
-    Ok(cert_list)
 }
 
 pub struct Http3Body<S, B> {
@@ -2132,8 +2108,6 @@ pub struct QuicStackConfig {
     pub hosts: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub identity_manager: Option<TlsIdentityManagerConfig>,
-    #[serde(default)]
-    pub certs: Vec<StackCertConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub alpn_protocols: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2203,7 +2177,6 @@ impl StackFactory for QuicStackFactory {
                 StackErrorCode::InvalidConfig,
                 "invalid quic stack config"
             ))?;
-        let cert_list = build_quic_domain_configs(&config.certs).await?;
         let identity_certs =
             build_identity_cert_config(&config.hosts, config.identity_manager.as_ref())?;
         let stack_context = context
@@ -2230,7 +2203,6 @@ impl StackFactory for QuicStackFactory {
             .bind(config.bind.to_string().as_str())
             .connection_manager(self.connection_manager.clone())
             .hook_point(config.hook_point.clone())
-            .add_certs(cert_list)
             .identity_certs(identity_certs)
             .alpn_protocols(
                 config
@@ -2262,9 +2234,9 @@ mod tests {
         GlobalCollectionManagerRef, LimiterManagerRef, ProcessChainConfigs, ProcessChainHttpServer,
         QuicDomainConfig, QuicStack, QuicStackConfig, QuicStackContext, QuicStackFactory,
         SelfCertConfig, SelfCertMgr, SelfCertMgrRef, Server, ServerManager, ServerManagerRef,
-        ServerResult, Stack, StackContext, StackFactory, StackProtocol, StatManager,
-        StatManagerRef, StreamInfo, StreamServer, TunnelManager, create_io_dump_stack_config,
-        decode_io_dump_frames,
+        ServerErrorCode, ServerResult, Stack, StackContext, StackFactory, StackProtocol,
+        StatManager, StatManagerRef, StreamInfo, StreamServer, TunnelManager,
+        create_io_dump_stack_config, decode_io_dump_frames, server_err,
     };
     use buckyos_kit::AsyncStream;
     use h3::error::{ConnectionError, StreamError};
@@ -3144,7 +3116,15 @@ mod tests {
                 let mut req = Vec::new();
                 let mut b = [0u8; 1];
                 loop {
-                    stream.read_exact(&mut b).await.unwrap();
+                    if let Err(e) = stream.read_exact(&mut b).await {
+                        if req.is_empty() {
+                            return Ok(());
+                        }
+                        return Err(server_err!(
+                            ServerErrorCode::StreamError,
+                            "failed to read keep-alive request: {e}"
+                        ));
+                    }
                     req.push(b[0]);
                     if req.ends_with(b"\r\n\r\n") {
                         break;
@@ -3159,8 +3139,18 @@ mod tests {
                     "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n",
                     body.len()
                 );
-                stream.write_all(resp.as_bytes()).await.unwrap();
-                stream.write_all(body).await.unwrap();
+                stream.write_all(resp.as_bytes()).await.map_err(|e| {
+                    server_err!(
+                        ServerErrorCode::StreamError,
+                        "failed to write keep-alive response headers: {e}"
+                    )
+                })?;
+                stream.write_all(body).await.map_err(|e| {
+                    server_err!(
+                        ServerErrorCode::StreamError,
+                        "failed to write keep-alive response body: {e}"
+                    )
+                })?;
             }
             Ok(())
         }
@@ -3924,7 +3914,6 @@ mod tests {
             hook_point: vec![],
             hosts: vec![],
             identity_manager: None,
-            certs: vec![],
             alpn_protocols: None,
             io_dump_file: None,
             io_dump_rotate_size: None,
@@ -3968,7 +3957,6 @@ hook_point: []
         .unwrap();
 
         assert_eq!(config.hosts, vec!["example.com", "*.example.org"]);
-        assert!(config.certs.is_empty());
         let identity_manager = config.identity_manager.unwrap();
         assert_eq!(
             identity_manager.public_root_path.as_deref(),

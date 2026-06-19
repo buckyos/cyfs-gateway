@@ -177,8 +177,6 @@ stacks:
     #   identity_manager: # optional; defaults to BUCKYOS_IDENTITY_ROOT/BUCKYOS_SECURITY_ROOT or $BUCKYOS_ROOT/local/identity and $BUCKYOS_ROOT/security
     #     public_root_path: ./identity
     #     security_root_path: ./security
-    #   certs:
-    #     - domain: * # optional local default certificate; all connections through this stack use certs generated from the local root, configured via tls_ca
     #   hook_point: { }
 
     # rtcp_example:
