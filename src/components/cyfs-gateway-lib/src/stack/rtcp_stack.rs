@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use buckyos_kit::AsyncStream;
@@ -16,6 +17,7 @@ use sfo_io::{LimitStream, StatStream};
 use sfo_reuseport::{
     ServerRuntime, SocketOptions, TaskHandle, TcpServer, TcpServiceConfig, TransparentMode,
 };
+use tokio::sync::Notify;
 use url::Url;
 
 use crate::forward::ForwardPlan;
@@ -34,8 +36,8 @@ use crate::tunnel_url_status::{
     TunnelUrlStatusSource, normalize_tunnel_url, reachable_status, unreachable_status,
 };
 use crate::{
-    ConnectionInfo, ConnectionManagerRef, DatagramInfo, DumpStream, GlobalCollectionManagerRef,
-    HandleConnectionController, IoDumpStackConfig, JsExternalsManagerRef, LimiterManagerRef,
+    ConnectionController, ConnectionInfo, ConnectionManagerRef, DatagramInfo, DumpStream,
+    GlobalCollectionManagerRef, IoDumpStackConfig, JsExternalsManagerRef, LimiterManagerRef,
     MutComposedSpeedStat, MutComposedSpeedStatRef, ProcessChainConfigs, RTcp, RTcpListener, Server,
     ServerManagerRef, Stack, StackConfig, StackContext, StackErrorCode, StackFactory,
     StackProtocol, StackRef, StackResult, StatManagerRef, StreamInfo, TunnelBox, TunnelBuilder,
@@ -800,6 +802,7 @@ impl RtcpConnectionHandler {
 
 struct Listener {
     bind_addr: String,
+    server_runtime: ServerRuntime,
     connection_manager: Option<ConnectionManagerRef>,
     handler: Arc<RwLock<Arc<RtcpConnectionHandler>>>,
 }
@@ -807,18 +810,81 @@ struct Listener {
 impl Listener {
     pub fn new(
         bind_addr: String,
+        server_runtime: ServerRuntime,
         connection_manager: Option<ConnectionManagerRef>,
         handler: Arc<RwLock<Arc<RtcpConnectionHandler>>>,
     ) -> Self {
         Self {
             bind_addr,
+            server_runtime,
             connection_manager,
             handler,
         }
     }
 }
 
-#[async_trait::async_trait(?Send)]
+struct TaskHandleConnectionController {
+    handle: Mutex<Option<TaskHandle>>,
+    completed: Arc<AtomicBool>,
+    completion_notify: Arc<Notify>,
+}
+
+impl TaskHandleConnectionController {
+    fn new(
+        handle: TaskHandle,
+        completed: Arc<AtomicBool>,
+        completion_notify: Arc<Notify>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            handle: Mutex::new(Some(handle)),
+            completed,
+            completion_notify,
+        })
+    }
+
+    fn mark_completed(&self) {
+        self.completed.store(true, Ordering::Release);
+        self.completion_notify.notify_waiters();
+    }
+}
+
+#[async_trait::async_trait]
+impl ConnectionController for TaskHandleConnectionController {
+    fn stop_connection(&self) {
+        if let Some(handle) = self.handle.lock().unwrap().take() {
+            handle.cancel();
+        }
+        self.mark_completed();
+    }
+
+    async fn wait_stop(&self) {
+        loop {
+            let notified = self.completion_notify.notified();
+            if self.completed.load(Ordering::Acquire) {
+                break;
+            }
+            notified.await;
+        }
+    }
+
+    fn is_stopped(&self) -> bool {
+        self.completed.load(Ordering::Acquire)
+    }
+}
+
+struct TaskStopGuard {
+    completed: Arc<AtomicBool>,
+    completion_notify: Arc<Notify>,
+}
+
+impl Drop for TaskStopGuard {
+    fn drop(&mut self) {
+        self.completed.store(true, Ordering::Release);
+        self.completion_notify.notify_waiters();
+    }
+}
+
+#[async_trait::async_trait]
 impl RTcpListener for Listener {
     async fn on_new_tunnel(
         &self,
@@ -830,10 +896,25 @@ impl RTcpListener for Listener {
             let handler = self.handler.read().unwrap();
             handler.clone()
         };
-        handler_snapshot
-            .handle_new_tunnel(endpoint, source_addr, source_device_info)
-            .await
-            .map_err(|e| TunnelError::ReasonError(format!("rtcp on_new_tunnel rejected: {}", e)))
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        let handle = self
+            .server_runtime
+            .spawn_task(move || async move {
+                let result = handler_snapshot
+                    .handle_new_tunnel(endpoint, source_addr, source_device_info)
+                    .await
+                    .map_err(|e| {
+                        TunnelError::ReasonError(format!("rtcp on_new_tunnel rejected: {}", e))
+                    });
+                let _ = result_tx.send(result);
+            })
+            .map_err(|e| {
+                TunnelError::ReasonError(format!("spawn rtcp on_new_tunnel handler failed: {}", e))
+            })?;
+        drop(handle);
+        result_rx.await.map_err(|e| {
+            TunnelError::ReasonError(format!("rtcp on_new_tunnel handler dropped: {}", e))
+        })?
     }
 
     async fn on_new_stream(
@@ -902,26 +983,40 @@ impl RTcpListener for Listener {
         let stat_stream = Box::new(StatStream::new_with_tracker(stream, stat.clone()));
 
         let speed = stat_stream.get_speed_stat();
-        let handle = tokio::task::spawn_local(async move {
-            if let Err(e) = handler_snapshot
-                .handle_stream(
-                    stat_stream,
-                    protocol,
-                    dest_host,
-                    dest_port,
-                    path,
-                    endpoint,
-                    stat,
-                    remote_addr,
-                    local_addr,
-                )
-                .await
-            {
-                error!("on_new_stream error: {}", e);
-            }
-        });
+        let completed = Arc::new(AtomicBool::new(false));
+        let completion_notify = Arc::new(Notify::new());
+        let task_completed = completed.clone();
+        let task_completion_notify = completion_notify.clone();
+        let handle = self
+            .server_runtime
+            .spawn_task(move || async move {
+                let _stop_guard = TaskStopGuard {
+                    completed: task_completed,
+                    completion_notify: task_completion_notify,
+                };
+                if let Err(e) = handler_snapshot
+                    .handle_stream(
+                        stat_stream,
+                        protocol,
+                        dest_host,
+                        dest_port,
+                        path,
+                        endpoint,
+                        stat,
+                        remote_addr,
+                        local_addr,
+                    )
+                    .await
+                {
+                    error!("on_new_stream error: {}", e);
+                }
+            })
+            .map_err(|e| {
+                TunnelError::ReasonError(format!("spawn rtcp stream handler failed: {}", e))
+            })?;
         if let Some(manager) = &self.connection_manager {
-            let controller = HandleConnectionController::new(handle);
+            let controller =
+                TaskHandleConnectionController::new(handle, completed, completion_notify);
             manager.add_connection(ConnectionInfo::new(
                 remote_addr.to_string(),
                 local_addr.to_string(),
@@ -999,27 +1094,41 @@ impl RTcpListener for Listener {
         let stat_stream = Box::new(StatStream::new_with_tracker(stream, stat.clone()));
 
         let speed = stat_stream.get_speed_stat();
-        let handle = tokio::task::spawn_local(async move {
-            if let Err(e) = handler_snapshot
-                .handle_datagram(
-                    stat_stream,
-                    protocol,
-                    dest_host,
-                    dest_port,
-                    path,
-                    endpoint,
-                    stat,
-                    remote_addr,
-                    local_addr,
-                )
-                .await
-            {
-                error!("on_new_stream error: {}", e);
-            }
-        });
+        let completed = Arc::new(AtomicBool::new(false));
+        let completion_notify = Arc::new(Notify::new());
+        let task_completed = completed.clone();
+        let task_completion_notify = completion_notify.clone();
+        let handle = self
+            .server_runtime
+            .spawn_task(move || async move {
+                let _stop_guard = TaskStopGuard {
+                    completed: task_completed,
+                    completion_notify: task_completion_notify,
+                };
+                if let Err(e) = handler_snapshot
+                    .handle_datagram(
+                        stat_stream,
+                        protocol,
+                        dest_host,
+                        dest_port,
+                        path,
+                        endpoint,
+                        stat,
+                        remote_addr,
+                        local_addr,
+                    )
+                    .await
+                {
+                    error!("on_new_stream error: {}", e);
+                }
+            })
+            .map_err(|e| {
+                TunnelError::ReasonError(format!("spawn rtcp datagram handler failed: {}", e))
+            })?;
 
         if let Some(manager) = &self.connection_manager {
-            let controller = HandleConnectionController::new(handle);
+            let controller =
+                TaskHandleConnectionController::new(handle, completed, completion_notify);
             manager.add_connection(ConnectionInfo::new(
                 remote_addr.to_string(),
                 local_addr.to_string(),
@@ -1309,6 +1418,7 @@ impl RtcpStack {
         let handler = Arc::new(RwLock::new(Arc::new(handler)));
         let listener = Listener::new(
             bind_addr.clone(),
+            server_runtime.clone(),
             connection_manager.clone(),
             handler.clone(),
         );

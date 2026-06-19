@@ -727,6 +727,79 @@ def write_file(path, content):
     path.write_text(content, encoding="utf-8")
 
 
+def install_control_test_template(buckyos_root):
+    template_dir = Path(buckyos_root) / "etc" / "cyfs_gateway" / "server_templates" / "control_test"
+    write_file(
+        template_dir / "pkg.yaml",
+        """
+name: control_test
+description: Control API test template
+main: main.js
+""".strip()
+        + "\n",
+    )
+    write_file(
+        template_dir / "main.js",
+        """
+export function main(argv) {
+    const helpText = [
+        "Usage:",
+        "  control_test --bind <ip:port> --path <dir>",
+    ].join("\\n");
+    if (argv.includes("--help") || argv.includes("-h")) {
+        console.log(helpText);
+        return "";
+    }
+
+    let bind = "";
+    let rootPath = "";
+    for (let i = 0; i < argv.length; i += 1) {
+        if (argv[i] === "--bind" && i + 1 < argv.length) {
+            bind = String(argv[i + 1]);
+            i += 1;
+            continue;
+        }
+        if (argv[i] === "--path" && i + 1 < argv.length) {
+            rootPath = String(argv[i + 1]);
+            i += 1;
+        }
+    }
+    if (bind.length === 0 || rootPath.length === 0) {
+        console.log(helpText);
+        return "";
+    }
+
+    return JSON.stringify({
+        stacks: {
+            control_test_stack: {
+                bind,
+                protocol: "tcp",
+                hook_point: {
+                    main: {
+                        priority: 1,
+                        blocks: {
+                            default: {
+                                priority: 1,
+                                block: "call-server control_test_dir;\\n",
+                            },
+                        },
+                    },
+                },
+            },
+        },
+        servers: {
+            control_test_dir: {
+                type: "dir",
+                root_path: rootPath,
+            },
+        },
+    });
+}
+""".strip()
+        + "\n",
+    )
+
+
 def render_runtime_config(case_dir, entry_port, upstream_port):
     dir_root = case_dir / "www" / "dir"
     fallback_root = case_dir / "www" / "fallback"
@@ -1735,6 +1808,41 @@ def generate_self_signed_cert(cert_path, key_path, common_name):
         check=False,
     )
     assert_process_ok(result, f"generate self-signed cert for {common_name}")
+
+
+def install_tls_identity_cert(buckyos_root, host):
+    public_dir = Path(buckyos_root) / "local" / "identity" / host
+    security_dir = Path(buckyos_root) / "security" / host
+    cert_path = public_dir / "server.fullchain.pem"
+    key_path = security_dir / "server.private.pem"
+    public_dir.mkdir(parents=True, exist_ok=True)
+    security_dir.mkdir(parents=True, exist_ok=True)
+    result = subprocess.run(
+        [
+            "openssl",
+            "req",
+            "-x509",
+            "-newkey",
+            "rsa:2048",
+            "-nodes",
+            "-days",
+            "30",
+            "-subj",
+            f"/CN={host}",
+            "-addext",
+            f"subjectAltName=DNS:{host}",
+            "-keyout",
+            str(key_path),
+            "-out",
+            str(cert_path),
+        ],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        timeout=20,
+        check=False,
+    )
+    assert_process_ok(result, f"generate TLS identity cert for {host}")
 
 
 def generate_named_rtcp_files(target_dir, name, key_name, doc_name):
@@ -3386,6 +3494,133 @@ servers: {}
         udp_echo.stop()
 
 
+def test_control_api_surface_roundtrip(case_dir):
+    config_path = case_dir / "cyfs_gateway.yaml"
+    buckyos_root = case_dir / "buckyos-root"
+    template_port = free_port()
+    template_root = case_dir / "template-root"
+    save_path = case_dir / "saved-config.json"
+    write_file(template_root / "index.html", "CONTROL-TEMPLATE")
+    install_control_test_template(buckyos_root)
+    write_file(
+        config_path,
+        """
+user_name: app_user
+password: app_pass
+collections:
+  app_set:
+    type: memory_set
+  app_map:
+    type: memory_map
+stacks: {}
+servers: {}
+""".strip()
+        + "\n",
+    )
+    gateway = GatewayProcess(case_dir, config_path, buckyos_root)
+    try:
+        gateway.start()
+        wait_gateway_ready(gateway, BUILTIN_CONTROL_PORT)
+        token = control_login(BUILTIN_CONTROL_PORT)
+
+        system_info = control_rpc(
+            BUILTIN_CONTROL_PORT,
+            "get_system_info",
+            {"dashboard_port": 12345},
+            token=token,
+        )["result"]
+        assert_eq(system_info.get("ui_mode"), "developer", "control get_system_info ui_mode")
+        assert_true(
+            isinstance(system_info.get("dashboard", {}).get("port"), int),
+            "control get_system_info dashboard port type",
+        )
+
+        config = control_rpc(BUILTIN_CONTROL_PORT, "get_config", None, token=token)["result"]
+        assert_true("stacks" in config, "control get_config missing stacks")
+        init_config = control_rpc(BUILTIN_CONTROL_PORT, "get_init_config", None, token=token)[
+            "result"
+        ]
+        assert_true("collections" in init_config, "control get_init_config missing collections")
+
+        saved = control_rpc(
+            BUILTIN_CONTROL_PORT,
+            "save_config",
+            {"config": str(save_path)},
+            token=token,
+        )["result"]
+        assert_eq(saved, str(save_path), "control save_config path")
+        assert_true(save_path.exists(), "control save_config did not write file")
+
+        connections = control_rpc(BUILTIN_CONTROL_PORT, "get_connections", None, token=token)[
+            "result"
+        ]
+        devices = control_rpc(
+            BUILTIN_CONTROL_PORT,
+            "get_connection_devices",
+            None,
+            token=token,
+        )["result"]
+        assert_true(isinstance(connections, list), "control get_connections result type")
+        assert_true(isinstance(devices, list), "control get_connection_devices result type")
+
+        tunnel_params = {
+            "urls": ["udp://127.0.0.1:9/", "unknown://127.0.0.1:9/"],
+            "sort": "reachable_first",
+            "include_unsupported": False,
+        }
+        for method in ("query_tunnel_url_statuses", "tunnels_probe", "/tunnels/probe"):
+            probe = control_rpc(BUILTIN_CONTROL_PORT, method, tunnel_params, token=token)["result"]
+            assert_true("statuses" in probe, f"control {method} missing statuses")
+            assert_true("sorted_urls" in probe, f"control {method} missing sorted_urls")
+
+        for method, trust_level in (("add_name_provider", 101), ("add-name-provider", 102)):
+            provider = control_rpc(
+                BUILTIN_CONTROL_PORT,
+                method,
+                {"url": f"http://127.0.0.1:{free_port()}", "trust_level": trust_level},
+                token=token,
+            )["result"]
+            assert_eq(provider.get("scheme"), "http", f"control {method} scheme")
+            assert_eq(provider.get("trust_level"), trust_level, f"control {method} trust")
+
+        cmds = control_rpc(BUILTIN_CONTROL_PORT, "external_cmds", None, token=token)["result"]
+        assert_true(
+            any(cmd.get("name") == "control_test" for cmd in cmds),
+            "control external_cmds missing control_test",
+        )
+        help_text = control_rpc(
+            BUILTIN_CONTROL_PORT,
+            "cmd_help",
+            {"cmd": "control_test"},
+            token=token,
+        )["result"]
+        assert_in("control_test", help_text, "control cmd_help")
+
+        started = control_rpc(
+            BUILTIN_CONTROL_PORT,
+            "start",
+            {
+                "template_id": "control_test",
+                "args": ["--bind", f"127.0.0.1:{template_port}", "--path", str(template_root)],
+            },
+            token=token,
+        )["result"]
+        assert_true("stacks" in started, "control start result missing stacks")
+        wait_tcp_port(gateway, template_port, "control start template")
+        status, _, body = http_text(template_port, "control.test", "/")
+        assert_eq(status, 200, "control start template status")
+        assert_eq(body, "CONTROL-TEMPLATE", "control start template body")
+
+        invalid = control_rpc_raw(BUILTIN_CONTROL_PORT, "missing_control_method", None, token=token)
+        assert_eq(invalid["status"], 200, "control invalid method http status")
+        assert_true(
+            invalid["data"].get("error") is not None,
+            "control invalid method should return rpc error",
+        )
+    finally:
+        gateway.stop()
+
+
 def test_control_collection_roundtrip(case_dir):
     config_path = case_dir / "cyfs_gateway.yaml"
     write_file(
@@ -3891,7 +4126,9 @@ servers:
 def test_tls_stack_self_cert_http_smoke(case_dir):
     tls_port = free_port()
     root = case_dir / "tls-www"
+    buckyos_root = case_dir / "buckyos-root"
     write_file(root / "index.html", "TLS-OK")
+    install_tls_identity_cert(buckyos_root, "tls.test")
     config_path = case_dir / "cyfs_gateway.yaml"
     write_file(
         config_path,
@@ -3900,8 +4137,8 @@ stacks:
   tls_entry:
     bind: 127.0.0.1:{tls_port}
     protocol: tls
-    certs:
-      - domain: "*"
+    hosts:
+      - tls.test
     hook_point:
       main:
         priority: 1
@@ -3930,7 +4167,7 @@ servers:
 """.strip()
         + "\n",
     )
-    gateway = GatewayProcess(case_dir, config_path, case_dir / "buckyos-root")
+    gateway = GatewayProcess(case_dir, config_path, buckyos_root)
     try:
         gateway.start()
         wait_gateway_ready(gateway, BUILTIN_CONTROL_PORT)
@@ -3995,6 +4232,7 @@ CASES = [
     ("control_rule_mutation_roundtrip", test_control_rule_mutation_roundtrip),
     ("control_router_roundtrip", test_control_router_roundtrip),
     ("control_dispatch_roundtrip", test_control_dispatch_roundtrip),
+    ("control_api_surface_roundtrip", test_control_api_surface_roundtrip),
     ("control_collection_roundtrip", test_control_collection_roundtrip),
     ("http_dir_server_options", test_http_dir_server_options),
     ("http_compression_options", test_http_compression_options),

@@ -27,8 +27,8 @@ use percent_encoding::percent_decode_str;
 use rand::Rng;
 use sha2::Sha256;
 use std::fmt;
-use std::net::{IpAddr, SocketAddr};
 use std::io::ErrorKind;
+use std::net::{IpAddr, SocketAddr};
 
 #[cfg(unix)]
 use std::os::fd::{FromRawFd, IntoRawFd};
@@ -1147,7 +1147,7 @@ impl RTcpInner {
                 debug!("RTcp stack accept new tcp stream from {}", addr.clone());
 
                 let this = this.clone();
-                task::spawn_local(async move {
+                task::spawn(async move {
                     this.serve_connection(stream, addr).await;
                 });
             }
@@ -1642,7 +1642,7 @@ impl RTcpInner {
 
             let result: TunnelResult<Box<dyn TunnelBox>> = Ok(Box::new(tunnel.clone()));
             let tunnel_map = self.tunnel_map.clone();
-            task::spawn_local(async move {
+            task::spawn(async move {
                 debug!(
                     "RTcp tunnel {} established (bootstrap), tunnel running",
                     tunnel_key.as_str()
@@ -1741,7 +1741,7 @@ impl RTcpInner {
                     );
                     let result: TunnelResult<Box<dyn TunnelBox>> = Ok(Box::new(tunnel.clone()));
                     let tunnel_map = self.tunnel_map.clone();
-                    task::spawn_local(async move {
+                    task::spawn(async move {
                         debug!(
                             "RTcp tunnel {} established, tunnel running",
                             tunnel_key.as_str()
@@ -2758,7 +2758,7 @@ impl RTcpTunnel {
         // arriving HelloStream does not stall the tunnel read loop. The
         // permit is dropped when the task exits, releasing the quota slot.
         let this = self.clone();
-        tokio::task::spawn_local(async move {
+        tokio::task::spawn(async move {
             let _permit = permit;
             if let Err(e) = this.finish_open(open_package, real_key).await {
                 error!("RTcp on_open background task error: {}", e);
@@ -3310,7 +3310,7 @@ impl RTcpTunnel {
     }
 }
 
-#[async_trait::async_trait(?Send)]
+#[async_trait::async_trait]
 pub trait RTcpListener: 'static + Send + Sync {
     async fn on_new_tunnel(
         &self,
@@ -3598,7 +3598,7 @@ mod tests {
         }
     }
 
-    #[async_trait::async_trait(?Send)]
+    #[async_trait::async_trait]
     impl RTcpListener for MockRTcpListener {
         async fn on_new_stream(
             &self,
@@ -3655,7 +3655,7 @@ mod tests {
         }
     }
 
-    #[async_trait::async_trait(?Send)]
+    #[async_trait::async_trait]
     impl RTcpListener for RelayRTcpListener {
         async fn on_new_stream(
             &self,
