@@ -531,15 +531,15 @@ impl ProcessChainHttpServer {
                 host,
             )
         };
-        let origin_uri = Self::origin_form_uri(org_url.as_str());
+        let client_origin_uri = Self::origin_form_uri(org_url.as_str());
         // Trim URL boundary slashes so we don't end up with "//" when target_url ends with '/'
         // and the request path starts with '/'.
-        let raw_url = if target_url.ends_with('/') || origin_uri.starts_with('/') {
+        let raw_url = if target_url.ends_with('/') || client_origin_uri.starts_with('/') {
             let base = target_url.trim_end_matches('/');
-            let path = origin_uri.trim_start_matches('/');
+            let path = client_origin_uri.trim_start_matches('/');
             format!("{}/{}", base, path)
         } else {
-            format!("{}{}", target_url, origin_uri)
+            format!("{}{}", target_url, client_origin_uri)
         };
         let request_url = Url::parse(&raw_url).map_err(|e| {
             server_err!(
@@ -549,6 +549,7 @@ impl ProcessChainHttpServer {
                 e
             )
         })?;
+        let upstream_origin_uri = Self::origin_form_uri(request_url.as_str());
         debug!("handle_upstream url: {}", request_url);
         // Per §6.7 we report the outcome of every business attempt to
         // tunnel_mgr against the *candidate* URL (target_url), not the
@@ -645,7 +646,7 @@ impl ProcessChainHttpServer {
                     .boxed();
                 let mut upstream_req = Request::builder()
                     .method(method)
-                    .uri(origin_uri.as_str())
+                    .uri(upstream_origin_uri.as_str())
                     .body(body)
                     .map_err(|e| {
                         server_err!(
@@ -813,7 +814,7 @@ impl ProcessChainHttpServer {
                     .boxed();
                 let mut upstream_req = Request::builder()
                     .method(method)
-                    .uri(origin_uri.as_str())
+                    .uri(upstream_origin_uri.as_str())
                     .version(upstream_http_version)
                     .body(body)
                     .map_err(|e| {
@@ -898,7 +899,7 @@ impl ProcessChainHttpServer {
                     .boxed();
                 let mut upstream_req = Request::builder()
                     .method(method)
-                    .uri(origin_uri.as_str())
+                    .uri(client_origin_uri.as_str())
                     .body(body)
                     .map_err(|e| {
                         server_err!(
@@ -3383,6 +3384,94 @@ mod tests {
 
         let body = resp.collect().await.unwrap().to_bytes();
         assert_eq!(body, Bytes::from("forward success"));
+    }
+
+    #[tokio::test]
+    async fn test_process_chain_http_server_forward_http_base_path_keeps_origin_form_uri() {
+        use http_body_util::BodyExt;
+        use tokio::net::TcpListener;
+
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = upstream_listener.accept().await.unwrap();
+            let service = hyper::service::service_fn(
+                |req: http::Request<hyper::body::Incoming>| async move {
+                    assert_eq!(req.uri().scheme_str(), None);
+                    assert_eq!(req.uri().authority(), None);
+                    assert_eq!(req.uri().to_string(), "/base/v1/chat?x=1");
+                    let _ = req.collect().await;
+                    Ok::<_, ServerError>(
+                        http::Response::builder()
+                            .status(StatusCode::OK)
+                            .body(
+                                Full::new(Bytes::from("base path success"))
+                                    .map_err(|e| match e {})
+                                    .boxed(),
+                            )
+                            .unwrap(),
+                    )
+                },
+            );
+
+            let _ = hyper::server::conn::http1::Builder::new()
+                .serve_connection(TokioIo::new(stream), service)
+                .await;
+        });
+
+        let mock_server_mgr = Arc::new(ServerManager::new());
+        let chains = format!(
+            r#"
+- id: main
+  priority: 1
+  blocks:
+    - id: main
+      block: |
+        forward http://{}/base/;
+        "#,
+            upstream_addr
+        );
+
+        let chains: ProcessChainConfigs = serde_yaml_ng::from_str(&chains).unwrap();
+        let http_server = Arc::new(
+            ProcessChainHttpServer::builder()
+                .id("test_forward_http_base_path")
+                .version("HTTP/1.1".to_string())
+                .hook_point(chains)
+                .server_mgr(Arc::downgrade(&mock_server_mgr))
+                .tunnel_manager(TunnelManager::new())
+                .build()
+                .await
+                .unwrap(),
+        );
+
+        let (client, server) = tokio::io::duplex(1024);
+        tokio::spawn(async move {
+            hyper_serve_http(Box::new(server), http_server, StreamInfo::default())
+                .await
+                .unwrap();
+        });
+
+        let request = http::Request::builder()
+            .method("GET")
+            .uri("/v1/chat?x=1")
+            .body(Full::new(Bytes::new()).map_err(|e| match e {}).boxed())
+            .unwrap();
+
+        let (mut sender, conn) = hyper::client::conn::http1::Builder::new()
+            .handshake(TokioIo::new(client))
+            .await
+            .unwrap();
+
+        tokio::spawn(async move {
+            conn.await.unwrap();
+        });
+
+        let resp = sender.send_request(request).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = resp.collect().await.unwrap().to_bytes();
+        assert_eq!(body, Bytes::from("base path success"));
     }
 
     #[tokio::test]
