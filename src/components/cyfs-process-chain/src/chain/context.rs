@@ -19,11 +19,38 @@ pub struct SearchResult {
 // The context in which the block are executed
 #[derive(Clone)]
 pub struct Context {
-    current_pointer: ExecPointer, // The current execution pointer
     process_chain_manager: ProcessChainLinkedManagerRef,
     env: EnvManager,
-    goto_counter: GotoCounterRef, // Counter for goto command executions
-    pipe: CommandPipe,            // Pipe for command execution
+    execution_state: ExecutionState,
+}
+
+#[derive(Clone)]
+struct ExecutionState {
+    current_pointer: ExecPointer,
+    goto_counter: GotoCounterRef,
+    pipe: CommandPipe,
+}
+
+impl ExecutionState {
+    fn new(goto_counter: GotoCounterRef, pipe: CommandPipe) -> Self {
+        Self {
+            current_pointer: ExecPointer::new(),
+            goto_counter,
+            pipe,
+        }
+    }
+
+    fn current_pointer(&self) -> &ExecPointer {
+        &self.current_pointer
+    }
+
+    fn counter(&self) -> &GotoCounterRef {
+        &self.goto_counter
+    }
+
+    fn pipe(&self) -> &CommandPipe {
+        &self.pipe
+    }
 }
 
 impl Context {
@@ -37,16 +64,14 @@ impl Context {
         let env_manager = EnvManager::new(global_env, chain_env);
 
         Self {
-            current_pointer: ExecPointer::new(), // Initialize with a new execution pointer
             process_chain_manager,
             env: env_manager,
-            goto_counter,
-            pipe,
+            execution_state: ExecutionState::new(goto_counter, pipe),
         }
     }
 
     pub fn current_pointer(&self) -> &ExecPointer {
-        &self.current_pointer
+        self.execution_state.current_pointer()
     }
 
     pub fn process_chain_manager(&self) -> &ProcessChainLinkedManagerRef {
@@ -55,7 +80,7 @@ impl Context {
 
     pub fn search_lib(&self, lib_id: &str) -> Result<Option<SearchResult>, String> {
         // If current pointer is same as the requested lib_id, return it
-        if let Some(current_lib) = self.current_pointer.get_lib()
+        if let Some(current_lib) = self.current_pointer().get_lib()
             && current_lib.get_id() == lib_id
         {
             let ret = SearchResult {
@@ -89,11 +114,11 @@ impl Context {
         chain_id: &str,
     ) -> Result<Option<SearchResult>, String> {
         // If lib_id is not specified, or is same as the current pointer's lib, then first try the current pointer.
-        if let Some(current_lib) = self.current_pointer.get_lib()
+        if let Some(current_lib) = self.current_pointer().get_lib()
             && (lib_id.is_none() || current_lib.get_id() == lib_id.unwrap())
         {
             // If chain_id is same as the current pointer's chain, return it
-            if let Some(current_chain) = self.current_pointer.get_chain()
+            if let Some(current_chain) = self.current_pointer().get_chain()
                 && current_chain.id() == chain_id
             {
                 let ret = SearchResult {
@@ -152,10 +177,10 @@ impl Context {
         block_id: &str,
     ) -> Result<Option<SearchResult>, String> {
         // If lib_id is not specified, or is same as the current pointer's lib, then first try the current pointer.
-        if let Some(current_lib) = self.current_pointer.get_lib()
+        if let Some(current_lib) = self.current_pointer().get_lib()
             && (lib_id.is_none() || current_lib.get_id() == lib_id.unwrap())
         {
-            if let Some(current_chain) = self.current_pointer.get_chain() {
+            if let Some(current_chain) = self.current_pointer().get_chain() {
                 // If chain_id is same as the current pointer's chain, or if chain_id is None, check the current chain for the block
                 if chain_id.is_none() || current_chain.id() == chain_id.unwrap() {
                     if let Some(_block) = current_chain.get_block(block_id) {
@@ -269,11 +294,11 @@ impl Context {
     }
 
     pub fn counter(&self) -> &GotoCounterRef {
-        &self.goto_counter
+        self.execution_state.counter()
     }
 
     pub fn pipe(&self) -> &CommandPipe {
-        &self.pipe
+        self.execution_state.pipe()
     }
 
     pub fn fork_block(&self) -> Self {
@@ -283,11 +308,9 @@ impl Context {
         let env = EnvManager::new(self.env.get_global().clone(), self.env.get_chain().clone());
         env.set_policy(self.env.policy());
         Self {
-            current_pointer: self.current_pointer.clone(),
             process_chain_manager: self.process_chain_manager.clone(),
             env,
-            goto_counter: self.goto_counter.clone(), // Use the same goto counter for the block context
-            pipe: self.pipe.clone(),
+            execution_state: self.execution_state.clone(),
         }
     }
 
@@ -298,11 +321,9 @@ impl Context {
         env.set_policy(self.env.policy());
 
         Self {
-            current_pointer: self.current_pointer.clone(),
             process_chain_manager: self.process_chain_manager.clone(),
             env,
-            goto_counter: self.goto_counter.clone(), // Use the same goto counter for the chain context
-            pipe: self.pipe.clone(),
+            execution_state: self.execution_state.clone(),
         }
     }
 }
