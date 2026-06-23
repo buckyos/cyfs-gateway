@@ -1,6 +1,6 @@
 use crate::chain::{ProcessChainLibRef, ProcessChainRef};
 use std::sync::atomic::AtomicU32;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex};
 
 pub const MAX_GOTO_COUNT: u32 = 128; // Maximum number of times the goto command can be executed in process chains execution
 
@@ -182,7 +182,7 @@ impl ExecPointerStack {
 
 #[derive(Clone, Default)]
 pub struct ExecPointer {
-    stack: Arc<RwLock<ExecPointerStack>>, // The inner state of the execution pointer
+    stack: Arc<Mutex<ExecPointerStack>>, // The inner state of the execution pointer
 }
 
 impl ExecPointer {
@@ -191,7 +191,7 @@ impl ExecPointer {
     }
 
     fn set_lib(&self, lib: ProcessChainLibRef) -> Result<(), String> {
-        let mut stack = self.stack.write().unwrap();
+        let mut stack = self.stack.lock().unwrap();
         stack.check_depth()?;
         stack.push_lib(lib);
 
@@ -199,12 +199,12 @@ impl ExecPointer {
     }
 
     fn reset_lib(&self) {
-        let mut stack = self.stack.write().unwrap();
+        let mut stack = self.stack.lock().unwrap();
         stack.pop_lib();
     }
 
     fn set_chain(&self, chain: ProcessChainRef) -> Result<(), String> {
-        let mut stack = self.stack.write().unwrap();
+        let mut stack = self.stack.lock().unwrap();
         stack.check_depth()?;
         stack.push_chain(chain);
 
@@ -212,12 +212,12 @@ impl ExecPointer {
     }
 
     fn reset_chain(&self) {
-        let mut stack = self.stack.write().unwrap();
+        let mut stack = self.stack.lock().unwrap();
         stack.pop_chain();
     }
 
     fn set_block(&self, block: &str) -> Result<(), String> {
-        let mut stack = self.stack.write().unwrap();
+        let mut stack = self.stack.lock().unwrap();
         stack.check_depth()?;
         stack.push_block(block.to_string());
 
@@ -225,25 +225,25 @@ impl ExecPointer {
     }
 
     fn reset_block(&self) {
-        let mut stack = self.stack.write().unwrap();
+        let mut stack = self.stack.lock().unwrap();
         stack.pop_block();
     }
 
     // Get current executing library
     pub fn get_lib(&self) -> Option<ProcessChainLibRef> {
-        let inner = self.stack.read().unwrap();
+        let inner = self.stack.lock().unwrap();
         inner.current_lib().cloned()
     }
 
     // Get current executing chain
     pub fn get_chain(&self) -> Option<ProcessChainRef> {
-        let inner = self.stack.read().unwrap();
+        let inner = self.stack.lock().unwrap();
         inner.current_chain().cloned()
     }
 
     // Get current executing block
     pub fn get_block(&self) -> Option<String> {
-        let inner = self.stack.read().unwrap();
+        let inner = self.stack.lock().unwrap();
         inner.current_block().map(|s| s.to_owned())
     }
 }
