@@ -205,6 +205,25 @@ impl Default for ExecutionPolicy {
 }
 
 #[derive(Clone)]
+pub(crate) struct EnvExecutionState {
+    policy: Arc<RwLock<ExecutionPolicy>>,
+}
+
+impl EnvExecutionState {
+    pub(crate) fn new() -> Self {
+        Self {
+            policy: Arc::new(RwLock::new(ExecutionPolicy::default())),
+        }
+    }
+}
+
+impl Default for EnvExecutionState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Clone)]
 pub struct EnvManager {
     global: EnvRef,
     chain: EnvRef,
@@ -212,7 +231,7 @@ pub struct EnvManager {
 
     // Tracking variables current level
     var_level_tracker: Arc<RwLock<HashMap<String, EnvLevel>>>,
-    policy: Arc<RwLock<ExecutionPolicy>>,
+    execution_state: EnvExecutionState,
 }
 
 impl EnvManager {
@@ -245,23 +264,48 @@ impl EnvManager {
 
         let block = Arc::new(Env::new(EnvLevel::Block, Some(chain_env.clone())));
         let var_level_tracker = Arc::new(RwLock::new(HashMap::new()));
-        let policy = Arc::new(RwLock::new(ExecutionPolicy::default()));
 
         Self {
             global: global_env,
             chain: chain_env,
             block,
             var_level_tracker,
-            policy,
+            execution_state: EnvExecutionState::new(),
+        }
+    }
+
+    pub(crate) fn new_with_execution_state(
+        global_env: EnvRef,
+        chain_env: EnvRef,
+        execution_state: EnvExecutionState,
+    ) -> Self {
+        assert!(
+            global_env.level() == EnvLevel::Global,
+            "Global environment must be at global level"
+        );
+        assert!(
+            chain_env.level() == EnvLevel::Chain,
+            "Chain environment must be at chain level"
+        );
+
+        let block = Arc::new(Env::new(EnvLevel::Block, Some(chain_env.clone())));
+        let var_level_tracker = Arc::new(RwLock::new(HashMap::new()));
+
+        Self {
+            global: global_env,
+            chain: chain_env,
+            block,
+            var_level_tracker,
+            execution_state,
         }
     }
 
     pub fn policy(&self) -> ExecutionPolicy {
-        *self.policy.read().unwrap()
+        *self.execution_state.policy.read().unwrap()
     }
 
     pub fn set_policy(&self, policy: ExecutionPolicy) {
-        let mut guard = self.policy.write().unwrap();
+        let mut guard = self.execution_state.policy.write().unwrap();
         if *guard != policy {
             log!(
                 self.get_log_level(),

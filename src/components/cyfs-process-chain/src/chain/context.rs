@@ -3,7 +3,8 @@ use log::Level;
 use super::env::{Env, EnvLevel};
 use super::stack::*;
 use crate::chain::{
-    EnvManager, EnvRef, ProcessChainLibRef, ProcessChainLinkedManagerRef, ProcessChainRef,
+    EnvExecutionState, EnvManager, EnvRef, ProcessChainLibRef, ProcessChainLinkedManagerRef,
+    ProcessChainRef,
 };
 use crate::pipe::CommandPipe;
 use std::sync::Arc;
@@ -29,6 +30,7 @@ struct ExecutionState {
     current_pointer: ExecPointer,
     goto_counter: GotoCounterRef,
     pipe: CommandPipe,
+    env_state: EnvExecutionState,
 }
 
 impl ExecutionState {
@@ -37,6 +39,7 @@ impl ExecutionState {
             current_pointer: ExecPointer::new(),
             goto_counter,
             pipe,
+            env_state: EnvExecutionState::new(),
         }
     }
 
@@ -51,6 +54,10 @@ impl ExecutionState {
     fn pipe(&self) -> &CommandPipe {
         &self.pipe
     }
+
+    fn env_state(&self) -> EnvExecutionState {
+        self.env_state.clone()
+    }
 }
 
 impl Context {
@@ -60,13 +67,18 @@ impl Context {
         goto_counter: GotoCounterRef,
         pipe: CommandPipe,
     ) -> Self {
+        let execution_state = ExecutionState::new(goto_counter, pipe);
         let chain_env = Arc::new(Env::new(EnvLevel::Chain, Some(global_env.clone())));
-        let env_manager = EnvManager::new(global_env, chain_env);
+        let env_manager = EnvManager::new_with_execution_state(
+            global_env,
+            chain_env,
+            execution_state.env_state(),
+        );
 
         Self {
             process_chain_manager,
             env: env_manager,
-            execution_state: ExecutionState::new(goto_counter, pipe),
+            execution_state,
         }
     }
 
@@ -305,8 +317,11 @@ impl Context {
         // Create a new block environment that inherits from the chain environment
 
         // Use the same global and chain environment
-        let env = EnvManager::new(self.env.get_global().clone(), self.env.get_chain().clone());
-        env.set_policy(self.env.policy());
+        let env = EnvManager::new_with_execution_state(
+            self.env.get_global().clone(),
+            self.env.get_chain().clone(),
+            self.execution_state.env_state(),
+        );
         Self {
             process_chain_manager: self.process_chain_manager.clone(),
             env,
@@ -317,8 +332,11 @@ impl Context {
     pub fn fork_chain(&self) -> Self {
         // Create a new chain environment that inherits from the global environment
         let chain_env = Arc::new(Env::new(EnvLevel::Chain, Some(self.global_env().clone())));
-        let env = EnvManager::new(self.env.get_global().clone(), chain_env);
-        env.set_policy(self.env.policy());
+        let env = EnvManager::new_with_execution_state(
+            self.env.get_global().clone(),
+            chain_env,
+            self.execution_state.env_state(),
+        );
 
         Self {
             process_chain_manager: self.process_chain_manager.clone(),
