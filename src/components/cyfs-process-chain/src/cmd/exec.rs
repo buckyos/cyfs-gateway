@@ -1,9 +1,7 @@
 use super::types::*;
 use crate::ProcessChainExecutor;
 use crate::block::{CommandArg, CommandArgs};
-use crate::chain::{
-    Context, ExecPointerChainGuard, ExecPointerLibGuard, ParserContext, ProcessChainLibExecutor,
-};
+use crate::chain::{Context, ParserContext, ProcessChainLibExecutor};
 use crate::{CollectionValue, EnvLevel, MapCollection, MapCollectionRef, MemoryMapCollection};
 use clap::{Arg, ArgAction, ArgGroup, ArgMatches, Command};
 use std::collections::HashSet;
@@ -357,10 +355,7 @@ impl ExecCommandExecutor {
             None
         } else {
             let target_lib = ret.lib.unwrap();
-            Some(ExecPointerLibGuard::new(
-                context.current_pointer(),
-                target_lib,
-            )?)
+            Some(context.enter_lib(target_lib)?)
         };
 
         let _chain_guard = if ret.same_chain {
@@ -371,10 +366,7 @@ impl ExecCommandExecutor {
             None
         } else {
             let target_chain = ret.chain.clone().unwrap();
-            Some(ExecPointerChainGuard::new(
-                context.current_pointer(),
-                target_chain,
-            )?)
+            Some(context.enter_chain(target_chain)?)
         };
 
         use std::borrow::Cow;
@@ -407,10 +399,7 @@ impl ExecCommandExecutor {
             None
         } else {
             let target_lib = ret.lib.unwrap();
-            Some(ExecPointerLibGuard::new(
-                context.current_pointer(),
-                target_lib,
-            )?)
+            Some(context.enter_lib(target_lib)?)
         };
 
         // Always fork new chain context for chain execution, even if the chain is in the same chain as current pointer
@@ -736,10 +725,7 @@ impl InvokeCommandExecutor {
             None
         } else {
             let target_lib = ret.lib.unwrap();
-            Some(ExecPointerLibGuard::new(
-                context.current_pointer(),
-                target_lib,
-            )?)
+            Some(context.enter_lib(target_lib)?)
         };
 
         let _chain_guard = if ret.same_chain {
@@ -754,10 +740,7 @@ impl InvokeCommandExecutor {
                 "Chain must not be in the same library if same_chain is false"
             );
             let target_chain = ret.chain.clone().unwrap();
-            Some(ExecPointerChainGuard::new(
-                context.current_pointer(),
-                target_chain,
-            )?)
+            Some(context.enter_chain(target_chain)?)
         };
 
         let invoke_context = context.fork_chain();
@@ -786,10 +769,7 @@ impl InvokeCommandExecutor {
             None
         } else {
             let target_lib = ret.lib.unwrap();
-            Some(ExecPointerLibGuard::new(
-                context.current_pointer(),
-                target_lib,
-            )?)
+            Some(context.enter_lib(target_lib)?)
         };
 
         let invoke_context = context.fork_chain();

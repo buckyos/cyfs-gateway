@@ -48,11 +48,9 @@ pub struct ErrorLocation {
 
 impl ErrorLocation {
     pub fn from_context(context: &Context) -> Self {
-        let pointer = context.current_pointer();
-
-        let lib = pointer.get_lib().map(|lib| lib.get_id().to_string());
-        let chain = pointer.get_chain().map(|chain| chain.id().to_string());
-        let block = pointer.get_block();
+        let lib = context.current_lib().map(|lib| lib.get_id().to_string());
+        let chain = context.current_chain().map(|chain| chain.id().to_string());
+        let block = context.current_block();
 
         Self {
             lib,

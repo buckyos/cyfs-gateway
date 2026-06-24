@@ -181,12 +181,12 @@ impl ExecPointerStack {
 }
 
 #[derive(Clone, Default)]
-pub struct ExecPointer {
+pub(in crate::chain) struct ExecPointer {
     stack: Arc<Mutex<ExecPointerStack>>, // The inner state of the execution pointer
 }
 
 impl ExecPointer {
-    pub fn new() -> Self {
+    pub(in crate::chain) fn new() -> Self {
         Self::default()
     }
 
@@ -230,31 +230,34 @@ impl ExecPointer {
     }
 
     // Get current executing library
-    pub fn get_lib(&self) -> Option<ProcessChainLibRef> {
+    pub(in crate::chain) fn get_lib(&self) -> Option<ProcessChainLibRef> {
         let inner = self.stack.lock().unwrap();
         inner.current_lib().cloned()
     }
 
     // Get current executing chain
-    pub fn get_chain(&self) -> Option<ProcessChainRef> {
+    pub(in crate::chain) fn get_chain(&self) -> Option<ProcessChainRef> {
         let inner = self.stack.lock().unwrap();
         inner.current_chain().cloned()
     }
 
     // Get current executing block
-    pub fn get_block(&self) -> Option<String> {
+    pub(in crate::chain) fn get_block(&self) -> Option<String> {
         let inner = self.stack.lock().unwrap();
         inner.current_block().map(|s| s.to_owned())
     }
 }
 
-pub struct ExecPointerLibGuard<'a> {
+pub(crate) struct ExecPointerLibGuard<'a> {
     pointer: &'a ExecPointer, // The execution pointer that this guard is managing
 }
 
 impl<'a> ExecPointerLibGuard<'a> {
     // Return value must be handled by caller
-    pub fn new(pointer: &'a ExecPointer, lib: ProcessChainLibRef) -> Result<Self, String> {
+    pub(in crate::chain) fn new(
+        pointer: &'a ExecPointer,
+        lib: ProcessChainLibRef,
+    ) -> Result<Self, String> {
         pointer.set_lib(lib)?;
         Ok(Self { pointer })
     }
@@ -266,12 +269,15 @@ impl<'a> Drop for ExecPointerLibGuard<'a> {
     }
 }
 
-pub struct ExecPointerChainGuard<'a> {
+pub(crate) struct ExecPointerChainGuard<'a> {
     pointer: &'a ExecPointer, // The execution pointer that this guard is managing
 }
 
 impl<'a> ExecPointerChainGuard<'a> {
-    pub fn new(pointer: &'a ExecPointer, chain: ProcessChainRef) -> Result<Self, String> {
+    pub(in crate::chain) fn new(
+        pointer: &'a ExecPointer,
+        chain: ProcessChainRef,
+    ) -> Result<Self, String> {
         pointer.set_chain(chain)?;
         Ok(Self { pointer })
     }
@@ -283,12 +289,12 @@ impl<'a> Drop for ExecPointerChainGuard<'a> {
     }
 }
 
-pub struct ExecPointerBlockGuard<'a> {
+pub(crate) struct ExecPointerBlockGuard<'a> {
     pointer: &'a ExecPointer, // The execution pointer that this guard is managing
 }
 
 impl<'a> ExecPointerBlockGuard<'a> {
-    pub fn new(pointer: &'a ExecPointer, block: &str) -> Result<Self, String> {
+    pub(in crate::chain) fn new(pointer: &'a ExecPointer, block: &str) -> Result<Self, String> {
         pointer.set_block(block)?;
         Ok(Self { pointer })
     }

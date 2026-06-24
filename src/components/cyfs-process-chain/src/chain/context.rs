@@ -47,6 +47,30 @@ impl ExecutionState {
         &self.current_pointer
     }
 
+    fn enter_lib(&self, lib: ProcessChainLibRef) -> Result<ExecPointerLibGuard<'_>, String> {
+        ExecPointerLibGuard::new(self.current_pointer(), lib)
+    }
+
+    fn enter_chain(&self, chain: ProcessChainRef) -> Result<ExecPointerChainGuard<'_>, String> {
+        ExecPointerChainGuard::new(self.current_pointer(), chain)
+    }
+
+    fn enter_block(&self, block: &str) -> Result<ExecPointerBlockGuard<'_>, String> {
+        ExecPointerBlockGuard::new(self.current_pointer(), block)
+    }
+
+    fn current_lib(&self) -> Option<ProcessChainLibRef> {
+        self.current_pointer().get_lib()
+    }
+
+    fn current_chain(&self) -> Option<ProcessChainRef> {
+        self.current_pointer().get_chain()
+    }
+
+    fn current_block(&self) -> Option<String> {
+        self.current_pointer().get_block()
+    }
+
     fn counter(&self) -> &GotoCounterRef {
         &self.goto_counter
     }
@@ -82,8 +106,34 @@ impl Context {
         }
     }
 
-    pub fn current_pointer(&self) -> &ExecPointer {
-        self.execution_state.current_pointer()
+    pub(crate) fn enter_lib(
+        &self,
+        lib: ProcessChainLibRef,
+    ) -> Result<ExecPointerLibGuard<'_>, String> {
+        self.execution_state.enter_lib(lib)
+    }
+
+    pub(crate) fn enter_chain(
+        &self,
+        chain: ProcessChainRef,
+    ) -> Result<ExecPointerChainGuard<'_>, String> {
+        self.execution_state.enter_chain(chain)
+    }
+
+    pub(crate) fn enter_block(&self, block: &str) -> Result<ExecPointerBlockGuard<'_>, String> {
+        self.execution_state.enter_block(block)
+    }
+
+    pub(crate) fn current_lib(&self) -> Option<ProcessChainLibRef> {
+        self.execution_state.current_lib()
+    }
+
+    pub(crate) fn current_chain(&self) -> Option<ProcessChainRef> {
+        self.execution_state.current_chain()
+    }
+
+    pub(crate) fn current_block(&self) -> Option<String> {
+        self.execution_state.current_block()
     }
 
     pub fn process_chain_manager(&self) -> &ProcessChainLinkedManagerRef {
@@ -92,7 +142,7 @@ impl Context {
 
     pub fn search_lib(&self, lib_id: &str) -> Result<Option<SearchResult>, String> {
         // If current pointer is same as the requested lib_id, return it
-        if let Some(current_lib) = self.current_pointer().get_lib()
+        if let Some(current_lib) = self.current_lib()
             && current_lib.get_id() == lib_id
         {
             let ret = SearchResult {
@@ -126,11 +176,11 @@ impl Context {
         chain_id: &str,
     ) -> Result<Option<SearchResult>, String> {
         // If lib_id is not specified, or is same as the current pointer's lib, then first try the current pointer.
-        if let Some(current_lib) = self.current_pointer().get_lib()
+        if let Some(current_lib) = self.current_lib()
             && (lib_id.is_none() || current_lib.get_id() == lib_id.unwrap())
         {
             // If chain_id is same as the current pointer's chain, return it
-            if let Some(current_chain) = self.current_pointer().get_chain()
+            if let Some(current_chain) = self.current_chain()
                 && current_chain.id() == chain_id
             {
                 let ret = SearchResult {
@@ -189,10 +239,10 @@ impl Context {
         block_id: &str,
     ) -> Result<Option<SearchResult>, String> {
         // If lib_id is not specified, or is same as the current pointer's lib, then first try the current pointer.
-        if let Some(current_lib) = self.current_pointer().get_lib()
+        if let Some(current_lib) = self.current_lib()
             && (lib_id.is_none() || current_lib.get_id() == lib_id.unwrap())
         {
-            if let Some(current_chain) = self.current_pointer().get_chain() {
+            if let Some(current_chain) = self.current_chain() {
                 // If chain_id is same as the current pointer's chain, or if chain_id is None, check the current chain for the block
                 if chain_id.is_none() || current_chain.id() == chain_id.unwrap() {
                     if let Some(_block) = current_chain.get_block(block_id) {

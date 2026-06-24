@@ -1,9 +1,7 @@
 use super::context::Context;
 use super::env::EnvRef;
 use super::manager::{ProcessChainLibRef, ProcessChainLinkedManagerRef};
-use super::stack::{
-    ExecPointerBlockGuard, ExecPointerChainGuard, ExecPointerLibGuard, GotoCounter,
-};
+use super::stack::GotoCounter;
 use super::types::ProcessChainRef;
 use crate::block::BlockExecuter;
 use crate::chain::{Env, EnvLevel};
@@ -42,7 +40,7 @@ impl ProcessChainExecutor {
             return Err(msg);
         }
 
-        let _block_guard = ExecPointerBlockGuard::new(context.current_pointer(), block_id)?;
+        let _block_guard = context.enter_block(block_id)?;
 
         let block = block.unwrap();
         let block_executer = BlockExecuter::new(&block.id);
@@ -63,12 +61,12 @@ impl ProcessChainExecutor {
             return Ok(CommandResult::success());
         }
 
-        let _chain_guard = ExecPointerChainGuard::new(context.current_pointer(), chain.clone())?;
+        let _chain_guard = context.enter_chain(chain.clone())?;
 
         let mut chain_result = CommandResult::success();
 
         for block in blocks {
-            let _block_guard = ExecPointerBlockGuard::new(context.current_pointer(), &block.id)?;
+            let _block_guard = context.enter_block(&block.id)?;
 
             let block_executer = BlockExecuter::new(&block.id);
             let block_context = context.fork_block();
@@ -212,10 +210,7 @@ impl ProcessChainLibExecutor {
     pub async fn execute_lib(self) -> Result<CommandResult, String> {
         let mut final_result = CommandResult::success();
 
-        let _lib_guard = ExecPointerLibGuard::new(
-            self.context.current_pointer(),
-            self.process_chain_lib.clone(),
-        )?;
+        let _lib_guard = self.context.enter_lib(self.process_chain_lib.clone())?;
 
         // We execute the first chain in the list
         let mut chain_index = 0;
@@ -281,10 +276,7 @@ impl ProcessChainLibExecutor {
             msg
         })?;
 
-        let _lib_guard = ExecPointerLibGuard::new(
-            self.context.current_pointer(),
-            self.process_chain_lib.clone(),
-        )?;
+        let _lib_guard = self.context.enter_lib(self.process_chain_lib.clone())?;
 
         ProcessChainExecutor::execute_chain(&chain, &self.context).await
     }
