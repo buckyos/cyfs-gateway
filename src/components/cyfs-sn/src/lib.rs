@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
 pub mod name_info_cache;
+mod relay_mgr;
 mod sn_auth;
 mod sn_db;
 mod sn_device_info;
@@ -9,6 +10,7 @@ mod sqlite_db;
 mod v2;
 
 pub use name_info_cache::*;
+pub use relay_mgr::*;
 pub use sn_auth::*;
 pub use sn_db::*;
 pub use sn_device_info::*;

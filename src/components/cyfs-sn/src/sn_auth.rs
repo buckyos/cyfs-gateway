@@ -185,6 +185,15 @@ pub trait SnAuthDB: Send + Sync + 'static {
 
     async fn get_zone_info(&self, username: &str) -> SnResult<Option<ZoneInfo>>;
     async fn update_zone_info(&self, username: &str, patch: ZoneInfoPatch) -> SnResult<()>;
+    async fn update_zone_relay_sn(
+        &self,
+        zone: &str,
+        relay_sn: &str,
+        source_version: Option<&str>,
+    ) -> SnResult<bool> {
+        let _ = (zone, relay_sn, source_version);
+        Ok(false)
+    }
 
     async fn create_account_session(
         &self,
@@ -383,6 +392,14 @@ impl SqliteSnAuthDB {
 
     fn invalid_input(context: impl AsRef<str>) -> SnError {
         sn_err!(SnErrorCode::InvalidInput, "{}", context.as_ref())
+    }
+
+    fn check_non_empty(value: &str, field: &str) -> SnResult<()> {
+        if value.trim().is_empty() {
+            return Err(Self::invalid_input(format!("{} is empty", field)));
+        }
+
+        Ok(())
     }
 
     fn canonical_user_domain(domain: &str) -> Option<String> {
@@ -1617,6 +1634,33 @@ impl SnAuthDB for SqliteSnAuthDB {
             .await
             .map_err(|e| Self::db_err("commit transaction failed", e))?;
         Ok(())
+    }
+
+    async fn update_zone_relay_sn(
+        &self,
+        zone: &str,
+        relay_sn: &str,
+        source_version: Option<&str>,
+    ) -> SnResult<bool> {
+        Self::check_non_empty(zone, "zone")?;
+        Self::check_non_empty(relay_sn, "relay_sn")?;
+        let now = Self::now_secs();
+        let result = sqlx::query(
+            "UPDATE zone_info
+             SET relay_sn = ?1,
+                 source_version = COALESCE(?2, source_version),
+                 updated_at = ?3
+             WHERE zone = ?4 OR bns_name = ?4 OR username = ?4",
+        )
+        .bind(relay_sn)
+        .bind(source_version)
+        .bind(now as i64)
+        .bind(zone)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| Self::db_err("update zone relay_sn failed", e))?;
+
+        Ok(result.rows_affected() > 0)
     }
 
     async fn create_account_session(
