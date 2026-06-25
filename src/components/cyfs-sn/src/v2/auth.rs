@@ -51,12 +51,12 @@ pub(crate) async fn handle_auth(server: &SNServer, req: RPCRequest) -> RpcCallRe
             SNServer::validate_registration_username(username.as_str())
                 .map_err(|message| parse_error(SnV2ErrorCode::InvalidUsername, message))?;
             if server
-                .db()
+                .auth_db()
                 .is_user_exist(username.as_str())
                 .await
                 .into_rpc()?
                 || server
-                    .db()
+                    .auth_db()
                     .get_v2_auth(username.as_str())
                     .await
                     .into_rpc()?
@@ -69,7 +69,7 @@ pub(crate) async fn handle_auth(server: &SNServer, req: RPCRequest) -> RpcCallRe
             }
             let (password_hash, password_salt) = hash_password(params.pwd_hash.as_str())?;
             let ok = server
-                .db()
+                .auth_db()
                 .register_user_v2(
                     params.active_code.as_str(),
                     username.as_str(),
@@ -91,7 +91,7 @@ pub(crate) async fn handle_auth(server: &SNServer, req: RPCRequest) -> RpcCallRe
             let params: LoginReq = parse_params(&req)?;
             let username = normalize_username(params.name.as_str())?;
             let auth = server
-                .db()
+                .auth_db()
                 .get_v2_auth(username.as_str())
                 .await
                 .into_rpc()?
@@ -99,7 +99,7 @@ pub(crate) async fn handle_auth(server: &SNServer, req: RPCRequest) -> RpcCallRe
                     parse_error(SnV2ErrorCode::UserAuthNotFound, "user auth not found")
                 })?;
             let user = server
-                .db()
+                .auth_db()
                 .get_user_info(username.as_str())
                 .await
                 .into_rpc()?
@@ -119,7 +119,7 @@ pub(crate) async fn handle_auth(server: &SNServer, req: RPCRequest) -> RpcCallRe
                 ));
             }
             server
-                .db()
+                .auth_db()
                 .update_v2_last_login(username.as_str(), now_secs())
                 .await
                 .into_rpc()?;
@@ -148,7 +148,7 @@ pub(crate) async fn handle_auth(server: &SNServer, req: RPCRequest) -> RpcCallRe
         "me" => {
             let username = require_account_username(server, &req)?;
             let user = server
-                .db()
+                .auth_db()
                 .get_user_info(username.as_str())
                 .await
                 .into_rpc()?

@@ -1,4 +1,4 @@
-use crate::{SNServer, SnDBRef, SnV2AuthInfo};
+use crate::{SNServer, SnAuthDBRef, SnCompatibilityStoreRef, SnV2AuthInfo};
 use ::kRPC::*;
 use buckyos_kit::get_buckyos_service_data_dir;
 use jsonwebtoken::{jwk::Jwk, DecodingKey, EncodingKey};
@@ -468,13 +468,20 @@ pub(crate) fn device_to_json(device: &crate::SNDeviceInfo) -> Value {
     })
 }
 
-pub(crate) async fn query_by_did(db: &SnDBRef, did: &str) -> RpcCallResult<crate::OODInfo> {
-    let device = db
+pub(crate) async fn query_by_did(
+    compat_store: &SnCompatibilityStoreRef,
+    auth_db: &SnAuthDBRef,
+    did: &str,
+) -> RpcCallResult<crate::OODInfo> {
+    let device = compat_store
         .query_device_by_did(did)
         .await
         .into_rpc()?
         .ok_or_else(|| parse_error(SnV2ErrorCode::DeviceNotFound, "device not found"))?;
-    let user = db.get_user_info(device.owner.as_str()).await.into_rpc()?;
+    let user = auth_db
+        .get_user_info(device.owner.as_str())
+        .await
+        .into_rpc()?;
     Ok(crate::OODInfo {
         did_hostname: device.did,
         owner_id: device.owner,
@@ -484,11 +491,11 @@ pub(crate) async fn query_by_did(db: &SnDBRef, did: &str) -> RpcCallResult<crate
 }
 
 pub(crate) async fn ensure_owned_device(
-    db: &SnDBRef,
+    compat_store: &SnCompatibilityStoreRef,
     username: &str,
     device_did: &str,
 ) -> RpcCallResult<crate::SNDeviceInfo> {
-    let device = db
+    let device = compat_store
         .query_device_by_did(device_did)
         .await
         .into_rpc()?

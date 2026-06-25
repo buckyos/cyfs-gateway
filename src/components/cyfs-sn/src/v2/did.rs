@@ -22,7 +22,7 @@ pub(crate) async fn handle_did(server: &SNServer, req: RPCRequest) -> RpcCallRes
             hasher.update(doc_string.as_bytes());
             let obj_id = hex::encode(hasher.finalize());
             server
-                .db()
+                .compat_store()
                 .insert_user_did_document(
                     obj_id.as_str(),
                     username.as_str(),
@@ -42,7 +42,7 @@ pub(crate) async fn handle_did(server: &SNServer, req: RPCRequest) -> RpcCallRes
                 require_account_username(server, &req)?
             };
             let doc = server
-                .db()
+                .compat_store()
                 .query_user_did_document(
                     username.as_str(),
                     params.obj_name.as_str(),

@@ -1,15 +1,21 @@
 #![allow(unused)]
 use crate::name_info_cache::{NameInfoCache, NameInfoCacheQueryResult, NameInfoCacheRef};
-use crate::sn_db::{self, *};
+use crate::sn_compat_store::{SNDeviceInfo, SnCompatibilityStoreRef, SqliteSnCompatibilityStore};
 use crate::sn_resolver::{
     device_config_from_mini_jwt, ResolverCompatibilityReader, ResolverDeviceDocument,
-    ResolverDidDocument, SnAuthReader, SnResolver, SnResolverConfig, SnResolverError,
+    ResolverDidDocument, SnAuthResolverReader, SnDeviceInfoResolverReader,
+    SnRelayManagerResolverReader, SnResolver, SnResolverConfig, SnResolverError,
     SnResolverErrorKind, SnResolverRef, SnResolverResult,
 };
-use crate::sqlite_db::SqliteSnDB;
 use crate::v2::{
     handle_auth, handle_device, handle_did, handle_dns, handle_query, handle_user, handle_zone,
     SnV2AuthManager,
+};
+use crate::{
+    SNUserInfo, SnAuthDBRef, SnDeviceEndpointUpdate, SnDeviceInfoDBRef, SnDeviceRole,
+    SnDeviceStateUpdate, SnEndpointProtocol, SnEndpointScope, SnEndpointSource, SnNatType,
+    SnRelayManagerRef, SnResult, SqliteSnAuthDB, SqliteSnDeviceInfoDB, SqliteSnRelayManager,
+    ZoneInfoPatch,
 };
 use ::kRPC::*;
 use async_trait::async_trait;
@@ -88,88 +94,17 @@ fn push_exportable_device_ip(address_vec: &mut Vec<IpAddr>, ip: IpAddr) {
     }
 }
 
-struct LegacySnAuthReader {
-    db: SnDBRef,
-}
-
-impl LegacySnAuthReader {
-    fn new(db: SnDBRef) -> Self {
-        Self { db }
-    }
-}
-
-#[async_trait]
-impl SnAuthReader for LegacySnAuthReader {
-    async fn get_user_info(&self, username: &str) -> SnResolverResult<Option<SNUserInfo>> {
-        self.db
-            .get_user_info(username)
-            .await
-            .map_err(|e| SnResolverError::backend(format!("query user {} failed: {}", username, e)))
-    }
-
-    async fn get_user_by_domain(&self, domain: &str) -> SnResolverResult<Option<SNUserInfo>> {
-        self.db.get_user_info_by_domain(domain).await.map_err(|e| {
-            SnResolverError::backend(format!("query user by domain {} failed: {}", domain, e))
-        })
-    }
-
-    async fn get_zone_info(&self, username: &str) -> SnResolverResult<Option<crate::ZoneInfo>> {
-        let user = self.db.get_user_info(username).await.map_err(|e| {
-            SnResolverError::backend(format!("query legacy zone_info {} failed: {}", username, e))
-        })?;
-
-        Ok(user.map(|user| crate::ZoneInfo {
-            username: user
-                .username
-                .clone()
-                .unwrap_or_else(|| username.to_string()),
-            bns_name: user.username.unwrap_or_else(|| username.to_string()),
-            zone: if user.zone_config.trim().is_empty() {
-                None
-            } else {
-                Some(user.zone_config)
-            },
-            relay_sn: None,
-            self_cert: user.self_cert,
-            cert_checked_at: None,
-            cert_expires_at: None,
-            sn_ips: user.sn_ips,
-            source_version: None,
-            updated_at: 0,
-        }))
-    }
-
-    async fn get_user_sn_ips(&self, username: &str) -> SnResolverResult<Vec<IpAddr>> {
-        let Some(values) = self
-            .db
-            .get_user_sn_ips_as_vec(username)
-            .await
-            .map_err(|e| {
-                SnResolverError::backend(format!("query sn_ips {} failed: {}", username, e))
-            })?
-        else {
-            return Ok(Vec::new());
-        };
-
-        Ok(values
-            .into_iter()
-            .filter_map(|value| {
-                value
-                    .parse::<IpAddr>()
-                    .map_err(|e| warn!("invalid sn_ip {} for {}: {}", value, username, e))
-                    .ok()
-            })
-            .collect())
-    }
-}
-
 struct LegacyResolverCompatibilityReader {
-    db: SnDBRef,
+    auth_db: SnAuthDBRef,
+    compat_store: SnCompatibilityStoreRef,
 }
 
 impl LegacyResolverCompatibilityReader {
-    fn new(db: SnDBRef) -> Self {
-        Self { db }
+    fn new(auth_db: SnAuthDBRef, compat_store: SnCompatibilityStoreRef) -> Self {
+        Self {
+            auth_db,
+            compat_store,
+        }
     }
 
     async fn convert_device(
@@ -178,7 +113,7 @@ impl LegacyResolverCompatibilityReader {
     ) -> SnResolverResult<ResolverDeviceDocument> {
         let raw_document = serde_json::from_str::<Value>(device.description.as_str()).ok();
         let user_public_key = self
-            .db
+            .auth_db
             .get_user_info(device.owner.as_str())
             .await
             .map_err(|e| {
@@ -243,7 +178,7 @@ impl ResolverCompatibilityReader for LegacyResolverCompatibilityReader {
         domain: &str,
         record_type: RecordType,
     ) -> SnResolverResult<Option<(String, u32)>> {
-        self.db
+        self.compat_store
             .query_domain_record(domain, record_type.to_string().as_str())
             .await
             .map_err(|e| {
@@ -262,7 +197,7 @@ impl ResolverCompatibilityReader for LegacyResolverCompatibilityReader {
         device_name: &str,
     ) -> SnResolverResult<Option<ResolverDeviceDocument>> {
         let Some(device) = self
-            .db
+            .compat_store
             .query_device_by_name(zone_name, device_name)
             .await
             .map_err(|e| {
@@ -282,10 +217,11 @@ impl ResolverCompatibilityReader for LegacyResolverCompatibilityReader {
         &self,
         did: &str,
     ) -> SnResolverResult<Option<ResolverDeviceDocument>> {
-        let Some(device) =
-            self.db.query_device_by_did(did).await.map_err(|e| {
-                SnResolverError::backend(format!("query device {} failed: {}", did, e))
-            })?
+        let Some(device) = self
+            .compat_store
+            .query_device_by_did(did)
+            .await
+            .map_err(|e| SnResolverError::backend(format!("query device {} failed: {}", did, e)))?
         else {
             return Ok(None);
         };
@@ -300,7 +236,7 @@ impl ResolverCompatibilityReader for LegacyResolverCompatibilityReader {
         doc_type: Option<&str>,
     ) -> SnResolverResult<Option<ResolverDidDocument>> {
         let Some((obj_id, document_json, stored_type)) = self
-            .db
+            .compat_store
             .query_user_did_document(owner_user, obj_name, doc_type)
             .await
             .map_err(|e| {
@@ -481,7 +417,10 @@ pub struct SNServer {
     boot_jwt: String,
     owner_pkx: String,
     device_jwt: Vec<String>,
-    db: SnDBRef,
+    auth_db: SnAuthDBRef,
+    device_info_db: SnDeviceInfoDBRef,
+    compat_store: SnCompatibilityStoreRef,
+    relay_manager: SnRelayManagerRef,
     v2_auth: Arc<SnV2AuthManager>,
     name_info_cache: NameInfoCacheRef,
     resolver: SnResolverRef,
@@ -703,7 +642,13 @@ impl SNServer {
         }
     }
 
-    pub async fn new(server_config: SNServerConfig, db: SnDBRef) -> Self {
+    pub async fn new(
+        server_config: SNServerConfig,
+        auth_db: SnAuthDBRef,
+        device_info_db: SnDeviceInfoDBRef,
+        compat_store: SnCompatibilityStoreRef,
+        relay_manager: SnRelayManagerRef,
+    ) -> Self {
         let server_host = server_config.host;
         let server_ip = IpAddr::from_str(server_config.ip.as_str()).unwrap();
         let server_aliases = server_config.aliases;
@@ -726,10 +671,16 @@ impl SNServer {
         let resolver = Arc::new(
             SnResolver::new(
                 resolver_config,
-                Arc::new(LegacySnAuthReader::new(db.clone())),
+                Arc::new(SnAuthResolverReader::new(auth_db.clone())),
             )
+            .with_device_online_reader(Arc::new(SnDeviceInfoResolverReader::new(
+                device_info_db.clone(),
+            )))
+            .with_relay_reader(Arc::new(SnRelayManagerResolverReader::new(
+                relay_manager.clone(),
+            )))
             .with_compatibility_reader(Arc::new(
-                LegacyResolverCompatibilityReader::new(db.clone()),
+                LegacyResolverCompatibilityReader::new(auth_db.clone(), compat_store.clone()),
             )),
         );
 
@@ -741,7 +692,10 @@ impl SNServer {
             boot_jwt,
             owner_pkx,
             device_jwt,
-            db,
+            auth_db,
+            device_info_db,
+            compat_store,
+            relay_manager,
             v2_auth,
             name_info_cache: NameInfoCache::new_ref(),
             resolver,
@@ -790,6 +744,130 @@ impl SNServer {
         }
     }
 
+    fn collect_device_report_ips(ip: &str, description: &str) -> Vec<String> {
+        let mut result = Vec::new();
+        if let Some(ip) = parse_ip_or_socket_addr(ip) {
+            result.push(ip.to_string());
+        }
+
+        let value = serde_json::from_str::<Value>(description).ok();
+        let mut candidates = Vec::new();
+        collect_device_ips_from_legacy_document(value.as_ref(), &mut candidates);
+        for ip in candidates {
+            let value = ip.to_string();
+            if !result.contains(&value) {
+                result.push(value);
+            }
+        }
+
+        result
+    }
+
+    async fn sync_device_online_state(
+        &self,
+        username: &str,
+        device_name: &str,
+        did: &str,
+        ip: &str,
+        description: &str,
+    ) -> SnResult<()> {
+        let role = if device_name == "ood1" {
+            SnDeviceRole::Ood
+        } else {
+            SnDeviceRole::Normal
+        };
+        self.device_info_db
+            .upsert_device_index(did, username, device_name, role)
+            .await?;
+
+        let mut reported_ips = Self::collect_device_report_ips(ip, description);
+        let reported_ip = reported_ips.first().cloned();
+        if reported_ip.is_some() {
+            reported_ips.remove(0);
+        }
+
+        let endpoint = reported_ip.as_ref().map(|host| SnDeviceEndpointUpdate {
+            endpoint_id: "device_report".to_string(),
+            protocol: SnEndpointProtocol::Tcp,
+            host: host.clone(),
+            port: None,
+            scope: SnEndpointScope::Public,
+            priority: 100,
+            source: SnEndpointSource::DeviceReport,
+            expires_at: None,
+        });
+
+        self.device_info_db
+            .update_device_state(SnDeviceStateUpdate {
+                did: did.to_string(),
+                reported_ip,
+                reported_ips,
+                from_ip: None,
+                nat_type: SnNatType::Unknown,
+                endpoints: endpoint.into_iter().collect(),
+                report_seq: None,
+                ttl: 300,
+                raw_report: serde_json::from_str::<Value>(description)
+                    .ok()
+                    .map(|_| description.to_string()),
+            })
+            .await
+    }
+
+    pub(crate) async fn register_device_record(
+        &self,
+        username: &str,
+        device_name: &str,
+        did: &str,
+        mini_config_jwt: &str,
+        ip: &str,
+        description: &str,
+    ) -> SnResult<()> {
+        self.compat_store
+            .register_device(username, device_name, did, mini_config_jwt, ip, description)
+            .await?;
+        self.sync_device_online_state(username, device_name, did, ip, description)
+            .await
+    }
+
+    pub(crate) async fn update_device_record(
+        &self,
+        username: &str,
+        device_name: &str,
+        did: Option<&str>,
+        mini_config_jwt: Option<&str>,
+        ip: &str,
+        description: &str,
+    ) -> SnResult<()> {
+        if let (Some(did), Some(mini_config_jwt)) = (did, mini_config_jwt) {
+            self.compat_store
+                .update_device_by_name(username, device_name, did, mini_config_jwt, ip, description)
+                .await?;
+            self.sync_device_online_state(username, device_name, did, ip, description)
+                .await?;
+        } else {
+            self.compat_store
+                .update_device_info_by_name(username, device_name, ip, description)
+                .await?;
+            if let Some(device) = self
+                .compat_store
+                .query_device_by_name(username, device_name)
+                .await?
+            {
+                self.sync_device_online_state(
+                    username,
+                    device_name,
+                    device.did.as_str(),
+                    ip,
+                    description,
+                )
+                .await?;
+            }
+        }
+
+        Ok(())
+    }
+
     fn normalize_query_name(name: &str) -> String {
         if name.ends_with(".") {
             name.trim_end_matches('.').to_string()
@@ -820,7 +898,7 @@ impl SNServer {
                 (false, "invalid_username".to_string(), message.to_string())
             } else {
                 let exists = self
-                    .db
+                    .auth_db
                     .is_user_exist(username.as_str())
                     .await
                     .map_err(|e| {
@@ -870,7 +948,7 @@ impl SNServer {
             ));
         }
         let active_code = active_code.unwrap();
-        let ret = self.db.check_active_code(active_code).await;
+        let ret = self.auth_db.check_active_code(active_code).await;
         if ret.is_err() {
             return Err(RPCErrors::ReasonError(ret.err().unwrap().to_string()));
         }
@@ -895,7 +973,7 @@ impl SNServer {
         }
 
         let result = self
-            .db
+            .auth_db
             .clear_state_by_active_code(CLEAR_STATE_ACTIVE_CODE)
             .await
             .map_err(|e| {
@@ -955,13 +1033,14 @@ impl SNServer {
         }
 
         let ret = self
-            .db
-            .register_user(
+            .auth_db
+            .register_user_with_owner_key(
                 active_code,
                 user_name.as_str(),
                 public_key,
                 zone_config_jwt,
                 real_user_domain,
+                None,
             )
             .await;
         if ret.is_err() {
@@ -1071,8 +1150,7 @@ impl SNServer {
         }
 
         let ret = self
-            .db
-            .register_device(
+            .register_device_record(
                 user_name,
                 device_name,
                 device_did,
@@ -1158,7 +1236,7 @@ impl SNServer {
         //TODO 这里的验证太简单了
 
         // Update zone_config and user_domain in database
-        self.db
+        self.auth_db
             .update_user_zone_config(user_name, zone_config_jwt)
             .await
             .map_err(|e| {
@@ -1170,7 +1248,7 @@ impl SNServer {
             })?;
 
         if let Some(domain) = &real_user_domain {
-            self.db
+            self.auth_db
                 .update_user_domain(user_name, Some(domain.clone()))
                 .await
                 .map_err(|e| {
@@ -1240,7 +1318,7 @@ impl SNServer {
             }
         }
 
-        self.db
+        self.auth_db
             .update_user_zone_config(user_name, "")
             .await
             .map_err(|e| {
@@ -1322,15 +1400,16 @@ impl SNServer {
         );
         let ip_str = ip_from.to_string();
 
-        self.db
-            .update_device_info_by_name(
-                owner_id,
-                &device_info.name.clone(),
-                ip_str.as_str(),
-                device_info_json.to_string().as_str(),
-            )
-            .await
-            .map_err(|e| RPCErrors::ReasonError(format!("{}", e)));
+        self.update_device_record(
+            owner_id,
+            device_info.name.as_str(),
+            None,
+            None,
+            ip_str.as_str(),
+            device_info_json.to_string().as_str(),
+        )
+        .await
+        .map_err(|e| RPCErrors::ReasonError(format!("{}", e)))?;
 
         let resp = RPCResponse::create_by_req(
             RPCResult::Success(json!({
@@ -1366,7 +1445,7 @@ impl SNServer {
         );
         let device_name = "ood1";
         let user_info = {
-            self.db
+            self.auth_db
                 .get_user_by_public_key(public_key.as_str())
                 .await
                 .map_err(|e| {
@@ -1524,7 +1603,7 @@ impl SNServer {
     }
 
     async fn get_user_sn_ips(&self, owner_id: &str) -> Vec<IpAddr> {
-        let sn_ips = self.db.get_user_sn_ips_as_vec(owner_id).await;
+        let sn_ips = self.auth_db.get_user_sn_ips_as_vec(owner_id).await;
         if sn_ips.is_err() {
             warn!(
                 "failed to get user sn ips for {}: {:?}",
@@ -1559,7 +1638,10 @@ impl SNServer {
         device_name: &str,
     ) -> ServerResult<Option<(DeviceInfo, IpAddr)>> {
         let key = format!("{}_{}", owner_id, device_name);
-        let device_json = self.db.query_device_by_name(owner_id, device_name).await;
+        let device_json = self
+            .compat_store
+            .query_device_by_name(owner_id, device_name)
+            .await;
         if device_json.is_err() {
             warn!(
                 "failed to query device info for {} from db: {:?}",
@@ -1609,7 +1691,7 @@ impl SNServer {
         &self,
         domain: &str,
     ) -> Option<(String, String, Option<String>)> {
-        let user_info = self.db.get_user_info_by_domain(domain).await;
+        let user_info = self.auth_db.get_user_by_domain(domain).await;
 
         if user_info.is_err() {
             warn!(
@@ -1640,7 +1722,7 @@ impl SNServer {
         &self,
         username: &str,
     ) -> Option<(String, String, Option<String>, Option<String>)> {
-        let user_info = self.db.get_user_info(username).await;
+        let user_info = self.auth_db.get_user_info(username).await;
         if user_info.is_err() {
             warn!(
                 "failed to get user info for {}: {:?}",
@@ -1658,7 +1740,10 @@ impl SNServer {
             let sn_ips = user_info.sn_ips.clone();
             let stored_info = (public_key.clone(), zone_config.clone());
 
-            let device_info = self.db.query_device_by_name(username, "ood1").await;
+            let device_info = self
+                .compat_store
+                .query_device_by_name(username, "ood1")
+                .await;
             if device_info.is_ok() {
                 let device_info = device_info.unwrap();
                 if device_info.is_some() {
@@ -1677,7 +1762,7 @@ impl SNServer {
     }
 
     async fn get_user_public_key(&self, username: &str) -> Option<String> {
-        let user_info = self.db.get_user_info(username).await;
+        let user_info = self.auth_db.get_user_info(username).await;
         if user_info.is_err() {
             warn!(
                 "failed to get user info for {}: {:?}",
@@ -1729,7 +1814,7 @@ impl SNServer {
         domain: &str,
         record_type: RecordType,
     ) -> ServerResult<Option<Vec<IpAddr>>> {
-        let user_info = self.db.get_user_info_by_domain(domain).await;
+        let user_info = self.auth_db.get_user_by_domain(domain).await;
         if user_info.is_err() {
             warn!(
                 "failed to get user info by domain {}: {:?}",
@@ -1820,7 +1905,7 @@ impl SNServer {
         }
         let device_did = device_did.unwrap();
 
-        let device_info = self.db.query_device_by_did(device_did).await;
+        let device_info = self.compat_store.query_device_by_did(device_did).await;
         if device_info.is_err() {
             warn!("device {} not found", device_did);
             return Err(RPCErrors::ParseRequestError("device not found".to_string()));
@@ -1906,7 +1991,7 @@ impl SNServer {
         }
 
         let ret = self
-            .db
+            .compat_store
             .add_user_domain(user_name, domain, record_type, record_value, ttl as u32)
             .await;
         if ret.is_err() {
@@ -1961,7 +2046,7 @@ impl SNServer {
         }
         let device_did = device_did.unwrap();
 
-        let device_info = self.db.query_device_by_did(device_did).await;
+        let device_info = self.compat_store.query_device_by_did(device_did).await;
         if device_info.is_err() {
             warn!("device {} not found", device_did);
             return Err(RPCErrors::ParseRequestError("device not found".to_string()));
@@ -2019,7 +2104,7 @@ impl SNServer {
         if let Some(has_cert) = has_cert {
             let has_cert = has_cert.as_bool();
             if has_cert.is_some() && has_cert.unwrap() {
-                let ret = self.db.update_user_self_cert(user_name, true).await;
+                let ret = self.auth_db.update_user_self_cert(user_name, true).await;
                 if ret.is_err() {
                     let err_str = ret.err().unwrap().to_string();
                     warn!("Failed to update user self cert: {}", err_str);
@@ -2040,7 +2125,7 @@ impl SNServer {
         }
 
         let ret = self
-            .db
+            .compat_store
             .remove_user_domain(user_name, domain, record_type)
             .await;
         if ret.is_err() {
@@ -2105,7 +2190,7 @@ impl SNServer {
         }
 
         // Make sure user exists
-        let user = self.db.get_user_info(username).await.map_err(|e| {
+        let user = self.auth_db.get_user_info(username).await.map_err(|e| {
             RPCErrors::ReasonError(format!("failed to query user {}: {}", username, e))
         })?;
         if user.is_none() {
@@ -2114,7 +2199,7 @@ impl SNServer {
 
         // Resolve device by (username, device_name), then verify token signature with that device's key.
         let device = self
-            .db
+            .compat_store
             .query_device_by_name(username, device_name.as_str())
             .await
             .map_err(|e| RPCErrors::ReasonError(format!("query device failed: {}", e)))?;
@@ -2137,7 +2222,10 @@ impl SNServer {
             })?;
         rpc_session_token.verify_by_key(&verify_public_key)?;
 
-        let ret = self.db.update_user_self_cert(username, self_cert).await;
+        let ret = self
+            .auth_db
+            .update_user_self_cert(username, self_cert)
+            .await;
         if ret.is_err() {
             let err_str = ret.err().unwrap().to_string();
             warn!(
@@ -2245,7 +2333,7 @@ impl SNServer {
         let obj_id = hex::encode(hasher.finalize());
 
         let ret = self
-            .db
+            .compat_store
             .insert_user_did_document(
                 obj_id.as_str(),
                 owner_user,
@@ -2468,7 +2556,7 @@ impl SNServer {
     }
 
     async fn query_by_did(&self, did: &str) -> Option<OODInfo> {
-        let device_info = self.db.query_device_by_did(did).await;
+        let device_info = self.compat_store.query_device_by_did(did).await;
         if device_info.is_err() {
             warn!("query device by did error: {}", device_info.err().unwrap());
             return None;
@@ -2508,7 +2596,7 @@ impl SNServer {
         let get_result = SNServer::get_user_subhost_from_host(req_host, &self.server_host);
         if get_result.is_some() {
             let (sub_host, username) = get_result.unwrap();
-            let user_info = self.db.get_user_info(username.as_str()).await;
+            let user_info = self.auth_db.get_user_info(username.as_str()).await;
             if user_info.is_err() {
                 warn!("get user info error: {}", user_info.err().unwrap());
                 return None;
@@ -2543,7 +2631,7 @@ impl SNServer {
                 warn!("ood1 device info not found for {} in sn server", username);
             }
         } else {
-            let user_info = self.db.get_user_info_by_domain(req_host).await;
+            let user_info = self.auth_db.get_user_by_domain(req_host).await;
             if user_info.is_err() {
                 info!(
                     "failed to get user info by domain: {}",
@@ -2660,7 +2748,7 @@ impl SNServer {
     }
 
     async fn resolve_user_by_domain(&self, domain: &str) -> ServerResult<SNUserInfo> {
-        let user_info = self.db.get_user_info_by_domain(domain).await.map_err(|e| {
+        let user_info = self.auth_db.get_user_by_domain(domain).await.map_err(|e| {
             server_err!(
                 ServerErrorCode::ProcessChainError,
                 "failed to query user by domain {}: {}",
@@ -2680,7 +2768,7 @@ impl SNServer {
     }
 
     async fn resolve_user_by_username(&self, username: &str) -> ServerResult<SNUserInfo> {
-        let user_info = self.db.get_user_info(username).await.map_err(|e| {
+        let user_info = self.auth_db.get_user_info(username).await.map_err(|e| {
             server_err!(
                 ServerErrorCode::ProcessChainError,
                 "failed to query user {}: {}",
@@ -2705,7 +2793,7 @@ impl SNServer {
         device_name: &str,
     ) -> ServerResult<SNDeviceInfo> {
         let device_info = self
-            .db
+            .compat_store
             .query_device_by_name(username, device_name)
             .await
             .map_err(|e| {
@@ -2730,14 +2818,18 @@ impl SNServer {
     }
 
     async fn resolve_device_by_did(&self, did: &str) -> ServerResult<SNDeviceInfo> {
-        let device_info = self.db.query_device_by_did(did).await.map_err(|e| {
-            server_err!(
-                ServerErrorCode::ProcessChainError,
-                "failed to query device {}: {}",
-                did,
-                e
-            )
-        })?;
+        let device_info = self
+            .compat_store
+            .query_device_by_did(did)
+            .await
+            .map_err(|e| {
+                server_err!(
+                    ServerErrorCode::ProcessChainError,
+                    "failed to query device {}: {}",
+                    did,
+                    e
+                )
+            })?;
 
         match device_info {
             Some(device_info) => Ok(device_info),
@@ -3160,7 +3252,7 @@ impl SNServer {
                         },
                         Err(e) if e.code() == ServerErrorCode::NotFound => {
                             let latest_doc = self
-                                .db
+                                .compat_store
                                 .query_user_did_document(username.as_str(), obj_name, doc_type)
                                 .await
                                 .map_err(|err| {
@@ -3339,7 +3431,10 @@ impl SNServer {
             );
             match record_type {
                 RecordType::TXT => {
-                    let ret = self.db.query_domain_record(req_real_name, "TXT").await;
+                    let ret = self
+                        .compat_store
+                        .query_domain_record(req_real_name, "TXT")
+                        .await;
                     if let Ok(Some((record, ttl))) = ret {
                         let mut name_info = NameInfo::default();
                         name_info.ttl = Some(ttl);
@@ -3369,7 +3464,7 @@ impl SNServer {
                 }
                 RecordType::A | RecordType::AAAA => {
                     let ret = self
-                        .db
+                        .compat_store
                         .query_domain_record(req_real_name, record_type.to_string().as_str())
                         .await;
                     if let Ok(Some((record, ttl))) = ret {
@@ -3452,8 +3547,12 @@ impl SNServer {
         }
     }
 
-    pub(crate) fn db(&self) -> &SnDBRef {
-        &self.db
+    pub(crate) fn auth_db(&self) -> &SnAuthDBRef {
+        &self.auth_db
+    }
+
+    pub(crate) fn compat_store(&self) -> &SnCompatibilityStoreRef {
+        &self.compat_store
     }
 
     pub(crate) fn v2_auth(&self) -> Arc<SnV2AuthManager> {
@@ -3893,26 +3992,31 @@ impl ServerConfig for SNServerConfig {
     }
 }
 
-#[async_trait::async_trait]
-#[callback_trait::callback_trait]
-pub trait SnDBFactory: Send + Sync + 'static {
-    async fn create(&self, params: Value) -> ServerResult<SnDBRef>;
-}
-
-pub struct SnServerFactory {
-    db_factorys: HashMap<String, Arc<dyn SnDBFactory>>,
-}
+pub struct SnServerFactory;
 
 impl SnServerFactory {
     pub fn new() -> Self {
-        SnServerFactory {
-            db_factorys: HashMap::new(),
-        }
+        SnServerFactory
     }
 
-    pub fn register_db_factory(&mut self, db_type: &str, factory: impl SnDBFactory) {
-        self.db_factorys
-            .insert(db_type.to_string(), Arc::new(factory));
+    fn sqlite_db_path(config: &SNServerConfig) -> String {
+        let configured = config.db_params.as_ref().and_then(|params| {
+            params
+                .get("db_path")
+                .or_else(|| {
+                    params
+                        .get("db_params")
+                        .and_then(|value| value.get("db_path"))
+                })
+                .and_then(Value::as_str)
+        });
+
+        configured.map(ToString::to_string).unwrap_or_else(|| {
+            get_buckyos_service_data_dir("sn")
+                .join("sn.sqlite3")
+                .to_string_lossy()
+                .to_string()
+        })
     }
 }
 
@@ -3932,21 +4036,103 @@ impl ServerFactory for SnServerFactory {
                 config.server_type()
             ))?;
 
-        let db_type = config.db_type.clone().unwrap_or("sqlite".to_string());
-        let db_factory = self.db_factorys.get(db_type.as_str());
-        if db_factory.is_none() {
+        let db_type = config
+            .db_type
+            .clone()
+            .unwrap_or_else(|| "sqlite".to_string());
+        if db_type != "sqlite" {
             return Err(server_err!(
                 ServerErrorCode::InvalidConfig,
                 "invalid db type {}",
                 db_type
             ));
         }
-        let db = db_factory
-            .unwrap()
-            .create(config.db_params.clone().unwrap_or(Value::Null))
-            .await?;
 
-        let sn = Arc::new(SNServer::new(config.clone(), db).await);
+        let db_path = Self::sqlite_db_path(config);
+        let auth_db = SqliteSnAuthDB::new_by_path(db_path.as_str())
+            .await
+            .map_err(|e| {
+                server_err!(
+                    ServerErrorCode::InvalidConfig,
+                    "open sn auth db failed: {}",
+                    e
+                )
+            })?;
+        auth_db.initialize_database().await.map_err(|e| {
+            server_err!(
+                ServerErrorCode::InvalidConfig,
+                "initialize sn auth db failed: {}",
+                e
+            )
+        })?;
+        let auth_db: SnAuthDBRef = Arc::new(auth_db);
+
+        let device_info_db = SqliteSnDeviceInfoDB::new_by_path(db_path.as_str())
+            .await
+            .map_err(|e| {
+                server_err!(
+                    ServerErrorCode::InvalidConfig,
+                    "open sn device info db failed: {}",
+                    e
+                )
+            })?;
+        device_info_db.initialize_database().await.map_err(|e| {
+            server_err!(
+                ServerErrorCode::InvalidConfig,
+                "initialize sn device info db failed: {}",
+                e
+            )
+        })?;
+        let device_info_db: SnDeviceInfoDBRef = Arc::new(device_info_db);
+
+        let compat_store = SqliteSnCompatibilityStore::new_by_path(db_path.as_str())
+            .await
+            .map_err(|e| {
+                server_err!(
+                    ServerErrorCode::InvalidConfig,
+                    "open sn compatibility store failed: {}",
+                    e
+                )
+            })?;
+        compat_store.initialize_database().await.map_err(|e| {
+            server_err!(
+                ServerErrorCode::InvalidConfig,
+                "initialize sn compatibility store failed: {}",
+                e
+            )
+        })?;
+        let compat_store: SnCompatibilityStoreRef = Arc::new(compat_store);
+
+        let relay_manager = SqliteSnRelayManager::new_by_path(db_path.as_str())
+            .await
+            .map_err(|e| {
+                server_err!(
+                    ServerErrorCode::InvalidConfig,
+                    "open sn relay manager failed: {}",
+                    e
+                )
+            })?
+            .with_auth_db(auth_db.clone())
+            .with_device_info_db(device_info_db.clone());
+        relay_manager.initialize_database().await.map_err(|e| {
+            server_err!(
+                ServerErrorCode::InvalidConfig,
+                "initialize sn relay manager failed: {}",
+                e
+            )
+        })?;
+        let relay_manager: SnRelayManagerRef = Arc::new(relay_manager);
+
+        let sn = Arc::new(
+            SNServer::new(
+                config.clone(),
+                auth_db,
+                device_info_db,
+                compat_store,
+                relay_manager,
+            )
+            .await,
+        );
         Ok(vec![
             Server::NameServer(sn.clone()),
             Server::Http(sn.clone()),
@@ -3958,7 +4144,7 @@ impl ServerFactory for SnServerFactory {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::SqliteDBFactory;
+    use crate::SnAuthDB;
     use buckyos_kit::init_logging;
     use cyfs_gateway_lib::hyper_serve_http;
     use hyper_util::rt::TokioIo;
@@ -4270,13 +4456,12 @@ mod tests {
             .unwrap()
             .to_string();
 
-        let mut sn_factory = SnServerFactory::new();
-        sn_factory.register_db_factory("sqlite", SqliteDBFactory::new());
+        let sn_factory = SnServerFactory::new();
 
         let db = tempfile::NamedTempFile::with_suffix(".db").unwrap();
 
         {
-            let db = SqliteSnDB::new_by_path(db.path().to_str().unwrap())
+            let db = SqliteSnAuthDB::new_by_path(db.path().to_str().unwrap())
                 .await
                 .unwrap();
             db.initialize_database().await.unwrap();
@@ -4962,14 +5147,13 @@ mod tests {
             .to_string();
         let device_info = DeviceInfo::from_device_doc(&device_config);
 
-        let mut sn_factory = SnServerFactory::new();
-        sn_factory.register_db_factory("sqlite", SqliteDBFactory::new());
+        let sn_factory = SnServerFactory::new();
 
         let db = tempfile::NamedTempFile::with_suffix(".db").unwrap();
         let auth_dir = tempfile::tempdir().unwrap();
 
         {
-            let db = SqliteSnDB::new_by_path(db.path().to_str().unwrap())
+            let db = SqliteSnAuthDB::new_by_path(db.path().to_str().unwrap())
                 .await
                 .unwrap();
             db.initialize_database().await.unwrap();

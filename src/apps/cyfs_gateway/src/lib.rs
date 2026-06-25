@@ -33,7 +33,7 @@ use anyhow::anyhow;
 use anyhow::Result;
 use buckyos_kit::init_logging;
 use buckyos_kit::{get_buckyos_service_data_dir, get_buckyos_system_etc_dir};
-use cyfs_sn::{SnServerFactory, SqliteDBFactory};
+use cyfs_sn::SnServerFactory;
 use cyfs_socks::SocksServerFactory;
 use cyfs_tun::TunStackFactory;
 use kRPC::RPCSessionToken;
@@ -194,9 +194,7 @@ async fn run_gateway_with_config(
     debug!("Register control server factory");
     factory.register_server_factory("local_dns", Arc::new(LocalDnsFactory::new()));
     debug!("Register local dns server factory");
-    let mut sn_factory = SnServerFactory::new();
-    sn_factory.register_db_factory("sqlite", SqliteDBFactory::new());
-    factory.register_server_factory("sn", Arc::new(sn_factory));
+    factory.register_server_factory("sn", Arc::new(SnServerFactory::new()));
     debug!("Register sn server factory");
     let gateway = factory
         .create_gateway(config_file, gateway_config, init_gateway_config)

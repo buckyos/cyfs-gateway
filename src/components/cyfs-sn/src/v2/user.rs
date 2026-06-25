@@ -28,7 +28,7 @@ pub(crate) async fn handle_user(server: &SNServer, req: RPCRequest) -> RpcCallRe
                 )
             })?;
             server
-                .db()
+                .auth_db()
                 .update_user_public_key(username.as_str(), public_key_str.as_str())
                 .await
                 .into_rpc()?;
@@ -37,7 +37,7 @@ pub(crate) async fn handle_user(server: &SNServer, req: RPCRequest) -> RpcCallRe
         "get_owner_key" => {
             let username = require_account_username(server, &req)?;
             let user = server
-                .db()
+                .auth_db()
                 .get_user_info(username.as_str())
                 .await
                 .into_rpc()?
@@ -60,7 +60,7 @@ pub(crate) async fn handle_user(server: &SNServer, req: RPCRequest) -> RpcCallRe
             let username = require_account_username(server, &req)?;
             let params: SetSelfCertReq = parse_params(&req)?;
             server
-                .db()
+                .auth_db()
                 .update_user_self_cert(username.as_str(), params.self_cert)
                 .await
                 .into_rpc()?;
@@ -69,7 +69,7 @@ pub(crate) async fn handle_user(server: &SNServer, req: RPCRequest) -> RpcCallRe
         "get_profile" => {
             let username = require_account_username(server, &req)?;
             let user = server
-                .db()
+                .auth_db()
                 .get_user_info(username.as_str())
                 .await
                 .into_rpc()?

@@ -51,15 +51,18 @@ pub(crate) async fn handle_dns(server: &SNServer, req: RPCRequest) -> RpcCallRes
         "add_record" => {
             let username = require_account_username(server, &req)?;
             let user = server
-                .db()
+                .auth_db()
                 .get_user_info(username.as_str())
                 .await
                 .into_rpc()?
                 .ok_or_else(|| parse_error(SnV2ErrorCode::UserNotFound, "user not found"))?;
             let params: AddDnsRecordReq = parse_params(&req)?;
-            let device =
-                ensure_owned_device(server.db(), username.as_str(), params.device_did.as_str())
-                    .await?;
+            let device = ensure_owned_device(
+                server.compat_store(),
+                username.as_str(),
+                params.device_did.as_str(),
+            )
+            .await?;
             ensure_user_dns_domain(
                 username.as_str(),
                 user.user_domain.as_deref(),
@@ -67,7 +70,7 @@ pub(crate) async fn handle_dns(server: &SNServer, req: RPCRequest) -> RpcCallRes
                 server.server_host_v2(),
             )?;
             server
-                .db()
+                .compat_store()
                 .add_user_domain(
                     username.as_str(),
                     params.domain.as_str(),
@@ -84,7 +87,7 @@ pub(crate) async fn handle_dns(server: &SNServer, req: RPCRequest) -> RpcCallRes
             }
             if params.has_cert.unwrap_or(false) {
                 server
-                    .db()
+                    .auth_db()
                     .update_user_self_cert(username.as_str(), true)
                     .await
                     .into_rpc()?;
@@ -97,13 +100,18 @@ pub(crate) async fn handle_dns(server: &SNServer, req: RPCRequest) -> RpcCallRes
         "remove_record" => {
             let username = require_account_username(server, &req)?;
             let user = server
-                .db()
+                .auth_db()
                 .get_user_info(username.as_str())
                 .await
                 .into_rpc()?
                 .ok_or_else(|| parse_error(SnV2ErrorCode::UserNotFound, "user not found"))?;
             let params: RemoveDnsRecordReq = parse_params(&req)?;
-            ensure_owned_device(server.db(), username.as_str(), params.device_did.as_str()).await?;
+            ensure_owned_device(
+                server.compat_store(),
+                username.as_str(),
+                params.device_did.as_str(),
+            )
+            .await?;
             ensure_user_dns_domain(
                 username.as_str(),
                 user.user_domain.as_deref(),
@@ -112,13 +120,13 @@ pub(crate) async fn handle_dns(server: &SNServer, req: RPCRequest) -> RpcCallRes
             )?;
             if params.has_cert.unwrap_or(false) {
                 server
-                    .db()
+                    .auth_db()
                     .update_user_self_cert(username.as_str(), true)
                     .await
                     .into_rpc()?;
             }
             server
-                .db()
+                .compat_store()
                 .remove_user_domain(
                     username.as_str(),
                     params.domain.as_str(),
@@ -136,7 +144,7 @@ pub(crate) async fn handle_dns(server: &SNServer, req: RPCRequest) -> RpcCallRes
         "list_records" => {
             let username = resolve_self_scoped_username(server, &req, false).await?;
             let items = server
-                .db()
+                .compat_store()
                 .query_user_domain_records(username.as_str())
                 .await
                 .into_rpc()?;

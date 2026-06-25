@@ -44,7 +44,7 @@ pub(crate) async fn handle_query(
             let params: ResolveDeviceReq = parse_params(&req)?;
             let username = normalize_username(params.name.as_str())?;
             let device = server
-                .db()
+                .compat_store()
                 .query_device_by_name(username.as_str(), params.device_name.as_str())
                 .await
                 .into_rpc()?

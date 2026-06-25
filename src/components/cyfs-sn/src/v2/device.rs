@@ -16,7 +16,7 @@ pub(crate) async fn handle_device(
         "register" => {
             let username = require_account_username(server, &req)?;
             let user = server
-                .db()
+                .auth_db()
                 .get_user_info(username.as_str())
                 .await
                 .into_rpc()?
@@ -38,8 +38,7 @@ pub(crate) async fn handle_device(
                 ));
             }
             server
-                .db()
-                .register_device(
+                .register_device_record(
                     username.as_str(),
                     params.device_name.as_str(),
                     params.device_did.as_str(),
@@ -54,44 +53,24 @@ pub(crate) async fn handle_device(
         "update" => {
             let username = require_account_username(server, &req)?;
             let params: DeviceUpdateReq = parse_params(&req)?;
-            match (
-                params.device_did.as_deref(),
-                params.mini_config_jwt.as_deref(),
-            ) {
-                (Some(device_did), Some(mini_config_jwt)) => {
-                    server
-                        .db()
-                        .update_device_by_name(
-                            username.as_str(),
-                            params.device_name.as_str(),
-                            device_did,
-                            mini_config_jwt,
-                            params.device_ip.as_str(),
-                            params.device_info.as_str(),
-                        )
-                        .await
-                        .into_rpc()?;
-                }
-                _ => {
-                    server
-                        .db()
-                        .update_device_info_by_name(
-                            username.as_str(),
-                            params.device_name.as_str(),
-                            params.device_ip.as_str(),
-                            params.device_info.as_str(),
-                        )
-                        .await
-                        .into_rpc()?;
-                }
-            }
+            server
+                .update_device_record(
+                    username.as_str(),
+                    params.device_name.as_str(),
+                    params.device_did.as_deref(),
+                    params.mini_config_jwt.as_deref(),
+                    params.device_ip.as_str(),
+                    params.device_info.as_str(),
+                )
+                .await
+                .into_rpc()?;
             ok_response(&req, json!({ "code": 0 }))
         }
         "get" => {
             let username = resolve_self_scoped_username(server, &req, false).await?;
             let params: DeviceGetReq = parse_params(&req)?;
             let device = server
-                .db()
+                .compat_store()
                 .query_device_by_name(username.as_str(), params.device_name.as_str())
                 .await
                 .into_rpc()?
@@ -101,7 +80,7 @@ pub(crate) async fn handle_device(
         "list" => {
             let username = resolve_self_scoped_username(server, &req, false).await?;
             let items = server
-                .db()
+                .compat_store()
                 .list_user_devices(username.as_str())
                 .await
                 .into_rpc()?;
@@ -123,7 +102,12 @@ pub(crate) async fn handle_device(
         }
         "query_by_did" => {
             let params: QueryByDidReq = parse_params(&req)?;
-            let ood_info = query_by_did(server.db(), params.source_device_id.as_str()).await?;
+            let ood_info = query_by_did(
+                server.compat_store(),
+                server.auth_db(),
+                params.source_device_id.as_str(),
+            )
+            .await?;
             ok_response(&req, serde_json::to_value(ood_info).unwrap())
         }
         "query_by_hostname" => {

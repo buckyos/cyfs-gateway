@@ -12,7 +12,7 @@ pub(crate) async fn handle_zone(server: &SNServer, req: RPCRequest) -> RpcCallRe
         "get" => {
             let username = resolve_self_scoped_username(server, &req, false).await?;
             let user = server
-                .db()
+                .auth_db()
                 .get_user_info(username.as_str())
                 .await
                 .into_rpc()?
@@ -31,7 +31,7 @@ pub(crate) async fn handle_zone(server: &SNServer, req: RPCRequest) -> RpcCallRe
         "bind_config" => {
             let username = require_account_username(server, &req)?;
             let user = server
-                .db()
+                .auth_db()
                 .get_user_info(username.as_str())
                 .await
                 .into_rpc()?
@@ -39,13 +39,13 @@ pub(crate) async fn handle_zone(server: &SNServer, req: RPCRequest) -> RpcCallRe
             ensure_owner_key_bound(&user)?;
             let params: BindZoneReq = parse_params(&req)?;
             server
-                .db()
+                .auth_db()
                 .update_user_zone_config(username.as_str(), params.zone_config.as_str())
                 .await
                 .into_rpc()?;
             if let Some(user_domain) = params.user_domain {
                 server
-                    .db()
+                    .auth_db()
                     .update_user_domain(username.as_str(), Some(user_domain))
                     .await
                     .into_rpc()?;

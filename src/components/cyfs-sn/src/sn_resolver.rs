@@ -1673,7 +1673,7 @@ impl SnResolver {
                     return Ok(DidResolution {
                         did: did.to_string(),
                         doc_type: doc_type.to_string(),
-                        document: EncodedDocument::JsonLd(serde_json::to_value(online).unwrap()),
+                        document: EncodedDocument::JsonLd(device_online_info_document(&online)),
                         source: DidResolutionSource::DeviceOnlineInfo,
                     });
                 }
@@ -1729,7 +1729,7 @@ impl SnResolver {
                 return Ok(DidResolution {
                     did: did_str,
                     doc_type: doc_type.to_string(),
-                    document: EncodedDocument::JsonLd(serde_json::to_value(online).unwrap()),
+                    document: EncodedDocument::JsonLd(device_online_info_document(&online)),
                     source: DidResolutionSource::DeviceOnlineInfo,
                 });
             }
@@ -2072,6 +2072,34 @@ fn device_info_document_or_fallback(device: &ResolverDeviceDocument) -> Value {
                 "addresses": device.addresses,
             })
         })
+}
+
+fn device_online_info_document(online: &SnDeviceStateView) -> Value {
+    let mut value = serde_json::to_value(online).unwrap_or_else(|_| json!({}));
+    if let Some(obj) = value.as_object_mut() {
+        obj.entry("owner".to_string())
+            .or_insert_with(|| Value::String(online.zone.clone()));
+        obj.entry("zone_name".to_string())
+            .or_insert_with(|| Value::String(online.zone.clone()));
+
+        let exportable_ips: Vec<Value> = online
+            .public_ips
+            .iter()
+            .chain(online.private_ips.iter())
+            .cloned()
+            .map(Value::String)
+            .collect();
+
+        if let Some(first_ip) = exportable_ips.first().cloned() {
+            obj.entry("ip".to_string()).or_insert(first_ip);
+        }
+        obj.entry("ips".to_string())
+            .or_insert_with(|| Value::Array(exportable_ips.clone()));
+        obj.entry("all_ip".to_string())
+            .or_insert_with(|| Value::Array(exportable_ips));
+    }
+
+    value
 }
 
 fn find_gateway_device_name(value: &Value) -> Option<String> {

@@ -164,9 +164,47 @@ pub trait SnAuthDB: Send + Sync + 'static {
         password_algo: &str,
     ) -> SnResult<bool>;
     async fn is_user_exist(&self, username: &str) -> SnResult<bool>;
+    async fn register_user_with_owner_key(
+        &self,
+        active_code: &str,
+        username: &str,
+        public_key: &str,
+        zone_config: &str,
+        user_domain: Option<String>,
+        sn_ips: Option<String>,
+    ) -> SnResult<bool>;
+    async fn get_user_by_public_key(
+        &self,
+        public_key: &str,
+    ) -> SnResult<Option<(String, String, Option<String>)>>;
     async fn get_user_info(&self, username: &str) -> SnResult<Option<SNUserInfo>>;
     async fn get_user_by_domain(&self, domain: &str) -> SnResult<Option<SNUserInfo>>;
     async fn set_user_state(&self, username: &str, state: UserState) -> SnResult<()>;
+    async fn update_user_public_key(&self, username: &str, public_key: &str) -> SnResult<()>;
+    async fn update_user_zone_config(&self, username: &str, zone_config: &str) -> SnResult<()>;
+    async fn update_user_self_cert(&self, username: &str, self_cert: bool) -> SnResult<()>;
+    async fn update_user_domain(&self, username: &str, user_domain: Option<String>)
+        -> SnResult<()>;
+    async fn get_user_sn_ips(&self, username: &str) -> SnResult<Option<String>>;
+    async fn get_user_sn_ips_as_vec(&self, username: &str) -> SnResult<Option<Vec<String>>> {
+        let Some(sn_ips) = self.get_user_sn_ips(username).await? else {
+            return Ok(None);
+        };
+        if sn_ips.trim().is_empty() {
+            return Ok(Some(Vec::new()));
+        }
+        match serde_json::from_str::<Vec<String>>(sn_ips.as_str()) {
+            Ok(ips) => Ok(Some(ips)),
+            Err(_) => Ok(Some(
+                sn_ips
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|ip| !ip.is_empty())
+                    .map(ToString::to_string)
+                    .collect(),
+            )),
+        }
+    }
     async fn get_v2_auth(&self, username: &str) -> SnResult<Option<SnV2AuthInfo>>;
     async fn update_v2_last_login(&self, username: &str, last_login_at: u64) -> SnResult<()>;
 
@@ -1109,6 +1147,169 @@ impl SnAuthDB for SqliteSnAuthDB {
         Ok(count > 0)
     }
 
+    async fn register_user_with_owner_key(
+        &self,
+        active_code: &str,
+        username: &str,
+        public_key: &str,
+        zone_config: &str,
+        user_domain: Option<String>,
+        sn_ips: Option<String>,
+    ) -> SnResult<bool> {
+        let _locker =
+            async_named_locker::Locker::get_locker(format!("active_code_{}", active_code)).await;
+        let _domain_locker = if user_domain.is_some() {
+            Some(
+                async_named_locker::Locker::get_locker(Self::USER_DOMAIN_BINDING_LOCK.to_string())
+                    .await,
+            )
+        } else {
+            None
+        };
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| Self::db_err("begin transaction failed", e))?;
+
+        let code_unused =
+            sqlx::query_scalar::<_, i64>("SELECT used FROM activation_codes WHERE code = ?1")
+                .bind(active_code)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|e| Self::db_err("query activation code failed", e))?
+                == Some(0);
+        if !code_unused {
+            return Ok(false);
+        }
+
+        let user_count =
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM users WHERE username = ?1")
+                .bind(username)
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(|e| Self::db_err("query user count failed", e))?;
+        if user_count > 0 {
+            return Ok(false);
+        }
+
+        let canonical_domain = user_domain.as_deref().and_then(Self::canonical_user_domain);
+        if let Some(domain) = canonical_domain.as_deref() {
+            Self::check_domain_conflicts_tx(&mut tx, username, domain).await?;
+        }
+
+        let now = Self::now_secs() as i64;
+        sqlx::query(
+            "INSERT INTO users
+                (username, state, bns_name, public_key, activation_code, owner_key_ref,
+                 zone_config, user_domain, self_cert, sn_ips, created_at, updated_at, last_login_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7, 0, ?8, ?9, ?9, NULL)",
+        )
+        .bind(username)
+        .bind(UserState::Active.to_string())
+        .bind(username)
+        .bind(public_key)
+        .bind(active_code)
+        .bind(zone_config)
+        .bind(canonical_domain.as_deref())
+        .bind(sn_ips.as_deref())
+        .bind(now)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| Self::db_err("insert user failed", e))?;
+
+        sqlx::query(
+            "INSERT INTO zone_info
+                (username, bns_name, zone, relay_sn, self_cert, cert_checked_at,
+                 cert_expires_at, sn_ips, source_version, updated_at)
+             VALUES (?1, ?2, ?3, NULL, 0, NULL, NULL, ?4, NULL, ?5)",
+        )
+        .bind(username)
+        .bind(username)
+        .bind(if zone_config.trim().is_empty() {
+            None
+        } else {
+            Some(zone_config)
+        })
+        .bind(sn_ips.as_deref())
+        .bind(now)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| Self::db_err("insert zone info failed", e))?;
+
+        if let Some(domain) = canonical_domain.as_deref() {
+            let pkx = Self::pkx_value(public_key)?;
+            let pkx_record_name = Self::pkx_record_name(domain);
+            sqlx::query(
+                "INSERT INTO user_domain_bindings
+                    (domain, owner, state, pkx, pkx_record_name, verified_at, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, ?6)
+                 ON CONFLICT(domain) DO UPDATE SET
+                    owner = excluded.owner,
+                    state = excluded.state,
+                    pkx = excluded.pkx,
+                    pkx_record_name = excluded.pkx_record_name,
+                    verified_at = excluded.verified_at,
+                    updated_at = excluded.updated_at",
+            )
+            .bind(domain)
+            .bind(username)
+            .bind(DOMAIN_BINDING_ACTIVE)
+            .bind(pkx.as_str())
+            .bind(pkx_record_name.as_str())
+            .bind(now)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| Self::db_err("upsert user_domain binding failed", e))?;
+            sqlx::query(
+                "INSERT OR IGNORE INTO user_domain_history (domain, owner, created_at)
+                 VALUES (?1, ?2, ?3)",
+            )
+            .bind(domain)
+            .bind(username)
+            .bind(now)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| Self::db_err("insert user_domain history failed", e))?;
+        }
+
+        sqlx::query("UPDATE activation_codes SET used = 1 WHERE code = ?1")
+            .bind(active_code)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| Self::db_err("update activation code failed", e))?;
+
+        tx.commit()
+            .await
+            .map_err(|e| Self::db_err("commit transaction failed", e))?;
+        Ok(true)
+    }
+
+    async fn get_user_by_public_key(
+        &self,
+        public_key: &str,
+    ) -> SnResult<Option<(String, String, Option<String>)>> {
+        let row =
+            sqlx::query("SELECT username, zone_config, sn_ips FROM users WHERE public_key = ?1")
+                .bind(public_key)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| Self::db_err("query user by public_key failed", e))?;
+
+        row.map(|row| {
+            Ok((
+                row.try_get("username")
+                    .map_err(|e| Self::db_err("read username failed", e))?,
+                row.try_get::<Option<String>, _>("zone_config")
+                    .map_err(|e| Self::db_err("read zone_config failed", e))?
+                    .unwrap_or_default(),
+                row.try_get("sn_ips")
+                    .map_err(|e| Self::db_err("read sn_ips failed", e))?,
+            ))
+        })
+        .transpose()
+    }
+
     async fn get_user_info(&self, username: &str) -> SnResult<Option<SNUserInfo>> {
         let row = sqlx::query(
             "SELECT username, state, public_key, activation_code, zone_config,
@@ -1143,6 +1344,25 @@ impl SnAuthDB for SqliteSnAuthDB {
         .await
         .map_err(|e| Self::db_err("query user by domain failed", e))?;
 
+        if row.is_some() {
+            return row.as_ref().map(Self::user_from_row).transpose();
+        }
+
+        let row = sqlx::query(
+            "SELECT username, state, public_key, activation_code, zone_config,
+                    self_cert, user_domain, sn_ips
+             FROM users
+             WHERE user_domain IS NOT NULL
+               AND user_domain != ''
+               AND (?1 = user_domain OR ?1 LIKE '%.' || user_domain)
+             ORDER BY length(user_domain) DESC
+             LIMIT 1",
+        )
+        .bind(canonical_domain.as_str())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| Self::db_err("query legacy user_domain failed", e))?;
+
         row.as_ref().map(Self::user_from_row).transpose()
     }
 
@@ -1159,6 +1379,163 @@ impl SnAuthDB for SqliteSnAuthDB {
             self.revoke_user_sessions(username, now as u64).await?;
         }
         Ok(())
+    }
+
+    async fn update_user_public_key(&self, username: &str, public_key: &str) -> SnResult<()> {
+        let now = Self::now_secs() as i64;
+        sqlx::query("UPDATE users SET public_key = ?1, updated_at = ?2 WHERE username = ?3")
+            .bind(public_key)
+            .bind(now)
+            .bind(username)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| Self::db_err("update user public_key failed", e))?;
+        Ok(())
+    }
+
+    async fn update_user_zone_config(&self, username: &str, zone_config: &str) -> SnResult<()> {
+        self.update_zone_info(
+            username,
+            ZoneInfoPatch {
+                zone: Some(zone_config.to_string()),
+                ..ZoneInfoPatch::default()
+            },
+        )
+        .await
+    }
+
+    async fn update_user_self_cert(&self, username: &str, self_cert: bool) -> SnResult<()> {
+        self.update_zone_info(
+            username,
+            ZoneInfoPatch {
+                self_cert: Some(self_cert),
+                ..ZoneInfoPatch::default()
+            },
+        )
+        .await
+    }
+
+    async fn update_user_domain(
+        &self,
+        username: &str,
+        user_domain: Option<String>,
+    ) -> SnResult<()> {
+        let _locker =
+            async_named_locker::Locker::get_locker(Self::USER_DOMAIN_BINDING_LOCK.to_string())
+                .await;
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| Self::db_err("begin transaction failed", e))?;
+        let now = Self::now_secs() as i64;
+
+        let canonical_domain = user_domain.as_deref().and_then(Self::canonical_user_domain);
+
+        if let Some(domain) = canonical_domain.as_deref() {
+            Self::check_domain_conflicts_tx(&mut tx, username, domain).await?;
+            let user =
+                sqlx::query("SELECT public_key, owner_key_ref FROM users WHERE username = ?1")
+                    .bind(username)
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .map_err(|e| Self::db_err("query user failed", e))?
+                    .ok_or_else(|| {
+                        sn_err!(SnErrorCode::NotFound, "user not found: {}", username)
+                    })?;
+            let owner_key_ref: Option<String> = user
+                .try_get("owner_key_ref")
+                .map_err(|e| Self::db_err("read owner_key_ref failed", e))?;
+            let public_key: Option<String> = user
+                .try_get("public_key")
+                .map_err(|e| Self::db_err("read public_key failed", e))?;
+            let pkx_source = owner_key_ref
+                .filter(|value| !value.trim().is_empty())
+                .or_else(|| public_key.filter(|value| !value.trim().is_empty()))
+                .unwrap_or_default();
+            let pkx = if pkx_source.trim().is_empty() {
+                String::new()
+            } else {
+                Self::pkx_value(pkx_source.as_str())?
+            };
+            let pkx_record_name = Self::pkx_record_name(domain);
+            sqlx::query(
+                "INSERT INTO user_domain_bindings
+                    (domain, owner, state, pkx, pkx_record_name, verified_at, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, ?6)
+                 ON CONFLICT(domain) DO UPDATE SET
+                    owner = excluded.owner,
+                    state = excluded.state,
+                    pkx = excluded.pkx,
+                    pkx_record_name = excluded.pkx_record_name,
+                    verified_at = excluded.verified_at,
+                    updated_at = excluded.updated_at",
+            )
+            .bind(domain)
+            .bind(username)
+            .bind(DOMAIN_BINDING_ACTIVE)
+            .bind(pkx.as_str())
+            .bind(pkx_record_name.as_str())
+            .bind(now)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| Self::db_err("upsert user_domain binding failed", e))?;
+            sqlx::query(
+                "INSERT OR IGNORE INTO user_domain_history (domain, owner, created_at)
+                 VALUES (?1, ?2, ?3)",
+            )
+            .bind(domain)
+            .bind(username)
+            .bind(now)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| Self::db_err("insert user_domain history failed", e))?;
+        } else {
+            sqlx::query(
+                "UPDATE user_domain_bindings
+                 SET state = ?1, updated_at = ?2
+                 WHERE owner = ?3 AND state = ?4",
+            )
+            .bind(DOMAIN_BINDING_REVOKED)
+            .bind(now)
+            .bind(username)
+            .bind(DOMAIN_BINDING_ACTIVE)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| Self::db_err("revoke user_domain bindings failed", e))?;
+        }
+
+        sqlx::query("UPDATE users SET user_domain = ?1, updated_at = ?2 WHERE username = ?3")
+            .bind(canonical_domain.as_deref())
+            .bind(now)
+            .bind(username)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| Self::db_err("update user_domain failed", e))?;
+
+        tx.commit()
+            .await
+            .map_err(|e| Self::db_err("commit transaction failed", e))?;
+        Ok(())
+    }
+
+    async fn get_user_sn_ips(&self, username: &str) -> SnResult<Option<String>> {
+        if let Some(zone_info) = self.get_zone_info(username).await? {
+            if zone_info.sn_ips.is_some() {
+                return Ok(zone_info.sn_ips);
+            }
+        }
+
+        let row = sqlx::query("SELECT sn_ips FROM users WHERE username = ?1")
+            .bind(username)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| Self::db_err("query user sn_ips failed", e))?;
+        row.map(|row| {
+            row.try_get("sn_ips")
+                .map_err(|e| Self::db_err("read sn_ips failed", e))
+        })
+        .transpose()
     }
 
     async fn get_v2_auth(&self, username: &str) -> SnResult<Option<SnV2AuthInfo>> {
