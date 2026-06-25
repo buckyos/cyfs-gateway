@@ -1,6 +1,11 @@
 #![allow(unused)]
 use crate::name_info_cache::{NameInfoCache, NameInfoCacheQueryResult, NameInfoCacheRef};
 use crate::sn_db::{self, *};
+use crate::sn_resolver::{
+    device_config_from_mini_jwt, ResolverCompatibilityReader, ResolverDeviceDocument,
+    ResolverDidDocument, SnAuthReader, SnResolver, SnResolverConfig, SnResolverError,
+    SnResolverErrorKind, SnResolverRef, SnResolverResult,
+};
 use crate::sqlite_db::SqliteSnDB;
 use crate::v2::{
     handle_auth, handle_device, handle_did, handle_dns, handle_query, handle_user, handle_zone,
@@ -83,6 +88,328 @@ fn push_exportable_device_ip(address_vec: &mut Vec<IpAddr>, ip: IpAddr) {
     }
 }
 
+struct LegacySnAuthReader {
+    db: SnDBRef,
+}
+
+impl LegacySnAuthReader {
+    fn new(db: SnDBRef) -> Self {
+        Self { db }
+    }
+}
+
+#[async_trait]
+impl SnAuthReader for LegacySnAuthReader {
+    async fn get_user_info(&self, username: &str) -> SnResolverResult<Option<SNUserInfo>> {
+        self.db
+            .get_user_info(username)
+            .await
+            .map_err(|e| SnResolverError::backend(format!("query user {} failed: {}", username, e)))
+    }
+
+    async fn get_user_by_domain(&self, domain: &str) -> SnResolverResult<Option<SNUserInfo>> {
+        self.db.get_user_info_by_domain(domain).await.map_err(|e| {
+            SnResolverError::backend(format!("query user by domain {} failed: {}", domain, e))
+        })
+    }
+
+    async fn get_zone_info(&self, username: &str) -> SnResolverResult<Option<crate::ZoneInfo>> {
+        let user = self.db.get_user_info(username).await.map_err(|e| {
+            SnResolverError::backend(format!("query legacy zone_info {} failed: {}", username, e))
+        })?;
+
+        Ok(user.map(|user| crate::ZoneInfo {
+            username: user
+                .username
+                .clone()
+                .unwrap_or_else(|| username.to_string()),
+            bns_name: user.username.unwrap_or_else(|| username.to_string()),
+            zone: if user.zone_config.trim().is_empty() {
+                None
+            } else {
+                Some(user.zone_config)
+            },
+            relay_sn: None,
+            self_cert: user.self_cert,
+            cert_checked_at: None,
+            cert_expires_at: None,
+            sn_ips: user.sn_ips,
+            source_version: None,
+            updated_at: 0,
+        }))
+    }
+
+    async fn get_user_sn_ips(&self, username: &str) -> SnResolverResult<Vec<IpAddr>> {
+        let Some(values) = self
+            .db
+            .get_user_sn_ips_as_vec(username)
+            .await
+            .map_err(|e| {
+                SnResolverError::backend(format!("query sn_ips {} failed: {}", username, e))
+            })?
+        else {
+            return Ok(Vec::new());
+        };
+
+        Ok(values
+            .into_iter()
+            .filter_map(|value| {
+                value
+                    .parse::<IpAddr>()
+                    .map_err(|e| warn!("invalid sn_ip {} for {}: {}", value, username, e))
+                    .ok()
+            })
+            .collect())
+    }
+}
+
+struct LegacyResolverCompatibilityReader {
+    db: SnDBRef,
+}
+
+impl LegacyResolverCompatibilityReader {
+    fn new(db: SnDBRef) -> Self {
+        Self { db }
+    }
+
+    async fn convert_device(
+        &self,
+        device: SNDeviceInfo,
+    ) -> SnResolverResult<ResolverDeviceDocument> {
+        let raw_document = serde_json::from_str::<Value>(device.description.as_str()).ok();
+        let user_public_key = self
+            .db
+            .get_user_info(device.owner.as_str())
+            .await
+            .map_err(|e| {
+                SnResolverError::backend(format!(
+                    "query owner {} for device {} failed: {}",
+                    device.owner, device.device_name, e
+                ))
+            })?
+            .map(|user| user.public_key);
+
+        let document = if !device.mini_config_jwt.trim().is_empty() {
+            if let Some(public_key) = user_public_key.as_deref() {
+                match device_config_from_mini_jwt(
+                    device.mini_config_jwt.as_str(),
+                    public_key,
+                    device.owner.as_str(),
+                ) {
+                    Ok(value) => Some(value),
+                    Err(e) => {
+                        warn!(
+                            "failed to build legacy device document for {}.{} from mini jwt: {}",
+                            device.device_name, device.owner, e
+                        );
+                        raw_document.clone()
+                    }
+                }
+            } else {
+                raw_document.clone()
+            }
+        } else {
+            raw_document.clone()
+        };
+
+        let mut addresses = Vec::new();
+        if let Some(ip) = parse_ip_or_socket_addr(device.ip.as_str()) {
+            push_exportable_device_ip(&mut addresses, ip);
+        }
+        collect_device_ips_from_legacy_document(raw_document.as_ref(), &mut addresses);
+
+        Ok(ResolverDeviceDocument {
+            zone_name: device.owner.clone(),
+            device_name: device.device_name.clone(),
+            did: device.did.clone(),
+            mini_config_jwt: if device.mini_config_jwt.trim().is_empty() {
+                None
+            } else {
+                Some(device.mini_config_jwt.clone())
+            },
+            document,
+            info_document: Some(build_legacy_device_info_json(&device)),
+            addresses,
+            ttl: None,
+            version: None,
+        })
+    }
+}
+
+#[async_trait]
+impl ResolverCompatibilityReader for LegacyResolverCompatibilityReader {
+    async fn query_domain_record(
+        &self,
+        domain: &str,
+        record_type: RecordType,
+    ) -> SnResolverResult<Option<(String, u32)>> {
+        self.db
+            .query_domain_record(domain, record_type.to_string().as_str())
+            .await
+            .map_err(|e| {
+                SnResolverError::backend(format!(
+                    "query domain record {} {} failed: {}",
+                    domain,
+                    record_type.to_string(),
+                    e
+                ))
+            })
+    }
+
+    async fn get_device_by_name(
+        &self,
+        zone_name: &str,
+        device_name: &str,
+    ) -> SnResolverResult<Option<ResolverDeviceDocument>> {
+        let Some(device) = self
+            .db
+            .query_device_by_name(zone_name, device_name)
+            .await
+            .map_err(|e| {
+                SnResolverError::backend(format!(
+                    "query device {}.{} failed: {}",
+                    device_name, zone_name, e
+                ))
+            })?
+        else {
+            return Ok(None);
+        };
+
+        self.convert_device(device).await.map(Some)
+    }
+
+    async fn get_device_by_did(
+        &self,
+        did: &str,
+    ) -> SnResolverResult<Option<ResolverDeviceDocument>> {
+        let Some(device) =
+            self.db.query_device_by_did(did).await.map_err(|e| {
+                SnResolverError::backend(format!("query device {} failed: {}", did, e))
+            })?
+        else {
+            return Ok(None);
+        };
+
+        self.convert_device(device).await.map(Some)
+    }
+
+    async fn query_user_did_document(
+        &self,
+        owner_user: &str,
+        obj_name: &str,
+        doc_type: Option<&str>,
+    ) -> SnResolverResult<Option<ResolverDidDocument>> {
+        let Some((obj_id, document_json, stored_type)) = self
+            .db
+            .query_user_did_document(owner_user, obj_name, doc_type)
+            .await
+            .map_err(|e| {
+                SnResolverError::backend(format!(
+                    "query did document {}/{} failed: {}",
+                    owner_user, obj_name, e
+                ))
+            })?
+        else {
+            return Ok(None);
+        };
+
+        Ok(Some(ResolverDidDocument {
+            obj_id,
+            document_json,
+            doc_type: stored_type,
+        }))
+    }
+}
+
+fn collect_device_ips_from_legacy_document(value: Option<&Value>, result: &mut Vec<IpAddr>) {
+    let Some(value) = value else {
+        return;
+    };
+
+    for key in ["ip", "ips", "all_ip", "addresses"] {
+        let Some(ip_values) = value.get(key) else {
+            continue;
+        };
+
+        if let Some(ip_str) = ip_values.as_str() {
+            if let Some(ip) = parse_ip_or_socket_addr(ip_str) {
+                push_exportable_device_ip(result, ip);
+            }
+            continue;
+        }
+
+        if let Some(ip_values) = ip_values.as_array() {
+            for ip_str in ip_values.iter().filter_map(|v| v.as_str()) {
+                if let Some(ip) = parse_ip_or_socket_addr(ip_str) {
+                    push_exportable_device_ip(result, ip);
+                }
+            }
+        }
+    }
+}
+
+fn build_legacy_device_info_json(device: &SNDeviceInfo) -> Value {
+    let mut value = serde_json::from_str::<Value>(device.description.as_str())
+        .unwrap_or_else(|_| json!({ "description": device.description }));
+
+    if let Some(obj) = value.as_object_mut() {
+        obj.insert("did".to_string(), Value::String(device.did.clone()));
+        obj.insert("ip".to_string(), Value::String(device.ip.clone()));
+        obj.insert("owner".to_string(), Value::String(device.owner.clone()));
+        obj.insert(
+            "device_name".to_string(),
+            Value::String(device.device_name.clone()),
+        );
+        obj.insert(
+            "created_at".to_string(),
+            Value::Number(serde_json::Number::from(device.created_at)),
+        );
+        obj.insert(
+            "updated_at".to_string(),
+            Value::Number(serde_json::Number::from(device.updated_at)),
+        );
+        sanitize_device_info_json_for_export(obj);
+    }
+
+    value
+}
+
+fn sanitize_device_info_json_for_export(obj: &mut serde_json::Map<String, Value>) {
+    let mut exportable_ips = Vec::new();
+
+    if let Some(ip_str) = obj.get("ip").and_then(|v| v.as_str()) {
+        if let Some(ip) = parse_ip_or_socket_addr(ip_str) {
+            push_exportable_device_ip(&mut exportable_ips, ip);
+        }
+    }
+
+    for key in ["ips", "all_ip"] {
+        if let Some(ip_values) = obj.get(key).and_then(|v| v.as_array()) {
+            for ip_str in ip_values.iter().filter_map(|v| v.as_str()) {
+                if let Some(ip) = parse_ip_or_socket_addr(ip_str) {
+                    push_exportable_device_ip(&mut exportable_ips, ip);
+                }
+            }
+        }
+    }
+
+    if let Some(first_ip) = exportable_ips.first() {
+        obj.insert("ip".to_string(), Value::String(first_ip.to_string()));
+    } else {
+        obj.remove("ip");
+    }
+
+    let exportable_ip_values: Vec<Value> = exportable_ips
+        .iter()
+        .map(|ip| Value::String(ip.to_string()))
+        .collect();
+    for key in ["ips", "all_ip"] {
+        if obj.contains_key(key) {
+            obj.insert(key.to_string(), Value::Array(exportable_ip_values.clone()));
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SnRpcPath {
     Root,
@@ -157,6 +484,7 @@ pub struct SNServer {
     db: SnDBRef,
     v2_auth: Arc<SnV2AuthManager>,
     name_info_cache: NameInfoCacheRef,
+    resolver: SnResolverRef,
 }
 
 enum UncachedNameInfoQueryResult {
@@ -378,28 +706,54 @@ impl SNServer {
     pub async fn new(server_config: SNServerConfig, db: SnDBRef) -> Self {
         let server_host = server_config.host;
         let server_ip = IpAddr::from_str(server_config.ip.as_str()).unwrap();
+        let server_aliases = server_config.aliases;
+        let boot_jwt = server_config.boot_jwt;
+        let owner_pkx = server_config.owner_pkx;
+        let device_jwt = server_config.device_jwt;
         let v2_auth = Arc::new(
             SnV2AuthManager::new(server_config.v2_auth_data_dir.as_deref())
                 .await
                 .expect("init sn v2 auth manager"),
         );
+        let resolver_config = SnResolverConfig::new(
+            server_host.clone(),
+            server_ip,
+            boot_jwt.clone(),
+            owner_pkx.clone(),
+            device_jwt.clone(),
+        )
+        .with_aliases(server_aliases.clone());
+        let resolver = Arc::new(
+            SnResolver::new(
+                resolver_config,
+                Arc::new(LegacySnAuthReader::new(db.clone())),
+            )
+            .with_compatibility_reader(Arc::new(
+                LegacyResolverCompatibilityReader::new(db.clone()),
+            )),
+        );
 
         SNServer {
             id: server_config.id,
-            server_host: server_host,
-            server_ip: server_ip,
-            server_aliases: server_config.aliases,
-            boot_jwt: server_config.boot_jwt,
-            owner_pkx: server_config.owner_pkx,
-            device_jwt: server_config.device_jwt,
+            server_host,
+            server_ip,
+            server_aliases,
+            boot_jwt,
+            owner_pkx,
+            device_jwt,
             db,
             v2_auth,
             name_info_cache: NameInfoCache::new_ref(),
+            resolver,
         }
     }
 
     pub fn name_info_cache(&self) -> NameInfoCacheRef {
         self.name_info_cache.clone()
+    }
+
+    pub fn resolver(&self) -> SnResolverRef {
+        self.resolver.clone()
     }
 
     pub fn add_name_info_cache(
@@ -2133,6 +2487,24 @@ impl SNServer {
     }
 
     pub(crate) async fn query_device_by_hostname_v2(&self, req_host: &str) -> Option<OODInfo> {
+        match self.resolver.resolve_gateway_by_hostname(req_host).await {
+            Ok(gateway) => {
+                let did_hostname = DID::from_str(gateway.gateway_did.as_str())
+                    .map(|did| did.to_host_name())
+                    .unwrap_or_else(|_| gateway.gateway_did.clone());
+                return Some(OODInfo {
+                    did_hostname,
+                    owner_id: gateway.zone_name,
+                    self_cert: gateway.self_cert,
+                    state: "active".to_string(),
+                });
+            }
+            Err(e) if e.kind() != SnResolverErrorKind::NotManaged => {
+                warn!("sn_resolver hostname query failed for {}: {}", req_host, e);
+            }
+            Err(_) => {}
+        }
+
         let get_result = SNServer::get_user_subhost_from_host(req_host, &self.server_host);
         if get_result.is_some() {
             let (sub_host, username) = get_result.unwrap();
@@ -2669,6 +3041,19 @@ impl SNServer {
         doc_type: Option<&str>,
         from_ip: Option<IpAddr>,
     ) -> ServerResult<EncodedDocument> {
+        self.resolver
+            .resolve_did(did, doc_type, from_ip)
+            .await
+            .map(|resolution| resolution.document)
+            .map_err(|e| e.to_server_error())
+    }
+
+    async fn query_did_v2_legacy(
+        &self,
+        did: &DID,
+        doc_type: Option<&str>,
+        from_ip: Option<IpAddr>,
+    ) -> ServerResult<EncodedDocument> {
         let doc_type = doc_type.and_then(|t| {
             let t = t.trim();
             if t.is_empty() {
@@ -3170,10 +3555,12 @@ impl NameServer for SNServer {
             req_real_name, record_type
         );
         match self
-            .query_name_info_uncached(name, req_real_name.as_str(), record_type, from_ip)
-            .await?
+            .resolver
+            .resolve_dns(req_real_name.as_str(), record_type)
+            .await
         {
-            UncachedNameInfoQueryResult::Found(name_info) => {
+            Ok(resolution) => {
+                let name_info = resolution.into_name_info(name);
                 let cache_ttl_secs = name_info.ttl;
                 self.name_info_cache.add(
                     req_real_name.as_str(),
@@ -3183,7 +3570,15 @@ impl NameServer for SNServer {
                 );
                 Ok(name_info)
             }
-            UncachedNameInfoQueryResult::Tombstone => {
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    SnResolverErrorKind::NotManaged
+                        | SnResolverErrorKind::NameNotFound
+                        | SnResolverErrorKind::DocumentNotFound
+                        | SnResolverErrorKind::DeviceNotFound
+                ) =>
+            {
                 self.name_info_cache
                     .add_tombstone(req_real_name.as_str(), record_type, None);
                 Err(server_err!(
@@ -3192,6 +3587,7 @@ impl NameServer for SNServer {
                     name.to_string()
                 ))
             }
+            Err(e) => Err(e.to_server_error()),
         }
     }
 
