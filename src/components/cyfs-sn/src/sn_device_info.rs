@@ -1,9 +1,8 @@
 use crate::{into_sn_err, sn_err, SnErrorCode, SnResult};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use sfo_sql::mysql::sql_query;
-use sfo_sql::sqlite::{SqlPool, SqlRowObject, SqliteJournalMode};
-use sfo_sql::Row;
+use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteRow};
+use sqlx::{Row, SqlitePool};
 use std::collections::HashSet;
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -327,7 +326,7 @@ pub trait SnDeviceInfoDB: Send + Sync + 'static {
 }
 
 pub struct SqliteSnDeviceInfoDB {
-    pool: SqlPool,
+    pool: SqlitePool,
 }
 
 impl SqliteSnDeviceInfoDB {
@@ -339,13 +338,23 @@ impl SqliteSnDeviceInfoDB {
     }
 
     pub async fn new_by_path(path: &str) -> SnResult<Self> {
-        let pool = SqlPool::open(
-            format!("sqlite://{}", path).as_str(),
-            300,
-            Some(SqliteJournalMode::Wal),
-        )
-        .await
-        .map_err(into_sn_err!(SnErrorCode::DBError, "open file: {:?}", path))?;
+        let db_url = if path.starts_with("sqlite:") {
+            path.to_string()
+        } else {
+            format!("sqlite://{}", path)
+        };
+        let options = SqliteConnectOptions::from_str(db_url.as_str())
+            .map_err(into_sn_err!(
+                SnErrorCode::DBError,
+                "parse sqlite url failed"
+            ))?
+            .create_if_missing(true)
+            .journal_mode(SqliteJournalMode::Wal);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(300)
+            .connect_with(options)
+            .await
+            .map_err(into_sn_err!(SnErrorCode::DBError, "open file: {:?}", path))?;
 
         Ok(Self { pool })
     }
@@ -359,16 +368,17 @@ impl SqliteSnDeviceInfoDB {
     pub async fn initialize_database(&self) -> SnResult<()> {
         let mut conn = self
             .pool
-            .get_conn()
+            .acquire()
             .await
             .map_err(into_sn_err!(SnErrorCode::DBError, "get conn"))?;
 
-        conn.execute_sql(sql_query("PRAGMA foreign_keys = ON"))
+        sqlx::query("PRAGMA foreign_keys = ON")
+            .execute(&mut *conn)
             .await
             .map_err(into_sn_err!(SnErrorCode::DBError, "enable foreign keys"))?;
 
-        let endpoint_columns = conn
-            .query_all(sql_query("PRAGMA table_info(device_endpoints)"))
+        let endpoint_columns = sqlx::query("PRAGMA table_info(device_endpoints)")
+            .fetch_all(&mut *conn)
             .await
             .map_err(into_sn_err!(
                 SnErrorCode::DBError,
@@ -379,7 +389,8 @@ impl SqliteSnDeviceInfoDB {
                 .iter()
                 .any(|row| row.get::<String, _>(1) == "endpoint_id")
         {
-            conn.execute_sql(sql_query("DROP TABLE device_endpoints"))
+            sqlx::query("DROP TABLE device_endpoints")
+                .execute(&mut *conn)
                 .await
                 .map_err(into_sn_err!(
                     SnErrorCode::DBError,
@@ -387,7 +398,7 @@ impl SqliteSnDeviceInfoDB {
                 ))?;
         }
 
-        conn.execute_sql(sql_query(
+        sqlx::query(
             "CREATE TABLE IF NOT EXISTS device_indexes (
                 did TEXT PRIMARY KEY,
                 zone TEXT NOT NULL,
@@ -397,14 +408,15 @@ impl SqliteSnDeviceInfoDB {
                 updated_at INTEGER NOT NULL,
                 UNIQUE(zone, device_name)
             )",
-        ))
+        )
+        .execute(&mut *conn)
         .await
         .map_err(into_sn_err!(
             SnErrorCode::DBError,
             "create device_indexes table failed"
         ))?;
 
-        conn.execute_sql(sql_query(
+        sqlx::query(
             "CREATE TABLE IF NOT EXISTS device_runtime_states (
                 did TEXT PRIMARY KEY,
                 state TEXT NOT NULL,
@@ -424,14 +436,15 @@ impl SqliteSnDeviceInfoDB {
                 updated_at INTEGER NOT NULL,
                 FOREIGN KEY(did) REFERENCES device_indexes(did)
             )",
-        ))
+        )
+        .execute(&mut *conn)
         .await
         .map_err(into_sn_err!(
             SnErrorCode::DBError,
             "create device_runtime_states table failed"
         ))?;
 
-        conn.execute_sql(sql_query(
+        sqlx::query(
             "CREATE TABLE IF NOT EXISTS device_endpoints (
                 did TEXT NOT NULL,
                 endpoint_id TEXT NOT NULL,
@@ -449,14 +462,15 @@ impl SqliteSnDeviceInfoDB {
                 PRIMARY KEY(did, endpoint_id),
                 FOREIGN KEY(did) REFERENCES device_indexes(did)
             )",
-        ))
+        )
+        .execute(&mut *conn)
         .await
         .map_err(into_sn_err!(
             SnErrorCode::DBError,
             "create device_endpoints table failed"
         ))?;
 
-        conn.execute_sql(sql_query(
+        sqlx::query(
             "CREATE TABLE IF NOT EXISTS device_state_events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 did TEXT NOT NULL,
@@ -467,47 +481,52 @@ impl SqliteSnDeviceInfoDB {
                 event_at INTEGER NOT NULL,
                 detail TEXT NULL
             )",
-        ))
+        )
+        .execute(&mut *conn)
         .await
         .map_err(into_sn_err!(
             SnErrorCode::DBError,
             "create device_state_events table failed"
         ))?;
 
-        conn.execute_sql(sql_query(
+        sqlx::query(
             "CREATE INDEX IF NOT EXISTS idx_device_indexes_zone_name
                 ON device_indexes(zone, device_name)",
-        ))
+        )
+        .execute(&mut *conn)
         .await
         .map_err(into_sn_err!(
             SnErrorCode::DBError,
             "create device index zone/name index failed"
         ))?;
 
-        conn.execute_sql(sql_query(
+        sqlx::query(
             "CREATE INDEX IF NOT EXISTS idx_device_runtime_state_expires
                 ON device_runtime_states(state, expires_at)",
-        ))
+        )
+        .execute(&mut *conn)
         .await
         .map_err(into_sn_err!(
             SnErrorCode::DBError,
             "create runtime expires index failed"
         ))?;
 
-        conn.execute_sql(sql_query(
+        sqlx::query(
             "CREATE INDEX IF NOT EXISTS idx_device_endpoints_did_state_priority
                 ON device_endpoints(did, state, priority)",
-        ))
+        )
+        .execute(&mut *conn)
         .await
         .map_err(into_sn_err!(
             SnErrorCode::DBError,
             "create endpoint state priority index failed"
         ))?;
 
-        conn.execute_sql(sql_query(
+        sqlx::query(
             "CREATE INDEX IF NOT EXISTS idx_device_state_events_did_time
                 ON device_state_events(did, event_at)",
-        ))
+        )
+        .execute(&mut *conn)
         .await
         .map_err(into_sn_err!(
             SnErrorCode::DBError,
@@ -803,7 +822,7 @@ impl SqliteSnDeviceInfoDB {
         )
     }
 
-    fn runtime_state_from_row(row: SqlRowObject) -> SnResult<RuntimeStateRow> {
+    fn runtime_state_from_row(row: SqliteRow) -> SnResult<RuntimeStateRow> {
         let state = Self::parse_db_enum::<SnDeviceState>(row.get(1), "state")?;
         let reported_ips = Self::parse_json_string_vec(row.get(3), "reported_ips")?;
         let lan_ips = Self::parse_json_string_vec(row.get(6), "lan_ips")?;
@@ -824,7 +843,7 @@ impl SqliteSnDeviceInfoDB {
         })
     }
 
-    fn device_index_from_row(row: SqlRowObject) -> SnResult<SnDeviceIndex> {
+    fn device_index_from_row(row: SqliteRow) -> SnResult<SnDeviceIndex> {
         Ok(SnDeviceIndex {
             did: row.get(0),
             zone: row.get(1),
@@ -835,7 +854,7 @@ impl SqliteSnDeviceInfoDB {
         })
     }
 
-    fn endpoint_from_row(row: SqlRowObject) -> SnResult<SnDeviceEndpoint> {
+    fn endpoint_from_row(row: SqliteRow) -> SnResult<SnDeviceEndpoint> {
         let port = row
             .get::<Option<i64>, _>(4)
             .and_then(|port| u16::try_from(port).ok());
@@ -860,22 +879,20 @@ impl SqliteSnDeviceInfoDB {
     async fn fetch_device_index(&self, did: &str) -> SnResult<Option<SnDeviceIndex>> {
         let mut conn = self
             .pool
-            .get_conn()
+            .acquire()
             .await
             .map_err(into_sn_err!(SnErrorCode::DBError, "get conn"))?;
-        let rows = conn
-            .query_all(
-                sql_query(
-                    "SELECT did, zone, device_name, device_role, created_at, updated_at
+        let rows = sqlx::query(
+            "SELECT did, zone, device_name, device_role, created_at, updated_at
                      FROM device_indexes WHERE did = ?1 LIMIT 1",
-                )
-                .bind(did),
-            )
-            .await
-            .map_err(into_sn_err!(
-                SnErrorCode::DBError,
-                "query device index failed"
-            ))?;
+        )
+        .bind(did)
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(into_sn_err!(
+            SnErrorCode::DBError,
+            "query device index failed"
+        ))?;
 
         rows.into_iter()
             .next()
@@ -890,23 +907,21 @@ impl SqliteSnDeviceInfoDB {
     ) -> SnResult<Option<SnDeviceIndex>> {
         let mut conn = self
             .pool
-            .get_conn()
+            .acquire()
             .await
             .map_err(into_sn_err!(SnErrorCode::DBError, "get conn"))?;
-        let rows = conn
-            .query_all(
-                sql_query(
-                    "SELECT did, zone, device_name, device_role, created_at, updated_at
+        let rows = sqlx::query(
+            "SELECT did, zone, device_name, device_role, created_at, updated_at
                      FROM device_indexes WHERE zone = ?1 AND device_name = ?2 LIMIT 1",
-                )
-                .bind(zone)
-                .bind(device_name),
-            )
-            .await
-            .map_err(into_sn_err!(
-                SnErrorCode::DBError,
-                "query device index by name failed"
-            ))?;
+        )
+        .bind(zone)
+        .bind(device_name)
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(into_sn_err!(
+            SnErrorCode::DBError,
+            "query device index by name failed"
+        ))?;
 
         rows.into_iter()
             .next()
@@ -917,24 +932,22 @@ impl SqliteSnDeviceInfoDB {
     async fn fetch_runtime_state(&self, did: &str) -> SnResult<Option<RuntimeStateRow>> {
         let mut conn = self
             .pool
-            .get_conn()
+            .acquire()
             .await
             .map_err(into_sn_err!(SnErrorCode::DBError, "get conn"))?;
-        let rows = conn
-            .query_all(
-                sql_query(
-                    "SELECT did, state, reported_ip, reported_ips, from_ip, wan_ip, lan_ips,
+        let rows = sqlx::query(
+            "SELECT did, state, reported_ip, reported_ips, from_ip, wan_ip, lan_ips,
                             nat_type, is_wan_device, last_seen_at, last_report_at, expires_at,
                             report_seq, raw_report, created_at, updated_at
                      FROM device_runtime_states WHERE did = ?1 LIMIT 1",
-                )
-                .bind(did),
-            )
-            .await
-            .map_err(into_sn_err!(
-                SnErrorCode::DBError,
-                "query device runtime state failed"
-            ))?;
+        )
+        .bind(did)
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(into_sn_err!(
+            SnErrorCode::DBError,
+            "query device runtime state failed"
+        ))?;
 
         rows.into_iter()
             .next()
@@ -945,27 +958,25 @@ impl SqliteSnDeviceInfoDB {
     async fn list_active_endpoints(&self, did: &str, now: u64) -> SnResult<Vec<SnDeviceEndpoint>> {
         let mut conn = self
             .pool
-            .get_conn()
+            .acquire()
             .await
             .map_err(into_sn_err!(SnErrorCode::DBError, "get conn"))?;
-        let rows = conn
-            .query_all(
-                sql_query(
-                    "SELECT did, endpoint_id, protocol, host, port, scope, priority, source,
+        let rows = sqlx::query(
+            "SELECT did, endpoint_id, protocol, host, port, scope, priority, source,
                             state, last_seen_at, expires_at, created_at, updated_at
                      FROM device_endpoints
                      WHERE did = ?1
                        AND state = 'active'
                        AND (expires_at IS NULL OR expires_at >= ?2)",
-                )
-                .bind(did)
-                .bind(Self::to_db_time(now, "now")?),
-            )
-            .await
-            .map_err(into_sn_err!(
-                SnErrorCode::DBError,
-                "query device endpoints failed"
-            ))?;
+        )
+        .bind(did)
+        .bind(Self::to_db_time(now, "now")?)
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(into_sn_err!(
+            SnErrorCode::DBError,
+            "query device endpoints failed"
+        ))?;
 
         let mut endpoints = rows
             .into_iter()
@@ -978,22 +989,20 @@ impl SqliteSnDeviceInfoDB {
     async fn list_zone_indexes(&self, zone: &str) -> SnResult<Vec<SnDeviceIndex>> {
         let mut conn = self
             .pool
-            .get_conn()
+            .acquire()
             .await
             .map_err(into_sn_err!(SnErrorCode::DBError, "get conn"))?;
-        let rows = conn
-            .query_all(
-                sql_query(
-                    "SELECT did, zone, device_name, device_role, created_at, updated_at
+        let rows = sqlx::query(
+            "SELECT did, zone, device_name, device_role, created_at, updated_at
                      FROM device_indexes WHERE zone = ?1 ORDER BY device_name ASC",
-                )
-                .bind(zone),
-            )
-            .await
-            .map_err(into_sn_err!(
-                SnErrorCode::DBError,
-                "query zone device indexes failed"
-            ))?;
+        )
+        .bind(zone)
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(into_sn_err!(
+            SnErrorCode::DBError,
+            "query zone device indexes failed"
+        ))?;
 
         rows.into_iter()
             .map(Self::device_index_from_row)
@@ -1012,24 +1021,23 @@ impl SqliteSnDeviceInfoDB {
         let now = Self::now_secs();
         let mut conn = self
             .pool
-            .get_conn()
+            .acquire()
             .await
             .map_err(into_sn_err!(SnErrorCode::DBError, "get conn"))?;
 
-        conn.execute_sql(
-            sql_query(
-                "INSERT INTO device_state_events
+        sqlx::query(
+            "INSERT INTO device_state_events
                  (did, event_type, old_state, new_state, reason, event_at, detail)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            )
-            .bind(did)
-            .bind(event_type.as_str())
-            .bind(old_state.map(|state| state.as_str().to_string()))
-            .bind(new_state.map(|state| state.as_str().to_string()))
-            .bind(reason.map(|v| v.to_string()))
-            .bind(Self::to_db_time(now, "event_at")?)
-            .bind(detail),
         )
+        .bind(did)
+        .bind(event_type.as_str())
+        .bind(old_state.map(|state| state.as_str().to_string()))
+        .bind(new_state.map(|state| state.as_str().to_string()))
+        .bind(reason.map(|v| v.to_string()))
+        .bind(Self::to_db_time(now, "event_at")?)
+        .bind(detail)
+        .execute(&mut *conn)
         .await
         .map_err(into_sn_err!(
             SnErrorCode::DBError,
@@ -1062,13 +1070,12 @@ impl SqliteSnDeviceInfoDB {
         let now_db = Self::to_db_time(now, "now")?;
         let mut conn = self
             .pool
-            .get_conn()
+            .acquire()
             .await
             .map_err(into_sn_err!(SnErrorCode::DBError, "get conn"))?;
 
-        conn.execute_sql(
-            sql_query(
-                "INSERT INTO device_runtime_states
+        sqlx::query(
+            "INSERT INTO device_runtime_states
                  (did, state, nat_type, is_wan_device, last_seen_at, last_report_at,
                   expires_at, created_at, updated_at)
                  VALUES (?1, ?2, 'unknown', 0, NULL, NULL, NULL, ?3, ?3)
@@ -1076,11 +1083,11 @@ impl SqliteSnDeviceInfoDB {
                     state = ?2,
                     updated_at = ?3,
                     expires_at = NULL",
-            )
-            .bind(did)
-            .bind(state.as_str())
-            .bind(now_db),
         )
+        .bind(did)
+        .bind(state.as_str())
+        .bind(now_db)
+        .execute(&mut *conn)
         .await
         .map_err(into_sn_err!(
             SnErrorCode::DBError,
@@ -1088,30 +1095,28 @@ impl SqliteSnDeviceInfoDB {
         ))?;
 
         if state == SnDeviceState::Blocked {
-            conn.execute_sql(
-                sql_query(
-                    "UPDATE device_endpoints
+            sqlx::query(
+                "UPDATE device_endpoints
                      SET state = 'disabled', updated_at = ?2
                      WHERE did = ?1 AND state = 'active'",
-                )
-                .bind(did)
-                .bind(now_db),
             )
+            .bind(did)
+            .bind(now_db)
+            .execute(&mut *conn)
             .await
             .map_err(into_sn_err!(
                 SnErrorCode::DBError,
                 "disable device endpoints failed"
             ))?;
         } else if state == SnDeviceState::Offline || state == SnDeviceState::Stale {
-            conn.execute_sql(
-                sql_query(
-                    "UPDATE device_endpoints
+            sqlx::query(
+                "UPDATE device_endpoints
                      SET state = 'stale', updated_at = ?2
                      WHERE did = ?1 AND state = 'active'",
-                )
-                .bind(did)
-                .bind(now_db),
             )
+            .bind(did)
+            .bind(now_db)
+            .execute(&mut *conn)
             .await
             .map_err(into_sn_err!(
                 SnErrorCode::DBError,
@@ -1142,35 +1147,33 @@ impl SqliteSnDeviceInfoDB {
         let now_db = Self::to_db_time(now, "now")?;
         let mut conn = self
             .pool
-            .get_conn()
+            .acquire()
             .await
             .map_err(into_sn_err!(SnErrorCode::DBError, "get conn"))?;
 
-        conn.execute_sql(
-            sql_query(
-                "UPDATE device_runtime_states
+        sqlx::query(
+            "UPDATE device_runtime_states
                  SET state = 'stale', updated_at = ?2
                  WHERE did = ?1 AND state = 'online'",
-            )
-            .bind(did)
-            .bind(now_db),
         )
+        .bind(did)
+        .bind(now_db)
+        .execute(&mut *conn)
         .await
         .map_err(into_sn_err!(
             SnErrorCode::DBError,
             "mark expired device stale failed"
         ))?;
 
-        conn.execute_sql(
-            sql_query(
-                "UPDATE device_endpoints
+        sqlx::query(
+            "UPDATE device_endpoints
                  SET state = 'stale', updated_at = ?2
                  WHERE did = ?1 AND state = 'active'
                    AND expires_at IS NOT NULL AND expires_at < ?2",
-            )
-            .bind(did)
-            .bind(now_db),
         )
+        .bind(did)
+        .bind(now_db)
+        .execute(&mut *conn)
         .await
         .map_err(into_sn_err!(
             SnErrorCode::DBError,
@@ -1255,19 +1258,18 @@ impl SnDeviceInfoDB for SqliteSnDeviceInfoDB {
             let now = Self::now_secs();
             let mut conn = self
                 .pool
-                .get_conn()
+                .acquire()
                 .await
                 .map_err(into_sn_err!(SnErrorCode::DBError, "get conn"))?;
-            conn.execute_sql(
-                sql_query(
-                    "UPDATE device_indexes
+            sqlx::query(
+                "UPDATE device_indexes
                      SET device_role = ?2, updated_at = ?3
                      WHERE did = ?1",
-                )
-                .bind(did)
-                .bind(device_role.as_str())
-                .bind(Self::to_db_time(now, "updated_at")?),
             )
+            .bind(did)
+            .bind(device_role.as_str())
+            .bind(Self::to_db_time(now, "updated_at")?)
+            .execute(&mut *conn)
             .await
             .map_err(into_sn_err!(
                 SnErrorCode::DBError,
@@ -1291,22 +1293,21 @@ impl SnDeviceInfoDB for SqliteSnDeviceInfoDB {
         let now_db = Self::to_db_time(now, "now")?;
         let mut conn = self
             .pool
-            .get_conn()
+            .acquire()
             .await
             .map_err(into_sn_err!(SnErrorCode::DBError, "get conn"))?;
 
-        conn.execute_sql(
-            sql_query(
-                "INSERT INTO device_indexes
+        sqlx::query(
+            "INSERT INTO device_indexes
                  (did, zone, device_name, device_role, created_at, updated_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
-            )
-            .bind(did)
-            .bind(zone)
-            .bind(device_name)
-            .bind(device_role.as_str())
-            .bind(now_db),
         )
+        .bind(did)
+        .bind(zone)
+        .bind(device_name)
+        .bind(device_role.as_str())
+        .bind(now_db)
+        .execute(&mut *conn)
         .await
         .map_err(into_sn_err!(
             SnErrorCode::DBError,
@@ -1367,21 +1368,20 @@ impl SnDeviceInfoDB for SqliteSnDeviceInfoDB {
         let now = Self::now_secs();
         let mut conn = self
             .pool
-            .get_conn()
+            .acquire()
             .await
             .map_err(into_sn_err!(SnErrorCode::DBError, "get conn"))?;
-        conn.execute_sql(
-            sql_query(
-                "UPDATE device_indexes
+        sqlx::query(
+            "UPDATE device_indexes
                  SET zone = ?2, device_name = ?3, device_role = ?4, updated_at = ?5
                  WHERE did = ?1",
-            )
-            .bind(did)
-            .bind(new_zone)
-            .bind(new_device_name)
-            .bind(new_device_role.as_str())
-            .bind(Self::to_db_time(now, "updated_at")?),
         )
+        .bind(did)
+        .bind(new_zone)
+        .bind(new_device_name)
+        .bind(new_device_role.as_str())
+        .bind(Self::to_db_time(now, "updated_at")?)
+        .execute(&mut *conn)
         .await
         .map_err(into_sn_err!(
             SnErrorCode::DBError,
@@ -1422,25 +1422,31 @@ impl SnDeviceInfoDB for SqliteSnDeviceInfoDB {
 
         let mut conn = self
             .pool
-            .get_conn()
+            .acquire()
             .await
             .map_err(into_sn_err!(SnErrorCode::DBError, "get conn"))?;
 
-        conn.execute_sql(sql_query("DELETE FROM device_runtime_states WHERE did = ?1").bind(did))
+        sqlx::query("DELETE FROM device_runtime_states WHERE did = ?1")
+            .bind(did)
+            .execute(&mut *conn)
             .await
             .map_err(into_sn_err!(
                 SnErrorCode::DBError,
                 "delete device runtime state failed"
             ))?;
 
-        conn.execute_sql(sql_query("DELETE FROM device_endpoints WHERE did = ?1").bind(did))
+        sqlx::query("DELETE FROM device_endpoints WHERE did = ?1")
+            .bind(did)
+            .execute(&mut *conn)
             .await
             .map_err(into_sn_err!(
                 SnErrorCode::DBError,
                 "delete device endpoints failed"
             ))?;
 
-        conn.execute_sql(sql_query("DELETE FROM device_indexes WHERE did = ?1").bind(did))
+        sqlx::query("DELETE FROM device_indexes WHERE did = ?1")
+            .bind(did)
+            .execute(&mut *conn)
             .await
             .map_err(into_sn_err!(
                 SnErrorCode::DBError,
@@ -1569,12 +1575,11 @@ impl SnDeviceInfoDB for SqliteSnDeviceInfoDB {
 
         let mut conn = self
             .pool
-            .get_conn()
+            .acquire()
             .await
             .map_err(into_sn_err!(SnErrorCode::DBError, "get conn"))?;
-        conn.execute_sql(
-            sql_query(
-                "INSERT INTO device_runtime_states
+        sqlx::query(
+            "INSERT INTO device_runtime_states
                  (did, state, reported_ip, reported_ips, from_ip, wan_ip, lan_ips, nat_type,
                   is_wan_device, last_seen_at, last_report_at, expires_at, report_seq,
                   raw_report, created_at, updated_at)
@@ -1594,25 +1599,25 @@ impl SnDeviceInfoDB for SqliteSnDeviceInfoDB {
                     report_seq = ?11,
                     raw_report = ?12,
                     updated_at = ?9",
-            )
-            .bind(&update.did)
-            .bind(update.reported_ip.clone())
-            .bind(reported_ips_json)
-            .bind(update.from_ip.clone())
-            .bind(wan_ip.clone())
-            .bind(lan_ips_json)
-            .bind(update.nat_type.as_str())
-            .bind(if wan_ip.is_some() { 1i64 } else { 0i64 })
-            .bind(Self::to_db_time(now, "now")?)
-            .bind(Self::to_db_time(expires_at, "expires_at")?)
-            .bind(
-                update
-                    .report_seq
-                    .map(|seq| Self::to_db_time(seq, "report_seq"))
-                    .transpose()?,
-            )
-            .bind(update.raw_report.clone()),
         )
+        .bind(&update.did)
+        .bind(update.reported_ip.clone())
+        .bind(reported_ips_json)
+        .bind(update.from_ip.clone())
+        .bind(wan_ip.clone())
+        .bind(lan_ips_json)
+        .bind(update.nat_type.as_str())
+        .bind(if wan_ip.is_some() { 1i64 } else { 0i64 })
+        .bind(Self::to_db_time(now, "now")?)
+        .bind(Self::to_db_time(expires_at, "expires_at")?)
+        .bind(
+            update
+                .report_seq
+                .map(|seq| Self::to_db_time(seq, "report_seq"))
+                .transpose()?,
+        )
+        .bind(update.raw_report.clone())
+        .execute(&mut *conn)
         .await
         .map_err(into_sn_err!(
             SnErrorCode::DBError,
@@ -1620,9 +1625,8 @@ impl SnDeviceInfoDB for SqliteSnDeviceInfoDB {
         ))?;
 
         for endpoint in &update.endpoints {
-            conn.execute_sql(
-                sql_query(
-                    "INSERT INTO device_endpoints
+            sqlx::query(
+                "INSERT INTO device_endpoints
                      (did, endpoint_id, protocol, host, port, scope, priority, source, state,
                       last_seen_at, expires_at, created_at, updated_at)
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'active', ?9, ?10, ?9, ?9)
@@ -1640,24 +1644,24 @@ impl SnDeviceInfoDB for SqliteSnDeviceInfoDB {
                         last_seen_at = ?9,
                         expires_at = ?10,
                         updated_at = ?9",
-                )
-                .bind(&update.did)
-                .bind(&endpoint.endpoint_id)
-                .bind(endpoint.protocol.as_str())
-                .bind(&endpoint.host)
-                .bind(endpoint.port.map(i64::from))
-                .bind(endpoint.scope.as_str())
-                .bind(endpoint.priority)
-                .bind(endpoint.source.as_str())
-                .bind(Self::to_db_time(now, "endpoint last_seen_at")?)
-                .bind(
-                    endpoint
-                        .expires_at
-                        .or(Some(expires_at))
-                        .map(|value| Self::to_db_time(value, "endpoint expires_at"))
-                        .transpose()?,
-                ),
             )
+            .bind(&update.did)
+            .bind(&endpoint.endpoint_id)
+            .bind(endpoint.protocol.as_str())
+            .bind(&endpoint.host)
+            .bind(endpoint.port.map(i64::from))
+            .bind(endpoint.scope.as_str())
+            .bind(endpoint.priority)
+            .bind(endpoint.source.as_str())
+            .bind(Self::to_db_time(now, "endpoint last_seen_at")?)
+            .bind(
+                endpoint
+                    .expires_at
+                    .or(Some(expires_at))
+                    .map(|value| Self::to_db_time(value, "endpoint expires_at"))
+                    .transpose()?,
+            )
+            .execute(&mut *conn)
             .await
             .map_err(into_sn_err!(SnErrorCode::DBError, "upsert endpoint failed"))?;
         }
@@ -1796,18 +1800,17 @@ impl SnDeviceInfoDB for SqliteSnDeviceInfoDB {
         let now = Self::now_secs();
         let mut conn = self
             .pool
-            .get_conn()
+            .acquire()
             .await
             .map_err(into_sn_err!(SnErrorCode::DBError, "get conn"))?;
-        conn.execute_sql(
-            sql_query(
-                "UPDATE device_endpoints
+        sqlx::query(
+            "UPDATE device_endpoints
                  SET state = 'stale', updated_at = ?2
                  WHERE did = ?1 AND state = 'disabled'",
-            )
-            .bind(did)
-            .bind(Self::to_db_time(now, "updated_at")?),
         )
+        .bind(did)
+        .bind(Self::to_db_time(now, "updated_at")?)
+        .execute(&mut *conn)
         .await
         .map_err(into_sn_err!(
             SnErrorCode::DBError,
@@ -1820,7 +1823,7 @@ impl SnDeviceInfoDB for SqliteSnDeviceInfoDB {
     async fn expire_devices(&self, now: u64, batch_size: Option<usize>) -> SnResult<usize> {
         let mut conn = self
             .pool
-            .get_conn()
+            .acquire()
             .await
             .map_err(into_sn_err!(SnErrorCode::DBError, "get conn"))?;
 
@@ -1835,14 +1838,17 @@ impl SnDeviceInfoDB for SqliteSnDeviceInfoDB {
 
         let rows =
             if let Some(batch_size) = batch_size {
-                conn.query_all(sql_query(&query).bind(Self::to_db_time(now, "now")?).bind(
-                    i64::try_from(batch_size).map_err(|_| {
+                sqlx::query(&query)
+                    .bind(Self::to_db_time(now, "now")?)
+                    .bind(i64::try_from(batch_size).map_err(|_| {
                         sn_err!(SnErrorCode::InvalidInput, "batch_size is too large")
-                    })?,
-                ))
-                .await
+                    })?)
+                    .fetch_all(&mut *conn)
+                    .await
             } else {
-                conn.query_all(sql_query(&query).bind(Self::to_db_time(now, "now")?))
+                sqlx::query(&query)
+                    .bind(Self::to_db_time(now, "now")?)
+                    .fetch_all(&mut *conn)
                     .await
             }
             .map_err(into_sn_err!(

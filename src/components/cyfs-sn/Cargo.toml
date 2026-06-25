@@ -33,7 +33,6 @@ name-lib.workspace = true
 cyfs-gateway-lib = { path = "../cyfs-gateway-lib" }
 async-named-locker = "0.1"
 callback-trait = "0.1"
-sfo-sql = "0.4"
 sfo-result = "0.2"
 #buckyos-api = { path = "../../kernel/buckyos-api" }
 

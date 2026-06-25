@@ -5,15 +5,15 @@ use crate::{
 use cyfs_gateway_lib::{into_server_err, ServerErrorCode, ServerResult};
 use rand::Rng;
 use serde::Deserialize;
-use sfo_sql::mysql::sql_query;
-use sfo_sql::sqlite::{SqlPool, SqliteJournalMode};
-use sfo_sql::Row;
+use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
+use sqlx::{Row, SqlitePool};
 use std::path::PathBuf;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub struct SqliteSnDB {
-    pool: SqlPool,
+    pool: SqlitePool,
 }
 
 impl SqliteSnDB {
@@ -28,72 +28,80 @@ impl SqliteSnDB {
     }
 
     pub async fn new_by_path(path: &str) -> SnResult<SqliteSnDB> {
-        let pool = SqlPool::open(
-            format!("sqlite://{}", path).as_str(),
-            300,
-            Some(SqliteJournalMode::Wal),
-        )
-        .await
-        .map_err(into_sn_err!(SnErrorCode::DBError, "open file: {:?}", path))?;
+        let db_url = if path.starts_with("sqlite:") {
+            path.to_string()
+        } else {
+            format!("sqlite://{}", path)
+        };
+        let options = SqliteConnectOptions::from_str(db_url.as_str())
+            .map_err(into_sn_err!(
+                SnErrorCode::DBError,
+                "parse sqlite url failed"
+            ))?
+            .create_if_missing(true)
+            .journal_mode(SqliteJournalMode::Wal);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(300)
+            .connect_with(options)
+            .await
+            .map_err(into_sn_err!(SnErrorCode::DBError, "open file: {:?}", path))?;
         Ok(SqliteSnDB { pool })
     }
 
     pub async fn initialize_database(&self) -> SnResult<()> {
         let mut conn = self
             .pool
-            .get_conn()
+            .acquire()
             .await
             .map_err(into_sn_err!(SnErrorCode::DBError, "get conn"))?;
-        conn.execute_sql(sql_query(
+        sqlx::query(
             "CREATE TABLE IF NOT EXISTS activation_codes (code TEXT PRIMARY KEY, used INTEGER)",
-        ))
+        )
+        .execute(&mut *conn)
         .await
         .map_err(into_sn_err!(
             SnErrorCode::DBError,
             "create activation_codes table failed"
         ))?;
-        conn.execute_sql(sql_query("CREATE TABLE IF NOT EXISTS users (username TEXT PRIMARY KEY, state TEXT, public_key TEXT, activation_code TEXT, zone_config TEXT, self_cert boolean, user_domain TEXT, sn_ips TEXT)")).await
+        sqlx::query("CREATE TABLE IF NOT EXISTS users (username TEXT PRIMARY KEY, state TEXT, public_key TEXT, activation_code TEXT, zone_config TEXT, self_cert boolean, user_domain TEXT, sn_ips TEXT)").execute(&mut *conn).await
             .map_err(into_sn_err!(SnErrorCode::DBError, "create users table failed"))?;
-        conn.execute_sql(sql_query("CREATE TABLE IF NOT EXISTS user_auth_v2 (username TEXT PRIMARY KEY, password_hash TEXT NOT NULL, password_salt TEXT NOT NULL, password_algo TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, last_login_at INTEGER NULL)")).await
+        sqlx::query("CREATE TABLE IF NOT EXISTS user_auth_v2 (username TEXT PRIMARY KEY, password_hash TEXT NOT NULL, password_salt TEXT NOT NULL, password_algo TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, last_login_at INTEGER NULL)").execute(&mut *conn).await
             .map_err(into_sn_err!(SnErrorCode::DBError, "create user_auth_v2 table failed"))?;
-        conn.execute_sql(sql_query("CREATE TABLE IF NOT EXISTS devices (owner TEXT, device_name TEXT, did TEXT PRIMARY KEY, ip TEXT, description TEXT, mini_config_jwt TEXT, created_at INTEGER, updated_at INTEGER)")).await
+        sqlx::query("CREATE TABLE IF NOT EXISTS devices (owner TEXT, device_name TEXT, did TEXT PRIMARY KEY, ip TEXT, description TEXT, mini_config_jwt TEXT, created_at INTEGER, updated_at INTEGER)").execute(&mut *conn).await
             .map_err(into_sn_err!(SnErrorCode::DBError, "create devices table failed"))?;
-        conn.execute_sql(sql_query("CREATE TABLE IF NOT EXISTS user_dns_records (id INTEGER PRIMARY KEY AUTOINCREMENT, owner TEXT, domain TEXT, record_type TEXT, record TEXT, ttl INTEGER, created_at INTEGER, updated_at INTEGER)")).await
+        sqlx::query("CREATE TABLE IF NOT EXISTS user_dns_records (id INTEGER PRIMARY KEY AUTOINCREMENT, owner TEXT, domain TEXT, record_type TEXT, record TEXT, ttl INTEGER, created_at INTEGER, updated_at INTEGER)").execute(&mut *conn).await
             .map_err(into_sn_err!(SnErrorCode::DBError, "create user_dns_records table failed"))?;
-        conn.execute_sql(sql_query("CREATE UNIQUE INDEX IF NOT EXISTS idx_user_domain_record_type ON user_dns_records (owner, domain, record_type)")).await
+        sqlx::query("CREATE UNIQUE INDEX IF NOT EXISTS idx_user_domain_record_type ON user_dns_records (owner, domain, record_type)").execute(&mut *conn).await
             .map_err(into_sn_err!(SnErrorCode::DBError, "create unique index on user_dns_records failed"))?;
-        conn.execute_sql(sql_query("CREATE INDEX IF NOT EXISTS user_dns_records_domain_index ON user_dns_records (domain, id)")).await
+        sqlx::query("CREATE INDEX IF NOT EXISTS user_dns_records_domain_index ON user_dns_records (domain, id)").execute(&mut *conn).await
             .map_err(into_sn_err!(SnErrorCode::DBError, "create user_dns_records_domain_index failed"))?;
-        conn.execute_sql(sql_query("CREATE TABLE IF NOT EXISTS user_domain_history (domain TEXT PRIMARY KEY, owner TEXT NOT NULL, created_at INTEGER NOT NULL)")).await
+        sqlx::query("CREATE TABLE IF NOT EXISTS user_domain_history (domain TEXT PRIMARY KEY, owner TEXT NOT NULL, created_at INTEGER NOT NULL)").execute(&mut *conn).await
             .map_err(into_sn_err!(SnErrorCode::DBError, "create user_domain_history table failed"))?;
-        conn.execute_sql(sql_query("CREATE TABLE IF NOT EXISTS did_documents (id INTEGER PRIMARY KEY AUTOINCREMENT, obj_id TEXT, owner_user TEXT, obj_name TEXT, did_document TEXT, doc_type TEXT, update_time INTEGER)")).await
+        sqlx::query("CREATE TABLE IF NOT EXISTS did_documents (id INTEGER PRIMARY KEY AUTOINCREMENT, obj_id TEXT, owner_user TEXT, obj_name TEXT, did_document TEXT, doc_type TEXT, update_time INTEGER)").execute(&mut *conn).await
             .map_err(into_sn_err!(SnErrorCode::DBError, "create did_documents table failed"))?;
-        conn.execute_sql(sql_query("CREATE INDEX IF NOT EXISTS idx_did_documents_owner_obj ON did_documents (owner_user, obj_name, update_time)")).await
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_did_documents_owner_obj ON did_documents (owner_user, obj_name, update_time)").execute(&mut *conn).await
             .map_err(into_sn_err!(SnErrorCode::DBError, "create did_documents index failed"))?;
 
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs() as i64;
-        let rows = conn
-            .query_all(sql_query(
-                "SELECT username, user_domain FROM users WHERE user_domain IS NOT NULL",
-            ))
-            .await
-            .map_err(into_sn_err!(
-                SnErrorCode::DBError,
-                "query existing user_domain history failed"
-            ))?;
+        let rows =
+            sqlx::query("SELECT username, user_domain FROM users WHERE user_domain IS NOT NULL")
+                .fetch_all(&mut *conn)
+                .await
+                .map_err(into_sn_err!(
+                    SnErrorCode::DBError,
+                    "query existing user_domain history failed"
+                ))?;
         for row in rows {
             let username: String = row.get(0);
             let user_domain: String = row.get(1);
             if let Some(canonical_domain) = Self::canonical_user_domain(user_domain.as_str()) {
-                conn.execute_sql(
-                    sql_query("INSERT OR IGNORE INTO user_domain_history (domain, owner, created_at) VALUES (?1, ?2, ?3)")
+                sqlx::query("INSERT OR IGNORE INTO user_domain_history (domain, owner, created_at) VALUES (?1, ?2, ?3)")
                         .bind(canonical_domain)
                         .bind(username)
-                        .bind(now),
-                )
+                        .bind(now).execute(&mut *conn)
                 .await
                 .map_err(into_sn_err!(
                     SnErrorCode::DBError,
@@ -124,13 +132,11 @@ impl SnDB for SqliteSnDB {
     async fn get_activation_codes(&self) -> SnResult<Vec<String>> {
         let mut conn = self
             .pool
-            .get_conn()
+            .acquire()
             .await
             .map_err(into_sn_err!(SnErrorCode::DBError, "get conn"))?;
-        let rows = conn
-            .query_all(sql_query(
-                "SELECT code FROM activation_codes WHERE used = 0",
-            ))
+        let rows = sqlx::query("SELECT code FROM activation_codes WHERE used = 0")
+            .fetch_all(&mut *conn)
             .await
             .map_err(into_sn_err!(
                 SnErrorCode::DBError,
@@ -144,17 +150,17 @@ impl SnDB for SqliteSnDB {
     async fn insert_activation_code(&self, code: &str) -> SnResult<()> {
         let mut conn = self
             .pool
-            .get_conn()
+            .acquire()
             .await
             .map_err(into_sn_err!(SnErrorCode::DBError, "get conn"))?;
-        conn.execute_sql(
-            sql_query("INSERT INTO activation_codes (code, used) VALUES (?1, 0)").bind(code),
-        )
-        .await
-        .map_err(into_sn_err!(
-            SnErrorCode::DBError,
-            "insert activation_codes failed"
-        ))?;
+        sqlx::query("INSERT INTO activation_codes (code, used) VALUES (?1, 0)")
+            .bind(code)
+            .execute(&mut *conn)
+            .await
+            .map_err(into_sn_err!(
+                SnErrorCode::DBError,
+                "insert activation_codes failed"
+            ))?;
         Ok(())
     }
 
@@ -162,20 +168,20 @@ impl SnDB for SqliteSnDB {
         let mut codes: Vec<String> = Vec::new();
         let mut conn = self
             .pool
-            .get_conn()
+            .acquire()
             .await
             .map_err(into_sn_err!(SnErrorCode::DBError, "get conn"))?;
         for _ in 0..count {
             let code: String = rand::rng().random_range(0..1000000).to_string();
             codes.push(code.clone());
-            conn.execute_sql(
-                sql_query("INSERT INTO activation_codes (code, used) VALUES (?1, 0)").bind(code),
-            )
-            .await
-            .map_err(into_sn_err!(
-                SnErrorCode::DBError,
-                "insert activation_codes failed"
-            ))?;
+            sqlx::query("INSERT INTO activation_codes (code, used) VALUES (?1, 0)")
+                .bind(code)
+                .execute(&mut *conn)
+                .await
+                .map_err(into_sn_err!(
+                    SnErrorCode::DBError,
+                    "insert activation_codes failed"
+                ))?;
         }
         Ok(codes)
     }
@@ -183,13 +189,12 @@ impl SnDB for SqliteSnDB {
     async fn check_active_code(&self, active_code: &str) -> SnResult<bool> {
         let mut conn = self
             .pool
-            .get_conn()
+            .acquire()
             .await
             .map_err(into_sn_err!(SnErrorCode::DBError, "get conn"))?;
-        match conn
-            .query_one(
-                sql_query("SELECT used FROM activation_codes WHERE code = ?1").bind(active_code),
-            )
+        match sqlx::query("SELECT used FROM activation_codes WHERE code = ?1")
+            .bind(active_code)
+            .fetch_one(&mut *conn)
             .await
         {
             Ok(row) => {
@@ -201,103 +206,76 @@ impl SnDB for SqliteSnDB {
     }
 
     async fn clear_state_by_active_code(&self, active_code: &str) -> SnResult<SnClearStateResult> {
-        let mut conn = self
-            .pool
-            .get_conn()
-            .await
-            .map_err(into_sn_err!(SnErrorCode::DBError, "get conn"))?;
-
-        conn.begin_transaction().await.map_err(into_sn_err!(
+        let mut conn = self.pool.begin().await.map_err(into_sn_err!(
             SnErrorCode::DBError,
             "begin transaction failed"
         ))?;
 
-        let user_count: i64 = conn
-            .query_one(
-                sql_query("SELECT COUNT(*) FROM users WHERE activation_code = ?1")
-                    .bind(active_code),
-            )
+        let user_count: i64 = sqlx::query("SELECT COUNT(*) FROM users WHERE activation_code = ?1")
+            .bind(active_code)
+            .fetch_one(&mut *conn)
             .await
             .map_err(into_sn_err!(SnErrorCode::DBError, "count users failed"))?
             .get(0);
 
-        let device_count: i64 = conn
-            .query_one(
-                sql_query(
+        let device_count: i64 = sqlx::query(
                     "SELECT COUNT(*) FROM devices WHERE owner IN (SELECT username FROM users WHERE activation_code = ?1)",
                 )
-                .bind(active_code),
-            )
+                .bind(active_code).fetch_one(&mut *conn)
             .await
             .map_err(into_sn_err!(SnErrorCode::DBError, "count devices failed"))?
             .get(0);
 
-        let domain_record_count: i64 = conn
-            .query_one(
-                sql_query(
+        let domain_record_count: i64 = sqlx::query(
                     "SELECT COUNT(*) FROM user_dns_records WHERE owner IN (SELECT username FROM users WHERE activation_code = ?1)",
                 )
-                .bind(active_code),
-            )
+                .bind(active_code).fetch_one(&mut *conn)
             .await
             .map_err(into_sn_err!(SnErrorCode::DBError, "count user_dns_records failed"))?
             .get(0);
 
-        let did_doc_count: i64 = conn
-            .query_one(
-                sql_query(
+        let did_doc_count: i64 = sqlx::query(
                     "SELECT COUNT(*) FROM did_documents WHERE owner_user IN (SELECT username FROM users WHERE activation_code = ?1)",
                 )
-                .bind(active_code),
-            )
+                .bind(active_code).fetch_one(&mut *conn)
             .await
             .map_err(into_sn_err!(SnErrorCode::DBError, "count did_documents failed"))?
             .get(0);
 
-        conn.execute_sql(
-            sql_query("DELETE FROM devices WHERE owner IN (SELECT username FROM users WHERE activation_code = ?1)")
-                .bind(active_code),
-        )
+        sqlx::query("DELETE FROM devices WHERE owner IN (SELECT username FROM users WHERE activation_code = ?1)")
+                .bind(active_code).execute(&mut *conn)
         .await
         .map_err(into_sn_err!(SnErrorCode::DBError, "delete devices failed"))?;
 
-        conn.execute_sql(
-            sql_query("DELETE FROM user_dns_records WHERE owner IN (SELECT username FROM users WHERE activation_code = ?1)")
-                .bind(active_code),
-        )
+        sqlx::query("DELETE FROM user_dns_records WHERE owner IN (SELECT username FROM users WHERE activation_code = ?1)")
+                .bind(active_code).execute(&mut *conn)
         .await
         .map_err(into_sn_err!(SnErrorCode::DBError, "delete user dns records failed"))?;
 
-        conn.execute_sql(
-            sql_query("DELETE FROM did_documents WHERE owner_user IN (SELECT username FROM users WHERE activation_code = ?1)")
-                .bind(active_code),
-        )
+        sqlx::query("DELETE FROM did_documents WHERE owner_user IN (SELECT username FROM users WHERE activation_code = ?1)")
+                .bind(active_code).execute(&mut *conn)
         .await
         .map_err(into_sn_err!(SnErrorCode::DBError, "delete did documents failed"))?;
 
-        conn.execute_sql(
-            sql_query("DELETE FROM user_auth_v2 WHERE username IN (SELECT username FROM users WHERE activation_code = ?1)")
-                .bind(active_code),
-        )
+        sqlx::query("DELETE FROM user_auth_v2 WHERE username IN (SELECT username FROM users WHERE activation_code = ?1)")
+                .bind(active_code).execute(&mut *conn)
         .await
         .map_err(into_sn_err!(SnErrorCode::DBError, "delete user auth v2 failed"))?;
 
-        conn.execute_sql(
-            sql_query("DELETE FROM users WHERE activation_code = ?1").bind(active_code),
-        )
-        .await
-        .map_err(into_sn_err!(SnErrorCode::DBError, "delete users failed"))?;
+        sqlx::query("DELETE FROM users WHERE activation_code = ?1")
+            .bind(active_code)
+            .execute(&mut *conn)
+            .await
+            .map_err(into_sn_err!(SnErrorCode::DBError, "delete users failed"))?;
 
-        conn.execute_sql(
-            sql_query(
+        sqlx::query(
                 "INSERT INTO activation_codes (code, used) VALUES (?1, 0) ON CONFLICT(code) DO UPDATE SET used = 0",
             )
-            .bind(active_code),
-        )
+            .bind(active_code).execute(&mut *conn)
         .await
         .map_err(into_sn_err!(SnErrorCode::DBError, "reset activation code failed"))?;
 
-        conn.commit_transaction().await.map_err(into_sn_err!(
+        conn.commit().await.map_err(into_sn_err!(
             SnErrorCode::DBError,
             "commit transaction failed"
         ))?;
@@ -349,21 +327,14 @@ impl SnDB for SqliteSnDB {
         } else {
             None
         };
-        let mut conn = self
-            .pool
-            .get_conn()
-            .await
-            .map_err(into_sn_err!(SnErrorCode::DBError, "get conn"))?;
-
-        conn.begin_transaction().await.map_err(into_sn_err!(
+        let mut conn = self.pool.begin().await.map_err(into_sn_err!(
             SnErrorCode::DBError,
             "begin transaction failed"
         ))?;
         // 检查激活码是否未使用
-        match conn
-            .query_one(
-                sql_query("SELECT used FROM activation_codes WHERE code = ?1").bind(active_code),
-            )
+        match sqlx::query("SELECT used FROM activation_codes WHERE code = ?1")
+            .bind(active_code)
+            .fetch_one(&mut *conn)
             .await
         {
             Ok(row) => {
@@ -374,12 +345,9 @@ impl SnDB for SqliteSnDB {
                             Self::canonical_user_domain(user_domain.as_str())
                         {
                             let descendant_pattern = format!("%.{}", canonical_domain);
-                            let conflicts = conn
-                                .query_all(
-                                    sql_query("SELECT domain, owner FROM user_domain_history WHERE domain = ?1 OR domain LIKE ?2 OR ?1 LIKE '%.' || domain")
+                            let conflicts = sqlx::query("SELECT domain, owner FROM user_domain_history WHERE domain = ?1 OR domain LIKE ?2 OR ?1 LIKE '%.' || domain")
                                         .bind(canonical_domain.as_str())
-                                        .bind(descendant_pattern),
-                                )
+                                        .bind(descendant_pattern).fetch_all(&mut *conn)
                                 .await
                                 .map_err(into_sn_err!(
                                     SnErrorCode::DBError,
@@ -402,14 +370,14 @@ impl SnDB for SqliteSnDB {
                     }
 
                     // 插入用户记录
-                    conn.execute_sql(sql_query("INSERT INTO users (username, state, public_key, activation_code, zone_config, user_domain, sn_ips) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)")
+                    sqlx::query("INSERT INTO users (username, state, public_key, activation_code, zone_config, user_domain, sn_ips) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)")
                         .bind(username)
                         .bind(UserState::Active.to_string())
                         .bind(public_key)
                         .bind(active_code)
                         .bind(zone_config)
                         .bind(user_domain.clone())
-                        .bind(sn_ips)).await
+                        .bind(sn_ips).execute(&mut *conn).await
                         .map_err(into_sn_err!(SnErrorCode::DBError, "insert user failed"))?;
 
                     if let Some(user_domain) = user_domain.as_ref() {
@@ -420,12 +388,10 @@ impl SnDB for SqliteSnDB {
                                 .duration_since(UNIX_EPOCH)
                                 .unwrap()
                                 .as_secs() as i64;
-                            conn.execute_sql(
-                                sql_query("INSERT OR IGNORE INTO user_domain_history (domain, owner, created_at) VALUES (?1, ?2, ?3)")
+                            sqlx::query("INSERT OR IGNORE INTO user_domain_history (domain, owner, created_at) VALUES (?1, ?2, ?3)")
                                     .bind(canonical_domain)
                                     .bind(username)
-                                    .bind(now),
-                            )
+                                    .bind(now).execute(&mut *conn)
                             .await
                             .map_err(into_sn_err!(
                                 SnErrorCode::DBError,
@@ -435,17 +401,16 @@ impl SnDB for SqliteSnDB {
                     }
 
                     // 更新激活码为已使用
-                    conn.execute_sql(
-                        sql_query("UPDATE activation_codes SET used = 1 WHERE code = ?1")
-                            .bind(active_code),
-                    )
-                    .await
-                    .map_err(into_sn_err!(
-                        SnErrorCode::DBError,
-                        "update activation code failed"
-                    ))?;
+                    sqlx::query("UPDATE activation_codes SET used = 1 WHERE code = ?1")
+                        .bind(active_code)
+                        .execute(&mut *conn)
+                        .await
+                        .map_err(into_sn_err!(
+                            SnErrorCode::DBError,
+                            "update activation code failed"
+                        ))?;
 
-                    conn.commit_transaction().await.map_err(into_sn_err!(
+                    conn.commit().await.map_err(into_sn_err!(
                         SnErrorCode::DBError,
                         "commit transaction failed"
                     ))?;
@@ -464,14 +429,12 @@ impl SnDB for SqliteSnDB {
     ) -> SnResult<Option<(String, String, Option<String>)>> {
         let mut conn = self
             .pool
-            .get_conn()
+            .acquire()
             .await
             .map_err(into_sn_err!(SnErrorCode::DBError, "get conn"))?;
-        match conn
-            .query_one(
-                sql_query("SELECT username, zone_config, sn_ips FROM users WHERE public_key = ?1")
-                    .bind(public_key),
-            )
+        match sqlx::query("SELECT username, zone_config, sn_ips FROM users WHERE public_key = ?1")
+            .bind(public_key)
+            .fetch_one(&mut *conn)
             .await
         {
             Ok(row) => Ok(Some((row.get(0), row.get(1), row.get(2)))),
@@ -495,12 +458,7 @@ impl SnDB for SqliteSnDB {
             None
         };
         let sn_ips: Option<String> = None;
-        let mut conn = self
-            .pool
-            .get_conn()
-            .await
-            .map_err(into_sn_err!(SnErrorCode::DBError, "get conn"))?;
-        conn.begin_transaction().await.map_err(into_sn_err!(
+        let mut conn = self.pool.begin().await.map_err(into_sn_err!(
             SnErrorCode::DBError,
             "begin transaction failed"
         ))?;
@@ -508,12 +466,9 @@ impl SnDB for SqliteSnDB {
         if let Some(user_domain) = user_domain.as_ref() {
             if let Some(canonical_domain) = Self::canonical_user_domain(user_domain.as_str()) {
                 let descendant_pattern = format!("%.{}", canonical_domain);
-                let conflicts = conn
-                    .query_all(
-                        sql_query("SELECT domain, owner FROM user_domain_history WHERE domain = ?1 OR domain LIKE ?2 OR ?1 LIKE '%.' || domain")
+                let conflicts = sqlx::query("SELECT domain, owner FROM user_domain_history WHERE domain = ?1 OR domain LIKE ?2 OR ?1 LIKE '%.' || domain")
                             .bind(canonical_domain.as_str())
-                            .bind(descendant_pattern),
-                    )
+                            .bind(descendant_pattern).fetch_all(&mut *conn)
                     .await
                     .map_err(into_sn_err!(
                         SnErrorCode::DBError,
@@ -535,7 +490,7 @@ impl SnDB for SqliteSnDB {
             }
         }
 
-        conn.execute_sql(sql_query("INSERT INTO users (username, state, public_key, activation_code, zone_config, user_domain, self_cert, sn_ips) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)")
+        sqlx::query("INSERT INTO users (username, state, public_key, activation_code, zone_config, user_domain, self_cert, sn_ips) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)")
             .bind(username)
             .bind(UserState::Active.to_string())
             .bind(public_key)
@@ -543,7 +498,7 @@ impl SnDB for SqliteSnDB {
             .bind(zone_config)
             .bind(user_domain.clone())
             .bind(true)
-            .bind(sn_ips)).await
+            .bind(sn_ips).execute(&mut *conn).await
             .map_err(into_sn_err!(SnErrorCode::DBError, "insert user failed"))?;
 
         if let Some(user_domain) = user_domain.as_ref() {
@@ -552,12 +507,10 @@ impl SnDB for SqliteSnDB {
                     .duration_since(UNIX_EPOCH)
                     .unwrap()
                     .as_secs() as i64;
-                conn.execute_sql(
-                    sql_query("INSERT OR IGNORE INTO user_domain_history (domain, owner, created_at) VALUES (?1, ?2, ?3)")
+                sqlx::query("INSERT OR IGNORE INTO user_domain_history (domain, owner, created_at) VALUES (?1, ?2, ?3)")
                         .bind(canonical_domain)
                         .bind(username)
-                        .bind(now),
-                )
+                        .bind(now).execute(&mut *conn)
                 .await
                 .map_err(into_sn_err!(
                     SnErrorCode::DBError,
@@ -566,7 +519,7 @@ impl SnDB for SqliteSnDB {
             }
         }
 
-        conn.commit_transaction().await.map_err(into_sn_err!(
+        conn.commit().await.map_err(into_sn_err!(
             SnErrorCode::DBError,
             "commit transaction failed"
         ))?;
@@ -583,21 +536,14 @@ impl SnDB for SqliteSnDB {
     ) -> SnResult<bool> {
         let _locker =
             async_named_locker::Locker::get_locker(format!("active_code_{}", active_code)).await;
-        let mut conn = self
-            .pool
-            .get_conn()
-            .await
-            .map_err(into_sn_err!(SnErrorCode::DBError, "get conn"))?;
-
-        conn.begin_transaction().await.map_err(into_sn_err!(
+        let mut conn = self.pool.begin().await.map_err(into_sn_err!(
             SnErrorCode::DBError,
             "begin transaction failed"
         ))?;
 
-        let active_code_row = conn
-            .query_one(
-                sql_query("SELECT used FROM activation_codes WHERE code = ?1").bind(active_code),
-            )
+        let active_code_row = sqlx::query("SELECT used FROM activation_codes WHERE code = ?1")
+            .bind(active_code)
+            .fetch_one(&mut *conn)
             .await;
         let code_unused = match active_code_row {
             Ok(row) => row.get::<i32, _>(0) == 0,
@@ -607,8 +553,9 @@ impl SnDB for SqliteSnDB {
             return Ok(false);
         }
 
-        let user_count: i64 = conn
-            .query_one(sql_query("SELECT COUNT(*) FROM users WHERE username = ?1").bind(username))
+        let user_count: i64 = sqlx::query("SELECT COUNT(*) FROM users WHERE username = ?1")
+            .bind(username)
+            .fetch_one(&mut *conn)
             .await
             .map_err(into_sn_err!(
                 SnErrorCode::DBError,
@@ -625,7 +572,7 @@ impl SnDB for SqliteSnDB {
             .as_secs() as i64;
         let sn_ips: Option<String> = None;
 
-        conn.execute_sql(sql_query("INSERT INTO users (username, state, public_key, activation_code, zone_config, user_domain, self_cert, sn_ips) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)")
+        sqlx::query("INSERT INTO users (username, state, public_key, activation_code, zone_config, user_domain, self_cert, sn_ips) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)")
             .bind(username)
             .bind(UserState::Active.to_string())
             .bind("")
@@ -633,29 +580,29 @@ impl SnDB for SqliteSnDB {
             .bind("")
             .bind(Option::<String>::None)
             .bind(false)
-            .bind(sn_ips))
+            .bind(sn_ips).execute(&mut *conn)
             .await
             .map_err(into_sn_err!(SnErrorCode::DBError, "insert v2 user failed"))?;
 
-        conn.execute_sql(sql_query("INSERT INTO user_auth_v2 (username, password_hash, password_salt, password_algo, created_at, updated_at, last_login_at) VALUES (?1, ?2, ?3, ?4, ?5, ?5, NULL)")
+        sqlx::query("INSERT INTO user_auth_v2 (username, password_hash, password_salt, password_algo, created_at, updated_at, last_login_at) VALUES (?1, ?2, ?3, ?4, ?5, ?5, NULL)")
             .bind(username)
             .bind(password_hash)
             .bind(password_salt)
             .bind(password_algo)
-            .bind(now))
+            .bind(now).execute(&mut *conn)
             .await
             .map_err(into_sn_err!(SnErrorCode::DBError, "insert v2 auth failed"))?;
 
-        conn.execute_sql(
-            sql_query("UPDATE activation_codes SET used = 1 WHERE code = ?1").bind(active_code),
-        )
-        .await
-        .map_err(into_sn_err!(
-            SnErrorCode::DBError,
-            "update activation code failed"
-        ))?;
+        sqlx::query("UPDATE activation_codes SET used = 1 WHERE code = ?1")
+            .bind(active_code)
+            .execute(&mut *conn)
+            .await
+            .map_err(into_sn_err!(
+                SnErrorCode::DBError,
+                "update activation code failed"
+            ))?;
 
-        conn.commit_transaction().await.map_err(into_sn_err!(
+        conn.commit().await.map_err(into_sn_err!(
             SnErrorCode::DBError,
             "commit transaction failed"
         ))?;
@@ -673,12 +620,13 @@ impl SnDB for SqliteSnDB {
             async_named_locker::Locker::get_locker(format!("username_{}", username)).await;
         let mut conn = self
             .pool
-            .get_conn()
+            .acquire()
             .await
             .map_err(into_sn_err!(SnErrorCode::DBError, "get conn"))?;
 
-        let user_count: i64 = conn
-            .query_one(sql_query("SELECT COUNT(*) FROM users WHERE username = ?1").bind(username))
+        let user_count: i64 = sqlx::query("SELECT COUNT(*) FROM users WHERE username = ?1")
+            .bind(username)
+            .fetch_one(&mut *conn)
             .await
             .map_err(into_sn_err!(
                 SnErrorCode::DBError,
@@ -689,10 +637,9 @@ impl SnDB for SqliteSnDB {
             return Ok(false);
         }
 
-        let auth_count: i64 = conn
-            .query_one(
-                sql_query("SELECT COUNT(*) FROM user_auth_v2 WHERE username = ?1").bind(username),
-            )
+        let auth_count: i64 = sqlx::query("SELECT COUNT(*) FROM user_auth_v2 WHERE username = ?1")
+            .bind(username)
+            .fetch_one(&mut *conn)
             .await
             .map_err(into_sn_err!(
                 SnErrorCode::DBError,
@@ -707,12 +654,12 @@ impl SnDB for SqliteSnDB {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs() as i64;
-        conn.execute_sql(sql_query("INSERT INTO user_auth_v2 (username, password_hash, password_salt, password_algo, created_at, updated_at, last_login_at) VALUES (?1, ?2, ?3, ?4, ?5, ?5, NULL)")
+        sqlx::query("INSERT INTO user_auth_v2 (username, password_hash, password_salt, password_algo, created_at, updated_at, last_login_at) VALUES (?1, ?2, ?3, ?4, ?5, ?5, NULL)")
             .bind(username)
             .bind(password_hash)
             .bind(password_salt)
             .bind(password_algo)
-            .bind(now))
+            .bind(now).execute(&mut *conn)
             .await
             .map_err(into_sn_err!(SnErrorCode::DBError, "insert v2 auth failed"))?;
         Ok(true)
@@ -721,11 +668,12 @@ impl SnDB for SqliteSnDB {
     async fn is_user_exist(&self, username: &str) -> SnResult<bool> {
         let mut conn = self
             .pool
-            .get_conn()
+            .acquire()
             .await
             .map_err(into_sn_err!(SnErrorCode::DBError, "get conn"))?;
-        let row = conn
-            .query_one(sql_query("SELECT COUNT(*) FROM users WHERE username = ?1").bind(username))
+        let row = sqlx::query("SELECT COUNT(*) FROM users WHERE username = ?1")
+            .bind(username)
+            .fetch_one(&mut *conn)
             .await
             .map_err(into_sn_err!(SnErrorCode::DBError, "query user failed"))?;
         let count: i64 = row.get(0);
@@ -735,76 +683,72 @@ impl SnDB for SqliteSnDB {
     async fn update_user_public_key(&self, username: &str, public_key: &str) -> SnResult<()> {
         let mut conn = self
             .pool
-            .get_conn()
+            .acquire()
             .await
             .map_err(into_sn_err!(SnErrorCode::DBError, "get conn"))?;
-        conn.execute_sql(
-            sql_query("UPDATE users SET public_key = ?1 WHERE username = ?2")
-                .bind(public_key)
-                .bind(username),
-        )
-        .await
-        .map_err(into_sn_err!(
-            SnErrorCode::DBError,
-            "update user public key failed"
-        ))?;
+        sqlx::query("UPDATE users SET public_key = ?1 WHERE username = ?2")
+            .bind(public_key)
+            .bind(username)
+            .execute(&mut *conn)
+            .await
+            .map_err(into_sn_err!(
+                SnErrorCode::DBError,
+                "update user public key failed"
+            ))?;
         Ok(())
     }
 
     async fn update_user_zone_config(&self, username: &str, zone_config: &str) -> SnResult<()> {
         let mut conn = self
             .pool
-            .get_conn()
+            .acquire()
             .await
             .map_err(into_sn_err!(SnErrorCode::DBError, "get conn"))?;
-        conn.execute_sql(
-            sql_query("UPDATE users SET zone_config = ?1 WHERE username = ?2")
-                .bind(zone_config)
-                .bind(username),
-        )
-        .await
-        .map_err(into_sn_err!(
-            SnErrorCode::DBError,
-            "update user zone_config failed"
-        ))?;
+        sqlx::query("UPDATE users SET zone_config = ?1 WHERE username = ?2")
+            .bind(zone_config)
+            .bind(username)
+            .execute(&mut *conn)
+            .await
+            .map_err(into_sn_err!(
+                SnErrorCode::DBError,
+                "update user zone_config failed"
+            ))?;
         Ok(())
     }
 
     async fn update_user_sn_ips(&self, username: &str, sn_ips: &str) -> SnResult<()> {
         let mut conn = self
             .pool
-            .get_conn()
+            .acquire()
             .await
             .map_err(into_sn_err!(SnErrorCode::DBError, "get conn"))?;
-        conn.execute_sql(
-            sql_query("UPDATE users SET sn_ips = ?1 WHERE username = ?2")
-                .bind(sn_ips)
-                .bind(username),
-        )
-        .await
-        .map_err(into_sn_err!(
-            SnErrorCode::DBError,
-            "update user sn_ips failed"
-        ))?;
+        sqlx::query("UPDATE users SET sn_ips = ?1 WHERE username = ?2")
+            .bind(sn_ips)
+            .bind(username)
+            .execute(&mut *conn)
+            .await
+            .map_err(into_sn_err!(
+                SnErrorCode::DBError,
+                "update user sn_ips failed"
+            ))?;
         Ok(())
     }
 
     async fn update_user_self_cert(&self, username: &str, self_cert: bool) -> SnResult<()> {
         let mut conn = self
             .pool
-            .get_conn()
+            .acquire()
             .await
             .map_err(into_sn_err!(SnErrorCode::DBError, "get conn"))?;
-        conn.execute_sql(
-            sql_query("UPDATE users SET self_cert = ?1 WHERE username = ?2")
-                .bind(self_cert)
-                .bind(username),
-        )
-        .await
-        .map_err(into_sn_err!(
-            SnErrorCode::DBError,
-            "update user self_cert failed"
-        ))?;
+        sqlx::query("UPDATE users SET self_cert = ?1 WHERE username = ?2")
+            .bind(self_cert)
+            .bind(username)
+            .execute(&mut *conn)
+            .await
+            .map_err(into_sn_err!(
+                SnErrorCode::DBError,
+                "update user self_cert failed"
+            ))?;
         Ok(())
     }
 
@@ -816,12 +760,7 @@ impl SnDB for SqliteSnDB {
         let _user_domain_locker =
             async_named_locker::Locker::get_locker(Self::USER_DOMAIN_BINDING_LOCK.to_string())
                 .await;
-        let mut conn = self
-            .pool
-            .get_conn()
-            .await
-            .map_err(into_sn_err!(SnErrorCode::DBError, "get conn"))?;
-        conn.begin_transaction().await.map_err(into_sn_err!(
+        let mut conn = self.pool.begin().await.map_err(into_sn_err!(
             SnErrorCode::DBError,
             "begin transaction failed"
         ))?;
@@ -829,12 +768,9 @@ impl SnDB for SqliteSnDB {
         if let Some(user_domain) = user_domain.as_ref() {
             if let Some(canonical_domain) = Self::canonical_user_domain(user_domain.as_str()) {
                 let descendant_pattern = format!("%.{}", canonical_domain);
-                let conflicts = conn
-                    .query_all(
-                        sql_query("SELECT domain, owner FROM user_domain_history WHERE domain = ?1 OR domain LIKE ?2 OR ?1 LIKE '%.' || domain")
+                let conflicts = sqlx::query("SELECT domain, owner FROM user_domain_history WHERE domain = ?1 OR domain LIKE ?2 OR ?1 LIKE '%.' || domain")
                             .bind(canonical_domain.as_str())
-                            .bind(descendant_pattern),
-                    )
+                            .bind(descendant_pattern).fetch_all(&mut *conn)
                     .await
                     .map_err(into_sn_err!(
                         SnErrorCode::DBError,
@@ -856,16 +792,15 @@ impl SnDB for SqliteSnDB {
             }
         }
 
-        conn.execute_sql(
-            sql_query("UPDATE users SET user_domain =?1 WHERE username =?2")
-                .bind(user_domain.clone())
-                .bind(username),
-        )
-        .await
-        .map_err(into_sn_err!(
-            SnErrorCode::DBError,
-            "update user user_domain failed"
-        ))?;
+        sqlx::query("UPDATE users SET user_domain =?1 WHERE username =?2")
+            .bind(user_domain.clone())
+            .bind(username)
+            .execute(&mut *conn)
+            .await
+            .map_err(into_sn_err!(
+                SnErrorCode::DBError,
+                "update user user_domain failed"
+            ))?;
 
         if let Some(user_domain) = user_domain.as_ref() {
             if let Some(canonical_domain) = Self::canonical_user_domain(user_domain.as_str()) {
@@ -873,12 +808,10 @@ impl SnDB for SqliteSnDB {
                     .duration_since(UNIX_EPOCH)
                     .unwrap()
                     .as_secs() as i64;
-                conn.execute_sql(
-                    sql_query("INSERT OR IGNORE INTO user_domain_history (domain, owner, created_at) VALUES (?1, ?2, ?3)")
+                sqlx::query("INSERT OR IGNORE INTO user_domain_history (domain, owner, created_at) VALUES (?1, ?2, ?3)")
                         .bind(canonical_domain)
                         .bind(username)
-                        .bind(now),
-                )
+                        .bind(now).execute(&mut *conn)
                 .await
                 .map_err(into_sn_err!(
                     SnErrorCode::DBError,
@@ -887,7 +820,7 @@ impl SnDB for SqliteSnDB {
             }
         }
 
-        conn.commit_transaction().await.map_err(into_sn_err!(
+        conn.commit().await.map_err(into_sn_err!(
             SnErrorCode::DBError,
             "commit transaction failed"
         ))?;
@@ -897,11 +830,12 @@ impl SnDB for SqliteSnDB {
     async fn get_user_sn_ips(&self, username: &str) -> SnResult<Option<String>> {
         let mut conn = self
             .pool
-            .get_conn()
+            .acquire()
             .await
             .map_err(into_sn_err!(SnErrorCode::DBError, "get conn"))?;
-        match conn
-            .query_one(sql_query("SELECT sn_ips FROM users WHERE username = ?1").bind(username))
+        match sqlx::query("SELECT sn_ips FROM users WHERE username = ?1")
+            .bind(username)
+            .fetch_one(&mut *conn)
             .await
         {
             Ok(row) => Ok(row.get(0)),
@@ -967,10 +901,10 @@ impl SnDB for SqliteSnDB {
     async fn get_user_info(&self, username: &str) -> SnResult<Option<SNUserInfo>> {
         let mut conn = self
             .pool
-            .get_conn()
+            .acquire()
             .await
             .map_err(into_sn_err!(SnErrorCode::DBError, "get conn"))?;
-        match conn.query_one(sql_query("SELECT state, public_key, activation_code, zone_config, self_cert, user_domain, sn_ips FROM users WHERE username = ?1").bind(username)).await {
+        match sqlx::query("SELECT state, public_key, activation_code, zone_config, self_cert, user_domain, sn_ips FROM users WHERE username = ?1").bind(username).fetch_one(&mut *conn).await {
             Ok(row) => {
                 let state_str: Option<String> = row.get(0);
                 let self_cert: bool = row.get(4);
@@ -1004,10 +938,10 @@ impl SnDB for SqliteSnDB {
             .as_secs();
         let mut conn = self
             .pool
-            .get_conn()
+            .acquire()
             .await
             .map_err(into_sn_err!(SnErrorCode::DBError, "get conn"))?;
-        conn.execute_sql(sql_query("INSERT INTO devices (owner, device_name, did, ip, description, mini_config_jwt, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)")
+        sqlx::query("INSERT INTO devices (owner, device_name, did, ip, description, mini_config_jwt, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)")
             .bind(username)
             .bind(device_name)
             .bind(did)
@@ -1015,7 +949,7 @@ impl SnDB for SqliteSnDB {
             .bind(description)
             .bind(mini_config_jwt)
             .bind(now as i64)
-            .bind(now as i64)).await
+            .bind(now as i64).execute(&mut *conn).await
             .map_err(into_sn_err!(SnErrorCode::DBError, "insert device failed"))?;
         Ok(())
     }
@@ -1027,23 +961,20 @@ impl SnDB for SqliteSnDB {
             .as_secs();
         let mut conn = self
             .pool
-            .get_conn()
+            .acquire()
             .await
             .map_err(into_sn_err!(SnErrorCode::DBError, "get conn"))?;
-        conn.execute_sql(
-            sql_query(
-                "UPDATE devices SET ip = ?1, description = ?2, updated_at = ?3 WHERE did = ?4",
-            )
+        sqlx::query("UPDATE devices SET ip = ?1, description = ?2, updated_at = ?3 WHERE did = ?4")
             .bind(ip)
             .bind(description)
             .bind(now as i64)
-            .bind(did),
-        )
-        .await
-        .map_err(into_sn_err!(
-            SnErrorCode::DBError,
-            "update device by did failed"
-        ))?;
+            .bind(did)
+            .execute(&mut *conn)
+            .await
+            .map_err(into_sn_err!(
+                SnErrorCode::DBError,
+                "update device by did failed"
+            ))?;
         Ok(())
     }
 
@@ -1062,17 +993,17 @@ impl SnDB for SqliteSnDB {
             .as_secs();
         let mut conn = self
             .pool
-            .get_conn()
+            .acquire()
             .await
             .map_err(into_sn_err!(SnErrorCode::DBError, "get conn"))?;
-        conn.execute_sql(sql_query("UPDATE devices SET did = ?1, mini_config_jwt = ?2, ip = ?3, description = ?4, updated_at = ?5 WHERE device_name = ?6 AND owner = ?7")
+        sqlx::query("UPDATE devices SET did = ?1, mini_config_jwt = ?2, ip = ?3, description = ?4, updated_at = ?5 WHERE device_name = ?6 AND owner = ?7")
             .bind(did)
             .bind(mini_config_jwt)
             .bind(ip)
             .bind(description)
             .bind(now as i64)
             .bind(device_name)
-            .bind(username)).await
+            .bind(username).execute(&mut *conn).await
             .map_err(into_sn_err!(SnErrorCode::DBError, "update device by name failed"))?;
         Ok(())
     }
@@ -1090,15 +1021,15 @@ impl SnDB for SqliteSnDB {
             .as_secs();
         let mut conn = self
             .pool
-            .get_conn()
+            .acquire()
             .await
             .map_err(into_sn_err!(SnErrorCode::DBError, "get conn"))?;
-        conn.execute_sql(sql_query("UPDATE devices SET ip = ?1, description = ?2, updated_at = ?3 WHERE device_name = ?4 AND owner = ?5")
+        sqlx::query("UPDATE devices SET ip = ?1, description = ?2, updated_at = ?3 WHERE device_name = ?4 AND owner = ?5")
             .bind(ip)
             .bind(description)
             .bind(now as i64)
             .bind(device_name)
-            .bind(username)).await
+            .bind(username).execute(&mut *conn).await
             .map_err(into_sn_err!(SnErrorCode::DBError, "update device info by name failed"))?;
         Ok(())
     }
@@ -1110,12 +1041,12 @@ impl SnDB for SqliteSnDB {
     ) -> SnResult<Option<SNDeviceInfo>> {
         let mut conn = self
             .pool
-            .get_conn()
+            .acquire()
             .await
             .map_err(into_sn_err!(SnErrorCode::DBError, "get conn"))?;
-        match conn.query_one(sql_query("SELECT owner, device_name, mini_config_jwt, did, ip, description, created_at, updated_at FROM devices WHERE device_name = ?1 AND owner = ?2")
+        match sqlx::query("SELECT owner, device_name, mini_config_jwt, did, ip, description, created_at, updated_at FROM devices WHERE device_name = ?1 AND owner = ?2")
             .bind(device_name)
-            .bind(username)).await {
+            .bind(username).fetch_one(&mut *conn).await {
             Ok(row) => {
                 Ok(Some(SNDeviceInfo {
                     owner: row.get(0),
@@ -1138,14 +1069,11 @@ impl SnDB for SqliteSnDB {
     async fn list_user_devices(&self, username: &str) -> SnResult<Vec<SNDeviceInfo>> {
         let mut conn = self
             .pool
-            .get_conn()
+            .acquire()
             .await
             .map_err(into_sn_err!(SnErrorCode::DBError, "get conn"))?;
-        let rows = conn
-            .query_all(
-                sql_query("SELECT owner, device_name, mini_config_jwt, did, ip, description, created_at, updated_at FROM devices WHERE owner = ?1 ORDER BY device_name ASC")
-                    .bind(username),
-            )
+        let rows = sqlx::query("SELECT owner, device_name, mini_config_jwt, did, ip, description, created_at, updated_at FROM devices WHERE owner = ?1 ORDER BY device_name ASC")
+                    .bind(username).fetch_all(&mut *conn)
             .await
             .map_err(into_sn_err!(SnErrorCode::DBError, "list user devices failed"))?;
         Ok(rows
@@ -1166,10 +1094,10 @@ impl SnDB for SqliteSnDB {
     async fn query_device_by_did(&self, did: &str) -> SnResult<Option<SNDeviceInfo>> {
         let mut conn = self
             .pool
-            .get_conn()
+            .acquire()
             .await
             .map_err(into_sn_err!(SnErrorCode::DBError, "get conn"))?;
-        match conn.query_one(sql_query("SELECT owner, device_name, mini_config_jwt, did, ip, description, created_at, updated_at FROM devices WHERE did = ?1").bind(did)).await {
+        match sqlx::query("SELECT owner, device_name, mini_config_jwt, did, ip, description, created_at, updated_at FROM devices WHERE did = ?1").bind(did).fetch_one(&mut *conn).await {
             Ok(row) => {
                 Ok(Some(SNDeviceInfo {
                     owner: row.get(0),
@@ -1189,11 +1117,11 @@ impl SnDB for SqliteSnDB {
     async fn get_user_info_by_domain(&self, domain: &str) -> SnResult<Option<SNUserInfo>> {
         let mut conn = self
             .pool
-            .get_conn()
+            .acquire()
             .await
             .map_err(into_sn_err!(SnErrorCode::DBError, "get conn"))?;
-        match conn.query_one(sql_query("SELECT username, state, public_key, activation_code, zone_config, self_cert, user_domain, sn_ips FROM users WHERE ?1 = user_domain OR ?1 LIKE '%.' || user_domain")
-            .bind(domain)).await {
+        match sqlx::query("SELECT username, state, public_key, activation_code, zone_config, self_cert, user_domain, sn_ips FROM users WHERE ?1 = user_domain OR ?1 LIKE '%.' || user_domain")
+            .bind(domain).fetch_one(&mut *conn).await {
             Ok(row) => {
                 let state_str: Option<String> = row.get(1);
                 let self_cert: bool = row.get(5);
@@ -1215,10 +1143,10 @@ impl SnDB for SqliteSnDB {
     async fn query_device(&self, did: &str) -> SnResult<Option<SNDeviceInfo>> {
         let mut conn = self
             .pool
-            .get_conn()
+            .acquire()
             .await
             .map_err(into_sn_err!(SnErrorCode::DBError, "get conn"))?;
-        match conn.query_one(sql_query("SELECT owner, device_name, mini_config_jwt, did, ip, description, created_at, updated_at FROM devices WHERE did = ?1").bind(did)).await {
+        match sqlx::query("SELECT owner, device_name, mini_config_jwt, did, ip, description, created_at, updated_at FROM devices WHERE did = ?1").bind(did).fetch_one(&mut *conn).await {
             Ok(row) => {
                 Ok(Some(SNDeviceInfo {
                     owner: row.get(0),
@@ -1245,7 +1173,7 @@ impl SnDB for SqliteSnDB {
     ) -> SnResult<()> {
         let mut conn = self
             .pool
-            .get_conn()
+            .acquire()
             .await
             .map_err(into_sn_err!(SnErrorCode::DBError, "get conn"))?;
 
@@ -1255,13 +1183,13 @@ impl SnDB for SqliteSnDB {
             .as_secs();
 
         // 使用 INSERT ... ON CONFLICT 在单个 SQL 语句中完成：如果 (owner, domain, record_type) 组合已存在则更新，否则插入新记录
-        conn.execute_sql(sql_query("INSERT INTO user_dns_records (owner, domain, record_type, record, ttl, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?6, ?5, ?5) ON CONFLICT(owner, domain, record_type) DO UPDATE SET record = ?4, updated_at = ?5")
+        sqlx::query("INSERT INTO user_dns_records (owner, domain, record_type, record, ttl, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?6, ?5, ?5) ON CONFLICT(owner, domain, record_type) DO UPDATE SET record = ?4, updated_at = ?5")
             .bind(username)
             .bind(domain)
             .bind(record_type)
             .bind(record)
             .bind(now as i64)
-            .bind(ttl as i64)).await
+            .bind(ttl as i64).execute(&mut *conn).await
             .map_err(into_sn_err!(SnErrorCode::DBError, "insert on conflict user dns record failed"))?;
 
         Ok(())
@@ -1275,15 +1203,22 @@ impl SnDB for SqliteSnDB {
     ) -> SnResult<()> {
         let mut conn = self
             .pool
-            .get_conn()
+            .acquire()
             .await
             .map_err(into_sn_err!(SnErrorCode::DBError, "get conn"))?;
 
-        conn.execute_sql(sql_query("DELETE FROM user_dns_records WHERE owner = ?1 AND domain = ?2 AND record_type = ?3")
-            .bind(username)
-            .bind(domain)
-            .bind(record_type)).await
-            .map_err(into_sn_err!(SnErrorCode::DBError, "delete user dns record failed"))?;
+        sqlx::query(
+            "DELETE FROM user_dns_records WHERE owner = ?1 AND domain = ?2 AND record_type = ?3",
+        )
+        .bind(username)
+        .bind(domain)
+        .bind(record_type)
+        .execute(&mut *conn)
+        .await
+        .map_err(into_sn_err!(
+            SnErrorCode::DBError,
+            "delete user dns record failed"
+        ))?;
 
         Ok(())
     }
@@ -1295,40 +1230,42 @@ impl SnDB for SqliteSnDB {
     ) -> SnResult<Option<(String, u32)>> {
         let mut conn = self
             .pool
-            .get_conn()
+            .acquire()
             .await
             .map_err(into_sn_err!(SnErrorCode::DBError, "get conn"))?;
 
-        match conn.query_one(sql_query("SELECT record, ttl FROM user_dns_records WHERE domain = ?1 AND record_type = ?2")
-            .bind(domain)
-            .bind(record_type)).await {
+        match sqlx::query(
+            "SELECT record, ttl FROM user_dns_records WHERE domain = ?1 AND record_type = ?2",
+        )
+        .bind(domain)
+        .bind(record_type)
+        .fetch_one(&mut *conn)
+        .await
+        {
             Ok(row) => {
                 let record: String = row.get(0);
                 Ok(Some((record, row.get::<i64, _>(1) as u32)))
             }
-            Err(_) => Ok(None)
+            Err(_) => Ok(None),
         }
     }
 
     async fn query_domain_records(&self, domain: &str) -> SnResult<Vec<(String, String, u32)>> {
         let mut conn = self
             .pool
-            .get_conn()
+            .acquire()
             .await
             .map_err(into_sn_err!(SnErrorCode::DBError, "get conn"))?;
 
-        let rows = conn
-            .query_all(
-                sql_query(
-                    "SELECT record_type, record, ttl FROM user_dns_records WHERE domain = ?1",
-                )
-                .bind(domain),
-            )
-            .await
-            .map_err(into_sn_err!(
-                SnErrorCode::DBError,
-                "query user dns records failed"
-            ))?;
+        let rows =
+            sqlx::query("SELECT record_type, record, ttl FROM user_dns_records WHERE domain = ?1")
+                .bind(domain)
+                .fetch_all(&mut *conn)
+                .await
+                .map_err(into_sn_err!(
+                    SnErrorCode::DBError,
+                    "query user dns records failed"
+                ))?;
 
         let records: Vec<(String, String, u32)> = rows
             .into_iter()
@@ -1344,12 +1281,19 @@ impl SnDB for SqliteSnDB {
     ) -> SnResult<Vec<(String, String, String, u32)>> {
         let mut conn = self
             .pool
-            .get_conn()
+            .acquire()
             .await
             .map_err(into_sn_err!(SnErrorCode::DBError, "get conn"))?;
-        let rows = conn.query_all(sql_query("SELECT domain, record_type, record, ttl FROM user_dns_records WHERE owner = ?1")
-            .bind(username)).await
-            .map_err(into_sn_err!(SnErrorCode::DBError, "query user dns records failed"))?;
+        let rows = sqlx::query(
+            "SELECT domain, record_type, record, ttl FROM user_dns_records WHERE owner = ?1",
+        )
+        .bind(username)
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(into_sn_err!(
+            SnErrorCode::DBError,
+            "query user dns records failed"
+        ))?;
         Ok(rows
             .into_iter()
             .map(|row| {
@@ -1373,7 +1317,7 @@ impl SnDB for SqliteSnDB {
     ) -> SnResult<()> {
         let mut conn = self
             .pool
-            .get_conn()
+            .acquire()
             .await
             .map_err(into_sn_err!(SnErrorCode::DBError, "get conn"))?;
 
@@ -1382,13 +1326,13 @@ impl SnDB for SqliteSnDB {
             .unwrap()
             .as_secs();
 
-        conn.execute_sql(sql_query("INSERT INTO did_documents (obj_id, owner_user, obj_name, did_document, doc_type, update_time) VALUES (?1, ?2, ?3, ?4, ?5, ?6)")
+        sqlx::query("INSERT INTO did_documents (obj_id, owner_user, obj_name, did_document, doc_type, update_time) VALUES (?1, ?2, ?3, ?4, ?5, ?6)")
             .bind(obj_id)
             .bind(owner_user)
             .bind(obj_name)
             .bind(did_document)
             .bind(doc_type)
-            .bind(now as i64)).await
+            .bind(now as i64).execute(&mut *conn).await
             .map_err(into_sn_err!(SnErrorCode::DBError, "insert did document failed"))?;
         Ok(())
     }
@@ -1401,19 +1345,19 @@ impl SnDB for SqliteSnDB {
     ) -> SnResult<Option<(String, String, Option<String>)>> {
         let mut conn = self
             .pool
-            .get_conn()
+            .acquire()
             .await
             .map_err(into_sn_err!(SnErrorCode::DBError, "get conn"))?;
 
         let rows = if let Some(doc_type) = doc_type {
-            conn.query_all(sql_query("SELECT obj_id, did_document, doc_type FROM did_documents WHERE owner_user = ?1 AND obj_name = ?2 AND doc_type = ?3 ORDER BY update_time DESC LIMIT 1")
+            sqlx::query("SELECT obj_id, did_document, doc_type FROM did_documents WHERE owner_user = ?1 AND obj_name = ?2 AND doc_type = ?3 ORDER BY update_time DESC LIMIT 1")
                 .bind(owner_user)
                 .bind(obj_name)
-                .bind(doc_type)).await
+                .bind(doc_type).fetch_all(&mut *conn).await
         } else {
-            conn.query_all(sql_query("SELECT obj_id, did_document, doc_type FROM did_documents WHERE owner_user = ?1 AND obj_name = ?2 ORDER BY update_time DESC LIMIT 1")
+            sqlx::query("SELECT obj_id, did_document, doc_type FROM did_documents WHERE owner_user = ?1 AND obj_name = ?2 ORDER BY update_time DESC LIMIT 1")
                 .bind(owner_user)
-                .bind(obj_name)).await
+                .bind(obj_name).fetch_all(&mut *conn).await
         };
 
         match rows {
@@ -1431,14 +1375,11 @@ impl SnDB for SqliteSnDB {
     async fn get_v2_auth(&self, username: &str) -> SnResult<Option<SnV2AuthInfo>> {
         let mut conn = self
             .pool
-            .get_conn()
+            .acquire()
             .await
             .map_err(into_sn_err!(SnErrorCode::DBError, "get conn"))?;
-        match conn
-            .query_one(
-                sql_query("SELECT username, password_hash, password_salt, password_algo, created_at, updated_at, last_login_at FROM user_auth_v2 WHERE username = ?1")
-                    .bind(username),
-            )
+        match sqlx::query("SELECT username, password_hash, password_salt, password_algo, created_at, updated_at, last_login_at FROM user_auth_v2 WHERE username = ?1")
+                    .bind(username).fetch_one(&mut *conn)
             .await
         {
             Ok(row) => Ok(Some(SnV2AuthInfo {
@@ -1457,16 +1398,15 @@ impl SnDB for SqliteSnDB {
     async fn update_v2_last_login(&self, username: &str, last_login_at: u64) -> SnResult<()> {
         let mut conn = self
             .pool
-            .get_conn()
+            .acquire()
             .await
             .map_err(into_sn_err!(SnErrorCode::DBError, "get conn"))?;
-        conn.execute_sql(
-            sql_query(
-                "UPDATE user_auth_v2 SET last_login_at = ?1, updated_at = ?1 WHERE username = ?2",
-            )
-            .bind(last_login_at as i64)
-            .bind(username),
+        sqlx::query(
+            "UPDATE user_auth_v2 SET last_login_at = ?1, updated_at = ?1 WHERE username = ?2",
         )
+        .bind(last_login_at as i64)
+        .bind(username)
+        .execute(&mut *conn)
         .await
         .map_err(into_sn_err!(
             SnErrorCode::DBError,
