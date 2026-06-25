@@ -24,6 +24,7 @@ http-body-util.workspace = true
 sha2.workspace = true
 hex.workspace = true
 ring.workspace = true
+sqlx.workspace = true
 
 buckyos-kit.workspace = true
 kRPC.workspace = true

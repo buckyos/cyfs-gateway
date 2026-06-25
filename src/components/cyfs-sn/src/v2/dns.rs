@@ -77,6 +77,11 @@ pub(crate) async fn handle_dns(server: &SNServer, req: RPCRequest) -> RpcCallRes
                 )
                 .await
                 .into_rpc()?;
+            if let Some(record_type) =
+                crate::SNServer::parse_name_record_type(params.record_type.as_str())
+            {
+                server.remove_name_info_cache(params.domain.as_str(), record_type);
+            }
             if params.has_cert.unwrap_or(false) {
                 server
                     .db()
@@ -121,6 +126,11 @@ pub(crate) async fn handle_dns(server: &SNServer, req: RPCRequest) -> RpcCallRes
                 )
                 .await
                 .into_rpc()?;
+            if let Some(record_type) =
+                crate::SNServer::parse_name_record_type(params.record_type.as_str())
+            {
+                server.remove_name_info_cache(params.domain.as_str(), record_type);
+            }
             ok_response(&req, json!({ "code": 0 }))
         }
         "list_records" => {

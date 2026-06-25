@@ -106,10 +106,10 @@ pub(crate) async fn handle_auth(server: &SNServer, req: RPCRequest) -> RpcCallRe
                 .ok_or_else(|| {
                     parse_error(SnV2ErrorCode::UserNotActivated, "user not activated")
                 })?;
-            if user.activation_code.as_deref() != Some(params.active_code.as_str()) {
+            if !matches!(user.state, crate::UserState::Active) {
                 return Err(parse_error(
-                    SnV2ErrorCode::InvalidActiveCode,
-                    "invalid active code",
+                    SnV2ErrorCode::UserNotActivated,
+                    "user is not active",
                 ));
             }
             if !verify_password(params.pwd_hash.as_str(), &auth)? {

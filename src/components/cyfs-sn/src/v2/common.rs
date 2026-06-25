@@ -130,7 +130,8 @@ pub(crate) struct RegisterReq {
 pub(crate) struct LoginReq {
     pub(crate) name: String,
     pub(crate) pwd_hash: String,
-    pub(crate) active_code: String,
+    #[serde(default)]
+    pub(crate) active_code: Option<String>,
 }
 
 #[derive(Deserialize)]

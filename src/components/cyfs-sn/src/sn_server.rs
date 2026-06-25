@@ -423,6 +423,19 @@ impl SNServer {
             .add_tombstone(name, record_type, cache_ttl_secs);
     }
 
+    pub fn remove_name_info_cache(&self, name: &str, record_type: RecordType) {
+        self.name_info_cache.remove(name, record_type);
+    }
+
+    pub(crate) fn parse_name_record_type(record_type: &str) -> Option<RecordType> {
+        match record_type.to_ascii_uppercase().as_str() {
+            "A" => Some(RecordType::A),
+            "AAAA" => Some(RecordType::AAAA),
+            "TXT" => Some(RecordType::TXT),
+            _ => None,
+        }
+    }
+
     fn normalize_query_name(name: &str) -> String {
         if name.ends_with(".") {
             name.trim_end_matches('.').to_string()
@@ -1557,6 +1570,9 @@ impl SNServer {
         }
 
         info!("add dns record {} {} success", user_name, domain);
+        if let Some(record_type) = Self::parse_name_record_type(record_type) {
+            self.remove_name_info_cache(domain, record_type);
+        }
 
         let resp = RPCResponse::create_by_req(
             RPCResult::Success(json!({
@@ -1688,6 +1704,9 @@ impl SNServer {
         }
 
         info!("remove dns record {} {} success", user_name, domain);
+        if let Some(record_type) = Self::parse_name_record_type(record_type) {
+            self.remove_name_info_cache(domain, record_type);
+        }
 
         let resp = RPCResponse::create_by_req(
             RPCResult::Success(json!({
@@ -4768,8 +4787,7 @@ mod tests {
                 "auth.login",
                 json!({
                     "name": TEST_USER_V2,
-                    "pwd_hash": "12345678",
-                    "active_code": CLEAR_STATE_ACTIVE_CODE
+                    "pwd_hash": "12345678"
                 }),
             )
             .await
@@ -4777,7 +4795,7 @@ mod tests {
         let login_access_token = result["access_token"].as_str().unwrap().to_string();
         assert!(!login_access_token.is_empty());
 
-        let invalid_login_result = login_krpc
+        let login_with_legacy_active_code = login_krpc
             .call(
                 "auth.login",
                 json!({
@@ -4787,9 +4805,20 @@ mod tests {
                 }),
             )
             .await;
+        assert!(login_with_legacy_active_code.is_ok());
+
+        let invalid_login_result = login_krpc
+            .call(
+                "auth.login",
+                json!({
+                    "name": TEST_USER_V2,
+                    "pwd_hash": "wrong-password"
+                }),
+            )
+            .await;
         assert!(invalid_login_result.is_err());
         let invalid_login_err = invalid_login_result.err().unwrap().to_string();
-        assert!(invalid_login_err.contains("[SNV2:1003:invalid_active_code]"));
+        assert!(invalid_login_err.contains("[SNV2:1005:invalid_password]"));
 
         let invalid_register_result = auth_krpc
             .call(
