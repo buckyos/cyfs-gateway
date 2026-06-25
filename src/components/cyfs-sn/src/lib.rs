@@ -4,6 +4,7 @@ mod api;
 pub mod name_info_cache;
 mod relay_mgr;
 mod sn_auth;
+mod sn_bns_reader;
 mod sn_compat_store;
 mod sn_device_info;
 pub mod sn_resolver;

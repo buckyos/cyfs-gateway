@@ -3,6 +3,7 @@ use crate::api::{
     handle_auth, handle_device, handle_did, handle_dns, handle_query, handle_user, handle_zone,
 };
 use crate::name_info_cache::{NameInfoCache, NameInfoCacheQueryResult, NameInfoCacheRef};
+use crate::sn_bns_reader::BnsIndexerDocumentReader;
 use crate::sn_compat_store::{SNDeviceInfo, SnCompatibilityStoreRef, SqliteSnCompatibilityStore};
 use crate::sn_resolver::{
     device_config_from_mini_jwt, ResolverCompatibilityReader, ResolverDeviceDocument,
@@ -649,6 +650,8 @@ impl SNServer {
         compat_store: SnCompatibilityStoreRef,
         relay_manager: SnRelayManagerRef,
     ) -> Self {
+        let bns_indexer_url = server_config.bns_indexer_url.clone();
+        let bns_session_token = server_config.bns_session_token.clone();
         let server_host = server_config.host;
         let server_ip = IpAddr::from_str(server_config.ip.as_str()).unwrap();
         let server_aliases = server_config.aliases;
@@ -668,21 +671,27 @@ impl SNServer {
             device_jwt.clone(),
         )
         .with_aliases(server_aliases.clone());
-        let resolver = Arc::new(
-            SnResolver::new(
-                resolver_config,
-                Arc::new(SnAuthResolverReader::new(auth_db.clone())),
-            )
-            .with_device_online_reader(Arc::new(SnDeviceInfoResolverReader::new(
-                device_info_db.clone(),
-            )))
-            .with_relay_reader(Arc::new(SnRelayManagerResolverReader::new(
-                relay_manager.clone(),
-            )))
-            .with_compatibility_reader(Arc::new(
-                LegacyResolverCompatibilityReader::new(auth_db.clone(), compat_store.clone()),
-            )),
-        );
+        let mut resolver = SnResolver::new(
+            resolver_config,
+            Arc::new(SnAuthResolverReader::new(auth_db.clone())),
+        )
+        .with_device_online_reader(Arc::new(SnDeviceInfoResolverReader::new(
+            device_info_db.clone(),
+        )))
+        .with_relay_reader(Arc::new(SnRelayManagerResolverReader::new(
+            relay_manager.clone(),
+        )))
+        .with_compatibility_reader(Arc::new(LegacyResolverCompatibilityReader::new(
+            auth_db.clone(),
+            compat_store.clone(),
+        )));
+        if let Some(indexer_url) = bns_indexer_url.as_deref() {
+            resolver = resolver.with_bns_reader(Arc::new(BnsIndexerDocumentReader::new(
+                indexer_url,
+                bns_session_token,
+            )));
+        }
+        let resolver = Arc::new(resolver);
 
         SNServer {
             id: server_config.id,
@@ -3971,6 +3980,10 @@ pub struct SNServerConfig {
     pub aliases: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub v2_auth_data_dir: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bns_indexer_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bns_session_token: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub db_type: Option<String>,
     #[serde(flatten)]

@@ -726,7 +726,7 @@ impl RTcpInner {
 
     fn fresh_nonce_hex() -> String {
         let mut nonce_bytes = [0u8; 16];
-        rand::thread_rng().fill(&mut nonce_bytes);
+        rand::rng().fill(&mut nonce_bytes);
         nonce_bytes.encode_hex()
     }
 
@@ -1314,7 +1314,7 @@ impl RTcpInner {
         let my_xpub_hex: String = my_xpub_bytes.encode_hex();
 
         let mut challenge_bytes = [0u8; 16];
-        rand::thread_rng().fill(&mut challenge_bytes);
+        rand::rng().fill(&mut challenge_bytes);
         let challenge_hex: String = challenge_bytes.encode_hex();
 
         let mut bearing: RTcpBearingStream = Box::new(stream);
