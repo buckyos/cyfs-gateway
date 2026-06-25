@@ -89,6 +89,12 @@ pub(crate) fn parse_rtcp_stack_id(stack_id: &str) -> Option<RTcpTargetStackEP> {
             if params.is_empty() {
                 return None;
             }
+            if remote.is_empty() {
+                return None;
+            }
+            if params.contains('@') {
+                return None;
+            }
             let decoded = percent_decode_str(params).decode_utf8().ok()?.into_owned();
             if decoded.is_empty() {
                 return None;
@@ -188,6 +194,27 @@ mod tests {
     #[test]
     fn parse_rejects_empty_params() {
         assert!(parse_rtcp_stack_id("@remote.com:2981").is_none());
+    }
+
+    #[test]
+    fn parse_rejects_empty_remote_part() {
+        let bootstrap = Url::parse("rtcp://relay.example.com:2993/bootstrap:1").unwrap();
+        let encoded = utf8_percent_encode(bootstrap.as_str(), NON_ALPHANUMERIC).to_string();
+        assert!(parse_rtcp_stack_id(&format!("{}@", encoded)).is_none());
+    }
+
+    #[test]
+    fn parse_rejects_invalid_remote_port() {
+        assert!(parse_rtcp_stack_id("remote.com:not-a-port").is_none());
+        assert!(parse_rtcp_stack_id("remote.com:99999").is_none());
+    }
+
+    #[test]
+    fn parse_rejects_unencoded_bootstrap_url_with_raw_at() {
+        assert!(
+            parse_rtcp_stack_id("socks://aaa:bbb@pub.proxy.com/remote.com@remote.com:2981")
+                .is_none()
+        );
     }
 
     #[test]

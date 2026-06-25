@@ -2209,7 +2209,19 @@ impl RTcpTunnel {
                 let _ = RTcpTunnelPackage::send_package(write_stream, pong_package).await?;
                 return Ok(());
             }
-            RTcpTunnelPackage::ROpen(ropen_package) => self.on_ropen(ropen_package).await,
+            RTcpTunnelPackage::ROpen(ropen_package) => {
+                // ROpen may build a new transport leg and then hand the
+                // stream to a long-lived listener. Keep the tunnel control
+                // read loop free so concurrent Open/ROpen responses are not
+                // head-of-line blocked behind that business stream.
+                let this = self.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = this.on_ropen(ropen_package).await {
+                        error!("RTcp on_ropen background task error: {}", e);
+                    }
+                });
+                Ok(())
+            }
             RTcpTunnelPackage::ROpenResp(ropen_resp_package) => {
                 // Deliver the result code to the post_ropen waiter. A
                 // non-zero result tells the initiator no HelloStream is
@@ -3285,6 +3297,7 @@ mod tests {
     use std::collections::HashMap;
     use std::net::SocketAddr;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::io::{AsyncReadExt, AsyncWriteExt, copy_bidirectional};
 
     // §14.2 regression: the nonce cache retention window must cover the
@@ -3395,6 +3408,155 @@ mod tests {
             .unwrap();
     }
 
+    fn ed25519_test_keys() -> (EncodingKey, DecodingKey) {
+        let (signing_key, pkcs8_bytes) = generate_ed25519_key();
+        let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
+        let device_config =
+            DeviceConfig::new_by_jwk("key-test", serde_json::from_value(jwk).unwrap());
+        let default_key = device_config.get_default_key().unwrap();
+        let public_key = jwk_to_ed25519_pk(&default_key).unwrap();
+        (
+            EncodingKey::from_ed_der(&pkcs8_bytes),
+            DecodingKey::from_ed_der(&public_key),
+        )
+    }
+
+    #[test]
+    fn test_rtcp_verify_hello_token_rejects_from_binding_and_bad_xpub() {
+        let (encoding_key, decoding_key) = ed25519_test_keys();
+        let payload = TunnelTokenPayload {
+            aud: RTCP_HELLO_AUD.to_string(),
+            to: "did:web:responder.example.com".to_string(),
+            from: "did:web:initiator.example.com".to_string(),
+            xpub: hex::encode([1u8; 32]),
+            exp: buckyos_get_unix_timestamp() + TUNNEL_TOKEN_EXP_SECS,
+            nonce: hex::encode([2u8; 16]),
+        };
+        let token = RTcpInner::sign_jwt(&encoding_key, &payload).unwrap();
+
+        RTcpInner::verify_hello_token(&token, &decoding_key, Some("did:web:initiator.example.com"))
+            .unwrap();
+
+        let err = RTcpInner::verify_hello_token(
+            &token,
+            &decoding_key,
+            Some("did:web:attacker.example.com"),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("not match expected"),
+            "unexpected error: {}",
+            err
+        );
+
+        let mut bad_xpub = payload.clone();
+        bad_xpub.xpub = "abcd".to_string();
+        let bad_xpub_token = RTcpInner::sign_jwt(&encoding_key, &bad_xpub).unwrap();
+        let err = RTcpInner::verify_hello_token(
+            &bad_xpub_token,
+            &decoding_key,
+            Some("did:web:initiator.example.com"),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("x25519 pub key"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_rtcp_verify_ack_token_rejects_identity_and_peer_xpub_mismatch() {
+        let (encoding_key, decoding_key) = ed25519_test_keys();
+        let expected_from = "did:web:responder.example.com";
+        let expected_to = "did:web:initiator.example.com";
+        let expected_peer_xpub = hex::encode([7u8; 32]);
+        let payload = TunnelAckTokenPayload {
+            aud: RTCP_HELLO_ACK_AUD.to_string(),
+            to: expected_to.to_string(),
+            from: expected_from.to_string(),
+            xpub: hex::encode([8u8; 32]),
+            peer_xpub: expected_peer_xpub.clone(),
+            exp: buckyos_get_unix_timestamp() + TUNNEL_TOKEN_EXP_SECS,
+            nonce: hex::encode([9u8; 16]),
+        };
+        let token = RTcpInner::sign_jwt(&encoding_key, &payload).unwrap();
+
+        RTcpInner::verify_ack_token(
+            &token,
+            &decoding_key,
+            expected_from,
+            expected_to,
+            &expected_peer_xpub,
+        )
+        .unwrap();
+
+        let mut wrong_from = payload.clone();
+        wrong_from.from = "did:web:other-responder.example.com".to_string();
+        let token = RTcpInner::sign_jwt(&encoding_key, &wrong_from).unwrap();
+        assert!(
+            RTcpInner::verify_ack_token(
+                &token,
+                &decoding_key,
+                expected_from,
+                expected_to,
+                &expected_peer_xpub,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("from")
+        );
+
+        let mut wrong_to = payload.clone();
+        wrong_to.to = "did:web:other-initiator.example.com".to_string();
+        let token = RTcpInner::sign_jwt(&encoding_key, &wrong_to).unwrap();
+        assert!(
+            RTcpInner::verify_ack_token(
+                &token,
+                &decoding_key,
+                expected_from,
+                expected_to,
+                &expected_peer_xpub,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("to")
+        );
+
+        let mut wrong_peer_xpub = payload.clone();
+        wrong_peer_xpub.peer_xpub = hex::encode([10u8; 32]);
+        let token = RTcpInner::sign_jwt(&encoding_key, &wrong_peer_xpub).unwrap();
+        assert!(
+            RTcpInner::verify_ack_token(
+                &token,
+                &decoding_key,
+                expected_from,
+                expected_to,
+                &expected_peer_xpub,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("peer_xpub")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_rtcp_validate_hello_target_rejects_non_web_alias() {
+        let this_host = "did:web:this.example.com";
+        RTcpInner::validate_hello_target(this_host, this_host)
+            .await
+            .unwrap();
+
+        let err = RTcpInner::validate_hello_target("did:test:other", this_host)
+            .await
+            .unwrap_err();
+        assert!(
+            err.contains("not this device") || err.contains("not a valid DID"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
     #[test]
     fn test_rtcp_struct_creation() {
         // 测试RTcp结构体的创建
@@ -3413,6 +3575,123 @@ mod tests {
         // 这里可以添加更多针对公共方法的测试
         // 目前只验证基本创建
         assert!(true);
+    }
+
+    #[tokio::test]
+    async fn test_rtcp_bootstrap_url_requires_tunnel_manager() {
+        let bootstrap_url = Url::parse("tcp://127.0.0.1:9/bootstrap").unwrap();
+        let remote = DID::new("web", "remote.example.com").to_host_name();
+        let stack_id = build_rtcp_nested_remote_stack_id(&bootstrap_url, &remote, Some(2981));
+        let inner = RTcpInner::new(
+            DID::new("web", "local.example.com"),
+            "127.0.0.1:0".to_string(),
+            None,
+            None,
+            Arc::new(MockRTcpListener::new()),
+        );
+
+        let err = match inner.create_tunnel(Some(&stack_id)).await {
+            Ok(_) => panic!("bootstrap tunnel creation should fail without tunnel_manager"),
+            Err(err) => err,
+        };
+
+        assert!(
+            err.to_string().contains("tunnel_manager is not set"),
+            "unexpected error: {}",
+            err
+        );
+        assert!(
+            inner
+                .tunnel_map
+                .get_tunnel(&inner.compute_tunnel_key(&parse_rtcp_stack_id(&stack_id).unwrap()))
+                .await
+                .is_none(),
+            "failed bootstrap setup must not register a tunnel"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_rtcp_bootstrap_stream_open_failure_does_not_register_tunnel() {
+        let create_count = Arc::new(AtomicUsize::new(0));
+        let open_count = Arc::new(AtomicUsize::new(0));
+        let tunnel_manager = TunnelManager::new();
+        tunnel_manager.register_tunnel_builder(
+            "mockfail",
+            Arc::new(FailingBootstrapTunnelBuilder {
+                create_count: create_count.clone(),
+                open_count: open_count.clone(),
+            }),
+        );
+
+        let bootstrap_url = Url::parse("mockfail://bootstrap.example/rtcp-bearing").unwrap();
+        let remote = DID::new("web", "remote.example.com").to_host_name();
+        let stack_id = build_rtcp_nested_remote_stack_id(&bootstrap_url, &remote, Some(2981));
+        let mut inner = RTcpInner::new(
+            DID::new("web", "local.example.com"),
+            "127.0.0.1:0".to_string(),
+            None,
+            None,
+            Arc::new(MockRTcpListener::new()),
+        );
+        inner.tunnel_manager = Some(tunnel_manager);
+
+        let err = match inner.create_tunnel(Some(&stack_id)).await {
+            Ok(_) => panic!("bootstrap tunnel creation should fail when bootstrap stream fails"),
+            Err(err) => err,
+        };
+
+        assert!(
+            err.to_string().contains("open bootstrap stream"),
+            "unexpected error: {}",
+            err
+        );
+        assert_eq!(create_count.load(Ordering::SeqCst), 1);
+        assert_eq!(open_count.load(Ordering::SeqCst), 1);
+        assert!(
+            inner
+                .tunnel_map
+                .get_tunnel(&inner.compute_tunnel_key(&parse_rtcp_stack_id(&stack_id).unwrap()))
+                .await
+                .is_none(),
+            "failed bootstrap stream setup must not register a tunnel"
+        );
+    }
+
+    #[test]
+    fn test_rtcp_tunnel_key_separates_direct_and_bootstrap_paths() {
+        let inner = RTcpInner::new(
+            DID::new("web", "local.example.com"),
+            "127.0.0.1:0".to_string(),
+            None,
+            None,
+            Arc::new(MockRTcpListener::new()),
+        );
+        let remote = DID::new("web", "remote.example.com").to_host_name();
+        let direct = parse_rtcp_stack_id(&format!("{}:2981", remote)).unwrap();
+        let bootstrap_a = Url::parse("rtcp://relay-a.example.com:2993/remote:2981").unwrap();
+        let bootstrap_b = Url::parse("rtcp://relay-b.example.com:2993/remote:2981").unwrap();
+        let nested_a = parse_rtcp_stack_id(&build_rtcp_nested_remote_stack_id(
+            &bootstrap_a,
+            &remote,
+            Some(2981),
+        ))
+        .unwrap();
+        let nested_b = parse_rtcp_stack_id(&build_rtcp_nested_remote_stack_id(
+            &bootstrap_b,
+            &remote,
+            Some(2981),
+        ))
+        .unwrap();
+
+        let direct_key = inner.compute_tunnel_key(&direct);
+        let nested_a_key = inner.compute_tunnel_key(&nested_a);
+        let nested_b_key = inner.compute_tunnel_key(&nested_b);
+
+        assert_ne!(direct_key, nested_a_key);
+        assert_ne!(nested_a_key, nested_b_key);
+        assert!(!direct_key.contains("|bootstrap="));
+        assert!(nested_a_key.contains("|bootstrap=rtcp://relay-a.example.com:2993/remote:2981"));
+        assert!(nested_b_key.contains("|bootstrap=rtcp://relay-b.example.com:2993/remote:2981"));
     }
 
     // Mock实现用于测试
@@ -3436,6 +3715,7 @@ mod tests {
 
     struct TestRtcpTunnelBuilder {
         inner: Arc<RTcpInner>,
+        create_count: Option<Arc<AtomicUsize>>,
     }
 
     #[async_trait::async_trait]
@@ -3444,7 +3724,84 @@ mod tests {
             &self,
             tunnel_stack_id: Option<&str>,
         ) -> TunnelResult<Box<dyn TunnelBox>> {
+            if let Some(create_count) = self.create_count.as_ref() {
+                create_count.fetch_add(1, Ordering::SeqCst);
+            }
             self.inner.create_tunnel(tunnel_stack_id).await
+        }
+    }
+
+    #[derive(Clone)]
+    struct FailingBootstrapTunnel {
+        open_count: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl Tunnel for FailingBootstrapTunnel {
+        async fn ping(&self) -> Result<(), std::io::Error> {
+            Ok(())
+        }
+
+        async fn open_stream_by_dest(
+            &self,
+            _dest_port: u16,
+            _dest_host: Option<String>,
+        ) -> Result<Box<dyn AsyncStream>, std::io::Error> {
+            self.open_count.fetch_add(1, Ordering::SeqCst);
+            Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionRefused,
+                "mock bootstrap stream refused",
+            ))
+        }
+
+        async fn open_stream(
+            &self,
+            _stream_id: &str,
+        ) -> Result<Box<dyn AsyncStream>, std::io::Error> {
+            self.open_count.fetch_add(1, Ordering::SeqCst);
+            Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionRefused,
+                "mock bootstrap stream refused",
+            ))
+        }
+
+        async fn create_datagram_client_by_dest(
+            &self,
+            _dest_port: u16,
+            _dest_host: Option<String>,
+        ) -> Result<Box<dyn DatagramClientBox>, std::io::Error> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "mock bootstrap datagram unsupported",
+            ))
+        }
+
+        async fn create_datagram_client(
+            &self,
+            _session_id: &str,
+        ) -> Result<Box<dyn DatagramClientBox>, std::io::Error> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "mock bootstrap datagram unsupported",
+            ))
+        }
+    }
+
+    struct FailingBootstrapTunnelBuilder {
+        create_count: Arc<AtomicUsize>,
+        open_count: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl TunnelBuilder for FailingBootstrapTunnelBuilder {
+        async fn create_tunnel(
+            &self,
+            _tunnel_stack_id: Option<&str>,
+        ) -> TunnelResult<Box<dyn TunnelBox>> {
+            self.create_count.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::new(FailingBootstrapTunnel {
+                open_count: self.open_count.clone(),
+            }))
         }
     }
 
@@ -3459,21 +3816,26 @@ mod tests {
             _remote_addr: SocketAddr,
             _local_addr: SocketAddr,
         ) -> TunnelResult<()> {
-            loop {
-                let mut buf = [0u8; 1024];
-                match stream.read(&mut buf).await {
-                    Ok(n) => {
-                        if n == 0 {
+            tokio::spawn(async move {
+                loop {
+                    let mut buf = [0u8; 1024];
+                    match stream.read(&mut buf).await {
+                        Ok(n) => {
+                            if n == 0 {
+                                break;
+                            }
+                            if let Err(e) = stream.write_all(&buf[0..n]).await {
+                                error!("write error: {}", e);
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            error!("read error: {}", e);
                             break;
                         }
-                        stream.write_all(&buf[0..n]).await.unwrap();
-                    }
-                    Err(e) => {
-                        error!("read error: {}", e);
-                        break;
                     }
                 }
-            }
+            });
             Ok(())
         }
 
@@ -3976,14 +4338,38 @@ mod tests {
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
 
-    #[tokio::test]
-    async fn test_rtcp_nested_remote_rebinds_transport_via_rtcp_relay() {
+    struct NestedRtcpRelayFixture {
+        rtcp_a: RTcp,
+        _rtcp_b: RTcp,
+        _rtcp_c: RTcp,
+        id_a: DID,
+        id_b: DID,
+        id_c: DID,
+        nested_url: Url,
+        tunnel: Box<dyn TunnelBox>,
+        reverse_tunnel: Box<dyn TunnelBox>,
+        bootstrap_create_count: Arc<AtomicUsize>,
+    }
+
+    async fn setup_nested_rtcp_relay_fixture(test_name: &str) -> NestedRtcpRelayFixture {
         let _ = init_name_lib_for_test(&HashMap::new()).await;
+        let (port_a, port_b, port_c) = {
+            let listener_a = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            let listener_b = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            let listener_c = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            (
+                listener_a.local_addr().unwrap().port(),
+                listener_b.local_addr().unwrap().port(),
+                listener_c.local_addr().unwrap().port(),
+            )
+        };
 
         let (signing_key, pkcs8_bytes) = generate_ed25519_key();
         let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
-        let device_config =
-            DeviceConfig::new_by_jwk("test-a", serde_json::from_value(jwk).unwrap());
+        let device_config = DeviceConfig::new_by_jwk(
+            format!("{}-a", test_name).as_str(),
+            serde_json::from_value(jwk).unwrap(),
+        );
         let id_a = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
@@ -4002,25 +4388,29 @@ mod tests {
 
         let mut rtcp_a = RTcp::new(
             device_config.id,
-            "127.0.0.1:19073".to_string(),
+            format!("127.0.0.1:{}", port_a),
             Some(pkcs8_bytes),
             None,
             Arc::new(MockRTcpListener::new()),
         );
         let tunnel_manager = TunnelManager::new();
         rtcp_a.set_tunnel_manager(tunnel_manager.clone());
+        let bootstrap_create_count = Arc::new(AtomicUsize::new(0));
         tunnel_manager.register_tunnel_builder(
             "rtcp",
             Arc::new(TestRtcpTunnelBuilder {
                 inner: rtcp_a.inner.clone(),
+                create_count: Some(bootstrap_create_count.clone()),
             }),
         );
         rtcp_a.start().await.unwrap();
 
         let (signing_key, pkcs8_bytes) = generate_ed25519_key();
         let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
-        let device_config =
-            DeviceConfig::new_by_jwk("test-b", serde_json::from_value(jwk).unwrap());
+        let device_config = DeviceConfig::new_by_jwk(
+            format!("{}-b", test_name).as_str(),
+            serde_json::from_value(jwk).unwrap(),
+        );
         let id_b = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
@@ -4039,7 +4429,7 @@ mod tests {
 
         let mut rtcp_b = RTcp::new(
             device_config.id,
-            "127.0.0.1:19074".to_string(),
+            format!("127.0.0.1:{}", port_b),
             Some(pkcs8_bytes),
             None,
             Arc::new(MockRTcpListener::new()),
@@ -4048,8 +4438,10 @@ mod tests {
 
         let (signing_key, pkcs8_bytes) = generate_ed25519_key();
         let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
-        let device_config =
-            DeviceConfig::new_by_jwk("test-c", serde_json::from_value(jwk).unwrap());
+        let device_config = DeviceConfig::new_by_jwk(
+            format!("{}-c", test_name).as_str(),
+            serde_json::from_value(jwk).unwrap(),
+        );
         let id_c = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
@@ -4066,11 +4458,13 @@ mod tests {
         .await
         .unwrap();
 
-        let relay_routes =
-            HashMap::from([(id_b.to_host_name(), "127.0.0.1:19074".parse().unwrap())]);
+        let relay_routes = HashMap::from([(
+            id_b.to_host_name(),
+            format!("127.0.0.1:{}", port_b).parse().unwrap(),
+        )]);
         let mut rtcp_c = RTcp::new(
             device_config.id,
-            "127.0.0.1:19075".to_string(),
+            format!("127.0.0.1:{}", port_c),
             Some(pkcs8_bytes),
             None,
             Arc::new(RelayRTcpListener::new(relay_routes)),
@@ -4081,16 +4475,19 @@ mod tests {
 
         let bootstrap_url = Url::parse(
             format!(
-                "rtcp://{}:19075/{}:19074",
+                "rtcp://{}:{}/{}:{}",
                 id_c.to_host_name(),
-                id_b.to_host_name()
+                port_c,
+                id_b.to_host_name(),
+                port_b
             )
             .as_str(),
         )
         .unwrap();
         let nested_remote_stack_id =
-            build_rtcp_nested_remote_stack_id(&bootstrap_url, &id_b.to_host_name(), Some(19074));
+            build_rtcp_nested_remote_stack_id(&bootstrap_url, &id_b.to_host_name(), Some(port_b));
 
+        let before_outer_tunnel = bootstrap_create_count.load(Ordering::SeqCst);
         let tunnel = tokio::time::timeout(
             Duration::from_secs(10),
             rtcp_a.create_tunnel(Some(nested_remote_stack_id.as_str())),
@@ -4098,31 +4495,267 @@ mod tests {
         .await
         .expect("nested remote tunnel creation timed out")
         .expect("A should build the outer tunnel to B through C");
+        assert!(
+            bootstrap_create_count.load(Ordering::SeqCst) > before_outer_tunnel,
+            "nested outer tunnel creation must obtain its bearing stream through bootstrap"
+        );
 
         tokio::time::timeout(Duration::from_secs(10), tunnel.ping())
             .await
             .expect("nested remote tunnel ping timed out")
             .expect("nested remote tunnel ping failed");
 
-        let mut stream =
-            tokio::time::timeout(Duration::from_secs(10), tunnel.open_stream("test:80"))
-                .await
-                .expect("nested remote stream open timed out")
-                .expect("A should reach B through C with nested remote rtcp");
-        tokio::time::timeout(Duration::from_secs(10), stream.write_all(b"test"))
-            .await
-            .expect("nested remote stream write timed out")
-            .unwrap();
+        let nested_url = Url::parse(format!("rtcp://{}", nested_remote_stack_id).as_str()).unwrap();
 
-        let mut buf = [0u8; 4];
-        tokio::time::timeout(Duration::from_secs(10), stream.read_exact(&mut buf))
-            .await
-            .expect("nested remote stream read timed out")
-            .unwrap();
-        assert_eq!(&buf, b"test");
+        let reverse_tunnel_key = format!("{}_{}", id_b.to_string(), id_a.to_string());
+        let reverse_tunnel = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Some(tunnel) = rtcp_b
+                    .inner
+                    .tunnel_map
+                    .get_tunnel(&reverse_tunnel_key)
+                    .await
+                {
+                    break tunnel;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("B-side nested tunnel registration timed out");
 
-        assert_ne!(id_a, id_b);
-        assert_ne!(id_b, id_c);
+        NestedRtcpRelayFixture {
+            rtcp_a,
+            _rtcp_b: rtcp_b,
+            _rtcp_c: rtcp_c,
+            id_a,
+            id_b,
+            id_c,
+            nested_url,
+            tunnel,
+            reverse_tunnel: Box::new(reverse_tunnel),
+            bootstrap_create_count,
+        }
+    }
+
+    async fn open_echo_stream(
+        tunnel: &dyn TunnelBox,
+        stream_id: &str,
+        payload: &[u8],
+        context: &str,
+    ) -> Box<dyn AsyncStream> {
+        open_echo_stream_with_open_retries(tunnel, stream_id, payload, context, 1).await
+    }
+
+    async fn open_echo_stream_with_open_retries(
+        tunnel: &dyn TunnelBox,
+        stream_id: &str,
+        payload: &[u8],
+        context: &str,
+        open_attempts: usize,
+    ) -> Box<dyn AsyncStream> {
+        let stream =
+            open_stream_with_quota_retries(tunnel, stream_id, context, open_attempts).await;
+        echo_stream(stream, payload, context).await
+    }
+
+    async fn echo_stream(
+        mut stream: Box<dyn AsyncStream>,
+        payload: &[u8],
+        context: &str,
+    ) -> Box<dyn AsyncStream> {
+        match tokio::time::timeout(Duration::from_secs(60), stream.write_all(payload)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => panic!("{} stream write failed: {}", context, e),
+            Err(_) => panic!("{} stream write timed out", context),
+        }
+
+        let mut buf = vec![0u8; payload.len()];
+        match tokio::time::timeout(Duration::from_secs(60), stream.read_exact(&mut buf)).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => panic!("{} stream read failed: {}", context, e),
+            Err(_) => panic!("{} stream read timed out", context),
+        }
+        assert_eq!(buf, payload, "{} stream echo payload mismatch", context);
+
+        stream
+    }
+
+    async fn open_stream_with_quota_retries(
+        tunnel: &dyn TunnelBox,
+        stream_id: &str,
+        context: &str,
+        open_attempts: usize,
+    ) -> Box<dyn AsyncStream> {
+        let open_attempts = open_attempts.max(1);
+        for attempt in 1..=open_attempts {
+            match tokio::time::timeout(Duration::from_secs(30), tunnel.open_stream(stream_id)).await
+            {
+                Ok(Ok(stream)) => return stream,
+                Ok(Err(e)) => {
+                    let error_message = e.to_string();
+                    let is_transient_rejection =
+                        error_message.contains("result=1") || error_message.contains("result=2");
+                    if is_transient_rejection && attempt < open_attempts {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                        continue;
+                    }
+                    panic!("{} stream open failed: {}", context, e);
+                }
+                Err(_) => panic!("{} stream open timed out", context),
+            }
+        }
+        unreachable!("open_attempts is clamped to at least one");
+    }
+
+    async fn assert_concurrent_stream_opens(
+        tunnel: Box<dyn TunnelBox>,
+        stream_id_prefix: &'static str,
+        count: usize,
+    ) {
+        let mut streams = FuturesUnordered::new();
+        for i in 0..count {
+            let tunnel = tunnel.clone();
+            streams.push(async move {
+                let stream_id = format!("{}{}.test:80", stream_id_prefix, i);
+                let stream = open_stream_with_quota_retries(
+                    tunnel.as_ref(),
+                    &stream_id,
+                    stream_id_prefix,
+                    500,
+                )
+                .await;
+                drop(stream);
+            });
+        }
+
+        let mut completed = 0usize;
+        while streams.next().await.is_some() {
+            completed += 1;
+        }
+        assert_eq!(completed, count, "{} streams opened", stream_id_prefix);
+    }
+
+    #[tokio::test]
+    async fn test_rtcp_nested_remote_rebinds_transport_via_rtcp_relay() {
+        let fixture = setup_nested_rtcp_relay_fixture("nested-flow").await;
+
+        let nested_status = tokio::time::timeout(
+            Duration::from_secs(10),
+            fixture
+                .rtcp_a
+                .probe_url(&fixture.nested_url, &TunnelProbeOptions::default()),
+        )
+        .await
+        .expect("nested remote probe timed out")
+        .expect("nested remote probe failed");
+        assert_eq!(
+            nested_status.state,
+            crate::tunnel_url_status::TunnelUrlState::Reachable
+        );
+        assert_eq!(
+            nested_status.source,
+            crate::tunnel_url_status::TunnelUrlStatusSource::ExistingTunnel
+        );
+        assert!(
+            nested_status
+                .runtime_tunnel_key
+                .as_deref()
+                .unwrap_or_default()
+                .contains("|bootstrap=rtcp://"),
+            "nested probe must report a bootstrap-qualified tunnel key: {:?}",
+            nested_status.runtime_tunnel_key
+        );
+
+        let before_business_stream = fixture.bootstrap_create_count.load(Ordering::SeqCst);
+        let stream = open_echo_stream(
+            fixture.tunnel.as_ref(),
+            "test:80",
+            b"test",
+            "nested remote forward",
+        )
+        .await;
+        assert!(
+            fixture.bootstrap_create_count.load(Ordering::SeqCst) > before_business_stream,
+            "nested business stream open must replay the bootstrap transport"
+        );
+
+        let before_reverse_stream = fixture.bootstrap_create_count.load(Ordering::SeqCst);
+        let reverse_stream = open_echo_stream(
+            fixture.reverse_tunnel.as_ref(),
+            "reverse.test:80",
+            b"back",
+            "nested remote reverse",
+        )
+        .await;
+        assert!(
+            fixture.bootstrap_create_count.load(Ordering::SeqCst) > before_reverse_stream,
+            "B-side reverse open should make A replay the bootstrap transport"
+        );
+        drop(stream);
+
+        let control_status_while_reverse_stream_open = tokio::time::timeout(
+            Duration::from_secs(10),
+            fixture
+                .rtcp_a
+                .probe_url(&fixture.nested_url, &TunnelProbeOptions::default()),
+        )
+        .await
+        .expect("nested remote control probe timed out while reverse stream is open")
+        .expect("nested remote control probe failed while reverse stream is open");
+        assert_eq!(
+            control_status_while_reverse_stream_open.state,
+            crate::tunnel_url_status::TunnelUrlState::Reachable
+        );
+        assert_eq!(
+            control_status_while_reverse_stream_open.source,
+            crate::tunnel_url_status::TunnelUrlStatusSource::ExistingTunnel
+        );
+        drop(reverse_stream);
+
+        assert_ne!(fixture.id_a, fixture.id_b);
+        assert_ne!(fixture.id_b, fixture.id_c);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn test_rtcp_nested_remote_concurrent_streams_via_rtcp_relay() {
+        let fixture = setup_nested_rtcp_relay_fixture("nested-concurrent").await;
+        let concurrent_stream_count = 1000usize;
+
+        let before_concurrent_streams = fixture.bootstrap_create_count.load(Ordering::SeqCst);
+        tokio::join!(
+            assert_concurrent_stream_opens(
+                fixture.tunnel.clone(),
+                "forward",
+                concurrent_stream_count,
+            ),
+            assert_concurrent_stream_opens(
+                fixture.reverse_tunnel.clone(),
+                "reverse",
+                concurrent_stream_count,
+            ),
+        );
+        assert!(
+            fixture.bootstrap_create_count.load(Ordering::SeqCst)
+                >= before_concurrent_streams + (concurrent_stream_count * 2),
+            "each concurrent forward and reverse stream should replay the bootstrap transport"
+        );
+
+        let _forward_after_stress = open_echo_stream(
+            fixture.tunnel.as_ref(),
+            "forward-after-stress.test:80",
+            b"forward-after-stress",
+            "forward after concurrent open stress",
+        )
+        .await;
+
+        let _reverse_after_stress = open_echo_stream(
+            fixture.reverse_tunnel.as_ref(),
+            "reverse-after-stress.test:80",
+            b"reverse-after-stress",
+            "reverse after concurrent open stress",
+        )
+        .await;
     }
 
     #[tokio::test]
