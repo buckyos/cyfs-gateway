@@ -1,9 +1,10 @@
 use super::common::{
-    build_profile_json, hash_password, normalize_username, now_secs, ok_response, parse_params,
-    require_account_username, verify_password, ActiveCodeReq, IntoRpcResult, LoginReq, NameReq,
-    RefreshReq, RegisterReq, RpcCallResult, PASSWORD_ALGO,
+    build_profile_json, normalize_username, now_secs, ok_response, parse_params,
+    require_account_username, ActiveCodeReq, IntoRpcResult, LoginReq, NameReq, RefreshReq,
+    RegisterReq, RpcCallResult,
 };
 use super::errors::{parse_error, SnV2ErrorCode};
+use crate::sn_v2_auth::{hash_password, verify_password, PASSWORD_ALGO};
 use crate::SNServer;
 use ::kRPC::{RPCErrors, RPCRequest, RPCResponse};
 use serde_json::json;

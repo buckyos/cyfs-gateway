@@ -1,23 +1,11 @@
-use crate::{SNServer, SnAuthDBRef, SnCompatibilityStoreRef, SnV2AuthInfo};
+use crate::{SNServer, SnAuthDBRef, SnCompatibilityStoreRef};
 use ::kRPC::*;
-use buckyos_kit::get_buckyos_service_data_dir;
-use jsonwebtoken::{jwk::Jwk, DecodingKey, EncodingKey};
-use name_lib::{generate_ed25519_key_pair, load_private_key};
-use ring::pbkdf2::{self, PBKDF2_HMAC_SHA256};
+use jsonwebtoken::{jwk::Jwk, DecodingKey};
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::num::NonZeroU32;
-use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::errors::{parse_error, reason_error, SnV2ErrorCode};
-
-const V2_ACCESS_AUD: &str = "sn-v2";
-const V2_REFRESH_AUD: &str = "sn-v2-refresh";
-const V2_ACCESS_TOKEN_EXPIRE_SECS: u64 = 60 * 60;
-const V2_REFRESH_TOKEN_EXPIRE_SECS: u64 = 60 * 60 * 24;
-pub(crate) const PASSWORD_ALGO: &str = "pbkdf2-sha256-100000";
-const PASSWORD_ITERATIONS: u32 = 100_000;
 
 pub(crate) type RpcCallResult<T> = std::result::Result<T, RPCErrors>;
 
@@ -28,84 +16,6 @@ pub(crate) trait IntoRpcResult<T> {
 impl<T> IntoRpcResult<T> for crate::SnResult<T> {
     fn into_rpc(self) -> RpcCallResult<T> {
         self.map_err(|e| reason_error(SnV2ErrorCode::InternalError, e.to_string()))
-    }
-}
-
-#[derive(Clone)]
-pub(crate) struct SnV2AuthManager {
-    token_encode_key: EncodingKey,
-    token_decode_key: DecodingKey,
-}
-
-impl SnV2AuthManager {
-    pub(crate) async fn new(configured_dir: Option<&str>) -> std::result::Result<Self, String> {
-        let data_dir = resolve_v2_auth_dir(configured_dir);
-        std::fs::create_dir_all(&data_dir).map_err(|e| {
-            format!(
-                "failed to create sn v2 auth dir {}: {}",
-                data_dir.display(),
-                e
-            )
-        })?;
-
-        let private_key = data_dir.join("private_key.pem");
-        let public_key = data_dir.join("public_key.json");
-        let (encode_key, decode_key) = if private_key.exists() && public_key.exists() {
-            let encode_key = load_private_key(private_key.as_path()).map_err(|e| e.to_string())?;
-            let public_key = std::fs::read_to_string(public_key.as_path())
-                .map_err(|e| format!("read public key failed: {}", e))?;
-            let public_key: Jwk = serde_json::from_str(public_key.as_str())
-                .map_err(|e| format!("parse public key failed: {}", e))?;
-            let decode_key =
-                DecodingKey::from_jwk(&public_key).map_err(|e| format!("decode key: {}", e))?;
-            (encode_key, decode_key)
-        } else {
-            let (sign_key, public_key_value) = generate_ed25519_key_pair();
-            std::fs::write(private_key.as_path(), sign_key.as_bytes())
-                .map_err(|e| format!("write private key failed: {}", e))?;
-            std::fs::write(
-                public_key.as_path(),
-                serde_json::to_string(&public_key_value).unwrap(),
-            )
-            .map_err(|e| format!("write public key failed: {}", e))?;
-            let jwk = serde_json::from_value::<Jwk>(public_key_value)
-                .map_err(|e| format!("parse generated jwk failed: {}", e))?;
-            let encode_key = load_private_key(private_key.as_path()).map_err(|e| e.to_string())?;
-            let decode_key =
-                DecodingKey::from_jwk(&jwk).map_err(|e| format!("decode key: {}", e))?;
-            (encode_key, decode_key)
-        };
-
-        Ok(Self {
-            token_encode_key: encode_key,
-            token_decode_key: decode_key,
-        })
-    }
-
-    pub(crate) fn issue_access_token(&self, username: &str) -> RpcCallResult<String> {
-        issue_rpc_jwt(
-            username,
-            V2_ACCESS_AUD,
-            V2_ACCESS_TOKEN_EXPIRE_SECS,
-            &self.token_encode_key,
-        )
-    }
-
-    pub(crate) fn issue_refresh_token(&self, username: &str) -> RpcCallResult<String> {
-        issue_rpc_jwt(
-            username,
-            V2_REFRESH_AUD,
-            V2_REFRESH_TOKEN_EXPIRE_SECS,
-            &self.token_encode_key,
-        )
-    }
-
-    pub(crate) fn verify_access_token(&self, token: &str) -> RpcCallResult<String> {
-        verify_rpc_jwt(token, V2_ACCESS_AUD, &self.token_decode_key)
-    }
-
-    pub(crate) fn verify_refresh_token(&self, token: &str) -> RpcCallResult<String> {
-        verify_rpc_jwt(token, V2_REFRESH_AUD, &self.token_decode_key)
     }
 }
 
@@ -272,122 +182,6 @@ where
 
 pub(crate) fn ok_response(req: &RPCRequest, value: Value) -> RpcCallResult<RPCResponse> {
     Ok(RPCResponse::create_by_req(RPCResult::Success(value), req))
-}
-
-fn resolve_v2_auth_dir(configured_dir: Option<&str>) -> PathBuf {
-    if let Some(path) = configured_dir {
-        let configured = PathBuf::from(path);
-        if configured.is_absolute() {
-            return configured;
-        }
-        return std::env::current_dir()
-            .unwrap_or_else(|_| PathBuf::from("."))
-            .join(configured);
-    }
-    get_buckyos_service_data_dir("cyfs_gateway").join("sn_v2_token_key")
-}
-
-fn issue_rpc_jwt(
-    username: &str,
-    aud: &str,
-    expire_secs: u64,
-    key: &EncodingKey,
-) -> RpcCallResult<String> {
-    let (_, mut session) =
-        RPCSessionToken::generate_jwt_token(username, aud, None, key).map_err(|e| {
-            reason_error(
-                SnV2ErrorCode::InternalError,
-                format!("generate jwt token failed: {}", e),
-            )
-        })?;
-    session.aud = Some(aud.to_string());
-    session.exp = Some(
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs()
-            + expire_secs,
-    );
-    session
-        .generate_jwt(None, key)
-        .map(|jwt| jwt.to_string())
-        .map_err(|e| {
-            reason_error(
-                SnV2ErrorCode::InternalError,
-                format!("generate jwt token failed: {}", e),
-            )
-        })
-}
-
-fn verify_rpc_jwt(token: &str, expected_aud: &str, key: &DecodingKey) -> RpcCallResult<String> {
-    let mut session = RPCSessionToken::from_string(token)
-        .map_err(|e| parse_error(SnV2ErrorCode::InvalidToken, e.to_string()))?;
-    session
-        .verify_by_key(key)
-        .map_err(|e| parse_error(SnV2ErrorCode::InvalidToken, e.to_string()))?;
-    if session.aud.as_deref() != Some(expected_aud) {
-        return Err(parse_error(
-            SnV2ErrorCode::InvalidToken,
-            format!("invalid aud {:?}, expect {}", session.aud, expected_aud),
-        ));
-    }
-    session
-        .sub
-        .ok_or_else(|| parse_error(SnV2ErrorCode::InvalidToken, "subject is none"))
-}
-
-pub(crate) fn hash_password(password: &str) -> RpcCallResult<(String, String)> {
-    let salt = rand::random::<[u8; 16]>();
-    let salt_hex = hex::encode(salt);
-    let password_hash = derive_password_hash(password, salt_hex.as_str())?;
-    Ok((password_hash, salt_hex))
-}
-
-pub(crate) fn verify_password(password: &str, auth: &SnV2AuthInfo) -> RpcCallResult<bool> {
-    if auth.password_algo != PASSWORD_ALGO {
-        return Err(reason_error(
-            SnV2ErrorCode::UnsupportedPasswordAlgo,
-            format!("unsupported password algo {}", auth.password_algo),
-        ));
-    }
-    let salt = hex::decode(auth.password_salt.as_str()).map_err(|e| {
-        reason_error(
-            SnV2ErrorCode::InvalidPasswordStorage,
-            format!("invalid password salt: {}", e),
-        )
-    })?;
-    let expected = hex::decode(auth.password_hash.as_str()).map_err(|e| {
-        reason_error(
-            SnV2ErrorCode::InvalidPasswordStorage,
-            format!("invalid password hash: {}", e),
-        )
-    })?;
-    Ok(pbkdf2::verify(
-        PBKDF2_HMAC_SHA256,
-        NonZeroU32::new(PASSWORD_ITERATIONS).unwrap(),
-        &salt,
-        password.as_bytes(),
-        &expected,
-    )
-    .is_ok())
-}
-
-fn derive_password_hash(password: &str, salt_hex: &str) -> RpcCallResult<String> {
-    let salt = hex::decode(salt_hex).map_err(|e| {
-        reason_error(
-            SnV2ErrorCode::InvalidPasswordStorage,
-            format!("invalid password salt: {}", e),
-        )
-    })?;
-    let mut hash = [0u8; 32];
-    pbkdf2::derive(
-        PBKDF2_HMAC_SHA256,
-        NonZeroU32::new(PASSWORD_ITERATIONS).unwrap(),
-        &salt,
-        password.as_bytes(),
-        &mut hash,
-    );
-    Ok(hex::encode(hash))
 }
 
 pub(crate) fn normalize_username(username: &str) -> RpcCallResult<String> {

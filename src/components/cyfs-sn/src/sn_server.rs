@@ -1,4 +1,7 @@
 #![allow(unused)]
+use crate::api::{
+    handle_auth, handle_device, handle_did, handle_dns, handle_query, handle_user, handle_zone,
+};
 use crate::name_info_cache::{NameInfoCache, NameInfoCacheQueryResult, NameInfoCacheRef};
 use crate::sn_compat_store::{SNDeviceInfo, SnCompatibilityStoreRef, SqliteSnCompatibilityStore};
 use crate::sn_resolver::{
@@ -7,10 +10,7 @@ use crate::sn_resolver::{
     SnRelayManagerResolverReader, SnResolver, SnResolverConfig, SnResolverError,
     SnResolverErrorKind, SnResolverRef, SnResolverResult,
 };
-use crate::v2::{
-    handle_auth, handle_device, handle_did, handle_dns, handle_query, handle_user, handle_zone,
-    SnV2AuthManager,
-};
+use crate::sn_v2_auth::SnV2AuthManager;
 use crate::{
     SNUserInfo, SnAuthDBRef, SnDeviceEndpointUpdate, SnDeviceInfoDBRef, SnDeviceRole,
     SnDeviceStateUpdate, SnEndpointProtocol, SnEndpointScope, SnEndpointSource, SnNatType,

@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 
+mod api;
 pub mod name_info_cache;
 mod relay_mgr;
 mod sn_auth;
@@ -7,7 +8,7 @@ mod sn_compat_store;
 mod sn_device_info;
 pub mod sn_resolver;
 mod sn_server;
-mod v2;
+mod sn_v2_auth;
 
 pub use name_info_cache::*;
 pub use relay_mgr::*;
