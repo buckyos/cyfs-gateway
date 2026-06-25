@@ -5,13 +5,13 @@ use crate::{
     hash_json, is_top_level_name, now_timestamp, parent_name, validate_did, validate_hash,
     validate_semantic_owner, AliasKind, AliasState, AuthorityKey, AuthorityKeyStatus,
     AuthorityKeyUpdate, AuthorityRole, AuthoritySetState, BnsRegistryError, BnsRegistryResult,
-    BnsRegistryStore, BnsRegistryStoreTx, CallAuthority, ControllerRule, DocumentRef,
-    DocumentState, DocumentStatus, DocumentUpdate, EventLogRecord, LogCheckpoint, MutationGuard,
-    NameState, NameStatus, OwnerResolution, OwnerSource, PaymentTargetResolution, Principal,
-    PrincipalKind, PurchaseContext, RegisterOptions, RegistryEvent, ReleaseMode, ResolveResult,
-    KEY_PURPOSE_AUTHENTICATION, MAX_OWNER_REF_DEPTH, PERMISSION_PUBLISH_DOCUMENT,
-    PERMISSION_REVOKE_DOCUMENT, PERMISSION_SET_ALIAS, PERMISSION_SET_NAMESPACE,
-    PERMISSION_SET_PAYMENT, ZERO_HASH,
+    BnsRegistryStore, BnsRegistryStoreTx, BootstrapDocumentVersion, BootstrapNameResult,
+    CallAuthority, ControllerRule, DocumentRef, DocumentState, DocumentStatus, DocumentUpdate,
+    EventLogRecord, LogCheckpoint, MutationGuard, NameState, NameStatus, OwnerResolution,
+    OwnerSource, PaymentTargetResolution, Principal, PrincipalKind, PurchaseContext,
+    RegisterOptions, RegistryEvent, ReleaseMode, ResolveResult, KEY_PURPOSE_AUTHENTICATION,
+    MAX_OWNER_REF_DEPTH, PERMISSION_PUBLISH_DOCUMENT, PERMISSION_REVOKE_DOCUMENT,
+    PERMISSION_SET_ALIAS, PERMISSION_SET_NAMESPACE, PERMISSION_SET_PAYMENT, ZERO_HASH,
 };
 
 use crate::sqlite::recompute_authority_set;
@@ -290,6 +290,189 @@ where
             }
 
             Ok(state.name_seq)
+        })
+    }
+
+    pub fn bootstrap_name(
+        &self,
+        name: &str,
+        asset_owner: &str,
+        options: RegisterOptions,
+        initial_documents: Vec<DocumentUpdate>,
+        authority_key_updates: Vec<AuthorityKeyUpdate>,
+        semantic_owner_after_authority: Option<Principal>,
+        controller_policy: Vec<ControllerRule>,
+        controller_policy_hash: &str,
+        authority: CallAuthority,
+        guard: MutationGuard,
+    ) -> BnsRegistryResult<BootstrapNameResult> {
+        let name = canonical_bns_name(name)?;
+        ensure_registerable_depth(&name)?;
+        if asset_owner.is_empty() {
+            return Err(BnsRegistryError::InvalidMutation(
+                "asset owner must not be empty".to_string(),
+            ));
+        }
+        options.validate()?;
+        for update in &initial_documents {
+            update.validate()?;
+            if update.expected_version != 0 {
+                return Err(BnsRegistryError::StaleDocumentVersion {
+                    name: name.clone(),
+                    doc_type: update.doc_type.clone(),
+                    expected: update.expected_version,
+                    actual: 0,
+                });
+            }
+        }
+        for update in &authority_key_updates {
+            update.key.validate()?;
+        }
+        if let Some(owner) = &semantic_owner_after_authority {
+            validate_semantic_owner(owner)?;
+        }
+        validate_hash(controller_policy_hash)?;
+        for rule in &controller_policy {
+            rule.validate()?;
+        }
+
+        self.store.transact(|tx| {
+            let now = now_timestamp();
+            let existing = tx.get_name(&name)?;
+            if matches!(
+                existing.as_ref().map(|state| state.status),
+                Some(NameStatus::Active | NameStatus::Expired | NameStatus::Tombstoned)
+            ) {
+                return Err(BnsRegistryError::NameAlreadyExists { name: name.clone() });
+            }
+
+            if let Some(parent) = parent_name(&name) {
+                let parent_state = self.required_active_name(tx, parent)?;
+                if guard.expected_parent_name_seq != parent_state.name_seq {
+                    return Err(BnsRegistryError::StaleParentNameSeq {
+                        name: parent.to_string(),
+                        expected: guard.expected_parent_name_seq,
+                        actual: parent_state.name_seq,
+                    });
+                }
+                self.authorize_owner_for_loaded(tx, &parent_state, &authority)?;
+            } else if authority.role != AuthorityRole::None {
+                return Err(BnsRegistryError::InvalidMutation(
+                    "root registration does not use registry owner/controller authority"
+                        .to_string(),
+                ));
+            }
+
+            self.validate_semantic_owner_target(tx, &options.initial_semantic_owner)?;
+
+            let lineage_epoch = existing.as_ref().map_or(0, |state| state.lineage_epoch + 1);
+            let next_seq = existing.as_ref().map_or(1, |state| state.name_seq + 1);
+            let mut state = NameState {
+                name: name.clone(),
+                asset_owner: asset_owner.to_string(),
+                semantic_owner: options.initial_semantic_owner.clone(),
+                effective_owner: Principal::unset(),
+                owner_source: OwnerSource::None,
+                standard_transfer_enabled: false,
+                status: NameStatus::Active,
+                registered_at: now,
+                expire_at: now + options.duration,
+                grace_until: now + options.duration + options.grace_period,
+                updated_at: now,
+                name_seq: next_seq,
+                owner_document_version: 0,
+                lineage_epoch,
+                renewable: options.renewable,
+                transferable: options.transferable,
+                allow_delegated_subnames: options.allow_delegated_subnames,
+                namespace_policy_hash: options.initial_namespace_policy_hash.clone(),
+                payment_policy_hash: options.initial_payment_policy_hash.clone(),
+                alias_state_hash: ZERO_HASH.to_string(),
+            };
+
+            self.validate_owner_graph_with(tx, Some(&state))?;
+            state = self.materialize_name_state(tx, state)?;
+            tx.put_name(&state)?;
+            tx.append_event(
+                &RegistryEvent::NameRegistered {
+                    name: name.clone(),
+                    asset_owner: asset_owner.to_string(),
+                    expire_at: state.expire_at,
+                    lineage_epoch,
+                    name_seq: state.name_seq,
+                },
+                now,
+            )?;
+
+            let mut initial_document_versions = Vec::with_capacity(initial_documents.len());
+            for update in initial_documents {
+                let doc_type = update.doc_type.clone();
+                let version = self.publish_document_internal(tx, &name, update, false, now)?;
+                let document = tx.get_document(&name, &doc_type, version)?.ok_or_else(|| {
+                    BnsRegistryError::DocumentNotFound {
+                        name: name.clone(),
+                        doc_type: doc_type.clone(),
+                    }
+                })?;
+                initial_document_versions.push(BootstrapDocumentVersion {
+                    doc_type,
+                    version,
+                    content_hash: document.document.content_hash,
+                    document_state_hash: document.document_state_hash,
+                });
+            }
+
+            if !authority_key_updates.is_empty() {
+                self.apply_authority_updates(tx, &name, authority_key_updates, now)?;
+            }
+
+            if let Some(semantic_owner) = semantic_owner_after_authority {
+                let mut state = self.required_active_name(tx, &name)?;
+                self.validate_semantic_owner_target(tx, &semantic_owner)?;
+                state.semantic_owner = semantic_owner;
+                state.name_seq += 1;
+                state.updated_at = now;
+                self.validate_owner_graph_with(tx, Some(&state))?;
+                state = self.materialize_name_state(tx, state)?;
+                tx.put_name(&state)?;
+                tx.append_event(
+                    &RegistryEvent::NameOwnerUpdated {
+                        name: name.clone(),
+                        owner: state.semantic_owner.clone(),
+                        owner_source: state.owner_source,
+                        standard_transfer_enabled: state.standard_transfer_enabled,
+                        name_seq: state.name_seq,
+                    },
+                    now,
+                )?;
+            }
+
+            for rule in &controller_policy {
+                if rule.controller.kind == PrincipalKind::BnsName {
+                    self.require_active_authority_set(tx, &rule.controller.value)?;
+                }
+            }
+            tx.put_controller_policy(&name, &controller_policy, controller_policy_hash)?;
+            let mut state = self.required_active_name(tx, &name)?;
+            state.name_seq += 1;
+            state.updated_at = now;
+            state = self.materialize_name_state(tx, state)?;
+            tx.put_name(&state)?;
+            tx.append_event(
+                &RegistryEvent::ControllerPolicyUpdated {
+                    name: name.clone(),
+                    policy_hash: controller_policy_hash.to_string(),
+                    name_seq: state.name_seq,
+                },
+                now,
+            )?;
+
+            Ok(BootstrapNameResult {
+                name_seq: state.name_seq,
+                initial_documents: initial_document_versions,
+                authority_set: self.authority_set(tx, &name)?,
+                controller_policy_hash: controller_policy_hash.to_string(),
+            })
         })
     }
 

@@ -3,11 +3,11 @@ use super::http_compression::{
     apply_response_compression,
 };
 use super::{into_server_err, server_err};
-use crate::global_process_chains::{GlobalProcessChainsRef, create_process_chain_executor};
 use crate::forward::{
     BalanceMethod, ForwardFailureRegistry, ForwardPlan, HttpMethodClass, NextUpstreamCondition,
     apply_least_time_via_tunnel_mgr,
 };
+use crate::global_process_chains::{GlobalProcessChainsRef, create_process_chain_executor};
 use crate::tunnel_url_status::TunnelFailureReason;
 use crate::{
     GlobalCollectionManagerRef, HttpRequestHeaderMap, HttpRequestProcessChainVars,
@@ -740,10 +740,7 @@ impl ProcessChainHttpServer {
                         e
                     )
                 })?;
-                let tls_stream = match tls_connector
-                    .connect(server_name, tcp_stream)
-                    .await
-                {
+                let tls_stream = match tls_connector.connect(server_name, tcp_stream).await {
                     Ok(s) => s,
                     Err(e) => {
                         if let Some(key) = history_key.as_ref() {
@@ -971,8 +968,7 @@ impl ProcessChainHttpServer {
         //     `non_idempotent`,
         //   - max_body_buffer_bytes > 0.
         let method_class = HttpMethodClass::classify(req.method().as_str());
-        let method_replay_allowed =
-            method_class.is_idempotent() || policy.allow_non_idempotent();
+        let method_replay_allowed = method_class.is_idempotent() || policy.allow_non_idempotent();
         let http_status_retry_armed = policy.is_enabled()
             && policy.any_http_status()
             && method_replay_allowed
@@ -986,7 +982,8 @@ impl ProcessChainHttpServer {
 
         // Stage 2 path: connection-stage retry only, body forwarded
         // once after probing the chosen candidate.
-        self.handle_forward_group_connect_only(req, plan, info).await
+        self.handle_forward_group_connect_only(req, plan, info)
+            .await
     }
 
     /// Connection-stage retry only (§6.3). The body is sent only after
@@ -1040,8 +1037,7 @@ impl ProcessChainHttpServer {
                 }
             }
 
-            let attempt_fut =
-                self.forward_to_candidate(&mut req_slot, &candidate.url, info);
+            let attempt_fut = self.forward_to_candidate(&mut req_slot, &candidate.url, info);
             let (attempt_res, attempt_cond) = match deadline {
                 Some(d) => {
                     let remaining = d.saturating_duration_since(std::time::Instant::now());
@@ -1066,14 +1062,19 @@ impl ProcessChainHttpServer {
                     registry.record_success(&group_key, &candidate.url);
                     log::debug!(
                         "forward-group {}: http selected candidate idx={} url={}",
-                        group_key, idx, candidate.url
+                        group_key,
+                        idx,
+                        candidate.url
                     );
                     return Ok(resp);
                 }
                 Err(e) => {
                     log::debug!(
                         "forward-group {}: http candidate {} (idx {}) failed: {}",
-                        group_key, candidate.url, idx, e
+                        group_key,
+                        candidate.url,
+                        idx,
+                        e
                     );
                     registry.record_failure(
                         &group_key,
@@ -1179,8 +1180,7 @@ impl ProcessChainHttpServer {
             Self::set_content_length(&mut attempt_req);
             let mut req_slot = Some(attempt_req);
 
-            let attempt_fut =
-                self.forward_to_candidate(&mut req_slot, &candidate.url, info);
+            let attempt_fut = self.forward_to_candidate(&mut req_slot, &candidate.url, info);
             let (attempt_res, attempt_cond) = match deadline {
                 Some(d) => {
                     let remaining = d.saturating_duration_since(std::time::Instant::now());
@@ -1206,7 +1206,9 @@ impl ProcessChainHttpServer {
                     if policy.matches_http_status(status) && idx + 1 < max_attempts {
                         log::debug!(
                             "forward-group {}: candidate {} returned {}, retrying next candidate",
-                            group_key, candidate.url, status
+                            group_key,
+                            candidate.url,
+                            status
                         );
                         registry.record_failure(
                             &group_key,
@@ -1220,14 +1222,18 @@ impl ProcessChainHttpServer {
                     registry.record_success(&group_key, &candidate.url);
                     log::debug!(
                         "forward-group {}: http selected candidate idx={} url={} (status-retry armed)",
-                        group_key, idx, candidate.url
+                        group_key,
+                        idx,
+                        candidate.url
                     );
                     return Ok(r);
                 }
                 Err(e) => {
                     log::debug!(
                         "forward-group {}: candidate {} request failed: {}",
-                        group_key, candidate.url, e
+                        group_key,
+                        candidate.url,
+                        e
                     );
                     registry.record_failure(
                         &group_key,
@@ -1286,18 +1292,13 @@ impl ProcessChainHttpServer {
 
     fn set_content_length(req: &mut http::Request<BoxBody<Bytes, ServerError>>) {
         use hyper::body::Body;
-        let len = req
-            .body()
-            .size_hint()
-            .exact()
-            .unwrap_or(0);
+        let len = req.body().size_hint().exact().unwrap_or(0);
         if let Ok(v) = http::HeaderValue::from_str(&len.to_string()) {
             req.headers_mut().insert(http::header::CONTENT_LENGTH, v);
         }
         // Replayable bodies can't keep Transfer-Encoding: chunked.
         req.headers_mut().remove(http::header::TRANSFER_ENCODING);
     }
-
 
     fn parse_redirect_status_code(status: Option<&str>) -> ServerResult<StatusCode> {
         let status_code = match status {

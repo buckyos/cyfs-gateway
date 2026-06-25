@@ -21,8 +21,13 @@ pub use sfo_result::into_err as into_sn_err;
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum SnErrorCode {
     Failed,
+    InvalidInput,
     NotFound,
+    Conflict,
+    StaleReport,
+    Blocked,
     DBError,
+    RemoteError,
 }
 
 pub type SnResult<T> = sfo_result::Result<T, SnErrorCode>;

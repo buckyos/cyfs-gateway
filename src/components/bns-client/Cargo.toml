@@ -1,0 +1,16 @@
+[package]
+name = "bns-client"
+version.workspace = true
+edition = "2021"
+authors = ["BuckyOS DAO", "@waterflier", "@lurenpluto", "@wugren"]
+
+[dependencies]
+async-trait.workspace = true
+bns-indexer = { path = "../bns-indexer" }
+kRPC.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true

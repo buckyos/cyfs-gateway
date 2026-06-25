@@ -247,7 +247,9 @@ impl CyfsDirServer {
                 return Ok(ChainOutcome::Response(empty_response(StatusCode::OK)));
             }
             if ret.is_reject() {
-                return Ok(ChainOutcome::Response(empty_response(StatusCode::FORBIDDEN)));
+                return Ok(ChainOutcome::Response(empty_response(
+                    StatusCode::FORBIDDEN,
+                )));
             }
             if let Some(CommandControl::Error(e)) = ret.as_control() {
                 let msg = e.value.to_string();
@@ -317,11 +319,19 @@ impl CyfsDirServer {
                 );
             }
 
-            return Ok(ChainOutcome::Resolved(rewrite_to_o_link(req, &record.obj_id, &self.url_prefix)));
+            return Ok(ChainOutcome::Resolved(rewrite_to_o_link(
+                req,
+                &record.obj_id,
+                &self.url_prefix,
+            )));
         }
 
         if let Some(CollectionValue::String(obj_id)) = id_value {
-            return Ok(ChainOutcome::Resolved(rewrite_to_o_link(req, &obj_id, &self.url_prefix)));
+            return Ok(ChainOutcome::Resolved(rewrite_to_o_link(
+                req,
+                &obj_id,
+                &self.url_prefix,
+            )));
         }
 
         Ok(ChainOutcome::PassThrough(req))
@@ -466,9 +476,7 @@ impl ServerFactory for CyfsDirServerFactory {
         let mut inner_cfg = NdnDirServerConfig::new(semantic_root, store_mgr.clone(), mode)
             .url_prefix(cfg.url_prefix.clone())
             .obj_id_in_host(cfg.obj_id_in_host)
-            .scan_interval(Duration::from_secs(
-                cfg.scan_interval_secs.max(1),
-            ));
+            .scan_interval(Duration::from_secs(cfg.scan_interval_secs.max(1)));
         if let Some(key) = signing_key {
             inner_cfg = inner_cfg.signing_key(key, signing_kid);
         }
@@ -575,4 +583,3 @@ fn rewrite_to_o_link(
     }
     req
 }
-

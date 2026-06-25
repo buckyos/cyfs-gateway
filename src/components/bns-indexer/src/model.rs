@@ -645,6 +645,22 @@ pub struct ResolveResult {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BootstrapDocumentVersion {
+    pub doc_type: String,
+    pub version: u64,
+    pub content_hash: String,
+    pub document_state_hash: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BootstrapNameResult {
+    pub name_seq: u64,
+    pub initial_documents: Vec<BootstrapDocumentVersion>,
+    pub authority_set: AuthoritySetState,
+    pub controller_policy_hash: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DocumentKey {
     pub name: String,
     pub doc_type: String,

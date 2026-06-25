@@ -5213,13 +5213,11 @@ mod tests {
         println!("{}", rule);
         assert!(rule.starts_with(r#"match ${REQ.path} "/static/*" && rewrite ${REQ.path} "/static/*" "/*" && call-server"#));
         // dir server created
-        assert!(
-            updated["servers"]
-                .as_object()
-                .unwrap()
-                .keys()
-                .any(|k| k.starts_with("router_dir_"))
-        );
+        assert!(updated["servers"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .any(|k| k.starts_with("router_dir_")));
 
         let (updated, removed_id) =
             Gateway::remove_router_from_config(updated, Some("router_test"), "/static/*", "/www/")

@@ -6,7 +6,7 @@ use cyfs_gateway_lib::{RtcpStackConfig, StackProtocol};
 use cyfs_sn::OODInfo;
 use kRPC::RPCSessionToken;
 use name_lib::{
-    DID, DeviceConfig, encode_ed25519_pkcs8_sk_to_pk, get_x_from_jwk, load_raw_private_key,
+    encode_ed25519_pkcs8_sk_to_pk, get_x_from_jwk, load_raw_private_key, DeviceConfig, DID,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;

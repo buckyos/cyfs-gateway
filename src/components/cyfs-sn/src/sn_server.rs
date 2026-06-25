@@ -11,9 +11,9 @@ use async_trait::async_trait;
 use buckyos_kit::{get_buckyos_service_data_dir, is_valid_name, NameType};
 use cyfs_gateway_lib::{into_server_err, server_err};
 use cyfs_gateway_lib::{
-    qa_json_to_rpc_request, HttpRequestProcessChainVars, HttpServer, NameServer, QAServer,
-    Server, ServerConfig, ServerContextRef, ServerError, ServerErrorCode, ServerFactory,
-    ServerResult, StreamInfo,
+    qa_json_to_rpc_request, HttpRequestProcessChainVars, HttpServer, NameServer, QAServer, Server,
+    ServerConfig, ServerContextRef, ServerError, ServerErrorCode, ServerFactory, ServerResult,
+    StreamInfo,
 };
 use http::{Method, Response, StatusCode};
 use http_body_util::combinators::BoxBody;
@@ -450,11 +450,7 @@ impl SNServer {
         let username = Self::normalize_registration_username(username);
         let (valid, reason, message) =
             if let Err(message) = Self::validate_registration_username(username.as_str()) {
-                (
-                    false,
-                    "invalid_username".to_string(),
-                    message.to_string(),
-                )
+                (false, "invalid_username".to_string(), message.to_string())
             } else {
                 let exists = self
                     .db

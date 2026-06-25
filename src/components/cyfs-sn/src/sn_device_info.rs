@@ -1,35 +1,329 @@
 use crate::{into_sn_err, sn_err, SnErrorCode, SnResult};
+use serde::{Deserialize, Serialize};
+use serde_json::json;
 use sfo_sql::mysql::sql_query;
-use sfo_sql::sqlite::{SqlPool, SqliteJournalMode};
+use sfo_sql::sqlite::{SqlPool, SqlRowObject, SqliteJournalMode};
 use sfo_sql::Row;
+use std::collections::HashSet;
+use std::fmt;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::PathBuf;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub type SnDeviceInfoDBRef = Arc<dyn SnDeviceInfoDB>;
 
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub struct SnDidInfo {
+macro_rules! string_enum {
+    ($name:ident { $($variant:ident => $value:literal),+ $(,)? }) => {
+        impl $name {
+            pub fn as_str(self) -> &'static str {
+                match self {
+                    $(Self::$variant => $value,)+
+                }
+            }
+        }
+
+        impl fmt::Display for $name {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str((*self).as_str())
+            }
+        }
+
+        impl FromStr for $name {
+            type Err = String;
+
+            fn from_str(value: &str) -> Result<Self, Self::Err> {
+                match value {
+                    $($value => Ok(Self::$variant),)+
+                    _ => Err(format!("invalid {}: {}", stringify!($name), value)),
+                }
+            }
+        }
+    };
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SnDeviceRole {
+    Gateway,
+    Ood,
+    Normal,
+    Unknown,
+}
+
+string_enum!(SnDeviceRole {
+    Gateway => "gateway",
+    Ood => "ood",
+    Normal => "normal",
+    Unknown => "unknown",
+});
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SnDeviceState {
+    Online,
+    Offline,
+    Stale,
+    Blocked,
+}
+
+string_enum!(SnDeviceState {
+    Online => "online",
+    Offline => "offline",
+    Stale => "stale",
+    Blocked => "blocked",
+});
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SnNatType {
+    Public,
+    Private,
+    Symmetric,
+    Unknown,
+}
+
+string_enum!(SnNatType {
+    Public => "public",
+    Private => "private",
+    Symmetric => "symmetric",
+    Unknown => "unknown",
+});
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SnEndpointProtocol {
+    Tcp,
+    Udp,
+    Quic,
+    Rtcp,
+    Http,
+    Https,
+}
+
+string_enum!(SnEndpointProtocol {
+    Tcp => "tcp",
+    Udp => "udp",
+    Quic => "quic",
+    Rtcp => "rtcp",
+    Http => "http",
+    Https => "https",
+});
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SnEndpointScope {
+    Public,
+    Private,
+    Relay,
+    Loopback,
+    Unknown,
+}
+
+string_enum!(SnEndpointScope {
+    Public => "public",
+    Private => "private",
+    Relay => "relay",
+    Loopback => "loopback",
+    Unknown => "unknown",
+});
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SnEndpointSource {
+    DeviceReport,
+    FromIp,
+    RelayObserved,
+    Admin,
+}
+
+string_enum!(SnEndpointSource {
+    DeviceReport => "device_report",
+    FromIp => "from_ip",
+    RelayObserved => "relay_observed",
+    Admin => "admin",
+});
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SnEndpointState {
+    Active,
+    Stale,
+    Failed,
+    Disabled,
+}
+
+string_enum!(SnEndpointState {
+    Active => "active",
+    Stale => "stale",
+    Failed => "failed",
+    Disabled => "disabled",
+});
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SnDeviceStateEventType {
+    Registered,
+    Rebound,
+    Online,
+    Offline,
+    Stale,
+    Blocked,
+    Unblocked,
+    EndpointChanged,
+    ReportRejected,
+}
+
+string_enum!(SnDeviceStateEventType {
+    Registered => "registered",
+    Rebound => "rebound",
+    Online => "online",
+    Offline => "offline",
+    Stale => "stale",
+    Blocked => "blocked",
+    Unblocked => "unblocked",
+    EndpointChanged => "endpoint_changed",
+    ReportRejected => "report_rejected",
+});
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SnDeviceIndex {
     pub did: String,
-    pub did_info: String,
+    pub zone: String,
+    pub device_name: String,
+    pub device_role: SnDeviceRole,
     pub created_at: u64,
     pub updated_at: u64,
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SnDeviceEndpointUpdate {
+    pub endpoint_id: String,
+    pub protocol: SnEndpointProtocol,
+    pub host: String,
+    pub port: Option<u16>,
+    pub scope: SnEndpointScope,
+    pub priority: i64,
+    pub source: SnEndpointSource,
+    pub expires_at: Option<u64>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SnDeviceEndpoint {
     pub did: String,
-    pub endpoint: String,
+    pub endpoint_id: String,
+    pub protocol: SnEndpointProtocol,
+    pub host: String,
+    pub port: Option<u16>,
+    pub scope: SnEndpointScope,
+    pub priority: i64,
+    pub source: SnEndpointSource,
+    pub state: SnEndpointState,
+    pub last_seen_at: Option<u64>,
+    pub expires_at: Option<u64>,
     pub created_at: u64,
     pub updated_at: u64,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SnDeviceStateUpdate {
+    pub did: String,
+    pub reported_ip: Option<String>,
+    pub reported_ips: Vec<String>,
+    pub from_ip: Option<String>,
+    pub nat_type: SnNatType,
+    pub endpoints: Vec<SnDeviceEndpointUpdate>,
+    pub report_seq: Option<u64>,
+    pub ttl: u64,
+    pub raw_report: Option<String>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SnDeviceStateView {
+    pub did: String,
+    pub zone: String,
+    pub device_name: String,
+    pub device_role: SnDeviceRole,
+    pub state: SnDeviceState,
+    pub public_ips: Vec<String>,
+    pub private_ips: Vec<String>,
+    pub active_endpoints: Vec<SnDeviceEndpoint>,
+    pub preferred_endpoint: Option<SnDeviceEndpoint>,
+    pub nat_type: SnNatType,
+    pub is_wan_device: bool,
+    pub last_seen_at: Option<u64>,
+    pub expires_at: Option<u64>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize, Default)]
+pub struct SnDeviceListOptions {
+    pub state: Option<SnDeviceState>,
+    pub offset: Option<usize>,
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SnDeviceStateEvent {
+    pub id: u64,
+    pub did: String,
+    pub event_type: SnDeviceStateEventType,
+    pub old_state: Option<SnDeviceState>,
+    pub new_state: Option<SnDeviceState>,
+    pub reason: Option<String>,
+    pub event_at: u64,
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct RuntimeStateRow {
+    state: SnDeviceState,
+    reported_ip: Option<String>,
+    reported_ips: Vec<String>,
+    from_ip: Option<String>,
+    wan_ip: Option<String>,
+    lan_ips: Vec<String>,
+    nat_type: SnNatType,
+    is_wan_device: bool,
+    last_seen_at: Option<u64>,
+    expires_at: Option<u64>,
+    report_seq: Option<u64>,
 }
 
 #[async_trait::async_trait]
 pub trait SnDeviceInfoDB: Send + Sync + 'static {
-    async fn update_did_info(&self, did: &str, did_info: &str) -> SnResult<()>;
-    async fn get_did_info(&self, did: &str) -> SnResult<Option<SnDidInfo>>;
-    async fn update_device_endpoint(&self, did: &str, endpoint: &str) -> SnResult<()>;
-    async fn get_device_endpoint(&self, did: &str) -> SnResult<Option<SnDeviceEndpoint>>;
+    async fn upsert_device_index(
+        &self,
+        did: &str,
+        zone: &str,
+        device_name: &str,
+        device_role: SnDeviceRole,
+    ) -> SnResult<()>;
+    async fn rebind_device_index(
+        &self,
+        did: &str,
+        new_zone: &str,
+        new_device_name: &str,
+        new_device_role: SnDeviceRole,
+        reason: &str,
+    ) -> SnResult<()>;
+    async fn remove_device_index(&self, did: &str) -> SnResult<()>;
+    async fn update_device_state(&self, update: SnDeviceStateUpdate) -> SnResult<()>;
+    async fn get_device_state(&self, did: &str) -> SnResult<Option<SnDeviceStateView>>;
+    async fn get_device_state_by_name(
+        &self,
+        zone: &str,
+        device_name: &str,
+    ) -> SnResult<Option<SnDeviceStateView>>;
+    async fn list_zone_devices(
+        &self,
+        zone: &str,
+        options: SnDeviceListOptions,
+    ) -> SnResult<Vec<SnDeviceStateView>>;
+    async fn mark_device_offline(&self, did: &str, reason: &str) -> SnResult<()>;
+    async fn block_device(&self, did: &str, reason: &str) -> SnResult<()>;
+    async fn unblock_device(&self, did: &str, reason: &str) -> SnResult<()>;
+    async fn expire_devices(&self, now: u64, batch_size: Option<usize>) -> SnResult<usize>;
 }
 
 pub struct SqliteSnDeviceInfoDB {
@@ -56,6 +350,12 @@ impl SqliteSnDeviceInfoDB {
         Ok(Self { pool })
     }
 
+    pub async fn open_local(path: &str) -> SnResult<SnDeviceInfoDBRef> {
+        let db = Self::new_by_path(path).await?;
+        db.initialize_database().await?;
+        Ok(Arc::new(db))
+    }
+
     pub async fn initialize_database(&self) -> SnResult<()> {
         let mut conn = self
             .pool
@@ -63,32 +363,155 @@ impl SqliteSnDeviceInfoDB {
             .await
             .map_err(into_sn_err!(SnErrorCode::DBError, "get conn"))?;
 
+        conn.execute_sql(sql_query("PRAGMA foreign_keys = ON"))
+            .await
+            .map_err(into_sn_err!(SnErrorCode::DBError, "enable foreign keys"))?;
+
+        let endpoint_columns = conn
+            .query_all(sql_query("PRAGMA table_info(device_endpoints)"))
+            .await
+            .map_err(into_sn_err!(
+                SnErrorCode::DBError,
+                "query device_endpoints schema failed"
+            ))?;
+        if !endpoint_columns.is_empty()
+            && !endpoint_columns
+                .iter()
+                .any(|row| row.get::<String, _>(1) == "endpoint_id")
+        {
+            conn.execute_sql(sql_query("DROP TABLE device_endpoints"))
+                .await
+                .map_err(into_sn_err!(
+                    SnErrorCode::DBError,
+                    "drop legacy device_endpoints failed"
+                ))?;
+        }
+
         conn.execute_sql(sql_query(
-            "CREATE TABLE IF NOT EXISTS did_infos (
+            "CREATE TABLE IF NOT EXISTS device_indexes (
                 did TEXT PRIMARY KEY,
-                did_info TEXT NOT NULL,
+                zone TEXT NOT NULL,
+                device_name TEXT NOT NULL,
+                device_role TEXT NOT NULL DEFAULT 'unknown',
                 created_at INTEGER NOT NULL,
-                updated_at INTEGER NOT NULL
+                updated_at INTEGER NOT NULL,
+                UNIQUE(zone, device_name)
             )",
         ))
         .await
         .map_err(into_sn_err!(
             SnErrorCode::DBError,
-            "create did_infos table failed"
+            "create device_indexes table failed"
+        ))?;
+
+        conn.execute_sql(sql_query(
+            "CREATE TABLE IF NOT EXISTS device_runtime_states (
+                did TEXT PRIMARY KEY,
+                state TEXT NOT NULL,
+                reported_ip TEXT NULL,
+                reported_ips TEXT NULL,
+                from_ip TEXT NULL,
+                wan_ip TEXT NULL,
+                lan_ips TEXT NULL,
+                nat_type TEXT NOT NULL DEFAULT 'unknown',
+                is_wan_device INTEGER NOT NULL DEFAULT 0,
+                last_seen_at INTEGER NULL,
+                last_report_at INTEGER NULL,
+                expires_at INTEGER NULL,
+                report_seq INTEGER NULL,
+                raw_report TEXT NULL,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                FOREIGN KEY(did) REFERENCES device_indexes(did)
+            )",
+        ))
+        .await
+        .map_err(into_sn_err!(
+            SnErrorCode::DBError,
+            "create device_runtime_states table failed"
         ))?;
 
         conn.execute_sql(sql_query(
             "CREATE TABLE IF NOT EXISTS device_endpoints (
-                did TEXT PRIMARY KEY,
-                endpoint TEXT NOT NULL,
+                did TEXT NOT NULL,
+                endpoint_id TEXT NOT NULL,
+                protocol TEXT NOT NULL,
+                host TEXT NOT NULL,
+                port INTEGER NULL,
+                scope TEXT NOT NULL DEFAULT 'unknown',
+                priority INTEGER NOT NULL DEFAULT 100,
+                source TEXT NOT NULL,
+                state TEXT NOT NULL,
+                last_seen_at INTEGER NULL,
+                expires_at INTEGER NULL,
                 created_at INTEGER NOT NULL,
-                updated_at INTEGER NOT NULL
+                updated_at INTEGER NOT NULL,
+                PRIMARY KEY(did, endpoint_id),
+                FOREIGN KEY(did) REFERENCES device_indexes(did)
             )",
         ))
         .await
         .map_err(into_sn_err!(
             SnErrorCode::DBError,
             "create device_endpoints table failed"
+        ))?;
+
+        conn.execute_sql(sql_query(
+            "CREATE TABLE IF NOT EXISTS device_state_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                did TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                old_state TEXT NULL,
+                new_state TEXT NULL,
+                reason TEXT NULL,
+                event_at INTEGER NOT NULL,
+                detail TEXT NULL
+            )",
+        ))
+        .await
+        .map_err(into_sn_err!(
+            SnErrorCode::DBError,
+            "create device_state_events table failed"
+        ))?;
+
+        conn.execute_sql(sql_query(
+            "CREATE INDEX IF NOT EXISTS idx_device_indexes_zone_name
+                ON device_indexes(zone, device_name)",
+        ))
+        .await
+        .map_err(into_sn_err!(
+            SnErrorCode::DBError,
+            "create device index zone/name index failed"
+        ))?;
+
+        conn.execute_sql(sql_query(
+            "CREATE INDEX IF NOT EXISTS idx_device_runtime_state_expires
+                ON device_runtime_states(state, expires_at)",
+        ))
+        .await
+        .map_err(into_sn_err!(
+            SnErrorCode::DBError,
+            "create runtime expires index failed"
+        ))?;
+
+        conn.execute_sql(sql_query(
+            "CREATE INDEX IF NOT EXISTS idx_device_endpoints_did_state_priority
+                ON device_endpoints(did, state, priority)",
+        ))
+        .await
+        .map_err(into_sn_err!(
+            SnErrorCode::DBError,
+            "create endpoint state priority index failed"
+        ))?;
+
+        conn.execute_sql(sql_query(
+            "CREATE INDEX IF NOT EXISTS idx_device_state_events_did_time
+                ON device_state_events(did, event_at)",
+        ))
+        .await
+        .map_err(into_sn_err!(
+            SnErrorCode::DBError,
+            "create state event index failed"
         ))?;
 
         Ok(())
@@ -101,71 +524,491 @@ impl SqliteSnDeviceInfoDB {
             .as_secs()
     }
 
-    fn check_did(did: &str) -> SnResult<()> {
-        if did.trim().is_empty() {
-            return Err(sn_err!(SnErrorCode::Failed, "device did is empty"));
+    fn check_non_empty(value: &str, field: &str) -> SnResult<()> {
+        if value.trim().is_empty() {
+            return Err(sn_err!(SnErrorCode::InvalidInput, "{} is empty", field));
         }
 
         Ok(())
     }
-}
 
-#[async_trait::async_trait]
-impl SnDeviceInfoDB for SqliteSnDeviceInfoDB {
-    async fn update_did_info(&self, did: &str, did_info: &str) -> SnResult<()> {
-        Self::check_did(did)?;
-        let now = Self::now_secs();
-        let mut conn = self
-            .pool
-            .get_conn()
-            .await
-            .map_err(into_sn_err!(SnErrorCode::DBError, "get conn"))?;
+    fn check_did(did: &str) -> SnResult<()> {
+        Self::check_non_empty(did, "device did")
+    }
 
-        conn.execute_sql(
-            sql_query(
-                "INSERT INTO did_infos (did, did_info, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?3)
-                 ON CONFLICT(did) DO UPDATE SET did_info = ?2, updated_at = ?3",
+    fn check_zone(zone: &str) -> SnResult<()> {
+        Self::check_non_empty(zone, "zone")
+    }
+
+    fn check_device_name(device_name: &str) -> SnResult<()> {
+        Self::check_non_empty(device_name, "device_name")
+    }
+
+    fn check_reason(reason: &str) -> SnResult<()> {
+        Self::check_non_empty(reason, "reason")
+    }
+
+    fn to_db_time(value: u64, field: &str) -> SnResult<i64> {
+        i64::try_from(value).map_err(|_| {
+            sn_err!(
+                SnErrorCode::InvalidInput,
+                "{} is too large for sqlite integer",
+                field
             )
-            .bind(did)
-            .bind(did_info)
-            .bind(now as i64),
-        )
-        .await
-        .map_err(into_sn_err!(SnErrorCode::DBError, "update did info failed"))?;
+        })
+    }
+
+    fn opt_to_u64(value: Option<i64>) -> Option<u64> {
+        value.and_then(|v| u64::try_from(v).ok())
+    }
+
+    fn parse_db_enum<T>(value: String, field: &str) -> SnResult<T>
+    where
+        T: FromStr<Err = String>,
+    {
+        value
+            .parse()
+            .map_err(|e| sn_err!(SnErrorCode::DBError, "invalid {} in db: {}", field, e))
+    }
+
+    fn parse_json_string_vec(value: Option<String>, field: &str) -> SnResult<Vec<String>> {
+        match value {
+            Some(value) if !value.trim().is_empty() => serde_json::from_str(&value)
+                .map_err(|e| sn_err!(SnErrorCode::DBError, "invalid {} json: {}", field, e)),
+            _ => Ok(Vec::new()),
+        }
+    }
+
+    fn parse_ip(value: &str, field: &str) -> SnResult<IpAddr> {
+        value.trim().parse::<IpAddr>().map_err(|e| {
+            sn_err!(
+                SnErrorCode::InvalidInput,
+                "invalid {} ip {}: {}",
+                field,
+                value,
+                e
+            )
+        })
+    }
+
+    fn normalize_ip_option(value: Option<String>, field: &str) -> SnResult<Option<String>> {
+        match value {
+            Some(value) => Ok(Some(Self::parse_ip(&value, field)?.to_string())),
+            None => Ok(None),
+        }
+    }
+
+    fn normalize_ip_vec(values: Vec<String>, field: &str) -> SnResult<Vec<String>> {
+        let mut seen = HashSet::new();
+        let mut result = Vec::new();
+        for value in values {
+            let ip = Self::parse_ip(&value, field)?.to_string();
+            if seen.insert(ip.clone()) {
+                result.push(ip);
+            }
+        }
+        Ok(result)
+    }
+
+    fn is_public_ip(ip: &IpAddr) -> bool {
+        match ip {
+            IpAddr::V4(ip) => Self::is_public_ipv4(ip),
+            IpAddr::V6(ip) => Self::is_public_ipv6(ip),
+        }
+    }
+
+    fn is_public_ipv4(ip: &Ipv4Addr) -> bool {
+        let octets = ip.octets();
+
+        if ip.is_private()
+            || ip.is_loopback()
+            || ip.is_link_local()
+            || ip.is_multicast()
+            || ip.is_unspecified()
+            || *ip == Ipv4Addr::new(255, 255, 255, 255)
+        {
+            return false;
+        }
+
+        if octets[0] == 100 && (64..=127).contains(&octets[1]) {
+            return false;
+        }
+
+        if octets[0] == 198 && (18..=19).contains(&octets[1]) {
+            return false;
+        }
+
+        if octets[0] >= 240 {
+            return false;
+        }
+
+        true
+    }
+
+    fn is_public_ipv6(ip: &Ipv6Addr) -> bool {
+        let segments = ip.segments();
+
+        if ip.is_loopback() || ip.is_multicast() || ip.is_unspecified() {
+            return false;
+        }
+
+        if (segments[0] & 0xfe00) == 0xfc00 {
+            return false;
+        }
+
+        if (segments[0] & 0xffc0) == 0xfe80 {
+            return false;
+        }
+
+        if segments[0] == 0x2001 && segments[1] == 0x0db8 {
+            return false;
+        }
+
+        true
+    }
+
+    fn is_private_candidate_ip(ip: &IpAddr) -> bool {
+        match ip {
+            IpAddr::V4(ip) => {
+                ip.is_private()
+                    || ip.is_link_local()
+                    || (ip.octets()[0] == 100 && (64..=127).contains(&ip.octets()[1]))
+            }
+            IpAddr::V6(ip) => {
+                let segments = ip.segments();
+                (segments[0] & 0xfe00) == 0xfc00 || (segments[0] & 0xffc0) == 0xfe80
+            }
+        }
+    }
+
+    fn push_unique_ip(result: &mut Vec<String>, ip: IpAddr) {
+        let value = ip.to_string();
+        if !result.contains(&value) {
+            result.push(value);
+        }
+    }
+
+    fn classify_ips(
+        reported_ip: Option<&str>,
+        reported_ips: &[String],
+        from_ip: Option<&str>,
+    ) -> SnResult<(Option<String>, Vec<String>)> {
+        let mut public_ips = Vec::new();
+        let mut private_ips = Vec::new();
+
+        for (value, field) in reported_ip
+            .into_iter()
+            .map(|v| (v, "reported_ip"))
+            .chain(reported_ips.iter().map(|v| (v.as_str(), "reported_ips")))
+            .chain(from_ip.into_iter().map(|v| (v, "from_ip")))
+        {
+            let ip = Self::parse_ip(value, field)?;
+            if Self::is_public_ip(&ip) {
+                Self::push_unique_ip(&mut public_ips, ip);
+            } else if Self::is_private_candidate_ip(&ip) {
+                Self::push_unique_ip(&mut private_ips, ip);
+            }
+        }
+
+        Ok((public_ips.into_iter().next(), private_ips))
+    }
+
+    fn public_ips_for_view(runtime: Option<&RuntimeStateRow>) -> SnResult<Vec<String>> {
+        let Some(runtime) = runtime else {
+            return Ok(Vec::new());
+        };
+
+        let mut result = Vec::new();
+        for value in runtime
+            .wan_ip
+            .as_deref()
+            .into_iter()
+            .chain(runtime.reported_ip.as_deref())
+            .chain(runtime.reported_ips.iter().map(|v| v.as_str()))
+            .chain(runtime.from_ip.as_deref())
+        {
+            let ip = Self::parse_ip(value, "runtime ip")?;
+            if Self::is_public_ip(&ip) {
+                Self::push_unique_ip(&mut result, ip);
+            }
+        }
+
+        Ok(result)
+    }
+
+    fn private_ips_for_view(runtime: Option<&RuntimeStateRow>) -> SnResult<Vec<String>> {
+        let Some(runtime) = runtime else {
+            return Ok(Vec::new());
+        };
+
+        let mut result = Vec::new();
+        for value in runtime
+            .lan_ips
+            .iter()
+            .map(|v| v.as_str())
+            .chain(runtime.reported_ip.as_deref())
+            .chain(runtime.reported_ips.iter().map(|v| v.as_str()))
+            .chain(runtime.from_ip.as_deref())
+        {
+            let ip = Self::parse_ip(value, "runtime ip")?;
+            if Self::is_private_candidate_ip(&ip) {
+                Self::push_unique_ip(&mut result, ip);
+            }
+        }
+
+        Ok(result)
+    }
+
+    fn validate_endpoint(endpoint: &SnDeviceEndpointUpdate) -> SnResult<()> {
+        Self::check_non_empty(&endpoint.endpoint_id, "endpoint_id")?;
+        Self::check_non_empty(&endpoint.host, "endpoint host")?;
+
+        if endpoint.priority < 0 {
+            return Err(sn_err!(
+                SnErrorCode::InvalidInput,
+                "endpoint priority must be non-negative"
+            ));
+        }
+
+        if let Some(expires_at) = endpoint.expires_at {
+            Self::to_db_time(expires_at, "endpoint expires_at")?;
+        }
 
         Ok(())
     }
 
-    async fn get_did_info(&self, did: &str) -> SnResult<Option<SnDidInfo>> {
-        Self::check_did(did)?;
+    fn endpoint_sort_key(endpoint: &SnDeviceEndpoint) -> (i32, i64, String) {
+        let scope_rank = match endpoint.scope {
+            SnEndpointScope::Public => 0,
+            SnEndpointScope::Relay => 1,
+            SnEndpointScope::Private => 2,
+            SnEndpointScope::Loopback => 3,
+            SnEndpointScope::Unknown => 4,
+        };
+
+        (scope_rank, endpoint.priority, endpoint.endpoint_id.clone())
+    }
+
+    fn endpoint_signature(endpoint: &SnDeviceEndpoint) -> String {
+        format!(
+            "{}|{}|{}|{:?}|{}|{}|{}|{}",
+            endpoint.endpoint_id,
+            endpoint.protocol,
+            endpoint.host,
+            endpoint.port,
+            endpoint.scope,
+            endpoint.priority,
+            endpoint.source,
+            endpoint.state
+        )
+    }
+
+    fn runtime_state_from_row(row: SqlRowObject) -> SnResult<RuntimeStateRow> {
+        let state = Self::parse_db_enum::<SnDeviceState>(row.get(1), "state")?;
+        let reported_ips = Self::parse_json_string_vec(row.get(3), "reported_ips")?;
+        let lan_ips = Self::parse_json_string_vec(row.get(6), "lan_ips")?;
+        let nat_type = Self::parse_db_enum::<SnNatType>(row.get(7), "nat_type")?;
+
+        Ok(RuntimeStateRow {
+            state,
+            reported_ip: row.get(2),
+            reported_ips,
+            from_ip: row.get(4),
+            wan_ip: row.get(5),
+            lan_ips,
+            nat_type,
+            is_wan_device: row.get::<i64, _>(8) != 0,
+            last_seen_at: Self::opt_to_u64(row.get(9)),
+            expires_at: Self::opt_to_u64(row.get(11)),
+            report_seq: Self::opt_to_u64(row.get(12)),
+        })
+    }
+
+    fn device_index_from_row(row: SqlRowObject) -> SnResult<SnDeviceIndex> {
+        Ok(SnDeviceIndex {
+            did: row.get(0),
+            zone: row.get(1),
+            device_name: row.get(2),
+            device_role: Self::parse_db_enum::<SnDeviceRole>(row.get(3), "device_role")?,
+            created_at: u64::try_from(row.get::<i64, _>(4)).unwrap_or_default(),
+            updated_at: u64::try_from(row.get::<i64, _>(5)).unwrap_or_default(),
+        })
+    }
+
+    fn endpoint_from_row(row: SqlRowObject) -> SnResult<SnDeviceEndpoint> {
+        let port = row
+            .get::<Option<i64>, _>(4)
+            .and_then(|port| u16::try_from(port).ok());
+
+        Ok(SnDeviceEndpoint {
+            did: row.get(0),
+            endpoint_id: row.get(1),
+            protocol: Self::parse_db_enum::<SnEndpointProtocol>(row.get(2), "protocol")?,
+            host: row.get(3),
+            port,
+            scope: Self::parse_db_enum::<SnEndpointScope>(row.get(5), "scope")?,
+            priority: row.get(6),
+            source: Self::parse_db_enum::<SnEndpointSource>(row.get(7), "source")?,
+            state: Self::parse_db_enum::<SnEndpointState>(row.get(8), "endpoint state")?,
+            last_seen_at: Self::opt_to_u64(row.get(9)),
+            expires_at: Self::opt_to_u64(row.get(10)),
+            created_at: u64::try_from(row.get::<i64, _>(11)).unwrap_or_default(),
+            updated_at: u64::try_from(row.get::<i64, _>(12)).unwrap_or_default(),
+        })
+    }
+
+    async fn fetch_device_index(&self, did: &str) -> SnResult<Option<SnDeviceIndex>> {
         let mut conn = self
             .pool
             .get_conn()
             .await
             .map_err(into_sn_err!(SnErrorCode::DBError, "get conn"))?;
-
-        match conn
-            .query_one(
+        let rows = conn
+            .query_all(
                 sql_query(
-                    "SELECT did, did_info, created_at, updated_at FROM did_infos WHERE did = ?1",
+                    "SELECT did, zone, device_name, device_role, created_at, updated_at
+                     FROM device_indexes WHERE did = ?1 LIMIT 1",
                 )
                 .bind(did),
             )
             .await
-        {
-            Ok(row) => Ok(Some(SnDidInfo {
-                did: row.get(0),
-                did_info: row.get(1),
-                created_at: row.get::<i64, _>(2) as u64,
-                updated_at: row.get::<i64, _>(3) as u64,
-            })),
-            Err(_) => Ok(None),
-        }
+            .map_err(into_sn_err!(
+                SnErrorCode::DBError,
+                "query device index failed"
+            ))?;
+
+        rows.into_iter()
+            .next()
+            .map(Self::device_index_from_row)
+            .transpose()
     }
 
-    async fn update_device_endpoint(&self, did: &str, endpoint: &str) -> SnResult<()> {
-        Self::check_did(did)?;
+    async fn fetch_device_index_by_name(
+        &self,
+        zone: &str,
+        device_name: &str,
+    ) -> SnResult<Option<SnDeviceIndex>> {
+        let mut conn = self
+            .pool
+            .get_conn()
+            .await
+            .map_err(into_sn_err!(SnErrorCode::DBError, "get conn"))?;
+        let rows = conn
+            .query_all(
+                sql_query(
+                    "SELECT did, zone, device_name, device_role, created_at, updated_at
+                     FROM device_indexes WHERE zone = ?1 AND device_name = ?2 LIMIT 1",
+                )
+                .bind(zone)
+                .bind(device_name),
+            )
+            .await
+            .map_err(into_sn_err!(
+                SnErrorCode::DBError,
+                "query device index by name failed"
+            ))?;
+
+        rows.into_iter()
+            .next()
+            .map(Self::device_index_from_row)
+            .transpose()
+    }
+
+    async fn fetch_runtime_state(&self, did: &str) -> SnResult<Option<RuntimeStateRow>> {
+        let mut conn = self
+            .pool
+            .get_conn()
+            .await
+            .map_err(into_sn_err!(SnErrorCode::DBError, "get conn"))?;
+        let rows = conn
+            .query_all(
+                sql_query(
+                    "SELECT did, state, reported_ip, reported_ips, from_ip, wan_ip, lan_ips,
+                            nat_type, is_wan_device, last_seen_at, last_report_at, expires_at,
+                            report_seq, raw_report, created_at, updated_at
+                     FROM device_runtime_states WHERE did = ?1 LIMIT 1",
+                )
+                .bind(did),
+            )
+            .await
+            .map_err(into_sn_err!(
+                SnErrorCode::DBError,
+                "query device runtime state failed"
+            ))?;
+
+        rows.into_iter()
+            .next()
+            .map(Self::runtime_state_from_row)
+            .transpose()
+    }
+
+    async fn list_active_endpoints(&self, did: &str, now: u64) -> SnResult<Vec<SnDeviceEndpoint>> {
+        let mut conn = self
+            .pool
+            .get_conn()
+            .await
+            .map_err(into_sn_err!(SnErrorCode::DBError, "get conn"))?;
+        let rows = conn
+            .query_all(
+                sql_query(
+                    "SELECT did, endpoint_id, protocol, host, port, scope, priority, source,
+                            state, last_seen_at, expires_at, created_at, updated_at
+                     FROM device_endpoints
+                     WHERE did = ?1
+                       AND state = 'active'
+                       AND (expires_at IS NULL OR expires_at >= ?2)",
+                )
+                .bind(did)
+                .bind(Self::to_db_time(now, "now")?),
+            )
+            .await
+            .map_err(into_sn_err!(
+                SnErrorCode::DBError,
+                "query device endpoints failed"
+            ))?;
+
+        let mut endpoints = rows
+            .into_iter()
+            .map(Self::endpoint_from_row)
+            .collect::<SnResult<Vec<_>>>()?;
+        endpoints.sort_by_key(Self::endpoint_sort_key);
+        Ok(endpoints)
+    }
+
+    async fn list_zone_indexes(&self, zone: &str) -> SnResult<Vec<SnDeviceIndex>> {
+        let mut conn = self
+            .pool
+            .get_conn()
+            .await
+            .map_err(into_sn_err!(SnErrorCode::DBError, "get conn"))?;
+        let rows = conn
+            .query_all(
+                sql_query(
+                    "SELECT did, zone, device_name, device_role, created_at, updated_at
+                     FROM device_indexes WHERE zone = ?1 ORDER BY device_name ASC",
+                )
+                .bind(zone),
+            )
+            .await
+            .map_err(into_sn_err!(
+                SnErrorCode::DBError,
+                "query zone device indexes failed"
+            ))?;
+
+        rows.into_iter()
+            .map(Self::device_index_from_row)
+            .collect::<SnResult<Vec<_>>>()
+    }
+
+    async fn record_event(
+        &self,
+        did: &str,
+        event_type: SnDeviceStateEventType,
+        old_state: Option<SnDeviceState>,
+        new_state: Option<SnDeviceState>,
+        reason: Option<&str>,
+        detail: Option<String>,
+    ) -> SnResult<()> {
         let now = Self::now_secs();
         let mut conn = self
             .pool
@@ -175,49 +1018,848 @@ impl SnDeviceInfoDB for SqliteSnDeviceInfoDB {
 
         conn.execute_sql(
             sql_query(
-                "INSERT INTO device_endpoints (did, endpoint, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?3)
-                 ON CONFLICT(did) DO UPDATE SET endpoint = ?2, updated_at = ?3",
+                "INSERT INTO device_state_events
+                 (did, event_type, old_state, new_state, reason, event_at, detail)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             )
             .bind(did)
-            .bind(endpoint)
-            .bind(now as i64),
+            .bind(event_type.as_str())
+            .bind(old_state.map(|state| state.as_str().to_string()))
+            .bind(new_state.map(|state| state.as_str().to_string()))
+            .bind(reason.map(|v| v.to_string()))
+            .bind(Self::to_db_time(now, "event_at")?)
+            .bind(detail),
         )
         .await
         .map_err(into_sn_err!(
             SnErrorCode::DBError,
-            "update device endpoint failed"
+            "insert device state event failed"
         ))?;
 
         Ok(())
     }
 
-    async fn get_device_endpoint(&self, did: &str) -> SnResult<Option<SnDeviceEndpoint>> {
+    async fn update_state_without_report(
+        &self,
+        did: &str,
+        state: SnDeviceState,
+        reason: &str,
+        event_type: SnDeviceStateEventType,
+    ) -> SnResult<()> {
         Self::check_did(did)?;
+        Self::check_reason(reason)?;
+
+        if self.fetch_device_index(did).await?.is_none() {
+            return Err(sn_err!(
+                SnErrorCode::NotFound,
+                "device index not found: {}",
+                did
+            ));
+        }
+
+        let old_state = self.fetch_runtime_state(did).await?.map(|row| row.state);
+        let now = Self::now_secs();
+        let now_db = Self::to_db_time(now, "now")?;
         let mut conn = self
             .pool
             .get_conn()
             .await
             .map_err(into_sn_err!(SnErrorCode::DBError, "get conn"))?;
 
-        match conn
-            .query_one(
+        conn.execute_sql(
+            sql_query(
+                "INSERT INTO device_runtime_states
+                 (did, state, nat_type, is_wan_device, last_seen_at, last_report_at,
+                  expires_at, created_at, updated_at)
+                 VALUES (?1, ?2, 'unknown', 0, NULL, NULL, NULL, ?3, ?3)
+                 ON CONFLICT(did) DO UPDATE SET
+                    state = ?2,
+                    updated_at = ?3,
+                    expires_at = NULL",
+            )
+            .bind(did)
+            .bind(state.as_str())
+            .bind(now_db),
+        )
+        .await
+        .map_err(into_sn_err!(
+            SnErrorCode::DBError,
+            "update device runtime state failed"
+        ))?;
+
+        if state == SnDeviceState::Blocked {
+            conn.execute_sql(
                 sql_query(
-                    "SELECT did, endpoint, created_at, updated_at
-                     FROM device_endpoints WHERE did = ?1",
+                    "UPDATE device_endpoints
+                     SET state = 'disabled', updated_at = ?2
+                     WHERE did = ?1 AND state = 'active'",
                 )
-                .bind(did),
+                .bind(did)
+                .bind(now_db),
             )
             .await
-        {
-            Ok(row) => Ok(Some(SnDeviceEndpoint {
-                did: row.get(0),
-                endpoint: row.get(1),
-                created_at: row.get::<i64, _>(2) as u64,
-                updated_at: row.get::<i64, _>(3) as u64,
-            })),
-            Err(_) => Ok(None),
+            .map_err(into_sn_err!(
+                SnErrorCode::DBError,
+                "disable device endpoints failed"
+            ))?;
+        } else if state == SnDeviceState::Offline || state == SnDeviceState::Stale {
+            conn.execute_sql(
+                sql_query(
+                    "UPDATE device_endpoints
+                     SET state = 'stale', updated_at = ?2
+                     WHERE did = ?1 AND state = 'active'",
+                )
+                .bind(did)
+                .bind(now_db),
+            )
+            .await
+            .map_err(into_sn_err!(
+                SnErrorCode::DBError,
+                "stale device endpoints failed"
+            ))?;
         }
+
+        self.record_event(did, event_type, old_state, Some(state), Some(reason), None)
+            .await
+    }
+
+    async fn mark_stale_if_expired(&self, did: &str, now: u64) -> SnResult<bool> {
+        let Some(runtime) = self.fetch_runtime_state(did).await? else {
+            return Ok(false);
+        };
+
+        if runtime.state != SnDeviceState::Online {
+            return Ok(false);
+        }
+
+        if !runtime
+            .expires_at
+            .is_some_and(|expires_at| expires_at < now)
+        {
+            return Ok(false);
+        }
+
+        let now_db = Self::to_db_time(now, "now")?;
+        let mut conn = self
+            .pool
+            .get_conn()
+            .await
+            .map_err(into_sn_err!(SnErrorCode::DBError, "get conn"))?;
+
+        conn.execute_sql(
+            sql_query(
+                "UPDATE device_runtime_states
+                 SET state = 'stale', updated_at = ?2
+                 WHERE did = ?1 AND state = 'online'",
+            )
+            .bind(did)
+            .bind(now_db),
+        )
+        .await
+        .map_err(into_sn_err!(
+            SnErrorCode::DBError,
+            "mark expired device stale failed"
+        ))?;
+
+        conn.execute_sql(
+            sql_query(
+                "UPDATE device_endpoints
+                 SET state = 'stale', updated_at = ?2
+                 WHERE did = ?1 AND state = 'active'
+                   AND expires_at IS NOT NULL AND expires_at < ?2",
+            )
+            .bind(did)
+            .bind(now_db),
+        )
+        .await
+        .map_err(into_sn_err!(
+            SnErrorCode::DBError,
+            "mark expired endpoints stale failed"
+        ))?;
+
+        self.record_event(
+            did,
+            SnDeviceStateEventType::Stale,
+            Some(runtime.state),
+            Some(SnDeviceState::Stale),
+            Some("ttl expired"),
+            None,
+        )
+        .await?;
+
+        Ok(true)
+    }
+
+    async fn build_state_view(
+        &self,
+        index: SnDeviceIndex,
+        runtime: Option<RuntimeStateRow>,
+        now: u64,
+    ) -> SnResult<SnDeviceStateView> {
+        let active_endpoints = self.list_active_endpoints(&index.did, now).await?;
+        let preferred_endpoint = active_endpoints.first().cloned();
+        let public_ips = Self::public_ips_for_view(runtime.as_ref())?;
+        let private_ips = Self::private_ips_for_view(runtime.as_ref())?;
+
+        Ok(SnDeviceStateView {
+            did: index.did,
+            zone: index.zone,
+            device_name: index.device_name,
+            device_role: index.device_role,
+            state: runtime
+                .as_ref()
+                .map(|runtime| runtime.state)
+                .unwrap_or(SnDeviceState::Offline),
+            public_ips,
+            private_ips,
+            active_endpoints,
+            preferred_endpoint,
+            nat_type: runtime
+                .as_ref()
+                .map(|runtime| runtime.nat_type)
+                .unwrap_or(SnNatType::Unknown),
+            is_wan_device: runtime
+                .as_ref()
+                .map(|runtime| runtime.is_wan_device)
+                .unwrap_or(false),
+            last_seen_at: runtime.as_ref().and_then(|runtime| runtime.last_seen_at),
+            expires_at: runtime.as_ref().and_then(|runtime| runtime.expires_at),
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl SnDeviceInfoDB for SqliteSnDeviceInfoDB {
+    async fn upsert_device_index(
+        &self,
+        did: &str,
+        zone: &str,
+        device_name: &str,
+        device_role: SnDeviceRole,
+    ) -> SnResult<()> {
+        Self::check_did(did)?;
+        Self::check_zone(zone)?;
+        Self::check_device_name(device_name)?;
+
+        if let Some(existing) = self.fetch_device_index(did).await? {
+            if existing.zone != zone || existing.device_name != device_name {
+                return Err(sn_err!(
+                    SnErrorCode::Conflict,
+                    "device did {} is bound to {}/{}; use rebind_device_index",
+                    did,
+                    existing.zone,
+                    existing.device_name
+                ));
+            }
+
+            let now = Self::now_secs();
+            let mut conn = self
+                .pool
+                .get_conn()
+                .await
+                .map_err(into_sn_err!(SnErrorCode::DBError, "get conn"))?;
+            conn.execute_sql(
+                sql_query(
+                    "UPDATE device_indexes
+                     SET device_role = ?2, updated_at = ?3
+                     WHERE did = ?1",
+                )
+                .bind(did)
+                .bind(device_role.as_str())
+                .bind(Self::to_db_time(now, "updated_at")?),
+            )
+            .await
+            .map_err(into_sn_err!(
+                SnErrorCode::DBError,
+                "update device index failed"
+            ))?;
+
+            return Ok(());
+        }
+
+        if let Some(existing) = self.fetch_device_index_by_name(zone, device_name).await? {
+            return Err(sn_err!(
+                SnErrorCode::Conflict,
+                "{}/{} is already bound to {}",
+                zone,
+                device_name,
+                existing.did
+            ));
+        }
+
+        let now = Self::now_secs();
+        let now_db = Self::to_db_time(now, "now")?;
+        let mut conn = self
+            .pool
+            .get_conn()
+            .await
+            .map_err(into_sn_err!(SnErrorCode::DBError, "get conn"))?;
+
+        conn.execute_sql(
+            sql_query(
+                "INSERT INTO device_indexes
+                 (did, zone, device_name, device_role, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
+            )
+            .bind(did)
+            .bind(zone)
+            .bind(device_name)
+            .bind(device_role.as_str())
+            .bind(now_db),
+        )
+        .await
+        .map_err(into_sn_err!(
+            SnErrorCode::DBError,
+            "insert device index failed"
+        ))?;
+
+        self.record_event(
+            did,
+            SnDeviceStateEventType::Registered,
+            None,
+            None,
+            None,
+            Some(
+                json!({
+                    "zone": zone,
+                    "device_name": device_name,
+                    "device_role": device_role.as_str(),
+                })
+                .to_string(),
+            ),
+        )
+        .await
+    }
+
+    async fn rebind_device_index(
+        &self,
+        did: &str,
+        new_zone: &str,
+        new_device_name: &str,
+        new_device_role: SnDeviceRole,
+        reason: &str,
+    ) -> SnResult<()> {
+        Self::check_did(did)?;
+        Self::check_zone(new_zone)?;
+        Self::check_device_name(new_device_name)?;
+        Self::check_reason(reason)?;
+
+        let existing = self
+            .fetch_device_index(did)
+            .await?
+            .ok_or_else(|| sn_err!(SnErrorCode::NotFound, "device index not found: {}", did))?;
+
+        if let Some(bound) = self
+            .fetch_device_index_by_name(new_zone, new_device_name)
+            .await?
+        {
+            if bound.did != did {
+                return Err(sn_err!(
+                    SnErrorCode::Conflict,
+                    "{}/{} is already bound to {}",
+                    new_zone,
+                    new_device_name,
+                    bound.did
+                ));
+            }
+        }
+
+        let now = Self::now_secs();
+        let mut conn = self
+            .pool
+            .get_conn()
+            .await
+            .map_err(into_sn_err!(SnErrorCode::DBError, "get conn"))?;
+        conn.execute_sql(
+            sql_query(
+                "UPDATE device_indexes
+                 SET zone = ?2, device_name = ?3, device_role = ?4, updated_at = ?5
+                 WHERE did = ?1",
+            )
+            .bind(did)
+            .bind(new_zone)
+            .bind(new_device_name)
+            .bind(new_device_role.as_str())
+            .bind(Self::to_db_time(now, "updated_at")?),
+        )
+        .await
+        .map_err(into_sn_err!(
+            SnErrorCode::DBError,
+            "rebind device index failed"
+        ))?;
+
+        self.record_event(
+            did,
+            SnDeviceStateEventType::Rebound,
+            None,
+            None,
+            Some(reason),
+            Some(
+                json!({
+                    "old_zone": existing.zone,
+                    "old_device_name": existing.device_name,
+                    "old_device_role": existing.device_role.as_str(),
+                    "new_zone": new_zone,
+                    "new_device_name": new_device_name,
+                    "new_device_role": new_device_role.as_str(),
+                })
+                .to_string(),
+            ),
+        )
+        .await
+    }
+
+    async fn remove_device_index(&self, did: &str) -> SnResult<()> {
+        Self::check_did(did)?;
+
+        if self.fetch_device_index(did).await?.is_none() {
+            return Err(sn_err!(
+                SnErrorCode::NotFound,
+                "device index not found: {}",
+                did
+            ));
+        }
+
+        let mut conn = self
+            .pool
+            .get_conn()
+            .await
+            .map_err(into_sn_err!(SnErrorCode::DBError, "get conn"))?;
+
+        conn.execute_sql(sql_query("DELETE FROM device_runtime_states WHERE did = ?1").bind(did))
+            .await
+            .map_err(into_sn_err!(
+                SnErrorCode::DBError,
+                "delete device runtime state failed"
+            ))?;
+
+        conn.execute_sql(sql_query("DELETE FROM device_endpoints WHERE did = ?1").bind(did))
+            .await
+            .map_err(into_sn_err!(
+                SnErrorCode::DBError,
+                "delete device endpoints failed"
+            ))?;
+
+        conn.execute_sql(sql_query("DELETE FROM device_indexes WHERE did = ?1").bind(did))
+            .await
+            .map_err(into_sn_err!(
+                SnErrorCode::DBError,
+                "delete device index failed"
+            ))?;
+
+        Ok(())
+    }
+
+    async fn update_device_state(&self, mut update: SnDeviceStateUpdate) -> SnResult<()> {
+        Self::check_did(&update.did)?;
+        if update.ttl == 0 {
+            return Err(sn_err!(
+                SnErrorCode::InvalidInput,
+                "device state ttl must be greater than zero"
+            ));
+        }
+
+        if self.fetch_device_index(&update.did).await?.is_none() {
+            return Err(sn_err!(
+                SnErrorCode::NotFound,
+                "device index not found: {}",
+                update.did
+            ));
+        }
+
+        update.reported_ip = Self::normalize_ip_option(update.reported_ip, "reported_ip")?;
+        update.reported_ips = Self::normalize_ip_vec(update.reported_ips, "reported_ips")?;
+        update.from_ip = Self::normalize_ip_option(update.from_ip, "from_ip")?;
+
+        if let Some(raw_report) = update.raw_report.as_ref() {
+            serde_json::from_str::<serde_json::Value>(raw_report).map_err(|e| {
+                sn_err!(
+                    SnErrorCode::InvalidInput,
+                    "raw_report is invalid json: {}",
+                    e
+                )
+            })?;
+        }
+
+        for endpoint in &update.endpoints {
+            Self::validate_endpoint(endpoint)?;
+        }
+
+        let old_runtime = self.fetch_runtime_state(&update.did).await?;
+        if old_runtime
+            .as_ref()
+            .is_some_and(|runtime| runtime.state == SnDeviceState::Blocked)
+        {
+            self.record_event(
+                &update.did,
+                SnDeviceStateEventType::ReportRejected,
+                Some(SnDeviceState::Blocked),
+                Some(SnDeviceState::Blocked),
+                Some("device is blocked"),
+                update.raw_report.clone(),
+            )
+            .await?;
+
+            return Err(sn_err!(
+                SnErrorCode::Blocked,
+                "device is blocked: {}",
+                update.did
+            ));
+        }
+
+        if let (Some(current_seq), Some(new_seq)) = (
+            old_runtime.as_ref().and_then(|runtime| runtime.report_seq),
+            update.report_seq,
+        ) {
+            if new_seq < current_seq {
+                self.record_event(
+                    &update.did,
+                    SnDeviceStateEventType::ReportRejected,
+                    old_runtime.as_ref().map(|runtime| runtime.state),
+                    old_runtime.as_ref().map(|runtime| runtime.state),
+                    Some("stale report sequence"),
+                    Some(
+                        json!({
+                            "current_report_seq": current_seq,
+                            "incoming_report_seq": new_seq,
+                        })
+                        .to_string(),
+                    ),
+                )
+                .await?;
+
+                return Err(sn_err!(
+                    SnErrorCode::StaleReport,
+                    "incoming report seq {} is older than current {}",
+                    new_seq,
+                    current_seq
+                ));
+            }
+        }
+
+        let old_endpoints = self
+            .list_active_endpoints(&update.did, Self::now_secs())
+            .await?;
+        let old_endpoint_signature = old_endpoints
+            .iter()
+            .map(Self::endpoint_signature)
+            .collect::<Vec<_>>();
+
+        let now = Self::now_secs();
+        let expires_at = now.checked_add(update.ttl).ok_or_else(|| {
+            sn_err!(
+                SnErrorCode::InvalidInput,
+                "device state expires_at overflows u64"
+            )
+        })?;
+        let (wan_ip, lan_ips) = Self::classify_ips(
+            update.reported_ip.as_deref(),
+            &update.reported_ips,
+            update.from_ip.as_deref(),
+        )?;
+        let reported_ips_json = serde_json::to_string(&update.reported_ips).map_err(|e| {
+            sn_err!(
+                SnErrorCode::InvalidInput,
+                "serialize reported_ips failed: {}",
+                e
+            )
+        })?;
+        let lan_ips_json = serde_json::to_string(&lan_ips)
+            .map_err(|e| sn_err!(SnErrorCode::InvalidInput, "serialize lan_ips failed: {}", e))?;
+
+        let mut conn = self
+            .pool
+            .get_conn()
+            .await
+            .map_err(into_sn_err!(SnErrorCode::DBError, "get conn"))?;
+        conn.execute_sql(
+            sql_query(
+                "INSERT INTO device_runtime_states
+                 (did, state, reported_ip, reported_ips, from_ip, wan_ip, lan_ips, nat_type,
+                  is_wan_device, last_seen_at, last_report_at, expires_at, report_seq,
+                  raw_report, created_at, updated_at)
+                 VALUES (?1, 'online', ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9, ?10, ?11, ?12, ?9, ?9)
+                 ON CONFLICT(did) DO UPDATE SET
+                    state = 'online',
+                    reported_ip = ?2,
+                    reported_ips = ?3,
+                    from_ip = ?4,
+                    wan_ip = ?5,
+                    lan_ips = ?6,
+                    nat_type = ?7,
+                    is_wan_device = ?8,
+                    last_seen_at = ?9,
+                    last_report_at = ?9,
+                    expires_at = ?10,
+                    report_seq = ?11,
+                    raw_report = ?12,
+                    updated_at = ?9",
+            )
+            .bind(&update.did)
+            .bind(update.reported_ip.clone())
+            .bind(reported_ips_json)
+            .bind(update.from_ip.clone())
+            .bind(wan_ip.clone())
+            .bind(lan_ips_json)
+            .bind(update.nat_type.as_str())
+            .bind(if wan_ip.is_some() { 1i64 } else { 0i64 })
+            .bind(Self::to_db_time(now, "now")?)
+            .bind(Self::to_db_time(expires_at, "expires_at")?)
+            .bind(
+                update
+                    .report_seq
+                    .map(|seq| Self::to_db_time(seq, "report_seq"))
+                    .transpose()?,
+            )
+            .bind(update.raw_report.clone()),
+        )
+        .await
+        .map_err(into_sn_err!(
+            SnErrorCode::DBError,
+            "upsert device runtime state failed"
+        ))?;
+
+        for endpoint in &update.endpoints {
+            conn.execute_sql(
+                sql_query(
+                    "INSERT INTO device_endpoints
+                     (did, endpoint_id, protocol, host, port, scope, priority, source, state,
+                      last_seen_at, expires_at, created_at, updated_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'active', ?9, ?10, ?9, ?9)
+                     ON CONFLICT(did, endpoint_id) DO UPDATE SET
+                        protocol = ?3,
+                        host = ?4,
+                        port = ?5,
+                        scope = ?6,
+                        priority = ?7,
+                        source = ?8,
+                        state = CASE
+                            WHEN device_endpoints.state = 'disabled' THEN 'disabled'
+                            ELSE 'active'
+                        END,
+                        last_seen_at = ?9,
+                        expires_at = ?10,
+                        updated_at = ?9",
+                )
+                .bind(&update.did)
+                .bind(&endpoint.endpoint_id)
+                .bind(endpoint.protocol.as_str())
+                .bind(&endpoint.host)
+                .bind(endpoint.port.map(i64::from))
+                .bind(endpoint.scope.as_str())
+                .bind(endpoint.priority)
+                .bind(endpoint.source.as_str())
+                .bind(Self::to_db_time(now, "endpoint last_seen_at")?)
+                .bind(
+                    endpoint
+                        .expires_at
+                        .or(Some(expires_at))
+                        .map(|value| Self::to_db_time(value, "endpoint expires_at"))
+                        .transpose()?,
+                ),
+            )
+            .await
+            .map_err(into_sn_err!(SnErrorCode::DBError, "upsert endpoint failed"))?;
+        }
+
+        if old_runtime
+            .as_ref()
+            .map(|runtime| runtime.state)
+            .unwrap_or(SnDeviceState::Offline)
+            != SnDeviceState::Online
+        {
+            self.record_event(
+                &update.did,
+                SnDeviceStateEventType::Online,
+                old_runtime.as_ref().map(|runtime| runtime.state),
+                Some(SnDeviceState::Online),
+                None,
+                update.raw_report.clone(),
+            )
+            .await?;
+        }
+
+        let new_endpoint_signature = self
+            .list_active_endpoints(&update.did, now)
+            .await?
+            .iter()
+            .map(Self::endpoint_signature)
+            .collect::<Vec<_>>();
+        if old_endpoint_signature != new_endpoint_signature {
+            self.record_event(
+                &update.did,
+                SnDeviceStateEventType::EndpointChanged,
+                Some(SnDeviceState::Online),
+                Some(SnDeviceState::Online),
+                None,
+                Some(
+                    json!({
+                        "old": old_endpoint_signature,
+                        "new": new_endpoint_signature,
+                    })
+                    .to_string(),
+                ),
+            )
+            .await?;
+        }
+
+        Ok(())
+    }
+
+    async fn get_device_state(&self, did: &str) -> SnResult<Option<SnDeviceStateView>> {
+        Self::check_did(did)?;
+        let Some(index) = self.fetch_device_index(did).await? else {
+            return Ok(None);
+        };
+
+        let now = Self::now_secs();
+        self.mark_stale_if_expired(did, now).await?;
+        let runtime = self.fetch_runtime_state(did).await?;
+
+        self.build_state_view(index, runtime, now).await.map(Some)
+    }
+
+    async fn get_device_state_by_name(
+        &self,
+        zone: &str,
+        device_name: &str,
+    ) -> SnResult<Option<SnDeviceStateView>> {
+        Self::check_zone(zone)?;
+        Self::check_device_name(device_name)?;
+
+        let Some(index) = self.fetch_device_index_by_name(zone, device_name).await? else {
+            return Ok(None);
+        };
+
+        self.get_device_state(&index.did).await
+    }
+
+    async fn list_zone_devices(
+        &self,
+        zone: &str,
+        options: SnDeviceListOptions,
+    ) -> SnResult<Vec<SnDeviceStateView>> {
+        Self::check_zone(zone)?;
+
+        self.expire_devices(Self::now_secs(), None).await?;
+
+        let now = Self::now_secs();
+        let indexes = self.list_zone_indexes(zone).await?;
+        let mut views = Vec::new();
+        for index in indexes {
+            let runtime = self.fetch_runtime_state(&index.did).await?;
+            let view = self.build_state_view(index, runtime, now).await?;
+            if options
+                .state
+                .is_some_and(|expected_state| expected_state != view.state)
+            {
+                continue;
+            }
+
+            views.push(view);
+        }
+
+        let offset = options.offset.unwrap_or(0);
+        let limit = options.limit.unwrap_or(usize::MAX);
+        Ok(views.into_iter().skip(offset).take(limit).collect())
+    }
+
+    async fn mark_device_offline(&self, did: &str, reason: &str) -> SnResult<()> {
+        self.update_state_without_report(
+            did,
+            SnDeviceState::Offline,
+            reason,
+            SnDeviceStateEventType::Offline,
+        )
+        .await
+    }
+
+    async fn block_device(&self, did: &str, reason: &str) -> SnResult<()> {
+        self.update_state_without_report(
+            did,
+            SnDeviceState::Blocked,
+            reason,
+            SnDeviceStateEventType::Blocked,
+        )
+        .await
+    }
+
+    async fn unblock_device(&self, did: &str, reason: &str) -> SnResult<()> {
+        self.update_state_without_report(
+            did,
+            SnDeviceState::Offline,
+            reason,
+            SnDeviceStateEventType::Unblocked,
+        )
+        .await?;
+
+        let now = Self::now_secs();
+        let mut conn = self
+            .pool
+            .get_conn()
+            .await
+            .map_err(into_sn_err!(SnErrorCode::DBError, "get conn"))?;
+        conn.execute_sql(
+            sql_query(
+                "UPDATE device_endpoints
+                 SET state = 'stale', updated_at = ?2
+                 WHERE did = ?1 AND state = 'disabled'",
+            )
+            .bind(did)
+            .bind(Self::to_db_time(now, "updated_at")?),
+        )
+        .await
+        .map_err(into_sn_err!(
+            SnErrorCode::DBError,
+            "mark unblocked endpoints stale failed"
+        ))?;
+
+        Ok(())
+    }
+
+    async fn expire_devices(&self, now: u64, batch_size: Option<usize>) -> SnResult<usize> {
+        let mut conn = self
+            .pool
+            .get_conn()
+            .await
+            .map_err(into_sn_err!(SnErrorCode::DBError, "get conn"))?;
+
+        let mut query = String::from(
+            "SELECT did FROM device_runtime_states
+             WHERE state = 'online' AND expires_at IS NOT NULL AND expires_at < ?1
+             ORDER BY expires_at ASC",
+        );
+        if batch_size.is_some() {
+            query.push_str(" LIMIT ?2");
+        }
+
+        let rows =
+            if let Some(batch_size) = batch_size {
+                conn.query_all(sql_query(&query).bind(Self::to_db_time(now, "now")?).bind(
+                    i64::try_from(batch_size).map_err(|_| {
+                        sn_err!(SnErrorCode::InvalidInput, "batch_size is too large")
+                    })?,
+                ))
+                .await
+            } else {
+                conn.query_all(sql_query(&query).bind(Self::to_db_time(now, "now")?))
+                    .await
+            }
+            .map_err(into_sn_err!(
+                SnErrorCode::DBError,
+                "query expired devices failed"
+            ))?;
+
+        let dids = rows
+            .into_iter()
+            .map(|row| row.get::<String, _>(0))
+            .collect::<Vec<_>>();
+
+        for did in &dids {
+            self.mark_stale_if_expired(did, now).await?;
+        }
+
+        Ok(dids.len())
     }
 }
 
@@ -225,40 +1867,152 @@ impl SnDeviceInfoDB for SqliteSnDeviceInfoDB {
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn test_update_and_get_device_dynamic_info() -> SnResult<()> {
+    async fn temp_db() -> SnResult<(tempfile::TempDir, SqliteSnDeviceInfoDB)> {
         let tmp_dir = tempfile::tempdir()
             .map_err(|e| sn_err!(SnErrorCode::DBError, "create temp dir failed: {}", e))?;
         let db_path = tmp_dir.path().join("sn_device_info.sqlite3");
         let db = SqliteSnDeviceInfoDB::new_by_path(db_path.to_string_lossy().as_ref()).await?;
         db.initialize_database().await?;
+        Ok((tmp_dir, db))
+    }
 
+    fn endpoint(endpoint_id: &str, host: &str, scope: SnEndpointScope) -> SnDeviceEndpointUpdate {
+        SnDeviceEndpointUpdate {
+            endpoint_id: endpoint_id.to_string(),
+            protocol: SnEndpointProtocol::Tcp,
+            host: host.to_string(),
+            port: Some(8080),
+            scope,
+            priority: 10,
+            source: SnEndpointSource::DeviceReport,
+            expires_at: None,
+        }
+    }
+
+    fn state_update(did: &str, seq: u64, ttl: u64) -> SnDeviceStateUpdate {
+        SnDeviceStateUpdate {
+            did: did.to_string(),
+            reported_ip: Some("192.168.1.10".to_string()),
+            reported_ips: vec!["8.8.8.8".to_string(), "10.0.0.2".to_string()],
+            from_ip: Some("1.1.1.1".to_string()),
+            nat_type: SnNatType::Public,
+            endpoints: vec![
+                endpoint("private", "192.168.1.10", SnEndpointScope::Private),
+                endpoint("public", "8.8.8.8", SnEndpointScope::Public),
+            ],
+            report_seq: Some(seq),
+            ttl,
+            raw_report: Some(r#"{"ok":true}"#.to_string()),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_device_state_lifecycle() -> SnResult<()> {
+        let (_tmp_dir, db) = temp_db().await?;
         let did = "did:dev:test-device-id";
-        assert!(db.get_did_info(did).await?.is_none());
-        assert!(db.get_device_endpoint(did).await?.is_none());
 
-        db.update_did_info(did, r#"{"online":true}"#).await?;
-        db.update_device_endpoint(did, "tcp://127.0.0.1:8080")
+        assert!(db.get_device_state(did).await?.is_none());
+        db.upsert_device_index(did, "example", "ood1", SnDeviceRole::Ood)
             .await?;
 
-        let did_info = db.get_did_info(did).await?.unwrap();
-        assert_eq!(did_info.did, did);
-        assert_eq!(did_info.did_info, r#"{"online":true}"#);
-        assert!(did_info.created_at <= did_info.updated_at);
+        let offline = db.get_device_state(did).await?.unwrap();
+        assert_eq!(offline.state, SnDeviceState::Offline);
+        assert!(offline.active_endpoints.is_empty());
 
-        let endpoint = db.get_device_endpoint(did).await?.unwrap();
-        assert_eq!(endpoint.did, did);
-        assert_eq!(endpoint.endpoint, "tcp://127.0.0.1:8080");
-        assert!(endpoint.created_at <= endpoint.updated_at);
+        db.update_device_state(state_update(did, 10, 60)).await?;
+        let online = db
+            .get_device_state_by_name("example", "ood1")
+            .await?
+            .unwrap();
+        assert_eq!(online.state, SnDeviceState::Online);
+        assert_eq!(online.public_ips, vec!["8.8.8.8", "1.1.1.1"]);
+        assert_eq!(online.private_ips, vec!["192.168.1.10", "10.0.0.2"]);
+        assert_eq!(online.active_endpoints.len(), 2);
+        assert_eq!(
+            online.preferred_endpoint.as_ref().unwrap().endpoint_id,
+            "public"
+        );
+        assert!(online.is_wan_device);
 
-        db.update_did_info(did, r#"{"online":false}"#).await?;
-        db.update_device_endpoint(did, "tcp://127.0.0.1:8081")
+        db.mark_device_offline(did, "manual").await?;
+        let offline = db.get_device_state(did).await?.unwrap();
+        assert_eq!(offline.state, SnDeviceState::Offline);
+        assert!(offline.active_endpoints.is_empty());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_device_index_conflict_and_rebind() -> SnResult<()> {
+        let (_tmp_dir, db) = temp_db().await?;
+        let did = "did:dev:test-device-id";
+
+        db.upsert_device_index(did, "example", "ood1", SnDeviceRole::Ood)
             .await?;
 
-        let did_info = db.get_did_info(did).await?.unwrap();
-        assert_eq!(did_info.did_info, r#"{"online":false}"#);
-        let endpoint = db.get_device_endpoint(did).await?.unwrap();
-        assert_eq!(endpoint.endpoint, "tcp://127.0.0.1:8081");
+        assert!(db
+            .upsert_device_index(did, "example", "ood2", SnDeviceRole::Ood)
+            .await
+            .is_err());
+
+        db.upsert_device_index("did:dev:other", "example", "ood2", SnDeviceRole::Ood)
+            .await?;
+        assert!(db
+            .rebind_device_index(did, "example", "ood2", SnDeviceRole::Ood, "move")
+            .await
+            .is_err());
+
+        db.rebind_device_index(did, "example", "gateway", SnDeviceRole::Gateway, "move")
+            .await?;
+        assert!(db
+            .get_device_state_by_name("example", "ood1")
+            .await?
+            .is_none());
+        assert!(db
+            .get_device_state_by_name("example", "gateway")
+            .await?
+            .is_some());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_stale_report_block_and_expire() -> SnResult<()> {
+        let (_tmp_dir, db) = temp_db().await?;
+        let did = "did:dev:test-device-id";
+        db.upsert_device_index(did, "example", "ood1", SnDeviceRole::Ood)
+            .await?;
+
+        db.update_device_state(state_update(did, 10, 1)).await?;
+        assert!(db
+            .update_device_state(state_update(did, 9, 1))
+            .await
+            .is_err());
+
+        let expired_count = db
+            .expire_devices(SqliteSnDeviceInfoDB::now_secs() + 2, None)
+            .await?;
+        assert_eq!(expired_count, 1);
+        assert_eq!(
+            db.get_device_state(did).await?.unwrap().state,
+            SnDeviceState::Stale
+        );
+
+        db.block_device(did, "admin").await?;
+        assert!(db
+            .update_device_state(state_update(did, 11, 60))
+            .await
+            .is_err());
+        assert_eq!(
+            db.get_device_state(did).await?.unwrap().state,
+            SnDeviceState::Blocked
+        );
+
+        db.unblock_device(did, "admin").await?;
+        db.update_device_state(state_update(did, 11, 60)).await?;
+        let online = db.get_device_state(did).await?.unwrap();
+        assert_eq!(online.state, SnDeviceState::Online);
+        assert_eq!(online.active_endpoints.len(), 2);
 
         Ok(())
     }
