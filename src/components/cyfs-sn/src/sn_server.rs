@@ -4162,11 +4162,49 @@ mod tests {
     use cyfs_gateway_lib::hyper_serve_http;
     use hyper_util::rt::TokioIo;
     use std::time::SystemTime;
+    use tokio::net::{TcpListener, TcpStream};
 
     const TEST_USER: &str = "testuser";
     const TEST_USER_V2: &str = "testuserv2";
     const TEST_ROOT_USER: &str = "testroot";
     const TEST_LEGACY_USER: &str = "testlegacy";
+
+    async fn spawn_test_http_server(http_server: Arc<dyn HttpServer>) -> SocketAddr {
+        let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                let http_server = http_server.clone();
+                let stream_info = StreamInfo::new(addr.to_string());
+                tokio::spawn(async move {
+                    let ret = hyper_serve_http(Box::new(stream), http_server, stream_info).await;
+                    if let Err(e) = ret {
+                        warn!("hyper_serve_http returned error: {}", e);
+                    }
+                });
+            }
+        });
+
+        wait_for_tcp(addr).await;
+        addr
+    }
+
+    async fn wait_for_tcp(addr: SocketAddr) {
+        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+        loop {
+            if TcpStream::connect(addr).await.is_ok() {
+                return;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                panic!("test HTTP server did not become ready at {}", addr);
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+        }
+    }
 
     #[test]
     fn test_split_host_name() {
@@ -4510,33 +4548,10 @@ mod tests {
         }
         let dns_server = dns_server.unwrap();
 
-        tokio::spawn(async move {
-            use http_body_util::BodyExt;
-            use tokio::net::TcpListener;
+        let http_addr = spawn_test_http_server(http_server).await;
+        let base_url = format!("http://{}", http_addr);
 
-            let listener = TcpListener::bind("127.0.0.1:19091").await.unwrap();
-
-            loop {
-                let (stream, _) = listener.accept().await.unwrap();
-                let http_server = http_server.clone();
-                tokio::spawn(async move {
-                    let ret = hyper_serve_http(
-                        Box::new(stream),
-                        http_server,
-                        StreamInfo::new("127.0.0.1:19091".to_string()),
-                    )
-                    .await;
-                    if let Err(e) = ret {
-                        warn!("hyper_serve_http returned error: {}", e);
-                    }
-                });
-            }
-        });
-
-        // 等待服务器启动
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-
-        let krpc = kRPC::new("http://127.0.0.1:19091", Some(token.clone()));
+        let krpc = kRPC::new(base_url.as_str(), Some(token.clone()));
         let result = krpc
             .call(
                 "check_username",
@@ -4685,7 +4700,7 @@ mod tests {
             .await;
         assert!(result.is_err());
 
-        let krpc = kRPC::new("http://127.0.0.1:19091", Some(user_token.clone()));
+        let krpc = kRPC::new(base_url.as_str(), Some(user_token.clone()));
         let result = krpc
             .call(
                 "register",
@@ -4707,8 +4722,8 @@ mod tests {
         // did:bns:username type=boot
         let resp = client
             .get(format!(
-                "http://127.0.0.1:19091/1.0/identifiers/did:bns:{}?type=boot",
-                TEST_USER
+                "{}/1.0/identifiers/did:bns:{}?type=boot",
+                base_url, TEST_USER
             ))
             .send()
             .await
@@ -4720,8 +4735,8 @@ mod tests {
         // did:bns:username type=zone (default)
         let resp = client
             .get(format!(
-                "http://127.0.0.1:19091/1.0/identifiers/did:bns:{}",
-                TEST_USER
+                "{}/1.0/identifiers/did:bns:{}",
+                base_url, TEST_USER
             ))
             .send()
             .await
@@ -4734,8 +4749,8 @@ mod tests {
         // did:web:domain -> routes to did:bns:username
         let resp = client
             .get(format!(
-                "http://127.0.0.1:19091/1.0/identifiers/did:web:{}.buckyos.ai",
-                TEST_USER
+                "{}/1.0/identifiers/did:web:{}.buckyos.ai",
+                base_url, TEST_USER
             ))
             .send()
             .await
@@ -4747,8 +4762,8 @@ mod tests {
         // did:bns:device.username type=doc
         let resp = client
             .get(format!(
-                "http://127.0.0.1:19091/1.0/identifiers/did:bns:ood1.{}?type=doc",
-                TEST_USER
+                "{}/1.0/identifiers/did:bns:ood1.{}?type=doc",
+                base_url, TEST_USER
             ))
             .send()
             .await
@@ -4761,8 +4776,8 @@ mod tests {
         // did:bns:device.domain -> routes domain -> username -> device
         let resp = client
             .get(format!(
-                "http://127.0.0.1:19091/1.0/identifiers/did:bns:ood1.{}.buckyos.ai?type=doc",
-                TEST_USER
+                "{}/1.0/identifiers/did:bns:ood1.{}.buckyos.ai?type=doc",
+                base_url, TEST_USER
             ))
             .send()
             .await
@@ -4774,8 +4789,8 @@ mod tests {
         // did:bns:device.username type=info
         let resp = client
             .get(format!(
-                "http://127.0.0.1:19091/1.0/identifiers/did:bns:ood1.{}?type=info",
-                TEST_USER
+                "{}/1.0/identifiers/did:bns:ood1.{}?type=info",
+                base_url, TEST_USER
             ))
             .send()
             .await
@@ -4790,10 +4805,7 @@ mod tests {
         // did:dev:public_key type=doc/info
         let did_dev = device_config.id.to_string();
         let resp = client
-            .get(format!(
-                "http://127.0.0.1:19091/1.0/identifiers/{}?type=doc",
-                did_dev
-            ))
+            .get(format!("{}/1.0/identifiers/{}?type=doc", base_url, did_dev))
             .send()
             .await
             .unwrap();
@@ -4803,8 +4815,8 @@ mod tests {
 
         let resp = client
             .get(format!(
-                "http://127.0.0.1:19091/1.0/identifiers/{}?type=info",
-                did_dev
+                "{}/1.0/identifiers/{}?type=info",
+                base_url, did_dev
             ))
             .send()
             .await
@@ -4814,7 +4826,7 @@ mod tests {
         assert_eq!(v.get("device_name").unwrap().as_str().unwrap(), "ood1");
         //assert!(v.get("ip").is_some());
 
-        let krpc = kRPC::new("http://127.0.0.1:19091", Some(token.clone()));
+        let krpc = kRPC::new(base_url.as_str(), Some(token.clone()));
         let result = krpc
             .call(
                 "get",
@@ -4955,7 +4967,7 @@ mod tests {
         let name_info = result.unwrap();
         assert_eq!(name_info.txt.len(), 3);
 
-        let krpc = kRPC::new("http://127.0.0.1:19091", Some(token2.clone()));
+        let krpc = kRPC::new(base_url.as_str(), Some(token2.clone()));
         let device_info2 = DeviceInfo::from_device_doc(&device_config2);
         let result = krpc
             .call(
@@ -4968,7 +4980,7 @@ mod tests {
             .await;
         assert!(result.is_err());
 
-        let krpc = kRPC::new("http://127.0.0.1:19091", Some(token.clone()));
+        let krpc = kRPC::new(base_url.as_str(), Some(token.clone()));
         let mut device_info = DeviceInfo::from_device_doc(&device_config);
         device_info.cpu_info = Some("AMD".to_string());
         let result = krpc
@@ -4982,7 +4994,7 @@ mod tests {
             .await;
         assert!(result.is_ok());
 
-        let krpc = kRPC::new("http://127.0.0.1:19091", Some(token.clone()));
+        let krpc = kRPC::new(base_url.as_str(), Some(token.clone()));
         let result = krpc
             .call(
                 "get",
@@ -5196,32 +5208,13 @@ mod tests {
         }
         let http_server = http_server.unwrap();
 
-        tokio::spawn(async move {
-            use http_body_util::BodyExt;
-            use tokio::net::TcpListener;
+        let http_addr = spawn_test_http_server(http_server).await;
+        let base_url = format!("http://{}", http_addr);
+        let sn_url = format!("{}/kapi/sn", base_url);
+        let auth_url = format!("{}/kapi/sn/auth", base_url);
+        let bns_url = format!("{}/kapi/sn/bns", base_url);
 
-            let listener = TcpListener::bind("127.0.0.1:19092").await.unwrap();
-
-            loop {
-                let (stream, _) = listener.accept().await.unwrap();
-                let http_server = http_server.clone();
-                tokio::spawn(async move {
-                    let ret = hyper_serve_http(
-                        Box::new(stream),
-                        http_server,
-                        StreamInfo::new("127.0.0.1:19092".to_string()),
-                    )
-                    .await;
-                    if let Err(e) = ret {
-                        warn!("hyper_serve_http returned error: {}", e);
-                    }
-                });
-            }
-        });
-
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-
-        let root_krpc = kRPC::new("http://127.0.0.1:19092/kapi/sn", None);
+        let root_krpc = kRPC::new(sn_url.as_str(), None);
         let result = root_krpc
             .call(
                 "auth.check_username",
@@ -5283,7 +5276,7 @@ mod tests {
         assert!(!result["valid"].as_bool().unwrap());
         assert_eq!(result["reason"].as_str().unwrap(), "invalid_username");
 
-        let auth_krpc = kRPC::new("http://127.0.0.1:19092/kapi/sn/auth", None);
+        let auth_krpc = kRPC::new(auth_url.as_str(), None);
         let result = auth_krpc
             .call(
                 "auth.check_username",
@@ -5366,15 +5359,12 @@ mod tests {
             .unwrap()
             .contains("already exists"));
 
-        let auth_me_krpc = kRPC::new(
-            "http://127.0.0.1:19092/kapi/sn/auth",
-            Some(access_token.clone()),
-        );
+        let auth_me_krpc = kRPC::new(auth_url.as_str(), Some(access_token.clone()));
         let result = auth_me_krpc.call("auth.me", json!({})).await.unwrap();
         assert_eq!(result["name"].as_str().unwrap(), TEST_USER_V2);
         assert!(!result["owner_key_bound"].as_bool().unwrap());
 
-        let login_krpc = kRPC::new("http://127.0.0.1:19092/kapi/sn/auth", None);
+        let login_krpc = kRPC::new(auth_url.as_str(), None);
         let result = login_krpc
             .call(
                 "auth.login",
@@ -5427,7 +5417,7 @@ mod tests {
         let invalid_register_err = invalid_register_result.err().unwrap().to_string();
         assert!(invalid_register_err.contains("[SNV2:1001:invalid_username]"));
 
-        let refresh_krpc = kRPC::new("http://127.0.0.1:19092/kapi/sn/auth", None);
+        let refresh_krpc = kRPC::new(auth_url.as_str(), None);
         let result = refresh_krpc
             .call(
                 "auth.refresh",
@@ -5439,10 +5429,7 @@ mod tests {
             .unwrap();
         assert!(!result["access_token"].as_str().unwrap().is_empty());
 
-        let user_krpc = kRPC::new(
-            "http://127.0.0.1:19092/kapi/sn/bns",
-            Some(login_access_token.clone()),
-        );
+        let user_krpc = kRPC::new(bns_url.as_str(), Some(login_access_token.clone()));
         let result = user_krpc
             .call(
                 "user.bind_owner_key",
@@ -5476,20 +5463,14 @@ mod tests {
             .unwrap()
             .to_string();
 
-        let bns_user_krpc = kRPC::new(
-            "http://127.0.0.1:19092/kapi/sn/bns",
-            Some(login_access_token.clone()),
-        );
+        let bns_user_krpc = kRPC::new(bns_url.as_str(), Some(login_access_token.clone()));
         let result = bns_user_krpc
             .call("user.get_profile", json!({}))
             .await
             .unwrap();
         assert_eq!(result["name"].as_str().unwrap(), TEST_USER_V2);
 
-        let zone_krpc = kRPC::new(
-            "http://127.0.0.1:19092/kapi/sn/bns",
-            Some(login_access_token.clone()),
-        );
+        let zone_krpc = kRPC::new(bns_url.as_str(), Some(login_access_token.clone()));
         let result = zone_krpc
             .call(
                 "zone.bind_config",
@@ -5509,10 +5490,7 @@ mod tests {
             format!("{}.buckyos.ai", TEST_USER_V2)
         );
 
-        let device_krpc = kRPC::new(
-            "http://127.0.0.1:19092/kapi/sn/bns",
-            Some(login_access_token.clone()),
-        );
+        let device_krpc = kRPC::new(bns_url.as_str(), Some(login_access_token.clone()));
         let result = device_krpc
             .call(
                 "device.register",
@@ -5531,10 +5509,7 @@ mod tests {
         let result = device_krpc.call("device.list", json!({})).await.unwrap();
         assert_eq!(result["items"].as_array().unwrap().len(), 1);
 
-        let dns_krpc = kRPC::new(
-            "http://127.0.0.1:19092/kapi/sn",
-            Some(login_access_token.clone()),
-        );
+        let dns_krpc = kRPC::new(sn_url.as_str(), Some(login_access_token.clone()));
         let result = dns_krpc
             .call(
                 "dns.add_record",
@@ -5565,10 +5540,7 @@ mod tests {
         let err = result.err().unwrap().to_string();
         assert!(err.contains("[SNV2:1015:invalid_domain]"));
 
-        let did_krpc = kRPC::new(
-            "http://127.0.0.1:19092/kapi/sn",
-            Some(login_access_token.clone()),
-        );
+        let did_krpc = kRPC::new(sn_url.as_str(), Some(login_access_token.clone()));
         let result = did_krpc
             .call(
                 "did.set_document",
@@ -5600,10 +5572,7 @@ mod tests {
             TEST_USER_V2
         );
 
-        let query_krpc = kRPC::new(
-            "http://127.0.0.1:19092/kapi/sn",
-            Some(login_access_token.clone()),
-        );
+        let query_krpc = kRPC::new(sn_url.as_str(), Some(login_access_token.clone()));
         let result = query_krpc
             .call(
                 "query.resolve_hostname",
@@ -5670,10 +5639,7 @@ mod tests {
             .unwrap();
         assert_eq!(result["code"].as_i64().unwrap(), 0);
 
-        let bns_admin_krpc = kRPC::new(
-            "http://127.0.0.1:19092/kapi/sn/bns",
-            Some(login_access_token),
-        );
+        let bns_admin_krpc = kRPC::new(bns_url.as_str(), Some(login_access_token));
         let result = bns_admin_krpc
             .call("admin.clear_state_by_active_code", json!({}))
             .await

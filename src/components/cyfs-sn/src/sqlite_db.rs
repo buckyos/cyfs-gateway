@@ -1468,36 +1468,27 @@ mod tests {
 
     #[tokio::test]
     async fn test_main() -> SnResult<()> {
-        //let tmp_dir = std::env::temp_dir();
-        let base_dir = std::env::temp_dir();
-        let db_path = base_dir.join("sn_db.sqlite3");
-        let _ = std::fs::remove_file(db_path.clone());
-        println!("db_path: {}", db_path.to_str().unwrap());
-        //remove db file
-        let db_path_str = db_path.to_str().unwrap();
+        let db_file = tempfile::NamedTempFile::with_suffix(".db").unwrap();
+        let db_path_str = db_file.path().to_str().unwrap();
 
         let db = SqliteSnDB::new_by_path(db_path_str).await?;
         db.initialize_database().await?;
         let codes = db.generate_activation_codes(100).await?;
-        println!("codes: {:?}", codes);
-        // Example usage
-        println!("codes: {:?}", codes);
-        let first_code = codes.first().unwrap();
+        assert_eq!(codes.len(), 100);
+        let first_code = codes.first().expect("activation code should be generated");
 
         let registration_success = db.register_user(first_code.as_str(), "lzc", "T4Quc1L6Ogu4N2tTKOvneV1yYnBcmhP89B_RsuFsJZ8",
                                                     "eyJhbGciOiJFZERTQSJ9.eyJkaWQiOiJkaWQ6ZW5zOmx6YyIsIm9vZHMiOlsib29kMSJdLCJzbiI6IndlYjMuYnVja3lvcy5pbyIsImV4cCI6MjA0NDgyMzMzNn0.Xqd-4FsDbqZt1YZOIfduzsJik5UZmuylknMiAxLToB2jBBzHHccn1KQptLhhyEL5_Y-89YihO9BX6wO7RoqABw",
                                                     Some("www.zhicong.me".to_string()),
         ).await?;
-        if registration_success {
-            println!("User registered successfully.");
+        assert!(registration_success);
 
-            // 设置初始的 sn_ips
-            db.set_user_sn_ips_from_vec("lzc", &vec!["70.221.32.12".to_string()])
-                .await?;
-            println!("Set initial sn_ips for user");
-        } else {
-            println!("Registration failed.");
-        }
+        db.set_user_sn_ips_from_vec("lzc", &["70.221.32.12".to_string()])
+            .await?;
+        assert_eq!(
+            db.get_user_sn_ips_as_vec("lzc").await?,
+            Some(vec!["70.221.32.12".to_string()])
+        );
 
         let ret = db
             .add_user_domain("lzc", "example.com", "A", "192.168.1.100", 3600)
@@ -1546,44 +1537,38 @@ mod tests {
         assert!(ret.is_ok());
         assert_eq!(ret.unwrap(), vec![]);
 
-        // 测试 sn_ips 功能
-        if let Some(sn_ips) = db.get_user_sn_ips("lzc").await? {
-            println!("User sn_ips: {}", sn_ips);
-        }
-
-        if let Some(ips_vec) = db.get_user_sn_ips_as_vec("lzc").await? {
-            println!("User sn_ips as vec: {:?}", ips_vec);
-        }
+        assert_eq!(
+            db.get_user_sn_ips("lzc").await?,
+            Some(r#"["70.221.32.12"]"#.to_string())
+        );
 
         // 添加新的 IP
         db.add_user_sn_ip("lzc", "192.168.1.100").await?;
-        println!("Added new IP to user");
-
-        if let Some(ips_vec) = db.get_user_sn_ips_as_vec("lzc").await? {
-            println!("User sn_ips after adding: {:?}", ips_vec);
-        }
+        assert_eq!(
+            db.get_user_sn_ips_as_vec("lzc").await?,
+            Some(vec![
+                "70.221.32.12".to_string(),
+                "192.168.1.100".to_string()
+            ])
+        );
 
         // 移除 IP
         db.remove_user_sn_ip("lzc", "70.221.32.12").await?;
-        println!("Removed IP from user");
-
-        if let Some(ips_vec) = db.get_user_sn_ips_as_vec("lzc").await? {
-            println!("User sn_ips after removing: {:?}", ips_vec);
-        }
+        assert_eq!(
+            db.get_user_sn_ips_as_vec("lzc").await?,
+            Some(vec!["192.168.1.100".to_string()])
+        );
 
         // 测试更新用户 self_cert 字段
-        println!("\n=== Test update_user_self_cert ===");
         db.update_user_self_cert("lzc", true).await?;
-        println!("Updated user self_cert to true");
-
-        if let Some(user_info) = db.get_user_info("lzc").await? {
-            println!("Self cert after update: {}", user_info.self_cert);
-            assert_eq!(user_info.self_cert, true, "self_cert should be true");
-        }
+        let user_info = db
+            .get_user_info("lzc")
+            .await?
+            .expect("registered user should exist");
+        assert!(user_info.self_cert, "self_cert should be true");
 
         // 测试设备注册和查询
         let device_info_str = r#"{"hostname":"ood1","device_type":"ood","did":"did:dev:gubVIszw-u_d5PVTh-oc8CKAhM9C-ne5G_yUK5BDaXc","ip":"192.168.1.86","sys_hostname":"LZC-USWORK","base_os_info":"Ubuntu 22.04 5.15.153.1-microsoft-standard-WSL2","cpu_info":"AMD Ryzen 7 5800X 8-Core Processor @ 3800 MHz","cpu_usage":0.0,"total_mem":67392299008,"mem_usage":5.7286677}"#;
-        println!("\ndevice_info_str: {}", device_info_str);
         let mini_config_jwt = "eyJhbGciOiJFZERTQSJ9.eyJkaWQiOiJkaWQ6ZGV2Om9vZDEiLCJvd25lciI6ImRpZDplbnM6bHpjIiwiZXhwIjoyMDQ0ODIzMzM2fQ.test_signature";
         db.register_device(
             "lzc",
@@ -1595,36 +1580,29 @@ mod tests {
         )
         .await?;
 
-        // 测试使用 SNDeviceInfo 结构体
-        if let Some(device_info) = db
+        let device_info = db
             .query_device("did:dev:gubVIszw-u_d5PVTh-oc8CKAhM9C-ne5G_yUK5BDaXc")
             .await?
-        {
-            println!("\n=== Device Info (by DID) ===");
-            println!("Device info: {:?}", device_info);
-            println!("Device owner: {}", device_info.owner);
-            println!("Device name: {}", device_info.device_name);
-            println!("Device DID: {}", device_info.did);
-            println!("Device mini_config_jwt: {}", device_info.mini_config_jwt);
-            println!("Device IP: {}", device_info.ip);
-            println!("Device created_at: {}", device_info.created_at);
-            println!("Device updated_at: {}", device_info.updated_at);
-        } else {
-            println!("Device not found.");
-        }
+            .expect("device should be queryable by DID");
+        assert_eq!(device_info.owner, "lzc");
+        assert_eq!(device_info.device_name, "ood1");
+        assert_eq!(
+            device_info.did,
+            "did:dev:gubVIszw-u_d5PVTh-oc8CKAhM9C-ne5G_yUK5BDaXc"
+        );
+        assert_eq!(device_info.mini_config_jwt, mini_config_jwt);
+        assert_eq!(device_info.ip, "192.168.1.188");
 
         // 测试通过设备名查询
-        if let Some(device_info) = db.query_device_by_name("lzc", "ood1").await? {
-            println!("\n=== Device Info (by name) ===");
-            println!(
-                "Query device by name - owner: {}, did: {}",
-                device_info.owner, device_info.did
-            );
-            println!("Mini config JWT: {}", device_info.mini_config_jwt);
-        }
+        let device_info = db
+            .query_device_by_name("lzc", "ood1")
+            .await?
+            .expect("device should be queryable by owner/name");
+        assert_eq!(device_info.owner, "lzc");
+        assert_eq!(device_info.did, "did:dev:gubVIszw-u_d5PVTh-oc8CKAhM9C-ne5G_yUK5BDaXc");
+        assert_eq!(device_info.mini_config_jwt, mini_config_jwt);
 
         // 测试更新设备信息（包括 did 和 mini_config_jwt）
-        println!("\n=== Test update_device_by_name ===");
         let updated_device_info_str = r#"{"hostname":"ood1","device_type":"ood","did":"did:dev:gubVIszw-u_d5PVTh-oc8CKAhM9C-ne5G_yUK5BDaXc","ip":"192.168.1.100","sys_hostname":"LZC-USWORK-UPDATED","base_os_info":"Ubuntu 22.04","cpu_info":"AMD Ryzen 7 5800X","cpu_usage":1.5,"total_mem":67392299008,"mem_usage":6.0}"#;
         let updated_did = "did:dev:gubVIszw-u_d5PVTh-oc8CKAhM9C-ne5G_yUK5BDaXc-updated";
         let updated_mini_config_jwt = "eyJhbGciOiJFZERTQSJ9.eyJkaWQiOiJkaWQ6ZGV2Om9vZDEiLCJvd25lciI6ImRpZDplbnM6bHpjIiwiZXhwIjoyMDQ0ODIzMzM2fQ.updated_signature";
@@ -1637,65 +1615,35 @@ mod tests {
             updated_device_info_str,
         )
         .await?;
-        println!("Updated device by name with new DID, mini_config_jwt, IP and description");
-
-        if let Some(device_info) = db.query_device_by_name("lzc", "ood1").await? {
-            println!("Updated device DID: {}", device_info.did);
-            println!("Updated device IP: {}", device_info.ip);
-            println!("Updated mini_config_jwt: {}", device_info.mini_config_jwt);
-            assert_eq!(device_info.did, updated_did, "DID should be updated");
-            assert_eq!(device_info.ip, "192.168.1.200", "IP should be updated");
-            assert_eq!(
-                device_info.mini_config_jwt, updated_mini_config_jwt,
-                "mini_config_jwt should be updated"
-            );
-        }
+        let device_info = db
+            .query_device_by_name("lzc", "ood1")
+            .await?
+            .expect("updated device should still be queryable by owner/name");
+        assert_eq!(device_info.did, updated_did, "DID should be updated");
+        assert_eq!(device_info.ip, "192.168.1.200", "IP should be updated");
+        assert_eq!(
+            device_info.mini_config_jwt, updated_mini_config_jwt,
+            "mini_config_jwt should be updated"
+        );
 
         // 测试使用 SNUserInfo 结构体 - 验证所有字段都被正确填充
-        if let Some(user_info) = db.get_user_info("lzc").await? {
-            println!("\n=== User Info (by username) - Final State ===");
-            println!("User info: {:?}", user_info);
-            println!("State: {:?}", user_info.state);
-            println!("Public key: {}", user_info.public_key);
-            println!("Zone config: {}", user_info.zone_config);
-            println!(
-                "Self cert: {} (should be true after update)",
-                user_info.self_cert
-            );
-            assert_eq!(
-                user_info.self_cert, true,
-                "self_cert should be true after update"
-            );
-            if let Some(domain) = &user_info.user_domain {
-                println!("User domain: {}", domain);
-            }
-            if let Some(sn_ips) = &user_info.sn_ips {
-                println!("SN IPs: {}", sn_ips);
-            }
-        }
+        let user_info = db
+            .get_user_info("lzc")
+            .await?
+            .expect("registered user should still exist");
+        assert!(user_info.self_cert, "self_cert should be true after update");
+        assert_eq!(user_info.user_domain.as_deref(), Some("www.zhicong.me"));
+        assert_eq!(user_info.sn_ips.as_deref(), Some(r#"["192.168.1.100"]"#));
 
         // 测试通过域名查询用户信息 - 验证所有字段都被正确填充
-        if let Some(user_info) = db.get_user_info_by_domain("app1.www.zhicong.me").await? {
-            println!("\n=== User Info (by domain) ===");
-            println!("User info by domain: {:?}", user_info);
-            if let Some(username) = &user_info.username {
-                println!("Username from domain query: {}", username);
-            }
-            println!("State: {:?}", user_info.state);
-            println!("Public key from domain query: {}", user_info.public_key);
-            println!("Zone config: {}", user_info.zone_config);
-            println!("Self cert: {} (should be true)", user_info.self_cert);
-            assert_eq!(
-                user_info.self_cert, true,
-                "self_cert should be true in domain query"
-            );
-            if let Some(domain) = &user_info.user_domain {
-                println!("User domain from query: {}", domain);
-            }
-            if let Some(sn_ips) = &user_info.sn_ips {
-                println!("SN IPs from domain query: {}", sn_ips);
-            }
-        }
+        let user_info = db
+            .get_user_info_by_domain("app1.www.zhicong.me")
+            .await?
+            .expect("registered user should be queryable by subdomain");
+        assert_eq!(user_info.username.as_deref(), Some("lzc"));
+        assert!(user_info.self_cert, "self_cert should be true in domain query");
+        assert_eq!(user_info.user_domain.as_deref(), Some("www.zhicong.me"));
+        assert_eq!(user_info.sn_ips.as_deref(), Some(r#"["192.168.1.100"]"#));
 
         Ok(())
     }
