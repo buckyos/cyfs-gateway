@@ -5,6 +5,8 @@
 //! authenticated [`CallAuthority`]. State is persisted through
 //! [`BnsRegistryStore`], with SQLite provided as the first backend.
 
+pub mod dns_document;
+
 mod error;
 mod model;
 mod registry;

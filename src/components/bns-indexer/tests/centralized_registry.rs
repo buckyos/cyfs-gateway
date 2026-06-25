@@ -1,9 +1,10 @@
 use bns_indexer::{
-    controller_rule, default_document_update, sha256_hex, AliasKind, AuthorityKey,
-    AuthorityKeyUpdate, BnsRegistryError, CallAuthority, CentralizedBnsRegistry, DocumentRef,
-    DocumentStatus, MutationGuard, NameStatus, OwnerSource, Principal, PrincipalKind,
-    RegisterOptions, ReleaseMode, SqliteBnsRegistryStore, PERMISSION_PUBLISH_DOCUMENT,
-    PERMISSION_SET_ALIAS, ZERO_HASH,
+    controller_rule, default_document_update,
+    dns_document::{self, DnsTxtRecord, DNS_TXT_DOC_TYPE},
+    sha256_hex, AliasKind, AuthorityKey, AuthorityKeyUpdate, BnsRegistryError, CallAuthority,
+    CentralizedBnsRegistry, DocumentRef, DocumentStatus, MutationGuard, NameStatus, OwnerSource,
+    Principal, PrincipalKind, RegisterOptions, ReleaseMode, SqliteBnsRegistryStore,
+    PERMISSION_PUBLISH_DOCUMENT, PERMISSION_SET_ALIAS, ZERO_HASH,
 };
 use ndn_lib::{FileObject, NamedObject, ObjId};
 
@@ -73,6 +74,68 @@ fn payment_doc_update(
 
 fn inline_body(result: &bns_indexer::ResolveResult) -> String {
     String::from_utf8(result.document_state.document.inline_document.clone()).unwrap()
+}
+
+#[test]
+fn dns_document_helper_adds_txt_records_for_publish_document() {
+    let registry = registry();
+    let seq = registry
+        .register_name(
+            "alice",
+            OWNER_A,
+            RegisterOptions::default(),
+            vec![],
+            CallAuthority::public(),
+            MutationGuard::default(),
+        )
+        .unwrap();
+    assert_eq!(seq, 1);
+
+    let update =
+        dns_document::add_txt_record(None, 600, "v=spf1 include:_spf.example.net -all").unwrap();
+    assert_eq!(update.doc_type, DNS_TXT_DOC_TYPE);
+    assert_eq!(update.expected_version, 0);
+
+    let (authority, guard) = chain_owner(1, OWNER_A);
+    let version = registry
+        .publish_document("alice", update, authority, guard)
+        .unwrap();
+    assert_eq!(version, 1);
+
+    let current = registry
+        .resolve_document("alice", DNS_TXT_DOC_TYPE)
+        .unwrap();
+    let update = dns_document::add_txt_record(
+        Some(&current.document_state),
+        600,
+        "google-site-verification=abc",
+    )
+    .unwrap();
+    assert_eq!(update.expected_version, 1);
+
+    let (authority, guard) = chain_owner(2, OWNER_A);
+    let version = registry
+        .publish_document("alice", update, authority, guard)
+        .unwrap();
+    assert_eq!(version, 2);
+
+    let resolved = registry
+        .resolve_document("alice", DNS_TXT_DOC_TYPE)
+        .unwrap();
+    let records = dns_document::txt_records_from_document(&resolved.document_state).unwrap();
+    assert_eq!(
+        records,
+        vec![
+            DnsTxtRecord {
+                ttl: 600,
+                value: "v=spf1 include:_spf.example.net -all".to_string(),
+            },
+            DnsTxtRecord {
+                ttl: 600,
+                value: "google-site-verification=abc".to_string(),
+            },
+        ]
+    );
 }
 
 #[test]

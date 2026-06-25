@@ -319,6 +319,27 @@ RPC resolver 可以提供 `resolveDid("did:bns:alice", ...)` 便捷接口，但�
 | `content` | 通用内容 meta |
 | `payment` | 支付策略扩展文档 |
 
+DNS 记录型文档保留 `dns_` 前缀：
+
+```text
+doc_type = "dns_" + lower_case_dns_rrtype
+```
+
+其中 `lower_case_dns_rrtype` 是传统 DNS 记录类型的小写名字，例如 `dns_a`、`dns_aaaa`、`dns_cname`、`dns_mx`、`dns_txt`、`dns_srv`、`dns_caa`、`dns_ns`。
+
+当通过 `publishDocument` 发布 `doc_type = dns_xxx` 的文档时，`DocumentRef` 指向的文档内容可以是一组同类型 DNS 记录数组。该数组表示同一个 `(name, rrtype)` 的 RRset；记录类型由 `doc_type` 隐含，数组元素只需要保存该类型对应的 rdata、ttl 以及必要的优先级、权重、端口等字段。建议使用 canonical JSON array，以保证 `contentHash` 稳定。
+
+示例：
+
+```json
+[
+  { "ttl": 600, "value": "v=spf1 include:_spf.example.net -all" },
+  { "ttl": 600, "value": "google-site-verification=..." }
+]
+```
+
+依赖 BNS 合约的 DNS Server 可以把传统 DNS 查询 `(qname, qtype)` 映射为 `resolveDocument(canonical_name(qname), "dns_" + lower_case(qtype))`，验证 `DocumentRef.contentHash` 后从记录数组合成 DNS Answer。这样，即使权威数据来自 BNS Registry，仍能兼容 `TXT`、`MX`、`AAAA` 等传统 DNS 记录查询模型。
+
 `info` 是运行时上报信息，默认不作为 Registry 文档类型。
 
 ### 5.4 版本和并发保护
@@ -945,6 +966,7 @@ function publishDocument(
 - JSON 文档应先生成 canonical JSON UTF-8 bytes。
 - `contentHash` 必须等于文档原文 hash。
 - 链下 provider 返回的文档也必须匹配同一 `contentHash`。
+- `docType` 使用 `dns_` 前缀时，文档原文建议为 canonical JSON 记录数组；该数组表示对应 DNS 记录类型的 RRset，供 DNS Server 验证 hash 后转换为传统 DNS Answer。
 - inline 文档应有大小上限（建议 `MAX_INLINE_DOCUMENT = 4 KiB`），仅用于短 OwnerConfig、关键 tombstone 说明等；超限文档必须走 `DocumentRef` 外链。该上限在中心化阶段防止状态膨胀，在未来链上实现里同时也是 gas 保护。
 
 ### revokeDocument
