@@ -120,6 +120,23 @@ pub struct ZoneInfo {
     pub updated_at: u64,
 }
 
+impl ZoneInfo {
+    pub fn default_for(username: &str) -> Self {
+        Self {
+            username: username.to_string(),
+            bns_name: username.to_string(),
+            zone: None,
+            relay_sn: None,
+            self_cert: false,
+            cert_checked_at: None,
+            cert_expires_at: None,
+            sn_ips: None,
+            source_version: None,
+            updated_at: 0,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ZoneInfoPatch {
     pub bns_name: Option<String>,
@@ -1298,19 +1315,6 @@ impl SnAuthDB for SqliteSnAuthDB {
         .await
         .map_err(|e| Self::db_err("insert v2 auth failed", e))?;
 
-        sqlx::query(
-            "INSERT INTO zone_info
-                (username, bns_name, zone, relay_sn, self_cert, cert_checked_at,
-                 cert_expires_at, sn_ips, source_version, updated_at)
-             VALUES (?1, ?2, NULL, NULL, 0, NULL, NULL, NULL, NULL, ?3)",
-        )
-        .bind(username)
-        .bind(username)
-        .bind(now)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| Self::db_err("insert zone info failed", e))?;
-
         sqlx::query("UPDATE activation_codes SET used = 1 WHERE code = ?1")
             .bind(active_code)
             .execute(&mut *tx)
@@ -2128,41 +2132,26 @@ impl SnAuthDB for SqliteSnAuthDB {
             return Self::zone_info_from_row(row).map(Some);
         }
 
-        let user = self.get_user_info(username).await?;
-        Ok(user.map(|user| ZoneInfo {
-            username: username.to_string(),
-            bns_name: username.to_string(),
-            zone: if user.zone_config.trim().is_empty() {
-                None
-            } else {
-                Some(user.zone_config)
-            },
-            relay_sn: None,
-            self_cert: user.self_cert,
-            cert_checked_at: None,
-            cert_expires_at: None,
-            sn_ips: user.sn_ips,
-            source_version: None,
-            updated_at: 0,
-        }))
+        let Some(user) = self.get_user_info(username).await? else {
+            return Ok(Some(ZoneInfo::default_for(username)));
+        };
+
+        let mut zone_info = ZoneInfo::default_for(username);
+        zone_info.zone = if user.zone_config.trim().is_empty() {
+            None
+        } else {
+            Some(user.zone_config)
+        };
+        zone_info.self_cert = user.self_cert;
+        zone_info.sn_ips = user.sn_ips;
+        Ok(Some(zone_info))
     }
 
     async fn update_zone_info(&self, username: &str, patch: ZoneInfoPatch) -> SnResult<()> {
         let mut current = self
             .get_zone_info(username)
             .await?
-            .unwrap_or_else(|| ZoneInfo {
-                username: username.to_string(),
-                bns_name: username.to_string(),
-                zone: None,
-                relay_sn: None,
-                self_cert: false,
-                cert_checked_at: None,
-                cert_expires_at: None,
-                sn_ips: None,
-                source_version: None,
-                updated_at: 0,
-            });
+            .unwrap_or_else(|| ZoneInfo::default_for(username));
         if let Some(value) = patch.bns_name {
             current.bns_name = value;
         }
@@ -2270,6 +2259,28 @@ impl SnAuthDB for SqliteSnAuthDB {
         .execute(&self.pool)
         .await
         .map_err(|e| Self::db_err("update zone relay_sn failed", e))?;
+
+        if result.rows_affected() > 0 {
+            return Ok(true);
+        }
+
+        let result = sqlx::query(
+            "INSERT INTO zone_info
+                (username, bns_name, zone, relay_sn, self_cert, cert_checked_at,
+                 cert_expires_at, sn_ips, source_version, updated_at)
+             VALUES (?1, ?1, NULL, ?2, 0, NULL, NULL, NULL, ?3, ?4)
+             ON CONFLICT(username) DO UPDATE SET
+                relay_sn = excluded.relay_sn,
+                source_version = COALESCE(excluded.source_version, zone_info.source_version),
+                updated_at = excluded.updated_at",
+        )
+        .bind(zone)
+        .bind(relay_sn)
+        .bind(source_version)
+        .bind(now as i64)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| Self::db_err("insert zone relay_sn cache failed", e))?;
 
         Ok(result.rows_affected() > 0)
     }
@@ -2576,7 +2587,11 @@ mod tests {
         assert!(db.check_active_code("clear-me").await?);
         assert!(!db.is_user_exist("alice").await?);
         assert!(db.get_v2_auth("alice").await?.is_none());
-        assert!(db.get_zone_info("alice").await?.is_none());
+        let zone = db.get_zone_info("alice").await?.unwrap();
+        assert_eq!(zone.username, "alice");
+        assert_eq!(zone.bns_name, "alice");
+        assert!(!zone.self_cert);
+        assert!(zone.zone.is_none());
 
         Ok(())
     }

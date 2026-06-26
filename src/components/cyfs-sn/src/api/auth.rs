@@ -158,9 +158,6 @@ pub(crate) async fn handle_auth(server: &SNServer, req: RPCRequest) -> RpcCallRe
                     "register failed, invalid activation code",
                 ));
             }
-            server
-                .maybe_assign_zone_relay(username.as_str(), None, "register")
-                .await;
             build_auth_success_response(server, &req, username.as_str(), need_bind_owner_key).await
         }
         "login" => {

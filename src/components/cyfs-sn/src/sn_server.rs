@@ -703,6 +703,10 @@ impl SNServer {
                 indexer_url,
                 bns_session_token,
             )));
+        } else {
+            warn!(
+                "bns_indexer_url is not configured; SN resolver will use legacy local cache only and cannot lazy-load BNS contract state"
+            );
         }
         let resolver = Arc::new(resolver);
 

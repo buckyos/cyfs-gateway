@@ -41,6 +41,7 @@ pub(crate) async fn handle_device(
             }
             let mut bns_receipt = None;
             let mut pending_bns_publish = server.bns_controller().is_none();
+            let mut published_to_bns = false;
             if let Some(controller) = server.bns_controller() {
                 let auth_context =
                     crate::sn_authority::require_owner_for_name(server, &req, username.as_str())
@@ -93,21 +94,21 @@ pub(crate) async fn handle_device(
                     .map_err(bns_write_error)?;
                 bns_receipt = Some(serde_json::to_value(receipt).unwrap_or_default());
                 pending_bns_publish = false;
+                published_to_bns = true;
             }
-            server
-                .register_device_record(
-                    username.as_str(),
-                    params.device_name.as_str(),
-                    params.device_did.as_str(),
-                    params.mini_config_jwt.as_str(),
-                    params.device_ip.as_str(),
-                    params.device_info.as_str(),
-                )
-                .await
-                .into_rpc()?;
-            server
-                .maybe_assign_zone_relay(username.as_str(), None, "device_register")
-                .await;
+            if !published_to_bns {
+                server
+                    .register_device_record(
+                        username.as_str(),
+                        params.device_name.as_str(),
+                        params.device_did.as_str(),
+                        params.mini_config_jwt.as_str(),
+                        params.device_ip.as_str(),
+                        params.device_info.as_str(),
+                    )
+                    .await
+                    .into_rpc()?;
+            }
             ok_response(
                 &req,
                 json!({

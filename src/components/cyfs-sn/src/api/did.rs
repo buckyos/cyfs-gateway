@@ -19,6 +19,7 @@ pub(crate) async fn handle_did(server: &SNServer, req: RPCRequest) -> RpcCallRes
                 .clone()
                 .unwrap_or_else(|| "did_doc".to_string());
             let mut bns_receipt = None;
+            let mut published_to_bns = false;
             if let Some(controller) = server.bns_controller() {
                 let auth_context =
                     crate::sn_authority::require_owner_for_name(server, &req, username.as_str())
@@ -55,6 +56,7 @@ pub(crate) async fn handle_did(server: &SNServer, req: RPCRequest) -> RpcCallRes
                     .await
                     .map_err(bns_write_error)?;
                 bns_receipt = Some(serde_json::to_value(receipt).unwrap_or_default());
+                published_to_bns = true;
             }
             let doc_string = if params.did_document.is_null() {
                 String::new()
@@ -64,17 +66,19 @@ pub(crate) async fn handle_did(server: &SNServer, req: RPCRequest) -> RpcCallRes
             let mut hasher = sha2::Sha256::new();
             hasher.update(doc_string.as_bytes());
             let obj_id = hex::encode(hasher.finalize());
-            server
-                .compat_store()
-                .insert_user_did_document(
-                    obj_id.as_str(),
-                    username.as_str(),
-                    params.obj_name.as_str(),
-                    doc_string.as_str(),
-                    Some(doc_type.as_str()),
-                )
-                .await
-                .into_rpc()?;
+            if !published_to_bns {
+                server
+                    .compat_store()
+                    .insert_user_did_document(
+                        obj_id.as_str(),
+                        username.as_str(),
+                        params.obj_name.as_str(),
+                        doc_string.as_str(),
+                        Some(doc_type.as_str()),
+                    )
+                    .await
+                    .into_rpc()?;
+            }
             ok_response(
                 &req,
                 json!({

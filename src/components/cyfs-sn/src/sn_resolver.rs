@@ -25,6 +25,7 @@ pub const BNS_DOC_ZONE: &str = "zone";
 pub const BNS_DOC_BOOT: &str = "boot";
 pub const BNS_DOC_DEVICE_MINI: &str = "device_mini_doc";
 pub const BNS_DOC_DNS_TXT: &str = "dns_txt";
+pub const UNASSIGNED_RELAY_SN: &str = "unassigned";
 
 pub type SnResolverRef = Arc<SnResolver>;
 pub type SnResolverResult<T> = std::result::Result<T, SnResolverError>;
@@ -464,8 +465,7 @@ impl SnAuthReader for EmptySnAuthReader {
     }
 
     async fn get_zone_info(&self, username: &str) -> SnResolverResult<Option<ZoneInfo>> {
-        let _ = username;
-        Ok(None)
+        Ok(Some(ZoneInfo::default_for(username)))
     }
 }
 
@@ -1153,10 +1153,12 @@ impl SnResolver {
             }
         }
 
-        Err(SnResolverError::new(
-            SnResolverErrorKind::DocumentNotFound,
-            format!("relay assignment not found for {}", zone_name),
-        ))
+        Ok(RelayResolution {
+            zone_name,
+            relay_sn: UNASSIGNED_RELAY_SN.to_string(),
+            relay_state: RelayState::Unknown,
+            migration_hint: None,
+        })
     }
 
     pub async fn resolve_did(
@@ -1592,33 +1594,33 @@ impl SnResolver {
             });
         }
 
-        let user = self
-            .auth
-            .get_user_info(zone_name.as_str())
-            .await?
-            .ok_or_else(|| {
-                SnResolverError::new(
-                    SnResolverErrorKind::NameNotFound,
-                    format!("user {} not found", zone_name),
-                )
-            })?;
-
         match doc_type {
-            BNS_DOC_ZONE => Ok(DidResolution {
-                did: did.to_string(),
-                doc_type: doc_type.to_string(),
-                document: EncodedDocument::JsonLd(build_legacy_zone_config_json(
-                    zone_name.as_str(),
-                    &user,
-                )),
-                source: DidResolutionSource::LegacyLocalDidDocument,
-            }),
-            BNS_DOC_BOOT => Ok(DidResolution {
-                did: did.to_string(),
-                doc_type: doc_type.to_string(),
-                document: EncodedDocument::JsonLd(json!({ "boot": user.zone_config })),
-                source: DidResolutionSource::LegacyLocalDidDocument,
-            }),
+            BNS_DOC_ZONE | BNS_DOC_BOOT => {
+                let user = self.auth.get_user_info(zone_name.as_str()).await?;
+                if let Some(user) = user {
+                    let document = if doc_type == BNS_DOC_ZONE {
+                        build_legacy_zone_config_json(zone_name.as_str(), &user)
+                    } else {
+                        json!({ "boot": user.zone_config })
+                    };
+                    return Ok(DidResolution {
+                        did: did.to_string(),
+                        doc_type: doc_type.to_string(),
+                        document: EncodedDocument::JsonLd(document),
+                        source: DidResolutionSource::LegacyLocalDidDocument,
+                    });
+                }
+
+                let kind = if self.bns.resolve_owner(zone_name.as_str()).await?.is_some() {
+                    SnResolverErrorKind::DocumentNotFound
+                } else {
+                    SnResolverErrorKind::NameNotFound
+                };
+                Err(SnResolverError::new(
+                    kind,
+                    format!("BNS document {}/{} not found", zone_name, doc_type),
+                ))
+            }
             device_name => {
                 if let Ok((device_doc, compatibility_device)) = self
                     .resolve_device_mini_doc(zone_name.as_str(), device_name)
@@ -1676,6 +1678,20 @@ impl SnResolver {
                         doc_type: doc_type.to_string(),
                         document: EncodedDocument::JsonLd(device_online_info_document(&online)),
                         source: DidResolutionSource::DeviceOnlineInfo,
+                    });
+                }
+
+                if let Ok((device_doc, compatibility_device)) =
+                    self.resolve_device_mini_doc(zone_name, obj_name).await
+                {
+                    return Ok(DidResolution {
+                        did: did.to_string(),
+                        doc_type: doc_type.to_string(),
+                        document: EncodedDocument::JsonLd(device_offline_info_document(
+                            &device_doc,
+                            compatibility_device.as_ref(),
+                        )),
+                        source: DidResolutionSource::DeviceMiniDocument,
                     });
                 }
 
@@ -2076,6 +2092,32 @@ fn device_info_document_or_fallback(device: &ResolverDeviceDocument) -> Value {
                 "addresses": device.addresses,
             })
         })
+}
+
+fn device_offline_info_document(
+    device_doc: &DeviceMiniDocument,
+    compatibility_device: Option<&ResolverDeviceDocument>,
+) -> Value {
+    if let Some(compatibility_device) = compatibility_device {
+        return device_info_document_or_fallback(compatibility_device);
+    }
+
+    json!({
+        "did": device_doc.did.clone(),
+        "device_name": device_doc.device_name.clone(),
+        "owner": device_doc.zone_name.clone(),
+        "zone_name": device_doc.zone_name.clone(),
+        "mini_config_jwt": device_doc.mini_config_jwt.clone(),
+        "state": "offline",
+        "public_ips": [],
+        "private_ips": [],
+        "active_endpoints": [],
+        "preferred_endpoint": null,
+        "nat_type": "unknown",
+        "is_wan_device": false,
+        "last_seen_at": null,
+        "expires_at": null,
+    })
 }
 
 fn device_online_info_document(online: &SnDeviceStateView) -> Value {
@@ -2533,19 +2575,57 @@ fn dedup_strings(values: &mut Vec<String>) {
 mod tests {
     use super::*;
 
+    #[derive(Default)]
+    struct StaticBnsReader {
+        owners: HashMap<String, BnsOwner>,
+        documents: HashMap<(String, String), BnsDocument>,
+    }
+
+    #[async_trait]
+    impl BnsDocumentReader for StaticBnsReader {
+        async fn resolve_owner(&self, name: &str) -> SnResolverResult<Option<BnsOwner>> {
+            Ok(self.owners.get(name).cloned())
+        }
+
+        async fn get_document(
+            &self,
+            name: &str,
+            doc_type: &str,
+        ) -> SnResolverResult<Option<BnsDocument>> {
+            Ok(self
+                .documents
+                .get(&(name.to_string(), doc_type.to_string()))
+                .cloned())
+        }
+    }
+
+    fn test_resolver_with_bns(bns: StaticBnsReader) -> SnResolver {
+        SnResolver::new(
+            SnResolverConfig::new(
+                "buckyos.test",
+                "192.0.2.10".parse::<IpAddr>().unwrap(),
+                "",
+                "",
+                Vec::new(),
+            ),
+            Arc::new(EmptySnAuthReader),
+        )
+        .with_bns_reader(Arc::new(bns))
+    }
+
     #[test]
     fn legacy_web3_host_parser_matches_existing_rules() {
-        let parsed = parse_legacy_web3_host("alice.web3.buckyos.ai", "buckyos.ai").unwrap();
-        assert_eq!(parsed.sub_host, "alice");
-        assert_eq!(parsed.username, "alice");
+        let parsed = parse_legacy_web3_host("testuser.web3.buckyos.ai", "buckyos.ai").unwrap();
+        assert_eq!(parsed.sub_host, "testuser");
+        assert_eq!(parsed.username, "testuser");
 
-        let parsed = parse_legacy_web3_host("home.alice.web3.buckyos.ai", "buckyos.ai").unwrap();
-        assert_eq!(parsed.sub_host, "home.alice");
-        assert_eq!(parsed.username, "alice");
+        let parsed = parse_legacy_web3_host("home.testuser.web3.buckyos.ai", "buckyos.ai").unwrap();
+        assert_eq!(parsed.sub_host, "home.testuser");
+        assert_eq!(parsed.username, "testuser");
 
-        let parsed = parse_legacy_web3_host("www-alice.web3.buckyos.ai", "buckyos.ai").unwrap();
-        assert_eq!(parsed.sub_host, "www-alice");
-        assert_eq!(parsed.username, "alice");
+        let parsed = parse_legacy_web3_host("www-testuser.web3.buckyos.ai", "buckyos.ai").unwrap();
+        assert_eq!(parsed.sub_host, "www-testuser");
+        assert_eq!(parsed.username, "testuser");
     }
 
     #[test]
@@ -2586,14 +2666,14 @@ mod tests {
             vec!["8.8.8.8".parse::<IpAddr>().unwrap()]
         );
 
-        let value = json!({ "oods": ["ood2.alice"] });
+        let value = json!({ "oods": ["ood2.testuser"] });
         assert_eq!(find_gateway_device_name(&value).as_deref(), Some("ood2"));
     }
 
     #[test]
     fn parses_device_mini_doc_from_aggregate() {
         let doc = BnsDocument::json(
-            "alice",
+            "testuser",
             BNS_DOC_DEVICE_MINI,
             json!({
                 "devices": {
@@ -2605,9 +2685,115 @@ mod tests {
             }),
         );
 
-        let device = device_doc_from_aggregate("alice", "gw1", &doc).unwrap();
+        let device = device_doc_from_aggregate("testuser", "gw1", &doc).unwrap();
         assert_eq!(device.device_name, "gw1");
         assert_eq!(device.did, "did:dev:abc");
         assert_eq!(device.mini_config_jwt.as_deref(), Some("jwt"));
+    }
+
+    #[tokio::test]
+    async fn resolves_bns_zone_document_without_sn_user() {
+        let mut bns = StaticBnsReader::default();
+        bns.owners.insert(
+            "testuser".to_string(),
+            BnsOwner {
+                name: "testuser".to_string(),
+                effective_owner: Some("owner-key".to_string()),
+                owner_config: None,
+            },
+        );
+        bns.documents.insert(
+            ("testuser".to_string(), BNS_DOC_ZONE.to_string()),
+            BnsDocument::json(
+                "testuser",
+                BNS_DOC_ZONE,
+                json!({
+                    "gateway": { "device_name": "ood1" }
+                }),
+            ),
+        );
+        let resolver = test_resolver_with_bns(bns);
+        let did = DID::from_str("did:bns:testuser").unwrap();
+
+        let resolved = resolver
+            .resolve_did(&did, Some(BNS_DOC_ZONE), None)
+            .await
+            .unwrap();
+
+        assert_eq!(resolved.source, DidResolutionSource::BnsDocument);
+        assert_eq!(resolved.doc_type, BNS_DOC_ZONE);
+    }
+
+    #[tokio::test]
+    async fn resolves_bns_device_document_without_sn_user() {
+        let mut bns = StaticBnsReader::default();
+        bns.owners.insert(
+            "testuser".to_string(),
+            BnsOwner {
+                name: "testuser".to_string(),
+                effective_owner: Some("owner-key".to_string()),
+                owner_config: None,
+            },
+        );
+        bns.documents.insert(
+            ("testuser".to_string(), BNS_DOC_DEVICE_MINI.to_string()),
+            BnsDocument::json(
+                "testuser",
+                BNS_DOC_DEVICE_MINI,
+                json!({
+                    "devices": {
+                        "ood1": {
+                            "did": "did:dev:abc",
+                            "mini_config_jwt": "jwt"
+                        }
+                    }
+                }),
+            ),
+        );
+        let resolver = test_resolver_with_bns(bns);
+        let did = DID::from_str("did:bns:testuser").unwrap();
+
+        let resolved = resolver
+            .resolve_did(&did, Some("ood1"), None)
+            .await
+            .unwrap();
+
+        assert_eq!(resolved.source, DidResolutionSource::DeviceMiniDocument);
+        assert_eq!(resolved.doc_type, "ood1");
+    }
+
+    #[tokio::test]
+    async fn resolves_bns_device_info_as_offline_without_runtime_state() {
+        let mut bns = StaticBnsReader::default();
+        bns.documents.insert(
+            ("testuser".to_string(), BNS_DOC_DEVICE_MINI.to_string()),
+            BnsDocument::json(
+                "testuser",
+                BNS_DOC_DEVICE_MINI,
+                json!({
+                    "devices": {
+                        "ood1": {
+                            "did": "did:dev:abc",
+                            "mini_config_jwt": "jwt"
+                        }
+                    }
+                }),
+            ),
+        );
+        let resolver = test_resolver_with_bns(bns);
+        let did = DID::from_str("did:bns:ood1.testuser").unwrap();
+
+        let resolved = resolver
+            .resolve_did(&did, Some("info"), None)
+            .await
+            .unwrap();
+        let value = match resolved.document {
+            EncodedDocument::JsonLd(value) => value,
+            EncodedDocument::Jwt(_) => panic!("expected json document"),
+        };
+
+        assert_eq!(resolved.source, DidResolutionSource::DeviceMiniDocument);
+        assert_eq!(value["state"], "offline");
+        assert_eq!(value["did"], "did:dev:abc");
     }
 }

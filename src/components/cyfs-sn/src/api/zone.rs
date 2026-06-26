@@ -66,6 +66,9 @@ pub(crate) async fn handle_zone(server: &SNServer, req: RPCRequest) -> RpcCallRe
                 .into_rpc()?
                 .ok_or_else(|| parse_error(SnV2ErrorCode::UserNotFound, "user not found"))?;
             let params: BindZoneReq = parse_params(&req)?;
+            if let Some(user_domain) = params.user_domain.as_deref() {
+                ensure_verified_user_domain(server, username.as_str(), user_domain).await?;
+            }
             let mut bns_receipt = None;
             if let Some(controller) = server.bns_controller() {
                 let auth_context =
@@ -120,24 +123,6 @@ pub(crate) async fn handle_zone(server: &SNServer, req: RPCRequest) -> RpcCallRe
                     "owner public key is not bound",
                 ));
             }
-            if let Some(user_domain) = params.user_domain.as_deref() {
-                ensure_verified_user_domain(server, username.as_str(), user_domain).await?;
-            }
-            server
-                .auth_db()
-                .update_user_zone_config(username.as_str(), params.zone_config.as_str())
-                .await
-                .into_rpc()?;
-            if let Some(user_domain) = params.user_domain {
-                server
-                    .auth_db()
-                    .update_user_domain(username.as_str(), Some(user_domain))
-                    .await
-                    .into_rpc()?;
-            }
-            server
-                .maybe_assign_zone_relay(username.as_str(), None, "bind_zone")
-                .await;
             ok_response(
                 &req,
                 json!({
