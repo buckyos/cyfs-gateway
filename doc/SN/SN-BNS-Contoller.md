@@ -495,9 +495,10 @@ Resolver 依赖：
 
 当前实现差异：
 
-- `cyfs-sn` V2 `auth.register` 只写本地 `users` 和 `user_auth_v2`。
-- 新实现应在 `register_user_v2` 之前调用 `sn_bns_controller.bootstrap_name`。
-- 当前返回的 `need_bind_owner_key=true` 是兼容状态；目标流程中 owner key 应随 BNS bootstrap 一起完成。
+- 重构第一阶段已实现 BNS 写入库本身：`SnBnsController::bootstrap_name`（`src/components/bns-client/src/sn_bns_controller.rs:343`）组装 owner 文档 + authority key + controller policy，并调用 `bns-indexer` 的原子 `bootstrap_name`（`src/components/bns-indexer/src/registry.rs:296`，单 `store.transact` 事务）。
+- 但 `cyfs-sn` 至今**未接入**这个写入层：`api/auth.rs` 的 `register` 仍只调用 `register_user_v2` 写本地 `users` 和 `user_auth_v2`，是 compat-shim，**未迁移**。
+- 因此"在 `register_user_v2` 之前调用 `sn_bns_controller.bootstrap_name`"属于**阶段二**待办。
+- 当前返回的 `need_bind_owner_key=true` 仍是兼容状态；目标流程中 owner key 应随 BNS bootstrap 一起完成。
 
 ### bind zone
 
@@ -517,7 +518,9 @@ Resolver 依赖：
 
 当前实现差异：
 
-- `zone.bind_config` 目前只写 `users.zone_config`，并依赖 `users.public_key`。
+- 写入库 `SnBnsController::bind_zone_documents`（`src/components/bns-client/src/sn_bns_controller.rs:424`）已实现：owner 授权下顺序发布 `zone` 和 `boot`（用 `{request_id}:zone` / `:boot` 派生子 key）。当前是顺序发布而非单 BNS batch，符合本文允许的第一版回退。
+- 但 `cyfs-sn` 的 `api/zone.rs` 的 `bind_config` **未接入**该写入库：目前仍只调用 `update_user_zone_config` 写 `users.zone_config`（并按需 `update_user_domain`），是 compat-shim，**未迁移**（阶段二）。
+- 写入库按不透明 `Value` 透传 `zone` / `boot`，尚缺专用 schema 校验器（阶段二/三）。
 - 目标实现中 `users.zone_config` 只能作为迁移缓存或 UI fallback，权威数据来自 BNS。
 
 ### 注册设备
@@ -547,8 +550,9 @@ Resolver 依赖：
 
 当前实现差异：
 
-- `device.register` 目前校验 `mini_config_jwt` 后写本地 `devices` 表。
-- 新实现应把 `mini_config_jwt` 作为 BNS `device_mini_doc` 输入，成功后再写本地 runtime cache。
+- 写入库 `SnBnsController::publish_device_mini_doc`（`src/components/bns-client/src/sn_bns_controller.rs:468`）已实现：owner 授权下按 `device_name` 聚合 read-merge-publish（`DeviceMiniDocCollection`），校验 `did` / `device_name`，并用正确 `expected_version` 发布。
+- 但 `cyfs-sn` 的 `api/device.rs` 的 `register` **未接入**：目前仍校验 `mini_config_jwt` 后写本地 `devices` 表，是 compat-shim，**未迁移**（阶段二）。本地也尚无 `pending_bns_publish` 状态。
+- 目标实现应把 `mini_config_jwt` 作为 BNS `device_mini_doc` 输入，成功后再写本地 runtime cache。
 
 ### ACME / DNS TXT 写入
 
@@ -661,15 +665,35 @@ SN API 响应中建议包含：
 
 ## 当前实现映射
 
-### `cyfs-sn`
+> 重要现状（割裂事实）：BNS 写入层 `SnBnsController` **已实现，但物理上在 `bns-client` crate**（`src/components/bns-client/src/sn_bns_controller.rs`，约 1151 行），**不在 `cyfs-sn` 里**。`cyfs-sn` 至今只消费**只读侧**——`sn_bns_reader.rs` 的 `BnsIndexerDocumentReader` 接在 resolver 上（`src/components/cyfs-sn/src/sn_server.rs:689`），从不实例化或调用 `SnBnsController`。换言之：写入库本身基本写完并通过自身单测，但**尚未被它所服务的 SN 业务流程采用**；目前 `SnBnsController` 的唯一调用方是 `bns-client` 自己的测试（`src/components/bns-client/tests/rpc_and_controller.rs`）。
 
-当前实现中需要迁移到 `sn_bns_controller` 的写入点：
+### 写入层 `SnBnsController`（`bns-client`，已完成）
 
-- `v2/auth.rs::auth.register`: 从只写本地账号，改为先 bootstrap BNS name。
-- `v2/zone.rs::zone.bind_config`: 从写 `users.zone_config`，改为发布 BNS `zone` / `boot`，本地只缓存运行态。
-- `v2/device.rs::device.register`: 从写本地 `devices.mini_config_jwt`，改为发布 BNS `device_mini_doc` 后写本地在线态。
-- `v2/dns.rs::dns.add_record/remove_record`: BNS name 的 TXT 记录改为发布 `dns_txt`；传统 `user_domain` 记录继续走 `sn_auth`，直到 domain proof 和传统 DNS owner 机制完成。
-- `v2/did.rs::did.set_document`: 对标准 doc type 应改为 BNS `publish_document`；本地 `did_documents` 只保留兼容缓存或非权威草稿。
+第一阶段已实现并通过单测，文件 `src/components/bns-client/src/sn_bns_controller.rs`：
+
+- 原子 `bootstrap_name`（`:343`）：组装 owner 文档 + authority key + controller policy，调用 `bns-indexer` 的单事务 `bootstrap_name`（`src/components/bns-indexer/src/registry.rs:296`，`store.transact`）。
+- controller policy doc-type 限制 + 拒绝 wildcard / 高风险类型（`SnBnsControllerConfig::validate`，`:257-286`；运行期 `ensure_authority_can_publish`，`:817-857`）。默认 allowlist 为 `dns_txt` + `relay_assignment`。
+- `bind_zone_documents`（`:424`）：owner 授权下顺序发布 `zone` / `boot`（派生子 request_id）。
+- `publish_device_mini_doc`（`:468`）：按 `device_name` 聚合 read-merge-publish，校验 `did` / `device_name`。
+- `upsert_dns_txt`（`:512`）：`add` / `remove` / `replace` + 去重 + stale 有限重试。
+- `publish_owner_document`（`:398`）、`publish_relay_assignment`（`:543`）。
+- version guard：`expected_name_seq` 来自 `NameState`，`expected_version` 来自当前文档状态（`:660-715`）。
+- 幂等逻辑 `run_idempotent`（`:902-1012`）：request_id 必填、payload_hash 冲突拒绝、pending/failed/succeeded 状态机、重放 `mark_reused`。
+
+### `cyfs-sn`（写 API 全部仍是 compat-shim，未迁移，阶段二）
+
+下列写入点目标是迁移到 `SnBnsController`，但目前**全部仍只写本地 SQLite**，未接入写入层：
+
+- `api/auth.rs::register`: 仍只 `register_user_v2` 写本地 `users` / `user_auth_v2`，返回 `need_bind_owner_key=true`；尚未调用 `bootstrap_name`。
+- `api/zone.rs::bind_config`: 仍只写 `users.zone_config`（按需 `update_user_domain`）；尚未发布 BNS `zone` / `boot`。
+- `api/device.rs::register`: 仍校验 `mini_config_jwt` 后写本地 `devices` 表；尚未发布 BNS `device_mini_doc`，本地也无 `pending_bns_publish` 状态。
+- `api/dns.rs::add_record/remove_record`: 仍只写本地 `user_dns_records`（compat store）；尚未发布 BNS `dns_txt`。传统 `user_domain` 记录本就继续走 `sn_auth`。
+- `api/did.rs::set_document`: 仍只写本地 `did_documents` 表，是纯 compat 缓存；尚未对标准 doc type 改为 BNS `publish_document`。
+
+`cyfs-sn` 侧其它已知缺口：
+
+- 没有 `sn_authority` → `CallAuthority` 的桥接；写入库把 `CallAuthority` 当作已构造好的入参。
+- 文档错误映射表（`CONTROLLER_SCOPE_DENIED` / `NOT_EFFECTIVE_OWNER` 等 → SN API code，见上文"错误映射"）在 `cyfs-sn` 中**不存在**，因为根本没有调用 controller。
 
 ### `bns-indexer`
 
@@ -684,24 +708,34 @@ SN API 响应中建议包含：
 - `CallAuthority`
 - `ControllerRule::permits`
 
-当前缺口：
+已补齐的能力：
 
-- 注册时缺少 authority key + controller policy 的原子 bootstrap。
+- 注册时 authority key + controller policy 的原子 bootstrap（`bootstrap_name`，`src/components/bns-indexer/src/registry.rs:296`）。
+- `dns_document` 的删除 / replace RRset 已由 `SnBnsController::upsert_dns_txt` 在 SN 侧解析后构造完整 update 实现。
+
+仍存在的缺口：
+
 - `constraint_hash` 尚未执行约束校验，SN 侧必须自己校验。
-- `dns_document` 只有 add helper，删除 / replace RRset 需要补 helper 或在 SN 侧解析后构造完整 update。
-- 文档 schema helper 还只有 `dns_txt`，`zone`、`boot`、`device_mini_doc` 需要补 canonical encoder / validator。
+- 文档 schema helper 还只有 `dns_txt`；`zone`、`boot`、`device_mini_doc` 仍按不透明 `Value` 透传，缺 canonical encoder / validator。
 
 ## 第一版落地步骤
 
-1. 在 `bns-indexer` 增加 bootstrap/batch 接口，保证注册、初始文档、authority key、controller policy 原子提交。
-2. 新建 `sn_bns_controller` 模块，封装 registry client、幂等表、错误映射和版本重试。
-3. 增加 `zone`、`boot`、`device_mini_doc`、`dns_txt` 文档 schema helper。
-4. 在 `auth.register` 中接入 `bootstrap_name`。
-5. 在 `zone.bind_config` 中接入 `bind_zone_documents`。
-6. 在 `device.register` 中接入 `publish_device_mini_doc`，并把本地设备记录降级为 runtime cache。
-7. 在 ACME / DNS TXT 流程中接入 `upsert_dns_txt`。
-8. 给 SN controller policy 加固定 allowlist，禁止 wildcard controller。
-9. 增加 admin / repair 命令，用于修复 BNS 已成功但本地 DB 未完成的注册。
+已完成（阶段一）：
+
+1. ✅ 在 `bns-indexer` 增加原子 bootstrap 接口，保证注册、初始文档、authority key、controller policy 单事务提交（`registry.rs:296`）。
+2. ✅ 实现 `SnBnsController` 模块（落在 `bns-client`），封装 registry client、幂等逻辑、错误码透传和版本重试（`sn_bns_controller.rs`）。
+3. 🟡 `dns_txt` 文档 schema helper 已具备；`zone`、`boot`、`device_mini_doc` 仍缺专用 canonical encoder / validator。
+8. ✅ SN controller policy 已加固定 allowlist 并禁止 wildcard controller（`validate:257-286`）。
+
+待完成（阶段二 / 三）：
+
+4. ⬜ 在 `cyfs-sn::api/auth.rs::register` 中接入 `bootstrap_name`。
+5. ⬜ 在 `cyfs-sn::api/zone.rs::bind_config` 中接入 `bind_zone_documents`。
+6. ⬜ 在 `cyfs-sn::api/device.rs::register` 中接入 `publish_device_mini_doc`，并把本地设备记录降级为 runtime cache。
+7. ⬜ 在 ACME / DNS TXT 流程中接入 `upsert_dns_txt`。
+9. ⬜ 增加 admin / repair 命令，用于修复 BNS 已成功但本地 DB 未完成的注册（依赖基于 BNS 状态的恢复路径）。
+10. ⬜ 把幂等存储从 `MemorySnBnsWriteRequestStore`（内存，重启即失）替换为持久化 `sn_bns_write_requests` 表，并实现基于 BNS 状态的恢复。
+11. ⬜ 增加 `sn_authority` → `CallAuthority` 桥接，以及在 `cyfs-sn` 侧落地文档错误映射表（BNS error code → SN API code）。
 
 ## 测试要求
 

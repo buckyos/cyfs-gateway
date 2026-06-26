@@ -578,3 +578,41 @@ relay 相关模块可以读取 `device_state_view` 和 endpoint。
 - `expire_devices` 可以由 SN API Server 定时触发，也可以由独立服务内部定时触发。
 - 状态事件表应有保留策略，避免无限增长。
 - 关键指标应包括写入 QPS、查询 QPS、SQLite 错误数、过期设备数、stale report 拒绝数、远程调用延迟。
+
+## 当前实现状态（阶段一）
+
+本节只记录当前实现现状，不修改上文的目标设计。重构第一阶段已落地进程内（local）组件，remote 模式和部分运维要求留待阶段二。
+
+### 已完成
+
+- ✅ `sn_device_info` 组件已实现为进程内 SQLite 状态管理组件（`src/components/cyfs-sn/src/sn_device_info.rs:328`，trait `SnDeviceInfoDB` 定义于 `:292`）。
+- ✅ 四张表 schema 与本文逐字段对齐：
+  - `device_indexes`（`sn_device_info.rs:402`）
+  - `device_runtime_states`（`sn_device_info.rs:419`）
+  - `device_endpoints`（`sn_device_info.rs:448`）
+  - `device_state_events`（`sn_device_info.rs:474`）
+  - 四个索引也按本文创建（`sn_device_info.rs:492-534`）。
+- ✅ 11 个状态管理接口方法语义完整：
+  - `upsert_device_index`（`sn_device_info.rs:1236`，含 `(zone,device_name)` 变化时返回 `Conflict`、要求显式 rebind）
+  - `rebind_device_index`（`sn_device_info.rs:1335`，NotFound/Conflict 校验、保留 runtime/endpoint、记录 `rebound`）
+  - `remove_device_index`（`sn_device_info.rs:1412`，删除 runtime/endpoint/index，保留事件）
+  - `update_device_state`（`sn_device_info.rs:1459`，含 blocked 拒绝 + `report_rejected`、stale-seq 拒绝 + `StaleReport`、wan/lan 分类、`expires_at = now + ttl`、endpoint upsert、`online`/`endpoint_changed` 事件）
+  - `get_device_state` / `get_device_state_by_name`（`sn_device_info.rs:1713` / `:1726`，过期时先落库为 `stale` 再返回视图）
+  - `list_zone_devices`（`sn_device_info.rs:1741`，支持 state 过滤与分页）
+  - `mark_device_offline`（`sn_device_info.rs:1771`）
+  - `block_device` / `unblock_device`（`sn_device_info.rs:1781` / `:1791`）
+  - `expire_devices`（`sn_device_info.rs:1823`，过期 `online` → `stale`，含批量大小）
+- ✅ `device_state_view` 已接入上游读侧：
+  - resolver 经 `SnDeviceInfoResolverReader` 读取（`src/components/cyfs-sn/src/sn_resolver.rs:597`）。
+  - relay 经 `relay_mgr` 读取（`src/components/cyfs-sn/src/relay_mgr.rs:681`）。
+- ✅ IP 与 endpoint 规则已实现：公网 IP 过滤（`is_public_ipv4`/`is_public_ipv6`，`sn_device_info.rs:639` / `:667`）、wan/lan 分类（`classify_ips`，`sn_device_info.rs:710`）、endpoint 优先级排序（`endpoint_sort_key`，`sn_device_info.rs:799`，public < relay < private < loopback < unknown，再按 priority）。
+- ✅ 与 BNS 解耦正确：组件内不做 BNS/mini_doc 校验；mini_config_jwt 解码与 DID 一致性校验在调用方侧（`src/components/cyfs-sn/src/api/device.rs:27-39`）。
+- ✅ 错误类型基本对齐（`SnErrorCode`，`src/components/cyfs-sn/src/lib.rs:26`）：`InvalidInput`、`NotFound`、`Conflict`、`StaleReport`、`Blocked`、`RemoteError` 均已定义；本文的 `StorageError` 当前以 `DBError` 表示。
+
+### 待实现（阶段二）
+
+- ❌ remote 独立服务模式与健康检查完全未实现：仅有 `open_local`（`sn_device_info.rs:362`）；`RemoteError` 已定义但未使用，没有 remote client、监听端口或健康检查接口。
+- 🟡 生产调用方未完整驱动组件能力：`sync_device_online_state`（`src/components/cyfs-sn/src/sn_server.rs:775-824`）始终传 `from_ip = None`、`nat_type = Unknown`、`report_seq = None`，导致已实现的 from_ip/NAT 检测与 stale-report 拒绝机制在真实上报路径中空转；`device_role` 仍是 `device_name == "ood1"` 的硬编码判断（`sn_server.rs:783`，从不赋 `gateway`），`ttl` 硬编码 300，endpoint `scope` 恒为 `Public`。
+- 🟡 API 读路径尚未迁移：旧 `devices` 表（`src/components/cyfs-sn/src/sqlite_db.rs:70`，`register_device` `:926`）仍是 `device.get` / `device.list` / `query_by_did` 的权威来源（`api/device.rs:69-111`）；新组件目前仅 resolver/relay 读取，写入由 server 并行双写。
+- ❌ 状态事件表无保留策略：`device_state_events` 只插入、从不清理。
+- ❌ 无运维指标、健康检查与远程调用超时（remote 模式缺失时后者暂不适用）。

@@ -5,7 +5,9 @@
 - `sn_relay_manager`: Relay 控制面，负责 zone -> relay 的分配、relay 节点健康、准入、迁移和手工调度。
 - `sn_relay`: 部署在边缘的 Relay 数据面节点，负责设备 `keep_tunnel`、HTTP/HTTPS 转发和 RTCP 转发。
 
-当本文和当前实现冲突时，以 `doc/SN/新SN核心流程整理.md` 中的设计意图为准；当前 `cyfs-sn` 实现只作为字段、兼容接口和迁移状态参考。当前实现还没有独立的 `sn_relay_manager` 和 `sn_relay` 模块，已有能力主要散落在 `SNServer` 的设备注册、hostname/DID 查询、`self_cert`、`sn_ips` 和旧 `zone_config` 逻辑中。
+当本文和当前实现冲突时，以 `doc/SN/新SN核心流程整理.md` 中的设计意图为准；当前 `cyfs-sn` 实现只作为字段、兼容接口和迁移状态参考。
+
+重构第一阶段已完成：`sn_relay_manager` 控制面已抽成独立模块 `src/components/cyfs-sn/src/relay_mgr.rs`（`SnRelayManager` trait + `SqliteSnRelayManager` 实现），不再散落在 `SNServer` 内。控制面的节点注册、心跳、zone -> relay 分配、准入决策、迁移窗口和 `zone_info.relay_sn` 回写都已实现并有单元测试。仍缺的是数据面 `sn_relay` 节点模块，以及把控制面接入实时准入和转发路径；HTTP/HTTPS、`self_cert`、`sn_ips`、旧 `zone_config` 等兼容逻辑仍部分留在 `SNServer` 内。详见末尾 `## 当前实现状态`。
 
 ## 设计定位
 
@@ -568,22 +570,39 @@ CREATE INDEX IF NOT EXISTS idx_relay_admission_events_zone_time
 
 ## 迁移建议
 
-1. 在 `cyfs-sn` 内新增 `sn_relay_manager` trait 和 SQLite 实现，先只支持节点表、assignment 表和 `get/check` 能力。
-2. 把 `users.sn_ips` 作为兼容输入迁移到 `relay_assignment` 或 `zone_info.relay_sn`，新写入停止使用 `sn_ips` 表达 relay。
-3. 在 `sn_auth.zone_info` 中明确加入 `relay_sn` 字段，并只允许 `sn_relay_manager` 更新。
-4. 把 `query_device_by_hostname_v2` 固定 `ood1` 的逻辑迁移到 `sn_resolver`，由 BNS `zone` / `boot` 决定 gateway device。
-5. 把设备在线态从旧 `devices.ip` / `description` 逐步迁移到 `sn_device_info`，供 relay 转发和 resolver 查询。
-6. 第一版 `sn_relay` 可复用 `cyfs-gateway-lib` 的 RTCP stack，通过内部 API 调用 `sn_relay_manager.check_relay_admission`。
-7. 增加 SN Admin 手工调整 relay assignment 的接口和审计。
-8. 再实现 relay heartbeat、drain、迁移窗口和故障切换。
+1. ✅ 已完成：在 `cyfs-sn` 内新增 `sn_relay_manager` trait 和 SQLite 实现，支持节点表、assignment 表、admission 事件表和 `get/check` 能力（`relay_mgr.rs`）。
+2. 🟡 部分完成：relay 表达已迁移到 `relay_assignments` + `zone_info.relay_sn`，新写入不再用 `sn_ips` 表达 relay；旧 `sn_ips` 兼容输入回填尚未实现。
+3. ✅ 已完成：`sn_auth.zone_info` 已有 `relay_sn` 字段，并由 `sn_relay_manager.sync_zone_relay_cache` 回写（`relay_mgr.rs:666-678`）。
+4. 🟡 部分完成：`query_device_by_hostname_v2` 已优先走 `sn_resolver.resolve_gateway_by_hostname`，`ood1` 降级为兜底默认（`sn_server.rs:2586-2603`，兜底分支 `:2620`）；尚未彻底移除硬编码兜底（`sn_server.rs:1862` 仍有 TODO）。
+5. 🟡 部分完成：设备在线态已部分迁移到 `sn_device_info`，但旧 `devices.ip` / `description` 仍在，relay 所需的完整 reachability view 未成形。
+6. ⛔ 待实现（阶段二）：数据面 `sn_relay` 节点尚不存在；`check_relay_admission` 已实现但**零调用方**，未通过内部 API 接入任何实时准入路径。
+7. 🟡 部分完成：`assign_zone_relay(source=Admin)` 与 `start_relay_migration` 支持手工调整，但缺独立 admin 鉴权与 assignment/migration 审计事件（仅 admission 有审计）。
+8. 🟡 部分完成：heartbeat、drain、迁移窗口已实现（`relay_mgr.rs`）；心跳超时检测和故障切换自动化尚未实现。
 
-## 当前实现缺口
+## 当前实现状态
 
-- 没有独立 `sn_relay_manager`。
-- 没有 relay 节点注册、heartbeat、健康和负载模型。
-- 没有 zone -> relay assignment 表。
-- 没有 `keep_tunnel` 准入接口。
-- 没有 assignment generation、迁移窗口和 redirect 语义。
-- `query_device_by_hostname_v2` 仍固定选择 `ood1`。
-- `sn_ips` 语义偏旧，不能表达 relay 节点、assignment generation、迁移和健康状态。
-- 设备在线态仍主要存在旧 `devices` 表和新的简化 `sn_device_info` 表中，尚未形成 relay 所需的完整 reachability view。
+### 第一阶段已完成（控制面）
+
+- 独立的 `sn_relay_manager` 控制面模块 `relay_mgr.rs`：`SnRelayManager` trait（`:290-302`）+ `SqliteSnRelayManager` 实现。
+- `relay_nodes` / `relay_assignments` / `relay_admission_events` 三张表与 doc 目标 schema 对齐（建表 `:366-446`）。
+- 节点注册与心跳：`register_relay_node`（`:1050-1122`）、`heartbeat_relay_node`（`:1124-1190`）。
+- zone -> relay 分配：`assign_zone_relay`（`:1192-1250`）+ `choose_relay_node` 评分（region 命中 → 负载/容量比 → capacity，`:548-557`）与 sticky 复用（`:532-546`）；首次 keep_tunnel 自动建分配（`:713-740`）。
+- `keep_tunnel` 准入决策 `check_relay_admission`（`:1263-1396`）：allow / reject / redirect，错误 relay 返回 `expected_relay_sn` 和 `generation`，draining / suspended / stale-generation / device-binding 等分支齐全，并写 admission 审计事件。
+- 迁移窗口：`start_relay_migration`（`:1398-1450`）+ `complete_relay_migration`（`:1452-1455`），含 generation 单调递增、`migrated_from`、默认 300s 迁移窗口。
+- `sync_zone_relay_cache` 回写 `zone_info.relay_sn`（`:666-678`）。
+- 查询能力：`get_zone_relay`、`list_zone_relays_by_node`、`zone_belongs_to_relay`（`:1252-1261`、`:473-490`、`:492-501`）。
+- resolver 集成：`SnRelayManagerResolverReader` 让 `sn_resolver` 读取当前 `relay_sn`（`sn_resolver.rs:644-661`，装配于 `sn_server.rs:681`）。
+- 以上控制面能力均有单元测试（`relay_mgr.rs` 末尾 `mod tests`）。
+
+### 待实现（阶段二 / 三）
+
+- `check_relay_admission` 目前是**孤儿 API**，除自身和测试外**零调用方**，未接入任何实时准入路径。
+- **没有数据面 `sn_relay` 节点模块**；没有咨询 manager 的 HTTP/HTTPS / RTCP 转发，无跨 zone 准入执行，无 80/443 端口选择落地。
+- admission 内**无 token / `sn_authority` 校验**（`auth_context` 被接收但未验证，`TokenInvalid` 永不返回）；设备绑定校验仅查 DB。
+- **无心跳超时检测与故障切换自动化**：`Unhealthy` 仅靠下一次心跳翻回 `Active`，无后台扫描，`RelayAssignmentSource::Recovery` 从不产生。
+- register / bind zone / `update_ood_info` 流程**不触发**自动分配；`lease_expires_at` 被存储但从不评估与重分配。
+- `from_ip` 地理分配**被接收但未使用**，`choose_relay_node` 仅用显式 `region`，未用 ISP / tags 评分。
+- 迁移 / admin 操作**无审计事件**（`operator` 被接收但丢弃），且手工调整缺独立 admin 鉴权。
+- **无 `relay.*` API gateway 入口**，控制面目前只能进程内调用。
+- `query_device_by_hostname_v2` 的 `ood1` 兜底尚未彻底移除（`sn_server.rs:1862` TODO）。
+- 设备在线态仍并存于旧 `devices` 表与简化 `sn_device_info` 表，尚未形成 relay 所需的完整 reachability view。

@@ -56,8 +56,10 @@ SN Auth 的核心权限边界是：
 
 当前实现映射：
 
-- `src/components/cyfs-sn/src/sn_auth.rs` 和 `sqlite_db.rs` 的 `users` 表保存 `username`、`state`、`public_key`、`activation_code`、`zone_config`、`self_cert`、`user_domain`、`sn_ips`。
+- `src/components/cyfs-sn/src/sn_auth.rs:294-308` 的 `users` 表已含全部目标字段：`username`、`state`、`bns_name`、`public_key`、`activation_code`、`owner_key_ref`、`zone_config`、`self_cert`、`user_domain`、`sn_ips`、`created_at`、`updated_at`、`last_login_at`。
+- `state` 枚举（active/suspended/deleted/banned）已建模（sn_auth.rs:21-53）。
 - `public_key` 当前存 JWK 字符串，未来应视为本地缓存，不作为 BNS authority 的最终来源。
+- 待实现（阶段二）：`owner_key_ref` 列虽已建，但所有 insert 路径都置 NULL，从不写入（sn_auth.rs:1041、1206）；`public_key` 仍是事实上的 owner key 来源。
 
 ### password_credential
 
@@ -73,12 +75,12 @@ SN Auth 的核心权限边界是：
 - `updated_at`
 - `last_login_at`
 
-当前实现：
+当前实现（阶段一已完成）：
 
-- `user_auth_v2` 表保存上述字段。
-- V2 使用 `pbkdf2-sha256-100000`，salt 为 16 字节随机值，hash 为 32 字节结果的 hex。
+- `user_auth_v2` 表保存上述全部字段（sn_auth.rs:316-324）。
+- V2 使用 `pbkdf2-sha256-100000`，salt 为 16 字节随机值，hash 为 32 字节结果的 hex（sn_v2_auth.rs:16-17、97-101、195-210）。
 
-服务端不得存储明文密码。RPC 参数名里历史上使用 `pwd_hash`，但当前 V2 实际会把该值再次 PBKDF2 后保存；后续接口命名应澄清为 `password` 或明确客户端预哈希语义，避免“双 hash”语义不清。
+服务端不得存储明文密码。RPC 参数名里历史上使用 `pwd_hash`，但当前 V2 实际会把该值再次 PBKDF2 后保存（register/login 直接把 `pwd_hash` 喂给 `hash_password`/`verify_password`，auth.rs:71、116）；后续接口命名应澄清为 `password` 或明确客户端预哈希语义，避免“双 hash”语义不清。
 
 ### account_session
 
@@ -94,10 +96,11 @@ SN 登录态是 `SnUser(username)` 的证明。
 
 当前实现：
 
-- `SnV2AuthManager` 使用 Ed25519 key 签发 JWT。
+- `SnV2AuthManager` 使用 Ed25519 key 签发 JWT，`sub`=username、`aud`=`sn-v2`/`sn-v2-refresh`、`exp`（sn_v2_auth.rs:12-15、70-94、146-176）。
 - access token 默认 1 小时，refresh token 默认 24 小时。
 - token key 存在 `sn_v2_token_key/private_key.pem` 和 `public_key.json`。
-- `auth.logout` 目前是空操作，没有服务端撤销表。
+- 阶段一已完成：`account_sessions` 撤销表已建（sn_auth.rs:383-402），`create_account_session`/`revoke_account_session`/`revoke_user_sessions`/`get_account_session` 方法已实现（sn_auth.rs:2043-2136），`set_user_state` 置非 active 时自动撤销该用户 session（sn_auth.rs:1378-1380）。
+- 待实现（阶段二）：token 不含 `kid` 和 `session_id`/`jti`；签发路径（`build_auth_success_response`，auth.rs:12-29）从不调用 `create_account_session`，校验路径（sn_v2_auth.rs:88-94、178-193）也从不检查 session 状态，因此撤销表目前是“建好但未接线”的死代码；`auth.logout` 仍是空操作（auth.rs:148）。
 
 ### user_domain
 
@@ -115,18 +118,19 @@ SN 登录态是 `SnUser(username)` 的证明。
 
 PKX 是 `user_domain` 唯一的证明方法。它不是一次性随机挑战，也不需要 nonce 或过期时间。用户参与一次，在传统 DNS 中写入稳定的 PKX 记录；SN 后续接管该域名 DNS 基础设施后，也继续写入同一个 PKX，因此绑定证明不会因为挑战记录切换带来解析抖动。
 
-当前实现映射：
+当前实现映射（阶段一已完成）：
 
-- `users.user_domain` 保存当前绑定域名。
-- `user_domain_history` 保存历史绑定，用于冲突检查。
-- `canonical_user_domain` 会去掉 `*.` 前缀、小写、去尾点。
-- 冲突检查会阻止同一域名、祖先域名、子域名被不同用户历史绑定。
+- 已新增独立 `user_domain_bindings` 表，含 `domain`、`owner`、`state`、`pkx`、`pkx_record_name`、`verified_at`、`created_at`、`updated_at`，state 取值 `pending_pkx | active | revoked`（sn_auth.rs:342-355、13-15）。
+- `users.user_domain` 仍保存当前绑定域名（作兼容缓存）。
+- `user_domain_history` 保存历史绑定，用于冲突检查（sn_auth.rs:331-339）。
+- `canonical_user_domain` 会去掉 `*.` 前缀、小写、去尾点（sn_auth.rs:443-455）。
+- 冲突检查会阻止同一域名、祖先域名、子域名被不同用户历史绑定（sn_auth.rs:695-757）。
+- `pending_pkx` 状态已持久化；PKX 计算与 TXT 比对的 DB 层逻辑已实现（`pkx_record_name`/`pkx_value`/`txt_matches_pkx`，sn_auth.rs:457-473；`create_pkx_binding`/`verify_pkx_binding`，sn_auth.rs:1616-1840）。
 
-当前缺口：
+待实现（阶段二）：
 
-- 还没有持久化 `pending_pkx` 状态。
-- 还没有实现 PKX TXT 校验。
-- 还没有把 `PKX(sn_user.pkx)` 作为 `user_domain` 绑定的唯一证明项验证。
+- PKX proof 仅在 DB 层实现，`create_pkx_binding`/`verify_pkx_binding` 没有任何 RPC handler 调用，`verify_pkx_binding` 的 `txt_records` 参数也没有 DNS TXT 查询接线，端到端不可达。
+- `PKX(sn_user.pkx)` 的输入仍来自本地 `users.public_key`（或未写入的 `owner_key_ref`），尚未对接 BNS owner_config / authority key。
 
 ### zone_info
 
@@ -143,11 +147,12 @@ PKX 是 `user_domain` 唯一的证明方法。它不是一次性随机挑战，�
 - `source_version`: 从 BNS `zone`/`boot` 更新缓存时使用的版本信息。
 - `updated_at`
 
-当前实现映射：
+当前实现映射（阶段一已完成）：
 
-- `users.self_cert` 对应 `zone_info.self_cert`。
-- `users.sn_ips` 对应旧的 relay/SN IP 配置缓存。
-- `users.zone_config` 当前保存旧 `zone_config`/boot JWT。目标架构中，`zone` 和 `boot` 应进入 BNS 文档，`sn_auth` 只保存必要运行态缓存。
+- 已新增独立 `zone_info` 表，含全部目标字段 `username`、`bns_name`、`zone`、`relay_sn`、`self_cert`、`cert_checked_at`、`cert_expires_at`、`sn_ips`、`source_version`、`updated_at`（sn_auth.rs:365-380）。
+- `get_zone_info`/`update_zone_info`（patch 语义）与从 `users` 回填的 backfill 已实现（sn_auth.rs:1883-2014、548-600）。
+- 兼容期 `update_zone_info` 仍会把 `zone`/`self_cert`/`sn_ips` 双写回 `users` 表（sn_auth.rs:1993-2008）。
+- `users.zone_config` 当前仍保存旧 `zone_config`/boot JWT。目标架构中，`zone` 和 `boot` 应进入 BNS 文档，`sn_auth` 只保存必要运行态缓存。
 
 ## 数据归属
 
@@ -199,9 +204,8 @@ PKX 是 `user_domain` 唯一的证明方法。它不是一次性随机挑战，�
 
 当前实现：
 
-- `register_user_v2` 已经用事务完成 `users`、`user_auth_v2`、`activation_codes.used` 的一致写入。
-- 当前 V2 `auth.register` 只写本地 DB，没有调用 `sn_bns_controller`。
-- 当前返回 token 并提示 `need_bind_owner_key=true`。
+- 阶段一已完成：`register_user_v2` 在命名锁下用事务完成 `users`、`user_auth_v2`、`zone_info`、`activation_codes.used` 的一致写入（sn_auth.rs:989-1091），返回 access+refresh token 并提示 `need_bind_owner_key=true`（auth.rs:89）。
+- 待实现（阶段二）：V2 `auth.register` 只写本地 DB，没有调用 `sn_bns_controller` / `bns-indexer.register`（`bns_indexer_url` 只接入了 resolver 读路径，sn_server.rs:688-693），没有 `request_id` 幂等 key，也没有“BNS name 已存在但本地未完成”的恢复流程。
 
 ### public key 注册
 
@@ -232,11 +236,10 @@ PKX 是 `user_domain` 唯一的证明方法。它不是一次性随机挑战，�
 6. 签发 access token 和 refresh token。
 7. 返回 `need_bind_owner_key`、profile 摘要和必要的 BNS name 状态。
 
-当前实现差异：
+当前实现：
 
-- V2 `auth.login` 仍要求 `active_code`，并校验它等于用户注册时的激活码。
-- 设计上 `active_code` 应主要用于注册、测试清理或特定恢复流程；普通登录不应长期依赖激活码。
-- `auth.logout` 当前没有撤销 token。目标实现应支持基于 `session_id`/`jti` 的撤销，至少能撤销 refresh token。
+- 阶段一已完成：V2 `auth.login` 不再依赖 `active_code`。`LoginReq.active_code` 已改为可选且 login 分支从不读取它，只做用户 active 校验 + 密码校验 + 更新 `last_login_at`（auth.rs:91-133，common.rs:39-45）。`need_bind_owner_key` 由 `public_key` 是否为空推导。
+- 待实现（阶段二）：`auth.logout` 仍未撤销 token；撤销表已建但签发/校验路径未接线（见 account_session 小节）。目标实现应支持基于 `session_id`/`jti` 的撤销，至少能撤销 refresh token。
 
 ## owner key 绑定
 
@@ -269,10 +272,11 @@ PKX 是 `user_domain` 唯一的证明方法。它不是一次性随机挑战，�
 
 `sn_auth` 在该流程中只负责最后一步的本地运行态缓存更新，不负责判断 BNS owner 权限，也不直接发布 BNS 文档。
 
-当前实现差异：
+当前实现差异（待实现项归阶段二）：
 
-- V2 `zone.bind_config` 要求 SN access token 和本地 `public_key` 已绑定，然后直接更新 `users.zone_config`。
-- 旧 `bind_zone_config` 使用 owner public key 验证 RPCSessionToken，但校验仍偏简化。
+- V2 `zone.bind_config` 要求 SN access token 和本地 `public_key` 已绑定，然后直接更新 zone_info/`users.zone_config`（zone.rs:31-53）。这里的“owner”只是本地 `public_key`，不是 BNS authority。
+- 旧 `bind_zone_config` 使用 owner public key 验证 RPCSessionToken（sn_server.rs:1114-1132 等），但校验仍偏简化。
+- 绕过风险（阶段二待修）：`zone.bind_config` 仍可同时写 `user_domain` 且不强制 PKX proof，`update_user_domain` 直接把 binding 置 `active`（zone.rs:46-52，sn_auth.rs:1418-1519）；`register_user_with_owner_key` 同样无证明就插入 `active` binding（sn_auth.rs:1240-1263）。
 - 当前没有发布 BNS `zone` / `boot` 文档。
 - 当前 `zone_config` 字段应视为历史 boot JWT 字段，目标上应由 BNS 权威文档替代。
 
@@ -323,10 +327,17 @@ PKX 记录是稳定状态，不是临时验证状态。SN 接管 DNS 基础设�
 
 ### 当前实现差异
 
-- `update_user_domain` 已有全局锁和历史冲突检查。
+阶段一已完成：
+
+- `update_user_domain` 已有全局锁和历史冲突检查（sn_auth.rs:1418-1519）。
 - `user_domain_history` 已记录 canonical domain 和 owner。
-- 还没有 `pending_pkx` 表和 PKX TXT 校验。
-- V2 `zone.bind_config` 可以同时写 `user_domain`，目前未强制 proof。
+- `pending_pkx` 状态与 PKX TXT 校验的 DB 层逻辑已实现：`create_pkx_binding` 写 `pending_pkx`、`verify_pkx_binding` 比对 TXT 后置 `active`、`unbind_user_domain` 置 `revoked`（sn_auth.rs:1616-1881）。
+- `get_user_by_domain` 已按 active binding 最长匹配 + legacy `users.user_domain` 回退查询 owner（sn_auth.rs:1327-1367）。
+
+待实现（阶段二）：
+
+- PKX proof 没有 RPC handler，也没有 DNS TXT 查询接线，端到端不可达。
+- V2 `zone.bind_config` 与 `register_user_with_owner_key` 仍可不经 proof 把 `user_domain` 置 active（绕过风险，见 bind zone 小节）。
 
 ## user DNS records
 
@@ -366,11 +377,11 @@ PKX 记录是稳定状态，不是临时验证状态。SN 接管 DNS 基础设�
 - device 上报 `self_cert` 时，必须由 `sn_authority` 校验 device token，得到 `Device(zone, device_name, did)`。
 - `relay_sn` 应由 `sn_relay_manager` 写入，用户 session token 不能直接设置。
 
-当前实现差异：
+当前实现：
 
-- `user.set_self_cert` V2 使用 access token 即可更新 `self_cert`。
-- 旧 `set_user_self_cert` 支持 device-signed token，并校验 token subject 对应设备名。
-- `dns.add_record` / `dns.remove_record` 在 `has_cert=true` 时会把 `self_cert` 置 true。
+- 阶段一已完成：`update_zone_info` 提供 patch 写入，`update_user_self_cert` 走该统一入口（sn_auth.rs:1407-1416、1916-2014）。
+- 待实现（阶段二，绕过风险）：`user.set_self_cert` V2 用裸 access token 即可把 `self_cert` 置 true（user.rs:59-67），`dns.add_record` / `dns.remove_record` 在 `has_cert=true` 时同样置 true（dns.rs:88-93、121-127），均无证书校验或可信 device 证明。
+- 旧 `set_user_self_cert` 支持 device-signed token，会按 (user, device_name) 解析设备并用设备 DID 的 ed25519 key 校验 token 签名（sn_server.rs:2209-2232），但只产生本地效果，不产生 `Device(zone,device,did)` 上下文。
 - 目标实现应把这些入口收敛到 `sn_authority + update_zone_info`，并记录审计事件。
 
 ## Admin 能力
@@ -384,12 +395,12 @@ PKX 记录是稳定状态，不是临时验证状态。SN 接管 DNS 基础设�
 - 禁用或回收激活码。
 - 审计激活码发放和使用。
 
-当前实现：
+当前实现（阶段一已完成）：
 
-- `sn_auth.rs` 生成 32 位字母数字激活码。
-- `check_active_code` 判断 code 存在且未使用。
-- `register_user_v2` 成功后标记 `used=1`。
-- `clear_state_by_active_code` 可删除该激活码关联用户、设备、DNS 记录、DID 文档并重置激活码。
+- `sn_auth.rs` 生成 32 位字母数字激活码（sn_auth.rs:417-425、857-883）。
+- `check_active_code` 判断 code 存在且未使用（sn_auth.rs:885-893）。
+- `register_user_v2` 成功后在事务内标记 `used=1`（sn_auth.rs:1080）。
+- `clear_state_by_active_code` 可事务化删除该激活码关联用户、设备、DNS 记录、DID 文档、session、binding、zone_info 并重置激活码（sn_auth.rs:895-987）。
 
 `clear_state_by_active_code` 更像测试/运维清理接口，不应作为普通产品能力暴露给终端用户。
 
@@ -404,6 +415,8 @@ PKX 记录是稳定状态，不是临时验证状态。SN 接管 DNS 基础设�
 - session 撤销。
 
 这些能力只影响 SN 登录能力，不影响 BNS owner 权限。
+
+当前实现状态：阶段一仅实现账号冻结/解冻（`set_user_state`，sn_auth.rs:1369-1382，并在置非 active 时触发 session 撤销）。待实现（阶段二）：change password、password reset、登录失败次数/限流/风控均缺失；session 撤销表已建但未接线（见 account_session 小节）。
 
 ## 对外查询
 
@@ -464,46 +477,56 @@ RPC 层可以使用 breaking API，不要求保留旧 method alias。内部不�
 
 ## 当前实现对照
 
+### 阶段一已完成（数据层 / 状态机重写）
+
 `src/components/cyfs-sn/src/sn_auth.rs` 已实现：
 
-- `SnAuthDB` trait。
-- SQLite 初始化 `activation_codes`、`users`、`user_auth_v2`。
-- 32 位随机激活码生成。
-- 激活码查询和写入。
-- `register_user_v2` 事务化注册。
-- `create_v2_auth`。
-- `get_user_info`。
-- `get_v2_auth`。
-- `update_v2_last_login`。
-- `clear_state_by_active_code`，包含可选清理旧 `devices`、`user_dns_records`、`did_documents`。
+- `SnAuthDB` trait（sn_auth.rs:144-247）。
+- SQLite 初始化 `activation_codes`、`users`、`user_auth_v2`、`user_domain_history`、`user_domain_bindings`、`zone_info`、`account_sessions`（sn_auth.rs:282-408）。
+- 32 位随机激活码生成、查询、写入（sn_auth.rs:417-425、835-893）。
+- `register_user_v2` 事务化注册（含 zone_info 写入与激活码标记，sn_auth.rs:989-1091）。
+- `create_v2_auth`、`get_user_info`、`get_user_by_domain`、`get_v2_auth`、`update_v2_last_login`、`set_user_state`。
+- PKX 状态机 DB 层：`create_pkx_binding`/`verify_pkx_binding`/`unbind_user_domain` + 冲突历史检查（sn_auth.rs:1616-1881、695-757）。
+- 独立 `zone_info`：`get_zone_info`/`update_zone_info`/`update_zone_relay_sn` + backfill（sn_auth.rs:1883-2041、548-600）。
+- `account_sessions` 撤销表方法：`create_account_session`/`revoke_account_session`/`revoke_user_sessions`/`get_account_session`（sn_auth.rs:2043-2136）。
+- `clear_state_by_active_code`，包含可选清理旧 `devices`、`user_dns_records`、`did_documents`（sn_auth.rs:895-987）。
 
 相关实现分散在：
 
-- `src/components/cyfs-sn/src/v2/common.rs`: 密码 PBKDF2、JWT 签发/校验、username/public key 规范化。
-- `src/components/cyfs-sn/src/v2/auth.rs`: `auth.*` RPC。
-- `src/components/cyfs-sn/src/v2/zone.rs`: `zone.get`、`zone.bind_config`。
-- `src/components/cyfs-sn/src/v2/user.rs`: owner key、profile、self_cert。
-- `src/components/cyfs-sn/src/v2/dns.rs`: user DNS records。
-- `src/components/cyfs-sn/src/sqlite_db.rs`: 当前完整 `SnDB` SQLite 实现，包含 `user_domain_history`、devices、DNS records、DID documents。
+- `src/components/cyfs-sn/src/sn_v2_auth.rs`: 密码 PBKDF2、Ed25519 JWT 签发/校验。
+- `src/components/cyfs-sn/src/api/common.rs`: username/public key 规范化、token 解析 helper。
+- `src/components/cyfs-sn/src/api/auth.rs`: `auth.*` RPC。
+- `src/components/cyfs-sn/src/api/zone.rs`: `zone.get`、`zone.bind_config`。
+- `src/components/cyfs-sn/src/api/user.rs`: owner key、profile、self_cert。
+- `src/components/cyfs-sn/src/api/dns.rs`: user DNS records。
+- `src/components/cyfs-sn/src/sn_server.rs`: RPC 路由、旧 alias 兼容、device-signed token 校验。
+- `src/components/cyfs-sn/src/sqlite_db.rs`: 兼容期 `SnDB` SQLite 实现，包含 devices、DNS records、DID documents。
 
-主要差距：
+### 阶段二待实现（主要差距）
 
-- 注册流程还没有和 `sn_bns_controller` / `bns-indexer.register` 串成一个幂等流程。
-- `SN 登录 token = SnUser` 的权限边界在部分旧接口中还不清晰。
-- 普通登录仍要求 `active_code`，不符合目标账号模型。
-- PKX proof 尚未实现，只实现了历史冲突检查。
-- `zone_info` 还没有独立模型，仍散落在 `users.zone_config`、`users.self_cert`、`users.sn_ips`。
+- 没有 `sn_authority` 统一鉴权上下文模块：不存在 `AuthContext`/`Owner(name)`/`Controller(name,scope)`/`Device(zone,device,did)`/`SnUser(username)` 类型，各 handler 仍各自解析 token（V2 走 `require_account_username`→`verify_access_token`，common.rs:332-341；旧接口各自 `RPCSessionToken::from_string(...).verify_by_key(...)`，sn_server.rs:1114-1132 等）。
+- 注册流程还没有和 `sn_bns_controller` / `bns-indexer.register` 串成一个幂等流程（无 `request_id`，无 BNS owner 创建/恢复）。
+- PKX proof 在 DB 层已实现但无 RPC handler、无 DNS TXT 查询接线，端到端不可达。
+- 绕过风险：`zone.bind_config` / `register_user_with_owner_key` 仍能不经 proof 把 `user_domain` 置 active；`self_cert` 可被裸 access token（含 `dns.*` 的 `has_cert=true`）置 true。
+- owner 权限仍是“本地 `public_key` = owner”，不是 BNS authority；`owner_key_ref` 列从不写入。
+- `auth.logout` 与 session 撤销表已建但未接线（签发/校验路径不写也不查 `account_sessions`）。
+- 传统账号安全大多缺失：change password、password reset、登录失败限流/风控未实现。
 - `zone.bind_config` 还没有发布 BNS `zone` / `boot` 文档。
-- `auth.logout` 没有服务端撤销能力。
-- `self_cert` 的写入口需要收敛到可信 ACME/device 上报和证书校验结果。
 
 ## 迁移步骤
 
-1. 引入明确的 `zone_info` 数据结构，先映射到现有 `users.self_cert`、`users.sn_ips`、`users.zone_config`，再迁移到独立表。
-2. 为 `user_domain` 增加 PKX 绑定表和 PKX TXT 校验流程，强制校验 `PKX(sn_user.pkx)`，不实现其它挑战方式。
-3. 调整 `auth.login`，去掉普通登录对 `active_code` 的依赖。
-4. 增加 session revocation / refresh token 存储，使 `auth.logout` 和账号冻结能立即生效。
-5. 把 `zone.bind_config` 拆成 owner authority 校验、BNS document 发布、`zone_info` 缓存更新三段。
-6. 把 BNS 修改类请求统一接到 `sn_authority`，禁止业务 handler 自行把 SN access token 当 owner token 使用。
-7. 把 `self_cert` 更新入口收敛为 `sn_auth.update_zone_info`，并记录来源和审计日志。
-8. 删除旧 RPC method alias 或让旧 alias 显式失败，内部只走新的 authority 和 store API。
+阶段一已完成：
+
+1. ~~引入明确的 `zone_info` 数据结构~~：已落地独立 `zone_info` 表（sn_auth.rs:365-380）。
+2. ~~为 `user_domain` 增加 PKX 绑定表和 PKX TXT 校验流程~~：DB 层已实现 `user_domain_bindings` + PKX 状态机（sn_auth.rs:342-355、1616-1881），仅缺 RPC/DNS 接线。
+3. ~~调整 `auth.login`，去掉普通登录对 `active_code` 的依赖~~：已完成（auth.rs:91-133）。
+
+阶段二待办：
+
+4. 给 PKX 绑定加 RPC handler 与 DNS TXT 查询接线，使端到端可达；并堵住 `zone.bind_config` / `register_user_with_owner_key` 无证明置 active 的绕过。
+5. 把 session 签发/校验接到 `account_sessions`，使 `auth.logout` 和账号冻结立即生效。
+6. 把 `zone.bind_config` 拆成 owner authority 校验、BNS document 发布、`zone_info` 缓存更新三段。
+7. 引入 `sn_authority` 统一鉴权上下文，把 BNS 修改类请求统一接入，禁止业务 handler 自行把 SN access token 当 owner token 使用。
+8. 把 `self_cert` 更新入口收敛为可信 ACME/device 上报 + 证书校验，并记录来源和审计日志。
+9. 补齐传统账号安全（change password、reset、限流），并写入 `owner_key_ref`。
+10. 删除旧 RPC method alias 或让旧 alias 显式失败，内部只走新的 authority 和 store API。
