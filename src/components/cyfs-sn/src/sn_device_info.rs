@@ -325,6 +325,107 @@ pub trait SnDeviceInfoDB: Send + Sync + 'static {
     async fn expire_devices(&self, now: u64, batch_size: Option<usize>) -> SnResult<usize>;
 }
 
+/// Remote SnDeviceInfoDB backed by the sn_device_info_db S2S KRPC API.
+#[derive(Clone)]
+pub struct RemoteSnDeviceInfoDB {
+    client: crate::s2s_api::SnDeviceInfoDbClient,
+}
+
+impl RemoteSnDeviceInfoDB {
+    pub fn new(client: crate::s2s_api::SnDeviceInfoDbClient) -> Self {
+        Self { client }
+    }
+
+    pub fn new_krpc(client: Arc<::kRPC::kRPC>) -> Self {
+        Self::new(crate::s2s_api::SnDeviceInfoDbClient::new_krpc(client))
+    }
+
+    pub fn new_krpc_url(device_info_db_url: &str, session_token: Option<String>) -> Self {
+        Self::new(crate::s2s_api::SnDeviceInfoDbClient::new_krpc_url(
+            device_info_db_url,
+            session_token,
+        ))
+    }
+
+    pub fn client(&self) -> &crate::s2s_api::SnDeviceInfoDbClient {
+        &self.client
+    }
+}
+
+#[async_trait::async_trait]
+impl SnDeviceInfoDB for RemoteSnDeviceInfoDB {
+    async fn upsert_device_index(
+        &self,
+        did: &str,
+        zone: &str,
+        device_name: &str,
+        device_role: SnDeviceRole,
+    ) -> SnResult<()> {
+        self.client
+            .upsert_device_index(did, zone, device_name, device_role)
+            .await
+    }
+
+    async fn rebind_device_index(
+        &self,
+        did: &str,
+        new_zone: &str,
+        new_device_name: &str,
+        new_device_role: SnDeviceRole,
+        reason: &str,
+    ) -> SnResult<()> {
+        self.client
+            .rebind_device_index(did, new_zone, new_device_name, new_device_role, reason)
+            .await
+    }
+
+    async fn remove_device_index(&self, did: &str) -> SnResult<()> {
+        self.client.remove_device_index(did).await
+    }
+
+    async fn update_device_state(&self, update: SnDeviceStateUpdate) -> SnResult<()> {
+        self.client.update_device_state(update).await
+    }
+
+    async fn get_device_state(&self, did: &str) -> SnResult<Option<SnDeviceStateView>> {
+        self.client.get_device_state(did).await
+    }
+
+    async fn get_device_state_by_name(
+        &self,
+        zone: &str,
+        device_name: &str,
+    ) -> SnResult<Option<SnDeviceStateView>> {
+        self.client
+            .get_device_state_by_name(zone, device_name)
+            .await
+    }
+
+    async fn list_zone_devices(
+        &self,
+        zone: &str,
+        options: SnDeviceListOptions,
+    ) -> SnResult<Vec<SnDeviceStateView>> {
+        self.client.list_zone_devices(zone, options).await
+    }
+
+    async fn mark_device_offline(&self, did: &str, reason: &str) -> SnResult<()> {
+        self.client.mark_device_offline(did, reason).await
+    }
+
+    async fn block_device(&self, did: &str, reason: &str) -> SnResult<()> {
+        self.client.block_device(did, reason).await
+    }
+
+    async fn unblock_device(&self, did: &str, reason: &str) -> SnResult<()> {
+        self.client.unblock_device(did, reason).await
+    }
+
+    async fn expire_devices(&self, now: u64, batch_size: Option<usize>) -> SnResult<usize> {
+        self.client.expire_devices(now, batch_size).await
+    }
+}
+
 pub struct SqliteSnDeviceInfoDB {
     pool: SqlitePool,
 }
