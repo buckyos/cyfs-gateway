@@ -1,5 +1,6 @@
 use crate::{sn_err, SnError, SnErrorCode, SnResult};
 use rand::Rng;
+use serde::{Deserialize, Serialize};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use sqlx::{Row, Sqlite, SqlitePool, Transaction};
 use std::path::PathBuf;
@@ -18,7 +19,8 @@ const SESSION_REVOKED: &str = "revoked";
 
 pub type SnAuthDBRef = Arc<dyn SnAuthDB>;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum UserState {
     Active,
     Suspended,
@@ -52,7 +54,7 @@ impl UserState {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SNUserInfo {
     pub username: Option<String>,
     pub state: UserState,
@@ -64,7 +66,7 @@ pub struct SNUserInfo {
     pub sn_ips: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SnClearStateResult {
     pub deleted_users: u64,
     pub deleted_devices: u64,
@@ -73,7 +75,7 @@ pub struct SnClearStateResult {
     pub activation_code_reset: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SnV2AuthInfo {
     pub username: String,
     pub password_hash: String,
@@ -84,7 +86,7 @@ pub struct SnV2AuthInfo {
     pub last_login_at: Option<u64>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PkxBindingChallenge {
     pub username: String,
     pub domain: String,
@@ -95,7 +97,7 @@ pub struct PkxBindingChallenge {
     pub updated_at: u64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DomainBinding {
     pub username: String,
     pub domain: String,
@@ -104,7 +106,7 @@ pub struct DomainBinding {
     pub verified_at: u64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ZoneInfo {
     pub username: String,
     pub bns_name: String,
@@ -118,7 +120,7 @@ pub struct ZoneInfo {
     pub updated_at: u64,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ZoneInfoPatch {
     pub bns_name: Option<String>,
     pub zone: Option<String>,
@@ -130,7 +132,7 @@ pub struct ZoneInfoPatch {
     pub source_version: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AccountSession {
     pub session_id: String,
     pub username: String,
@@ -244,6 +246,238 @@ pub trait SnAuthDB: Send + Sync + 'static {
     async fn revoke_account_session(&self, session_id: &str, revoked_at: u64) -> SnResult<()>;
     async fn revoke_user_sessions(&self, username: &str, revoked_at: u64) -> SnResult<u64>;
     async fn get_account_session(&self, session_id: &str) -> SnResult<Option<AccountSession>>;
+}
+
+/// Remote SnAuthDB backed by the sn_auth_db S2S KRPC API.
+#[derive(Clone)]
+pub struct RemoteSnAuthDB {
+    client: crate::s2s_api::SnAuthDbClient,
+}
+
+impl RemoteSnAuthDB {
+    pub fn new(client: crate::s2s_api::SnAuthDbClient) -> Self {
+        Self { client }
+    }
+
+    pub fn new_krpc(client: std::sync::Arc<::kRPC::kRPC>) -> Self {
+        Self::new(crate::s2s_api::SnAuthDbClient::new_krpc(client))
+    }
+
+    pub fn new_krpc_url(auth_db_url: &str, session_token: Option<String>) -> Self {
+        Self::new(crate::s2s_api::SnAuthDbClient::new_krpc_url(
+            auth_db_url,
+            session_token,
+        ))
+    }
+
+    pub fn client(&self) -> &crate::s2s_api::SnAuthDbClient {
+        &self.client
+    }
+}
+
+#[async_trait::async_trait]
+impl SnAuthDB for RemoteSnAuthDB {
+    async fn get_activation_codes(&self) -> SnResult<Vec<String>> {
+        self.client.get_activation_codes().await
+    }
+
+    async fn insert_activation_code(&self, code: &str) -> SnResult<()> {
+        self.client.insert_activation_code(code).await
+    }
+
+    async fn generate_activation_codes(&self, count: usize) -> SnResult<Vec<String>> {
+        self.client.generate_activation_codes(count).await
+    }
+
+    async fn check_active_code(&self, active_code: &str) -> SnResult<bool> {
+        self.client.check_active_code(active_code).await
+    }
+
+    async fn clear_state_by_active_code(&self, active_code: &str) -> SnResult<SnClearStateResult> {
+        self.client.clear_state_by_active_code(active_code).await
+    }
+
+    async fn register_user_v2(
+        &self,
+        active_code: &str,
+        username: &str,
+        password_hash: &str,
+        password_salt: &str,
+        password_algo: &str,
+    ) -> SnResult<bool> {
+        self.client
+            .register_user_v2(
+                active_code,
+                username,
+                password_hash,
+                password_salt,
+                password_algo,
+            )
+            .await
+    }
+
+    async fn create_v2_auth(
+        &self,
+        username: &str,
+        password_hash: &str,
+        password_salt: &str,
+        password_algo: &str,
+    ) -> SnResult<bool> {
+        self.client
+            .create_v2_auth(username, password_hash, password_salt, password_algo)
+            .await
+    }
+
+    async fn is_user_exist(&self, username: &str) -> SnResult<bool> {
+        self.client.is_user_exist(username).await
+    }
+
+    async fn register_user_with_owner_key(
+        &self,
+        active_code: &str,
+        username: &str,
+        public_key: &str,
+        zone_config: &str,
+        user_domain: Option<String>,
+        sn_ips: Option<String>,
+    ) -> SnResult<bool> {
+        self.client
+            .register_user_with_owner_key(
+                active_code,
+                username,
+                public_key,
+                zone_config,
+                user_domain,
+                sn_ips,
+            )
+            .await
+    }
+
+    async fn get_user_by_public_key(
+        &self,
+        public_key: &str,
+    ) -> SnResult<Option<(String, String, Option<String>)>> {
+        self.client.get_user_by_public_key(public_key).await
+    }
+
+    async fn get_user_info(&self, username: &str) -> SnResult<Option<SNUserInfo>> {
+        self.client.get_user_info(username).await
+    }
+
+    async fn get_user_by_domain(&self, domain: &str) -> SnResult<Option<SNUserInfo>> {
+        self.client.get_user_by_domain(domain).await
+    }
+
+    async fn set_user_state(&self, username: &str, state: UserState) -> SnResult<()> {
+        self.client.set_user_state(username, state).await
+    }
+
+    async fn update_user_public_key(&self, username: &str, public_key: &str) -> SnResult<()> {
+        self.client
+            .update_user_public_key(username, public_key)
+            .await
+    }
+
+    async fn update_user_zone_config(&self, username: &str, zone_config: &str) -> SnResult<()> {
+        self.client
+            .update_user_zone_config(username, zone_config)
+            .await
+    }
+
+    async fn update_user_self_cert(&self, username: &str, self_cert: bool) -> SnResult<()> {
+        self.client.update_user_self_cert(username, self_cert).await
+    }
+
+    async fn update_user_domain(
+        &self,
+        username: &str,
+        user_domain: Option<String>,
+    ) -> SnResult<()> {
+        self.client.update_user_domain(username, user_domain).await
+    }
+
+    async fn get_user_sn_ips(&self, username: &str) -> SnResult<Option<String>> {
+        self.client.get_user_sn_ips(username).await
+    }
+
+    async fn get_v2_auth(&self, username: &str) -> SnResult<Option<SnV2AuthInfo>> {
+        self.client.get_v2_auth(username).await
+    }
+
+    async fn update_v2_last_login(&self, username: &str, last_login_at: u64) -> SnResult<()> {
+        self.client
+            .update_v2_last_login(username, last_login_at)
+            .await
+    }
+
+    async fn create_pkx_binding(
+        &self,
+        username: &str,
+        domain: &str,
+    ) -> SnResult<PkxBindingChallenge> {
+        self.client.create_pkx_binding(username, domain).await
+    }
+
+    async fn verify_pkx_binding(
+        &self,
+        username: &str,
+        domain: &str,
+        txt_records: &[String],
+    ) -> SnResult<DomainBinding> {
+        self.client
+            .verify_pkx_binding(username, domain, txt_records)
+            .await
+    }
+
+    async fn unbind_user_domain(&self, username: &str, domain: &str) -> SnResult<()> {
+        self.client.unbind_user_domain(username, domain).await
+    }
+
+    async fn get_zone_info(&self, username: &str) -> SnResult<Option<ZoneInfo>> {
+        self.client.get_zone_info(username).await
+    }
+
+    async fn update_zone_info(&self, username: &str, patch: ZoneInfoPatch) -> SnResult<()> {
+        self.client.update_zone_info(username, patch).await
+    }
+
+    async fn update_zone_relay_sn(
+        &self,
+        zone: &str,
+        relay_sn: &str,
+        source_version: Option<&str>,
+    ) -> SnResult<bool> {
+        self.client
+            .update_zone_relay_sn(zone, relay_sn, source_version)
+            .await
+    }
+
+    async fn create_account_session(
+        &self,
+        session_id: &str,
+        username: &str,
+        token_aud: &str,
+        issued_at: u64,
+        expires_at: u64,
+    ) -> SnResult<()> {
+        self.client
+            .create_account_session(session_id, username, token_aud, issued_at, expires_at)
+            .await
+    }
+
+    async fn revoke_account_session(&self, session_id: &str, revoked_at: u64) -> SnResult<()> {
+        self.client
+            .revoke_account_session(session_id, revoked_at)
+            .await
+    }
+
+    async fn revoke_user_sessions(&self, username: &str, revoked_at: u64) -> SnResult<u64> {
+        self.client.revoke_user_sessions(username, revoked_at).await
+    }
+
+    async fn get_account_session(&self, session_id: &str) -> SnResult<Option<AccountSession>> {
+        self.client.get_account_session(session_id).await
+    }
 }
 
 pub struct SqliteSnAuthDB {

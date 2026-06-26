@@ -3,6 +3,7 @@ use ::kRPC::*;
 use jsonwebtoken::{jwk::Jwk, DecodingKey};
 use serde::Deserialize;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::errors::{parse_error, reason_error, SnV2ErrorCode};
@@ -34,6 +35,12 @@ pub(crate) struct RegisterReq {
     pub(crate) name: String,
     pub(crate) pwd_hash: String,
     pub(crate) active_code: String,
+    #[serde(default)]
+    pub(crate) request_id: Option<String>,
+    #[serde(default)]
+    pub(crate) asset_owner: Option<String>,
+    #[serde(default)]
+    pub(crate) owner_config: Option<Value>,
 }
 
 #[derive(Deserialize)]
@@ -57,13 +64,19 @@ pub(crate) struct BindOwnerKeyReq {
 #[derive(Deserialize)]
 pub(crate) struct SetSelfCertReq {
     pub(crate) self_cert: bool,
+    #[serde(default)]
+    pub(crate) device_did: Option<String>,
 }
 
 #[derive(Deserialize)]
 pub(crate) struct BindZoneReq {
     pub(crate) zone_config: String,
     #[serde(default)]
+    pub(crate) boot_config: Option<String>,
+    #[serde(default)]
     pub(crate) user_domain: Option<String>,
+    #[serde(default)]
+    pub(crate) request_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -73,6 +86,8 @@ pub(crate) struct DeviceRegisterReq {
     pub(crate) mini_config_jwt: String,
     pub(crate) device_ip: String,
     pub(crate) device_info: String,
+    #[serde(default)]
+    pub(crate) request_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -118,6 +133,8 @@ pub(crate) struct AddDnsRecordReq {
     pub(crate) ttl: Option<u32>,
     #[serde(default)]
     pub(crate) has_cert: Option<bool>,
+    #[serde(default)]
+    pub(crate) request_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -126,7 +143,11 @@ pub(crate) struct RemoveDnsRecordReq {
     pub(crate) domain: String,
     pub(crate) record_type: String,
     #[serde(default)]
+    pub(crate) record: Option<String>,
+    #[serde(default)]
     pub(crate) has_cert: Option<bool>,
+    #[serde(default)]
+    pub(crate) request_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -136,6 +157,8 @@ pub(crate) struct SetDidDocumentReq {
     pub(crate) did_document: Value,
     #[serde(default)]
     pub(crate) doc_type: Option<String>,
+    #[serde(default)]
+    pub(crate) request_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -236,6 +259,35 @@ pub(crate) fn now_secs() -> u64 {
         .as_secs()
 }
 
+pub(crate) fn stable_request_id(
+    provided: Option<String>,
+    operation: &str,
+    name: &str,
+    payload: &Value,
+) -> String {
+    if let Some(request_id) = provided.filter(|value| !value.trim().is_empty()) {
+        return request_id;
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(operation.as_bytes());
+    hasher.update([0]);
+    hasher.update(name.as_bytes());
+    hasher.update([0]);
+    hasher.update(payload.to_string().as_bytes());
+    format!(
+        "sn:v2:{}:{}:{}",
+        operation,
+        name,
+        hex::encode(hasher.finalize())
+    )
+}
+
+pub(crate) fn document_value_from_param(raw: &str, fallback_key: &str) -> Value {
+    serde_json::from_str::<Value>(raw)
+        .ok()
+        .unwrap_or_else(|| json!({ fallback_key: raw }))
+}
+
 pub(crate) fn build_profile_json(username: &str, user: &crate::SNUserInfo) -> Value {
     json!({
         "code": 0,
@@ -329,15 +381,15 @@ pub(crate) fn ensure_owner_decoding_key(user: &crate::SNUserInfo) -> RpcCallResu
     })
 }
 
-pub(crate) fn require_account_username(
+pub(crate) async fn require_account_username(
     server: &SNServer,
     req: &RPCRequest,
 ) -> RpcCallResult<String> {
-    let token = req
-        .token
-        .as_ref()
-        .ok_or_else(|| parse_error(SnV2ErrorCode::AuthRequired, "session_token is none"))?;
-    server.v2_auth().verify_access_token(token.as_str())
+    let context = crate::sn_authority::require_sn_user(server, req).await?;
+    context
+        .sn_username()
+        .map(ToString::to_string)
+        .ok_or_else(|| parse_error(SnV2ErrorCode::AuthRequired, "session token is not a user"))
 }
 
 pub(crate) async fn resolve_self_scoped_username(
@@ -353,8 +405,8 @@ pub(crate) async fn resolve_self_scoped_username(
         .transpose()?;
 
     match req.token.as_ref() {
-        Some(token) => {
-            let username = server.v2_auth().verify_access_token(token.as_str())?;
+        Some(_) => {
+            let username = require_account_username(server, req).await?;
             if let Some(requested_name) = requested_name {
                 if requested_name != username {
                     return Err(parse_error(

@@ -1,9 +1,11 @@
 #![allow(unused)]
 use crate::api::{
-    handle_auth, handle_device, handle_did, handle_dns, handle_query, handle_user, handle_zone,
+    handle_auth, handle_device, handle_did, handle_dns, handle_domain, handle_query, handle_user,
+    handle_zone,
 };
 use crate::name_info_cache::{NameInfoCache, NameInfoCacheQueryResult, NameInfoCacheRef};
 use crate::sn_bns_reader::BnsIndexerDocumentReader;
+use crate::sn_bns_store::SqliteSnBnsWriteRequestStore;
 use crate::sn_compat_store::{SNDeviceInfo, SnCompatibilityStoreRef, SqliteSnCompatibilityStore};
 use crate::sn_resolver::{
     device_config_from_mini_jwt, ResolverCompatibilityReader, ResolverDeviceDocument,
@@ -13,13 +15,15 @@ use crate::sn_resolver::{
 };
 use crate::sn_v2_auth::SnV2AuthManager;
 use crate::{
-    SNUserInfo, SnAuthDBRef, SnDeviceEndpointUpdate, SnDeviceInfoDBRef, SnDeviceRole,
-    SnDeviceStateUpdate, SnEndpointProtocol, SnEndpointScope, SnEndpointSource, SnNatType,
-    SnRelayManagerRef, SnResult, SqliteSnAuthDB, SqliteSnDeviceInfoDB, SqliteSnRelayManager,
-    ZoneInfoPatch,
+    AssignZoneRelayReq, RelayAssignmentSource, SNUserInfo, SnAuthDBRef, SnDeviceEndpointUpdate,
+    SnDeviceInfoDBRef, SnDeviceRole, SnDeviceStateUpdate, SnEndpointProtocol, SnEndpointScope,
+    SnEndpointSource, SnNatType, SnRelayManagerRef, SnResult, SqliteSnAuthDB, SqliteSnDeviceInfoDB,
+    SqliteSnRelayManager, ZoneInfoPatch,
 };
 use ::kRPC::*;
 use async_trait::async_trait;
+use bns_client::{BnsIndexerApi, BnsIndexerClient, SnBnsController, SnBnsControllerConfig};
+use bns_indexer::{Principal, PrincipalKind};
 use buckyos_kit::{get_buckyos_service_data_dir, is_valid_name, NameType};
 use cyfs_gateway_lib::{into_server_err, server_err};
 use cyfs_gateway_lib::{
@@ -425,6 +429,7 @@ pub struct SNServer {
     v2_auth: Arc<SnV2AuthManager>,
     name_info_cache: NameInfoCacheRef,
     resolver: SnResolverRef,
+    bns_controller: Option<Arc<SnBnsController>>,
 }
 
 enum UncachedNameInfoQueryResult {
@@ -472,6 +477,11 @@ impl SNServer {
             | "user.get_owner_key"
             | "user.get_profile"
             | "user.set_self_cert"
+            | "domain.begin_verify"
+            | "domain.create_pkx_binding"
+            | "domain.verify"
+            | "domain.verify_pkx_binding"
+            | "domain.unbind"
             | "zone.bind_config"
             | "zone.unbind_config"
             | "zone.get" => SnRpcPath::Bns,
@@ -649,6 +659,7 @@ impl SNServer {
         device_info_db: SnDeviceInfoDBRef,
         compat_store: SnCompatibilityStoreRef,
         relay_manager: SnRelayManagerRef,
+        bns_controller: Option<Arc<SnBnsController>>,
     ) -> Self {
         let bns_indexer_url = server_config.bns_indexer_url.clone();
         let bns_session_token = server_config.bns_session_token.clone();
@@ -708,6 +719,7 @@ impl SNServer {
             v2_auth,
             name_info_cache: NameInfoCache::new_ref(),
             resolver,
+            bns_controller,
         }
     }
 
@@ -717,6 +729,37 @@ impl SNServer {
 
     pub fn resolver(&self) -> SnResolverRef {
         self.resolver.clone()
+    }
+
+    pub(crate) fn bns_controller(&self) -> Option<Arc<SnBnsController>> {
+        self.bns_controller.clone()
+    }
+
+    pub(crate) async fn maybe_assign_zone_relay(
+        &self,
+        zone: &str,
+        from_ip: Option<String>,
+        reason: &str,
+    ) {
+        let result = self
+            .relay_manager
+            .assign_zone_relay(AssignZoneRelayReq {
+                zone: zone.to_string(),
+                relay_id: None,
+                relay_sn: None,
+                from_ip,
+                region: None,
+                source: RelayAssignmentSource::Auto,
+                reason: Some(reason.to_string()),
+                sticky_until: None,
+                lease_expires_at: None,
+                backup_relay_id: None,
+                source_version: None,
+            })
+            .await;
+        if let Err(error) = result {
+            debug!("skip auto relay assignment for {}: {}", zone, error);
+        }
     }
 
     pub fn add_name_info_cache(
@@ -2418,6 +2461,18 @@ impl SNServer {
                     handle_user(self, Self::rewrite_rpc_method(req, "set_self_cert")).await
                 }
             }
+            "domain.begin_verify"
+            | "domain.create_pkx_binding"
+            | "domain.verify"
+            | "domain.verify_pkx_binding"
+            | "domain.unbind" => {
+                let bare_method = req
+                    .method
+                    .strip_prefix("domain.")
+                    .unwrap_or(req.method.as_str())
+                    .to_string();
+                handle_domain(self, Self::rewrite_rpc_method(req, bare_method.as_str())).await
+            }
             "zone.bind_config" => {
                 if req.params.get("user_name").is_some() || !self.has_v2_access_token(&req) {
                     self.bind_zone_to_user(Self::rewrite_rpc_method(req, "bind_zone_config"))
@@ -3984,6 +4039,18 @@ pub struct SNServerConfig {
     pub bns_indexer_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bns_session_token: Option<String>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bns_write_enabled: Option<bool>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sn_controller_principal: Option<Value>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sn_controller_kid: Option<String>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allowed_controller_doc_types: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub db_type: Option<String>,
     #[serde(flatten)]
@@ -4030,6 +4097,94 @@ impl SnServerFactory {
                 .to_string_lossy()
                 .to_string()
         })
+    }
+
+    fn parse_sn_controller_principal(config: &SNServerConfig) -> ServerResult<Principal> {
+        let Some(value) = config.sn_controller_principal.as_ref() else {
+            return Ok(Principal::chain_account(format!("sn:{}", config.id)));
+        };
+
+        if let Some(principal) = value.as_str() {
+            return Ok(Principal::chain_account(principal));
+        }
+
+        let kind = value
+            .get("kind")
+            .and_then(Value::as_str)
+            .unwrap_or("chain_account");
+        let principal_value = value
+            .get("value")
+            .and_then(Value::as_str)
+            .ok_or(server_err!(
+                ServerErrorCode::InvalidConfig,
+                "sn_controller_principal.value is required"
+            ))?;
+
+        match kind {
+            "chain_account" | "chain" | "account" | "eth" => {
+                Ok(Principal::chain_account(principal_value))
+            }
+            "bns_name" | "bns" => Principal::bns_name(principal_value).map_err(|e| {
+                server_err!(
+                    ServerErrorCode::InvalidConfig,
+                    "invalid sn_controller_principal bns_name: {}",
+                    e
+                )
+            }),
+            "unset" => Ok(Principal {
+                kind: PrincipalKind::Unset,
+                value: String::new(),
+            }),
+            other => Err(server_err!(
+                ServerErrorCode::InvalidConfig,
+                "unsupported sn_controller_principal.kind {}",
+                other
+            )),
+        }
+    }
+
+    fn build_bns_controller(
+        config: &SNServerConfig,
+        db_path: &str,
+    ) -> ServerResult<Option<Arc<SnBnsController>>> {
+        let write_enabled = config
+            .bns_write_enabled
+            .unwrap_or_else(|| config.bns_indexer_url.is_some());
+        if !write_enabled {
+            return Ok(None);
+        }
+
+        let indexer_url = config.bns_indexer_url.as_deref().ok_or(server_err!(
+            ServerErrorCode::InvalidConfig,
+            "bns_write_enabled requires bns_indexer_url"
+        ))?;
+        let principal = Self::parse_sn_controller_principal(config)?;
+        let mut controller_config = SnBnsControllerConfig::new(
+            principal,
+            config.sn_controller_kid.clone().unwrap_or_default(),
+        );
+        if let Some(doc_types) = config.allowed_controller_doc_types.clone() {
+            controller_config.allowed_controller_doc_types = doc_types;
+        }
+        let client: Arc<dyn BnsIndexerApi> = Arc::new(BnsIndexerClient::new_krpc_url(
+            indexer_url,
+            config.bns_session_token.clone(),
+        ));
+        let store = Arc::new(SqliteSnBnsWriteRequestStore::open(db_path).map_err(|e| {
+            server_err!(
+                ServerErrorCode::InvalidConfig,
+                "open sn bns write request store failed: {}",
+                e
+            )
+        })?);
+        let controller = SnBnsController::new(client, store, controller_config).map_err(|e| {
+            server_err!(
+                ServerErrorCode::InvalidConfig,
+                "create sn bns controller failed: {}",
+                e
+            )
+        })?;
+        Ok(Some(Arc::new(controller)))
     }
 }
 
@@ -4135,6 +4290,7 @@ impl ServerFactory for SnServerFactory {
             )
         })?;
         let relay_manager: SnRelayManagerRef = Arc::new(relay_manager);
+        let bns_controller = Self::build_bns_controller(config, db_path.as_str())?;
 
         let sn = Arc::new(
             SNServer::new(
@@ -4143,6 +4299,7 @@ impl ServerFactory for SnServerFactory {
                 device_info_db,
                 compat_store,
                 relay_manager,
+                bns_controller,
             )
             .await,
         );
@@ -5422,12 +5579,31 @@ mod tests {
             .call(
                 "auth.refresh",
                 json!({
-                    "refresh_token": refresh_token
+                    "refresh_token": refresh_token.clone()
                 }),
             )
             .await
             .unwrap();
         assert!(!result["access_token"].as_str().unwrap().is_empty());
+
+        let logout_krpc = kRPC::new(auth_url.as_str(), Some(access_token.clone()));
+        let result = logout_krpc
+            .call(
+                "auth.logout",
+                json!({
+                    "refresh_token": refresh_token
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["code"].as_i64().unwrap(), 0);
+        let revoked_access_result = auth_me_krpc.call("auth.me", json!({})).await;
+        assert!(revoked_access_result.is_err());
+        assert!(revoked_access_result
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("[SNV2:1007:invalid_token]"));
 
         let user_krpc = kRPC::new(bns_url.as_str(), Some(login_access_token.clone()));
         let result = user_krpc
@@ -5470,13 +5646,40 @@ mod tests {
             .unwrap();
         assert_eq!(result["name"].as_str().unwrap(), TEST_USER_V2);
 
+        let user_domain = format!("{}.buckyos.ai", TEST_USER_V2);
+        let result = user_krpc
+            .call(
+                "domain.begin_verify",
+                json!({
+                    "domain": user_domain
+                }),
+            )
+            .await
+            .unwrap();
+        let pkx = result["pkx"].as_str().unwrap().to_string();
+        assert_eq!(
+            result["pkx_record_name"].as_str().unwrap(),
+            format!("_pkx.{}", user_domain)
+        );
+        let result = user_krpc
+            .call(
+                "domain.verify",
+                json!({
+                    "domain": user_domain,
+                    "txt_records": [pkx]
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["code"].as_i64().unwrap(), 0);
+
         let zone_krpc = kRPC::new(bns_url.as_str(), Some(login_access_token.clone()));
         let result = zone_krpc
             .call(
                 "zone.bind_config",
                 json!({
                     "zone_config": zone_jwt,
-                    "user_domain": format!("{}.buckyos.ai", TEST_USER_V2)
+                    "user_domain": user_domain
                 }),
             )
             .await
@@ -5485,10 +5688,7 @@ mod tests {
 
         let result = zone_krpc.call("zone.get", json!({})).await.unwrap();
         assert_eq!(result["user_name"].as_str().unwrap(), TEST_USER_V2);
-        assert_eq!(
-            result["user_domain"].as_str().unwrap(),
-            format!("{}.buckyos.ai", TEST_USER_V2)
-        );
+        assert_eq!(result["user_domain"].as_str().unwrap(), user_domain);
 
         let device_krpc = kRPC::new(bns_url.as_str(), Some(login_access_token.clone()));
         let result = device_krpc

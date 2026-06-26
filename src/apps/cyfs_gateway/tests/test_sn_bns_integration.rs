@@ -4,6 +4,7 @@ use bns_indexer::{
 use bns_server::{open_sqlite_registry, spawn_listener, BnsIndexerHttpServer};
 use buckyos_kit::init_logging;
 use cyfs_gateway::{gateway_service_main, GatewayParams};
+use cyfs_sn::{SnAuthDB, SqliteSnAuthDB};
 use hickory_resolver::config::{NameServerConfig, Protocol, ResolverConfig, ResolverOpts};
 use hickory_resolver::TokioAsyncResolver;
 use kRPC::kRPC;
@@ -20,6 +21,8 @@ const BNS_GATEWAY_DEVICE: &str = "gateway1";
 const BNS_GATEWAY_DID: &str = "did:dev:bnsdevice1";
 const BNS_GATEWAY_IP: &str = "203.0.113.11";
 const BNS_TXT_RECORD: &str = "bns-txt=ok";
+const BNS_WRITE_USER: &str = "bnswriter";
+const BNS_WRITE_ACTIVE_CODE: &str = "bns-writer-active-code";
 
 fn inline_json_doc(doc_type: &str, value: Value) -> bns_indexer::DocumentUpdate {
     default_document_update(
@@ -118,7 +121,7 @@ async fn gateway_sn_resolves_bns_documents_through_sn_only() {
     let bns_db = tempfile::NamedTempFile::with_suffix(".bns.sqlite").unwrap();
     seed_bns_registry(bns_db.path());
     let registry = open_sqlite_registry(bns_db.path()).unwrap();
-    let bns_http = BnsIndexerHttpServer::from_registry(registry);
+    let bns_http = BnsIndexerHttpServer::from_registry(registry.clone());
     let bns_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let bns_addr = bns_listener.local_addr().unwrap();
     let bns_server = spawn_listener(bns_listener, Arc::new(bns_http)).unwrap();
@@ -128,6 +131,16 @@ async fn gateway_sn_resolves_bns_documents_through_sn_only() {
     let dns_port = allocate_free_port().await;
     let sn_db = tempfile::NamedTempFile::with_suffix(".sn.sqlite").unwrap();
     let auth_dir = tempfile::TempDir::new().unwrap();
+    {
+        let auth_db = SqliteSnAuthDB::new_by_path(sn_db.path().to_string_lossy().as_ref())
+            .await
+            .unwrap();
+        auth_db.initialize_database().await.unwrap();
+        auth_db
+            .insert_activation_code(BNS_WRITE_ACTIVE_CODE)
+            .await
+            .unwrap();
+    }
     let config_file = tempfile::NamedTempFile::with_suffix(".yaml").unwrap();
     let config = format!(
         r#"
@@ -215,6 +228,25 @@ servers:
 
     let sn_endpoint = format!("http://127.0.0.1:{}/kapi/sn", http_port);
     let sn = kRPC::new(sn_endpoint.as_str(), None);
+    let sn_auth_endpoint = format!("http://127.0.0.1:{}/kapi/sn/auth", http_port);
+    let sn_auth = kRPC::new(sn_auth_endpoint.as_str(), None);
+
+    let registered = sn_auth
+        .call(
+            "auth.register",
+            json!({
+                "name": BNS_WRITE_USER,
+                "pwd_hash": "test-password-hash",
+                "active_code": BNS_WRITE_ACTIVE_CODE
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(registered["code"].as_i64().unwrap(), 0);
+    assert!(!registered["need_bind_owner_key"].as_bool().unwrap());
+    let created_name = registry.query_name_state(BNS_WRITE_USER).unwrap().unwrap();
+    assert_eq!(created_name.name, BNS_WRITE_USER);
+    assert_eq!(created_name.asset_owner, BNS_WRITE_USER);
 
     let zone = sn
         .call(

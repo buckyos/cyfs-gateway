@@ -1,6 +1,6 @@
 use super::common::{
-    build_profile_json, normalize_public_key, ok_response, parse_params, require_account_username,
-    BindOwnerKeyReq, IntoRpcResult, RpcCallResult, SetSelfCertReq,
+    build_profile_json, ensure_owned_device, normalize_public_key, ok_response, parse_params,
+    require_account_username, BindOwnerKeyReq, IntoRpcResult, RpcCallResult, SetSelfCertReq,
 };
 use super::errors::{parse_error, SnV2ErrorCode};
 use crate::SNServer;
@@ -11,7 +11,7 @@ use serde_json::{json, Value};
 pub(crate) async fn handle_user(server: &SNServer, req: RPCRequest) -> RpcCallResult<RPCResponse> {
     match req.method.as_str() {
         "bind_owner_key" => {
-            let username = require_account_username(server, &req)?;
+            let username = require_account_username(server, &req).await?;
             let params: BindOwnerKeyReq = parse_params(&req)?;
             let public_key_str = normalize_public_key(params.public_key)?;
             let public_key_jwk: Jwk =
@@ -35,7 +35,7 @@ pub(crate) async fn handle_user(server: &SNServer, req: RPCRequest) -> RpcCallRe
             ok_response(&req, json!({ "code": 0 }))
         }
         "get_owner_key" => {
-            let username = require_account_username(server, &req)?;
+            let username = require_account_username(server, &req).await?;
             let user = server
                 .auth_db()
                 .get_user_info(username.as_str())
@@ -57,8 +57,17 @@ pub(crate) async fn handle_user(server: &SNServer, req: RPCRequest) -> RpcCallRe
             )
         }
         "set_self_cert" => {
-            let username = require_account_username(server, &req)?;
+            let username = require_account_username(server, &req).await?;
             let params: SetSelfCertReq = parse_params(&req)?;
+            if params.self_cert {
+                let device_did = params.device_did.as_deref().ok_or_else(|| {
+                    parse_error(
+                        SnV2ErrorCode::DevicePermissionDenied,
+                        "device_did is required to enable self_cert",
+                    )
+                })?;
+                ensure_owned_device(server.compat_store(), username.as_str(), device_did).await?;
+            }
             server
                 .auth_db()
                 .update_user_self_cert(username.as_str(), params.self_cert)
@@ -67,7 +76,7 @@ pub(crate) async fn handle_user(server: &SNServer, req: RPCRequest) -> RpcCallRe
             ok_response(&req, json!({ "code": 0 }))
         }
         "get_profile" => {
-            let username = require_account_username(server, &req)?;
+            let username = require_account_username(server, &req).await?;
             let user = server
                 .auth_db()
                 .get_user_info(username.as_str())

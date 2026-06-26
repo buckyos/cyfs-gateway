@@ -5,6 +5,7 @@ use buckyos_kit::get_buckyos_service_data_dir;
 use jsonwebtoken::{jwk::Jwk, DecodingKey, EncodingKey};
 use name_lib::{generate_ed25519_key_pair, load_private_key};
 use ring::pbkdf2::{self, PBKDF2_HMAC_SHA256};
+use serde::Serialize;
 use std::num::NonZeroU32;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -20,6 +21,15 @@ const PASSWORD_ITERATIONS: u32 = 100_000;
 pub(crate) struct SnV2AuthManager {
     token_encode_key: EncodingKey,
     token_decode_key: DecodingKey,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct IssuedRpcToken {
+    pub(crate) token: String,
+    pub(crate) session_id: String,
+    pub(crate) token_aud: String,
+    pub(crate) issued_at: u64,
+    pub(crate) expires_at: u64,
 }
 
 impl SnV2AuthManager {
@@ -68,6 +78,11 @@ impl SnV2AuthManager {
     }
 
     pub(crate) fn issue_access_token(&self, username: &str) -> RpcCallResult<String> {
+        self.issue_access_session(username)
+            .map(|issued| issued.token)
+    }
+
+    pub(crate) fn issue_access_session(&self, username: &str) -> RpcCallResult<IssuedRpcToken> {
         issue_rpc_jwt(
             username,
             V2_ACCESS_AUD,
@@ -77,6 +92,11 @@ impl SnV2AuthManager {
     }
 
     pub(crate) fn issue_refresh_token(&self, username: &str) -> RpcCallResult<String> {
+        self.issue_refresh_session(username)
+            .map(|issued| issued.token)
+    }
+
+    pub(crate) fn issue_refresh_session(&self, username: &str) -> RpcCallResult<IssuedRpcToken> {
         issue_rpc_jwt(
             username,
             V2_REFRESH_AUD,
@@ -89,8 +109,16 @@ impl SnV2AuthManager {
         verify_rpc_jwt(token, V2_ACCESS_AUD, &self.token_decode_key)
     }
 
+    pub(crate) fn verify_access_session(&self, token: &str) -> RpcCallResult<RPCSessionToken> {
+        verify_rpc_session(token, V2_ACCESS_AUD, &self.token_decode_key)
+    }
+
     pub(crate) fn verify_refresh_token(&self, token: &str) -> RpcCallResult<String> {
         verify_rpc_jwt(token, V2_REFRESH_AUD, &self.token_decode_key)
+    }
+
+    pub(crate) fn verify_refresh_session(&self, token: &str) -> RpcCallResult<RPCSessionToken> {
+        verify_rpc_session(token, V2_REFRESH_AUD, &self.token_decode_key)
     }
 }
 
@@ -148,7 +176,7 @@ fn issue_rpc_jwt(
     aud: &str,
     expire_secs: u64,
     key: &EncodingKey,
-) -> RpcCallResult<String> {
+) -> RpcCallResult<IssuedRpcToken> {
     let (_, mut session) =
         RPCSessionToken::generate_jwt_token(username, aud, None, key).map_err(|e| {
             reason_error(
@@ -156,26 +184,41 @@ fn issue_rpc_jwt(
                 format!("generate jwt token failed: {}", e),
             )
         })?;
+    let issued_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let expires_at = issued_at + expire_secs;
     session.aud = Some(aud.to_string());
-    session.exp = Some(
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs()
-            + expire_secs,
-    );
-    session
-        .generate_jwt(None, key)
-        .map(|jwt| jwt.to_string())
-        .map_err(|e| {
-            reason_error(
-                SnV2ErrorCode::InternalError,
-                format!("generate jwt token failed: {}", e),
-            )
-        })
+    session.exp = Some(expires_at);
+    session.jti = Some(hex::encode(rand::random::<[u8; 16]>()));
+    let token = session.generate_jwt(None, key).map_err(|e| {
+        reason_error(
+            SnV2ErrorCode::InternalError,
+            format!("generate jwt token failed: {}", e),
+        )
+    })?;
+    Ok(IssuedRpcToken {
+        token,
+        session_id: session.jti.unwrap_or_default(),
+        token_aud: aud.to_string(),
+        issued_at,
+        expires_at,
+    })
 }
 
 fn verify_rpc_jwt(token: &str, expected_aud: &str, key: &DecodingKey) -> RpcCallResult<String> {
+    let session = verify_rpc_session(token, expected_aud, key)?;
+    session
+        .sub
+        .ok_or_else(|| parse_error(SnV2ErrorCode::InvalidToken, "subject is none"))
+}
+
+fn verify_rpc_session(
+    token: &str,
+    expected_aud: &str,
+    key: &DecodingKey,
+) -> RpcCallResult<RPCSessionToken> {
     let mut session = RPCSessionToken::from_string(token)
         .map_err(|e| parse_error(SnV2ErrorCode::InvalidToken, e.to_string()))?;
     session
@@ -187,9 +230,7 @@ fn verify_rpc_jwt(token: &str, expected_aud: &str, key: &DecodingKey) -> RpcCall
             format!("invalid aud {:?}, expect {}", session.aud, expected_aud),
         ));
     }
-    session
-        .sub
-        .ok_or_else(|| parse_error(SnV2ErrorCode::InvalidToken, "subject is none"))
+    Ok(session)
 }
 
 fn derive_password_hash(password: &str, salt_hex: &str) -> RpcCallResult<String> {

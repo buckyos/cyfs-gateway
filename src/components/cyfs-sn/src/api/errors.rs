@@ -1,4 +1,6 @@
 use ::kRPC::RPCErrors;
+use bns_client::{BnsClientError, SnBnsControllerError};
+use serde_json::json;
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum SnV2ErrorCode {
@@ -25,6 +27,9 @@ pub(crate) enum SnV2ErrorCode {
     InvalidPasswordStorage = 1020,
     InvalidDid = 1021,
     UserNotActivated = 1022,
+    BnsPermissionDenied = 1023,
+    BnsNameAlreadyExists = 1024,
+    BnsWriteFailed = 1025,
     InternalError = 1099,
 }
 
@@ -58,6 +63,9 @@ impl SnV2ErrorCode {
             Self::InvalidPasswordStorage => "invalid_password_storage",
             Self::InvalidDid => "invalid_did",
             Self::UserNotActivated => "user_not_activated",
+            Self::BnsPermissionDenied => "bns_permission_denied",
+            Self::BnsNameAlreadyExists => "bns_name_already_exists",
+            Self::BnsWriteFailed => "bns_write_failed",
             Self::InternalError => "internal_error",
         }
     }
@@ -78,4 +86,31 @@ pub(crate) fn parse_error(code: SnV2ErrorCode, message: impl AsRef<str>) -> RPCE
 
 pub(crate) fn reason_error(code: SnV2ErrorCode, message: impl AsRef<str>) -> RPCErrors {
     RPCErrors::ReasonError(code.format(message))
+}
+
+pub(crate) fn bns_write_error(error: SnBnsControllerError) -> RPCErrors {
+    let (code, bns_code, expected, actual) = match &error {
+        SnBnsControllerError::Bns(BnsClientError::Registry(info)) => {
+            let code = match info.code.as_str() {
+                "CONTROLLER_SCOPE_DENIED" | "NOT_EFFECTIVE_OWNER" => {
+                    SnV2ErrorCode::BnsPermissionDenied
+                }
+                "NAME_ALREADY_EXISTS" => SnV2ErrorCode::BnsNameAlreadyExists,
+                _ => SnV2ErrorCode::BnsWriteFailed,
+            };
+            (code, info.code.as_str(), info.expected, info.actual)
+        }
+        other => (SnV2ErrorCode::BnsWriteFailed, other.code(), None, None),
+    };
+
+    reason_error(
+        code,
+        json!({
+            "bns_code": bns_code,
+            "expected": expected,
+            "actual": actual,
+            "message": error.to_string(),
+        })
+        .to_string(),
+    )
 }

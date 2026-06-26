@@ -1,11 +1,12 @@
 use super::common::{
     ensure_owned_device, ok_response, parse_params, require_account_username,
-    resolve_self_scoped_username, AddDnsRecordReq, IntoRpcResult, RemoveDnsRecordReq,
-    RpcCallResult,
+    resolve_self_scoped_username, stable_request_id, AddDnsRecordReq, IntoRpcResult,
+    RemoveDnsRecordReq, RpcCallResult,
 };
-use super::errors::{parse_error, SnV2ErrorCode};
+use super::errors::{bns_write_error, parse_error, SnV2ErrorCode};
 use crate::SNServer;
 use ::kRPC::{RPCErrors, RPCRequest, RPCResponse};
+use bns_client::{DnsTxtUpdate, UpsertDnsTxtParams};
 use serde_json::{json, Value};
 
 fn normalize_domain(domain: &str) -> String {
@@ -49,7 +50,7 @@ fn ensure_user_dns_domain(
 pub(crate) async fn handle_dns(server: &SNServer, req: RPCRequest) -> RpcCallResult<RPCResponse> {
     match req.method.as_str() {
         "add_record" => {
-            let username = require_account_username(server, &req)?;
+            let username = require_account_username(server, &req).await?;
             let user = server
                 .auth_db()
                 .get_user_info(username.as_str())
@@ -69,6 +70,34 @@ pub(crate) async fn handle_dns(server: &SNServer, req: RPCRequest) -> RpcCallRes
                 params.domain.as_str(),
                 server.server_host_v2(),
             )?;
+            let mut bns_receipt = None;
+            if params.record_type.eq_ignore_ascii_case("TXT") {
+                if let Some(controller) = server.bns_controller() {
+                    let payload = json!({
+                        "domain": normalize_domain(params.domain.as_str()),
+                        "record": params.record.clone(),
+                        "ttl": params.ttl.unwrap_or(600),
+                    });
+                    let receipt = controller
+                        .upsert_dns_txt(UpsertDnsTxtParams {
+                            request_id: stable_request_id(
+                                params.request_id.clone(),
+                                "upsert_dns_txt",
+                                username.as_str(),
+                                &payload,
+                            ),
+                            name: username.clone(),
+                            update: DnsTxtUpdate::Add {
+                                ttl: params.ttl.unwrap_or(600),
+                                value: params.record.clone(),
+                            },
+                            authority: controller.sn_controller_authority(),
+                        })
+                        .await
+                        .map_err(bns_write_error)?;
+                    bns_receipt = Some(serde_json::to_value(receipt).unwrap_or_default());
+                }
+            }
             server
                 .compat_store()
                 .add_user_domain(
@@ -94,11 +123,15 @@ pub(crate) async fn handle_dns(server: &SNServer, req: RPCRequest) -> RpcCallRes
             }
             ok_response(
                 &req,
-                json!({ "code": 0, "device_name": device.device_name }),
+                json!({
+                    "code": 0,
+                    "device_name": device.device_name,
+                    "bns_receipt": bns_receipt,
+                }),
             )
         }
         "remove_record" => {
-            let username = require_account_username(server, &req)?;
+            let username = require_account_username(server, &req).await?;
             let user = server
                 .auth_db()
                 .get_user_info(username.as_str())
@@ -118,6 +151,37 @@ pub(crate) async fn handle_dns(server: &SNServer, req: RPCRequest) -> RpcCallRes
                 params.domain.as_str(),
                 server.server_host_v2(),
             )?;
+            let mut bns_receipt = None;
+            if params.record_type.eq_ignore_ascii_case("TXT") {
+                if let Some(controller) = server.bns_controller() {
+                    let update = params
+                        .record
+                        .clone()
+                        .map(|value| DnsTxtUpdate::Remove { value })
+                        .unwrap_or_else(|| DnsTxtUpdate::Replace {
+                            records: Vec::new(),
+                        });
+                    let payload = json!({
+                        "domain": normalize_domain(params.domain.as_str()),
+                        "record": params.record.clone(),
+                    });
+                    let receipt = controller
+                        .upsert_dns_txt(UpsertDnsTxtParams {
+                            request_id: stable_request_id(
+                                params.request_id.clone(),
+                                "remove_dns_txt",
+                                username.as_str(),
+                                &payload,
+                            ),
+                            name: username.clone(),
+                            update,
+                            authority: controller.sn_controller_authority(),
+                        })
+                        .await
+                        .map_err(bns_write_error)?;
+                    bns_receipt = Some(serde_json::to_value(receipt).unwrap_or_default());
+                }
+            }
             if params.has_cert.unwrap_or(false) {
                 server
                     .auth_db()
@@ -139,7 +203,7 @@ pub(crate) async fn handle_dns(server: &SNServer, req: RPCRequest) -> RpcCallRes
             {
                 server.remove_name_info_cache(params.domain.as_str(), record_type);
             }
-            ok_response(&req, json!({ "code": 0 }))
+            ok_response(&req, json!({ "code": 0, "bns_receipt": bns_receipt }))
         }
         "list_records" => {
             let username = resolve_self_scoped_username(server, &req, false).await?;

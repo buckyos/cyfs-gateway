@@ -421,6 +421,32 @@ impl SnBnsController {
         .await
     }
 
+    pub async fn publish_document(
+        &self,
+        params: PublishDocumentParams,
+    ) -> SnBnsControllerResult<BnsWriteReceipt> {
+        self.ensure_owner_authority(&params.authority, &params.doc_type)?;
+        self.run_idempotent(
+            &params.request_id,
+            BnsWriteOperation::PublishDocument,
+            &params.name,
+            Some(&params.doc_type),
+            &params,
+            || async {
+                self.publish_json_document_once(
+                    &params.request_id,
+                    BnsWriteOperation::PublishDocument,
+                    &params.name,
+                    &params.doc_type,
+                    &params.document,
+                    params.authority.clone(),
+                )
+                .await
+            },
+        )
+        .await
+    }
+
     pub async fn bind_zone_documents(
         &self,
         params: BindZoneDocumentsParams,
@@ -1031,6 +1057,15 @@ pub struct PublishOwnerDocumentParams {
     pub request_id: String,
     pub name: String,
     pub owner_config: Value,
+    pub authority: CallAuthority,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PublishDocumentParams {
+    pub request_id: String,
+    pub name: String,
+    pub doc_type: String,
+    pub document: Value,
     pub authority: CallAuthority,
 }
 

@@ -25,6 +25,7 @@ sha2.workspace = true
 hex.workspace = true
 ring.workspace = true
 sqlx.workspace = true
+rusqlite = { version = "0.32.1", features = ["bundled"] }
 
 buckyos-kit.workspace = true
 kRPC.workspace = true
@@ -32,6 +33,7 @@ name-client.workspace = true
 name-lib.workspace = true
 cyfs-gateway-lib = { path = "../cyfs-gateway-lib" }
 bns-client = { path = "../bns-client" }
+bns-indexer = { path = "../bns-indexer" }
 async-named-locker = "0.1"
 callback-trait = "0.1"
 sfo-result = "0.2"

@@ -1,11 +1,13 @@
 use super::common::{
     device_to_json, ensure_owner_decoding_key, ok_response, parse_params, query_by_did,
-    require_account_username, resolve_self_scoped_username, DeviceGetReq, DeviceRegisterReq,
-    DeviceUpdateReq, IntoRpcResult, QueryByDidReq, QueryByHostnameReq, QueryByPkReq, RpcCallResult,
+    require_account_username, resolve_self_scoped_username, stable_request_id, DeviceGetReq,
+    DeviceRegisterReq, DeviceUpdateReq, IntoRpcResult, QueryByDidReq, QueryByHostnameReq,
+    QueryByPkReq, RpcCallResult,
 };
-use super::errors::{parse_error, SnV2ErrorCode};
+use super::errors::{bns_write_error, parse_error, SnV2ErrorCode};
 use crate::SNServer;
 use ::kRPC::{RPCErrors, RPCRequest, RPCResponse};
+use bns_client::PublishDeviceMiniDocParams;
 use serde_json::{json, Value};
 
 pub(crate) async fn handle_device(
@@ -14,7 +16,7 @@ pub(crate) async fn handle_device(
 ) -> RpcCallResult<RPCResponse> {
     match req.method.as_str() {
         "register" => {
-            let username = require_account_username(server, &req)?;
+            let username = require_account_username(server, &req).await?;
             let user = server
                 .auth_db()
                 .get_user_info(username.as_str())
@@ -37,6 +39,61 @@ pub(crate) async fn handle_device(
                     format!("invalid device did: {} != {}", dev_did, params.device_did),
                 ));
             }
+            let mut bns_receipt = None;
+            let mut pending_bns_publish = server.bns_controller().is_none();
+            if let Some(controller) = server.bns_controller() {
+                let auth_context =
+                    crate::sn_authority::require_owner_for_name(server, &req, username.as_str())
+                        .await?;
+                let authority = auth_context.to_call_authority().ok_or_else(|| {
+                    parse_error(SnV2ErrorCode::AuthRequired, "owner authority is required")
+                })?;
+                let mut device_mini_doc =
+                    serde_json::from_str::<Value>(params.device_info.as_str())
+                        .ok()
+                        .filter(|value| value.is_object())
+                        .unwrap_or_else(|| json!({ "device_info": params.device_info }));
+                if let Some(obj) = device_mini_doc.as_object_mut() {
+                    obj.insert("did".to_string(), Value::String(params.device_did.clone()));
+                    obj.insert(
+                        "device_name".to_string(),
+                        Value::String(params.device_name.clone()),
+                    );
+                    obj.insert(
+                        "mini_config_jwt".to_string(),
+                        Value::String(params.mini_config_jwt.clone()),
+                    );
+                }
+                let payload = json!({
+                    "device_name": params.device_name.clone(),
+                    "device_did": params.device_did.clone(),
+                    "device_mini_doc": device_mini_doc,
+                });
+                let receipt = controller
+                    .publish_device_mini_doc(PublishDeviceMiniDocParams {
+                        request_id: stable_request_id(
+                            params.request_id.clone(),
+                            "publish_device",
+                            username.as_str(),
+                            &payload,
+                        ),
+                        name: username.clone(),
+                        device_name: payload["device_name"]
+                            .as_str()
+                            .unwrap_or_default()
+                            .to_string(),
+                        did: payload["device_did"]
+                            .as_str()
+                            .unwrap_or_default()
+                            .to_string(),
+                        device_mini_doc: payload["device_mini_doc"].clone(),
+                        authority,
+                    })
+                    .await
+                    .map_err(bns_write_error)?;
+                bns_receipt = Some(serde_json::to_value(receipt).unwrap_or_default());
+                pending_bns_publish = false;
+            }
             server
                 .register_device_record(
                     username.as_str(),
@@ -48,10 +105,20 @@ pub(crate) async fn handle_device(
                 )
                 .await
                 .into_rpc()?;
-            ok_response(&req, json!({ "code": 0 }))
+            server
+                .maybe_assign_zone_relay(username.as_str(), None, "device_register")
+                .await;
+            ok_response(
+                &req,
+                json!({
+                    "code": 0,
+                    "pending_bns_publish": pending_bns_publish,
+                    "bns_receipt": bns_receipt,
+                }),
+            )
         }
         "update" => {
-            let username = require_account_username(server, &req)?;
+            let username = require_account_username(server, &req).await?;
             let params: DeviceUpdateReq = parse_params(&req)?;
             server
                 .update_device_record(

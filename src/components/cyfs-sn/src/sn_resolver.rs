@@ -3,6 +3,7 @@ use crate::{
     SnDeviceStateView, SnRelayManagerRef, ZoneInfo,
 };
 use async_trait::async_trait;
+use buckyos_kit::{is_valid_name, NameType};
 use cyfs_gateway_lib::{server_err, ServerError, ServerErrorCode};
 use jsonwebtoken::DecodingKey;
 use log::{debug, warn};
@@ -1052,6 +1053,19 @@ impl SnResolver {
                 .await;
         }
 
+        if let Some(owner) = self.bns.resolve_owner(hostname.as_str()).await? {
+            return self
+                .resolve_zone_by_bns_owner(
+                    hostname.as_str(),
+                    hostname.as_str(),
+                    owner,
+                    ZoneResolutionSource::BnsName,
+                    None,
+                    None,
+                )
+                .await;
+        }
+
         if let Some(user) = self.auth.get_user_by_domain(hostname.as_str()).await? {
             let username = user.username.clone().ok_or_else(|| {
                 SnResolverError::not_found(format!("user_domain {} has no username", hostname))
@@ -1062,19 +1076,6 @@ impl SnResolver {
                     username.as_str(),
                     user,
                     ZoneResolutionSource::UserDomain,
-                )
-                .await;
-        }
-
-        if let Some(owner) = self.bns.resolve_owner(hostname.as_str()).await? {
-            return self
-                .resolve_zone_by_bns_owner(
-                    hostname.as_str(),
-                    hostname.as_str(),
-                    owner,
-                    ZoneResolutionSource::BnsName,
-                    None,
-                    None,
                 )
                 .await;
         }
@@ -1861,7 +1862,10 @@ fn normalize_host_lossy(hostname: &str) -> String {
 
 fn normalize_bns_name(name: &str) -> SnResolverResult<String> {
     let name = name.trim().trim_end_matches('.').to_ascii_lowercase();
-    if name.is_empty() || name.contains(char::is_whitespace) {
+    if name.is_empty()
+        || name.contains(char::is_whitespace)
+        || !is_valid_name(&name, NameType::User)
+    {
         return Err(SnResolverError::new(
             SnResolverErrorKind::InvalidHostname,
             format!("invalid BNS name {}", name),
