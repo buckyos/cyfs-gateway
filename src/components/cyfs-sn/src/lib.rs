@@ -7,7 +7,6 @@ pub mod s2s_api;
 mod sn_auth;
 mod sn_authority;
 mod sn_bns_reader;
-mod sn_bns_store;
 mod sn_compat_store;
 mod sn_device_info;
 pub mod sn_resolver;

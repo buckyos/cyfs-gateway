@@ -8,6 +8,7 @@ authors = ["BuckyOS DAO", "@waterflier", "@lurenpluto", "@wugren"]
 async-trait.workspace = true
 bns-indexer = { path = "../bns-indexer" }
 kRPC.workspace = true
+rusqlite = { version = "0.32.1", features = ["bundled"] }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

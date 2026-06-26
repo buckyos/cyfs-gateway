@@ -5,7 +5,6 @@ use crate::api::{
 };
 use crate::name_info_cache::{NameInfoCache, NameInfoCacheQueryResult, NameInfoCacheRef};
 use crate::sn_bns_reader::BnsIndexerDocumentReader;
-use crate::sn_bns_store::SqliteSnBnsWriteRequestStore;
 use crate::sn_compat_store::{SNDeviceInfo, SnCompatibilityStoreRef, SqliteSnCompatibilityStore};
 use crate::sn_resolver::{
     device_config_from_mini_jwt, ResolverCompatibilityReader, ResolverDeviceDocument,
@@ -22,7 +21,10 @@ use crate::{
 };
 use ::kRPC::*;
 use async_trait::async_trait;
-use bns_client::{BnsIndexerApi, BnsIndexerClient, SnBnsController, SnBnsControllerConfig};
+use bns_client::{
+    BnsIndexerApi, BnsIndexerClient, SnBnsController, SnBnsControllerConfig,
+    SqliteSnBnsWriteRequestStore,
+};
 use bns_indexer::{Principal, PrincipalKind};
 use buckyos_kit::{get_buckyos_service_data_dir, is_valid_name, NameType};
 use cyfs_gateway_lib::{into_server_err, server_err};

@@ -25,7 +25,6 @@ sha2.workspace = true
 hex.workspace = true
 ring.workspace = true
 sqlx.workspace = true
-rusqlite = { version = "0.32.1", features = ["bundled"] }
 
 buckyos-kit.workspace = true
 kRPC.workspace = true

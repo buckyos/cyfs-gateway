@@ -6,6 +6,8 @@
 
 mod rpc;
 mod sn_bns_controller;
+mod sn_bns_store;
 
 pub use rpc::*;
 pub use sn_bns_controller::*;
+pub use sn_bns_store::*;

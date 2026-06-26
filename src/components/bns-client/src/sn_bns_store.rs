@@ -1,4 +1,4 @@
-use bns_client::{
+use crate::{
     BnsWriteOperation, BnsWriteRequestState, SnBnsControllerError, SnBnsControllerResult,
     SnBnsWriteRequestRecord, SnBnsWriteRequestStore,
 };
@@ -7,12 +7,12 @@ use serde_json::Value;
 use std::path::Path;
 use std::sync::Mutex;
 
-pub(crate) struct SqliteSnBnsWriteRequestStore {
+pub struct SqliteSnBnsWriteRequestStore {
     conn: Mutex<Connection>,
 }
 
 impl SqliteSnBnsWriteRequestStore {
-    pub(crate) fn open(path: impl AsRef<Path>) -> SnBnsControllerResult<Self> {
+    pub fn open(path: impl AsRef<Path>) -> SnBnsControllerResult<Self> {
         if let Some(parent) = path.as_ref().parent() {
             if !parent.as_os_str().is_empty() {
                 std::fs::create_dir_all(parent)
