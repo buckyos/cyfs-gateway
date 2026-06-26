@@ -11,54 +11,69 @@ SN 是 BNS 早期可用性的过渡服务，最终目标不是生态化，而是
 - user-owned gateway 负责用户自己的公网可达入口，可以部署在 VPS、云主机、家庭公网 IP 或托管但用户可控的 gateway 上。
 - SN 只负责在 user-owned gateway 还没有普及时提供 fallback bootstrap/relay 能力，解决 Personal Server 仍在 NAT 后面的过渡问题。
 
+因此应把 BNS 和 SN 当成两个独立系统来看：BNS 是权威状态系统，SN 是依赖 BNS 的运行时 fallback 系统。对有钱包的 Web3 用户，核心流程应是：
+
+```text
+用户 / 钱包 / BuckyOS App
+  -> BNS Registry / 合约
+  -> 用户局域网或 SN 信任域内的 bns-indexer
+  -> SN 读取 bns-indexer 的最终状态
+  -> resolver / relay / node_daemon 使用该状态
+```
+
+这条核心路径中，SN 不代替用户写 BNS，不持有 owner 权限，也不需要成为 BNS controller。`bns-indexer` 是 BNS 合约或中心化模拟 Registry 的本地可信索引器，负责把已验证事件和文档版本整理成可查询的最终状态；SN 只消费这个最终状态。
+
 因此，`cyfs-sn` 的开源实现主要是 SN 过渡层的参考实现，用来说明协议原理、支持审计、测试和兼容性验证；它不应该被理解为鼓励普通用户或第三方服务商长期运行生产 SN。第三方运行 SN 可以作为兼容结果存在，但不应成为 BNS 的产品主路径，也不应形成“用户选择 SN 服务商”的终局模型。
 
 设计上应避免把 SN 写进 BNS 的长期信任模型：
 
 - BNS 合约不设计“选择 SN provider / operator”的权威字段。
 - SN 不拥有域名解析权威，也不成为用户身份入口。
-- SN controller 只用于过渡阶段必要的受限自动写操作，并且必须可被迁移或撤销。
+- SN controller / bns-controller 只属于 Web2 兼容产品路径，用于照顾日常不使用钱包的用户；它不是 Web3 核心路径。
 - 官方 SN 的长期目标不是承载更多流量，而是随着 user-owned gateway 普及逐步降低依赖，最终可以下线。
 
 ## 设计目标
 
-新版本 SN 基于 `bns-indexer` 构造。BNS 负责名字、文档、controller key、controller policy 等权威状态；SN 作为过渡服务，现阶段负责账号、设备在线信息、域名绑定、边缘 relay 分配和流量转发。
+新版本 SN 基于 `bns-indexer` 的最终状态构造。BNS 负责名字、文档、controller key、controller policy 等权威状态；SN 作为过渡服务，现阶段负责账号、设备在线信息、传统域名绑定、边缘 relay 分配和流量转发。
 
-重点不是把所有状态都上链，而是让 SN 对 BNS 的写操作走未来合约也能支持的 controller 机制：
+重点不是让 SN 成为 BNS 的写入口，而是让 SN 的 resolver、relay 和设备管理逻辑都以 BNS 最终状态为输入：
 
 - Owner 仍然是名字和核心文档的最终控制者。
-- SN 可以在 BNS 创建阶段同步写入自己持有的 controller key/policy。
-- SN 后续只对被授权的 doc type 执行自动化写操作，例如 `dns_txt`、relay assignment 相关文档。
+- Web3 用户通过钱包、BuckyOS App、CLI 或其它 BNS 工具直接更新 BNS。
+- `bns-indexer` 在本地信任域内同步 BNS 事件和文档版本，并向 SN 提供只读最终状态。
+- SN core 不要求持有 controller key，也不把 SN login token 映射为 BNS owner 权限。
+- `bns-controller` 可以保留为 Web2 用户的兼容入口，用于托管或代操作 BNS 更新，但它不是 SN 核心路径。
 - `bns-indexer` 保持为 registry/document 状态机，不直接承担 RPC 鉴权、账号登录或设备在线状态。
 
-这些 controller 能力服务于过渡阶段的可用性，不代表 SN 是 BNS 终局架构的一部分。长期应把公网可达性迁移到 user-owned gateway，把 SN 依赖降到 0。
+Web2 兼容路径服务于过渡阶段的可用性和产品易用性，不代表 SN 是 BNS 终局架构的一部分。长期应把公网可达性迁移到 user-owned gateway，把 SN 依赖降到 0。
 
 ## 模块划分
 
 ### bns-indexer
 
-BNS 权威状态机。负责：
+BNS 本地索引器和最终状态查询层。站在 SN 视角，它负责：
 
-- register name
-- publish / resolve document
-- authority key
-- controller policy
-- document version / name seq guard
-- helper schema，例如 `zone`、`boot`、`device_mini_doc`、`dns_txt`
+- resolve name / owner / document
+- authority key 和 controller policy 的最终状态视图
+- document version / name seq / event seq 查询
+- helper schema 解析和校验，例如 `zone`、`boot`、`device_mini_doc`、`dns_txt`
+- 从 BNS Registry / 合约事件生成本地最终状态，供 SN、local resolver 和 gateway 查询
+
+中心化模拟阶段，当前实现可以继续把 register name、publish document 等写接口放在 `bns-indexer` crate 或相邻服务中；但从 SN core 的架构边界看，这些属于 BNS 系统接口，不是 SN 的必需依赖。
 
 `sn_document_schema` 不单独拆服务，应该沉到 `bns-indexer` helper 中。
 
 ### sn_bns_controller
 
-SN 对 `bns-indexer` 的写操作封装层。负责：
+Web2 兼容路径中，SN 对 BNS 写操作的产品封装层。它服务于没有钱包或日常不使用钱包的用户，不属于 Web3 核心路径。负责：
 
-- 将 SN 鉴权结果转换为 BNS 可接受的 owner/controller 调用。
-- 创建 BNS name 时同步设置 SN controller key 和 controller policy。
-- 发布 `zone`、`boot`、`device_mini_doc`、`dns_txt` 等 BNS 文档。
+- 将 Web2 账号、托管 key、用户授权或产品策略转换为 BNS 可接受的 owner/controller 调用。
+- 创建 BNS name 时同步设置必要的托管 controller key / controller policy。
+- 代表 Web2 用户发布 `zone`、`boot`、`device_mini_doc`、`dns_txt` 等 BNS 文档。
 - 维护 BNS 写操作的 version guard、幂等参数和错误映射。
-- 约束 SN controller 只能写被授权的 doc type，避免 SN 拥有过宽权限。
+- 约束托管 controller 只能写被授权的 doc type，避免产品层拥有过宽权限。
 
-这里是系统事务性的关键点。暂不单独设计 `sn_consistency_worker`，优先通过 `sn_bns_controller` 把 BNS name 创建、初始文档、SN controller 授权做成一个 BNS 侧原子流程。
+这里不是 SN core 的系统事务关键点。SN core 的关键路径是“从 `bns-indexer` 读最终状态并维护自己的运行态”。`sn_bns_controller` 的事务性只约束 Web2 兼容注册和代操作流程。暂不单独设计 `sn_consistency_worker`，如果 Web2 注册路径需要创建 BNS name、初始文档、托管 controller 授权，应优先在 BNS 侧做成一个原子流程。
 
 ### sn_auth
 
@@ -86,17 +101,18 @@ BNS 中的 `device_mini_doc` 是设备身份和基础配置的权威文档；`sn
 
 鉴权工具库，不做独立 SSO 服务。负责验证并归一化：
 
-- Owner ETH 私钥签发的请求。
 - SN 登录后由 `sn_auth` 签发的用户 session token。
 - 设备私钥签发的自动化请求。
-- SN controller key 签发的 BNS 自动化请求。
+- SN Admin / relay 节点凭证。
+- 可选 Web2 兼容路径中，托管 owner/controller key 签发的 BNS 自动化请求。
 
 输出应是统一的权限上下文，例如：
 
-- `Owner(name)`
-- `Controller(name, doc_type_scope)`
 - `Device(zone, device_name, did)`
 - `SnUser(username)`
+- `SnAdmin(scope)`
+- `RelayNode(sn_name)`
+- 可选兼容路径中的 `ManagedBnsOwner(name)` / `ManagedBnsController(name, doc_type_scope)`
 
 业务模块不应重复解析 token，而是消费 `sn_authority` 的结果。
 
@@ -128,13 +144,15 @@ BNS 中的 `device_mini_doc` 是设备身份和基础配置的权威文档；`sn
 
 - JSON-RPC / HTTP 路由。
 - 参数校验、错误码、兼容旧接口。
-- 调用 `sn_authority`、`sn_bns_controller`、`sn_auth`、`sn_device_info`、`sn_resolver`、`sn_relay_manager`。
+- 调用 `sn_authority`、`sn_auth`、`sn_device_info`、`sn_resolver`、`sn_relay_manager`。
+- 在 Web2 兼容产品路径中，可选调用 `sn_bns_controller`。
 
 ### sn_acme_client
 
 暂不单独拆成 `sn_acme_manager`。ACME 自动行为基于 `sn_auth` 中的 `zone_info` 和 BNS `dns_txt` 文档实现：
 
-- DNS challenge 写入由 `sn_bns_controller` 使用 SN controller key 发布到 BNS `dns_txt`。
+- Web3 核心路径中，DNS challenge 写入由用户侧 BNS 工具、local gateway 或钱包授权流程发布到 BNS `dns_txt`。
+- Web2 兼容路径中，可以由 `sn_bns_controller` 使用托管 controller key 发布到 BNS `dns_txt`。
 - 证书状态写回 `sn_auth.zone_info.self_cert`。
 - 后续如果 ACME 生命周期、失败重试、TXT 清理变复杂，再考虑单独拆组件。
 
@@ -188,29 +206,55 @@ BNS 中的 `device_mini_doc` 是设备身份和基础配置的权威文档；`sn
 
 ## 注册管理
 
-### 注册用户 owner
+注册管理分为 Web3 核心路径和 Web2 兼容路径。
+
+### Web3 注册 / 更新 BNS name（核心路径）
+
+输入：
+
+- BNS name
+- owner public keys，至少包含 BNS/ETH owner key 和后续文档签名所需 key
+- owner_config
+- zone / boot / device_mini_doc / dns_txt 等需要发布的 BNS 文档
+- 钱包签名、BNS authority key 签名，或 BNS 侧认可的调用方式
+
+流程：
+
+1. 用户通过钱包、BuckyOS App、CLI 或其它 BNS 工具调用 BNS Registry / 合约。
+2. BNS 创建或更新 name，并发布 owner_config、zone、boot、device_mini_doc、dns_txt 等文档。
+3. `bns-indexer` 同步 BNS 事件，生成本地最终状态。
+4. SN 通过 `bns-indexer` 读取最终状态，更新 resolver cache、zone runtime cache 或 relay hint。
+5. 如果用户需要 SN Web2 账号，则 `sn_auth` 只建立 `sn_user <-> BNS name` 的本地绑定，不参与 BNS owner 权限。
+
+需要保证：
+
+- SN core 不需要为 BNS 注册提供幂等 key、半失败恢复或 controller policy 写入。
+- SN cache 失效应跟随 `bns-indexer` 暴露的 name_seq、document version 或 event seq。
+- `sn_auth` 的账号恢复、密码找回不能改变 BNS owner。
+
+### Web2 注册 SN 用户并代管 BNS（兼容路径）
 
 输入：
 
 - username
-- owner public keys，至少包含 BNS/ETH owner key 和后续文档签名所需 key
-- owner_config
 - password_hash
 - active_code 或其它注册许可
+- 托管 owner/controller key、恢复策略或用户授权凭证
+- owner_config 及初始 zone / boot 文档
 
 流程：
 
 1. `sn_auth` 判断用户名是否合法、激活码是否可用。
-2. `sn_bns_controller` 调用 `bns-indexer.register` 创建 BNS name。
-3. BNS 创建阶段同步发布 owner_config，并设置 SN controller key / controller policy。
+2. `sn_bns_controller` 调用 BNS Registry / 合约适配器创建 BNS name。
+3. BNS 创建阶段同步发布 owner_config，并设置必要的托管 controller key / controller policy。
 4. `sn_auth.register` 写入账号、密码和基础用户状态。
-5. 返回登录态和 BNS name 状态。
+5. 返回登录态、BNS name 状态和托管权限状态。
 
 需要保证：
 
 - `sn_bns_controller` 的注册请求要有幂等 key。
 - 如果 BNS name 已存在但 `sn_auth` 未完成，应能通过明确的恢复流程继续绑定账号或人工处理。
-- SN controller policy 必须限制 doc type，不能给 SN 全量 owner 权限。
+- 托管 controller policy 必须限制 doc type，不能给 SN 产品层全量 owner 权限。
 
 ### bind zone
 
@@ -222,11 +266,19 @@ BNS 中的 `device_mini_doc` 是设备身份和基础配置的权威文档；`sn
 
 流程：
 
-1. `sn_authority` 校验 owner 权限。
-2. `sn_bns_controller` 校验 `zone_config` 和 `zone_boot_config` 签名。
-3. 发布 BNS `zone` document。
-4. 发布 BNS `boot` document。
-5. 根据 zone/boot 内容更新 `sn_auth.zone_info` 中的运行态缓存。
+Web3 核心路径：
+
+1. 用户通过 BNS 工具或钱包授权流程发布 BNS `zone` document。
+2. 用户通过 BNS 工具或钱包授权流程发布 BNS `boot` document。
+3. `bns-indexer` 同步新版本。
+4. SN 根据 `bns-indexer` 的 zone/boot 内容更新 `sn_auth.zone_info` 中的运行态缓存。
+
+Web2 兼容路径：
+
+1. `sn_authority` 校验 SN session、托管授权或其它产品层权限。
+2. `sn_bns_controller` 校验 `zone_config` 和 `zone_boot_config`。
+3. `sn_bns_controller` 代表用户发布 BNS `zone` / `boot` document。
+4. SN 等待或订阅 `bns-indexer` 看到新版本后，再更新运行态缓存。
 
 ### 注册设备
 
@@ -240,16 +292,26 @@ BNS 中的 `device_mini_doc` 是设备身份和基础配置的权威文档；`sn
 
 流程：
 
-1. `sn_authority` 校验 owner/session-token 或 device-token。
+Web3 核心路径：
+
+1. owner 或被 BNS 授权的自动化 key 发布 BNS `device_mini_doc`。
+2. `bns-indexer` 同步该设备文档。
+3. 设备调用 `sn_device_info.update_ood_info`。
+4. `sn_authority` 根据 `bns-indexer` 中的 `device_mini_doc` 校验 device token。
+5. `sn_device_info` 写入设备在线态初始记录或更新记录。
+
+Web2 兼容路径：
+
+1. `sn_authority` 校验 SN session、托管授权或 device token。
 2. 校验 `device_mini_doc` 与 DID、公钥、zone/device_name 一致。
-3. `sn_device_info.register_device` 写入设备在线态初始记录。
-4. `sn_bns_controller` 发布 BNS `device_mini_doc`。
+3. `sn_bns_controller` 代表用户发布 BNS `device_mini_doc`。
+4. `bns-indexer` 同步后，`sn_device_info` 接受该设备的在线态上报。
 
 权限规则：
 
-- owner 可以注册或替换 device。
+- owner 可以在 BNS 中注册或替换 device。
 - device 私钥只能更新自己的在线态。
-- 如果允许 device 私钥发布 `device_mini_doc`，必须由 BNS controller policy 明确授予该 device 对特定 doc type / device_name 的权限。
+- 如果允许 device 私钥发布 `device_mini_doc`，必须由 BNS controller policy 明确授予该 device 对特定 doc type / device_name 的权限；这属于 BNS 侧授权，不由 SN core 决定。
 
 ### 注册 user_domain
 
@@ -268,9 +330,9 @@ BNS 中的 `device_mini_doc` 是设备身份和基础配置的权威文档；`sn
 
 ### BNS 修改类请求
 
-优先使用 owner ETH 私钥或 BNS authority key 签名。`sn_authority` 将签名请求转换为 `Owner(name)` 或 `Controller(name, doc_type_scope)`。
+Web3 核心路径中，BNS 修改类请求不进入 SN core。用户应直接通过 BNS Registry / 合约调用适配器完成 owner/controller 鉴权、nonce、防重放和状态更新。
 
-SN 登录 token 只表示 `SnUser(username)`，不天然等价于 BNS owner。它可以用于 UI 管理和低风险账号操作；涉及 BNS owner 权限时，应要求 owner 签名，或通过已经写入 BNS 的 controller policy 授权 SN 执行特定 doc type 的自动操作。
+SN 登录 token 只表示 `SnUser(username)`，不天然等价于 BNS owner。它可以用于 UI 管理、传统账号操作和 Web2 兼容路径的产品授权；涉及 BNS owner 权限时，应转到 BNS 工具 / 钱包，或由可选 `sn_bns_controller` 在明确托管授权范围内执行。
 
 ### BuckyOS 自动化请求
 
@@ -281,13 +343,12 @@ device 权限主要用于：
 - update_ood_info
 - keep_tunnel
 - ACME 证书状态上报
-- 受限 DNS challenge 请求
 
 device token 不应默认拥有 BNS owner 权限。
 
 ## BuckyOS 自动行为
 
-自动行为原则上不是 owner 级链操作。需要写 BNS 时，由 `sn_bns_controller` 使用 SN controller key，在 BNS controller policy 授权范围内执行。
+SN core 中的自动行为原则上不是 owner 级链操作。自动行为如果需要更新 BNS 权威状态，Web3 核心路径应回到 BNS 侧自动化 key、钱包授权或 local gateway；Web2 兼容路径才由 `sn_bns_controller` 使用托管 controller key，在 BNS controller policy 授权范围内执行。
 
 ### update_ood_info
 
@@ -321,10 +382,11 @@ relay_sn:
 证书无效时开始更新：
 
 1. 根据证书机构要求生成 DNS challenge。
-2. 调用 SN DNS API。
-3. `sn_bns_controller` 使用 SN controller key 发布 BNS `dns_txt` document。
-4. ACME 校验成功后，调用 `sn_auth.update_zone_info(self_cert=true)`。
-5. ACME 校验失败时，不应立即覆盖已有有效证书状态；应区分“本轮签发失败”和“当前证书不可用”。
+2. Web3 核心路径中，通过 BNS 工具、local gateway 或钱包授权流程发布 BNS `dns_txt` document。
+3. Web2 兼容路径中，可以调用 SN DNS API，由 `sn_bns_controller` 使用托管 controller key 发布 BNS `dns_txt` document。
+4. `bns-indexer` 同步 `dns_txt` 新版本后，SN DNS 查询返回对应 TXT。
+5. ACME 校验成功后，调用 `sn_auth.update_zone_info(self_cert=true)`。
+6. ACME 校验失败时，不应立即覆盖已有有效证书状态；应区分“本轮签发失败”和“当前证书不可用”。
 
 ## http 流量中转
 
@@ -374,17 +436,18 @@ forward 目标端口：
 - controller key rotation
 - 手工调整 relay 分配
 
-其中 owner key / controller key rotation 必须通过 `sn_bns_controller` 走 BNS authority/controller 机制。
+其中 owner key / controller key rotation 属于 BNS 权威操作。Web3 用户应通过 BNS 工具或钱包完成；Web2 兼容用户可以通过 `sn_bns_controller` 的托管授权流程完成。SN core 不应把密码找回或 SN Admin 操作升级为 BNS key rotation。
 
 ## 内容发布
 
-先支持 CLI 工具，再在 BuckyOS App 里支持。
+先支持 BNS CLI 工具，再在 BuckyOS App 里支持。
 
 publishDocument:
 
-- 普通 owner 文档需要 Owner ETH 私钥或 BNS authority key。
-- SN 自动化文档需要 SN controller key，并且只能发布 controller policy 授权的 doc type。
-- 发布请求必须携带 expected_version / name_seq guard，避免覆盖并发更新。
+- Web3 核心路径中，普通 owner 文档需要 Owner ETH 私钥、BNS authority key 或 BNS 侧认可的调用方式。
+- Web2 兼容路径中，托管自动化文档可以由 `sn_bns_controller` 使用托管 controller key 发布，并且只能发布 controller policy 授权的 doc type。
+- 发布请求必须携带 expected_version / name_seq guard，避免覆盖并发更新；这是 BNS 状态机要求，不是 SN core 要求。
+- SN core 只读取 `bns-indexer` 看到的最终 document version。
 
 ## SN Admin
 
@@ -413,7 +476,8 @@ publishDocument:
 
 需要记录：
 
-- BNS 写操作请求、authority、doc_type、version。
+- Web2 兼容路径中的 BNS 代操作请求、authority、doc_type、version。
+- `bns-indexer` 同步到的 BNS event seq、name_seq、document version。
 - user_domain 绑定和 domain proof。
 - relay 分配调整。
 - ACME challenge 写入和清理。
