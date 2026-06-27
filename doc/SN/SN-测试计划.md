@@ -204,36 +204,37 @@
 
 ## 4. SN-DeviceInfo 单元测试（`cyfs-sn::sn_device_info`）
 
-现状：组件已实现（`SnDeviceInfoDB` trait + 4 表 + 11 接口，[sn_device_info.rs](../src/components/cyfs-sn/src/sn_device_info.rs)），**尚无独立测试**，需新建 `mod tests`（用临时 SQLite）。
+现状：组件已实现（`SnDeviceInfoDB` trait + 4 表 + 11 接口，[sn_device_info.rs](../src/components/cyfs-sn/src/sn_device_info.rs)）。
+> 已实现 `mod tests`（[sn_device_info.rs](../src/components/cyfs-sn/src/sn_device_info.rs) 内 `#[cfg(test)] mod tests`，23 例全绿；`tempfile` SQLite 夹具 `temp_db` + 原始 DB 内省 helper `event_types`/`scalar_i64`，覆盖 §4.1–§4.5）。
 
 ### 4.1 索引与重绑（device_index）
-- [ ] `upsert_device_index`：新 DID 创建；同 DID 同 `(zone,device_name)` 更新 role；同 DID 但 `(zone,device_name)` 变化 → `Conflict`（要求 rebind）；新 `(zone,device_name)` 已被他 DID 占用 → `Conflict`。
-- [ ] `rebind_device_index`：DID 不存在 → `NotFound`；目标 `(zone,device_name)` 冲突 → `Conflict`；成功保留 runtime/endpoint + 记 `rebound` 事件。
-- [ ] `remove_device_index`：删 runtime/endpoint/index，保留 `device_state_events`。
-- [ ] 唯一约束：`did` 唯一、`(zone,device_name)` 唯一。
+- [x] `upsert_device_index`：新 DID 创建；同 DID 同 `(zone,device_name)` 更新 role；同 DID 但 `(zone,device_name)` 变化 → `Conflict`（要求 rebind）；新 `(zone,device_name)` 已被他 DID 占用 → `Conflict`（`test_upsert_device_index_create_update_and_conflicts`）。
+- [x] `rebind_device_index`：DID 不存在 → `NotFound`；目标 `(zone,device_name)` 冲突 → `Conflict`；成功保留 runtime/endpoint + 记 `rebound` 事件（`test_rebind_not_found_conflict_and_preserves_runtime`）。
+- [x] `remove_device_index`：删 runtime/endpoint/index，保留 `device_state_events`（`test_remove_device_index_keeps_events`）。
+- [x] 唯一约束：`did` 唯一、`(zone,device_name)` 唯一（`test_unique_constraints`）。
 
 ### 4.2 运行态写入（update_device_state）
-- [ ] DID 不存在 → `NotFound`。
-- [ ] **stale 拒绝**：`report_seq` 明显旧于当前 → 拒绝 + `report_rejected` 事件 + `StaleReport` 错误语义。
-- [ ] **blocked 保护**：blocked 设备普通上报不改回 online + `report_rejected`；仅 `unblock_device` 可恢复。
-- [ ] `expires_at = now + ttl`；endpoint upsert；首次上线记 `online`、endpoint 变化记 `endpoint_changed`。
-- [ ] `from_ip`（上游观察）与设备自报 `reported_ip`/`reported_ips` 分开保存。
+- [x] DID 不存在 → `NotFound`（`test_update_device_state_not_found`）。
+- [x] **stale 拒绝**：`report_seq` 明显旧于当前 → 拒绝 + `report_rejected` 事件 + `StaleReport` 错误语义（`test_stale_report_rejected_records_event`）。
+- [x] **blocked 保护**：blocked 设备普通上报不改回 online + `report_rejected`；仅 `unblock_device` 可恢复（`test_blocked_device_rejects_report_only_unblock_recovers`）。
+- [x] `expires_at = now + ttl`；endpoint upsert；首次上线记 `online`、endpoint 变化记 `endpoint_changed`（`test_update_device_state_expiry_and_events`）。
+- [x] `from_ip`（上游观察）与设备自报 `reported_ip`/`reported_ips` 分开保存（`test_from_ip_and_reported_ip_stored_separately`）。
 
 ### 4.3 IP / endpoint 规则
-- [ ] 公网 IP 过滤（`is_public_ipv4`/`is_public_ipv6`）：排除 RFC1918、loopback、link-local、multicast、unspecified；ULA/link-local/loopback IPv6 排除；公网 v4/v6 进 `public_ips`。
-- [ ] wan/lan 分类（`classify_ips`）：私网进 `private_ips` 不进 DNS 视图；`is_wan_device` 计算。
-- [ ] endpoint 排序（`endpoint_sort_key`）：active 优先于 stale/failed/disabled；priority 小优先；public < relay < private < loopback < unknown。
-- [ ] 过期 / disabled endpoint 不进 active 列表；disabled 仅显式 enable/replace 恢复。
+- [x] 公网 IP 过滤（`is_public_ipv4`/`is_public_ipv6`）：排除 RFC1918、loopback、link-local、multicast、unspecified；ULA/link-local/loopback IPv6 排除；公网 v4/v6 进 `public_ips`（`test_is_public_ipv4_rules` / `test_is_public_ipv6_rules`）。
+- [x] wan/lan 分类（`classify_ips`）：私网进 `private_ips` 不进 DNS 视图；`is_wan_device` 计算（`test_classify_ips_wan_lan`）。
+- [x] endpoint 排序（`endpoint_sort_key`）：active 优先于 stale/failed/disabled；priority 小优先；public < relay < private < loopback < unknown（`test_endpoint_sort_key_ordering`）。
+- [x] 过期 / disabled endpoint 不进 active 列表；disabled 仅显式 enable/replace 恢复（`test_expired_and_disabled_endpoints_excluded`）。
 
 ### 4.4 查询视图与状态迁移
-- [ ] `get_device_state` / `get_device_state_by_name`：过期时先落库 `stale` 再返回视图，不返回过期/disabled endpoint。
-- [ ] `list_zone_devices`：state 过滤 + 分页。
-- [ ] `mark_device_offline`：state→offline、active endpoint→stale、记 `offline`。
-- [ ] `block_device`/`unblock_device`：block→blocked+禁用 endpoint；unblock→offline 等下次上报；事件正确。
-- [ ] `expire_devices`：`expires_at<now` 且 `online` → `stale`，过期 endpoint→stale，批量大小生效。
+- [x] `get_device_state` / `get_device_state_by_name`：过期时先落库 `stale` 再返回视图，不返回过期/disabled endpoint（`test_get_device_state_marks_stale_on_expiry`）。
+- [x] `list_zone_devices`：state 过滤 + 分页（`test_list_zone_devices_filter_and_pagination`）。
+- [x] `mark_device_offline`：state→offline、active endpoint→stale、记 `offline`（`test_mark_device_offline_event_and_endpoints`）。
+- [x] `block_device`/`unblock_device`：block→blocked+禁用 endpoint；unblock→offline 等下次上报；事件正确（`test_block_unblock_events_and_endpoints`）。
+- [x] `expire_devices`：`expires_at<now` 且 `online` → `stale`，过期 endpoint→stale，批量大小生效（`test_expire_devices_batch_size`）。
 
 ### 4.5 错误语义
-- [ ] `InvalidInput`（空 DID/zone/device_name、非法 IP/endpoint/TTL/枚举）、`NotFound`、`Conflict`、`StaleReport`、`Blocked`、`DBError`(=StorageError) 各有用例。
+- [x] `InvalidInput`（空 DID/zone/device_name、非法 IP/endpoint/TTL/枚举）、`NotFound`、`Conflict`、`StaleReport`、`Blocked`、`DBError`(=StorageError) 各有用例（`test_invalid_input_errors` / `test_db_error_on_closed_pool`，其余错误码散见 §4.1–§4.2 用例）。
 
 ### 4.6 阶段二（落地后补）
 - [ ] **remote 模式**：本地 service 与 remote client 暴露**同一组接口**，同一批用例参数化跑两遍（local / remote）结果一致；健康检查接口；连接/请求超时。

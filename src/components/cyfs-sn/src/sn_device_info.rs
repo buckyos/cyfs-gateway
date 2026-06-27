@@ -2123,4 +2123,800 @@ mod tests {
 
         Ok(())
     }
+
+    // ---- test helpers (raw DB introspection) ----
+
+    async fn event_types(db: &SqliteSnDeviceInfoDB, did: &str) -> Vec<String> {
+        let mut conn = db.pool.acquire().await.unwrap();
+        let rows = sqlx::query(
+            "SELECT event_type FROM device_state_events WHERE did = ?1 ORDER BY id ASC",
+        )
+        .bind(did)
+        .fetch_all(&mut *conn)
+        .await
+        .unwrap();
+        rows.into_iter().map(|r| r.get::<String, _>(0)).collect()
+    }
+
+    async fn scalar_i64(db: &SqliteSnDeviceInfoDB, sql: &str, did: &str) -> i64 {
+        let mut conn = db.pool.acquire().await.unwrap();
+        let row = sqlx::query(sql).bind(did).fetch_one(&mut *conn).await.unwrap();
+        row.get::<i64, _>(0)
+    }
+
+    async fn runtime_pair(
+        db: &SqliteSnDeviceInfoDB,
+        did: &str,
+    ) -> (Option<String>, Option<String>) {
+        let mut conn = db.pool.acquire().await.unwrap();
+        let row = sqlx::query("SELECT reported_ip, from_ip FROM device_runtime_states WHERE did = ?1")
+            .bind(did)
+            .fetch_one(&mut *conn)
+            .await
+            .unwrap();
+        (row.get::<Option<String>, _>(0), row.get::<Option<String>, _>(1))
+    }
+
+    fn ep_full(endpoint_id: &str, scope: SnEndpointScope, priority: i64) -> SnDeviceEndpoint {
+        SnDeviceEndpoint {
+            did: "did:dev:x".to_string(),
+            endpoint_id: endpoint_id.to_string(),
+            protocol: SnEndpointProtocol::Tcp,
+            host: "1.2.3.4".to_string(),
+            port: Some(80),
+            scope,
+            priority,
+            source: SnEndpointSource::DeviceReport,
+            state: SnEndpointState::Active,
+            last_seen_at: None,
+            expires_at: None,
+            created_at: 0,
+            updated_at: 0,
+        }
+    }
+
+    // =====================================================================
+    // §4.1 索引与重绑 (device_index)
+    // =====================================================================
+
+    #[tokio::test]
+    async fn test_upsert_device_index_create_update_and_conflicts() -> SnResult<()> {
+        let (_tmp, db) = temp_db().await?;
+        let did = "did:dev:a";
+
+        // 新 DID 创建
+        db.upsert_device_index(did, "zone1", "ood1", SnDeviceRole::Ood)
+            .await?;
+        assert_eq!(
+            db.get_device_state(did).await?.unwrap().device_role,
+            SnDeviceRole::Ood
+        );
+
+        // 同 DID 同 (zone,device_name) → 更新 role
+        db.upsert_device_index(did, "zone1", "ood1", SnDeviceRole::Gateway)
+            .await?;
+        assert_eq!(
+            db.get_device_state(did).await?.unwrap().device_role,
+            SnDeviceRole::Gateway
+        );
+
+        // 同 DID 但 (zone,device_name) 变化 → Conflict（要求 rebind）
+        let err = db
+            .upsert_device_index(did, "zone1", "ood2", SnDeviceRole::Ood)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), SnErrorCode::Conflict);
+
+        // 新 (zone,device_name) 已被他 DID 占用 → Conflict
+        db.upsert_device_index("did:dev:b", "zone1", "ood3", SnDeviceRole::Ood)
+            .await?;
+        let err = db
+            .upsert_device_index("did:dev:c", "zone1", "ood3", SnDeviceRole::Ood)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), SnErrorCode::Conflict);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_rebind_not_found_conflict_and_preserves_runtime() -> SnResult<()> {
+        let (_tmp, db) = temp_db().await?;
+        let did = "did:dev:a";
+
+        // DID 不存在 → NotFound
+        let err = db
+            .rebind_device_index(did, "zone1", "ood1", SnDeviceRole::Ood, "move")
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), SnErrorCode::NotFound);
+
+        db.upsert_device_index(did, "zone1", "ood1", SnDeviceRole::Ood)
+            .await?;
+        db.update_device_state(state_update(did, 10, 60)).await?;
+
+        // 目标 (zone,device_name) 已被他 DID 占用 → Conflict
+        db.upsert_device_index("did:dev:b", "zone1", "ood2", SnDeviceRole::Ood)
+            .await?;
+        let err = db
+            .rebind_device_index(did, "zone1", "ood2", SnDeviceRole::Ood, "move")
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), SnErrorCode::Conflict);
+
+        // 成功重绑：保留 runtime + endpoint，记 rebound 事件
+        db.rebind_device_index(did, "zone1", "gw", SnDeviceRole::Gateway, "promote")
+            .await?;
+        let view = db.get_device_state(did).await?.unwrap();
+        assert_eq!(view.device_name, "gw");
+        assert_eq!(view.device_role, SnDeviceRole::Gateway);
+        assert_eq!(view.state, SnDeviceState::Online); // runtime 保留
+        assert_eq!(view.active_endpoints.len(), 2); // endpoint 保留
+        assert!(event_types(&db, did).await.contains(&"rebound".to_string()));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_remove_device_index_keeps_events() -> SnResult<()> {
+        let (_tmp, db) = temp_db().await?;
+        let did = "did:dev:a";
+
+        db.upsert_device_index(did, "zone1", "ood1", SnDeviceRole::Ood)
+            .await?;
+        db.update_device_state(state_update(did, 10, 60)).await?;
+
+        db.remove_device_index(did).await?;
+
+        // index / runtime / endpoints 删除
+        assert!(db.get_device_state(did).await?.is_none());
+        assert_eq!(
+            scalar_i64(
+                &db,
+                "SELECT COUNT(*) FROM device_runtime_states WHERE did = ?1",
+                did
+            )
+            .await,
+            0
+        );
+        assert_eq!(
+            scalar_i64(
+                &db,
+                "SELECT COUNT(*) FROM device_endpoints WHERE did = ?1",
+                did
+            )
+            .await,
+            0
+        );
+
+        // device_state_events 保留
+        assert!(scalar_i64(
+            &db,
+            "SELECT COUNT(*) FROM device_state_events WHERE did = ?1",
+            did
+        )
+        .await
+            > 0);
+
+        // 删除不存在的 DID → NotFound
+        let err = db.remove_device_index("did:dev:missing").await.unwrap_err();
+        assert_eq!(err.code(), SnErrorCode::NotFound);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_unique_constraints() -> SnResult<()> {
+        let (_tmp, db) = temp_db().await?;
+
+        db.upsert_device_index("did:dev:a", "zone1", "ood1", SnDeviceRole::Ood)
+            .await?;
+        // (zone,device_name) 唯一：他 DID 占用同名 → Conflict
+        let err = db
+            .upsert_device_index("did:dev:b", "zone1", "ood1", SnDeviceRole::Ood)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), SnErrorCode::Conflict);
+
+        // did 唯一：同 DID 不同名也无法再创建第二行（走 rebind 语义）
+        let err = db
+            .upsert_device_index("did:dev:a", "zone2", "ood9", SnDeviceRole::Ood)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), SnErrorCode::Conflict);
+        assert_eq!(
+            scalar_i64(
+                &db,
+                "SELECT COUNT(*) FROM device_indexes WHERE did = ?1",
+                "did:dev:a"
+            )
+            .await,
+            1
+        );
+
+        Ok(())
+    }
+
+    // =====================================================================
+    // §4.2 运行态写入 (update_device_state)
+    // =====================================================================
+
+    #[tokio::test]
+    async fn test_update_device_state_not_found() -> SnResult<()> {
+        let (_tmp, db) = temp_db().await?;
+        let err = db
+            .update_device_state(state_update("did:dev:missing", 1, 60))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), SnErrorCode::NotFound);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_stale_report_rejected_records_event() -> SnResult<()> {
+        let (_tmp, db) = temp_db().await?;
+        let did = "did:dev:a";
+        db.upsert_device_index(did, "zone1", "ood1", SnDeviceRole::Ood)
+            .await?;
+
+        db.update_device_state(state_update(did, 20, 60)).await?;
+
+        // report_seq 明显旧于当前 → StaleReport + report_rejected 事件
+        let err = db
+            .update_device_state(state_update(did, 5, 60))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), SnErrorCode::StaleReport);
+        assert!(event_types(&db, did)
+            .await
+            .contains(&"report_rejected".to_string()));
+
+        // 相等 seq 不算 stale（>= 接受）
+        db.update_device_state(state_update(did, 20, 60)).await?;
+        // 更大 seq 接受
+        db.update_device_state(state_update(did, 21, 60)).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_blocked_device_rejects_report_only_unblock_recovers() -> SnResult<()> {
+        let (_tmp, db) = temp_db().await?;
+        let did = "did:dev:a";
+        db.upsert_device_index(did, "zone1", "ood1", SnDeviceRole::Ood)
+            .await?;
+        db.update_device_state(state_update(did, 10, 60)).await?;
+
+        db.block_device(did, "admin").await?;
+
+        // blocked 设备普通上报被拒，不改回 online，记 report_rejected
+        let err = db
+            .update_device_state(state_update(did, 11, 60))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), SnErrorCode::Blocked);
+        assert_eq!(
+            db.get_device_state(did).await?.unwrap().state,
+            SnDeviceState::Blocked
+        );
+        assert!(event_types(&db, did)
+            .await
+            .contains(&"report_rejected".to_string()));
+
+        // 仅 unblock_device 可恢复（恢复为 offline 等下次上报）
+        db.unblock_device(did, "admin").await?;
+        assert_eq!(
+            db.get_device_state(did).await?.unwrap().state,
+            SnDeviceState::Offline
+        );
+        db.update_device_state(state_update(did, 11, 60)).await?;
+        assert_eq!(
+            db.get_device_state(did).await?.unwrap().state,
+            SnDeviceState::Online
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_update_device_state_expiry_and_events() -> SnResult<()> {
+        let (_tmp, db) = temp_db().await?;
+        let did = "did:dev:a";
+        db.upsert_device_index(did, "zone1", "ood1", SnDeviceRole::Ood)
+            .await?;
+
+        let before = SqliteSnDeviceInfoDB::now_secs();
+        db.update_device_state(state_update(did, 10, 120)).await?;
+        let view = db.get_device_state(did).await?.unwrap();
+        // expires_at = now + ttl
+        let expires = view.expires_at.unwrap();
+        assert!(expires >= before + 120 && expires <= SqliteSnDeviceInfoDB::now_secs() + 120);
+
+        // 首次上线记 online + endpoint 变化记 endpoint_changed
+        let events = event_types(&db, did).await;
+        assert!(events.contains(&"online".to_string()));
+        assert!(events.contains(&"endpoint_changed".to_string()));
+
+        // 幂等：相同上报不再追加事件
+        let before_count = event_types(&db, did).await.len();
+        db.update_device_state(state_update(did, 10, 120)).await?;
+        assert_eq!(event_types(&db, did).await.len(), before_count);
+
+        // endpoint 集合变化 → 再次 endpoint_changed
+        let mut changed = state_update(did, 11, 120);
+        changed.endpoints = vec![endpoint("relay", "9.9.9.9", SnEndpointScope::Relay)];
+        db.update_device_state(changed).await?;
+        let endpoint_changes = event_types(&db, did)
+            .await
+            .into_iter()
+            .filter(|e| e == "endpoint_changed")
+            .count();
+        assert!(endpoint_changes >= 2);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_from_ip_and_reported_ip_stored_separately() -> SnResult<()> {
+        let (_tmp, db) = temp_db().await?;
+        let did = "did:dev:a";
+        db.upsert_device_index(did, "zone1", "ood1", SnDeviceRole::Ood)
+            .await?;
+
+        let mut update = state_update(did, 10, 60);
+        update.reported_ip = Some("203.0.113.5".to_string());
+        update.from_ip = Some("198.51.100.7".to_string());
+        db.update_device_state(update).await?;
+
+        let (reported_ip, from_ip) = runtime_pair(&db, did).await;
+        assert_eq!(reported_ip.as_deref(), Some("203.0.113.5"));
+        assert_eq!(from_ip.as_deref(), Some("198.51.100.7"));
+
+        Ok(())
+    }
+
+    // =====================================================================
+    // §4.3 IP / endpoint 规则
+    // =====================================================================
+
+    #[tokio::test]
+    async fn test_is_public_ipv4_rules() {
+        let public = ["8.8.8.8", "1.1.1.1", "203.0.113.1"];
+        for ip in public {
+            assert!(
+                SqliteSnDeviceInfoDB::is_public_ipv4(&ip.parse().unwrap()),
+                "{} should be public",
+                ip
+            );
+        }
+        let private = [
+            "10.0.0.1",        // RFC1918
+            "172.16.0.1",      // RFC1918
+            "192.168.1.1",     // RFC1918
+            "127.0.0.1",       // loopback
+            "169.254.1.1",     // link-local
+            "224.0.0.1",       // multicast
+            "0.0.0.0",         // unspecified
+            "255.255.255.255", // broadcast
+            "100.64.0.1",      // CGNAT
+            "198.18.0.1",      // benchmarking
+            "240.0.0.1",       // reserved
+        ];
+        for ip in private {
+            assert!(
+                !SqliteSnDeviceInfoDB::is_public_ipv4(&ip.parse().unwrap()),
+                "{} should not be public",
+                ip
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_is_public_ipv6_rules() {
+        assert!(SqliteSnDeviceInfoDB::is_public_ipv6(
+            &"2606:4700:4700::1111".parse().unwrap()
+        ));
+        let non_public = [
+            "::1",          // loopback
+            "ff02::1",      // multicast
+            "::",           // unspecified
+            "fc00::1",      // ULA
+            "fe80::1",      // link-local
+            "2001:db8::1",  // documentation
+        ];
+        for ip in non_public {
+            assert!(
+                !SqliteSnDeviceInfoDB::is_public_ipv6(&ip.parse().unwrap()),
+                "{} should not be public",
+                ip
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_classify_ips_wan_lan() -> SnResult<()> {
+        let (wan, lan) = SqliteSnDeviceInfoDB::classify_ips(
+            Some("192.168.0.5"),
+            &["8.8.8.8".to_string(), "10.0.0.7".to_string()],
+            Some("1.1.1.1"),
+        )?;
+        // 第一个公网作为 wan，私网进 lan（不进 DNS 视图）
+        assert_eq!(wan.as_deref(), Some("8.8.8.8"));
+        assert_eq!(lan, vec!["192.168.0.5", "10.0.0.7"]);
+
+        // 全私网 → 无 wan
+        let (wan, lan) =
+            SqliteSnDeviceInfoDB::classify_ips(Some("10.0.0.1"), &[], None)?;
+        assert!(wan.is_none());
+        assert_eq!(lan, vec!["10.0.0.1"]);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_endpoint_sort_key_ordering() {
+        let mut endpoints = vec![
+            ep_full("unknown", SnEndpointScope::Unknown, 1),
+            ep_full("loopback", SnEndpointScope::Loopback, 1),
+            ep_full("private", SnEndpointScope::Private, 1),
+            ep_full("relay", SnEndpointScope::Relay, 1),
+            ep_full("public-hi", SnEndpointScope::Public, 50),
+            ep_full("public-lo", SnEndpointScope::Public, 10),
+        ];
+        endpoints.sort_by_key(SqliteSnDeviceInfoDB::endpoint_sort_key);
+        let order: Vec<&str> = endpoints.iter().map(|e| e.endpoint_id.as_str()).collect();
+        // public(priority 小优先) < relay < private < loopback < unknown
+        assert_eq!(
+            order,
+            vec![
+                "public-lo", "public-hi", "relay", "private", "loopback", "unknown"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_expired_and_disabled_endpoints_excluded() -> SnResult<()> {
+        let (_tmp, db) = temp_db().await?;
+        let did = "did:dev:a";
+        db.upsert_device_index(did, "zone1", "ood1", SnDeviceRole::Ood)
+            .await?;
+
+        // 一个过期 endpoint（expires_at 在过去）+ 一个正常 endpoint
+        let mut update = state_update(did, 10, 600);
+        let mut expired_ep = endpoint("expired", "8.8.4.4", SnEndpointScope::Public);
+        expired_ep.expires_at = Some(1);
+        update.endpoints = vec![
+            expired_ep,
+            endpoint("live", "8.8.8.8", SnEndpointScope::Public),
+        ];
+        db.update_device_state(update).await?;
+
+        let view = db.get_device_state(did).await?.unwrap();
+        let ids: Vec<&str> = view
+            .active_endpoints
+            .iter()
+            .map(|e| e.endpoint_id.as_str())
+            .collect();
+        assert_eq!(ids, vec!["live"]); // 过期 endpoint 不进 active 列表
+
+        // block → endpoint disabled → 不进 active 列表
+        db.block_device(did, "admin").await?;
+        assert!(db
+            .get_device_state(did)
+            .await?
+            .unwrap()
+            .active_endpoints
+            .is_empty());
+        assert_eq!(
+            scalar_i64(
+                &db,
+                "SELECT COUNT(*) FROM device_endpoints WHERE did = ?1 AND state = 'disabled'",
+                did
+            )
+            .await,
+            2
+        );
+
+        Ok(())
+    }
+
+    // =====================================================================
+    // §4.4 查询视图与状态迁移
+    // =====================================================================
+
+    #[tokio::test]
+    async fn test_get_device_state_marks_stale_on_expiry() -> SnResult<()> {
+        let (_tmp, db) = temp_db().await?;
+        let did = "did:dev:a";
+        db.upsert_device_index(did, "zone1", "ood1", SnDeviceRole::Ood)
+            .await?;
+        db.update_device_state(state_update(did, 10, 600)).await?;
+
+        // 强制 runtime 过期
+        {
+            let mut conn = db.pool.acquire().await.unwrap();
+            sqlx::query("UPDATE device_runtime_states SET expires_at = 1 WHERE did = ?1")
+                .bind(did)
+                .execute(&mut *conn)
+                .await
+                .unwrap();
+        }
+
+        // 读路径先落库 stale 再返回视图
+        assert_eq!(
+            db.get_device_state(did).await?.unwrap().state,
+            SnDeviceState::Stale
+        );
+        assert_eq!(
+            scalar_i64(
+                &db,
+                "SELECT COUNT(*) FROM device_runtime_states WHERE did = ?1 AND state = 'stale'",
+                did
+            )
+            .await,
+            1
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_list_zone_devices_filter_and_pagination() -> SnResult<()> {
+        let (_tmp, db) = temp_db().await?;
+        for i in 0..3 {
+            let did = format!("did:dev:{}", i);
+            db.upsert_device_index(&did, "zone1", &format!("ood{}", i), SnDeviceRole::Ood)
+                .await?;
+            db.update_device_state(state_update(&did, 10, 600)).await?;
+        }
+        // 另一台保持 offline
+        db.upsert_device_index("did:dev:off", "zone1", "ood-off", SnDeviceRole::Ood)
+            .await?;
+
+        // state 过滤
+        let online = db
+            .list_zone_devices(
+                "zone1",
+                SnDeviceListOptions {
+                    state: Some(SnDeviceState::Online),
+                    ..Default::default()
+                },
+            )
+            .await?;
+        assert_eq!(online.len(), 3);
+
+        let offline = db
+            .list_zone_devices(
+                "zone1",
+                SnDeviceListOptions {
+                    state: Some(SnDeviceState::Offline),
+                    ..Default::default()
+                },
+            )
+            .await?;
+        assert_eq!(offline.len(), 1);
+
+        // 分页
+        let page = db
+            .list_zone_devices(
+                "zone1",
+                SnDeviceListOptions {
+                    offset: Some(1),
+                    limit: Some(2),
+                    ..Default::default()
+                },
+            )
+            .await?;
+        assert_eq!(page.len(), 2);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_mark_device_offline_event_and_endpoints() -> SnResult<()> {
+        let (_tmp, db) = temp_db().await?;
+        let did = "did:dev:a";
+        db.upsert_device_index(did, "zone1", "ood1", SnDeviceRole::Ood)
+            .await?;
+        db.update_device_state(state_update(did, 10, 600)).await?;
+
+        db.mark_device_offline(did, "manual").await?;
+        let view = db.get_device_state(did).await?.unwrap();
+        assert_eq!(view.state, SnDeviceState::Offline);
+        assert!(view.active_endpoints.is_empty()); // active endpoint → stale
+        assert!(event_types(&db, did).await.contains(&"offline".to_string()));
+        assert_eq!(
+            scalar_i64(
+                &db,
+                "SELECT COUNT(*) FROM device_endpoints WHERE did = ?1 AND state = 'stale'",
+                did
+            )
+            .await,
+            2
+        );
+
+        // 空 reason → InvalidInput
+        let err = db.mark_device_offline(did, "").await.unwrap_err();
+        assert_eq!(err.code(), SnErrorCode::InvalidInput);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_block_unblock_events_and_endpoints() -> SnResult<()> {
+        let (_tmp, db) = temp_db().await?;
+        let did = "did:dev:a";
+        db.upsert_device_index(did, "zone1", "ood1", SnDeviceRole::Ood)
+            .await?;
+        db.update_device_state(state_update(did, 10, 600)).await?;
+
+        // block → blocked + 禁用 endpoint + blocked 事件
+        db.block_device(did, "abuse").await?;
+        assert_eq!(
+            db.get_device_state(did).await?.unwrap().state,
+            SnDeviceState::Blocked
+        );
+        assert!(event_types(&db, did).await.contains(&"blocked".to_string()));
+        assert_eq!(
+            scalar_i64(
+                &db,
+                "SELECT COUNT(*) FROM device_endpoints WHERE did = ?1 AND state = 'disabled'",
+                did
+            )
+            .await,
+            2
+        );
+
+        // unblock → offline 等下次上报 + unblocked 事件 + disabled→stale
+        db.unblock_device(did, "appeal").await?;
+        assert_eq!(
+            db.get_device_state(did).await?.unwrap().state,
+            SnDeviceState::Offline
+        );
+        assert!(event_types(&db, did)
+            .await
+            .contains(&"unblocked".to_string()));
+        assert_eq!(
+            scalar_i64(
+                &db,
+                "SELECT COUNT(*) FROM device_endpoints WHERE did = ?1 AND state = 'disabled'",
+                did
+            )
+            .await,
+            0
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_expire_devices_batch_size() -> SnResult<()> {
+        let (_tmp, db) = temp_db().await?;
+        for i in 0..3 {
+            let did = format!("did:dev:{}", i);
+            db.upsert_device_index(&did, "zone1", &format!("ood{}", i), SnDeviceRole::Ood)
+                .await?;
+            db.update_device_state(state_update(&did, 10, 1)).await?;
+        }
+
+        let future = SqliteSnDeviceInfoDB::now_secs() + 10;
+        // 批量大小生效：只处理 2 台
+        let expired = db.expire_devices(future, Some(2)).await?;
+        assert_eq!(expired, 2);
+        let mut conn = db.pool.acquire().await.unwrap();
+        let online_left = sqlx::query(
+            "SELECT COUNT(*) FROM device_runtime_states WHERE state = 'online'",
+        )
+        .fetch_one(&mut *conn)
+        .await
+        .unwrap()
+        .get::<i64, _>(0);
+        drop(conn);
+        assert_eq!(online_left, 1);
+
+        // 再次无限制 → 处理剩余
+        let expired = db.expire_devices(future, None).await?;
+        assert_eq!(expired, 1);
+
+        Ok(())
+    }
+
+    // =====================================================================
+    // §4.5 错误语义
+    // =====================================================================
+
+    #[tokio::test]
+    async fn test_invalid_input_errors() -> SnResult<()> {
+        let (_tmp, db) = temp_db().await?;
+
+        // 空 DID / zone / device_name
+        assert_eq!(
+            db.upsert_device_index("", "zone1", "ood1", SnDeviceRole::Ood)
+                .await
+                .unwrap_err()
+                .code(),
+            SnErrorCode::InvalidInput
+        );
+        assert_eq!(
+            db.upsert_device_index("did:dev:a", "  ", "ood1", SnDeviceRole::Ood)
+                .await
+                .unwrap_err()
+                .code(),
+            SnErrorCode::InvalidInput
+        );
+        assert_eq!(
+            db.upsert_device_index("did:dev:a", "zone1", "", SnDeviceRole::Ood)
+                .await
+                .unwrap_err()
+                .code(),
+            SnErrorCode::InvalidInput
+        );
+
+        db.upsert_device_index("did:dev:a", "zone1", "ood1", SnDeviceRole::Ood)
+            .await?;
+
+        // ttl = 0
+        let mut zero_ttl = state_update("did:dev:a", 1, 0);
+        assert_eq!(
+            db.update_device_state(zero_ttl.clone()).await.unwrap_err().code(),
+            SnErrorCode::InvalidInput
+        );
+
+        // 非法 IP
+        zero_ttl.ttl = 60;
+        zero_ttl.reported_ip = Some("not-an-ip".to_string());
+        assert_eq!(
+            db.update_device_state(zero_ttl).await.unwrap_err().code(),
+            SnErrorCode::InvalidInput
+        );
+
+        // 非法 endpoint（空 host）
+        let mut bad_ep = state_update("did:dev:a", 1, 60);
+        bad_ep.reported_ip = Some("8.8.8.8".to_string());
+        bad_ep.reported_ips = vec![];
+        bad_ep.from_ip = None;
+        bad_ep.endpoints = vec![endpoint("ep", "", SnEndpointScope::Public)];
+        assert_eq!(
+            db.update_device_state(bad_ep).await.unwrap_err().code(),
+            SnErrorCode::InvalidInput
+        );
+
+        // 非法 endpoint（priority 为负）
+        let mut neg_prio = state_update("did:dev:a", 1, 60);
+        neg_prio.reported_ip = Some("8.8.8.8".to_string());
+        neg_prio.reported_ips = vec![];
+        neg_prio.from_ip = None;
+        let mut ep = endpoint("ep", "8.8.8.8", SnEndpointScope::Public);
+        ep.priority = -1;
+        neg_prio.endpoints = vec![ep];
+        assert_eq!(
+            db.update_device_state(neg_prio).await.unwrap_err().code(),
+            SnErrorCode::InvalidInput
+        );
+
+        // 非法 raw_report json
+        let mut bad_json = state_update("did:dev:a", 1, 60);
+        bad_json.reported_ip = Some("8.8.8.8".to_string());
+        bad_json.reported_ips = vec![];
+        bad_json.from_ip = None;
+        bad_json.endpoints = vec![];
+        bad_json.raw_report = Some("{not json".to_string());
+        assert_eq!(
+            db.update_device_state(bad_json).await.unwrap_err().code(),
+            SnErrorCode::InvalidInput
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_db_error_on_closed_pool() -> SnResult<()> {
+        let (_tmp, db) = temp_db().await?;
+        db.pool.close().await;
+
+        let err = db.get_device_state("did:dev:a").await.unwrap_err();
+        assert_eq!(err.code(), SnErrorCode::DBError);
+
+        Ok(())
+    }
 }
