@@ -4,8 +4,8 @@ use crate::{
 };
 use ::kRPC::{kRPC, RPCErrors, RPCHandler, RPCRequest, RPCResponse, RPCResult};
 use async_trait::async_trait;
-use serde::de::DeserializeOwned;
-use serde::{Deserialize, Serialize};
+use serde::de::{DeserializeOwned, Error as DeError};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -43,11 +43,52 @@ impl SnDeviceInfoDbRpcErrorInfo {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct SnDeviceInfoDbRpcEnvelope<T> {
     pub ok: bool,
     pub result: Option<T>,
     pub error: Option<SnDeviceInfoDbRpcErrorInfo>,
+}
+
+#[derive(Deserialize)]
+struct SnDeviceInfoDbRpcEnvelopeWire {
+    ok: bool,
+    #[serde(default, deserialize_with = "deserialize_present_json_value")]
+    result: Option<Value>,
+    error: Option<SnDeviceInfoDbRpcErrorInfo>,
+}
+
+fn deserialize_present_json_value<'de, D>(deserializer: D) -> Result<Option<Value>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Value::deserialize(deserializer).map(Some)
+}
+
+impl<'de, T> Deserialize<'de> for SnDeviceInfoDbRpcEnvelope<T>
+where
+    T: DeserializeOwned,
+{
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = SnDeviceInfoDbRpcEnvelopeWire::deserialize(deserializer)?;
+        let result = if wire.ok {
+            wire.result
+                .map(serde_json::from_value)
+                .transpose()
+                .map_err(DeError::custom)?
+        } else {
+            None
+        };
+
+        Ok(Self {
+            ok: wire.ok,
+            result,
+            error: wire.error,
+        })
+    }
 }
 
 impl<T> SnDeviceInfoDbRpcEnvelope<T> {
@@ -674,5 +715,32 @@ mod tests {
         let envelope: SnDeviceInfoDbRpcEnvelope<Value> = serde_json::from_value(value).unwrap();
 
         assert!(envelope.into_unit_result().is_ok());
+    }
+
+    #[test]
+    fn test_optional_envelope_roundtrip_preserves_null_success() {
+        let value =
+            serde_json::to_value(SnDeviceInfoDbRpcEnvelope::success(None::<String>)).unwrap();
+        assert_eq!(value["result"], Value::Null);
+
+        let envelope: SnDeviceInfoDbRpcEnvelope<Option<String>> =
+            serde_json::from_value(value).unwrap();
+
+        assert_eq!(envelope.into_result().unwrap(), None);
+    }
+
+    #[test]
+    fn test_error_envelope_null_result_does_not_parse_response_type() {
+        let value = serde_json::to_value(SnDeviceInfoDbRpcEnvelope::<String>::failure(sn_err!(
+            SnErrorCode::NotFound,
+            "missing"
+        )))
+        .unwrap();
+        assert_eq!(value["result"], Value::Null);
+
+        let envelope: SnDeviceInfoDbRpcEnvelope<String> = serde_json::from_value(value).unwrap();
+        let error = envelope.into_result().unwrap_err();
+
+        assert_eq!(error.code(), SnErrorCode::NotFound);
     }
 }

@@ -14,7 +14,7 @@ use cyfs_sn::{
     RemoteSnDeviceInfoDB, SnDeviceEndpointUpdate, SnDeviceInfoDB, SnDeviceInfoDbClient,
     SnDeviceInfoDbDeviceReasonReq, SnDeviceInfoDbDidReq, SnDeviceInfoDbExpireDevicesReq,
     SnDeviceInfoDbGetDeviceStateByNameReq, SnDeviceInfoDbListZoneDevicesReq,
-    SnDeviceInfoDbRebindDeviceIndexReq, SnDeviceInfoDbRpcHandler,
+    SnDeviceInfoDbRebindDeviceIndexReq, SnDeviceInfoDbRpcEnvelope, SnDeviceInfoDbRpcHandler,
     SnDeviceInfoDbUpdateDeviceStateReq, SnDeviceInfoDbUpsertDeviceIndexReq, SnDeviceListOptions,
     SnDeviceRole, SnDeviceState, SnDeviceStateUpdate, SnDeviceStateView, SnEndpointProtocol,
     SnEndpointScope, SnEndpointSource, SnError, SnErrorCode, SnNatType, SnResult,
@@ -58,37 +58,20 @@ impl LoopbackClient {
         }
     }
 
-    fn decode_error(value: &Value) -> SnError {
-        let info = &value["error"];
-        let code: SnErrorCode = serde_json::from_value(info["code"].clone())
-            .unwrap_or(SnErrorCode::RemoteError);
-        let message = info["message"].as_str().unwrap_or_default().to_string();
-        SnError::new(code, message)
-    }
-
     async fn call_unit<Req: Serialize>(&self, method: &str, req: Req) -> SnResult<()> {
         let value = self.dispatch(method, req).await?;
-        if value["ok"].as_bool().unwrap_or(false) {
-            Ok(())
-        } else {
-            Err(Self::decode_error(&value))
-        }
+        let envelope: SnDeviceInfoDbRpcEnvelope<Value> = serde_json::from_value(value).unwrap();
+        envelope.into_unit_result()
     }
 
-    // 直接从 envelope 的 `result` 反序列化目标类型；`Ok(None)`/`Ok(vec![])` 这类
-    // 会被序列化成 `null`（envelope.result 丢掉 `Some(None)` 区分），按 null→默认值还原。
     async fn call<Req: Serialize, Resp: serde::de::DeserializeOwned>(
         &self,
         method: &str,
         req: Req,
     ) -> SnResult<Resp> {
         let value = self.dispatch(method, req).await?;
-        if value["ok"].as_bool().unwrap_or(false) {
-            let result = value.get("result").cloned().unwrap_or(Value::Null);
-            Ok(serde_json::from_value(result).unwrap())
-        } else {
-            Err(Self::decode_error(&value))
-        }
+        let envelope: SnDeviceInfoDbRpcEnvelope<Resp> = serde_json::from_value(value).unwrap();
+        envelope.into_result()
     }
 }
 
