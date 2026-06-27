@@ -24,11 +24,17 @@ contract Smoke {
 
         Bns bns = new Bns();
         DocumentUpdate[] memory emptyDocs = new DocumentUpdate[](0);
+        AuthorityKeyUpdate[] memory noKeys = new AuthorityKeyUpdate[](0);
+        ControllerRule[] memory noRules = new ControllerRule[](0);
 
         bns.registerName(
             "alice",
             deployer,
             _defaultOptions(_unset()),
+            noKeys,
+            _unset(),
+            noRules,
+            ZERO,
             emptyDocs,
             CallAuthority({ role: AuthorityRole.None, actor: _unset(), kid: ZERO }),
             MutationGuard({ expectedNameSeq: 0, expectedParentNameSeq: 0 })

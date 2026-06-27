@@ -26,7 +26,7 @@ contract BnsEventsTest is BnsTestBase {
         vm.expectEmit(true, true, true, true, address(bns));
         emit NameRegistered(nh, "reg", ALICE, ALICE, uint64(1000 + 365 days), 0, 1);
         vm.prank(ALICE);
-        bns.registerName("reg", ALICE, _defaultOptions(_unset()), noDocs, _noneAuth(), _guard(0));
+        _registerName("reg", ALICE, _defaultOptions(_unset()), noDocs, _noneAuth(), _guard(0));
     }
 
     function testEmitProtocolEventOnRegister() public {
@@ -210,6 +210,6 @@ contract BnsEventsTest is BnsTestBase {
 
     function _registerWith(string memory name, address owner, RegisterOptions memory opts) internal {
         DocumentUpdate[] memory noDocs = new DocumentUpdate[](0);
-        bns.registerName(name, owner, opts, noDocs, _noneAuth(), _guard(0));
+        _registerName(name, owner, opts, noDocs, _noneAuth(), _guard(0));
     }
 }

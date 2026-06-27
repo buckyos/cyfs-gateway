@@ -15,7 +15,7 @@ contract BnsLifecycleTest is BnsTestBase {
         returns (uint64)
     {
         DocumentUpdate[] memory noDocs = new DocumentUpdate[](0);
-        return bns.registerName(name, owner, opts, noDocs, _noneAuth(), _guard(0));
+        return _registerName(name, owner, opts, noDocs, _noneAuth(), _guard(0));
     }
 
     // --- renew -------------------------------------------------------------
@@ -83,7 +83,7 @@ contract BnsLifecycleTest is BnsTestBase {
         // Re-registration is permanently blocked.
         DocumentUpdate[] memory noDocs = new DocumentUpdate[](0);
         vm.expectPartialRevert(NameAlreadyExists.selector);
-        bns.registerName("alice", BOB, _defaultOptions(_unset()), noDocs, _noneAuth(), _guard(0));
+        _registerName("alice", BOB, _defaultOptions(_unset()), noDocs, _noneAuth(), _guard(0));
     }
 
     // --- bootstrap (atomic install) ---------------------------------------
@@ -107,18 +107,20 @@ contract BnsLifecycleTest is BnsTestBase {
             _singleRule(_chain(CTRL), "dns_txt", bns.PERMISSION_PUBLISH_DOCUMENT(), 0, 0);
         DocumentUpdate[] memory noDocs = new DocumentUpdate[](0);
 
-        bns.bootstrapName(
+        (uint64 nameSeq, uint64 authoritySeq,) = bns.registerName(
             "zone",
             ALICE,
             _defaultOptions(_unset()),
-            noDocs,
             keys,
             _bnsName("zone"), // self-owned after authority install
             rules,
             keccak256("ctrl-policy"),
+            noDocs,
             _noneAuth(),
             _guard(0)
         );
+        assertEqUint(nameSeq, 1, "bootstrap register keeps create nameSeq");
+        assertEqUint(authoritySeq, 1, "authority installed");
 
         NameState memory st = bns.queryNameState("zone");
         assertTrue(st.ownerSource == OwnerSource.ExplicitSemanticOwner, "self semantic owner");

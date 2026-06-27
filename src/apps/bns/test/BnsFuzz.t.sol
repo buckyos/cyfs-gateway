@@ -102,14 +102,20 @@ contract BnsHandler {
     function register(uint8 i) external {
         string memory name = pool[i % 5];
         DocumentUpdate[] memory empty = new DocumentUpdate[](0);
+        AuthorityKeyUpdate[] memory noKeys = new AuthorityKeyUpdate[](0);
+        ControllerRule[] memory noRules = new ControllerRule[](0);
         try bns.registerName(
             name,
             address(this),
             _opts(),
+            noKeys,
+            Principal(PrincipalKind.Unset, ""),
+            noRules,
+            ZERO,
             empty,
             CallAuthority({ role: AuthorityRole.None, actor: Principal(PrincipalKind.Unset, ""), kid: ZERO }),
             MutationGuard({ expectedNameSeq: 0, expectedParentNameSeq: 0 })
-        ) returns (uint64) {
+        ) returns (uint64, uint64, bytes32) {
             expectedEvents += 1;
         } catch {}
     }

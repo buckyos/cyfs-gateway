@@ -38,11 +38,11 @@ contract BnsGuardReplayTest is BnsTestBase {
         // Wrong parent seq -> StaleParentNameSeq.
         vm.prank(ALICE);
         vm.expectPartialRevert(StaleParentNameSeq.selector);
-        bns.registerName("sub.alice", BOB, opts, noDocs, _ownerAuth(ALICE), _guard(0, 999));
+        _registerName("sub.alice", BOB, opts, noDocs, _ownerAuth(ALICE), _guard(0, 999));
 
         // Correct parent seq -> child registered.
         vm.prank(ALICE);
-        bns.registerName("sub.alice", BOB, opts, noDocs, _ownerAuth(ALICE), _guard(0, parentSeq));
+        _registerName("sub.alice", BOB, opts, noDocs, _ownerAuth(ALICE), _guard(0, parentSeq));
         NameState memory st = bns.queryNameState("sub.alice");
         assertTrue(st.status == NameStatus.Active, "subname active");
         assertTrue(st.assetOwner == BOB, "subname asset owner");
@@ -57,7 +57,7 @@ contract BnsGuardReplayTest is BnsTestBase {
         // BOB is not the parent owner -> not authorized.
         vm.prank(BOB);
         vm.expectPartialRevert(NotEffectiveOwner.selector);
-        bns.registerName("sub.alice", BOB, opts, noDocs, _ownerAuth(BOB), _guard(0, parentSeq));
+        _registerName("sub.alice", BOB, opts, noDocs, _ownerAuth(BOB), _guard(0, parentSeq));
     }
 
     // --- domain separation: contract address ------------------------------

@@ -296,11 +296,27 @@ contract BnsTestBase {
 
     // --- common flows ------------------------------------------------------
 
+    function _registerName(
+        string memory name,
+        address owner,
+        RegisterOptions memory options,
+        DocumentUpdate[] memory initialDocuments,
+        CallAuthority memory authority,
+        MutationGuard memory guard
+    ) internal returns (uint64) {
+        AuthorityKeyUpdate[] memory noKeys = new AuthorityKeyUpdate[](0);
+        ControllerRule[] memory noRules = new ControllerRule[](0);
+        (uint64 nameSeq,,) = bns.registerName(
+            name, owner, options, noKeys, _unset(), noRules, ZERO, initialDocuments, authority, guard
+        );
+        return nameSeq;
+    }
+
     /// Register a root name (asset-owner fallback ownership). Root registration
     /// is permissionless (authority must be None), so the caller doesn't matter.
     function _registerRoot(string memory name, address owner) internal returns (uint64) {
         DocumentUpdate[] memory emptyDocs = new DocumentUpdate[](0);
-        return bns.registerName(
+        return _registerName(
             name, owner, _defaultOptions(_unset()), emptyDocs, _noneAuth(), _guard(0)
         );
     }

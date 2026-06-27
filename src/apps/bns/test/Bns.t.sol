@@ -251,10 +251,16 @@ contract BnsTest {
 
     function _registerRoot(string memory name, address owner) internal {
         DocumentUpdate[] memory emptyDocs = new DocumentUpdate[](0);
+        AuthorityKeyUpdate[] memory noKeys = new AuthorityKeyUpdate[](0);
+        ControllerRule[] memory noRules = new ControllerRule[](0);
         bns.registerName(
             name,
             owner,
             _defaultOptions(_unset()),
+            noKeys,
+            _unset(),
+            noRules,
+            ZERO,
             emptyDocs,
             CallAuthority({ role: AuthorityRole.None, actor: _unset(), kid: ZERO }),
             MutationGuard({ expectedNameSeq: 0, expectedParentNameSeq: 0 })

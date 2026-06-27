@@ -256,6 +256,8 @@ error InvalidMutation(bytes32 reason);
 
 contract Bns {
     uint64 public constant MAX_INLINE_DOCUMENT = 4 * 1024;
+    uint8 public constant MAX_MUTATION_BATCH_ITEMS = 32;
+    uint256 public constant MAX_MUTATION_BATCH_INLINE_DOCUMENTS = 64 * 1024;
     uint8 public constant MAX_OWNER_REF_DEPTH = 8;
 
     uint32 public constant KEY_PURPOSE_AUTHENTICATION = 1 << 0;
@@ -292,13 +294,16 @@ contract Bns {
 
     bytes32 private constant ERR_BAD_DURATION = keccak256("BAD_DURATION");
     bytes32 private constant ERR_NOT_RENEWABLE = keccak256("NOT_RENEWABLE");
-    bytes32 private constant ERR_OWNER_DOC_REQUIRED = keccak256("OWNER_DOC_REQUIRED");
     bytes32 private constant ERR_ROOT_AUTHORITY_NOT_USED = keccak256("ROOT_AUTHORITY_NOT_USED");
     bytes32 private constant ERR_EMPTY_STORAGE_TYPE = keccak256("EMPTY_STORAGE_TYPE");
     bytes32 private constant ERR_INLINE_URI_NOT_EMPTY = keccak256("INLINE_URI_NOT_EMPTY");
     bytes32 private constant ERR_BAD_CONTENT_HASH = keccak256("BAD_CONTENT_HASH");
     bytes32 private constant ERR_NON_INLINE_HAS_BYTES = keccak256("NON_INLINE_HAS_BYTES");
     bytes32 private constant ERR_INVALID_DID = keccak256("INVALID_DID");
+    bytes32 private constant ERR_EMPTY_MUTATION_BATCH = keccak256("EMPTY_MUTATION_BATCH");
+    bytes32 private constant ERR_MUTATION_BATCH_TOO_LARGE = keccak256("MUTATION_BATCH_TOO_LARGE");
+    bytes32 private constant ERR_BATCH_INLINE_TOO_LARGE = keccak256("BATCH_INLINE_TOO_LARGE");
+    bytes32 private constant ERR_DUPLICATE_DOC_TYPE = keccak256("DUPLICATE_DOC_TYPE");
 
     mapping(bytes32 => NameState) private _names;
     mapping(bytes32 => bool) private _knownNameHash;
@@ -621,22 +626,11 @@ contract Bns {
         string calldata name,
         address assetOwner,
         RegisterOptions calldata options,
-        DocumentUpdate[] calldata initialDocuments,
-        CallAuthority calldata authority,
-        MutationGuard calldata guard
-    ) external payable returns (uint64 nameSeq) {
-        return _registerName(name, assetOwner, options, initialDocuments, authority, guard);
-    }
-
-    function bootstrapName(
-        string calldata name,
-        address assetOwner,
-        RegisterOptions calldata options,
-        DocumentUpdate[] calldata initialDocuments,
         AuthorityKeyUpdate[] calldata authorityUpdates,
         Principal calldata semanticOwnerAfterAuthority,
         ControllerRule[] calldata controllerPolicy,
         bytes32 controllerPolicyHash,
+        DocumentUpdate[] calldata initialDocuments,
         CallAuthority calldata authority,
         MutationGuard calldata guard
     )
@@ -644,6 +638,8 @@ contract Bns {
         payable
         returns (uint64 nameSeq, uint64 authoritySeq, bytes32 authorityRoot)
     {
+        _validateBatchBounds(authorityUpdates.length, initialDocuments);
+        _validateUniqueDocumentTypes(initialDocuments);
         bytes32 nameHash =
             _registerNameHash(name, assetOwner, options, initialDocuments, authority, guard);
 
@@ -653,12 +649,11 @@ contract Bns {
             authorityRoot = set.authorityRoot;
         }
 
+        _validateSemanticOwnerCalldata(semanticOwnerAfterAuthority);
         if (semanticOwnerAfterAuthority.kind != PrincipalKind.Unset) {
-            _validateSemanticOwnerCalldata(semanticOwnerAfterAuthority);
             _requireActiveAuthoritySetForPrincipal(semanticOwnerAfterAuthority);
             NameState storage state = _names[nameHash];
             _copyPrincipal(state.semanticOwner, semanticOwnerAfterAuthority);
-            state.nameSeq += 1;
             state.updatedAt = _now();
             _validateAllOwnerGraphs();
             NameState memory materialized = _materializeNameState(state);
@@ -688,7 +683,7 @@ contract Bns {
         }
 
         if (controllerPolicy.length != 0 || controllerPolicyHash != bytes32(0)) {
-            _setControllerPolicyInternal(nameHash, name, controllerPolicy, controllerPolicyHash);
+            _setControllerPolicyInternal(nameHash, name, controllerPolicy, controllerPolicyHash, false);
         }
 
         NameState storage latest = _names[nameHash];
@@ -908,24 +903,51 @@ contract Bns {
         return (set.authoritySeq, set.authorityRoot);
     }
 
-    function rotateAuthorityAndOwnerDocument(
+    function applyMutations(
         string calldata name,
-        AuthorityKeyUpdate[] calldata keyUpdates,
-        DocumentUpdate calldata ownerDocumentUpdate,
+        AuthorityKeyUpdate[] calldata authorityUpdates,
+        DocumentUpdate[] calldata documents,
         CallAuthority calldata authority,
         MutationGuard calldata guard
-    ) external returns (uint64 authoritySeq, uint64 ownerDocumentVersion) {
+    ) external returns (uint64 nameSeq, uint64 authoritySeq, bytes32 authorityRoot) {
+        if (authorityUpdates.length == 0 && documents.length == 0) {
+            revert InvalidMutation(ERR_EMPTY_MUTATION_BATCH);
+        }
+        _validateBatchBounds(authorityUpdates.length, documents);
+        _validateUniqueDocumentTypes(documents);
+
         bytes32 nameHash = _validateName(name);
         _requireActiveName(nameHash, name);
-        if (keccak256(bytes(ownerDocumentUpdate.docType)) != keccak256(bytes("owner"))) {
-            revert InvalidMutation(ERR_OWNER_DOC_REQUIRED);
-        }
         NameState storage state = _names[nameHash];
         _checkGuard(state, guard, name);
-        _authorizeOwner(nameHash, name, state, authority);
-        AuthoritySetState memory set = _applyAuthorityUpdates(nameHash, name, keyUpdates);
-        uint64 version = _publishDocumentUpdateInternal(nameHash, name, ownerDocumentUpdate, true);
-        return (set.authoritySeq, version);
+
+        if (authorityUpdates.length != 0) {
+            _authorizeOwner(nameHash, name, state, authority);
+        }
+        for (uint256 i = 0; i < documents.length; i++) {
+            _authorizeUpdateNoGuard(
+                nameHash,
+                name,
+                state,
+                documents[i].docType,
+                PERMISSION_PUBLISH_DOCUMENT,
+                OP_PUBLISH_DOCUMENT,
+                authority
+            );
+        }
+
+        if (authorityUpdates.length != 0) {
+            _applyAuthorityUpdates(nameHash, name, authorityUpdates);
+        }
+        if (documents.length != 0) {
+            state.nameSeq += 1;
+            for (uint256 i = 0; i < documents.length; i++) {
+                _publishDocumentUpdateInternal(nameHash, name, documents[i], false);
+            }
+        }
+
+        AuthoritySetState memory finalSet = _authoritySets[nameHash];
+        return (state.nameSeq, finalSet.authoritySeq, finalSet.authorityRoot);
     }
 
     function publishDocument(
@@ -1039,7 +1061,7 @@ contract Bns {
         NameState storage state = _names[nameHash];
         _checkGuard(state, guard, name);
         _authorizeOwner(nameHash, name, state, authority);
-        return _setControllerPolicyInternal(nameHash, name, rules, policyHash);
+        return _setControllerPolicyInternal(nameHash, name, rules, policyHash, true);
     }
 
     function setDidAlias(
@@ -1161,19 +1183,6 @@ contract Bns {
         );
     }
 
-    function _registerName(
-        string calldata name,
-        address assetOwner,
-        RegisterOptions calldata options,
-        DocumentUpdate[] calldata initialDocuments,
-        CallAuthority calldata authority,
-        MutationGuard calldata guard
-    ) internal returns (uint64 nameSeq) {
-        bytes32 nameHash =
-            _registerNameHash(name, assetOwner, options, initialDocuments, authority, guard);
-        return _names[nameHash].nameSeq;
-    }
-
     function _registerNameHash(
         string calldata name,
         address assetOwner,
@@ -1233,7 +1242,7 @@ contract Bns {
         }
 
         uint64 nowTs = _now();
-        uint64 nextSeq = existing.nameSeq + 1;
+        uint64 nextSeq = 1;
         uint64 lineageEpoch = existing.nameSeq == 0 ? 0 : existing.lineageEpoch + 1;
 
         existing.name = name;
@@ -1376,7 +1385,8 @@ contract Bns {
         bytes32 nameHash,
         string memory name,
         ControllerRule[] calldata rules,
-        bytes32 policyHash
+        bytes32 policyHash,
+        bool bumpNameSeq
     ) internal returns (uint64 nameSeq) {
         delete _controllerPolicies[nameHash];
         for (uint256 i = 0; i < rules.length; i++) {
@@ -1396,7 +1406,9 @@ contract Bns {
         }
 
         NameState storage state = _names[nameHash];
-        state.nameSeq += 1;
+        if (bumpNameSeq) {
+            state.nameSeq += 1;
+        }
         state.updatedAt = _now();
         _commitEvent(EVENT_CONTROLLER_POLICY, keccak256(abi.encode(nameHash, policyHash, state.nameSeq)));
         emit ControllerPolicyUpdated(nameHash, name, msg.sender, policyHash, state.nameSeq);
@@ -1495,6 +1507,18 @@ contract Bns {
         MutationGuard calldata guard
     ) internal view {
         _checkGuard(state, guard, name);
+        _authorizeUpdateNoGuard(nameHash, name, state, docType, permission, operation, authority);
+    }
+
+    function _authorizeUpdateNoGuard(
+        bytes32 nameHash,
+        string memory name,
+        NameState storage state,
+        string memory docType,
+        uint32 permission,
+        bytes32 operation,
+        CallAuthority calldata authority
+    ) internal view {
         if (authority.role == AuthorityRole.Owner) {
             _authorizeOwner(nameHash, name, state, authority);
             return;
@@ -1711,6 +1735,36 @@ contract Bns {
             }
         }
         return false;
+    }
+
+    function _validateBatchBounds(uint256 authorityUpdateCount, DocumentUpdate[] calldata documents)
+        internal
+        pure
+    {
+        if (authorityUpdateCount + documents.length > MAX_MUTATION_BATCH_ITEMS) {
+            revert InvalidMutation(ERR_MUTATION_BATCH_TOO_LARGE);
+        }
+
+        uint256 inlineBytes = 0;
+        for (uint256 i = 0; i < documents.length; i++) {
+            inlineBytes += documents[i].document.inlineDocument.length;
+            if (inlineBytes > MAX_MUTATION_BATCH_INLINE_DOCUMENTS) {
+                revert InvalidMutation(ERR_BATCH_INLINE_TOO_LARGE);
+            }
+        }
+    }
+
+    function _validateUniqueDocumentTypes(DocumentUpdate[] calldata documents) internal pure {
+        bytes32[] memory seen = new bytes32[](documents.length);
+        for (uint256 i = 0; i < documents.length; i++) {
+            bytes32 docTypeHash = _validateDocType(documents[i].docType);
+            for (uint256 j = 0; j < i; j++) {
+                if (seen[j] == docTypeHash) {
+                    revert InvalidMutation(ERR_DUPLICATE_DOC_TYPE);
+                }
+            }
+            seen[i] = docTypeHash;
+        }
     }
 
     function _validateDocumentRef(DocumentRef calldata documentRef) internal pure {

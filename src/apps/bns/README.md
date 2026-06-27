@@ -89,9 +89,9 @@ Use `dv-up.sh --keep-running` to run in the foreground for manual debugging.
 
 Implemented:
 
-- `registerName`, `bootstrapName`, `renewName`, `transferName`, `setNameOwner`,
+- `registerName`, `applyMutations`, `renewName`, `transferName`, `setNameOwner`,
   `releaseName`, `setNamespacePolicy`
-- `updateAuthorityKeys`, `rotateAuthorityAndOwnerDocument`, `setControllerPolicy`
+- `updateAuthorityKeys`, `setControllerPolicy`
 - `publishDocument`, `revokeDocument`, `setDidAlias`, `setPaymentTarget`
 - core query APIs from the interface design
 
