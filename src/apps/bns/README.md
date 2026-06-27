@@ -55,6 +55,36 @@ forge script script/Smoke.s.sol:Smoke \
   --disable-code-size-limit
 ```
 
+## DV Integration Environment (end-to-end)
+
+See `doc/SN/SN-测试计划.md` §5. Two ways to exercise the full
+`BNS(contract) <-> Indexer <-> Server <-> Client <-> Controller` path against a real
+private chain (requires Foundry: `anvil`, `forge`, `cast`).
+
+**(A) Self-contained Rust e2e** (recommended, CI-able). Spawns its own anvil + deploys
+in-process; `#[ignore]` by default, skipped gracefully when Foundry is absent:
+
+```bash
+cd src
+cargo test -p bns-client --test e2e_anvil -- --ignored
+```
+
+**(B) Scripted DV environment + smoke.** `dv-up.sh` brings up anvil, deploys `Bns.sol`,
+and runs `bns-dv serve` (indexer `sync_once` poll loop + contract server over a shared
+SQLite projection), then writes `dv-env.json`:
+
+```bash
+cd src/apps/bns
+./scripts/dv-up.sh --fresh        # fresh chain + deploy + indexer/server (background)
+./scripts/dv-smoke.sh             # register -> publish -> wait sync -> read (cross-layer)
+./scripts/dv-down.sh              # stop services (anvil state persists for --resume)
+./scripts/dv-up.sh --resume       # reuse anvil-state + contract + indexer cursor
+./scripts/dv-smoke.sh             # cursor continues (no replay from 0)
+./scripts/dv-down.sh --purge      # stop + remove persisted state
+```
+
+Use `dv-up.sh --keep-running` to run in the foreground for manual debugging.
+
 ## V1 Scope
 
 Implemented:

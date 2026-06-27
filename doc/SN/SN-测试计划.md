@@ -252,6 +252,8 @@
 
 ### 5.1 一键启动环境（新建 / resume）
 
+> 已实现：[scripts/dv-up.sh](../src/apps/bns/scripts/dv-up.sh) + [scripts/dv-down.sh](../src/apps/bns/scripts/dv-down.sh)，配套开发用守护/驱动二进制 [bns-server/src/bin/bns_dv.rs](../src/components/bns-server/src/bin/bns_dv.rs)（`bns-dv serve` = indexer 轮询 `sync_once` + BNS-Server 读投影/写转发，共享一份 SQLite，WAL 并发）。已验证 `--fresh → resume` 全流程（合约地址与 indexer 游标延续，链状态不复位）。
+
 新增脚本 `src/apps/bns/scripts/dv-up.sh`（编排现有 [anvil.sh](../src/apps/bns/scripts/anvil.sh) + [deploy.sh](../src/apps/bns/scripts/deploy.sh)），语义：
 
 ```
@@ -261,9 +263,8 @@ dv-up.sh [--fresh | --resume] [--keep-running]
 - **`--fresh`（新环境）**：删除 `var/anvil-state.json` 与 `deployments/anvil.local.json` 及 indexer SQLite，重新：
   1. 起 anvil（确定性助记词、chainId=31337、block-time=1、`--disable-code-size-limit`、`--state var/anvil-state.json` 持久化）。
   2. `deploy.sh` 部署 `Bns.sol` → 写 `deployments/anvil.local.json`（合约地址）。
-  3. 起 BNS-Indexer（轮询 `sync_once` 调度器，source=`evm:anvil:31337:{contract}`，游标从 0）。
-  4. 起 BNS-Server（读查投影、写转发 `eth_sendRawTransaction`），监听内部端口。
-  5. 生成 `dv-env.json`（rpc endpoint / chainId / 合约地址 / server 端口 / indexer db 路径 / 托管私钥来源 / 部署块高），供测试脚本与 `SNServerConfig.bns_evm` 读取。
+  3. 起 BNS-Indexer + BNS-Server（同一个 `bns-dv serve` 进程：indexer 轮询 `sync_once`，source=`evm:anvil-local:31337:{contract}`，游标从 0；server 读查投影、写转发 `eth_sendRawTransaction`，监听内部端口）。
+  4. 生成 `dv-env.json`（rpc endpoint / chainId / 合约地址 / server url / indexer db 路径 / 部署者私钥来源 / 部署块高 / PID 文件），供测试脚本与 `SNServerConfig.bns_evm` 读取。
 - **`--resume`（恢复环境）**：复用已存在的 `anvil-state.json`（anvil `--state` 自动加载）+ 已部署合约地址 + indexer 已有游标继续同步。校验：链上 chainId/合约地址与 `dv-env.json` 一致，否则报错要求 `--fresh`。
 - **`--keep-running`**：前台保活供手工调试；否则各服务以 PID 文件后台托管，配套 `dv-down.sh` 清理。
 - **健康门控**：脚本在每步后轮询就绪（anvil `eth_chainId`、合约 `eth_getCode != 0x`、indexer 游标 ≥ 部署块、server 读接口返回）才进入下一步，全部就绪打印 `dv-env.json` 路径。
@@ -274,24 +275,24 @@ dv-up.sh [--fresh | --resume] [--keep-running]
 
 两种驱动方式，二选一或都做：
 
-**(A) Rust e2e（推荐，进 CI 可控）**——新增 `src/components/bns-client/tests/e2e_anvil.rs`，用 `alloy-node-bindings` 在测试进程内拉起 anvil + 部署（不依赖 5.1 脚本，自包含），`#[ignore]` 默认跳过、`--ignored` 显式运行，并按 `which anvil/forge` 缺失时优雅跳过。覆盖：
-- [ ] **写读闭环**：Controller Client 注册 name → `publishDocument`(inline) → 触发 `sync_once` → Server 读 `resolveDocument` 命中，内容/版本一致。
-- [ ] **签名边界（真 EVM）**：Controller 用托管私钥签名，链上 `msg.sender` == 私钥地址 → 通过；构造一个 `CallAuthority.actor` != signer 的 TX → 链上 revert，错误码透传到 client。
-- [ ] **selector / packing / event topic**：只有真 EVM 暴露的问题——calldata selector、参数 packing、revert reason、event topic 与 §1.7/§2.1 断言一致。
-- [ ] **nonce / 重放**：连续两笔写 nonce 递增；重放同一 raw TX → 链上拒绝；chainId 不匹配的 TX → 拒绝（设计 §9 防重放待补项）。
-- [ ] **confirmations / 同步推进**：写入后未达 confirmations 时 indexer 不投影，达到后投影命中；游标单调推进。
-- [ ] **重部署从 0 重放**（设计 §9 未测项）：换合约地址（新 source）→ indexer 从 `start_block` 重放 → 投影与首次等价。
-- [ ] **controller 策略真链路**：controller 只能 publish 授权 docType，越权 docType → 链上 revert。
+**(A) Rust e2e（推荐，进 CI 可控）**——已实现 [tests/e2e_anvil.rs](../src/components/bns-client/tests/e2e_anvil.rs)（6 例，装有 Foundry 时全绿）。在测试进程内用 `std::process` 拉起 `anvil`（依赖无关，等价于 `alloy-node-bindings`）+ `forge create` 部署 `Bns.sol`（不依赖 5.1 脚本，自包含），`#[ignore]` 默认跳过、`--ignored` 显式运行，`anvil`/`forge` 缺失时优雅跳过。覆盖：
+- [x] **写读闭环**：Controller Client 注册 name → `publishDocument`(inline) → `sync_once` → 读投影命中，且投影 == 链上 `eth_call` 权威态（`e2e_write_read_closed_loop_matches_onchain_truth`）。
+- [x] **签名边界（真 EVM）**：托管私钥签名时 `msg.sender` == 私钥地址 → 通过；构造 `CallAuthority.actor` != signer 的 TX → 链上 revert（receipt status 0 + `eth_call` 模拟回传错误），投影不变（`e2e_signing_boundary_actor_mismatch_reverts_onchain`）。
+- [x] **selector / packing / event topic**：真 EVM 接受 client 编码 calldata 并 emit 事件，indexer 解码后投影与 §1.7/§2.1 一致（由写读闭环用例隐式钉死）。
+- [x] **nonce / 重放**：连续两笔写 nonce 递增；重放同一已上链 raw TX → 链上拒绝；chainId 不匹配的 TX → 拒绝（`e2e_nonce_replay_and_chain_id_rejection`）。
+- [x] **confirmations / 同步推进**：未达 confirmations 不投影，挖够块后投影命中；游标单调推进（`e2e_confirmations_gate_and_cursor_advance`）。
+- [x] **重部署从 0 重放**（设计 §9 未测项）：换合约地址（新 source）→ indexer 从 `start_block` 重放 → 投影与链上等价（`e2e_redeploy_uses_isolated_source_and_replays_from_zero`）。
+- [x] **controller 策略真链路**：controller 只能 publish 授权 docType，越权 docType → 链上 revert（`e2e_controller_policy_scopes_doc_types_on_chain`）。
 
-**(B) 脚本化冒烟**——`src/apps/bns/scripts/dv-smoke.sh`：在 5.1 环境上用 client CLI / curl 跑
-注册 → 发布 → 等待同步 → 读命中 的最小路径，打印每步耗时与结果，作为"环境是否健康"的快速门禁（对应已有 [Smoke.s.sol](../src/apps/bns/script/Smoke.s.sol) 的链上版，本脚本是跨全分层版）。
+**(B) 脚本化冒烟**——已实现 [scripts/dv-smoke.sh](../src/apps/bns/scripts/dv-smoke.sh)：读 5.1 的 `dv-env.json`，用 `bns-dv smoke` 经 BNS-Server 跑
+注册 → 发布(inline) → 等待 indexer 投影 → 经 server 读命中 的最小路径，打印每步耗时与结果，作为"环境是否健康"的快速门禁（对应已有 [Smoke.s.sol](../src/apps/bns/script/Smoke.s.sol) 的链上版，本脚本是跨全分层版）。默认 name 带时间戳，便于 `--resume` 后重复冒烟并验证游标增量投影（不从 0 重放）。
 
 **SN 业务级集成（阶段二，待 `sn_bns_controller` 切 EVM 后）**：
 - [ ] `sn_auth.register` → `sn_bns_controller` 提交 BNS 注册 TX（owner_config + controller policy）→ indexer 投影 → `sn_resolver` 读到 BNS 文档，串成幂等流程（`request_id`），验证一致性要求（无"本地成功 BNS 未创建"窗口）。
 
 ### 5.3 集成测试通过标准
-- 5.2(A) 全部 `--ignored` 用例在装有 Foundry 的机器上绿。
-- `dv-up.sh --fresh` 后 `dv-smoke.sh` 通过；`dv-down.sh` 再 `dv-up.sh --resume` 后 smoke 仍通过且 indexer 游标延续（不从 0 重放）。
+- [x] 5.2(A) 全部 `--ignored` 用例在装有 Foundry 的机器上绿（`cargo test -p bns-client --test e2e_anvil -- --ignored`，6/6 通过）。
+- [x] `dv-up.sh --fresh` 后 `dv-smoke.sh` 通过；`dv-down.sh` 再 `dv-up.sh --resume` 后 smoke 仍通过且 indexer 游标延续（不从 0 重放，合约地址与链状态续用）。
 - 集成层只断言"跨层拼接 + 真 EVM 行为"，不重复 §1–§4 的分支覆盖。
 
 ---

@@ -2,4 +2,5 @@ cache/
 out/
 broadcast/
 deployments/*.local.json
-var/*.json
+var/
+dv-env.json
