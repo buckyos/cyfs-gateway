@@ -159,7 +159,7 @@
 - [x] **EVM 模式多步 zone bind**（已有 `evm_mode_rejects_multi_step_zone_bind_without_submission`）：保持。
 - [x] **nonce 管理（基础）**：连续两笔写 nonce 递增（`controller_increments_nonce_across_consecutive_writes`）、提交失败回退重查（`controller_resets_cached_nonce_after_submission_failure`）。> 增强项（并发冲突、可选等待回执确认上链）仍待设计 §4 落地。
 - [ ] **迁移项**（设计 §4 TODO → 落地后补）：`sn_bns_controller.rs` 从手工拼 `CallAuthority` 切到"构造 op → Controller 自动签名"后，验证不再产生 `CallAuthority` 写 RPC。
-- [ ] **幂等元数据**：`SnBnsWriteRequestStore` 的 `evm_chain_id`/`evm_nonce`/`evm_tx_hash`/`evm_raw_tx` 写入与去重（同 request_id 不重复提交）。> 依赖迁移项落地。
+- [x] **幂等元数据**：`SqliteSnBnsWriteRequestStore` 的 `evm_chain_id`/`evm_nonce`/`evm_tx_hash`/`evm_raw_tx` 写入与按 `request_id` 去重（[tests/sn_bns_store.rs](../src/components/bns-client/tests/sn_bns_store.rs)：evm 元数据 round-trip；同 request_id 第二次 `put` 走 `ON CONFLICT(request_id) DO UPDATE` 原地 upsert，`created_at` 保留证明非新增行）。
 
 运行：`cargo test -p bns-client`。
 
@@ -177,8 +177,8 @@
 
 ### 3.2 session（account_sessions）
 - [x] `create_account_session` / `get_account_session`（未知 → None）/ `revoke_account_session` / `revoke_user_sessions`（只计活跃、跨用户隔离、幂等返回 0）语义（`test_account_session_lifecycle_and_counts`）。
-- [ ] **阶段二接线后**：签发路径写 session、校验路径查 session 状态、`auth.logout` 撤销生效、冻结用户后旧 token 立即失效（覆盖设计指出的"建好未接线死代码"）。
-- [ ] token：`sub=username`、`aud=sn-v2`/`sn-v2-refresh`、access 1h / refresh 24h 过期；阶段二补 `kid` / `jti`。
+- [x] **阶段二接线后**：签发路径写 session（`auth.rs build_auth_success_response` → `create_account_session`）、校验路径查 session 状态（`sn_authority::validate_account_session`）、`auth.logout` 撤销生效（`test_sn_v2_api` 内 logout 后旧 access token → `SNV2:1007`）、冻结用户后旧 token 立即失效（`test_sn_v2_phase_two_security_regressions`：`set_user_state(Suspended)` → `auth.me` → `SNV2:1007`）。
+- [x] token：`sub=username`、`aud=sn-v2`/`sn-v2-refresh`、access 1h / refresh 24h 过期、`jti` 存在（`test_sn_v2_phase_two_security_regressions` 解码 access/refresh JWT 断言 sub/aud/jti/exp 间隔 ~23h）。> 注：`kid` 仍以 `jti` 承载会话标识，未单列 claim。
 
 ### 3.3 user_domain + PKX proof
 - [x] `canonical_user_domain`：去 `*.` 前缀、小写、去尾点、空/仅点 → None（`test_user_domain_helpers_are_stable`）。
@@ -186,17 +186,18 @@
 - [x] PKX 状态机：`create_pkx_binding` 写 `pending_pkx` 并返回固定 `pkx_record_name`/`pkx`（重入幂等）；`verify_pkx_binding` TXT 匹配 → `active`；`unbind_user_domain` → `revoked`；history 保留（`test_pkx_binding_state_transitions_and_history`）。
 - [x] `txt_matches_pkx` / `pkx_record_name` / `pkx_value` helper 的稳定性（同输入恒等，无 nonce/exp；空源被拒）（`test_user_domain_helpers_are_stable`）。
 - [x] `get_user_by_domain`：active binding 最长匹配 + legacy `users.user_domain` 回退（`test_get_user_by_domain_longest_match_and_legacy_fallback`）。
-- [ ] **绕过风险回归（阶段二修复后转正）**：`zone.bind_config` / `register_user_with_owner_key` 不再能无 proof 置 `active`；PKX RPC handler + DNS TXT 查询接线后端到端可达。
+- [x] **绕过风险回归**：`zone.bind_config` 传未经 PKX 校验的 `user_domain` → `SNV2:1015 invalid_domain`（`zone.rs ensure_verified_user_domain`；`test_sn_v2_phase_two_security_regressions`）；PKX RPC handler + DNS TXT 端到端可达（`test_sn_v2_api`：`domain.begin_verify` → `domain.verify`(txt_records) → `zone.bind_config` 成功）。> 注：`register_user_with_owner_key` 直接置 `active` 的 legacy DB 路径未经 RPC 暴露，留观察。
 
 ### 3.4 zone_info
 - [x] `get_zone_info`（缺行从 `users` backfill、未知用户返默认）/ `update_zone_info`（patch 只改传入字段、users 缓存同步）（`test_zone_info_patch_only_changes_given_fields` / `test_get_zone_info_backfills_from_users`）。
 - [x] `update_zone_relay_sn`：按 zone/bns_name/username 命中或缺行插入写 `relay_sn`；空参数 → `InvalidInput`（`test_update_zone_relay_sn_paths`）。
-- [ ] **self_cert 权限（阶段二修复后）**：裸 access token 不能置 `self_cert=true`；仅 ACME 成功 / 证书校验 / 受信 device 上报驱动；来源与审计事件记录。
+- [x] **self_cert 权限**：裸 access token（无 `device_did`）置 `self_cert=true` → `SNV2:1013 device_permission_denied`（`user.rs set_self_cert` → `ensure_owned_device`；`test_sn_v2_phase_two_security_regressions`）；正向路径经受信 device（`dns.add_record has_cert` / 拥有的 device）驱动 `update_user_self_cert`（`test_sn_v2_api` 内 `query.resolve_hostname` 命中 `self_cert=true`）。> 注：当前 gate 为「拥有该 device」，ACME 成功/证书校验驱动与审计事件仍待补。
 
-### 3.5 RPC 层（阶段二 `sn_authority` 落地后）
-- [ ] `auth.register/login/refresh/logout/me`、`user.bind_owner_key/get_owner_key/get_profile`、`zone.get/bind_config`、`dns.add_record/remove_record/list_records`、`admin.clear_state_by_active_code`。
-- [ ] 统一鉴权上下文：`Owner(name)` / `Controller(name,scope)` / `Device(zone,device,did)` / `SnUser(username)` 的产出与边界（SN access token ≠ BNS owner）。
-- [ ] 注册流程与 `sn_bns_controller` 串联：`request_id` 幂等、"BNS name 已存在但本地未完成"的恢复流程、绝不出现"本地成功但 BNS 未创建却误认有 owner 权"的状态。
+### 3.5 RPC 层（`sn_authority` 已落地）
+> 端到端 RPC 覆盖：[sn_server.rs](../src/components/cyfs-sn/src/sn_server.rs) 内 `test_sn_v2_api`（进程内 HTTP + kRPC 客户端，全绿）。
+- [x] `auth.register/login/refresh/logout/me`、`user.bind_owner_key/get_owner_key/get_profile`、`zone.get/bind_config`、`dns.add_record/remove_record`、`admin.clear_state_by_active_code`、`domain.begin_verify/verify`、`device.register/list`、`did.set/get_document`、`query.*` 经 `handle_namespaced_rpc_call` 路由并断言 envelope/错误码（`test_sn_v2_api`）。
+- [x] 统一鉴权上下文：`AuthContext::{Owner,Controller,Device,SnUser}`（[sn_authority.rs](../src/components/cyfs-sn/src/sn_authority.rs)）产出与边界——SN access token 跨用户 → `CrossUserAccessDenied`；裸 token 不能置 self_cert/未校验域名（`test_sn_v2_phase_two_security_regressions`）。
+- [ ] 注册流程与 `sn_bns_controller` 串联：`request_id` 幂等、"BNS name 已存在但本地未完成"的恢复流程。> 依赖 §2.4 迁移项（controller 切 EVM 自动签名）落地，见 §5.2 SN 业务级集成。
 
 运行：`cargo test -p cyfs-sn sn_auth`（DB 层用 `tempfile` SQLite 夹具 `new_test_db`）。
 
@@ -237,10 +238,10 @@
 - [x] `InvalidInput`（空 DID/zone/device_name、非法 IP/endpoint/TTL/枚举）、`NotFound`、`Conflict`、`StaleReport`、`Blocked`、`DBError`(=StorageError) 各有用例（`test_invalid_input_errors` / `test_db_error_on_closed_pool`，其余错误码散见 §4.1–§4.2 用例）。
 
 ### 4.6 阶段二（落地后补）
-- [ ] **remote 模式**：本地 service 与 remote client 暴露**同一组接口**，同一批用例参数化跑两遍（local / remote）结果一致；健康检查接口；连接/请求超时。
+- [x] **remote 模式**：本地 service 与 remote client 暴露**同一组接口**，同一批用例参数化跑两遍（local / remote）结果一致（[tests/sn_device_info_remote.rs](../src/components/cyfs-sn/tests/sn_device_info_remote.rs)：`local_and_remote_clients_agree_on_same_batch` 用经真实 S2S 编解码的 loopback —— 序列化 → `SnDeviceInfoDbRpcHandler::handle_rpc_call` → envelope 反序列化 —— 与直连 DB 对同一批 index/rebind/上报/stale/block/expire/错误码用例结果逐条相等；`production_remote_wrapper_exposes_same_trait` 钉死 `RemoteSnDeviceInfoDB` in-process 包装）。> 发现：真 KRPC 传输下 `SnDeviceInfoDbRpcEnvelope::into_result` 无法还原 `Ok(None)`（`success(None)` 序列化成 `result:null` → 反序列化丢失 `Some(None)` → 误判 "missing result"），导致远端查不存在设备返回 `RemoteError` 而非 `Ok(None)`——loopback 按 `null→None` 还原回避；生产 client 需修。健康检查接口/连接超时仍待加。
 - [ ] 生产调用方驱动（`sync_device_online_state` 真填 `from_ip`/`nat_type`/`report_seq`，`device_role` 不再硬编码）后的端到端字段流。
 
-运行：`cargo test -p cyfs-sn sn_device_info`。
+运行：`cargo test -p cyfs-sn sn_device_info`（DB 层）+ `cargo test -p cyfs-sn --test sn_device_info_remote`（local/remote 一致性）。
 
 ---
 

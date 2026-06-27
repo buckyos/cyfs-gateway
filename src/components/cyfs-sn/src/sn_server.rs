@@ -6179,7 +6179,7 @@ mod tests {
             .call(
                 "zone.bind_config",
                 json!({
-                    "zone_config": { "oods": ["ood1"] },
+                    "zone_config": "{\"oods\":[\"ood1\"]}",
                     "user_domain": format!("{}.buckyos.ai", REG_USER)
                 }),
             )
@@ -6197,7 +6197,7 @@ mod tests {
             .set_user_state(REG_USER, UserState::Suspended)
             .await
             .unwrap();
-        let me_err = bns_krpc
+        let me_err = kRPC::new(auth_url.as_str(), Some(access_token.clone()))
             .call("auth.me", json!({}))
             .await
             .err()
