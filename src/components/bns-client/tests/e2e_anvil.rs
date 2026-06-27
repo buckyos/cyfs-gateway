@@ -195,6 +195,10 @@ fn register_alice_req() -> BnsRegisterNameReq {
         name: "alice".to_string(),
         asset_owner: WRITER_ADDR.to_string(),
         options: RegisterOptions::default(),
+        authority_key_updates: vec![],
+        semantic_owner_after_authority: None,
+        controller_policy: vec![],
+        controller_policy_hash: String::new(),
         initial_documents: vec![],
         // registerName 走 msg.sender 准入；CallAuthority 仅作提示，用 public()。
         authority: CallAuthority::public(),

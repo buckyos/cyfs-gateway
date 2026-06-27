@@ -980,6 +980,101 @@ async fn sync_projects_authority_set_and_keys_via_mixed_strategy() {
 }
 
 #[tokio::test]
+async fn sync_backfills_authority_keys_from_apply_mutations_call() {
+    let tx_hash = B256::repeat_byte(0xAB);
+    let key = bns_evm::AuthorityKey {
+        kid: B256::repeat_byte(0x0B),
+        verificationMethod: bytes32_label("ed25519"),
+        keyData: bns_evm::Bytes::from_static(b"batch-pubkey"),
+        purposes: 0b0000_0011,
+        validFrom: 0,
+        validUntil: 0,
+        status: bns_evm::AuthorityKeyStatus::Active,
+        metadataHash: B256::ZERO,
+    };
+    let calldata = Bns::applyMutationsCall {
+        name: "alice".to_string(),
+        authorityUpdates: vec![bns_evm::AuthorityKeyUpdate { key, active: true }],
+        documents: vec![],
+        authority: bns_evm::CallAuthority {
+            role: bns_evm::AuthorityRole::Owner,
+            actor: bns_evm::Principal {
+                kind: bns_evm::PrincipalKind::ChainAccount,
+                value: bns_evm::Bytes::copy_from_slice(OWNER.as_slice()),
+            },
+            kid: B256::ZERO,
+        },
+        guard: bns_evm::MutationGuard {
+            expectedNameSeq: 1,
+            expectedParentNameSeq: 0,
+        },
+    }
+    .abi_encode();
+
+    let mut eth_call_returns = HashMap::new();
+    eth_call_returns.insert(
+        selector_hex::<Bns::getAuthoritySetCall>(),
+        format!(
+            "0x{}",
+            hex::encode(Bns::getAuthoritySetCall::abi_encode_returns(
+                &bns_evm::AuthoritySetState {
+                    name: "alice".to_string(),
+                    authoritySeq: 5,
+                    authorityRoot: B256::repeat_byte(0x78),
+                    activeKeyCount: 1,
+                }
+            ))
+        ),
+    );
+    let mut txs = HashMap::new();
+    txs.insert(
+        format!("{tx_hash:#x}").to_lowercase(),
+        format!("0x{}", hex::encode(&calldata)),
+    );
+
+    let logs = vec![
+        protocol_event_log(14, 0x67, 1),
+        event_log_json_with_tx(
+            &Bns::AuthorityKeysUpdated {
+                nameHash: B256::repeat_byte(0x09),
+                name: "alice".to_string(),
+                actor: ACTOR,
+                authoritySeq: 5,
+                authorityRoot: B256::repeat_byte(0x78),
+            },
+            1,
+            tx_hash,
+        ),
+    ];
+
+    let mock = MockEthRpc::start(MockConfig {
+        chain_id: 31_337,
+        block_number: 1,
+        logs_json: logs,
+        eth_call_returns,
+        txs,
+        ..Default::default()
+    })
+    .await;
+    let store = SqliteBnsRegistryStore::open_memory().unwrap();
+    let outcome = sync_bns_contract_once(
+        &store,
+        with_endpoint(config_for_chain(31_337), &mock.endpoint),
+    )
+    .await
+    .unwrap();
+    assert_eq!(outcome.registry_events_stored, 1);
+
+    let keys = store
+        .transact(|tx| tx.list_authority_keys("alice"))
+        .unwrap();
+    assert_eq!(keys.len(), 1);
+    assert_eq!(keys[0].kid, format!("{:#x}", B256::repeat_byte(0x0B)));
+    assert_eq!(keys[0].key_data, b"batch-pubkey");
+    assert_eq!(keys[0].purposes, 0b0000_0011);
+}
+
+#[tokio::test]
 async fn sync_projects_did_alias_via_eth_call() {
     // DidAliasSet → push_name_state + eth_call getAlias 拉权威 alias 态写投影。
     let mut eth_call_returns = HashMap::new();
@@ -996,14 +1091,16 @@ async fn sync_projects_did_alias_via_eth_call() {
         selector_hex::<Bns::getAliasCall>(),
         format!(
             "0x{}",
-            hex::encode(Bns::getAliasCall::abi_encode_returns(&bns_evm::AliasState {
-                name: "alice".to_string(),
-                kind: bns_evm::AliasKind::Alias,
-                targetDid: "did:bns:alice".to_string(),
-                proofHash: B256::repeat_byte(0x88),
-                setAt: 42,
-                nameSeq: 5,
-            }))
+            hex::encode(Bns::getAliasCall::abi_encode_returns(
+                &bns_evm::AliasState {
+                    name: "alice".to_string(),
+                    kind: bns_evm::AliasKind::Alias,
+                    targetDid: "did:bns:alice".to_string(),
+                    proofHash: B256::repeat_byte(0x88),
+                    setAt: 42,
+                    nameSeq: 5,
+                }
+            ))
         ),
     );
 

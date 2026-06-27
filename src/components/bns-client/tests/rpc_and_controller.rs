@@ -1,7 +1,7 @@
 use ::kRPC::{RPCHandler, RPCRequest, RPCResult};
 use async_trait::async_trait;
 use bns_client::{
-    publish_document_call, register_name_call, BindZoneDocumentsParams, BnsBootstrapNameReq,
+    publish_document_call, register_name_call, BindZoneDocumentsParams, BnsApplyMutationsReq,
     BnsClientError, BnsClientResult, BnsEvmClientConfig, BnsEvmKeyManager, BnsEvmSignRequest,
     BnsEvmStandardClient, BnsEvmTxSubmission, BnsEvmWriteOperation, BnsIndexerApi,
     BnsIndexerClient, BnsIndexerRpcHandler, BnsPublishDocumentReq, BnsRegisterNameReq,
@@ -59,14 +59,19 @@ fn in_process_client(
 
 #[derive(Default)]
 struct RecordingEvmSubmitter {
-    bootstraps: Mutex<Vec<BnsBootstrapNameReq>>,
+    registrations: Mutex<Vec<BnsRegisterNameReq>>,
+    mutations: Mutex<Vec<BnsApplyMutationsReq>>,
     published: Mutex<Vec<BnsPublishDocumentReq>>,
     next_nonce: Mutex<u64>,
 }
 
 impl RecordingEvmSubmitter {
-    fn bootstraps(&self) -> Vec<BnsBootstrapNameReq> {
-        self.bootstraps.lock().unwrap().clone()
+    fn registrations(&self) -> Vec<BnsRegisterNameReq> {
+        self.registrations.lock().unwrap().clone()
+    }
+
+    fn mutations(&self) -> Vec<BnsApplyMutationsReq> {
+        self.mutations.lock().unwrap().clone()
     }
 
     fn published(&self) -> Vec<BnsPublishDocumentReq> {
@@ -92,11 +97,16 @@ impl RecordingEvmSubmitter {
 
 #[async_trait]
 impl SnBnsEvmSubmitter for RecordingEvmSubmitter {
-    async fn bootstrap_name(
+    async fn register_name(&self, req: &BnsRegisterNameReq) -> BnsClientResult<BnsEvmTxSubmission> {
+        self.registrations.lock().unwrap().push(req.clone());
+        Ok(self.submission())
+    }
+
+    async fn apply_mutations(
         &self,
-        req: &BnsBootstrapNameReq,
+        req: &BnsApplyMutationsReq,
     ) -> BnsClientResult<BnsEvmTxSubmission> {
-        self.bootstraps.lock().unwrap().push(req.clone());
+        self.mutations.lock().unwrap().push(req.clone());
         Ok(self.submission())
     }
 
@@ -142,6 +152,10 @@ fn evm_register_call_encodes_chain_account_principal_as_address_bytes() {
         name: "alice".to_string(),
         asset_owner: OWNER.to_string(),
         options: RegisterOptions::default(),
+        authority_key_updates: vec![],
+        semantic_owner_after_authority: None,
+        controller_policy: vec![],
+        controller_policy_hash: String::new(),
         initial_documents: vec![],
         authority: owner_authority(),
         guard: guard(3),
@@ -192,6 +206,10 @@ fn evm_standard_client_builds_unsigned_contract_tx() {
         name: "alice".to_string(),
         asset_owner: OWNER.to_string(),
         options: RegisterOptions::default(),
+        authority_key_updates: vec![],
+        semantic_owner_after_authority: None,
+        controller_policy: vec![],
+        controller_policy_hash: String::new(),
         initial_documents: vec![],
         authority: CallAuthority::public(),
         guard: MutationGuard::default(),
@@ -226,6 +244,10 @@ async fn static_evm_key_manager_signs_tx_for_authority_context() {
         name: "alice".to_string(),
         asset_owner: ANVIL_ADDRESS.to_string(),
         options: RegisterOptions::default(),
+        authority_key_updates: vec![],
+        semantic_owner_after_authority: None,
+        controller_policy: vec![],
+        controller_policy_hash: String::new(),
         initial_documents: vec![],
         authority: CallAuthority::public(),
         guard: MutationGuard::default(),
@@ -247,6 +269,10 @@ async fn rpc_handler_wraps_registry_result_in_envelope() {
         name: "alice".to_string(),
         asset_owner: OWNER.to_string(),
         options: RegisterOptions::default(),
+        authority_key_updates: vec![],
+        semantic_owner_after_authority: None,
+        controller_policy: vec![],
+        controller_policy_hash: String::new(),
         initial_documents: vec![],
         authority: CallAuthority::public(),
         guard: MutationGuard::default(),
@@ -278,12 +304,12 @@ fn sn_controller_config_rejects_high_risk_doc_type_scope() {
 }
 
 #[tokio::test]
-async fn sn_controller_bootstrap_name_submits_controller_policy() {
+async fn sn_controller_register_name_submits_controller_policy() {
     let registry = registry();
     let (controller, submitter) = sn_controller_with_submitter(registry.clone());
 
     let output = controller
-        .bootstrap_name(BootstrapNameParams {
+        .register_name(BootstrapNameParams {
             request_id: "bootstrap-1".to_string(),
             name: "alice".to_string(),
             asset_owner: OWNER.to_string(),
@@ -301,15 +327,15 @@ async fn sn_controller_bootstrap_name_submits_controller_policy() {
     assert_eq!(output.receipt.name_seq, 0);
     assert_eq!(output.initial_documents.len(), 0);
 
-    let bootstraps = submitter.bootstraps();
-    assert_eq!(bootstraps.len(), 1);
-    assert_eq!(bootstraps[0].initial_documents.len(), 1);
-    assert_eq!(bootstraps[0].initial_documents[0].doc_type, "owner");
-    assert_eq!(bootstraps[0].controller_policy.len(), 2);
+    let registrations = submitter.registrations();
+    assert_eq!(registrations.len(), 1);
+    assert_eq!(registrations[0].initial_documents.len(), 1);
+    assert_eq!(registrations[0].initial_documents[0].doc_type, "owner");
+    assert_eq!(registrations[0].controller_policy.len(), 2);
 }
 
 #[tokio::test]
-async fn sn_controller_bind_zone_documents_submits_single_embedded_zone_document() {
+async fn sn_controller_bind_zone_documents_submits_atomic_zone_and_boot_documents() {
     let registry = registry();
     registry
         .register_name(
@@ -335,17 +361,22 @@ async fn sn_controller_bind_zone_documents_submits_single_embedded_zone_document
         .unwrap();
 
     assert_eq!(receipt.status, BnsWriteReceiptStatus::Submitted);
-    assert_eq!(receipt.receipts.len(), 1);
+    assert_eq!(receipt.receipts.len(), 2);
     assert_eq!(receipt.receipts[0].doc_type.as_deref(), Some(ZONE_DOC_TYPE));
+    assert_eq!(receipt.receipts[1].doc_type.as_deref(), Some(BOOT_DOC_TYPE));
 
-    let published = submitter.published();
-    assert_eq!(published.len(), 1);
-    assert_eq!(published[0].update.doc_type, ZONE_DOC_TYPE);
-    assert_ne!(published[0].update.doc_type, BOOT_DOC_TYPE);
+    let mutations = submitter.mutations();
+    assert_eq!(mutations.len(), 1);
+    assert_eq!(mutations[0].documents.len(), 2);
+    assert_eq!(mutations[0].documents[0].doc_type, ZONE_DOC_TYPE);
+    assert_eq!(mutations[0].documents[1].doc_type, BOOT_DOC_TYPE);
     let document: serde_json::Value =
-        serde_json::from_slice(&published[0].update.document.inline_document).unwrap();
+        serde_json::from_slice(&mutations[0].documents[0].document.inline_document).unwrap();
     assert_eq!(document["gateway"]["device_name"], "ood1");
-    assert_eq!(document["boot_jwt"], "boot-token");
+    assert!(document.get("boot_jwt").is_none());
+    let boot_document: serde_json::Value =
+        serde_json::from_slice(&mutations[0].documents[1].document.inline_document).unwrap();
+    assert_eq!(boot_document["boot_config_jwt"], "boot-token");
 }
 
 #[tokio::test]
@@ -502,6 +533,10 @@ async fn bns_client_preserves_stale_guard_error_codes() {
             name: "alice".to_string(),
             asset_owner: OWNER.to_string(),
             options: RegisterOptions::default(),
+            authority_key_updates: vec![],
+            semantic_owner_after_authority: None,
+            controller_policy: vec![],
+            controller_policy_hash: String::new(),
             initial_documents: vec![],
             authority: CallAuthority::public(),
             guard: MutationGuard::default(),

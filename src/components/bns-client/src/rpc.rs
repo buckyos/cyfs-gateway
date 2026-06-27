@@ -4,7 +4,7 @@ use bns_indexer::{
     AuthorityKey, AuthorityKeyUpdate, AuthoritySetState, BnsRegistryError, BnsRegistryResult,
     BnsRegistryStore, CallAuthority, CentralizedBnsRegistry, ControllerRule, DocumentState,
     DocumentUpdate, EventLogRecord, LogCheckpoint, MutationGuard, NameState, OwnerResolution,
-    RegisterOptions, ResolveResult,
+    RegisterOptions, ResolveResult, ZERO_HASH,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -25,6 +25,7 @@ pub const METHOD_GET_DOCUMENT_VERSION: &str = "document.get_version";
 pub const METHOD_SUBMIT_RAW_TX: &str = "tx.submit_raw";
 pub const METHOD_REGISTER_NAME: &str = "name.register";
 pub const METHOD_BOOTSTRAP_NAME: &str = "name.bootstrap";
+pub const METHOD_APPLY_MUTATIONS: &str = "mutation.apply";
 pub const METHOD_PUBLISH_DOCUMENT: &str = "document.publish";
 pub const METHOD_REVOKE_DOCUMENT: &str = "document.revoke";
 pub const METHOD_SET_CONTROLLER_POLICY: &str = "controller.set_policy";
@@ -283,6 +284,10 @@ pub struct BnsRegisterNameReq {
     pub name: String,
     pub asset_owner: String,
     pub options: RegisterOptions,
+    pub authority_key_updates: Vec<AuthorityKeyUpdate>,
+    pub semantic_owner_after_authority: Option<bns_indexer::Principal>,
+    pub controller_policy: Vec<ControllerRule>,
+    pub controller_policy_hash: String,
     pub initial_documents: Vec<DocumentUpdate>,
     pub authority: CallAuthority,
     pub guard: MutationGuard,
@@ -346,6 +351,22 @@ pub struct BnsPublishDocumentReq {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BnsPublishDocumentResp {
     pub document_version: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BnsApplyMutationsReq {
+    pub name: String,
+    pub authority_key_updates: Vec<AuthorityKeyUpdate>,
+    pub documents: Vec<DocumentUpdate>,
+    pub authority: CallAuthority,
+    pub guard: MutationGuard,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BnsApplyMutationsResp {
+    pub name_seq: u64,
+    pub documents: Vec<BnsDocumentVersion>,
+    pub authority_set: AuthoritySetState,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -428,6 +449,15 @@ pub trait BnsIndexerApi: Send + Sync {
     }
 
     async fn register_name(&self, req: BnsRegisterNameReq) -> BnsClientResult<BnsRegisterNameResp>;
+
+    async fn apply_mutations(
+        &self,
+        _req: BnsApplyMutationsReq,
+    ) -> BnsClientResult<BnsApplyMutationsResp> {
+        Err(BnsClientError::unsupported(
+            "bns-indexer apply_mutations handler is not configured",
+        ))
+    }
 
     async fn bootstrap_name(
         &self,
@@ -617,6 +647,16 @@ impl BnsIndexerApi for BnsIndexerClient {
         }
     }
 
+    async fn apply_mutations(
+        &self,
+        req: BnsApplyMutationsReq,
+    ) -> BnsClientResult<BnsApplyMutationsResp> {
+        match self {
+            Self::InProcess(handler) => handler.apply_mutations(req).await,
+            Self::KRPC(_) => self.call(METHOD_APPLY_MUTATIONS, &req).await,
+        }
+    }
+
     async fn bootstrap_name(
         &self,
         req: BnsBootstrapNameReq,
@@ -754,9 +794,27 @@ where
     }
 
     async fn register_name(&self, req: BnsRegisterNameReq) -> BnsClientResult<BnsRegisterNameResp> {
-        let name_seq = self
-            .registry
-            .register_name(
+        let has_bootstrap_fields = !req.authority_key_updates.is_empty()
+            || req.semantic_owner_after_authority.is_some()
+            || !req.controller_policy.is_empty()
+            || (!req.controller_policy_hash.is_empty() && req.controller_policy_hash != ZERO_HASH);
+        let name_seq = if has_bootstrap_fields {
+            self.registry
+                .bootstrap_name(
+                    &req.name,
+                    &req.asset_owner,
+                    req.options,
+                    req.initial_documents,
+                    req.authority_key_updates,
+                    req.semantic_owner_after_authority,
+                    req.controller_policy,
+                    &req.controller_policy_hash,
+                    req.authority,
+                    req.guard,
+                )
+                .map(|result| result.name_seq)
+        } else {
+            self.registry.register_name(
                 &req.name,
                 &req.asset_owner,
                 req.options,
@@ -764,8 +822,39 @@ where
                 req.authority,
                 req.guard,
             )
-            .map_err(BnsClientError::from)?;
+        }
+        .map_err(BnsClientError::from)?;
         Ok(BnsRegisterNameResp { name_seq })
+    }
+
+    async fn apply_mutations(
+        &self,
+        req: BnsApplyMutationsReq,
+    ) -> BnsClientResult<BnsApplyMutationsResp> {
+        let result = self
+            .registry
+            .apply_mutations(
+                &req.name,
+                req.authority_key_updates,
+                req.documents,
+                req.authority,
+                req.guard,
+            )
+            .map_err(BnsClientError::from)?;
+        Ok(BnsApplyMutationsResp {
+            name_seq: result.name_seq,
+            documents: result
+                .documents
+                .into_iter()
+                .map(|document| BnsDocumentVersion {
+                    doc_type: document.doc_type,
+                    version: document.version,
+                    content_hash: document.content_hash,
+                    document_state_hash: document.document_state_hash,
+                })
+                .collect(),
+            authority_set: result.authority_set,
+        })
     }
 
     async fn bootstrap_name(
@@ -946,6 +1035,11 @@ where
                 let parsed: BnsRegisterNameReq =
                     parse_req(req.params.clone(), "BnsRegisterNameReq")?;
                 rpc_envelope_response(self.0.register_name(parsed).await, &req)
+            }
+            METHOD_APPLY_MUTATIONS | "apply_mutations" => {
+                let parsed: BnsApplyMutationsReq =
+                    parse_req(req.params.clone(), "BnsApplyMutationsReq")?;
+                rpc_envelope_response(self.0.apply_mutations(parsed).await, &req)
             }
             METHOD_BOOTSTRAP_NAME | "bootstrap_name" => {
                 let parsed: BnsBootstrapNameReq =

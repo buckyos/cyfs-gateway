@@ -586,9 +586,9 @@ fn authority_keys_from_call(
         return Ok(Vec::new());
     };
     let updates = match decoded_call {
-        BnsCall::bootstrapName(call) if call.name == name => &call.authorityUpdates,
+        BnsCall::registerName(call) if call.name == name => &call.authorityUpdates,
         BnsCall::updateAuthorityKeys(call) if call.name == name => &call.updates,
-        BnsCall::rotateAuthorityAndOwnerDocument(call) if call.name == name => &call.keyUpdates,
+        BnsCall::applyMutations(call) if call.name == name => &call.authorityUpdates,
         _ => return Ok(Vec::new()),
     };
     updates.iter().map(authority_key_update_from_evm).collect()
@@ -602,7 +602,7 @@ fn controller_rules_from_call(
         return Ok(None);
     };
     let rules = match decoded_call {
-        BnsCall::bootstrapName(call) if call.name == name => &call.controllerPolicy,
+        BnsCall::registerName(call) if call.name == name => &call.controllerPolicy,
         BnsCall::setControllerPolicy(call) if call.name == name => &call.rules,
         _ => return Ok(None),
     };

@@ -12,15 +12,16 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bns_client::{
-    BnsAuthorityKeyReq, BnsBootstrapNameReq, BnsBootstrapNameResp, BnsClientError, BnsClientResult,
-    BnsDocumentReq, BnsDocumentVersionReq, BnsIndexerApi, BnsIndexerRpcHandler, BnsListEventsReq,
-    BnsNameReq, BnsPublishDocumentReq, BnsPublishDocumentResp, BnsRegisterNameReq,
-    BnsRegisterNameResp, BnsRevokeDocumentReq, BnsRevokeDocumentResp, BnsRpcEnvelope,
-    BnsSetControllerPolicyReq, BnsSetControllerPolicyResp, BnsSubmitRawTxReq, BnsSubmitRawTxResp,
-    BnsUpdateAuthorityKeysReq, BnsUpdateAuthorityKeysResp, CentralizedBnsIndexerHandler,
-    BNS_INDEXER_RPC_PATH, BNS_SERVER_RPC_PATH, METHOD_GET_AUTHORITY_KEY, METHOD_GET_AUTHORITY_SET,
-    METHOD_GET_DOCUMENT_VERSION, METHOD_LATEST_CHECKPOINT, METHOD_LIST_EVENTS,
-    METHOD_QUERY_NAME_STATE, METHOD_RESOLVE_DOCUMENT, METHOD_RESOLVE_OWNER, METHOD_SUBMIT_RAW_TX,
+    BnsApplyMutationsReq, BnsApplyMutationsResp, BnsAuthorityKeyReq, BnsBootstrapNameReq,
+    BnsBootstrapNameResp, BnsClientError, BnsClientResult, BnsDocumentReq, BnsDocumentVersionReq,
+    BnsIndexerApi, BnsIndexerRpcHandler, BnsListEventsReq, BnsNameReq, BnsPublishDocumentReq,
+    BnsPublishDocumentResp, BnsRegisterNameReq, BnsRegisterNameResp, BnsRevokeDocumentReq,
+    BnsRevokeDocumentResp, BnsRpcEnvelope, BnsSetControllerPolicyReq, BnsSetControllerPolicyResp,
+    BnsSubmitRawTxReq, BnsSubmitRawTxResp, BnsUpdateAuthorityKeysReq, BnsUpdateAuthorityKeysResp,
+    CentralizedBnsIndexerHandler, BNS_INDEXER_RPC_PATH, BNS_SERVER_RPC_PATH,
+    METHOD_GET_AUTHORITY_KEY, METHOD_GET_AUTHORITY_SET, METHOD_GET_DOCUMENT_VERSION,
+    METHOD_LATEST_CHECKPOINT, METHOD_LIST_EVENTS, METHOD_QUERY_NAME_STATE, METHOD_RESOLVE_DOCUMENT,
+    METHOD_RESOLVE_OWNER, METHOD_SUBMIT_RAW_TX,
 };
 use bns_evm::EthRpcClient;
 use bns_indexer::{
@@ -170,6 +171,13 @@ where
         _req: BnsBootstrapNameReq,
     ) -> BnsClientResult<BnsBootstrapNameResp> {
         self.unsupported_call_authority_write("name.bootstrap")
+    }
+
+    async fn apply_mutations(
+        &self,
+        _req: BnsApplyMutationsReq,
+    ) -> BnsClientResult<BnsApplyMutationsResp> {
+        self.unsupported_call_authority_write("mutation.apply")
     }
 
     async fn publish_document(
@@ -955,6 +963,10 @@ mod tests {
                 name: "alice".to_string(),
                 asset_owner: OWNER.to_string(),
                 options: RegisterOptions::default(),
+                authority_key_updates: vec![],
+                semantic_owner_after_authority: None,
+                controller_policy: vec![],
+                controller_policy_hash: String::new(),
                 initial_documents: vec![],
                 authority: CallAuthority::public(),
                 guard: MutationGuard::default(),
@@ -1089,6 +1101,10 @@ mod tests {
                 name: "bob".to_string(),
                 asset_owner: OWNER.to_string(),
                 options: RegisterOptions::default(),
+                authority_key_updates: vec![],
+                semantic_owner_after_authority: None,
+                controller_policy: vec![],
+                controller_policy_hash: String::new(),
                 initial_documents: vec![],
                 authority: CallAuthority::public(),
                 guard: MutationGuard::default(),

@@ -3,15 +3,16 @@ use std::collections::{HashMap, HashSet};
 use crate::{
     canonical_bns_name, canonical_doc_type, document_state_hash, ensure_registerable_depth,
     hash_json, is_top_level_name, now_timestamp, parent_name, validate_did, validate_hash,
-    validate_semantic_owner, AliasKind, AliasState, AuthorityKey, AuthorityKeyStatus,
-    AuthorityKeyUpdate, AuthorityRole, AuthoritySetState, BnsRegistryError, BnsRegistryResult,
-    BnsRegistryStore, BnsRegistryStoreTx, BootstrapDocumentVersion, BootstrapNameResult,
-    CallAuthority, ControllerRule, DocumentRef, DocumentState, DocumentStatus, DocumentUpdate,
-    EventLogRecord, LogCheckpoint, MutationGuard, NameState, NameStatus, OwnerResolution,
-    OwnerSource, PaymentTargetResolution, Principal, PrincipalKind, PurchaseContext,
-    RegisterOptions, RegistryEvent, ReleaseMode, ResolveResult, KEY_PURPOSE_AUTHENTICATION,
-    MAX_OWNER_REF_DEPTH, PERMISSION_PUBLISH_DOCUMENT, PERMISSION_REVOKE_DOCUMENT,
-    PERMISSION_SET_ALIAS, PERMISSION_SET_NAMESPACE, PERMISSION_SET_PAYMENT, ZERO_HASH,
+    validate_semantic_owner, AliasKind, AliasState, ApplyMutationsResult, AuthorityKey,
+    AuthorityKeyStatus, AuthorityKeyUpdate, AuthorityRole, AuthoritySetState, BnsRegistryError,
+    BnsRegistryResult, BnsRegistryStore, BnsRegistryStoreTx, BootstrapDocumentVersion,
+    BootstrapNameResult, CallAuthority, ControllerRule, DocumentRef, DocumentState, DocumentStatus,
+    DocumentUpdate, EventLogRecord, LogCheckpoint, MutationGuard, NameState, NameStatus,
+    OwnerResolution, OwnerSource, PaymentTargetResolution, Principal, PrincipalKind,
+    PurchaseContext, RegisterOptions, RegistryEvent, ReleaseMode, ResolveResult,
+    KEY_PURPOSE_AUTHENTICATION, MAX_OWNER_REF_DEPTH, PERMISSION_PUBLISH_DOCUMENT,
+    PERMISSION_REVOKE_DOCUMENT, PERMISSION_SET_ALIAS, PERMISSION_SET_NAMESPACE,
+    PERMISSION_SET_PAYMENT, ZERO_HASH,
 };
 
 use crate::sqlite::recompute_authority_set;
@@ -779,6 +780,94 @@ where
         })
     }
 
+    pub fn apply_mutations(
+        &self,
+        name: &str,
+        authority_updates: Vec<AuthorityKeyUpdate>,
+        documents: Vec<DocumentUpdate>,
+        authority: CallAuthority,
+        guard: MutationGuard,
+    ) -> BnsRegistryResult<ApplyMutationsResult> {
+        self.ensure_write_path("apply_mutations")?;
+        if authority_updates.is_empty() && documents.is_empty() {
+            return Err(BnsRegistryError::InvalidMutation(
+                "mutation batch must not be empty".to_string(),
+            ));
+        }
+        let name = canonical_bns_name(name)?;
+        for update in &authority_updates {
+            update.key.validate()?;
+        }
+        let mut doc_types = HashSet::with_capacity(documents.len());
+        for update in &documents {
+            update.validate()?;
+            let doc_type = canonical_doc_type(&update.doc_type)?;
+            if !doc_types.insert(doc_type) {
+                return Err(BnsRegistryError::InvalidMutation(
+                    "mutation batch contains duplicate document type".to_string(),
+                ));
+            }
+        }
+
+        self.store.transact(|tx| {
+            let now = now_timestamp();
+            let state = self.required_active_name(tx, &name)?;
+            self.check_guard(&state, &guard)?;
+
+            if !authority_updates.is_empty() {
+                self.authorize_owner_for_loaded(tx, &state, &authority)?;
+            }
+            for update in &documents {
+                self.authorize_update_no_guard(
+                    tx,
+                    &state,
+                    &update.doc_type,
+                    PERMISSION_PUBLISH_DOCUMENT,
+                    "publish_document",
+                    &authority,
+                )?;
+            }
+
+            if !authority_updates.is_empty() {
+                self.apply_authority_updates(tx, &name, authority_updates, now)?;
+            }
+
+            let mut document_versions = Vec::with_capacity(documents.len());
+            if !documents.is_empty() {
+                let mut state = self.required_active_name(tx, &name)?;
+                state.name_seq += 1;
+                state.updated_at = now;
+                state = self.materialize_name_state(tx, state)?;
+                tx.put_name(&state)?;
+
+                for update in documents {
+                    let doc_type = update.doc_type.clone();
+                    let version = self.publish_document_internal(tx, &name, update, false, now)?;
+                    let document =
+                        tx.get_document(&name, &doc_type, version)?.ok_or_else(|| {
+                            BnsRegistryError::DocumentNotFound {
+                                name: name.clone(),
+                                doc_type: doc_type.clone(),
+                            }
+                        })?;
+                    document_versions.push(BootstrapDocumentVersion {
+                        doc_type,
+                        version,
+                        content_hash: document.document.content_hash,
+                        document_state_hash: document.document_state_hash,
+                    });
+                }
+            }
+
+            let state = self.required_active_name(tx, &name)?;
+            Ok(ApplyMutationsResult {
+                name_seq: state.name_seq,
+                documents: document_versions,
+                authority_set: self.authority_set(tx, &name)?,
+            })
+        })
+    }
+
     pub fn rotate_authority_and_owner_document(
         &self,
         name: &str,
@@ -1264,6 +1353,43 @@ where
         guard: &MutationGuard,
     ) -> BnsRegistryResult<()> {
         self.check_guard(state, guard)?;
+        match authority.role {
+            AuthorityRole::Owner => self.authorize_owner_for_loaded(tx, state, authority),
+            AuthorityRole::Controller => {
+                let now = now_timestamp();
+                authority.actor.validate()?;
+                if authority.actor.kind == PrincipalKind::BnsName {
+                    self.validate_actor_key(tx, &authority.actor, &authority.kid, now)?;
+                }
+                let rules = tx.get_controller_policy(&state.name)?;
+                if rules
+                    .iter()
+                    .any(|rule| rule.permits(&authority.actor, doc_type, permission, now))
+                {
+                    Ok(())
+                } else {
+                    Err(BnsRegistryError::ControllerScopeDenied {
+                        name: state.name.clone(),
+                        doc_type: doc_type.to_string(),
+                        operation,
+                    })
+                }
+            }
+            AuthorityRole::None => Err(BnsRegistryError::NotEffectiveOwner {
+                name: state.name.clone(),
+            }),
+        }
+    }
+
+    fn authorize_update_no_guard(
+        &self,
+        tx: &mut dyn BnsRegistryStoreTx,
+        state: &NameState,
+        doc_type: &str,
+        permission: u32,
+        operation: &'static str,
+        authority: &CallAuthority,
+    ) -> BnsRegistryResult<()> {
         match authority.role {
             AuthorityRole::Owner => self.authorize_owner_for_loaded(tx, state, authority),
             AuthorityRole::Controller => {

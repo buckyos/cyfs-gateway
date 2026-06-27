@@ -115,7 +115,7 @@ pub(crate) async fn handle_auth(server: &SNServer, req: RPCRequest) -> RpcCallRe
             let need_bind_owner_key = server.bns_controller().is_none();
             if let Some(controller) = server.bns_controller() {
                 controller
-                    .bootstrap_name(BootstrapNameParams {
+                    .register_name(BootstrapNameParams {
                         request_id: params
                             .request_id
                             .clone()

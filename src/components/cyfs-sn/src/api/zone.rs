@@ -85,11 +85,9 @@ pub(crate) async fn handle_zone(server: &SNServer, req: RPCRequest) -> RpcCallRe
                         "zone_config must be a JSON object or JWT string",
                     ));
                 }
-                // When boot_config is omitted, leave it null (zone-only write).
-                // The controller embeds a boot_jwt into the zone document only
-                // when a real boot JWT is present; a bogus placeholder object
-                // cannot be read back by the resolver, so we no longer synthesize
-                // one.
+                // When boot_config is omitted, leave it null and let the
+                // controller publish a zone-only mutation batch. When present,
+                // boot_config is written as its own BNS boot document.
                 let boot_config = match params.boot_config.as_deref() {
                     Some(value) => {
                         let parsed = document_value_from_param(value, "boot_config_jwt");

@@ -22,9 +22,9 @@ use serde::{Deserialize, Serialize};
 use tokio::time::{sleep, Duration, Instant};
 
 use crate::{
-    BnsBootstrapNameReq, BnsClientError, BnsClientResult, BnsIndexerApi, BnsPublishDocumentReq,
-    BnsRegisterNameReq, BnsRevokeDocumentReq, BnsSetControllerPolicyReq, BnsSubmitRawTxReq,
-    BnsUpdateAuthorityKeysReq,
+    BnsApplyMutationsReq, BnsBootstrapNameReq, BnsClientError, BnsClientResult, BnsIndexerApi,
+    BnsPublishDocumentReq, BnsRegisterNameReq, BnsRevokeDocumentReq, BnsSetControllerPolicyReq,
+    BnsSubmitRawTxReq, BnsUpdateAuthorityKeysReq,
 };
 
 impl From<BnsEvmError> for BnsClientError {
@@ -130,6 +130,7 @@ pub enum BnsEvmWriteOperation {
     Manual,
     RegisterName,
     BootstrapName,
+    ApplyMutations,
     PublishDocument,
     RevokeDocument,
     SetControllerPolicy,
@@ -142,6 +143,7 @@ impl BnsEvmWriteOperation {
             Self::Manual => "manual",
             Self::RegisterName => "register_name",
             Self::BootstrapName => "bootstrap_name",
+            Self::ApplyMutations => "apply_mutations",
             Self::PublishDocument => "publish_document",
             Self::RevokeDocument => "revoke_document",
             Self::SetControllerPolicy => "set_controller_policy",
@@ -554,6 +556,19 @@ impl BnsEvmControllerClient {
             .await
     }
 
+    pub async fn apply_mutations(
+        &self,
+        req: &BnsApplyMutationsReq,
+    ) -> BnsClientResult<BnsEvmTxSubmission> {
+        let request = BnsEvmSignRequest::new(
+            BnsEvmWriteOperation::ApplyMutations,
+            req.name.clone(),
+            req.authority.clone(),
+        );
+        self.sign_and_submit_with_request(&request, &apply_mutations_call(req)?)
+            .await
+    }
+
     pub async fn publish_document(
         &self,
         req: &BnsPublishDocumentReq,
@@ -647,18 +662,6 @@ pub fn register_name_call(req: &BnsRegisterNameReq) -> BnsClientResult<Bns::regi
         name: req.name.clone(),
         assetOwner: parse_address(&req.asset_owner, "asset_owner")?,
         options: register_options_to_evm(&req.options)?,
-        initialDocuments: document_updates_to_evm(&req.initial_documents)?,
-        authority: call_authority_to_evm(&req.authority)?,
-        guard: mutation_guard_to_evm(req.guard),
-    })
-}
-
-pub fn bootstrap_name_call(req: &BnsBootstrapNameReq) -> BnsClientResult<Bns::bootstrapNameCall> {
-    Ok(Bns::bootstrapNameCall {
-        name: req.name.clone(),
-        assetOwner: parse_address(&req.asset_owner, "asset_owner")?,
-        options: register_options_to_evm(&req.options)?,
-        initialDocuments: document_updates_to_evm(&req.initial_documents)?,
         authorityUpdates: authority_key_updates_to_evm(&req.authority_key_updates)?,
         semanticOwnerAfterAuthority: req
             .semantic_owner_after_authority
@@ -671,6 +674,42 @@ pub fn bootstrap_name_call(req: &BnsBootstrapNameReq) -> BnsClientResult<Bns::bo
             &req.controller_policy_hash,
             "controller_policy_hash",
         )?,
+        initialDocuments: document_updates_to_evm(&req.initial_documents)?,
+        authority: call_authority_to_evm(&req.authority)?,
+        guard: mutation_guard_to_evm(req.guard),
+    })
+}
+
+pub fn bootstrap_name_call(req: &BnsBootstrapNameReq) -> BnsClientResult<Bns::registerNameCall> {
+    Ok(Bns::registerNameCall {
+        name: req.name.clone(),
+        assetOwner: parse_address(&req.asset_owner, "asset_owner")?,
+        options: register_options_to_evm(&req.options)?,
+        authorityUpdates: authority_key_updates_to_evm(&req.authority_key_updates)?,
+        semanticOwnerAfterAuthority: req
+            .semantic_owner_after_authority
+            .as_ref()
+            .map(principal_to_evm)
+            .transpose()?
+            .unwrap_or_else(unset_principal),
+        controllerPolicy: controller_rules_to_evm(&req.controller_policy)?,
+        controllerPolicyHash: parse_b256_or_zero(
+            &req.controller_policy_hash,
+            "controller_policy_hash",
+        )?,
+        initialDocuments: document_updates_to_evm(&req.initial_documents)?,
+        authority: call_authority_to_evm(&req.authority)?,
+        guard: mutation_guard_to_evm(req.guard),
+    })
+}
+
+pub fn apply_mutations_call(
+    req: &BnsApplyMutationsReq,
+) -> BnsClientResult<Bns::applyMutationsCall> {
+    Ok(Bns::applyMutationsCall {
+        name: req.name.clone(),
+        authorityUpdates: authority_key_updates_to_evm(&req.authority_key_updates)?,
+        documents: document_updates_to_evm(&req.documents)?,
         authority: call_authority_to_evm(&req.authority)?,
         guard: mutation_guard_to_evm(req.guard),
     })

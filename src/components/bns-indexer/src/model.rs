@@ -661,6 +661,13 @@ pub struct BootstrapNameResult {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApplyMutationsResult {
+    pub name_seq: u64,
+    pub documents: Vec<BootstrapDocumentVersion>,
+    pub authority_set: AuthoritySetState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DocumentKey {
     pub name: String,
     pub doc_type: String,

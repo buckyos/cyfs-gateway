@@ -12,13 +12,13 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use bns_client::{
-    BnsAuthorityKeyReq, BnsBootstrapNameReq, BnsBootstrapNameResp, BnsClientError, BnsClientResult,
-    BnsDocumentReq, BnsDocumentVersionReq, BnsEvmClientConfig, BnsEvmControllerClient,
-    BnsEvmRawTxSubmitter, BnsEvmReceiptWaitConfig, BnsEvmStandardClient, BnsIndexerApi, BnsNameReq,
-    BnsPublishDocumentReq, BnsPublishDocumentResp, BnsRegisterNameReq, BnsRegisterNameResp,
-    BnsRevokeDocumentReq, BnsRevokeDocumentResp, BnsSetControllerPolicyReq,
-    BnsSetControllerPolicyResp, BnsSubmitRawTxReq, BnsSubmitRawTxResp, BnsUpdateAuthorityKeysReq,
-    BnsUpdateAuthorityKeysResp,
+    BnsApplyMutationsReq, BnsApplyMutationsResp, BnsAuthorityKeyReq, BnsBootstrapNameReq,
+    BnsBootstrapNameResp, BnsClientError, BnsClientResult, BnsDocumentReq, BnsDocumentVersionReq,
+    BnsEvmClientConfig, BnsEvmControllerClient, BnsEvmRawTxSubmitter, BnsEvmReceiptWaitConfig,
+    BnsEvmStandardClient, BnsIndexerApi, BnsNameReq, BnsPublishDocumentReq, BnsPublishDocumentResp,
+    BnsRegisterNameReq, BnsRegisterNameResp, BnsRevokeDocumentReq, BnsRevokeDocumentResp,
+    BnsSetControllerPolicyReq, BnsSetControllerPolicyResp, BnsSubmitRawTxReq, BnsSubmitRawTxResp,
+    BnsUpdateAuthorityKeysReq, BnsUpdateAuthorityKeysResp,
 };
 use bns_evm::{decode_signed_eip1559, Address};
 use bns_indexer::{
@@ -105,6 +105,12 @@ impl BnsIndexerApi for CapturingBnsServer {
         _req: BnsRegisterNameReq,
     ) -> BnsClientResult<BnsRegisterNameResp> {
         unused("register_name")
+    }
+    async fn apply_mutations(
+        &self,
+        _req: BnsApplyMutationsReq,
+    ) -> BnsClientResult<BnsApplyMutationsResp> {
+        unused("apply_mutations")
     }
     async fn publish_document(
         &self,
@@ -280,6 +286,10 @@ fn register_req(name: &str) -> BnsRegisterNameReq {
         name: name.to_string(),
         asset_owner: OWNER.to_string(),
         options: RegisterOptions::default(),
+        authority_key_updates: vec![],
+        semantic_owner_after_authority: None,
+        controller_policy: vec![],
+        controller_policy_hash: String::new(),
         initial_documents: vec![],
         authority: CallAuthority::public(),
         guard: MutationGuard::default(),
@@ -446,6 +456,12 @@ async fn controller_resets_cached_nonce_after_submission_failure() {
             _r: BnsRegisterNameReq,
         ) -> BnsClientResult<BnsRegisterNameResp> {
             unused("register_name")
+        }
+        async fn apply_mutations(
+            &self,
+            _r: BnsApplyMutationsReq,
+        ) -> BnsClientResult<BnsApplyMutationsResp> {
+            unused("apply_mutations")
         }
         async fn publish_document(
             &self,
