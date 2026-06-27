@@ -14,6 +14,7 @@ use std::sync::Arc;
 use thiserror::Error;
 
 pub const BNS_INDEXER_RPC_PATH: &str = "/kapi/bns-indexer";
+pub const BNS_SERVER_RPC_PATH: &str = "/kapi/bns";
 
 pub const METHOD_QUERY_NAME_STATE: &str = "name.query_state";
 pub const METHOD_RESOLVE_OWNER: &str = "name.resolve_owner";
@@ -21,6 +22,7 @@ pub const METHOD_GET_AUTHORITY_SET: &str = "authority.get_set";
 pub const METHOD_GET_AUTHORITY_KEY: &str = "authority.get_key";
 pub const METHOD_RESOLVE_DOCUMENT: &str = "document.resolve";
 pub const METHOD_GET_DOCUMENT_VERSION: &str = "document.get_version";
+pub const METHOD_SUBMIT_RAW_TX: &str = "tx.submit_raw";
 pub const METHOD_REGISTER_NAME: &str = "name.register";
 pub const METHOD_BOOTSTRAP_NAME: &str = "name.bootstrap";
 pub const METHOD_PUBLISH_DOCUMENT: &str = "document.publish";
@@ -233,6 +235,49 @@ pub struct BnsDocumentVersionReq {
     pub version: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BnsSubmitRawTxReq {
+    pub raw_tx: String,
+}
+
+impl BnsSubmitRawTxReq {
+    pub fn from_hex(raw_tx: impl Into<String>) -> Self {
+        Self {
+            raw_tx: raw_tx.into(),
+        }
+    }
+
+    pub fn from_bytes(raw_tx: &[u8]) -> Self {
+        Self {
+            raw_tx: format!("0x{}", hex::encode(raw_tx)),
+        }
+    }
+
+    pub fn raw_tx_bytes(&self) -> BnsClientResult<Vec<u8>> {
+        let raw = self.raw_tx.trim();
+        if raw.is_empty() {
+            return Err(BnsClientError::Serialization(
+                "raw_tx must not be empty".to_string(),
+            ));
+        }
+        let hex = raw.strip_prefix("0x").unwrap_or(raw);
+        if hex.is_empty() || hex.len() % 2 != 0 {
+            return Err(BnsClientError::Serialization(format!(
+                "raw_tx must be even-length hex, got `{}`",
+                self.raw_tx
+            )));
+        }
+        hex::decode(hex).map_err(|e| {
+            BnsClientError::Serialization(format!("invalid raw_tx hex `{}`: {}", self.raw_tx, e))
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BnsSubmitRawTxResp {
+    pub tx_hash: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BnsRegisterNameReq {
     pub name: String,
@@ -376,6 +421,12 @@ pub trait BnsIndexerApi: Send + Sync {
         version: u64,
     ) -> BnsClientResult<Option<DocumentState>>;
 
+    async fn submit_raw_tx(&self, _req: BnsSubmitRawTxReq) -> BnsClientResult<BnsSubmitRawTxResp> {
+        Err(BnsClientError::unsupported(
+            "BNS raw TX submission is not configured",
+        ))
+    }
+
     async fn register_name(&self, req: BnsRegisterNameReq) -> BnsClientResult<BnsRegisterNameResp>;
 
     async fn bootstrap_name(
@@ -433,6 +484,11 @@ impl BnsIndexerClient {
 
     pub fn new_krpc_url(indexer_url: &str, session_token: Option<String>) -> Self {
         let endpoint = normalize_bns_indexer_url(indexer_url);
+        Self::KRPC(Arc::new(kRPC::new(endpoint.as_str(), session_token)))
+    }
+
+    pub fn new_bns_server_url(server_url: &str, session_token: Option<String>) -> Self {
+        let endpoint = normalize_bns_server_url(server_url);
         Self::KRPC(Arc::new(kRPC::new(endpoint.as_str(), session_token)))
     }
 
@@ -544,6 +600,13 @@ impl BnsIndexerApi for BnsIndexerClient {
                 )
                 .await
             }
+        }
+    }
+
+    async fn submit_raw_tx(&self, req: BnsSubmitRawTxReq) -> BnsClientResult<BnsSubmitRawTxResp> {
+        match self {
+            Self::InProcess(handler) => handler.submit_raw_tx(req).await,
+            Self::KRPC(_) => self.call(METHOD_SUBMIT_RAW_TX, &req).await,
         }
     }
 
@@ -875,6 +938,10 @@ where
                     &req,
                 )
             }
+            METHOD_SUBMIT_RAW_TX | "submit_raw_tx" => {
+                let parsed: BnsSubmitRawTxReq = parse_req(req.params.clone(), "BnsSubmitRawTxReq")?;
+                rpc_envelope_response(self.0.submit_raw_tx(parsed).await, &req)
+            }
             METHOD_REGISTER_NAME | "register_name" => {
                 let parsed: BnsRegisterNameReq =
                     parse_req(req.params.clone(), "BnsRegisterNameReq")?;
@@ -926,6 +993,14 @@ pub fn normalize_bns_indexer_url(indexer_url: &str) -> String {
         return format!("{}{}", base, BNS_INDEXER_RPC_PATH);
     }
     format!("{}{}", trimmed, BNS_INDEXER_RPC_PATH)
+}
+
+pub fn normalize_bns_server_url(server_url: &str) -> String {
+    let trimmed = server_url.trim_end_matches('/');
+    if let Some(base) = trimmed.strip_suffix(BNS_SERVER_RPC_PATH) {
+        return format!("{}{}", base, BNS_SERVER_RPC_PATH);
+    }
+    format!("{}{}", trimmed, BNS_SERVER_RPC_PATH)
 }
 
 fn parse_req<T: DeserializeOwned>(value: Value, type_name: &str) -> Result<T, RPCErrors> {
