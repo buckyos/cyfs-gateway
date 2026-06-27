@@ -537,6 +537,33 @@ impl BnsRegistryStoreTx for SqliteStoreTx<'_> {
         Ok(record)
     }
 
+    fn put_event_record(&mut self, record: &EventLogRecord) -> BnsRegistryResult<()> {
+        self.tx.execute(
+            r#"
+            INSERT INTO bns_events
+                (seq, event_type, observed_at, event_hash, previous_log_root, log_root, payload_json)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            ON CONFLICT(seq) DO UPDATE SET
+                event_type = excluded.event_type,
+                observed_at = excluded.observed_at,
+                event_hash = excluded.event_hash,
+                previous_log_root = excluded.previous_log_root,
+                log_root = excluded.log_root,
+                payload_json = excluded.payload_json
+            "#,
+            params![
+                to_i64(record.seq, "seq")?,
+                record.event_type,
+                to_i64(record.observed_at, "observed_at")?,
+                record.event_hash,
+                record.previous_log_root,
+                record.log_root,
+                to_json(record)?
+            ],
+        )?;
+        Ok(())
+    }
+
     fn get_event(&mut self, seq: u64) -> BnsRegistryResult<Option<EventLogRecord>> {
         let payload = self
             .tx

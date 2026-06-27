@@ -5,6 +5,7 @@ edition = "2021"
 authors = ["BuckyOS DAO", "@waterflier", "@lurenpluto", "@wugren"]
 
 [dependencies]
+bns-evm = { path = "../bns-evm" }
 hex.workspace = true
 rusqlite = { version = "0.32.1", features = ["bundled"] }
 serde.workspace = true

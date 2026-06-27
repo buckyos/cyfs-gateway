@@ -48,6 +48,10 @@ impl SqliteSnBnsWriteRequestStore {
                 result_json TEXT NULL,
                 error_code TEXT NULL,
                 error_message TEXT NULL,
+                evm_chain_id INTEGER NULL,
+                evm_nonce INTEGER NULL,
+                evm_tx_hash TEXT NULL,
+                evm_raw_tx TEXT NULL,
                 created_at INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL
             );
@@ -57,6 +61,10 @@ impl SqliteSnBnsWriteRequestStore {
             "#,
         )
         .map_err(|e| SnBnsControllerError::Store(e.to_string()))?;
+        ensure_column(&conn, "evm_chain_id", "INTEGER NULL")?;
+        ensure_column(&conn, "evm_nonce", "INTEGER NULL")?;
+        ensure_column(&conn, "evm_tx_hash", "TEXT NULL")?;
+        ensure_column(&conn, "evm_raw_tx", "TEXT NULL")?;
         Ok(())
     }
 
@@ -80,7 +88,9 @@ impl SnBnsWriteRequestStore for SqliteSnBnsWriteRequestStore {
         let record = conn
             .query_row(
                 "SELECT request_id, operation, name, doc_type, payload_hash, state,
-                        result_json, error_code, error_message, created_at, updated_at
+                        result_json, error_code, error_message,
+                        evm_chain_id, evm_nonce, evm_tx_hash, evm_raw_tx,
+                        created_at, updated_at
                  FROM sn_bns_write_requests
                  WHERE request_id = ?1",
                 params![request_id],
@@ -96,8 +106,12 @@ impl SnBnsWriteRequestStore for SqliteSnBnsWriteRequestStore {
                         result_json,
                         row.get::<_, Option<String>>(7)?,
                         row.get::<_, Option<String>>(8)?,
-                        row.get::<_, i64>(9)?,
-                        row.get::<_, i64>(10)?,
+                        row.get::<_, Option<i64>>(9)?,
+                        row.get::<_, Option<i64>>(10)?,
+                        row.get::<_, Option<String>>(11)?,
+                        row.get::<_, Option<String>>(12)?,
+                        row.get::<_, i64>(13)?,
+                        row.get::<_, i64>(14)?,
                     ))
                 },
             )
@@ -116,6 +130,10 @@ impl SnBnsWriteRequestStore for SqliteSnBnsWriteRequestStore {
                     result_json,
                     error_code,
                     error_message,
+                    evm_chain_id,
+                    evm_nonce,
+                    evm_tx_hash,
+                    evm_raw_tx,
                     created_at,
                     updated_at,
                 )| {
@@ -137,6 +155,10 @@ impl SnBnsWriteRequestStore for SqliteSnBnsWriteRequestStore {
                             })?,
                         error_code,
                         error_message,
+                        evm_chain_id: evm_chain_id.map(|value| value.max(0) as u64),
+                        evm_nonce: evm_nonce.map(|value| value.max(0) as u64),
+                        evm_tx_hash,
+                        evm_raw_tx,
                         created_at: created_at.max(0) as u64,
                         updated_at: updated_at.max(0) as u64,
                     })
@@ -168,8 +190,10 @@ impl SnBnsWriteRequestStore for SqliteSnBnsWriteRequestStore {
         conn.execute(
             "INSERT INTO sn_bns_write_requests
                 (request_id, operation, name, doc_type, payload_hash, state,
-                 result_json, error_code, error_message, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                 result_json, error_code, error_message,
+                 evm_chain_id, evm_nonce, evm_tx_hash, evm_raw_tx,
+                 created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
              ON CONFLICT(request_id) DO UPDATE SET
                 operation = excluded.operation,
                 name = excluded.name,
@@ -179,6 +203,10 @@ impl SnBnsWriteRequestStore for SqliteSnBnsWriteRequestStore {
                 result_json = excluded.result_json,
                 error_code = excluded.error_code,
                 error_message = excluded.error_message,
+                evm_chain_id = excluded.evm_chain_id,
+                evm_nonce = excluded.evm_nonce,
+                evm_tx_hash = excluded.evm_tx_hash,
+                evm_raw_tx = excluded.evm_raw_tx,
                 updated_at = excluded.updated_at",
             params![
                 record.request_id,
@@ -190,6 +218,10 @@ impl SnBnsWriteRequestStore for SqliteSnBnsWriteRequestStore {
                 result_json,
                 record.error_code,
                 record.error_message,
+                record.evm_chain_id.map(|value| value as i64),
+                record.evm_nonce.map(|value| value as i64),
+                record.evm_tx_hash,
+                record.evm_raw_tx,
                 record.created_at as i64,
                 record.updated_at as i64,
             ],
@@ -197,4 +229,23 @@ impl SnBnsWriteRequestStore for SqliteSnBnsWriteRequestStore {
         .map_err(|e| SnBnsControllerError::Store(e.to_string()))?;
         Ok(())
     }
+}
+
+fn ensure_column(conn: &Connection, column: &str, column_def: &str) -> SnBnsControllerResult<()> {
+    let exists = conn
+        .query_row(
+            "SELECT 1 FROM pragma_table_info('sn_bns_write_requests') WHERE name = ?1",
+            params![column],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .map_err(|e| SnBnsControllerError::Store(e.to_string()))?;
+    if exists.is_none() {
+        conn.execute(
+            &format!("ALTER TABLE sn_bns_write_requests ADD COLUMN {column} {column_def}"),
+            [],
+        )
+        .map_err(|e| SnBnsControllerError::Store(e.to_string()))?;
+    }
+    Ok(())
 }

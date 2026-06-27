@@ -261,6 +261,13 @@ stacks:
   #   device_jwt:
   #     - "<jwt>"
   #   aliases: []                 # optional
+  #   bns_indexer_url: http://127.0.0.1:13450  # optional BNS read/indexer API
+  #   bns_evm:                    # optional EVM write path configuration
+  #     rpc_endpoint: http://127.0.0.1:8545
+  #     chain_id: 31337
+  #     contract_address: "0x0000000000000000000000000000000000000000"
+  #     controller_private_key_env: BNS_PRIVATE_KEY
+  #     gas_limit: 3000000
   #   db_type: sqlite             # optional
   #   db_params:
   #     db_path: ./sn.db

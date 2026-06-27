@@ -1,12 +1,14 @@
 use ::kRPC::{RPCHandler, RPCRequest, RPCResult};
 use bns_client::{
-    BnsClientError, BnsIndexerApi, BnsIndexerClient, BnsIndexerRpcHandler, BnsPublishDocumentReq,
-    BnsRegisterNameReq, BnsRegisterNameResp, BnsRpcEnvelope, BootstrapNameParams,
-    CentralizedBnsIndexerHandler, DnsTxtUpdate, MemorySnBnsWriteRequestStore,
+    publish_document_call, register_name_call, BnsClientError, BnsEvmClientConfig,
+    BnsEvmStandardClient, BnsIndexerApi, BnsIndexerClient, BnsIndexerRpcHandler,
+    BnsPublishDocumentReq, BnsRegisterNameReq, BnsRegisterNameResp, BnsRpcEnvelope,
+    BootstrapNameParams, CentralizedBnsIndexerHandler, DnsTxtUpdate, MemorySnBnsWriteRequestStore,
     PublishDeviceMiniDocParams, PublishRelayAssignmentParams, SnBnsController,
     SnBnsControllerConfig, SnBnsControllerError, UpsertDnsTxtParams, DEVICE_MINI_DOC_TYPE,
     METHOD_REGISTER_NAME, RELAY_ASSIGNMENT_DOC_TYPE,
 };
+use bns_evm::{AuthorityRole as EvmAuthorityRole, PrincipalKind as EvmPrincipalKind, SolCall};
 use bns_indexer::dns_document::{self, DNS_TXT_DOC_TYPE};
 use bns_indexer::{
     controller_rule, default_document_update, policy_hash_from_rules, CallAuthority,
@@ -64,6 +66,74 @@ fn inline_update(doc_type: &str, expected_version: u64, body: &str) -> bns_index
         DocumentRef::inline(body.as_bytes()),
     )
     .unwrap()
+}
+
+#[test]
+fn evm_register_call_encodes_chain_account_principal_as_address_bytes() {
+    let req = BnsRegisterNameReq {
+        name: "alice".to_string(),
+        asset_owner: OWNER.to_string(),
+        options: RegisterOptions::default(),
+        initial_documents: vec![],
+        authority: owner_authority(),
+        guard: guard(3),
+    };
+
+    let call = register_name_call(&req).unwrap();
+    assert_eq!(call.assetOwner.to_string().to_lowercase(), OWNER);
+    assert!(matches!(call.authority.role, EvmAuthorityRole::Owner));
+    assert!(matches!(
+        call.authority.actor.kind,
+        EvmPrincipalKind::ChainAccount
+    ));
+    assert_eq!(call.authority.actor.value.len(), 20);
+    assert_eq!(call.guard.expectedNameSeq, 3);
+    assert_eq!(
+        call.abi_encode()[..4],
+        bns_evm::Bns::registerNameCall::SELECTOR
+    );
+}
+
+#[test]
+fn evm_publish_call_preserves_document_ref_and_authority_boundary() {
+    let update = inline_update(DNS_TXT_DOC_TYPE, 0, r#"[{"ttl":60,"value":"x"}]"#);
+    let req = BnsPublishDocumentReq {
+        name: "alice".to_string(),
+        update,
+        authority: sn_controller_authority(),
+        guard: guard(1),
+    };
+
+    let call = publish_document_call(&req).unwrap();
+    assert_eq!(call.docType, DNS_TXT_DOC_TYPE);
+    assert_eq!(call.document.storageType.as_slice()[..6], *b"inline");
+    assert!(!call.document.inlineDocument.is_empty());
+    assert!(matches!(call.authority.role, EvmAuthorityRole::Controller));
+    assert_eq!(call.authority.actor.value.len(), 20);
+    assert_eq!(call.guard.expectedNameSeq, 1);
+}
+
+#[test]
+fn evm_standard_client_builds_unsigned_contract_tx() {
+    let client = BnsEvmStandardClient::new(BnsEvmClientConfig::anvil(
+        "http://127.0.0.1:8545",
+        "0x2222222222222222222222222222222222222222",
+        31_337,
+    ));
+    let req = BnsRegisterNameReq {
+        name: "alice".to_string(),
+        asset_owner: OWNER.to_string(),
+        options: RegisterOptions::default(),
+        initial_documents: vec![],
+        authority: CallAuthority::public(),
+        guard: MutationGuard::default(),
+    };
+    let call = register_name_call(&req).unwrap();
+    let tx = client.build_unsigned_tx(&call, 9).unwrap();
+
+    assert_eq!(tx.chain_id, 31_337);
+    assert_eq!(tx.nonce, 9);
+    assert_eq!(tx.input, client.build_calldata(&call));
 }
 
 #[tokio::test]

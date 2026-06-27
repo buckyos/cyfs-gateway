@@ -8,12 +8,17 @@
 pub mod dns_document;
 
 mod error;
+mod evm_projection;
 mod model;
 mod registry;
 mod sqlite;
 mod store;
 
 pub use error::{BnsRegistryError, BnsRegistryResult};
+pub use evm_projection::{
+    checkpoint_from_event, store_event_record, ContractEventProjector, ContractProtocolEvent,
+    ProjectedContractEvent,
+};
 pub use model::*;
 pub use registry::{
     controller_rule, default_document_update, policy_hash_from_rules, CentralizedBnsRegistry,

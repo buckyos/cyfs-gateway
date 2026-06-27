@@ -6,7 +6,9 @@ authors = ["BuckyOS DAO", "@waterflier", "@lurenpluto", "@wugren"]
 
 [dependencies]
 async-trait.workspace = true
+bns-evm = { path = "../bns-evm" }
 bns-indexer = { path = "../bns-indexer" }
+hex.workspace = true
 kRPC.workspace = true
 rusqlite = { version = "0.32.1", features = ["bundled"] }
 serde.workspace = true

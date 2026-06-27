@@ -55,6 +55,7 @@ pub trait BnsRegistryStoreTx {
         event: &RegistryEvent,
         observed_at: u64,
     ) -> BnsRegistryResult<EventLogRecord>;
+    fn put_event_record(&mut self, record: &EventLogRecord) -> BnsRegistryResult<()>;
     fn get_event(&mut self, seq: u64) -> BnsRegistryResult<Option<EventLogRecord>>;
     fn latest_event(&mut self) -> BnsRegistryResult<Option<EventLogRecord>>;
     fn list_events(

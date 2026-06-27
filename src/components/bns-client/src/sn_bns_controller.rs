@@ -130,6 +130,14 @@ pub struct SnBnsWriteRequestRecord {
     pub result_json: Option<Value>,
     pub error_code: Option<String>,
     pub error_message: Option<String>,
+    #[serde(default)]
+    pub evm_chain_id: Option<u64>,
+    #[serde(default)]
+    pub evm_nonce: Option<u64>,
+    #[serde(default)]
+    pub evm_tx_hash: Option<String>,
+    #[serde(default)]
+    pub evm_raw_tx: Option<String>,
     pub created_at: u64,
     pub updated_at: u64,
 }
@@ -995,6 +1003,10 @@ impl SnBnsController {
             result_json: None,
             error_code: None,
             error_message: None,
+            evm_chain_id: None,
+            evm_nonce: None,
+            evm_tx_hash: None,
+            evm_raw_tx: None,
             created_at: now,
             updated_at: now,
         })?;
@@ -1013,6 +1025,10 @@ impl SnBnsController {
                     result_json: Some(result_json),
                     error_code: None,
                     error_message: None,
+                    evm_chain_id: None,
+                    evm_nonce: None,
+                    evm_tx_hash: None,
+                    evm_raw_tx: None,
                     created_at: now,
                     updated_at: bns_indexer::now_timestamp(),
                 })?;
@@ -1029,6 +1045,10 @@ impl SnBnsController {
                     result_json: None,
                     error_code: Some(error.code().to_string()),
                     error_message: Some(error.to_string()),
+                    evm_chain_id: None,
+                    evm_nonce: None,
+                    evm_tx_hash: None,
+                    evm_raw_tx: None,
                     created_at: now,
                     updated_at: bns_indexer::now_timestamp(),
                 })?;

@@ -1,0 +1,219 @@
+use alloy_primitives::{Address, Bytes, Log, B256};
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+
+use crate::{BnsEvmError, BnsEvmResult};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BlockRange {
+    Latest,
+    Number(u64),
+}
+
+impl BlockRange {
+    fn to_rpc_value(&self) -> Value {
+        match self {
+            Self::Latest => Value::String("latest".to_string()),
+            Self::Number(number) => Value::String(quantity_hex(*number)),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RpcLogFilter {
+    pub address: Address,
+    pub from_block: BlockRange,
+    pub to_block: BlockRange,
+    pub topics: Vec<Option<B256>>,
+}
+
+impl RpcLogFilter {
+    fn to_rpc_value(&self) -> Value {
+        let topics: Vec<Value> = self
+            .topics
+            .iter()
+            .map(|topic| match topic {
+                Some(topic) => Value::String(hex_b256(*topic)),
+                None => Value::Null,
+            })
+            .collect();
+        json!({
+            "address": hex_address(self.address),
+            "fromBlock": self.from_block.to_rpc_value(),
+            "toBlock": self.to_block.to_rpc_value(),
+            "topics": topics,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EthLog {
+    pub address: Address,
+    pub topics: Vec<B256>,
+    pub data: Bytes,
+    #[serde(default, deserialize_with = "deserialize_optional_quantity")]
+    pub block_number: Option<u64>,
+    #[serde(default)]
+    pub block_hash: Option<B256>,
+    #[serde(default)]
+    pub transaction_hash: Option<B256>,
+    #[serde(default, deserialize_with = "deserialize_optional_quantity")]
+    pub transaction_index: Option<u64>,
+    #[serde(default, deserialize_with = "deserialize_optional_quantity")]
+    pub log_index: Option<u64>,
+    #[serde(default)]
+    pub removed: bool,
+}
+
+impl EthLog {
+    pub fn as_alloy_log(&self) -> Log {
+        Log::new_unchecked(self.address, self.topics.clone(), self.data.clone())
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct EthRpcClient {
+    endpoint: String,
+    client: reqwest::Client,
+}
+
+impl EthRpcClient {
+    pub fn new(endpoint: impl Into<String>) -> Self {
+        Self {
+            endpoint: endpoint.into(),
+            client: reqwest::Client::new(),
+        }
+    }
+
+    pub fn endpoint(&self) -> &str {
+        &self.endpoint
+    }
+
+    pub async fn chain_id(&self) -> BnsEvmResult<u64> {
+        let value: String = self.call("eth_chainId", json!([])).await?;
+        parse_quantity(&value)
+    }
+
+    pub async fn transaction_count(&self, address: Address) -> BnsEvmResult<u64> {
+        let value: String = self
+            .call(
+                "eth_getTransactionCount",
+                json!([hex_address(address), "pending"]),
+            )
+            .await?;
+        parse_quantity(&value)
+    }
+
+    pub async fn gas_price(&self) -> BnsEvmResult<u128> {
+        let value: String = self.call("eth_gasPrice", json!([])).await?;
+        parse_quantity(&value).map(u128::from)
+    }
+
+    pub async fn max_priority_fee_per_gas(&self) -> BnsEvmResult<u128> {
+        let value: String = self.call("eth_maxPriorityFeePerGas", json!([])).await?;
+        parse_quantity(&value).map(u128::from)
+    }
+
+    pub async fn send_raw_transaction(&self, raw_tx: &[u8]) -> BnsEvmResult<B256> {
+        let tx_hash: B256 = self
+            .call(
+                "eth_sendRawTransaction",
+                json!([format!("0x{}", hex::encode(raw_tx))]),
+            )
+            .await?;
+        Ok(tx_hash)
+    }
+
+    pub async fn get_logs(&self, filter: &RpcLogFilter) -> BnsEvmResult<Vec<EthLog>> {
+        self.call("eth_getLogs", json!([filter.to_rpc_value()]))
+            .await
+    }
+
+    pub async fn call<R>(&self, method: &str, params: Value) -> BnsEvmResult<R>
+    where
+        R: DeserializeOwned,
+    {
+        let request = RpcRequest {
+            jsonrpc: "2.0",
+            id: 1,
+            method,
+            params,
+        };
+        let response = self
+            .client
+            .post(&self.endpoint)
+            .json(&request)
+            .send()
+            .await
+            .map_err(|err| BnsEvmError::Rpc(err.to_string()))?
+            .error_for_status()
+            .map_err(|err| BnsEvmError::Rpc(err.to_string()))?
+            .json::<RpcResponse<R>>()
+            .await
+            .map_err(|err| BnsEvmError::Rpc(err.to_string()))?;
+
+        if let Some(error) = response.error {
+            return Err(BnsEvmError::Rpc(format!(
+                "{} ({})",
+                error.message, error.code
+            )));
+        }
+        response
+            .result
+            .ok_or_else(|| BnsEvmError::Rpc("JSON-RPC response missing result".to_string()))
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct RpcRequest<'a> {
+    jsonrpc: &'static str,
+    id: u64,
+    method: &'a str,
+    params: Value,
+}
+
+#[derive(Debug, Deserialize)]
+struct RpcResponse<T> {
+    result: Option<T>,
+    error: Option<RpcError>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RpcError {
+    code: i64,
+    message: String,
+}
+
+fn quantity_hex(value: u64) -> String {
+    format!("0x{value:x}")
+}
+
+fn hex_address(address: Address) -> String {
+    format!("{address:#x}")
+}
+
+fn hex_b256(value: B256) -> String {
+    format!("{value:#x}")
+}
+
+fn parse_quantity(value: &str) -> BnsEvmResult<u64> {
+    let hex = value
+        .strip_prefix("0x")
+        .ok_or_else(|| BnsEvmError::Parse(format!("quantity `{value}` missing 0x prefix")))?;
+    u64::from_str_radix(if hex.is_empty() { "0" } else { hex }, 16)
+        .map_err(|err| BnsEvmError::Parse(format!("invalid quantity `{value}`: {err}")))
+}
+
+fn deserialize_optional_quantity<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<String>::deserialize(deserializer)?;
+    value
+        .as_deref()
+        .map(parse_quantity)
+        .transpose()
+        .map_err(serde::de::Error::custom)
+}

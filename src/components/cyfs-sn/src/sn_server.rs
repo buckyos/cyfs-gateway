@@ -22,7 +22,7 @@ use crate::{
 use ::kRPC::*;
 use async_trait::async_trait;
 use bns_client::{
-    BnsIndexerApi, BnsIndexerClient, SnBnsController, SnBnsControllerConfig,
+    BnsEvmClientConfig, BnsIndexerApi, BnsIndexerClient, SnBnsController, SnBnsControllerConfig,
     SqliteSnBnsWriteRequestStore,
 };
 use bns_indexer::{Principal, PrincipalKind};
@@ -4057,11 +4057,39 @@ pub struct SNServerConfig {
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub allowed_controller_doc_types: Option<Vec<String>>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bns_evm: Option<SNBnsEvmConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub db_type: Option<String>,
     #[serde(flatten)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub db_params: Option<Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SNBnsEvmConfig {
+    pub rpc_endpoint: String,
+    pub chain_id: u64,
+    pub contract_address: String,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub controller_private_key_env: Option<String>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub controller_private_key_file: Option<String>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub controller_private_key: Option<String>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gas_limit: Option<u64>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_fee_per_gas: Option<u128>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_priority_fee_per_gas: Option<u128>,
 }
 
 impl ServerConfig for SNServerConfig {
@@ -4149,6 +4177,29 @@ impl SnServerFactory {
         }
     }
 
+    fn parse_bns_evm_client_config(
+        config: &SNServerConfig,
+    ) -> ServerResult<Option<BnsEvmClientConfig>> {
+        let Some(evm) = config.bns_evm.as_ref() else {
+            return Ok(None);
+        };
+        let mut client = BnsEvmClientConfig::anvil(
+            evm.rpc_endpoint.clone(),
+            evm.contract_address.clone(),
+            evm.chain_id,
+        );
+        if let Some(gas_limit) = evm.gas_limit {
+            client.gas_limit = gas_limit;
+        }
+        if let Some(max_fee_per_gas) = evm.max_fee_per_gas {
+            client.max_fee_per_gas = max_fee_per_gas;
+        }
+        if let Some(max_priority_fee_per_gas) = evm.max_priority_fee_per_gas {
+            client.max_priority_fee_per_gas = max_priority_fee_per_gas;
+        }
+        Ok(Some(client))
+    }
+
     fn build_bns_controller(
         config: &SNServerConfig,
         db_path: &str,
@@ -4159,6 +4210,7 @@ impl SnServerFactory {
         if !write_enabled {
             return Ok(None);
         }
+        let _evm_config = Self::parse_bns_evm_client_config(config)?;
 
         let indexer_url = config.bns_indexer_url.as_deref().ok_or(server_err!(
             ServerErrorCode::InvalidConfig,
@@ -4387,6 +4439,37 @@ mod tests {
             assert_eq!(username, "lzc".to_string());
             println!("username: {}", username);
         }
+    }
+
+    #[test]
+    fn sn_config_accepts_bns_evm_settings() {
+        let config = json!({
+            "id": "test",
+            "host": "buckyos.ai",
+            "ip": "127.0.0.1",
+            "boot_jwt": "",
+            "owner_pkx": "",
+            "device_jwt": [],
+            "bns_evm": {
+                "rpc_endpoint": "http://127.0.0.1:8545",
+                "chain_id": 31337,
+                "contract_address": "0x2222222222222222222222222222222222222222",
+                "controller_private_key_env": "BNS_PRIVATE_KEY",
+                "gas_limit": 1234567
+            }
+        });
+        let config: SNServerConfig = serde_json::from_value(config).unwrap();
+        let evm = SnServerFactory::parse_bns_evm_client_config(&config)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(evm.rpc_endpoint, "http://127.0.0.1:8545");
+        assert_eq!(evm.chain_id, 31337);
+        assert_eq!(
+            evm.contract_address,
+            "0x2222222222222222222222222222222222222222"
+        );
+        assert_eq!(evm.gas_limit, 1234567);
     }
 
     #[test]
