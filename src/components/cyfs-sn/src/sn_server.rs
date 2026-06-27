@@ -6074,4 +6074,142 @@ mod tests {
         let err = result.err().unwrap().to_string();
         assert!(err.contains("[SNV2:1004:user_auth_not_found]"));
     }
+
+    // §3.2/§3.3/§3.4 阶段二安全回归：token claims、冻结用户旧 token 立即失效、
+    // 未经 PKX 校验的 user_domain 不能 bind、裸 access token 不能置 self_cert=true。
+    #[tokio::test]
+    async fn test_sn_v2_phase_two_security_regressions() {
+        use crate::UserState;
+
+        const REG_USER: &str = "regressuser";
+
+        let sn_factory = SnServerFactory::new();
+        let db = tempfile::NamedTempFile::with_suffix(".db").unwrap();
+        let auth_dir = tempfile::tempdir().unwrap();
+        {
+            let db = SqliteSnAuthDB::new_by_path(db.path().to_str().unwrap())
+                .await
+                .unwrap();
+            db.initialize_database().await.unwrap();
+            db.insert_activation_code(CLEAR_STATE_ACTIVE_CODE)
+                .await
+                .unwrap();
+        }
+        let config = json!({
+            "id": "test-v2-sec",
+            "host": "buckyos.ai",
+            "ip": "127.0.0.1",
+            "boot_jwt": "",
+            "owner_pkx": "",
+            "device_jwt": [],
+            "db_type": "sqlite",
+            "db_path": db.path().to_str().unwrap(),
+            "v2_auth_data_dir": auth_dir.path().to_str().unwrap(),
+        });
+        let config: SNServerConfig = serde_json::from_value(config).unwrap();
+        let servers = sn_factory.create(Arc::new(config), None).await.unwrap();
+        let http_server = servers
+            .iter()
+            .find_map(|server| match server {
+                Server::Http(server) => Some(server.clone()),
+                _ => None,
+            })
+            .unwrap();
+        let sn_server = servers
+            .iter()
+            .find_map(|server| match server {
+                Server::NameServer(server) => Some(server.clone()),
+                _ => None,
+            })
+            .unwrap();
+
+        let http_addr = spawn_test_http_server(http_server).await;
+        let base_url = format!("http://{}", http_addr);
+        let auth_url = format!("{}/kapi/sn/auth", base_url);
+        let bns_url = format!("{}/kapi/sn/bns", base_url);
+
+        // 注册 → 拿 access/refresh token。
+        let auth_krpc = kRPC::new(auth_url.as_str(), None);
+        let result = auth_krpc
+            .call(
+                "auth.register",
+                json!({
+                    "name": REG_USER,
+                    "pwd_hash": "12345678",
+                    "active_code": CLEAR_STATE_ACTIVE_CODE
+                }),
+            )
+            .await
+            .unwrap();
+        let access_token = result["access_token"].as_str().unwrap().to_string();
+        let refresh_token = result["refresh_token"].as_str().unwrap().to_string();
+
+        // §3.2 token claims：access=sn-v2/1h，refresh=sn-v2-refresh/24h，sub=username，jti 存在。
+        let access_session = RPCSessionToken::from_string(access_token.as_str()).unwrap();
+        let refresh_session = RPCSessionToken::from_string(refresh_token.as_str()).unwrap();
+        assert_eq!(access_session.sub.as_deref(), Some(REG_USER));
+        assert_eq!(access_session.aud.as_deref(), Some("sn-v2"));
+        assert_eq!(refresh_session.aud.as_deref(), Some("sn-v2-refresh"));
+        assert!(access_session.jti.as_deref().is_some_and(|j| !j.is_empty()));
+        assert!(refresh_session.jti.as_deref().is_some_and(|j| !j.is_empty()));
+        let access_exp = access_session.exp.unwrap();
+        let refresh_exp = refresh_session.exp.unwrap();
+        // 同批签发：refresh 比 access 多 23h（允许 ±2s 时钟抖动）。
+        assert!(
+            (82_798..=82_802).contains(&(refresh_exp - access_exp)),
+            "refresh-access exp gap should be ~23h, got {}",
+            refresh_exp - access_exp
+        );
+
+        // §3.4 裸 access token（无 device_did）不能开 self_cert。
+        let bns_krpc = kRPC::new(bns_url.as_str(), Some(access_token.clone()));
+        let self_cert_err = bns_krpc
+            .call("user.set_self_cert", json!({ "self_cert": true }))
+            .await
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(
+            self_cert_err.contains("[SNV2:1013:device_permission_denied]"),
+            "unexpected self_cert error: {self_cert_err}"
+        );
+        // 未开启 self_cert：zone.get 仍为 false。
+        let zone = bns_krpc.call("zone.get", json!({})).await.unwrap();
+        assert!(!zone["self_cert"].as_bool().unwrap());
+
+        // §3.3 未经 PKX 校验的 user_domain 不能 bind（绕过风险已堵）。
+        let bind_err = bns_krpc
+            .call(
+                "zone.bind_config",
+                json!({
+                    "zone_config": { "oods": ["ood1"] },
+                    "user_domain": format!("{}.buckyos.ai", REG_USER)
+                }),
+            )
+            .await
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(
+            bind_err.contains("[SNV2:1015:invalid_domain]"),
+            "unexpected bind error: {bind_err}"
+        );
+
+        // §3.2 冻结用户 → 旧 access token 立即失效（会话被撤销）。
+        sn_server
+            .auth_db()
+            .set_user_state(REG_USER, UserState::Suspended)
+            .await
+            .unwrap();
+        let me_err = bns_krpc
+            .call("auth.me", json!({}))
+            .await
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(
+            me_err.contains("[SNV2:1007:invalid_token]"),
+            "frozen user token should be rejected, got: {me_err}"
+        );
+    }
 }

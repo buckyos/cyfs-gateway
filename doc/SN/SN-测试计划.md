@@ -71,7 +71,7 @@
 ### 1.6 生命周期与命名空间
 已实现：[test/BnsLifecycle.t.sol](../src/apps/bns/test/BnsLifecycle.t.sol)（10 例全绿）。
 - [x] `registerName` / `bootstrapName` / `renewName`（到期前后续期）/ `releaseName`（释放后 tombstone 拒绝写，对应 indexer 侧 `released_and_tombstoned_names_reject_state_writes`）。
-- [ ] `releaseName` 不能破坏 active semantic owner 图（对应 indexer 侧 `release_name_rejects_breaking_active_semantic_owner_graph`）。> 注：当前合约 `releaseName` 不做 owner-graph 校验，此约束在 indexer 侧实现，留待 §2.2。
+- [x] `releaseName` 不能破坏 active semantic owner 图（indexer 侧 `release_name_rejects_breaking_active_semantic_owner_graph`，`registry.rs` `release_name` → `validate_owner_graph_with`）。> 注：合约 `releaseName` 不做 owner-graph 校验，该约束在 indexer 侧实现并已测。
 - [x] `setNamespacePolicy` 读写（`allowDelegatedSubnames`/`namespacePolicyHash` 落库 + 事件）。> 注：合约未在子名注册路径硬性 gate `allowDelegatedSubnames`，准入约束目前仅记录策略哈希。
 - [x] `setDidAlias` / `setPaymentTarget` / `resolvePaymentTarget` 读写一致。
 - [x] `publishLogCheckpoint` → `latestCheckpoint` 覆盖语义（checkpoint 记录其提交事件之前的 logRoot/lastSeq）。
@@ -112,7 +112,7 @@
 **投影正确性（projection_for_record，[sync.rs:280](../src/components/bns-indexer/src/sync.rs:280)）**：
 - [x] **混合投影策略**：`sync_projects_document_published_via_mixed_eth_call_strategy` —— DocumentPublished 事件只定位 name/doc，随后 `eth_call`（`queryNameState`/`getDocumentVersion`）拉权威态，验证投影=最新快照（nameSeq 取自 eth_call 而非事件回放）。
 - [x] authority key / controller rule 通过 `decode_bns_call`（按 tx hash 缓存）补全：`sync_backfills_controller_rules_from_decoded_call`（ControllerPolicyUpdated 事件不带 rules，经 `eth_getTransactionByHash` + decode 补全）。
-- [ ] 其余 docType（authority set+keys / alias / checkpoint）逐类投影字段补全（混合投影路径已打通，按 docType 复用即可）。
+- [x] 其余 docType（authority set+keys / alias / checkpoint）逐类投影字段补全（`sync_projects_authority_set_and_keys_via_mixed_strategy`：getAuthoritySet 拉 set + decode `updateAuthorityKeys` 补 key；`sync_projects_did_alias_via_eth_call`：getAlias 拉 alias）。
 
 **同步器（sync_once，[sync.rs:164](../src/components/bns-indexer/src/sync.rs:164)）**，用 mock JSON-RPC：
 - [x] chain_id 校验：链上 chainId 与配置不符 → 拒绝同步（`sync_rejects_chain_id_mismatch`）。
@@ -124,7 +124,7 @@
 
 **EventLog / Checkpoint**：
 - [x] `EventLogRecord` 由 `seq`/`previousLogRoot`/`logRoot` 派生写入 `bns_events`（混合投影测试内断言 `list_events` 的 seq/event_type/log_root；另有 evm_projection 基线）。
-- [ ] `LogCheckpointPublished` → `eth_call latestCheckpoint` → `put_checkpoint` 的 `ON CONFLICT(last_seq)` 覆盖（checkpoint 投影路径同 docType 补全）。
+- [x] `LogCheckpointPublished` → `eth_call latestCheckpoint` → `put_checkpoint` 的 `ON CONFLICT(last_seq)` 覆盖（`sync_projects_log_checkpoint_and_overwrites_on_last_seq_conflict`：同 lastSeq、新 logRoot/issuedAt → UPDATE 覆盖而非新增行）。
 
 **registry 回归**：保留 `centralized_registry.rs` 全部用例为回归（状态机下线前的语义基线）。
 

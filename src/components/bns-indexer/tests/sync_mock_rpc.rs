@@ -80,8 +80,10 @@ impl MockEthRpc {
                     let result = handle_method(method, &req, &cfg, &calls);
                     let payload = serde_json::json!({"jsonrpc":"2.0","id":id,"result":result});
                     let body = serde_json::to_string(&payload).unwrap();
+                    // 每个连接只服务一次请求即关闭；用 `Connection: close` 显式告知客户端
+                    // 不要复用该 keep-alive 连接，避免在已关闭 socket 上发请求的竞态。
                     let response = format!(
-                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nconnection: close\r\ncontent-length: {}\r\n\r\n{}",
                         body.len(),
                         body
                     );
@@ -862,6 +864,278 @@ async fn event_and_projection_share_atomic_transaction_rollback() {
     // 回滚后两条 put_name 都不应落库。
     let names = store.transact(|tx| tx.list_names()).unwrap();
     assert!(names.is_empty(), "failed batch must roll back atomically");
+}
+
+#[tokio::test]
+async fn sync_projects_authority_set_and_keys_via_mixed_strategy() {
+    // AuthorityKeysUpdated 事件只带 authoritySeq/authorityRoot：indexer eth_call getAuthoritySet
+    // 拉权威 set，并用 decode updateAuthorityKeys（按 tx hash）补全逐 key（同混合投影策略）。
+    let tx_hash = B256::repeat_byte(0xAA);
+    let key = bns_evm::AuthorityKey {
+        kid: B256::repeat_byte(0x0A),
+        verificationMethod: bytes32_label("ed25519"),
+        keyData: bns_evm::Bytes::from_static(b"pubkey-bytes"),
+        purposes: 0b0000_0001,
+        validFrom: 0,
+        validUntil: 0,
+        status: bns_evm::AuthorityKeyStatus::Active,
+        metadataHash: B256::ZERO,
+    };
+    let calldata = Bns::updateAuthorityKeysCall {
+        name: "alice".to_string(),
+        updates: vec![bns_evm::AuthorityKeyUpdate { key, active: true }],
+        authority: bns_evm::CallAuthority {
+            role: bns_evm::AuthorityRole::Owner,
+            actor: bns_evm::Principal {
+                kind: bns_evm::PrincipalKind::ChainAccount,
+                value: bns_evm::Bytes::copy_from_slice(OWNER.as_slice()),
+            },
+            kid: B256::ZERO,
+        },
+        guard: bns_evm::MutationGuard {
+            expectedNameSeq: 0,
+            expectedParentNameSeq: 0,
+        },
+    }
+    .abi_encode();
+
+    let mut eth_call_returns = HashMap::new();
+    eth_call_returns.insert(
+        selector_hex::<Bns::getAuthoritySetCall>(),
+        format!(
+            "0x{}",
+            hex::encode(Bns::getAuthoritySetCall::abi_encode_returns(
+                &bns_evm::AuthoritySetState {
+                    name: "alice".to_string(),
+                    authoritySeq: 4,
+                    authorityRoot: B256::repeat_byte(0x77),
+                    activeKeyCount: 1,
+                }
+            ))
+        ),
+    );
+    let mut txs = HashMap::new();
+    txs.insert(
+        format!("{tx_hash:#x}").to_lowercase(),
+        format!("0x{}", hex::encode(&calldata)),
+    );
+
+    let logs = vec![
+        protocol_event_log(13, 0x66, 1),
+        event_log_json_with_tx(
+            &Bns::AuthorityKeysUpdated {
+                nameHash: B256::repeat_byte(0x09),
+                name: "alice".to_string(),
+                actor: ACTOR,
+                authoritySeq: 4,
+                authorityRoot: B256::repeat_byte(0x77),
+            },
+            1,
+            tx_hash,
+        ),
+    ];
+
+    let mock = MockEthRpc::start(MockConfig {
+        chain_id: 31_337,
+        block_number: 1,
+        logs_json: logs,
+        eth_call_returns,
+        txs,
+        ..Default::default()
+    })
+    .await;
+    let store = SqliteBnsRegistryStore::open_memory().unwrap();
+    let outcome = sync_bns_contract_once(
+        &store,
+        with_endpoint(config_for_chain(31_337), &mock.endpoint),
+    )
+    .await
+    .unwrap();
+    assert_eq!(outcome.registry_events_stored, 1);
+
+    let (set, keys) = store
+        .transact(|tx| {
+            Ok((
+                tx.get_authority_set("alice")?,
+                tx.list_authority_keys("alice")?,
+            ))
+        })
+        .unwrap();
+
+    // authority set 取自 eth_call getAuthoritySet 权威态。
+    let set = set.expect("authority set projected");
+    assert_eq!(set.authority_seq, 4);
+    assert_eq!(set.active_key_count, 1);
+    assert_eq!(
+        set.authority_root,
+        format!("{:#x}", B256::repeat_byte(0x77))
+    );
+
+    // 逐 key 经 decode_bns_call(updateAuthorityKeys) 补全（事件不带 key 明细）。
+    assert_eq!(keys.len(), 1, "key backfilled from decoded call");
+    assert_eq!(keys[0].kid, format!("{:#x}", B256::repeat_byte(0x0A)));
+    assert_eq!(keys[0].status, bns_indexer::AuthorityKeyStatus::Active);
+    assert_eq!(keys[0].key_data, b"pubkey-bytes");
+    assert_eq!(keys[0].purposes, 0b0000_0001);
+}
+
+#[tokio::test]
+async fn sync_projects_did_alias_via_eth_call() {
+    // DidAliasSet → push_name_state + eth_call getAlias 拉权威 alias 态写投影。
+    let mut eth_call_returns = HashMap::new();
+    eth_call_returns.insert(
+        selector_hex::<Bns::queryNameStateCall>(),
+        format!(
+            "0x{}",
+            hex::encode(Bns::queryNameStateCall::abi_encode_returns(
+                &evm_name_state("alice", 5)
+            ))
+        ),
+    );
+    eth_call_returns.insert(
+        selector_hex::<Bns::getAliasCall>(),
+        format!(
+            "0x{}",
+            hex::encode(Bns::getAliasCall::abi_encode_returns(&bns_evm::AliasState {
+                name: "alice".to_string(),
+                kind: bns_evm::AliasKind::Alias,
+                targetDid: "did:bns:alice".to_string(),
+                proofHash: B256::repeat_byte(0x88),
+                setAt: 42,
+                nameSeq: 5,
+            }))
+        ),
+    );
+
+    let logs = vec![
+        protocol_event_log(17, 0x77, 1),
+        event_log_json(
+            &Bns::DidAliasSet {
+                nameHash: B256::repeat_byte(0x09),
+                name: "alice".to_string(),
+                actor: ACTOR,
+                targetDid: "did:bns:alice".to_string(),
+                kind: bns_evm::AliasKind::Alias,
+                proofHash: B256::repeat_byte(0x88),
+                nameSeq: 5,
+            },
+            1,
+        ),
+    ];
+
+    let mock = MockEthRpc::start(MockConfig {
+        chain_id: 31_337,
+        block_number: 1,
+        logs_json: logs,
+        eth_call_returns,
+        ..Default::default()
+    })
+    .await;
+    let store = SqliteBnsRegistryStore::open_memory().unwrap();
+    sync_bns_contract_once(
+        &store,
+        with_endpoint(config_for_chain(31_337), &mock.endpoint),
+    )
+    .await
+    .unwrap();
+
+    let alias = store
+        .transact(|tx| tx.get_alias("alice"))
+        .unwrap()
+        .expect("alias projected");
+    assert_eq!(alias.kind, bns_indexer::AliasKind::Alias);
+    assert_eq!(alias.target_did, "did:bns:alice");
+    assert_eq!(alias.name_seq, 5);
+    assert_eq!(alias.set_at, 42);
+    assert_eq!(alias.proof_hash, format!("{:#x}", B256::repeat_byte(0x88)));
+}
+
+#[tokio::test]
+async fn sync_projects_log_checkpoint_and_overwrites_on_last_seq_conflict() {
+    // LogCheckpointPublished → eth_call latestCheckpoint → put_checkpoint。
+    // 第二个 checkpoint 同 lastSeq、新 logRoot → ON CONFLICT(last_seq) 覆盖（而非新增行）。
+    let issuer = bns_evm::Principal {
+        kind: bns_evm::PrincipalKind::ChainAccount,
+        value: bns_evm::Bytes::copy_from_slice(OWNER.as_slice()),
+    };
+    let checkpoint_return = |log_root: u8, last_seq: u64, issued_at: u64| {
+        format!(
+            "0x{}",
+            hex::encode(Bns::latestCheckpointCall::abi_encode_returns(
+                &bns_evm::LogCheckpoint {
+                    logRoot: B256::repeat_byte(log_root),
+                    lastSeq: last_seq,
+                    issuedAt: issued_at,
+                    issuer: issuer.clone(),
+                    externalAnchor: B256::ZERO,
+                }
+            ))
+        )
+    };
+    let checkpoint_log = |log_root: u8, block_number: u64, seq: u64| {
+        vec![
+            protocol_event_log(seq, log_root, block_number),
+            event_log_json(
+                &Bns::LogCheckpointPublished {
+                    logRoot: B256::repeat_byte(log_root),
+                    actor: ACTOR,
+                    lastSeq: 9,
+                    issuedAt: 100,
+                    externalAnchor: B256::ZERO,
+                },
+                block_number,
+            ),
+        ]
+    };
+
+    let mut eth_call_returns = HashMap::new();
+    eth_call_returns.insert(
+        selector_hex::<Bns::latestCheckpointCall>(),
+        checkpoint_return(0xC1, 9, 100),
+    );
+
+    let mock = MockEthRpc::start(MockConfig {
+        chain_id: 31_337,
+        block_number: 1,
+        logs_json: checkpoint_log(0xC1, 1, 9),
+        eth_call_returns,
+        ..Default::default()
+    })
+    .await;
+    let store = SqliteBnsRegistryStore::open_memory().unwrap();
+    let config = config_for_chain(31_337);
+
+    sync_bns_contract_once(&store, with_endpoint(config.clone(), &mock.endpoint))
+        .await
+        .unwrap();
+    let first = store
+        .transact(|tx| tx.latest_checkpoint())
+        .unwrap()
+        .expect("checkpoint projected");
+    assert_eq!(first.last_seq, 9);
+    assert_eq!(first.issued_at, 100);
+    assert_eq!(first.log_root, format!("{:#x}", B256::repeat_byte(0xC1)));
+
+    // 第二个 checkpoint：同 lastSeq=9、新 logRoot/issuedAt → 覆盖。
+    let second_return = checkpoint_return(0xC2, 9, 200);
+    mock.update(|cfg| {
+        cfg.block_number = 2;
+        cfg.logs_json = checkpoint_log(0xC2, 2, 10);
+        cfg.eth_call_returns
+            .insert(selector_hex::<Bns::latestCheckpointCall>(), second_return);
+    });
+
+    sync_bns_contract_once(&store, with_endpoint(config, &mock.endpoint))
+        .await
+        .unwrap();
+    let second = store
+        .transact(|tx| tx.latest_checkpoint())
+        .unwrap()
+        .expect("checkpoint still present after overwrite");
+    // 同 last_seq 行被 UPDATE 覆盖：log_root/issued_at 更新为第二个 checkpoint。
+    assert_eq!(second.last_seq, 9);
+    assert_eq!(second.issued_at, 200);
+    assert_eq!(second.log_root, format!("{:#x}", B256::repeat_byte(0xC2)));
 }
 
 fn sample_name_state() -> bns_indexer::NameState {
