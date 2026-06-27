@@ -1,12 +1,13 @@
 use ::kRPC::{RPCHandler, RPCRequest, RPCResult};
 use bns_client::{
-    publish_document_call, register_name_call, BnsClientError, BnsEvmClientConfig,
-    BnsEvmStandardClient, BnsIndexerApi, BnsIndexerClient, BnsIndexerRpcHandler,
-    BnsPublishDocumentReq, BnsRegisterNameReq, BnsRegisterNameResp, BnsRpcEnvelope,
-    BootstrapNameParams, CentralizedBnsIndexerHandler, DnsTxtUpdate, MemorySnBnsWriteRequestStore,
-    PublishDeviceMiniDocParams, PublishRelayAssignmentParams, SnBnsController,
-    SnBnsControllerConfig, SnBnsControllerError, UpsertDnsTxtParams, DEVICE_MINI_DOC_TYPE,
-    METHOD_REGISTER_NAME, RELAY_ASSIGNMENT_DOC_TYPE,
+    publish_document_call, register_name_call, BindZoneDocumentsParams, BnsClientError,
+    BnsEvmClientConfig, BnsEvmControllerClient, BnsEvmKeyManager, BnsEvmSignRequest,
+    BnsEvmStandardClient, BnsEvmWriteOperation, BnsIndexerApi, BnsIndexerClient,
+    BnsIndexerRpcHandler, BnsPublishDocumentReq, BnsRegisterNameReq, BnsRegisterNameResp,
+    BnsRpcEnvelope, BootstrapNameParams, CentralizedBnsIndexerHandler, DnsTxtUpdate,
+    MemorySnBnsWriteRequestStore, PublishDeviceMiniDocParams, PublishRelayAssignmentParams,
+    SnBnsController, SnBnsControllerConfig, SnBnsControllerError, StaticBnsEvmKeyManager,
+    UpsertDnsTxtParams, DEVICE_MINI_DOC_TYPE, METHOD_REGISTER_NAME, RELAY_ASSIGNMENT_DOC_TYPE,
 };
 use bns_evm::{AuthorityRole as EvmAuthorityRole, PrincipalKind as EvmPrincipalKind, SolCall};
 use bns_indexer::dns_document::{self, DNS_TXT_DOC_TYPE};
@@ -21,6 +22,9 @@ use std::sync::Arc;
 
 const OWNER: &str = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const SN_CONTROLLER: &str = "0xcccccccccccccccccccccccccccccccccccccccc";
+const ANVIL_PRIVATE_KEY: &str =
+    "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
+const ANVIL_ADDRESS: &str = "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266";
 
 fn registry() -> Arc<CentralizedBnsRegistry<SqliteBnsRegistryStore>> {
     Arc::new(CentralizedBnsRegistry::new(
@@ -137,6 +141,42 @@ fn evm_standard_client_builds_unsigned_contract_tx() {
 }
 
 #[tokio::test]
+async fn static_evm_key_manager_signs_tx_for_authority_context() {
+    let key_manager = StaticBnsEvmKeyManager::new(ANVIL_PRIVATE_KEY).unwrap();
+    let request = BnsEvmSignRequest::new(
+        BnsEvmWriteOperation::RegisterName,
+        "alice",
+        CallAuthority::public(),
+    );
+    let signer_address = BnsEvmKeyManager::signer_address(&key_manager, &request)
+        .await
+        .unwrap();
+    assert_eq!(format!("{signer_address:#x}"), ANVIL_ADDRESS);
+
+    let client = BnsEvmStandardClient::new(BnsEvmClientConfig::anvil(
+        "http://127.0.0.1:8545",
+        "0x2222222222222222222222222222222222222222",
+        31_337,
+    ));
+    let req = BnsRegisterNameReq {
+        name: "alice".to_string(),
+        asset_owner: ANVIL_ADDRESS.to_string(),
+        options: RegisterOptions::default(),
+        initial_documents: vec![],
+        authority: CallAuthority::public(),
+        guard: MutationGuard::default(),
+    };
+    let call = register_name_call(&req).unwrap();
+    let tx = client.build_unsigned_tx(&call, 7).unwrap();
+    let signed = key_manager.sign_transaction(&request, tx).await.unwrap();
+
+    assert_eq!(signed.signer, signer_address);
+    assert_eq!(signed.nonce, 7);
+    assert_eq!(signed.chain_id, 31_337);
+    assert!(!signed.raw_tx.is_empty());
+}
+
+#[tokio::test]
 async fn rpc_handler_wraps_registry_result_in_envelope() {
     let handler = BnsIndexerRpcHandler::new(CentralizedBnsIndexerHandler::new(registry()));
     let req = BnsRegisterNameReq {
@@ -210,6 +250,46 @@ async fn sn_controller_bootstrap_name_installs_controller_policy() {
         .await
         .unwrap();
     assert_eq!(receipt.document_version, Some(1));
+}
+
+#[tokio::test]
+async fn sn_controller_evm_mode_rejects_multi_step_zone_bind_without_submission() {
+    let registry = registry();
+    let read_client = in_process_client(registry);
+    let evm_controller = Arc::new(
+        BnsEvmControllerClient::new(
+            BnsEvmClientConfig::anvil(
+                "http://127.0.0.1:8545",
+                "0x2222222222222222222222222222222222222222",
+                31_337,
+            ),
+            ANVIL_PRIVATE_KEY,
+        )
+        .unwrap(),
+    );
+    let controller = SnBnsController::new_evm(
+        read_client,
+        Arc::new(MemorySnBnsWriteRequestStore::new()),
+        SnBnsControllerConfig::new(Principal::chain_account(ANVIL_ADDRESS), ""),
+        evm_controller,
+    )
+    .unwrap();
+
+    let error = controller
+        .bind_zone_documents(BindZoneDocumentsParams {
+            request_id: "zone-evm-denied".to_string(),
+            name: "alice".to_string(),
+            zone_config: json!({"version":1}),
+            boot_config: json!({"version":1}),
+            authority: owner_authority(),
+        })
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.code(), "INVALID_INPUT");
+    assert!(error
+        .to_string()
+        .contains("separate guarded contract writes"));
 }
 
 #[tokio::test]

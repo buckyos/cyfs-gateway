@@ -1,13 +1,15 @@
 use crate::{
-    BnsBootstrapNameReq, BnsBootstrapNameResp, BnsClientError, BnsDocumentVersion, BnsIndexerApi,
-    BnsPublishDocumentReq, BnsRpcErrorInfo,
+    BnsBootstrapNameReq, BnsBootstrapNameResp, BnsClientError, BnsDocumentVersion,
+    BnsEvmControllerClient, BnsEvmTxSubmission, BnsIndexerApi, BnsPublishDocumentReq,
+    BnsPublishDocumentResp, BnsRpcErrorInfo,
 };
+use async_trait::async_trait;
 use bns_indexer::dns_document::{self, DnsTxtRecord, DNS_TXT_DOC_TYPE};
 use bns_indexer::{
     canonical_bns_name, canonical_doc_type, controller_rule, default_document_update, hash_json,
     policy_hash_from_rules, AuthorityKeyUpdate, AuthorityRole, AuthoritySetState, BnsRegistryError,
     CallAuthority, DocumentRef, DocumentState, DocumentUpdate, MutationGuard, NameState, Principal,
-    PrincipalKind, RegisterOptions, PERMISSION_PUBLISH_DOCUMENT,
+    PrincipalKind, RegisterOptions, PERMISSION_PUBLISH_DOCUMENT, ZERO_HASH,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -55,11 +57,26 @@ impl BnsWriteOperation {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BnsWriteReceiptStatus {
+    Applied,
+    Submitted,
+}
+
+impl Default for BnsWriteReceiptStatus {
+    fn default() -> Self {
+        Self::Applied
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BnsWriteReceipt {
     pub request_id: String,
     pub name: String,
     pub operation: BnsWriteOperation,
+    #[serde(default)]
+    pub status: BnsWriteReceiptStatus,
     pub name_seq: u64,
     pub doc_type: Option<String>,
     pub document_version: Option<u64>,
@@ -68,6 +85,14 @@ pub struct BnsWriteReceipt {
     pub authority_seq: u64,
     pub authority_root: String,
     pub controller_policy_hash: Option<String>,
+    #[serde(default)]
+    pub evm_chain_id: Option<u64>,
+    #[serde(default)]
+    pub evm_nonce: Option<u64>,
+    #[serde(default)]
+    pub evm_tx_hash: Option<String>,
+    #[serde(default)]
+    pub evm_raw_tx: Option<String>,
     pub created_or_reused: bool,
 }
 
@@ -76,6 +101,16 @@ pub struct BnsMultiWriteReceipt {
     pub request_id: String,
     pub name: String,
     pub operation: BnsWriteOperation,
+    #[serde(default)]
+    pub status: BnsWriteReceiptStatus,
+    #[serde(default)]
+    pub evm_chain_id: Option<u64>,
+    #[serde(default)]
+    pub evm_nonce: Option<u64>,
+    #[serde(default)]
+    pub evm_tx_hash: Option<String>,
+    #[serde(default)]
+    pub evm_raw_tx: Option<String>,
     pub receipts: Vec<BnsWriteReceipt>,
     pub created_or_reused: bool,
 }
@@ -90,9 +125,25 @@ trait MarkIdempotentReuse {
     fn mark_reused(&mut self);
 }
 
+trait BnsWriteMetadata {
+    fn evm_submission(&self) -> Option<BnsEvmTxSubmission>;
+}
+
 impl MarkIdempotentReuse for BnsWriteReceipt {
     fn mark_reused(&mut self) {
         self.created_or_reused = true;
+    }
+}
+
+impl BnsWriteMetadata for BnsWriteReceipt {
+    fn evm_submission(&self) -> Option<BnsEvmTxSubmission> {
+        Some(BnsEvmTxSubmission {
+            tx_hash: self.evm_tx_hash.clone()?,
+            raw_tx: self.evm_raw_tx.clone()?,
+            from: String::new(),
+            nonce: self.evm_nonce?,
+            chain_id: self.evm_chain_id?,
+        })
     }
 }
 
@@ -105,9 +156,32 @@ impl MarkIdempotentReuse for BnsMultiWriteReceipt {
     }
 }
 
+impl BnsWriteMetadata for BnsMultiWriteReceipt {
+    fn evm_submission(&self) -> Option<BnsEvmTxSubmission> {
+        self.receipts
+            .iter()
+            .find_map(BnsWriteMetadata::evm_submission)
+            .or_else(|| {
+                Some(BnsEvmTxSubmission {
+                    tx_hash: self.evm_tx_hash.clone()?,
+                    raw_tx: self.evm_raw_tx.clone()?,
+                    from: String::new(),
+                    nonce: self.evm_nonce?,
+                    chain_id: self.evm_chain_id?,
+                })
+            })
+    }
+}
+
 impl MarkIdempotentReuse for BootstrapNameOutput {
     fn mark_reused(&mut self) {
         self.receipt.mark_reused();
+    }
+}
+
+impl BnsWriteMetadata for BootstrapNameOutput {
+    fn evm_submission(&self) -> Option<BnsEvmTxSubmission> {
+        self.receipt.evm_submission()
     }
 }
 
@@ -316,8 +390,107 @@ impl SnBnsControllerConfig {
     }
 }
 
+enum SnBnsWriteSubmission<T> {
+    Applied(T),
+    Submitted(BnsEvmTxSubmission),
+}
+
+#[async_trait]
+trait SnBnsWriteBackend: Send + Sync {
+    fn writes_apply_immediately(&self) -> bool;
+
+    async fn bootstrap_name(
+        &self,
+        req: BnsBootstrapNameReq,
+    ) -> SnBnsControllerResult<SnBnsWriteSubmission<BnsBootstrapNameResp>>;
+
+    async fn publish_document(
+        &self,
+        req: BnsPublishDocumentReq,
+    ) -> SnBnsControllerResult<SnBnsWriteSubmission<BnsPublishDocumentResp>>;
+}
+
+struct LegacySnBnsWriteBackend {
+    client: Arc<dyn BnsIndexerApi>,
+}
+
+impl LegacySnBnsWriteBackend {
+    fn new(client: Arc<dyn BnsIndexerApi>) -> Self {
+        Self { client }
+    }
+}
+
+#[async_trait]
+impl SnBnsWriteBackend for LegacySnBnsWriteBackend {
+    fn writes_apply_immediately(&self) -> bool {
+        true
+    }
+
+    async fn bootstrap_name(
+        &self,
+        req: BnsBootstrapNameReq,
+    ) -> SnBnsControllerResult<SnBnsWriteSubmission<BnsBootstrapNameResp>> {
+        self.client
+            .bootstrap_name(req)
+            .await
+            .map(SnBnsWriteSubmission::Applied)
+            .map_err(Into::into)
+    }
+
+    async fn publish_document(
+        &self,
+        req: BnsPublishDocumentReq,
+    ) -> SnBnsControllerResult<SnBnsWriteSubmission<BnsPublishDocumentResp>> {
+        self.client
+            .publish_document(req)
+            .await
+            .map(SnBnsWriteSubmission::Applied)
+            .map_err(Into::into)
+    }
+}
+
+struct EvmSnBnsWriteBackend {
+    controller: Arc<BnsEvmControllerClient>,
+}
+
+impl EvmSnBnsWriteBackend {
+    fn new(controller: Arc<BnsEvmControllerClient>) -> Self {
+        Self { controller }
+    }
+}
+
+#[async_trait]
+impl SnBnsWriteBackend for EvmSnBnsWriteBackend {
+    fn writes_apply_immediately(&self) -> bool {
+        false
+    }
+
+    async fn bootstrap_name(
+        &self,
+        req: BnsBootstrapNameReq,
+    ) -> SnBnsControllerResult<SnBnsWriteSubmission<BnsBootstrapNameResp>> {
+        self.controller
+            .bootstrap_name(&req)
+            .await
+            .map(SnBnsWriteSubmission::Submitted)
+            .map_err(Into::into)
+    }
+
+    async fn publish_document(
+        &self,
+        req: BnsPublishDocumentReq,
+    ) -> SnBnsControllerResult<SnBnsWriteSubmission<BnsPublishDocumentResp>> {
+        self.controller
+            .publish_document(&req)
+            .await
+            .map(SnBnsWriteSubmission::Submitted)
+            .map_err(Into::into)
+    }
+}
+
 pub struct SnBnsController {
     client: Arc<dyn BnsIndexerApi>,
+    write_backend: Arc<dyn SnBnsWriteBackend>,
     idempotency_store: Arc<dyn SnBnsWriteRequestStore>,
     config: SnBnsControllerConfig,
 }
@@ -330,7 +503,23 @@ impl SnBnsController {
     ) -> SnBnsControllerResult<Self> {
         config.validate()?;
         Ok(Self {
+            write_backend: Arc::new(LegacySnBnsWriteBackend::new(client.clone())),
             client,
+            idempotency_store,
+            config,
+        })
+    }
+
+    pub fn new_evm(
+        client: Arc<dyn BnsIndexerApi>,
+        idempotency_store: Arc<dyn SnBnsWriteRequestStore>,
+        config: SnBnsControllerConfig,
+        evm_controller: Arc<BnsEvmControllerClient>,
+    ) -> SnBnsControllerResult<Self> {
+        config.validate()?;
+        Ok(Self {
+            client,
+            write_backend: Arc::new(EvmSnBnsWriteBackend::new(evm_controller)),
             idempotency_store,
             config,
         })
@@ -396,8 +585,20 @@ impl SnBnsController {
             None,
             &payload,
             || async move {
-                let resp = self.client.bootstrap_name(req).await?;
-                Ok(self.bootstrap_output_from_resp(&response_request_id, &response_name, resp))
+                match self.write_backend.bootstrap_name(req).await? {
+                    SnBnsWriteSubmission::Applied(resp) => Ok(self.bootstrap_output_from_resp(
+                        &response_request_id,
+                        &response_name,
+                        resp,
+                    )),
+                    SnBnsWriteSubmission::Submitted(submission) => Ok(self
+                        .bootstrap_output_from_submission(
+                            &response_request_id,
+                            &response_name,
+                            &controller_policy_hash,
+                            submission,
+                        )),
+                }
             },
         )
         .await
@@ -460,6 +661,12 @@ impl SnBnsController {
         params: BindZoneDocumentsParams,
     ) -> SnBnsControllerResult<BnsMultiWriteReceipt> {
         self.ensure_owner_authority(&params.authority, ZONE_DOC_TYPE)?;
+        if !self.write_backend.writes_apply_immediately() {
+            return Err(SnBnsControllerError::InvalidInput(
+                "bind_zone_documents cannot be automated as one EVM submission flow because zone and boot are separate guarded contract writes; submit each document after the indexer observes the previous tx"
+                    .to_string(),
+            ));
+        }
         self.run_idempotent(
             &params.request_id,
             BnsWriteOperation::BindZoneDocuments,
@@ -487,10 +694,26 @@ impl SnBnsController {
                         params.authority.clone(),
                     )
                     .await?;
+                let status = if [zone_receipt.status, boot_receipt.status]
+                    .iter()
+                    .any(|status| *status == BnsWriteReceiptStatus::Submitted)
+                {
+                    BnsWriteReceiptStatus::Submitted
+                } else {
+                    BnsWriteReceiptStatus::Applied
+                };
+                let evm_submission = zone_receipt
+                    .evm_submission()
+                    .or_else(|| boot_receipt.evm_submission());
                 Ok(BnsMultiWriteReceipt {
                     request_id: params.request_id.clone(),
                     name: params.name.clone(),
                     operation: BnsWriteOperation::BindZoneDocuments,
+                    status,
+                    evm_chain_id: evm_submission.as_ref().map(|tx| tx.chain_id),
+                    evm_nonce: evm_submission.as_ref().map(|tx| tx.nonce),
+                    evm_tx_hash: evm_submission.as_ref().map(|tx| tx.tx_hash.clone()),
+                    evm_raw_tx: evm_submission.as_ref().map(|tx| tx.raw_tx.clone()),
                     receipts: vec![zone_receipt, boot_receipt],
                     created_or_reused: false,
                 })
@@ -705,15 +928,30 @@ impl SnBnsController {
             expected_name_seq: name_state.name_seq,
             expected_parent_name_seq: 0,
         };
-        let resp = self
-            .client
+        let submission = self
+            .write_backend
             .publish_document(BnsPublishDocumentReq {
                 name: name.to_string(),
-                update,
+                update: update.clone(),
                 authority,
                 guard,
             })
             .await?;
+
+        let resp = match submission {
+            SnBnsWriteSubmission::Applied(resp) => resp,
+            SnBnsWriteSubmission::Submitted(submission) => {
+                let authority_set = self.client.get_authority_set(name).await?;
+                return Ok(receipt_from_submitted_document(
+                    request_id,
+                    operation,
+                    &name_state,
+                    &update,
+                    &authority_set,
+                    submission,
+                ));
+            }
+        };
 
         let document_state = self
             .client
@@ -919,6 +1157,7 @@ impl SnBnsController {
                 request_id: request_id.to_string(),
                 name: name.to_string(),
                 operation: BnsWriteOperation::BootstrapName,
+                status: BnsWriteReceiptStatus::Applied,
                 name_seq: resp.name_seq,
                 doc_type: None,
                 document_version: None,
@@ -927,9 +1166,44 @@ impl SnBnsController {
                 authority_seq: resp.authority_set.authority_seq,
                 authority_root: resp.authority_set.authority_root,
                 controller_policy_hash: Some(resp.controller_policy_hash.clone()),
+                evm_chain_id: None,
+                evm_nonce: None,
+                evm_tx_hash: None,
+                evm_raw_tx: None,
                 created_or_reused: false,
             },
             initial_documents: resp.initial_documents,
+        }
+    }
+
+    fn bootstrap_output_from_submission(
+        &self,
+        request_id: &str,
+        name: &str,
+        controller_policy_hash: &str,
+        submission: BnsEvmTxSubmission,
+    ) -> BootstrapNameOutput {
+        BootstrapNameOutput {
+            receipt: BnsWriteReceipt {
+                request_id: request_id.to_string(),
+                name: name.to_string(),
+                operation: BnsWriteOperation::BootstrapName,
+                status: BnsWriteReceiptStatus::Submitted,
+                name_seq: 0,
+                doc_type: None,
+                document_version: None,
+                content_hash: None,
+                document_state_hash: None,
+                authority_seq: 0,
+                authority_root: ZERO_HASH.to_string(),
+                controller_policy_hash: Some(controller_policy_hash.to_string()),
+                evm_chain_id: Some(submission.chain_id),
+                evm_nonce: Some(submission.nonce),
+                evm_tx_hash: Some(submission.tx_hash),
+                evm_raw_tx: Some(submission.raw_tx),
+                created_or_reused: false,
+            },
+            initial_documents: Vec::new(),
         }
     }
 
@@ -943,7 +1217,7 @@ impl SnBnsController {
         execute: F,
     ) -> SnBnsControllerResult<T>
     where
-        T: Serialize + DeserializeOwned + MarkIdempotentReuse,
+        T: Serialize + DeserializeOwned + MarkIdempotentReuse + BnsWriteMetadata,
         P: Serialize + ?Sized,
         F: FnOnce() -> Fut,
         Fut: Future<Output = SnBnsControllerResult<T>>,
@@ -1014,6 +1288,7 @@ impl SnBnsController {
         let result = execute().await;
         match result {
             Ok(value) => {
+                let evm_submission = value.evm_submission();
                 let result_json = serde_json::to_value(&value)?;
                 self.idempotency_store.put(SnBnsWriteRequestRecord {
                     request_id: request_id.to_string(),
@@ -1025,10 +1300,10 @@ impl SnBnsController {
                     result_json: Some(result_json),
                     error_code: None,
                     error_message: None,
-                    evm_chain_id: None,
-                    evm_nonce: None,
-                    evm_tx_hash: None,
-                    evm_raw_tx: None,
+                    evm_chain_id: evm_submission.as_ref().map(|tx| tx.chain_id),
+                    evm_nonce: evm_submission.as_ref().map(|tx| tx.nonce),
+                    evm_tx_hash: evm_submission.as_ref().map(|tx| tx.tx_hash.clone()),
+                    evm_raw_tx: evm_submission.as_ref().map(|tx| tx.raw_tx.clone()),
                     created_at: now,
                     updated_at: bns_indexer::now_timestamp(),
                 })?;
@@ -1192,6 +1467,7 @@ fn receipt_from_document(
         request_id: request_id.to_string(),
         name: name_state.name.clone(),
         operation,
+        status: BnsWriteReceiptStatus::Applied,
         name_seq: name_state.name_seq,
         doc_type: Some(document_state.doc_type.clone()),
         document_version: Some(document_state.version),
@@ -1200,6 +1476,39 @@ fn receipt_from_document(
         authority_seq: authority_set.authority_seq,
         authority_root: authority_set.authority_root.clone(),
         controller_policy_hash: Some(document_state.controller_policy_hash.clone()),
+        evm_chain_id: None,
+        evm_nonce: None,
+        evm_tx_hash: None,
+        evm_raw_tx: None,
+        created_or_reused: false,
+    }
+}
+
+fn receipt_from_submitted_document(
+    request_id: &str,
+    operation: BnsWriteOperation,
+    name_state: &NameState,
+    update: &DocumentUpdate,
+    authority_set: &AuthoritySetState,
+    submission: BnsEvmTxSubmission,
+) -> BnsWriteReceipt {
+    BnsWriteReceipt {
+        request_id: request_id.to_string(),
+        name: name_state.name.clone(),
+        operation,
+        status: BnsWriteReceiptStatus::Submitted,
+        name_seq: name_state.name_seq,
+        doc_type: Some(update.doc_type.clone()),
+        document_version: Some(update.expected_version + 1),
+        content_hash: Some(update.document.content_hash.clone()),
+        document_state_hash: None,
+        authority_seq: authority_set.authority_seq,
+        authority_root: authority_set.authority_root.clone(),
+        controller_policy_hash: Some(update.controller_policy_hash.clone()),
+        evm_chain_id: Some(submission.chain_id),
+        evm_nonce: Some(submission.nonce),
+        evm_tx_hash: Some(submission.tx_hash),
+        evm_raw_tx: Some(submission.raw_tx),
         created_or_reused: false,
     }
 }

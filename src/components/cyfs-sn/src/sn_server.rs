@@ -22,8 +22,8 @@ use crate::{
 use ::kRPC::*;
 use async_trait::async_trait;
 use bns_client::{
-    BnsEvmClientConfig, BnsIndexerApi, BnsIndexerClient, SnBnsController, SnBnsControllerConfig,
-    SqliteSnBnsWriteRequestStore,
+    BnsEvmClientConfig, BnsEvmControllerClient, BnsIndexerApi, BnsIndexerClient, SnBnsController,
+    SnBnsControllerConfig, SqliteSnBnsWriteRequestStore,
 };
 use bns_indexer::{Principal, PrincipalKind};
 use buckyos_kit::{get_buckyos_service_data_dir, is_valid_name, NameType};
@@ -46,6 +46,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
+use std::fs;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -4200,6 +4201,60 @@ impl SnServerFactory {
         Ok(Some(client))
     }
 
+    fn load_bns_evm_controller_private_key(
+        config: &SNServerConfig,
+    ) -> ServerResult<Option<String>> {
+        let Some(evm) = config.bns_evm.as_ref() else {
+            return Ok(None);
+        };
+
+        if let Some(env_name) = evm.controller_private_key_env.as_deref() {
+            let value = std::env::var(env_name).map_err(|e| {
+                server_err!(
+                    ServerErrorCode::InvalidConfig,
+                    "read bns_evm.controller_private_key_env {} failed: {}",
+                    env_name,
+                    e
+                )
+            })?;
+            let value = value.trim().to_string();
+            if value.is_empty() {
+                return Err(server_err!(
+                    ServerErrorCode::InvalidConfig,
+                    "bns_evm.controller_private_key_env {} is empty",
+                    env_name
+                ));
+            }
+            return Ok(Some(value));
+        }
+
+        if let Some(path) = evm.controller_private_key_file.as_deref() {
+            let value = fs::read_to_string(path).map_err(|e| {
+                server_err!(
+                    ServerErrorCode::InvalidConfig,
+                    "read bns_evm.controller_private_key_file {} failed: {}",
+                    path,
+                    e
+                )
+            })?;
+            let value = value.trim().to_string();
+            if value.is_empty() {
+                return Err(server_err!(
+                    ServerErrorCode::InvalidConfig,
+                    "bns_evm.controller_private_key_file {} is empty",
+                    path
+                ));
+            }
+            return Ok(Some(value));
+        }
+
+        Ok(evm
+            .controller_private_key
+            .as_ref()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty()))
+    }
+
     fn build_bns_controller(
         config: &SNServerConfig,
         db_path: &str,
@@ -4210,13 +4265,38 @@ impl SnServerFactory {
         if !write_enabled {
             return Ok(None);
         }
-        let _evm_config = Self::parse_bns_evm_client_config(config)?;
+        let evm_config = Self::parse_bns_evm_client_config(config)?;
+        let evm_controller = if let Some(evm_config) = evm_config {
+            let private_key = Self::load_bns_evm_controller_private_key(config)?.ok_or(server_err!(
+                ServerErrorCode::InvalidConfig,
+                "bns_evm requires controller_private_key_env, controller_private_key_file or controller_private_key"
+            ))?;
+            Some(Arc::new(
+                BnsEvmControllerClient::new(evm_config, private_key.as_str()).map_err(|e| {
+                    server_err!(
+                        ServerErrorCode::InvalidConfig,
+                        "create bns evm controller failed: {}",
+                        e
+                    )
+                })?,
+            ))
+        } else {
+            None
+        };
 
         let indexer_url = config.bns_indexer_url.as_deref().ok_or(server_err!(
             ServerErrorCode::InvalidConfig,
             "bns_write_enabled requires bns_indexer_url"
         ))?;
-        let principal = Self::parse_sn_controller_principal(config)?;
+        let principal = if config.sn_controller_principal.is_none() {
+            evm_controller
+                .as_ref()
+                .and_then(|controller| controller.default_signer_address())
+                .map(|address| Principal::chain_account(format!("{address:#x}")))
+                .unwrap_or(Self::parse_sn_controller_principal(config)?)
+        } else {
+            Self::parse_sn_controller_principal(config)?
+        };
         let mut controller_config = SnBnsControllerConfig::new(
             principal,
             config.sn_controller_kid.clone().unwrap_or_default(),
@@ -4235,7 +4315,12 @@ impl SnServerFactory {
                 e
             )
         })?);
-        let controller = SnBnsController::new(client, store, controller_config).map_err(|e| {
+        let controller = if let Some(evm_controller) = evm_controller {
+            SnBnsController::new_evm(client, store, controller_config, evm_controller)
+        } else {
+            SnBnsController::new(client, store, controller_config)
+        }
+        .map_err(|e| {
             server_err!(
                 ServerErrorCode::InvalidConfig,
                 "create sn bns controller failed: {}",
@@ -4383,6 +4468,9 @@ mod tests {
     const TEST_USER_V2: &str = "testuserv2";
     const TEST_ROOT_USER: &str = "testroot";
     const TEST_LEGACY_USER: &str = "testlegacy";
+    const ANVIL_PRIVATE_KEY: &str =
+        "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
+    const ANVIL_ADDRESS: &str = "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266";
 
     async fn spawn_test_http_server(http_server: Arc<dyn HttpServer>) -> SocketAddr {
         let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
@@ -4454,7 +4542,7 @@ mod tests {
                 "rpc_endpoint": "http://127.0.0.1:8545",
                 "chain_id": 31337,
                 "contract_address": "0x2222222222222222222222222222222222222222",
-                "controller_private_key_env": "BNS_PRIVATE_KEY",
+                "controller_private_key": ANVIL_PRIVATE_KEY,
                 "gas_limit": 1234567
             }
         });
@@ -4470,6 +4558,43 @@ mod tests {
             "0x2222222222222222222222222222222222222222"
         );
         assert_eq!(evm.gas_limit, 1234567);
+        assert_eq!(
+            SnServerFactory::load_bns_evm_controller_private_key(&config)
+                .unwrap()
+                .as_deref(),
+            Some(ANVIL_PRIVATE_KEY)
+        );
+    }
+
+    #[test]
+    fn sn_bns_controller_uses_evm_signer_as_default_principal() {
+        let db = tempfile::NamedTempFile::new().unwrap();
+        let config = json!({
+            "id": "test",
+            "host": "buckyos.ai",
+            "ip": "127.0.0.1",
+            "boot_jwt": "",
+            "owner_pkx": "",
+            "device_jwt": [],
+            "bns_write_enabled": true,
+            "bns_indexer_url": "http://127.0.0.1:18080",
+            "bns_evm": {
+                "rpc_endpoint": "http://127.0.0.1:8545",
+                "chain_id": 31337,
+                "contract_address": "0x2222222222222222222222222222222222222222",
+                "controller_private_key": ANVIL_PRIVATE_KEY
+            }
+        });
+        let config: SNServerConfig = serde_json::from_value(config).unwrap();
+        let controller =
+            SnServerFactory::build_bns_controller(&config, db.path().to_str().unwrap())
+                .unwrap()
+                .unwrap();
+
+        assert_eq!(
+            controller.config().sn_controller_principal,
+            Principal::chain_account(ANVIL_ADDRESS)
+        );
     }
 
     #[test]

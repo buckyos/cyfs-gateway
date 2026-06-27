@@ -1,6 +1,8 @@
+use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 
+use async_trait::async_trait;
 use bns_evm::{
     build_eip1559_contract_tx, sign_eip1559_tx, signer_from_private_key, Address,
     AuthorityKey as EvmAuthorityKey, AuthorityKeyStatus as EvmAuthorityKeyStatus,
@@ -8,7 +10,7 @@ use bns_evm::{
     BnsEvmError, Bytes, CallAuthority as EvmCallAuthority, ControllerRule as EvmControllerRule,
     DocumentRef as EvmDocumentRef, DocumentUpdate as EvmDocumentUpdate, Eip1559TxParams,
     EthRpcClient, MutationGuard as EvmMutationGuard, Principal as EvmPrincipal,
-    PrincipalKind as EvmPrincipalKind, PrivateKeySigner, RegisterOptions as EvmRegisterOptions,
+    PrincipalKind as EvmPrincipalKind, RegisterOptions as EvmRegisterOptions, SignedEip1559Tx,
     SolCall, TxEip1559, B256, U256,
 };
 use bns_indexer::{
@@ -19,8 +21,9 @@ use bns_indexer::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    BnsBootstrapNameReq, BnsClientError, BnsClientResult, BnsPublishDocumentReq,
-    BnsRegisterNameReq, BnsRevokeDocumentReq, BnsSetControllerPolicyReq, BnsUpdateAuthorityKeysReq,
+    BnsBootstrapNameReq, BnsClientError, BnsClientResult, BnsIndexerApi, BnsPublishDocumentReq,
+    BnsRegisterNameReq, BnsRevokeDocumentReq, BnsSetControllerPolicyReq, BnsSubmitRawTxReq,
+    BnsUpdateAuthorityKeysReq,
 };
 
 impl From<BnsEvmError> for BnsClientError {
@@ -87,6 +90,148 @@ pub struct BnsEvmTxSubmission {
     pub chain_id: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BnsEvmWriteOperation {
+    Manual,
+    RegisterName,
+    BootstrapName,
+    PublishDocument,
+    RevokeDocument,
+    SetControllerPolicy,
+    UpdateAuthorityKeys,
+}
+
+impl BnsEvmWriteOperation {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Manual => "manual",
+            Self::RegisterName => "register_name",
+            Self::BootstrapName => "bootstrap_name",
+            Self::PublishDocument => "publish_document",
+            Self::RevokeDocument => "revoke_document",
+            Self::SetControllerPolicy => "set_controller_policy",
+            Self::UpdateAuthorityKeys => "update_authority_keys",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BnsEvmSignRequest {
+    pub operation: BnsEvmWriteOperation,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub doc_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub asset_owner: Option<String>,
+    pub authority: CallAuthority,
+}
+
+impl BnsEvmSignRequest {
+    pub fn new(
+        operation: BnsEvmWriteOperation,
+        name: impl Into<String>,
+        authority: CallAuthority,
+    ) -> Self {
+        Self {
+            operation,
+            name: name.into(),
+            doc_type: None,
+            asset_owner: None,
+            authority,
+        }
+    }
+
+    fn for_register(operation: BnsEvmWriteOperation, req: &BnsRegisterNameReq) -> Self {
+        Self {
+            operation,
+            name: req.name.clone(),
+            doc_type: None,
+            asset_owner: Some(req.asset_owner.clone()),
+            authority: req.authority.clone(),
+        }
+    }
+
+    fn for_bootstrap(req: &BnsBootstrapNameReq) -> Self {
+        Self {
+            operation: BnsEvmWriteOperation::BootstrapName,
+            name: req.name.clone(),
+            doc_type: None,
+            asset_owner: Some(req.asset_owner.clone()),
+            authority: req.authority.clone(),
+        }
+    }
+
+    fn for_document(
+        operation: BnsEvmWriteOperation,
+        name: &str,
+        doc_type: impl Into<String>,
+        authority: CallAuthority,
+    ) -> Self {
+        Self {
+            operation,
+            name: name.to_string(),
+            doc_type: Some(doc_type.into()),
+            asset_owner: None,
+            authority,
+        }
+    }
+}
+
+#[async_trait]
+pub trait BnsEvmKeyManager: Send + Sync {
+    async fn signer_address(&self, request: &BnsEvmSignRequest) -> BnsClientResult<Address>;
+
+    async fn sign_transaction(
+        &self,
+        request: &BnsEvmSignRequest,
+        tx: TxEip1559,
+    ) -> BnsClientResult<SignedEip1559Tx>;
+}
+
+pub struct StaticBnsEvmKeyManager {
+    private_key: String,
+    signer_address: Address,
+}
+
+impl StaticBnsEvmKeyManager {
+    pub fn new(private_key: impl Into<String>) -> BnsClientResult<Self> {
+        let private_key = private_key.into();
+        let signer = signer_from_private_key(private_key.as_str()).map_err(BnsClientError::from)?;
+        Ok(Self {
+            private_key,
+            signer_address: signer.address(),
+        })
+    }
+
+    pub fn signer_address(&self) -> Address {
+        self.signer_address
+    }
+}
+
+#[async_trait]
+impl BnsEvmKeyManager for StaticBnsEvmKeyManager {
+    async fn signer_address(&self, _request: &BnsEvmSignRequest) -> BnsClientResult<Address> {
+        Ok(self.signer_address)
+    }
+
+    async fn sign_transaction(
+        &self,
+        _request: &BnsEvmSignRequest,
+        tx: TxEip1559,
+    ) -> BnsClientResult<SignedEip1559Tx> {
+        let signer =
+            signer_from_private_key(self.private_key.as_str()).map_err(BnsClientError::from)?;
+        sign_eip1559_tx(tx, &signer).map_err(BnsClientError::from)
+    }
+}
+
+#[derive(Clone)]
+pub enum BnsEvmRawTxSubmitter {
+    ChainRpc,
+    BnsServer(Arc<dyn BnsIndexerApi>),
+}
+
 #[derive(Clone)]
 pub struct BnsEvmStandardClient {
     rpc: Arc<EthRpcClient>,
@@ -135,21 +280,91 @@ impl BnsEvmStandardClient {
 
 pub struct BnsEvmControllerClient {
     standard: BnsEvmStandardClient,
-    signer: PrivateKeySigner,
-    next_nonce: Mutex<Option<u64>>,
+    key_manager: Arc<dyn BnsEvmKeyManager>,
+    raw_tx_submitter: BnsEvmRawTxSubmitter,
+    default_signer_address: Option<Address>,
+    next_nonces: Mutex<HashMap<Address, u64>>,
 }
 
 impl BnsEvmControllerClient {
     pub fn new(config: BnsEvmClientConfig, private_key: &str) -> BnsClientResult<Self> {
-        Ok(Self {
-            standard: BnsEvmStandardClient::new(config),
-            signer: signer_from_private_key(private_key).map_err(BnsClientError::from)?,
-            next_nonce: Mutex::new(None),
-        })
+        let key_manager = StaticBnsEvmKeyManager::new(private_key)?;
+        let default_signer_address = Some(key_manager.signer_address());
+        Ok(Self::new_with_key_manager_and_submitter(
+            config,
+            Arc::new(key_manager),
+            BnsEvmRawTxSubmitter::ChainRpc,
+            default_signer_address,
+        ))
     }
 
-    pub fn signer_address(&self) -> Address {
-        self.signer.address()
+    pub fn new_with_key_manager(
+        config: BnsEvmClientConfig,
+        key_manager: Arc<dyn BnsEvmKeyManager>,
+    ) -> Self {
+        Self::new_with_key_manager_and_submitter(
+            config,
+            key_manager,
+            BnsEvmRawTxSubmitter::ChainRpc,
+            None,
+        )
+    }
+
+    pub fn new_with_bns_server_submitter(
+        config: BnsEvmClientConfig,
+        key_manager: Arc<dyn BnsEvmKeyManager>,
+        bns_server: Arc<dyn BnsIndexerApi>,
+    ) -> Self {
+        Self::new_with_key_manager_and_submitter(
+            config,
+            key_manager,
+            BnsEvmRawTxSubmitter::BnsServer(bns_server),
+            None,
+        )
+    }
+
+    fn new_with_key_manager_and_submitter(
+        config: BnsEvmClientConfig,
+        key_manager: Arc<dyn BnsEvmKeyManager>,
+        raw_tx_submitter: BnsEvmRawTxSubmitter,
+        default_signer_address: Option<Address>,
+    ) -> Self {
+        Self {
+            standard: BnsEvmStandardClient::new(config),
+            key_manager,
+            raw_tx_submitter,
+            default_signer_address,
+            next_nonces: Mutex::new(HashMap::new()),
+        }
+    }
+
+    pub fn default_signer_address(&self) -> Option<Address> {
+        self.default_signer_address
+    }
+
+    pub fn key_manager(&self) -> &Arc<dyn BnsEvmKeyManager> {
+        &self.key_manager
+    }
+
+    pub async fn signer_address_for(
+        &self,
+        request: &BnsEvmSignRequest,
+    ) -> BnsClientResult<Address> {
+        self.key_manager.signer_address(request).await
+    }
+
+    pub fn with_raw_tx_submitter(mut self, raw_tx_submitter: BnsEvmRawTxSubmitter) -> Self {
+        self.raw_tx_submitter = raw_tx_submitter;
+        self
+    }
+
+    pub fn with_default_signer_address(mut self, address: Address) -> Self {
+        self.default_signer_address = Some(address);
+        self
+    }
+
+    pub fn signer_address(&self) -> Option<Address> {
+        self.default_signer_address
     }
 
     pub fn standard(&self) -> &BnsEvmStandardClient {
@@ -160,21 +375,50 @@ impl BnsEvmControllerClient {
         &self,
         call: &C,
     ) -> BnsClientResult<BnsEvmTxSubmission> {
-        let nonce = self.next_nonce().await?;
+        let request =
+            BnsEvmSignRequest::new(BnsEvmWriteOperation::Manual, "", CallAuthority::public());
+        self.sign_and_submit_with_request(&request, call).await
+    }
+
+    pub async fn sign_and_submit_with_request<C: SolCall>(
+        &self,
+        request: &BnsEvmSignRequest,
+        call: &C,
+    ) -> BnsClientResult<BnsEvmTxSubmission> {
+        let signer_address = self.key_manager.signer_address(request).await?;
+        let nonce = self.next_nonce(signer_address).await?;
         let tx = self.standard.build_unsigned_tx(call, nonce)?;
-        let signed = sign_eip1559_tx(tx, &self.signer).map_err(BnsClientError::from)?;
-        match self.standard.rpc.send_raw_transaction(&signed.raw_tx).await {
+        let signed = self.key_manager.sign_transaction(request, tx).await?;
+        if signed.signer != signer_address {
+            self.reset_nonce(signer_address);
+            return Err(BnsClientError::Serialization(format!(
+                "BNS EVM key manager signed as {:#x}, expected {:#x}",
+                signed.signer, signer_address
+            )));
+        }
+
+        match self.submit_raw_tx(&signed.raw_tx).await {
             Ok(tx_hash) => Ok(BnsEvmTxSubmission {
-                tx_hash: format!("{tx_hash:#x}"),
+                tx_hash,
                 raw_tx: format!("0x{}", hex::encode(&signed.raw_tx)),
                 from: format!("{:#x}", signed.signer),
                 nonce: signed.nonce,
                 chain_id: signed.chain_id,
             }),
             Err(error) => {
-                self.reset_nonce();
-                Err(error.into())
+                self.reset_nonce(signer_address);
+                Err(error)
             }
+        }
+    }
+
+    async fn submit_raw_tx(&self, raw_tx: &[u8]) -> BnsClientResult<String> {
+        match &self.raw_tx_submitter {
+            BnsEvmRawTxSubmitter::ChainRpc => self.standard.submit_raw_tx(raw_tx).await,
+            BnsEvmRawTxSubmitter::BnsServer(server) => server
+                .submit_raw_tx(BnsSubmitRawTxReq::from_bytes(raw_tx))
+                .await
+                .map(|resp| resp.tx_hash),
         }
     }
 
@@ -182,35 +426,58 @@ impl BnsEvmControllerClient {
         &self,
         req: &BnsRegisterNameReq,
     ) -> BnsClientResult<BnsEvmTxSubmission> {
-        self.sign_and_submit(&register_name_call(req)?).await
+        let request = BnsEvmSignRequest::for_register(BnsEvmWriteOperation::RegisterName, req);
+        self.sign_and_submit_with_request(&request, &register_name_call(req)?)
+            .await
     }
 
     pub async fn bootstrap_name(
         &self,
         req: &BnsBootstrapNameReq,
     ) -> BnsClientResult<BnsEvmTxSubmission> {
-        self.sign_and_submit(&bootstrap_name_call(req)?).await
+        let request = BnsEvmSignRequest::for_bootstrap(req);
+        self.sign_and_submit_with_request(&request, &bootstrap_name_call(req)?)
+            .await
     }
 
     pub async fn publish_document(
         &self,
         req: &BnsPublishDocumentReq,
     ) -> BnsClientResult<BnsEvmTxSubmission> {
-        self.sign_and_submit(&publish_document_call(req)?).await
+        let request = BnsEvmSignRequest::for_document(
+            BnsEvmWriteOperation::PublishDocument,
+            &req.name,
+            req.update.doc_type.clone(),
+            req.authority.clone(),
+        );
+        self.sign_and_submit_with_request(&request, &publish_document_call(req)?)
+            .await
     }
 
     pub async fn revoke_document(
         &self,
         req: &BnsRevokeDocumentReq,
     ) -> BnsClientResult<BnsEvmTxSubmission> {
-        self.sign_and_submit(&revoke_document_call(req)?).await
+        let request = BnsEvmSignRequest::for_document(
+            BnsEvmWriteOperation::RevokeDocument,
+            &req.name,
+            req.doc_type.clone(),
+            req.authority.clone(),
+        );
+        self.sign_and_submit_with_request(&request, &revoke_document_call(req)?)
+            .await
     }
 
     pub async fn set_controller_policy(
         &self,
         req: &BnsSetControllerPolicyReq,
     ) -> BnsClientResult<BnsEvmTxSubmission> {
-        self.sign_and_submit(&set_controller_policy_call(req)?)
+        let request = BnsEvmSignRequest::new(
+            BnsEvmWriteOperation::SetControllerPolicy,
+            req.name.clone(),
+            req.authority.clone(),
+        );
+        self.sign_and_submit_with_request(&request, &set_controller_policy_call(req)?)
             .await
     }
 
@@ -218,39 +485,45 @@ impl BnsEvmControllerClient {
         &self,
         req: &BnsUpdateAuthorityKeysReq,
     ) -> BnsClientResult<BnsEvmTxSubmission> {
-        self.sign_and_submit(&update_authority_keys_call(req)?)
+        let request = BnsEvmSignRequest::new(
+            BnsEvmWriteOperation::UpdateAuthorityKeys,
+            req.name.clone(),
+            req.authority.clone(),
+        );
+        self.sign_and_submit_with_request(&request, &update_authority_keys_call(req)?)
             .await
     }
 
-    async fn next_nonce(&self) -> BnsClientResult<u64> {
+    async fn next_nonce(&self, signer_address: Address) -> BnsClientResult<u64> {
         {
-            let mut cached = self.next_nonce.lock().map_err(|_| {
+            let mut cached = self.next_nonces.lock().map_err(|_| {
                 BnsClientError::Transport("BNS EVM nonce lock poisoned".to_string())
             })?;
-            if let Some(nonce) = *cached {
-                *cached = Some(nonce + 1);
-                return Ok(nonce);
+            if let Some(nonce) = cached.get_mut(&signer_address) {
+                let current = *nonce;
+                *nonce += 1;
+                return Ok(current);
             }
         }
 
         let chain_nonce = self
             .standard
             .rpc
-            .transaction_count(self.signer.address())
+            .transaction_count(signer_address)
             .await
             .map_err(BnsClientError::from)?;
         let mut cached = self
-            .next_nonce
+            .next_nonces
             .lock()
             .map_err(|_| BnsClientError::Transport("BNS EVM nonce lock poisoned".to_string()))?;
-        let nonce = cached.unwrap_or(chain_nonce);
-        *cached = Some(nonce + 1);
+        let nonce = *cached.get(&signer_address).unwrap_or(&chain_nonce);
+        cached.insert(signer_address, nonce + 1);
         Ok(nonce)
     }
 
-    fn reset_nonce(&self) {
-        if let Ok(mut cached) = self.next_nonce.lock() {
-            *cached = None;
+    fn reset_nonce(&self, signer_address: Address) {
+        if let Ok(mut cached) = self.next_nonces.lock() {
+            cached.remove(&signer_address);
         }
     }
 }
