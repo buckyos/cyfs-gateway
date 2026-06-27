@@ -6115,12 +6115,9 @@ mod tests {
                 _ => None,
             })
             .unwrap();
-        let sn_server = servers
-            .iter()
-            .find_map(|server| match server {
-                Server::NameServer(server) => Some(server.clone()),
-                _ => None,
-            })
+        // 独立打开同一 SQLite 文件，用于直接驱动用户状态（服务端读同一份文件）。
+        let auth_db = SqliteSnAuthDB::new_by_path(db.path().to_str().unwrap())
+            .await
             .unwrap();
 
         let http_addr = spawn_test_http_server(http_server).await;
@@ -6196,8 +6193,7 @@ mod tests {
         );
 
         // §3.2 冻结用户 → 旧 access token 立即失效（会话被撤销）。
-        sn_server
-            .auth_db()
+        auth_db
             .set_user_state(REG_USER, UserState::Suspended)
             .await
             .unwrap();
