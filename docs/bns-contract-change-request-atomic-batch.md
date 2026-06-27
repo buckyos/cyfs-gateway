@@ -20,6 +20,14 @@
 这两个本质都是"几个原语的原子组合"。与其为每种业务组合各开一个函数,不如提供
 **一个原子批量原语**覆盖它们,以及未来任意组合。
 
+非目标:
+
+- 本次不以"显著降低每份文档的主体写入 gas"为目标。批量接口主要节省多 TX 固定成本、
+  重复 name/guard/鉴权校验和重复 `nameSeq` 写入;每份文档自己的版本、状态、引用和事件仍然
+  必须逐条写入。
+- 本次不处理合约 runtime size / code size 策略。目标链仍在选择中,最终公链可能允许更宽松的
+  code size 限制;该问题不阻塞本接口收敛。
+
 ---
 
 ## 2. 现状分解:原语 vs 组合
@@ -91,11 +99,13 @@ function applyMutations(
     DocumentUpdate[] documents,              // 空 = 不发布文档;>=1 时即"批量 publishDocuments"
     CallAuthority authority,
     MutationGuard guard
-) external returns (uint64 authoritySeq, bytes32 authorityRoot, uint64[] documentVersions);
+) external returns (uint64 nameSeq, uint64 authoritySeq, bytes32 authorityRoot);
 ```
 - `documents` only → 等价"批量 `publishDocuments`"(覆盖 zone+boot 的诉求);
 - `authorityUpdates` + `documents=[owner]` → 等价 `rotateAuthorityAndOwnerDocument`;
 - 复用既有 `DocumentUpdate`(L174)/`AuthorityKeyUpdate` 结构体,调用方零新结构。
+- 文档版本不通过动态返回数组返回;调用方从 `DocumentPublished` 事件或 `getDocumentVersion`
+  / `resolveDocument` 读取。链上交易通常拿不到返回值,保留动态返回数组会增加 ABI 和 gas 成本。
 
 **保留**:`publishDocument` / `updateAuthorityKeys` 等单步原语(它们不是"强业务",可作为
 `applyMutations` 单元素的便捷封装继续存在,或一并下沉为 wrapper,二选一)。
@@ -119,6 +129,8 @@ function applyMutations(
    demonstrated need 就是"authority keys + documents",类型化批量正好覆盖,不需要为不存在的
    组合需求提前付出 bytes 分发的代价。
 4. **indexer 改动小**:仍是逐函数 `sol!` 解码,只是多/改几个具名函数,无需二级 bytes 解码。
+5. **gas 边界清晰**:`applyMutations` 节省的是批内重复开销,不是文档主体状态写入;这符合
+   "把多个必须原子的业务写合并为一笔 TX"的目标,不会用不透明 batch 掩盖真实成本。
 
 **何时升级到方案 A**:当可组合的 op 种类显著增多、且确实出现"任意组合"的业务需求时,
 再把 `applyMutations` 泛化为 `applyOps(Op[])`。届时已有的一次性迁移经验可复用。
@@ -132,14 +144,33 @@ function applyMutations(
 
 1. **原子性**:任一条目鉴权/应用失败 → 整笔 revert。
 2. **Guard 一次**:整批只 `_checkGuard` 一次;调用方只提供一个 `expectedNameSeq`。
-3. **逐条鉴权**:每个 `documents[i].docType` 按现有 `PERMISSION_PUBLISH_DOCUMENT` + controller policy
-   规则鉴权;`authorityUpdates` 按现有 Owner-only 规则鉴权(与单步函数完全等价)。
-4. **顺序**:若同批既改 authority 又发文档,需明确应用顺序(建议先 authority 后文档,
-   与 `rotateAuthorityAndOwnerDocument` 现有语义一致)。
-5. **事件**:每个子操作发出与对应单步函数**相同**的事件,使 indexer projection 复用现有路径
-   (一笔 tx → 多个事件 + 一次 nameSeq 变更)。
-6. **校验**:`authorityUpdates` 与 `documents` 不可同时为空;`documents` 内重复 docType 建议 revert;
-   建议设条目上限防 gas 失控。
+3. **Pre-state 鉴权**:整批鉴权必须基于批处理前状态完成。`authorityUpdates` 使用更新前
+   effective owner 做 Owner-only 鉴权;`documents[i]` 使用更新前 NameState / OwnerResolution /
+   controller policy 做 publish 鉴权。这样 key rotation 可以在同一批里撤销当前 key 并发布新的
+   owner 文档;撤销后的权限从下一笔 TX 开始生效。
+4. **逐条文档权限**:每个 `documents[i].docType` 都按现有 `PERMISSION_PUBLISH_DOCUMENT`
+   + controller policy 规则检查。若批内某个 docType 不被当前 owner/controller 授权,整批 revert。
+5. **应用顺序**:通过 pre-state 鉴权后,实际写入顺序为 authority updates → documents,与
+   `rotateAuthorityAndOwnerDocument` 现有写入语义一致。
+6. **`nameSeq` 规则**:
+   - `applyMutations`: `documents.length > 0` 时整批只 bump 一次 `nameSeq`;authority-only 批不
+     bump `nameSeq`,只更新 `authoritySeq`。
+   - 合并后的 `registerName`: 创建、初始文档、初始 authority、初始 semantic owner、
+     初始 controller policy 都属于同一个创建事务,最终 `nameSeq` 建议固定为 1。后续变更再按
+     `MutationGuard.expectedNameSeq=1` 继续。
+7. **事件**:每个子操作发出与对应单步函数**相同类型**的事件,使 indexer projection 复用现有路径。
+   同一批内多个 Registry event 由各自 preceding `ProtocolEvent.seq` 区分;不要求每个子事件都
+   拥有不同 `nameSeq`。
+   - **对合约的显式约束(勿优化掉)**:批内**每个子操作各自调用一次 `_commitEvent`**
+     (commit-then-emit per sub-op),即每发布一个文档就发出"一个 `ProtocolEvent`(`globalEventSeq` 自增)
+     + 一个 `DocumentPublished`"。`_commitEvent`(Bns.sol:1925-1932)每次 `globalEventSeq += 1`。
+     indexer 的事件配对 / 主键 / 排序全部依赖"每个子事件有独立 `seq`",**不要为省 gas 把一批文档
+     合并成单个聚合事件**——那会破坏 indexer 投影。`applyMutations` 复用现有
+     `_publishDocumentUpdateInternal → _publishDocumentInternal → _commitEvent` 路径即天然满足。
+8. **校验**:`authorityUpdates` 与 `documents` 不可同时为空;`documents` 内重复 docType 必须 revert;
+   建议设条目上限和批内 inline bytes 总量上限,防止单笔 TX gas 失控。
+9. **返回值**:`applyMutations` 返回最终 `nameSeq`、`authoritySeq`、`authorityRoot` 即可。
+   每份文档版本由 `DocumentPublished` 事件或读接口获取。
 
 ---
 
@@ -153,11 +184,20 @@ function applyMutations(
 3. **bns-indexer**:更新 `decoded_call_for_log` / projection 以认得新函数(sync.rs:215)。
    ✅ **历史兼容已不是问题**:目标链处于开发测试阶段、生产环境零部署(2026-06-27 确认),
    可直接硬删旧函数、随意重置测试链,**无需保留旧 ABI 历史解码器**。
+   ✅ **同 nameSeq 多事件已验证安全,文档投影无需改**(2026-06-27 核查现状实现):
+   indexer 从一开始就不靠 nameSeq 标识/排序/去重文档——
+   - 事件主键 `bns_events PRIMARY KEY(seq)`(sqlite.rs:103),`seq` 来自合约 `globalEventSeq`,批内逐子事件唯一;
+   - 文档身份 `bns_documents PRIMARY KEY(name,doc_type,version)`(sqlite.rs:67),不含 nameSeq;
+   - 文档版本取自事件 `version` 字段,再 `getDocumentVersion(name,docType,version)` 从合约拉取(sync.rs:372/471),非由 nameSeq 推导;
+   - ProtocolEvent↔RegistryEvent 配对靠 `pending_protocol.pop_front()` 按发射顺序,不靠 nameSeq;
+   - nameSeq 仅作 `NameState`/`AliasState` 元数据与 name 级 `MutationGuard` 一致性检查(registry.rs:1349),与文档投影无关。
+   前提即上面第 5.7 条的合约约束(per-sub-op `_commitEvent`)成立;`decode_bns_call` 仅需新增 `applyMutations` 变体用于 calldata 补全,投影路径零改动。
 4. **bns-client**:更新/替换 `bootstrap_name_call`、新增 `apply_mutations_call`;`BnsBootstrapNameReq` 等请求类型调整。
 5. **SN 调用方**:
    - `cyfs-sn api/auth.rs:118` 的 `bootstrap_name` 调用切到合并后的 `register_name`。
    - `bind_zone_documents` 改用 `apply_mutations`(documents=[zone, boot]),写回**独立原子文档**,
-     弃用"boot_jwt 内嵌 zone"(仅 DNS TXT 出口保留 JWT 紧凑序列化)。
+     弃用"boot_jwt 内嵌 zone"(仅 DNS TXT 出口保留 JWT 紧凑序列化)。该变化从 gas 看会比
+     单个内嵌文档更贵,收益是文档边界清晰、zone/boot 可独立版本化,且两份文档仍保持同 TX 原子性。
    - 任何 key 轮换 + owner 文档流程改用 `apply_mutations`。
 6. **低成本红利**:`rotateAuthorityAndOwnerDocument` 当前 Rust 侧**零调用**,删除无迁移负担。
 
@@ -172,4 +212,5 @@ function applyMutations(
        否则保持最小集 authority+documents。)
 - [ ] 合并后的 `registerName` 参数较多,需评估可读性 / 是否拆 struct 入参。
 - [ ] payable 收费仅在创建路径,`applyMutations` 非 payable,确认无费用语义遗漏。
-- [ ] 安全审计:逐 op 鉴权矩阵、批内顺序、guard-once + nameSeq 自增的不变量。
+- [ ] 安全审计:pre-state 鉴权矩阵、批内顺序、guard-once + batch-level `nameSeq` 自增的不变量。
+- [ ] `applyMutations` 的条目上限、inline bytes 总量上限和 gas limit 推荐值。
