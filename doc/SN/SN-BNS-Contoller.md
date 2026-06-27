@@ -1,8 +1,10 @@
 # SN-BNS-Controller
 
-`sn_bns_controller` 是 SN 写入 BNS Registry 的封装层。它把 SN 侧已经完成的业务鉴权、owner 签名校验、设备签名校验和自动化任务，转换成 `bns-indexer` 可执行的 `CallAuthority + MutationGuard + DocumentUpdate` 调用。
+`sn_bns_controller` 是 SN 写入 BNS 的封装层，对应分层模型中的 **BNS-Controller**（BNS-Client 在“持有该资产 control 私钥”时启用的前置签名逻辑）。它把 SN 侧已经完成的业务鉴权、owner 签名校验、设备签名校验和自动化任务，构造成 BNS 合约写操作：填 nonce / chainId / gas → ABI 编码（`CallAuthority + MutationGuard + DocumentUpdate` 作为合约入参）→ 用托管 control 私钥**签名** → 经 BNS-Client/BNS-Server 提交 raw TX（`eth_sendRawTransaction`）到 BNS 合约。
 
-当本文和当前实现冲突时，以 `doc/SN/新SN核心流程整理.md` 和 `doc/BNS 智能合约接口设计.md` 的设计语义为准；当前 `cyfs-sn` / `bns-indexer` 实现只作为第一版落地路径和迁移参考。
+> 签名边界（见 `doc/SN/BNS-签名边界改造-EVM-TX-TODO.md`）：权威状态在 **`Bns.sol` 合约**，合约只信任节点恢复出的 `msg.sender` 做访问控制。BNS-Server 是标准合约处理器，只转发已签名 raw TX 和查只读投影，**不签名、不持私钥、不含 control 逻辑**；`bns-indexer` 是只读事件索引器，不再是权威状态机。因此 `sn_bns_controller` 提交的 TX，其签名地址必须等于合约要求的 owner / 授权 controller 地址；`CallAuthority` 作为合约入参仅用于提示 role（Owner/Controller）与选择 `kid`，不再作为身份信任来源。
+
+当本文和当前实现冲突时，以 `doc/SN/新SN核心流程整理.md`、`doc/SN/BNS-签名边界改造-EVM-TX-TODO.md` 和 `doc/BNS 智能合约接口设计.md` 的设计语义为准；当前 `cyfs-sn` / `bns-indexer` 实现只作为第一版落地路径和迁移参考。
 
 文件名中保留了历史拼写 `Contoller`，模块名和文档正文统一使用 `sn_bns_controller` / `SN-BNS-Controller`。
 
@@ -35,18 +37,20 @@
 - SN controller key 是受限自动化权限，只能写 policy 明确允许的 doc type。
 - 新提交的文档内容、controller 字段或 owner 字段不能授权本次调用。
 
-## 与 BNS Registry 的关系
+## 与 BNS 合约的关系
 
-`bns-indexer` 当前已经提供下面的核心能力：
+权威状态在 **`Bns.sol` 合约**。合约提供下面的核心写操作（`sn_bns_controller` 通过构造并签名 EVM TX、经 BNS-Server 提交 raw TX 调用），以及对应的只读 view（由 `bns-indexer` 投影后查询）：
 
-- `register_name(name, asset_owner, RegisterOptions, initial_documents, authority, guard)`
-- `publish_document(name, DocumentUpdate, authority, guard)`
-- `revoke_document(name, doc_type, from_version, to_version, reason_hash, authority, guard)`
-- `set_controller_policy(name, Vec<ControllerRule>, policy_hash, authority, guard)`
-- `update_authority_keys(name, Vec<AuthorityKeyUpdate>, authority, guard)`
-- `resolve_document`、`query_name_state`、`get_authority_set` 等 view 接口。
+- `registerName` / `bootstrapName`
+- `publishDocument`
+- `revokeDocument`
+- `setControllerPolicy`
+- `updateAuthorityKeys`
+- `resolveDocument`、`queryNameState`、`getAuthoritySet` 等只读 view（经 `bns-indexer` 只读投影查询）。
 
-`sn_bns_controller` 不应重新实现 Registry 状态机，而是调用这些接口，并补足 SN 侧需要的编排能力：
+> 历史命名对照：本文早期版本中的 `register_name` / `publish_document` 等 `bns-indexer` Rust 接口，对应现在合约的 `registerName` / `publishDocument` 等函数；`authority` / `guard` 入参对应合约的 `CallAuthority`（仅 role/kid 提示）/ `MutationGuard`。鉴权不再由 indexer 端 `ecrecover` 或信任传入 `CallAuthority`，而是由合约用 `msg.sender` 做 `require`。
+
+`sn_bns_controller` 不应重新实现状态机，而是构造合约调用并补足 SN 侧需要的编排能力：
 
 - 注册流程的幂等和恢复。
 - 多个 BNS 写操作之间的业务原子性。
@@ -54,18 +58,18 @@
 - SN controller policy 的固定模板。
 - 与 SN 本地 DB 的一致性边界。
 
-目标形态中，BNS 侧需要提供一个原子 bootstrap 接口，或者 `sn_bns_controller` 需要在同一 BNS store transaction 中执行注册批处理。原因是当前 `register_name` 只能原子创建 name 和初始文档，不能同时写 authority key 与 controller policy；如果用多个公开调用串起来，中途失败会留下已注册但未授权 SN controller 的半成品状态。
+注册需要一个原子 bootstrap：在单个合约 TX 内同时创建 name、初始文档、authority key 与 controller policy。原因是 `registerName` 只能原子创建 name 和初始文档，不能同时写 authority key 与 controller policy；如果用多个 TX 串起来，中途失败会留下已注册但未授权 SN controller 的半成品状态。合约已提供 `bootstrapName` 承担该原子操作（单个 TX 即一个原子单元）。
 
 目标 bootstrap 等价操作：
 
-1. `register_name`
+1. `registerName`
 2. 发布初始 `owner` 文档。
 3. 写入 owner authority keys。
 4. 必要时把 `semantic_owner` 切到本 name 或指定 authority name。
 5. 写入 SN controller policy。
 6. 返回 `name_seq`、初始文档版本、authority root、controller policy hash。
 
-当前中心化实现落地时可以先增加 `CentralizedBnsRegistry::bootstrap_name(...)` 或 `apply_registry_batch(...)`，不要在 SN 业务层用多个无事务公开调用模拟原子注册。
+应使用合约 `bootstrapName` 在单个 TX 内完成，不要在 SN 业务层用多个无事务调用模拟原子注册。（迁移期当前实现仍走 `CentralizedBnsRegistry::bootstrap_name(...)` 单事务，见“当前实现映射”；该状态机将随写路径切到 EVM raw TX 后下线。）
 
 ## 权限模型
 
@@ -79,6 +83,8 @@
 | `Controller(name, doc_type_scope)` | `CallAuthority::controller(...)` | 必须命中 BNS controller policy。 |
 | `Device(zone, device_name, did)` | 默认不能直接写 BNS | 只能更新在线态；如需写 BNS，必须有单独 device controller rule。 |
 | `SnUser(username)` | 默认不能直接写 BNS | 只代表 SN 本地账号登录。 |
+
+> 签名边界：表中的 `CallAuthority` 只是合约入参，用于提示 role（Owner/Controller）和选择 `kid`，**不是身份信任来源**。真正决定权限的是 TX 的签名者——`sn_bns_controller` 必须用与该 role 对应的 owner / controller 私钥签名，合约要求恢复出的 `msg.sender` 等于登记的 owner / 授权 controller 地址。
 
 `SnUser(username)` 可以发起流程，但流程中涉及 BNS 写入时，还必须补充 owner 签名、SN controller 授权或明确的 device controller 授权。
 
@@ -96,8 +102,8 @@ Owner 级写入适用于：
 
 转换规则：
 
-- 如果 BNS effective owner 是 `ChainAccount`，当前 `bns-indexer` 只检查 actor 值，`kid` 可以为空；RPC/签名验证必须在 adapter 或 `sn_authority` 中完成。
-- 如果 BNS effective owner 是 `BnsName(x)`，必须提供 `kid`，并且该 key 是 `x` authority set 中当前有效的 authentication key。
+- 如果 BNS effective owner 是 `ChainAccount`，则 TX 必须由该 ETH 地址对应私钥签名，合约校验 `msg.sender == effectiveOwner`；`CallAuthority` 中 `kid` 可以为空。
+- 如果 BNS effective owner 是 `BnsName(x)`，则 TX 必须由 `x` authority set 中当前有效的 authentication key 签名，并在 `CallAuthority` 中提供对应 `kid`（合约据 `kid` 选 key，并要求其地址 == `msg.sender`）。
 - `MutationGuard.expected_name_seq` 必须来自更新前的 `NameState.name_seq`。
 
 ### SN controller 写入
@@ -145,7 +151,7 @@ SN controller 只用于自动化、低风险、可审计的文档更新，例如
 
 目标字段：
 
-- `registry`: BNS registry client 或 `CentralizedBnsRegistry` 引用。
+- `registry`: BNS 合约 client（构造/签名 EVM TX 并经 BNS-Server 提交 raw TX）；迁移期可仍为 `CentralizedBnsRegistry` 引用。
 - `sn_controller_principal`: SN controller 的 BNS `Principal`。
 - `sn_controller_kid`: SN controller key id。controller 是 `ChainAccount` 时可为空。
 - `sn_controller_key_ref`: 本地 KMS / keystore 引用，不直接暴露私钥。
@@ -665,6 +671,8 @@ SN API 响应中建议包含：
 
 ## 当前实现映射
 
+> 与目标设计的差异（迁移期现状）：下面映射的是**当前已落地的中心化状态机路径**——`SnBnsController` 仍通过 `bns-client` 直接调用 `bns-indexer` 的 `CentralizedBnsRegistry` 单事务接口（`registry.rs`），尚未切到“构造并签名 EVM TX → 经 BNS-Server `eth_sendRawTransaction` 提交到 `Bns.sol` 合约”的目标写路径（见 `doc/SN/BNS-签名边界改造-EVM-TX-TODO.md`）。EVM 合约/索引器/raw-TX 提交已部分落地，SN 写路径切换属后续工作；下文的 `registry.rs` 引用应理解为迁移期实现，而非目标权威源。
+>
 > 重要现状（割裂事实）：BNS 写入层 `SnBnsController` **已实现，但物理上在 `bns-client` crate**（`src/components/bns-client/src/sn_bns_controller.rs`，约 1151 行），**不在 `cyfs-sn` 里**。`cyfs-sn` 至今只消费**只读侧**——`sn_bns_reader.rs` 的 `BnsIndexerDocumentReader` 接在 resolver 上（`src/components/cyfs-sn/src/sn_server.rs:689`），从不实例化或调用 `SnBnsController`。换言之：写入库本身基本写完并通过自身单测，但**尚未被它所服务的 SN 业务流程采用**；目前 `SnBnsController` 的唯一调用方是 `bns-client` 自己的测试（`src/components/bns-client/tests/rpc_and_controller.rs`）。
 
 ### 写入层 `SnBnsController`（`bns-client`，已完成）

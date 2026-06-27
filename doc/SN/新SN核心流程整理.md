@@ -21,7 +21,7 @@ SN 是 BNS 早期可用性的过渡服务，最终目标不是生态化，而是
   -> resolver / relay / node_daemon 使用该状态
 ```
 
-这条核心路径中，SN 不代替用户写 BNS，不持有 owner 权限，也不需要成为 BNS controller。`bns-indexer` 是 BNS 合约或中心化模拟 Registry 的本地可信索引器，负责把已验证事件和文档版本整理成可查询的最终状态；SN 只消费这个最终状态。
+这条核心路径中，SN 不代替用户写 BNS，不持有 owner 权限，也不需要成为 BNS controller。`bns-indexer` 是 BNS 合约的本地只读事件索引器，监听合约 event、解码后整理成可查询的最终状态投影；权威状态始终在合约本身，SN 只消费这个只读最终状态。BNS 写路径与签名边界的细化设计见 `doc/SN/BNS-签名边界改造-EVM-TX-TODO.md`。
 
 因此，`cyfs-sn` 的开源实现主要是 SN 过渡层的参考实现，用来说明协议原理、支持审计、测试和兼容性验证；它不应该被理解为鼓励普通用户或第三方服务商长期运行生产 SN。第三方运行 SN 可以作为兼容结果存在，但不应成为 BNS 的产品主路径，也不应形成“用户选择 SN 服务商”的终局模型。
 
@@ -43,7 +43,7 @@ SN 是 BNS 早期可用性的过渡服务，最终目标不是生态化，而是
 - `bns-indexer` 在本地信任域内同步 BNS 事件和文档版本，并向 SN 提供只读最终状态。
 - SN core 不要求持有 controller key，也不把 SN login token 映射为 BNS owner 权限。
 - `bns-controller` 可以保留为 Web2 用户的兼容入口，用于托管或代操作 BNS 更新，但它不是 SN 核心路径。
-- `bns-indexer` 保持为 registry/document 状态机，不直接承担 RPC 鉴权、账号登录或设备在线状态。
+- `bns-indexer` 保持为 BNS 合约的只读事件索引器，不直接承担 RPC 鉴权、账号登录或设备在线状态，也不持有权威写状态。
 
 Web2 兼容路径服务于过渡阶段的可用性和产品易用性，不代表 SN 是 BNS 终局架构的一部分。长期应把公网可达性迁移到 user-owned gateway，把 SN 依赖降到 0。
 
@@ -57,9 +57,9 @@ BNS 本地索引器和最终状态查询层。站在 SN 视角，它负责：
 - authority key 和 controller policy 的最终状态视图
 - document version / name seq / event seq 查询
 - helper schema 解析和校验，例如 `zone`、`boot`、`device_mini_doc`、`dns_txt`
-- 从 BNS Registry / 合约事件生成本地最终状态，供 SN、local resolver 和 gateway 查询
+- 从 BNS 合约 event 监听、解码生成本地只读最终状态投影，供 SN、local resolver 和 gateway 查询
 
-中心化模拟阶段，当前实现可以继续把 register name、publish document 等写接口放在 `bns-indexer` crate 或相邻服务中；但从 SN core 的架构边界看，这些属于 BNS 系统接口，不是 SN 的必需依赖。
+`bns-indexer` 是只读事件索引器，不再持有 register name / publish document 等写接口；BNS 写操作一律以已签名 raw TX 提交到 BNS 合约（经 BNS-Server `eth_sendRawTransaction` 转发），由合约 emit event 后再被索引器投影。详见 `doc/SN/BNS-签名边界改造-EVM-TX-TODO.md`。从 SN core 的架构边界看，这些 BNS 读写都属于 BNS 系统接口，不是 SN 的必需依赖。
 
 `sn_document_schema` 不单独拆服务，应该沉到 `bns-indexer` helper 中。
 
@@ -446,7 +446,7 @@ publishDocument:
 
 - Web3 核心路径中，普通 owner 文档需要 Owner ETH 私钥、BNS authority key 或 BNS 侧认可的调用方式。
 - Web2 兼容路径中，托管自动化文档可以由 `sn_bns_controller` 使用托管 controller key 发布，并且只能发布 controller policy 授权的 doc type。
-- 发布请求必须携带 expected_version / name_seq guard，避免覆盖并发更新；这是 BNS 状态机要求，不是 SN core 要求。
+- 发布请求必须携带 expected_version / name_seq guard，避免覆盖并发更新；这是 BNS 合约（`MutationGuard`）要求，不是 SN core 要求。
 - SN core 只读取 `bns-indexer` 看到的最终 document version。
 
 ## SN Admin

@@ -38,7 +38,7 @@
 - 不直接决定 hostname 的 gateway device 身份。
 - 不直接修改设备身份信息。
 
-其中 BNS 权威文档由 `bns-indexer` 和 `sn_bns_controller` 管理；账号、`zone_info.self_cert` 和 `zone_info.relay_sn` 的本地缓存由 `sn_auth` 管理；设备在线态和 endpoint 由 `sn_device_info` 管理；hostname/DID/zone/device 到 gateway device 和 relay 信息的查询合成由 `sn_resolver` 管理。
+其中 BNS 权威状态在 BNS 合约，写操作由 `sn_bns_controller` 构造并签名 TX 提交、只读投影由 `bns-indexer` 索引；账号、`zone_info.self_cert` 和 `zone_info.relay_sn` 的本地缓存由 `sn_auth` 管理；设备在线态和 endpoint 由 `sn_device_info` 管理；hostname/DID/zone/device 到 gateway device 和 relay 信息的查询合成由 `sn_resolver` 管理。
 
 ### sn_relay 节点负责
 

@@ -35,7 +35,7 @@
 
 ### BNS 权威状态
 
-来自 `bns-indexer`：
+权威源是 BNS 合约，`sn_resolver` 经 `bns-indexer` 的只读投影读取：
 
 - name owner / owner_config。
 - authority key 和 controller policy。

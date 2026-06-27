@@ -2,7 +2,7 @@
 
 `sn_auth` 是 SN 的账号与低频用户状态模块。它负责 SN 本地账号体系、登录态、`sn_user <-> user_domain` 绑定关系，以及不适合放入 BNS 权威文档的 `zone_info` 运行态。
 
-当本文和当前实现冲突时，以 `doc/SN/新SN核心流程整理.md` 中的设计意图为准；当前实现只作为差距对照，不作为兼容约束。本版本是 breaking change，不要求兼容旧 RPC alias、旧 token 语义或旧 `user_domain` 绑定方式。
+当本文和当前实现冲突时，以 `doc/SN/新SN核心流程整理.md` 中的设计意图为准；BNS 写路径与签名边界以 `doc/SN/BNS-签名边界改造-EVM-TX-TODO.md` 为准。当前实现只作为差距对照，不作为兼容约束。本版本是 breaking change，不要求兼容旧 RPC alias、旧 token 语义或旧 `user_domain` 绑定方式。
 
 ## 设计定位
 
@@ -190,7 +190,7 @@ PKX 是 `user_domain` 唯一的证明方法。它不是一次性随机挑战，�
 1. `sn_auth` 规范化并校验 `username`。
 2. `sn_auth` 检查 `active_code` 未使用。
 3. `sn_auth` 检查本地账号不存在。
-4. `sn_bns_controller` 调用 `bns-indexer.register` 创建 BNS name。
+4. `sn_bns_controller` 构造并用托管 owner/controller 私钥签名 BNS 合约注册 TX，经 BNS-Server 提交 raw TX 创建 BNS name。
 5. BNS 创建阶段同步发布 owner_config，并设置 SN controller key 和受限 controller policy。
 6. BNS 注册成功后，`sn_auth.register` 在一个本地事务中写入 `sn_user`、`password_credential`，并标记激活码已使用。
 7. 返回 access token、refresh token 和 BNS name 状态。
@@ -205,7 +205,7 @@ PKX 是 `user_domain` 唯一的证明方法。它不是一次性随机挑战，�
 当前实现：
 
 - 阶段一已完成：`register_user_v2` 在命名锁下用事务完成 `users`、`user_auth_v2`、`zone_info`、`activation_codes.used` 的一致写入（sn_auth.rs:989-1091），返回 access+refresh token 并提示 `need_bind_owner_key=true`（auth.rs:89）。
-- 待实现（阶段二）：V2 `auth.register` 只写本地 DB，没有调用 `sn_bns_controller` / `bns-indexer.register`（`bns_indexer_url` 只接入了 resolver 读路径，sn_server.rs:688-693），没有 `request_id` 幂等 key，也没有“BNS name 已存在但本地未完成”的恢复流程。
+- 待实现（阶段二）：V2 `auth.register` 只写本地 DB，没有调用 `sn_bns_controller` 提交 BNS 合约注册 TX（`bns_indexer_url` 只接入了 resolver 读路径，sn_server.rs:688-693），没有 `request_id` 幂等 key，也没有“BNS name 已存在但本地未完成”的恢复流程。
 
 ### public key 注册
 
@@ -505,7 +505,7 @@ RPC 层可以使用 breaking API，不要求保留旧 method alias。内部不�
 ### 阶段二待实现（主要差距）
 
 - 没有 `sn_authority` 统一鉴权上下文模块：不存在 `AuthContext`/`Owner(name)`/`Controller(name,scope)`/`Device(zone,device,did)`/`SnUser(username)` 类型，各 handler 仍各自解析 token（V2 走 `require_account_username`→`verify_access_token`，common.rs:332-341；旧接口各自 `RPCSessionToken::from_string(...).verify_by_key(...)`，sn_server.rs:1114-1132 等）。
-- 注册流程还没有和 `sn_bns_controller` / `bns-indexer.register` 串成一个幂等流程（无 `request_id`，无 BNS owner 创建/恢复）。
+- 注册流程还没有和 `sn_bns_controller` 提交 BNS 合约注册 TX 串成一个幂等流程（无 `request_id`，无 BNS owner 创建/恢复）。
 - PKX proof 在 DB 层已实现但无 RPC handler、无 DNS TXT 查询接线，端到端不可达。
 - 绕过风险：`zone.bind_config` / `register_user_with_owner_key` 仍能不经 proof 把 `user_domain` 置 active；`self_cert` 可被裸 access token（含 `dns.*` 的 `has_cert=true`）置 true。
 - owner 权限仍是“本地 `public_key` = owner”，不是 BNS authority；`owner_key_ref` 列从不写入。
