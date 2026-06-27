@@ -143,6 +143,9 @@ impl BnsWriteMetadata for BnsWriteReceipt {
             from: String::new(),
             nonce: self.evm_nonce?,
             chain_id: self.evm_chain_id?,
+            receipt_status: None,
+            receipt_block_number: None,
+            receipt_confirmations: None,
         })
     }
 }
@@ -168,6 +171,9 @@ impl BnsWriteMetadata for BnsMultiWriteReceipt {
                     from: String::new(),
                     nonce: self.evm_nonce?,
                     chain_id: self.evm_chain_id?,
+                    receipt_status: None,
+                    receipt_block_number: None,
+                    receipt_confirmations: None,
                 })
             })
     }

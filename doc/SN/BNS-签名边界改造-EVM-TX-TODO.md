@@ -18,10 +18,10 @@ EVM 客户端基础层与索引器事件投影已部分落地；BNS Server 已�
 | `forge test` 合约单测 | ✅ 已完成 | 6 个用例，覆盖鉴权 / guard / 文档 / 事件，见 [test/Bns.t.sol](../src/apps/bns/test/Bns.t.sol) |
 | 链上 smoke 流程 | ✅ 已完成 | [script/Smoke.s.sol](../src/apps/bns/script/Smoke.s.sol)：部署 → registerName → publishDocument → resolveDocument |
 | `bns-evm` crate（alloy 绑定 + TX 构造/签名） | ✅ 基础已完成 | 新增 [src/components/bns-evm](../src/components/bns-evm)：`sol!` ABI 绑定、calldata/event 解码、EIP-1559 TX 构造/签名、JSON-RPC helper、round-trip 测试 |
-| Standard / Controller 客户端 | 🟡 基础已完成，SN 迁移未完成 | `src/components/bns-client` 新增 EVM Standard/Controller client、raw TX 提交、unsigned TX helper、托管私钥签名；`sn_bns_controller.rs` 尚未切换到 EVM 提交流程 |
+| Standard / Controller 客户端 | ✅ 已完成 | `src/components/bns-client` 新增 EVM Standard/Controller client、raw TX 提交、unsigned TX helper、托管私钥签名；`sn_bns_controller.rs` 已通过 EVM write backend 切到 Controller Client 自动签名提交，旧 backend 仅保留兼容 |
 | `bns-indexer` → 事件索引器 | 🟡 区块同步器 + 完整投影已落地 | 新增 [sync.rs](../src/components/bns-indexer/src/sync.rs)：轮询 `eth_getLogs` 同步器、last-synced-block 游标、完整读投影重建（names/documents/authority/controller/alias/checkpoint）、`EventLogRecord` 写入；尚缺 `eth_subscribe`/常驻循环/reorg 回滚，`CentralizedBnsRegistry` 状态机仍未下线 |
 | BNS Server 读/写路径改造 | ✅ 已完成 | 新增 `BnsContractServerHandler` / `SqliteBnsServerHttpServer`：写路径 `tx.submit_raw` 转发 `eth_sendRawTransaction`，读路径查 SQLite 投影；旧 `CallAuthority` 写 RPC 在新 handler 中返回 unsupported |
-| SN EVM 配置 | 🟡 配置结构已完成，运行链路未切换 | `SNServerConfig` 新增 `bns_evm` RPC/chainId/合约地址/gas/私钥来源字段；旧 `CallAuthority` 路径仍保留 |
+| SN EVM 配置 | ✅ 已完成 | `SNServerConfig` 新增 `bns_evm` RPC/chainId/合约地址/gas/私钥来源字段；配置存在时 SN 写路径构造 `BnsEvmControllerClient` 并走 EVM Controller 提交 |
 
 ### 与原计划的两处关键偏差（需注意）
 
@@ -128,17 +128,17 @@ BNS(合约) <-> BNS-Indexer <-> BNS-Server <-> BNS-Client <-> BNS-Controller
 - [x] round-trip 测试：calldata 编/解码一致；独立解码自己签的 TX，恢复出的 signer 地址一致。
 - [ ] 后续补 `alloy-node-bindings`/自动部署合约的端到端测试。
 
-## 4. BNS-Client（薄封装）与 BNS-Controller（前置签名逻辑）🟡 基础已完成，SN 写路径迁移未完成
+## 4. BNS-Client（薄封装）与 BNS-Controller（前置签名逻辑）✅ 已完成
 
 > **定位**（见 §0.1）：这两者都在 BNS-Server 之上。**Standard Client = BNS-Client 的默认薄封装形态（不持私钥）**；**Controller Client = BNS-Controller**，即 Client 在"自己持有该资产 control 公钥"时启用的前置签名逻辑。所有自动签名/control 决策都收敛在 Controller，Server 层完全不感知。
-> **现状**：`src/components/bns-client` 已新增 EVM Standard/Controller client（见 [evm.rs](../src/components/bns-client/src/evm.rs)）。旧的 `sn_bns_controller.rs` 仍保留旧 RPC/`CallAuthority` 流程，尚未切换到 EVM TX。
+> **现状**：`src/components/bns-client` 已新增 EVM Standard/Controller client（见 [evm.rs](../src/components/bns-client/src/evm.rs)）。`sn_bns_controller.rs` 已通过 `SnBnsWriteBackend` 接入 EVM Controller Client；配置 `bns_evm` 时 SN 写路径构造 op → Controller 自动查 nonce / 填 TX / 签名 / 提交。旧 RPC backend 仅保留为兼容路径。
 
 - [x] **Standard Client**（= BNS-Client 薄封装，无私钥）：入参为**已签名 raw TX 字节**，`eth_sendRawTransaction` 提交；另提供 `build_calldata`/`build_unsigned_tx` helper 给外部签名方。读走索引器。
 - [x] **Controller Client**（= BNS-Controller，托管私钥，自动签名）：持 secp256k1 私钥，自动查 nonce → 填 chainId/to/gas → ABI 编码 → 签名 → 提交。仅在 Client 判断持有对应 control 公钥时走此路径。
-  - [ ] 迁移 `sn_bns_controller.rs`：删掉手工拼 `CallAuthority`，改为构造 op → Controller Client 自动签名提交。
+  - [x] 迁移 `sn_bns_controller.rs`：通过 EVM write backend 构造合约 op → Controller Client 自动签名提交；旧 `CallAuthority` RPC 写 backend 仅保留兼容。
   - [x] 幂等元数据：`SnBnsWriteRequestStore` 增加 `evm_chain_id` / `evm_nonce` / `evm_tx_hash` / `evm_raw_tx` 字段，避免后续迁移时重复提交信息丢失。
   - [x] nonce 管理基础：Controller Client 本地缓存 pending nonce。
-  - [ ] nonce 管理增强：失败回退重查、并发冲突处理、可选等待回执确认上链。
+  - [x] nonce 管理增强：签名/提交失败回退重查、Controller Client 内串行化提交避免并发 nonce 冲突、可选等待 `eth_getTransactionReceipt` 确认上链与确认数。
 
 ## 5. `bns-indexer` = 真正的事件索引器 🟡 区块同步器 + 完整投影已落地
 
@@ -174,7 +174,7 @@ BNS(合约) <-> BNS-Indexer <-> BNS-Server <-> BNS-Client <-> BNS-Controller
 - [x] `AuthorityKey` 承载 secp256k1 公钥/地址（合约 `keyData` 解析为 20/32 字节地址），授权集投影由 `updateAuthorityKeys` 事件维护（`authoritySeq` / `authorityRoot` / `activeKeyCount`）。
 - [x] owner / controller 校验全部在合约 `require` 里完成。
 - [x] Rust 客户端侧已能构造并签名 EIP-1559 TX；节点负责恢复 signer 并作为合约 `msg.sender`。
-- [ ] SN 写路径仍需从旧 `CallAuthority` RPC 切到 EVM TX 提交。
+- [x] SN 写路径已在 `bns_evm` 配置存在时从旧 `CallAuthority` RPC 切到 EVM TX 提交。
 
 ## 8. 下一步：内嵌 revm（中心化生产形态，可选/后置）
 

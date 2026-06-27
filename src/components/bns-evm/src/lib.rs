@@ -20,7 +20,9 @@ pub use bindings::{
     OwnerResolution, OwnerSource, Principal, PrincipalKind, PurchaseContext, RegisterOptions,
     ReleaseMode, ResolveResult,
 };
-pub use rpc::{BlockRange, EthLog, EthRpcClient, EthTransaction, RpcLogFilter};
+pub use rpc::{
+    BlockRange, EthLog, EthRpcClient, EthTransaction, EthTransactionReceipt, RpcLogFilter,
+};
 pub use tx::{
     build_eip1559_contract_tx, decode_signed_eip1559, encode_call, sign_eip1559_tx,
     signer_from_private_key, BnsEvmError, BnsEvmResult, Eip1559TxParams, SignedEip1559Tx,

@@ -14,10 +14,11 @@ use async_trait::async_trait;
 use bns_client::{
     BnsAuthorityKeyReq, BnsBootstrapNameReq, BnsBootstrapNameResp, BnsClientError, BnsClientResult,
     BnsDocumentReq, BnsDocumentVersionReq, BnsEvmClientConfig, BnsEvmControllerClient,
-    BnsEvmRawTxSubmitter, BnsEvmStandardClient, BnsIndexerApi, BnsNameReq, BnsPublishDocumentReq,
-    BnsPublishDocumentResp, BnsRegisterNameReq, BnsRegisterNameResp, BnsRevokeDocumentReq,
-    BnsRevokeDocumentResp, BnsSetControllerPolicyReq, BnsSetControllerPolicyResp, BnsSubmitRawTxReq,
-    BnsSubmitRawTxResp, BnsUpdateAuthorityKeysReq, BnsUpdateAuthorityKeysResp,
+    BnsEvmRawTxSubmitter, BnsEvmReceiptWaitConfig, BnsEvmStandardClient, BnsIndexerApi, BnsNameReq,
+    BnsPublishDocumentReq, BnsPublishDocumentResp, BnsRegisterNameReq, BnsRegisterNameResp,
+    BnsRevokeDocumentReq, BnsRevokeDocumentResp, BnsSetControllerPolicyReq,
+    BnsSetControllerPolicyResp, BnsSubmitRawTxReq, BnsSubmitRawTxResp, BnsUpdateAuthorityKeysReq,
+    BnsUpdateAuthorityKeysResp,
 };
 use bns_evm::{decode_signed_eip1559, Address};
 use bns_indexer::{
@@ -197,10 +198,18 @@ impl MockEthRpc {
                             }
                             serde_json::Value::String(SERVER_TX_HASH.to_string())
                         }
+                        "eth_getTransactionReceipt" => serde_json::json!({
+                            "transactionHash": SERVER_TX_HASH,
+                            "blockHash": "0x5555555555555555555555555555555555555555555555555555555555555555",
+                            "blockNumber": "0x8",
+                            "transactionIndex": "0x0",
+                            "status": "0x1",
+                            "gasUsed": "0x5208"
+                        }),
+                        "eth_blockNumber" => serde_json::Value::String("0xa".to_string()),
                         _ => serde_json::Value::Null,
                     };
-                    let payload =
-                        serde_json::json!({"jsonrpc":"2.0","id":id,"result":result});
+                    let payload = serde_json::json!({"jsonrpc":"2.0","id":id,"result":result});
                     let body = serde_json::to_string(&payload).unwrap();
                     let response = format!(
                         "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
@@ -290,10 +299,16 @@ async fn controller_auto_nonce_signs_and_submits_via_bns_server() {
         server.clone(),
     );
 
-    let submission = controller.register_name(&register_req("alice")).await.unwrap();
+    let submission = controller
+        .register_name(&register_req("alice"))
+        .await
+        .unwrap();
 
     // 返回的提交回执：from = 托管私钥地址，nonce = 链上 5，chainId = 31337，tx hash 来自 server。
-    assert_eq!(submission.from.to_lowercase(), format!("{ANVIL_ADDRESS:#x}"));
+    assert_eq!(
+        submission.from.to_lowercase(),
+        format!("{ANVIL_ADDRESS:#x}")
+    );
     assert_eq!(submission.nonce, 5);
     assert_eq!(submission.chain_id, 31_337);
     assert_eq!(submission.tx_hash, SERVER_TX_HASH);
@@ -319,8 +334,14 @@ async fn controller_increments_nonce_across_consecutive_writes() {
         server.clone(),
     );
 
-    let first = controller.register_name(&register_req("alice")).await.unwrap();
-    let second = controller.register_name(&register_req("bob")).await.unwrap();
+    let first = controller
+        .register_name(&register_req("alice"))
+        .await
+        .unwrap();
+    let second = controller
+        .register_name(&register_req("bob"))
+        .await
+        .unwrap();
     assert_eq!(first.nonce, 5);
     assert_eq!(second.nonce, 6, "nonce must increment for the next write");
 
@@ -328,6 +349,55 @@ async fn controller_increments_nonce_across_consecutive_writes() {
     assert_eq!(received.len(), 2);
     assert_eq!(decode_signed_eip1559(&received[0]).unwrap().tx().nonce, 5);
     assert_eq!(decode_signed_eip1559(&received[1]).unwrap().tx().nonce, 6);
+}
+
+#[tokio::test]
+async fn controller_serializes_concurrent_writes_for_nonce_allocation() {
+    let eth = MockEthRpc::start(5).await;
+    let server = Arc::new(CapturingBnsServer::new());
+    let controller = Arc::new(BnsEvmControllerClient::new_with_bns_server_submitter(
+        config(&eth.endpoint),
+        Arc::new(bns_client::StaticBnsEvmKeyManager::new(ANVIL_PRIVATE_KEY).unwrap()),
+        server.clone(),
+    ));
+
+    let alice_controller = controller.clone();
+    let bob_controller = controller.clone();
+    let (alice, bob) = tokio::join!(
+        async move { alice_controller.register_name(&register_req("alice")).await },
+        async move { bob_controller.register_name(&register_req("bob")).await },
+    );
+    let mut nonces = vec![alice.unwrap().nonce, bob.unwrap().nonce];
+    nonces.sort_unstable();
+
+    assert_eq!(nonces, vec![5, 6]);
+    assert_eq!(server.received().len(), 2);
+}
+
+#[tokio::test]
+async fn controller_can_wait_for_receipt_confirmations() {
+    let eth = MockEthRpc::start(5).await;
+    let server = Arc::new(CapturingBnsServer::new());
+    let controller = BnsEvmControllerClient::new_with_bns_server_submitter(
+        config(&eth.endpoint),
+        Arc::new(bns_client::StaticBnsEvmKeyManager::new(ANVIL_PRIVATE_KEY).unwrap()),
+        server,
+    )
+    .with_receipt_wait(Some(BnsEvmReceiptWaitConfig {
+        timeout_ms: 1_000,
+        poll_interval_ms: 1,
+        confirmations: 3,
+        require_success: true,
+    }));
+
+    let submission = controller
+        .register_name(&register_req("alice"))
+        .await
+        .unwrap();
+
+    assert_eq!(submission.receipt_status, Some(1));
+    assert_eq!(submission.receipt_block_number, Some(8));
+    assert_eq!(submission.receipt_confirmations, Some(3));
 }
 
 #[tokio::test]
@@ -401,11 +471,7 @@ async fn controller_resets_cached_nonce_after_submission_failure() {
         ) -> BnsClientResult<BnsUpdateAuthorityKeysResp> {
             unused("update_authority_keys")
         }
-        async fn list_events(
-            &self,
-            _f: u64,
-            _l: usize,
-        ) -> BnsClientResult<Vec<EventLogRecord>> {
+        async fn list_events(&self, _f: u64, _l: usize) -> BnsClientResult<Vec<EventLogRecord>> {
             unused("list_events")
         }
         async fn latest_checkpoint(&self) -> BnsClientResult<Option<LogCheckpoint>> {
@@ -419,11 +485,17 @@ async fn controller_resets_cached_nonce_after_submission_failure() {
         Arc::new(FailingServer),
     );
 
-    let err = controller.register_name(&register_req("alice")).await.unwrap_err();
+    let err = controller
+        .register_name(&register_req("alice"))
+        .await
+        .unwrap_err();
     assert!(matches!(err, BnsClientError::Transport(_)));
 
     // 缓存已回退：下一笔重新从链上取 nonce（仍是 5）。
-    let err2 = controller.register_name(&register_req("bob")).await.unwrap_err();
+    let err2 = controller
+        .register_name(&register_req("bob"))
+        .await
+        .unwrap_err();
     assert!(matches!(err2, BnsClientError::Transport(_)));
 }
 
@@ -450,7 +522,10 @@ async fn controller_with_explicit_chain_rpc_submitter_uses_chain() {
         .unwrap()
         .with_raw_tx_submitter(BnsEvmRawTxSubmitter::ChainRpc);
 
-    let submission = controller.register_name(&register_req("alice")).await.unwrap();
+    let submission = controller
+        .register_name(&register_req("alice"))
+        .await
+        .unwrap();
     assert_eq!(submission.nonce, 2);
     assert_eq!(submission.tx_hash, SERVER_TX_HASH);
 
@@ -460,7 +535,10 @@ async fn controller_with_explicit_chain_rpc_submitter_uses_chain() {
     assert_eq!(sent[0].to_lowercase(), submission.raw_tx.to_lowercase());
     let raw_bytes = hex::decode(sent[0].trim_start_matches("0x")).unwrap();
     assert_eq!(
-        decode_signed_eip1559(&raw_bytes).unwrap().recover_signer().unwrap(),
+        decode_signed_eip1559(&raw_bytes)
+            .unwrap()
+            .recover_signer()
+            .unwrap(),
         ANVIL_ADDRESS
     );
 }

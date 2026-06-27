@@ -92,6 +92,22 @@ pub struct EthTransaction {
     pub transaction_index: Option<u64>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EthTransactionReceipt {
+    pub transaction_hash: B256,
+    #[serde(default)]
+    pub block_hash: Option<B256>,
+    #[serde(default, deserialize_with = "deserialize_optional_quantity")]
+    pub block_number: Option<u64>,
+    #[serde(default, deserialize_with = "deserialize_optional_quantity")]
+    pub transaction_index: Option<u64>,
+    #[serde(default, deserialize_with = "deserialize_optional_quantity")]
+    pub status: Option<u64>,
+    #[serde(default, deserialize_with = "deserialize_optional_quantity")]
+    pub gas_used: Option<u64>,
+}
+
 #[derive(Debug, Clone)]
 pub struct EthRpcClient {
     endpoint: String,
@@ -177,7 +193,15 @@ impl EthRpcClient {
     }
 
     pub async fn transaction_by_hash(&self, tx_hash: B256) -> BnsEvmResult<Option<EthTransaction>> {
-        self.call("eth_getTransactionByHash", json!([hex_b256(tx_hash)]))
+        self.call_nullable("eth_getTransactionByHash", json!([hex_b256(tx_hash)]))
+            .await
+    }
+
+    pub async fn transaction_receipt(
+        &self,
+        tx_hash: B256,
+    ) -> BnsEvmResult<Option<EthTransactionReceipt>> {
+        self.call_nullable("eth_getTransactionReceipt", json!([hex_b256(tx_hash)]))
             .await
     }
 
@@ -185,6 +209,29 @@ impl EthRpcClient {
     where
         R: DeserializeOwned,
     {
+        let value = self.call_value(method, params).await?;
+        if value.is_null() {
+            return Err(BnsEvmError::Rpc(
+                "JSON-RPC response missing result".to_string(),
+            ));
+        }
+        serde_json::from_value(value).map_err(|err| BnsEvmError::Rpc(err.to_string()))
+    }
+
+    pub async fn call_nullable<R>(&self, method: &str, params: Value) -> BnsEvmResult<Option<R>>
+    where
+        R: DeserializeOwned,
+    {
+        let value = self.call_value(method, params).await?;
+        if value.is_null() {
+            return Ok(None);
+        }
+        serde_json::from_value(value)
+            .map(Some)
+            .map_err(|err| BnsEvmError::Rpc(err.to_string()))
+    }
+
+    async fn call_value(&self, method: &str, params: Value) -> BnsEvmResult<Value> {
         let request = RpcRequest {
             jsonrpc: "2.0",
             id: 1,
@@ -200,7 +247,7 @@ impl EthRpcClient {
             .map_err(|err| BnsEvmError::Rpc(err.to_string()))?
             .error_for_status()
             .map_err(|err| BnsEvmError::Rpc(err.to_string()))?
-            .json::<RpcResponse<R>>()
+            .json::<RpcResponse>()
             .await
             .map_err(|err| BnsEvmError::Rpc(err.to_string()))?;
 
@@ -210,9 +257,7 @@ impl EthRpcClient {
                 error.message, error.code
             )));
         }
-        response
-            .result
-            .ok_or_else(|| BnsEvmError::Rpc("JSON-RPC response missing result".to_string()))
+        Ok(response.result)
     }
 }
 
@@ -225,8 +270,9 @@ struct RpcRequest<'a> {
 }
 
 #[derive(Debug, Deserialize)]
-struct RpcResponse<T> {
-    result: Option<T>,
+struct RpcResponse {
+    #[serde(default)]
+    result: Value,
     error: Option<RpcError>,
 }
 

@@ -9,9 +9,9 @@ use bns_evm::{
     AuthorityKeyUpdate as EvmAuthorityKeyUpdate, AuthorityRole as EvmAuthorityRole, Bns,
     BnsEvmError, Bytes, CallAuthority as EvmCallAuthority, ControllerRule as EvmControllerRule,
     DocumentRef as EvmDocumentRef, DocumentUpdate as EvmDocumentUpdate, Eip1559TxParams,
-    EthRpcClient, MutationGuard as EvmMutationGuard, Principal as EvmPrincipal,
-    PrincipalKind as EvmPrincipalKind, RegisterOptions as EvmRegisterOptions, SignedEip1559Tx,
-    SolCall, TxEip1559, B256, U256,
+    EthRpcClient, EthTransactionReceipt, MutationGuard as EvmMutationGuard,
+    Principal as EvmPrincipal, PrincipalKind as EvmPrincipalKind,
+    RegisterOptions as EvmRegisterOptions, SignedEip1559Tx, SolCall, TxEip1559, B256, U256,
 };
 use bns_indexer::{
     AuthorityKey, AuthorityKeyStatus, AuthorityKeyUpdate, AuthorityRole, CallAuthority,
@@ -19,6 +19,7 @@ use bns_indexer::{
     RegisterOptions,
 };
 use serde::{Deserialize, Serialize};
+use tokio::time::{sleep, Duration, Instant};
 
 use crate::{
     BnsBootstrapNameReq, BnsClientError, BnsClientResult, BnsIndexerApi, BnsPublishDocumentReq,
@@ -88,6 +89,39 @@ pub struct BnsEvmTxSubmission {
     pub from: String,
     pub nonce: u64,
     pub chain_id: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receipt_status: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receipt_block_number: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receipt_confirmations: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BnsEvmTxReceipt {
+    pub tx_hash: String,
+    pub status: Option<u64>,
+    pub block_number: u64,
+    pub confirmations: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BnsEvmReceiptWaitConfig {
+    pub timeout_ms: u64,
+    pub poll_interval_ms: u64,
+    pub confirmations: u64,
+    pub require_success: bool,
+}
+
+impl BnsEvmReceiptWaitConfig {
+    pub fn included() -> Self {
+        Self {
+            timeout_ms: 30_000,
+            poll_interval_ms: 500,
+            confirmations: 1,
+            require_success: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -284,6 +318,8 @@ pub struct BnsEvmControllerClient {
     raw_tx_submitter: BnsEvmRawTxSubmitter,
     default_signer_address: Option<Address>,
     next_nonces: Mutex<HashMap<Address, u64>>,
+    submission_lock: tokio::sync::Mutex<()>,
+    receipt_wait: Option<BnsEvmReceiptWaitConfig>,
 }
 
 impl BnsEvmControllerClient {
@@ -335,6 +371,8 @@ impl BnsEvmControllerClient {
             raw_tx_submitter,
             default_signer_address,
             next_nonces: Mutex::new(HashMap::new()),
+            submission_lock: tokio::sync::Mutex::new(()),
+            receipt_wait: None,
         }
     }
 
@@ -363,6 +401,11 @@ impl BnsEvmControllerClient {
         self
     }
 
+    pub fn with_receipt_wait(mut self, receipt_wait: Option<BnsEvmReceiptWaitConfig>) -> Self {
+        self.receipt_wait = receipt_wait;
+        self
+    }
+
     pub fn signer_address(&self) -> Option<Address> {
         self.default_signer_address
     }
@@ -386,9 +429,16 @@ impl BnsEvmControllerClient {
         call: &C,
     ) -> BnsClientResult<BnsEvmTxSubmission> {
         let signer_address = self.key_manager.signer_address(request).await?;
+        let _submission_guard = self.submission_lock.lock().await;
         let nonce = self.next_nonce(signer_address).await?;
         let tx = self.standard.build_unsigned_tx(call, nonce)?;
-        let signed = self.key_manager.sign_transaction(request, tx).await?;
+        let signed = match self.key_manager.sign_transaction(request, tx).await {
+            Ok(signed) => signed,
+            Err(error) => {
+                self.reset_nonce(signer_address);
+                return Err(error);
+            }
+        };
         if signed.signer != signer_address {
             self.reset_nonce(signer_address);
             return Err(BnsClientError::Serialization(format!(
@@ -398,18 +448,82 @@ impl BnsEvmControllerClient {
         }
 
         match self.submit_raw_tx(&signed.raw_tx).await {
-            Ok(tx_hash) => Ok(BnsEvmTxSubmission {
-                tx_hash,
-                raw_tx: format!("0x{}", hex::encode(&signed.raw_tx)),
-                from: format!("{:#x}", signed.signer),
-                nonce: signed.nonce,
-                chain_id: signed.chain_id,
-            }),
+            Ok(tx_hash) => {
+                let receipt = match self.receipt_wait {
+                    Some(config) => Some(self.wait_for_receipt(tx_hash.as_str(), config).await?),
+                    None => None,
+                };
+                Ok(BnsEvmTxSubmission {
+                    tx_hash,
+                    raw_tx: format!("0x{}", hex::encode(&signed.raw_tx)),
+                    from: format!("{:#x}", signed.signer),
+                    nonce: signed.nonce,
+                    chain_id: signed.chain_id,
+                    receipt_status: receipt.as_ref().and_then(|receipt| receipt.status),
+                    receipt_block_number: receipt.as_ref().map(|receipt| receipt.block_number),
+                    receipt_confirmations: receipt.as_ref().map(|receipt| receipt.confirmations),
+                })
+            }
             Err(error) => {
                 self.reset_nonce(signer_address);
                 Err(error)
             }
         }
+    }
+
+    pub async fn wait_for_receipt(
+        &self,
+        tx_hash: &str,
+        config: BnsEvmReceiptWaitConfig,
+    ) -> BnsClientResult<BnsEvmTxReceipt> {
+        let tx_hash_value = parse_b256(tx_hash, "tx_hash")?;
+        let required_confirmations = config.confirmations.max(1);
+        let poll_interval = Duration::from_millis(config.poll_interval_ms.max(1));
+        let deadline = Instant::now() + Duration::from_millis(config.timeout_ms.max(1));
+
+        loop {
+            if let Some(receipt) = self
+                .standard
+                .rpc
+                .transaction_receipt(tx_hash_value)
+                .await
+                .map_err(BnsClientError::from)?
+            {
+                if let Some(block_number) = receipt.block_number {
+                    let confirmations = self.receipt_confirmations(block_number).await?;
+                    if confirmations >= required_confirmations {
+                        if config.require_success && receipt.status == Some(0) {
+                            return Err(BnsClientError::registry(
+                                "EVM_TX_REVERTED",
+                                format!("BNS EVM tx {tx_hash} reverted"),
+                            ));
+                        }
+                        return Ok(receipt_to_submission_receipt(
+                            tx_hash,
+                            receipt,
+                            confirmations,
+                        ));
+                    }
+                }
+            }
+
+            if Instant::now() >= deadline {
+                return Err(BnsClientError::Transport(format!(
+                    "timed out waiting for BNS EVM tx receipt {tx_hash}"
+                )));
+            }
+            sleep(poll_interval).await;
+        }
+    }
+
+    async fn receipt_confirmations(&self, block_number: u64) -> BnsClientResult<u64> {
+        let latest = self
+            .standard
+            .rpc
+            .block_number()
+            .await
+            .map_err(BnsClientError::from)?;
+        Ok(latest.saturating_sub(block_number) + 1)
     }
 
     async fn submit_raw_tx(&self, raw_tx: &[u8]) -> BnsClientResult<String> {
@@ -814,13 +928,17 @@ fn parse_address_or_zero(value: &str, field: &str) -> BnsClientResult<Address> {
     }
 }
 
+fn parse_b256(value: &str, field: &str) -> BnsClientResult<B256> {
+    B256::from_str(value).map_err(|err| {
+        BnsClientError::Serialization(format!("invalid {field} bytes32 `{value}`: {err}"))
+    })
+}
+
 fn parse_b256_or_zero(value: &str, field: &str) -> BnsClientResult<B256> {
     if value.is_empty() {
         return Ok(B256::ZERO);
     }
-    B256::from_str(value).map_err(|err| {
-        BnsClientError::Serialization(format!("invalid {field} bytes32 `{value}`: {err}"))
-    })
+    parse_b256(value, field)
 }
 
 fn bytes32_label_or_hash(value: &str, field: &str) -> BnsClientResult<B256> {
@@ -839,4 +957,17 @@ fn bytes32_label_or_hash(value: &str, field: &str) -> BnsClientResult<B256> {
     let mut out = [0u8; 32];
     out[..bytes.len()].copy_from_slice(bytes);
     Ok(B256::from(out))
+}
+
+fn receipt_to_submission_receipt(
+    tx_hash: &str,
+    receipt: EthTransactionReceipt,
+    confirmations: u64,
+) -> BnsEvmTxReceipt {
+    BnsEvmTxReceipt {
+        tx_hash: tx_hash.to_string(),
+        status: receipt.status,
+        block_number: receipt.block_number.unwrap_or_default(),
+        confirmations,
+    }
 }
