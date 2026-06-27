@@ -9,7 +9,7 @@
 ## 实现现状
 
 第一阶段（私链环境 + 合约）已落地，代码在 **`src/apps/bns`**（Foundry 工程，非原计划的 `contracts/`）。
-EVM 客户端基础层与索引器事件投影已部分落地；BNS Server 已切到 raw TX + 投影读模型，SN 写路径仍未完全切到 EVM。
+EVM 客户端基础层与索引器事件投影已落地；BNS Server 已切到 raw TX + 投影读模型，SN 写路径仍未完全切到 EVM。
 
 | 模块 | 状态 | 说明 |
 | --- | --- | --- |
@@ -19,7 +19,7 @@ EVM 客户端基础层与索引器事件投影已部分落地；BNS Server 已�
 | 链上 smoke 流程 | ✅ 已完成 | [script/Smoke.s.sol](../src/apps/bns/script/Smoke.s.sol)：部署 → registerName → publishDocument → resolveDocument |
 | `bns-evm` crate（alloy 绑定 + TX 构造/签名） | ✅ 基础已完成 | 新增 [src/components/bns-evm](../src/components/bns-evm)：`sol!` ABI 绑定、calldata/event 解码、EIP-1559 TX 构造/签名、JSON-RPC helper、round-trip 测试 |
 | Standard / Controller 客户端 | ✅ 已完成 | `src/components/bns-client` 新增 EVM Standard/Controller client、raw TX 提交、unsigned TX helper、托管私钥签名；`sn_bns_controller.rs` 已通过 EVM write backend 切到 Controller Client 自动签名提交，旧 backend 仅保留兼容 |
-| `bns-indexer` → 事件索引器 | 🟡 区块同步器 + 完整投影已落地 | 新增 [sync.rs](../src/components/bns-indexer/src/sync.rs)：轮询 `eth_getLogs` 同步器、last-synced-block 游标、完整读投影重建（names/documents/authority/controller/alias/checkpoint）、`EventLogRecord` 写入；尚缺 `eth_subscribe`/常驻循环/reorg 回滚，`CentralizedBnsRegistry` 状态机仍未下线 |
+| `bns-indexer` → 事件索引器 | ✅ 已完成 | [sync.rs](../src/components/bns-indexer/src/sync.rs)：轮询 `eth_getLogs` 同步器、常驻 polling driver、last-synced-block+block-hash 游标、reorg 检测后重放、完整读投影重建（names/documents/authority/controller/alias/checkpoint）、`EventLogRecord` 写入；`CentralizedBnsRegistry::new` 默认只读，旧状态机写路径仅保留隐藏 legacy 测试入口 |
 | BNS Server 读/写路径改造 | ✅ 已完成 | 新增 `BnsContractServerHandler` / `SqliteBnsServerHttpServer`：写路径 `tx.submit_raw` 转发 `eth_sendRawTransaction`，读路径查 SQLite 投影；旧 `CallAuthority` 写 RPC 在新 handler 中返回 unsupported |
 | SN EVM 配置 | ✅ 已完成 | `SNServerConfig` 新增 `bns_evm` RPC/chainId/合约地址/gas/私钥来源字段；配置存在时 SN 写路径构造 `BnsEvmControllerClient` 并走 EVM Controller 提交 |
 
@@ -73,7 +73,7 @@ BNS(合约) <-> BNS-Indexer <-> BNS-Server <-> BNS-Client <-> BNS-Controller
 
 **本质变化**：
 - 权威源：`Rust 状态机` → **`Bns.sol` 合约**。✅ 合约侧已成立（链上 `_names`/`_documents`/`_authoritySets` 等即权威状态）。
-- `bns-indexer`：`状态机+存储` → **事件索引器**。🟡 区块同步器（轮询 `eth_getLogs`）+ 完整读投影重建已落地；常驻循环 / `eth_subscribe` / reorg 回滚仍待完成，旧状态机尚未下线。
+- `bns-indexer`：`状态机+存储` → **事件索引器**。✅ 轮询 `eth_getLogs` 同步器 + 常驻 polling driver + 完整读投影重建 + block-hash reorg 检测/重放已落地；默认构造已是只读投影 facade，旧状态机写路径下线。
 - `bns-server`：`状态机 HTTP 包装` → **标准智能合约处理器**：只处理 TX（转发已签 raw TX）和读（查索引器投影），不签名、不含 control 逻辑。✅ 新 handler 已落地。
 - 鉴权：不再由 server 端 `ecrecover` 或信任传入的 `CallAuthority`；**节点恢复 sender，合约用 `msg.sender` 做 `require` 访问控制**——✅ 合约侧已成立（`CallAuthority` 仅作 role/kid 提示，地址必须 == `msg.sender`）。Rust 客户端侧已能构造/签名 EVM TX，但 SN/BNS Server 写路径尚未完全迁移。
 
@@ -140,23 +140,23 @@ BNS(合约) <-> BNS-Indexer <-> BNS-Server <-> BNS-Client <-> BNS-Controller
   - [x] nonce 管理基础：Controller Client 本地缓存 pending nonce。
   - [x] nonce 管理增强：签名/提交失败回退重查、Controller Client 内串行化提交避免并发 nonce 冲突、可选等待 `eth_getTransactionReceipt` 确认上链与确认数。
 
-## 5. `bns-indexer` = 真正的事件索引器 🟡 区块同步器 + 完整投影已落地
+## 5. `bns-indexer` = 真正的事件索引器 ✅ 已完成
 
 > 状态权威在合约；indexer 只**读链、建索引、供查询**，不再有任何 mutation/validate 逻辑。
-> **现状**：已新增 [sync.rs](../src/components/bns-indexer/src/sync.rs) 区块同步器 `BnsContractEventIndexer`。`sync_once()`（[sync.rs:164](../src/components/bns-indexer/src/sync.rs:164)）完成一轮链→投影同步：
-> 校验链 `chain_id` → 取最新块并按 `confirmations` 回退 → 读游标定起始块 → 按 `max_block_span` 分片 `eth_getLogs` → 逐日志投影。
-> `CentralizedBnsRegistry` 状态机（[registry.rs](../src/components/bns-indexer/src/registry.rs)）仍保留，未下线。
+> **现状**：[sync.rs](../src/components/bns-indexer/src/sync.rs) 的 `BnsContractEventIndexer` 已完成链→投影同步与常驻 polling driver。`sync_once()` 完成一轮：
+> 校验链 `chain_id` → 取最新块并按 `confirmations` 回退 → 校验游标 block hash/reorg → 读游标定起始块 → 按 `max_block_span` 分片 `eth_getLogs` → 逐日志投影 → 写入带 block hash 的游标。
+> `CentralizedBnsRegistry::new` 默认只读；旧状态机写路径仅通过隐藏 `new_legacy_state_machine` 给历史测试使用。
 
-- [ ] **删除/下线**现有状态机写路径：`registry.rs` 的 mutation、`validate_actor_key`、`authorize_owner_*`、以及作为入参的 `CallAuthority`（见 §10）。
-- [x] 同步器（**轮询版**）：`BnsContractEventIndexer::sync_once` 按合约地址过滤、按 `max_block_span` 分片轮询 `eth_getLogs`，用 `bns-evm` event 绑定解码。`eth_subscribe`(logs) 推送版与常驻循环 driver 暂未实现（当前是单次同步，需外层调度反复调用）。
+- [x] **删除/下线**现有状态机写路径：`registry.rs` 的 mutation / `validate_actor_key` / `authorize_owner_*` 不再是默认可达权威路径；`CentralizedBnsRegistry::new` 对所有写入口返回 `UNSUPPORTED_OPERATION`，读方法只查投影。历史状态机仅保留隐藏 legacy 构造函数供旧测试覆盖。
+- [x] 同步器（**轮询版**）：`BnsContractEventIndexer::sync_once` 按合约地址过滤、按 `max_block_span` 分片轮询 `eth_getLogs`，用 `bns-evm` event 绑定解码；`run_polling_loop` 提供 crate 内常驻 driver，`bns-dv serve` 已改为使用该 driver。`eth_subscribe(logs)` 推送版不作为本阶段必要路径。
 - [x] 合约事件解码/投影基础：用 `bns-evm` event 绑定解码日志，将 `ProtocolEvent` 与专用事件投影为现有 `RegistryEvent` / `EventLogRecord`。
 - [x] 重建完整索引投影：复用现有 SQLite schema 作为**只读投影表**（names / documents / authority set+keys / controller policy / alias / checkpoint），由 `projection_for_record`（[sync.rs:280](../src/components/bns-indexer/src/sync.rs:280)）写入；事件 + projection 在同一 `store.transact` 内原子落库，不再是权威存储。
   - ⚠️ **设计要点（非纯事件回放）**：投影采用**混合**策略——事件只用来定位"哪个 name/doc 变了"，随后通过 `eth_call`（`queryNameState` / `getDocumentVersion` / `getAuthoritySet` / `getAlias` / `latestCheckpoint`）拉取**当前权威状态**，并对 authority key / controller rule 解码原始 calldata（`decode_bns_call`，按 tx hash 缓存）补全事件未携带的入参。即"投影=最新状态快照"，而非按事件流逐条回放历史。
-- [x] 同步进度游标：新增 `bns_indexer_cursors` 表与 `IndexerCursor`（按 `source_id = evm:{network}:{chainId}:{contract}` 作用域隔离），记录 last-synced-block；合约重部署后换 contract 地址即换 source，可从 `start_block` 从 0 重放。
-- [ ] reorg 处理：当前仅靠 `confirmations` 回退深度规避；游标虽预留 `block_hash` 字段但**未做 reorg 检测/回滚**（私链一般无 reorg，留作后续）。
+- [x] 同步进度游标：`bns_indexer_cursors` 表与 `IndexerCursor`（按 `source_id = evm:{network}:{chainId}:{contract}` 作用域隔离）记录 last-synced-block + block hash；合约重部署后换 contract 地址即换 source，可从 `start_block` 重放。
+- [x] reorg 处理：同步前通过 `eth_getBlockByNumber` 校验游标块 hash；发现 hash 不匹配或游标块高于链头时清空当前投影和该 source 游标，从 `start_block` 按 canonical chain 重放。当前 SQLite 投影表未按 source 分区，因此 reset 会清空全局读投影，避免 fork 状态残留。
 - [x] `EventLogRecord` 基础写入：由链上 `ProtocolEvent` 的 `seq` / `previousLogRoot` / `logRoot` 派生并经 `put_event_record` 写入 `bns_events`。
 - [x] `LogCheckpoint` 对齐：监听 `LogCheckpointPublished` 后 `eth_call` `latestCheckpoint` 读取并 upsert（`put_checkpoint` 已支持 `ON CONFLICT(last_seq)` 覆盖）。
-- [x] BNS Server 保留现有**读 API**（query_name_state / resolve_owner / resolve_document / get_authority_* / list_events / latest_checkpoint），新 `BnsContractServerHandler` 已改为查索引投影。`bns-indexer` crate 内 `CentralizedBnsRegistry` 旧状态机仍待 §10 下线。
+- [x] BNS Server 保留现有**读 API**（query_name_state / resolve_owner / resolve_document / get_authority_* / list_events / latest_checkpoint），新 `BnsContractServerHandler` 已改为查索引投影；旧 `CallAuthority` 写 RPC 返回 unsupported，默认 `CentralizedBnsRegistry` 不再接受本地写。
 
 ## 6. BNS Server = 标准智能合约处理器（TX + 读）✅ 已完成
 
@@ -197,11 +197,11 @@ BNS(合约) <-> BNS-Indexer <-> BNS-Server <-> BNS-Client <-> BNS-Controller
 - [x] `bns-server` 标准合约处理器测试：投影读、旧 `CallAuthority` 写 RPC 禁用、raw TX 转发到 `eth_sendRawTransaction`。
 - [ ] 端到端集成：`alloy-node-bindings` 拉起 anvil → 部署 `Bns.sol` → Controller Client 提交 → `sync_once` 同步 → 读 API 命中。**未开始**（`sync_once` 已就绪，仍缺活节点 e2e）。
 - [ ] 防重放/隔离：合约侧已含 `block.chainid`+`address(this)` 隔离与 guard；nonce 重放 / chainId 不匹配的 TX 级测试待 §3/§4 落地后补。
-- [ ] 合约重部署 → 索引器从 0 重放一致性。**未测**：游标已按 `source_id`（含 contract 地址）隔离，重部署即换 source、从 `start_block` 重放，机制已就绪但缺验证用例。
+- [x] 合约重部署 → 索引器从 0 重放一致性：`bns-indexer` mock RPC 测试已覆盖换 contract 地址即换 source、旧游标不串扰、新 source 从 `start_block` 重放。
 
 ## 10. 收尾
 
-- [ ] 移除 `bns-indexer` 的状态机写逻辑与 `CentralizedBnsRegistry` 权威语义（降级为索引投影或删除）。
+- [x] 移除 `bns-indexer` 的状态机写逻辑与 `CentralizedBnsRegistry` 权威语义：默认构造降级为只读投影 facade，所有写入口返回 `UNSUPPORTED_OPERATION`；旧状态机仅保留隐藏 legacy 测试入口。
 - [ ] 更新 `doc/BNS 智能合约接口设计.md`、SN 文档：权威源=合约、indexer=事件索引器、两客户端模型。
 - [x] `SNServerConfig` 新增链 RPC / chainId / 合约地址 / controller 私钥来源 / gas 配置字段。
 - [ ] 去掉裸 `CallAuthority` 配置/写路径，并接入 Controller Client。

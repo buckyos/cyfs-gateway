@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::str::FromStr;
+use std::time::Duration;
 
 use bns_evm::{
     decode_bns_call, Address, AliasKind as EvmAliasKind, AliasState as EvmAliasState,
@@ -118,6 +119,7 @@ pub struct BnsIndexerSyncOutcome {
     pub latest_block: u64,
     pub from_block: u64,
     pub to_block: Option<u64>,
+    pub reorg_detected: bool,
     pub logs_seen: usize,
     pub protocol_events_seen: usize,
     pub registry_events_stored: usize,
@@ -171,6 +173,7 @@ where
         }
 
         let latest_block = self.rpc.block_number().await?;
+        let reorg_detected = self.reset_projection_if_reorged(latest_block).await?;
         let target_block = latest_block.saturating_sub(self.config.confirmations);
         let from_block = self.next_block_to_sync()?;
         if from_block > target_block {
@@ -181,6 +184,7 @@ where
                 latest_block,
                 from_block,
                 to_block: None,
+                reorg_detected,
                 logs_seen: 0,
                 protocol_events_seen: 0,
                 registry_events_stored: 0,
@@ -221,10 +225,11 @@ where
             }
         }
 
+        let block_hash = self.block_hash_string(to_block).await?;
         let cursor = IndexerCursor {
             source: self.source.clone(),
             block_number: to_block,
-            block_hash: None,
+            block_hash: Some(block_hash),
             log_index: i64::MAX as u64,
             updated_at: now_timestamp(),
         };
@@ -237,11 +242,27 @@ where
             latest_block,
             from_block,
             to_block: Some(to_block),
+            reorg_detected,
             logs_seen: logs.len(),
             protocol_events_seen,
             registry_events_stored,
             cursor: Some(cursor),
         })
+    }
+
+    pub async fn run_polling_loop<F>(&self, interval: Duration, mut on_sync: F)
+    where
+        F: FnMut(BnsRegistryResult<BnsIndexerSyncOutcome>),
+    {
+        let interval = if interval.is_zero() {
+            Duration::from_millis(1)
+        } else {
+            interval
+        };
+        loop {
+            on_sync(self.sync_once().await);
+            tokio::time::sleep(interval).await;
+        }
     }
 
     fn next_block_to_sync(&self) -> BnsRegistryResult<u64> {
@@ -255,6 +276,55 @@ where
     fn cursor(&self) -> BnsRegistryResult<Option<IndexerCursor>> {
         self.store
             .transact(|tx| tx.get_indexer_cursor(&self.source))
+    }
+
+    async fn reset_projection_if_reorged(&self, latest_block: u64) -> BnsRegistryResult<bool> {
+        let Some(mut cursor) = self.cursor()? else {
+            return Ok(false);
+        };
+
+        let should_reset = if cursor.block_number > latest_block {
+            true
+        } else if let Some(expected_hash) = cursor.block_hash.as_deref() {
+            self.block_hash_string(cursor.block_number).await? != expected_hash
+        } else {
+            cursor.block_hash = Some(self.block_hash_string(cursor.block_number).await?);
+            cursor.updated_at = now_timestamp();
+            self.store.transact(|tx| tx.put_indexer_cursor(&cursor))?;
+            false
+        };
+
+        if should_reset {
+            self.store
+                .transact(|tx| tx.reset_indexer_projection(&self.source))?;
+        }
+        Ok(should_reset)
+    }
+
+    async fn block_hash_string(&self, block_number: u64) -> BnsRegistryResult<String> {
+        let block = self
+            .rpc
+            .block_by_number(block_number)
+            .await?
+            .ok_or_else(|| {
+                BnsRegistryError::InvalidConfig(format!(
+                    "BNS indexer cannot read block {block_number} from RPC {}",
+                    self.config.source.rpc_endpoint
+                ))
+            })?;
+        if let Some(actual_number) = block.number {
+            if actual_number != block_number {
+                return Err(BnsRegistryError::InvalidConfig(format!(
+                    "BNS indexer requested block {block_number}, RPC returned block {actual_number}"
+                )));
+            }
+        }
+        block.hash.map(hash_string).ok_or_else(|| {
+            BnsRegistryError::InvalidConfig(format!(
+                "BNS indexer block {block_number} from RPC {} has no hash",
+                self.config.source.rpc_endpoint
+            ))
+        })
     }
 
     async fn decoded_call_for_log(

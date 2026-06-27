@@ -69,4 +69,5 @@ pub trait BnsRegistryStoreTx {
 
     fn get_indexer_cursor(&mut self, source: &str) -> BnsRegistryResult<Option<IndexerCursor>>;
     fn put_indexer_cursor(&mut self, cursor: &IndexerCursor) -> BnsRegistryResult<()>;
+    fn reset_indexer_projection(&mut self, source: &str) -> BnsRegistryResult<()>;
 }

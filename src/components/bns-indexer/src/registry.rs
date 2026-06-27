@@ -21,6 +21,7 @@ where
     S: BnsRegistryStore,
 {
     store: S,
+    writes_enabled: bool,
 }
 
 impl<S> CentralizedBnsRegistry<S>
@@ -28,11 +29,32 @@ where
     S: BnsRegistryStore,
 {
     pub fn new(store: S) -> Self {
-        Self { store }
+        Self {
+            store,
+            writes_enabled: false,
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn new_legacy_state_machine(store: S) -> Self {
+        Self {
+            store,
+            writes_enabled: true,
+        }
     }
 
     pub fn store(&self) -> &S {
         &self.store
+    }
+
+    fn ensure_write_path(&self, operation: &'static str) -> BnsRegistryResult<()> {
+        if self.writes_enabled {
+            Ok(())
+        } else {
+            Err(BnsRegistryError::UnsupportedOperation(format!(
+                "CentralizedBnsRegistry no longer accepts `{operation}` writes; submit a signed EVM raw TX and let bns-indexer rebuild the read projection from contract events"
+            )))
+        }
     }
 
     pub fn query_name_state(&self, name: &str) -> BnsRegistryResult<Option<NameState>> {
@@ -197,6 +219,7 @@ where
         authority: CallAuthority,
         guard: MutationGuard,
     ) -> BnsRegistryResult<u64> {
+        self.ensure_write_path("register_name")?;
         let name = canonical_bns_name(name)?;
         ensure_registerable_depth(&name)?;
         if asset_owner.is_empty() {
@@ -306,6 +329,7 @@ where
         authority: CallAuthority,
         guard: MutationGuard,
     ) -> BnsRegistryResult<BootstrapNameResult> {
+        self.ensure_write_path("bootstrap_name")?;
         let name = canonical_bns_name(name)?;
         ensure_registerable_depth(&name)?;
         if asset_owner.is_empty() {
@@ -477,6 +501,7 @@ where
     }
 
     pub fn renew_name(&self, name: &str, duration: u64) -> BnsRegistryResult<u64> {
+        self.ensure_write_path("renew_name")?;
         let name = canonical_bns_name(name)?;
         if duration == 0 {
             return Err(BnsRegistryError::InvalidMutation(
@@ -521,6 +546,7 @@ where
         authority: CallAuthority,
         guard: MutationGuard,
     ) -> BnsRegistryResult<u64> {
+        self.ensure_write_path("transfer_name")?;
         let name = canonical_bns_name(name)?;
         if new_asset_owner.is_empty() {
             return Err(BnsRegistryError::InvalidMutation(
@@ -582,6 +608,7 @@ where
         name: &str,
         new_asset_owner: &str,
     ) -> BnsRegistryResult<u64> {
+        self.ensure_write_path("standard_transfer_name")?;
         let name = canonical_bns_name(name)?;
         if new_asset_owner.is_empty() {
             return Err(BnsRegistryError::InvalidMutation(
@@ -622,6 +649,7 @@ where
         authority: CallAuthority,
         guard: MutationGuard,
     ) -> BnsRegistryResult<u64> {
+        self.ensure_write_path("set_name_owner")?;
         let name = canonical_bns_name(name)?;
         validate_semantic_owner(&semantic_owner)?;
         self.store.transact(|tx| {
@@ -658,6 +686,7 @@ where
         authority: CallAuthority,
         guard: MutationGuard,
     ) -> BnsRegistryResult<u64> {
+        self.ensure_write_path("release_name")?;
         let name = canonical_bns_name(name)?;
         validate_hash(reason_hash)?;
         self.store.transact(|tx| {
@@ -695,6 +724,7 @@ where
         authority: CallAuthority,
         guard: MutationGuard,
     ) -> BnsRegistryResult<u64> {
+        self.ensure_write_path("set_namespace_policy")?;
         let name = canonical_bns_name(name)?;
         validate_hash(namespace_policy_hash)?;
         self.store.transact(|tx| {
@@ -735,6 +765,7 @@ where
         authority: CallAuthority,
         guard: MutationGuard,
     ) -> BnsRegistryResult<AuthoritySetState> {
+        self.ensure_write_path("update_authority_keys")?;
         let name = canonical_bns_name(name)?;
         for update in &updates {
             update.key.validate()?;
@@ -756,6 +787,7 @@ where
         authority: CallAuthority,
         guard: MutationGuard,
     ) -> BnsRegistryResult<(AuthoritySetState, u64)> {
+        self.ensure_write_path("rotate_authority_and_owner_document")?;
         let name = canonical_bns_name(name)?;
         if owner_document_update.doc_type != "owner" {
             return Err(BnsRegistryError::InvalidMutation(
@@ -786,6 +818,7 @@ where
         authority: CallAuthority,
         guard: MutationGuard,
     ) -> BnsRegistryResult<u64> {
+        self.ensure_write_path("publish_document")?;
         let name = canonical_bns_name(name)?;
         update.validate()?;
         self.store.transact(|tx| {
@@ -814,6 +847,7 @@ where
         authority: CallAuthority,
         guard: MutationGuard,
     ) -> BnsRegistryResult<u64> {
+        self.ensure_write_path("revoke_document")?;
         let name = canonical_bns_name(name)?;
         let doc_type = canonical_doc_type(doc_type)?;
         validate_hash(reason_hash)?;
@@ -889,6 +923,7 @@ where
         authority: CallAuthority,
         guard: MutationGuard,
     ) -> BnsRegistryResult<u64> {
+        self.ensure_write_path("set_controller_policy")?;
         let name = canonical_bns_name(name)?;
         validate_hash(policy_hash)?;
         for rule in &rules {
@@ -930,6 +965,7 @@ where
         authority: CallAuthority,
         guard: MutationGuard,
     ) -> BnsRegistryResult<u64> {
+        self.ensure_write_path("set_did_alias")?;
         let name = canonical_bns_name(name)?;
         if kind != AliasKind::None {
             validate_did(target_did)?;
@@ -989,6 +1025,7 @@ where
         authority: CallAuthority,
         guard: MutationGuard,
     ) -> BnsRegistryResult<u64> {
+        self.ensure_write_path("set_payment_target")?;
         let name = canonical_bns_name(name)?;
         let doc_type = canonical_doc_type(doc_type)?;
         beneficiary.validate()?;
@@ -1055,6 +1092,7 @@ where
         issuer: Principal,
         external_anchor: &str,
     ) -> BnsRegistryResult<LogCheckpoint> {
+        self.ensure_write_path("publish_log_checkpoint")?;
         issuer.validate()?;
         validate_hash(external_anchor)?;
         self.store.transact(|tx| {

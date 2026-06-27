@@ -27,7 +27,7 @@ const ANVIL_PRIVATE_KEY: &str =
 const ANVIL_ADDRESS: &str = "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266";
 
 fn registry() -> Arc<CentralizedBnsRegistry<SqliteBnsRegistryStore>> {
-    Arc::new(CentralizedBnsRegistry::new(
+    Arc::new(CentralizedBnsRegistry::new_legacy_state_machine(
         SqliteBnsRegistryStore::open_memory().unwrap(),
     ))
 }

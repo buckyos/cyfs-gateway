@@ -76,6 +76,17 @@ impl EthLog {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct EthBlock {
+    #[serde(default, deserialize_with = "deserialize_optional_quantity")]
+    pub number: Option<u64>,
+    #[serde(default)]
+    pub hash: Option<B256>,
+    #[serde(default)]
+    pub parent_hash: Option<B256>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct EthTransaction {
     pub hash: B256,
     #[serde(default)]
@@ -190,6 +201,14 @@ impl EthRpcClient {
     pub async fn get_logs(&self, filter: &RpcLogFilter) -> BnsEvmResult<Vec<EthLog>> {
         self.call("eth_getLogs", json!([filter.to_rpc_value()]))
             .await
+    }
+
+    pub async fn block_by_number(&self, block_number: u64) -> BnsEvmResult<Option<EthBlock>> {
+        self.call_nullable(
+            "eth_getBlockByNumber",
+            json!([quantity_hex(block_number), false]),
+        )
+        .await
     }
 
     pub async fn transaction_by_hash(&self, tx_hash: B256) -> BnsEvmResult<Option<EthTransaction>> {

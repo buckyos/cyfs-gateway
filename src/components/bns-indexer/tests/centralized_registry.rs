@@ -13,7 +13,24 @@ const OWNER_B: &str = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 const CONTROLLER: &str = "0xcccccccccccccccccccccccccccccccccccccccc";
 
 fn registry() -> CentralizedBnsRegistry<SqliteBnsRegistryStore> {
-    CentralizedBnsRegistry::new(SqliteBnsRegistryStore::open_memory().unwrap())
+    CentralizedBnsRegistry::new_legacy_state_machine(SqliteBnsRegistryStore::open_memory().unwrap())
+}
+
+#[test]
+fn centralized_registry_default_constructor_is_read_only_projection() {
+    let registry = CentralizedBnsRegistry::new(SqliteBnsRegistryStore::open_memory().unwrap());
+    let err = registry
+        .register_name(
+            "alice",
+            OWNER_A,
+            RegisterOptions::default(),
+            vec![],
+            CallAuthority::public(),
+            MutationGuard::default(),
+        )
+        .unwrap_err();
+
+    assert_eq!(err.code(), "UNSUPPORTED_OPERATION");
 }
 
 fn guard(seq: u64) -> MutationGuard {
@@ -626,7 +643,9 @@ fn sqlite_backend_persists_registry_state() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("bns.sqlite3");
     {
-        let registry = CentralizedBnsRegistry::new(SqliteBnsRegistryStore::open(&path).unwrap());
+        let registry = CentralizedBnsRegistry::new_legacy_state_machine(
+            SqliteBnsRegistryStore::open(&path).unwrap(),
+        );
         registry
             .register_name(
                 "alice",

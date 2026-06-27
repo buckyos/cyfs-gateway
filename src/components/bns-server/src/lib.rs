@@ -943,14 +943,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn serves_bns_indexer_rpc_over_http() {
+    async fn bns_indexer_rpc_rejects_legacy_writes_over_http() {
         let server = Arc::new(SqliteBnsIndexerHttpServer::open_memory().unwrap());
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let handle = spawn_listener(listener, server).unwrap();
         let endpoint = format!("http://{}", handle.local_addr());
         let client = BnsIndexerClient::new_krpc_url(&endpoint, None);
 
-        let registered = client
+        let error = client
             .register_name(BnsRegisterNameReq {
                 name: "alice".to_string(),
                 asset_owner: OWNER.to_string(),
@@ -960,12 +960,8 @@ mod tests {
                 guard: MutationGuard::default(),
             })
             .await
-            .unwrap();
-        assert_eq!(registered.name_seq, 1);
-
-        let state = client.query_name_state("alice").await.unwrap().unwrap();
-        assert_eq!(state.name, "alice");
-        assert_eq!(state.asset_owner, OWNER);
+            .unwrap_err();
+        assert_eq!(error.code(), "UNSUPPORTED_OPERATION");
 
         handle.shutdown().await;
     }
@@ -1132,7 +1128,7 @@ mod tests {
 
     #[test]
     fn constructs_server_from_existing_registry() {
-        let registry = Arc::new(CentralizedBnsRegistry::new(
+        let registry = Arc::new(CentralizedBnsRegistry::new_legacy_state_machine(
             SqliteBnsRegistryStore::open_memory().unwrap(),
         ));
         registry

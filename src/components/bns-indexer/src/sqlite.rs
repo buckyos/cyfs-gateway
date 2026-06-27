@@ -691,6 +691,22 @@ impl BnsRegistryStoreTx for SqliteStoreTx<'_> {
         )?;
         Ok(())
     }
+
+    fn reset_indexer_projection(&mut self, source: &str) -> BnsRegistryResult<()> {
+        self.tx.execute("DELETE FROM bns_names", [])?;
+        self.tx.execute("DELETE FROM bns_documents", [])?;
+        self.tx.execute("DELETE FROM bns_authority_keys", [])?;
+        self.tx.execute("DELETE FROM bns_authority_sets", [])?;
+        self.tx.execute("DELETE FROM bns_controller_policies", [])?;
+        self.tx.execute("DELETE FROM bns_aliases", [])?;
+        self.tx.execute("DELETE FROM bns_events", [])?;
+        self.tx.execute("DELETE FROM bns_checkpoints", [])?;
+        self.tx.execute(
+            "DELETE FROM bns_indexer_cursors WHERE source = ?1",
+            params![source],
+        )?;
+        Ok(())
+    }
 }
 
 pub(crate) fn recompute_authority_set(

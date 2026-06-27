@@ -81,6 +81,9 @@ pub enum BnsRegistryError {
     #[error("invalid BNS indexer config: {0}")]
     InvalidConfig(String),
 
+    #[error("unsupported BNS operation: {0}")]
+    UnsupportedOperation(String),
+
     #[error("integer value for `{field}` is outside sqlite INTEGER range: {value}")]
     IntegerOutOfRange { field: &'static str, value: u64 },
 
@@ -160,6 +163,7 @@ impl BnsRegistryError {
             Self::InlineDocumentTooLarge { .. } => "INLINE_DOCUMENT_TOO_LARGE",
             Self::InvalidMutation(_) => "INVALID_MUTATION",
             Self::InvalidConfig(_) => "INVALID_CONFIG",
+            Self::UnsupportedOperation(_) => "UNSUPPORTED_OPERATION",
             Self::IntegerOutOfRange { .. } => "INTEGER_OUT_OF_RANGE",
             Self::DbLockPoisoned => "DB_LOCK_POISONED",
             Self::Sqlite(_) => "SQLITE_ERROR",

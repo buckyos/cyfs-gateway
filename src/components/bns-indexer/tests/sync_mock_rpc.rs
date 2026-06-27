@@ -12,13 +12,16 @@
 //! 全部用进程内 mock JSON-RPC HTTP 服务，无需活节点。
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use alloy_sol_types::{SolCall, SolEvent};
 use bns_evm::{address, Address, Bns, B256};
 use bns_indexer::{
-    sync_bns_contract_once, BnsBlockSyncSourceConfig, BnsIndexerSyncConfig, BnsRegistryError,
-    BnsRegistryStore, DocumentStatus, NameStatus, SqliteBnsRegistryStore,
+    sync_bns_contract_once, BnsBlockSyncSourceConfig, BnsContractEventIndexer,
+    BnsIndexerSyncConfig, BnsRegistryError, BnsRegistryStore, DocumentStatus, NameStatus,
+    SqliteBnsRegistryStore,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -38,10 +41,13 @@ struct MockConfig {
     eth_call_returns: HashMap<String, String>,
     // tx hash(lowercase, 含 0x) -> input calldata hex（含 0x），供 decode_bns_call 补全入参。
     txs: HashMap<String, String>,
+    // block number -> block hash（含 0x），用于游标 reorg 检测。
+    block_hashes: HashMap<u64, String>,
 }
 
 struct MockEthRpc {
     endpoint: String,
+    config: Arc<Mutex<MockConfig>>,
     get_logs_calls: Arc<Mutex<u64>>,
 }
 
@@ -85,8 +91,13 @@ impl MockEthRpc {
         });
         Self {
             endpoint,
+            config,
             get_logs_calls,
         }
+    }
+
+    fn update(&self, op: impl FnOnce(&mut MockConfig)) {
+        op(&mut self.config.lock().unwrap());
     }
 
     fn get_logs_calls(&self) -> u64 {
@@ -108,6 +119,19 @@ fn handle_method(
             *calls.lock().unwrap() += 1;
             serde_json::Value::Array(cfg.logs_json.clone())
         }
+        "eth_getBlockByNumber" => {
+            let block_number =
+                parse_rpc_quantity(req["params"][0].as_str().unwrap_or("0x0")).unwrap();
+            serde_json::json!({
+                "number": format!("0x{block_number:x}"),
+                "hash": cfg
+                    .block_hashes
+                    .get(&block_number)
+                    .cloned()
+                    .unwrap_or_else(|| block_hash_hex(block_number)),
+                "parentHash": block_hash_hex(block_number.saturating_sub(1)),
+            })
+        }
         "eth_getTransactionByHash" => {
             let hash = req["params"][0].as_str().unwrap_or("").to_lowercase();
             match cfg.txs.get(&hash) {
@@ -126,6 +150,14 @@ fn handle_method(
         }
         _ => serde_json::Value::Null,
     }
+}
+
+fn parse_rpc_quantity(value: &str) -> Result<u64, std::num::ParseIntError> {
+    u64::from_str_radix(value.trim_start_matches("0x"), 16)
+}
+
+fn block_hash_hex(block_number: u64) -> String {
+    format!("0x{:064x}", block_number + 1)
 }
 
 async fn read_http_request(stream: &mut TcpStream) -> String {
@@ -181,7 +213,11 @@ fn bytes32_label(label: &str) -> B256 {
 /// 把一个 BNS 事件结构编码为 eth_getLogs 返回的 JSON log 对象（topics + data）。
 fn event_log_json<E: SolEvent>(event: &E, block_number: u64) -> serde_json::Value {
     let log_data = event.encode_log_data();
-    let topics: Vec<String> = log_data.topics().iter().map(|t| format!("{t:#x}")).collect();
+    let topics: Vec<String> = log_data
+        .topics()
+        .iter()
+        .map(|t| format!("{t:#x}"))
+        .collect();
     serde_json::json!({
         "address": format!("{CONTRACT}"),
         "topics": topics,
@@ -341,8 +377,15 @@ async fn sync_respects_confirmations_rollback() {
         .unwrap();
     assert_eq!(outcome.latest_block, 10);
     assert_eq!(outcome.from_block, 8);
-    assert_eq!(outcome.to_block, None, "block within confirmation window must not sync");
-    assert_eq!(mock.get_logs_calls(), 0, "no getLogs when nothing confirmed");
+    assert_eq!(
+        outcome.to_block, None,
+        "block within confirmation window must not sync"
+    );
+    assert_eq!(
+        mock.get_logs_calls(),
+        0,
+        "no getLogs when nothing confirmed"
+    );
     // 游标未建立。
     assert!(outcome.cursor.is_none());
 }
@@ -383,7 +426,11 @@ async fn sync_shards_large_range_by_max_block_span_and_advances_cursor() {
     assert_eq!(o3.from_block, 20);
     assert_eq!(o3.to_block, Some(25));
 
-    assert_eq!(mock.get_logs_calls(), 3, "large range split into 3 eth_getLogs");
+    assert_eq!(
+        mock.get_logs_calls(),
+        3,
+        "large range split into 3 eth_getLogs"
+    );
 }
 
 #[tokio::test]
@@ -416,7 +463,151 @@ async fn sync_is_idempotent_when_already_caught_up() {
         "no extra getLogs when caught up (idempotent)"
     );
     // 游标停在 5。
-    assert_eq!(second.cursor.unwrap().block_number, 5);
+    let cursor = second.cursor.unwrap();
+    assert_eq!(cursor.block_number, 5);
+    assert_eq!(
+        cursor.block_hash.as_deref(),
+        Some(block_hash_hex(5).as_str())
+    );
+}
+
+#[tokio::test]
+async fn sync_detects_reorg_by_cursor_block_hash_and_replays_projection() {
+    let mut eth_call_returns = HashMap::new();
+    eth_call_returns.insert(
+        selector_hex::<Bns::queryNameStateCall>(),
+        format!(
+            "0x{}",
+            hex::encode(Bns::queryNameStateCall::abi_encode_returns(
+                &evm_name_state("alice", 1)
+            ))
+        ),
+    );
+    let alice_logs = vec![
+        protocol_event_log(1, 0x11, 1),
+        event_log_json(
+            &Bns::NameRegistered {
+                nameHash: B256::repeat_byte(0xA1),
+                name: "alice".to_string(),
+                assetOwner: OWNER,
+                actor: ACTOR,
+                expireAt: 1_000,
+                lineageEpoch: 0,
+                nameSeq: 1,
+            },
+            1,
+        ),
+    ];
+    let mock = MockEthRpc::start(MockConfig {
+        chain_id: 31_337,
+        block_number: 1,
+        logs_json: alice_logs,
+        eth_call_returns,
+        ..Default::default()
+    })
+    .await;
+    let store = SqliteBnsRegistryStore::open_memory().unwrap();
+    let config = config_for_chain(31_337);
+
+    let first = sync_bns_contract_once(&store, with_endpoint(config.clone(), &mock.endpoint))
+        .await
+        .unwrap();
+    assert!(!first.reorg_detected);
+    assert_eq!(
+        first.cursor.as_ref().unwrap().block_hash.as_deref(),
+        Some(block_hash_hex(1).as_str())
+    );
+    let names = store.transact(|tx| tx.list_names()).unwrap();
+    assert_eq!(
+        names.iter().map(|n| n.name.as_str()).collect::<Vec<_>>(),
+        ["alice"]
+    );
+
+    let mut bob_eth_call_returns = HashMap::new();
+    bob_eth_call_returns.insert(
+        selector_hex::<Bns::queryNameStateCall>(),
+        format!(
+            "0x{}",
+            hex::encode(Bns::queryNameStateCall::abi_encode_returns(
+                &evm_name_state("bob", 1)
+            ))
+        ),
+    );
+    let bob_logs = vec![
+        protocol_event_log(1, 0x22, 1),
+        event_log_json(
+            &Bns::NameRegistered {
+                nameHash: B256::repeat_byte(0xB2),
+                name: "bob".to_string(),
+                assetOwner: OWNER,
+                actor: ACTOR,
+                expireAt: 1_000,
+                lineageEpoch: 0,
+                nameSeq: 1,
+            },
+            1,
+        ),
+    ];
+    mock.update(|cfg| {
+        cfg.block_hashes
+            .insert(1, B256::repeat_byte(0x99).to_string());
+        cfg.logs_json = bob_logs;
+        cfg.eth_call_returns = bob_eth_call_returns;
+    });
+
+    let replay = sync_bns_contract_once(&store, with_endpoint(config, &mock.endpoint))
+        .await
+        .unwrap();
+    assert!(replay.reorg_detected);
+    assert_eq!(replay.from_block, 0);
+    assert_eq!(replay.to_block, Some(1));
+    assert_eq!(
+        replay.cursor.as_ref().unwrap().block_hash.as_deref(),
+        Some(B256::repeat_byte(0x99).to_string().as_str())
+    );
+
+    let (names, events) = store
+        .transact(|tx| Ok((tx.list_names()?, tx.list_events(1, 10)?)))
+        .unwrap();
+    assert_eq!(
+        names.iter().map(|n| n.name.as_str()).collect::<Vec<_>>(),
+        ["bob"]
+    );
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].event_type, "name_registered");
+    assert_eq!(events[0].log_root, B256::repeat_byte(0x22).to_string());
+}
+
+#[tokio::test]
+async fn polling_loop_runs_sync_once_repeatedly() {
+    let mock = MockEthRpc::start(MockConfig {
+        chain_id: 31_337,
+        block_number: 0,
+        logs_json: Vec::new(),
+        ..Default::default()
+    })
+    .await;
+    let store = SqliteBnsRegistryStore::open_memory().unwrap();
+    let indexer = BnsContractEventIndexer::new(
+        &store,
+        with_endpoint(config_for_chain(31_337), &mock.endpoint),
+    )
+    .unwrap();
+    let outcomes = Arc::new(AtomicUsize::new(0));
+    let observed = outcomes.clone();
+
+    tokio::select! {
+        _ = indexer.run_polling_loop(Duration::from_millis(1), move |outcome| {
+            outcome.unwrap();
+            observed.fetch_add(1, Ordering::SeqCst);
+        }) => panic!("polling loop should not return"),
+        _ = tokio::time::sleep(Duration::from_millis(20)) => {}
+    }
+
+    assert!(
+        outcomes.load(Ordering::SeqCst) >= 2,
+        "polling loop should call sync_once more than once"
+    );
 }
 
 #[tokio::test]
@@ -427,9 +618,9 @@ async fn sync_projects_document_published_via_mixed_eth_call_strategy() {
         selector_hex::<Bns::queryNameStateCall>(),
         format!(
             "0x{}",
-            hex::encode(Bns::queryNameStateCall::abi_encode_returns(&evm_name_state(
-                "alice", 2
-            )))
+            hex::encode(Bns::queryNameStateCall::abi_encode_returns(
+                &evm_name_state("alice", 2)
+            ))
         ),
     );
     eth_call_returns.insert(
@@ -465,6 +656,7 @@ async fn sync_projects_document_published_via_mixed_eth_call_strategy() {
         logs_json: logs,
         eth_call_returns,
         txs: HashMap::new(),
+        ..Default::default()
     })
     .await;
     let store = SqliteBnsRegistryStore::open_memory().unwrap();
@@ -494,13 +686,19 @@ async fn sync_projects_document_published_via_mixed_eth_call_strategy() {
     let doc_state = doc_state.expect("document projected");
     assert_eq!(doc_state.version, 3);
     assert_eq!(doc_state.status, DocumentStatus::Active);
-    assert_eq!(doc_state.document.inline_document, b"{\"id\":\"did:bns:alice\"}");
+    assert_eq!(
+        doc_state.document.inline_document,
+        b"{\"id\":\"did:bns:alice\"}"
+    );
 
     // EventLog：ProtocolEvent 的 seq/logRoot 派生写入 bns_events。
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].seq, 7);
     assert_eq!(events[0].event_type, "document_published");
-    assert_eq!(events[0].log_root, format!("{:#x}", B256::repeat_byte(0x44)));
+    assert_eq!(
+        events[0].log_root,
+        format!("{:#x}", B256::repeat_byte(0x44))
+    );
 }
 
 #[tokio::test]
@@ -542,9 +740,9 @@ async fn sync_backfills_controller_rules_from_decoded_call() {
         selector_hex::<Bns::queryNameStateCall>(),
         format!(
             "0x{}",
-            hex::encode(Bns::queryNameStateCall::abi_encode_returns(&evm_name_state(
-                "alice", 3
-            )))
+            hex::encode(Bns::queryNameStateCall::abi_encode_returns(
+                &evm_name_state("alice", 3)
+            ))
         ),
     );
     let mut txs = HashMap::new();
@@ -574,18 +772,26 @@ async fn sync_backfills_controller_rules_from_decoded_call() {
         logs_json: logs,
         eth_call_returns,
         txs,
+        ..Default::default()
     })
     .await;
     let store = SqliteBnsRegistryStore::open_memory().unwrap();
-    let outcome = sync_bns_contract_once(&store, with_endpoint(config_for_chain(31_337), &mock.endpoint))
-        .await
-        .unwrap();
+    let outcome = sync_bns_contract_once(
+        &store,
+        with_endpoint(config_for_chain(31_337), &mock.endpoint),
+    )
+    .await
+    .unwrap();
     assert_eq!(outcome.registry_events_stored, 1);
 
     let rules = store
         .transact(|tx| tx.get_controller_policy("alice"))
         .unwrap();
-    assert_eq!(rules.len(), 1, "controller rule backfilled from decoded call");
+    assert_eq!(
+        rules.len(),
+        1,
+        "controller rule backfilled from decoded call"
+    );
     assert_eq!(rules[0].doc_type, "device");
     assert_eq!(rules[0].permissions, 0b0000_0011);
     assert_eq!(rules[0].valid_from, 10);
@@ -614,8 +820,7 @@ async fn redeploy_to_new_contract_uses_isolated_source_cursor() {
 
     // 新合约地址（重部署）+ start_block=0。
     let mut new_config = config_for_chain(31_337);
-    new_config.source.contract_address =
-        "0x3333333333333333333333333333333333333333".to_string();
+    new_config.source.contract_address = "0x3333333333333333333333333333333333333333".to_string();
     let new = sync_bns_contract_once(&store, with_endpoint(new_config, &mock.endpoint))
         .await
         .unwrap();

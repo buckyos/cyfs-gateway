@@ -21,9 +21,9 @@ use bns_client::{
     BnsPublishDocumentReq, BnsRegisterNameReq, StaticBnsEvmKeyManager,
 };
 use bns_indexer::{
-    default_document_update, sync_bns_contract_once, BnsBlockSyncSourceConfig, BnsIndexerSyncConfig,
-    CallAuthority, DocumentRef, MutationGuard, NameStatus, Principal, RegisterOptions,
-    SqliteBnsRegistryStore,
+    default_document_update, BnsBlockSyncSourceConfig, BnsContractEventIndexer,
+    BnsIndexerSyncConfig, CallAuthority, DocumentRef, MutationGuard, NameStatus, Principal,
+    RegisterOptions, SqliteBnsRegistryStore,
 };
 use bns_server::{bind_and_serve, BnsContractHttpServer};
 use cyfs_gateway_lib::HttpServer;
@@ -80,26 +80,38 @@ async fn serve(flags: HashMap<String, String>) -> Result<(), DynError> {
 
     // indexer 轮询循环。
     tokio::spawn(async move {
-        loop {
-            match sync_bns_contract_once(&indexer_store, sync_config.clone()).await {
-                Ok(outcome) => {
-                    if outcome.registry_events_stored > 0 {
-                        eprintln!(
-                            "[indexer] synced to block {:?}: +{} events (cursor {:?})",
-                            outcome.to_block,
-                            outcome.registry_events_stored,
-                            outcome.cursor.as_ref().map(|c| c.block_number),
-                        );
-                    }
-                }
-                Err(err) => eprintln!("[indexer] sync_once error: {err}"),
+        let indexer = match BnsContractEventIndexer::new(&indexer_store, sync_config.clone()) {
+            Ok(indexer) => indexer,
+            Err(err) => {
+                eprintln!("[indexer] config error: {err}");
+                return;
             }
-            tokio::time::sleep(Duration::from_millis(interval_ms)).await;
-        }
+        };
+        indexer
+            .run_polling_loop(
+                Duration::from_millis(interval_ms),
+                |outcome| match outcome {
+                    Ok(outcome) => {
+                        if outcome.registry_events_stored > 0 || outcome.reorg_detected {
+                            eprintln!(
+                                "[indexer] synced to block {:?}: +{} events (cursor {:?}, reorg={})",
+                                outcome.to_block,
+                                outcome.registry_events_stored,
+                                outcome.cursor.as_ref().map(|c| c.block_number),
+                                outcome.reorg_detected,
+                            );
+                        }
+                    }
+                    Err(err) => eprintln!("[indexer] sync_once error: {err}"),
+                },
+            )
+            .await;
     });
 
-    let server: Arc<dyn HttpServer> =
-        Arc::new(BnsContractHttpServer::from_contract_store(server_store, rpc.clone()));
+    let server: Arc<dyn HttpServer> = Arc::new(BnsContractHttpServer::from_contract_store(
+        server_store,
+        rpc.clone(),
+    ));
 
     eprintln!(
         "[serve] bns-dv ready\n  rpc={rpc}\n  contract={contract}\n  chain_id={chain_id}\n  \
@@ -123,7 +135,10 @@ async fn smoke(flags: HashMap<String, String>) -> Result<(), DynError> {
     let contract = require(&flags, "contract")?;
     let chain_id: u64 = require(&flags, "chain-id")?.parse()?;
     let key = require(&flags, "key")?;
-    let name = flags.get("name").cloned().unwrap_or_else(|| "alice".to_string());
+    let name = flags
+        .get("name")
+        .cloned()
+        .unwrap_or_else(|| "alice".to_string());
     let timeout_ms: u64 = flags.get("timeout-ms").map_or(Ok(30_000), |v| v.parse())?;
 
     let key_manager = Arc::new(StaticBnsEvmKeyManager::new(key.clone())?);
@@ -192,7 +207,10 @@ async fn smoke(flags: HashMap<String, String>) -> Result<(), DynError> {
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
-    println!("[3/4] indexer projected {name} ({} ms)", t.elapsed().as_millis());
+    println!(
+        "[3/4] indexer projected {name} ({} ms)",
+        t.elapsed().as_millis()
+    );
 
     // 4) 经 server 读命中：resolveDocument 内容/版本一致。
     let t = Instant::now();

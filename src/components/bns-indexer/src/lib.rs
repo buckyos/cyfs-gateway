@@ -1,9 +1,10 @@
 //! BNS contract event indexer and read projection.
 //!
 //! The contract is the authority for BNS state. This crate persists a SQLite
-//! read projection and event log derived from BNS contract logs. The legacy
-//! [`CentralizedBnsRegistry`] state machine is still exported for old in-process
-//! tests and RPC paths while callers migrate to EVM transaction submission.
+//! read projection and event log derived from BNS contract logs. The
+//! [`CentralizedBnsRegistry`] facade is read-only by default; its legacy
+//! in-process mutation state machine is only available through the hidden
+//! compatibility constructor used by historical tests.
 
 pub mod dns_document;
 
