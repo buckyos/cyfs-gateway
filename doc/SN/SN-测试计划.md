@@ -92,72 +92,74 @@
 ## 2. BNS Rust 组件独立测试
 
 ### 2.1 `bns-evm`（ABI 绑定 + TX 构造/签名）
-现状：[tests/abi_tx.rs](../src/components/bns-evm/tests/abi_tx.rs) 已有 round-trip 用例。补全：
+现状：[tests/abi_tx.rs](../src/components/bns-evm/tests/abi_tx.rs) 已有 round-trip 用例。
+> 已实现：[tests/evm_components.rs](../src/components/bns-evm/tests/evm_components.rs)（25 例，全绿）。
 
-- [ ] **calldata round-trip**（已有）：扩到每个写函数 `sol!` 绑定的 encode→decode 一致；`EvmCallAuthority` / `EvmMutationGuard` / `EvmRegisterOptions` 等结构 packing 一致。
-- [ ] **chainAccountPrincipal 编码**：地址按 20 字节、bnsName 按规范编码（对应 client 侧 `evm_register_call_encodes_chain_account_principal_as_address_bytes`）。
-- [ ] **TX 构造**：`build_tx(call, nonce, chainId, to, gas)` 产出 EIP-1559 字段正确（maxFeePerGas/maxPriorityFee/gasLimit/nonce/chainId/to/value=0）。
-- [ ] **签名与 signer 恢复**：`sign(tx, key)` → 独立解码 raw TX → 恢复 signer 地址 == key 地址（防"签了但 sender 不对"）。
-- [ ] **event 解码**：用 §1.7 钉死的事件字节，验证 `decode_bns_event` 解出的 `ProtocolEvent` + 专用事件字段一致。
-- [ ] **call 解码**：`decode_bns_call` 从 calldata 还原入参（indexer 补全 authority key / controller rule 时依赖）。
-- [ ] **边界/错误**：截断 calldata、未知 selector、错误 chainId → 明确错误而非 panic。
+- [x] **calldata round-trip**：覆盖 register/publish/revoke/setControllerPolicy/setDidAlias/setPaymentTarget/setNamespacePolicy/release/transfer/setNameOwner/renewName 各写函数 encode→decode 一致；`CallAuthority` / `MutationGuard` / `RegisterOptions` / `Principal` packing 一致。
+- [x] **chainAccountPrincipal 编码**：地址按 20 字节、bnsName 按 utf-8 名字字节编码，往返后仍是 20 字节裸地址（`chain_account_principal_encodes_address_as_20_bytes`）。
+- [x] **TX 构造**：`build_eip1559_contract_tx` 产出 EIP-1559 字段正确（maxFeePerGas/maxPriorityFee/gasLimit/nonce/chainId/to/value=0、access_list 空、input==encoded call）。
+- [x] **签名与 signer 恢复**：`sign_eip1559_tx` → 独立 `decode_signed_eip1559` → 恢复 signer 地址 == key 地址；不同 key 恢复不同 signer。
+- [x] **event 解码**：用 sol! 绑定 encode 的 `ProtocolEvent` / `DocumentPublished` / `NameRegistered` 字节验证 `decode_bns_event` 字段一致。
+- [x] **call 解码**：`decode_bns_call` 从 calldata 还原 authority / controller rule 入参（indexer 补全时依赖）。
+- [x] **边界/错误**：截断 calldata、未知 selector、空 calldata、坏 raw TX、错误 chainId（签名 hash 不同）→ 明确错误而非 panic。
 
 运行：`cargo test -p bns-evm`，无需节点。
 
 ### 2.2 `bns-indexer`（事件索引器）
 现状：[tests/sync_config.rs](../src/components/bns-indexer/tests/sync_config.rs)、[tests/evm_projection.rs](../src/components/bns-indexer/tests/evm_projection.rs)、[tests/centralized_registry.rs](../src/components/bns-indexer/tests/centralized_registry.rs)。
+> 已实现 mock JSON-RPC 套件：[tests/sync_mock_rpc.rs](../src/components/bns-indexer/tests/sync_mock_rpc.rs)（8 例，全绿；内置进程内 `MockEthRpc`，按方法名/selector 返回预置 JSON）。
 
 **投影正确性（projection_for_record，[sync.rs:280](../src/components/bns-indexer/src/sync.rs:280)）**：
-- [ ] 每类事件 → SQLite 投影（names / documents / authority set+keys / controller policy / alias / checkpoint）字段正确（已有 evm_projection 基线，逐 docType 补全）。
-- [ ] **混合投影策略**：事件只定位"哪个 name/doc 变了"，随后 `eth_call`（`queryNameState`/`getDocumentVersion`/`getAuthoritySet`/`getAlias`/`latestCheckpoint`）拉当前权威态——用 **mock eth_call** 注入返回，验证投影=最新快照而非逐条回放。
-- [ ] authority key / controller rule 通过 `decode_bns_call`（按 tx hash 缓存）补全事件未携带入参。
+- [x] **混合投影策略**：`sync_projects_document_published_via_mixed_eth_call_strategy` —— DocumentPublished 事件只定位 name/doc，随后 `eth_call`（`queryNameState`/`getDocumentVersion`）拉权威态，验证投影=最新快照（nameSeq 取自 eth_call 而非事件回放）。
+- [x] authority key / controller rule 通过 `decode_bns_call`（按 tx hash 缓存）补全：`sync_backfills_controller_rules_from_decoded_call`（ControllerPolicyUpdated 事件不带 rules，经 `eth_getTransactionByHash` + decode 补全）。
+- [ ] 其余 docType（authority set+keys / alias / checkpoint）逐类投影字段补全（混合投影路径已打通，按 docType 复用即可）。
 
 **同步器（sync_once，[sync.rs:164](../src/components/bns-indexer/src/sync.rs:164)）**，用 mock JSON-RPC：
-- [ ] chain_id 校验：链上 chainId 与配置不符 → 拒绝同步。
-- [ ] confirmations 回退：最新块按 `confirmations` 回退后才同步。
-- [ ] `max_block_span` 分片：大区间被切成多次 `eth_getLogs`。
-- [ ] 游标推进：`bns_indexer_cursors` 的 last-synced-block 单调推进；重复调用幂等（不重投影已处理日志）。
-- [ ] **source 隔离**（已有 sync_config）：`source_id = evm:{network}:{chainId}:{contract}`，换合约地址即换 source。
-- [ ] **合约重部署从 0 重放一致性**（设计 §9 待测项）：旧 source 游标不串扰，新 source 从 `start_block` 重放后投影等价于一次性同步。
-- [ ] 事件+投影同一 `store.transact` 原子落库：mock 在写投影中段失败 → 整批回滚，游标不前进。
+- [x] chain_id 校验：链上 chainId 与配置不符 → 拒绝同步（`sync_rejects_chain_id_mismatch`）。
+- [x] confirmations 回退：未达 `confirmations` 的块不被同步（`sync_respects_confirmations_rollback`）。
+- [x] `max_block_span` 分片：大区间被切成多次 `eth_getLogs`，游标按 span 推进（`sync_shards_large_range_by_max_block_span_and_advances_cursor`）。
+- [x] 游标推进 + 幂等：追平后重复调用不再 `eth_getLogs`、不重投影（`sync_is_idempotent_when_already_caught_up`）。
+- [x] **source 隔离**（sync_config）+ **合约重部署从 0 重放**：换合约地址即换 source，新 source 从 `start_block` 重放、旧游标不串扰（`redeploy_to_new_contract_uses_isolated_source_cursor`）。
+- [x] 事件+投影同一 `store.transact` 原子落库：中段失败 → 整批回滚（`event_and_projection_share_atomic_transaction_rollback`）。
 
 **EventLog / Checkpoint**：
-- [ ] `EventLogRecord` 由 `seq`/`previousLogRoot`/`logRoot` 派生写入 `bns_events`（`put_event_record`）。
-- [ ] `LogCheckpointPublished` → `eth_call latestCheckpoint` → `put_checkpoint` 的 `ON CONFLICT(last_seq)` 覆盖。
+- [x] `EventLogRecord` 由 `seq`/`previousLogRoot`/`logRoot` 派生写入 `bns_events`（混合投影测试内断言 `list_events` 的 seq/event_type/log_root；另有 evm_projection 基线）。
+- [ ] `LogCheckpointPublished` → `eth_call latestCheckpoint` → `put_checkpoint` 的 `ON CONFLICT(last_seq)` 覆盖（checkpoint 投影路径同 docType 补全）。
 
 **registry 回归**：保留 `centralized_registry.rs` 全部用例为回归（状态机下线前的语义基线）。
 
 运行：`cargo test -p bns-indexer`，mock RPC 无需活节点。
-> 建议：引入一个 `MockEthRpc`（按方法名返回预置 JSON）测试夹具，集中给 indexer/server 复用。
 
 ### 2.3 `bns-server`（标准智能合约处理器）
-现状：逻辑在 [bns-server/src/lib.rs](../src/components/bns-server/src/lib.rs)（`BnsContractServerHandler` / `submit_raw_tx` / `BnsContractServerRpcHandler`），当前**无 tests 目录**，需新建 `tests/`。
+现状：逻辑在 [bns-server/src/lib.rs](../src/components/bns-server/src/lib.rs)（`BnsContractServerHandler` / `submit_raw_tx` / `BnsContractServerRpcHandler`），已有 lib 内 in-module 测试。
+> 新建 tests 目录：[tests/contract_server.rs](../src/components/bns-server/tests/contract_server.rs)（10 例，全绿；内存 SQLite 投影 + 复用型 `MockEthRpc`）。
 
-- [ ] **写路径 `tx.submit_raw`**：合法 raw TX hex → 解码 → 转发 `eth_sendRawTransaction`（mock RPC 断言收到的 raw 字节一致），返回 tx hash；非法 hex / 空 → 明确错误。
-- [ ] **不解释 payload / 不鉴权**：server 不解析 calldata、不校验签名（鉴权在合约 `msg.sender`）——构造一个签名无效的 raw TX，server 仍原样转发（拒绝在链上发生）。
-- [ ] **旧写 RPC 禁用**：`name.register` / `document.publish` / `controller.set_policy` 等旧 `CallAuthority` 写方法返回 `UNSUPPORTED_OPERATION`（`unsupported_call`，[lib.rs:84](../src/components/bns-server/src/lib.rs:84)）。
-- [ ] **读路径**：`query_name_state` / `resolve_owner` / `resolve_document` / `get_authority_*` / `list_events` / `latest_checkpoint` 后端查 SQLite 投影，envelope 包装正确（`rpc_envelope_response`）。
-- [ ] **RPC 路由**：`METHOD_SUBMIT_RAW_TX` 与别名 `submit_raw_tx` 都命中；未知 method → 错误码正确。
+- [x] **写路径 `tx.submit_raw`**：合法 raw TX hex → 转发 `eth_sendRawTransaction`（mock 断言收到的 raw 字节一致），返回 tx hash；非法 hex / 空 → 明确错误。
+- [x] **不解释 payload / 不鉴权**：构造一段非合法签名 TX 的"垃圾"字节，server 仍原样转发（`submit_raw_tx_does_not_parse_or_authenticate_payload`）。
+- [x] **旧写 RPC 禁用**：直接 handler 调用 → `UNSUPPORTED_OPERATION`；RPC 层 `name.register` / `document.publish` / `controller.set_policy` → `UnknownMethod`（不路由旧写）。
+- [x] **读路径**：`query_name_state` / `resolve_document` 查 SQLite 投影，envelope（`ok`/`result`）包装正确。
+- [x] **RPC 路由**：`METHOD_SUBMIT_RAW_TX` 与别名 `submit_raw_tx` 都命中；未知 method → `UnknownMethod`。
 
 运行：`cargo test -p bns-server`，用内存/临时 SQLite 投影 + mock eth RPC。
 
 ### 2.4 `bns-client`（薄封装）与 `bns-controller`（前置签名）
-现状：[tests/rpc_and_controller.rs](../src/components/bns-client/tests/rpc_and_controller.rs) 已较充分（in-process registry）。补全围绕 EVM 迁移：
+现状：[tests/rpc_and_controller.rs](../src/components/bns-client/tests/rpc_and_controller.rs) 已较充分（in-process registry）。
+> 补全 EVM 提交链路：[tests/evm_submit_chain.rs](../src/components/bns-client/tests/evm_submit_chain.rs)（5 例，全绿；捕获型 mock `BnsIndexerApi` server + mock eth RPC，无活节点）。
 
 **Standard Client（无私钥）**：
-- [ ] `build_calldata` / `build_unsigned_tx`（已有 `evm_standard_client_builds_unsigned_contract_tx`）：unsigned TX 字段供外部签名。
-- [ ] 入参为外部已签 raw TX → 经 server `submit_raw` 提交（与 §2.3 对接，可用 mock server）。
-- [ ] 读路径转发索引器查询。
+- [x] `build_calldata` / `build_unsigned_tx`（`evm_standard_client_builds_unsigned_contract_tx`）：unsigned TX 字段供外部签名。
+- [x] 入参为外部已签 raw TX → 经 server `submit_raw` 提交（`controller_auto_nonce_signs_and_submits_via_bns_server`，对接 §2.3 的 mock server，断言 server 收到的 raw 字节可恢复出 signer）。
+- [x] Standard client `submit_raw_tx` 直接转发 `eth_sendRawTransaction`，原样 raw 字节（`standard_client_submit_raw_tx_forwards_to_chain_rpc`）；读路径走 in-process / kRPC 索引器（rpc_and_controller 覆盖）。
 
 **Controller Client（托管私钥，自动签名）**：
-- [ ] 自动 nonce → chainId/to/gas → ABI 编码 → 签名 → 提交全链（已有 `static_evm_key_manager_signs_tx_for_authority_context`）。
-- [ ] **控制策略边界**（已有多例，保持）：高风险 docType scope 拒绝、controller 不能写 owner-scoped 文档、docType scope denial 映射、bootstrap 安装 controller policy。
-- [ ] **DNS TXT 幂等**（已有 `sn_controller_upserts_dns_txt_with_idempotency` / `removes_last_dns_txt_record_by_publishing_empty_rrset`）：保持。
-- [ ] **stale guard 错误码透传**（已有 `bns_client_preserves_stale_guard_error_codes`）：合约 guard revert → client 保留原始错误码。
-- [ ] **EVM 模式多步 zone bind**（已有 `evm_mode_rejects_multi_step_zone_bind_without_submission`）：保持。
-- [ ] **nonce 管理增强**（设计 §4 待实现 → 待测）：失败回退重查、并发冲突、可选等待回执确认上链。
+- [x] 自动 nonce（链上 `eth_getTransactionCount`）→ chainId/to/gas → ABI 编码 → 签名 → 提交全链（`controller_auto_nonce_signs_and_submits_via_bns_server` / `controller_with_explicit_chain_rpc_submitter_uses_chain`）。
+- [x] **控制策略边界**（已有多例，保持）：高风险 docType scope 拒绝、controller 不能写 owner-scoped 文档、docType scope denial 映射、bootstrap 安装 controller policy。
+- [x] **DNS TXT 幂等**（已有 `sn_controller_upserts_dns_txt_with_idempotency` / `removes_last_dns_txt_record_by_publishing_empty_rrset`）：保持。
+- [x] **stale guard 错误码透传**（已有 `bns_client_preserves_stale_guard_error_codes`）：合约 guard revert → client 保留原始错误码。
+- [x] **EVM 模式多步 zone bind**（已有 `evm_mode_rejects_multi_step_zone_bind_without_submission`）：保持。
+- [x] **nonce 管理（基础）**：连续两笔写 nonce 递增（`controller_increments_nonce_across_consecutive_writes`）、提交失败回退重查（`controller_resets_cached_nonce_after_submission_failure`）。> 增强项（并发冲突、可选等待回执确认上链）仍待设计 §4 落地。
 - [ ] **迁移项**（设计 §4 TODO → 落地后补）：`sn_bns_controller.rs` 从手工拼 `CallAuthority` 切到"构造 op → Controller 自动签名"后，验证不再产生 `CallAuthority` 写 RPC。
-- [ ] **幂等元数据**：`SnBnsWriteRequestStore` 的 `evm_chain_id`/`evm_nonce`/`evm_tx_hash`/`evm_raw_tx` 写入与去重（同 request_id 不重复提交）。
+- [ ] **幂等元数据**：`SnBnsWriteRequestStore` 的 `evm_chain_id`/`evm_nonce`/`evm_tx_hash`/`evm_raw_tx` 写入与去重（同 request_id 不重复提交）。> 依赖迁移项落地。
 
 运行：`cargo test -p bns-client`。
 
@@ -165,30 +167,30 @@
 
 ## 3. SN-Auth 单元测试（`cyfs-sn::sn_auth`）
 
-现状：[sn_auth.rs:2385](../src/components/cyfs-sn/src/sn_auth.rs:2385) 的 `mod tests` 已有 4 例（激活码+V2、PKX 冲突、zone_info patch+session 撤销、clear_state）。本节按设计文档目标补全 DB 层与（阶段二落地后的）RPC 层。
+现状：[sn_auth.rs:2385](../src/components/cyfs-sn/src/sn_auth.rs:2385) 的 `mod tests` 已补全至 17 例（4 例基线 + 13 例新增，覆盖 §3.1–§3.4 DB 层，全绿）。本节按设计文档目标补全 DB 层与（阶段二落地后的）RPC 层。
 
 ### 3.1 账号与凭证（DB 层）
-- [ ] 激活码：生成 32 位、`check_active_code`（存在且未用）、注册后事务内置 `used=1`、二次使用被拒。
-- [ ] `register_user_v2` 事务性（已有基线）：`users`+`user_auth_v2`+`zone_info`+激活码标记一致写入；命名锁下并发同名注册只成功一个。
-- [ ] 密码：PBKDF2-sha256-100000、16B salt、hash hex；`verify_password` 正确/错误；服务端不存明文。
-- [ ] 用户状态机：`set_user_state` active/suspended/deleted/banned；置非 active 时自动撤销该用户 session（[sn_auth.rs:1378](../src/components/cyfs-sn/src/sn_auth.rs:1378)）。
+- [x] 激活码：生成 32 位、charset 受限且唯一、`check_active_code`（存在且未用 / 未知 → false）、注册后事务内置 `used=1`、二次使用被拒（`test_activation_code_generation_and_single_use`）。
+- [x] `register_user_v2` 事务性：`users`+`user_auth_v2`+`zone_info`+激活码标记一致写入（`test_register_user_v2_writes_consistent_rows`）；命名锁下同激活码并发注册只成功一个（`test_register_user_v2_concurrent_single_success`）。
+- [x] 密码：PBKDF2-sha256-100000、16B salt(hex)、32B hash(hex)；`verify_password` 正确/错误；同密码不同 salt → 不同 hash；不存明文；不支持算法被拒（`test_password_pbkdf2_hash_and_verify`，调用 `sn_v2_auth::{hash_password,verify_password}`）。
+- [x] 用户状态机：`set_user_state` active/suspended/deleted/banned 落库；置非 active 时自动撤销该用户 session、active 不撤销（`test_set_user_state_revokes_sessions`，[sn_auth.rs:1378](../src/components/cyfs-sn/src/sn_auth.rs:1378)）。
 
 ### 3.2 session（account_sessions）
-- [ ] `create_account_session` / `get_account_session` / `revoke_account_session` / `revoke_user_sessions` 语义（DB 层已有）。
+- [x] `create_account_session` / `get_account_session`（未知 → None）/ `revoke_account_session` / `revoke_user_sessions`（只计活跃、跨用户隔离、幂等返回 0）语义（`test_account_session_lifecycle_and_counts`）。
 - [ ] **阶段二接线后**：签发路径写 session、校验路径查 session 状态、`auth.logout` 撤销生效、冻结用户后旧 token 立即失效（覆盖设计指出的"建好未接线死代码"）。
 - [ ] token：`sub=username`、`aud=sn-v2`/`sn-v2-refresh`、access 1h / refresh 24h 过期；阶段二补 `kid` / `jti`。
 
 ### 3.3 user_domain + PKX proof
-- [ ] `canonical_user_domain`：去 `*.` 前缀、小写、去尾点。
-- [ ] 冲突检查（已有基线）：同域名 / 祖先域名 / 子域名被不同用户历史绑定 → 拒绝。
-- [ ] PKX 状态机：`create_pkx_binding` 写 `pending_pkx` 并返回固定 `pkx_record_name`/`pkx`；`verify_pkx_binding` TXT 匹配 → `active`；`unbind_user_domain` → `revoked`；history 保留。
-- [ ] `txt_matches_pkx` / `pkx_record_name` / `pkx_value` helper 的稳定性（同输入恒等，无 nonce/exp）。
-- [ ] `get_user_by_domain`：active binding 最长匹配 + legacy `users.user_domain` 回退。
+- [x] `canonical_user_domain`：去 `*.` 前缀、小写、去尾点、空/仅点 → None（`test_user_domain_helpers_are_stable`）。
+- [x] 冲突检查：同域名 / 祖先域名 / 子域名被不同用户历史绑定 → `Conflict`，本人子域名允许（`test_domain_conflict_rules`）。
+- [x] PKX 状态机：`create_pkx_binding` 写 `pending_pkx` 并返回固定 `pkx_record_name`/`pkx`（重入幂等）；`verify_pkx_binding` TXT 匹配 → `active`；`unbind_user_domain` → `revoked`；history 保留（`test_pkx_binding_state_transitions_and_history`）。
+- [x] `txt_matches_pkx` / `pkx_record_name` / `pkx_value` helper 的稳定性（同输入恒等，无 nonce/exp；空源被拒）（`test_user_domain_helpers_are_stable`）。
+- [x] `get_user_by_domain`：active binding 最长匹配 + legacy `users.user_domain` 回退（`test_get_user_by_domain_longest_match_and_legacy_fallback`）。
 - [ ] **绕过风险回归（阶段二修复后转正）**：`zone.bind_config` / `register_user_with_owner_key` 不再能无 proof 置 `active`；PKX RPC handler + DNS TXT 查询接线后端到端可达。
 
 ### 3.4 zone_info
-- [ ] `get_zone_info` / `update_zone_info`（patch 语义，只改传入字段）/ 从 `users` backfill。
-- [ ] `update_zone_relay_sn` 只允许 relay 管理路径写 `relay_sn`。
+- [x] `get_zone_info`（缺行从 `users` backfill、未知用户返默认）/ `update_zone_info`（patch 只改传入字段、users 缓存同步）（`test_zone_info_patch_only_changes_given_fields` / `test_get_zone_info_backfills_from_users`）。
+- [x] `update_zone_relay_sn`：按 zone/bns_name/username 命中或缺行插入写 `relay_sn`；空参数 → `InvalidInput`（`test_update_zone_relay_sn_paths`）。
 - [ ] **self_cert 权限（阶段二修复后）**：裸 access token 不能置 `self_cert=true`；仅 ACME 成功 / 证书校验 / 受信 device 上报驱动；来源与审计事件记录。
 
 ### 3.5 RPC 层（阶段二 `sn_authority` 落地后）

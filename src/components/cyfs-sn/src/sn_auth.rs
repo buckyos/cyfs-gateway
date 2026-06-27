@@ -2595,4 +2595,599 @@ mod tests {
 
         Ok(())
     }
+
+    // ---- §3.1 账号与凭证（DB 层）----
+
+    /// 激活码：生成 32 位、charset 受限、唯一；`check_active_code` 区分存在/已用/未知；
+    /// 注册后事务内置 `used=1`，二次使用被拒。
+    #[tokio::test]
+    async fn test_activation_code_generation_and_single_use() -> SnResult<()> {
+        let (_tmp_dir, db) = new_test_db().await?;
+
+        let codes = db.generate_activation_codes(8).await?;
+        assert_eq!(codes.len(), 8);
+        for code in &codes {
+            assert_eq!(code.len(), ACTIVATION_CODE_LEN);
+            assert!(code
+                .bytes()
+                .all(|b| ACTIVATION_CODE_CHARS.contains(&b)));
+        }
+        let unique: std::collections::HashSet<_> = codes.iter().cloned().collect();
+        assert_eq!(unique.len(), codes.len(), "generated codes must be unique");
+
+        // 未知激活码 → false（既非存在也非未用）。
+        assert!(!db.check_active_code("does-not-exist").await?);
+
+        let code = codes[0].as_str();
+        assert!(db.check_active_code(code).await?);
+        assert!(
+            db.register_user_v2(code, "alice", "h", "s", "pbkdf2")
+                .await?
+        );
+
+        // 注册后事务内 used=1。
+        let used: i64 =
+            sqlx::query_scalar("SELECT used FROM activation_codes WHERE code = ?1")
+                .bind(code)
+                .fetch_one(&db.pool)
+                .await
+                .map_err(|e| SqliteSnAuthDB::db_err("read used flag failed", e))?;
+        assert_eq!(used, 1);
+        assert!(!db.check_active_code(code).await?);
+
+        // 二次使用被拒（既不创建用户，也不报错，按契约返回 false）。
+        assert!(
+            !db.register_user_v2(code, "bob", "h", "s", "pbkdf2")
+                .await?
+        );
+        assert!(!db.is_user_exist("bob").await?);
+
+        Ok(())
+    }
+
+    /// `register_user_v2` 事务性：`users` + `user_auth_v2` + `zone_info` 一致写入，激活码标记 used。
+    #[tokio::test]
+    async fn test_register_user_v2_writes_consistent_rows() -> SnResult<()> {
+        let (_tmp_dir, db) = new_test_db().await?;
+        db.insert_activation_code("code-1").await?;
+        assert!(
+            db.register_user_v2("code-1", "alice", "hash", "salt", "pbkdf2")
+                .await?
+        );
+
+        // users 行。
+        let user = db.get_user_info("alice").await?.unwrap();
+        assert_eq!(user.username.as_deref(), Some("alice"));
+        assert_eq!(user.activation_code.as_deref(), Some("code-1"));
+        assert!(matches!(user.state, UserState::Active));
+
+        // user_auth_v2 行。
+        let auth = db.get_v2_auth("alice").await?.unwrap();
+        assert_eq!(auth.username, "alice");
+        assert_eq!(auth.password_hash, "hash");
+        assert_eq!(auth.password_salt, "salt");
+        assert_eq!(auth.password_algo, "pbkdf2");
+
+        // zone_info 行（bns_name 默认为 username）。
+        let zone = db.get_zone_info("alice").await?.unwrap();
+        assert_eq!(zone.username, "alice");
+        assert_eq!(zone.bns_name, "alice");
+
+        // 同名二次注册（换激活码）被拒，且不破坏已有行。
+        db.insert_activation_code("code-2").await?;
+        assert!(
+            !db.register_user_v2("code-2", "alice", "h2", "s2", "pbkdf2")
+                .await?
+        );
+        // code-2 未被消费。
+        assert!(db.check_active_code("code-2").await?);
+        let auth = db.get_v2_auth("alice").await?.unwrap();
+        assert_eq!(auth.password_hash, "hash", "existing auth must be untouched");
+
+        Ok(())
+    }
+
+    /// 命名锁下并发注册：N 个任务用同一激活码注册不同用户名，只允许一个成功。
+    #[tokio::test]
+    async fn test_register_user_v2_concurrent_single_success() -> SnResult<()> {
+        let (_tmp_dir, db) = new_test_db().await?;
+        db.insert_activation_code("shared-code").await?;
+        let db = Arc::new(db);
+
+        let mut handles = Vec::new();
+        for i in 0..8 {
+            let db = db.clone();
+            handles.push(tokio::spawn(async move {
+                db.register_user_v2(
+                    "shared-code",
+                    &format!("user-{i}"),
+                    "hash",
+                    "salt",
+                    "pbkdf2",
+                )
+                .await
+            }));
+        }
+
+        let mut success = 0;
+        for handle in handles {
+            if handle.await.expect("task panicked")? {
+                success += 1;
+            }
+        }
+        assert_eq!(success, 1, "exactly one concurrent registration may win");
+
+        // 激活码已消费，且只创建了一个用户。
+        assert!(!db.check_active_code("shared-code").await?);
+        let user_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users")
+            .fetch_one(&db.pool)
+            .await
+            .map_err(|e| SqliteSnAuthDB::db_err("count users failed", e))?;
+        assert_eq!(user_count, 1);
+
+        Ok(())
+    }
+
+    /// 密码：PBKDF2-sha256-100000、16B salt(hex)、32B hash(hex)；`verify_password` 正确/错误；
+    /// 服务端不存明文；不支持的算法被拒。
+    #[tokio::test]
+    async fn test_password_pbkdf2_hash_and_verify() -> SnResult<()> {
+        use crate::sn_v2_auth::{hash_password, verify_password, PASSWORD_ALGO};
+
+        let (hash, salt) = hash_password("hunter2")
+            .map_err(|e| sn_err!(SnErrorCode::Failed, "hash failed: {:?}", e))?;
+        // 16 字节 salt → 32 hex 字符；32 字节 hash → 64 hex 字符。
+        assert_eq!(salt.len(), 32);
+        assert_eq!(hash.len(), 64);
+        assert_eq!(hex::decode(&salt).unwrap().len(), 16);
+        assert_eq!(hex::decode(&hash).unwrap().len(), 32);
+        // 不存明文。
+        assert_ne!(hash, "hunter2");
+
+        // 同一密码 + 不同随机 salt → 不同 hash。
+        let (hash2, salt2) = hash_password("hunter2")
+            .map_err(|e| sn_err!(SnErrorCode::Failed, "hash failed: {:?}", e))?;
+        assert_ne!(salt, salt2);
+        assert_ne!(hash, hash2);
+
+        let auth = SnV2AuthInfo {
+            username: "alice".to_string(),
+            password_hash: hash,
+            password_salt: salt,
+            password_algo: PASSWORD_ALGO.to_string(),
+            created_at: 0,
+            updated_at: 0,
+            last_login_at: None,
+        };
+        assert!(verify_password("hunter2", &auth)
+            .map_err(|e| sn_err!(SnErrorCode::Failed, "verify failed: {:?}", e))?);
+        assert!(!verify_password("wrong-pass", &auth)
+            .map_err(|e| sn_err!(SnErrorCode::Failed, "verify failed: {:?}", e))?);
+
+        // 不支持的算法 → 错误，而非 false。
+        let mut bad = auth.clone();
+        bad.password_algo = "plaintext".to_string();
+        assert!(verify_password("hunter2", &bad).is_err());
+
+        Ok(())
+    }
+
+    /// 用户状态机：`set_user_state` 写入 active/suspended/deleted/banned；
+    /// 置非 active 时自动撤销该用户 session；active 不撤销。
+    #[tokio::test]
+    async fn test_set_user_state_revokes_sessions() -> SnResult<()> {
+        let (_tmp_dir, db) = new_test_db().await?;
+        db.insert_activation_code("state-code").await?;
+        assert!(
+            db.register_user_v2("state-code", "alice", "h", "s", "pbkdf2")
+                .await?
+        );
+
+        // active → active：session 保留。
+        db.create_account_session("sess-keep", "alice", "sn-v2-refresh", 1, 100)
+            .await?;
+        db.set_user_state("alice", UserState::Active).await?;
+        assert_eq!(
+            db.get_account_session("sess-keep").await?.unwrap().state,
+            SESSION_ACTIVE
+        );
+
+        // 逐个非 active 状态：写库 + 撤销 session。
+        for (state, label) in [
+            (UserState::Suspended, "suspended"),
+            (UserState::Deleted, "deleted"),
+            (UserState::Banned, "banned"),
+        ] {
+            // 重新发一个活跃 session。
+            let sid = format!("sess-{label}");
+            db.create_account_session(&sid, "alice", "sn-v2-refresh", 1, 100)
+                .await?;
+            db.set_user_state("alice", state).await?;
+
+            let stored: String =
+                sqlx::query_scalar("SELECT state FROM users WHERE username = 'alice'")
+                    .fetch_one(&db.pool)
+                    .await
+                    .map_err(|e| SqliteSnAuthDB::db_err("read user state failed", e))?;
+            assert_eq!(stored, label);
+
+            let session = db.get_account_session(&sid).await?.unwrap();
+            assert_eq!(session.state, SESSION_REVOKED, "{label} must revoke session");
+            assert!(session.revoked_at.is_some());
+        }
+
+        Ok(())
+    }
+
+    // ---- §3.2 session（account_sessions）----
+
+    /// session 生命周期：create/get/revoke/revoke_user_sessions 语义与计数。
+    #[tokio::test]
+    async fn test_account_session_lifecycle_and_counts() -> SnResult<()> {
+        let (_tmp_dir, db) = new_test_db().await?;
+
+        // 未知 session → None。
+        assert!(db.get_account_session("missing").await?.is_none());
+
+        db.create_account_session("a1", "alice", "sn-v2-refresh", 1, 100)
+            .await?;
+        db.create_account_session("a2", "alice", "sn-v2-refresh", 2, 100)
+            .await?;
+        db.create_account_session("b1", "bob", "sn-v2-refresh", 3, 100)
+            .await?;
+
+        let s = db.get_account_session("a1").await?.unwrap();
+        assert_eq!(s.username, "alice");
+        assert_eq!(s.token_aud, "sn-v2-refresh");
+        assert_eq!(s.state, SESSION_ACTIVE);
+        assert_eq!(s.issued_at, 1);
+        assert_eq!(s.expires_at, 100);
+        assert!(s.revoked_at.is_none());
+
+        // 单条撤销。
+        db.revoke_account_session("a1", 50).await?;
+        let s = db.get_account_session("a1").await?.unwrap();
+        assert_eq!(s.state, SESSION_REVOKED);
+        assert_eq!(s.revoked_at, Some(50));
+
+        // 批量撤销只命中 alice 的活跃 session（a1 已撤销，仅 a2 计入）。
+        assert_eq!(db.revoke_user_sessions("alice", 60).await?, 1);
+        assert_eq!(
+            db.get_account_session("a2").await?.unwrap().state,
+            SESSION_REVOKED
+        );
+        // bob 不受影响。
+        assert_eq!(
+            db.get_account_session("b1").await?.unwrap().state,
+            SESSION_ACTIVE
+        );
+
+        // 再次批量撤销 alice：已无活跃 session → 0。
+        assert_eq!(db.revoke_user_sessions("alice", 70).await?, 0);
+
+        Ok(())
+    }
+
+    // ---- §3.3 user_domain + PKX proof ----
+
+    /// `canonical_user_domain` / `pkx_record_name` / `pkx_value` / `txt_matches_pkx` helper 稳定性。
+    #[test]
+    fn test_user_domain_helpers_are_stable() {
+        // 去 `*.` 前缀、小写、去尾点。
+        assert_eq!(
+            SqliteSnAuthDB::canonical_user_domain("*.Example.COM."),
+            Some("example.com".to_string())
+        );
+        assert_eq!(
+            SqliteSnAuthDB::canonical_user_domain("  API.Example.com  "),
+            Some("api.example.com".to_string())
+        );
+        assert_eq!(
+            SqliteSnAuthDB::canonical_user_domain("example.com"),
+            Some("example.com".to_string())
+        );
+        // 空 / 仅点 / 仅通配 → None。
+        assert_eq!(SqliteSnAuthDB::canonical_user_domain("   "), None);
+        assert_eq!(SqliteSnAuthDB::canonical_user_domain("."), None);
+
+        // 派生 helper 同输入恒等（无 nonce / exp）。
+        assert_eq!(
+            SqliteSnAuthDB::pkx_record_name("example.com"),
+            "_pkx.example.com"
+        );
+        assert_eq!(
+            SqliteSnAuthDB::pkx_value("owner-key").unwrap(),
+            SqliteSnAuthDB::pkx_value("owner-key").unwrap()
+        );
+        assert_eq!(
+            SqliteSnAuthDB::pkx_value("  owner-key  ").unwrap(),
+            "PKX(owner-key)"
+        );
+        assert!(SqliteSnAuthDB::pkx_value("   ").is_err());
+
+        // TXT 比较容忍包裹引号与首尾空白。
+        assert!(SqliteSnAuthDB::txt_matches_pkx(
+            "  \"PKX(owner-key)\"  ",
+            "PKX(owner-key)"
+        ));
+        assert!(!SqliteSnAuthDB::txt_matches_pkx("PKX(other)", "PKX(owner-key)"));
+    }
+
+    /// PKX 状态机：create → pending、verify → active、unbind → revoked，history 保留。
+    #[tokio::test]
+    async fn test_pkx_binding_state_transitions_and_history() -> SnResult<()> {
+        let (_tmp_dir, db) = new_test_db().await?;
+        db.insert_activation_code("alice-code").await?;
+        assert!(
+            db.register_user_v2("alice-code", "alice", "h", "s", "pbkdf2")
+                .await?
+        );
+        db.update_user_public_key("alice", "alice-owner-key").await?;
+
+        // create → pending_pkx，返回固定的 record name / pkx。
+        let challenge = db.create_pkx_binding("alice", "Example.com.").await?;
+        assert_eq!(challenge.domain, "example.com");
+        assert_eq!(challenge.pkx_record_name, "_pkx.example.com");
+        assert_eq!(challenge.pkx, "PKX(alice-owner-key)");
+        assert_eq!(
+            binding_state(&db, "example.com").await?,
+            DOMAIN_BINDING_PENDING_PKX
+        );
+        // pending 未被 get_user_by_domain 命中。
+        assert!(db.get_user_by_domain("example.com").await?.is_none());
+
+        // 重新 create 幂等：record name / pkx 不变。
+        let challenge2 = db.create_pkx_binding("alice", "example.com").await?;
+        assert_eq!(challenge2.pkx, challenge.pkx);
+        assert_eq!(challenge2.pkx_record_name, challenge.pkx_record_name);
+
+        // verify TXT 匹配 → active。
+        let binding = db
+            .verify_pkx_binding("alice", "example.com", &[challenge.pkx.clone()])
+            .await?;
+        assert_eq!(binding.domain, "example.com");
+        assert_eq!(
+            binding_state(&db, "example.com").await?,
+            DOMAIN_BINDING_ACTIVE
+        );
+        assert_eq!(
+            db.get_user_by_domain("api.example.com")
+                .await?
+                .unwrap()
+                .username
+                .as_deref(),
+            Some("alice")
+        );
+
+        // unbind → revoked，但 history 仍保留。
+        db.unbind_user_domain("alice", "example.com").await?;
+        assert_eq!(
+            binding_state(&db, "example.com").await?,
+            DOMAIN_BINDING_REVOKED
+        );
+        assert!(db.get_user_by_domain("api.example.com").await?.is_none());
+        let history: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM user_domain_history WHERE domain = 'example.com' AND owner = 'alice'",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .map_err(|e| SqliteSnAuthDB::db_err("count history failed", e))?;
+        assert_eq!(history, 1, "history must be retained after unbind");
+
+        Ok(())
+    }
+
+    /// 域名冲突：相同 / 祖先 / 子域名被他人历史绑定 → Conflict；本人则允许。
+    #[tokio::test]
+    async fn test_domain_conflict_rules() -> SnResult<()> {
+        let (_tmp_dir, db) = new_test_db().await?;
+        for (code, user) in [("a-code", "alice"), ("b-code", "bob")] {
+            db.insert_activation_code(code).await?;
+            assert!(db.register_user_v2(code, user, "h", "s", "pbkdf2").await?);
+        }
+        db.update_user_public_key("alice", "alice-key").await?;
+        db.update_user_public_key("bob", "bob-key").await?;
+
+        // alice 激活 example.com。
+        db.create_pkx_binding("alice", "example.com").await?;
+        db.verify_pkx_binding("alice", "example.com", &[String::from("PKX(alice-key)")])
+            .await?;
+
+        // bob：相同域名冲突。
+        let err = db.create_pkx_binding("bob", "example.com").await.unwrap_err();
+        assert_eq!(err.code(), SnErrorCode::Conflict);
+        // bob：子域名（descendant）冲突。
+        let err = db
+            .create_pkx_binding("bob", "api.example.com")
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), SnErrorCode::Conflict);
+        // bob：祖先域名（ancestor）冲突。
+        let err = db.create_pkx_binding("bob", "com").await.unwrap_err();
+        assert_eq!(err.code(), SnErrorCode::Conflict);
+
+        // alice 本人的子域名允许（owner 相同被排除）。
+        let challenge = db.create_pkx_binding("alice", "sub.example.com").await?;
+        assert_eq!(challenge.domain, "sub.example.com");
+
+        Ok(())
+    }
+
+    /// `get_user_by_domain`：active binding 最长匹配 + legacy `users.user_domain` 回退。
+    #[tokio::test]
+    async fn test_get_user_by_domain_longest_match_and_legacy_fallback() -> SnResult<()> {
+        let (_tmp_dir, db) = new_test_db().await?;
+        db.insert_activation_code("alice-code").await?;
+        assert!(
+            db.register_user_v2("alice-code", "alice", "h", "s", "pbkdf2")
+                .await?
+        );
+        db.update_user_public_key("alice", "alice-key").await?;
+
+        // alice 同时激活 example.com 与更具体的 sub.example.com。
+        db.create_pkx_binding("alice", "example.com").await?;
+        db.verify_pkx_binding("alice", "example.com", &[String::from("PKX(alice-key)")])
+            .await?;
+        db.create_pkx_binding("alice", "sub.example.com").await?;
+        db.verify_pkx_binding("alice", "sub.example.com", &[String::from("PKX(alice-key)")])
+            .await?;
+
+        // host.sub.example.com → 命中最长的 sub.example.com binding（同样属 alice）。
+        assert_eq!(
+            db.get_user_by_domain("host.sub.example.com")
+                .await?
+                .unwrap()
+                .username
+                .as_deref(),
+            Some("alice")
+        );
+        assert!(db.get_user_by_domain("unrelated.org").await?.is_none());
+
+        // legacy 回退：bob 仅在 users.user_domain 留有遗留域名、无 binding 行。
+        db.insert_activation_code("bob-code").await?;
+        assert!(db.register_user_v2("bob-code", "bob", "h", "s", "pbkdf2").await?);
+        sqlx::query("UPDATE users SET user_domain = 'legacy.test' WHERE username = 'bob'")
+            .execute(&db.pool)
+            .await
+            .map_err(|e| SqliteSnAuthDB::db_err("set legacy domain failed", e))?;
+        assert_eq!(
+            db.get_user_by_domain("host.legacy.test")
+                .await?
+                .unwrap()
+                .username
+                .as_deref(),
+            Some("bob")
+        );
+
+        Ok(())
+    }
+
+    // ---- §3.4 zone_info ----
+
+    /// `update_zone_info` patch 语义：只改传入字段，其余保留；users 缓存同步。
+    #[tokio::test]
+    async fn test_zone_info_patch_only_changes_given_fields() -> SnResult<()> {
+        let (_tmp_dir, db) = new_test_db().await?;
+        db.insert_activation_code("zone-code").await?;
+        assert!(
+            db.register_user_v2("zone-code", "alice", "h", "s", "pbkdf2")
+                .await?
+        );
+
+        // 初始整体写入。
+        db.update_zone_info(
+            "alice",
+            ZoneInfoPatch {
+                zone: Some("did:zone:alice".to_string()),
+                self_cert: Some(true),
+                sn_ips: Some("[\"1.2.3.4\"]".to_string()),
+                ..Default::default()
+            },
+        )
+        .await?;
+
+        // 仅 patch relay_sn，其余字段保留。
+        db.update_zone_info(
+            "alice",
+            ZoneInfoPatch {
+                relay_sn: Some("relay-a".to_string()),
+                ..Default::default()
+            },
+        )
+        .await?;
+        let zone = db.get_zone_info("alice").await?.unwrap();
+        assert_eq!(zone.relay_sn.as_deref(), Some("relay-a"));
+        assert_eq!(zone.zone.as_deref(), Some("did:zone:alice"));
+        assert!(zone.self_cert);
+        assert_eq!(zone.sn_ips.as_deref(), Some("[\"1.2.3.4\"]"));
+        // users 缓存同步。
+        assert!(db.get_user_info("alice").await?.unwrap().self_cert);
+
+        Ok(())
+    }
+
+    /// `get_zone_info` 在缺 zone_info 行时从 `users` 回退派生（backfill 分支）。
+    #[tokio::test]
+    async fn test_get_zone_info_backfills_from_users() -> SnResult<()> {
+        let (_tmp_dir, db) = new_test_db().await?;
+        db.insert_activation_code("zone-code").await?;
+        assert!(
+            db.register_user_v2("zone-code", "alice", "h", "s", "pbkdf2")
+                .await?
+        );
+
+        // 删 zone_info 行，并在 users 上留下 zone_config / self_cert。
+        sqlx::query("DELETE FROM zone_info WHERE username = 'alice'")
+            .execute(&db.pool)
+            .await
+            .map_err(|e| SqliteSnAuthDB::db_err("delete zone_info failed", e))?;
+        sqlx::query(
+            "UPDATE users SET zone_config = 'did:zone:legacy', self_cert = 1 WHERE username = 'alice'",
+        )
+        .execute(&db.pool)
+        .await
+        .map_err(|e| SqliteSnAuthDB::db_err("update user cache failed", e))?;
+
+        let zone = db.get_zone_info("alice").await?.unwrap();
+        assert_eq!(zone.username, "alice");
+        assert_eq!(zone.bns_name, "alice");
+        assert_eq!(zone.zone.as_deref(), Some("did:zone:legacy"));
+        assert!(zone.self_cert);
+
+        // 完全未知用户 → 默认值（不报错）。
+        let zone = db.get_zone_info("ghost").await?.unwrap();
+        assert_eq!(zone.username, "ghost");
+        assert!(zone.zone.is_none());
+        assert!(!zone.self_cert);
+
+        Ok(())
+    }
+
+    /// `update_zone_relay_sn`：按 zone/bns_name/username 命中写 relay_sn；缺行则插入；空参数被拒。
+    #[tokio::test]
+    async fn test_update_zone_relay_sn_paths() -> SnResult<()> {
+        let (_tmp_dir, db) = new_test_db().await?;
+        db.insert_activation_code("zone-code").await?;
+        assert!(
+            db.register_user_v2("zone-code", "alice", "h", "s", "pbkdf2")
+                .await?
+        );
+
+        // 按 username/bns_name 命中既有行。
+        assert!(db.update_zone_relay_sn("alice", "relay-a", Some("v2")).await?);
+        let zone = db.get_zone_info("alice").await?.unwrap();
+        assert_eq!(zone.relay_sn.as_deref(), Some("relay-a"));
+        assert_eq!(zone.source_version.as_deref(), Some("v2"));
+
+        // 空 zone / 空 relay_sn → InvalidInput。
+        assert_eq!(
+            db.update_zone_relay_sn("", "relay-a", None)
+                .await
+                .unwrap_err()
+                .code(),
+            SnErrorCode::InvalidInput
+        );
+        assert_eq!(
+            db.update_zone_relay_sn("alice", "  ", None)
+                .await
+                .unwrap_err()
+                .code(),
+            SnErrorCode::InvalidInput
+        );
+
+        // 缺行 → 插入新 zone_info 行。
+        assert!(db.update_zone_relay_sn("ghost-zone", "relay-b", None).await?);
+        let zone = db.get_zone_info("ghost-zone").await?.unwrap();
+        assert_eq!(zone.relay_sn.as_deref(), Some("relay-b"));
+
+        Ok(())
+    }
+
+    async fn binding_state(db: &SqliteSnAuthDB, domain: &str) -> SnResult<String> {
+        sqlx::query_scalar("SELECT state FROM user_domain_bindings WHERE domain = ?1")
+            .bind(domain)
+            .fetch_one(&db.pool)
+            .await
+            .map_err(|e| SqliteSnAuthDB::db_err("read binding state failed", e))
+    }
 }
