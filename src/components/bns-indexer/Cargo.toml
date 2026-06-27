@@ -16,3 +16,6 @@ thiserror.workspace = true
 [dev-dependencies]
 ndn-lib.workspace = true
 tempfile.workspace = true
+tokio.workspace = true
+serde_json.workspace = true
+alloy-sol-types = { version = "1.6.0", features = ["json"] }
