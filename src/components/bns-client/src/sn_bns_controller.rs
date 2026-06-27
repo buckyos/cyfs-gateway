@@ -114,10 +114,12 @@ pub struct BnsMultiWriteReceipt {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BootstrapNameOutput {
+pub struct RegisterNameOutput {
     pub receipt: BnsWriteReceipt,
     pub initial_documents: Vec<BnsDocumentVersion>,
 }
+
+pub type BootstrapNameOutput = RegisterNameOutput;
 
 trait MarkIdempotentReuse {
     fn mark_reused(&mut self);
@@ -177,13 +179,13 @@ impl BnsWriteMetadata for BnsMultiWriteReceipt {
     }
 }
 
-impl MarkIdempotentReuse for BootstrapNameOutput {
+impl MarkIdempotentReuse for RegisterNameOutput {
     fn mark_reused(&mut self) {
         self.receipt.mark_reused();
     }
 }
 
-impl BnsWriteMetadata for BootstrapNameOutput {
+impl BnsWriteMetadata for RegisterNameOutput {
     fn evm_submission(&self) -> Option<BnsEvmTxSubmission> {
         self.receipt.evm_submission()
     }
@@ -378,6 +380,13 @@ impl SnBnsControllerConfig {
         )
     }
 
+    pub fn sn_managed_owner_authority(&self) -> CallAuthority {
+        CallAuthority::owner(
+            self.sn_controller_principal.clone(),
+            self.sn_controller_kid.clone(),
+        )
+    }
+
     pub fn sn_controller_policy(&self) -> SnBnsControllerResult<Vec<bns_indexer::ControllerRule>> {
         self.validate()?;
         Ok(self
@@ -541,15 +550,15 @@ impl SnBnsController {
 
     pub async fn bootstrap_name(
         &self,
-        params: BootstrapNameParams,
-    ) -> SnBnsControllerResult<BootstrapNameOutput> {
+        params: RegisterNameParams,
+    ) -> SnBnsControllerResult<RegisterNameOutput> {
         self.register_name(params).await
     }
 
     pub async fn register_name(
         &self,
-        params: BootstrapNameParams,
-    ) -> SnBnsControllerResult<BootstrapNameOutput> {
+        params: RegisterNameParams,
+    ) -> SnBnsControllerResult<RegisterNameOutput> {
         self.ensure_owner_authority_or_public_registration(&params.authority)?;
         let controller_policy = self.sn_controller_policy()?;
         let controller_policy_hash =
@@ -1077,7 +1086,7 @@ impl SnBnsController {
             Ok(())
         } else {
             Err(SnBnsControllerError::InvalidInput(
-                "bootstrap_name requires owner authority for subnames or public authority for root registration"
+                "register_name requires owner authority for subnames or public authority for root registration"
                     .to_string(),
             ))
         }
@@ -1149,8 +1158,8 @@ impl SnBnsController {
         name: &str,
         controller_policy_hash: &str,
         submission: BnsEvmTxSubmission,
-    ) -> BootstrapNameOutput {
-        BootstrapNameOutput {
+    ) -> RegisterNameOutput {
+        RegisterNameOutput {
             receipt: BnsWriteReceipt {
                 request_id: request_id.to_string(),
                 name: name.to_string(),
@@ -1301,7 +1310,7 @@ impl SnBnsController {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BootstrapNameParams {
+pub struct RegisterNameParams {
     pub request_id: String,
     pub name: String,
     pub asset_owner: String,
@@ -1313,6 +1322,8 @@ pub struct BootstrapNameParams {
     pub authority: CallAuthority,
     pub guard: MutationGuard,
 }
+
+pub type BootstrapNameParams = RegisterNameParams;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PublishOwnerDocumentParams {

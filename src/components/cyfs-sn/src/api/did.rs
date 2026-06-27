@@ -1,6 +1,7 @@
 use super::common::{
-    normalize_username, ok_response, parse_params, require_account_username, stable_request_id,
-    GetDidDocumentReq, IntoRpcResult, RpcCallResult, SetDidDocumentReq,
+    bns_managed_owner_authority, normalize_username, ok_response, parse_params,
+    require_account_username, stable_request_id, GetDidDocumentReq, IntoRpcResult, RpcCallResult,
+    SetDidDocumentReq,
 };
 use super::errors::{bns_write_error, parse_error, SnV2ErrorCode};
 use crate::SNServer;
@@ -21,12 +22,10 @@ pub(crate) async fn handle_did(server: &SNServer, req: RPCRequest) -> RpcCallRes
             let mut bns_receipt = None;
             let mut published_to_bns = false;
             if let Some(controller) = server.bns_controller() {
-                let auth_context =
+                let _auth_context =
                     crate::sn_authority::require_owner_for_name(server, &req, username.as_str())
                         .await?;
-                let authority = auth_context.to_call_authority().ok_or_else(|| {
-                    parse_error(SnV2ErrorCode::AuthRequired, "owner authority is required")
-                })?;
+                let authority = bns_managed_owner_authority(&controller)?;
                 let document = if params.did_document.is_object() {
                     params.did_document.clone()
                 } else {

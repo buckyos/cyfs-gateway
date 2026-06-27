@@ -1,13 +1,13 @@
 use super::common::{
-    build_profile_json, normalize_username, now_secs, ok_response, parse_params,
-    require_account_username, ActiveCodeReq, IntoRpcResult, LoginReq, NameReq, RefreshReq,
-    RegisterReq, RpcCallResult,
+    bns_default_asset_owner, build_profile_json, normalize_evm_address, normalize_username,
+    now_secs, ok_response, parse_params, require_account_username, ActiveCodeReq, IntoRpcResult,
+    LoginReq, NameReq, RefreshReq, RegisterReq, RpcCallResult,
 };
 use super::errors::{bns_write_error, parse_error, SnV2ErrorCode};
 use crate::sn_v2_auth::{hash_password, verify_password, PASSWORD_ALGO};
 use crate::SNServer;
 use ::kRPC::{RPCErrors, RPCRequest, RPCResponse};
-use bns_client::BootstrapNameParams;
+use bns_client::RegisterNameParams;
 use bns_indexer::{CallAuthority, MutationGuard, RegisterOptions};
 use serde_json::{json, Value};
 
@@ -114,17 +114,18 @@ pub(crate) async fn handle_auth(server: &SNServer, req: RPCRequest) -> RpcCallRe
             let (password_hash, password_salt) = hash_password(params.pwd_hash.as_str())?;
             let need_bind_owner_key = server.bns_controller().is_none();
             if let Some(controller) = server.bns_controller() {
+                let asset_owner = match params.asset_owner.as_deref() {
+                    Some(value) => normalize_evm_address(value, "asset_owner")?,
+                    None => bns_default_asset_owner(&controller)?,
+                };
                 controller
-                    .register_name(BootstrapNameParams {
+                    .register_name(RegisterNameParams {
                         request_id: params
                             .request_id
                             .clone()
                             .unwrap_or_else(|| format!("sn:v2:register:{}", username)),
                         name: username.clone(),
-                        asset_owner: params
-                            .asset_owner
-                            .clone()
-                            .unwrap_or_else(|| username.clone()),
+                        asset_owner,
                         register_options: RegisterOptions {
                             ..RegisterOptions::default()
                         },

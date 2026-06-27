@@ -1,6 +1,7 @@
 use super::common::{
-    document_value_from_param, ok_response, parse_params, require_account_username,
-    resolve_self_scoped_username, stable_request_id, BindZoneReq, IntoRpcResult, RpcCallResult,
+    bns_managed_owner_authority, document_value_from_param, ok_response, parse_params,
+    require_account_username, resolve_self_scoped_username, stable_request_id, BindZoneReq,
+    IntoRpcResult, RpcCallResult,
 };
 use super::errors::{bns_write_error, parse_error, SnV2ErrorCode};
 use crate::SNServer;
@@ -71,12 +72,10 @@ pub(crate) async fn handle_zone(server: &SNServer, req: RPCRequest) -> RpcCallRe
             }
             let mut bns_receipt = None;
             if let Some(controller) = server.bns_controller() {
-                let auth_context =
+                let _auth_context =
                     crate::sn_authority::require_owner_for_name(server, &req, username.as_str())
                         .await?;
-                let authority = auth_context.to_call_authority().ok_or_else(|| {
-                    parse_error(SnV2ErrorCode::AuthRequired, "owner authority is required")
-                })?;
+                let authority = bns_managed_owner_authority(&controller)?;
                 let zone_config =
                     document_value_from_param(params.zone_config.as_str(), "zone_config_jwt");
                 if !zone_config.is_object() {

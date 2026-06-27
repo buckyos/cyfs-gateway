@@ -1,5 +1,7 @@
 use crate::{SNServer, SnAuthDBRef, SnCompatibilityStoreRef};
 use ::kRPC::*;
+use bns_client::SnBnsController;
+use bns_indexer::{CallAuthority, PrincipalKind};
 use jsonwebtoken::{jwk::Jwk, DecodingKey};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -286,6 +288,49 @@ pub(crate) fn document_value_from_param(raw: &str, fallback_key: &str) -> Value 
     serde_json::from_str::<Value>(raw)
         .ok()
         .unwrap_or_else(|| json!({ fallback_key: raw }))
+}
+
+fn is_evm_address(value: &str) -> bool {
+    value
+        .strip_prefix("0x")
+        .is_some_and(|hex| hex.len() == 40 && hex.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
+pub(crate) fn normalize_evm_address(value: &str, field: &str) -> RpcCallResult<String> {
+    let value = value.trim();
+    if is_evm_address(value) {
+        Ok(value.to_ascii_lowercase())
+    } else {
+        Err(parse_error(
+            SnV2ErrorCode::InvalidParams,
+            format!("{field} must be a 0x-prefixed EVM address"),
+        ))
+    }
+}
+
+pub(crate) fn bns_default_asset_owner(controller: &SnBnsController) -> RpcCallResult<String> {
+    let principal = &controller.config().sn_controller_principal;
+    if principal.kind != PrincipalKind::ChainAccount {
+        return Err(parse_error(
+            SnV2ErrorCode::InvalidParams,
+            "asset_owner is required when SN controller principal is not a chain account",
+        ));
+    }
+
+    normalize_evm_address(principal.value.as_str(), "sn_controller_principal.value")
+}
+
+pub(crate) fn bns_managed_owner_authority(
+    controller: &SnBnsController,
+) -> RpcCallResult<CallAuthority> {
+    let principal = &controller.config().sn_controller_principal;
+    if principal.kind != PrincipalKind::ChainAccount || !is_evm_address(principal.value.as_str()) {
+        return Err(parse_error(
+            SnV2ErrorCode::AuthRequired,
+            "managed BNS owner writes require an EVM chain-account SN controller principal",
+        ));
+    }
+    Ok(controller.config().sn_managed_owner_authority())
 }
 
 pub(crate) fn build_profile_json(username: &str, user: &crate::SNUserInfo) -> Value {

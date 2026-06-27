@@ -1,8 +1,8 @@
 use super::common::{
-    device_to_json, ensure_owner_decoding_key, ok_response, parse_params, query_by_did,
-    require_account_username, resolve_self_scoped_username, stable_request_id, DeviceGetReq,
-    DeviceRegisterReq, DeviceUpdateReq, IntoRpcResult, QueryByDidReq, QueryByHostnameReq,
-    QueryByPkReq, RpcCallResult,
+    bns_managed_owner_authority, device_to_json, ensure_owner_decoding_key, ok_response,
+    parse_params, query_by_did, require_account_username, resolve_self_scoped_username,
+    stable_request_id, DeviceGetReq, DeviceRegisterReq, DeviceUpdateReq, IntoRpcResult,
+    QueryByDidReq, QueryByHostnameReq, QueryByPkReq, RpcCallResult,
 };
 use super::errors::{bns_write_error, parse_error, SnV2ErrorCode};
 use crate::SNServer;
@@ -43,12 +43,10 @@ pub(crate) async fn handle_device(
             let mut pending_bns_publish = server.bns_controller().is_none();
             let mut published_to_bns = false;
             if let Some(controller) = server.bns_controller() {
-                let auth_context =
+                let _auth_context =
                     crate::sn_authority::require_owner_for_name(server, &req, username.as_str())
                         .await?;
-                let authority = auth_context.to_call_authority().ok_or_else(|| {
-                    parse_error(SnV2ErrorCode::AuthRequired, "owner authority is required")
-                })?;
+                let authority = bns_managed_owner_authority(&controller)?;
                 let mut device_mini_doc =
                     serde_json::from_str::<Value>(params.device_info.as_str())
                         .ok()
