@@ -272,6 +272,7 @@ pub struct ZoneDocument {
     pub raw: Option<Value>,
     pub jwt: Option<String>,
     pub boot_jwt: Option<String>,
+    pub devices: HashMap<String, Value>,
     pub gateway_device_name: Option<String>,
     pub gateway_ips: Vec<IpAddr>,
     pub ttl: Option<u32>,
@@ -284,6 +285,7 @@ impl ZoneDocument {
             raw: None,
             jwt: None,
             boot_jwt: None,
+            devices: HashMap::new(),
             gateway_device_name: None,
             gateway_ips: Vec::new(),
             ttl: None,
@@ -295,6 +297,7 @@ impl ZoneDocument {
         let raw = document.content.to_json_value();
         let jwt = document.content.as_jwt();
         let boot_jwt = raw.as_ref().and_then(find_boot_jwt);
+        let devices = raw.as_ref().map(find_device_mini_map).unwrap_or_default();
         let gateway_device_name = raw.as_ref().and_then(find_gateway_device_name);
         let gateway_ips = raw.as_ref().map(find_gateway_ips).unwrap_or_default();
         let ttl = raw.as_ref().and_then(find_ttl).or(document.meta.ttl);
@@ -302,6 +305,7 @@ impl ZoneDocument {
             raw,
             jwt,
             boot_jwt,
+            devices,
             gateway_device_name,
             gateway_ips,
             ttl,
@@ -1275,7 +1279,11 @@ impl SnResolver {
             .to_string();
 
         let (device_doc, compatibility_device) = self
-            .resolve_device_mini_doc(zone.zone_name.as_str(), gateway_device_name.as_str())
+            .resolve_device_mini_doc(
+                zone.zone_name.as_str(),
+                gateway_device_name.as_str(),
+                Some(&zone.zone_doc),
+            )
             .await?;
 
         let online = self
@@ -1309,17 +1317,8 @@ impl SnResolver {
         &self,
         zone_name: &str,
         device_name: &str,
+        zone_doc: Option<&ZoneDocument>,
     ) -> SnResolverResult<(DeviceMiniDocument, Option<ResolverDeviceDocument>)> {
-        if let Some(document) = self
-            .bns
-            .get_document(zone_name, BNS_DOC_DEVICE_MINI)
-            .await?
-        {
-            if let Some(device_doc) = device_doc_from_aggregate(zone_name, device_name, &document) {
-                return Ok((device_doc, None));
-            }
-        }
-
         let child_name = format!("{}.{}", device_name, zone_name);
         for doc_type in [BNS_DOC_DEVICE_MINI, "doc"] {
             if let Some(document) = self.bns.get_document(child_name.as_str(), doc_type).await? {
@@ -1331,6 +1330,39 @@ impl SnResolver {
                 ) {
                     return Ok((device_doc, None));
                 }
+            }
+        }
+
+        if let Some(document) = self
+            .bns
+            .get_document(zone_name, BNS_DOC_DEVICE_MINI)
+            .await?
+        {
+            if let Some(device_doc) = device_doc_from_aggregate(zone_name, device_name, &document) {
+                return Ok((device_doc, None));
+            }
+        }
+
+        if let Some(zone_doc) = zone_doc {
+            if let Some(device_doc) = device_doc_from_map(
+                zone_name,
+                device_name,
+                &zone_doc.devices,
+                zone_doc.ttl,
+                zone_doc.version,
+            ) {
+                return Ok((device_doc, None));
+            }
+        } else if let Some(document) = self.bns.get_document(zone_name, BNS_DOC_ZONE).await? {
+            let zone_doc = ZoneDocument::from_bns_document(&document);
+            if let Some(device_doc) = device_doc_from_map(
+                zone_name,
+                device_name,
+                &zone_doc.devices,
+                zone_doc.ttl,
+                zone_doc.version,
+            ) {
+                return Ok((device_doc, None));
             }
         }
 
@@ -1429,29 +1461,40 @@ impl SnResolver {
             txt.push(format!("BOOT={};", raw));
         }
 
+        let mut device_jwt_source_found = false;
         if let Some(document) = self
             .bns
             .get_document(zone.zone_name.as_str(), BNS_DOC_DEVICE_MINI)
             .await?
         {
+            device_jwt_source_found = true;
             for jwt in device_jwts_from_bns_document(&document) {
                 txt.push(format!("DEV={};", jwt));
             }
-        } else if let Some(device) = self
-            .compatibility
-            .get_device_by_name(
-                zone.zone_name.as_str(),
-                zone.zone_doc
-                    .gateway_device_name
-                    .as_deref()
-                    .or(zone.boot_doc.gateway_device_name.as_deref())
-                    .unwrap_or(self.config.legacy_gateway_device_name.as_str()),
-            )
-            .await?
-        {
-            if let Some(mini_config_jwt) = device.mini_config_jwt {
-                if !mini_config_jwt.trim().is_empty() {
-                    txt.push(format!("DEV={};", mini_config_jwt));
+        } else if !zone.zone_doc.devices.is_empty() {
+            device_jwt_source_found = true;
+            for jwt in device_jwts_from_map(&zone.zone_doc.devices) {
+                txt.push(format!("DEV={};", jwt));
+            }
+        }
+
+        if !device_jwt_source_found {
+            if let Some(device) = self
+                .compatibility
+                .get_device_by_name(
+                    zone.zone_name.as_str(),
+                    zone.zone_doc
+                        .gateway_device_name
+                        .as_deref()
+                        .or(zone.boot_doc.gateway_device_name.as_deref())
+                        .unwrap_or(self.config.legacy_gateway_device_name.as_str()),
+                )
+                .await?
+            {
+                if let Some(mini_config_jwt) = device.mini_config_jwt {
+                    if !mini_config_jwt.trim().is_empty() {
+                        txt.push(format!("DEV={};", mini_config_jwt));
+                    }
                 }
             }
         }
@@ -1629,7 +1672,7 @@ impl SnResolver {
             }
             device_name => {
                 if let Ok((device_doc, compatibility_device)) = self
-                    .resolve_device_mini_doc(zone_name.as_str(), device_name)
+                    .resolve_device_mini_doc(zone_name.as_str(), device_name, None)
                     .await
                 {
                     let document =
@@ -1662,8 +1705,9 @@ impl SnResolver {
     ) -> SnResolverResult<DidResolution> {
         match doc_type {
             "doc" => {
-                let (device_doc, compatibility_device) =
-                    self.resolve_device_mini_doc(zone_name, obj_name).await?;
+                let (device_doc, compatibility_device) = self
+                    .resolve_device_mini_doc(zone_name, obj_name, None)
+                    .await?;
                 let document =
                     device_document_or_fallback(device_doc, compatibility_device.as_ref());
                 Ok(DidResolution {
@@ -1687,8 +1731,9 @@ impl SnResolver {
                     });
                 }
 
-                if let Ok((device_doc, compatibility_device)) =
-                    self.resolve_device_mini_doc(zone_name, obj_name).await
+                if let Ok((device_doc, compatibility_device)) = self
+                    .resolve_device_mini_doc(zone_name, obj_name, None)
+                    .await
                 {
                     return Ok(DidResolution {
                         did: did.to_string(),
@@ -1791,7 +1836,11 @@ impl SnResolver {
         if let Some(online) = online {
             if doc_type == "doc" {
                 let (device_doc, _) = self
-                    .resolve_device_mini_doc(online.zone.as_str(), online.device_name.as_str())
+                    .resolve_device_mini_doc(
+                        online.zone.as_str(),
+                        online.device_name.as_str(),
+                        None,
+                    )
                     .await?;
                 return Ok(DidResolution {
                     did: did_str,
@@ -2193,6 +2242,22 @@ fn find_boot_jwt(value: &Value) -> Option<String> {
     bns_indexer::dns_document::extract_boot_jwt(value)
 }
 
+fn find_device_mini_map(value: &Value) -> HashMap<String, Value> {
+    let mut result = HashMap::new();
+    for path in [
+        &["devices"][..],
+        &["device_mini_doc", "devices"][..],
+        &["device_mini_docs", "devices"][..],
+    ] {
+        if let Some(devices) = find_object_path(value, path) {
+            for (name, device) in devices {
+                result.entry(name.clone()).or_insert_with(|| device.clone());
+            }
+        }
+    }
+    result
+}
+
 fn short_device_name(value: &str) -> String {
     value.split('.').next().unwrap_or(value).to_string()
 }
@@ -2231,6 +2296,17 @@ fn find_array_path<'a>(value: &'a Value, path: &[&str]) -> Option<&'a Vec<Value>
         current = current.get(*key)?;
     }
     current.as_array()
+}
+
+fn find_object_path<'a>(
+    value: &'a Value,
+    path: &[&str],
+) -> Option<&'a serde_json::Map<String, Value>> {
+    let mut current = value;
+    for key in path {
+        current = current.get(*key)?;
+    }
+    current.as_object()
 }
 
 fn collect_ips_from_value_path(value: &Value, path: &[&str], result: &mut Vec<IpAddr>) {
@@ -2284,6 +2360,16 @@ fn device_jwts_from_bns_document(document: &BnsDocument) -> Vec<String> {
     result
 }
 
+fn device_jwts_from_map(devices: &HashMap<String, Value>) -> Vec<String> {
+    let mut result = Vec::new();
+    for device in devices.values() {
+        if let Some(jwt) = find_string_path(device, &["mini_config_jwt"]) {
+            result.push(jwt);
+        }
+    }
+    result
+}
+
 fn txt_records_from_bns_document(document: &BnsDocument) -> Vec<String> {
     let Some(value) = document.content.to_json_value() else {
         return document
@@ -2319,6 +2405,17 @@ fn txt_records_from_bns_document(document: &BnsDocument) -> Vec<String> {
     }
 
     result
+}
+
+fn device_doc_from_map(
+    zone_name: &str,
+    device_name: &str,
+    devices: &HashMap<String, Value>,
+    ttl: Option<u32>,
+    version: Option<u64>,
+) -> Option<DeviceMiniDocument> {
+    let device_value = devices.get(device_name)?;
+    device_doc_from_value(zone_name, device_name, device_value, ttl, version)
 }
 
 fn device_doc_from_aggregate(
@@ -2716,6 +2813,151 @@ mod tests {
         assert_eq!(device.device_name, "gw1");
         assert_eq!(device.did, "did:dev:abc");
         assert_eq!(device.mini_config_jwt.as_deref(), Some("jwt"));
+    }
+
+    #[test]
+    fn parses_device_mini_map_from_zone_document() {
+        let doc = BnsDocument::json(
+            "testuser",
+            BNS_DOC_ZONE,
+            json!({
+                "devices": {
+                    "gw1": {
+                        "did": "did:dev:abc",
+                        "mini_config_jwt": "jwt"
+                    }
+                }
+            }),
+        );
+
+        let zone_doc = ZoneDocument::from_bns_document(&doc);
+        let device = device_doc_from_map(
+            "testuser",
+            "gw1",
+            &zone_doc.devices,
+            zone_doc.ttl,
+            zone_doc.version,
+        )
+        .unwrap();
+
+        assert_eq!(device.device_name, "gw1");
+        assert_eq!(device.did, "did:dev:abc");
+        assert_eq!(device.mini_config_jwt.as_deref(), Some("jwt"));
+    }
+
+    #[tokio::test]
+    async fn resolves_device_mini_doc_from_embedded_zone_devices() {
+        let mut bns = StaticBnsReader::default();
+        bns.documents.insert(
+            ("testuser".to_string(), BNS_DOC_ZONE.to_string()),
+            BnsDocument::json(
+                "testuser",
+                BNS_DOC_ZONE,
+                json!({
+                    "devices": {
+                        "ood1": {
+                            "did": "did:dev:embedded",
+                            "mini_config_jwt": "embedded-jwt"
+                        }
+                    }
+                }),
+            ),
+        );
+        let resolver = test_resolver_with_bns(bns);
+
+        let (device, compatibility) = resolver
+            .resolve_device_mini_doc("testuser", "ood1", None)
+            .await
+            .unwrap();
+
+        assert!(compatibility.is_none());
+        assert_eq!(device.device_name, "ood1");
+        assert_eq!(device.did, "did:dev:embedded");
+        assert_eq!(device.mini_config_jwt.as_deref(), Some("embedded-jwt"));
+    }
+
+    #[tokio::test]
+    async fn embedded_and_standalone_device_maps_resolve_equivalently() {
+        let device_map = json!({
+            "devices": {
+                "ood1": {
+                    "did": "did:dev:abc",
+                    "mini_config_jwt": "jwt",
+                    "role": "gateway"
+                }
+            }
+        });
+
+        let mut embedded_bns = StaticBnsReader::default();
+        embedded_bns.documents.insert(
+            ("testuser".to_string(), BNS_DOC_ZONE.to_string()),
+            BnsDocument::json("testuser", BNS_DOC_ZONE, device_map.clone()),
+        );
+        let embedded_resolver = test_resolver_with_bns(embedded_bns);
+
+        let mut standalone_bns = StaticBnsReader::default();
+        standalone_bns.documents.insert(
+            ("testuser".to_string(), BNS_DOC_DEVICE_MINI.to_string()),
+            BnsDocument::json("testuser", BNS_DOC_DEVICE_MINI, device_map),
+        );
+        let standalone_resolver = test_resolver_with_bns(standalone_bns);
+
+        let (embedded, _) = embedded_resolver
+            .resolve_device_mini_doc("testuser", "ood1", None)
+            .await
+            .unwrap();
+        let (standalone, _) = standalone_resolver
+            .resolve_device_mini_doc("testuser", "ood1", None)
+            .await
+            .unwrap();
+
+        assert_eq!(embedded, standalone);
+    }
+
+    #[tokio::test]
+    async fn child_device_doc_overrides_aggregate_and_doc_type_doc_is_supported() {
+        let mut bns = StaticBnsReader::default();
+        bns.documents.insert(
+            ("testuser".to_string(), BNS_DOC_DEVICE_MINI.to_string()),
+            BnsDocument::json(
+                "testuser",
+                BNS_DOC_DEVICE_MINI,
+                json!({
+                    "devices": {
+                        "ood1": {
+                            "did": "did:dev:aggregate",
+                            "source": "aggregate"
+                        }
+                    }
+                }),
+            ),
+        );
+        bns.documents.insert(
+            ("ood1.testuser".to_string(), "doc".to_string()),
+            BnsDocument::json(
+                "ood1.testuser",
+                "doc",
+                json!({
+                    "did": "did:dev:child",
+                    "source": "child"
+                }),
+            ),
+        );
+        let resolver = test_resolver_with_bns(bns);
+
+        let (device, _) = resolver
+            .resolve_device_mini_doc("testuser", "ood1", None)
+            .await
+            .unwrap();
+
+        assert_eq!(device.did, "did:dev:child");
+        assert_eq!(
+            device
+                .document
+                .as_ref()
+                .and_then(|value| value["source"].as_str()),
+            Some("child")
+        );
     }
 
     #[tokio::test]

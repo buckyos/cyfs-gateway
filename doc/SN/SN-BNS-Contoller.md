@@ -275,7 +275,9 @@ Resolver 依赖：
 
 用途：设备身份和基础配置的权威文档。
 
-当前 BNS 文档主键是 `(name, doc_type)`，没有独立 document path。第一版推荐使用聚合文档：
+规范形态是 `zone` document 内嵌同一份 `devices` mini map；独立 `device_mini_doc`
+是 DNS TXT / inline 大小受限时的拆分存储，语义与内嵌 map 保持一致。当前
+`publish_device_mini_doc` 写入的是独立聚合文档：
 
 ```json
 {
@@ -296,7 +298,7 @@ Resolver 依赖：
 - doc_type 固定为 `device_mini_doc`。
 - 内容按 `device_name` 聚合，发布新设备时读取当前版本、合并、发布新版本。
 - `expected_version` 必须匹配当前 `device_mini_doc` 版本。
-- 设备多、文档超过 4 KiB 后，应改为外部文档引用，或把每个设备注册为二级 BNS name，例如 `ood1.alice`，并在该 name 下发布 `device_mini_doc`。
+- 设备多、文档超过 4 KiB 后，应使用独立 `device_mini_doc` 拆分存储，或把每个设备注册为二级 BNS name，例如 `ood1.alice`，并在该 name 下发布 `device_mini_doc` / `doc`。
 
 权限：
 

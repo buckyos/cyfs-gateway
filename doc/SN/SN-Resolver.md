@@ -331,7 +331,7 @@ resolve_gateway_by_hostname(hostname) -> GatewayResolution
 - `info`: 返回设备在线信息的公开投影。
 - 其它 `doc_type`: 查询对应 BNS document 或兼容本地 DID document。
 
-已实现：`resolve_bns_object_doc`（`sn_resolver.rs:1647`）把 BNS document 放在前面（`resolve_device_mini_doc` 先读 BNS aggregate / 子 document，再回退兼容 store，`sn_resolver.rs:1299`），设备在线信息只来自 `sn_device_info`（`get_device_state_by_name`，`info` 投影）。含 `.` 的 owner 经 `user_domain` 映射到 username（`sn_resolver.rs:1561`）。
+已实现：`resolve_bns_object_doc` 把 BNS document 放在前面；`resolve_device_mini_doc` 的优先级是 child 名独立文档（`device_mini_doc` / `doc`）→ zone 级独立聚合 `device_mini_doc` → `zone` document 内嵌 `devices` map → 兼容 store。设备在线信息只来自 `sn_device_info`（`get_device_state_by_name`，`info` 投影）。含 `.` 的 owner 经 `user_domain` 映射到 username。
 
 ### did:web
 
@@ -482,7 +482,7 @@ resolve_relay_for_zone(zone)
   - 5 个输出类型齐全：`ZoneResolution`（`sn_resolver.rs:364`）、`GatewayResolution`（`sn_resolver.rs:378`）、`DnsResolution`（`sn_resolver.rs:391`）、`DidResolution`（`sn_resolver.rs:401`）、`RelayResolution`（`sn_resolver.rs:409`）。
   - `resolve_dns` / `resolve_dns_cached` / `resolve_name_info`（DNS）、`resolve_gateway_by_hostname`（hostname→gateway）、`resolve_did`（DID，web/bns/dev 三种 method，`sn_resolver.rs:1161`）、`resolve_relay_for_zone`（relay，`sn_resolver.rs:1130`）。
   - 结构化错误类型 `SnResolverErrorKind`（10 个变体，`sn_resolver.rs:36`）。
-  - BNS-first + legacy fallback：`resolve_zone_by_bns_owner` 优先读 BNS `zone`/`boot` document（`sn_resolver.rs:1197`），无则回退本地 `zone_config`。
+  - BNS-first + legacy fallback：`resolve_zone_by_bns_owner` 优先读 BNS `zone`/`boot` document，无则回退本地 `zone_config`；device mini doc 优先 child 独立文档，其次独立聚合 `device_mini_doc`，再读 `zone` 内嵌 `devices` map。
   - TXT 合并 `zone`+`boot`+`dns_txt`（`resolve_zone_txt`，`sn_resolver.rs:1405`）。
   - A/AAAA 优先 `gateway_ips`、否则从 `zone`/`boot` 派生 gateway device，`ood1` 降级为兜底默认 `DEFAULT_LEGACY_GATEWAY_DEVICE`（`sn_resolver.rs:22`）。
   - IP 过滤/去重：loopback、`172.16.0.0/12`、record type 分流（`sn_resolver.rs:2473`）。
@@ -504,7 +504,7 @@ resolve_relay_for_zone(zone)
 1. [已完成] 抽出 `sn_resolver` 模块，先包住现有 `SNServer` 解析逻辑，保证旧测试不变（`sn_resolver.rs`）。
 2. [已完成] 定义 `ZoneResolution`、`GatewayResolution`、`DnsResolution`、`DidResolution`、`RelayResolution`（`sn_resolver.rs:364` 起）。
 3. [已完成] 把 `NameServer::query`（`sn_server.rs:3665`）、`query_did_v2`（`sn_server.rs:3145`）、`query_device_by_hostname_v2`（`sn_server.rs:2587`）改为调用 resolver 并做兼容投影。
-4. [已完成] 接入 `bns-indexer` read client，把 BNS `zone`、`boot`、`device_mini_doc`、`dns_txt` 放到第一优先级（`sn_bns_reader.rs::BnsIndexerDocumentReader`，装配于 `sn_server.rs:689`；未配置 indexer 时退回 legacy 后端）。
+4. [已完成] 接入 `bns-indexer` read client，把 BNS `zone`、`boot`、`device_mini_doc`、`dns_txt` 放到 legacy 之前；device mini doc 解析同时支持独立聚合文档和 `zone` 内嵌 `devices` map（`sn_bns_reader.rs::BnsIndexerDocumentReader`，装配于 `sn_server.rs:689`；未配置 indexer 时退回 legacy 后端）。
 5. [已完成] 把 gateway device 从硬编码 `ood1` 改成读取 BNS `zone/boot`，`ood1` 仅作兜底默认（`resolve_gateway_for_zone`，`sn_resolver.rs:1260`）。
 6. [部分完成] 显式本地 DNS record 已作为兼容 fallback 优先返回（`sn_resolver.rs:963`）；新写入仍走本地 `user_dns_records`（`api/dns.rs`），尚未改为通过 `sn_bns_controller` 发布 BNS `dns_txt`。
 7. [待实现] 增加 cache invalidation：BNS version、device online 更新、user_domain 修改、relay 分配变化（目前仅 DNS 写入时手动 `remove`）。

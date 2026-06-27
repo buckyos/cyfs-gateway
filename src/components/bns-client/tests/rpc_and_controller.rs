@@ -119,6 +119,104 @@ impl SnBnsEvmSubmitter for RecordingEvmSubmitter {
     }
 }
 
+struct ApplyingEvmSubmitter {
+    registry: Arc<CentralizedBnsRegistry<SqliteBnsRegistryStore>>,
+    next_nonce: Mutex<u64>,
+}
+
+impl ApplyingEvmSubmitter {
+    fn new(registry: Arc<CentralizedBnsRegistry<SqliteBnsRegistryStore>>) -> Self {
+        Self {
+            registry,
+            next_nonce: Mutex::new(0),
+        }
+    }
+
+    fn submission(&self) -> BnsEvmTxSubmission {
+        let mut next_nonce = self.next_nonce.lock().unwrap();
+        let nonce = *next_nonce;
+        *next_nonce += 1;
+        BnsEvmTxSubmission {
+            tx_hash: format!("0x{nonce:064x}"),
+            raw_tx: format!("0x{nonce:02x}"),
+            from: ANVIL_ADDRESS.to_string(),
+            nonce,
+            chain_id: 31_337,
+            receipt_status: None,
+            receipt_block_number: None,
+            receipt_confirmations: None,
+        }
+    }
+}
+
+#[async_trait]
+impl SnBnsEvmSubmitter for ApplyingEvmSubmitter {
+    async fn register_name(&self, req: &BnsRegisterNameReq) -> BnsClientResult<BnsEvmTxSubmission> {
+        if req.authority_key_updates.is_empty()
+            && req.semantic_owner_after_authority.is_none()
+            && req.controller_policy.is_empty()
+        {
+            self.registry
+                .register_name(
+                    req.name.as_str(),
+                    req.asset_owner.as_str(),
+                    req.options.clone(),
+                    req.initial_documents.clone(),
+                    req.authority.clone(),
+                    req.guard,
+                )
+                .map_err(BnsClientError::from)?;
+        } else {
+            self.registry
+                .bootstrap_name(
+                    req.name.as_str(),
+                    req.asset_owner.as_str(),
+                    req.options.clone(),
+                    req.initial_documents.clone(),
+                    req.authority_key_updates.clone(),
+                    req.semantic_owner_after_authority.clone(),
+                    req.controller_policy.clone(),
+                    req.controller_policy_hash.as_str(),
+                    req.authority.clone(),
+                    req.guard,
+                )
+                .map_err(BnsClientError::from)?;
+        }
+        Ok(self.submission())
+    }
+
+    async fn apply_mutations(
+        &self,
+        req: &BnsApplyMutationsReq,
+    ) -> BnsClientResult<BnsEvmTxSubmission> {
+        self.registry
+            .apply_mutations(
+                req.name.as_str(),
+                req.authority_key_updates.clone(),
+                req.documents.clone(),
+                req.authority.clone(),
+                req.guard,
+            )
+            .map_err(BnsClientError::from)?;
+        Ok(self.submission())
+    }
+
+    async fn publish_document(
+        &self,
+        req: &BnsPublishDocumentReq,
+    ) -> BnsClientResult<BnsEvmTxSubmission> {
+        self.registry
+            .publish_document(
+                req.name.as_str(),
+                req.update.clone(),
+                req.authority.clone(),
+                req.guard,
+            )
+            .map_err(BnsClientError::from)?;
+        Ok(self.submission())
+    }
+}
+
 fn sn_controller_with_submitter(
     registry: Arc<CentralizedBnsRegistry<SqliteBnsRegistryStore>>,
 ) -> (SnBnsController, Arc<RecordingEvmSubmitter>) {
@@ -135,6 +233,19 @@ fn sn_controller_with_submitter(
 
 fn sn_controller(registry: Arc<CentralizedBnsRegistry<SqliteBnsRegistryStore>>) -> SnBnsController {
     sn_controller_with_submitter(registry).0
+}
+
+fn sn_controller_with_applying_submitter(
+    registry: Arc<CentralizedBnsRegistry<SqliteBnsRegistryStore>>,
+) -> SnBnsController {
+    let submitter = Arc::new(ApplyingEvmSubmitter::new(registry.clone()));
+    SnBnsController::new_with_evm_submitter(
+        in_process_client(registry),
+        Arc::new(MemorySnBnsWriteRequestStore::new()),
+        SnBnsControllerConfig::new(Principal::chain_account(SN_CONTROLLER), ""),
+        submitter,
+    )
+    .unwrap()
 }
 
 fn inline_update(doc_type: &str, expected_version: u64, body: &str) -> bns_indexer::DocumentUpdate {
@@ -445,6 +556,98 @@ async fn sn_controller_upserts_dns_txt_with_idempotency() {
         conflict,
         SnBnsControllerError::IdempotencyConflict { .. }
     ));
+}
+
+#[tokio::test]
+async fn owner_can_publish_device_mini_doc_and_resolve_it() {
+    let registry = registry();
+    registry
+        .register_name(
+            "alice",
+            OWNER,
+            RegisterOptions::default(),
+            vec![],
+            CallAuthority::public(),
+            MutationGuard::default(),
+        )
+        .unwrap();
+    let controller = sn_controller_with_applying_submitter(registry.clone());
+
+    let receipt = controller
+        .publish_device_mini_doc(PublishDeviceMiniDocParams {
+            request_id: "device-owner-publish".to_string(),
+            name: "alice".to_string(),
+            device_name: "ood1".to_string(),
+            did: "did:dev:ood1".to_string(),
+            device_mini_doc: json!({
+                "did": "did:dev:ood1",
+                "mini_config_jwt": "jwt"
+            }),
+            authority: owner_authority(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(receipt.status, BnsWriteReceiptStatus::Submitted);
+    assert_eq!(receipt.document_version, Some(1));
+
+    let resolved = registry
+        .resolve_document("alice", DEVICE_MINI_DOC_TYPE)
+        .unwrap();
+    let document: serde_json::Value =
+        serde_json::from_slice(&resolved.document_state.document.inline_document).unwrap();
+
+    assert_eq!(document["version"], 1);
+    assert_eq!(document["devices"]["ood1"]["did"], "did:dev:ood1");
+    assert_eq!(document["devices"]["ood1"]["mini_config_jwt"], "jwt");
+}
+
+#[tokio::test]
+async fn sn_controller_can_publish_relay_assignment_and_resolve_it() {
+    let registry = registry();
+    registry
+        .register_name(
+            "alice",
+            OWNER,
+            RegisterOptions::default(),
+            vec![],
+            CallAuthority::public(),
+            MutationGuard::default(),
+        )
+        .unwrap();
+    let rules = vec![controller_rule(
+        Principal::chain_account(SN_CONTROLLER),
+        RELAY_ASSIGNMENT_DOC_TYPE,
+        PERMISSION_PUBLISH_DOCUMENT,
+    )];
+    let policy_hash = policy_hash_from_rules(&rules).unwrap();
+    registry
+        .set_controller_policy("alice", rules, &policy_hash, owner_authority(), guard(1))
+        .unwrap();
+    let controller = sn_controller_with_applying_submitter(registry.clone());
+
+    let receipt = controller
+        .publish_relay_assignment(PublishRelayAssignmentParams {
+            request_id: "relay-controller-publish".to_string(),
+            name: "alice".to_string(),
+            relay_assignment: json!({
+                "relay": "relay-a",
+                "generation": 1
+            }),
+            authority: sn_controller_authority(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(receipt.status, BnsWriteReceiptStatus::Submitted);
+    assert_eq!(receipt.document_version, Some(1));
+
+    let resolved = registry
+        .resolve_document("alice", RELAY_ASSIGNMENT_DOC_TYPE)
+        .unwrap();
+    let document: serde_json::Value =
+        serde_json::from_slice(&resolved.document_state.document.inline_document).unwrap();
+
+    assert_eq!(document["relay"], "relay-a");
+    assert_eq!(document["generation"], 1);
 }
 
 #[tokio::test]
