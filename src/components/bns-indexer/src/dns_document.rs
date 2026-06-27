@@ -82,3 +82,86 @@ pub fn txt_records_update(
     update.validate()?;
     Ok(update)
 }
+
+/// Extracts a boot config JWT embedded in a zone or boot config JSON value.
+///
+/// Zone configs may carry the boot config inline as a JWT string — a compromise
+/// for the 256-byte DNS TXT record limit, not the canonical model (boot is
+/// normally its own atomic document). Both the SN controller (write side, when
+/// embedding into the zone document) and the resolver (read side, as a fallback
+/// when no standalone boot document exists) call this, so the embedded
+/// `boot_jwt` is written and read through the exact same set of locations.
+///
+/// Recognizes a bare JWT string and the known nested keys, returning the first
+/// non-empty JWT found. Returns `None` when no JWT is present (e.g. a structured
+/// boot object that is not a JWT).
+pub fn extract_boot_jwt(value: &serde_json::Value) -> Option<String> {
+    fn non_empty_jwt(value: &serde_json::Value) -> Option<String> {
+        let jwt = value.as_str()?.trim();
+        (!jwt.is_empty()).then(|| jwt.to_string())
+    }
+
+    if let Some(jwt) = non_empty_jwt(value) {
+        return Some(jwt);
+    }
+
+    const PATHS: &[&[&str]] = &[
+        &["boot_jwt"],
+        &["boot_config_jwt"],
+        &["zone_config_jwt"],
+        &["boot", "boot_jwt"],
+        &["boot", "boot_config_jwt"],
+        &["boot", "zone_config_jwt"],
+        &["boot", "jwt"],
+        &["boot"],
+        &["zone_config_ref", "boot_jwt"],
+        &["zone_config_ref", "boot_config_jwt"],
+        &["zone_config_ref", "zone_config_jwt"],
+        &["zone_config_ref", "boot"],
+    ];
+
+    PATHS.iter().find_map(|path| {
+        let mut current = value;
+        for key in *path {
+            current = current.get(*key)?;
+        }
+        non_empty_jwt(current)
+    })
+}
+
+#[cfg(test)]
+mod boot_jwt_tests {
+    use super::extract_boot_jwt;
+    use serde_json::json;
+
+    #[test]
+    fn extracts_bare_and_nested_boot_jwt() {
+        assert_eq!(
+            extract_boot_jwt(&json!(" inline-boot ")).as_deref(),
+            Some("inline-boot")
+        );
+        assert_eq!(
+            extract_boot_jwt(&json!({ "boot_jwt": "top" })).as_deref(),
+            Some("top")
+        );
+        assert_eq!(
+            extract_boot_jwt(&json!({ "boot": { "boot_config_jwt": "nested" } })).as_deref(),
+            Some("nested")
+        );
+        assert_eq!(
+            extract_boot_jwt(&json!({ "boot": "legacy" })).as_deref(),
+            Some("legacy")
+        );
+        assert_eq!(
+            extract_boot_jwt(&json!({ "zone_config_ref": { "boot_jwt": "ref" } })).as_deref(),
+            Some("ref")
+        );
+    }
+
+    #[test]
+    fn returns_none_for_non_jwt_boot_object() {
+        assert_eq!(extract_boot_jwt(&json!({ "boot": { "foo": 1 } })), None);
+        assert_eq!(extract_boot_jwt(&json!({ "gateway": "x" })), None);
+        assert_eq!(extract_boot_jwt(&json!(null)), None);
+    }
+}

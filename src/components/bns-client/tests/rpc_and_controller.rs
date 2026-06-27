@@ -1,13 +1,16 @@
 use ::kRPC::{RPCHandler, RPCRequest, RPCResult};
+use async_trait::async_trait;
 use bns_client::{
-    publish_document_call, register_name_call, BindZoneDocumentsParams, BnsClientError,
-    BnsEvmClientConfig, BnsEvmControllerClient, BnsEvmKeyManager, BnsEvmSignRequest,
-    BnsEvmStandardClient, BnsEvmWriteOperation, BnsIndexerApi, BnsIndexerClient,
-    BnsIndexerRpcHandler, BnsPublishDocumentReq, BnsRegisterNameReq, BnsRegisterNameResp,
-    BnsRpcEnvelope, BootstrapNameParams, CentralizedBnsIndexerHandler, DnsTxtUpdate,
-    MemorySnBnsWriteRequestStore, PublishDeviceMiniDocParams, PublishRelayAssignmentParams,
-    SnBnsController, SnBnsControllerConfig, SnBnsControllerError, StaticBnsEvmKeyManager,
-    UpsertDnsTxtParams, DEVICE_MINI_DOC_TYPE, METHOD_REGISTER_NAME, RELAY_ASSIGNMENT_DOC_TYPE,
+    publish_document_call, register_name_call, BindZoneDocumentsParams, BnsBootstrapNameReq,
+    BnsClientError, BnsClientResult, BnsEvmClientConfig, BnsEvmKeyManager, BnsEvmSignRequest,
+    BnsEvmStandardClient, BnsEvmTxSubmission, BnsEvmWriteOperation, BnsIndexerApi,
+    BnsIndexerClient, BnsIndexerRpcHandler, BnsPublishDocumentReq, BnsRegisterNameReq,
+    BnsRegisterNameResp, BnsRpcEnvelope, BnsWriteReceiptStatus, BootstrapNameParams,
+    CentralizedBnsIndexerHandler, DnsTxtUpdate, MemorySnBnsWriteRequestStore,
+    PublishDeviceMiniDocParams, PublishRelayAssignmentParams, SnBnsController,
+    SnBnsControllerConfig, SnBnsControllerError, SnBnsEvmSubmitter, StaticBnsEvmKeyManager,
+    UpsertDnsTxtParams, BOOT_DOC_TYPE, DEVICE_MINI_DOC_TYPE, METHOD_REGISTER_NAME,
+    RELAY_ASSIGNMENT_DOC_TYPE, ZONE_DOC_TYPE,
 };
 use bns_evm::{AuthorityRole as EvmAuthorityRole, PrincipalKind as EvmPrincipalKind, SolCall};
 use bns_indexer::dns_document::{self, DNS_TXT_DOC_TYPE};
@@ -18,7 +21,7 @@ use bns_indexer::{
 };
 use serde_json::json;
 use std::net::{IpAddr, Ipv4Addr};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 const OWNER: &str = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const SN_CONTROLLER: &str = "0xcccccccccccccccccccccccccccccccccccccccc";
@@ -54,13 +57,74 @@ fn in_process_client(
     Arc::new(BnsIndexerClient::new_in_process(handler))
 }
 
-fn sn_controller(registry: Arc<CentralizedBnsRegistry<SqliteBnsRegistryStore>>) -> SnBnsController {
-    SnBnsController::new(
+#[derive(Default)]
+struct RecordingEvmSubmitter {
+    bootstraps: Mutex<Vec<BnsBootstrapNameReq>>,
+    published: Mutex<Vec<BnsPublishDocumentReq>>,
+    next_nonce: Mutex<u64>,
+}
+
+impl RecordingEvmSubmitter {
+    fn bootstraps(&self) -> Vec<BnsBootstrapNameReq> {
+        self.bootstraps.lock().unwrap().clone()
+    }
+
+    fn published(&self) -> Vec<BnsPublishDocumentReq> {
+        self.published.lock().unwrap().clone()
+    }
+
+    fn submission(&self) -> BnsEvmTxSubmission {
+        let mut next_nonce = self.next_nonce.lock().unwrap();
+        let nonce = *next_nonce;
+        *next_nonce += 1;
+        BnsEvmTxSubmission {
+            tx_hash: format!("0x{nonce:064x}"),
+            raw_tx: format!("0x{nonce:02x}"),
+            from: ANVIL_ADDRESS.to_string(),
+            nonce,
+            chain_id: 31_337,
+            receipt_status: None,
+            receipt_block_number: None,
+            receipt_confirmations: None,
+        }
+    }
+}
+
+#[async_trait]
+impl SnBnsEvmSubmitter for RecordingEvmSubmitter {
+    async fn bootstrap_name(
+        &self,
+        req: &BnsBootstrapNameReq,
+    ) -> BnsClientResult<BnsEvmTxSubmission> {
+        self.bootstraps.lock().unwrap().push(req.clone());
+        Ok(self.submission())
+    }
+
+    async fn publish_document(
+        &self,
+        req: &BnsPublishDocumentReq,
+    ) -> BnsClientResult<BnsEvmTxSubmission> {
+        self.published.lock().unwrap().push(req.clone());
+        Ok(self.submission())
+    }
+}
+
+fn sn_controller_with_submitter(
+    registry: Arc<CentralizedBnsRegistry<SqliteBnsRegistryStore>>,
+) -> (SnBnsController, Arc<RecordingEvmSubmitter>) {
+    let submitter = Arc::new(RecordingEvmSubmitter::default());
+    let controller = SnBnsController::new_with_evm_submitter(
         in_process_client(registry),
         Arc::new(MemorySnBnsWriteRequestStore::new()),
         SnBnsControllerConfig::new(Principal::chain_account(SN_CONTROLLER), ""),
+        submitter.clone(),
     )
-    .unwrap()
+    .unwrap();
+    (controller, submitter)
+}
+
+fn sn_controller(registry: Arc<CentralizedBnsRegistry<SqliteBnsRegistryStore>>) -> SnBnsController {
+    sn_controller_with_submitter(registry).0
 }
 
 fn inline_update(doc_type: &str, expected_version: u64, body: &str) -> bns_indexer::DocumentUpdate {
@@ -214,9 +278,9 @@ fn sn_controller_config_rejects_high_risk_doc_type_scope() {
 }
 
 #[tokio::test]
-async fn sn_controller_bootstrap_name_installs_controller_policy() {
+async fn sn_controller_bootstrap_name_submits_controller_policy() {
     let registry = registry();
-    let controller = sn_controller(registry.clone());
+    let (controller, submitter) = sn_controller_with_submitter(registry.clone());
 
     let output = controller
         .bootstrap_name(BootstrapNameParams {
@@ -233,63 +297,55 @@ async fn sn_controller_bootstrap_name_installs_controller_policy() {
         })
         .await
         .unwrap();
-    assert_eq!(output.receipt.name_seq, 2);
-    assert_eq!(output.initial_documents.len(), 1);
-    assert_eq!(output.initial_documents[0].doc_type, "owner");
+    assert_eq!(output.receipt.status, BnsWriteReceiptStatus::Submitted);
+    assert_eq!(output.receipt.name_seq, 0);
+    assert_eq!(output.initial_documents.len(), 0);
 
-    let receipt = controller
-        .upsert_dns_txt(UpsertDnsTxtParams {
-            request_id: "bootstrap-dns".to_string(),
-            name: "alice".to_string(),
-            update: DnsTxtUpdate::Add {
-                ttl: 60,
-                value: "_acme-challenge=bootstrapped".to_string(),
-            },
-            authority: sn_controller_authority(),
-        })
-        .await
-        .unwrap();
-    assert_eq!(receipt.document_version, Some(1));
+    let bootstraps = submitter.bootstraps();
+    assert_eq!(bootstraps.len(), 1);
+    assert_eq!(bootstraps[0].initial_documents.len(), 1);
+    assert_eq!(bootstraps[0].initial_documents[0].doc_type, "owner");
+    assert_eq!(bootstraps[0].controller_policy.len(), 2);
 }
 
 #[tokio::test]
-async fn sn_controller_evm_mode_rejects_multi_step_zone_bind_without_submission() {
+async fn sn_controller_bind_zone_documents_submits_single_embedded_zone_document() {
     let registry = registry();
-    let read_client = in_process_client(registry);
-    let evm_controller = Arc::new(
-        BnsEvmControllerClient::new(
-            BnsEvmClientConfig::anvil(
-                "http://127.0.0.1:8545",
-                "0x2222222222222222222222222222222222222222",
-                31_337,
-            ),
-            ANVIL_PRIVATE_KEY,
+    registry
+        .register_name(
+            "alice",
+            OWNER,
+            RegisterOptions::default(),
+            vec![],
+            CallAuthority::public(),
+            MutationGuard::default(),
         )
-        .unwrap(),
-    );
-    let controller = SnBnsController::new_evm(
-        read_client,
-        Arc::new(MemorySnBnsWriteRequestStore::new()),
-        SnBnsControllerConfig::new(Principal::chain_account(ANVIL_ADDRESS), ""),
-        evm_controller,
-    )
-    .unwrap();
+        .unwrap();
+    let (controller, submitter) = sn_controller_with_submitter(registry);
 
-    let error = controller
+    let receipt = controller
         .bind_zone_documents(BindZoneDocumentsParams {
-            request_id: "zone-evm-denied".to_string(),
+            request_id: "zone-evm-submit".to_string(),
             name: "alice".to_string(),
-            zone_config: json!({"version":1}),
-            boot_config: json!({"version":1}),
+            zone_config: json!({"gateway":{"device_name":"ood1"}}),
+            boot_config: json!({"boot_config_jwt":"boot-token"}),
             authority: owner_authority(),
         })
         .await
-        .unwrap_err();
+        .unwrap();
 
-    assert_eq!(error.code(), "INVALID_INPUT");
-    assert!(error
-        .to_string()
-        .contains("separate guarded contract writes"));
+    assert_eq!(receipt.status, BnsWriteReceiptStatus::Submitted);
+    assert_eq!(receipt.receipts.len(), 1);
+    assert_eq!(receipt.receipts[0].doc_type.as_deref(), Some(ZONE_DOC_TYPE));
+
+    let published = submitter.published();
+    assert_eq!(published.len(), 1);
+    assert_eq!(published[0].update.doc_type, ZONE_DOC_TYPE);
+    assert_ne!(published[0].update.doc_type, BOOT_DOC_TYPE);
+    let document: serde_json::Value =
+        serde_json::from_slice(&published[0].update.document.inline_document).unwrap();
+    assert_eq!(document["gateway"]["device_name"], "ood1");
+    assert_eq!(document["boot_jwt"], "boot-token");
 }
 
 #[tokio::test]
@@ -315,7 +371,7 @@ async fn sn_controller_upserts_dns_txt_with_idempotency() {
         .set_controller_policy("alice", rules, &policy_hash, owner_authority(), guard(1))
         .unwrap();
 
-    let controller = sn_controller(registry.clone());
+    let (controller, submitter) = sn_controller_with_submitter(registry.clone());
 
     let add = UpsertDnsTxtParams {
         request_id: "dns-1".to_string(),
@@ -327,6 +383,7 @@ async fn sn_controller_upserts_dns_txt_with_idempotency() {
         authority: sn_controller_authority(),
     };
     let receipt = controller.upsert_dns_txt(add.clone()).await.unwrap();
+    assert_eq!(receipt.status, BnsWriteReceiptStatus::Submitted);
     assert_eq!(receipt.document_version, Some(1));
     assert!(!receipt.created_or_reused);
 
@@ -334,10 +391,10 @@ async fn sn_controller_upserts_dns_txt_with_idempotency() {
     assert_eq!(replay.document_version, Some(1));
     assert!(replay.created_or_reused);
 
-    let resolved = registry
-        .resolve_document("alice", DNS_TXT_DOC_TYPE)
-        .unwrap();
-    let records = dns_document::txt_records_from_document(&resolved.document_state).unwrap();
+    let published = submitter.published();
+    assert_eq!(published.len(), 1);
+    let records: Vec<dns_document::DnsTxtRecord> =
+        serde_json::from_slice(&published[0].update.document.inline_document).unwrap();
     assert_eq!(records.len(), 1);
     assert_eq!(records[0].value, "_acme-challenge=token-a");
 
@@ -394,7 +451,7 @@ async fn sn_controller_cannot_publish_owner_scoped_device_doc() {
 }
 
 #[tokio::test]
-async fn sn_controller_maps_registry_doc_type_scope_denial() {
+async fn sn_controller_rejects_controller_doc_type_outside_configured_scope() {
     let registry = registry();
     registry
         .register_name(
@@ -406,16 +463,16 @@ async fn sn_controller_maps_registry_doc_type_scope_denial() {
             MutationGuard::default(),
         )
         .unwrap();
-    let rules = vec![controller_rule(
-        Principal::chain_account(SN_CONTROLLER),
-        DNS_TXT_DOC_TYPE,
-        PERMISSION_PUBLISH_DOCUMENT,
-    )];
-    let policy_hash = policy_hash_from_rules(&rules).unwrap();
-    registry
-        .set_controller_policy("alice", rules, &policy_hash, owner_authority(), guard(1))
-        .unwrap();
-    let controller = sn_controller(registry.clone());
+    let submitter = Arc::new(RecordingEvmSubmitter::default());
+    let mut config = SnBnsControllerConfig::new(Principal::chain_account(SN_CONTROLLER), "");
+    config.allowed_controller_doc_types = vec![DNS_TXT_DOC_TYPE.to_string()];
+    let controller = SnBnsController::new_with_evm_submitter(
+        in_process_client(registry.clone()),
+        Arc::new(MemorySnBnsWriteRequestStore::new()),
+        config,
+        submitter,
+    )
+    .unwrap();
 
     let error = controller
         .publish_relay_assignment(PublishRelayAssignmentParams {
@@ -427,14 +484,10 @@ async fn sn_controller_maps_registry_doc_type_scope_denial() {
         .await
         .unwrap_err();
 
-    assert_eq!(error.code(), "CONTROLLER_SCOPE_DENIED");
-    match error {
-        SnBnsControllerError::Bns(BnsClientError::Registry(info)) => {
-            assert_eq!(info.name.as_deref(), Some("alice"));
-            assert_eq!(info.doc_type.as_deref(), Some(RELAY_ASSIGNMENT_DOC_TYPE));
-        }
-        other => panic!("unexpected error: {other:?}"),
-    }
+    assert_eq!(error.code(), "INVALID_INPUT");
+    assert!(error
+        .to_string()
+        .contains("not allowed to publish doc_type"));
     assert!(registry
         .resolve_document("alice", RELAY_ASSIGNMENT_DOC_TYPE)
         .is_err());
@@ -530,20 +583,20 @@ async fn sn_controller_removes_last_dns_txt_record_by_publishing_empty_rrset() {
         .set_controller_policy("alice", rules, &policy_hash, owner_authority(), guard(1))
         .unwrap();
 
-    let controller = sn_controller(registry.clone());
-
-    controller
-        .upsert_dns_txt(UpsertDnsTxtParams {
-            request_id: "dns-add".to_string(),
-            name: "alice".to_string(),
-            update: DnsTxtUpdate::Add {
-                ttl: 60,
-                value: "google-site-verification=abc".to_string(),
-            },
-            authority: sn_controller_authority(),
-        })
-        .await
+    registry
+        .publish_document(
+            "alice",
+            inline_update(
+                DNS_TXT_DOC_TYPE,
+                0,
+                r#"[{"ttl":60,"value":"google-site-verification=abc"}]"#,
+            ),
+            owner_authority(),
+            guard(2),
+        )
         .unwrap();
+
+    let (controller, submitter) = sn_controller_with_submitter(registry.clone());
 
     let remove = controller
         .upsert_dns_txt(UpsertDnsTxtParams {
@@ -558,10 +611,11 @@ async fn sn_controller_removes_last_dns_txt_record_by_publishing_empty_rrset() {
         .unwrap();
     assert_eq!(remove.document_version, Some(2));
 
-    let resolved = registry
-        .resolve_document("alice", DNS_TXT_DOC_TYPE)
-        .unwrap();
-    assert_eq!(resolved.document_state.document.inline_document, b"[]");
-    let records = dns_document::txt_records_from_document(&resolved.document_state).unwrap();
+    let published = submitter.published();
+    assert_eq!(published.len(), 1);
+    assert_eq!(published[0].update.expected_version, 1);
+    assert_eq!(published[0].update.document.inline_document, b"[]");
+    let records: Vec<dns_document::DnsTxtRecord> =
+        serde_json::from_slice(&published[0].update.document.inline_document).unwrap();
     assert!(records.is_empty());
 }

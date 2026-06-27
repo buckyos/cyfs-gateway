@@ -4315,18 +4315,18 @@ impl SnServerFactory {
                 e
             )
         })?);
-        let controller = if let Some(evm_controller) = evm_controller {
-            SnBnsController::new_evm(client, store, controller_config, evm_controller)
-        } else {
-            SnBnsController::new(client, store, controller_config)
-        }
-        .map_err(|e| {
-            server_err!(
-                ServerErrorCode::InvalidConfig,
-                "create sn bns controller failed: {}",
-                e
-            )
-        })?;
+        let evm_controller = evm_controller.ok_or(server_err!(
+            ServerErrorCode::InvalidConfig,
+            "bns_write_enabled requires bns_evm because SN BNS writes must go through the EVM contract"
+        ))?;
+        let controller = SnBnsController::new_evm(client, store, controller_config, evm_controller)
+            .map_err(|e| {
+                server_err!(
+                    ServerErrorCode::InvalidConfig,
+                    "create sn bns controller failed: {}",
+                    e
+                )
+            })?;
         Ok(Some(Arc::new(controller)))
     }
 }

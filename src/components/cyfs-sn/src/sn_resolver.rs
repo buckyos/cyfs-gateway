@@ -271,6 +271,7 @@ impl BnsDocument {
 pub struct ZoneDocument {
     pub raw: Option<Value>,
     pub jwt: Option<String>,
+    pub boot_jwt: Option<String>,
     pub gateway_device_name: Option<String>,
     pub gateway_ips: Vec<IpAddr>,
     pub ttl: Option<u32>,
@@ -282,6 +283,7 @@ impl ZoneDocument {
         Self {
             raw: None,
             jwt: None,
+            boot_jwt: None,
             gateway_device_name: None,
             gateway_ips: Vec::new(),
             ttl: None,
@@ -292,12 +294,14 @@ impl ZoneDocument {
     fn from_bns_document(document: &BnsDocument) -> Self {
         let raw = document.content.to_json_value();
         let jwt = document.content.as_jwt();
+        let boot_jwt = raw.as_ref().and_then(find_boot_jwt);
         let gateway_device_name = raw.as_ref().and_then(find_gateway_device_name);
         let gateway_ips = raw.as_ref().map(find_gateway_ips).unwrap_or_default();
         let ttl = raw.as_ref().and_then(find_ttl).or(document.meta.ttl);
         Self {
             raw,
             jwt,
+            boot_jwt,
             gateway_device_name,
             gateway_ips,
             ttl,
@@ -1217,6 +1221,8 @@ impl SnResolver {
         let boot_doc =
             if let Some(document) = self.bns.get_document(zone_name, BNS_DOC_BOOT).await? {
                 BootDocument::from_bns_document(&document)
+            } else if let Some(boot_jwt) = zone_doc.boot_jwt.as_deref() {
+                BootDocument::from_legacy_boot_jwt(boot_jwt)
             } else if let Some(user) = user.as_ref() {
                 if user.zone_config.trim().is_empty() {
                     BootDocument::empty()
@@ -2181,6 +2187,12 @@ fn find_gateway_device_name(value: &Value) -> Option<String> {
     None
 }
 
+fn find_boot_jwt(value: &Value) -> Option<String> {
+    // Shared with the SN controller's write side so the embedded boot_jwt is read
+    // back through the exact same locations it was written through.
+    bns_indexer::dns_document::extract_boot_jwt(value)
+}
+
 fn short_device_name(value: &str) -> String {
     value.split('.').next().unwrap_or(value).to_string()
 }
@@ -2671,6 +2683,21 @@ mod tests {
     }
 
     #[test]
+    fn parses_boot_jwt_from_zone_document() {
+        let value = json!({ "boot_jwt": " inline-boot " });
+        assert_eq!(find_boot_jwt(&value).as_deref(), Some("inline-boot"));
+
+        let value = json!({ "boot": { "boot_config_jwt": "nested-boot" } });
+        assert_eq!(find_boot_jwt(&value).as_deref(), Some("nested-boot"));
+
+        let value = json!({ "zone_config_jwt": "wrapped-boot" });
+        assert_eq!(find_boot_jwt(&value).as_deref(), Some("wrapped-boot"));
+
+        let value = json!({ "boot": "legacy-boot" });
+        assert_eq!(find_boot_jwt(&value).as_deref(), Some("legacy-boot"));
+    }
+
+    #[test]
     fn parses_device_mini_doc_from_aggregate() {
         let doc = BnsDocument::json(
             "testuser",
@@ -2722,6 +2749,90 @@ mod tests {
 
         assert_eq!(resolved.source, DidResolutionSource::BnsDocument);
         assert_eq!(resolved.doc_type, BNS_DOC_ZONE);
+    }
+
+    #[tokio::test]
+    async fn resolves_zone_with_embedded_boot_jwt_without_separate_boot_doc() {
+        let mut bns = StaticBnsReader::default();
+        bns.owners.insert(
+            "testuser".to_string(),
+            BnsOwner {
+                name: "testuser".to_string(),
+                effective_owner: Some("owner-key".to_string()),
+                owner_config: None,
+            },
+        );
+        bns.documents.insert(
+            ("testuser".to_string(), BNS_DOC_ZONE.to_string()),
+            BnsDocument::json(
+                "testuser",
+                BNS_DOC_ZONE,
+                json!({
+                    "gateway": { "device_name": "ood1" },
+                    "boot_jwt": "embedded-boot"
+                }),
+            ),
+        );
+        let resolver = test_resolver_with_bns(bns);
+
+        let resolved = resolver
+            .resolve_zone_by_bns_owner(
+                "testuser",
+                "testuser",
+                BnsOwner {
+                    name: "testuser".to_string(),
+                    effective_owner: Some("owner-key".to_string()),
+                    owner_config: None,
+                },
+                ZoneResolutionSource::BnsName,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resolved.zone_doc.boot_jwt.as_deref(), Some("embedded-boot"));
+        assert_eq!(resolved.boot_doc.jwt.as_deref(), Some("embedded-boot"));
+    }
+
+    #[tokio::test]
+    async fn separate_boot_doc_overrides_embedded_boot_jwt() {
+        let mut bns = StaticBnsReader::default();
+        bns.documents.insert(
+            ("testuser".to_string(), BNS_DOC_ZONE.to_string()),
+            BnsDocument::json(
+                "testuser",
+                BNS_DOC_ZONE,
+                json!({ "boot_jwt": "embedded-boot" }),
+            ),
+        );
+        bns.documents.insert(
+            ("testuser".to_string(), BNS_DOC_BOOT.to_string()),
+            BnsDocument::json("testuser", BNS_DOC_BOOT, json!({ "boot": "separate-boot" })),
+        );
+        let resolver = test_resolver_with_bns(bns);
+
+        let resolved = resolver
+            .resolve_zone_by_bns_owner(
+                "testuser",
+                "testuser",
+                BnsOwner {
+                    name: "testuser".to_string(),
+                    effective_owner: Some("owner-key".to_string()),
+                    owner_config: None,
+                },
+                ZoneResolutionSource::BnsName,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            resolved.boot_doc.raw,
+            Some(json!({ "boot": "separate-boot" }))
+        );
+        assert_eq!(resolved.boot_doc.jwt, None);
     }
 
     #[tokio::test]

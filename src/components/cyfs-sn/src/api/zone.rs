@@ -6,7 +6,7 @@ use super::errors::{bns_write_error, parse_error, SnV2ErrorCode};
 use crate::SNServer;
 use ::kRPC::{RPCErrors, RPCRequest, RPCResponse};
 use bns_client::BindZoneDocumentsParams;
-use serde_json::json;
+use serde_json::{json, Value};
 
 async fn ensure_verified_user_domain(
     server: &SNServer,
@@ -85,17 +85,24 @@ pub(crate) async fn handle_zone(server: &SNServer, req: RPCRequest) -> RpcCallRe
                         "zone_config must be a JSON object or JWT string",
                     ));
                 }
-                let boot_config = params
-                    .boot_config
-                    .as_deref()
-                    .map(|value| document_value_from_param(value, "boot_config_jwt"))
-                    .unwrap_or_else(|| json!({ "zone_config_ref": zone_config.clone() }));
-                if !boot_config.is_object() {
-                    return Err(parse_error(
-                        SnV2ErrorCode::InvalidZoneConfig,
-                        "boot_config must be a JSON object or JWT string",
-                    ));
-                }
+                // When boot_config is omitted, leave it null (zone-only write).
+                // The controller embeds a boot_jwt into the zone document only
+                // when a real boot JWT is present; a bogus placeholder object
+                // cannot be read back by the resolver, so we no longer synthesize
+                // one.
+                let boot_config = match params.boot_config.as_deref() {
+                    Some(value) => {
+                        let parsed = document_value_from_param(value, "boot_config_jwt");
+                        if !parsed.is_object() {
+                            return Err(parse_error(
+                                SnV2ErrorCode::InvalidZoneConfig,
+                                "boot_config must be a JSON object or JWT string",
+                            ));
+                        }
+                        parsed
+                    }
+                    None => Value::Null,
+                };
                 let payload = json!({
                     "zone_config": zone_config,
                     "boot_config": boot_config,
