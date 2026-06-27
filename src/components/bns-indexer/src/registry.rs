@@ -1,5 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
+use serde_json::Value;
+
 use crate::{
     canonical_bns_name, canonical_doc_type, document_state_hash, ensure_registerable_depth,
     hash_json, is_top_level_name, now_timestamp, parent_name, validate_did, validate_hash,
@@ -12,7 +14,7 @@ use crate::{
     PurchaseContext, RegisterOptions, RegistryEvent, ReleaseMode, ResolveResult,
     KEY_PURPOSE_AUTHENTICATION, MAX_OWNER_REF_DEPTH, PERMISSION_PUBLISH_DOCUMENT,
     PERMISSION_REVOKE_DOCUMENT, PERMISSION_SET_ALIAS, PERMISSION_SET_NAMESPACE,
-    PERMISSION_SET_PAYMENT, ZERO_HASH,
+    PERMISSION_SET_PAYMENT, STORAGE_TYPE_INLINE, ZERO_HASH,
 };
 
 use crate::sqlite::recompute_authority_set;
@@ -110,6 +112,12 @@ where
                 }
             })?;
             let owner = self.resolve_owner_for_name(tx, &name)?;
+            self.ensure_document_consistent(
+                &name,
+                &doc_type,
+                &document_state,
+                &owner.effective_owner,
+            )?;
             let alias = tx.get_alias(&name)?;
             let proof_root = self.current_proof_root(tx)?;
             let effective_controller = if document_state.controller.is_unset() {
@@ -144,8 +152,19 @@ where
     ) -> BnsRegistryResult<Option<DocumentState>> {
         let name = canonical_bns_name(name)?;
         let doc_type = canonical_doc_type(doc_type)?;
-        self.store
-            .transact(|tx| tx.get_document(&name, &doc_type, version))
+        self.store.transact(|tx| {
+            let document = tx.get_document(&name, &doc_type, version)?;
+            if let Some(document_state) = document.as_ref() {
+                let owner = self.resolve_owner_for_name(tx, &name)?;
+                self.ensure_document_consistent(
+                    &name,
+                    &doc_type,
+                    document_state,
+                    &owner.effective_owner,
+                )?;
+            }
+            Ok(document)
+        })
     }
 
     pub fn get_alias(&self, name: &str) -> BnsRegistryResult<Option<AliasState>> {
@@ -167,6 +186,8 @@ where
                     doc_type: doc_type.clone(),
                 }
             })?;
+            let owner = self.resolve_owner_for_name(tx, &name)?;
+            self.ensure_document_consistent(&name, &doc_type, &document, &owner.effective_owner)?;
             let proof_root = self.current_proof_root(tx)?;
             Ok(PurchaseContext {
                 name: name.clone(),
@@ -1643,6 +1664,40 @@ where
             .map_or_else(|| ZERO_HASH.to_string(), |record| record.log_root))
     }
 
+    fn ensure_document_consistent(
+        &self,
+        name: &str,
+        doc_type: &str,
+        document: &DocumentState,
+        effective_owner: &Principal,
+    ) -> BnsRegistryResult<()> {
+        let assertions = document_owner_assertions(doc_type, document).map_err(|reason| {
+            BnsRegistryError::DocumentInconsistent {
+                name: name.to_string(),
+                doc_type: doc_type.to_string(),
+                reason,
+            }
+        })?;
+
+        for assertion in assertions {
+            if !principals_match(&assertion.principal, effective_owner) {
+                return Err(BnsRegistryError::DocumentInconsistent {
+                    name: name.to_string(),
+                    doc_type: doc_type.to_string(),
+                    reason: format!(
+                        "{} declares {} `{}` but on-chain effective owner is `{}`",
+                        assertion.document_label,
+                        assertion.field,
+                        principal_display(&assertion.principal),
+                        principal_display(effective_owner)
+                    ),
+                });
+            }
+        }
+
+        Ok(())
+    }
+
     fn name_is_authority_owner(
         &self,
         tx: &mut dyn BnsRegistryStoreTx,
@@ -1739,6 +1794,256 @@ where
         } else {
             Err(BnsRegistryError::NoConcreteSigner)
         }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum DocumentAssertionSchema {
+    Owner,
+    Did,
+}
+
+struct DocumentOwnerAssertion {
+    document_label: &'static str,
+    field: &'static str,
+    principal: Principal,
+}
+
+fn document_owner_assertions(
+    doc_type: &str,
+    document: &DocumentState,
+) -> Result<Vec<DocumentOwnerAssertion>, String> {
+    let Some(schema) = document_assertion_schema(doc_type) else {
+        return Ok(Vec::new());
+    };
+    if document.document.storage_type != STORAGE_TYPE_INLINE
+        || document.document.inline_document.is_empty()
+    {
+        return Ok(Vec::new());
+    }
+
+    let value = match serde_json::from_slice::<Value>(&document.document.inline_document) {
+        Ok(value) => value,
+        Err(_) => return Ok(Vec::new()),
+    };
+    if !value.is_object() {
+        return Ok(Vec::new());
+    }
+
+    let mut assertions = Vec::new();
+    match schema {
+        DocumentAssertionSchema::Owner => {
+            collect_principal_assertions(
+                &mut assertions,
+                "owner document",
+                "owner",
+                value.get("owner"),
+            )?;
+            collect_principal_assertions(
+                &mut assertions,
+                "owner document",
+                "controller",
+                value.get("controller"),
+            )?;
+        }
+        DocumentAssertionSchema::Did => {
+            collect_principal_assertions(
+                &mut assertions,
+                "DID document",
+                "controller",
+                value.get("controller"),
+            )?;
+            collect_did_verification_method_controllers(&mut assertions, &value)?;
+        }
+    }
+
+    Ok(assertions)
+}
+
+fn document_assertion_schema(doc_type: &str) -> Option<DocumentAssertionSchema> {
+    match doc_type {
+        "owner" => Some(DocumentAssertionSchema::Owner),
+        "did" | "doc" => Some(DocumentAssertionSchema::Did),
+        _ => None,
+    }
+}
+
+fn collect_did_verification_method_controllers(
+    assertions: &mut Vec<DocumentOwnerAssertion>,
+    value: &Value,
+) -> Result<(), String> {
+    let Some(methods) = value.get("verificationMethod") else {
+        return Ok(());
+    };
+
+    match methods {
+        Value::Array(items) => {
+            for item in items {
+                collect_principal_assertions(
+                    assertions,
+                    "DID document",
+                    "verificationMethod.controller",
+                    item.get("controller"),
+                )?;
+            }
+        }
+        Value::Object(_) => {
+            collect_principal_assertions(
+                assertions,
+                "DID document",
+                "verificationMethod.controller",
+                methods.get("controller"),
+            )?;
+        }
+        _ => {}
+    }
+
+    Ok(())
+}
+
+fn collect_principal_assertions(
+    assertions: &mut Vec<DocumentOwnerAssertion>,
+    document_label: &'static str,
+    field: &'static str,
+    value: Option<&Value>,
+) -> Result<(), String> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    collect_principal_assertion_value(assertions, document_label, field, value)
+}
+
+fn collect_principal_assertion_value(
+    assertions: &mut Vec<DocumentOwnerAssertion>,
+    document_label: &'static str,
+    field: &'static str,
+    value: &Value,
+) -> Result<(), String> {
+    match value {
+        Value::Null => Ok(()),
+        Value::Array(items) => {
+            for item in items {
+                collect_principal_assertion_value(assertions, document_label, field, item)?;
+            }
+            Ok(())
+        }
+        Value::String(raw) => {
+            let principal = principal_from_document_string(raw).map_err(|reason| {
+                format!("{document_label} declares {field} `{raw}` but {reason}")
+            })?;
+            assertions.push(DocumentOwnerAssertion {
+                document_label,
+                field,
+                principal,
+            });
+            Ok(())
+        }
+        Value::Object(_) => {
+            let principal = principal_from_document_object(value).map_err(|reason| {
+                format!("{document_label} declares {field} object but {reason}")
+            })?;
+            assertions.push(DocumentOwnerAssertion {
+                document_label,
+                field,
+                principal,
+            });
+            Ok(())
+        }
+        other => Err(format!(
+            "{document_label} declares {field} with unsupported JSON {}",
+            json_type_name(other)
+        )),
+    }
+}
+
+fn principal_from_document_object(value: &Value) -> Result<Principal, String> {
+    let principal = serde_json::from_value::<Principal>(value.clone())
+        .map_err(|err| format!("it is not a Principal object: {err}"))?;
+    canonicalize_document_principal(principal)
+}
+
+fn principal_from_document_string(raw: &str) -> Result<Principal, String> {
+    let value = raw.trim();
+    if value.is_empty() {
+        return Err("principal is empty".to_string());
+    }
+
+    if let Some(name) = value.strip_prefix("did:bns:") {
+        return Principal::bns_name(name).map_err(|err| err.to_string());
+    }
+    if let Some(account) = normalize_prefixed_evm_address(value) {
+        return Ok(Principal::chain_account(account));
+    }
+
+    Principal::bns_name(value).map_err(|_| {
+        "expected did:bns:<name>, a BNS name, a 0x-prefixed EVM address, or a Principal object"
+            .to_string()
+    })
+}
+
+fn canonicalize_document_principal(principal: Principal) -> Result<Principal, String> {
+    match principal.kind {
+        PrincipalKind::Unset => {
+            principal.validate().map_err(|err| err.to_string())?;
+            Ok(Principal::unset())
+        }
+        PrincipalKind::ChainAccount => {
+            principal.validate().map_err(|err| err.to_string())?;
+            Ok(Principal::chain_account(
+                normalize_prefixed_evm_address(&principal.value).unwrap_or(principal.value),
+            ))
+        }
+        PrincipalKind::BnsName => {
+            Principal::bns_name(&principal.value).map_err(|err| err.to_string())
+        }
+    }
+}
+
+fn principals_match(left: &Principal, right: &Principal) -> bool {
+    if left.kind != right.kind {
+        return false;
+    }
+
+    match left.kind {
+        PrincipalKind::Unset => left.value == right.value,
+        PrincipalKind::BnsName => left.value == right.value,
+        PrincipalKind::ChainAccount => {
+            let left =
+                normalize_prefixed_evm_address(&left.value).unwrap_or_else(|| left.value.clone());
+            let right =
+                normalize_prefixed_evm_address(&right.value).unwrap_or_else(|| right.value.clone());
+            left.eq_ignore_ascii_case(&right)
+        }
+    }
+}
+
+fn normalize_prefixed_evm_address(value: &str) -> Option<String> {
+    let hex = value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))?;
+    if hex.len() == 40 && hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        Some(format!("0x{}", hex.to_ascii_lowercase()))
+    } else {
+        None
+    }
+}
+
+fn principal_display(principal: &Principal) -> String {
+    match principal.kind {
+        PrincipalKind::Unset => "unset".to_string(),
+        PrincipalKind::ChainAccount => principal.value.clone(),
+        PrincipalKind::BnsName => format!("did:bns:{}", principal.value),
+    }
+}
+
+fn json_type_name(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "bool",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
     }
 }
 

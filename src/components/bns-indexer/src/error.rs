@@ -26,6 +26,13 @@ pub enum BnsRegistryError {
     #[error("document `{name}/{doc_type}` was not found")]
     DocumentNotFound { name: String, doc_type: String },
 
+    #[error("document `{name}/{doc_type}` is inconsistent with on-chain state: {reason}")]
+    DocumentInconsistent {
+        name: String,
+        doc_type: String,
+        reason: String,
+    },
+
     #[error("stale name sequence for `{name}`: expected {expected}, actual {actual}")]
     StaleNameSeq {
         name: String,
@@ -151,6 +158,7 @@ impl BnsRegistryError {
             Self::NameAlreadyExists { .. } => "NAME_ALREADY_EXISTS",
             Self::NameNotFound { .. } => "NAME_NOT_FOUND",
             Self::DocumentNotFound { .. } => "DOCUMENT_NOT_FOUND",
+            Self::DocumentInconsistent { .. } => "DOCUMENT_INCONSISTENT",
             Self::StaleNameSeq { .. } => "STALE_NAME_SEQ",
             Self::StaleParentNameSeq { .. } => "STALE_PARENT_NAME_SEQ",
             Self::StaleDocumentVersion { .. } => "STALE_DOCUMENT_VERSION",

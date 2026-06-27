@@ -359,6 +359,83 @@ fn revoke_current_document_keeps_current_pointer_revoked() {
 }
 
 #[test]
+fn resolve_document_rejects_inconsistent_owner_assertion() {
+    let registry = registry();
+    let body = format!(r#"{{"owner":"{}"}}"#, OWNER_B);
+    registry
+        .register_name(
+            "alice",
+            OWNER_A,
+            RegisterOptions::default(),
+            vec![doc_update("owner", 0, &body)],
+            CallAuthority::public(),
+            MutationGuard::default(),
+        )
+        .unwrap();
+
+    let err = registry.resolve_document("alice", "owner").unwrap_err();
+    assert_eq!(err.code(), "DOCUMENT_INCONSISTENT");
+    match err {
+        BnsRegistryError::DocumentInconsistent {
+            name,
+            doc_type,
+            reason,
+        } => {
+            assert_eq!(name, "alice");
+            assert_eq!(doc_type, "owner");
+            assert!(reason.contains("owner document declares owner"));
+            assert!(reason.contains(OWNER_B));
+            assert!(reason.contains(OWNER_A));
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+}
+
+#[test]
+fn document_consistency_is_checked_against_current_owner() {
+    let registry = registry();
+    let body = format!(r#"{{"owner":"{}"}}"#, OWNER_A);
+    registry
+        .register_name(
+            "alice",
+            OWNER_A,
+            RegisterOptions::default(),
+            vec![doc_update("owner", 0, &body)],
+            CallAuthority::public(),
+            MutationGuard::default(),
+        )
+        .unwrap();
+
+    assert_eq!(
+        registry
+            .resolve_did("did:bns:alice", "owner")
+            .unwrap()
+            .document_state
+            .version,
+        1
+    );
+
+    registry.standard_transfer_name("alice", OWNER_B).unwrap();
+
+    assert!(matches!(
+        registry.resolve_document("alice", "owner"),
+        Err(BnsRegistryError::DocumentInconsistent { .. })
+    ));
+    assert!(matches!(
+        registry.resolve_did("did:bns:alice", "owner"),
+        Err(BnsRegistryError::DocumentInconsistent { .. })
+    ));
+    assert!(matches!(
+        registry.get_document_version("alice", "owner", 1),
+        Err(BnsRegistryError::DocumentInconsistent { .. })
+    ));
+    assert!(matches!(
+        registry.get_purchase_context("alice", "owner"),
+        Err(BnsRegistryError::DocumentInconsistent { .. })
+    ));
+}
+
+#[test]
 fn semantic_owner_requires_active_authority_set() {
     let registry = registry();
     registry

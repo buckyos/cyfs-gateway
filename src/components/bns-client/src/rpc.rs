@@ -69,6 +69,7 @@ impl BnsRpcErrorInfo {
                 info.doc_type = Some(doc_type.clone());
             }
             BnsRegistryError::DocumentNotFound { name, doc_type }
+            | BnsRegistryError::DocumentInconsistent { name, doc_type, .. }
             | BnsRegistryError::ControllerScopeDenied { name, doc_type, .. } => {
                 info.name = Some(name.clone());
                 info.doc_type = Some(doc_type.clone());

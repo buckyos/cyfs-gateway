@@ -22,7 +22,9 @@ impl BnsIndexerDocumentReader {
     }
 
     fn is_document_not_found(error: &BnsClientError) -> bool {
-        error.is_registry_code("NAME_NOT_FOUND") || error.is_registry_code("DOCUMENT_NOT_FOUND")
+        error.is_registry_code("NAME_NOT_FOUND")
+            || error.is_registry_code("DOCUMENT_NOT_FOUND")
+            || error.is_registry_code("DOCUMENT_INCONSISTENT")
     }
 
     fn backend_error(context: &str, error: impl std::fmt::Display) -> SnResolverError {
