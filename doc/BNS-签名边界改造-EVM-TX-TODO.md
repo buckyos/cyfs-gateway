@@ -35,24 +35,46 @@ EVM 客户端基础层与索引器事件投影已部分落地；SN/BNS Server �
 
 ## 0. 目标架构
 
+### 0.1 分层与交互顺序（重要）
+
+整条链路是一个**线性分层**结构，每一层只与相邻层对话：
+
 ```
-                       ┌─ 写：签名 EVM TX ─> eth_sendRawTransaction ─┐
-[ Controller Client ]  │  托管私钥，自动构造/签名/提交                │
-[ Standard Client   ]  │  薄封装，入参=已签名 raw TX，仅 ABI 编码     │
-                       └──────────────────────────────────────────────┘
-                                          │
-                                          ▼
-                              [ 私链 Anvil ]  ← 跑 Bns.sol（权威状态 + 访问控制 + emit event）
-                                          │  合约 emit 事件
-                                          ▼
-[ BNS Server ]  = 索引器查询 API（kRPC/HTTP）＋（可选）写代理
-[ BNS Indexer ] = 监听合约 event → 解码 → 建查询索引（只读投影）；EventLog/Checkpoint 由链上日志派生
+BNS(合约) <-> BNS-Indexer <-> BNS-Server <-> BNS-Client <-> BNS-Controller
 ```
+
+各层职责，以及"签名 / control 逻辑放在哪一层"是本文档的核心约定：
+
+| 层 | 角色 | 职责 | 不做什么 |
+| --- | --- | --- | --- |
+| **BNS(合约)** `Bns.sol` | 权威状态机 | 唯一权威源；访问控制（只认 `msg.sender`）；`emit` 事件 | — |
+| **BNS-Indexer** | 事件索引器（只读） | 监听合约 event → 解码 → 建只读查询索引投影；派生 EventLog/Checkpoint | 不持有业务逻辑、不做 mutation/鉴权 |
+| **BNS-Server** | **标准智能合约处理器**（BNS Index 的 Server 端） | 暴露**直接连接**的合约接口，**只处理两类请求：TX（写交易）和读（查询）**。写=接收**已签名的 raw TX** 并 `eth_sendRawTransaction`；读=查 Indexer 投影 | **不做自动签名、不持私钥、不含 control 逻辑** |
+| **BNS-Client** | 薄封装 | 对 BNS-Server 两类接口的薄封装：构造 calldata / unsigned TX、提交 raw TX、转发读请求。**自动签名与 control 这类"前置逻辑"在这一层之上完成** | 默认形态（Standard）不持私钥 |
+| **BNS-Controller** | Client 的前置逻辑（持 control 私钥时启用） | 当 Client **认为自己持有某些资产的 control 公钥**时，由 Controller 承担"自动签名 + control 决策"：构造 op → 查 nonce → 填 chainId/gas → ABI 编码 → **签名** → 经 Client/Server 提交 | — |
+
+**关键边界约定**：
+
+- **BNS-Server 是一个标准的智能合约处理器**——它能处理的接口"一定是直接连接的"，只对应合约本身能做的两件事：**提交交易（TX）** 和 **读状态**。它**不**承担任何自动签名或我们的 control 逻辑。
+- **凡是"自动签名 / control"这类前置处理，都在 BNS-Client 的前置逻辑里做**，具体由 **BNS-Controller** 实现。Client 只有在判断"自己持有该资产的 control 公钥"时，才走 Controller 路径用私钥自动签名；否则走 Standard 路径，入参就是外部已签好的 raw TX。
+
+### 0.2 写/读数据流
+
+```
+写：[ BNS-Controller ] 构造 op + 托管私钥签名 ──┐
+    [ BNS-Client(Standard) ] 入参=外部已签 raw TX ─┤─> [ BNS-Server ] eth_sendRawTransaction ─> [ BNS(合约) ]
+                                                                                                     │ emit event
+                                                                                                     ▼
+读：[ BNS-Client ] ──> [ BNS-Server ] 查询 API ──> [ BNS-Indexer ] 只读投影 <── 监听/解码合约 event
+```
+
+- 合约 `emit` 事件 → BNS-Indexer 监听、解码、建只读索引投影；EventLog/Checkpoint 由链上日志派生。
+- BNS-Server 读接口（kRPC/HTTP）后端查 Indexer 投影；写接口仅做 raw TX 转发，不解释、不签名。
 
 **本质变化**：
 - 权威源：`Rust 状态机` → **`Bns.sol` 合约**。✅ 合约侧已成立（链上 `_names`/`_documents`/`_authoritySets` 等即权威状态）。
 - `bns-indexer`：`状态机+存储` → **事件索引器**。🟡 已有合约事件解码/投影基础，完整同步器与读投影仍待完成。
-- `bns-server`：`状态机 HTTP 包装` → **索引器查询 API + 可选写代理**。❌ 尚未改造。
+- `bns-server`：`状态机 HTTP 包装` → **标准智能合约处理器**：只处理 TX（转发已签 raw TX）和读（查索引器投影），不签名、不含 control 逻辑。❌ 尚未改造。
 - 鉴权：不再由 server 端 `ecrecover` 或信任传入的 `CallAuthority`；**节点恢复 sender，合约用 `msg.sender` 做 `require` 访问控制**——✅ 合约侧已成立（`CallAuthority` 仅作 role/kid 提示，地址必须 == `msg.sender`）。Rust 客户端侧已能构造/签名 EVM TX，但 SN/BNS Server 写路径尚未完全迁移。
 
 ## 1. 私链环境（Anvil）✅ 已完成
@@ -106,12 +128,13 @@ EVM 客户端基础层与索引器事件投影已部分落地；SN/BNS Server �
 - [x] round-trip 测试：calldata 编/解码一致；独立解码自己签的 TX，恢复出的 signer 地址一致。
 - [ ] 后续补 `alloy-node-bindings`/自动部署合约的端到端测试。
 
-## 4. 两个客户端 🟡 基础已完成，SN 写路径迁移未完成
+## 4. BNS-Client（薄封装）与 BNS-Controller（前置签名逻辑）🟡 基础已完成，SN 写路径迁移未完成
 
-> **现状**：`src/components/bns-client` 已新增 EVM Standard/Controller client。旧的 `sn_bns_controller.rs` 仍保留旧 RPC/`CallAuthority` 流程，尚未切换到 EVM TX。
+> **定位**（见 §0.1）：这两者都在 BNS-Server 之上。**Standard Client = BNS-Client 的默认薄封装形态（不持私钥）**；**Controller Client = BNS-Controller**，即 Client 在"自己持有该资产 control 公钥"时启用的前置签名逻辑。所有自动签名/control 决策都收敛在 Controller，Server 层完全不感知。
+> **现状**：`src/components/bns-client` 已新增 EVM Standard/Controller client（见 [evm.rs](../src/components/bns-client/src/evm.rs)）。旧的 `sn_bns_controller.rs` 仍保留旧 RPC/`CallAuthority` 流程，尚未切换到 EVM TX。
 
-- [x] **Standard Client**（薄封装，无私钥）：入参为**已签名 raw TX 字节**，`eth_sendRawTransaction` 提交；另提供 `build_calldata`/`build_unsigned_tx` helper 给外部签名方。读走索引器。
-- [x] **Controller Client**（托管私钥，自动签名）：持 secp256k1 私钥，自动查 nonce → 填 chainId/to/gas → ABI 编码 → 签名 → 提交。
+- [x] **Standard Client**（= BNS-Client 薄封装，无私钥）：入参为**已签名 raw TX 字节**，`eth_sendRawTransaction` 提交；另提供 `build_calldata`/`build_unsigned_tx` helper 给外部签名方。读走索引器。
+- [x] **Controller Client**（= BNS-Controller，托管私钥，自动签名）：持 secp256k1 私钥，自动查 nonce → 填 chainId/to/gas → ABI 编码 → 签名 → 提交。仅在 Client 判断持有对应 control 公钥时走此路径。
   - [ ] 迁移 `sn_bns_controller.rs`：删掉手工拼 `CallAuthority`，改为构造 op → Controller Client 自动签名提交。
   - [x] 幂等元数据：`SnBnsWriteRequestStore` 增加 `evm_chain_id` / `evm_nonce` / `evm_tx_hash` / `evm_raw_tx` 字段，避免后续迁移时重复提交信息丢失。
   - [x] nonce 管理基础：Controller Client 本地缓存 pending nonce。
@@ -131,11 +154,15 @@ EVM 客户端基础层与索引器事件投影已部分落地；SN/BNS Server �
 - [ ] `LogCheckpoint` 完整对齐：合约已有 `globalEventSeq`（全局事件序）、`currentLogRoot`（链式哈希）、`publishLogCheckpoint`，索引器还需补同步/查询链路。
 - [ ] 保留现有**读 API**（query_name_state / resolve_owner / resolve_document / get_authority_* / list_events / latest_checkpoint），实现改为查索引投影。
 
-## 6. BNS Server = 查询 API（+ 可选写代理）❌ 未开始
+## 6. BNS Server = 标准智能合约处理器（TX + 读）❌ 未开始
 
-- [ ] 写路径决策（开放问题）：客户端**直连链 RPC** 提交 TX，还是经 **BNS Server 代理**？建议先直连，server 专注读。
+> **定位**（见 §0.1）：BNS-Server 是 BNS Index 的 Server 端，是一个**标准的智能合约处理器**。它暴露的接口"一定是直接连接的"，**只处理两类请求**：
+> - **TX（写交易）**：接收**已签名的 raw TX**，转发 `eth_sendRawTransaction`。**不签名、不持私钥、不含 control 逻辑**——自动签名/control 属于 BNS-Client 的前置逻辑（BNS-Controller）。
+> - **读（查询）**：kRPC/HTTP 读接口，后端查 BNS-Indexer 的只读投影。
+
+- [ ] 写路径：仅做 raw TX 转发（`eth_sendRawTransaction`），不解释 payload、不做鉴权（鉴权在合约 `msg.sender`）。
 - [ ] 读路径：保留 kRPC/HTTP 读接口，后端改为查索引器投影。
-- [ ] 删除旧的"传入 CallAuthority"写 RPC 方法。
+- [ ] 删除旧的"传入 CallAuthority"写 RPC 方法（这类含 control 语义的接口不属于合约处理器层）。
 
 ## 7. 身份与授权（合约侧 ✅ / Rust 侧 🟡）
 
@@ -180,7 +207,7 @@ EVM 客户端基础层与索引器事件投影已部分落地；SN/BNS Server �
 ### 待用户拍板的开放问题（部分已由实现确定）
 
 1. TX 类型 **EIP-1559** 还是 legacy？— **已按 EIP-1559 基础实现**（`bns-evm`）。
-2. 写路径：客户端**直连链 RPC** 还是经 **BNS Server 代理**？（建议先直连）— **未定**。
+2. 写路径：客户端**直连链 RPC** 还是经 **BNS Server 代理**？— **已澄清定位**（见 §0.1/§6）：无论直连还是经 BNS-Server，Server 层都只是**标准合约处理器**，仅做 raw TX 转发 + 读，不签名、不含 control 逻辑；自动签名/control 一律在 BNS-Client/BNS-Controller 完成。具体物理拓扑（直连 vs 经 Server）仍可后定。
 3. chainId 与合约地址如何分配/配置？— 私链已**默认 chainId = 31337**（`anvil.sh`，可经 `ANVIL_CHAIN_ID` 覆盖），合约地址由 `deploy.sh` 写入 `deployments/anvil.local.json`；Rust 侧已有 `SNServerConfig.bns_evm` 配置结构，生产分发方式仍待定。
 4. controller 托管私钥存放方式（配置 / KMS / 环境变量）？— Rust 配置结构已预留环境变量 / 文件 / inline 字段；实际加载与 SN 写路径接入仍待完成。
 5. gas 字段：接受并忽略，还是强制 0？— `bns-evm`/`SNServerConfig.bns_evm` 已按 EIP-1559 gas 字段处理；具体生产策略仍需按部署环境确定。

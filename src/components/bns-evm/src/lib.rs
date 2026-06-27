@@ -14,11 +14,13 @@ pub use alloy_primitives::{address, Address, Bytes, Log, LogData, TxKind, B256, 
 pub use alloy_signer_local::PrivateKeySigner;
 pub use alloy_sol_types::{SolCall, SolEventInterface, SolInterface};
 pub use bindings::{
-    AliasKind, AuthorityKey, AuthorityKeyStatus, AuthorityKeyUpdate, AuthorityRole, Bns,
-    CallAuthority, ControllerRule, DocumentRef, DocumentUpdate, MutationGuard, OwnerSource,
-    Principal, PrincipalKind, RegisterOptions, ReleaseMode,
+    AliasKind, AliasState, AuthorityKey, AuthorityKeyStatus, AuthorityKeyUpdate, AuthorityRole,
+    AuthoritySetState, Bns, CallAuthority, ControllerRule, DocumentRef, DocumentState,
+    DocumentStatus, DocumentUpdate, LogCheckpoint, MutationGuard, NameState, NameStatus,
+    OwnerResolution, OwnerSource, Principal, PrincipalKind, PurchaseContext, RegisterOptions,
+    ReleaseMode, ResolveResult,
 };
-pub use rpc::{BlockRange, EthLog, EthRpcClient, RpcLogFilter};
+pub use rpc::{BlockRange, EthLog, EthRpcClient, EthTransaction, RpcLogFilter};
 pub use tx::{
     build_eip1559_contract_tx, decode_signed_eip1559, encode_call, sign_eip1559_tx,
     signer_from_private_key, BnsEvmError, BnsEvmResult, Eip1559TxParams, SignedEip1559Tx,

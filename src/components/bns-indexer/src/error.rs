@@ -78,6 +78,9 @@ pub enum BnsRegistryError {
     #[error("invalid mutation: {0}")]
     InvalidMutation(String),
 
+    #[error("invalid BNS indexer config: {0}")]
+    InvalidConfig(String),
+
     #[error("integer value for `{field}` is outside sqlite INTEGER range: {value}")]
     IntegerOutOfRange { field: &'static str, value: u64 },
 
@@ -92,6 +95,9 @@ pub enum BnsRegistryError {
 
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+
+    #[error("EVM RPC/ABI error: {0}")]
+    Evm(#[from] bns_evm::BnsEvmError),
 }
 
 pub type BnsRegistryResult<T> = Result<T, BnsRegistryError>;
@@ -153,11 +159,13 @@ impl BnsRegistryError {
             Self::OwnerGraphTooDeep { .. } => "OWNER_GRAPH_TOO_DEEP",
             Self::InlineDocumentTooLarge { .. } => "INLINE_DOCUMENT_TOO_LARGE",
             Self::InvalidMutation(_) => "INVALID_MUTATION",
+            Self::InvalidConfig(_) => "INVALID_CONFIG",
             Self::IntegerOutOfRange { .. } => "INTEGER_OUT_OF_RANGE",
             Self::DbLockPoisoned => "DB_LOCK_POISONED",
             Self::Sqlite(_) => "SQLITE_ERROR",
             Self::Json(_) => "JSON_ERROR",
             Self::Io(_) => "IO_ERROR",
+            Self::Evm(_) => "EVM_ERROR",
         }
     }
 }

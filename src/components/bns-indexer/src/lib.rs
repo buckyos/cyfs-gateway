@@ -1,9 +1,9 @@
-//! Centralized BNS registry state machine.
+//! BNS contract event indexer and read projection.
 //!
-//! The implementation follows `doc/BNS 智能合约接口设计.md`: the registry core is
-//! independent from RPC/session authentication and only accepts an already
-//! authenticated [`CallAuthority`]. State is persisted through
-//! [`BnsRegistryStore`], with SQLite provided as the first backend.
+//! The contract is the authority for BNS state. This crate persists a SQLite
+//! read projection and event log derived from BNS contract logs. The legacy
+//! [`CentralizedBnsRegistry`] state machine is still exported for old in-process
+//! tests and RPC paths while callers migrate to EVM transaction submission.
 
 pub mod dns_document;
 
@@ -13,6 +13,7 @@ mod model;
 mod registry;
 mod sqlite;
 mod store;
+mod sync;
 
 pub use error::{BnsRegistryError, BnsRegistryResult};
 pub use evm_projection::{
@@ -25,5 +26,9 @@ pub use registry::{
 };
 pub use sqlite::SqliteBnsRegistryStore;
 pub use store::{BnsRegistryStore, BnsRegistryStoreTx};
+pub use sync::{
+    sync_bns_contract_once, BnsBlockSyncSourceConfig, BnsContractEventIndexer,
+    BnsIndexerSyncConfig, BnsIndexerSyncOutcome,
+};
 
 pub type SqliteBnsDb = SqliteBnsRegistryStore;

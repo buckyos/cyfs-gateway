@@ -1,6 +1,6 @@
 use crate::{
     AliasState, AuthorityKey, AuthoritySetState, BnsRegistryResult, ControllerRule, DocumentKey,
-    DocumentState, EventLogRecord, LogCheckpoint, NameState, RegistryEvent,
+    DocumentState, EventLogRecord, IndexerCursor, LogCheckpoint, NameState, RegistryEvent,
 };
 
 pub trait BnsRegistryStore: Send + Sync {
@@ -66,4 +66,7 @@ pub trait BnsRegistryStoreTx {
 
     fn put_checkpoint(&mut self, checkpoint: &LogCheckpoint) -> BnsRegistryResult<()>;
     fn latest_checkpoint(&mut self) -> BnsRegistryResult<Option<LogCheckpoint>>;
+
+    fn get_indexer_cursor(&mut self, source: &str) -> BnsRegistryResult<Option<IndexerCursor>>;
+    fn put_indexer_cursor(&mut self, cursor: &IndexerCursor) -> BnsRegistryResult<()>;
 }

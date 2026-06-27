@@ -1,4 +1,5 @@
 use alloy_primitives::{Address, Bytes, Log, B256};
+use alloy_sol_types::SolCall;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -73,6 +74,24 @@ impl EthLog {
     }
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EthTransaction {
+    pub hash: B256,
+    #[serde(default)]
+    pub from: Option<Address>,
+    #[serde(default)]
+    pub to: Option<Address>,
+    #[serde(default)]
+    pub input: Bytes,
+    #[serde(default, deserialize_with = "deserialize_optional_quantity")]
+    pub block_number: Option<u64>,
+    #[serde(default)]
+    pub block_hash: Option<B256>,
+    #[serde(default, deserialize_with = "deserialize_optional_quantity")]
+    pub transaction_index: Option<u64>,
+}
+
 #[derive(Debug, Clone)]
 pub struct EthRpcClient {
     endpoint: String,
@@ -93,6 +112,11 @@ impl EthRpcClient {
 
     pub async fn chain_id(&self) -> BnsEvmResult<u64> {
         let value: String = self.call("eth_chainId", json!([])).await?;
+        parse_quantity(&value)
+    }
+
+    pub async fn block_number(&self) -> BnsEvmResult<u64> {
+        let value: String = self.call("eth_blockNumber", json!([])).await?;
         parse_quantity(&value)
     }
 
@@ -126,8 +150,34 @@ impl EthRpcClient {
         Ok(tx_hash)
     }
 
+    pub async fn eth_call(&self, to: Address, calldata: &[u8]) -> BnsEvmResult<Bytes> {
+        let value: String = self
+            .call(
+                "eth_call",
+                json!([{
+                    "to": hex_address(to),
+                    "data": format!("0x{}", hex::encode(calldata)),
+                }, "latest"]),
+            )
+            .await?;
+        parse_hex_bytes(&value).map(Bytes::from)
+    }
+
+    pub async fn call_contract<C>(&self, to: Address, call: &C) -> BnsEvmResult<C::Return>
+    where
+        C: SolCall,
+    {
+        let output = self.eth_call(to, &call.abi_encode()).await?;
+        C::abi_decode_returns(&output).map_err(|err| BnsEvmError::Abi(err.to_string()))
+    }
+
     pub async fn get_logs(&self, filter: &RpcLogFilter) -> BnsEvmResult<Vec<EthLog>> {
         self.call("eth_getLogs", json!([filter.to_rpc_value()]))
+            .await
+    }
+
+    pub async fn transaction_by_hash(&self, tx_hash: B256) -> BnsEvmResult<Option<EthTransaction>> {
+        self.call("eth_getTransactionByHash", json!([hex_b256(tx_hash)]))
             .await
     }
 
@@ -204,6 +254,17 @@ fn parse_quantity(value: &str) -> BnsEvmResult<u64> {
         .ok_or_else(|| BnsEvmError::Parse(format!("quantity `{value}` missing 0x prefix")))?;
     u64::from_str_radix(if hex.is_empty() { "0" } else { hex }, 16)
         .map_err(|err| BnsEvmError::Parse(format!("invalid quantity `{value}`: {err}")))
+}
+
+fn parse_hex_bytes(value: &str) -> BnsEvmResult<Vec<u8>> {
+    let hex = value
+        .strip_prefix("0x")
+        .ok_or_else(|| BnsEvmError::Parse(format!("hex bytes `{value}` missing 0x prefix")))?;
+    if hex.is_empty() {
+        return Ok(Vec::new());
+    }
+    hex::decode(hex)
+        .map_err(|err| BnsEvmError::Parse(format!("invalid hex bytes `{value}`: {err}")))
 }
 
 fn deserialize_optional_quantity<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>

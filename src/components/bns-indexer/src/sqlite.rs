@@ -7,8 +7,8 @@ use std::sync::{Mutex, MutexGuard};
 use crate::{
     authority_root, canonical_bns_name, canonical_doc_type, hash_json, AliasState, AuthorityKey,
     AuthoritySetState, BnsRegistryError, BnsRegistryResult, BnsRegistryStore, BnsRegistryStoreTx,
-    ControllerRule, DocumentKey, DocumentState, EventLogRecord, LogCheckpoint, NameState,
-    RegistryEvent, ZERO_HASH,
+    ControllerRule, DocumentKey, DocumentState, EventLogRecord, IndexerCursor, LogCheckpoint,
+    NameState, RegistryEvent, ZERO_HASH,
 };
 
 pub struct SqliteBnsRegistryStore {
@@ -117,6 +117,15 @@ impl SqliteBnsRegistryStore {
                 last_seq INTEGER PRIMARY KEY,
                 log_root TEXT NOT NULL,
                 issued_at INTEGER NOT NULL,
+                payload_json TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS bns_indexer_cursors (
+                source TEXT PRIMARY KEY,
+                block_number INTEGER NOT NULL,
+                block_hash TEXT NULL,
+                log_index INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
                 payload_json TEXT NOT NULL
             );
 
@@ -619,6 +628,10 @@ impl BnsRegistryStoreTx for SqliteStoreTx<'_> {
             INSERT INTO bns_checkpoints
                 (last_seq, log_root, issued_at, payload_json)
             VALUES (?1, ?2, ?3, ?4)
+            ON CONFLICT(last_seq) DO UPDATE SET
+                log_root = excluded.log_root,
+                issued_at = excluded.issued_at,
+                payload_json = excluded.payload_json
             "#,
             params![
                 to_i64(checkpoint.last_seq, "last_seq")?,
@@ -640,6 +653,43 @@ impl BnsRegistryStoreTx for SqliteStoreTx<'_> {
             )
             .optional()?;
         payload.as_deref().map(from_json).transpose()
+    }
+
+    fn get_indexer_cursor(&mut self, source: &str) -> BnsRegistryResult<Option<IndexerCursor>> {
+        let payload = self
+            .tx
+            .query_row(
+                "SELECT payload_json FROM bns_indexer_cursors WHERE source = ?1",
+                params![source],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        payload.as_deref().map(from_json).transpose()
+    }
+
+    fn put_indexer_cursor(&mut self, cursor: &IndexerCursor) -> BnsRegistryResult<()> {
+        self.tx.execute(
+            r#"
+            INSERT INTO bns_indexer_cursors
+                (source, block_number, block_hash, log_index, updated_at, payload_json)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            ON CONFLICT(source) DO UPDATE SET
+                block_number = excluded.block_number,
+                block_hash = excluded.block_hash,
+                log_index = excluded.log_index,
+                updated_at = excluded.updated_at,
+                payload_json = excluded.payload_json
+            "#,
+            params![
+                cursor.source.as_str(),
+                to_i64(cursor.block_number, "block_number")?,
+                cursor.block_hash.as_deref(),
+                to_i64(cursor.log_index, "log_index")?,
+                to_i64(cursor.updated_at, "updated_at")?,
+                to_json(cursor)?
+            ],
+        )?;
+        Ok(())
     }
 }
 
