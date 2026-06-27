@@ -19,4 +19,3 @@
 
 ### SN-DeviceInfo-App
 
-### 
