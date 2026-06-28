@@ -1,4 +1,4 @@
-use crate::api::{parse_error, reason_error, RpcCallResult, SnV2ErrorCode};
+use crate::api::{parse_error, reason_error, RpcCallResult, SnApiErrorCode};
 use crate::SNServer;
 use kRPC::{RPCRequest, RPCSessionToken};
 use serde::{Deserialize, Serialize};
@@ -29,13 +29,13 @@ pub(crate) async fn require_sn_user(
     let token = req
         .token
         .as_ref()
-        .ok_or_else(|| parse_error(SnV2ErrorCode::AuthRequired, "session_token is none"))?;
-    let session = server.v2_auth().verify_access_session(token.as_str())?;
+        .ok_or_else(|| parse_error(SnApiErrorCode::AuthRequired, "session_token is none"))?;
+    let session = server.auth().verify_access_session(token.as_str())?;
     validate_account_session(server, &session, token.as_str()).await?;
     let username = session
         .sub
         .clone()
-        .ok_or_else(|| parse_error(SnV2ErrorCode::InvalidToken, "subject is none"))?;
+        .ok_or_else(|| parse_error(SnApiErrorCode::InvalidToken, "subject is none"))?;
     Ok(AuthContext::SnUser {
         username,
         session_id: session_id(&session, token.as_str()),
@@ -66,23 +66,23 @@ async fn validate_account_session(
         .auth_db()
         .get_account_session(session_id.as_str())
         .await
-        .map_err(|e| reason_error(SnV2ErrorCode::InternalError, e.to_string()))?
+        .map_err(|e| reason_error(SnApiErrorCode::InternalError, e.to_string()))?
     else {
         return Ok(());
     };
 
     if stored.state != "active" {
         return Err(parse_error(
-            SnV2ErrorCode::InvalidToken,
+            SnApiErrorCode::InvalidToken,
             "session has been revoked",
         ));
     }
     if stored.expires_at < now_secs() {
-        return Err(parse_error(SnV2ErrorCode::InvalidToken, "session expired"));
+        return Err(parse_error(SnApiErrorCode::InvalidToken, "session expired"));
     }
     if session.sub.as_deref() != Some(stored.username.as_str()) {
         return Err(parse_error(
-            SnV2ErrorCode::InvalidToken,
+            SnApiErrorCode::InvalidToken,
             "session subject mismatch",
         ));
     }

@@ -266,7 +266,7 @@ BNS 域名：
 
 - 已实现：A/AAAA 优先返回 `zone_doc.gateway_ips`（`resolve_dns`，`sn_resolver.rs:995`），否则从 `zone`/`boot` 文档派生 gateway device（`resolve_gateway_for_zone`，`sn_resolver.rs:1260`）。**`ood1` 已降级为兜底默认 `DEFAULT_LEGACY_GATEWAY_DEVICE`（`sn_resolver.rs:22`），仅在 `zone`/`boot` 都未声明 gateway device 时使用，主路径不再硬编码**。地址过滤/去重已实现：loopback、`172.16.0.0/12`、record type 分流、去重（`is_filtered_zonegate_ip` / `push_exportable_ip` / `push_dns_address`，`sn_resolver.rs:2473`）。在线态来自 `sn_device_info`（`get_device_state_by_name`，`sn_resolver.rs:1272`）。
 - 待实现（阶段二）：非 WAN device 的入口地址追加目前沿用旧行为，追加用户 `zone_info.sn_ips`（或 `server_ip`），而非按设计追加“当前分配 relay 的地址”（`resolve_gateway_addresses`，`sn_resolver.rs:1356`）。**resolver 完全没有按来源 `from_ip` 选内/外网地址**：`resolve_dns` 不接收 `from_ip`，`resolve_gateway_addresses` 无条件吐出全部 public+private+endpoint IP；`SnDeviceStateView` 虽带 `nat_type`/`from_ip`/`is_wan_device`，resolver 只用了 `is_wan_device`。
-- 遗留清理待完成：旧的 `get_user_zonegate_address`（仍绑定 `ood1`）和 `query_device_by_hostname_v2` 中查询 `ood1` 的兜底分支仍在 `sn_server.rs`，仅在 resolver 返回空时才执行（见“迁移步骤”）。
+- 遗留清理待完成：旧的 `get_user_zonegate_address`（仍绑定 `ood1`）和 `query_device_by_hostname` 中查询 `ood1` 的兜底分支仍在 `sn_server.rs`，仅在 resolver 返回空时才执行（见“迁移步骤”）。
 
 ## Hostname 到 Gateway 解析
 
@@ -294,7 +294,7 @@ resolve_gateway_by_hostname(hostname) -> GatewayResolution
 - node_daemon 使用 `relay_sn` 判断是否需要重新 keep tunnel。
 - 入口协议转发使用 `self_cert` 决定默认转发 80 还是 443。
 
-已实现：`resolve_gateway_by_hostname`（`sn_resolver.rs:1028`）覆盖上述 1-8 步，gateway device 由 `zone`/`boot` 派生、在线态来自 `sn_device_info`、`relay_sn` 与 `self_cert` 一并带出。`query_device_by_hostname_v2`（`sn_server.rs:2587`）已改为从 `GatewayResolution` 投影出兼容的 `OODInfo { did_hostname, owner_id, self_cert, state }`，不再硬编码 `ood1`（旧 `ood1` 分支仅在 resolver 返回空时作为兜底执行，`sn_server.rs:2605`）。
+已实现：`resolve_gateway_by_hostname`（`sn_resolver.rs:1028`）覆盖上述 1-8 步，gateway device 由 `zone`/`boot` 派生、在线态来自 `sn_device_info`、`relay_sn` 与 `self_cert` 一并带出。`query_device_by_hostname`（`sn_server.rs:2587`）已改为从 `GatewayResolution` 投影出兼容的 `OODInfo { did_hostname, owner_id, self_cert, state }`，不再硬编码 `ood1`（旧 `ood1` 分支仅在 resolver 返回空时作为兜底执行，`sn_server.rs:2605`）。
 
 ## DID 解析
 
@@ -486,7 +486,7 @@ resolve_relay_for_zone(zone)
   - TXT 合并 `zone`+`boot`+`dns_txt`（`resolve_zone_txt`，`sn_resolver.rs:1405`）。
   - A/AAAA 优先 `gateway_ips`、否则从 `zone`/`boot` 派生 gateway device，`ood1` 降级为兜底默认 `DEFAULT_LEGACY_GATEWAY_DEVICE`（`sn_resolver.rs:22`）。
   - IP 过滤/去重：loopback、`172.16.0.0/12`、record type 分流（`sn_resolver.rs:2473`）。
-- 接入点（`src/components/cyfs-sn/src/sn_server.rs`）：`NameServer::query` → `resolver.resolve_dns`（`sn_server.rs:3665`）；`query_did_v2` → `resolver.resolve_did`（`sn_server.rs:3145`）；`query_device_by_hostname_v2` → `resolver.resolve_gateway_by_hostname`，投影成兼容 `OODInfo`（`sn_server.rs:2587`）。构造时按真实后端装配 readers（`SnAuthResolverReader`、`SnDeviceInfoResolverReader`、`SnRelayManagerResolverReader`、`LegacyResolverCompatibilityReader`，配置了 `bns_indexer_url` 时再加 `BnsIndexerDocumentReader`，`sn_server.rs:666`）。
+- 接入点（`src/components/cyfs-sn/src/sn_server.rs`）：`NameServer::query` → `resolver.resolve_dns`（`sn_server.rs:3665`）；`query_did` → `resolver.resolve_did`（`sn_server.rs:3145`）；`query_device_by_hostname` → `resolver.resolve_gateway_by_hostname`，投影成兼容 `OODInfo`（`sn_server.rs:2587`）。构造时按真实后端装配 readers（`SnAuthResolverReader`、`SnDeviceInfoResolverReader`、`SnRelayManagerResolverReader`、`LegacyResolverCompatibilityReader`，配置了 `bns_indexer_url` 时再加 `BnsIndexerDocumentReader`，`sn_server.rs:666`）。
 - backend reader：`src/components/cyfs-sn/src/sn_bns_reader.rs`（`BnsDocumentReader` 实现）。
 - 兼容入口仍在：`api/query.rs`（`resolve_did`/`resolve_hostname`/`resolve_device`）、`api/device.rs`、`api/dns.rs`、`sqlite_db.rs`（`users`/`devices`/`user_dns_records`/`user_did_documents`）。
 
@@ -495,7 +495,7 @@ resolve_relay_for_zone(zone)
 - `user_domain` 子域名转发解析仍只支持精确匹配（`home.alice.example.com` 无法回退父 `user_domain`）。
 - 完全没有按来源 `from_ip` 选内/外网地址；`resolve_did` 的 `from_ip` 参数被忽略（`sn_resolver.rs:1165`）。
 - 缓存分层与失效未实现，且存在 `NameInfoCache` 与 `SnResolverCache` 两层重叠缓存。
-- 遗留清理未完成：死代码 `query_name_info_uncached`（`sn_server.rs:3361`，无调用方）、`ood1` 绑定的 `get_user_zonegate_address` 与 `query_device_by_hostname_v2` 的 `ood1` 兜底分支仍在 `sn_server.rs`。
+- 遗留清理未完成：死代码 `query_name_info_uncached`（`sn_server.rs:3361`，无调用方）、`ood1` 绑定的 `get_user_zonegate_address` 与 `query_device_by_hostname` 的 `ood1` 兜底分支仍在 `sn_server.rs`。
 - 分类顺序 `user_domain` 先于 BNS owner（`resolve_zone_by_hostname`，`sn_resolver.rs:1038`），与文档“先 BNS 后 user_domain”的优先级相反。
 - BNS 名校验（`normalize_bns_name`，`sn_resolver.rs:1862`）只查空/空白/长度，未调用 `buckyos-kit::is_valid_name`。
 
@@ -503,7 +503,7 @@ resolve_relay_for_zone(zone)
 
 1. [已完成] 抽出 `sn_resolver` 模块，先包住现有 `SNServer` 解析逻辑，保证旧测试不变（`sn_resolver.rs`）。
 2. [已完成] 定义 `ZoneResolution`、`GatewayResolution`、`DnsResolution`、`DidResolution`、`RelayResolution`（`sn_resolver.rs:364` 起）。
-3. [已完成] 把 `NameServer::query`（`sn_server.rs:3665`）、`query_did_v2`（`sn_server.rs:3145`）、`query_device_by_hostname_v2`（`sn_server.rs:2587`）改为调用 resolver 并做兼容投影。
+3. [已完成] 把 `NameServer::query`（`sn_server.rs:3665`）、`query_did`（`sn_server.rs:3145`）、`query_device_by_hostname`（`sn_server.rs:2587`）改为调用 resolver 并做兼容投影。
 4. [已完成] 接入 `bns-indexer` read client，把 BNS `zone`、`boot`、`device_mini_doc`、`dns_txt` 放到 legacy 之前；device mini doc 解析同时支持独立聚合文档和 `zone` 内嵌 `devices` map（`sn_bns_reader.rs::BnsIndexerDocumentReader`，装配于 `sn_server.rs:689`；未配置 indexer 时退回 legacy 后端）。
 5. [已完成] 把 gateway device 从硬编码 `ood1` 改成读取 BNS `zone/boot`，`ood1` 仅作兜底默认（`resolve_gateway_for_zone`，`sn_resolver.rs:1260`）。
 6. [部分完成] 显式本地 DNS record 已作为兼容 fallback 优先返回（`sn_resolver.rs:963`）；新写入仍走本地 `user_dns_records`（`api/dns.rs`），尚未改为通过 `sn_bns_controller` 发布 BNS `dns_txt`。

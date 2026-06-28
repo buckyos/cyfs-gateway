@@ -6,7 +6,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use super::errors::{parse_error, reason_error, SnV2ErrorCode};
+use super::errors::{parse_error, reason_error, SnApiErrorCode};
 
 pub(crate) type RpcCallResult<T> = std::result::Result<T, RPCErrors>;
 
@@ -16,7 +16,7 @@ pub(crate) trait IntoRpcResult<T> {
 
 impl<T> IntoRpcResult<T> for crate::SnResult<T> {
     fn into_rpc(self) -> RpcCallResult<T> {
-        self.map_err(|e| reason_error(SnV2ErrorCode::InternalError, e.to_string()))
+        self.map_err(|e| reason_error(SnApiErrorCode::InternalError, e.to_string()))
     }
 }
 
@@ -98,7 +98,7 @@ where
 {
     serde_json::from_value(req.params.clone()).map_err(|e| {
         parse_error(
-            SnV2ErrorCode::InvalidParams,
+            SnApiErrorCode::InvalidParams,
             format!("{}: {}", req.method, e),
         )
     })
@@ -112,13 +112,13 @@ pub(crate) fn normalize_username(username: &str) -> RpcCallResult<String> {
     let username = username.trim().to_lowercase();
     if username.is_empty() {
         return Err(parse_error(
-            SnV2ErrorCode::InvalidUsername,
+            SnApiErrorCode::InvalidUsername,
             "username is empty",
         ));
     }
     if SNServer::contains_special_chars(username.as_str()) {
         return Err(parse_error(
-            SnV2ErrorCode::InvalidUsername,
+            SnApiErrorCode::InvalidUsername,
             "username contains special characters",
         ));
     }
@@ -144,7 +144,7 @@ pub(crate) fn normalize_evm_address(value: &str, field: &str) -> RpcCallResult<S
         Ok(value.to_ascii_lowercase())
     } else {
         Err(parse_error(
-            SnV2ErrorCode::InvalidParams,
+            SnApiErrorCode::InvalidParams,
             format!("{field} must be a 0x-prefixed EVM address"),
         ))
     }
@@ -154,7 +154,7 @@ pub(crate) fn bns_default_asset_owner(controller: &SnBnsController) -> RpcCallRe
     let principal = &controller.config().sn_controller_principal;
     if principal.kind != PrincipalKind::ChainAccount {
         return Err(parse_error(
-            SnV2ErrorCode::InvalidParams,
+            SnApiErrorCode::InvalidParams,
             "asset_owner is required when SN controller principal is not a chain account",
         ));
     }
@@ -182,7 +182,7 @@ pub(crate) async fn require_account_username(
     context
         .sn_username()
         .map(ToString::to_string)
-        .ok_or_else(|| parse_error(SnV2ErrorCode::AuthRequired, "session token is not a user"))
+        .ok_or_else(|| parse_error(SnApiErrorCode::AuthRequired, "session token is not a user"))
 }
 
 pub(crate) async fn resolve_self_scoped_username(
@@ -203,7 +203,7 @@ pub(crate) async fn resolve_self_scoped_username(
             if let Some(requested_name) = requested_name {
                 if requested_name != username {
                     return Err(parse_error(
-                        SnV2ErrorCode::CrossUserAccessDenied,
+                        SnApiErrorCode::CrossUserAccessDenied,
                         "cross-user access is not allowed",
                     ));
                 }
@@ -212,12 +212,12 @@ pub(crate) async fn resolve_self_scoped_username(
         }
         None if allow_anonymous_name => requested_name.ok_or_else(|| {
             parse_error(
-                SnV2ErrorCode::InvalidParams,
+                SnApiErrorCode::InvalidParams,
                 "name is required when token is absent",
             )
         }),
         None => Err(parse_error(
-            SnV2ErrorCode::AuthRequired,
+            SnApiErrorCode::AuthRequired,
             "session_token is none",
         )),
     }

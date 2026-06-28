@@ -164,7 +164,7 @@ V2 采用 access/refresh token 会话模型。`require_account_username()` 从 t
 
 ---
 
-## 4. 错误码(`api/errors.rs`,前缀 `[SNV2:<code>:<name>]`)
+## 4. 错误码(`api/errors.rs`,前缀 `[SN:<code>:<name>]`)
 
 | code | name | code | name |
 |------|------|------|------|

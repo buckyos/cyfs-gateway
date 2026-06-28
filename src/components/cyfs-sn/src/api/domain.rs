@@ -1,7 +1,7 @@
 use super::common::{
     ok_response, parse_params, require_account_username, IntoRpcResult, RpcCallResult,
 };
-use super::errors::{parse_error, reason_error, SnV2ErrorCode};
+use super::errors::{parse_error, reason_error, SnApiErrorCode};
 use crate::{SNServer, SnError, SnErrorCode};
 use ::kRPC::{RPCErrors, RPCRequest, RPCResponse};
 use serde::Deserialize;
@@ -26,19 +26,19 @@ struct VerifyDomainReq {
 fn map_domain_error(error: SnError) -> RPCErrors {
     match error.code() {
         SnErrorCode::InvalidInput | SnErrorCode::Conflict | SnErrorCode::Blocked => {
-            parse_error(SnV2ErrorCode::InvalidDomain, error.to_string())
+            parse_error(SnApiErrorCode::InvalidDomain, error.to_string())
         }
         SnErrorCode::NotFound => {
             if error.to_string().contains("user not found") {
-                parse_error(SnV2ErrorCode::UserNotFound, error.to_string())
+                parse_error(SnApiErrorCode::UserNotFound, error.to_string())
             } else {
-                parse_error(SnV2ErrorCode::InvalidDomain, error.to_string())
+                parse_error(SnApiErrorCode::InvalidDomain, error.to_string())
             }
         }
         SnErrorCode::DBError | SnErrorCode::RemoteError | SnErrorCode::Failed => {
-            reason_error(SnV2ErrorCode::InternalError, error.to_string())
+            reason_error(SnApiErrorCode::InternalError, error.to_string())
         }
-        SnErrorCode::StaleReport => reason_error(SnV2ErrorCode::InternalError, error.to_string()),
+        SnErrorCode::StaleReport => reason_error(SnApiErrorCode::InternalError, error.to_string()),
     }
 }
 
@@ -80,7 +80,7 @@ pub(crate) async fn handle_domain(
             }
             if txt_records.is_empty() {
                 return Err(parse_error(
-                    SnV2ErrorCode::InvalidParams,
+                    SnApiErrorCode::InvalidParams,
                     "txt_records is required",
                 ));
             }

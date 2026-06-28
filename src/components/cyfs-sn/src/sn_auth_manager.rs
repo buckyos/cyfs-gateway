@@ -1,5 +1,5 @@
-use crate::api::{parse_error, reason_error, RpcCallResult, SnV2ErrorCode};
-use crate::SnV2AuthInfo;
+use crate::api::{parse_error, reason_error, RpcCallResult, SnApiErrorCode};
+use crate::SnAuthInfo;
 use ::kRPC::RPCSessionToken;
 use buckyos_kit::get_buckyos_service_data_dir;
 use jsonwebtoken::{jwk::Jwk, DecodingKey, EncodingKey};
@@ -10,15 +10,15 @@ use std::num::NonZeroU32;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const V2_ACCESS_AUD: &str = "sn-v2";
-const V2_REFRESH_AUD: &str = "sn-v2-refresh";
-const V2_ACCESS_TOKEN_EXPIRE_SECS: u64 = 60 * 60;
-const V2_REFRESH_TOKEN_EXPIRE_SECS: u64 = 60 * 60 * 24;
+const ACCESS_AUD: &str = "sn";
+const REFRESH_AUD: &str = "sn-refresh";
+const ACCESS_TOKEN_EXPIRE_SECS: u64 = 60 * 60;
+const REFRESH_TOKEN_EXPIRE_SECS: u64 = 60 * 60 * 24;
 pub(crate) const PASSWORD_ALGO: &str = "pbkdf2-sha256-100000";
 const PASSWORD_ITERATIONS: u32 = 100_000;
 
 #[derive(Clone)]
-pub(crate) struct SnV2AuthManager {
+pub(crate) struct SnAuthManager {
     token_encode_key: EncodingKey,
     token_decode_key: DecodingKey,
 }
@@ -32,12 +32,12 @@ pub(crate) struct IssuedRpcToken {
     pub(crate) expires_at: u64,
 }
 
-impl SnV2AuthManager {
+impl SnAuthManager {
     pub(crate) async fn new(configured_dir: Option<&str>) -> std::result::Result<Self, String> {
-        let data_dir = resolve_v2_auth_dir(configured_dir);
+        let data_dir = resolve_auth_dir(configured_dir);
         std::fs::create_dir_all(&data_dir).map_err(|e| {
             format!(
-                "failed to create sn v2 auth dir {}: {}",
+                "failed to create sn auth dir {}: {}",
                 data_dir.display(),
                 e
             )
@@ -80,8 +80,8 @@ impl SnV2AuthManager {
     pub(crate) fn issue_access_session(&self, username: &str) -> RpcCallResult<IssuedRpcToken> {
         issue_rpc_jwt(
             username,
-            V2_ACCESS_AUD,
-            V2_ACCESS_TOKEN_EXPIRE_SECS,
+            ACCESS_AUD,
+            ACCESS_TOKEN_EXPIRE_SECS,
             &self.token_encode_key,
         )
     }
@@ -89,18 +89,18 @@ impl SnV2AuthManager {
     pub(crate) fn issue_refresh_session(&self, username: &str) -> RpcCallResult<IssuedRpcToken> {
         issue_rpc_jwt(
             username,
-            V2_REFRESH_AUD,
-            V2_REFRESH_TOKEN_EXPIRE_SECS,
+            REFRESH_AUD,
+            REFRESH_TOKEN_EXPIRE_SECS,
             &self.token_encode_key,
         )
     }
 
     pub(crate) fn verify_access_session(&self, token: &str) -> RpcCallResult<RPCSessionToken> {
-        verify_rpc_session(token, V2_ACCESS_AUD, &self.token_decode_key)
+        verify_rpc_session(token, ACCESS_AUD, &self.token_decode_key)
     }
 
     pub(crate) fn verify_refresh_session(&self, token: &str) -> RpcCallResult<RPCSessionToken> {
-        verify_rpc_session(token, V2_REFRESH_AUD, &self.token_decode_key)
+        verify_rpc_session(token, REFRESH_AUD, &self.token_decode_key)
     }
 }
 
@@ -111,22 +111,22 @@ pub(crate) fn hash_password(password: &str) -> RpcCallResult<(String, String)> {
     Ok((password_hash, salt_hex))
 }
 
-pub(crate) fn verify_password(password: &str, auth: &SnV2AuthInfo) -> RpcCallResult<bool> {
+pub(crate) fn verify_password(password: &str, auth: &SnAuthInfo) -> RpcCallResult<bool> {
     if auth.password_algo != PASSWORD_ALGO {
         return Err(reason_error(
-            SnV2ErrorCode::UnsupportedPasswordAlgo,
+            SnApiErrorCode::UnsupportedPasswordAlgo,
             format!("unsupported password algo {}", auth.password_algo),
         ));
     }
     let salt = hex::decode(auth.password_salt.as_str()).map_err(|e| {
         reason_error(
-            SnV2ErrorCode::InvalidPasswordStorage,
+            SnApiErrorCode::InvalidPasswordStorage,
             format!("invalid password salt: {}", e),
         )
     })?;
     let expected = hex::decode(auth.password_hash.as_str()).map_err(|e| {
         reason_error(
-            SnV2ErrorCode::InvalidPasswordStorage,
+            SnApiErrorCode::InvalidPasswordStorage,
             format!("invalid password hash: {}", e),
         )
     })?;
@@ -140,7 +140,7 @@ pub(crate) fn verify_password(password: &str, auth: &SnV2AuthInfo) -> RpcCallRes
     .is_ok())
 }
 
-fn resolve_v2_auth_dir(configured_dir: Option<&str>) -> PathBuf {
+fn resolve_auth_dir(configured_dir: Option<&str>) -> PathBuf {
     if let Some(path) = configured_dir {
         let configured = PathBuf::from(path);
         if configured.is_absolute() {
@@ -150,7 +150,7 @@ fn resolve_v2_auth_dir(configured_dir: Option<&str>) -> PathBuf {
             .unwrap_or_else(|_| PathBuf::from("."))
             .join(configured);
     }
-    get_buckyos_service_data_dir("cyfs_gateway").join("sn_v2_token_key")
+    get_buckyos_service_data_dir("cyfs_gateway").join("sn_token_key")
 }
 
 fn issue_rpc_jwt(
@@ -162,7 +162,7 @@ fn issue_rpc_jwt(
     let (_, mut session) =
         RPCSessionToken::generate_jwt_token(username, aud, None, key).map_err(|e| {
             reason_error(
-                SnV2ErrorCode::InternalError,
+                SnApiErrorCode::InternalError,
                 format!("generate jwt token failed: {}", e),
             )
         })?;
@@ -176,7 +176,7 @@ fn issue_rpc_jwt(
     session.jti = Some(hex::encode(rand::random::<[u8; 16]>()));
     let token = session.generate_jwt(None, key).map_err(|e| {
         reason_error(
-            SnV2ErrorCode::InternalError,
+            SnApiErrorCode::InternalError,
             format!("generate jwt token failed: {}", e),
         )
     })?;
@@ -195,13 +195,13 @@ fn verify_rpc_session(
     key: &DecodingKey,
 ) -> RpcCallResult<RPCSessionToken> {
     let mut session = RPCSessionToken::from_string(token)
-        .map_err(|e| parse_error(SnV2ErrorCode::InvalidToken, e.to_string()))?;
+        .map_err(|e| parse_error(SnApiErrorCode::InvalidToken, e.to_string()))?;
     session
         .verify_by_key(key)
-        .map_err(|e| parse_error(SnV2ErrorCode::InvalidToken, e.to_string()))?;
+        .map_err(|e| parse_error(SnApiErrorCode::InvalidToken, e.to_string()))?;
     if session.aud.as_deref() != Some(expected_aud) {
         return Err(parse_error(
-            SnV2ErrorCode::InvalidToken,
+            SnApiErrorCode::InvalidToken,
             format!("invalid aud {:?}, expect {}", session.aud, expected_aud),
         ));
     }
@@ -211,7 +211,7 @@ fn verify_rpc_session(
 fn derive_password_hash(password: &str, salt_hex: &str) -> RpcCallResult<String> {
     let salt = hex::decode(salt_hex).map_err(|e| {
         reason_error(
-            SnV2ErrorCode::InvalidPasswordStorage,
+            SnApiErrorCode::InvalidPasswordStorage,
             format!("invalid password salt: {}", e),
         )
     })?;

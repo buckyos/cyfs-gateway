@@ -492,7 +492,7 @@ Resolver 依赖：
 1. `sn_auth` 校验 username、active_code、本地账号不存在。
 2. `sn_authority` 或注册 adapter 校验 owner key 格式和注册签名。
 3. `sn_bns_controller.bootstrap_name` 创建 BNS name、owner 文档、authority key、SN controller policy。
-4. BNS 成功后，`sn_auth.register_user_v2` 在本地事务中写入账号和密码凭证。
+4. BNS 成功后，`sn_auth.register_user` 在本地事务中写入账号和密码凭证。
 5. 返回登录 token、BNS name 状态和 `need_bind_owner_key=false` 或实际 owner key 状态。
 
 一致性要求：
@@ -504,8 +504,8 @@ Resolver 依赖：
 当前实现差异：
 
 - 重构第一阶段已实现 BNS 写入库本身：`SnBnsController::bootstrap_name`（`src/components/bns-client/src/sn_bns_controller.rs:343`）组装 owner 文档 + authority key + controller policy，并调用 `bns-indexer` 的原子 `bootstrap_name`（`src/components/bns-indexer/src/registry.rs:296`，单 `store.transact` 事务）。
-- 但 `cyfs-sn` 至今**未接入**这个写入层：`api/auth.rs` 的 `register` 仍只调用 `register_user_v2` 写本地 `users` 和 `user_auth_v2`，是 compat-shim，**未迁移**。
-- 因此"在 `register_user_v2` 之前调用 `sn_bns_controller.bootstrap_name`"属于**阶段二**待办。
+- 但 `cyfs-sn` 至今**未接入**这个写入层：`api/auth.rs` 的 `register` 仍只调用 `register_user` 写本地 `users` 和 `user_auth`，是 compat-shim，**未迁移**。
+- 因此"在 `register_user` 之前调用 `sn_bns_controller.bootstrap_name`"属于**阶段二**待办。
 - 当前返回的 `need_bind_owner_key=true` 仍是兼容状态；目标流程中 owner key 应随 BNS bootstrap 一起完成。
 
 ### bind zone
@@ -694,7 +694,7 @@ SN API 响应中建议包含：
 
 下列写入点目标是迁移到 `SnBnsController`，但目前**全部仍只写本地 SQLite**，未接入写入层：
 
-- `api/auth.rs::register`: 仍只 `register_user_v2` 写本地 `users` / `user_auth_v2`，返回 `need_bind_owner_key=true`；尚未调用 `bootstrap_name`。
+- `api/auth.rs::register`: 仍只 `register_user` 写本地 `users` / `user_auth`，返回 `need_bind_owner_key=true`；尚未调用 `bootstrap_name`。
 - `api/zone.rs::bind_config`: 仍只写 `users.zone_config`（按需 `update_user_domain`）；尚未发布 BNS `zone` / `boot`。
 - `api/device.rs::register`: 仍校验 `mini_config_jwt` 后写本地 `devices` 表；尚未发布 BNS `device_mini_doc`，本地也无 `pending_bns_publish` 状态。
 - `api/dns.rs::add_record/remove_record`: 仍只写本地 `user_dns_records`（compat store）；尚未发布 BNS `dns_txt`。传统 `user_domain` 记录本就继续走 `sn_auth`。

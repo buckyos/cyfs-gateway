@@ -68,7 +68,7 @@
 - `users.self_cert`: 当前用于 `query_by_hostname` 返回 `OODInfo.self_cert`，目标上仍作为 `sn_auth.zone_info.self_cert` 的运行态。
 - `users.zone_config`: 当前保存旧 boot JWT，目标上应由 BNS `zone` / `boot` 文档替代。
 - `devices.ip` 和 `devices.description`: 当前保存设备 IP 和 `DeviceInfo` JSON，目标上应迁移到 `sn_device_info` 的在线态和 endpoint。
-- `query_device_by_hostname_v2`: 当前根据 `sn_server.host` 或 `user_domain` 找用户，再固定查询 `ood1`；目标上必须通过 `sn_resolver` 从 BNS `zone` / `boot` 文档确定 gateway device。
+- `query_device_by_hostname`: 当前根据 `sn_server.host` 或 `user_domain` 找用户，再固定查询 `ood1`；目标上必须通过 `sn_resolver` 从 BNS `zone` / `boot` 文档确定 gateway device。
 - `query_by_did`: 当前根据 DID 查询设备并返回 `OODInfo`；目标上应由 `sn_resolver` 合成 DID、zone、device、relay 和证书状态。
 - V2 `device.register` / `device.update`: 当前使用 SN access token 和本地 DB；目标上设备身份发布走 BNS `device_mini_doc`，在线态更新走 `sn_device_info`，`keep_tunnel` 准入走 `sn_relay_manager`。
 
@@ -573,7 +573,7 @@ CREATE INDEX IF NOT EXISTS idx_relay_admission_events_zone_time
 1. ✅ 已完成：在 `cyfs-sn` 内新增 `sn_relay_manager` trait 和 SQLite 实现，支持节点表、assignment 表、admission 事件表和 `get/check` 能力（`relay_mgr.rs`）。
 2. 🟡 部分完成：relay 表达已迁移到 `relay_assignments` + `zone_info.relay_sn`，新写入不再用 `sn_ips` 表达 relay；旧 `sn_ips` 兼容输入回填尚未实现。
 3. ✅ 已完成：`sn_auth.zone_info` 已有 `relay_sn` 字段，并由 `sn_relay_manager.sync_zone_relay_cache` 回写（`relay_mgr.rs:666-678`）。
-4. 🟡 部分完成：`query_device_by_hostname_v2` 已优先走 `sn_resolver.resolve_gateway_by_hostname`，`ood1` 降级为兜底默认（`sn_server.rs:2586-2603`，兜底分支 `:2620`）；尚未彻底移除硬编码兜底（`sn_server.rs:1862` 仍有 TODO）。
+4. 🟡 部分完成：`query_device_by_hostname` 已优先走 `sn_resolver.resolve_gateway_by_hostname`，`ood1` 降级为兜底默认（`sn_server.rs:2586-2603`，兜底分支 `:2620`）；尚未彻底移除硬编码兜底（`sn_server.rs:1862` 仍有 TODO）。
 5. 🟡 部分完成：设备在线态已部分迁移到 `sn_device_info`，但旧 `devices.ip` / `description` 仍在，relay 所需的完整 reachability view 未成形。
 6. ⛔ 待实现（阶段二）：数据面 `sn_relay` 节点尚不存在；`check_relay_admission` 已实现但**零调用方**，未通过内部 API 接入任何实时准入路径。
 7. 🟡 部分完成：`assign_zone_relay(source=Admin)` 与 `start_relay_migration` 支持手工调整，但缺独立 admin 鉴权与 assignment/migration 审计事件（仅 admission 有审计）。
@@ -604,5 +604,5 @@ CREATE INDEX IF NOT EXISTS idx_relay_admission_events_zone_time
 - `from_ip` 地理分配**被接收但未使用**，`choose_relay_node` 仅用显式 `region`，未用 ISP / tags 评分。
 - 迁移 / admin 操作**无审计事件**（`operator` 被接收但丢弃），且手工调整缺独立 admin 鉴权。
 - **无 `relay.*` API gateway 入口**，控制面目前只能进程内调用。
-- `query_device_by_hostname_v2` 的 `ood1` 兜底尚未彻底移除（`sn_server.rs:1862` TODO）。
+- `query_device_by_hostname` 的 `ood1` 兜底尚未彻底移除（`sn_server.rs:1862` TODO）。
 - 设备在线态仍并存于旧 `devices` 表与简化 `sn_device_info` 表，尚未形成 relay 所需的完整 reachability view。

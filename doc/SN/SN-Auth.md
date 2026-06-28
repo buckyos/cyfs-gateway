@@ -77,8 +77,8 @@ SN Auth 的核心权限边界是：
 
 当前实现（阶段一已完成）：
 
-- `user_auth_v2` 表保存上述全部字段（sn_auth.rs:316-324）。
-- V2 使用 `pbkdf2-sha256-100000`，salt 为 16 字节随机值，hash 为 32 字节结果的 hex（sn_v2_auth.rs:16-17、97-101、195-210）。
+- `user_auth` 表保存上述全部字段（sn_auth.rs:316-324）。
+- V2 使用 `pbkdf2-sha256-100000`，salt 为 16 字节随机值，hash 为 32 字节结果的 hex（sn_auth_manager.rs:16-17、97-101、195-210）。
 
 服务端不得存储明文密码。RPC 参数名里历史上使用 `pwd_hash`，但当前 V2 实际会把该值再次 PBKDF2 后保存（register/login 直接把 `pwd_hash` 喂给 `hash_password`/`verify_password`，auth.rs:71、116）；后续接口命名应澄清为 `password` 或明确客户端预哈希语义，避免“双 hash”语义不清。
 
@@ -89,18 +89,18 @@ SN 登录态是 `SnUser(username)` 的证明。
 目标字段和约束：
 
 - `sub`: username。
-- `aud`: access token 使用 `sn-v2`，refresh token 使用 `sn-v2-refresh`。
+- `aud`: access token 使用 `sn`，refresh token 使用 `sn-refresh`。
 - `exp`: access token 短期有效，refresh token 较长有效。
 - `kid`: token signing key id，便于后续 key rotation。
 - `session_id` 或 `jti`: 便于 logout、撤销和审计。
 
 当前实现：
 
-- `SnV2AuthManager` 使用 Ed25519 key 签发 JWT，`sub`=username、`aud`=`sn-v2`/`sn-v2-refresh`、`exp`（sn_v2_auth.rs:12-15、70-94、146-176）。
+- `SnAuthManager` 使用 Ed25519 key 签发 JWT，`sub`=username、`aud`=`sn`/`sn-refresh`、`exp`（sn_auth_manager.rs:12-15、70-94、146-176）。
 - access token 默认 1 小时，refresh token 默认 24 小时。
-- token key 存在 `sn_v2_token_key/private_key.pem` 和 `public_key.json`。
+- token key 存在 `sn_token_key/private_key.pem` 和 `public_key.json`。
 - 阶段一已完成：`account_sessions` 撤销表已建（sn_auth.rs:383-402），`create_account_session`/`revoke_account_session`/`revoke_user_sessions`/`get_account_session` 方法已实现（sn_auth.rs:2043-2136），`set_user_state` 置非 active 时自动撤销该用户 session（sn_auth.rs:1378-1380）。
-- 待实现（阶段二）：token 不含 `kid` 和 `session_id`/`jti`；签发路径（`build_auth_success_response`，auth.rs:12-29）从不调用 `create_account_session`，校验路径（sn_v2_auth.rs:88-94、178-193）也从不检查 session 状态，因此撤销表目前是“建好但未接线”的死代码；`auth.logout` 仍是空操作（auth.rs:148）。
+- 待实现（阶段二）：token 不含 `kid` 和 `session_id`/`jti`；签发路径（`build_auth_success_response`，auth.rs:12-29）从不调用 `create_account_session`，校验路径（sn_auth_manager.rs:88-94、178-193）也从不检查 session 状态，因此撤销表目前是“建好但未接线”的死代码；`auth.logout` 仍是空操作（auth.rs:148）。
 
 ### user_domain
 
@@ -204,7 +204,7 @@ PKX 是 `user_domain` 唯一的证明方法。它不是一次性随机挑战，�
 
 当前实现：
 
-- 阶段一已完成：`register_user_v2` 在命名锁下用事务完成 `users`、`user_auth_v2`、`zone_info`、`activation_codes.used` 的一致写入（sn_auth.rs:989-1091），返回 access+refresh token 并提示 `need_bind_owner_key=true`（auth.rs:89）。
+- 阶段一已完成：`register_user` 在命名锁下用事务完成 `users`、`user_auth`、`zone_info`、`activation_codes.used` 的一致写入（sn_auth.rs:989-1091），返回 access+refresh token 并提示 `need_bind_owner_key=true`（auth.rs:89）。
 - 待实现（阶段二）：V2 `auth.register` 只写本地 DB，没有调用 `sn_bns_controller` 提交 BNS 合约注册 TX（`bns_indexer_url` 只接入了 resolver 读路径，sn_server.rs:688-693），没有 `request_id` 幂等 key，也没有“BNS name 已存在但本地未完成”的恢复流程。
 
 ### public key 注册
@@ -399,7 +399,7 @@ PKX 记录是稳定状态，不是临时验证状态。SN 接管 DNS 基础设�
 
 - `sn_auth.rs` 生成 32 位字母数字激活码（sn_auth.rs:417-425、857-883）。
 - `check_active_code` 判断 code 存在且未使用（sn_auth.rs:885-893）。
-- `register_user_v2` 成功后在事务内标记 `used=1`（sn_auth.rs:1080）。
+- `register_user` 成功后在事务内标记 `used=1`（sn_auth.rs:1080）。
 - `clear_state_by_active_code` 可事务化删除该激活码关联用户、设备、DNS 记录、DID 文档、session、binding、zone_info 并重置激活码（sn_auth.rs:895-987）。
 
 `clear_state_by_active_code` 更像测试/运维清理接口，不应作为普通产品能力暴露给终端用户。
@@ -482,10 +482,10 @@ RPC 层可以使用 breaking API，不要求保留旧 method alias。内部不�
 `src/components/cyfs-sn/src/sn_auth.rs` 已实现：
 
 - `SnAuthDB` trait（sn_auth.rs:144-247）。
-- SQLite 初始化 `activation_codes`、`users`、`user_auth_v2`、`user_domain_history`、`user_domain_bindings`、`zone_info`、`account_sessions`（sn_auth.rs:282-408）。
+- SQLite 初始化 `activation_codes`、`users`、`user_auth`、`user_domain_history`、`user_domain_bindings`、`zone_info`、`account_sessions`（sn_auth.rs:282-408）。
 - 32 位随机激活码生成、查询、写入（sn_auth.rs:417-425、835-893）。
-- `register_user_v2` 事务化注册（含 zone_info 写入与激活码标记，sn_auth.rs:989-1091）。
-- `create_v2_auth`、`get_user_info`、`get_user_by_domain`、`get_v2_auth`、`update_v2_last_login`、`set_user_state`。
+- `register_user` 事务化注册（含 zone_info 写入与激活码标记，sn_auth.rs:989-1091）。
+- `create_auth`、`get_user_info`、`get_user_by_domain`、`get_auth`、`update_last_login`、`set_user_state`。
 - PKX 状态机 DB 层：`create_pkx_binding`/`verify_pkx_binding`/`unbind_user_domain` + 冲突历史检查（sn_auth.rs:1616-1881、695-757）。
 - 独立 `zone_info`：`get_zone_info`/`update_zone_info`/`update_zone_relay_sn` + backfill（sn_auth.rs:1883-2041、548-600）。
 - `account_sessions` 撤销表方法：`create_account_session`/`revoke_account_session`/`revoke_user_sessions`/`get_account_session`（sn_auth.rs:2043-2136）。
@@ -493,7 +493,7 @@ RPC 层可以使用 breaking API，不要求保留旧 method alias。内部不�
 
 相关实现分散在：
 
-- `src/components/cyfs-sn/src/sn_v2_auth.rs`: 密码 PBKDF2、Ed25519 JWT 签发/校验。
+- `src/components/cyfs-sn/src/sn_auth_manager.rs`: 密码 PBKDF2、Ed25519 JWT 签发/校验。
 - `src/components/cyfs-sn/src/api/common.rs`: username/public key 规范化、token 解析 helper。
 - `src/components/cyfs-sn/src/api/auth.rs`: `auth.*` RPC。
 - `src/components/cyfs-sn/src/api/zone.rs`: `zone.get`、`zone.bind_config`。

@@ -3,7 +3,7 @@ use kRPC::RPCErrors;
 use serde_json::json;
 
 #[derive(Clone, Copy, Debug)]
-pub(crate) enum SnV2ErrorCode {
+pub(crate) enum SnApiErrorCode {
     InvalidParams = 1000,
     InvalidUsername = 1001,
     UsernameAlreadyExists = 1002,
@@ -28,7 +28,7 @@ pub(crate) enum SnV2ErrorCode {
     InternalError = 1099,
 }
 
-impl SnV2ErrorCode {
+impl SnApiErrorCode {
     pub(crate) fn code(self) -> u32 {
         self as u32
     }
@@ -62,7 +62,7 @@ impl SnV2ErrorCode {
 
     pub(crate) fn format(self, message: impl AsRef<str>) -> String {
         format!(
-            "[SNV2:{}:{}] {}",
+            "[SN:{}:{}] {}",
             self.code(),
             self.name(),
             message.as_ref()
@@ -70,11 +70,11 @@ impl SnV2ErrorCode {
     }
 }
 
-pub(crate) fn parse_error(code: SnV2ErrorCode, message: impl AsRef<str>) -> RPCErrors {
+pub(crate) fn parse_error(code: SnApiErrorCode, message: impl AsRef<str>) -> RPCErrors {
     RPCErrors::ParseRequestError(code.format(message))
 }
 
-pub(crate) fn reason_error(code: SnV2ErrorCode, message: impl AsRef<str>) -> RPCErrors {
+pub(crate) fn reason_error(code: SnApiErrorCode, message: impl AsRef<str>) -> RPCErrors {
     RPCErrors::ReasonError(code.format(message))
 }
 
@@ -83,14 +83,14 @@ pub(crate) fn bns_write_error(error: SnBnsControllerError) -> RPCErrors {
         SnBnsControllerError::Bns(BnsClientError::Registry(info)) => {
             let code = match info.code.as_str() {
                 "CONTROLLER_SCOPE_DENIED" | "NOT_EFFECTIVE_OWNER" => {
-                    SnV2ErrorCode::BnsPermissionDenied
+                    SnApiErrorCode::BnsPermissionDenied
                 }
-                "NAME_ALREADY_EXISTS" => SnV2ErrorCode::BnsNameAlreadyExists,
-                _ => SnV2ErrorCode::BnsWriteFailed,
+                "NAME_ALREADY_EXISTS" => SnApiErrorCode::BnsNameAlreadyExists,
+                _ => SnApiErrorCode::BnsWriteFailed,
             };
             (code, info.code.as_str(), info.expected, info.actual)
         }
-        other => (SnV2ErrorCode::BnsWriteFailed, other.code(), None, None),
+        other => (SnApiErrorCode::BnsWriteFailed, other.code(), None, None),
     };
 
     reason_error(

@@ -9,7 +9,7 @@ mod sn_compat_store;
 mod sn_device_info;
 pub mod sn_resolver;
 mod sn_server;
-mod sn_v2_auth;
+mod sn_auth_manager;
 
 pub use name_info_cache::*;
 pub use relay_mgr::*;

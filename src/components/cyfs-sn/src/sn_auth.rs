@@ -76,7 +76,7 @@ pub struct SnClearStateResult {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SnV2AuthInfo {
+pub struct SnAuthInfo {
     pub username: String,
     pub password_hash: String,
     pub password_salt: String,
@@ -167,7 +167,7 @@ pub trait SnAuthDB: Send + Sync + 'static {
     async fn generate_activation_codes(&self, count: usize) -> SnResult<Vec<String>>;
     async fn check_active_code(&self, active_code: &str) -> SnResult<bool>;
     async fn clear_state_by_active_code(&self, active_code: &str) -> SnResult<SnClearStateResult>;
-    async fn register_user_v2(
+    async fn register_user(
         &self,
         active_code: &str,
         username: &str,
@@ -175,7 +175,7 @@ pub trait SnAuthDB: Send + Sync + 'static {
         password_salt: &str,
         password_algo: &str,
     ) -> SnResult<bool>;
-    async fn create_v2_auth(
+    async fn create_auth(
         &self,
         username: &str,
         password_hash: &str,
@@ -224,8 +224,8 @@ pub trait SnAuthDB: Send + Sync + 'static {
             )),
         }
     }
-    async fn get_v2_auth(&self, username: &str) -> SnResult<Option<SnV2AuthInfo>>;
-    async fn update_v2_last_login(&self, username: &str, last_login_at: u64) -> SnResult<()>;
+    async fn get_auth(&self, username: &str) -> SnResult<Option<SnAuthInfo>>;
+    async fn update_last_login(&self, username: &str, last_login_at: u64) -> SnResult<()>;
 
     async fn create_pkx_binding(
         &self,
@@ -314,7 +314,7 @@ impl SnAuthDB for RemoteSnAuthDB {
         self.client.clear_state_by_active_code(active_code).await
     }
 
-    async fn register_user_v2(
+    async fn register_user(
         &self,
         active_code: &str,
         username: &str,
@@ -323,7 +323,7 @@ impl SnAuthDB for RemoteSnAuthDB {
         password_algo: &str,
     ) -> SnResult<bool> {
         self.client
-            .register_user_v2(
+            .register_user(
                 active_code,
                 username,
                 password_hash,
@@ -333,7 +333,7 @@ impl SnAuthDB for RemoteSnAuthDB {
             .await
     }
 
-    async fn create_v2_auth(
+    async fn create_auth(
         &self,
         username: &str,
         password_hash: &str,
@@ -341,7 +341,7 @@ impl SnAuthDB for RemoteSnAuthDB {
         password_algo: &str,
     ) -> SnResult<bool> {
         self.client
-            .create_v2_auth(username, password_hash, password_salt, password_algo)
+            .create_auth(username, password_hash, password_salt, password_algo)
             .await
     }
 
@@ -417,13 +417,13 @@ impl SnAuthDB for RemoteSnAuthDB {
         self.client.get_user_sn_ips(username).await
     }
 
-    async fn get_v2_auth(&self, username: &str) -> SnResult<Option<SnV2AuthInfo>> {
-        self.client.get_v2_auth(username).await
+    async fn get_auth(&self, username: &str) -> SnResult<Option<SnAuthInfo>> {
+        self.client.get_auth(username).await
     }
 
-    async fn update_v2_last_login(&self, username: &str, last_login_at: u64) -> SnResult<()> {
+    async fn update_last_login(&self, username: &str, last_login_at: u64) -> SnResult<()> {
         self.client
-            .update_v2_last_login(username, last_login_at)
+            .update_last_login(username, last_login_at)
             .await
     }
 
@@ -564,7 +564,7 @@ impl SqliteSnAuthDB {
         self.ensure_user_columns().await?;
 
         sqlx::query(
-            "CREATE TABLE IF NOT EXISTS user_auth_v2 (
+            "CREATE TABLE IF NOT EXISTS user_auth (
                 username TEXT PRIMARY KEY,
                 password_hash TEXT NOT NULL,
                 password_salt TEXT NOT NULL,
@@ -576,7 +576,7 @@ impl SqliteSnAuthDB {
         )
         .execute(&self.pool)
         .await
-        .map_err(|e| Self::db_err("create user_auth_v2 table failed", e))?;
+        .map_err(|e| Self::db_err("create user_auth table failed", e))?;
 
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS user_domain_history (
@@ -1199,7 +1199,7 @@ impl SnAuthDB for SqliteSnAuthDB {
         .map_err(|e| Self::db_err("delete zone info failed", e))?;
 
         sqlx::query(
-            "DELETE FROM user_auth_v2
+            "DELETE FROM user_auth
              WHERE username IN (
                 SELECT username FROM users WHERE activation_code = ?1
              )",
@@ -1207,7 +1207,7 @@ impl SnAuthDB for SqliteSnAuthDB {
         .bind(active_code)
         .execute(&mut *tx)
         .await
-        .map_err(|e| Self::db_err("delete user auth v2 failed", e))?;
+        .map_err(|e| Self::db_err("delete user auth failed", e))?;
 
         sqlx::query("DELETE FROM users WHERE activation_code = ?1")
             .bind(active_code)
@@ -1237,7 +1237,7 @@ impl SnAuthDB for SqliteSnAuthDB {
         })
     }
 
-    async fn register_user_v2(
+    async fn register_user(
         &self,
         active_code: &str,
         username: &str,
@@ -1275,7 +1275,7 @@ impl SnAuthDB for SqliteSnAuthDB {
         }
 
         let auth_count =
-            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM user_auth_v2 WHERE username = ?1")
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM user_auth WHERE username = ?1")
                 .bind(username)
                 .fetch_one(&mut *tx)
                 .await
@@ -1298,10 +1298,10 @@ impl SnAuthDB for SqliteSnAuthDB {
         .bind(now)
         .execute(&mut *tx)
         .await
-        .map_err(|e| Self::db_err("insert v2 user failed", e))?;
+        .map_err(|e| Self::db_err("insert user failed", e))?;
 
         sqlx::query(
-            "INSERT INTO user_auth_v2
+            "INSERT INTO user_auth
                 (username, password_hash, password_salt, password_algo,
                  created_at, updated_at, last_login_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?5, NULL)",
@@ -1313,7 +1313,7 @@ impl SnAuthDB for SqliteSnAuthDB {
         .bind(now)
         .execute(&mut *tx)
         .await
-        .map_err(|e| Self::db_err("insert v2 auth failed", e))?;
+        .map_err(|e| Self::db_err("insert auth failed", e))?;
 
         sqlx::query("UPDATE activation_codes SET used = 1 WHERE code = ?1")
             .bind(active_code)
@@ -1328,7 +1328,7 @@ impl SnAuthDB for SqliteSnAuthDB {
         Ok(true)
     }
 
-    async fn create_v2_auth(
+    async fn create_auth(
         &self,
         username: &str,
         password_hash: &str,
@@ -1348,7 +1348,7 @@ impl SnAuthDB for SqliteSnAuthDB {
         }
 
         let auth_count =
-            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM user_auth_v2 WHERE username = ?1")
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM user_auth WHERE username = ?1")
                 .bind(username)
                 .fetch_one(&self.pool)
                 .await
@@ -1359,7 +1359,7 @@ impl SnAuthDB for SqliteSnAuthDB {
 
         let now = Self::now_secs() as i64;
         sqlx::query(
-            "INSERT INTO user_auth_v2
+            "INSERT INTO user_auth
                 (username, password_hash, password_salt, password_algo,
                  created_at, updated_at, last_login_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?5, NULL)",
@@ -1371,7 +1371,7 @@ impl SnAuthDB for SqliteSnAuthDB {
         .bind(now)
         .execute(&self.pool)
         .await
-        .map_err(|e| Self::db_err("insert v2 auth failed", e))?;
+        .map_err(|e| Self::db_err("insert auth failed", e))?;
 
         Ok(true)
     }
@@ -1776,16 +1776,16 @@ impl SnAuthDB for SqliteSnAuthDB {
         .transpose()
     }
 
-    async fn get_v2_auth(&self, username: &str) -> SnResult<Option<SnV2AuthInfo>> {
+    async fn get_auth(&self, username: &str) -> SnResult<Option<SnAuthInfo>> {
         let row = sqlx::query(
             "SELECT username, password_hash, password_salt, password_algo,
                     created_at, updated_at, last_login_at
-             FROM user_auth_v2 WHERE username = ?1",
+             FROM user_auth WHERE username = ?1",
         )
         .bind(username)
         .fetch_optional(&self.pool)
         .await
-        .map_err(|e| Self::db_err("query v2 auth failed", e))?;
+        .map_err(|e| Self::db_err("query auth failed", e))?;
 
         row.map(|row| {
             let created_at: i64 = row
@@ -1797,7 +1797,7 @@ impl SnAuthDB for SqliteSnAuthDB {
             let last_login_at: Option<i64> = row
                 .try_get("last_login_at")
                 .map_err(|e| Self::db_err("read last_login_at failed", e))?;
-            Ok(SnV2AuthInfo {
+            Ok(SnAuthInfo {
                 username: row
                     .try_get("username")
                     .map_err(|e| Self::db_err("read username failed", e))?,
@@ -1818,7 +1818,7 @@ impl SnAuthDB for SqliteSnAuthDB {
         .transpose()
     }
 
-    async fn update_v2_last_login(&self, username: &str, last_login_at: u64) -> SnResult<()> {
+    async fn update_last_login(&self, username: &str, last_login_at: u64) -> SnResult<()> {
         let last_login_at = last_login_at as i64;
         let mut tx = self
             .pool
@@ -1826,7 +1826,7 @@ impl SnAuthDB for SqliteSnAuthDB {
             .await
             .map_err(|e| Self::db_err("begin transaction failed", e))?;
         sqlx::query(
-            "UPDATE user_auth_v2
+            "UPDATE user_auth
              SET last_login_at = ?1, updated_at = ?1
              WHERE username = ?2",
         )
@@ -1834,7 +1834,7 @@ impl SnAuthDB for SqliteSnAuthDB {
         .bind(username)
         .execute(&mut *tx)
         .await
-        .map_err(|e| Self::db_err("update v2 last login failed", e))?;
+        .map_err(|e| Self::db_err("update last login failed", e))?;
         sqlx::query(
             "UPDATE users
              SET last_login_at = ?1, updated_at = ?1
@@ -2391,7 +2391,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_activation_code_and_v2_auth_flow() -> SnResult<()> {
+    async fn test_activation_code_and_auth_flow() -> SnResult<()> {
         let (_tmp_dir, db) = new_test_db().await?;
         let codes = db.generate_activation_codes(3).await?;
         assert_eq!(codes.len(), 3);
@@ -2400,12 +2400,12 @@ mod tests {
         let active_code = codes[0].as_str();
         assert!(db.check_active_code(active_code).await?);
         assert!(
-            db.register_user_v2(active_code, "alice", "hash", "salt", "pbkdf2")
+            db.register_user(active_code, "alice", "hash", "salt", "pbkdf2")
                 .await?
         );
         assert!(!db.check_active_code(active_code).await?);
         assert!(
-            !db.register_user_v2(active_code, "bob", "hash2", "salt2", "pbkdf2")
+            !db.register_user(active_code, "bob", "hash2", "salt2", "pbkdf2")
                 .await?
         );
         assert!(db.is_user_exist("alice").await?);
@@ -2416,15 +2416,15 @@ mod tests {
         assert_eq!(user.public_key, "");
         assert!(!user.self_cert);
 
-        let auth = db.get_v2_auth("alice").await?.unwrap();
+        let auth = db.get_auth("alice").await?.unwrap();
         assert_eq!(auth.username, "alice");
         assert_eq!(auth.password_hash, "hash");
         assert_eq!(auth.password_salt, "salt");
         assert_eq!(auth.password_algo, "pbkdf2");
         assert!(auth.last_login_at.is_none());
 
-        db.update_v2_last_login("alice", 12345).await?;
-        let auth = db.get_v2_auth("alice").await?.unwrap();
+        db.update_last_login("alice", 12345).await?;
+        let auth = db.get_auth("alice").await?.unwrap();
         assert_eq!(auth.last_login_at, Some(12345));
         assert_eq!(auth.updated_at, 12345);
 
@@ -2442,11 +2442,11 @@ mod tests {
         db.insert_activation_code("alice-code").await?;
         db.insert_activation_code("bob-code").await?;
         assert!(
-            db.register_user_v2("alice-code", "alice", "hash", "salt", "pbkdf2")
+            db.register_user("alice-code", "alice", "hash", "salt", "pbkdf2")
                 .await?
         );
         assert!(
-            db.register_user_v2("bob-code", "bob", "hash", "salt", "pbkdf2")
+            db.register_user("bob-code", "bob", "hash", "salt", "pbkdf2")
                 .await?
         );
 
@@ -2497,7 +2497,7 @@ mod tests {
         let (_tmp_dir, db) = new_test_db().await?;
         db.insert_activation_code("zone-code").await?;
         assert!(
-            db.register_user_v2("zone-code", "alice", "hash", "salt", "pbkdf2")
+            db.register_user("zone-code", "alice", "hash", "salt", "pbkdf2")
                 .await?
         );
 
@@ -2522,7 +2522,7 @@ mod tests {
         assert_eq!(zone.sn_ips.as_deref(), Some("[\"1.2.3.4\"]"));
         assert_eq!(db.get_user_info("alice").await?.unwrap().self_cert, true);
 
-        db.create_account_session("refresh-1", "alice", "sn-v2-refresh", 1, 100)
+        db.create_account_session("refresh-1", "alice", "sn-refresh", 1, 100)
             .await?;
         let session = db.get_account_session("refresh-1").await?.unwrap();
         assert_eq!(session.state, SESSION_ACTIVE);
@@ -2531,7 +2531,7 @@ mod tests {
         assert_eq!(session.state, SESSION_REVOKED);
         assert_eq!(session.revoked_at, Some(50));
 
-        db.create_account_session("refresh-2", "alice", "sn-v2-refresh", 51, 100)
+        db.create_account_session("refresh-2", "alice", "sn-refresh", 51, 100)
             .await?;
         assert_eq!(db.revoke_user_sessions("alice", 60).await?, 1);
         let session = db.get_account_session("refresh-2").await?.unwrap();
@@ -2545,7 +2545,7 @@ mod tests {
         let (_tmp_dir, db) = new_test_db().await?;
         db.insert_activation_code("clear-me").await?;
         assert!(
-            db.register_user_v2("clear-me", "alice", "hash", "salt", "pbkdf2")
+            db.register_user("clear-me", "alice", "hash", "salt", "pbkdf2")
                 .await?
         );
 
@@ -2582,7 +2582,7 @@ mod tests {
         assert!(result.activation_code_reset);
         assert!(db.check_active_code("clear-me").await?);
         assert!(!db.is_user_exist("alice").await?);
-        assert!(db.get_v2_auth("alice").await?.is_none());
+        assert!(db.get_auth("alice").await?.is_none());
         let zone = db.get_zone_info("alice").await?.unwrap();
         assert_eq!(zone.username, "alice");
         assert_eq!(zone.bns_name, "alice");
@@ -2615,7 +2615,7 @@ mod tests {
         let code = codes[0].as_str();
         assert!(db.check_active_code(code).await?);
         assert!(
-            db.register_user_v2(code, "alice", "h", "s", "pbkdf2")
+            db.register_user(code, "alice", "h", "s", "pbkdf2")
                 .await?
         );
 
@@ -2629,19 +2629,19 @@ mod tests {
         assert!(!db.check_active_code(code).await?);
 
         // 二次使用被拒（既不创建用户，也不报错，按契约返回 false）。
-        assert!(!db.register_user_v2(code, "bob", "h", "s", "pbkdf2").await?);
+        assert!(!db.register_user(code, "bob", "h", "s", "pbkdf2").await?);
         assert!(!db.is_user_exist("bob").await?);
 
         Ok(())
     }
 
-    /// `register_user_v2` 事务性：`users` + `user_auth_v2` + `zone_info` 一致写入，激活码标记 used。
+    /// `register_user` 事务性：`users` + `user_auth` + `zone_info` 一致写入，激活码标记 used。
     #[tokio::test]
-    async fn test_register_user_v2_writes_consistent_rows() -> SnResult<()> {
+    async fn test_register_user_writes_consistent_rows() -> SnResult<()> {
         let (_tmp_dir, db) = new_test_db().await?;
         db.insert_activation_code("code-1").await?;
         assert!(
-            db.register_user_v2("code-1", "alice", "hash", "salt", "pbkdf2")
+            db.register_user("code-1", "alice", "hash", "salt", "pbkdf2")
                 .await?
         );
 
@@ -2651,8 +2651,8 @@ mod tests {
         assert_eq!(user.activation_code.as_deref(), Some("code-1"));
         assert!(matches!(user.state, UserState::Active));
 
-        // user_auth_v2 行。
-        let auth = db.get_v2_auth("alice").await?.unwrap();
+        // user_auth 行。
+        let auth = db.get_auth("alice").await?.unwrap();
         assert_eq!(auth.username, "alice");
         assert_eq!(auth.password_hash, "hash");
         assert_eq!(auth.password_salt, "salt");
@@ -2666,12 +2666,12 @@ mod tests {
         // 同名二次注册（换激活码）被拒，且不破坏已有行。
         db.insert_activation_code("code-2").await?;
         assert!(
-            !db.register_user_v2("code-2", "alice", "h2", "s2", "pbkdf2")
+            !db.register_user("code-2", "alice", "h2", "s2", "pbkdf2")
                 .await?
         );
         // code-2 未被消费。
         assert!(db.check_active_code("code-2").await?);
-        let auth = db.get_v2_auth("alice").await?.unwrap();
+        let auth = db.get_auth("alice").await?.unwrap();
         assert_eq!(
             auth.password_hash, "hash",
             "existing auth must be untouched"
@@ -2682,7 +2682,7 @@ mod tests {
 
     /// 命名锁下并发注册：N 个任务用同一激活码注册不同用户名，只允许一个成功。
     #[tokio::test]
-    async fn test_register_user_v2_concurrent_single_success() -> SnResult<()> {
+    async fn test_register_user_concurrent_single_success() -> SnResult<()> {
         let (_tmp_dir, db) = new_test_db().await?;
         db.insert_activation_code("shared-code").await?;
         let db = Arc::new(db);
@@ -2691,7 +2691,7 @@ mod tests {
         for i in 0..8 {
             let db = db.clone();
             handles.push(tokio::spawn(async move {
-                db.register_user_v2(
+                db.register_user(
                     "shared-code",
                     &format!("user-{i}"),
                     "hash",
@@ -2725,7 +2725,7 @@ mod tests {
     /// 服务端不存明文；不支持的算法被拒。
     #[tokio::test]
     async fn test_password_pbkdf2_hash_and_verify() -> SnResult<()> {
-        use crate::sn_v2_auth::{hash_password, verify_password, PASSWORD_ALGO};
+        use crate::sn_auth_manager::{hash_password, verify_password, PASSWORD_ALGO};
 
         let (hash, salt) = hash_password("hunter2")
             .map_err(|e| sn_err!(SnErrorCode::Failed, "hash failed: {:?}", e))?;
@@ -2743,7 +2743,7 @@ mod tests {
         assert_ne!(salt, salt2);
         assert_ne!(hash, hash2);
 
-        let auth = SnV2AuthInfo {
+        let auth = SnAuthInfo {
             username: "alice".to_string(),
             password_hash: hash,
             password_salt: salt,
@@ -2778,12 +2778,12 @@ mod tests {
         let (_tmp_dir, db) = new_test_db().await?;
         db.insert_activation_code("state-code").await?;
         assert!(
-            db.register_user_v2("state-code", "alice", "h", "s", "pbkdf2")
+            db.register_user("state-code", "alice", "h", "s", "pbkdf2")
                 .await?
         );
 
         // active → active：session 保留。
-        db.create_account_session("sess-keep", "alice", "sn-v2-refresh", 1, 100)
+        db.create_account_session("sess-keep", "alice", "sn-refresh", 1, 100)
             .await?;
         db.set_user_state("alice", UserState::Active).await?;
         assert_eq!(
@@ -2799,7 +2799,7 @@ mod tests {
         ] {
             // 重新发一个活跃 session。
             let sid = format!("sess-{label}");
-            db.create_account_session(&sid, "alice", "sn-v2-refresh", 1, 100)
+            db.create_account_session(&sid, "alice", "sn-refresh", 1, 100)
                 .await?;
             db.set_user_state("alice", state).await?;
 
@@ -2831,16 +2831,16 @@ mod tests {
         // 未知 session → None。
         assert!(db.get_account_session("missing").await?.is_none());
 
-        db.create_account_session("a1", "alice", "sn-v2-refresh", 1, 100)
+        db.create_account_session("a1", "alice", "sn-refresh", 1, 100)
             .await?;
-        db.create_account_session("a2", "alice", "sn-v2-refresh", 2, 100)
+        db.create_account_session("a2", "alice", "sn-refresh", 2, 100)
             .await?;
-        db.create_account_session("b1", "bob", "sn-v2-refresh", 3, 100)
+        db.create_account_session("b1", "bob", "sn-refresh", 3, 100)
             .await?;
 
         let s = db.get_account_session("a1").await?.unwrap();
         assert_eq!(s.username, "alice");
-        assert_eq!(s.token_aud, "sn-v2-refresh");
+        assert_eq!(s.token_aud, "sn-refresh");
         assert_eq!(s.state, SESSION_ACTIVE);
         assert_eq!(s.issued_at, 1);
         assert_eq!(s.expires_at, 100);
@@ -2924,7 +2924,7 @@ mod tests {
         let (_tmp_dir, db) = new_test_db().await?;
         db.insert_activation_code("alice-code").await?;
         assert!(
-            db.register_user_v2("alice-code", "alice", "h", "s", "pbkdf2")
+            db.register_user("alice-code", "alice", "h", "s", "pbkdf2")
                 .await?
         );
         db.update_user_public_key("alice", "alice-owner-key")
@@ -2989,7 +2989,7 @@ mod tests {
         let (_tmp_dir, db) = new_test_db().await?;
         for (code, user) in [("a-code", "alice"), ("b-code", "bob")] {
             db.insert_activation_code(code).await?;
-            assert!(db.register_user_v2(code, user, "h", "s", "pbkdf2").await?);
+            assert!(db.register_user(code, user, "h", "s", "pbkdf2").await?);
         }
         db.update_user_public_key("alice", "alice-key").await?;
         db.update_user_public_key("bob", "bob-key").await?;
@@ -3028,7 +3028,7 @@ mod tests {
         let (_tmp_dir, db) = new_test_db().await?;
         db.insert_activation_code("alice-code").await?;
         assert!(
-            db.register_user_v2("alice-code", "alice", "h", "s", "pbkdf2")
+            db.register_user("alice-code", "alice", "h", "s", "pbkdf2")
                 .await?
         );
         db.update_user_public_key("alice", "alice-key").await?;
@@ -3059,7 +3059,7 @@ mod tests {
         // legacy 回退：bob 仅在 users.user_domain 留有遗留域名、无 binding 行。
         db.insert_activation_code("bob-code").await?;
         assert!(
-            db.register_user_v2("bob-code", "bob", "h", "s", "pbkdf2")
+            db.register_user("bob-code", "bob", "h", "s", "pbkdf2")
                 .await?
         );
         sqlx::query("UPDATE users SET user_domain = 'legacy.test' WHERE username = 'bob'")
@@ -3086,7 +3086,7 @@ mod tests {
         let (_tmp_dir, db) = new_test_db().await?;
         db.insert_activation_code("zone-code").await?;
         assert!(
-            db.register_user_v2("zone-code", "alice", "h", "s", "pbkdf2")
+            db.register_user("zone-code", "alice", "h", "s", "pbkdf2")
                 .await?
         );
 
@@ -3128,7 +3128,7 @@ mod tests {
         let (_tmp_dir, db) = new_test_db().await?;
         db.insert_activation_code("zone-code").await?;
         assert!(
-            db.register_user_v2("zone-code", "alice", "h", "s", "pbkdf2")
+            db.register_user("zone-code", "alice", "h", "s", "pbkdf2")
                 .await?
         );
 
@@ -3165,7 +3165,7 @@ mod tests {
         let (_tmp_dir, db) = new_test_db().await?;
         db.insert_activation_code("zone-code").await?;
         assert!(
-            db.register_user_v2("zone-code", "alice", "h", "s", "pbkdf2")
+            db.register_user("zone-code", "alice", "h", "s", "pbkdf2")
                 .await?
         );
 

@@ -1696,7 +1696,7 @@ mod tests {
         auth_db.insert_activation_code("alice-code").await?;
         assert!(
             auth_db
-                .register_user_v2("alice-code", "alice", "hash", "salt", "pbkdf2")
+                .register_user("alice-code", "alice", "hash", "salt", "pbkdf2")
                 .await?
         );
         auth_db

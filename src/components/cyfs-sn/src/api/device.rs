@@ -2,7 +2,7 @@ use super::common::{
     ok_response, parse_params, require_account_username, resolve_self_scoped_username,
     IntoRpcResult, QueryByDidReq, QueryByHostnameReq, RpcCallResult,
 };
-use super::errors::{parse_error, SnV2ErrorCode};
+use super::errors::{parse_error, SnApiErrorCode};
 use crate::{
     SNServer, SnDeviceEndpointUpdate, SnDeviceListOptions, SnDeviceState, SnDeviceStateView,
 };
@@ -39,7 +39,7 @@ pub(crate) async fn handle_device(
             let params: DeviceOnlineUpdateReq = parse_params(&req)?;
             if params.mini_config_jwt.is_some() {
                 return Err(parse_error(
-                    SnV2ErrorCode::InvalidParams,
+                    SnApiErrorCode::InvalidParams,
                     "device identity document updates moved to /kapi/bns",
                 ));
             }
@@ -75,11 +75,11 @@ pub(crate) async fn handle_device(
                     .await
                     .into_rpc()?
                     .ok_or_else(|| {
-                        parse_error(SnV2ErrorCode::DeviceNotFound, "device not found")
+                        parse_error(SnApiErrorCode::DeviceNotFound, "device not found")
                     })?;
                 if view.zone != username {
                     return Err(parse_error(
-                        SnV2ErrorCode::CrossUserAccessDenied,
+                        SnApiErrorCode::CrossUserAccessDenied,
                         "cross-user access is not allowed",
                     ));
                 }
@@ -87,7 +87,7 @@ pub(crate) async fn handle_device(
             } else {
                 let device_name = params.device_name.ok_or_else(|| {
                     parse_error(
-                        SnV2ErrorCode::InvalidParams,
+                        SnApiErrorCode::InvalidParams,
                         "device_name or device_did is required",
                     )
                 })?;
@@ -96,7 +96,7 @@ pub(crate) async fn handle_device(
                     .get_device_state_by_name(username.as_str(), device_name.as_str())
                     .await
                     .into_rpc()?
-                    .ok_or_else(|| parse_error(SnV2ErrorCode::DeviceNotFound, "device not found"))?
+                    .ok_or_else(|| parse_error(SnApiErrorCode::DeviceNotFound, "device not found"))?
             };
             ok_response(&req, online_state_response(view))
         }
@@ -133,10 +133,10 @@ pub(crate) async fn handle_device(
         "resolve_ood_by_hostname" => {
             let params: QueryByHostnameReq = parse_params(&req)?;
             let ood_info = server
-                .query_device_by_hostname_v2(params.dest_host.as_str())
+                .query_device_by_hostname(params.dest_host.as_str())
                 .await
                 .ok_or_else(|| {
-                    parse_error(SnV2ErrorCode::HostnameNotFound, "hostname not found")
+                    parse_error(SnApiErrorCode::HostnameNotFound, "hostname not found")
                 })?;
             ok_response(&req, serde_json::to_value(ood_info).unwrap())
         }
@@ -237,7 +237,7 @@ async fn resolve_report_did(
     }
 
     Err(parse_error(
-        SnV2ErrorCode::InvalidDeviceDid,
+        SnApiErrorCode::InvalidDeviceDid,
         "device_did is required for the first online report",
     ))
 }
@@ -275,5 +275,5 @@ async fn report_device_online_state(
         .get_device_state(device_did)
         .await
         .into_rpc()?
-        .ok_or_else(|| parse_error(SnV2ErrorCode::DeviceNotFound, "device not found"))
+        .ok_or_else(|| parse_error(SnApiErrorCode::DeviceNotFound, "device not found"))
 }

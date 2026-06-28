@@ -11,5 +11,5 @@ pub(crate) use common::RpcCallResult;
 pub(crate) use device::handle_device;
 pub(crate) use dns::handle_dns;
 pub(crate) use domain::handle_domain;
-pub(crate) use errors::{parse_error, reason_error, SnV2ErrorCode};
+pub(crate) use errors::{parse_error, reason_error, SnApiErrorCode};
 pub(crate) use user::handle_user;

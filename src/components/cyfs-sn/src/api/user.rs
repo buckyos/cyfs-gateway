@@ -2,7 +2,7 @@ use super::common::{
     build_profile_json, ok_response, parse_params, require_account_username, IntoRpcResult,
     RpcCallResult, SetSelfCertReq,
 };
-use super::errors::{parse_error, SnV2ErrorCode};
+use super::errors::{parse_error, SnApiErrorCode};
 use crate::SNServer;
 use ::kRPC::{RPCErrors, RPCRequest, RPCResponse};
 use serde_json::json;
@@ -15,7 +15,7 @@ pub(crate) async fn handle_user(server: &SNServer, req: RPCRequest) -> RpcCallRe
             if params.self_cert {
                 let device_did = params.device_did.as_deref().ok_or_else(|| {
                     parse_error(
-                        SnV2ErrorCode::DevicePermissionDenied,
+                        SnApiErrorCode::DevicePermissionDenied,
                         "device_did is required to enable self_cert",
                     )
                 })?;
@@ -35,7 +35,7 @@ pub(crate) async fn handle_user(server: &SNServer, req: RPCRequest) -> RpcCallRe
                 .get_user_info(username.as_str())
                 .await
                 .into_rpc()?
-                .ok_or_else(|| parse_error(SnV2ErrorCode::UserNotFound, "user not found"))?;
+                .ok_or_else(|| parse_error(SnApiErrorCode::UserNotFound, "user not found"))?;
             ok_response(&req, build_profile_json(username.as_str(), &user))
         }
         _ => Err(RPCErrors::UnknownMethod(req.method)),
@@ -57,7 +57,7 @@ async fn ensure_owned_runtime_device(
             return Ok(());
         }
         return Err(parse_error(
-            SnV2ErrorCode::DevicePermissionDenied,
+            SnApiErrorCode::DevicePermissionDenied,
             "device has no permission",
         ));
     }
@@ -74,7 +74,7 @@ async fn ensure_owned_runtime_device(
     }
 
     Err(parse_error(
-        SnV2ErrorCode::DevicePermissionDenied,
+        SnApiErrorCode::DevicePermissionDenied,
         "device has no permission",
     ))
 }

@@ -1,6 +1,6 @@
 use crate::{
     sn_err, AccountSession, DomainBinding, PkxBindingChallenge, SNUserInfo, SnAuthDB,
-    SnClearStateResult, SnError, SnErrorCode, SnResult, SnV2AuthInfo, UserState, ZoneInfo,
+    SnClearStateResult, SnError, SnErrorCode, SnResult, SnAuthInfo, UserState, ZoneInfo,
     ZoneInfoPatch,
 };
 use ::kRPC::{kRPC, RPCErrors, RPCHandler, RPCRequest, RPCResponse, RPCResult};
@@ -17,8 +17,8 @@ pub const METHOD_INSERT_ACTIVATION_CODE: &str = "sn_auth_db.insert_activation_co
 pub const METHOD_GENERATE_ACTIVATION_CODES: &str = "sn_auth_db.generate_activation_codes";
 pub const METHOD_CHECK_ACTIVE_CODE: &str = "sn_auth_db.check_active_code";
 pub const METHOD_CLEAR_STATE_BY_ACTIVE_CODE: &str = "sn_auth_db.clear_state_by_active_code";
-pub const METHOD_REGISTER_USER_V2: &str = "sn_auth_db.register_user_v2";
-pub const METHOD_CREATE_V2_AUTH: &str = "sn_auth_db.create_v2_auth";
+pub const METHOD_REGISTER_USER: &str = "sn_auth_db.register_user";
+pub const METHOD_CREATE_AUTH: &str = "sn_auth_db.create_auth";
 pub const METHOD_IS_USER_EXIST: &str = "sn_auth_db.is_user_exist";
 pub const METHOD_REGISTER_USER_WITH_OWNER_KEY: &str = "sn_auth_db.register_user_with_owner_key";
 pub const METHOD_GET_USER_BY_PUBLIC_KEY: &str = "sn_auth_db.get_user_by_public_key";
@@ -30,8 +30,8 @@ pub const METHOD_UPDATE_USER_ZONE_CONFIG: &str = "sn_auth_db.update_user_zone_co
 pub const METHOD_UPDATE_USER_SELF_CERT: &str = "sn_auth_db.update_user_self_cert";
 pub const METHOD_UPDATE_USER_DOMAIN: &str = "sn_auth_db.update_user_domain";
 pub const METHOD_GET_USER_SN_IPS: &str = "sn_auth_db.get_user_sn_ips";
-pub const METHOD_GET_V2_AUTH: &str = "sn_auth_db.get_v2_auth";
-pub const METHOD_UPDATE_V2_LAST_LOGIN: &str = "sn_auth_db.update_v2_last_login";
+pub const METHOD_GET_AUTH: &str = "sn_auth_db.get_auth";
+pub const METHOD_UPDATE_LAST_LOGIN: &str = "sn_auth_db.update_last_login";
 pub const METHOD_CREATE_PKX_BINDING: &str = "sn_auth_db.create_pkx_binding";
 pub const METHOD_VERIFY_PKX_BINDING: &str = "sn_auth_db.verify_pkx_binding";
 pub const METHOD_UNBIND_USER_DOMAIN: &str = "sn_auth_db.unbind_user_domain";
@@ -188,7 +188,7 @@ impl SnAuthDbClearStateByActiveCodeReq {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SnAuthDbRegisterUserV2Req {
+pub struct SnAuthDbRegisterUserReq {
     pub active_code: String,
     pub username: String,
     pub password_hash: String,
@@ -196,7 +196,7 @@ pub struct SnAuthDbRegisterUserV2Req {
     pub password_algo: String,
 }
 
-impl SnAuthDbRegisterUserV2Req {
+impl SnAuthDbRegisterUserReq {
     pub fn new(
         active_code: &str,
         username: &str,
@@ -213,18 +213,18 @@ impl SnAuthDbRegisterUserV2Req {
         }
     }
 
-    impl_req_from_json!(SnAuthDbRegisterUserV2Req);
+    impl_req_from_json!(SnAuthDbRegisterUserReq);
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SnAuthDbCreateV2AuthReq {
+pub struct SnAuthDbCreateAuthReq {
     pub username: String,
     pub password_hash: String,
     pub password_salt: String,
     pub password_algo: String,
 }
 
-impl SnAuthDbCreateV2AuthReq {
+impl SnAuthDbCreateAuthReq {
     pub fn new(
         username: &str,
         password_hash: &str,
@@ -239,7 +239,7 @@ impl SnAuthDbCreateV2AuthReq {
         }
     }
 
-    impl_req_from_json!(SnAuthDbCreateV2AuthReq);
+    impl_req_from_json!(SnAuthDbCreateAuthReq);
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -405,12 +405,12 @@ impl SnAuthDbUpdateUserDomainReq {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SnAuthDbUpdateV2LastLoginReq {
+pub struct SnAuthDbUpdateLastLoginReq {
     pub username: String,
     pub last_login_at: u64,
 }
 
-impl SnAuthDbUpdateV2LastLoginReq {
+impl SnAuthDbUpdateLastLoginReq {
     pub fn new(username: &str, last_login_at: u64) -> Self {
         Self {
             username: username.to_string(),
@@ -418,7 +418,7 @@ impl SnAuthDbUpdateV2LastLoginReq {
         }
     }
 
-    impl_req_from_json!(SnAuthDbUpdateV2LastLoginReq);
+    impl_req_from_json!(SnAuthDbUpdateLastLoginReq);
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -717,7 +717,7 @@ impl SnAuthDB for SnAuthDbClient {
         }
     }
 
-    async fn register_user_v2(
+    async fn register_user(
         &self,
         active_code: &str,
         username: &str,
@@ -728,7 +728,7 @@ impl SnAuthDB for SnAuthDbClient {
         match self {
             Self::InProcess(handler) => {
                 handler
-                    .register_user_v2(
+                    .register_user(
                         active_code,
                         username,
                         password_hash,
@@ -739,8 +739,8 @@ impl SnAuthDB for SnAuthDbClient {
             }
             Self::KRPC(_) => {
                 self.call(
-                    METHOD_REGISTER_USER_V2,
-                    &SnAuthDbRegisterUserV2Req::new(
+                    METHOD_REGISTER_USER,
+                    &SnAuthDbRegisterUserReq::new(
                         active_code,
                         username,
                         password_hash,
@@ -753,7 +753,7 @@ impl SnAuthDB for SnAuthDbClient {
         }
     }
 
-    async fn create_v2_auth(
+    async fn create_auth(
         &self,
         username: &str,
         password_hash: &str,
@@ -763,13 +763,13 @@ impl SnAuthDB for SnAuthDbClient {
         match self {
             Self::InProcess(handler) => {
                 handler
-                    .create_v2_auth(username, password_hash, password_salt, password_algo)
+                    .create_auth(username, password_hash, password_salt, password_algo)
                     .await
             }
             Self::KRPC(_) => {
                 self.call(
-                    METHOD_CREATE_V2_AUTH,
-                    &SnAuthDbCreateV2AuthReq::new(
+                    METHOD_CREATE_AUTH,
+                    &SnAuthDbCreateAuthReq::new(
                         username,
                         password_hash,
                         password_salt,
@@ -947,23 +947,23 @@ impl SnAuthDB for SnAuthDbClient {
         }
     }
 
-    async fn get_v2_auth(&self, username: &str) -> SnResult<Option<SnV2AuthInfo>> {
+    async fn get_auth(&self, username: &str) -> SnResult<Option<SnAuthInfo>> {
         match self {
-            Self::InProcess(handler) => handler.get_v2_auth(username).await,
+            Self::InProcess(handler) => handler.get_auth(username).await,
             Self::KRPC(_) => {
-                self.call(METHOD_GET_V2_AUTH, &SnAuthDbUsernameReq::new(username))
+                self.call(METHOD_GET_AUTH, &SnAuthDbUsernameReq::new(username))
                     .await
             }
         }
     }
 
-    async fn update_v2_last_login(&self, username: &str, last_login_at: u64) -> SnResult<()> {
+    async fn update_last_login(&self, username: &str, last_login_at: u64) -> SnResult<()> {
         match self {
-            Self::InProcess(handler) => handler.update_v2_last_login(username, last_login_at).await,
+            Self::InProcess(handler) => handler.update_last_login(username, last_login_at).await,
             Self::KRPC(_) => {
                 self.call(
-                    METHOD_UPDATE_V2_LAST_LOGIN,
-                    &SnAuthDbUpdateV2LastLoginReq::new(username, last_login_at),
+                    METHOD_UPDATE_LAST_LOGIN,
+                    &SnAuthDbUpdateLastLoginReq::new(username, last_login_at),
                 )
                 .await
             }
@@ -1177,11 +1177,11 @@ where
                     &req,
                 )
             }
-            METHOD_REGISTER_USER_V2 | "register_user_v2" => {
-                let parsed = SnAuthDbRegisterUserV2Req::from_json(req.params.clone())?;
+            METHOD_REGISTER_USER | "register_user" => {
+                let parsed = SnAuthDbRegisterUserReq::from_json(req.params.clone())?;
                 rpc_envelope_response(
                     self.0
-                        .register_user_v2(
+                        .register_user(
                             &parsed.active_code,
                             &parsed.username,
                             &parsed.password_hash,
@@ -1192,11 +1192,11 @@ where
                     &req,
                 )
             }
-            METHOD_CREATE_V2_AUTH | "create_v2_auth" => {
-                let parsed = SnAuthDbCreateV2AuthReq::from_json(req.params.clone())?;
+            METHOD_CREATE_AUTH | "create_auth" => {
+                let parsed = SnAuthDbCreateAuthReq::from_json(req.params.clone())?;
                 rpc_envelope_response(
                     self.0
-                        .create_v2_auth(
+                        .create_auth(
                             &parsed.username,
                             &parsed.password_hash,
                             &parsed.password_salt,
@@ -1288,15 +1288,15 @@ where
                 let parsed = SnAuthDbUsernameReq::from_json(req.params.clone())?;
                 rpc_envelope_response(self.0.get_user_sn_ips(&parsed.username).await, &req)
             }
-            METHOD_GET_V2_AUTH | "get_v2_auth" => {
+            METHOD_GET_AUTH | "get_auth" => {
                 let parsed = SnAuthDbUsernameReq::from_json(req.params.clone())?;
-                rpc_envelope_response(self.0.get_v2_auth(&parsed.username).await, &req)
+                rpc_envelope_response(self.0.get_auth(&parsed.username).await, &req)
             }
-            METHOD_UPDATE_V2_LAST_LOGIN | "update_v2_last_login" => {
-                let parsed = SnAuthDbUpdateV2LastLoginReq::from_json(req.params.clone())?;
+            METHOD_UPDATE_LAST_LOGIN | "update_last_login" => {
+                let parsed = SnAuthDbUpdateLastLoginReq::from_json(req.params.clone())?;
                 rpc_envelope_response(
                     self.0
-                        .update_v2_last_login(&parsed.username, parsed.last_login_at)
+                        .update_last_login(&parsed.username, parsed.last_login_at)
                         .await,
                     &req,
                 )

@@ -201,7 +201,7 @@ servers:
     device_jwt: []
     db_type: sqlite
     db_path: {}
-    v2_auth_data_dir: {}
+    auth_data_dir: {}
     bns_indexer_url: http://{}
     bns_write_enabled: false
 "#,

@@ -2,7 +2,7 @@ use super::common::{
     ok_response, parse_params, require_account_username, resolve_self_scoped_username,
     AddDnsRecordReq, IntoRpcResult, RemoveDnsRecordReq, RpcCallResult,
 };
-use super::errors::{parse_error, SnV2ErrorCode};
+use super::errors::{parse_error, SnApiErrorCode};
 use crate::SNServer;
 use ::kRPC::{RPCErrors, RPCRequest, RPCResponse};
 use serde_json::{json, Value};
@@ -19,7 +19,7 @@ fn ensure_user_dns_domain(user_domain: Option<&str>, domain: &str) -> RpcCallRes
     let domain = normalize_domain(domain);
     let Some(user_domain) = user_domain else {
         return Err(parse_error(
-            SnV2ErrorCode::InvalidDomain,
+            SnApiErrorCode::InvalidDomain,
             "user_domain is required for user DNS records",
         ));
     };
@@ -29,7 +29,7 @@ fn ensure_user_dns_domain(user_domain: Option<&str>, domain: &str) -> RpcCallRes
     }
 
     Err(parse_error(
-        SnV2ErrorCode::InvalidDomain,
+        SnApiErrorCode::InvalidDomain,
         format!("invalid domain, expect {} or its subdomain", user_domain),
     ))
 }
@@ -43,7 +43,7 @@ pub(crate) async fn handle_dns(server: &SNServer, req: RPCRequest) -> RpcCallRes
                 .get_user_info(username.as_str())
                 .await
                 .into_rpc()?
-                .ok_or_else(|| parse_error(SnV2ErrorCode::UserNotFound, "user not found"))?;
+                .ok_or_else(|| parse_error(SnApiErrorCode::UserNotFound, "user not found"))?;
             let params: AddDnsRecordReq = parse_params(&req)?;
             let device_name =
                 ensure_owned_runtime_device(server, username.as_str(), params.device_did.as_str())
@@ -87,7 +87,7 @@ pub(crate) async fn handle_dns(server: &SNServer, req: RPCRequest) -> RpcCallRes
                 .get_user_info(username.as_str())
                 .await
                 .into_rpc()?
-                .ok_or_else(|| parse_error(SnV2ErrorCode::UserNotFound, "user not found"))?;
+                .ok_or_else(|| parse_error(SnApiErrorCode::UserNotFound, "user not found"))?;
             let params: RemoveDnsRecordReq = parse_params(&req)?;
             ensure_owned_runtime_device(server, username.as_str(), params.device_did.as_str())
                 .await?;
@@ -156,7 +156,7 @@ async fn ensure_owned_runtime_device(
             return Ok(view.device_name);
         }
         return Err(parse_error(
-            SnV2ErrorCode::DevicePermissionDenied,
+            SnApiErrorCode::DevicePermissionDenied,
             "device has no permission",
         ));
     }
@@ -173,7 +173,7 @@ async fn ensure_owned_runtime_device(
     }
 
     Err(parse_error(
-        SnV2ErrorCode::DevicePermissionDenied,
+        SnApiErrorCode::DevicePermissionDenied,
         "device has no permission",
     ))
 }
@@ -187,7 +187,7 @@ mod tests {
         let err = ensure_user_dns_domain(None, "home.alice.web3.buckyos.ai")
             .unwrap_err()
             .to_string();
-        assert!(err.contains("[SNV2:1015:invalid_domain]"));
+        assert!(err.contains("[SN:1015:invalid_domain]"));
     }
 
     #[test]
@@ -200,6 +200,6 @@ mod tests {
         let err = ensure_user_dns_domain(Some("alice.example.com"), "home.bob.example.com")
             .unwrap_err()
             .to_string();
-        assert!(err.contains("[SNV2:1015:invalid_domain]"));
+        assert!(err.contains("[SN:1015:invalid_domain]"));
     }
 }

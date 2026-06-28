@@ -8,7 +8,7 @@ use crate::sn_resolver::{
     SnRelayManagerResolverReader, SnResolver, SnResolverConfig, SnResolverError,
     SnResolverErrorKind, SnResolverRef, SnResolverResult,
 };
-use crate::sn_v2_auth::SnV2AuthManager;
+use crate::sn_auth_manager::SnAuthManager;
 use crate::{
     SNUserInfo, SnAuthDBRef, SnDeviceEndpointUpdate, SnDeviceInfoDBRef, SnDeviceRole,
     SnDeviceState, SnDeviceStateUpdate, SnEndpointProtocol, SnEndpointScope, SnEndpointSource,
@@ -420,7 +420,7 @@ pub struct SNServer {
     auth_db: SnAuthDBRef,
     device_info_db: SnDeviceInfoDBRef,
     compat_store: SnCompatibilityStoreRef,
-    v2_auth: Arc<SnV2AuthManager>,
+    auth: Arc<SnAuthManager>,
     name_info_cache: NameInfoCacheRef,
     resolver: SnResolverRef,
     bns_controller: Option<Arc<SnBnsController>>,
@@ -636,10 +636,10 @@ impl SNServer {
         let boot_jwt = server_config.boot_jwt;
         let owner_pkx = server_config.owner_pkx;
         let device_jwt = server_config.device_jwt;
-        let v2_auth = Arc::new(
-            SnV2AuthManager::new(server_config.v2_auth_data_dir.as_deref())
+        let auth = Arc::new(
+            SnAuthManager::new(server_config.auth_data_dir.as_deref())
                 .await
-                .expect("init sn v2 auth manager"),
+                .expect("init sn auth manager"),
         );
         let resolver_config = SnResolverConfig::new(
             server_host.clone(),
@@ -686,7 +686,7 @@ impl SNServer {
             auth_db,
             device_info_db,
             compat_store,
-            v2_auth,
+            auth,
             name_info_cache: NameInfoCache::new_ref(),
             resolver,
             bns_controller,
@@ -1348,7 +1348,7 @@ impl SNServer {
         }
     }
 
-    pub(crate) async fn query_device_by_hostname_v2(&self, req_host: &str) -> Option<OODInfo> {
+    pub(crate) async fn query_device_by_hostname(&self, req_host: &str) -> Option<OODInfo> {
         match self.resolver.resolve_gateway_by_hostname(req_host).await {
             Ok(gateway) => {
                 let did_hostname = DID::from_str(gateway.gateway_did.as_str())
@@ -1450,10 +1450,6 @@ impl SNServer {
         }
 
         return None;
-    }
-
-    async fn query_device_by_hostname(&self, req_host: &str) -> Option<OODInfo> {
-        self.query_device_by_hostname_v2(req_host).await
     }
 
     pub fn create_name_info_from_zone_config(
@@ -1904,20 +1900,7 @@ impl SNServer {
         }
     }
 
-    pub(crate) async fn query_did_v2(
-        &self,
-        did: &DID,
-        doc_type: Option<&str>,
-        from_ip: Option<IpAddr>,
-    ) -> ServerResult<EncodedDocument> {
-        self.resolver
-            .resolve_did(did, doc_type, from_ip)
-            .await
-            .map(|resolution| resolution.document)
-            .map_err(|e| e.to_server_error())
-    }
-
-    async fn query_did_v2_legacy(
+    async fn query_did_legacy(
         &self,
         did: &DID,
         doc_type: Option<&str>,
@@ -1952,7 +1935,7 @@ impl SNServer {
                                 e
                             )
                         })?;
-                        return Box::pin(self.query_did_v2(&bns_did, doc_type, from_ip)).await;
+                        return Box::pin(self.query_did(&bns_did, doc_type, from_ip)).await;
                     }
                     Err(e) if e.code() == ServerErrorCode::NotFound => {
                         if let Some((device_name, domain)) = id.split_once('.') {
@@ -1971,7 +1954,7 @@ impl SNServer {
                                     e
                                 )
                             })?;
-                            return Box::pin(self.query_did_v2(&bns_did, doc_type, from_ip)).await;
+                            return Box::pin(self.query_did(&bns_did, doc_type, from_ip)).await;
                         }
 
                         Err(server_err!(
@@ -2336,8 +2319,8 @@ impl SNServer {
         &self.device_info_db
     }
 
-    pub(crate) fn v2_auth(&self) -> Arc<SnV2AuthManager> {
-        self.v2_auth.clone()
+    pub(crate) fn auth(&self) -> Arc<SnAuthManager> {
+        self.auth.clone()
     }
 }
 
@@ -2472,7 +2455,11 @@ impl NameServer for SNServer {
         doc_type: Option<&str>,
         from_ip: Option<IpAddr>,
     ) -> ServerResult<EncodedDocument> {
-        self.query_did_v2(did, doc_type, from_ip).await
+        self.resolver
+            .resolve_did(did, doc_type, from_ip)
+            .await
+            .map(|resolution| resolution.document)
+            .map_err(|e| e.to_server_error())
     }
 }
 
@@ -2746,7 +2733,7 @@ pub struct SNServerConfig {
     #[serde(default)]
     pub aliases: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub v2_auth_data_dir: Option<String>,
+    pub auth_data_dir: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bns_indexer_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -3170,7 +3157,6 @@ mod tests {
     use tokio::net::{TcpListener, TcpStream};
 
     const TEST_USER: &str = "testuser";
-    const TEST_USER_V2: &str = "testuserv2";
     const TEST_ROOT_USER: &str = "testroot";
     const TEST_LEGACY_USER: &str = "testlegacy";
     const ANVIL_PRIVATE_KEY: &str =
@@ -4254,7 +4240,7 @@ mod tests {
             "device_jwt": [],
             "db_type": "sqlite",
             "db_path": db.path().to_str().unwrap(),
-            "v2_auth_data_dir": auth_dir.path().to_str().unwrap(),
+            "auth_data_dir": auth_dir.path().to_str().unwrap(),
         });
         let config: SNServerConfig = serde_json::from_value(config).unwrap();
         let servers = sn_factory.create(Arc::new(config), None).await.unwrap();
@@ -4424,8 +4410,8 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "legacy V2 BNS-in-SN route coverage replaced by refactored path test"]
-    async fn test_sn_v2_api() {
+    #[ignore = "legacy BNS-in-SN route coverage replaced by refactored path test"]
+    async fn test_sn_account_api() {
         init_logging("sn", false);
         let (user_signing_key, user_pkcs8_bytes) = generate_ed25519_key();
         let user_public_key = encode_ed25519_sk_to_pk_jwk(&user_signing_key);
@@ -4468,7 +4454,7 @@ mod tests {
         }
 
         let config = json!({
-            "id": "test-v2",
+            "id": "test",
             "host": "buckyos.ai",
             "ip": "127.0.0.1",
             "boot_jwt": "",
@@ -4476,7 +4462,7 @@ mod tests {
             "device_jwt": [],
             "db_type": "sqlite",
             "db_path": db.path().to_str().unwrap(),
-            "v2_auth_data_dir": auth_dir.path().to_str().unwrap(),
+            "auth_data_dir": auth_dir.path().to_str().unwrap(),
         });
         let config: SNServerConfig = serde_json::from_value(config).unwrap();
         let servers = sn_factory.create(Arc::new(config), None).await.unwrap();
@@ -4561,7 +4547,7 @@ mod tests {
             .call(
                 "auth.check_username",
                 json!({
-                    "name": TEST_USER_V2
+                    "name": TEST_USER
                 }),
             )
             .await
@@ -4605,13 +4591,13 @@ mod tests {
             .await;
         assert!(dotted_register_result.is_err());
         let dotted_register_err = dotted_register_result.err().unwrap().to_string();
-        assert!(dotted_register_err.contains("[SNV2:1001:invalid_username]"));
+        assert!(dotted_register_err.contains("[SN:1001:invalid_username]"));
 
         let result = auth_krpc
             .call(
                 "auth.register",
                 json!({
-                    "name": TEST_USER_V2,
+                    "name": TEST_USER,
                     "pwd_hash": "12345678",
                     "active_code": CLEAR_STATE_ACTIVE_CODE
                 }),
@@ -4627,7 +4613,7 @@ mod tests {
             .call(
                 "auth.check_username",
                 json!({
-                    "name": TEST_USER_V2
+                    "name": TEST_USER
                 }),
             )
             .await
@@ -4641,7 +4627,7 @@ mod tests {
 
         let auth_me_krpc = kRPC::new(auth_url.as_str(), Some(access_token.clone()));
         let result = auth_me_krpc.call("auth.me", json!({})).await.unwrap();
-        assert_eq!(result["name"].as_str().unwrap(), TEST_USER_V2);
+        assert_eq!(result["name"].as_str().unwrap(), TEST_USER);
         assert!(!result["owner_key_bound"].as_bool().unwrap());
 
         let login_krpc = kRPC::new(auth_url.as_str(), None);
@@ -4649,7 +4635,7 @@ mod tests {
             .call(
                 "auth.login",
                 json!({
-                    "name": TEST_USER_V2,
+                    "name": TEST_USER,
                     "pwd_hash": "12345678"
                 }),
             )
@@ -4662,7 +4648,7 @@ mod tests {
             .call(
                 "auth.login",
                 json!({
-                    "name": TEST_USER_V2,
+                    "name": TEST_USER,
                     "pwd_hash": "12345678",
                     "active_code": "wrong-active-code"
                 }),
@@ -4674,14 +4660,14 @@ mod tests {
             .call(
                 "auth.login",
                 json!({
-                    "name": TEST_USER_V2,
+                    "name": TEST_USER,
                     "pwd_hash": "wrong-password"
                 }),
             )
             .await;
         assert!(invalid_login_result.is_err());
         let invalid_login_err = invalid_login_result.err().unwrap().to_string();
-        assert!(invalid_login_err.contains("[SNV2:1005:invalid_password]"));
+        assert!(invalid_login_err.contains("[SN:1005:invalid_password]"));
 
         let invalid_register_result = auth_krpc
             .call(
@@ -4695,7 +4681,7 @@ mod tests {
             .await;
         assert!(invalid_register_result.is_err());
         let invalid_register_err = invalid_register_result.err().unwrap().to_string();
-        assert!(invalid_register_err.contains("[SNV2:1001:invalid_username]"));
+        assert!(invalid_register_err.contains("[SN:1001:invalid_username]"));
 
         let refresh_krpc = kRPC::new(auth_url.as_str(), None);
         let result = refresh_krpc
@@ -4726,7 +4712,7 @@ mod tests {
             .err()
             .unwrap()
             .to_string()
-            .contains("[SNV2:1007:invalid_token]"));
+            .contains("[SN:1007:invalid_token]"));
 
         let user_krpc = kRPC::new(bns_url.as_str(), Some(login_access_token.clone()));
         let result = user_krpc
@@ -4750,7 +4736,7 @@ mod tests {
         );
 
         let (_owner_token, mut owner_session) = RPCSessionToken::generate_jwt_token(
-            TEST_USER_V2,
+            TEST_USER,
             "active_service",
             None,
             &user_encoding_key,
@@ -4767,9 +4753,9 @@ mod tests {
             .call("user.get_profile", json!({}))
             .await
             .unwrap();
-        assert_eq!(result["name"].as_str().unwrap(), TEST_USER_V2);
+        assert_eq!(result["name"].as_str().unwrap(), TEST_USER);
 
-        let user_domain = format!("{}.buckyos.ai", TEST_USER_V2);
+        let user_domain = format!("{}.buckyos.ai", TEST_USER);
         let result = user_krpc
             .call(
                 "domain.begin_verify",
@@ -4810,7 +4796,7 @@ mod tests {
         assert_eq!(result["code"].as_i64().unwrap(), 0);
 
         let result = zone_krpc.call("zone.get", json!({})).await.unwrap();
-        assert_eq!(result["user_name"].as_str().unwrap(), TEST_USER_V2);
+        assert_eq!(result["user_name"].as_str().unwrap(), TEST_USER);
         assert_eq!(result["user_domain"].as_str().unwrap(), user_domain);
 
         let device_krpc = kRPC::new(bns_url.as_str(), Some(login_access_token.clone()));
@@ -4838,7 +4824,7 @@ mod tests {
                 "dns.add_record",
                 json!({
                     "device_did": device_config.id.to_string(),
-                    "domain": format!("home.{}.buckyos.ai", TEST_USER_V2),
+                    "domain": format!("home.{}.buckyos.ai", TEST_USER),
                     "record_type": "A",
                     "record": "127.0.0.1",
                     "ttl": 600,
@@ -4861,7 +4847,7 @@ mod tests {
             .await;
         assert!(result.is_err());
         let err = result.err().unwrap().to_string();
-        assert!(err.contains("[SNV2:1015:invalid_domain]"));
+        assert!(err.contains("[SN:1015:invalid_domain]"));
 
         let did_krpc = kRPC::new(sn_url.as_str(), Some(login_access_token.clone()));
         let result = did_krpc
@@ -4870,7 +4856,7 @@ mod tests {
                 json!({
                     "obj_name": "profile",
                     "did_document": {
-                        "name": TEST_USER_V2,
+                        "name": TEST_USER,
                         "version": 2
                     },
                     "doc_type": "profile"
@@ -4892,7 +4878,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             result["did_document"]["name"].as_str().unwrap(),
-            TEST_USER_V2
+            TEST_USER
         );
 
         let query_krpc = kRPC::new(sn_url.as_str(), Some(login_access_token.clone()));
@@ -4900,33 +4886,33 @@ mod tests {
             .call(
                 "query.resolve_hostname",
                 json!({
-                    "host": format!("home.{}.buckyos.ai", TEST_USER_V2)
+                    "host": format!("home.{}.buckyos.ai", TEST_USER)
                 }),
             )
             .await
             .unwrap();
         let ood_info = serde_json::from_value::<OODInfo>(result).unwrap();
-        assert_eq!(ood_info.owner_id, TEST_USER_V2.to_string());
+        assert_eq!(ood_info.owner_id, TEST_USER.to_string());
         assert!(ood_info.self_cert);
 
         let result = root_krpc
             .call(
                 "query.by_hostname",
                 json!({
-                    "dest_host": format!("home.{}.buckyos.ai", TEST_USER_V2)
+                    "dest_host": format!("home.{}.buckyos.ai", TEST_USER)
                 }),
             )
             .await
             .unwrap();
         let root_ood_info = serde_json::from_value::<OODInfo>(result).unwrap();
-        assert_eq!(root_ood_info.owner_id, TEST_USER_V2.to_string());
+        assert_eq!(root_ood_info.owner_id, TEST_USER.to_string());
         assert!(root_ood_info.self_cert);
 
         let result = query_krpc
             .call(
                 "query.resolve_did",
                 json!({
-                    "did": format!("did:bns:{}", TEST_USER_V2),
+                    "did": format!("did:bns:{}", TEST_USER),
                     "type": "zone"
                 }),
             )
@@ -4934,14 +4920,14 @@ mod tests {
             .unwrap();
         assert_eq!(
             result["document"]["user_name"].as_str().unwrap(),
-            TEST_USER_V2
+            TEST_USER
         );
 
         let result = query_krpc
             .call(
                 "query.resolve_device",
                 json!({
-                    "name": TEST_USER_V2,
+                    "name": TEST_USER,
                     "device_name": "ood1"
                 }),
             )
@@ -4954,7 +4940,7 @@ mod tests {
                 "dns.remove_record",
                 json!({
                     "device_did": device_config.id.to_string(),
-                    "domain": format!("home.{}.buckyos.ai", TEST_USER_V2),
+                    "domain": format!("home.{}.buckyos.ai", TEST_USER),
                     "record_type": "A"
                 }),
             )
@@ -4973,7 +4959,7 @@ mod tests {
             .call(
                 "auth.login",
                 json!({
-                    "name": TEST_USER_V2,
+                    "name": TEST_USER,
                     "pwd_hash": "12345678",
                     "active_code": CLEAR_STATE_ACTIVE_CODE
                 }),
@@ -4981,14 +4967,14 @@ mod tests {
             .await;
         assert!(result.is_err());
         let err = result.err().unwrap().to_string();
-        assert!(err.contains("[SNV2:1004:user_auth_not_found]"));
+        assert!(err.contains("[SN:1004:user_auth_not_found]"));
     }
 
     // §3.2/§3.3/§3.4 阶段二安全回归：token claims、冻结用户旧 token 立即失效、
     // 未经 PKX 校验的 user_domain 不能 bind、裸 access token 不能置 self_cert=true。
     #[tokio::test]
     #[ignore = "legacy /kapi/sn/bns zone binding coverage moved out of SN API"]
-    async fn test_sn_v2_phase_two_security_regressions() {
+    async fn test_sn_phase_two_security_regressions() {
         use crate::UserState;
 
         const REG_USER: &str = "regressuser";
@@ -5006,7 +4992,7 @@ mod tests {
                 .unwrap();
         }
         let config = json!({
-            "id": "test-v2-sec",
+            "id": "test-sec",
             "host": "buckyos.ai",
             "ip": "127.0.0.1",
             "boot_jwt": "",
@@ -5014,7 +5000,7 @@ mod tests {
             "device_jwt": [],
             "db_type": "sqlite",
             "db_path": db.path().to_str().unwrap(),
-            "v2_auth_data_dir": auth_dir.path().to_str().unwrap(),
+            "auth_data_dir": auth_dir.path().to_str().unwrap(),
         });
         let config: SNServerConfig = serde_json::from_value(config).unwrap();
         let servers = sn_factory.create(Arc::new(config), None).await.unwrap();
@@ -5051,12 +5037,12 @@ mod tests {
         let access_token = result["access_token"].as_str().unwrap().to_string();
         let refresh_token = result["refresh_token"].as_str().unwrap().to_string();
 
-        // §3.2 token claims：access=sn-v2/1h，refresh=sn-v2-refresh/24h，sub=username，jti 存在。
+        // §3.2 token claims：access=sn/1h，refresh=sn-refresh/24h，sub=username，jti 存在。
         let access_session = RPCSessionToken::from_string(access_token.as_str()).unwrap();
         let refresh_session = RPCSessionToken::from_string(refresh_token.as_str()).unwrap();
         assert_eq!(access_session.sub.as_deref(), Some(REG_USER));
-        assert_eq!(access_session.aud.as_deref(), Some("sn-v2"));
-        assert_eq!(refresh_session.aud.as_deref(), Some("sn-v2-refresh"));
+        assert_eq!(access_session.aud.as_deref(), Some("sn"));
+        assert_eq!(refresh_session.aud.as_deref(), Some("sn-refresh"));
         assert!(access_session.jti.as_deref().is_some_and(|j| !j.is_empty()));
         assert!(refresh_session
             .jti
@@ -5080,7 +5066,7 @@ mod tests {
             .unwrap()
             .to_string();
         assert!(
-            self_cert_err.contains("[SNV2:1013:device_permission_denied]"),
+            self_cert_err.contains("[SN:1013:device_permission_denied]"),
             "unexpected self_cert error: {self_cert_err}"
         );
         // 未开启 self_cert：zone.get 仍为 false。
@@ -5101,7 +5087,7 @@ mod tests {
             .unwrap()
             .to_string();
         assert!(
-            bind_err.contains("[SNV2:1015:invalid_domain]"),
+            bind_err.contains("[SN:1015:invalid_domain]"),
             "unexpected bind error: {bind_err}"
         );
 
@@ -5117,7 +5103,7 @@ mod tests {
             .unwrap()
             .to_string();
         assert!(
-            me_err.contains("[SNV2:1007:invalid_token]"),
+            me_err.contains("[SN:1007:invalid_token]"),
             "frozen user token should be rejected, got: {me_err}"
         );
     }
