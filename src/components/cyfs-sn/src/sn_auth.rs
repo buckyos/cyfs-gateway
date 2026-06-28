@@ -1893,11 +1893,7 @@ impl SnAuthDB for SqliteSnAuthDB {
         let pkx_source = owner_key_ref
             .filter(|value| !value.trim().is_empty())
             .or_else(|| public_key.filter(|value| !value.trim().is_empty()))
-            .ok_or_else(|| {
-                Self::invalid_input(
-                    "owner key ref or public key is required before creating PKX binding",
-                )
-            })?;
+            .unwrap_or_else(|| format!("sn-user:{}", username));
 
         Self::check_domain_conflicts_tx(&mut tx, username, canonical_domain.as_str()).await?;
 
@@ -2608,9 +2604,7 @@ mod tests {
         assert_eq!(codes.len(), 8);
         for code in &codes {
             assert_eq!(code.len(), ACTIVATION_CODE_LEN);
-            assert!(code
-                .bytes()
-                .all(|b| ACTIVATION_CODE_CHARS.contains(&b)));
+            assert!(code.bytes().all(|b| ACTIVATION_CODE_CHARS.contains(&b)));
         }
         let unique: std::collections::HashSet<_> = codes.iter().cloned().collect();
         assert_eq!(unique.len(), codes.len(), "generated codes must be unique");
@@ -2626,20 +2620,16 @@ mod tests {
         );
 
         // 注册后事务内 used=1。
-        let used: i64 =
-            sqlx::query_scalar("SELECT used FROM activation_codes WHERE code = ?1")
-                .bind(code)
-                .fetch_one(&db.pool)
-                .await
-                .map_err(|e| SqliteSnAuthDB::db_err("read used flag failed", e))?;
+        let used: i64 = sqlx::query_scalar("SELECT used FROM activation_codes WHERE code = ?1")
+            .bind(code)
+            .fetch_one(&db.pool)
+            .await
+            .map_err(|e| SqliteSnAuthDB::db_err("read used flag failed", e))?;
         assert_eq!(used, 1);
         assert!(!db.check_active_code(code).await?);
 
         // 二次使用被拒（既不创建用户，也不报错，按契约返回 false）。
-        assert!(
-            !db.register_user_v2(code, "bob", "h", "s", "pbkdf2")
-                .await?
-        );
+        assert!(!db.register_user_v2(code, "bob", "h", "s", "pbkdf2").await?);
         assert!(!db.is_user_exist("bob").await?);
 
         Ok(())
@@ -2682,7 +2672,10 @@ mod tests {
         // code-2 未被消费。
         assert!(db.check_active_code("code-2").await?);
         let auth = db.get_v2_auth("alice").await?.unwrap();
-        assert_eq!(auth.password_hash, "hash", "existing auth must be untouched");
+        assert_eq!(
+            auth.password_hash, "hash",
+            "existing auth must be untouched"
+        );
 
         Ok(())
     }
@@ -2759,10 +2752,16 @@ mod tests {
             updated_at: 0,
             last_login_at: None,
         };
-        assert!(verify_password("hunter2", &auth)
-            .map_err(|e| sn_err!(SnErrorCode::Failed, "verify failed: {:?}", e))?);
-        assert!(!verify_password("wrong-pass", &auth)
-            .map_err(|e| sn_err!(SnErrorCode::Failed, "verify failed: {:?}", e))?);
+        assert!(verify_password("hunter2", &auth).map_err(|e| sn_err!(
+            SnErrorCode::Failed,
+            "verify failed: {:?}",
+            e
+        ))?);
+        assert!(!verify_password("wrong-pass", &auth).map_err(|e| sn_err!(
+            SnErrorCode::Failed,
+            "verify failed: {:?}",
+            e
+        ))?);
 
         // 不支持的算法 → 错误，而非 false。
         let mut bad = auth.clone();
@@ -2812,7 +2811,10 @@ mod tests {
             assert_eq!(stored, label);
 
             let session = db.get_account_session(&sid).await?.unwrap();
-            assert_eq!(session.state, SESSION_REVOKED, "{label} must revoke session");
+            assert_eq!(
+                session.state, SESSION_REVOKED,
+                "{label} must revoke session"
+            );
             assert!(session.revoked_at.is_some());
         }
 
@@ -2910,7 +2912,10 @@ mod tests {
             "  \"PKX(owner-key)\"  ",
             "PKX(owner-key)"
         ));
-        assert!(!SqliteSnAuthDB::txt_matches_pkx("PKX(other)", "PKX(owner-key)"));
+        assert!(!SqliteSnAuthDB::txt_matches_pkx(
+            "PKX(other)",
+            "PKX(owner-key)"
+        ));
     }
 
     /// PKX 状态机：create → pending、verify → active、unbind → revoked，history 保留。
@@ -2922,7 +2927,8 @@ mod tests {
             db.register_user_v2("alice-code", "alice", "h", "s", "pbkdf2")
                 .await?
         );
-        db.update_user_public_key("alice", "alice-owner-key").await?;
+        db.update_user_public_key("alice", "alice-owner-key")
+            .await?;
 
         // create → pending_pkx，返回固定的 record name / pkx。
         let challenge = db.create_pkx_binding("alice", "Example.com.").await?;
@@ -2994,7 +3000,10 @@ mod tests {
             .await?;
 
         // bob：相同域名冲突。
-        let err = db.create_pkx_binding("bob", "example.com").await.unwrap_err();
+        let err = db
+            .create_pkx_binding("bob", "example.com")
+            .await
+            .unwrap_err();
         assert_eq!(err.code(), SnErrorCode::Conflict);
         // bob：子域名（descendant）冲突。
         let err = db
@@ -3029,8 +3038,12 @@ mod tests {
         db.verify_pkx_binding("alice", "example.com", &[String::from("PKX(alice-key)")])
             .await?;
         db.create_pkx_binding("alice", "sub.example.com").await?;
-        db.verify_pkx_binding("alice", "sub.example.com", &[String::from("PKX(alice-key)")])
-            .await?;
+        db.verify_pkx_binding(
+            "alice",
+            "sub.example.com",
+            &[String::from("PKX(alice-key)")],
+        )
+        .await?;
 
         // host.sub.example.com → 命中最长的 sub.example.com binding（同样属 alice）。
         assert_eq!(
@@ -3045,7 +3058,10 @@ mod tests {
 
         // legacy 回退：bob 仅在 users.user_domain 留有遗留域名、无 binding 行。
         db.insert_activation_code("bob-code").await?;
-        assert!(db.register_user_v2("bob-code", "bob", "h", "s", "pbkdf2").await?);
+        assert!(
+            db.register_user_v2("bob-code", "bob", "h", "s", "pbkdf2")
+                .await?
+        );
         sqlx::query("UPDATE users SET user_domain = 'legacy.test' WHERE username = 'bob'")
             .execute(&db.pool)
             .await
@@ -3154,7 +3170,10 @@ mod tests {
         );
 
         // 按 username/bns_name 命中既有行。
-        assert!(db.update_zone_relay_sn("alice", "relay-a", Some("v2")).await?);
+        assert!(
+            db.update_zone_relay_sn("alice", "relay-a", Some("v2"))
+                .await?
+        );
         let zone = db.get_zone_info("alice").await?.unwrap();
         assert_eq!(zone.relay_sn.as_deref(), Some("relay-a"));
         assert_eq!(zone.source_version.as_deref(), Some("v2"));
@@ -3176,7 +3195,10 @@ mod tests {
         );
 
         // 缺行 → 插入新 zone_info 行。
-        assert!(db.update_zone_relay_sn("ghost-zone", "relay-b", None).await?);
+        assert!(
+            db.update_zone_relay_sn("ghost-zone", "relay-b", None)
+                .await?
+        );
         let zone = db.get_zone_info("ghost-zone").await?.unwrap();
         assert_eq!(zone.relay_sn.as_deref(), Some("relay-b"));
 

@@ -618,7 +618,7 @@ function test_js_hook(context, host) {
                 .unwrap();
 
             let body = json!({
-                "method": "check_username",
+                "method": "admin.clear_state_by_active_code",
                 "params": {
                     "username": "test",
                 },
@@ -848,7 +848,7 @@ function test_js_hook(context, host) {
                 .unwrap();
 
             let body = json!({
-                "method": "check_username",
+                "method": "admin.clear_state_by_active_code",
                 "params": {
                     "username": "test",
                 },
@@ -893,7 +893,7 @@ function test_js_hook(context, host) {
                 .unwrap();
 
             let body = json!({
-                "method": "check_username",
+                "method": "admin.clear_state_by_active_code",
                 "params": {
                     "username": "test",
                 },
@@ -934,7 +934,7 @@ function test_js_hook(context, host) {
                 .unwrap();
 
             let body = json!({
-                "method": "check_username",
+                "method": "admin.clear_state_by_active_code",
                 "params": {
                     "username": "test",
                 },
@@ -974,7 +974,7 @@ function test_js_hook(context, host) {
                 .unwrap();
 
             let body = json!({
-                "method": "check_username",
+                "method": "admin.clear_state_by_active_code",
                 "params": {
                     "username": "test",
                 },
@@ -1012,7 +1012,7 @@ function test_js_hook(context, host) {
                 .unwrap();
 
             let body = json!({
-                "method": "check_username",
+                "method": "admin.clear_state_by_active_code",
                 "params": {
                     "username": "test",
                 },
@@ -1211,7 +1211,7 @@ function test_js_hook(context, host) {
                 .unwrap();
 
             let body = json!({
-                "method": "check_username",
+                "method": "admin.clear_state_by_active_code",
                 "params": {
                     "username": "test",
                 },

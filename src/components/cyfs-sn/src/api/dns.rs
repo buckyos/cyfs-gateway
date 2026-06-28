@@ -1,12 +1,10 @@
 use super::common::{
-    ensure_owned_device, ok_response, parse_params, require_account_username,
-    resolve_self_scoped_username, stable_request_id, AddDnsRecordReq, IntoRpcResult,
-    RemoveDnsRecordReq, RpcCallResult,
+    ok_response, parse_params, require_account_username, resolve_self_scoped_username,
+    AddDnsRecordReq, IntoRpcResult, RemoveDnsRecordReq, RpcCallResult,
 };
-use super::errors::{bns_write_error, parse_error, SnV2ErrorCode};
+use super::errors::{parse_error, SnV2ErrorCode};
 use crate::SNServer;
 use ::kRPC::{RPCErrors, RPCRequest, RPCResponse};
-use bns_client::{DnsTxtUpdate, UpsertDnsTxtParams};
 use serde_json::{json, Value};
 
 fn normalize_domain(domain: &str) -> String {
@@ -17,34 +15,23 @@ fn is_same_or_subdomain(domain: &str, zone: &str) -> bool {
     domain == zone || domain.ends_with(format!(".{}", zone).as_str())
 }
 
-fn ensure_user_dns_domain(
-    username: &str,
-    user_domain: Option<&str>,
-    domain: &str,
-    server_host: &str,
-) -> RpcCallResult<()> {
+fn ensure_user_dns_domain(user_domain: Option<&str>, domain: &str) -> RpcCallResult<()> {
     let domain = normalize_domain(domain);
-    if let Some(user_domain) = user_domain {
-        let user_domain = normalize_domain(user_domain);
-        if !user_domain.is_empty() && is_same_or_subdomain(domain.as_str(), user_domain.as_str()) {
-            return Ok(());
-        }
-
+    let Some(user_domain) = user_domain else {
         return Err(parse_error(
             SnV2ErrorCode::InvalidDomain,
-            format!("invalid domain, expect {} or its subdomain", user_domain),
+            "user_domain is required for user DNS records",
         ));
+    };
+    let user_domain = normalize_domain(user_domain);
+    if !user_domain.is_empty() && is_same_or_subdomain(domain.as_str(), user_domain.as_str()) {
+        return Ok(());
     }
 
-    let domain_suffix = format!(".{}.web3.{}", username, server_host);
-    if !domain.ends_with(domain_suffix.as_str()) {
-        return Err(parse_error(
-            SnV2ErrorCode::InvalidDomain,
-            format!("invalid domain, expect suffix {}", domain_suffix),
-        ));
-    }
-
-    Ok(())
+    Err(parse_error(
+        SnV2ErrorCode::InvalidDomain,
+        format!("invalid domain, expect {} or its subdomain", user_domain),
+    ))
 }
 
 pub(crate) async fn handle_dns(server: &SNServer, req: RPCRequest) -> RpcCallResult<RPCResponse> {
@@ -58,46 +45,10 @@ pub(crate) async fn handle_dns(server: &SNServer, req: RPCRequest) -> RpcCallRes
                 .into_rpc()?
                 .ok_or_else(|| parse_error(SnV2ErrorCode::UserNotFound, "user not found"))?;
             let params: AddDnsRecordReq = parse_params(&req)?;
-            let device = ensure_owned_device(
-                server.compat_store(),
-                username.as_str(),
-                params.device_did.as_str(),
-            )
-            .await?;
-            ensure_user_dns_domain(
-                username.as_str(),
-                user.user_domain.as_deref(),
-                params.domain.as_str(),
-                server.server_host_v2(),
-            )?;
-            let mut bns_receipt = None;
-            if params.record_type.eq_ignore_ascii_case("TXT") {
-                if let Some(controller) = server.bns_controller() {
-                    let payload = json!({
-                        "domain": normalize_domain(params.domain.as_str()),
-                        "record": params.record.clone(),
-                        "ttl": params.ttl.unwrap_or(600),
-                    });
-                    let receipt = controller
-                        .upsert_dns_txt(UpsertDnsTxtParams {
-                            request_id: stable_request_id(
-                                params.request_id.clone(),
-                                "upsert_dns_txt",
-                                username.as_str(),
-                                &payload,
-                            ),
-                            name: username.clone(),
-                            update: DnsTxtUpdate::Add {
-                                ttl: params.ttl.unwrap_or(600),
-                                value: params.record.clone(),
-                            },
-                            authority: controller.sn_controller_authority(),
-                        })
-                        .await
-                        .map_err(bns_write_error)?;
-                    bns_receipt = Some(serde_json::to_value(receipt).unwrap_or_default());
-                }
-            }
+            let device_name =
+                ensure_owned_runtime_device(server, username.as_str(), params.device_did.as_str())
+                    .await?;
+            ensure_user_dns_domain(user.user_domain.as_deref(), params.domain.as_str())?;
             server
                 .compat_store()
                 .add_user_domain(
@@ -125,8 +76,7 @@ pub(crate) async fn handle_dns(server: &SNServer, req: RPCRequest) -> RpcCallRes
                 &req,
                 json!({
                     "code": 0,
-                    "device_name": device.device_name,
-                    "bns_receipt": bns_receipt,
+                    "device_name": device_name,
                 }),
             )
         }
@@ -139,49 +89,9 @@ pub(crate) async fn handle_dns(server: &SNServer, req: RPCRequest) -> RpcCallRes
                 .into_rpc()?
                 .ok_or_else(|| parse_error(SnV2ErrorCode::UserNotFound, "user not found"))?;
             let params: RemoveDnsRecordReq = parse_params(&req)?;
-            ensure_owned_device(
-                server.compat_store(),
-                username.as_str(),
-                params.device_did.as_str(),
-            )
-            .await?;
-            ensure_user_dns_domain(
-                username.as_str(),
-                user.user_domain.as_deref(),
-                params.domain.as_str(),
-                server.server_host_v2(),
-            )?;
-            let mut bns_receipt = None;
-            if params.record_type.eq_ignore_ascii_case("TXT") {
-                if let Some(controller) = server.bns_controller() {
-                    let update = params
-                        .record
-                        .clone()
-                        .map(|value| DnsTxtUpdate::Remove { value })
-                        .unwrap_or_else(|| DnsTxtUpdate::Replace {
-                            records: Vec::new(),
-                        });
-                    let payload = json!({
-                        "domain": normalize_domain(params.domain.as_str()),
-                        "record": params.record.clone(),
-                    });
-                    let receipt = controller
-                        .upsert_dns_txt(UpsertDnsTxtParams {
-                            request_id: stable_request_id(
-                                params.request_id.clone(),
-                                "remove_dns_txt",
-                                username.as_str(),
-                                &payload,
-                            ),
-                            name: username.clone(),
-                            update,
-                            authority: controller.sn_controller_authority(),
-                        })
-                        .await
-                        .map_err(bns_write_error)?;
-                    bns_receipt = Some(serde_json::to_value(receipt).unwrap_or_default());
-                }
-            }
+            ensure_owned_runtime_device(server, username.as_str(), params.device_did.as_str())
+                .await?;
+            ensure_user_dns_domain(user.user_domain.as_deref(), params.domain.as_str())?;
             if params.has_cert.unwrap_or(false) {
                 server
                     .auth_db()
@@ -203,7 +113,7 @@ pub(crate) async fn handle_dns(server: &SNServer, req: RPCRequest) -> RpcCallRes
             {
                 server.remove_name_info_cache(params.domain.as_str(), record_type);
             }
-            ok_response(&req, json!({ "code": 0, "bns_receipt": bns_receipt }))
+            ok_response(&req, json!({ "code": 0 }))
         }
         "list_records" => {
             let username = resolve_self_scoped_username(server, &req, false).await?;
@@ -231,18 +141,50 @@ pub(crate) async fn handle_dns(server: &SNServer, req: RPCRequest) -> RpcCallRes
     }
 }
 
+async fn ensure_owned_runtime_device(
+    server: &SNServer,
+    username: &str,
+    device_did: &str,
+) -> RpcCallResult<String> {
+    if let Some(view) = server
+        .device_info_db()
+        .get_device_state(device_did)
+        .await
+        .into_rpc()?
+    {
+        if view.zone == username {
+            return Ok(view.device_name);
+        }
+        return Err(parse_error(
+            SnV2ErrorCode::DevicePermissionDenied,
+            "device has no permission",
+        ));
+    }
+
+    if let Some(device) = server
+        .compat_store()
+        .query_device_by_did(device_did)
+        .await
+        .into_rpc()?
+    {
+        if device.owner == username {
+            return Ok(device.device_name);
+        }
+    }
+
+    Err(parse_error(
+        SnV2ErrorCode::DevicePermissionDenied,
+        "device has no permission",
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::ensure_user_dns_domain;
 
     #[test]
-    fn test_ensure_user_dns_domain_for_web3_namespace() {
-        assert!(
-            ensure_user_dns_domain("alice", None, "home.alice.web3.buckyos.ai", "buckyos.ai")
-                .is_ok()
-        );
-
-        let err = ensure_user_dns_domain("alice", None, "home.bob.web3.buckyos.ai", "buckyos.ai")
+    fn test_ensure_user_dns_domain_requires_user_domain() {
+        let err = ensure_user_dns_domain(None, "home.alice.web3.buckyos.ai")
             .unwrap_err()
             .to_string();
         assert!(err.contains("[SNV2:1015:invalid_domain]"));
@@ -250,29 +192,14 @@ mod tests {
 
     #[test]
     fn test_ensure_user_dns_domain_for_custom_user_domain() {
-        assert!(ensure_user_dns_domain(
-            "alice",
-            Some("alice.example.com"),
-            "home.alice.example.com",
-            "buckyos.ai"
-        )
-        .is_ok());
-        assert!(ensure_user_dns_domain(
-            "alice",
-            Some("alice.example.com"),
-            "alice.example.com",
-            "buckyos.ai"
-        )
-        .is_ok());
+        assert!(
+            ensure_user_dns_domain(Some("alice.example.com"), "home.alice.example.com",).is_ok()
+        );
+        assert!(ensure_user_dns_domain(Some("alice.example.com"), "alice.example.com",).is_ok());
 
-        let err = ensure_user_dns_domain(
-            "alice",
-            Some("alice.example.com"),
-            "home.bob.example.com",
-            "buckyos.ai",
-        )
-        .unwrap_err()
-        .to_string();
+        let err = ensure_user_dns_domain(Some("alice.example.com"), "home.bob.example.com")
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("[SNV2:1015:invalid_domain]"));
     }
 }

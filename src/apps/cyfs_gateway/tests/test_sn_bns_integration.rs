@@ -224,40 +224,41 @@ servers:
     });
     wait_for_tcp(SocketAddr::from(([127, 0, 0, 1], http_port))).await;
 
-    let sn_endpoint = format!("http://127.0.0.1:{}/kapi/sn", http_port);
-    let sn = kRPC::new(sn_endpoint.as_str(), None);
+    let did_endpoint = format!("http://127.0.0.1:{}/1.0/identifiers", http_port);
+    let deviceinfo_endpoint = format!("http://127.0.0.1:{}/kapi/sn/deviceinfo", http_port);
+    let sn = kRPC::new(deviceinfo_endpoint.as_str(), None);
+    let http_client = reqwest::Client::new();
 
-    let zone = sn
-        .call(
-            "query.resolve_did",
-            json!({
-                "did": format!("did:bns:{}", BNS_NAME),
-                "type": "zone"
-            }),
-        )
+    let zone: serde_json::Value = http_client
+        .get(format!("{}/did:bns:{}?type=zone", did_endpoint, BNS_NAME))
+        .send()
+        .await
+        .unwrap()
+        .json()
         .await
         .unwrap();
-    assert_eq!(zone["document"]["gateway_device_name"], BNS_GATEWAY_DEVICE);
-    assert_eq!(zone["document"]["gateway_ips"][0], BNS_GATEWAY_IP);
+    assert_eq!(zone["gateway_device_name"], BNS_GATEWAY_DEVICE);
+    assert_eq!(zone["gateway_ips"][0], BNS_GATEWAY_IP);
 
-    let device = sn
-        .call(
-            "query.resolve_did",
-            json!({
-                "did": format!("did:bns:{}.{}", BNS_GATEWAY_DEVICE, BNS_NAME),
-                "type": "doc"
-            }),
-        )
+    let device: serde_json::Value = http_client
+        .get(format!(
+            "{}/did:bns:{}.{}?type=doc",
+            did_endpoint, BNS_GATEWAY_DEVICE, BNS_NAME
+        ))
+        .send()
+        .await
+        .unwrap()
+        .json()
         .await
         .unwrap();
-    assert_eq!(device["document"]["id"], BNS_GATEWAY_DID);
-    assert_eq!(device["document"]["device_name"], BNS_GATEWAY_DEVICE);
+    assert_eq!(device["id"], BNS_GATEWAY_DID);
+    assert_eq!(device["device_name"], BNS_GATEWAY_DEVICE);
 
     let gateway = sn
         .call(
-            "query.resolve_hostname",
+            "deviceinfo.resolve_ood_by_hostname",
             json!({
-                "host": BNS_NAME
+                "dest_host": BNS_NAME
             }),
         )
         .await

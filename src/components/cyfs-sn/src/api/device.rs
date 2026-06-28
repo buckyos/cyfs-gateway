@@ -1,182 +1,136 @@
 use super::common::{
-    bns_managed_owner_authority, device_to_json, ensure_owner_decoding_key, ok_response,
-    parse_params, query_by_did, require_account_username, resolve_self_scoped_username,
-    stable_request_id, DeviceGetReq, DeviceRegisterReq, DeviceUpdateReq, IntoRpcResult,
-    QueryByDidReq, QueryByHostnameReq, QueryByPkReq, RpcCallResult,
+    ok_response, parse_params, require_account_username, resolve_self_scoped_username,
+    IntoRpcResult, QueryByDidReq, QueryByHostnameReq, RpcCallResult,
 };
-use super::errors::{bns_write_error, parse_error, SnV2ErrorCode};
-use crate::SNServer;
+use super::errors::{parse_error, SnV2ErrorCode};
+use crate::{
+    SNServer, SnDeviceEndpointUpdate, SnDeviceListOptions, SnDeviceState, SnDeviceStateView,
+};
 use ::kRPC::{RPCErrors, RPCRequest, RPCResponse};
-use bns_client::PublishDeviceMiniDocParams;
+use serde::Deserialize;
 use serde_json::{json, Value};
 
 pub(crate) async fn handle_device(
     server: &SNServer,
     req: RPCRequest,
+    ip_from: std::net::IpAddr,
 ) -> RpcCallResult<RPCResponse> {
     match req.method.as_str() {
         "register" => {
             let username = require_account_username(server, &req).await?;
-            let user = server
-                .auth_db()
-                .get_user_info(username.as_str())
-                .await
-                .into_rpc()?
-                .ok_or_else(|| parse_error(SnV2ErrorCode::UserNotFound, "user not found"))?;
-            let public_key = ensure_owner_decoding_key(&user)?;
-            let params: DeviceRegisterReq = parse_params(&req)?;
-            let decode_context = format!("v2 register_device {}.{}", username, params.device_name);
-            let mini_device_config = SNServer::decode_mini_config_with_schema_compat(
-                params.mini_config_jwt.as_str(),
-                &public_key,
-                decode_context.as_str(),
+            let params: DeviceOnlineRegisterReq = parse_params(&req)?;
+            let view = report_device_online_state(
+                server,
+                username.as_str(),
+                params.device_name.as_str(),
+                params.device_did.as_str(),
+                params.device_ip.as_str(),
+                &params.device_info,
+                Some(ip_from),
+                params.endpoints,
+                params.report_seq,
+                params.ttl,
             )
-            .map_err(|e| parse_error(SnV2ErrorCode::InvalidParams, e))?;
-            let dev_did = format!("did:dev:{}", mini_device_config.x.as_str());
-            if dev_did != params.device_did {
-                return Err(parse_error(
-                    SnV2ErrorCode::InvalidDeviceDid,
-                    format!("invalid device did: {} != {}", dev_did, params.device_did),
-                ));
-            }
-            let mut bns_receipt = None;
-            let mut pending_bns_publish = server.bns_controller().is_none();
-            let mut published_to_bns = false;
-            if let Some(controller) = server.bns_controller() {
-                let _auth_context =
-                    crate::sn_authority::require_owner_for_name(server, &req, username.as_str())
-                        .await?;
-                let authority = bns_managed_owner_authority(&controller)?;
-                let mut device_mini_doc =
-                    serde_json::from_str::<Value>(params.device_info.as_str())
-                        .ok()
-                        .filter(|value| value.is_object())
-                        .unwrap_or_else(|| json!({ "device_info": params.device_info }));
-                if let Some(obj) = device_mini_doc.as_object_mut() {
-                    obj.insert("did".to_string(), Value::String(params.device_did.clone()));
-                    obj.insert(
-                        "device_name".to_string(),
-                        Value::String(params.device_name.clone()),
-                    );
-                    obj.insert(
-                        "mini_config_jwt".to_string(),
-                        Value::String(params.mini_config_jwt.clone()),
-                    );
-                }
-                let payload = json!({
-                    "device_name": params.device_name.clone(),
-                    "device_did": params.device_did.clone(),
-                    "device_mini_doc": device_mini_doc,
-                });
-                let receipt = controller
-                    .publish_device_mini_doc(PublishDeviceMiniDocParams {
-                        request_id: stable_request_id(
-                            params.request_id.clone(),
-                            "publish_device",
-                            username.as_str(),
-                            &payload,
-                        ),
-                        name: username.clone(),
-                        device_name: payload["device_name"]
-                            .as_str()
-                            .unwrap_or_default()
-                            .to_string(),
-                        did: payload["device_did"]
-                            .as_str()
-                            .unwrap_or_default()
-                            .to_string(),
-                        device_mini_doc: payload["device_mini_doc"].clone(),
-                        authority,
-                    })
-                    .await
-                    .map_err(bns_write_error)?;
-                bns_receipt = Some(serde_json::to_value(receipt).unwrap_or_default());
-                pending_bns_publish = false;
-                published_to_bns = true;
-            }
-            if !published_to_bns {
-                server
-                    .register_device_record(
-                        username.as_str(),
-                        params.device_name.as_str(),
-                        params.device_did.as_str(),
-                        params.mini_config_jwt.as_str(),
-                        params.device_ip.as_str(),
-                        params.device_info.as_str(),
-                    )
-                    .await
-                    .into_rpc()?;
-            }
-            ok_response(
-                &req,
-                json!({
-                    "code": 0,
-                    "pending_bns_publish": pending_bns_publish,
-                    "bns_receipt": bns_receipt,
-                }),
-            )
+            .await?;
+            ok_response(&req, online_state_response(view))
         }
         "update" => {
             let username = require_account_username(server, &req).await?;
-            let params: DeviceUpdateReq = parse_params(&req)?;
-            server
-                .update_device_record(
-                    username.as_str(),
-                    params.device_name.as_str(),
-                    params.device_did.as_deref(),
-                    params.mini_config_jwt.as_deref(),
-                    params.device_ip.as_str(),
-                    params.device_info.as_str(),
-                )
-                .await
-                .into_rpc()?;
-            ok_response(&req, json!({ "code": 0 }))
+            let params: DeviceOnlineUpdateReq = parse_params(&req)?;
+            if params.mini_config_jwt.is_some() {
+                return Err(parse_error(
+                    SnV2ErrorCode::InvalidParams,
+                    "device identity document updates moved to /kapi/bns",
+                ));
+            }
+            let device_did = resolve_report_did(
+                server,
+                username.as_str(),
+                params.device_name.as_str(),
+                params.device_did.as_deref(),
+            )
+            .await?;
+            let view = report_device_online_state(
+                server,
+                username.as_str(),
+                params.device_name.as_str(),
+                device_did.as_str(),
+                params.device_ip.as_str(),
+                &params.device_info,
+                Some(ip_from),
+                params.endpoints,
+                params.report_seq,
+                params.ttl,
+            )
+            .await?;
+            ok_response(&req, online_state_response(view))
         }
         "get" => {
             let username = resolve_self_scoped_username(server, &req, false).await?;
-            let params: DeviceGetReq = parse_params(&req)?;
-            let device = server
-                .compat_store()
-                .query_device_by_name(username.as_str(), params.device_name.as_str())
-                .await
-                .into_rpc()?
-                .ok_or_else(|| parse_error(SnV2ErrorCode::DeviceNotFound, "device not found"))?;
-            ok_response(&req, device_to_json(&device))
+            let params: DeviceOnlineGetReq = parse_params(&req)?;
+            let view = if let Some(device_did) = params.device_did {
+                let view = server
+                    .device_info_db()
+                    .get_device_state(device_did.as_str())
+                    .await
+                    .into_rpc()?
+                    .ok_or_else(|| {
+                        parse_error(SnV2ErrorCode::DeviceNotFound, "device not found")
+                    })?;
+                if view.zone != username {
+                    return Err(parse_error(
+                        SnV2ErrorCode::CrossUserAccessDenied,
+                        "cross-user access is not allowed",
+                    ));
+                }
+                view
+            } else {
+                let device_name = params.device_name.ok_or_else(|| {
+                    parse_error(
+                        SnV2ErrorCode::InvalidParams,
+                        "device_name or device_did is required",
+                    )
+                })?;
+                server
+                    .device_info_db()
+                    .get_device_state_by_name(username.as_str(), device_name.as_str())
+                    .await
+                    .into_rpc()?
+                    .ok_or_else(|| parse_error(SnV2ErrorCode::DeviceNotFound, "device not found"))?
+            };
+            ok_response(&req, online_state_response(view))
         }
         "list" => {
             let username = resolve_self_scoped_username(server, &req, false).await?;
+            let params: DeviceOnlineListReq = parse_params(&req)?;
             let items = server
-                .compat_store()
-                .list_user_devices(username.as_str())
+                .device_info_db()
+                .list_zone_devices(
+                    username.as_str(),
+                    SnDeviceListOptions {
+                        state: params.state,
+                        offset: params.offset,
+                        limit: params.limit,
+                    },
+                )
                 .await
                 .into_rpc()?;
             ok_response(
                 &req,
                 json!({
                     "code": 0,
-                    "items": items.iter().map(device_to_json).collect::<Vec<Value>>(),
+                    "items": items,
                 }),
             )
         }
-        "get_by_pk" => {
-            let params: QueryByPkReq = parse_params(&req)?;
-            let proxy_req = RPCRequest {
-                params: json!({ "public_key": params.public_key }),
-                ..req
-            };
-            server.get_device_by_public_key(proxy_req).await
-        }
-        "query_by_did" => {
+        "resolve_ood_by_did" => {
             let params: QueryByDidReq = parse_params(&req)?;
-            let ood_info = query_by_did(
-                server.compat_store(),
-                server.auth_db(),
-                params.source_device_id.as_str(),
-            )
-            .await?;
+            let ood_info = server
+                .resolve_ood_by_did(params.source_device_id.as_str())
+                .await?;
             ok_response(&req, serde_json::to_value(ood_info).unwrap())
         }
-        "query_by_hostname" => {
+        "resolve_ood_by_hostname" => {
             let params: QueryByHostnameReq = parse_params(&req)?;
             let ood_info = server
                 .query_device_by_hostname_v2(params.dest_host.as_str())
@@ -188,4 +142,138 @@ pub(crate) async fn handle_device(
         }
         _ => Err(RPCErrors::UnknownMethod(req.method)),
     }
+}
+
+#[derive(Deserialize)]
+struct DeviceOnlineRegisterReq {
+    device_name: String,
+    device_did: String,
+    device_ip: String,
+    device_info: Value,
+    #[serde(default)]
+    endpoints: Vec<SnDeviceEndpointUpdate>,
+    #[serde(default)]
+    report_seq: Option<u64>,
+    #[serde(default)]
+    ttl: Option<u64>,
+}
+
+#[derive(Deserialize)]
+struct DeviceOnlineUpdateReq {
+    device_name: String,
+    #[serde(default)]
+    device_did: Option<String>,
+    #[serde(default)]
+    mini_config_jwt: Option<String>,
+    device_ip: String,
+    device_info: Value,
+    #[serde(default)]
+    endpoints: Vec<SnDeviceEndpointUpdate>,
+    #[serde(default)]
+    report_seq: Option<u64>,
+    #[serde(default)]
+    ttl: Option<u64>,
+}
+
+#[derive(Deserialize)]
+struct DeviceOnlineGetReq {
+    #[serde(default)]
+    device_name: Option<String>,
+    #[serde(default)]
+    device_did: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct DeviceOnlineListReq {
+    #[serde(default)]
+    state: Option<SnDeviceState>,
+    #[serde(default)]
+    offset: Option<usize>,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+fn online_state_response(view: SnDeviceStateView) -> Value {
+    let mut value = serde_json::to_value(view).unwrap_or_else(|_| json!({}));
+    if let Some(obj) = value.as_object_mut() {
+        obj.insert("code".to_string(), Value::Number(0.into()));
+    }
+    value
+}
+
+fn device_info_to_report_string(value: &Value) -> String {
+    value
+        .as_str()
+        .map(ToString::to_string)
+        .unwrap_or_else(|| value.to_string())
+}
+
+async fn resolve_report_did(
+    server: &SNServer,
+    username: &str,
+    device_name: &str,
+    requested_did: Option<&str>,
+) -> RpcCallResult<String> {
+    if let Some(did) = requested_did.filter(|did| !did.trim().is_empty()) {
+        return Ok(did.to_string());
+    }
+
+    if let Some(view) = server
+        .device_info_db()
+        .get_device_state_by_name(username, device_name)
+        .await
+        .into_rpc()?
+    {
+        return Ok(view.did);
+    }
+
+    if let Some(device) = server
+        .compat_store()
+        .query_device_by_name(username, device_name)
+        .await
+        .into_rpc()?
+    {
+        return Ok(device.did);
+    }
+
+    Err(parse_error(
+        SnV2ErrorCode::InvalidDeviceDid,
+        "device_did is required for the first online report",
+    ))
+}
+
+async fn report_device_online_state(
+    server: &SNServer,
+    username: &str,
+    device_name: &str,
+    device_did: &str,
+    device_ip: &str,
+    device_info: &Value,
+    from_ip: Option<std::net::IpAddr>,
+    endpoints: Vec<SnDeviceEndpointUpdate>,
+    report_seq: Option<u64>,
+    ttl: Option<u64>,
+) -> RpcCallResult<SnDeviceStateView> {
+    let report = device_info_to_report_string(device_info);
+    server
+        .upsert_device_online_state(
+            username,
+            device_name,
+            device_did,
+            device_ip,
+            report.as_str(),
+            from_ip,
+            endpoints,
+            report_seq,
+            ttl,
+        )
+        .await
+        .into_rpc()?;
+
+    server
+        .device_info_db()
+        .get_device_state(device_did)
+        .await
+        .into_rpc()?
+        .ok_or_else(|| parse_error(SnV2ErrorCode::DeviceNotFound, "device not found"))
 }
