@@ -72,6 +72,7 @@ tokio-rustls = "0.26.1"
 rustls-pemfile = "2.0"
 rustls-platform-verifier = "0.6.1"
 ring = "0.17"
+hmac = "0.12.1"
 openssl = { version = "0.10", features = ["vendored"] }
 # 证书生成
 rcgen = { version = "0.14", features = ["pem", "x509-parser"] }
