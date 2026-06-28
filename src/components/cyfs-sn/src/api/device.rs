@@ -96,7 +96,9 @@ pub(crate) async fn handle_device(
                     .get_device_state_by_name(username.as_str(), device_name.as_str())
                     .await
                     .into_rpc()?
-                    .ok_or_else(|| parse_error(SnApiErrorCode::DeviceNotFound, "device not found"))?
+                    .ok_or_else(|| {
+                        parse_error(SnApiErrorCode::DeviceNotFound, "device not found")
+                    })?
             };
             ok_response(&req, online_state_response(view))
         }

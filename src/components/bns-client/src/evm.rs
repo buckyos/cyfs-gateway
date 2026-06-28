@@ -2,6 +2,11 @@ use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 
+use crate::{
+    AuthorityKey, AuthorityKeyStatus, AuthorityKeyUpdate, AuthorityRole, CallAuthority,
+    ControllerRule, DocumentRef, DocumentUpdate, MutationGuard, Principal, PrincipalKind,
+    RegisterOptions,
+};
 use async_trait::async_trait;
 use bns_evm::{
     build_eip1559_contract_tx, sign_eip1559_tx, signer_from_private_key, Address,
@@ -12,11 +17,6 @@ use bns_evm::{
     EthRpcClient, EthTransactionReceipt, MutationGuard as EvmMutationGuard,
     Principal as EvmPrincipal, PrincipalKind as EvmPrincipalKind,
     RegisterOptions as EvmRegisterOptions, SignedEip1559Tx, SolCall, TxEip1559, B256, U256,
-};
-use bns_indexer::{
-    AuthorityKey, AuthorityKeyStatus, AuthorityKeyUpdate, AuthorityRole, CallAuthority,
-    ControllerRule, DocumentRef, DocumentUpdate, MutationGuard, Principal, PrincipalKind,
-    RegisterOptions,
 };
 use serde::{Deserialize, Serialize};
 use tokio::time::{sleep, Duration, Instant};

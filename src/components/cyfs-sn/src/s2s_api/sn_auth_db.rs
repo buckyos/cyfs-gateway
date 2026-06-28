@@ -1,7 +1,6 @@
 use crate::{
-    sn_err, AccountSession, DomainBinding, PkxBindingChallenge, SNUserInfo, SnAuthDB,
-    SnClearStateResult, SnError, SnErrorCode, SnResult, SnAuthInfo, UserState, ZoneInfo,
-    ZoneInfoPatch,
+    sn_err, AccountSession, DomainBinding, PkxBindingChallenge, SNUserInfo, SnAuthDB, SnAuthInfo,
+    SnClearStateResult, SnError, SnErrorCode, SnResult, UserState, ZoneInfo, ZoneInfoPatch,
 };
 use ::kRPC::{kRPC, RPCErrors, RPCHandler, RPCRequest, RPCResponse, RPCResult};
 use async_trait::async_trait;

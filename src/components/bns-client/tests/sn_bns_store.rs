@@ -9,7 +9,11 @@ use bns_client::{
 };
 use serde_json::json;
 
-fn record(request_id: &str, state: BnsWriteRequestState, created_at: u64) -> SnBnsWriteRequestRecord {
+fn record(
+    request_id: &str,
+    state: BnsWriteRequestState,
+    created_at: u64,
+) -> SnBnsWriteRequestRecord {
     SnBnsWriteRequestRecord {
         request_id: request_id.to_string(),
         operation: BnsWriteOperation::PublishDocument,
@@ -80,5 +84,8 @@ fn same_request_id_upserts_in_place_without_duplicate() {
     assert_eq!(got.updated_at, 1_000);
     // created_at 不在 ON CONFLICT 的 SET 列表里：保留首次插入值，证明是原地 upsert（同一行），
     // 而非新增第二行。
-    assert_eq!(got.created_at, 100, "created_at must be preserved on upsert");
+    assert_eq!(
+        got.created_at, 100,
+        "created_at must be preserved on upsert"
+    );
 }

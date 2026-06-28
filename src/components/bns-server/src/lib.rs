@@ -18,18 +18,17 @@ use bns_client::{
     BnsPublishDocumentResp, BnsRegisterNameReq, BnsRegisterNameResp, BnsRevokeDocumentReq,
     BnsRevokeDocumentResp, BnsRpcEnvelope, BnsSetControllerPolicyReq, BnsSetControllerPolicyResp,
     BnsSubmitRawTxReq, BnsSubmitRawTxResp, BnsUpdateAuthorityKeysReq, BnsUpdateAuthorityKeysResp,
-    CentralizedBnsIndexerHandler, BNS_INDEXER_RPC_PATH, BNS_SERVER_RPC_PATH,
-    METHOD_GET_AUTHORITY_KEY, METHOD_GET_AUTHORITY_SET, METHOD_GET_DOCUMENT_VERSION,
-    METHOD_LATEST_CHECKPOINT, METHOD_LIST_EVENTS, METHOD_QUERY_NAME_STATE, METHOD_RESOLVE_DOCUMENT,
-    METHOD_RESOLVE_OWNER, METHOD_SUBMIT_RAW_TX,
+    BNS_INDEXER_RPC_PATH, BNS_SERVER_RPC_PATH, METHOD_GET_AUTHORITY_KEY, METHOD_GET_AUTHORITY_SET,
+    METHOD_GET_DOCUMENT_VERSION, METHOD_LATEST_CHECKPOINT, METHOD_LIST_EVENTS,
+    METHOD_QUERY_NAME_STATE, METHOD_RESOLVE_DOCUMENT, METHOD_RESOLVE_OWNER, METHOD_SUBMIT_RAW_TX,
 };
 use bns_evm::EthRpcClient;
 use bns_indexer::{
     canonical_bns_name, canonical_doc_type, is_top_level_name, parent_name, AliasKind,
     AuthorityKey, AuthoritySetState, BnsRegistryError, BnsRegistryResult, BnsRegistryStore,
-    BnsRegistryStoreTx, CentralizedBnsRegistry, DocumentState, EventLogRecord, LogCheckpoint,
-    NameState, NameStatus, OwnerResolution, OwnerSource, Principal, PrincipalKind, ResolveResult,
-    SqliteBnsRegistryStore, ZERO_HASH,
+    BnsRegistryStoreTx, CentralizedBnsIndexerHandler, CentralizedBnsRegistry, DocumentState,
+    EventLogRecord, LogCheckpoint, NameState, NameStatus, OwnerResolution, OwnerSource, Principal,
+    PrincipalKind, ResolveResult, SqliteBnsRegistryStore, ZERO_HASH,
 };
 use bytes::Bytes;
 use cyfs_gateway_lib::{

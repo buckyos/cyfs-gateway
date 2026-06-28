@@ -251,8 +251,11 @@ async fn mine_blocks(rpc: &EthRpcClient, count: u64) {
 }
 
 fn sync_config(endpoint: &str, contract: Address, confirmations: u64) -> BnsIndexerSyncConfig {
-    let mut config =
-        BnsIndexerSyncConfig::new(BnsBlockSyncSourceConfig::anvil(endpoint, format!("{contract:#x}"), 0));
+    let mut config = BnsIndexerSyncConfig::new(BnsBlockSyncSourceConfig::anvil(
+        endpoint,
+        format!("{contract:#x}"),
+        0,
+    ));
     config.confirmations = confirmations;
     config
 }
@@ -275,8 +278,14 @@ async fn e2e_write_read_closed_loop_matches_onchain_truth() {
     let controller = controller_client(node.endpoint(), contract, WRITER_KEY);
 
     // 写：注册 alice（nonce 自动）→ publishDocument(owner, inline)。
-    let registered = controller.register_name(&register_alice_req()).await.unwrap();
-    assert_eq!(receipt_status(&wait_receipt(&rpc, &registered.tx_hash).await), "0x1");
+    let registered = controller
+        .register_name(&register_alice_req())
+        .await
+        .unwrap();
+    assert_eq!(
+        receipt_status(&wait_receipt(&rpc, &registered.tx_hash).await),
+        "0x1"
+    );
     assert_eq!(registered.from.to_lowercase(), WRITER_ADDR);
 
     let body = r#"{"id":"did:bns:alice","v":1}"#;
@@ -284,7 +293,10 @@ async fn e2e_write_read_closed_loop_matches_onchain_truth() {
         .publish_document(&publish_owner_doc_req(1, body))
         .await
         .unwrap();
-    assert_eq!(receipt_status(&wait_receipt(&rpc, &published.tx_hash).await), "0x1");
+    assert_eq!(
+        receipt_status(&wait_receipt(&rpc, &published.tx_hash).await),
+        "0x1"
+    );
     // 连续两笔写 nonce 递增（注册 nonce N、发布 nonce N+1）。
     assert_eq!(published.nonce, registered.nonce + 1);
 
@@ -293,7 +305,10 @@ async fn e2e_write_read_closed_loop_matches_onchain_truth() {
     let outcome = sync_bns_contract_once(&store, sync_config(node.endpoint(), contract, 0))
         .await
         .unwrap();
-    assert!(outcome.registry_events_stored >= 2, "expected name+document events");
+    assert!(
+        outcome.registry_events_stored >= 2,
+        "expected name+document events"
+    );
 
     // 读投影：name Active、owner 文档 version 1、inline 内容一致。
     let (name_state, doc_state) = store
@@ -312,7 +327,12 @@ async fn e2e_write_read_closed_loop_matches_onchain_truth() {
 
     // 投影 == 链上 eth_call 权威态（nameSeq / status 由 eth_call 取得，而非事件回放）。
     let onchain = rpc
-        .call_contract(contract, &Bns::queryNameStateCall { name: "alice".to_string() })
+        .call_contract(
+            contract,
+            &Bns::queryNameStateCall {
+                name: "alice".to_string(),
+            },
+        )
         .await
         .unwrap();
     assert_eq!(onchain.nameSeq, name_state.name_seq);
@@ -349,7 +369,10 @@ async fn e2e_signing_boundary_actor_mismatch_reverts_onchain() {
     let rpc = node.rpc();
 
     let controller = controller_client(node.endpoint(), contract, WRITER_KEY);
-    let registered = controller.register_name(&register_alice_req()).await.unwrap();
+    let registered = controller
+        .register_name(&register_alice_req())
+        .await
+        .unwrap();
     wait_receipt(&rpc, &registered.tx_hash).await;
 
     // 正常路径：actor == signer == msg.sender → 通过。
@@ -357,7 +380,10 @@ async fn e2e_signing_boundary_actor_mismatch_reverts_onchain() {
         .publish_document(&publish_owner_doc_req(1, r#"{"v":"ok"}"#))
         .await
         .unwrap();
-    assert_eq!(receipt_status(&wait_receipt(&rpc, &ok.tx_hash).await), "0x1");
+    assert_eq!(
+        receipt_status(&wait_receipt(&rpc, &ok.tx_hash).await),
+        "0x1"
+    );
 
     // 越权路径：用 WRITER_KEY 签名（msg.sender = writer），但把 CallAuthority.actor
     // 改成另一个地址 → 合约只信 msg.sender 与有效 owner 的关系，actor 提示对不上 → revert。
@@ -372,7 +398,9 @@ async fn e2e_signing_boundary_actor_mismatch_reverts_onchain() {
     );
 
     // 错误码透传演示：用 eth_call（from = writer）模拟同一调用 → JSON-RPC 回传 revert 错误。
-    let bad_calldata = bns_client::publish_document_call(&bad).unwrap().abi_encode();
+    let bad_calldata = bns_client::publish_document_call(&bad)
+        .unwrap()
+        .abi_encode();
     let simulated: Result<String, _> = rpc
         .call(
             "eth_call",
@@ -383,7 +411,10 @@ async fn e2e_signing_boundary_actor_mismatch_reverts_onchain() {
             }, "latest"]),
         )
         .await;
-    assert!(simulated.is_err(), "eth_call simulation should surface the revert");
+    assert!(
+        simulated.is_err(),
+        "eth_call simulation should surface the revert"
+    );
 
     // 投影不变：越权写没有改变链上权威态，sync 后 owner 文档仍是上一笔合法版本。
     let store = SqliteBnsRegistryStore::open_memory().unwrap();
@@ -413,7 +444,10 @@ async fn e2e_nonce_replay_and_chain_id_rejection() {
     let rpc = node.rpc();
 
     let controller = controller_client(node.endpoint(), contract, WRITER_KEY);
-    let first = controller.register_name(&register_alice_req()).await.unwrap();
+    let first = controller
+        .register_name(&register_alice_req())
+        .await
+        .unwrap();
     let receipt = wait_receipt(&rpc, &first.tx_hash).await;
     assert_eq!(receipt_status(&receipt), "0x1");
 
@@ -436,11 +470,19 @@ async fn e2e_nonce_replay_and_chain_id_rejection() {
         .unwrap();
     let signed = sign_eip1559_tx(tx, &signer).unwrap();
     let wrong = standard.submit_raw_tx(&signed.raw_tx).await;
-    assert!(wrong.is_err(), "TX with mismatched chainId must be rejected");
+    assert!(
+        wrong.is_err(),
+        "TX with mismatched chainId must be rejected"
+    );
 
     // 自检：重放/错链都没有意外改变链状态，alice 仍只注册过一次（nameSeq == 1）。
     let onchain = rpc
-        .call_contract(contract, &Bns::queryNameStateCall { name: "alice".to_string() })
+        .call_contract(
+            contract,
+            &Bns::queryNameStateCall {
+                name: "alice".to_string(),
+            },
+        )
         .await
         .unwrap();
     assert_eq!(onchain.nameSeq, 1);
@@ -462,7 +504,10 @@ async fn e2e_confirmations_gate_and_cursor_advance() {
     let rpc = node.rpc();
 
     let controller = controller_client(node.endpoint(), contract, WRITER_KEY);
-    let registered = controller.register_name(&register_alice_req()).await.unwrap();
+    let registered = controller
+        .register_name(&register_alice_req())
+        .await
+        .unwrap();
     wait_receipt(&rpc, &registered.tx_hash).await;
     let write_block = rpc.block_number().await.unwrap();
 
@@ -470,9 +515,12 @@ async fn e2e_confirmations_gate_and_cursor_advance() {
     let confirmations = 5;
     let store = SqliteBnsRegistryStore::open_memory().unwrap();
 
-    let first = sync_bns_contract_once(&store, sync_config(node.endpoint(), contract, confirmations))
-        .await
-        .unwrap();
+    let first = sync_bns_contract_once(
+        &store,
+        sync_config(node.endpoint(), contract, confirmations),
+    )
+    .await
+    .unwrap();
     let cursor_after_first = first.cursor.as_ref().map(|c| c.block_number).unwrap_or(0);
     assert!(
         cursor_after_first < write_block,
@@ -485,9 +533,12 @@ async fn e2e_confirmations_gate_and_cursor_advance() {
 
     // 推进足够多的块满足 confirmations，再同步 → 投影命中。
     mine_blocks(&rpc, confirmations + 1).await;
-    let second = sync_bns_contract_once(&store, sync_config(node.endpoint(), contract, confirmations))
-        .await
-        .unwrap();
+    let second = sync_bns_contract_once(
+        &store,
+        sync_config(node.endpoint(), contract, confirmations),
+    )
+    .await
+    .unwrap();
     let cursor_after_second = second.cursor.as_ref().map(|c| c.block_number).unwrap_or(0);
     assert!(
         cursor_after_second > cursor_after_first,
@@ -520,34 +571,53 @@ async fn e2e_redeploy_uses_isolated_source_and_replays_from_zero() {
     // 第一份合约 + 写入 + 同步。
     let contract_a = deploy_bns(node.endpoint(), DEPLOYER_KEY).await;
     let controller_a = controller_client(node.endpoint(), contract_a, WRITER_KEY);
-    let reg_a = controller_a.register_name(&register_alice_req()).await.unwrap();
+    let reg_a = controller_a
+        .register_name(&register_alice_req())
+        .await
+        .unwrap();
     wait_receipt(&rpc, &reg_a.tx_hash).await;
 
     let store = SqliteBnsRegistryStore::open_memory().unwrap();
     let config_a = sync_config(node.endpoint(), contract_a, 0);
     let source_a = config_a.source.source_id().unwrap();
-    sync_bns_contract_once(&store, config_a.clone()).await.unwrap();
+    sync_bns_contract_once(&store, config_a.clone())
+        .await
+        .unwrap();
     assert!(store.transact(|tx| tx.get_name("alice")).unwrap().is_some());
 
     // 重部署：新合约地址 → 新 source；注册同名 alice。
     let contract_b = deploy_bns(node.endpoint(), DEPLOYER_KEY).await;
     assert_ne!(contract_a, contract_b, "redeploy must yield a new address");
     let controller_b = controller_client(node.endpoint(), contract_b, WRITER_KEY);
-    let reg_b = controller_b.register_name(&register_alice_req()).await.unwrap();
+    let reg_b = controller_b
+        .register_name(&register_alice_req())
+        .await
+        .unwrap();
     wait_receipt(&rpc, &reg_b.tx_hash).await;
 
     let config_b = sync_config(node.endpoint(), contract_b, 0);
     let source_b = config_b.source.source_id().unwrap();
-    assert_ne!(source_a, source_b, "new contract address must be a new source");
+    assert_ne!(
+        source_a, source_b,
+        "new contract address must be a new source"
+    );
 
     // 新 source 从 start_block(0) 重放（旧游标不串扰），投影命中且语义等价。
     let outcome_b = sync_bns_contract_once(&store, config_b).await.unwrap();
     assert_eq!(outcome_b.source, source_b);
-    assert_eq!(outcome_b.from_block, 0, "new source replays from start_block 0");
+    assert_eq!(
+        outcome_b.from_block, 0,
+        "new source replays from start_block 0"
+    );
     assert!(outcome_b.registry_events_stored >= 1);
 
     let onchain_b = rpc
-        .call_contract(contract_b, &Bns::queryNameStateCall { name: "alice".to_string() })
+        .call_contract(
+            contract_b,
+            &Bns::queryNameStateCall {
+                name: "alice".to_string(),
+            },
+        )
         .await
         .unwrap();
     let projected = store
@@ -597,25 +667,30 @@ async fn e2e_controller_policy_scopes_doc_types_on_chain() {
         })
         .await
         .unwrap();
-    assert_eq!(receipt_status(&wait_receipt(&rpc, &set_policy.tx_hash).await), "0x1");
+    assert_eq!(
+        receipt_status(&wait_receipt(&rpc, &set_policy.tx_hash).await),
+        "0x1"
+    );
     let name_seq_after_policy = rpc
-        .call_contract(contract, &Bns::queryNameStateCall { name: "alice".to_string() })
+        .call_contract(
+            contract,
+            &Bns::queryNameStateCall {
+                name: "alice".to_string(),
+            },
+        )
         .await
         .unwrap()
         .nameSeq;
 
     // controller（CONTROLLER_KEY）publish 授权 docType "service" → 通过。
     let controller = controller_client(node.endpoint(), contract, CONTROLLER_KEY);
-    let controller_authority = CallAuthority::controller(Principal::chain_account(CONTROLLER_ADDR), "");
+    let controller_authority =
+        CallAuthority::controller(Principal::chain_account(CONTROLLER_ADDR), "");
     let allowed = controller
         .publish_document(&BnsPublishDocumentReq {
             name: "alice".to_string(),
-            update: default_document_update(
-                "service",
-                0,
-                DocumentRef::inline(br#"{"svc":"ok"}"#),
-            )
-            .unwrap(),
+            update: default_document_update("service", 0, DocumentRef::inline(br#"{"svc":"ok"}"#))
+                .unwrap(),
             authority: controller_authority.clone(),
             guard: MutationGuard {
                 expected_name_seq: name_seq_after_policy,
@@ -630,7 +705,12 @@ async fn e2e_controller_policy_scopes_doc_types_on_chain() {
         "controller must publish its authorized docType"
     );
     let name_seq_after_allowed = rpc
-        .call_contract(contract, &Bns::queryNameStateCall { name: "alice".to_string() })
+        .call_contract(
+            contract,
+            &Bns::queryNameStateCall {
+                name: "alice".to_string(),
+            },
+        )
         .await
         .unwrap()
         .nameSeq;

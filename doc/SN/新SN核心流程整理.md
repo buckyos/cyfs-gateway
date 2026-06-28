@@ -21,7 +21,7 @@ SN 是 BNS 早期可用性的过渡服务，最终目标不是生态化，而是
   -> resolver / relay / node_daemon 使用该状态
 ```
 
-这条核心路径中，SN 不代替用户写 BNS，不持有 owner 权限，也不需要成为 BNS controller。`bns-indexer` 是 BNS 合约的本地只读事件索引器，监听合约 event、解码后整理成可查询的最终状态投影；权威状态始终在合约本身，SN 只消费这个只读最终状态。BNS 写路径与签名边界的细化设计见 `doc/SN/BNS-签名边界改造-EVM-TX-TODO.md`。
+这条核心路径中，SN 不代替用户写 BNS，不持有 owner 权限，也不需要成为 BNS controller。`bns-indexer` 是 BNS 合约的本地只读事件索引器，监听合约 event、解码后整理成可查询的最终状态投影；权威状态始终在合约本身，SN 只消费这个只读最终状态。BNS 写路径与签名边界的细化设计见 `../BNS/BNS-签名边界改造-EVM-TX-TODO.md`。
 
 因此，`cyfs-sn` 的开源实现主要是 SN 过渡层的参考实现，用来说明协议原理、支持审计、测试和兼容性验证；它不应该被理解为鼓励普通用户或第三方服务商长期运行生产 SN。第三方运行 SN 可以作为兼容结果存在，但不应成为 BNS 的产品主路径，也不应形成“用户选择 SN 服务商”的终局模型。
 
@@ -59,7 +59,7 @@ BNS 本地索引器和最终状态查询层。站在 SN 视角，它负责：
 - helper schema 解析和校验，例如 `zone`、`boot`、`device_mini_doc`、`dns_txt`
 - 从 BNS 合约 event 监听、解码生成本地只读最终状态投影，供 SN、local resolver 和 gateway 查询
 
-`bns-indexer` 是只读事件索引器，不再持有 register name / publish document 等写接口；BNS 写操作一律以已签名 raw TX 提交到 BNS 合约（经 BNS-Server `eth_sendRawTransaction` 转发），由合约 emit event 后再被索引器投影。详见 `doc/SN/BNS-签名边界改造-EVM-TX-TODO.md`。从 SN core 的架构边界看，这些 BNS 读写都属于 BNS 系统接口，不是 SN 的必需依赖。
+`bns-indexer` 是只读事件索引器，不再持有 register name / publish document 等写接口；BNS 写操作一律以已签名 raw TX 提交到 BNS 合约（经 BNS-Server `eth_sendRawTransaction` 转发），由合约 emit event 后再被索引器投影。详见 `../BNS/BNS-签名边界改造-EVM-TX-TODO.md`。从 SN core 的架构边界看，这些 BNS 读写都属于 BNS 系统接口，不是 SN 的必需依赖。
 
 `sn_document_schema` 不单独拆服务，应该沉到 `bns-indexer` helper 中。
 

@@ -16,8 +16,9 @@ use bns_evm::{
     encode_call, sign_eip1559_tx, signer_from_private_key, AliasKind as EvmAliasKind,
     AuthorityRole as EvmAuthorityRole, Bns, CallAuthority as EvmCallAuthority,
     ControllerRule as EvmControllerRule, DocumentRef as EvmDocumentRef, Eip1559TxParams,
-    MutationGuard as EvmMutationGuard, Principal as EvmPrincipal, PrincipalKind as EvmPrincipalKind,
-    RegisterOptions as EvmRegisterOptions, ReleaseMode as EvmReleaseMode, TxKind,
+    MutationGuard as EvmMutationGuard, Principal as EvmPrincipal,
+    PrincipalKind as EvmPrincipalKind, RegisterOptions as EvmRegisterOptions,
+    ReleaseMode as EvmReleaseMode, TxKind,
 };
 
 // 测试中复用的 anvil 第 0 个确定性账户私钥/地址。
@@ -116,7 +117,10 @@ fn register_name_call_round_trips() {
         decoded.authority.actor.kind,
         EvmPrincipalKind::ChainAccount
     ));
-    assert_eq!(decoded.authority.actor.value.as_ref(), ANVIL_ADDR_0.as_slice());
+    assert_eq!(
+        decoded.authority.actor.value.as_ref(),
+        ANVIL_ADDR_0.as_slice()
+    );
 
     let iface = decode_bns_call(&encoded).expect("decode interface");
     assert_eq!(iface.selector(), Bns::registerNameCall::SELECTOR);
@@ -308,7 +312,10 @@ fn set_name_owner_call_round_trips() {
     };
     let encoded = call.abi_encode();
     let decoded = Bns::setNameOwnerCall::abi_decode(&encoded).expect("decode setNameOwner");
-    assert_eq!(decoded.semanticOwner.value.as_ref(), ANVIL_ADDR_0.as_slice());
+    assert_eq!(
+        decoded.semanticOwner.value.as_ref(),
+        ANVIL_ADDR_0.as_slice()
+    );
 }
 
 #[test]

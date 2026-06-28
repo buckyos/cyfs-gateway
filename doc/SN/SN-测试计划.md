@@ -2,7 +2,7 @@
 
 > 本计划按当前仓库的实际实现整理，描述重点是测试目的和风险边界；具体用例名称、内部函数和行号以测试代码为准。
 >
-> 相关设计文档：[SN-Auth.md](SN-Auth.md)、[SN-DeviceInfo-DB.md](SN-DeviceInfo-DB.md)、[SN-BNS-Contoller.md](SN-BNS-Contoller.md)、[SN-Resolver.md](SN-Resolver.md)、[SN-Relay.md](SN-Relay.md)、[新SN核心流程整理.md](新SN核心流程整理.md)。
+> 相关设计文档：[SN-Auth.md](SN-Auth.md)、[SN-DeviceInfo-DB.md](SN-DeviceInfo-DB.md)、[SN-BNS-Contoller.md](../BNS/SN-BNS-Contoller.md)、[SN-Resolver.md](SN-Resolver.md)、[SN-Relay.md](SN-Relay.md)、[新SN核心流程整理.md](新SN核心流程整理.md)。
 
 ## 0. 总体目标
 

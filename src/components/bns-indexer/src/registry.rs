@@ -1,14 +1,23 @@
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
+use async_trait::async_trait;
+use bns_client::{
+    BnsApplyMutationsReq, BnsApplyMutationsResp, BnsBootstrapNameReq, BnsBootstrapNameResp,
+    BnsClientError, BnsClientResult, BnsDocumentVersion, BnsIndexerApi, BnsPublishDocumentReq,
+    BnsPublishDocumentResp, BnsRegisterNameReq, BnsRegisterNameResp, BnsRevokeDocumentReq,
+    BnsRevokeDocumentResp, BnsSetControllerPolicyReq, BnsSetControllerPolicyResp,
+    BnsUpdateAuthorityKeysReq, BnsUpdateAuthorityKeysResp,
+};
 use serde_json::Value;
 
 use crate::{
     canonical_bns_name, canonical_doc_type, document_state_hash, ensure_registerable_depth,
-    hash_json, is_top_level_name, now_timestamp, parent_name, validate_did, validate_hash,
+    is_top_level_name, now_timestamp, parent_name, validate_did, validate_hash,
     validate_semantic_owner, AliasKind, AliasState, ApplyMutationsResult, AuthorityKey,
     AuthorityKeyStatus, AuthorityKeyUpdate, AuthorityRole, AuthoritySetState, BnsRegistryError,
     BnsRegistryResult, BnsRegistryStore, BnsRegistryStoreTx, BootstrapDocumentVersion,
-    BootstrapNameResult, CallAuthority, ControllerRule, DocumentRef, DocumentState, DocumentStatus,
+    BootstrapNameResult, CallAuthority, ControllerRule, DocumentState, DocumentStatus,
     DocumentUpdate, EventLogRecord, LogCheckpoint, MutationGuard, NameState, NameStatus,
     OwnerResolution, OwnerSource, PaymentTargetResolution, Principal, PrincipalKind,
     PurchaseContext, RegisterOptions, RegistryEvent, ReleaseMode, ResolveResult,
@@ -25,6 +34,246 @@ where
 {
     store: S,
     writes_enabled: bool,
+}
+
+pub struct CentralizedBnsIndexerHandler<S>
+where
+    S: BnsRegistryStore,
+{
+    registry: Arc<CentralizedBnsRegistry<S>>,
+}
+
+impl<S> CentralizedBnsIndexerHandler<S>
+where
+    S: BnsRegistryStore,
+{
+    pub fn new(registry: Arc<CentralizedBnsRegistry<S>>) -> Self {
+        Self { registry }
+    }
+
+    pub fn registry(&self) -> &CentralizedBnsRegistry<S> {
+        &self.registry
+    }
+}
+
+#[async_trait]
+impl<S> BnsIndexerApi for CentralizedBnsIndexerHandler<S>
+where
+    S: BnsRegistryStore + 'static,
+{
+    async fn query_name_state(&self, name: &str) -> BnsClientResult<Option<NameState>> {
+        self.registry.query_name_state(name).map_err(Into::into)
+    }
+
+    async fn resolve_owner(&self, name: &str) -> BnsClientResult<OwnerResolution> {
+        self.registry.resolve_owner(name).map_err(Into::into)
+    }
+
+    async fn get_authority_set(&self, name: &str) -> BnsClientResult<AuthoritySetState> {
+        self.registry.get_authority_set(name).map_err(Into::into)
+    }
+
+    async fn get_authority_key(
+        &self,
+        name: &str,
+        kid: &str,
+    ) -> BnsClientResult<Option<AuthorityKey>> {
+        self.registry
+            .get_authority_key(name, kid)
+            .map_err(Into::into)
+    }
+
+    async fn resolve_document(&self, name: &str, doc_type: &str) -> BnsClientResult<ResolveResult> {
+        self.registry
+            .resolve_document(name, doc_type)
+            .map_err(Into::into)
+    }
+
+    async fn get_document_version(
+        &self,
+        name: &str,
+        doc_type: &str,
+        version: u64,
+    ) -> BnsClientResult<Option<DocumentState>> {
+        self.registry
+            .get_document_version(name, doc_type, version)
+            .map_err(Into::into)
+    }
+
+    async fn register_name(&self, req: BnsRegisterNameReq) -> BnsClientResult<BnsRegisterNameResp> {
+        let has_bootstrap_fields = !req.authority_key_updates.is_empty()
+            || req.semantic_owner_after_authority.is_some()
+            || !req.controller_policy.is_empty()
+            || (!req.controller_policy_hash.is_empty() && req.controller_policy_hash != ZERO_HASH);
+        let name_seq = if has_bootstrap_fields {
+            self.registry
+                .bootstrap_name(
+                    &req.name,
+                    &req.asset_owner,
+                    req.options,
+                    req.initial_documents,
+                    req.authority_key_updates,
+                    req.semantic_owner_after_authority,
+                    req.controller_policy,
+                    &req.controller_policy_hash,
+                    req.authority,
+                    req.guard,
+                )
+                .map(|result| result.name_seq)
+        } else {
+            self.registry.register_name(
+                &req.name,
+                &req.asset_owner,
+                req.options,
+                req.initial_documents,
+                req.authority,
+                req.guard,
+            )
+        }
+        .map_err(BnsClientError::from)?;
+        Ok(BnsRegisterNameResp { name_seq })
+    }
+
+    async fn apply_mutations(
+        &self,
+        req: BnsApplyMutationsReq,
+    ) -> BnsClientResult<BnsApplyMutationsResp> {
+        let result = self
+            .registry
+            .apply_mutations(
+                &req.name,
+                req.authority_key_updates,
+                req.documents,
+                req.authority,
+                req.guard,
+            )
+            .map_err(BnsClientError::from)?;
+        Ok(BnsApplyMutationsResp {
+            name_seq: result.name_seq,
+            documents: result
+                .documents
+                .into_iter()
+                .map(|document| BnsDocumentVersion {
+                    doc_type: document.doc_type,
+                    version: document.version,
+                    content_hash: document.content_hash,
+                    document_state_hash: document.document_state_hash,
+                })
+                .collect(),
+            authority_set: result.authority_set,
+        })
+    }
+
+    async fn bootstrap_name(
+        &self,
+        req: BnsBootstrapNameReq,
+    ) -> BnsClientResult<BnsBootstrapNameResp> {
+        let result = self
+            .registry
+            .bootstrap_name(
+                &req.name,
+                &req.asset_owner,
+                req.options,
+                req.initial_documents,
+                req.authority_key_updates,
+                req.semantic_owner_after_authority,
+                req.controller_policy,
+                &req.controller_policy_hash,
+                req.authority,
+                req.guard,
+            )
+            .map_err(BnsClientError::from)?;
+        Ok(BnsBootstrapNameResp {
+            name_seq: result.name_seq,
+            initial_documents: result
+                .initial_documents
+                .into_iter()
+                .map(|document| BnsDocumentVersion {
+                    doc_type: document.doc_type,
+                    version: document.version,
+                    content_hash: document.content_hash,
+                    document_state_hash: document.document_state_hash,
+                })
+                .collect(),
+            authority_set: result.authority_set,
+            controller_policy_hash: result.controller_policy_hash,
+        })
+    }
+
+    async fn publish_document(
+        &self,
+        req: BnsPublishDocumentReq,
+    ) -> BnsClientResult<BnsPublishDocumentResp> {
+        let document_version = self
+            .registry
+            .publish_document(&req.name, req.update, req.authority, req.guard)
+            .map_err(BnsClientError::from)?;
+        Ok(BnsPublishDocumentResp { document_version })
+    }
+
+    async fn revoke_document(
+        &self,
+        req: BnsRevokeDocumentReq,
+    ) -> BnsClientResult<BnsRevokeDocumentResp> {
+        let name_seq = self
+            .registry
+            .revoke_document(
+                &req.name,
+                &req.doc_type,
+                req.from_version,
+                req.to_version,
+                &req.reason_hash,
+                req.authority,
+                req.guard,
+            )
+            .map_err(BnsClientError::from)?;
+        Ok(BnsRevokeDocumentResp { name_seq })
+    }
+
+    async fn set_controller_policy(
+        &self,
+        req: BnsSetControllerPolicyReq,
+    ) -> BnsClientResult<BnsSetControllerPolicyResp> {
+        let name_seq = self
+            .registry
+            .set_controller_policy(
+                &req.name,
+                req.rules,
+                &req.policy_hash,
+                req.authority,
+                req.guard,
+            )
+            .map_err(BnsClientError::from)?;
+        Ok(BnsSetControllerPolicyResp {
+            name_seq,
+            policy_hash: req.policy_hash,
+        })
+    }
+
+    async fn update_authority_keys(
+        &self,
+        req: BnsUpdateAuthorityKeysReq,
+    ) -> BnsClientResult<BnsUpdateAuthorityKeysResp> {
+        let authority_set = self
+            .registry
+            .update_authority_keys(&req.name, req.updates, req.authority, req.guard)
+            .map_err(BnsClientError::from)?;
+        Ok(BnsUpdateAuthorityKeysResp { authority_set })
+    }
+
+    async fn list_events(
+        &self,
+        from_seq: u64,
+        limit: usize,
+    ) -> BnsClientResult<Vec<EventLogRecord>> {
+        self.registry
+            .list_events(from_seq, limit)
+            .map_err(Into::into)
+    }
+
+    async fn latest_checkpoint(&self) -> BnsClientResult<Option<LogCheckpoint>> {
+        self.registry.latest_checkpoint().map_err(Into::into)
+    }
 }
 
 impl<S> CentralizedBnsRegistry<S>
@@ -2045,45 +2294,4 @@ fn json_type_name(value: &Value) -> &'static str {
         Value::Array(_) => "array",
         Value::Object(_) => "object",
     }
-}
-
-pub fn default_document_update(
-    doc_type: &str,
-    expected_version: u64,
-    document: DocumentRef,
-) -> BnsRegistryResult<DocumentUpdate> {
-    Ok(DocumentUpdate {
-        doc_type: canonical_doc_type(doc_type)?,
-        expected_version,
-        document,
-        controller: Principal::unset(),
-        beneficiary: Principal::unset(),
-        payment_target: String::new(),
-        expire_at: 0,
-        controller_policy_hash: ZERO_HASH.to_string(),
-        payment_policy_hash: ZERO_HASH.to_string(),
-        split_policy_hash: ZERO_HASH.to_string(),
-        price_policy_hash: ZERO_HASH.to_string(),
-        rights_policy_hash: ZERO_HASH.to_string(),
-    })
-}
-
-pub fn controller_rule(
-    controller: Principal,
-    doc_type: impl Into<String>,
-    permissions: u32,
-) -> ControllerRule {
-    ControllerRule {
-        controller,
-        doc_type: doc_type.into(),
-        permissions,
-        namespace_scope_hash: ZERO_HASH.to_string(),
-        valid_from: 0,
-        valid_until: 0,
-        constraint_hash: ZERO_HASH.to_string(),
-    }
-}
-
-pub fn policy_hash_from_rules(rules: &[ControllerRule]) -> BnsRegistryResult<String> {
-    hash_json(rules)
 }

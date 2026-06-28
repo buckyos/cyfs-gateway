@@ -1,5 +1,6 @@
 use crate::api::{handle_auth, handle_device, handle_dns, handle_domain, handle_user};
 use crate::name_info_cache::{NameInfoCache, NameInfoCacheQueryResult, NameInfoCacheRef};
+use crate::sn_auth_manager::SnAuthManager;
 use crate::sn_bns_reader::BnsIndexerDocumentReader;
 use crate::sn_compat_store::{SNDeviceInfo, SnCompatibilityStoreRef, SqliteSnCompatibilityStore};
 use crate::sn_resolver::{
@@ -8,7 +9,6 @@ use crate::sn_resolver::{
     SnRelayManagerResolverReader, SnResolver, SnResolverConfig, SnResolverError,
     SnResolverErrorKind, SnResolverRef, SnResolverResult,
 };
-use crate::sn_auth_manager::SnAuthManager;
 use crate::{
     SNUserInfo, SnAuthDBRef, SnDeviceEndpointUpdate, SnDeviceInfoDBRef, SnDeviceRole,
     SnDeviceState, SnDeviceStateUpdate, SnEndpointProtocol, SnEndpointScope, SnEndpointSource,
@@ -4876,10 +4876,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(
-            result["did_document"]["name"].as_str().unwrap(),
-            TEST_USER
-        );
+        assert_eq!(result["did_document"]["name"].as_str().unwrap(), TEST_USER);
 
         let query_krpc = kRPC::new(sn_url.as_str(), Some(login_access_token.clone()));
         let result = query_krpc
@@ -4918,10 +4915,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(
-            result["document"]["user_name"].as_str().unwrap(),
-            TEST_USER
-        );
+        assert_eq!(result["document"]["user_name"].as_str().unwrap(), TEST_USER);
 
         let result = query_krpc
             .call(

@@ -422,9 +422,7 @@ impl SnAuthDB for RemoteSnAuthDB {
     }
 
     async fn update_last_login(&self, username: &str, last_login_at: u64) -> SnResult<()> {
-        self.client
-            .update_last_login(username, last_login_at)
-            .await
+        self.client.update_last_login(username, last_login_at).await
     }
 
     async fn create_pkx_binding(
@@ -2614,10 +2612,7 @@ mod tests {
 
         let code = codes[0].as_str();
         assert!(db.check_active_code(code).await?);
-        assert!(
-            db.register_user(code, "alice", "h", "s", "pbkdf2")
-                .await?
-        );
+        assert!(db.register_user(code, "alice", "h", "s", "pbkdf2").await?);
 
         // 注册后事务内 used=1。
         let used: i64 = sqlx::query_scalar("SELECT used FROM activation_codes WHERE code = ?1")

@@ -4,7 +4,7 @@
 > 与内嵌 `boot_jwt` **完全对称**。`device_mini_doc` 和 `boot` 拆成独立 doc_type 的**根本原因都是
 > DNS TXT 256 字节塞不下**,才被迫单独拆出去。即:内嵌于 zone-config 是规范形态,独立 doc 是 DNS 妥协。
 >
-> 参见 zone/boot 原子化设计、`doc/BNS 智能合约接口设计.md` §5.3、SN-BNS-Contoller.md。
+> 参见 zone/boot 原子化设计、`BNS 智能合约接口设计.md` §5.3、SN-BNS-Contoller.md。
 
 ---
 

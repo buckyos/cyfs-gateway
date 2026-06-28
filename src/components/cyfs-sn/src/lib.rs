@@ -3,13 +3,13 @@ pub mod name_info_cache;
 mod relay_mgr;
 pub mod s2s_api;
 mod sn_auth;
+mod sn_auth_manager;
 mod sn_authority;
 mod sn_bns_reader;
 mod sn_compat_store;
 mod sn_device_info;
 pub mod sn_resolver;
 mod sn_server;
-mod sn_auth_manager;
 
 pub use name_info_cache::*;
 pub use relay_mgr::*;

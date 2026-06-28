@@ -6,25 +6,20 @@
 //! in-process mutation state machine is only available through the hidden
 //! compatibility constructor used by historical tests.
 
-pub mod dns_document;
-
-mod error;
 mod evm_projection;
-mod model;
 mod registry;
 mod sqlite;
 mod store;
 mod sync;
 
-pub use error::{BnsRegistryError, BnsRegistryResult};
+pub use bns_client::dns_document;
+pub use bns_client::model::*;
+pub use bns_client::{BnsRegistryError, BnsRegistryResult};
 pub use evm_projection::{
     checkpoint_from_event, store_event_record, ContractEventProjector, ContractProtocolEvent,
     ProjectedContractEvent,
 };
-pub use model::*;
-pub use registry::{
-    controller_rule, default_document_update, policy_hash_from_rules, CentralizedBnsRegistry,
-};
+pub use registry::{CentralizedBnsIndexerHandler, CentralizedBnsRegistry};
 pub use sqlite::SqliteBnsRegistryStore;
 pub use store::{BnsRegistryStore, BnsRegistryStoreTx};
 pub use sync::{

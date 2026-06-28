@@ -62,8 +62,7 @@ impl MockEthRpc {
                             }
                         }
                     }
-                    let body =
-                        format!(r#"{{"jsonrpc":"2.0","id":1,"result":"{TX_HASH}"}}"#);
+                    let body = format!(r#"{{"jsonrpc":"2.0","id":1,"result":"{TX_HASH}"}}"#);
                     let response = format!(
                         "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
                         body.len(),
@@ -174,8 +173,10 @@ fn seeded_store() -> SqliteBnsRegistryStore {
 #[tokio::test]
 async fn submit_raw_tx_forwards_exact_bytes_and_returns_hash() {
     let mock = MockEthRpc::start().await;
-    let handler =
-        BnsContractServerHandler::new(SqliteBnsRegistryStore::open_memory().unwrap(), &mock.endpoint);
+    let handler = BnsContractServerHandler::new(
+        SqliteBnsRegistryStore::open_memory().unwrap(),
+        &mock.endpoint,
+    );
 
     let raw_hex = "0x02f86a8205";
     let resp = handler
@@ -195,8 +196,10 @@ async fn submit_raw_tx_does_not_parse_or_authenticate_payload() {
     // 不解释 payload / 不鉴权：一段不是合法签名 TX 的"垃圾"字节，server 仍原样转发；
     // 拒绝应发生在链上（mock 这里代表链，简单回 hash）。
     let mock = MockEthRpc::start().await;
-    let handler =
-        BnsContractServerHandler::new(SqliteBnsRegistryStore::open_memory().unwrap(), &mock.endpoint);
+    let handler = BnsContractServerHandler::new(
+        SqliteBnsRegistryStore::open_memory().unwrap(),
+        &mock.endpoint,
+    );
 
     let garbage = "0xdeadbeefcafe";
     let resp = handler
@@ -271,11 +274,7 @@ async fn legacy_write_methods_are_not_routed_by_rpc() {
         "http://127.0.0.1:1",
     );
     let rpc = BnsContractServerRpcHandler::new(handler);
-    for method in [
-        "name.register",
-        "document.publish",
-        "controller.set_policy",
-    ] {
+    for method in ["name.register", "document.publish", "controller.set_policy"] {
         let req = RPCRequest::new(method, serde_json::json!({}));
         let err = rpc
             .handle_rpc_call(req, "127.0.0.1".parse().unwrap())

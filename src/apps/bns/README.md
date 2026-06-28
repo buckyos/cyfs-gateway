@@ -1,7 +1,7 @@
 # BNS Contracts
 
 First EVM implementation of the BNS registry described in
-`../../../doc/BNS 智能合约接口设计.md`.
+`../../../doc/BNS/BNS 智能合约接口设计.md`.
 
 ## Layout
 

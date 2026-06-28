@@ -2,9 +2,9 @@
 
 `sn_bns_controller` 是 SN 写入 BNS 的封装层，对应分层模型中的 **BNS-Controller**（BNS-Client 在“持有该资产 control 私钥”时启用的前置签名逻辑）。它把 SN 侧已经完成的业务鉴权、owner 签名校验、设备签名校验和自动化任务，构造成 BNS 合约写操作：填 nonce / chainId / gas → ABI 编码（`CallAuthority + MutationGuard + DocumentUpdate` 作为合约入参）→ 用托管 control 私钥**签名** → 经 BNS-Client/BNS-Server 提交 raw TX（`eth_sendRawTransaction`）到 BNS 合约。
 
-> 签名边界（见 `doc/SN/BNS-签名边界改造-EVM-TX-TODO.md`）：权威状态在 **`Bns.sol` 合约**，合约只信任节点恢复出的 `msg.sender` 做访问控制。BNS-Server 是标准合约处理器，只转发已签名 raw TX 和查只读投影，**不签名、不持私钥、不含 control 逻辑**；`bns-indexer` 是只读事件索引器，不再是权威状态机。因此 `sn_bns_controller` 提交的 TX，其签名地址必须等于合约要求的 owner / 授权 controller 地址；`CallAuthority` 作为合约入参仅用于提示 role（Owner/Controller）与选择 `kid`，不再作为身份信任来源。
+> 签名边界（见 `BNS-签名边界改造-EVM-TX-TODO.md`）：权威状态在 **`Bns.sol` 合约**，合约只信任节点恢复出的 `msg.sender` 做访问控制。BNS-Server 是标准合约处理器，只转发已签名 raw TX 和查只读投影，**不签名、不持私钥、不含 control 逻辑**；`bns-indexer` 是只读事件索引器，不再是权威状态机。因此 `sn_bns_controller` 提交的 TX，其签名地址必须等于合约要求的 owner / 授权 controller 地址；`CallAuthority` 作为合约入参仅用于提示 role（Owner/Controller）与选择 `kid`，不再作为身份信任来源。
 
-当本文和当前实现冲突时，以 `doc/SN/新SN核心流程整理.md`、`doc/SN/BNS-签名边界改造-EVM-TX-TODO.md` 和 `doc/BNS 智能合约接口设计.md` 的设计语义为准；当前 `cyfs-sn` / `bns-indexer` 实现只作为第一版落地路径和迁移参考。
+当本文和当前实现冲突时，以 `../SN/新SN核心流程整理.md`、`BNS-签名边界改造-EVM-TX-TODO.md` 和 `BNS 智能合约接口设计.md` 的设计语义为准；当前 `cyfs-sn` / `bns-indexer` 实现只作为第一版落地路径和迁移参考。
 
 文件名中保留了历史拼写 `Contoller`，模块名和文档正文统一使用 `sn_bns_controller` / `SN-BNS-Controller`。
 
@@ -673,7 +673,7 @@ SN API 响应中建议包含：
 
 ## 当前实现映射
 
-> 与目标设计的差异（迁移期现状）：下面映射的是**当前已落地的中心化状态机路径**——`SnBnsController` 仍通过 `bns-client` 直接调用 `bns-indexer` 的 `CentralizedBnsRegistry` 单事务接口（`registry.rs`），尚未切到“构造并签名 EVM TX → 经 BNS-Server `eth_sendRawTransaction` 提交到 `Bns.sol` 合约”的目标写路径（见 `doc/SN/BNS-签名边界改造-EVM-TX-TODO.md`）。EVM 合约/索引器/raw-TX 提交已部分落地，SN 写路径切换属后续工作；下文的 `registry.rs` 引用应理解为迁移期实现，而非目标权威源。
+> 与目标设计的差异（迁移期现状）：下面映射的是**当前已落地的中心化状态机路径**——`SnBnsController` 仍通过 `bns-client` 直接调用 `bns-indexer` 的 `CentralizedBnsRegistry` 单事务接口（`registry.rs`），尚未切到“构造并签名 EVM TX → 经 BNS-Server `eth_sendRawTransaction` 提交到 `Bns.sol` 合约”的目标写路径（见 `BNS-签名边界改造-EVM-TX-TODO.md`）。EVM 合约/索引器/raw-TX 提交已部分落地，SN 写路径切换属后续工作；下文的 `registry.rs` 引用应理解为迁移期实现，而非目标权威源。
 >
 > 重要现状（割裂事实）：BNS 写入层 `SnBnsController` **已实现，但物理上在 `bns-client` crate**（`src/components/bns-client/src/sn_bns_controller.rs`，约 1151 行），**不在 `cyfs-sn` 里**。`cyfs-sn` 至今只消费**只读侧**——`sn_bns_reader.rs` 的 `BnsIndexerDocumentReader` 接在 resolver 上（`src/components/cyfs-sn/src/sn_server.rs:689`），从不实例化或调用 `SnBnsController`。换言之：写入库本身基本写完并通过自身单测，但**尚未被它所服务的 SN 业务流程采用**；目前 `SnBnsController` 的唯一调用方是 `bns-client` 自己的测试（`src/components/bns-client/tests/rpc_and_controller.rs`）。
 

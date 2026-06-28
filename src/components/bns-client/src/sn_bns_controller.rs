@@ -1,15 +1,15 @@
+use crate::dns_document::{self, DnsTxtRecord, DNS_TXT_DOC_TYPE};
 use crate::{
-    BnsApplyMutationsReq, BnsClientError, BnsDocumentVersion, BnsEvmControllerClient,
-    BnsEvmTxSubmission, BnsIndexerApi, BnsPublishDocumentReq, BnsRegisterNameReq, BnsRpcErrorInfo,
-};
-use async_trait::async_trait;
-use bns_indexer::dns_document::{self, DnsTxtRecord, DNS_TXT_DOC_TYPE};
-use bns_indexer::{
     canonical_bns_name, canonical_doc_type, controller_rule, default_document_update, hash_json,
     policy_hash_from_rules, AuthorityKeyUpdate, AuthorityRole, AuthoritySetState, BnsRegistryError,
     CallAuthority, DocumentRef, DocumentState, DocumentUpdate, MutationGuard, NameState, Principal,
     PrincipalKind, RegisterOptions, PERMISSION_PUBLISH_DOCUMENT, ZERO_HASH,
 };
+use crate::{
+    BnsApplyMutationsReq, BnsClientError, BnsDocumentVersion, BnsEvmControllerClient,
+    BnsEvmTxSubmission, BnsIndexerApi, BnsPublishDocumentReq, BnsRegisterNameReq, BnsRpcErrorInfo,
+};
+use async_trait::async_trait;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -337,7 +337,7 @@ impl SnBnsControllerConfig {
                 DNS_TXT_DOC_TYPE.to_string(),
                 RELAY_ASSIGNMENT_DOC_TYPE.to_string(),
             ],
-            max_inline_document_size: bns_indexer::MAX_INLINE_DOCUMENT,
+            max_inline_document_size: crate::MAX_INLINE_DOCUMENT,
             write_retry_limit: 2,
         }
     }
@@ -387,7 +387,7 @@ impl SnBnsControllerConfig {
         )
     }
 
-    pub fn sn_controller_policy(&self) -> SnBnsControllerResult<Vec<bns_indexer::ControllerRule>> {
+    pub fn sn_controller_policy(&self) -> SnBnsControllerResult<Vec<crate::ControllerRule>> {
         self.validate()?;
         Ok(self
             .allowed_controller_doc_types
@@ -544,7 +544,7 @@ impl SnBnsController {
         self.config.sn_controller_authority()
     }
 
-    pub fn sn_controller_policy(&self) -> SnBnsControllerResult<Vec<bns_indexer::ControllerRule>> {
+    pub fn sn_controller_policy(&self) -> SnBnsControllerResult<Vec<crate::ControllerRule>> {
         self.config.sn_controller_policy()
     }
 
@@ -760,7 +760,7 @@ impl SnBnsController {
     ) -> SnBnsControllerResult<BnsWriteReceipt> {
         self.ensure_owner_authority(&params.authority, DEVICE_MINI_DOC_TYPE)?;
         self.validate_device_name(&params.device_name)?;
-        bns_indexer::validate_did(&params.did).map_err(SnBnsControllerError::from)?;
+        crate::validate_did(&params.did).map_err(SnBnsControllerError::from)?;
 
         self.run_idempotent(
             &params.request_id,
@@ -1054,7 +1054,7 @@ impl SnBnsController {
         &self,
         state: &DocumentState,
     ) -> SnBnsControllerResult<T> {
-        if state.document.storage_type != bns_indexer::STORAGE_TYPE_INLINE {
+        if state.document.storage_type != crate::STORAGE_TYPE_INLINE {
             return Err(SnBnsControllerError::InvalidInput(format!(
                 "document `{}/{}` is not inline",
                 state.name, state.doc_type
@@ -1242,7 +1242,7 @@ impl SnBnsController {
             };
         }
 
-        let now = bns_indexer::now_timestamp();
+        let now = crate::now_timestamp();
         self.idempotency_store.put(SnBnsWriteRequestRecord {
             request_id: request_id.to_string(),
             operation,
@@ -1281,7 +1281,7 @@ impl SnBnsController {
                     evm_tx_hash: evm_submission.as_ref().map(|tx| tx.tx_hash.clone()),
                     evm_raw_tx: evm_submission.as_ref().map(|tx| tx.raw_tx.clone()),
                     created_at: now,
-                    updated_at: bns_indexer::now_timestamp(),
+                    updated_at: crate::now_timestamp(),
                 })?;
                 Ok(value)
             }
@@ -1301,7 +1301,7 @@ impl SnBnsController {
                     evm_tx_hash: None,
                     evm_raw_tx: None,
                     created_at: now,
-                    updated_at: bns_indexer::now_timestamp(),
+                    updated_at: crate::now_timestamp(),
                 })?;
                 Err(error)
             }

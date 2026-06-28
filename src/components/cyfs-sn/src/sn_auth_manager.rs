@@ -35,13 +35,8 @@ pub(crate) struct IssuedRpcToken {
 impl SnAuthManager {
     pub(crate) async fn new(configured_dir: Option<&str>) -> std::result::Result<Self, String> {
         let data_dir = resolve_auth_dir(configured_dir);
-        std::fs::create_dir_all(&data_dir).map_err(|e| {
-            format!(
-                "failed to create sn auth dir {}: {}",
-                data_dir.display(),
-                e
-            )
-        })?;
+        std::fs::create_dir_all(&data_dir)
+            .map_err(|e| format!("failed to create sn auth dir {}: {}", data_dir.display(), e))?;
 
         let private_key = data_dir.join("private_key.pem");
         let public_key = data_dir.join("public_key.json");

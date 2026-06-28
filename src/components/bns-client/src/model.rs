@@ -1079,3 +1079,44 @@ pub fn ensure_registerable_depth(name: &str) -> BnsRegistryResult<()> {
     }
     Ok(())
 }
+
+pub fn default_document_update(
+    doc_type: &str,
+    expected_version: u64,
+    document: DocumentRef,
+) -> BnsRegistryResult<DocumentUpdate> {
+    Ok(DocumentUpdate {
+        doc_type: canonical_doc_type(doc_type)?,
+        expected_version,
+        document,
+        controller: Principal::unset(),
+        beneficiary: Principal::unset(),
+        payment_target: String::new(),
+        expire_at: 0,
+        controller_policy_hash: ZERO_HASH.to_string(),
+        payment_policy_hash: ZERO_HASH.to_string(),
+        split_policy_hash: ZERO_HASH.to_string(),
+        price_policy_hash: ZERO_HASH.to_string(),
+        rights_policy_hash: ZERO_HASH.to_string(),
+    })
+}
+
+pub fn controller_rule(
+    controller: Principal,
+    doc_type: impl Into<String>,
+    permissions: u32,
+) -> ControllerRule {
+    ControllerRule {
+        controller,
+        doc_type: doc_type.into(),
+        permissions,
+        namespace_scope_hash: ZERO_HASH.to_string(),
+        valid_from: 0,
+        valid_until: 0,
+        constraint_hash: ZERO_HASH.to_string(),
+    }
+}
+
+pub fn policy_hash_from_rules(rules: &[ControllerRule]) -> BnsRegistryResult<String> {
+    hash_json(rules)
+}

@@ -2140,7 +2140,11 @@ mod tests {
 
     async fn scalar_i64(db: &SqliteSnDeviceInfoDB, sql: &str, did: &str) -> i64 {
         let mut conn = db.pool.acquire().await.unwrap();
-        let row = sqlx::query(sql).bind(did).fetch_one(&mut *conn).await.unwrap();
+        let row = sqlx::query(sql)
+            .bind(did)
+            .fetch_one(&mut *conn)
+            .await
+            .unwrap();
         row.get::<i64, _>(0)
     }
 
@@ -2149,12 +2153,16 @@ mod tests {
         did: &str,
     ) -> (Option<String>, Option<String>) {
         let mut conn = db.pool.acquire().await.unwrap();
-        let row = sqlx::query("SELECT reported_ip, from_ip FROM device_runtime_states WHERE did = ?1")
-            .bind(did)
-            .fetch_one(&mut *conn)
-            .await
-            .unwrap();
-        (row.get::<Option<String>, _>(0), row.get::<Option<String>, _>(1))
+        let row =
+            sqlx::query("SELECT reported_ip, from_ip FROM device_runtime_states WHERE did = ?1")
+                .bind(did)
+                .fetch_one(&mut *conn)
+                .await
+                .unwrap();
+        (
+            row.get::<Option<String>, _>(0),
+            row.get::<Option<String>, _>(1),
+        )
     }
 
     fn ep_full(endpoint_id: &str, scope: SnEndpointScope, priority: i64) -> SnDeviceEndpoint {
@@ -2290,13 +2298,15 @@ mod tests {
         );
 
         // device_state_events 保留
-        assert!(scalar_i64(
-            &db,
-            "SELECT COUNT(*) FROM device_state_events WHERE did = ?1",
-            did
-        )
-        .await
-            > 0);
+        assert!(
+            scalar_i64(
+                &db,
+                "SELECT COUNT(*) FROM device_state_events WHERE did = ?1",
+                did
+            )
+            .await
+                > 0
+        );
 
         // 删除不存在的 DID → NotFound
         let err = db.remove_device_index("did:dev:missing").await.unwrap_err();
@@ -2517,12 +2527,12 @@ mod tests {
             &"2606:4700:4700::1111".parse().unwrap()
         ));
         let non_public = [
-            "::1",          // loopback
-            "ff02::1",      // multicast
-            "::",           // unspecified
-            "fc00::1",      // ULA
-            "fe80::1",      // link-local
-            "2001:db8::1",  // documentation
+            "::1",         // loopback
+            "ff02::1",     // multicast
+            "::",          // unspecified
+            "fc00::1",     // ULA
+            "fe80::1",     // link-local
+            "2001:db8::1", // documentation
         ];
         for ip in non_public {
             assert!(
@@ -2545,8 +2555,7 @@ mod tests {
         assert_eq!(lan, vec!["192.168.0.5", "10.0.0.7"]);
 
         // 全私网 → 无 wan
-        let (wan, lan) =
-            SqliteSnDeviceInfoDB::classify_ips(Some("10.0.0.1"), &[], None)?;
+        let (wan, lan) = SqliteSnDeviceInfoDB::classify_ips(Some("10.0.0.1"), &[], None)?;
         assert!(wan.is_none());
         assert_eq!(lan, vec!["10.0.0.1"]);
 
@@ -2569,7 +2578,12 @@ mod tests {
         assert_eq!(
             order,
             vec![
-                "public-lo", "public-hi", "relay", "private", "loopback", "unknown"
+                "public-lo",
+                "public-hi",
+                "relay",
+                "private",
+                "loopback",
+                "unknown"
             ]
         );
     }
@@ -2804,13 +2818,12 @@ mod tests {
         let expired = db.expire_devices(future, Some(2)).await?;
         assert_eq!(expired, 2);
         let mut conn = db.pool.acquire().await.unwrap();
-        let online_left = sqlx::query(
-            "SELECT COUNT(*) FROM device_runtime_states WHERE state = 'online'",
-        )
-        .fetch_one(&mut *conn)
-        .await
-        .unwrap()
-        .get::<i64, _>(0);
+        let online_left =
+            sqlx::query("SELECT COUNT(*) FROM device_runtime_states WHERE state = 'online'")
+                .fetch_one(&mut *conn)
+                .await
+                .unwrap()
+                .get::<i64, _>(0);
         drop(conn);
         assert_eq!(online_left, 1);
 
@@ -2858,7 +2871,10 @@ mod tests {
         // ttl = 0
         let mut zero_ttl = state_update("did:dev:a", 1, 0);
         assert_eq!(
-            db.update_device_state(zero_ttl.clone()).await.unwrap_err().code(),
+            db.update_device_state(zero_ttl.clone())
+                .await
+                .unwrap_err()
+                .code(),
             SnErrorCode::InvalidInput
         );
 

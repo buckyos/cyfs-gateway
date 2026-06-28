@@ -5,19 +5,18 @@ use bns_client::{
     BnsClientError, BnsClientResult, BnsEvmClientConfig, BnsEvmKeyManager, BnsEvmSignRequest,
     BnsEvmStandardClient, BnsEvmTxSubmission, BnsEvmWriteOperation, BnsIndexerApi,
     BnsIndexerClient, BnsIndexerRpcHandler, BnsPublishDocumentReq, BnsRegisterNameReq,
-    BnsRegisterNameResp, BnsRpcEnvelope, BnsWriteReceiptStatus, BootstrapNameParams,
-    CentralizedBnsIndexerHandler, DnsTxtUpdate, MemorySnBnsWriteRequestStore,
-    PublishDeviceMiniDocParams, PublishRelayAssignmentParams, SnBnsController,
-    SnBnsControllerConfig, SnBnsControllerError, SnBnsEvmSubmitter, StaticBnsEvmKeyManager,
-    UpsertDnsTxtParams, BOOT_DOC_TYPE, DEVICE_MINI_DOC_TYPE, METHOD_REGISTER_NAME,
-    RELAY_ASSIGNMENT_DOC_TYPE, ZONE_DOC_TYPE,
+    BnsRegisterNameResp, BnsRpcEnvelope, BnsWriteReceiptStatus, BootstrapNameParams, DnsTxtUpdate,
+    MemorySnBnsWriteRequestStore, PublishDeviceMiniDocParams, PublishRelayAssignmentParams,
+    SnBnsController, SnBnsControllerConfig, SnBnsControllerError, SnBnsEvmSubmitter,
+    StaticBnsEvmKeyManager, UpsertDnsTxtParams, BOOT_DOC_TYPE, DEVICE_MINI_DOC_TYPE,
+    METHOD_REGISTER_NAME, RELAY_ASSIGNMENT_DOC_TYPE, ZONE_DOC_TYPE,
 };
 use bns_evm::{AuthorityRole as EvmAuthorityRole, PrincipalKind as EvmPrincipalKind, SolCall};
 use bns_indexer::dns_document::{self, DNS_TXT_DOC_TYPE};
 use bns_indexer::{
     controller_rule, default_document_update, policy_hash_from_rules, CallAuthority,
-    CentralizedBnsRegistry, DocumentRef, MutationGuard, Principal, RegisterOptions,
-    SqliteBnsRegistryStore, PERMISSION_PUBLISH_DOCUMENT,
+    CentralizedBnsIndexerHandler, CentralizedBnsRegistry, DocumentRef, MutationGuard, Principal,
+    RegisterOptions, SqliteBnsRegistryStore, PERMISSION_PUBLISH_DOCUMENT,
 };
 use serde_json::json;
 use std::net::{IpAddr, Ipv4Addr};

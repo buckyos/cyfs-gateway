@@ -232,11 +232,17 @@ async fn run_batch(db: &dyn SnDeviceInfoDB) -> Vec<String> {
     let b = "did:dev:device-b";
     let mut obs = Vec::new();
 
-    obs.push(format!("get-missing:{}", db.get_device_state(a).await.unwrap().is_none()));
+    obs.push(format!(
+        "get-missing:{}",
+        db.get_device_state(a).await.unwrap().is_none()
+    ));
 
     obs.push(format!(
         "upsert-a:{}",
-        err_code(db.upsert_device_index(a, zone, "ood1", SnDeviceRole::Ood).await)
+        err_code(
+            db.upsert_device_index(a, zone, "ood1", SnDeviceRole::Ood)
+                .await
+        )
     ));
     let offline = db.get_device_state(a).await.unwrap().unwrap();
     obs.push(format!(
@@ -249,21 +255,31 @@ async fn run_batch(db: &dyn SnDeviceInfoDB) -> Vec<String> {
         "report-a:{}",
         err_code(db.update_device_state(state_update(a, 10, 600)).await)
     ));
-    let online = db.get_device_state_by_name(zone, "ood1").await.unwrap().unwrap();
+    let online = db
+        .get_device_state_by_name(zone, "ood1")
+        .await
+        .unwrap()
+        .unwrap();
     obs.push(format!(
         "online:state={:?},pub={},priv={},eps={},pref={:?},wan={}",
         online.state,
         online.public_ips.join("|"),
         online.private_ips.join("|"),
         online.active_endpoints.len(),
-        online.preferred_endpoint.as_ref().map(|e| e.endpoint_id.clone()),
+        online
+            .preferred_endpoint
+            .as_ref()
+            .map(|e| e.endpoint_id.clone()),
         online.is_wan_device
     ));
 
     // 同 DID 改 (zone,device_name) → Conflict（要求 rebind）。
     obs.push(format!(
         "dup-upsert:{}",
-        err_code(db.upsert_device_index(a, zone, "ood2", SnDeviceRole::Ood).await)
+        err_code(
+            db.upsert_device_index(a, zone, "ood2", SnDeviceRole::Ood)
+                .await
+        )
     ));
     // 目标 (zone,device_name) 被他 DID 占用 → rebind Conflict。
     db.upsert_device_index(b, zone, "ood2", SnDeviceRole::Ood)
@@ -271,19 +287,35 @@ async fn run_batch(db: &dyn SnDeviceInfoDB) -> Vec<String> {
         .unwrap();
     obs.push(format!(
         "rebind-conflict:{}",
-        err_code(db.rebind_device_index(a, zone, "ood2", SnDeviceRole::Ood, "mv").await)
+        err_code(
+            db.rebind_device_index(a, zone, "ood2", SnDeviceRole::Ood, "mv")
+                .await
+        )
     ));
     // 合法 rebind：保留 runtime。
     obs.push(format!(
         "rebind-ok:{}",
-        err_code(db.rebind_device_index(a, zone, "gw", SnDeviceRole::Gateway, "mv").await)
+        err_code(
+            db.rebind_device_index(a, zone, "gw", SnDeviceRole::Gateway, "mv")
+                .await
+        )
     ));
     obs.push(format!(
         "old-name-gone:{}",
-        db.get_device_state_by_name(zone, "ood1").await.unwrap().is_none()
+        db.get_device_state_by_name(zone, "ood1")
+            .await
+            .unwrap()
+            .is_none()
     ));
-    let rebound = db.get_device_state_by_name(zone, "gw").await.unwrap().unwrap();
-    obs.push(format!("rebound:state={:?},wan={}", rebound.state, rebound.is_wan_device));
+    let rebound = db
+        .get_device_state_by_name(zone, "gw")
+        .await
+        .unwrap()
+        .unwrap();
+    obs.push(format!(
+        "rebound:state={:?},wan={}",
+        rebound.state, rebound.is_wan_device
+    ));
 
     // stale 上报（seq 5 < 10）被拒。
     obs.push(format!(
@@ -292,7 +324,10 @@ async fn run_batch(db: &dyn SnDeviceInfoDB) -> Vec<String> {
     ));
 
     // block → blocked；blocked 设备普通上报被拒；unblock 后回 offline。
-    obs.push(format!("block:{}", err_code(db.block_device(a, "abuse").await)));
+    obs.push(format!(
+        "block:{}",
+        err_code(db.block_device(a, "abuse").await)
+    ));
     obs.push(format!(
         "blocked-state:{:?}",
         db.get_device_state(a).await.unwrap().unwrap().state
@@ -301,18 +336,27 @@ async fn run_batch(db: &dyn SnDeviceInfoDB) -> Vec<String> {
         "blocked-report:{}",
         err_code(db.update_device_state(state_update(a, 20, 600)).await)
     ));
-    obs.push(format!("unblock:{}", err_code(db.unblock_device(a, "ok").await)));
+    obs.push(format!(
+        "unblock:{}",
+        err_code(db.unblock_device(a, "ok").await)
+    ));
     obs.push(format!(
         "after-unblock:{:?}",
         db.get_device_state(a).await.unwrap().unwrap().state
     ));
 
     // list（默认）计数。
-    let listed = db.list_zone_devices(zone, SnDeviceListOptions::default()).await.unwrap();
+    let listed = db
+        .list_zone_devices(zone, SnDeviceListOptions::default())
+        .await
+        .unwrap();
     obs.push(format!("list:count={}", listed.len()));
 
     // remove → 索引消失。
-    obs.push(format!("remove:{}", err_code(db.remove_device_index(a).await)));
+    obs.push(format!(
+        "remove:{}",
+        err_code(db.remove_device_index(a).await)
+    ));
     obs.push(format!(
         "after-remove:{}",
         db.get_device_state(a).await.unwrap().is_none()
@@ -321,11 +365,17 @@ async fn run_batch(db: &dyn SnDeviceInfoDB) -> Vec<String> {
     // 错误码：未知 DID 上报 → NotFound；空 DID → InvalidInput。
     obs.push(format!(
         "unknown-report:{}",
-        err_code(db.update_device_state(state_update("did:dev:zzz", 1, 600)).await)
+        err_code(
+            db.update_device_state(state_update("did:dev:zzz", 1, 600))
+                .await
+        )
     ));
     obs.push(format!(
         "empty-did:{}",
-        err_code(db.upsert_device_index("", zone, "x", SnDeviceRole::Ood).await)
+        err_code(
+            db.upsert_device_index("", zone, "x", SnDeviceRole::Ood)
+                .await
+        )
     ));
 
     obs
@@ -351,14 +401,24 @@ async fn local_and_remote_clients_agree_on_same_batch() {
 
     // 抽样钉死关键结构事实，确保批次确实跑了预期分支（非空一致）。
     assert!(local_obs.contains(&"get-missing:true".to_string()));
-    assert!(local_obs.iter().any(|o| o.contains("dup-upsert:err:Conflict")));
-    assert!(local_obs.iter().any(|o| o.contains("stale:err:StaleReport")));
-    assert!(local_obs.iter().any(|o| o.contains("blocked-report:err:Blocked")));
-    assert!(local_obs.iter().any(|o| o.contains("unknown-report:err:NotFound")));
-    assert!(local_obs.iter().any(|o| o.contains("empty-did:err:InvalidInput")));
     assert!(local_obs
         .iter()
-        .any(|o| o.contains("online:") && o.contains("wan=true") && o.contains("pref=Some(\"public\")")));
+        .any(|o| o.contains("dup-upsert:err:Conflict")));
+    assert!(local_obs
+        .iter()
+        .any(|o| o.contains("stale:err:StaleReport")));
+    assert!(local_obs
+        .iter()
+        .any(|o| o.contains("blocked-report:err:Blocked")));
+    assert!(local_obs
+        .iter()
+        .any(|o| o.contains("unknown-report:err:NotFound")));
+    assert!(local_obs
+        .iter()
+        .any(|o| o.contains("empty-did:err:InvalidInput")));
+    assert!(local_obs.iter().any(|o| o.contains("online:")
+        && o.contains("wan=true")
+        && o.contains("pref=Some(\"public\")")));
 }
 
 #[tokio::test]
@@ -376,6 +436,10 @@ async fn production_remote_wrapper_exposes_same_trait() {
     let view = remote.get_device_state("did:dev:p").await.unwrap().unwrap();
     assert_eq!(view.state, SnDeviceState::Offline);
     // 与底层 service 视图一致。
-    let direct = backing.get_device_state("did:dev:p").await.unwrap().unwrap();
+    let direct = backing
+        .get_device_state("did:dev:p")
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(view, direct);
 }

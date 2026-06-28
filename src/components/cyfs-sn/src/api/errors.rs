@@ -61,12 +61,7 @@ impl SnApiErrorCode {
     }
 
     pub(crate) fn format(self, message: impl AsRef<str>) -> String {
-        format!(
-            "[SN:{}:{}] {}",
-            self.code(),
-            self.name(),
-            message.as_ref()
-        )
+        format!("[SN:{}:{}] {}", self.code(), self.name(), message.as_ref())
     }
 }
 

@@ -2,7 +2,7 @@
 
 `sn_auth` 是 SN 的账号与低频用户状态模块。它负责 SN 本地账号体系、登录态、`sn_user <-> user_domain` 绑定关系，以及不适合放入 BNS 权威文档的 `zone_info` 运行态。
 
-当本文和当前实现冲突时，以 `doc/SN/新SN核心流程整理.md` 中的设计意图为准；BNS 写路径与签名边界以 `doc/SN/BNS-签名边界改造-EVM-TX-TODO.md` 为准。当前实现只作为差距对照，不作为兼容约束。本版本是 breaking change，不要求兼容旧 RPC alias、旧 token 语义或旧 `user_domain` 绑定方式。
+当本文和当前实现冲突时，以 `新SN核心流程整理.md` 中的设计意图为准；BNS 写路径与签名边界以 `../BNS/BNS-签名边界改造-EVM-TX-TODO.md` 为准。当前实现只作为差距对照，不作为兼容约束。本版本是 breaking change，不要求兼容旧 RPC alias、旧 token 语义或旧 `user_domain` 绑定方式。
 
 ## 设计定位
 

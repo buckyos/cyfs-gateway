@@ -202,7 +202,7 @@ BNS(合约) <-> BNS-Indexer <-> BNS-Server <-> BNS-Client <-> BNS-Controller
 ## 10. 收尾
 
 - [x] 移除 `bns-indexer` 的状态机写逻辑与 `CentralizedBnsRegistry` 权威语义：默认构造降级为只读投影 facade，所有写入口返回 `UNSUPPORTED_OPERATION`；旧状态机仅保留隐藏 legacy 测试入口。
-- [ ] 更新 `doc/BNS 智能合约接口设计.md`、SN 文档：权威源=合约、indexer=事件索引器、两客户端模型。
+- [ ] 更新 `BNS 智能合约接口设计.md`、SN 文档：权威源=合约、indexer=事件索引器、两客户端模型。
 - [x] `SNServerConfig` 新增链 RPC / chainId / 合约地址 / controller 私钥来源 / gas 配置字段。
 - [ ] 去掉裸 `CallAuthority` 配置/写路径，并接入 Controller Client。
 - [ ] （新增）清理合约 ABI：评估是否从写函数签名中**移除 `CallAuthority` 入参**（目前保留作 role/kid 提示，但身份只认 `msg.sender`），统一签名边界语义。
