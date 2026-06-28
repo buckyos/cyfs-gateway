@@ -64,11 +64,36 @@ pub(crate) async fn handle_auth(server: &SNServer, req: RPCRequest) -> RpcCallRe
     match req.method.as_str() {
         "check_username" => {
             let params: NameReq = parse_params(&req)?;
-            let proxy_req = RPCRequest {
-                params: json!({ "username": params.name }),
-                ..req
-            };
-            server.check_username(proxy_req).await
+            let username = params.name.trim().to_lowercase();
+            let (valid, reason, message) =
+                if let Err(message) = SNServer::validate_registration_username(username.as_str()) {
+                    (false, "invalid_username".to_string(), message)
+                } else {
+                    let exists = server
+                        .auth_db()
+                        .is_user_exist(username.as_str())
+                        .await
+                        .into_rpc()?;
+                    if exists {
+                        (
+                            false,
+                            "already_exists".to_string(),
+                            format!("username {} already exists", username),
+                        )
+                    } else {
+                        (true, "ok".to_string(), String::new())
+                    }
+                };
+
+            ok_response(
+                &req,
+                json!({
+                    "valid": valid,
+                    "reason": reason,
+                    "message": message,
+                    "normalized_name": username,
+                }),
+            )
         }
         "check_active_code" => {
             let params: ActiveCodeReq = parse_params(&req)?;

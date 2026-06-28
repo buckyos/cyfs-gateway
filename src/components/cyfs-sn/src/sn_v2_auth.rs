@@ -77,11 +77,6 @@ impl SnV2AuthManager {
         })
     }
 
-    pub(crate) fn issue_access_token(&self, username: &str) -> RpcCallResult<String> {
-        self.issue_access_session(username)
-            .map(|issued| issued.token)
-    }
-
     pub(crate) fn issue_access_session(&self, username: &str) -> RpcCallResult<IssuedRpcToken> {
         issue_rpc_jwt(
             username,
@@ -89,11 +84,6 @@ impl SnV2AuthManager {
             V2_ACCESS_TOKEN_EXPIRE_SECS,
             &self.token_encode_key,
         )
-    }
-
-    pub(crate) fn issue_refresh_token(&self, username: &str) -> RpcCallResult<String> {
-        self.issue_refresh_session(username)
-            .map(|issued| issued.token)
     }
 
     pub(crate) fn issue_refresh_session(&self, username: &str) -> RpcCallResult<IssuedRpcToken> {
@@ -105,16 +95,8 @@ impl SnV2AuthManager {
         )
     }
 
-    pub(crate) fn verify_access_token(&self, token: &str) -> RpcCallResult<String> {
-        verify_rpc_jwt(token, V2_ACCESS_AUD, &self.token_decode_key)
-    }
-
     pub(crate) fn verify_access_session(&self, token: &str) -> RpcCallResult<RPCSessionToken> {
         verify_rpc_session(token, V2_ACCESS_AUD, &self.token_decode_key)
-    }
-
-    pub(crate) fn verify_refresh_token(&self, token: &str) -> RpcCallResult<String> {
-        verify_rpc_jwt(token, V2_REFRESH_AUD, &self.token_decode_key)
     }
 
     pub(crate) fn verify_refresh_session(&self, token: &str) -> RpcCallResult<RPCSessionToken> {
@@ -205,13 +187,6 @@ fn issue_rpc_jwt(
         issued_at,
         expires_at,
     })
-}
-
-fn verify_rpc_jwt(token: &str, expected_aud: &str, key: &DecodingKey) -> RpcCallResult<String> {
-    let session = verify_rpc_session(token, expected_aud, key)?;
-    session
-        .sub
-        .ok_or_else(|| parse_error(SnV2ErrorCode::InvalidToken, "subject is none"))
 }
 
 fn verify_rpc_session(

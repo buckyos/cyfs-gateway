@@ -250,7 +250,8 @@ BNS 写入错误经 `bns_write_error()` 映射:`CONTROLLER_SCOPE_DENIED`/`NOT_EF
 |-----------|--------|------|----------|
 | `auth.check_username` / `check_active_code` | Auth | `/kapi/sn/auth` | SN |
 | `auth.register` / `login` / `refresh` / `logout` / `me` | Auth | `/kapi/sn/auth`(注册仍由 SN 统一上链,§7.3-1) | SN |
-| `device.register` / `update` / `get` / `list` / `get_by_pk` | Bns/Root | `/kapi/sn/deviceinfo` | SN |
+| `device.register` / `update` / `get` / `list` | Bns/Root | `/kapi/sn/deviceinfo`(改为在线/运行态语义) | SN |
+| `device.get_by_pk` | Root | **去掉**(实现已移除) | — |
 | `query.by_did` / `by_hostname` | Root | 保留并改名为 `deviceinfo.resolve_ood*`(relay 经 QA Server 调用,§7.4-3) | SN |
 | `dns.add_record` / `remove_record` / `list_records` | Bns/Root | 并入 `user.*`,**仅服务 user_domain**(§7.3-3) | SN |
 | `user.get_profile` / `set_self_cert` | Bns | `/kapi/sn/auth`(账号属性) | SN |
@@ -258,7 +259,7 @@ BNS 写入错误经 `bns_write_error()` 映射:`CONTROLLER_SCOPE_DENIED`/`NOT_EF
 | `query.resolve_did` / `resolve_hostname` / `resolve_device` | Root | **去掉**,改用 W3C DID Resolver + DNS NameServer(§3.10) | SN(非 kRPC) |
 | `zone.get` / `bind_config` / `unbind_config` | Bns | `/kapi/bns` | BNS |
 | `did.set_document` / `get_document` | Bns/Root | `/kapi/bns` | BNS |
-| `domain.begin_verify` / `verify` / `unbind`(PKX 绑定) | Bns | `/kapi/bns` | BNS |
+| `domain.begin_verify` / `verify` / `unbind`(PKX 绑定) | Bns | 保留 SN,落在 `/kapi/sn/auth`(user_domain 属账号,§7.4-4) | SN |
 | `user.register_by_public_key` | Bns | (并入 `/kapi/sn/auth` 或废弃) | SN |
 | `admin.clear_state_by_active_code` | Root(**公网可达,需收口**) | 移出公网,仅内网/管理面(InternalRoot `/` 或独立管理端口/socket) | SN(内网) |
 

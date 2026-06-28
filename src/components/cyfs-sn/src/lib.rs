@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 mod api;
 pub mod name_info_cache;
 mod relay_mgr;

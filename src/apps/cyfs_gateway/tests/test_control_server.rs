@@ -77,6 +77,12 @@ mod tests {
         init_logging("cyfs_gateway", false);
         let mut cmd_config: serde_json::Value =
             serde_yaml_ng::from_str(GATEWAY_CONTROL_SERVER_CONFIG).unwrap();
+        let control_port = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap().port()
+        };
+        cmd_config["stacks"]["__control_server__"]["bind"] =
+            json!(format!("127.0.0.1:{control_port}"));
 
         // Load config from json
         let parser = Arc::new(GatewayConfigParser::new());
@@ -175,7 +181,8 @@ mod tests {
         };
         gateway.start(params).await.unwrap();
 
-        let cmd_client = GatewayControlClient::new("http://127.0.0.1:13451".to_string(), None);
+        let cmd_client =
+            GatewayControlClient::new(format!("http://127.0.0.1:{control_port}"), None);
         let ret = cmd_client.get_system_info().await;
         assert!(ret.is_ok());
         let system_info = ret.unwrap();

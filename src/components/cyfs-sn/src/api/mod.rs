@@ -1,13 +1,10 @@
 mod auth;
 mod common;
 mod device;
-mod did;
 mod dns;
 mod domain;
 mod errors;
-mod query;
 mod user;
-mod zone;
 
 pub(crate) use auth::handle_auth;
 pub(crate) use common::RpcCallResult;

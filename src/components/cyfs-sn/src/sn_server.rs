@@ -1,4 +1,3 @@
-#![allow(unused)]
 use crate::api::{handle_auth, handle_device, handle_dns, handle_domain, handle_user};
 use crate::name_info_cache::{NameInfoCache, NameInfoCacheQueryResult, NameInfoCacheRef};
 use crate::sn_bns_reader::BnsIndexerDocumentReader;
@@ -11,10 +10,10 @@ use crate::sn_resolver::{
 };
 use crate::sn_v2_auth::SnV2AuthManager;
 use crate::{
-    AssignZoneRelayReq, RelayAssignmentSource, SNUserInfo, SnAuthDBRef, SnDeviceEndpointUpdate,
-    SnDeviceInfoDBRef, SnDeviceRole, SnDeviceState, SnDeviceStateUpdate, SnEndpointProtocol,
-    SnEndpointScope, SnEndpointSource, SnNatType, SnRelayManagerRef, SnResult, SqliteSnAuthDB,
-    SqliteSnDeviceInfoDB, SqliteSnRelayManager, ZoneInfoPatch,
+    SNUserInfo, SnAuthDBRef, SnDeviceEndpointUpdate, SnDeviceInfoDBRef, SnDeviceRole,
+    SnDeviceState, SnDeviceStateUpdate, SnEndpointProtocol, SnEndpointScope, SnEndpointSource,
+    SnNatType, SnRelayManagerRef, SnResult, SqliteSnAuthDB, SqliteSnDeviceInfoDB,
+    SqliteSnRelayManager,
 };
 use ::kRPC::*;
 use async_trait::async_trait;
@@ -24,7 +23,7 @@ use bns_client::{
 };
 use bns_indexer::{Principal, PrincipalKind};
 use buckyos_kit::{get_buckyos_service_data_dir, is_valid_name, NameType};
-use cyfs_gateway_lib::{into_server_err, server_err};
+use cyfs_gateway_lib::server_err;
 use cyfs_gateway_lib::{
     qa_json_to_rpc_request, HttpRequestProcessChainVars, HttpServer, NameServer, QAServer, Server,
     ServerConfig, ServerContextRef, ServerError, ServerErrorCode, ServerFactory, ServerResult,
@@ -32,28 +31,24 @@ use cyfs_gateway_lib::{
 };
 use http::{Method, Response, StatusCode};
 use http_body_util::combinators::BoxBody;
-use http_body_util::{BodyExt, Collected, Full};
+use http_body_util::{BodyExt, Full};
 use hyper::body::Bytes;
 use jsonwebtoken::DecodingKey;
-use lazy_static::lazy_static;
 use log::*;
 use name_client::*;
 use name_lib::*;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::fs;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::{
-    fmt::format,
     net::{IpAddr, Ipv4Addr},
     result::Result,
 };
-use tokio::sync::Mutex;
 
 const CLEAR_STATE_ACTIVE_CODE: &str = "zX6cV7bN8mK9lJ0hG1fD";
 const RESERVED_USER_NAMES_FILE_ENV: &str = "BUCKYOS_SN_RESERVED_NAMES_FILE";
@@ -425,7 +420,6 @@ pub struct SNServer {
     auth_db: SnAuthDBRef,
     device_info_db: SnDeviceInfoDBRef,
     compat_store: SnCompatibilityStoreRef,
-    relay_manager: SnRelayManagerRef,
     v2_auth: Arc<SnV2AuthManager>,
     name_info_cache: NameInfoCacheRef,
     resolver: SnResolverRef,
@@ -469,10 +463,6 @@ impl SNServer {
             "admin.clear_state_by_active_code" => SnRpcPath::InternalRoot,
             _ => SnRpcPath::Root,
         }
-    }
-
-    fn normalize_registration_username(username: &str) -> String {
-        username.trim().to_lowercase()
     }
 
     fn reserved_user_names_file() -> PathBuf {
@@ -532,13 +522,6 @@ impl SNServer {
             }
             SnRpcPath::Root => false,
         }
-    }
-
-    fn has_v2_access_token(&self, req: &RPCRequest) -> bool {
-        req.token
-            .as_ref()
-            .map(|token| self.v2_auth().verify_access_token(token.as_str()).is_ok())
-            .unwrap_or(false)
     }
 
     fn extract_missing_field_name(err: &str) -> Option<String> {
@@ -703,7 +686,6 @@ impl SNServer {
             auth_db,
             device_info_db,
             compat_store,
-            relay_manager,
             v2_auth,
             name_info_cache: NameInfoCache::new_ref(),
             resolver,
@@ -721,33 +703,6 @@ impl SNServer {
 
     pub(crate) fn bns_controller(&self) -> Option<Arc<SnBnsController>> {
         self.bns_controller.clone()
-    }
-
-    pub(crate) async fn maybe_assign_zone_relay(
-        &self,
-        zone: &str,
-        from_ip: Option<String>,
-        reason: &str,
-    ) {
-        let result = self
-            .relay_manager
-            .assign_zone_relay(AssignZoneRelayReq {
-                zone: zone.to_string(),
-                relay_id: None,
-                relay_sn: None,
-                from_ip,
-                region: None,
-                source: RelayAssignmentSource::Auto,
-                reason: Some(reason.to_string()),
-                sticky_until: None,
-                lease_expires_at: None,
-                backup_relay_id: None,
-                source_version: None,
-            })
-            .await;
-        if let Err(error) = result {
-            debug!("skip auto relay assignment for {}: {}", zone, error);
-        }
     }
 
     pub fn add_name_info_cache(
@@ -801,28 +756,6 @@ impl SNServer {
         }
 
         result
-    }
-
-    async fn sync_device_online_state(
-        &self,
-        username: &str,
-        device_name: &str,
-        did: &str,
-        ip: &str,
-        description: &str,
-    ) -> SnResult<()> {
-        self.upsert_device_online_state(
-            username,
-            device_name,
-            did,
-            ip,
-            description,
-            None,
-            Vec::new(),
-            None,
-            None,
-        )
-        .await
     }
 
     pub(crate) async fn upsert_device_online_state(
@@ -882,60 +815,6 @@ impl SNServer {
             .await
     }
 
-    pub(crate) async fn register_device_record(
-        &self,
-        username: &str,
-        device_name: &str,
-        did: &str,
-        mini_config_jwt: &str,
-        ip: &str,
-        description: &str,
-    ) -> SnResult<()> {
-        self.compat_store
-            .register_device(username, device_name, did, mini_config_jwt, ip, description)
-            .await?;
-        self.sync_device_online_state(username, device_name, did, ip, description)
-            .await
-    }
-
-    pub(crate) async fn update_device_record(
-        &self,
-        username: &str,
-        device_name: &str,
-        did: Option<&str>,
-        mini_config_jwt: Option<&str>,
-        ip: &str,
-        description: &str,
-    ) -> SnResult<()> {
-        if let (Some(did), Some(mini_config_jwt)) = (did, mini_config_jwt) {
-            self.compat_store
-                .update_device_by_name(username, device_name, did, mini_config_jwt, ip, description)
-                .await?;
-            self.sync_device_online_state(username, device_name, did, ip, description)
-                .await?;
-        } else {
-            self.compat_store
-                .update_device_info_by_name(username, device_name, ip, description)
-                .await?;
-            if let Some(device) = self
-                .compat_store
-                .query_device_by_name(username, device_name)
-                .await?
-            {
-                self.sync_device_online_state(
-                    username,
-                    device_name,
-                    device.did.as_str(),
-                    ip,
-                    description,
-                )
-                .await?;
-            }
-        }
-
-        Ok(())
-    }
-
     fn normalize_query_name(name: &str) -> String {
         if name.ends_with(".") {
             name.trim_end_matches('.').to_string()
@@ -949,51 +828,6 @@ impl SNServer {
             record_type,
             RecordType::A | RecordType::AAAA | RecordType::TXT
         )
-    }
-
-    pub async fn check_username(&self, req: RPCRequest) -> Result<RPCResponse, RPCErrors> {
-        let username = req.params.get("username");
-        if username.is_none() {
-            return Err(RPCErrors::ParseRequestError(
-                "Invalid params, username is none".to_string(),
-            ));
-        }
-        let username = username.unwrap().as_str();
-        let username = username.unwrap();
-        let username = Self::normalize_registration_username(username);
-        let (valid, reason, message) =
-            if let Err(message) = Self::validate_registration_username(username.as_str()) {
-                (false, "invalid_username".to_string(), message.to_string())
-            } else {
-                let exists = self
-                    .auth_db
-                    .is_user_exist(username.as_str())
-                    .await
-                    .map_err(|e| {
-                        error!("Failed to check username: {:?}", e);
-                        RPCErrors::ReasonError(e.to_string())
-                    })?;
-                if exists {
-                    (
-                        false,
-                        "already_exists".to_string(),
-                        format!("username {} already exists", username),
-                    )
-                } else {
-                    (true, "ok".to_string(), String::new())
-                }
-            };
-
-        let resp = RPCResponse::create_by_req(
-            RPCResult::Success(json!({
-                "valid": valid,
-                "reason": reason,
-                "message": message,
-                "normalized_name": username
-            })),
-            &req,
-        );
-        return Ok(resp);
     }
 
     // 辅助函数：检测字符串是否包含特殊字符
@@ -1065,609 +899,6 @@ impl SNServer {
             &req,
         );
         Ok(resp)
-    }
-
-    pub async fn register_user(&self, req: RPCRequest) -> Result<RPCResponse, RPCErrors> {
-        let user_name = req.params.get("user_name");
-        let public_key = req.params.get("public_key");
-        let active_code = req.params.get("active_code");
-        let zone_config_jwt = req.params.get("zone_config");
-        let user_domain = req.params.get("user_domain");
-        if user_name.is_none() || public_key.is_none() || active_code.is_none() {
-            return Err(RPCErrors::ParseRequestError(
-                "Invalid params, user_name or public_key or active_code is none".to_string(),
-            ));
-        }
-        let user_name = Self::normalize_registration_username(user_name.unwrap().as_str().unwrap());
-        if let Err(err) = Self::validate_registration_username(user_name.as_str()) {
-            return Err(RPCErrors::ParseRequestError(format!(
-                "Invalid user_name: {}",
-                err
-            )));
-        }
-        let public_key = public_key.unwrap().as_str().unwrap();
-        let active_code = active_code.unwrap().as_str().unwrap();
-        let zone_config_jwt = zone_config_jwt
-            .and_then(|value| value.as_str())
-            .unwrap_or("");
-
-        let mut real_user_domain = None;
-        if user_domain.is_some() {
-            let user_domain = user_domain.unwrap();
-            let user_domain_str = user_domain.as_str();
-            if user_domain_str.is_some() {
-                real_user_domain = Some(user_domain_str.unwrap().to_string());
-            }
-        }
-
-        let ret = self
-            .auth_db
-            .register_user_with_owner_key(
-                active_code,
-                user_name.as_str(),
-                public_key,
-                zone_config_jwt,
-                real_user_domain,
-                None,
-            )
-            .await;
-        if ret.is_err() {
-            let err_str = ret.err().unwrap().to_string();
-            warn!(
-                "Failed to register user {}: {:?}",
-                user_name,
-                err_str.as_str()
-            );
-            return Err(RPCErrors::ParseRequestError(format!(
-                "Failed to register user: {}",
-                err_str
-            )));
-        }
-
-        info!(
-            "user {} registered success, public_key: {}, active_code: {}",
-            user_name, public_key, active_code
-        );
-
-        let resp = RPCResponse::create_by_req(
-            RPCResult::Success(json!({
-                "code":0
-            })),
-            &req,
-        );
-        return Ok(resp);
-    }
-
-    pub async fn register_device(&self, req: RPCRequest) -> Result<RPCResponse, RPCErrors> {
-        let user_name = req.params.get("user_name");
-        let device_name = req.params.get("device_name");
-        let device_did = req.params.get("device_did");
-        let mini_config_jwt = req.params.get("mini_config_jwt");
-        let device_ip = req.params.get("device_ip");
-        let device_info = req.params.get("device_info");
-
-        if user_name.is_none()
-            || device_name.is_none()
-            || device_did.is_none()
-            || mini_config_jwt.is_none()
-            || device_ip.is_none()
-            || device_info.is_none()
-        {
-            return Err(RPCErrors::ParseRequestError("Invalid params, user_name or device_name or device_did or mini_config_jwt or device_ip or device_info is none".to_string()));
-        }
-        let user_name = user_name.unwrap().as_str().unwrap();
-        let device_name = device_name.unwrap().as_str().unwrap();
-        let device_did = device_did.unwrap().as_str().unwrap();
-        let mini_config_jwt = mini_config_jwt.unwrap().as_str().unwrap();
-        let device_ip = device_ip.unwrap().as_str().unwrap();
-        let device_info = device_info.unwrap().as_str().unwrap();
-
-        //check token is valid (verify pub key is user's public key)
-        let session_token = req.token.clone();
-        if session_token.is_none() {
-            return Err(RPCErrors::ParseRequestError(
-                "Invalid params, session_token is none".to_string(),
-            ));
-        }
-        let session_token = session_token.unwrap();
-        let mut rpc_session_token = RPCSessionToken::from_string(session_token.as_str())?;
-        let user_public_key = self.get_user_public_key(user_name).await;
-        if user_public_key.is_none() {
-            warn!("user {} not found", user_name);
-            return Err(RPCErrors::ParseRequestError("user not found".to_string()));
-        }
-        let user_public_key_str = user_public_key.unwrap();
-        let user_public_key: jsonwebtoken::jwk::Jwk =
-            serde_json::from_str(user_public_key_str.as_str()).map_err(|e| {
-                error!("Failed to parse user public key: {:?}", e);
-                RPCErrors::ParseRequestError(e.to_string())
-            })?;
-
-        let user_public_key = DecodingKey::from_jwk(&user_public_key).map_err(|e| {
-            error!("Failed to decode user public key: {:?}", e);
-            RPCErrors::ParseRequestError(e.to_string())
-        })?;
-
-        rpc_session_token.verify_by_key(&user_public_key)?;
-        if rpc_session_token.aud != Some("sn".to_string()) {
-            return Err(RPCErrors::ParseRequestError(format!(
-                "invalid aud {} expect sn",
-                rpc_session_token.aud.clone().unwrap_or("None".to_string())
-            )));
-        }
-
-        let decode_context = format!("register_device {}.{}", user_name, device_name);
-        let mini_device_config = Self::decode_mini_config_with_schema_compat(
-            mini_config_jwt,
-            &user_public_key,
-            decode_context.as_str(),
-        );
-        if mini_device_config.is_err() {
-            return Err(RPCErrors::ParseRequestError(format!(
-                "Failed to parse mini device config: {}",
-                mini_device_config.err().unwrap().to_string()
-            )));
-        }
-        let mini_device_config = mini_device_config.unwrap();
-        let dev_did = format!("did:dev:{}", mini_device_config.x.as_str());
-        if dev_did.as_str() != device_did {
-            return Err(RPCErrors::ParseRequestError(format!(
-                "Invalid device did: {} (from jwt) != {} (from request)",
-                dev_did, device_did
-            )));
-        }
-
-        let ret = self
-            .register_device_record(
-                user_name,
-                device_name,
-                device_did,
-                mini_config_jwt,
-                device_ip,
-                device_info,
-            )
-            .await;
-        if ret.is_err() {
-            let err_str = ret.err().unwrap().to_string();
-            warn!(
-                "Failed to register device {}_{}: {:?}",
-                user_name,
-                device_name,
-                err_str.as_str()
-            );
-            return Err(RPCErrors::ParseRequestError(format!(
-                "Failed to register device: {}",
-                err_str
-            )));
-        }
-
-        info!("device {}_{} registered success", user_name, device_name);
-
-        let resp = RPCResponse::create_by_req(
-            RPCResult::Success(json!({
-                "code":0
-            })),
-            &req,
-        );
-        return Ok(resp);
-    }
-
-    pub async fn bind_zone_to_user(&self, req: RPCRequest) -> Result<RPCResponse, RPCErrors> {
-        let user_name = req.params.get("user_name");
-        let user_domain = req.params.get("user_domain");
-        let zone_config_jwt = req.params.get("zone_config");
-
-        if user_name.is_none() || zone_config_jwt.is_none() {
-            return Err(RPCErrors::ParseRequestError(
-                "Invalid params, user_name or zone_config is none".to_string(),
-            ));
-        }
-        let user_name = user_name.unwrap().as_str().unwrap();
-        let zone_config_jwt = zone_config_jwt.unwrap().as_str().unwrap();
-
-        let mut real_user_domain = None;
-        if user_domain.is_some() {
-            let user_domain = user_domain.unwrap();
-            let user_domain_str = user_domain.as_str();
-            if user_domain_str.is_some() {
-                real_user_domain = Some(user_domain_str.unwrap().to_string());
-            }
-        }
-
-        //check token is valid (verify pub key is user's public key)
-        let session_token = req.token.clone();
-        if session_token.is_none() {
-            return Err(RPCErrors::ParseRequestError(
-                "Invalid params, session_token is none".to_string(),
-            ));
-        }
-        let session_token = session_token.unwrap();
-        let mut rpc_session_token = RPCSessionToken::from_string(session_token.as_str())?;
-        let user_public_key = self.get_user_public_key(user_name).await;
-        if user_public_key.is_none() {
-            warn!("user {} not found", user_name);
-            return Err(RPCErrors::ParseRequestError("user not found".to_string()));
-        }
-        let user_public_key_str = user_public_key.unwrap();
-        let user_public_key: jsonwebtoken::jwk::Jwk =
-            serde_json::from_str(user_public_key_str.as_str()).map_err(|e| {
-                error!("Failed to parse user public key: {:?}", e);
-                RPCErrors::ParseRequestError(e.to_string())
-            })?;
-
-        let user_public_key = DecodingKey::from_jwk(&user_public_key).map_err(|e| {
-            error!("Failed to decode user public key: {:?}", e);
-            RPCErrors::ParseRequestError(e.to_string())
-        })?;
-
-        rpc_session_token.verify_by_key(&user_public_key)?;
-        //TODO 这里的验证太简单了
-
-        // Update zone_config and user_domain in database
-        self.auth_db
-            .update_user_zone_config(user_name, zone_config_jwt)
-            .await
-            .map_err(|e| {
-                error!(
-                    "Failed to update zone_config for user {}: {:?}",
-                    user_name, e
-                );
-                RPCErrors::ParseRequestError(format!("Failed to update zone_config: {}", e))
-            })?;
-
-        if let Some(domain) = &real_user_domain {
-            self.auth_db
-                .update_user_domain(user_name, Some(domain.clone()))
-                .await
-                .map_err(|e| {
-                    error!(
-                        "Failed to update user_domain for user {}: {:?}",
-                        user_name, e
-                    );
-                    RPCErrors::ParseRequestError(format!("Failed to update user_domain: {}", e))
-                })?;
-        }
-
-        info!(
-            "user {} zone_config and user_domain updated successfully",
-            user_name
-        );
-
-        let resp = RPCResponse::create_by_req(
-            RPCResult::Success(json!({
-                "code":0
-            })),
-            &req,
-        );
-        return Ok(resp);
-    }
-
-    pub async fn unbind_zone_from_user(&self, req: RPCRequest) -> Result<RPCResponse, RPCErrors> {
-        let user_name = req
-            .params
-            .get("user_name")
-            .and_then(|value| value.as_str())
-            .ok_or_else(|| {
-                RPCErrors::ParseRequestError("Invalid params, user_name is none".to_string())
-            })?;
-
-        let session_token = req.token.clone().ok_or_else(|| {
-            RPCErrors::ParseRequestError("Invalid params, session_token is none".to_string())
-        })?;
-        let mut rpc_session_token = RPCSessionToken::from_string(session_token.as_str())?;
-
-        let user_public_key_str = self.get_user_public_key(user_name).await.ok_or_else(|| {
-            warn!("user {} not found", user_name);
-            RPCErrors::ParseRequestError("user not found".to_string())
-        })?;
-        let user_public_key: jsonwebtoken::jwk::Jwk =
-            serde_json::from_str(user_public_key_str.as_str()).map_err(|e| {
-                error!("Failed to parse user public key: {:?}", e);
-                RPCErrors::ParseRequestError(e.to_string())
-            })?;
-
-        let user_public_key = DecodingKey::from_jwk(&user_public_key).map_err(|e| {
-            error!("Failed to decode user public key: {:?}", e);
-            RPCErrors::ParseRequestError(e.to_string())
-        })?;
-
-        rpc_session_token.verify_by_key(&user_public_key)?;
-        match rpc_session_token.sub.as_deref() {
-            Some(sub) if sub == user_name => {}
-            Some(_) => {
-                return Err(RPCErrors::ParseRequestError(
-                    "token user mismatch".to_string(),
-                ))
-            }
-            None => {
-                return Err(RPCErrors::ParseRequestError(
-                    "Invalid token: sub is none".to_string(),
-                ))
-            }
-        }
-
-        self.auth_db
-            .update_user_zone_config(user_name, "")
-            .await
-            .map_err(|e| {
-                error!(
-                    "Failed to clear zone_config for user {}: {:?}",
-                    user_name, e
-                );
-                RPCErrors::ParseRequestError(format!("Failed to clear zone_config: {}", e))
-            })?;
-
-        info!("user {} zone_config cleared successfully", user_name);
-
-        Ok(RPCResponse::create_by_req(
-            RPCResult::Success(json!({ "code": 0 })),
-            &req,
-        ))
-    }
-
-    pub async fn update_device(
-        &self,
-        req: RPCRequest,
-        ip_from: IpAddr,
-    ) -> Result<RPCResponse, RPCErrors> {
-        let device_info_json = req.params.get("device_info");
-        let owner_id = req.params.get("owner_id");
-        if owner_id.is_none() || device_info_json.is_none() {
-            return Err(RPCErrors::ParseRequestError(
-                "Invalid params, owner_id or device_info is none".to_string(),
-            ));
-        }
-        let owner_id = owner_id.unwrap().as_str();
-        if owner_id.is_none() {
-            return Err(RPCErrors::ParseRequestError(
-                "Invalid params, owner_id is none".to_string(),
-            ));
-        }
-        let owner_id = owner_id.unwrap();
-        let device_info_json = device_info_json.unwrap();
-        let device_info =
-            serde_json::from_value::<DeviceInfo>(device_info_json.clone()).map_err(|e| {
-                error!("Failed to parse device info: {:?}", e);
-                RPCErrors::ParseRequestError(e.to_string())
-            })?;
-
-        //check session_token is valid (verify pub key is device's public key)
-
-        let old_device_info = self
-            .get_device_info(owner_id, device_info.name.as_str())
-            .await
-            .map_err(|e| RPCErrors::ReasonError(format!("device info error: {}", e)))?;
-        if old_device_info.is_none() {
-            warn!("device {} not found", owner_id);
-            return Err(RPCErrors::ParseRequestError("device not found".to_string()));
-        }
-        let (old_device_info, _) = old_device_info.unwrap();
-
-        let session_token = req.token.clone();
-        if session_token.is_none() {
-            return Err(RPCErrors::ParseRequestError(
-                "Invalid params, session_token is none".to_string(),
-            ));
-        }
-        let session_token = session_token.unwrap();
-        let mut rpc_session_token = RPCSessionToken::from_string(session_token.as_str())?;
-        let device_did = device_info.id.clone();
-
-        let verify_public_key = DecodingKey::from_ed_components(old_device_info.id.id.as_str())
-            .map_err(|e| {
-                error!("Failed to decode device public key: {:?}", e);
-                RPCErrors::ParseRequestError(e.to_string())
-            })?;
-        rpc_session_token.verify_by_key(&verify_public_key)?;
-
-        info!(
-            "start update {}_{} ==> {:?}",
-            owner_id,
-            device_info.name.clone(),
-            device_info_json
-        );
-        let ip_str = ip_from.to_string();
-
-        self.update_device_record(
-            owner_id,
-            device_info.name.as_str(),
-            None,
-            None,
-            ip_str.as_str(),
-            device_info_json.to_string().as_str(),
-        )
-        .await
-        .map_err(|e| RPCErrors::ReasonError(format!("{}", e)))?;
-
-        let resp = RPCResponse::create_by_req(
-            RPCResult::Success(json!({
-                "code":0
-            })),
-            &req,
-        );
-
-        let key = format!("{}_{}", owner_id, device_info.name.clone());
-
-        info!("update device info done: for {}", key);
-        return Ok(resp);
-    }
-
-    pub async fn get_device_by_public_key(
-        &self,
-        req: RPCRequest,
-    ) -> Result<RPCResponse, RPCErrors> {
-        let public_key = req
-            .params
-            .get("public_key")
-            .and_then(|value| value.as_str())
-            .ok_or_else(|| {
-                RPCErrors::ParseRequestError("Invalid params, public_key is none".to_string())
-            })?
-            .to_string();
-        let pk_preview: String = public_key.chars().take(16).collect();
-        info!(
-            "get_device_by_public_key start: req_id={}, public_key_len={}, pk_preview={}",
-            req.seq,
-            public_key.len(),
-            pk_preview
-        );
-        let device_name = "ood1";
-        let user_info = {
-            self.auth_db
-                .get_user_by_public_key(public_key.as_str())
-                .await
-                .map_err(|e| {
-                    error!(
-                        "Failed to query user by public_key {}, err: {:?}",
-                        public_key, e
-                    );
-                    RPCErrors::ReasonError(e.to_string())
-                })?
-        };
-
-        if user_info.is_none() {
-            warn!("user not found for public_key {}", public_key);
-            let response_value = json!({
-                "user_name": Value::Null,
-                "public_key": public_key,
-                "device_name": device_name,
-                "zone_config": Value::Null,
-                "sn_ips": Vec::<String>::new(),
-                "device_info": Value::Null,
-                "device_sn_ip": Value::Null,
-                "found": false,
-                "reason": "user not found",
-            });
-            return Ok(RPCResponse::create_by_req(
-                RPCResult::Success(response_value),
-                &req,
-            ));
-        }
-
-        let (username, zone_config, _) = user_info.unwrap();
-        info!(
-            "get_device_by_public_key matched username={} for req_id={}",
-            username, req.seq
-        );
-
-        let mut device_info_err: Option<String> = None;
-        let device_entry = match self.get_device_info(username.as_str(), device_name).await {
-            Ok(entry) => entry,
-            Err(e) => {
-                warn!(
-                    "device info parse failed for {}_{}: {}",
-                    username, device_name, e
-                );
-                device_info_err = Some(e.to_string());
-                None
-            }
-        };
-        if device_entry.is_some() {
-            info!(
-                "device info found for {}_{} when querying by public_key",
-                username, device_name
-            );
-        } else {
-            warn!(
-                "device info missing for {}_{} when querying by public_key",
-                username, device_name
-            );
-        }
-
-        let sn_ips_vec = self
-            .get_user_sn_ips(username.as_str())
-            .await
-            .into_iter()
-            .map(|ip| ip.to_string())
-            .collect::<Vec<String>>();
-        debug!(
-            "get_device_by_public_key collected {} sn_ips for user {}",
-            sn_ips_vec.len(),
-            username
-        );
-
-        let (device_info_value, device_sn_ip_value, reason_value) =
-            if let Some((device_info, sn_ip)) = device_entry {
-                let device_value = serde_json::to_value(device_info).map_err(|e| {
-                    error!(
-                        "Failed to serialize device info for {}_{}: {:?}",
-                        username, device_name, e
-                    );
-                    RPCErrors::ReasonError(e.to_string())
-                })?;
-                (Some(device_value), Some(sn_ip.to_string()), Value::Null)
-            } else {
-                let reason = device_info_err.unwrap_or_else(|| "device info not found".to_string());
-                (None, None, Value::String(reason))
-            };
-        let found = device_info_value.is_some();
-
-        let response_value = json!({
-            "user_name": username,
-            "public_key": public_key,
-            "device_name": device_name,
-            "zone_config": zone_config,
-            "sn_ips": sn_ips_vec,
-            "device_info": device_info_value,
-            "device_sn_ip": device_sn_ip_value,
-            "found": found,
-            "reason": reason_value,
-        });
-        info!(
-            "get_device_by_public_key success for user={}, device={}, device_found={}, sn_ip_cached={}",
-            response_value["user_name"].as_str().unwrap_or_default(),
-            response_value["device_name"].as_str().unwrap_or_default(),
-            response_value["device_info"].is_object(),
-            response_value["device_sn_ip"].is_string()
-        );
-
-        Ok(RPCResponse::create_by_req(
-            RPCResult::Success(response_value),
-            &req,
-        ))
-    }
-
-    //get device info by device_name and owner_name
-    pub async fn get_device(&self, req: RPCRequest) -> Result<RPCResponse, RPCErrors> {
-        //verify request.sesion_token is valid (known device token)
-        let device_id = req.params.get("device_id");
-        let owner_id = req.params.get("owner_id");
-        if owner_id.is_none() || device_id.is_none() {
-            return Err(RPCErrors::ParseRequestError(
-                "Invalid params, owner_id or device_info is none".to_string(),
-            ));
-        }
-        let device_id = device_id.unwrap().as_str();
-        let owner_id = owner_id.unwrap().as_str();
-        if device_id.is_none() || owner_id.is_none() {
-            return Err(RPCErrors::ParseRequestError(
-                "Invalid params, device_id or owner_id is none".to_string(),
-            ));
-        }
-        let device_id = device_id.unwrap();
-        let owner_id = owner_id.unwrap();
-        let device_info = self
-            .get_device_info(owner_id, device_id)
-            .await
-            .map_err(|e| RPCErrors::ReasonError(format!("device info error: {}", e)))?;
-        if device_info.is_some() {
-            let device_info = device_info.unwrap();
-            let device_value = serde_json::to_value(device_info.0).map_err(|e| {
-                warn!("Failed to parse device info: {:?}", e);
-                RPCErrors::ReasonError(e.to_string())
-            })?;
-            return Ok(RPCResponse::create_by_req(
-                RPCResult::Success(device_value),
-                &req,
-            ));
-        } else {
-            warn!("device info not found for {}_{}", owner_id, device_id);
-            let device_json = serde_json::to_value(device_info.clone()).unwrap();
-            return Ok(RPCResponse::create_by_req(
-                RPCResult::Success(device_json),
-                &req,
-            ));
-        }
     }
 
     async fn get_user_sn_ips(&self, owner_id: &str) -> Vec<IpAddr> {
@@ -1802,11 +1033,9 @@ impl SNServer {
         let user_info = user_info.unwrap();
         if user_info.is_some() {
             let user_info = user_info.unwrap();
-            // 只存储前两个字段 (public_key, zone_config)，忽略 sn_ips
             let public_key = user_info.public_key.clone();
             let zone_config = user_info.zone_config.clone();
             let sn_ips = user_info.sn_ips.clone();
-            let stored_info = (public_key.clone(), zone_config.clone());
 
             let device_info = self
                 .compat_store
@@ -1826,23 +1055,6 @@ impl SNServer {
             return Some((public_key, zone_config, sn_ips, None));
         }
         warn!("zone config not found for [{}]", username);
-        return None;
-    }
-
-    async fn get_user_public_key(&self, username: &str) -> Option<String> {
-        let user_info = self.auth_db.get_user_info(username).await;
-        if user_info.is_err() {
-            warn!(
-                "failed to get user info for {}: {:?}",
-                username,
-                user_info.err().unwrap()
-            );
-            return None;
-        }
-        let user_info = user_info.unwrap();
-        if user_info.is_some() {
-            return Some(user_info.unwrap().public_key.clone());
-        }
         return None;
     }
 
@@ -1947,487 +1159,6 @@ impl SNServer {
             return Ok(Some(address_vec));
         }
         return Ok(None);
-    }
-
-    async fn add_dns_record(&self, req: RPCRequest) -> Result<RPCResponse, RPCErrors> {
-        let session_token = req.token.clone();
-        if session_token.is_none() {
-            return Err(RPCErrors::ParseRequestError(
-                "Invalid params, session_token is none".to_string(),
-            ));
-        }
-        let session_token = session_token.unwrap();
-        let mut rpc_session_token = RPCSessionToken::from_string(session_token.as_str())?;
-
-        let device_did = req.params.get("device_did");
-        if device_did.is_none() {
-            return Err(RPCErrors::ParseRequestError(
-                "Invalid params, user_name is none".to_string(),
-            ));
-        }
-        let device_did = device_did.unwrap().as_str();
-        if device_did.is_none() {
-            return Err(RPCErrors::ParseRequestError(
-                "Invalid params, user_name is none".to_string(),
-            ));
-        }
-        let device_did = device_did.unwrap();
-
-        let device_info = self.compat_store.query_device_by_did(device_did).await;
-        if device_info.is_err() {
-            warn!("device {} not found", device_did);
-            return Err(RPCErrors::ParseRequestError("device not found".to_string()));
-        }
-        let device_info = device_info.unwrap();
-        if device_info.is_none() {
-            warn!("device {} not found", device_did);
-            return Err(RPCErrors::ParseRequestError("device not found".to_string()));
-        }
-        let device_info = device_info.unwrap();
-        let user_name = device_info.owner.as_str();
-        let device_did = DID::from_str(device_info.did.as_str());
-        if device_did.is_err() {
-            return Err(RPCErrors::ParseRequestError(
-                "Invalid params, device_id is invalid".to_string(),
-            ));
-        }
-        let device_did = device_did.unwrap();
-
-        let verify_public_key =
-            DecodingKey::from_ed_components(device_did.id.as_str()).map_err(|e| {
-                error!("Failed to decode device public key: {:?}", e);
-                RPCErrors::ParseRequestError(e.to_string())
-            })?;
-        rpc_session_token.verify_by_key(&verify_public_key)?;
-
-        let domain = req.params.get("domain");
-        if domain.is_none() {
-            return Err(RPCErrors::ParseRequestError(
-                "Invalid params, domain is none".to_string(),
-            ));
-        }
-        let domain = domain.unwrap().as_str();
-        if domain.is_none() {
-            return Err(RPCErrors::ParseRequestError(
-                "Invalid params, domain is none".to_string(),
-            ));
-        }
-        let domain = domain.unwrap();
-        let record_type = req.params.get("record_type");
-        if record_type.is_none() {
-            return Err(RPCErrors::ParseRequestError(
-                "Invalid params, record_type is none".to_string(),
-            ));
-        }
-        let record_type = record_type.unwrap().as_str();
-        if record_type.is_none() {
-            return Err(RPCErrors::ParseRequestError(
-                "Invalid params, record_type is none".to_string(),
-            ));
-        }
-        let record_type = record_type.unwrap();
-
-        let record_value = req.params.get("record");
-        if record_value.is_none() {
-            return Err(RPCErrors::ParseRequestError(
-                "Invalid params, record is none".to_string(),
-            ));
-        }
-        let record_value = record_value.unwrap().as_str();
-        if record_value.is_none() {
-            return Err(RPCErrors::ParseRequestError(
-                "Invalid params, record is none".to_string(),
-            ));
-        }
-        let record_value = record_value.unwrap();
-
-        let ttl = req.params.get("ttl");
-        if ttl.is_none() {
-            return Err(RPCErrors::ParseRequestError(
-                "Invalid params, ttl is none".to_string(),
-            ));
-        }
-        let ttl = ttl.unwrap().as_i64();
-        let ttl = if ttl.is_some() { ttl.unwrap() } else { 600 };
-
-        let end_string = format!(".{}.web3.{}", user_name, self.server_host);
-        if !domain.ends_with(end_string.as_str()) {
-            return Err(RPCErrors::ParseRequestError(format!(
-                "Invalid params, domain is not end with {}",
-                end_string
-            )));
-        }
-
-        let ret = self
-            .compat_store
-            .add_user_domain(user_name, domain, record_type, record_value, ttl as u32)
-            .await;
-        if ret.is_err() {
-            let err_str = ret.err().unwrap().to_string();
-            warn!(
-                "Failed to add dns record {}_{}: {:?}",
-                user_name,
-                domain,
-                err_str.as_str()
-            );
-            return Err(RPCErrors::ParseRequestError(format!(
-                "Failed to add dns record: {}",
-                err_str
-            )));
-        }
-
-        info!("add dns record {} {} success", user_name, domain);
-        if let Some(record_type) = Self::parse_name_record_type(record_type) {
-            self.remove_name_info_cache(domain, record_type);
-        }
-
-        let resp = RPCResponse::create_by_req(
-            RPCResult::Success(json!({
-                "code":0
-            })),
-            &req,
-        );
-        Ok(resp)
-    }
-
-    async fn remove_dns_record(&self, req: RPCRequest) -> Result<RPCResponse, RPCErrors> {
-        let session_token = req.token.clone();
-        if session_token.is_none() {
-            return Err(RPCErrors::ParseRequestError(
-                "Invalid params, session_token is none".to_string(),
-            ));
-        }
-        let session_token = session_token.unwrap();
-        let mut rpc_session_token = RPCSessionToken::from_string(session_token.as_str())?;
-
-        let device_did = req.params.get("device_did");
-        if device_did.is_none() {
-            return Err(RPCErrors::ParseRequestError(
-                "Invalid params, user_name is none".to_string(),
-            ));
-        }
-        let device_did = device_did.unwrap().as_str();
-        if device_did.is_none() {
-            return Err(RPCErrors::ParseRequestError(
-                "Invalid params, user_name is none".to_string(),
-            ));
-        }
-        let device_did = device_did.unwrap();
-
-        let device_info = self.compat_store.query_device_by_did(device_did).await;
-        if device_info.is_err() {
-            warn!("device {} not found", device_did);
-            return Err(RPCErrors::ParseRequestError("device not found".to_string()));
-        }
-        let device_info = device_info.unwrap();
-        if device_info.is_none() {
-            warn!("device {} not found", device_did);
-            return Err(RPCErrors::ParseRequestError("device not found".to_string()));
-        }
-        let device_info = device_info.unwrap();
-        let user_name = device_info.owner.as_str();
-        let device_did = DID::from_str(device_info.did.as_str());
-        if device_did.is_err() {
-            return Err(RPCErrors::ParseRequestError(
-                "Invalid params, device_id is invalid".to_string(),
-            ));
-        }
-        let device_did = device_did.unwrap();
-
-        let verify_public_key =
-            DecodingKey::from_ed_components(device_did.id.as_str()).map_err(|e| {
-                error!("Failed to decode device public key: {:?}", e);
-                RPCErrors::ParseRequestError(e.to_string())
-            })?;
-        rpc_session_token.verify_by_key(&verify_public_key)?;
-
-        let domain = req.params.get("domain");
-        if domain.is_none() {
-            return Err(RPCErrors::ParseRequestError(
-                "Invalid params, domain is none".to_string(),
-            ));
-        }
-        let domain = domain.unwrap().as_str();
-        if domain.is_none() {
-            return Err(RPCErrors::ParseRequestError(
-                "Invalid params, domain is none".to_string(),
-            ));
-        }
-        let domain = domain.unwrap();
-        let record_type = req.params.get("record_type");
-        if record_type.is_none() {
-            return Err(RPCErrors::ParseRequestError(
-                "Invalid params, record_type is none".to_string(),
-            ));
-        }
-        let record_type = record_type.unwrap().as_str();
-        if record_type.is_none() {
-            return Err(RPCErrors::ParseRequestError(
-                "Invalid params, record_type is none".to_string(),
-            ));
-        }
-        let record_type = record_type.unwrap();
-
-        let has_cert = req.params.get("has_cert");
-        if let Some(has_cert) = has_cert {
-            let has_cert = has_cert.as_bool();
-            if has_cert.is_some() && has_cert.unwrap() {
-                let ret = self.auth_db.update_user_self_cert(user_name, true).await;
-                if ret.is_err() {
-                    let err_str = ret.err().unwrap().to_string();
-                    warn!("Failed to update user self cert: {}", err_str);
-                    return Err(RPCErrors::ParseRequestError(format!(
-                        "Failed to update user self cert: {}",
-                        err_str
-                    )));
-                }
-            }
-        }
-
-        let end_string = format!(".{}.web3.{}", user_name, self.server_host);
-        if !domain.ends_with(end_string.as_str()) {
-            return Err(RPCErrors::ParseRequestError(format!(
-                "Invalid params, domain is not end with {}",
-                end_string
-            )));
-        }
-
-        let ret = self
-            .compat_store
-            .remove_user_domain(user_name, domain, record_type)
-            .await;
-        if ret.is_err() {
-            let err_str = ret.err().unwrap().to_string();
-            warn!(
-                "Failed to remove dns record {}_{}: {:?}",
-                user_name,
-                domain,
-                err_str.as_str()
-            );
-            return Err(RPCErrors::ParseRequestError(format!(
-                "Failed to remove dns record: {}",
-                err_str
-            )));
-        }
-
-        info!("remove dns record {} {} success", user_name, domain);
-        if let Some(record_type) = Self::parse_name_record_type(record_type) {
-            self.remove_name_info_cache(domain, record_type);
-        }
-
-        let resp = RPCResponse::create_by_req(
-            RPCResult::Success(json!({
-                "code":0
-            })),
-            &req,
-        );
-        Ok(resp)
-    }
-
-    async fn set_user_self_cert(&self, req: RPCRequest) -> Result<RPCResponse, RPCErrors> {
-        // set_user_self_cert(name:String,self_cert:boolean)
-        // `name` is username, but signature must be from any registered device of that user.
-        let session_token = req.token.clone().ok_or_else(|| {
-            RPCErrors::ParseRequestError("Invalid params, session_token is none".to_string())
-        })?;
-
-        let username = req
-            .params
-            .get("name")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| {
-                RPCErrors::ParseRequestError("Invalid params, name is none".to_string())
-            })?;
-
-        // self_cert is a bool flag; treat missing/null as false (delete).
-        let self_cert = req
-            .params
-            .get("self_cert")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-
-        // Parse token once, use token.sub as device_name (e.g. "ood1") to locate the device.
-        let mut rpc_session_token = RPCSessionToken::from_string(session_token.as_str())?;
-        let device_name = rpc_session_token.sub.clone().ok_or_else(|| {
-            RPCErrors::ParseRequestError("Invalid token: sub is none".to_string())
-        })?;
-        if device_name.trim().is_empty() {
-            return Err(RPCErrors::ParseRequestError(
-                "Invalid token: sub is empty".to_string(),
-            ));
-        }
-
-        // Make sure user exists
-        let user = self.auth_db.get_user_info(username).await.map_err(|e| {
-            RPCErrors::ReasonError(format!("failed to query user {}: {}", username, e))
-        })?;
-        if user.is_none() {
-            return Err(RPCErrors::ParseRequestError("user not found".to_string()));
-        }
-
-        // Resolve device by (username, device_name), then verify token signature with that device's key.
-        let device = self
-            .compat_store
-            .query_device_by_name(username, device_name.as_str())
-            .await
-            .map_err(|e| RPCErrors::ReasonError(format!("query device failed: {}", e)))?;
-        let device =
-            device.ok_or_else(|| RPCErrors::ParseRequestError("device not found".to_string()))?;
-
-        if device.owner != username {
-            return Err(RPCErrors::ParseRequestError(
-                "device has no permission".to_string(),
-            ));
-        }
-
-        let device_did = DID::from_str(device.did.as_str()).map_err(|_| {
-            RPCErrors::ParseRequestError("Invalid params, device_id is invalid".to_string())
-        })?;
-        let verify_public_key =
-            DecodingKey::from_ed_components(device_did.id.as_str()).map_err(|e| {
-                error!("Failed to decode device public key: {:?}", e);
-                RPCErrors::ParseRequestError(e.to_string())
-            })?;
-        rpc_session_token.verify_by_key(&verify_public_key)?;
-
-        let ret = self
-            .auth_db
-            .update_user_self_cert(username, self_cert)
-            .await;
-        if ret.is_err() {
-            let err_str = ret.err().unwrap().to_string();
-            warn!(
-                "Failed to update user self cert for user {}: {}",
-                username, err_str
-            );
-            return Err(RPCErrors::ParseRequestError(format!(
-                "Failed to update user self cert: {}",
-                err_str
-            )));
-        }
-
-        info!(
-            "set_user_self_cert success: user={}, device={}, self_cert={}",
-            username,
-            device.did.clone(),
-            self_cert
-        );
-        Ok(RPCResponse::create_by_req(
-            RPCResult::Success(json!({ "code": 0 })),
-            &req,
-        ))
-    }
-
-    async fn set_user_did_document(&self, req: RPCRequest) -> Result<RPCResponse, RPCErrors> {
-        // set_user_did_document(owner_user:String,obj_name:String,did_document:JSON,doc_type:String)
-        let session_token = req.token.clone().ok_or_else(|| {
-            RPCErrors::ParseRequestError("Invalid params, session_token is none".to_string())
-        })?;
-        let mut rpc_session_token = RPCSessionToken::from_string(session_token.as_str())?;
-
-        let owner_user = req
-            .params
-            .get("owner_user")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| {
-                RPCErrors::ParseRequestError("Invalid params, owner_user is none".to_string())
-            })?;
-        if owner_user.trim().is_empty() {
-            return Err(RPCErrors::ParseRequestError(
-                "Invalid params, owner_user is empty".to_string(),
-            ));
-        }
-
-        let obj_name = req
-            .params
-            .get("obj_name")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| {
-                RPCErrors::ParseRequestError("Invalid params, obj_name is none".to_string())
-            })?;
-        if obj_name.trim().is_empty() {
-            return Err(RPCErrors::ParseRequestError(
-                "Invalid params, obj_name is empty".to_string(),
-            ));
-        }
-
-        let doc_type = req
-            .params
-            .get("doc_type")
-            .and_then(|v| v.as_str())
-            .map(|s| s.trim())
-            .filter(|s| !s.is_empty())
-            .map(|s| s.to_string());
-
-        // Allow empty document; stringify to keep stored JSON text.
-        let did_document_str = req
-            .params
-            .get("did_document")
-            .map(|v| v.to_string())
-            .unwrap_or_else(String::new);
-
-        let user_public_key = self
-            .get_user_public_key(owner_user)
-            .await
-            .ok_or_else(|| RPCErrors::ParseRequestError("user not found".to_string()))?;
-        let user_public_key: jsonwebtoken::jwk::Jwk =
-            serde_json::from_str(user_public_key.as_str()).map_err(|e| {
-                error!("Failed to parse user public key: {:?}", e);
-                RPCErrors::ParseRequestError(e.to_string())
-            })?;
-
-        let verify_public_key = DecodingKey::from_jwk(&user_public_key).map_err(|e| {
-            error!("Failed to decode user public key: {:?}", e);
-            RPCErrors::ParseRequestError(e.to_string())
-        })?;
-
-        rpc_session_token.verify_by_key(&verify_public_key)?;
-        match rpc_session_token.sub.as_deref() {
-            Some(sub) if sub == owner_user => {}
-            Some(_) => {
-                return Err(RPCErrors::ParseRequestError(
-                    "token user mismatch".to_string(),
-                ))
-            }
-            None => {
-                return Err(RPCErrors::ParseRequestError(
-                    "Invalid token: sub is none".to_string(),
-                ))
-            }
-        }
-
-        let mut hasher = Sha256::new();
-        hasher.update(did_document_str.as_bytes());
-        let obj_id = hex::encode(hasher.finalize());
-
-        let ret = self
-            .compat_store
-            .insert_user_did_document(
-                obj_id.as_str(),
-                owner_user,
-                obj_name,
-                did_document_str.as_str(),
-                doc_type.as_deref(),
-            )
-            .await;
-        if let Err(e) = ret {
-            let err_str = e.to_string();
-            warn!(
-                "Failed to insert did document owner={}, obj_name={}, err={}",
-                owner_user, obj_name, err_str
-            );
-            return Err(RPCErrors::ReasonError(err_str));
-        }
-
-        info!(
-            "set_user_did_document success: owner={}, obj_name={}, obj_id={}, doc_type={:?}",
-            owner_user, obj_name, obj_id, doc_type
-        );
-
-        Ok(RPCResponse::create_by_req(
-            RPCResult::Success(json!({ "code": 0, "obj_id": obj_id })),
-            &req,
-        ))
     }
 
     pub(crate) async fn handle_namespaced_rpc_call(
@@ -2643,7 +1374,7 @@ impl SNServer {
 
         let get_result = SNServer::get_user_subhost_from_host(req_host, &self.server_host);
         if get_result.is_some() {
-            let (sub_host, username) = get_result.unwrap();
+            let (_, username) = get_result.unwrap();
             let user_info = self.auth_db.get_user_info(username.as_str()).await;
             if user_info.is_err() {
                 warn!("get user info error: {}", user_info.err().unwrap());
@@ -2666,7 +1397,7 @@ impl SNServer {
             if device_info.is_some() {
                 info!("ood1 device info found for {} in sn server", username);
                 //let device_did = device_info.unwrap().0.did;
-                let (device_info, device_ip) = device_info.unwrap();
+                let (device_info, _) = device_info.unwrap();
                 let did_hostname = device_info.id.to_host_name();
                 let ood_info = OODInfo {
                     did_hostname: did_hostname,
@@ -2693,8 +1424,6 @@ impl SNServer {
             }
             let user_info = user_info.unwrap();
             let username = user_info.username.as_ref().unwrap();
-            let public_key = &user_info.public_key;
-            let zone_config = &user_info.zone_config;
             let device_info = match self.get_device_info(username.as_str(), "ood1").await {
                 Ok(info) => info,
                 Err(e) => {
@@ -3491,7 +2220,7 @@ impl SNServer {
                     }
                     let zone_config = self.get_user_zone_config(username.as_str()).await;
                     if zone_config.is_some() {
-                        let (public_key, zone_config, sn_ips, device_jwt) = zone_config.unwrap();
+                        let (public_key, zone_config, _, device_jwt) = zone_config.unwrap();
                         let name_info = self.create_name_info_from_zone_config(
                             zone_config.as_str(),
                             public_key.as_str(),
@@ -3610,10 +2339,6 @@ impl SNServer {
     pub(crate) fn v2_auth(&self) -> Arc<SnV2AuthManager> {
         self.v2_auth.clone()
     }
-
-    pub(crate) fn server_host_v2(&self) -> &str {
-        self.server_host.as_str()
-    }
 }
 
 #[async_trait]
@@ -3666,14 +2391,13 @@ impl NameServer for SNServer {
         &self,
         name: &str,
         record_type: Option<RecordType>,
-        from_ip: Option<IpAddr>,
+        _from_ip: Option<IpAddr>,
     ) -> ServerResult<NameInfo> {
         info!(
             "sn server process name query: {} record_type: {:?}",
             name, record_type
         );
         let record_type = record_type.unwrap_or_default();
-        let from_ip = from_ip.unwrap_or(self.server_ip);
         let req_real_name = Self::normalize_query_name(name);
 
         match self
@@ -3992,7 +2716,7 @@ impl HttpServer for SNServer {
         };
 
         //parse resp to Response<Body>
-        let mut response_builder = Response::builder()
+        let response_builder = Response::builder()
             .header("Access-Control-Allow-Origin", "*")
             .header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
             .header(
