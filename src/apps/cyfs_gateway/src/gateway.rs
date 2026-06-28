@@ -23,6 +23,10 @@ use cyfs_dns::{
 };
 use cyfs_process_chain::CollectionValue;
 use cyfs_socks::SocksServerContext;
+use cyfs_traffic::{
+    TrafficQuotaService, TrafficServiceHandle, TrafficStatFactory, TrafficStatFactoryRef,
+    TrafficUserLimiterFactory,
+};
 use cyfs_tun::TunStackContext;
 use jsonwebtoken::jwk::Jwk;
 use jsonwebtoken::{DecodingKey, EncodingKey};
@@ -792,7 +796,8 @@ impl GatewayFactory {
         };
 
         let mut limiter_manager = DefaultLimiterManager::new();
-        let stat_manager = StatManager::new();
+        let traffic_stat_factory = TrafficStatFactory::new(config.traffic.stat_prefix.clone());
+        let stat_manager = StatManager::with_stat_factory(traffic_stat_factory.clone());
         if let Some(limiters_config) = config.limiters_config.clone() {
             for limiter_config in limiters_config.iter() {
                 if limiter_manager
@@ -823,8 +828,15 @@ impl GatewayFactory {
                 );
             }
         }
-        let limiter_manager: Arc<Box<dyn LimiterManager>> = Arc::new(limiter_manager);
-
+        if config.traffic.enabled {
+            limiter_manager.set_limiter_factory(Some(Arc::new(
+                TrafficUserLimiterFactory::new_http(
+                    config.traffic.clone(),
+                    traffic_stat_factory.clone(),
+                )?,
+            )));
+        }
+        let limiter_manager: LimiterManagerRef = Arc::new(limiter_manager);
         let sn_acme_data = get_buckyos_service_data_dir("cyfs_gateway").join("sn_dns");
         if !sn_acme_data.exists() {
             std::fs::create_dir_all(&sn_acme_data).unwrap();
@@ -943,6 +955,17 @@ impl GatewayFactory {
 
         let control_handler: Arc<dyn GatewayControlCmdHandler> = handler.clone();
         let timer_manager = TimerManager::new();
+        let traffic_service = if config.traffic.enabled {
+            TrafficQuotaService::start_http(
+                config.traffic.clone(),
+                stat_manager.clone(),
+                traffic_stat_factory.clone(),
+                limiter_manager.clone(),
+            )
+            .await?
+        } else {
+            None
+        };
         let gateway = Arc::new(Gateway {
             config_file: config_file.map(|v| v.to_path_buf()),
             init_config: Mutex::new(init_config),
@@ -955,11 +978,13 @@ impl GatewayFactory {
             server_factory: self.server_factory.clone(),
             limiter_manager: Mutex::new(limiter_manager),
             stat_manager,
+            traffic_stat_factory,
             external_cmds,
             control_handler,
             control_token_manager: token_manager,
             timer_manager,
             global_collection_manager: RwLock::new(global_collections.clone()),
+            traffic_service: Mutex::new(traffic_service),
         });
         let timers = gateway
             .config
@@ -1000,16 +1025,21 @@ pub struct Gateway {
     server_factory: CyfsServerFactoryRef,
     limiter_manager: Mutex<LimiterManagerRef>,
     stat_manager: StatManagerRef,
+    traffic_stat_factory: TrafficStatFactoryRef,
     external_cmds: JsPkgManagerRef,
     control_handler: Arc<dyn GatewayControlCmdHandler>,
     control_token_manager: Arc<LocalTokenManager<LocalTokenKeyStore>>,
     timer_manager: TimerManager,
     global_collection_manager: RwLock<GlobalCollectionManagerRef>,
+    traffic_service: Mutex<Option<TrafficServiceHandle>>,
 }
 
 impl Drop for Gateway {
     fn drop(&mut self) {
         self.timer_manager.stop_all();
+        if let Some(service) = self.traffic_service.lock().unwrap().take() {
+            service.shutdown_now();
+        }
         debug!("Gateway is dropped!");
     }
 }
@@ -2808,6 +2838,7 @@ impl Gateway {
     }
 
     pub async fn reload(&self, config: GatewayConfig) -> Result<()> {
+        let traffic_config = config.traffic.clone();
         let old_device_manager = { self.config.lock().unwrap().device_manager.clone() };
         if old_device_manager != config.device_manager {
             if config.device_manager.enabled {
@@ -2880,7 +2911,17 @@ impl Gateway {
             }
         }
         limiter_manager.retain(Box::new(move |id, _| exist_limters.contains(id)));
-        let limiter_manager = Arc::new(limiter_manager);
+        if traffic_config.enabled {
+            limiter_manager.set_limiter_factory(Some(Arc::new(
+                TrafficUserLimiterFactory::new_http(
+                    traffic_config.clone(),
+                    self.traffic_stat_factory.clone(),
+                )?,
+            )));
+        } else {
+            limiter_manager.set_limiter_factory(None);
+        }
+        let limiter_manager: LimiterManagerRef = Arc::new(limiter_manager);
 
         let cert_manager = build_acme_mgr_from_config(&config.acme_config).await?;
         let inner_dns_record_manager = InnerDnsRecordManager::new();
@@ -3049,8 +3090,37 @@ impl Gateway {
             .await?;
 
         *self.global_collection_manager.write().unwrap() = global_collections;
-        *self.config.lock().unwrap() = config;
+        let active_limiter_manager = limiter_manager.clone();
         *self.limiter_manager.lock().unwrap() = limiter_manager;
+        self.restart_traffic_service(traffic_config, active_limiter_manager)
+            .await?;
+        *self.config.lock().unwrap() = config;
+        Ok(())
+    }
+
+    async fn restart_traffic_service(
+        &self,
+        traffic_config: cyfs_traffic::TrafficConfig,
+        limiter_manager: LimiterManagerRef,
+    ) -> Result<()> {
+        let old_service = { self.traffic_service.lock().unwrap().take() };
+        if let Some(service) = old_service {
+            service.stop().await;
+        }
+
+        if !traffic_config.enabled {
+            *self.traffic_service.lock().unwrap() = None;
+            return Ok(());
+        }
+
+        let new_service = TrafficQuotaService::start_http(
+            traffic_config,
+            self.stat_manager.clone(),
+            self.traffic_stat_factory.clone(),
+            limiter_manager,
+        )
+        .await?;
+        *self.traffic_service.lock().unwrap() = new_service;
         Ok(())
     }
 }

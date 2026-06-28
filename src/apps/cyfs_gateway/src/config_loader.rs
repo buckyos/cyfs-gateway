@@ -9,6 +9,7 @@ use cyfs_gateway_lib::{
 };
 use cyfs_sn::*;
 use cyfs_socks::SocksServerConfig;
+use cyfs_traffic::TrafficConfig;
 use cyfs_tun::TunStackConfig;
 use log::*;
 use serde::{Deserialize, Deserializer, Serialize};
@@ -934,6 +935,22 @@ impl GatewayConfigParser {
             .transpose()?
             .unwrap_or_default();
 
+        let traffic = json_value
+            .get("traffic")
+            .map(|value| {
+                serde_json::from_value::<TrafficConfig>(value.clone()).map_err(|e| {
+                    config_err!(
+                        ConfigErrorCode::InvalidConfig,
+                        "invalid traffic config: {:?}\n{}",
+                        e,
+                        serde_json::to_string_pretty(value)
+                            .unwrap_or_else(|_| "<invalid json>".to_string())
+                    )
+                })
+            })
+            .transpose()?
+            .unwrap_or_default();
+
         Ok(GatewayConfig {
             raw_config,
             limiters_config,
@@ -945,6 +962,7 @@ impl GatewayConfigParser {
             collections,
             timers,
             device_manager,
+            traffic,
         })
     }
 }
@@ -1025,6 +1043,7 @@ pub struct GatewayConfig {
     pub collections: Vec<CollectionConfig>,
     pub timers: Vec<TimerConfig>,
     pub device_manager: DeviceManagerConfig,
+    pub traffic: TrafficConfig,
 }
 
 #[cfg(test)]
