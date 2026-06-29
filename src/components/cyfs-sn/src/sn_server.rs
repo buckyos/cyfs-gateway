@@ -10,10 +10,9 @@ use crate::sn_resolver::{
     SnResolverErrorKind, SnResolverRef, SnResolverResult,
 };
 use crate::{
-    SNUserInfo, SnAuthDBRef, SnDeviceEndpointUpdate, SnDeviceInfoDBRef, SnDeviceRole,
-    SnDeviceState, SnDeviceStateUpdate, SnEndpointProtocol, SnEndpointScope, SnEndpointSource,
-    SnNatType, SnRelayManagerRef, SnResult, SqliteSnAuthDB, SqliteSnDeviceInfoDB,
-    SqliteSnRelayManager,
+    SnAuthDBRef, SnDeviceEndpointUpdate, SnDeviceInfoDBRef, SnDeviceRole, SnDeviceState,
+    SnDeviceStateUpdate, SnEndpointProtocol, SnEndpointScope, SnEndpointSource, SnNatType,
+    SnRelayManagerRef, SnResult, SqliteSnAuthDB, SqliteSnDeviceInfoDB, SqliteSnRelayManager,
 };
 use ::kRPC::*;
 use async_trait::async_trait;
@@ -33,7 +32,6 @@ use http::{Method, Response, StatusCode};
 use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full};
 use hyper::body::Bytes;
-use jsonwebtoken::DecodingKey;
 use log::*;
 use name_client::*;
 use name_lib::*;
@@ -65,22 +63,6 @@ fn is_filtered_zonegate_ip(ip: IpAddr) -> bool {
             octets[0] == 172 && (16..=31).contains(&octets[1])
         }
         IpAddr::V6(ipv6) => ipv6.is_loopback(),
-    }
-}
-
-fn push_zonegate_address(address_vec: &mut Vec<IpAddr>, ip: IpAddr, record_type: RecordType) {
-    if is_filtered_zonegate_ip(ip) {
-        return;
-    }
-
-    if record_type == RecordType::A {
-        if ip.is_ipv4() && !address_vec.contains(&ip) {
-            address_vec.push(ip);
-        }
-    } else if record_type == RecordType::AAAA {
-        if ip.is_ipv6() && !address_vec.contains(&ip) {
-            address_vec.push(ip);
-        }
     }
 }
 
@@ -410,13 +392,7 @@ pub struct OODInfo {
 #[derive(Clone)]
 pub struct SNServer {
     id: String,
-    //ipaddress is the ip from update_op's ip_from
     server_host: String,
-    server_ip: IpAddr,
-    server_aliases: Vec<String>,
-    boot_jwt: String,
-    owner_pkx: String,
-    device_jwt: Vec<String>,
     auth_db: SnAuthDBRef,
     device_info_db: SnDeviceInfoDBRef,
     compat_store: SnCompatibilityStoreRef,
@@ -424,11 +400,6 @@ pub struct SNServer {
     name_info_cache: NameInfoCacheRef,
     resolver: SnResolverRef,
     bns_controller: Option<Arc<SnBnsController>>,
-}
-
-enum UncachedNameInfoQueryResult {
-    Found(NameInfo),
-    Tombstone,
 }
 
 impl SNServer {
@@ -541,85 +512,6 @@ impl SNServer {
         None
     }
 
-    pub(crate) fn decode_mini_config_with_schema_compat(
-        mini_config_jwt: &str,
-        user_public_key: &DecodingKey,
-        context: &str,
-    ) -> Result<DeviceMiniConfig, String> {
-        match DeviceMiniConfig::from_jwt(mini_config_jwt, user_public_key) {
-            Ok(config) => Ok(config),
-            Err(primary_err) => {
-                let primary_err = primary_err.to_string();
-                let missing_field = Self::extract_missing_field_name(primary_err.as_str());
-                if missing_field.is_none() {
-                    return Err(primary_err);
-                }
-
-                warn!(
-                    "[schema_compat] mini_config decode failed in {}: {}; trying jwt-claims compatibility fallback",
-                    context,
-                    primary_err
-                );
-
-                let mut claims = decode_json_from_jwt_with_pk(mini_config_jwt, user_public_key)
-                    .map_err(|e| {
-                        format!(
-                            "mini_config decode failed in {} ({}); jwt-claims fallback decode failed: {}",
-                            context, primary_err, e
-                        )
-                    })?;
-
-                let Some(obj) = claims.as_object_mut() else {
-                    return Err(format!(
-                        "mini_config decode failed in {} ({}); jwt-claims fallback expected object",
-                        context, primary_err
-                    ));
-                };
-
-                if !obj.contains_key("n") {
-                    if let Some(v) = obj.get("name").cloned() {
-                        obj.insert("n".to_string(), v);
-                    }
-                }
-                if !obj.contains_key("name") {
-                    if let Some(v) = obj.get("n").cloned() {
-                        obj.insert("name".to_string(), v);
-                    }
-                }
-                if !obj.contains_key("p") {
-                    if let Some(v) = obj.get("rtcp_port").cloned() {
-                        obj.insert("p".to_string(), v);
-                    }
-                }
-                if !obj.contains_key("rtcp_port") {
-                    if let Some(v) = obj.get("p").cloned() {
-                        obj.insert("rtcp_port".to_string(), v);
-                    }
-                }
-                if !obj.contains_key("hostname") {
-                    if let Some(v) = obj.get("name").cloned().or_else(|| obj.get("n").cloned()) {
-                        obj.insert("hostname".to_string(), v);
-                    }
-                }
-
-                match serde_json::from_value::<DeviceMiniConfig>(claims) {
-                    Ok(config) => {
-                        warn!(
-                            "[schema_compat] mini_config fallback applied in {} due to missing required field `{}`; please regenerate activation data with latest make_config",
-                            context,
-                            missing_field.unwrap_or_else(|| "unknown".to_string())
-                        );
-                        Ok(config)
-                    }
-                    Err(fallback_err) => Err(format!(
-                        "mini_config decode failed in {} ({}); fallback parse failed: {}",
-                        context, primary_err, fallback_err
-                    )),
-                }
-            }
-        }
-    }
-
     pub async fn new(
         server_config: SNServerConfig,
         auth_db: SnAuthDBRef,
@@ -644,11 +536,11 @@ impl SNServer {
         let resolver_config = SnResolverConfig::new(
             server_host.clone(),
             server_ip,
-            boot_jwt.clone(),
-            owner_pkx.clone(),
-            device_jwt.clone(),
+            boot_jwt,
+            owner_pkx,
+            device_jwt,
         )
-        .with_aliases(server_aliases.clone());
+        .with_aliases(server_aliases);
         let mut resolver = SnResolver::new(
             resolver_config,
             Arc::new(SnAuthResolverReader::new(auth_db.clone())),
@@ -678,11 +570,6 @@ impl SNServer {
         SNServer {
             id: server_config.id,
             server_host,
-            server_ip,
-            server_aliases,
-            boot_jwt,
-            owner_pkx,
-            device_jwt,
             auth_db,
             device_info_db,
             compat_store,
@@ -823,13 +710,6 @@ impl SNServer {
         }
     }
 
-    fn is_supported_name_record_type(record_type: RecordType) -> bool {
-        matches!(
-            record_type,
-            RecordType::A | RecordType::AAAA | RecordType::TXT
-        )
-    }
-
     // 辅助函数：检测字符串是否包含特殊字符
     pub(crate) fn contains_special_chars(s: &str) -> bool {
         s.chars()
@@ -901,36 +781,6 @@ impl SNServer {
         Ok(resp)
     }
 
-    async fn get_user_sn_ips(&self, owner_id: &str) -> Vec<IpAddr> {
-        let sn_ips = self.auth_db.get_user_sn_ips_as_vec(owner_id).await;
-        if sn_ips.is_err() {
-            warn!(
-                "failed to get user sn ips for {}: {:?}",
-                owner_id,
-                sn_ips.err().unwrap()
-            );
-            return vec![];
-        }
-        let sn_ips = sn_ips.unwrap();
-        if sn_ips.is_none() {
-            return vec![];
-        }
-        let sn_ips = sn_ips.unwrap();
-        if sn_ips.is_empty() {
-            return vec![];
-        }
-        let mut sn_ip_add: Vec<IpAddr> = Vec::new();
-        for ip_str in sn_ips {
-            let ip = IpAddr::from_str(ip_str.as_str());
-            if ip.is_ok() {
-                sn_ip_add.push(ip.unwrap());
-            } else {
-                warn!("failed to parse ip {} {}", ip_str, ip.err().unwrap());
-            }
-        }
-        return sn_ip_add;
-    }
-
     async fn get_device_info(
         &self,
         owner_id: &str,
@@ -985,79 +835,6 @@ impl SNServer {
         let device_info = device_info.unwrap();
         Ok(Some((device_info.clone(), sn_ip)))
     }
-    //return (owner_public_key,zone_config_jwt,device_jwt)
-    async fn get_user_zone_config_by_domain(
-        &self,
-        domain: &str,
-    ) -> Option<(String, String, Option<String>)> {
-        let user_info = self.auth_db.get_user_by_domain(domain).await;
-
-        if user_info.is_err() {
-            warn!(
-                "failed to get user info by domain {}: {:?}",
-                domain,
-                user_info.err().unwrap()
-            );
-            return None;
-        }
-        let user_info = user_info.unwrap();
-        if user_info.is_none() {
-            warn!("user info not found for domain {}", domain);
-            return None;
-        }
-        let user_info = user_info.unwrap();
-        let username = user_info.username.as_ref().unwrap();
-        let zone_config_info = self.get_user_zone_config(username.as_str()).await;
-        if zone_config_info.is_none() {
-            warn!("zone config not found for user {}", username);
-            return None;
-        }
-        let (public_key, zone_config, _sn_ips, device_jwt) = zone_config_info.unwrap();
-        return Some((public_key, zone_config, device_jwt));
-    }
-
-    //return (owner_public_key,zone_config_jwt,sn_ip,device_jwt)
-    async fn get_user_zone_config(
-        &self,
-        username: &str,
-    ) -> Option<(String, String, Option<String>, Option<String>)> {
-        let user_info = self.auth_db.get_user_info(username).await;
-        if user_info.is_err() {
-            warn!(
-                "failed to get user info for {}: {:?}",
-                username,
-                user_info.err().unwrap()
-            );
-            return None;
-        }
-        let user_info = user_info.unwrap();
-        if user_info.is_some() {
-            let user_info = user_info.unwrap();
-            let public_key = user_info.public_key.clone();
-            let zone_config = user_info.zone_config.clone();
-            let sn_ips = user_info.sn_ips.clone();
-
-            let device_info = self
-                .compat_store
-                .query_device_by_name(username, "ood1")
-                .await;
-            if device_info.is_ok() {
-                let device_info = device_info.unwrap();
-                if device_info.is_some() {
-                    let device_info = device_info.unwrap();
-                    let device_jwt = device_info.mini_config_jwt.clone();
-                    if device_jwt.len() > 3 {
-                        return Some((public_key, zone_config, sn_ips, Some(device_jwt)));
-                    }
-                }
-            }
-
-            return Some((public_key, zone_config, sn_ips, None));
-        }
-        warn!("zone config not found for [{}]", username);
-        return None;
-    }
-
     //return (subhost,username)
     pub fn get_user_subhost_from_host(host: &str, server_host: &str) -> Option<(String, String)> {
         let end_string = format!(".web3.{}", server_host);
@@ -1087,78 +864,6 @@ impl SNServer {
             }
         }
         return None;
-    }
-
-    async fn get_user_zonegate_address_by_domain(
-        &self,
-        domain: &str,
-        record_type: RecordType,
-    ) -> ServerResult<Option<Vec<IpAddr>>> {
-        let user_info = self.auth_db.get_user_by_domain(domain).await;
-        if user_info.is_err() {
-            warn!(
-                "failed to get user info by domain {}: {:?}",
-                domain,
-                user_info.err().unwrap()
-            );
-            return Ok(None);
-        }
-        let user_info = user_info.unwrap();
-        if user_info.is_none() {
-            warn!("user info not found for domain {}", domain);
-            return Ok(None);
-        }
-        let user_info = user_info.unwrap();
-
-        return self
-            .get_user_zonegate_address(user_info.username.as_ref().unwrap(), record_type)
-            .await;
-    }
-
-    async fn add_address_to_vec(
-        &self,
-        address_vec: &mut Vec<IpAddr>,
-        ip: IpAddr,
-        record_type: RecordType,
-    ) {
-        push_zonegate_address(address_vec, ip, record_type);
-    }
-
-    async fn get_user_zonegate_address(
-        &self,
-        username: &str,
-        record_type: RecordType,
-    ) -> ServerResult<Option<Vec<IpAddr>>> {
-        //TODO:需要根据zone_boot_config中的gateway device name来获取gateway device info，而不是写死ood1
-        let device_info = self.get_device_info(username, "ood1").await?;
-
-        if device_info.is_some() {
-            let (device_info, device_ip) = device_info.unwrap();
-            let mut address_vec: Vec<IpAddr> = Vec::new();
-            if !device_info.is_wan_device() {
-                let sn_ips = self.get_user_sn_ips(username).await;
-                if sn_ips.is_empty() {
-                    self.add_address_to_vec(&mut address_vec, self.server_ip, record_type)
-                        .await;
-                } else {
-                    for ip in sn_ips {
-                        self.add_address_to_vec(&mut address_vec, ip, record_type)
-                            .await;
-                    }
-                }
-            }
-
-            self.add_address_to_vec(&mut address_vec, device_ip, record_type)
-                .await;
-
-            for device_report_ip in device_info.all_ip.iter() {
-                self.add_address_to_vec(&mut address_vec, device_report_ip.clone(), record_type)
-                    .await;
-            }
-
-            return Ok(Some(address_vec));
-        }
-        return Ok(None);
     }
 
     pub(crate) async fn handle_namespaced_rpc_call(
@@ -1496,324 +1201,12 @@ impl SNServer {
             .unwrap())
     }
 
-    fn builder_json_http_response(
-        status: StatusCode,
-        value: &serde_json::Value,
-    ) -> ServerResult<http::Response<BoxBody<Bytes, ServerError>>> {
-        Ok(Response::builder()
-            .status(status)
-            .header("Access-Control-Allow-Origin", "*")
-            .header("Content-Type", "application/json")
-            .body(BoxBody::new(
-                Full::new(Bytes::from(serde_json::to_string(value).unwrap()))
-                    .map_err(|never| match never {})
-                    .boxed(),
-            ))
-            .unwrap())
-    }
-
     fn normalize_resolve_type(resolve_type: Option<String>) -> Option<String> {
         match resolve_type {
             None => None,
             Some(t) if t.trim().is_empty() => None,
             Some(t) => Some(t),
         }
-    }
-
-    async fn resolve_user_by_domain(&self, domain: &str) -> ServerResult<SNUserInfo> {
-        let user_info = self.auth_db.get_user_by_domain(domain).await.map_err(|e| {
-            server_err!(
-                ServerErrorCode::ProcessChainError,
-                "failed to query user by domain {}: {}",
-                domain,
-                e
-            )
-        })?;
-
-        match user_info {
-            Some(user_info) => Ok(user_info),
-            None => Err(server_err!(
-                ServerErrorCode::NotFound,
-                "user not found for domain {}",
-                domain
-            )),
-        }
-    }
-
-    async fn resolve_user_by_username(&self, username: &str) -> ServerResult<SNUserInfo> {
-        let user_info = self.auth_db.get_user_info(username).await.map_err(|e| {
-            server_err!(
-                ServerErrorCode::ProcessChainError,
-                "failed to query user {}: {}",
-                username,
-                e
-            )
-        })?;
-
-        match user_info {
-            Some(user_info) => Ok(user_info),
-            None => Err(server_err!(
-                ServerErrorCode::NotFound,
-                "user not found {}",
-                username
-            )),
-        }
-    }
-
-    async fn resolve_device_by_name(
-        &self,
-        username: &str,
-        device_name: &str,
-    ) -> ServerResult<SNDeviceInfo> {
-        let device_info = self
-            .compat_store
-            .query_device_by_name(username, device_name)
-            .await
-            .map_err(|e| {
-                server_err!(
-                    ServerErrorCode::ProcessChainError,
-                    "failed to query device {}.{}: {}",
-                    device_name,
-                    username,
-                    e
-                )
-            })?;
-
-        match device_info {
-            Some(device_info) => Ok(device_info),
-            None => Err(server_err!(
-                ServerErrorCode::NotFound,
-                "device not found {}.{}",
-                device_name,
-                username
-            )),
-        }
-    }
-
-    async fn resolve_device_by_did(&self, did: &str) -> ServerResult<SNDeviceInfo> {
-        let device_info = self
-            .compat_store
-            .query_device_by_did(did)
-            .await
-            .map_err(|e| {
-                server_err!(
-                    ServerErrorCode::ProcessChainError,
-                    "failed to query device {}: {}",
-                    did,
-                    e
-                )
-            })?;
-
-        match device_info {
-            Some(device_info) => Ok(device_info),
-            None => Err(server_err!(
-                ServerErrorCode::NotFound,
-                "device not found {}",
-                did
-            )),
-        }
-    }
-
-    fn build_device_info_json(device: &SNDeviceInfo) -> serde_json::Value {
-        // description is a JSON string (serialized DeviceInfo)
-        let mut v = serde_json::from_str::<serde_json::Value>(device.description.as_str())
-            .unwrap_or_else(|_| json!({ "description": device.description }));
-
-        if let Some(obj) = v.as_object_mut() {
-            obj.insert("did".to_string(), Value::String(device.did.clone()));
-            obj.insert("ip".to_string(), Value::String(device.ip.clone()));
-            obj.insert("owner".to_string(), Value::String(device.owner.clone()));
-            obj.insert(
-                "device_name".to_string(),
-                Value::String(device.device_name.clone()),
-            );
-            obj.insert(
-                "created_at".to_string(),
-                Value::Number(serde_json::Number::from(device.created_at)),
-            );
-            obj.insert(
-                "updated_at".to_string(),
-                Value::Number(serde_json::Number::from(device.updated_at)),
-            );
-            Self::sanitize_device_info_json_for_export(obj);
-        }
-
-        v
-    }
-
-    fn sanitize_device_info_json_for_export(obj: &mut serde_json::Map<String, Value>) {
-        let mut exportable_ips = Vec::new();
-
-        if let Some(ip_str) = obj.get("ip").and_then(|v| v.as_str()) {
-            if let Some(ip) = parse_ip_or_socket_addr(ip_str) {
-                push_exportable_device_ip(&mut exportable_ips, ip);
-            }
-        }
-
-        for key in ["ips", "all_ip"] {
-            if let Some(ip_values) = obj.get(key).and_then(|v| v.as_array()) {
-                for ip_str in ip_values.iter().filter_map(|v| v.as_str()) {
-                    if let Some(ip) = parse_ip_or_socket_addr(ip_str) {
-                        push_exportable_device_ip(&mut exportable_ips, ip);
-                    }
-                }
-            }
-        }
-
-        if let Some(first_ip) = exportable_ips.first() {
-            obj.insert("ip".to_string(), Value::String(first_ip.to_string()));
-        } else {
-            obj.remove("ip");
-        }
-
-        let exportable_ip_values: Vec<Value> = exportable_ips
-            .iter()
-            .map(|ip| Value::String(ip.to_string()))
-            .collect();
-        for key in ["ips", "all_ip"] {
-            if obj.contains_key(key) {
-                obj.insert(key.to_string(), Value::Array(exportable_ip_values.clone()));
-            }
-        }
-    }
-
-    fn build_zone_config_json(username: &str, user: &SNUserInfo) -> serde_json::Value {
-        json!({
-            "user_name": username,
-            "public_key": user.public_key.clone(),
-            "boot": user.zone_config.clone(), // stored boot jwt
-            "self_cert": user.self_cert,
-            "user_domain": user.user_domain.clone(),
-            "sn_ips": user.sn_ips.clone(),
-            "state": (&user.state).to_string(),
-        })
-    }
-
-    async fn handle_bns_username_resolve(
-        &self,
-        username: &str,
-        resolve_type: Option<&str>,
-    ) -> ServerResult<http::Response<BoxBody<Bytes, ServerError>>> {
-        let user = self.resolve_user_by_username(username).await?;
-        match resolve_type.unwrap_or("zone") {
-            "boot" => {
-                let v = json!({ "boot": user.zone_config.clone() });
-                Self::builder_json_http_response(StatusCode::OK, &v)
-            }
-            "zone" => {
-                let v = Self::build_zone_config_json(username, &user);
-                Self::builder_json_http_response(StatusCode::OK, &v)
-            }
-            device_name => {
-                let device = self.resolve_device_by_name(username, device_name).await?;
-                let device_doc = Self::device_config_from_mini_jwt(
-                    device.mini_config_jwt.as_str(),
-                    user.public_key.as_str(),
-                    username,
-                )
-                .map_err(|msg| server_err!(ServerErrorCode::InvalidParam, "{}", msg))?;
-                Self::builder_json_http_response(StatusCode::OK, &device_doc)
-            }
-        }
-    }
-
-    async fn handle_bns_device_resolve(
-        &self,
-        username: &str,
-        device_name: &str,
-        resolve_type: Option<&str>,
-    ) -> ServerResult<http::Response<BoxBody<Bytes, ServerError>>> {
-        let device = self.resolve_device_by_name(username, device_name).await?;
-        match resolve_type.unwrap_or("doc") {
-            "info" => {
-                let device_info = Self::build_device_info_json(&device);
-                Self::builder_json_http_response(StatusCode::OK, &device_info)
-            }
-            "doc" => {
-                let user = self.resolve_user_by_username(username).await?;
-                let device_doc = Self::device_config_from_mini_jwt(
-                    device.mini_config_jwt.as_str(),
-                    user.public_key.as_str(),
-                    username,
-                )
-                .map_err(|msg| server_err!(ServerErrorCode::InvalidParam, "{}", msg))?;
-                Self::builder_json_http_response(StatusCode::OK, &device_doc)
-            }
-            other => Self::builder_error_http_response(
-                StatusCode::BAD_REQUEST,
-                format!(
-                    "unsupported type {} for did:bns:{}.{}",
-                    other, device_name, username
-                ),
-            ),
-        }
-    }
-
-    async fn handle_dev_resolve(
-        &self,
-        did_str: &str,
-        resolve_type: Option<&str>,
-    ) -> ServerResult<http::Response<BoxBody<Bytes, ServerError>>> {
-        let device = self.resolve_device_by_did(did_str).await?;
-        match resolve_type.unwrap_or("doc") {
-            "info" => {
-                let device_info = Self::build_device_info_json(&device);
-                Self::builder_json_http_response(StatusCode::OK, &device_info)
-            }
-            "doc" => {
-                let user = self.resolve_user_by_username(device.owner.as_str()).await?;
-                let device_doc = Self::device_config_from_mini_jwt(
-                    device.mini_config_jwt.as_str(),
-                    user.public_key.as_str(),
-                    device.owner.as_str(),
-                )
-                .map_err(|msg| server_err!(ServerErrorCode::InvalidParam, "{}", msg))?;
-                Self::builder_json_http_response(StatusCode::OK, &device_doc)
-            }
-            other => Self::builder_error_http_response(
-                StatusCode::BAD_REQUEST,
-                format!("unsupported type {} for {}", other, did_str),
-            ),
-        }
-    }
-
-    fn device_config_from_mini_jwt(
-        mini_config_jwt: &str,
-        owner_public_key_jwk_str: &str,
-        owner_username: &str,
-    ) -> Result<serde_json::Value, String> {
-        // owner_public_key stored in DB is a JWK JSON string
-        let owner_public_key_jwk: jsonwebtoken::jwk::Jwk =
-            serde_json::from_str(owner_public_key_jwk_str)
-                .map_err(|e| format!("failed to parse owner public key jwk: {}", e))?;
-
-        let decoding_key = DecodingKey::from_jwk(&owner_public_key_jwk)
-            .map_err(|e| format!("failed to build decoding key from jwk: {}", e))?;
-
-        let decode_context = format!("query_did device_doc for {}", owner_username);
-        let mini = Self::decode_mini_config_with_schema_compat(
-            mini_config_jwt,
-            &decoding_key,
-            decode_context.as_str(),
-        )
-        .map_err(|e| format!("failed to parse mini_config_jwt: {}", e))?;
-
-        // In this gateway, we use did:bns:<username> as both zone_did and owner did.
-        let owner_did_str = format!("did:bns:{}", owner_username);
-        let zone_did = DID::from_str(owner_did_str.as_str())
-            .map_err(|e| format!("failed to build zone did: {}", e))?;
-        let owner_did = DID::from_str(owner_did_str.as_str())
-            .map_err(|e| format!("failed to build owner did: {}", e))?;
-
-        let device_config = DeviceConfig::new_by_mini_config(
-            &mini_config_jwt.to_string(),
-            &mini,
-            zone_did,
-            owner_did,
-        );
-
-        serde_json::to_value(device_config)
-            .map_err(|e| format!("failed to encode device_config: {}", e))
     }
 
     pub async fn handle_http_did_resolve_request(
@@ -1897,413 +1290,6 @@ impl SNServer {
                 };
                 Self::builder_error_http_response(status, msg)
             }
-        }
-    }
-
-    async fn query_did_legacy(
-        &self,
-        did: &DID,
-        doc_type: Option<&str>,
-        from_ip: Option<IpAddr>,
-    ) -> ServerResult<EncodedDocument> {
-        let doc_type = doc_type.and_then(|t| {
-            let t = t.trim();
-            if t.is_empty() {
-                None
-            } else {
-                Some(t)
-            }
-        });
-
-        match did.method.as_str() {
-            "web" => {
-                let id = did.id.as_str();
-
-                match self.resolve_user_by_domain(id).await {
-                    Ok(user_info) => {
-                        let username = user_info.username.clone().ok_or(server_err!(
-                            ServerErrorCode::NotFound,
-                            "user has no username bound for domain {}",
-                            id
-                        ))?;
-
-                        let bns_did_str = format!("did:bns:{}", username);
-                        let bns_did = DID::from_str(bns_did_str.as_str()).map_err(|e| {
-                            server_err!(
-                                ServerErrorCode::InvalidParam,
-                                "invalid mapped bns did: {}",
-                                e
-                            )
-                        })?;
-                        return Box::pin(self.query_did(&bns_did, doc_type, from_ip)).await;
-                    }
-                    Err(e) if e.code() == ServerErrorCode::NotFound => {
-                        if let Some((device_name, domain)) = id.split_once('.') {
-                            let user_info = self.resolve_user_by_domain(domain).await?;
-                            let username = user_info.username.clone().ok_or(server_err!(
-                                ServerErrorCode::NotFound,
-                                "user has no username bound for domain {}",
-                                domain
-                            ))?;
-
-                            let bns_did_str = format!("did:bns:{}.{}", device_name, username);
-                            let bns_did = DID::from_str(bns_did_str.as_str()).map_err(|e| {
-                                server_err!(
-                                    ServerErrorCode::InvalidParam,
-                                    "invalid mapped bns did: {}",
-                                    e
-                                )
-                            })?;
-                            return Box::pin(self.query_did(&bns_did, doc_type, from_ip)).await;
-                        }
-
-                        Err(server_err!(
-                            ServerErrorCode::NotFound,
-                            "user not found for domain {}",
-                            id
-                        ))
-                    }
-                    Err(e) => Err(e),
-                }?
-            }
-            "bns" => {
-                let id = did.id.as_str();
-
-                if let Some((obj_name, tail)) = id.split_once('.') {
-                    let username = if tail.contains('.') {
-                        let user_info = self.resolve_user_by_domain(tail).await?;
-                        user_info.username.clone().ok_or(server_err!(
-                            ServerErrorCode::NotFound,
-                            "user has no username bound for domain {}",
-                            tail
-                        ))?
-                    } else {
-                        tail.to_string()
-                    };
-
-                    match self
-                        .resolve_device_by_name(username.as_str(), obj_name)
-                        .await
-                    {
-                        Ok(device) => match doc_type.unwrap_or("doc") {
-                            "doc" => {
-                                let user = self.resolve_user_by_username(username.as_str()).await?;
-                                let v = Self::device_config_from_mini_jwt(
-                                    device.mini_config_jwt.as_str(),
-                                    user.public_key.as_str(),
-                                    username.as_str(),
-                                )
-                                .map_err(|msg| {
-                                    server_err!(ServerErrorCode::InvalidParam, "{}", msg)
-                                })?;
-                                Ok(EncodedDocument::JsonLd(v))
-                            }
-                            "info" => {
-                                let v = Self::build_device_info_json(&device);
-                                Ok(EncodedDocument::JsonLd(v))
-                            }
-                            other => Err(server_err!(
-                                ServerErrorCode::InvalidParam,
-                                "unsupported doc_type {} for did:bns:{}.{}",
-                                other,
-                                obj_name,
-                                username
-                            )),
-                        },
-                        Err(e) if e.code() == ServerErrorCode::NotFound => {
-                            let latest_doc = self
-                                .compat_store
-                                .query_user_did_document(username.as_str(), obj_name, doc_type)
-                                .await
-                                .map_err(|err| {
-                                    server_err!(
-                                        ServerErrorCode::ProcessChainError,
-                                        "query did document failed: {}",
-                                        err
-                                    )
-                                })?;
-
-                            if let Some((_obj_id, did_doc_str, _stored_type)) = latest_doc {
-                                let v = if did_doc_str.trim().is_empty() {
-                                    Value::Null
-                                } else {
-                                    serde_json::from_str::<Value>(did_doc_str.as_str()).map_err(
-                                        |e| {
-                                            server_err!(
-                                                ServerErrorCode::InvalidParam,
-                                                "invalid did_document json: {}",
-                                                e
-                                            )
-                                        },
-                                    )?
-                                };
-                                Ok(EncodedDocument::JsonLd(v))
-                            } else {
-                                Err(server_err!(
-                                    ServerErrorCode::NotFound,
-                                    "did document not found for did:bns:{}.{}",
-                                    obj_name,
-                                    username
-                                ))
-                            }
-                        }
-                        Err(e) => Err(e),
-                    }
-                } else {
-                    let username = id;
-                    let user = self.resolve_user_by_username(username).await?;
-
-                    match doc_type.unwrap_or("zone") {
-                        "zone" => {
-                            let v = Self::build_zone_config_json(username, &user);
-                            Ok(EncodedDocument::JsonLd(v))
-                        }
-                        "boot" => Ok(EncodedDocument::JsonLd(
-                            json!({ "boot": user.zone_config.clone() }),
-                        )),
-                        device_name => {
-                            let device = self.resolve_device_by_name(username, device_name).await?;
-                            let v = Self::device_config_from_mini_jwt(
-                                device.mini_config_jwt.as_str(),
-                                user.public_key.as_str(),
-                                username,
-                            )
-                            .map_err(|msg| server_err!(ServerErrorCode::InvalidParam, "{}", msg))?;
-                            Ok(EncodedDocument::JsonLd(v))
-                        }
-                    }
-                }
-            }
-            "dev" => {
-                let did_str = did.to_string();
-                let device = self.resolve_device_by_did(did_str.as_str()).await?;
-
-                match doc_type.unwrap_or("doc") {
-                    "doc" => {
-                        let user = self.resolve_user_by_username(device.owner.as_str()).await?;
-                        let v = Self::device_config_from_mini_jwt(
-                            device.mini_config_jwt.as_str(),
-                            user.public_key.as_str(),
-                            device.owner.as_str(),
-                        )
-                        .map_err(|msg| server_err!(ServerErrorCode::InvalidParam, "{}", msg))?;
-                        Ok(EncodedDocument::JsonLd(v))
-                    }
-                    "info" => {
-                        let v = Self::build_device_info_json(&device);
-                        Ok(EncodedDocument::JsonLd(v))
-                    }
-                    other => Err(server_err!(
-                        ServerErrorCode::InvalidParam,
-                        "unsupported doc_type {} for {}",
-                        other,
-                        did_str
-                    )),
-                }
-            }
-            other => Err(server_err!(
-                ServerErrorCode::InvalidParam,
-                "unsupported did method {}",
-                other
-            )),
-        }
-    }
-
-    async fn query_name_info_uncached(
-        &self,
-        name: &str,
-        req_real_name: &str,
-        record_type: RecordType,
-        _from_ip: IpAddr,
-    ) -> ServerResult<UncachedNameInfoQueryResult> {
-        if !Self::is_supported_name_record_type(record_type) {
-            return Err(server_err!(
-                ServerErrorCode::NotFound,
-                "sn-server not support record type {}",
-                record_type.to_string()
-            ));
-        }
-
-        let sn_full_host = format!("sn.{}", self.server_host);
-        if req_real_name == sn_full_host
-            || req_real_name == self.server_host
-            || self
-                .server_aliases
-                .iter()
-                .any(|alias| alias == req_real_name)
-        {
-            //返回当前服务器的地址
-            match record_type {
-                RecordType::A => {
-                    if self.server_ip.is_ipv4() {
-                        let result_name_info = NameInfo::from_address(name, self.server_ip);
-                        return Ok(UncachedNameInfoQueryResult::Found(result_name_info));
-                    }
-                    let result_name_info = NameInfo::from_address_vec(name, vec![]);
-                    return Ok(UncachedNameInfoQueryResult::Found(result_name_info));
-                }
-                RecordType::AAAA => {
-                    if self.server_ip.is_ipv6() {
-                        let result_name_info = NameInfo::from_address(name, self.server_ip);
-                        return Ok(UncachedNameInfoQueryResult::Found(result_name_info));
-                    }
-                    let result_name_info = NameInfo::from_address_vec(name, vec![]);
-                    return Ok(UncachedNameInfoQueryResult::Found(result_name_info));
-                }
-                RecordType::TXT => {
-                    let device_jwt = self.device_jwt.get(0);
-                    let name_info = self.create_name_info_from_zone_config(
-                        self.boot_jwt.as_str(),
-                        self.owner_pkx.as_str(),
-                        device_jwt,
-                    );
-                    return Ok(UncachedNameInfoQueryResult::Found(name_info));
-                }
-                _ => {
-                    return Err(server_err!(
-                        ServerErrorCode::NotFound,
-                        "sn-server not support record type {}",
-                        record_type.to_string()
-                    ));
-                }
-            }
-        }
-
-        let get_result = SNServer::get_user_subhost_from_host(req_real_name, &self.server_host);
-        if get_result.is_some() {
-            let (sub_host, username) = get_result.unwrap();
-
-            // if req_real_name.ends_with(&sn_full_host) {
-            //     let sub_name = name[0..name.len() - sn_full_host.len()].to_string();
-            //     //split sub_name by "."
-            //     let subs: Vec<&str> = sub_name.split(".").collect();
-            //     let username = subs.last();
-            //     if username.is_none() {
-            //         return Err(server_err!(
-            //             ServerErrorCode::NotFound,
-            //             "{}",
-            //             name.to_string()
-            //         ));
-            //     }
-            info!(
-                "host {} owner by user {}, sub_host: {}, record_type: {:?}",
-                req_real_name, username, sub_host, record_type
-            );
-            match record_type {
-                RecordType::TXT => {
-                    let ret = self
-                        .compat_store
-                        .query_domain_record(req_real_name, "TXT")
-                        .await;
-                    if let Ok(Some((record, ttl))) = ret {
-                        let mut name_info = NameInfo::default();
-                        name_info.ttl = Some(ttl);
-                        name_info.txt.push(record);
-                        return Ok(UncachedNameInfoQueryResult::Found(name_info));
-                    }
-                    let zone_config = self.get_user_zone_config(username.as_str()).await;
-                    if zone_config.is_some() {
-                        let (public_key, zone_config, _, device_jwt) = zone_config.unwrap();
-                        let name_info = self.create_name_info_from_zone_config(
-                            zone_config.as_str(),
-                            public_key.as_str(),
-                            device_jwt.as_ref(),
-                        );
-                        info!(
-                            "<={} zone_config:{} public_key:{} device_jwt:{:?} ",
-                            name, zone_config, public_key, device_jwt
-                        );
-                        Ok(UncachedNameInfoQueryResult::Found(name_info))
-                    } else {
-                        Err(server_err!(
-                            ServerErrorCode::NotFound,
-                            "{}",
-                            name.to_string()
-                        ))
-                    }
-                }
-                RecordType::A | RecordType::AAAA => {
-                    let ret = self
-                        .compat_store
-                        .query_domain_record(req_real_name, record_type.to_string().as_str())
-                        .await;
-                    if let Ok(Some((record, ttl))) = ret {
-                        let mut address_vec = Vec::new();
-                        record.split(',').for_each(|x| {
-                            if let Ok(ip) = IpAddr::from_str(x) {
-                                address_vec.push(ip);
-                            }
-                        });
-
-                        let mut result_name_info = NameInfo::from_address_vec(name, address_vec);
-                        result_name_info.ttl = Some(ttl);
-                        info!("=>{} result_name_info: {:?}", name, result_name_info);
-                        return Ok(UncachedNameInfoQueryResult::Found(result_name_info));
-                    }
-                    let address_vec = self
-                        .get_user_zonegate_address(username.as_str(), record_type)
-                        .await?;
-                    if address_vec.is_some() {
-                        let address_vec = address_vec.unwrap();
-                        let result_name_info = NameInfo::from_address_vec(name, address_vec);
-                        info!("=>{} result_name_info: {:?}", name, result_name_info);
-                        Ok(UncachedNameInfoQueryResult::Found(result_name_info))
-                    } else {
-                        Err(server_err!(
-                            ServerErrorCode::NotFound,
-                            "no address found for {}",
-                            name.to_string()
-                        ))
-                    }
-                }
-                _ => {
-                    return Err(server_err!(
-                        ServerErrorCode::NotFound,
-                        "sn-server not support record type {}",
-                        record_type.to_string()
-                    ));
-                }
-            }
-        } else {
-            info!("get user subhost from host: {} failed", req_real_name);
-            let real_domain_name = req_real_name.to_string();
-            match record_type {
-                RecordType::TXT => {
-                    let zone_config_info =
-                        self.get_user_zone_config_by_domain(&real_domain_name).await;
-                    if zone_config_info.is_some() {
-                        let (public_key, zone_config, device_jwt) = zone_config_info.unwrap();
-                        let name_info = self.create_name_info_from_zone_config(
-                            zone_config.as_str(),
-                            public_key.as_str(),
-                            device_jwt.as_ref(),
-                        );
-                        return Ok(UncachedNameInfoQueryResult::Found(name_info));
-                    } else {
-                        return Ok(UncachedNameInfoQueryResult::Tombstone);
-                    }
-                }
-                RecordType::A | RecordType::AAAA => {
-                    let address_vec = self
-                        .get_user_zonegate_address_by_domain(&real_domain_name, record_type)
-                        .await?;
-                    if address_vec.is_some() {
-                        let address_vec = address_vec.unwrap();
-                        let result_name_info = NameInfo::from_address_vec(name, address_vec);
-                        info!("=>{} result_name_info: {:?}", name, result_name_info);
-                        return Ok(UncachedNameInfoQueryResult::Found(result_name_info));
-                    }
-                }
-                _ => {
-                    return Err(server_err!(
-                        ServerErrorCode::NotFound,
-                        "sn-server not support record type {}",
-                        record_type.to_string()
-                    ));
-                }
-            }
-
-            Ok(UncachedNameInfoQueryResult::Tombstone)
         }
     }
 
@@ -3152,7 +2138,6 @@ mod tests {
     use crate::SnAuthDB;
     use buckyos_kit::init_logging;
     use cyfs_gateway_lib::hyper_serve_http;
-    use hyper_util::rt::TokioIo;
     use std::time::SystemTime;
     use tokio::net::{TcpListener, TcpStream};
 
@@ -3369,67 +2354,6 @@ mod tests {
     }
 
     #[test]
-    fn test_push_zonegate_address_for_a_record_keeps_192_filters_172_and_dedups() {
-        let mut addresses = Vec::new();
-
-        push_zonegate_address(&mut addresses, "172.17.0.1".parse().unwrap(), RecordType::A);
-        push_zonegate_address(
-            &mut addresses,
-            "192.168.100.191".parse().unwrap(),
-            RecordType::A,
-        );
-        push_zonegate_address(
-            &mut addresses,
-            "207.246.96.13".parse().unwrap(),
-            RecordType::A,
-        );
-        push_zonegate_address(
-            &mut addresses,
-            "192.168.100.191".parse().unwrap(),
-            RecordType::A,
-        );
-        push_zonegate_address(&mut addresses, "::1".parse().unwrap(), RecordType::A);
-
-        assert_eq!(
-            addresses,
-            vec![
-                "192.168.100.191".parse::<IpAddr>().unwrap(),
-                "207.246.96.13".parse::<IpAddr>().unwrap()
-            ]
-        );
-    }
-
-    #[test]
-    fn test_push_zonegate_address_for_aaaa_record_keeps_ipv6_and_filters_loopback() {
-        let mut addresses = Vec::new();
-
-        push_zonegate_address(
-            &mut addresses,
-            "240e:3b3:30c0:930::47f".parse().unwrap(),
-            RecordType::AAAA,
-        );
-        push_zonegate_address(
-            &mut addresses,
-            "fdc8:b144:c39b::47f".parse().unwrap(),
-            RecordType::AAAA,
-        );
-        push_zonegate_address(&mut addresses, "::1".parse().unwrap(), RecordType::AAAA);
-        push_zonegate_address(
-            &mut addresses,
-            "240e:3b3:30c0:930::47f".parse().unwrap(),
-            RecordType::AAAA,
-        );
-
-        assert_eq!(
-            addresses,
-            vec![
-                "240e:3b3:30c0:930::47f".parse::<IpAddr>().unwrap(),
-                "fdc8:b144:c39b::47f".parse::<IpAddr>().unwrap()
-            ]
-        );
-    }
-
-    #[test]
     fn test_build_device_info_json_filters_172_from_exported_ip_fields() {
         let device = SNDeviceInfo {
             owner: "meteormeta".to_string(),
@@ -3447,7 +2371,7 @@ mod tests {
             updated_at: 2,
         };
 
-        let exported = SNServer::build_device_info_json(&device);
+        let exported = build_legacy_device_info_json(&device);
         assert_eq!(
             exported.get("ip").and_then(|v| v.as_str()),
             Some("192.168.100.182")
@@ -3486,7 +2410,7 @@ mod tests {
             updated_at: 2,
         };
 
-        let exported = SNServer::build_device_info_json(&device);
+        let exported = build_legacy_device_info_json(&device);
         assert!(exported.get("ip").is_none());
         assert_eq!(
             exported.get("ips").and_then(|v| v.as_array()).cloned(),
@@ -3518,7 +2442,7 @@ mod tests {
             .unwrap()
             .to_string();
 
-        let (user_token, mut user_session) = RPCSessionToken::generate_jwt_token(
+        let (_user_token, mut user_session) = RPCSessionToken::generate_jwt_token(
             TEST_USER,
             "active_service",
             None,
@@ -3542,7 +2466,7 @@ mod tests {
 
         let encoding_key = jsonwebtoken::EncodingKey::from_ed_der(pkcs8_bytes.as_slice());
         // device signed token: userid is device_name (e.g. "ood1")
-        let (token, mut session) =
+        let (_token, mut session) =
             RPCSessionToken::generate_jwt_token("ood1", "cyfs_gateway", None, &encoding_key)
                 .unwrap();
         session.aud = Some("sn".to_string());
@@ -3561,7 +2485,7 @@ mod tests {
             DeviceConfig::new_by_jwk("ood2", serde_json::from_value(jwk2).unwrap());
 
         let encoding_key2 = jsonwebtoken::EncodingKey::from_ed_der(pkcs8_bytes2.as_slice());
-        let (token2, mut session2) =
+        let (_token2, mut session2) =
             RPCSessionToken::generate_jwt_token(TEST_USER, "cyfs_gateway", None, &encoding_key2)
                 .unwrap();
         session2.aud = Some("sn".to_string());
@@ -4743,7 +3667,7 @@ mod tests {
         )
         .unwrap();
         owner_session.aud = Some("sn".to_string());
-        let owner_signed_token = owner_session
+        let _owner_signed_token = owner_session
             .generate_jwt(None, &user_encoding_key)
             .unwrap()
             .to_string();

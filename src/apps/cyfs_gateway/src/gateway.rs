@@ -4415,6 +4415,7 @@ mod tests {
             .unwrap();
         assert_eq!(block.get("priority").and_then(|v| v.as_i64()), Some(1));
         let block_str = block.get("block").and_then(|v| v.as_str()).unwrap();
+        assert_eq!(block_str, "new;");
 
         let updated =
             Gateway::add_rule_to_config(raw_config.clone(), "stack:s1:main:default1", "new;")
@@ -4441,9 +4442,23 @@ mod tests {
 
         let updated =
             Gateway::add_rule_to_config(raw_config.clone(), "stack:s1:main", "new;").unwrap();
-        let blocks = updated["stacks"]["s1"]["hook_point"]["main"]["blocks"].clone();
+        let blocks = updated["stacks"]["s1"]["hook_point"]["main"]["blocks"]
+            .as_object()
+            .unwrap();
+        assert_eq!(blocks.len(), 2);
+        assert!(blocks
+            .values()
+            .any(|block| block["block"].as_str() == Some("new;")));
         let updated = Gateway::add_rule_to_config(raw_config.clone(), "stack:s1", "new;").unwrap();
-        let blocks = updated["stacks"]["s1"]["hook_point"].clone();
+        let chains = updated["stacks"]["s1"]["hook_point"].as_object().unwrap();
+        assert_eq!(chains.len(), 2);
+        assert!(chains.values().any(|chain| {
+            chain["blocks"].as_object().is_some_and(|blocks| {
+                blocks
+                    .values()
+                    .any(|block| block["block"].as_str() == Some("new;"))
+            })
+        }));
     }
 
     #[tokio::test]
@@ -4623,6 +4638,7 @@ mod tests {
             .unwrap();
         assert_eq!(block.get("priority").and_then(|v| v.as_i64()), Some(3));
         let block_str = block.get("block").and_then(|v| v.as_str()).unwrap();
+        assert_eq!(block_str, "new;");
 
         let updated =
             Gateway::append_rule_to_config(raw_config.clone(), "stack:s1:main:default1", "new;")
@@ -4649,10 +4665,24 @@ mod tests {
 
         let updated =
             Gateway::append_rule_to_config(raw_config.clone(), "stack:s1:main", "new;").unwrap();
-        let blocks = updated["stacks"]["s1"]["hook_point"]["main"]["blocks"].clone();
+        let blocks = updated["stacks"]["s1"]["hook_point"]["main"]["blocks"]
+            .as_object()
+            .unwrap();
+        assert_eq!(blocks.len(), 2);
+        assert!(blocks
+            .values()
+            .any(|block| block["block"].as_str() == Some("new;")));
         let updated =
             Gateway::append_rule_to_config(raw_config.clone(), "stack:s1", "new;").unwrap();
-        let blocks = updated["stacks"]["s1"]["hook_point"].clone();
+        let chains = updated["stacks"]["s1"]["hook_point"].as_object().unwrap();
+        assert_eq!(chains.len(), 2);
+        assert!(chains.values().any(|chain| {
+            chain["blocks"].as_object().is_some_and(|blocks| {
+                blocks
+                    .values()
+                    .any(|block| block["block"].as_str() == Some("new;"))
+            })
+        }));
     }
 
     #[tokio::test]

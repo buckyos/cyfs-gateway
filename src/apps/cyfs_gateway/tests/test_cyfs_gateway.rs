@@ -106,7 +106,6 @@ mod tests {
     const SOCKS_VERSION: u8 = 0x05;
     const SOCKS_AUTH_NONE: u8 = 0x00;
     const SOCKS_AUTH_USERNAME_PASSWORD: u8 = 0x02;
-    const SOCKS_AUTH_NO_ACCEPTABLE: u8 = 0xff;
     const SOCKS_CMD_CONNECT: u8 = 0x01;
     const SOCKS_ADDR_IPV4: u8 = 0x01;
     const SOCKS_ADDR_DOMAIN: u8 = 0x03;

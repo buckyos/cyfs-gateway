@@ -9,7 +9,7 @@
 ## 实现现状
 
 第一阶段（私链环境 + 合约）已落地，代码在 **`src/apps/bns`**（Foundry 工程，非原计划的 `contracts/`）。
-EVM 客户端基础层与索引器事件投影已落地；BNS Server 已切到 raw TX + 投影读模型，SN 写路径仍未完全切到 EVM。
+EVM 客户端基础层与索引器事件投影已落地；BNS Server 已切到 raw TX + 投影读模型，SN 写路径已**强制**走 EVM Controller（`sn_server.rs` 中 `bns_write_enabled` 必须配 `bns_evm`，否则启动报错；SN 写控制器只有 `new_evm` 构造路径）。剩余未完成的是几项明确标注为"后续/可选/上公链前"的非阻塞项（revm 内嵌、EIP-170 拆分、ABI 移除 `CallAuthority` 入参、部分文档同步）。
 
 | 模块 | 状态 | 说明 |
 | --- | --- | --- |
@@ -18,7 +18,7 @@ EVM 客户端基础层与索引器事件投影已落地；BNS Server 已切到 r
 | `forge test` 合约单测 | ✅ 已完成 | 6 个用例，覆盖鉴权 / guard / 文档 / 事件，见 [test/Bns.t.sol](../src/apps/bns/test/Bns.t.sol) |
 | 链上 smoke 流程 | ✅ 已完成 | [script/Smoke.s.sol](../src/apps/bns/script/Smoke.s.sol)：部署 → registerName → publishDocument → resolveDocument |
 | `bns-evm` crate（alloy 绑定 + TX 构造/签名） | ✅ 基础已完成 | 新增 [src/components/bns-evm](../src/components/bns-evm)：`sol!` ABI 绑定、calldata/event 解码、EIP-1559 TX 构造/签名、JSON-RPC helper、round-trip 测试 |
-| Standard / Controller 客户端 | ✅ 已完成 | `src/components/bns-client` 新增 EVM Standard/Controller client、raw TX 提交、unsigned TX helper、托管私钥签名；`sn_bns_controller.rs` 已通过 EVM write backend 切到 Controller Client 自动签名提交，旧 backend 仅保留兼容 |
+| Standard / Controller 客户端 | ✅ 已完成 | `src/components/bns-client` 新增 EVM Standard/Controller client、raw TX 提交、unsigned TX helper、托管私钥签名；`sn_bns_controller.rs` 写路径**仅有** `EvmSnBnsWriteBackend` 一种实现（[sn_bns_controller.rs:466](../src/components/bns-client/src/sn_bns_controller.rs:466)），通过 Controller Client 自动签名提交，旧 RPC/CallAuthority 写 backend 已删除 |
 | `bns-indexer` → 事件索引器 | ✅ 已完成 | [sync.rs](../src/components/bns-indexer/src/sync.rs)：轮询 `eth_getLogs` 同步器、常驻 polling driver、last-synced-block+block-hash 游标、reorg 检测后重放、完整读投影重建（names/documents/authority/controller/alias/checkpoint）、`EventLogRecord` 写入；`CentralizedBnsRegistry::new` 默认只读，旧状态机写路径仅保留隐藏 legacy 测试入口 |
 | BNS Server 读/写路径改造 | ✅ 已完成 | 新增 `BnsContractServerHandler` / `SqliteBnsServerHttpServer`：写路径 `tx.submit_raw` 转发 `eth_sendRawTransaction`，读路径查 SQLite 投影；旧 `CallAuthority` 写 RPC 在新 handler 中返回 unsupported |
 | SN EVM 配置 | ✅ 已完成 | `SNServerConfig` 新增 `bns_evm` RPC/chainId/合约地址/gas/私钥来源字段；配置存在时 SN 写路径构造 `BnsEvmControllerClient` 并走 EVM Controller 提交 |
@@ -75,7 +75,7 @@ BNS(合约) <-> BNS-Indexer <-> BNS-Server <-> BNS-Client <-> BNS-Controller
 - 权威源：`Rust 状态机` → **`Bns.sol` 合约**。✅ 合约侧已成立（链上 `_names`/`_documents`/`_authoritySets` 等即权威状态）。
 - `bns-indexer`：`状态机+存储` → **事件索引器**。✅ 轮询 `eth_getLogs` 同步器 + 常驻 polling driver + 完整读投影重建 + block-hash reorg 检测/重放已落地；默认构造已是只读投影 facade，旧状态机写路径下线。
 - `bns-server`：`状态机 HTTP 包装` → **标准智能合约处理器**：只处理 TX（转发已签 raw TX）和读（查索引器投影），不签名、不含 control 逻辑。✅ 新 handler 已落地。
-- 鉴权：不再由 server 端 `ecrecover` 或信任传入的 `CallAuthority`；**节点恢复 sender，合约用 `msg.sender` 做 `require` 访问控制**——✅ 合约侧已成立（`CallAuthority` 仅作 role/kid 提示，地址必须 == `msg.sender`）。Rust 客户端侧已能构造/签名 EVM TX，但 SN/BNS Server 写路径尚未完全迁移。
+- 鉴权：不再由 server 端 `ecrecover` 或信任传入的 `CallAuthority`；**节点恢复 sender，合约用 `msg.sender` 做 `require` 访问控制**——✅ 合约侧已成立（`CallAuthority` 仅作 role/kid 提示，地址必须 == `msg.sender`）。Rust 客户端侧已能构造/签名 EVM TX；SN 写路径已强制经 EVM Controller 提交（见上）。BNS Server 写路径仅做 raw TX 转发。
 
 ## 1. 私链环境（Anvil）✅ 已完成
 
@@ -83,9 +83,10 @@ BNS(合约) <-> BNS-Indexer <-> BNS-Server <-> BNS-Client <-> BNS-Controller
 - [x] 起链脚本 [scripts/anvil.sh](../src/apps/bns/scripts/anvil.sh)：`--state var/anvil-state.json`（持久化）、`--block-time 1`、固定助记词 `test test ... junk`（确定性账户）、`--chain-id 31337`、`--disable-code-size-limit`。
 - [x] 部署脚本 [scripts/deploy.sh](../src/apps/bns/scripts/deploy.sh)：`forge build` + `forge create src/Bns.sol:Bns`，输出到 `deployments/anvil.local.json`。
 - [x] "随时可改"工作流：改 `Bns.sol` → `forge build` → 重新部署。**中心化测试环境，零迁移负担**。
-- [ ] 集成测试用 `alloy-node-bindings` 从 Rust 里自动拉起 anvil + 部署合约 + 跑端到端。
+- [x] 集成测试从 Rust 里自动拉起 anvil + 部署合约 + 跑端到端：[tests/e2e_anvil.rs](../src/components/bns-client/tests/e2e_anvil.rs)（7 个 `#[ignore]` 用例，缺 Foundry 时优雅跳过）。**实现差异**：用 `std::process::Command` 直接拉起 `anvil` + `forge create`，未使用 `alloy-node-bindings` 库。
 - [x] 配置项进 Rust 侧：链 RPC endpoint、chainId、合约地址、controller 私钥来源字段已进入 `SNServerConfig.bns_evm`。
-- [ ] 删掉旧的裸 `CallAuthority` 字段/路径，并把 SN 写请求真正切到 EVM Controller Client。
+- [x] 把 SN 写请求真正切到 EVM Controller Client：`sn_server.rs` 写控制器仅 `new_evm` 构造，`bns_write_enabled` 强制要求 `bns_evm`。
+- [ ] 删掉旧的裸 `CallAuthority` 字段/路径：当前 `CallAuthority` 仍作为 role/kid 数据载体保留在请求结构与 ABI 入参中（合约只信 `msg.sender`），尚未从线协议/ABI 中移除。见 §10 与开放问题 8。
 
 ## 2. BNS 合约（Solidity）✅ 已完成（范围超出原计划）
 
@@ -93,27 +94,27 @@ BNS(合约) <-> BNS-Indexer <-> BNS-Server <-> BNS-Client <-> BNS-Controller
 > foundry 配置：solc `0.8.24`、`optimizer`、`via_ir`、`evm_version = paris`（[foundry.toml](../src/apps/bns/foundry.toml)）。
 
 - [x] 写操作（**远超**原计划的 5 个）：
-  - [x] `registerName`（[Bns.sol:620](../src/apps/bns/src/Bns.sol:620)）
-  - [x] `bootstrapName`（[Bns.sol:631](../src/apps/bns/src/Bns.sol:631)）— 原计划"第二批"，已实现
-  - [x] `renewName`（[Bns.sol:699](../src/apps/bns/src/Bns.sol:699)）
-  - [x] `transferName`（[Bns.sol:730](../src/apps/bns/src/Bns.sol:730)）
-  - [x] `setNameOwner`（[Bns.sol:793](../src/apps/bns/src/Bns.sol:793)）
-  - [x] `releaseName`（[Bns.sol:839](../src/apps/bns/src/Bns.sol:839)）
-  - [x] `setNamespacePolicy`（[Bns.sol:861](../src/apps/bns/src/Bns.sol:861)）
-  - [x] `updateAuthorityKeys`（[Bns.sol:896](../src/apps/bns/src/Bns.sol:896)）
-  - [x] `rotateAuthorityAndOwnerDocument`（[Bns.sol:911](../src/apps/bns/src/Bns.sol:911)）
-  - [x] `publishDocument`（[Bns.sol:931](../src/apps/bns/src/Bns.sol:931)）
-  - [x] `revokeDocument`（[Bns.sol:980](../src/apps/bns/src/Bns.sol:980)）
-  - [x] `setControllerPolicy`（[Bns.sol:1030](../src/apps/bns/src/Bns.sol:1030)）
-  - [x] `setDidAlias`（[Bns.sol:1045](../src/apps/bns/src/Bns.sol:1045)）
-  - [x] `setPaymentTarget`（[Bns.sol:1080](../src/apps/bns/src/Bns.sol:1080)）
-  - [x] `publishLogCheckpoint`（[Bns.sol:1140](../src/apps/bns/src/Bns.sol:1140)）
+  - [x] `registerName`（[Bns.sol:625](../src/apps/bns/src/Bns.sol:625)）
+  - [x] `renewName`（[Bns.sol:694](../src/apps/bns/src/Bns.sol:694)）
+  - [x] `transferName`（[Bns.sol:725](../src/apps/bns/src/Bns.sol:725)）
+  - [x] `setNameOwner`（[Bns.sol:788](../src/apps/bns/src/Bns.sol:788)）
+  - [x] `releaseName`（[Bns.sol:834](../src/apps/bns/src/Bns.sol:834)）
+  - [x] `setNamespacePolicy`（[Bns.sol:856](../src/apps/bns/src/Bns.sol:856)）
+  - [x] `updateAuthorityKeys`（[Bns.sol:891](../src/apps/bns/src/Bns.sol:891)）
+  - [x] `applyMutations`（[Bns.sol:906](../src/apps/bns/src/Bns.sol:906)）— 批量 authority key + document 变更（原计划的 `rotateAuthorityAndOwnerDocument` 已合并进此批量入口）
+  - [x] `publishDocument`（[Bns.sol:953](../src/apps/bns/src/Bns.sol:953)）
+  - [x] `revokeDocument`（[Bns.sol:1002](../src/apps/bns/src/Bns.sol:1002)）
+  - [x] `setControllerPolicy`（[Bns.sol:1052](../src/apps/bns/src/Bns.sol:1052)）
+  - [x] `setDidAlias`（[Bns.sol:1067](../src/apps/bns/src/Bns.sol:1067)）
+  - [x] `setPaymentTarget`（[Bns.sol:1102](../src/apps/bns/src/Bns.sol:1102)）
+  - [x] `publishLogCheckpoint`（[Bns.sol:1162](../src/apps/bns/src/Bns.sol:1162)）
+  - ⚠️ **与文档历史版本的差异**：原列出的 `bootstrapName` / `rotateAuthorityAndOwnerDocument` 两个独立函数在当前合约中**已不存在**——bootstrap 语义并入 `registerName`，authority+owner 文档轮换并入批量 `applyMutations`。功能未丢失，仅入口收敛。
 - [x] 读 API：`queryNameState` / `resolveOwner` / `isStandardTransferEnabled` / `getAuthoritySet` / `getAuthorityKey` / `resolveDocument` / `getDocumentVersion` / `getAlias` / `getPurchaseContext` / `resolvePaymentTarget` / `latestCheckpoint` / `chainAccountPrincipal` / `bnsNamePrincipal`。
-- [x] 访问控制基于 `msg.sender`：`_authorizeOwner`（[Bns.sol:1526](../src/apps/bns/src/Bns.sol:1526)）解析 effectiveOwner 后要求其地址 == `msg.sender`；controller 操作在 `_authorizeUpdate`（[Bns.sol:1487](../src/apps/bns/src/Bns.sol:1487)）中按 controller policy 的 `permissions` 位掩码 + docType 匹配 + 有效期校验，并要求登记的 controller 地址 == `msg.sender`。
+- [x] 访问控制基于 `msg.sender`：`_authorizeOwner`（[Bns.sol:1550](../src/apps/bns/src/Bns.sol:1550)）解析 effectiveOwner 后经 `_authenticateExpectedPrincipal`（[Bns.sol:1565](../src/apps/bns/src/Bns.sol:1565)）要求其地址 == `msg.sender`；controller 操作在 `_authorizeUpdate`（[Bns.sol:1499](../src/apps/bns/src/Bns.sol:1499)）中按 controller policy 的 `permissions` 位掩码 + docType 匹配 + 有效期校验，并要求登记的 controller 地址 == `msg.sender`。
 - [x] **合约级 controller 策略**：`ControllerRule[]`（`permissions` 含 `PUBLISH_DOCUMENT` / `REVOKE_DOCUMENT` / `SET_PAYMENT` / `SET_ALIAS` / `SET_NAMESPACE`），含 docType scope 与有效期窗口。映射现有 `ControllerRule`/controller policy 概念。
-- [x] 每个写操作 `emit` 专用事件 **＋** 统一的 `ProtocolEvent(seq, eventType, actor, previousLogRoot, logRoot)`（[Bns.sol:322](../src/apps/bns/src/Bns.sol:322)）；字段含 name/docType/version/actor/contentHash 等，可直接供索引器消费。
+- [x] 每个写操作 `emit` 专用事件 **＋** 统一的 `ProtocolEvent(seq, eventType, actor, previousLogRoot, logRoot)`（[Bns.sol:327](../src/apps/bns/src/Bns.sol:327)）；字段含 name/docType/version/actor/contentHash 等，可直接供索引器消费。
 - [x] 大对象走 `DocumentRef`：inline 上限 `MAX_INLINE_DOCUMENT = 4KB`（[Bns.sol:258](../src/apps/bns/src/Bns.sol:258)），inline 必须 `sha256(inlineDocument) == contentHash`；非 inline 走 `uri` + hash 引用。
-- [x] `MutationGuard`（`expectedNameSeq` + `expectedParentNameSeq`）作为参数进合约，`_checkGuard`（[Bns.sol:1639](../src/apps/bns/src/Bns.sol:1639)）`require(nameSeq == expected)`；`_hashDocumentState` / `_commitEvent` 均混入 `block.chainid` + `address(this)` 防跨部署重放。
+- [x] `MutationGuard`（`expectedNameSeq` + `expectedParentNameSeq`）作为参数进合约，`_checkGuard`（[Bns.sol:1663](../src/apps/bns/src/Bns.sol:1663)）`require(nameSeq == expected)`；`_hashDocumentState`（[Bns.sol:1945](../src/apps/bns/src/Bns.sol:1945)）/ `_commitEvent` 均混入 `block.chainid` + `address(this)` 防跨部署重放。
 - [x] `forge test` 写 Solidity 单测，覆盖鉴权 / guard / 文档 / 事件（见 §9）。
 - [ ] **上公链前的拆分**：当前单合约字节码超过 EIP-170 上限，仅私链 `--disable-code-size-limit` 可部署。上公链需拆 facet/module 或把读 helper 移出写合约。（README 已注明，留作后续。）
 
@@ -126,16 +127,16 @@ BNS(合约) <-> BNS-Indexer <-> BNS-Server <-> BNS-Client <-> BNS-Controller
 - [x] 用 `sol!(Bns, "out/Bns.sol/Bns.json")` 生成类型安全绑定（calldata 编码 + event 解码一份搞定）。
 - [x] 封装：`build_tx(call, nonce, chainId, to, gas) -> TxEip1559`、`sign(tx, key) -> RawTx`、`decode_bns_event` / `decode_bns_call` helper。
 - [x] round-trip 测试：calldata 编/解码一致；独立解码自己签的 TX，恢复出的 signer 地址一致。
-- [ ] 后续补 `alloy-node-bindings`/自动部署合约的端到端测试。
+- [x] 自动部署合约的端到端测试已补：[tests/e2e_anvil.rs](../src/components/bns-client/tests/e2e_anvil.rs)（用 `std::process::Command` 拉起 anvil + `forge create`，未用 `alloy-node-bindings` 库）。
 
 ## 4. BNS-Client（薄封装）与 BNS-Controller（前置签名逻辑）✅ 已完成
 
 > **定位**（见 §0.1）：这两者都在 BNS-Server 之上。**Standard Client = BNS-Client 的默认薄封装形态（不持私钥）**；**Controller Client = BNS-Controller**，即 Client 在"自己持有该资产 control 公钥"时启用的前置签名逻辑。所有自动签名/control 决策都收敛在 Controller，Server 层完全不感知。
-> **现状**：`src/components/bns-client` 已新增 EVM Standard/Controller client（见 [evm.rs](../src/components/bns-client/src/evm.rs)）。`sn_bns_controller.rs` 已通过 `SnBnsWriteBackend` 接入 EVM Controller Client；配置 `bns_evm` 时 SN 写路径构造 op → Controller 自动查 nonce / 填 TX / 签名 / 提交。旧 RPC backend 仅保留为兼容路径。
+> **现状**：`src/components/bns-client` 已新增 EVM Standard/Controller client（见 [evm.rs](../src/components/bns-client/src/evm.rs)）。`sn_bns_controller.rs` 已通过 `SnBnsWriteBackend` 接入 EVM Controller Client；配置 `bns_evm` 时 SN 写路径构造 op → Controller 自动查 nonce / 填 TX / 签名 / 提交。`SnBnsWriteBackend` 仅有 `EvmSnBnsWriteBackend` 一种实现，旧 RPC backend 已删除。
 
 - [x] **Standard Client**（= BNS-Client 薄封装，无私钥）：入参为**已签名 raw TX 字节**，`eth_sendRawTransaction` 提交；另提供 `build_calldata`/`build_unsigned_tx` helper 给外部签名方。读走索引器。
 - [x] **Controller Client**（= BNS-Controller，托管私钥，自动签名）：持 secp256k1 私钥，自动查 nonce → 填 chainId/to/gas → ABI 编码 → 签名 → 提交。仅在 Client 判断持有对应 control 公钥时走此路径。
-  - [x] 迁移 `sn_bns_controller.rs`：通过 EVM write backend 构造合约 op → Controller Client 自动签名提交；旧 `CallAuthority` RPC 写 backend 仅保留兼容。
+  - [x] 迁移 `sn_bns_controller.rs`：通过 EVM write backend 构造合约 op → Controller Client 自动签名提交；旧 `CallAuthority` RPC 写 backend 已删除（仅剩 `EvmSnBnsWriteBackend`）。
   - [x] 幂等元数据：`SnBnsWriteRequestStore` 增加 `evm_chain_id` / `evm_nonce` / `evm_tx_hash` / `evm_raw_tx` 字段，避免后续迁移时重复提交信息丢失。
   - [x] nonce 管理基础：Controller Client 本地缓存 pending nonce。
   - [x] nonce 管理增强：签名/提交失败回退重查、Controller Client 内串行化提交避免并发 nonce 冲突、可选等待 `eth_getTransactionReceipt` 确认上链与确认数。
@@ -195,8 +196,15 @@ BNS(合约) <-> BNS-Indexer <-> BNS-Server <-> BNS-Client <-> BNS-Controller
 - [x] `bns-indexer` 合约事件投影与 SQLite event 写入测试。
 - [x] `bns-indexer` 同步配置测试（[tests/sync_config.rs](../src/components/bns-indexer/tests/sync_config.rs)）：`source_id` 由 network/chainId/contract 组合且按链隔离；`IndexerCursor` 按 source 作用域存取互不串扰。
 - [x] `bns-server` 标准合约处理器测试：投影读、旧 `CallAuthority` 写 RPC 禁用、raw TX 转发到 `eth_sendRawTransaction`。
-- [ ] 端到端集成：`alloy-node-bindings` 拉起 anvil → 部署 `Bns.sol` → Controller Client 提交 → `sync_once` 同步 → 读 API 命中。**未开始**（`sync_once` 已就绪，仍缺活节点 e2e）。
-- [ ] 防重放/隔离：合约侧已含 `block.chainid`+`address(this)` 隔离与 guard；nonce 重放 / chainId 不匹配的 TX 级测试待 §3/§4 落地后补。
+- [x] 端到端集成：[tests/e2e_anvil.rs](../src/components/bns-client/tests/e2e_anvil.rs) 拉起 anvil → `forge create` 部署 `Bns.sol` → Controller Client 提交 → `sync_once` 同步 → 读 API 命中，全闭环已覆盖：
+  - `e2e_write_read_closed_loop_matches_onchain_truth`（写注册/发布 → 同步 → 读投影 == 链上真值）
+  - `e2e_signing_boundary_actor_mismatch_reverts_onchain`（签名边界：actor 不匹配链上 revert）
+  - `e2e_nonce_replay_and_chain_id_rejection`（nonce 重放 / chainId 不匹配拒绝）
+  - `e2e_confirmations_gate_and_cursor_advance`（确认数门控 + 游标推进）
+  - `e2e_redeploy_uses_isolated_source_and_replays_from_zero`（重部署 source 隔离 + 从 0 重放）
+  - `e2e_controller_policy_scopes_doc_types_on_chain`（controller policy docType scope 链上生效）
+  - **实现差异**：用 `std::process::Command` 拉起节点，未用 `alloy-node-bindings` 库。
+- [x] 防重放/隔离：合约侧已含 `block.chainid`+`address(this)` 隔离与 guard；nonce 重放 / chainId 不匹配的 TX 级测试已由 `e2e_nonce_replay_and_chain_id_rejection`（[tests/e2e_anvil.rs:437](../src/components/bns-client/tests/e2e_anvil.rs:437)）覆盖。
 - [x] 合约重部署 → 索引器从 0 重放一致性：`bns-indexer` mock RPC 测试已覆盖换 contract 地址即换 source、旧游标不串扰、新 source 从 `start_block` 重放。
 
 ## 10. 收尾
@@ -204,7 +212,8 @@ BNS(合约) <-> BNS-Indexer <-> BNS-Server <-> BNS-Client <-> BNS-Controller
 - [x] 移除 `bns-indexer` 的状态机写逻辑与 `CentralizedBnsRegistry` 权威语义：默认构造降级为只读投影 facade，所有写入口返回 `UNSUPPORTED_OPERATION`；旧状态机仅保留隐藏 legacy 测试入口。
 - [ ] 更新 `BNS 智能合约接口设计.md`、SN 文档：权威源=合约、indexer=事件索引器、两客户端模型。
 - [x] `SNServerConfig` 新增链 RPC / chainId / 合约地址 / controller 私钥来源 / gas 配置字段。
-- [ ] 去掉裸 `CallAuthority` 配置/写路径，并接入 Controller Client。
+- [x] 接入 Controller Client：SN 写路径已强制走 EVM Controller（`sn_server.rs`，仅 `new_evm`）。
+- [ ] 去掉裸 `CallAuthority` 配置/写路径：仍作 role/kid 提示保留，未从线协议/ABI 移除（与开放问题 8 合并处理）。
 - [ ] （新增）清理合约 ABI：评估是否从写函数签名中**移除 `CallAuthority` 入参**（目前保留作 role/kid 提示，但身份只认 `msg.sender`），统一签名边界语义。
 - [ ] （新增）公链化：拆分单合约以满足 EIP-170。
 
