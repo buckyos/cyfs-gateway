@@ -12,7 +12,6 @@ use crate::gateway_control_server::{
     GatewayControlServerConfigParser, GatewayControlServerContext, GATEWAY_CONTROL_SERVER_CONFIG,
     GATEWAY_CONTROL_SERVER_KEY,
 };
-use crate::socks::SocksTunnelBuilder;
 use crate::{merge, AcmeConfig, AcmeHostConfig, TlsCA};
 use anyhow::{anyhow, Result};
 use buckyos_kit::*;
@@ -22,7 +21,7 @@ use cyfs_dns::{
     DnsServerContext, InnerDnsRecordManager, InnerDnsRecordManagerRef, LocalDnsServerContext,
 };
 use cyfs_process_chain::CollectionValue;
-use cyfs_socks::SocksServerContext;
+use cyfs_socks::{SocksServerContext, SocksTunnelBuilder};
 use cyfs_traffic::{
     TrafficQuotaService, TrafficServiceHandle, TrafficStatFactory, TrafficStatFactoryRef,
     TrafficUserLimiterFactory,

@@ -8,7 +8,6 @@ mod debug;
 mod gateway;
 mod gateway_control_server;
 mod process_chain_doc;
-mod socks;
 
 use crate::debug::run_debug_command;
 use acme_sn_provider::*;

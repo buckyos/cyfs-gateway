@@ -3,6 +3,7 @@ name = "cyfs_gateway"
 version.workspace = true
 edition = "2021"
 authors = ["BuckyOS DAO","@waterflier","@lurenpluto","@wugren"]
+build = "build.rs"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]

@@ -1,8 +1,8 @@
-use buckyos_kit::AsyncStream;
-use cyfs_gateway_lib::TunnelManager;
-use cyfs_socks::{
+use crate::{
     SocksDataTunnelProvider, SocksDataTunnelProviderRef, SocksError, SocksResult, TargetAddr,
 };
+use buckyos_kit::AsyncStream;
+use cyfs_gateway_lib::TunnelManager;
 use log::{debug, error};
 use std::sync::Arc;
 use url::Url;
