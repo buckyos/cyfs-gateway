@@ -21,7 +21,7 @@ def main() -> int:
 
     for attempt in range(MAX_START_ATTEMPTS):
         started_at = time.monotonic()
-        result = subprocess.run(cmd)
+        result = subprocess.run(cmd, cwd=current_dir)
         elapsed = time.monotonic() - started_at
         if "debug" in args or elapsed >= STARTUP_STABLE_SECONDS:
             return result.returncode

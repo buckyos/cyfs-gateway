@@ -150,6 +150,9 @@ stacks:
     #   hosts: # TLS identities supported by this stack; certs are loaded through the identity manager path protocol
     #     - example.com
     #     - "*.example.org"
+    #     - host: cert.example.net # operator-managed certificate loaded directly from absolute paths
+    #       cert_path: /etc/ssl/certs/cert.example.net.fullchain.pem
+    #       key_path: /etc/ssl/private/cert.example.net.key
     #   identity_manager: # optional; defaults to BUCKYOS_IDENTITY_ROOT/BUCKYOS_SECURITY_ROOT or $BUCKYOS_ROOT/local/identity and $BUCKYOS_ROOT/security
     #     public_root_path: ./identity
     #     security_root_path: ./security

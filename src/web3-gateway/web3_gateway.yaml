@@ -115,13 +115,16 @@ stacks:
   main_tls:
     bind: 0.0.0.0:3443
     protocol: tls
-    certs:
-      - domain: "sn.{{sn_host}}"
-        cert_path: ./{{sn_cer}}
-        key_path: ./{{sn_pem}}
-      - domain: "*.web3.{{sn_host}}"
-        cert_path: ./{{web3_cer}}
-        key_path: ./{{web3_pem}}
+    hosts:
+      - host: "sn.{{sn_host}}"
+        cert_path: /opt/web3-gateway/{{sn_cer}}
+        key_path: /opt/web3-gateway/{{sn_pem}}
+      - host: "web3.{{sn_host}}"
+        cert_path: /opt/web3-gateway/{{web3_cer}}
+        key_path: /opt/web3-gateway/{{web3_pem}}
+      - host: "*.web3.{{sn_host}}"
+        cert_path: /opt/web3-gateway/{{web3_cer}}
+        key_path: /opt/web3-gateway/{{web3_pem}}
     hook_point:
       main:
         id: main

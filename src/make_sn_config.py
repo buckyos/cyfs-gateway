@@ -83,6 +83,20 @@ def write_json(path: Path, data: dict) -> None:
     print(f"write json {path}")
 
 
+def install_server_cert_identity(
+    target_dir: Path, identities: Iterable[str], cert_path: Path, key_path: Path
+) -> None:
+    for identity in identities:
+        dir_name = identity.replace("*.", "_.", 1)
+        public_dir = ensure_dir(target_dir / "identity" / dir_name)
+        security_dir = ensure_dir(target_dir / "security" / dir_name)
+        shutil.copy2(cert_path, public_dir / "server.fullchain.pem")
+        private_key_path = security_dir / "server.private.pem"
+        shutil.copy2(key_path, private_key_path)
+        private_key_path.chmod(0o600)
+        print(f"install server cert identity: {identity} -> {dir_name}")
+
+
 def make_global_env_config(
     target_dir: Path,
     web3_bns: str,
@@ -264,7 +278,8 @@ def make_sn_configs(
     
     所有配置文件直接平铺在 target_dir 目录下，包括：
     - sn_server_private_key.pem - rtcp 协议栈用到的设备私钥文件
-    - fullchain.cert, fullchain.pem - 包含 sn.$sn_base, *.web3.$sn_base 的证书和密钥
+    - fullchain.cert, fullchain.pem - 包含 sn.$sn_base, web3.$sn_base, *.web3.$sn_base 的证书和密钥
+    - identity/, security/ - TLS identity store，供 web3_gateway 的 main_tls.hosts 加载证书
     - ca/buckyos_sn_ca_cert.pem, ca/buckyos_sn_ca_key.pem - 测试环境自签名 CA 证书
     - zone_zone - 自动生成的，包含 buckyos 定制的 DNS TXT 记录模板
     
@@ -343,23 +358,32 @@ def make_sn_configs(
         ca_cert_path, ca_key_path = Path(ca_cert), Path(ca_key)
         print(f"已生成 CA 证书: {ca_cert_path}")
     
-    # 生成服务器证书（包含 sn.$sn_base 和 *.web3.$sn_base）
+    # 生成服务器证书（包含 sn.$sn_base, web3.$sn_base 和 *.web3.$sn_base）
     sn_hostname = f"sn.{sn_base_host}"
+    web3_hostname = f"web3.{sn_base_host}"
     web3_wildcard = f"*.web3.{sn_base_host}"
     
     cert_path, key_path = cm.create_cert_from_ca(
         str(ca_cert_path.parent),
         hostname=sn_hostname,
         target_dir=str(target_dir),
-        hostnames=["sn."+sn_base_host, web3_wildcard, f"web3.{sn_base_host}"],
+        hostnames=[sn_hostname, web3_hostname, web3_wildcard],
     )
     
     # 复制/重命名为标准文件名
     cert_file = Path(cert_path)
     key_file = Path(key_path)
     
-    shutil.move(cert_file, target_dir / "fullchain.cert")
-    shutil.move(key_file, target_dir / "fullchain.pem")
+    fullchain_cert_path = target_dir / "fullchain.cert"
+    fullchain_key_path = target_dir / "fullchain.pem"
+    shutil.move(cert_file, fullchain_cert_path)
+    shutil.move(key_file, fullchain_key_path)
+    install_server_cert_identity(
+        target_dir,
+        [sn_hostname, web3_hostname, web3_wildcard],
+        fullchain_cert_path,
+        fullchain_key_path,
+    )
     
     # 复制 CA 证书到 ca 目录（用于客户端信任）
     if ca_dir:
@@ -370,6 +394,8 @@ def make_sn_configs(
     print(f"TLS 证书已生成:")
     print(f"  - {target_dir / 'fullchain.cert'}")
     print(f"  - {target_dir / 'fullchain.pem'}")
+    print(f"  - {target_dir / 'identity'}")
+    print(f"  - {target_dir / 'security'}")
     print(f"  - {target_dir / 'ca' / ca_cert_path.name}")
     
     #3 修改params.json
@@ -390,6 +416,8 @@ def make_sn_configs(
     print(f"  - {target_dir / 'sn_private_key.pem'} (设备私钥)")
     print(f"  - {target_dir / 'fullchain.cert'} (服务器证书)")
     print(f"  - {target_dir / 'fullchain.pem'} (服务器私钥)")
+    print(f"  - {target_dir / 'identity'} (TLS 证书 identity store)")
+    print(f"  - {target_dir / 'security'} (TLS 私钥 identity store)")
     print(f"  - {target_dir / 'ca' / 'buckyos_sn_ca_cert.pem'} (CA 证书)")
     print(f"  - {target_dir / 'params.json'} (SN 配置参数)")
     print(f"\n需要手动创建的文件:")
