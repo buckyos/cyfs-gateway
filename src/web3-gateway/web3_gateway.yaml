@@ -69,9 +69,6 @@ stacks:
     bind: 0.0.0.0:2980
     protocol: rtcp
     identity: "{{sn_device_did}}"
-    identity_manager:
-      public_root_path: ./identity
-      security_root_path: ./security
     hook_point:
       main:
         id: main

@@ -679,14 +679,16 @@ RTCP stack 支持像 TLS stack 一样只声明一个本端 DID，由 identity ma
 示例：
 
 ```yaml
-rtcp:
-  protocol: rtcp
-  bind: 0.0.0.0:2980
-  identity: did:web:device.example.com
-  identity_manager:
-    public_root_path: /opt/buckyos/local/identity
-    security_root_path: /opt/buckyos/security
-  hook_point: {}
+identity_manager:
+  public_root_path: /opt/buckyos/local/identity
+  security_root_path: /opt/buckyos/security
+
+stacks:
+  rtcp:
+    protocol: rtcp
+    bind: 0.0.0.0:2980
+    identity: did:web:device.example.com
+    hook_point: {}
 ```
 
 文件布局沿用 identity manager 的目录规则：

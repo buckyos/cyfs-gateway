@@ -14,6 +14,10 @@
 #   geo_block: ./scripts/geo_block.js
 #   custom_auth: ./scripts/custom_auth.js
 
+# identity_manager:      # Gateway-wide identity store for ACME, TLS, QUIC, and RTCP identity loading
+#   public_root_path: ./identity
+#   security_root_path: ./security
+
 # timers:               # periodic process-chain tasks (optional)
 #   clean_cache:
 #     timeout: 300      # seconds, must be > 0
@@ -49,9 +53,7 @@
 #       dns_provider: sn-dns
 #   check_interval: 43200          # certificate check interval (seconds), default 12h
 #   renew_before_expiry: 604800    # renew ahead of expiry (seconds), default 7d
-#   identity_manager:              # optional; defaults to BUCKYOS_IDENTITY_ROOT/BUCKYOS_SECURITY_ROOT or $BUCKYOS_ROOT/local/identity and $BUCKYOS_ROOT/security
-#     public_root_path: ./identity
-#     security_root_path: ./security
+#   # identity_manager is optional here; defaults to the Gateway-wide identity_manager above
 
 # tls_ca:             # self-signed/CA certificate config (optional)
 #   cert_path: ./ca.crt
@@ -153,7 +155,7 @@ stacks:
     #     - host: cert.example.net # operator-managed certificate loaded directly from absolute paths
     #       cert_path: /etc/ssl/certs/cert.example.net.fullchain.pem
     #       key_path: /etc/ssl/private/cert.example.net.key
-    #   identity_manager: # optional; defaults to BUCKYOS_IDENTITY_ROOT/BUCKYOS_SECURITY_ROOT or $BUCKYOS_ROOT/local/identity and $BUCKYOS_ROOT/security
+    #   identity_manager: # optional stack-level override; prefer the Gateway-wide identity_manager
     #     public_root_path: ./identity
     #     security_root_path: ./security
     #   hook_point: { }
@@ -168,7 +170,7 @@ stacks:
     #   hosts: # QUIC identities supported by this stack; certs are loaded through the identity manager path protocol
     #     - example.com
     #     - "*.example.org"
-    #   identity_manager: # optional; defaults to BUCKYOS_IDENTITY_ROOT/BUCKYOS_SECURITY_ROOT or $BUCKYOS_ROOT/local/identity and $BUCKYOS_ROOT/security
+    #   identity_manager: # optional stack-level override; prefer the Gateway-wide identity_manager
     #     public_root_path: ./identity
     #     security_root_path: ./security
     #   certs:
@@ -179,7 +181,7 @@ stacks:
     #   protocol: rtcp
     #   bind: 0.0.0.0:2980
     #   identity: did:web:device.example.com # preferred; loads device identity from identity_manager roots
-    #   identity_manager: # optional; defaults to BUCKYOS_IDENTITY_ROOT/BUCKYOS_SECURITY_ROOT or $BUCKYOS_ROOT/local/identity and $BUCKYOS_ROOT/security
+    #   identity_manager: # optional stack-level override; prefer the Gateway-wide identity_manager
     #     public_root_path: ./identity
     #     security_root_path: ./security
     #   # Legacy explicit identity config is still supported:

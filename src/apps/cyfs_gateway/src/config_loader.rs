@@ -5,7 +5,7 @@ use cyfs_gateway_lib::{
     config_err, AcmeHttpChallengeServerConfig, BlockConfig, CollectionConfig, ConfigErrorCode,
     ConfigResult, CyfsDirServerConfig, DirServerConfig, ProcessChainConfig, ProcessChainConfigs,
     ProcessChainHttpServerConfig, QuicStackConfig, RtcpStackConfig, ServerConfig, StackConfig,
-    TcpStackConfig, UdpStackConfig,
+    TcpStackConfig, TlsStackConfig, UdpStackConfig,
 };
 use cyfs_sn::*;
 use cyfs_socks::SocksServerConfig;
@@ -274,18 +274,19 @@ impl TlsStackConfigParser {
 
 impl<D: for<'de> Deserializer<'de> + Clone> StackConfigParser<D> for TlsStackConfigParser {
     fn parse(&self, de: D) -> ConfigResult<Arc<dyn StackConfig>> {
-        let tls_config = cyfs_gateway_lib::TlsStackConfig::deserialize(
-            hook_point_value_map_to_vector(de.clone(), "hook_point")?,
-        )
-        .map_err(|e| {
-            config_err!(
-                ConfigErrorCode::InvalidConfig,
-                "invalid tls stack config: {}\n{}",
-                e,
-                serde_json::to_string_pretty(&serde_json::Value::deserialize(de.clone()).unwrap())
-                    .unwrap()
-            )
-        })?;
+        let tls_config =
+            TlsStackConfig::deserialize(hook_point_value_map_to_vector(de.clone(), "hook_point")?)
+                .map_err(|e| {
+                    config_err!(
+                        ConfigErrorCode::InvalidConfig,
+                        "invalid tls stack config: {}\n{}",
+                        e,
+                        serde_json::to_string_pretty(
+                            &serde_json::Value::deserialize(de.clone()).unwrap()
+                        )
+                        .unwrap()
+                    )
+                })?;
         Ok(Arc::new(tls_config))
     }
 }
@@ -627,6 +628,107 @@ pub struct GatewayConfigParser {
 }
 pub type GatewayConfigParserRef = Arc<GatewayConfigParser>;
 
+#[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
+pub struct GatewayIdentityManagerConfig {
+    #[serde(
+        default,
+        alias = "public_root",
+        alias = "public_identity_root",
+        alias = "public_identity_root_path",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub public_root_path: Option<String>,
+    #[serde(
+        default,
+        alias = "security_root",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub security_root_path: Option<String>,
+}
+
+impl GatewayIdentityManagerConfig {
+    fn to_acme_identity_config(&self) -> AcmeIdentityConfig {
+        AcmeIdentityConfig {
+            public_root_path: self.public_root_path.clone(),
+            security_root_path: self.security_root_path.clone(),
+        }
+    }
+}
+
+fn identity_manager_value(identity_manager: &GatewayIdentityManagerConfig) -> serde_json::Value {
+    let mut value = serde_json::Map::new();
+    if let Some(public_root_path) = identity_manager.public_root_path.as_ref() {
+        value.insert(
+            "public_root_path".to_string(),
+            serde_json::Value::String(public_root_path.clone()),
+        );
+    }
+    if let Some(security_root_path) = identity_manager.security_root_path.as_ref() {
+        value.insert(
+            "security_root_path".to_string(),
+            serde_json::Value::String(security_root_path.clone()),
+        );
+    }
+    serde_json::Value::Object(value)
+}
+
+fn stack_uses_identity_hosts(stack_config: &serde_json::Value) -> bool {
+    stack_config
+        .get("hosts")
+        .and_then(|value| value.as_array())
+        .map(|hosts| {
+            hosts
+                .iter()
+                .any(|host| host.as_str().is_some_and(|host| !host.trim().is_empty()))
+        })
+        .unwrap_or(false)
+}
+
+fn stack_declares_rtcp_identity(stack_config: &serde_json::Value) -> bool {
+    ["identity", "did", "device_did"].iter().any(|key| {
+        stack_config
+            .get(key)
+            .and_then(|value| value.as_str())
+            .is_some_and(|identity| !identity.trim().is_empty())
+    })
+}
+
+fn apply_gateway_identity_manager_to_stack(
+    mut stack_config: serde_json::Value,
+    identity_manager: Option<&GatewayIdentityManagerConfig>,
+) -> serde_json::Value {
+    let Some(identity_manager) = identity_manager else {
+        return stack_config;
+    };
+    if stack_config.get("identity_manager").is_some() {
+        return stack_config;
+    }
+
+    let protocol = stack_config
+        .get("protocol")
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+    let should_apply =
+        if protocol.eq_ignore_ascii_case("tls") || protocol.eq_ignore_ascii_case("quic") {
+            stack_uses_identity_hosts(&stack_config)
+        } else if protocol.eq_ignore_ascii_case("rtcp") {
+            stack_declares_rtcp_identity(&stack_config)
+        } else {
+            false
+        };
+
+    if should_apply {
+        if let Some(stack_config) = stack_config.as_object_mut() {
+            stack_config.insert(
+                "identity_manager".to_string(),
+                identity_manager_value(identity_manager),
+            );
+        }
+    }
+
+    stack_config
+}
+
 #[derive(Deserialize, Clone)]
 pub struct TimerConfig {
     pub id: String,
@@ -707,6 +809,21 @@ impl GatewayConfigParser {
 
     pub fn parse(&self, json_value: serde_json::Value) -> ConfigResult<GatewayConfig> {
         let raw_config = json_value.clone();
+        let identity_manager = json_value
+            .get("identity_manager")
+            .map(|value| {
+                serde_json::from_value::<GatewayIdentityManagerConfig>(value.clone()).map_err(|e| {
+                    config_err!(
+                        ConfigErrorCode::InvalidConfig,
+                        "invalid identity_manager config: {:?}\n{}",
+                        e,
+                        serde_json::to_string_pretty(value)
+                            .unwrap_or_else(|_| "<invalid json>".to_string())
+                    )
+                })
+            })
+            .transpose()?;
+
         let mut stacks = vec![];
         if let Some(stacks_value) = json_value.get("stacks") {
             //debug!("stacks_value: {:?}", stacks_value);
@@ -728,6 +845,8 @@ impl GatewayConfigParser {
             for (id, stack_value) in stack_value_list {
                 let mut stack_value = stack_value.clone();
                 stack_value["id"] = serde_json::Value::String(id.clone());
+                stack_value =
+                    apply_gateway_identity_manager_to_stack(stack_value, identity_manager.as_ref());
                 stacks.push(self.stack_config_parser.parse(stack_value)?);
             }
         }
@@ -779,7 +898,7 @@ impl GatewayConfigParser {
             }
         }
 
-        let acme_config: Option<AcmeConfig> = match json_value.get("acme") {
+        let mut acme_config: Option<AcmeConfig> = match json_value.get("acme") {
             Some(config) => match serde_json::from_value::<AcmeConfig>(config.clone()) {
                 Ok(config) => Some(config),
                 Err(err) => {
@@ -790,6 +909,13 @@ impl GatewayConfigParser {
             },
             None => None,
         };
+        if let Some(acme_config) = acme_config.as_mut() {
+            if acme_config.identity_manager.is_none() {
+                acme_config.identity_manager = identity_manager
+                    .as_ref()
+                    .map(|config| config.to_acme_identity_config());
+            }
+        }
 
         let tls_ca: Option<TlsCA> = match json_value.get("tls_ca") {
             Some(config) => match serde_json::from_value::<TlsCA>(config.clone()) {
@@ -953,6 +1079,7 @@ impl GatewayConfigParser {
 
         Ok(GatewayConfig {
             raw_config,
+            identity_manager,
             limiters_config,
             acme_config,
             tls_ca,
@@ -1034,6 +1161,7 @@ mod speed_parser {
 #[derive(Clone)]
 pub struct GatewayConfig {
     pub raw_config: serde_json::Value,
+    pub identity_manager: Option<GatewayIdentityManagerConfig>,
     pub limiters_config: Option<Vec<LimiterConfig>>,
     pub acme_config: Option<AcmeConfig>,
     pub tls_ca: Option<TlsCA>,
@@ -1049,7 +1177,7 @@ pub struct GatewayConfig {
 #[cfg(test)]
 mod tests {
     use crate::merge;
-    use cyfs_gateway_lib::RtcpStackConfig;
+    use cyfs_gateway_lib::{QuicStackConfig, RtcpStackConfig, TlsStackConfig};
     use serde_json::json;
     use std::sync::Arc;
 
@@ -1283,6 +1411,210 @@ mod tests {
             .unwrap();
         assert_eq!(rtcp_config.identity.as_deref(), Some("did:web:example.com"));
         assert!(rtcp_config.key_path.is_none());
+    }
+
+    #[test]
+    fn test_gateway_identity_manager_applies_to_identity_aware_configs() {
+        let parser = super::GatewayConfigParser::new();
+        parser.register_stack_config_parser("tls", Arc::new(super::TlsStackConfigParser::new()));
+        parser.register_stack_config_parser("quic", Arc::new(super::QuicStackConfigParser::new()));
+        parser.register_stack_config_parser("rtcp", Arc::new(super::RtcpStackConfigParser::new()));
+
+        let config = parser
+            .parse(json!({
+                "identity_manager": {
+                    "public_root_path": "/gateway/identity",
+                    "security_root_path": "/gateway/security"
+                },
+                "acme": {
+                    "hosts": [
+                        {
+                            "host": "gateway.example.com"
+                        }
+                    ]
+                },
+                "stacks": {
+                    "tls1": {
+                        "protocol": "tls",
+                        "bind": "127.0.0.1:0",
+                        "hosts": ["gateway.example.com"],
+                        "hook_point": {}
+                    },
+                    "quic1": {
+                        "protocol": "quic",
+                        "bind": "127.0.0.1:0",
+                        "hosts": ["gateway.example.com"],
+                        "hook_point": {}
+                    },
+                    "rtcp1": {
+                        "protocol": "rtcp",
+                        "bind": "127.0.0.1:0",
+                        "identity": "did:web:device.example.com",
+                        "hook_point": {}
+                    },
+                    "rtcp_legacy": {
+                        "protocol": "rtcp",
+                        "bind": "127.0.0.1:0",
+                        "key_path": "/tmp/test.pem",
+                        "name": "legacy",
+                        "hook_point": {}
+                    }
+                }
+            }))
+            .unwrap();
+
+        assert_eq!(
+            config
+                .identity_manager
+                .as_ref()
+                .unwrap()
+                .public_root_path
+                .as_deref(),
+            Some("/gateway/identity")
+        );
+
+        let acme = config.acme_config.as_ref().unwrap();
+        assert_eq!(
+            acme.identity_manager
+                .as_ref()
+                .unwrap()
+                .public_root_path
+                .as_deref(),
+            Some("/gateway/identity")
+        );
+
+        let tls_config = config
+            .stacks
+            .iter()
+            .find(|stack| stack.id() == "tls1")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<TlsStackConfig>()
+            .unwrap();
+        assert_eq!(
+            tls_config
+                .identity_manager
+                .as_ref()
+                .unwrap()
+                .public_root_path
+                .as_deref(),
+            Some("/gateway/identity")
+        );
+
+        let quic_config = config
+            .stacks
+            .iter()
+            .find(|stack| stack.id() == "quic1")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<QuicStackConfig>()
+            .unwrap();
+        assert_eq!(
+            quic_config
+                .identity_manager
+                .as_ref()
+                .unwrap()
+                .security_root_path
+                .as_deref(),
+            Some("/gateway/security")
+        );
+
+        let rtcp_config = config
+            .stacks
+            .iter()
+            .find(|stack| stack.id() == "rtcp1")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<RtcpStackConfig>()
+            .unwrap();
+        assert_eq!(
+            rtcp_config
+                .identity_manager
+                .as_ref()
+                .unwrap()
+                .public_root_path
+                .as_deref(),
+            Some("/gateway/identity")
+        );
+
+        let rtcp_legacy_config = config
+            .stacks
+            .iter()
+            .find(|stack| stack.id() == "rtcp_legacy")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<RtcpStackConfig>()
+            .unwrap();
+        assert!(rtcp_legacy_config.identity_manager.is_none());
+    }
+
+    #[test]
+    fn test_gateway_identity_manager_keeps_specific_overrides() {
+        let parser = super::GatewayConfigParser::new();
+        parser.register_stack_config_parser("tls", Arc::new(super::TlsStackConfigParser::new()));
+
+        let config = parser
+            .parse(json!({
+                "identity_manager": {
+                    "public_root_path": "/gateway/identity",
+                    "security_root_path": "/gateway/security"
+                },
+                "acme": {
+                    "identity_manager": {
+                        "public_root_path": "/acme/identity",
+                        "security_root_path": "/acme/security"
+                    },
+                    "hosts": [
+                        {
+                            "host": "gateway.example.com"
+                        }
+                    ]
+                },
+                "stacks": {
+                    "tls1": {
+                        "protocol": "tls",
+                        "bind": "127.0.0.1:0",
+                        "hosts": ["gateway.example.com"],
+                        "identity_manager": {
+                            "public_root_path": "/stack/identity",
+                            "security_root_path": "/stack/security"
+                        },
+                        "hook_point": {}
+                    }
+                }
+            }))
+            .unwrap();
+
+        assert_eq!(
+            config
+                .acme_config
+                .as_ref()
+                .unwrap()
+                .identity_manager
+                .as_ref()
+                .unwrap()
+                .public_root_path
+                .as_deref(),
+            Some("/acme/identity")
+        );
+
+        let tls_config = config
+            .stacks
+            .iter()
+            .find(|stack| stack.id() == "tls1")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<TlsStackConfig>()
+            .unwrap();
+        assert_eq!(
+            tls_config
+                .identity_manager
+                .as_ref()
+                .unwrap()
+                .security_root_path
+                .as_deref(),
+            Some("/stack/security")
+        );
     }
 
     #[test]
