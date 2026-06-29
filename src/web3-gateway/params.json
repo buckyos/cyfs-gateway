@@ -8,6 +8,7 @@
         "sn_cer": "fullchain.cert",
         "sn_pem": "fullchain.pem",
         "web3_cer": "fullchain.cert",
-        "web3_pem": "fullchain.pem"
+        "web3_pem": "fullchain.pem",
+        "bns_server_url": "http://127.0.0.1:18080"
     }
 }

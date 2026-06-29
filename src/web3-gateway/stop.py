@@ -13,4 +13,5 @@ def run_stop_command(cmd: list[str]) -> int:
 if __name__ == "__main__":
     supervisor_result = run_stop_command(["pkill", "-f", "/opt/web3-gateway/start.py"])
     gateway_result = run_stop_command(["killall", "web3_gateway"])
-    raise SystemExit(supervisor_result or gateway_result)
+    bns_result = run_stop_command(["killall", "bns_dv"])
+    raise SystemExit(supervisor_result or gateway_result or bns_result)

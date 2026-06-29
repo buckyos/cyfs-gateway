@@ -11,6 +11,7 @@ servers:
     owner_pkx: "{{sn_owner_pk}}"
     device_jwt: ["{{sn_device_jwt}}"]
     ip: "{{sn_ip}}"
+    bns_indexer_url: "{{bns_server_url}}"
 
   local_dns:
     type: local_dns
