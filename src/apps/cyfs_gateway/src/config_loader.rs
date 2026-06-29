@@ -1256,6 +1256,36 @@ mod tests {
     }
 
     #[test]
+    fn test_rtcp_identity_config_parser_without_key_path() {
+        let parser = super::GatewayConfigParser::new();
+        parser.register_stack_config_parser("rtcp", Arc::new(super::RtcpStackConfigParser::new()));
+
+        let config = parser
+            .parse(json!({
+                "stacks": {
+                    "rtcp1": {
+                        "protocol": "rtcp",
+                        "bind": "127.0.0.1:0",
+                        "identity": "did:web:example.com",
+                        "identity_manager": {
+                            "public_root_path": "/tmp/identity",
+                            "security_root_path": "/tmp/security"
+                        },
+                        "hook_point": {}
+                    }
+                }
+            }))
+            .unwrap();
+
+        let rtcp_config = config.stacks[0]
+            .as_any()
+            .downcast_ref::<RtcpStackConfig>()
+            .unwrap();
+        assert_eq!(rtcp_config.identity.as_deref(), Some("did:web:example.com"));
+        assert!(rtcp_config.key_path.is_none());
+    }
+
+    #[test]
     fn test_merge_config() {
         let mut json1 = serde_json::Value::Null;
         let json2_str = r#"

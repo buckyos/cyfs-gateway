@@ -178,9 +178,14 @@ stacks:
     # rtcp_example:
     #   protocol: rtcp
     #   bind: 0.0.0.0:2980
-    #   key_path: ./sn_private_key.pem
-    #   device_config_path: ./device.doc.jwt  # 也支持 JSON；只有配置 JWT 时，Hello 才会自动携带 device_doc_jwt
-    #   name: optional_name
+    #   identity: did:web:device.example.com # preferred; loads device identity from identity_manager roots
+    #   identity_manager: # optional; defaults to BUCKYOS_IDENTITY_ROOT/BUCKYOS_SECURITY_ROOT or $BUCKYOS_ROOT/local/identity and $BUCKYOS_ROOT/security
+    #     public_root_path: ./identity
+    #     security_root_path: ./security
+    #   # Legacy explicit identity config is still supported:
+    #   # key_path: ./sn_private_key.pem
+    #   # device_config_path: ./device.doc.jwt  # 也支持 JSON；只有配置 JWT 时，Hello 才会自动携带 device_doc_jwt
+    #   # name: optional_name
     #   reuse_address: false
     #   io_dump_file: rtcp.dump
     #   hook_point: { }

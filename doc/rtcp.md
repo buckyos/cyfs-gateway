@@ -672,6 +672,37 @@ RTCP stack 的 `device_config_path` 当前支持两类文件内容：
 
 因此，跨 zone 首次接入若希望让对端在“尚未知晓本设备公钥”的前提下完成准入，应该配置 JWT 形式的设备文档。
 
+### 12.1 通过 DID 加载本地身份
+
+RTCP stack 支持像 TLS stack 一样只声明一个本端 DID，由 identity manager 自动加载必要的设备身份文件和 Ed25519 私钥，替代显式配置 `key_path` / `device_config_path` / `name` 的方式。
+
+示例：
+
+```yaml
+rtcp:
+  protocol: rtcp
+  bind: 0.0.0.0:2980
+  identity: did:web:device.example.com
+  identity_manager:
+    public_root_path: /opt/buckyos/local/identity
+    security_root_path: /opt/buckyos/security
+  hook_point: {}
+```
+
+文件布局沿用 identity manager 的目录规则：
+
+- 设备文档 JWT：`<public_root>/<encoded-did>/device.doc.jwt`
+- 设备文档 JSON：`<public_root>/<encoded-did>/did.json`
+- 设备认证私钥：`<security_root>/<encoded-did>/authentication.private.pem`
+
+如果同时存在 `device.doc.jwt` 和 `did.json`，RTCP 优先使用 `device.doc.jwt`。这样发起 `Hello` 时可以继续携带 `device_doc_jwt`，便于对端在尚未缓存本设备公钥时完成身份校验。
+
+落地约束：
+
+- 一个 RTCP stack 只允许配置一个本端 DID；多 RTCP stack 暂不支持。当前 RTCP 设备身份语义仍是单设备身份、单 stack。
+- 加载出的私钥公钥必须与设备文档 default/authentication key 一致；加载出的设备文档 ID 必须与配置 DID 一致。
+- 热更新时不允许静默切换 DID 或私钥；这类变更会被拒绝，要求重启 RTCP stack。
+
 ## 13. 当前实现与文义设计的差异
 
 为了避免文档误导，下面这些点要特别说明：

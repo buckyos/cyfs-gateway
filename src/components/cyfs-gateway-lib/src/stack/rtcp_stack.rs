@@ -1,15 +1,16 @@
 use std::collections::HashSet;
 use std::net::SocketAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 
 use buckyos_kit::AsyncStream;
 use cyfs_process_chain::{
     CollectionValue, CommandControl, MemoryMapCollection, ProcessChainLibExecutor,
 };
+use name_client::{IdentityMaterial, IdentityRoots, IdentityUsage};
 use name_lib::{
-    DIDDocumentTrait, DeviceConfig, EncodedDocument, encode_ed25519_pkcs8_sk_to_pk, get_x_from_jwk,
-    load_raw_private_key,
+    DID, DIDDocumentTrait, DeviceConfig, EncodedDocument, encode_ed25519_pkcs8_sk_to_pk,
+    get_x_from_jwk, load_raw_private_key,
 };
 use serde::{Deserialize, Serialize};
 use sfo_io::{LimitStream, StatStream};
@@ -38,6 +39,8 @@ use crate::{
     TunnelEndpoint, TunnelError, TunnelManager, TunnelResult, create_io_dump_stack_config,
     get_external_commands, get_stat_info, has_scheme, hyper_serve_http, into_stack_err, stack_err,
 };
+
+const RTCP_IDENTITY_DEVICE_DOC_JWT_FILE: &str = "device.doc.jwt";
 
 #[derive(Clone)]
 pub struct RtcpStackContext {
@@ -1056,6 +1059,8 @@ impl TunnelUrlProber for RtcpUrlProber {
 pub struct RtcpStack {
     id: String,
     bind_addr: String,
+    device_id: String,
+    device_public_key: String,
     keep_tunnel: Vec<String>,
     reuse_address: bool,
     rtcp: Mutex<Option<RTcp>>,
@@ -1077,25 +1082,10 @@ fn load_device_config_from_path(
     content: &str,
     path: &str,
     public_key: &str,
+    expected_did: Option<&DID>,
 ) -> StackResult<(DeviceConfig, Option<String>)> {
     if let Ok(device_config) = serde_json::from_str::<DeviceConfig>(content) {
-        let default_key = device_config.get_default_key().ok_or(stack_err!(
-            StackErrorCode::InvalidConfig,
-            "device config {} has no default key",
-            path
-        ))?;
-        let x_of_auth_key = get_x_from_jwk(&default_key).map_err(into_stack_err!(
-            StackErrorCode::InvalidConfig,
-            "device config {} has no auth key",
-            path
-        ))?;
-        if x_of_auth_key != public_key {
-            return Err(stack_err!(
-                StackErrorCode::InvalidConfig,
-                "device config {} public key not match",
-                path
-            ));
-        }
+        validate_device_config_identity(&device_config, path, public_key, expected_did)?;
         return Ok((device_config, None));
     }
 
@@ -1106,24 +1096,234 @@ fn load_device_config_from_path(
             "parse device config jwt {} failed",
             path
         ))?;
-    let default_key = device_config.get_default_key().ok_or(stack_err!(
-        StackErrorCode::InvalidConfig,
-        "device config {} has no default key",
-        path
-    ))?;
-    let x_of_auth_key = get_x_from_jwk(&default_key).map_err(into_stack_err!(
+    validate_device_config_identity(&device_config, path, public_key, expected_did)?;
+    Ok((device_config, Some(jwt.to_string())))
+}
+
+fn validate_device_config_identity(
+    device_config: &DeviceConfig,
+    source: &str,
+    public_key: &str,
+    expected_did: Option<&DID>,
+) -> StackResult<()> {
+    let auth_key = device_config
+        .get_key_by_scope("authentication")
+        .map(|(_, _, jwk)| jwk)
+        .or_else(|| device_config.get_default_key())
+        .ok_or(stack_err!(
+            StackErrorCode::InvalidConfig,
+            "device config {} has no authentication key",
+            source
+        ))?;
+    let x_of_auth_key = get_x_from_jwk(&auth_key).map_err(into_stack_err!(
         StackErrorCode::InvalidConfig,
         "device config {} has no auth key",
-        path
+        source
     ))?;
     if x_of_auth_key != public_key {
         return Err(stack_err!(
             StackErrorCode::InvalidConfig,
             "device config {} public key not match",
-            path
+            source
         ));
     }
-    Ok((device_config, Some(jwt.to_string())))
+
+    if let Some(expected_did) = expected_did
+        && &device_config.id != expected_did
+    {
+        return Err(stack_err!(
+            StackErrorCode::InvalidConfig,
+            "device config {} id {} does not match configured identity {}",
+            source,
+            device_config.id.to_string(),
+            expected_did.to_string()
+        ));
+    }
+
+    Ok(())
+}
+
+struct RtcpIdentityMaterial {
+    device_config: DeviceConfig,
+    device_doc_jwt: Option<String>,
+    private_key: [u8; 48],
+    public_key: String,
+}
+
+fn build_rtcp_identity_roots(
+    identity_manager: Option<&RtcpIdentityManagerConfig>,
+) -> StackResult<IdentityRoots> {
+    let mut roots = IdentityRoots::from_env_or_buckyos_root().map_err(|e| {
+        stack_err!(
+            StackErrorCode::InvalidConfig,
+            "load identity manager roots failed: {}",
+            e
+        )
+    })?;
+    if let Some(identity_manager) = identity_manager {
+        if let Some(public_root_path) = identity_manager.public_root_path.as_ref() {
+            roots.public_root = PathBuf::from(public_root_path);
+        }
+        if let Some(security_root_path) = identity_manager.security_root_path.as_ref() {
+            roots.security_root = PathBuf::from(security_root_path);
+        }
+    }
+    Ok(roots)
+}
+
+fn has_legacy_rtcp_identity_config(config: &RtcpStackConfig) -> bool {
+    config.key_path.is_some() || config.device_config_path.is_some() || config.name.is_some()
+}
+
+async fn load_rtcp_identity_material(
+    config: &RtcpStackConfig,
+) -> StackResult<RtcpIdentityMaterial> {
+    if let Some(identity) = config.identity.as_deref() {
+        if has_legacy_rtcp_identity_config(config) {
+            return Err(stack_err!(
+                StackErrorCode::InvalidConfig,
+                "rtcp identity cannot be mixed with key_path/device_config_path/name"
+            ));
+        }
+        return load_rtcp_identity_from_manager(identity, config.identity_manager.as_ref()).await;
+    }
+
+    if config.identity_manager.is_some() {
+        return Err(stack_err!(
+            StackErrorCode::InvalidConfig,
+            "rtcp identity is required when identity_manager is configured"
+        ));
+    }
+
+    load_legacy_rtcp_identity_material(config).await
+}
+
+async fn load_legacy_rtcp_identity_material(
+    config: &RtcpStackConfig,
+) -> StackResult<RtcpIdentityMaterial> {
+    let key_path = config.key_path.as_deref().ok_or(stack_err!(
+        StackErrorCode::InvalidConfig,
+        "key_path is required"
+    ))?;
+    let private_key = load_raw_private_key(Path::new(key_path)).map_err(into_stack_err!(
+        StackErrorCode::InvalidConfig,
+        "load private key {} failed",
+        key_path
+    ))?;
+    let public_key = encode_ed25519_pkcs8_sk_to_pk(&private_key);
+    let (device_config, device_doc_jwt) = if let Some(path) = config.device_config_path.as_ref() {
+        let content = tokio::fs::read_to_string(path)
+            .await
+            .map_err(into_stack_err!(
+                StackErrorCode::InvalidConfig,
+                "load device config {} failed",
+                path
+            ))?;
+        load_device_config_from_path(content.as_str(), path, &public_key, None)?
+    } else {
+        if config.name.is_none() {
+            return Err(stack_err!(
+                StackErrorCode::InvalidConfig,
+                "name is required"
+            ));
+        }
+        (
+            DeviceConfig::new(config.name.as_ref().unwrap().as_str(), public_key.clone()),
+            None,
+        )
+    };
+
+    Ok(RtcpIdentityMaterial {
+        device_config,
+        device_doc_jwt,
+        private_key,
+        public_key,
+    })
+}
+
+async fn load_rtcp_identity_from_manager(
+    identity: &str,
+    identity_manager: Option<&RtcpIdentityManagerConfig>,
+) -> StackResult<RtcpIdentityMaterial> {
+    let identity = identity.trim();
+    if identity.is_empty() {
+        return Err(stack_err!(
+            StackErrorCode::InvalidConfig,
+            "rtcp identity is empty"
+        ));
+    }
+    let expected_did = DID::from_str(identity).map_err(into_stack_err!(
+        StackErrorCode::InvalidConfig,
+        "invalid rtcp identity {}",
+        identity
+    ))?;
+    let roots = build_rtcp_identity_roots(identity_manager)?;
+    let private_key_path = roots
+        .security_file(
+            identity,
+            IdentityUsage::Authentication,
+            IdentityMaterial::PrivateKey,
+        )
+        .map_err(into_stack_err!(
+            StackErrorCode::InvalidConfig,
+            "resolve rtcp identity private key failed"
+        ))?;
+    let private_key = load_raw_private_key(private_key_path.as_path()).map_err(into_stack_err!(
+        StackErrorCode::InvalidConfig,
+        "load rtcp identity private key {} failed",
+        private_key_path.display()
+    ))?;
+    let public_key = encode_ed25519_pkcs8_sk_to_pk(&private_key);
+
+    let public_dir = roots.public_dir(identity).map_err(into_stack_err!(
+        StackErrorCode::InvalidConfig,
+        "resolve rtcp identity public dir failed"
+    ))?;
+    let device_doc_jwt_path = public_dir.join(RTCP_IDENTITY_DEVICE_DOC_JWT_FILE);
+    let did_json_path = roots
+        .public_file(
+            identity,
+            IdentityUsage::Authentication,
+            IdentityMaterial::DidJson,
+        )
+        .map_err(into_stack_err!(
+            StackErrorCode::InvalidConfig,
+            "resolve rtcp identity did.json failed"
+        ))?;
+
+    let (document_path, prefer_jwt) = if device_doc_jwt_path.exists() {
+        (device_doc_jwt_path, true)
+    } else {
+        (did_json_path, false)
+    };
+    let content = tokio::fs::read_to_string(&document_path)
+        .await
+        .map_err(into_stack_err!(
+            StackErrorCode::InvalidConfig,
+            "load rtcp identity document {} failed",
+            document_path.display()
+        ))?;
+    let (device_config, device_doc_jwt) = load_device_config_from_path(
+        content.as_str(),
+        document_path.to_string_lossy().as_ref(),
+        &public_key,
+        Some(&expected_did),
+    )?;
+
+    if prefer_jwt && device_doc_jwt.is_none() {
+        return Err(stack_err!(
+            StackErrorCode::InvalidConfig,
+            "rtcp identity {} must contain a device document jwt",
+            document_path.display()
+        ));
+    }
+
+    Ok(RtcpIdentityMaterial {
+        device_config,
+        device_doc_jwt,
+        private_key,
+        public_key,
+    })
 }
 
 impl RtcpStack {
@@ -1243,8 +1443,13 @@ impl RtcpStack {
         let bind_addr = builder.bind_addr.clone().unwrap();
         let keep_tunnel = sanitize_keep_tunnels(&builder.keep_tunnel);
         let device_config = builder.device_config.take().unwrap();
+        let device_id = device_config.id.to_string();
         let device_doc_jwt = builder.device_doc_jwt.take();
         let private_key = builder.private_key.take();
+        let device_public_key = private_key
+            .as_ref()
+            .map(|key| encode_ed25519_pkcs8_sk_to_pk(key))
+            .unwrap_or_default();
         let connection_manager = builder.connection_manager.clone();
         let stack_context = if let Some(stack_context) = builder.stack_context.take() {
             stack_context
@@ -1279,6 +1484,8 @@ impl RtcpStack {
         Ok(Self {
             id,
             bind_addr,
+            device_id,
+            device_public_key,
             keep_tunnel,
             reuse_address: builder.reuse_address,
             rtcp: Mutex::new(Some(rtcp)),
@@ -1350,6 +1557,20 @@ impl Stack for RtcpStack {
             return Err(stack_err!(
                 StackErrorCode::InvalidConfig,
                 "reuse_address unmatch"
+            ));
+        }
+
+        let identity_material = load_rtcp_identity_material(config).await?;
+        if identity_material.device_config.id.to_string() != self.device_id {
+            return Err(stack_err!(
+                StackErrorCode::InvalidConfig,
+                "rtcp identity change requires stack restart"
+            ));
+        }
+        if identity_material.public_key != self.device_public_key {
+            return Err(stack_err!(
+                StackErrorCode::InvalidConfig,
+                "rtcp private key change requires stack restart"
             ));
         }
 
@@ -1501,6 +1722,24 @@ impl RtcpStackBuilder {
     }
 }
 
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct RtcpIdentityManagerConfig {
+    #[serde(
+        default,
+        alias = "public_root",
+        alias = "public_identity_root",
+        alias = "public_identity_root_path",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub public_root_path: Option<String>,
+    #[serde(
+        default,
+        alias = "security_root",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub security_root_path: Option<String>,
+}
+
 #[derive(Serialize, Deserialize, Clone)]
 pub struct RtcpStackConfig {
     pub id: String,
@@ -1511,8 +1750,20 @@ pub struct RtcpStackConfig {
     pub keep_tunnel: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub on_new_tunnel_hook_point: Option<Vec<crate::ProcessChainConfig>>,
-    pub key_path: String,
+    #[serde(
+        default,
+        alias = "did",
+        alias = "device_did",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub identity: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub identity_manager: Option<RtcpIdentityManagerConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub device_config_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub io_dump_file: Option<String>,
@@ -1566,35 +1817,7 @@ impl StackFactory for RtcpStackFactory {
                 "invalid rtcp stack config"
             ))?;
 
-        let private_key =
-            load_raw_private_key(Path::new(config.key_path.as_str())).map_err(into_stack_err!(
-                StackErrorCode::InvalidConfig,
-                "load private key {} failed",
-                config.key_path
-            ))?;
-        let public_key = encode_ed25519_pkcs8_sk_to_pk(&private_key);
-        let (device_config, device_doc_jwt) = if config.device_config_path.is_some() {
-            let path = config.device_config_path.as_ref().unwrap();
-            let content = tokio::fs::read_to_string(path)
-                .await
-                .map_err(into_stack_err!(
-                    StackErrorCode::InvalidConfig,
-                    "load device config {} failed",
-                    path
-                ))?;
-            load_device_config_from_path(content.as_str(), path, &public_key)?
-        } else {
-            if config.name.is_none() {
-                return Err(stack_err!(
-                    StackErrorCode::InvalidConfig,
-                    "name is required"
-                ));
-            }
-            (
-                DeviceConfig::new(config.name.as_ref().unwrap().as_str(), public_key),
-                None,
-            )
-        };
+        let identity_material = load_rtcp_identity_material(config).await?;
         let stack_context = context
             .as_ref()
             .as_any()
@@ -1619,8 +1842,8 @@ impl StackFactory for RtcpStackFactory {
             .bind(config.bind.clone())
             .keep_tunnel(config.keep_tunnel.clone())
             .connection_manager(self.connection_manager.clone())
-            .device_config(device_config)
-            .private_key(private_key)
+            .device_config(identity_material.device_config)
+            .private_key(identity_material.private_key)
             .hook_point(config.hook_point.clone());
         let stack = if let Some(on_new_tunnel_hook_point) = config.on_new_tunnel_hook_point.clone()
         {
@@ -1628,7 +1851,7 @@ impl StackFactory for RtcpStackFactory {
         } else {
             stack
         };
-        let stack = if let Some(device_doc_jwt) = device_doc_jwt {
+        let stack = if let Some(device_doc_jwt) = identity_material.device_doc_jwt {
             stack.device_doc_jwt(device_doc_jwt)
         } else {
             stack
@@ -1661,7 +1884,10 @@ fn sanitize_keep_tunnels(keep_tunnels: &[String]) -> Vec<String> {
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
-    use super::{RtcpConnectionHandler, sanitize_keep_tunnels};
+    use super::{
+        RTCP_IDENTITY_DEVICE_DOC_JWT_FILE, RtcpConnectionHandler, RtcpIdentityManagerConfig,
+        load_rtcp_identity_material, sanitize_keep_tunnels,
+    };
     use crate::global_process_chains::GlobalProcessChains;
     use crate::{
         ConnectionManager, DatagramInfo, DefaultLimiterManager, GlobalCollectionManager,
@@ -1673,7 +1899,10 @@ mod tests {
     };
     use buckyos_kit::AsyncStream;
     use jsonwebtoken::EncodingKey;
-    use name_client::{NameInfo, add_nameinfo_cache, init_name_lib_for_test, update_did_cache};
+    use name_client::{
+        IdentityMaterial, IdentityRoots, IdentityUsage, NameInfo, add_nameinfo_cache,
+        init_name_lib_for_test, update_did_cache,
+    };
     use name_lib::{
         DIDDocumentTrait, DeviceConfig, EncodedDocument, encode_ed25519_sk_to_pk_jwk,
         generate_ed25519_key, generate_ed25519_key_pair,
@@ -1716,6 +1945,87 @@ mod tests {
             stat_manager,
             global_process_chains,
             None,
+            None,
+        ))
+    }
+
+    fn build_rtcp_identity_config(
+        id: &str,
+        bind: &str,
+        identity: &str,
+        roots: &IdentityRoots,
+    ) -> RtcpStackConfig {
+        RtcpStackConfig {
+            id: id.to_string(),
+            protocol: StackProtocol::Rtcp,
+            bind: bind.to_string(),
+            hook_point: vec![],
+            keep_tunnel: vec![],
+            on_new_tunnel_hook_point: None,
+            identity: Some(identity.to_string()),
+            identity_manager: Some(RtcpIdentityManagerConfig {
+                public_root_path: Some(roots.public_root.to_string_lossy().to_string()),
+                security_root_path: Some(roots.security_root.to_string_lossy().to_string()),
+            }),
+            key_path: None,
+            device_config_path: None,
+            name: None,
+            io_dump_file: None,
+            io_dump_rotate_size: None,
+            io_dump_rotate_max_files: None,
+            io_dump_max_upload_bytes_per_conn: None,
+            io_dump_max_download_bytes_per_conn: None,
+            reuse_address: None,
+        }
+    }
+
+    fn write_rtcp_identity_files(
+        roots: &IdentityRoots,
+        identity: &str,
+        private_key_pem: &str,
+        did_json: Option<&DeviceConfig>,
+        device_doc_jwt: Option<&str>,
+    ) {
+        let public_dir = roots.public_dir(identity).unwrap();
+        let security_dir = roots.security_dir(identity).unwrap();
+        std::fs::create_dir_all(&public_dir).unwrap();
+        std::fs::create_dir_all(&security_dir).unwrap();
+        let private_key_path = roots
+            .security_file(
+                identity,
+                IdentityUsage::Authentication,
+                IdentityMaterial::PrivateKey,
+            )
+            .unwrap();
+        std::fs::write(private_key_path, private_key_pem).unwrap();
+        if let Some(did_json) = did_json {
+            let did_json_path = roots
+                .public_file(
+                    identity,
+                    IdentityUsage::Authentication,
+                    IdentityMaterial::DidJson,
+                )
+                .unwrap();
+            std::fs::write(did_json_path, serde_json::to_string(did_json).unwrap()).unwrap();
+        }
+        if let Some(device_doc_jwt) = device_doc_jwt {
+            std::fs::write(
+                public_dir.join(RTCP_IDENTITY_DEVICE_DOC_JWT_FILE),
+                device_doc_jwt,
+            )
+            .unwrap();
+        }
+    }
+
+    async fn build_factory_context() -> Arc<dyn StackContext> {
+        let collection_manager = GlobalCollectionManager::create(vec![]).await.unwrap();
+        Arc::new(RtcpStackContext::new(
+            Arc::new(ServerManager::new()),
+            TunnelManager::new(),
+            Arc::new(DefaultLimiterManager::new()),
+            StatManager::new(),
+            Some(Arc::new(GlobalProcessChains::new())),
+            Some(collection_manager),
             None,
         ))
     }
@@ -5108,7 +5418,9 @@ mod tests {
             hook_point: vec![],
             keep_tunnel: vec![],
             on_new_tunnel_hook_point: None,
-            key_path: key_file.path().to_string_lossy().to_string(),
+            identity: None,
+            identity_manager: None,
+            key_path: Some(key_file.path().to_string_lossy().to_string()),
             device_config_path: None,
             name: Some("test".to_string()),
             io_dump_file: None,
@@ -5140,7 +5452,9 @@ mod tests {
             hook_point: vec![],
             keep_tunnel: vec![],
             on_new_tunnel_hook_point: None,
-            key_path: key_file.path().to_string_lossy().to_string(),
+            identity: None,
+            identity_manager: None,
+            key_path: Some(key_file.path().to_string_lossy().to_string()),
             device_config_path: Some(config_file.path().to_string_lossy().to_string()),
             name: Some("test".to_string()),
             io_dump_file: None,
@@ -5178,7 +5492,9 @@ mod tests {
             hook_point: vec![],
             keep_tunnel: vec![],
             on_new_tunnel_hook_point: None,
-            key_path: key_file.path().to_string_lossy().to_string(),
+            identity: None,
+            identity_manager: None,
+            key_path: Some(key_file.path().to_string_lossy().to_string()),
             device_config_path: Some(jwt_config_file.path().to_string_lossy().to_string()),
             name: Some("test".to_string()),
             io_dump_file: None,
@@ -5191,6 +5507,116 @@ mod tests {
 
         let ret = factory.create(Arc::new(config), stack_context).await;
         assert!(ret.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_factory_loads_identity_manager_config() {
+        let temp = tempfile::tempdir().unwrap();
+        let roots = IdentityRoots::new(temp.path().join("identity"), temp.path().join("security"));
+        let (private_key_pem, public_jwk) = generate_ed25519_key_pair();
+        let device_config = DeviceConfig::new_by_jwk(
+            "identity-device",
+            serde_json::from_value(public_jwk).unwrap(),
+        );
+        let identity = device_config.id.to_string();
+        write_rtcp_identity_files(
+            &roots,
+            &identity,
+            &private_key_pem,
+            Some(&device_config),
+            None,
+        );
+
+        let factory = RtcpStackFactory::new(ConnectionManager::new());
+        let stack_context = build_factory_context().await;
+        let config = build_rtcp_identity_config("identity-test", "127.0.0.1:0", &identity, &roots);
+
+        let ret = factory.create(Arc::new(config), stack_context).await;
+        assert!(ret.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_identity_manager_prefers_device_doc_jwt() {
+        let temp = tempfile::tempdir().unwrap();
+        let roots = IdentityRoots::new(temp.path().join("identity"), temp.path().join("security"));
+        let (private_key_pem, public_jwk) = generate_ed25519_key_pair();
+        let json_device_config = DeviceConfig::new_by_jwk(
+            "json-device",
+            serde_json::from_value(public_jwk.clone()).unwrap(),
+        );
+        let identity = json_device_config.id.to_string();
+
+        let (owner_signing_key, owner_pkcs8_bytes) = generate_ed25519_key();
+        let owner_jwk = encode_ed25519_sk_to_pk_jwk(&owner_signing_key);
+        let owner_config =
+            DeviceConfig::new_by_jwk("owner", serde_json::from_value(owner_jwk).unwrap());
+        let owner_private_key = EncodingKey::from_ed_der(&owner_pkcs8_bytes);
+        let mut jwt_device_config =
+            DeviceConfig::new_by_jwk("jwt-device", serde_json::from_value(public_jwk).unwrap());
+        jwt_device_config.owner = owner_config.id.clone();
+        let device_doc_jwt = match jwt_device_config.encode(Some(&owner_private_key)).unwrap() {
+            EncodedDocument::Jwt(jwt) => jwt,
+            _ => panic!("device config encode should return jwt"),
+        };
+
+        write_rtcp_identity_files(
+            &roots,
+            &identity,
+            &private_key_pem,
+            Some(&json_device_config),
+            Some(&device_doc_jwt),
+        );
+        let config = build_rtcp_identity_config("identity-jwt", "127.0.0.1:0", &identity, &roots);
+
+        let material = load_rtcp_identity_material(&config).await.unwrap();
+        assert_eq!(material.device_config.name, "jwt-device");
+        assert_eq!(
+            material.device_doc_jwt.as_deref(),
+            Some(device_doc_jwt.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_prepare_update_rejects_identity_switch() {
+        let temp = tempfile::tempdir().unwrap();
+        let roots = IdentityRoots::new(temp.path().join("identity"), temp.path().join("security"));
+        let (private_key_pem1, public_jwk1) = generate_ed25519_key_pair();
+        let device_config1 =
+            DeviceConfig::new_by_jwk("device-1", serde_json::from_value(public_jwk1).unwrap());
+        let identity1 = device_config1.id.to_string();
+        write_rtcp_identity_files(
+            &roots,
+            &identity1,
+            &private_key_pem1,
+            Some(&device_config1),
+            None,
+        );
+
+        let (private_key_pem2, public_jwk2) = generate_ed25519_key_pair();
+        let device_config2 =
+            DeviceConfig::new_by_jwk("device-2", serde_json::from_value(public_jwk2).unwrap());
+        let identity2 = device_config2.id.to_string();
+        write_rtcp_identity_files(
+            &roots,
+            &identity2,
+            &private_key_pem2,
+            Some(&device_config2),
+            None,
+        );
+
+        let factory = RtcpStackFactory::new(ConnectionManager::new());
+        let stack_context = build_factory_context().await;
+        let config1 =
+            build_rtcp_identity_config("identity-update", "127.0.0.1:0", &identity1, &roots);
+        let stack = factory
+            .create(Arc::new(config1), stack_context)
+            .await
+            .unwrap();
+
+        let config2 =
+            build_rtcp_identity_config("identity-update", "127.0.0.1:0", &identity2, &roots);
+        let ret = stack.prepare_update(Arc::new(config2), None).await;
+        assert!(ret.is_err());
     }
 
     #[test]
