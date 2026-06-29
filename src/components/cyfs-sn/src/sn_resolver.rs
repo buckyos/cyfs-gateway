@@ -3,7 +3,7 @@ use crate::{
     SnDeviceStateView, SnRelayManagerRef, ZoneInfo,
 };
 use async_trait::async_trait;
-use buckyos_kit::{is_valid_name, NameType};
+use bns_client::canonical_bns_name;
 use cyfs_gateway_lib::{server_err, ServerError, ServerErrorCode};
 use jsonwebtoken::DecodingKey;
 use log::{debug, warn};
@@ -1933,16 +1933,12 @@ fn normalize_host_lossy(hostname: &str) -> String {
 
 fn normalize_bns_name(name: &str) -> SnResolverResult<String> {
     let name = name.trim().trim_end_matches('.').to_ascii_lowercase();
-    if name.is_empty()
-        || name.contains(char::is_whitespace)
-        || !is_valid_name(&name, NameType::User)
-    {
-        return Err(SnResolverError::new(
+    canonical_bns_name(name.as_str()).map_err(|_| {
+        SnResolverError::new(
             SnResolverErrorKind::InvalidHostname,
             format!("invalid BNS name {}", name),
-        ));
-    }
-    Ok(name)
+        )
+    })
 }
 
 fn normalize_doc_type(doc_type: Option<&str>) -> Option<String> {
@@ -1958,9 +1954,12 @@ fn normalize_doc_type(doc_type: Option<&str>) -> Option<String> {
 
 fn parse_legacy_web3_host(host: &str, server_host: &str) -> Option<LegacyWeb3HostParts> {
     let host = normalize_host_lossy(host);
-    let server_host = normalize_host_lossy(server_host);
-    let suffix = format!(".web3.{}", server_host);
-    let sub_name = host.strip_suffix(suffix.as_str())?;
+    let sub_name = legacy_web3_server_hosts(server_host)
+        .into_iter()
+        .find_map(|server_host| {
+            let suffix = format!(".web3.{}", server_host);
+            host.strip_suffix(suffix.as_str()).map(str::to_string)
+        })?;
     if sub_name.is_empty() {
         return None;
     }
@@ -1985,6 +1984,25 @@ fn parse_legacy_web3_host(host: &str, server_host: &str) -> Option<LegacyWeb3Hos
         sub_host: sub_name.to_string(),
         username: sub_name.to_string(),
     })
+}
+
+fn legacy_web3_server_hosts(server_host: &str) -> Vec<String> {
+    let server_host = normalize_host_lossy(server_host);
+    let mut hosts = Vec::new();
+    push_legacy_web3_server_host(&mut hosts, server_host.as_str());
+    if let Some(root_host) = server_host.strip_prefix("sn.") {
+        push_legacy_web3_server_host(&mut hosts, root_host);
+    }
+    if let Some(root_host) = server_host.strip_prefix("web3.") {
+        push_legacy_web3_server_host(&mut hosts, root_host);
+    }
+    hosts
+}
+
+fn push_legacy_web3_server_host(hosts: &mut Vec<String>, host: &str) {
+    if !host.is_empty() && !hosts.iter().any(|existing| existing == host) {
+        hosts.push(host.to_string());
+    }
 }
 
 fn legacy_owner(name: &str, user: Option<&SNUserInfo>) -> BnsOwner {
@@ -2683,6 +2701,7 @@ fn dedup_strings(values: &mut Vec<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{SnDeviceRole, SnDeviceState, SnNatType};
 
     #[derive(Default)]
     struct StaticBnsReader {
@@ -2708,6 +2727,58 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct StaticAuthReader {
+        users: HashMap<String, SNUserInfo>,
+        zones: HashMap<String, ZoneInfo>,
+    }
+
+    #[async_trait]
+    impl SnAuthReader for StaticAuthReader {
+        async fn get_user_info(&self, username: &str) -> SnResolverResult<Option<SNUserInfo>> {
+            Ok(self.users.get(username).cloned())
+        }
+
+        async fn get_user_by_domain(&self, domain: &str) -> SnResolverResult<Option<SNUserInfo>> {
+            Ok(self
+                .users
+                .values()
+                .find(|user| user.user_domain.as_deref() == Some(domain))
+                .cloned())
+        }
+
+        async fn get_zone_info(&self, username: &str) -> SnResolverResult<Option<ZoneInfo>> {
+            Ok(self
+                .zones
+                .get(username)
+                .cloned()
+                .or_else(|| Some(ZoneInfo::default_for(username))))
+        }
+    }
+
+    #[derive(Default)]
+    struct StaticDeviceOnlineReader {
+        by_name: HashMap<(String, String), SnDeviceStateView>,
+    }
+
+    #[async_trait]
+    impl DeviceOnlineReader for StaticDeviceOnlineReader {
+        async fn get_device_state(&self, did: &str) -> SnResolverResult<Option<SnDeviceStateView>> {
+            Ok(self.by_name.values().find(|view| view.did == did).cloned())
+        }
+
+        async fn get_device_state_by_name(
+            &self,
+            zone: &str,
+            device_name: &str,
+        ) -> SnResolverResult<Option<SnDeviceStateView>> {
+            Ok(self
+                .by_name
+                .get(&(zone.to_string(), device_name.to_string()))
+                .cloned())
+        }
+    }
+
     fn test_resolver_with_bns(bns: StaticBnsReader) -> SnResolver {
         SnResolver::new(
             SnResolverConfig::new(
@@ -2720,6 +2791,99 @@ mod tests {
             Arc::new(EmptySnAuthReader),
         )
         .with_bns_reader(Arc::new(bns))
+    }
+
+    fn alice_bns_with_gateway_ip(gateway_ip: &str) -> StaticBnsReader {
+        let mut bns = StaticBnsReader::default();
+        bns.owners.insert(
+            "alice".to_string(),
+            BnsOwner {
+                name: "alice".to_string(),
+                effective_owner: Some("owner-key".to_string()),
+                owner_config: None,
+            },
+        );
+        bns.documents.insert(
+            ("alice".to_string(), BNS_DOC_ZONE.to_string()),
+            BnsDocument::json(
+                "alice",
+                BNS_DOC_ZONE,
+                json!({
+                    "gateway_ips": [gateway_ip]
+                }),
+            ),
+        );
+        bns
+    }
+
+    fn alice_bns_with_gateway_device() -> StaticBnsReader {
+        let mut bns = StaticBnsReader::default();
+        bns.owners.insert(
+            "alice".to_string(),
+            BnsOwner {
+                name: "alice".to_string(),
+                effective_owner: Some("owner-key".to_string()),
+                owner_config: None,
+            },
+        );
+        bns.documents.insert(
+            ("alice".to_string(), BNS_DOC_ZONE.to_string()),
+            BnsDocument::json(
+                "alice",
+                BNS_DOC_ZONE,
+                json!({
+                    "devices": {
+                        "ood1": {
+                            "did": "did:dev:alice-ood"
+                        }
+                    }
+                }),
+            ),
+        );
+        bns
+    }
+
+    fn alice_gateway_state(is_wan_device: bool) -> SnDeviceStateView {
+        SnDeviceStateView {
+            did: "did:dev:alice-ood".to_string(),
+            zone: "alice".to_string(),
+            device_name: "ood1".to_string(),
+            device_role: SnDeviceRole::Ood,
+            state: SnDeviceState::Online,
+            public_ips: vec!["198.51.100.42".to_string()],
+            private_ips: vec!["192.168.1.42".to_string()],
+            active_endpoints: Vec::new(),
+            preferred_endpoint: None,
+            nat_type: if is_wan_device {
+                SnNatType::Public
+            } else {
+                SnNatType::Private
+            },
+            is_wan_device,
+            last_seen_at: Some(1),
+            expires_at: Some(600),
+        }
+    }
+
+    fn resolver_with_alice_gateway_state(is_wan_device: bool) -> SnResolver {
+        let mut online = StaticDeviceOnlineReader::default();
+        online.by_name.insert(
+            ("alice".to_string(), "ood1".to_string()),
+            alice_gateway_state(is_wan_device),
+        );
+
+        SnResolver::new(
+            SnResolverConfig::new(
+                "devtests.org",
+                "192.0.2.10".parse::<IpAddr>().unwrap(),
+                "",
+                "",
+                Vec::new(),
+            ),
+            Arc::new(StaticAuthReader::default()),
+        )
+        .with_bns_reader(Arc::new(alice_bns_with_gateway_device()))
+        .with_device_online_reader(Arc::new(online))
     }
 
     #[test]
@@ -2735,6 +2899,82 @@ mod tests {
         let parsed = parse_legacy_web3_host("www-testuser.web3.buckyos.ai", "buckyos.ai").unwrap();
         assert_eq!(parsed.sub_host, "www-testuser");
         assert_eq!(parsed.username, "testuser");
+
+        let parsed =
+            parse_legacy_web3_host("public.alice.web3.devtests.org", "devtests.org").unwrap();
+        assert_eq!(parsed.sub_host, "public.alice");
+        assert_eq!(parsed.username, "alice");
+
+        let parsed =
+            parse_legacy_web3_host("public.alice.web3.devtests.org", "sn.devtests.org").unwrap();
+        assert_eq!(parsed.sub_host, "public.alice");
+        assert_eq!(parsed.username, "alice");
+    }
+
+    #[tokio::test]
+    async fn resolves_legacy_web3_dns_host_with_short_bns_name() {
+        let bns = alice_bns_with_gateway_ip("2001:db8::42");
+        let resolver = SnResolver::new(
+            SnResolverConfig::new(
+                "devtests.org",
+                "192.0.2.10".parse::<IpAddr>().unwrap(),
+                "",
+                "",
+                Vec::new(),
+            ),
+            Arc::new(EmptySnAuthReader),
+        )
+        .with_bns_reader(Arc::new(bns));
+
+        let resolved = resolver
+            .resolve_dns("alice.web3.devtests.org.", RecordType::AAAA)
+            .await
+            .unwrap();
+
+        assert_eq!(resolved.source, DnsResolutionSource::BnsDocument);
+        assert_eq!(
+            resolved.addresses,
+            vec!["2001:db8::42".parse::<IpAddr>().unwrap()]
+        );
+    }
+
+    #[tokio::test]
+    async fn resolves_non_wan_nested_legacy_web3_dns_host_with_sn_address() {
+        let resolver = resolver_with_alice_gateway_state(false);
+
+        let resolved = resolver
+            .resolve_dns("public.alice.web3.devtests.org.", RecordType::A)
+            .await
+            .unwrap();
+
+        assert_eq!(resolved.source, DnsResolutionSource::DeviceOnlineInfo);
+        assert_eq!(
+            resolved.addresses,
+            vec![
+                "192.0.2.10".parse::<IpAddr>().unwrap(),
+                "198.51.100.42".parse::<IpAddr>().unwrap(),
+                "192.168.1.42".parse::<IpAddr>().unwrap()
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn resolves_wan_nested_legacy_web3_dns_host_without_sn_address() {
+        let resolver = resolver_with_alice_gateway_state(true);
+
+        let resolved = resolver
+            .resolve_dns("public.alice.web3.devtests.org.", RecordType::A)
+            .await
+            .unwrap();
+
+        assert_eq!(resolved.source, DnsResolutionSource::DeviceOnlineInfo);
+        assert_eq!(
+            resolved.addresses,
+            vec![
+                "198.51.100.42".parse::<IpAddr>().unwrap(),
+                "192.168.1.42".parse::<IpAddr>().unwrap()
+            ]
+        );
     }
 
     #[test]

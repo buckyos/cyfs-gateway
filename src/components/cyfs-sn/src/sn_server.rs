@@ -17,8 +17,8 @@ use crate::{
 use ::kRPC::*;
 use async_trait::async_trait;
 use bns_client::{
-    BnsEvmClientConfig, BnsEvmControllerClient, BnsIndexerApi, BnsIndexerClient, SnBnsController,
-    SnBnsControllerConfig, SqliteSnBnsWriteRequestStore,
+    canonical_bns_name, BnsEvmClientConfig, BnsEvmControllerClient, BnsIndexerApi,
+    BnsIndexerClient, SnBnsController, SnBnsControllerConfig, SqliteSnBnsWriteRequestStore,
 };
 use bns_indexer::{Principal, PrincipalKind};
 use buckyos_kit::{get_buckyos_service_data_dir, is_valid_name, NameType};
@@ -78,14 +78,53 @@ fn push_exportable_device_ip(address_vec: &mut Vec<IpAddr>, ip: IpAddr) {
 
 struct LegacyResolverCompatibilityReader {
     auth_db: SnAuthDBRef,
+    device_info_db: SnDeviceInfoDBRef,
     compat_store: SnCompatibilityStoreRef,
 }
 
 impl LegacyResolverCompatibilityReader {
-    fn new(auth_db: SnAuthDBRef, compat_store: SnCompatibilityStoreRef) -> Self {
+    fn new(
+        auth_db: SnAuthDBRef,
+        device_info_db: SnDeviceInfoDBRef,
+        compat_store: SnCompatibilityStoreRef,
+    ) -> Self {
         Self {
             auth_db,
+            device_info_db,
             compat_store,
+        }
+    }
+
+    fn convert_device_state(view: crate::SnDeviceStateView) -> ResolverDeviceDocument {
+        let mut addresses = Vec::new();
+        for value in view
+            .public_ips
+            .iter()
+            .chain(view.private_ips.iter())
+            .map(|s| s.as_str())
+        {
+            if let Some(ip) = parse_ip_or_socket_addr(value) {
+                push_exportable_device_ip(&mut addresses, ip);
+            }
+        }
+        for endpoint in &view.active_endpoints {
+            if let Some(ip) = parse_ip_or_socket_addr(endpoint.host.as_str()) {
+                push_exportable_device_ip(&mut addresses, ip);
+            }
+        }
+
+        let document = serde_json::to_value(&view).ok();
+
+        ResolverDeviceDocument {
+            zone_name: view.zone,
+            device_name: view.device_name,
+            did: view.did,
+            mini_config_jwt: None,
+            document: document.clone(),
+            info_document: document,
+            addresses,
+            ttl: None,
+            version: None,
         }
     }
 
@@ -178,6 +217,18 @@ impl ResolverCompatibilityReader for LegacyResolverCompatibilityReader {
         zone_name: &str,
         device_name: &str,
     ) -> SnResolverResult<Option<ResolverDeviceDocument>> {
+        let registered_device = self
+            .device_info_db
+            .get_device_state_by_name(zone_name, device_name)
+            .await
+            .map_err(|e| {
+                SnResolverError::backend(format!(
+                    "query registered device {}.{} failed: {}",
+                    device_name, zone_name, e
+                ))
+            })?
+            .map(Self::convert_device_state);
+
         let Some(device) = self
             .compat_store
             .query_device_by_name(zone_name, device_name)
@@ -189,7 +240,7 @@ impl ResolverCompatibilityReader for LegacyResolverCompatibilityReader {
                 ))
             })?
         else {
-            return Ok(None);
+            return Ok(registered_device);
         };
 
         self.convert_device(device).await.map(Some)
@@ -199,6 +250,17 @@ impl ResolverCompatibilityReader for LegacyResolverCompatibilityReader {
         &self,
         did: &str,
     ) -> SnResolverResult<Option<ResolverDeviceDocument>> {
+        if let Some(view) = self
+            .device_info_db
+            .get_device_state(did)
+            .await
+            .map_err(|e| {
+                SnResolverError::backend(format!("query registered device {} failed: {}", did, e))
+            })?
+        {
+            return Ok(Some(Self::convert_device_state(view)));
+        }
+
         let Some(device) = self
             .compat_store
             .query_device_by_did(did)
@@ -486,6 +548,9 @@ impl SNServer {
         if !is_valid_name(username, NameType::User) {
             return Err("username does not meet naming rules".to_string());
         }
+        if canonical_bns_name(username).is_err() {
+            return Err("username does not meet naming rules".to_string());
+        }
         if Self::load_reserved_user_names().contains(username) {
             return Err("username is reserved by server".to_string());
         }
@@ -559,6 +624,7 @@ impl SNServer {
         )))
         .with_compatibility_reader(Arc::new(LegacyResolverCompatibilityReader::new(
             auth_db.clone(),
+            device_info_db.clone(),
             compat_store.clone(),
         )));
         if let Some(indexer_url) = bns_indexer_url.as_deref() {
@@ -843,33 +909,8 @@ impl SNServer {
     }
     //return (subhost,username)
     pub fn get_user_subhost_from_host(host: &str, server_host: &str) -> Option<(String, String)> {
-        let end_string = format!(".web3.{}", server_host);
-        if host.ends_with(&end_string) {
-            let sub_name = host[0..host.len() - end_string.len()].to_string();
-            if sub_name.contains(".") {
-                let sub_name2 = sub_name.clone();
-                let subs: Vec<&str> = sub_name.split(".").collect();
-                let username = subs.last();
-                if username.is_some() {
-                    return Some((sub_name2, username.unwrap().to_string()));
-                } else {
-                    return None;
-                }
-            } else {
-                if sub_name.contains("-") {
-                    let sub_name2 = sub_name.clone();
-                    let subs: Vec<&str> = sub_name.split("-").collect();
-                    let username = subs.last();
-                    if username.is_some() {
-                        return Some((sub_name2, username.unwrap().to_string()));
-                    } else {
-                        return None;
-                    }
-                }
-                return Some((sub_name.clone(), sub_name));
-            }
-        }
-        return None;
+        SnResolver::get_user_subhost_from_host(host, server_host)
+            .map(|parts| (parts.sub_host, parts.username))
     }
 
     pub(crate) async fn handle_namespaced_rpc_call(
@@ -2563,6 +2604,19 @@ mod tests {
             SNServer::get_user_subhost_from_host(&req_host, &server_host).unwrap();
         assert_eq!(sub_host, "alice".to_string());
         assert_eq!(username, "alice".to_string());
+
+        let req_host = "public.alice.web3.devtests.org".to_string();
+        let (sub_host, username) =
+            SNServer::get_user_subhost_from_host(&req_host, &server_host).unwrap();
+        assert_eq!(sub_host, "public.alice".to_string());
+        assert_eq!(username, "alice".to_string());
+
+        let server_host = "sn.devtests.org".to_string();
+        let req_host = "public.alice.web3.devtests.org".to_string();
+        let (sub_host, username) =
+            SNServer::get_user_subhost_from_host(&req_host, &server_host).unwrap();
+        assert_eq!(sub_host, "public.alice".to_string());
+        assert_eq!(username, "alice".to_string());
     }
 
     #[test]
@@ -2571,6 +2625,11 @@ mod tests {
             assert!(
                 SNServer::validate_registration_username(username).is_ok(),
                 "expected valid username: {}",
+                username
+            );
+            assert!(
+                canonical_bns_name(username).is_ok(),
+                "SN-valid username must also be a valid BNS name: {}",
                 username
             );
         }
@@ -3549,6 +3608,22 @@ mod tests {
                 "deviceinfo.resolve_ood_by_did",
                 json!({
                     "source_device_id": bns_device_did
+                }),
+            )
+            .await
+            .unwrap();
+        let ood_info = serde_json::from_value::<OODInfo>(result).unwrap();
+        assert_eq!(ood_info.did_hostname, registered_did_hostname);
+        assert_eq!(ood_info.owner_id, REFACTOR_USER);
+        assert_eq!(ood_info.state, "active");
+        assert!(!ood_info.self_cert);
+
+        let nested_web3_host = format!("public.{}.web3.buckyos.ai", REFACTOR_USER);
+        let result = device_krpc
+            .call(
+                "deviceinfo.resolve_ood_by_hostname",
+                json!({
+                    "dest_host": nested_web3_host
                 }),
             )
             .await
