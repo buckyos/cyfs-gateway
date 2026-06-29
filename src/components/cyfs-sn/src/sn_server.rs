@@ -389,6 +389,12 @@ pub struct OODInfo {
     pub state: String, //active,suspended,disabled,banned
 }
 
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct RegisteredDeviceKey {
+    zone: String,
+    device_name: String,
+}
+
 #[derive(Clone)]
 pub struct SNServer {
     id: String,
@@ -1007,36 +1013,290 @@ impl SNServer {
             .await
             .map_err(|e| RPCErrors::ReasonError(e.to_string()))?
         {
-            let user = self
-                .auth_db
-                .get_user_info(view.zone.as_str())
-                .await
-                .map_err(|e| RPCErrors::ReasonError(e.to_string()))?;
-            return Ok(OODInfo {
-                did_hostname: Self::did_hostname(did),
-                owner_id: view.zone,
-                self_cert: user.map(|u| u.self_cert).unwrap_or(false),
-                state: Self::device_state_to_ood_state(view.state).to_string(),
-            });
+            let registered_did = view.did.clone();
+            return self
+                .ood_info_from_device_state(registered_did.as_str(), view)
+                .await;
         }
 
-        let device_info = self
+        if let Some(device_info) = self
             .compat_store
             .query_device_by_did(did)
             .await
             .map_err(|e| RPCErrors::ReasonError(e.to_string()))?
-            .ok_or_else(|| RPCErrors::ParseRequestError("device not found".to_string()))?;
+        {
+            let registered_did = device_info.did.clone();
+            return self
+                .ood_info_from_legacy_device(registered_did.as_str(), device_info)
+                .await;
+        }
+
+        if let Some(key) = self.registered_device_key_from_did(did).await? {
+            let canonical_did = self.canonical_device_did_from_scoped_did(did).await?;
+            if let Some(view) = self
+                .device_info_db
+                .get_device_state_by_name(key.zone.as_str(), key.device_name.as_str())
+                .await
+                .map_err(|e| RPCErrors::ReasonError(e.to_string()))?
+            {
+                if let Some(canonical_did) = canonical_did.as_deref() {
+                    if canonical_did != view.did.as_str() {
+                        return Err(RPCErrors::ParseRequestError(
+                            Self::registered_device_did_mismatch(
+                                did,
+                                canonical_did,
+                                view.did.as_str(),
+                            ),
+                        ));
+                    }
+                }
+                let registered_did = view.did.clone();
+                return self
+                    .ood_info_from_device_state(registered_did.as_str(), view)
+                    .await;
+            }
+
+            if let Some(device_info) = self
+                .compat_store
+                .query_device_by_name(key.zone.as_str(), key.device_name.as_str())
+                .await
+                .map_err(|e| RPCErrors::ReasonError(e.to_string()))?
+            {
+                if let Some(canonical_did) = canonical_did.as_deref() {
+                    if canonical_did != device_info.did.as_str() {
+                        return Err(RPCErrors::ParseRequestError(
+                            Self::registered_device_did_mismatch(
+                                did,
+                                canonical_did,
+                                device_info.did.as_str(),
+                            ),
+                        ));
+                    }
+                }
+                let registered_did = device_info.did.clone();
+                return self
+                    .ood_info_from_legacy_device(registered_did.as_str(), device_info)
+                    .await;
+            }
+        }
+
+        Err(RPCErrors::ParseRequestError(
+            Self::registered_device_not_found(did),
+        ))
+    }
+
+    async fn ood_info_from_device_state(
+        &self,
+        did_for_hostname: &str,
+        view: crate::SnDeviceStateView,
+    ) -> Result<OODInfo, RPCErrors> {
+        let user = self
+            .auth_db
+            .get_user_info(view.zone.as_str())
+            .await
+            .map_err(|e| RPCErrors::ReasonError(e.to_string()))?;
+        Ok(OODInfo {
+            did_hostname: Self::did_hostname(did_for_hostname),
+            owner_id: view.zone,
+            self_cert: user.map(|u| u.self_cert).unwrap_or(false),
+            state: Self::device_state_to_ood_state(view.state).to_string(),
+        })
+    }
+
+    async fn ood_info_from_legacy_device(
+        &self,
+        did_for_hostname: &str,
+        device_info: SNDeviceInfo,
+    ) -> Result<OODInfo, RPCErrors> {
         let user = self
             .auth_db
             .get_user_info(device_info.owner.as_str())
             .await
             .map_err(|e| RPCErrors::ReasonError(e.to_string()))?;
         Ok(OODInfo {
-            did_hostname: Self::did_hostname(device_info.did.as_str()),
+            did_hostname: Self::did_hostname(did_for_hostname),
             owner_id: device_info.owner,
             self_cert: user.map(|u| u.self_cert).unwrap_or(false),
             state: "active".to_string(),
         })
+    }
+
+    async fn registered_device_key_from_did(
+        &self,
+        did: &str,
+    ) -> Result<Option<RegisteredDeviceKey>, RPCErrors> {
+        let did = match DID::from_str(did) {
+            Ok(did) => did,
+            Err(_) => return Ok(None),
+        };
+
+        match did.method.as_str() {
+            "bns" => {
+                self.registered_device_key_from_bns_id(did.id.as_str())
+                    .await
+            }
+            "web" => {
+                self.registered_device_key_from_web_id(did.id.as_str())
+                    .await
+            }
+            _ => Ok(None),
+        }
+    }
+
+    async fn registered_device_key_from_bns_id(
+        &self,
+        id: &str,
+    ) -> Result<Option<RegisteredDeviceKey>, RPCErrors> {
+        let id = Self::normalize_did_name(id);
+        let Some((device_name, zone_ref)) = id.split_once('.') else {
+            return Ok(None);
+        };
+        if device_name.is_empty() || zone_ref.is_empty() {
+            return Ok(None);
+        }
+
+        let zone = if zone_ref.contains('.') {
+            let Some(user) = self
+                .auth_db
+                .get_user_by_domain(zone_ref)
+                .await
+                .map_err(|e| RPCErrors::ReasonError(e.to_string()))?
+            else {
+                return Ok(None);
+            };
+            let Some(username) = user.username else {
+                return Ok(None);
+            };
+            username
+        } else {
+            zone_ref.to_string()
+        };
+
+        Ok(Self::registered_device_key(zone, device_name.to_string()))
+    }
+
+    async fn registered_device_key_from_web_id(
+        &self,
+        id: &str,
+    ) -> Result<Option<RegisteredDeviceKey>, RPCErrors> {
+        let id = Self::normalize_did_name(id);
+        let Some(user) = self
+            .auth_db
+            .get_user_by_domain(id.as_str())
+            .await
+            .map_err(|e| RPCErrors::ReasonError(e.to_string()))?
+        else {
+            return Ok(None);
+        };
+        let Some(zone) = user.username else {
+            return Ok(None);
+        };
+        let Some(user_domain) = user.user_domain else {
+            return Ok(None);
+        };
+        let user_domain = Self::normalize_did_name(user_domain.as_str());
+        if id == user_domain {
+            return Ok(None);
+        }
+
+        let suffix = format!(".{}", user_domain);
+        let Some(device_name) = id.strip_suffix(suffix.as_str()) else {
+            return Ok(None);
+        };
+
+        Ok(Self::registered_device_key(zone, device_name.to_string()))
+    }
+
+    fn registered_device_key(zone: String, device_name: String) -> Option<RegisteredDeviceKey> {
+        if zone.trim().is_empty() || device_name.trim().is_empty() {
+            return None;
+        }
+
+        Some(RegisteredDeviceKey { zone, device_name })
+    }
+
+    fn normalize_did_name(value: &str) -> String {
+        value.trim().trim_end_matches('.').to_ascii_lowercase()
+    }
+
+    async fn canonical_device_did_from_scoped_did(
+        &self,
+        did: &str,
+    ) -> Result<Option<String>, RPCErrors> {
+        let did = match DID::from_str(did) {
+            Ok(did) => did,
+            Err(_) => return Ok(None),
+        };
+        if did.method != "bns" && did.method != "web" {
+            return Ok(None);
+        }
+
+        let resolution = match self.resolver.resolve_did(&did, Some("doc"), None).await {
+            Ok(resolution) => resolution,
+            Err(e) => {
+                debug!(
+                    "skip canonical device DID check for {}: resolver failed: {}",
+                    did.to_string(),
+                    e
+                );
+                return Ok(None);
+            }
+        };
+
+        let value = match resolution.document.to_json_value() {
+            Ok(value) => value,
+            Err(e) => {
+                debug!(
+                    "skip canonical device DID check for {}: document decode failed: {}",
+                    did.to_string(),
+                    e
+                );
+                return Ok(None);
+            }
+        };
+
+        Ok(Self::device_did_from_document(&value))
+    }
+
+    fn device_did_from_document(value: &Value) -> Option<String> {
+        for key in ["did", "id"] {
+            if let Some(did) = value.get(key).and_then(|v| v.as_str()) {
+                if !did.trim().is_empty() {
+                    return Some(did.trim().to_string());
+                }
+            }
+        }
+
+        value
+            .get("x")
+            .and_then(|v| v.as_str())
+            .filter(|x| !x.trim().is_empty())
+            .map(|x| format!("did:dev:{}", x.trim()))
+    }
+
+    fn registered_device_not_found(did: &str) -> String {
+        format!(
+            "registered device not found for source_device_id={did}; \
+             deviceinfo.resolve_ood_by_did checks the exact DID first, then for \
+             did:bns:<device>.<zone> or did:web:<device>.<domain> checks the \
+             registered device binding by zone and device_name. Prefer passing the \
+             canonical did:dev device DID after registration; scoped BNS/Web device \
+             DIDs are accepted as compatibility aliases. Verify the SN sqlite \
+             devices/device_indexes tables contain a device registered for the same \
+             public key, device name, and zone."
+        )
+    }
+
+    fn registered_device_did_mismatch(
+        query_did: &str,
+        resolved_did: &str,
+        registered_did: &str,
+    ) -> String {
+        format!(
+            "registered device DID mismatch for source_device_id={query_did}; \
+             scoped DID resolves to canonical device DID {resolved_did}, but the \
+             registered device binding points to {registered_did}."
+        )
     }
 
     fn did_hostname(did: &str) -> String {
@@ -1324,13 +1584,16 @@ impl QAServer for SNServer {
         let rpc_response = self
             .handle_rpc_call(rpc_request, IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)))
             .await;
-        if rpc_response.is_err() {
-            return Err(server_err!(
-                ServerErrorCode::ProcessChainError,
-                "failed to handle rpc call"
-            ));
-        }
-        let rpc_response = rpc_response.unwrap();
+        let rpc_response = match rpc_response {
+            Ok(response) => response,
+            Err(e) => {
+                return Err(server_err!(
+                    ServerErrorCode::ProcessChainError,
+                    "failed to handle rpc call: {}",
+                    e
+                ))
+            }
+        };
         match rpc_response.result {
             RPCResult::Success(result) => {
                 return Ok(result);
@@ -3220,6 +3483,22 @@ mod tests {
         assert!(removed_owner_key.contains("not available on /kapi/sn/auth"));
 
         let device_krpc = kRPC::new(deviceinfo_url.as_str(), Some(access_token.clone()));
+        let missing_device = "did:dev:missing-device";
+        let missing_device_err = device_krpc
+            .call(
+                "deviceinfo.resolve_ood_by_did",
+                json!({
+                    "source_device_id": missing_device
+                }),
+            )
+            .await
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(missing_device_err.contains("registered device not found"));
+        assert!(missing_device_err.contains(missing_device));
+        assert!(missing_device_err.contains("registered device binding by zone and device_name"));
+
         let result = device_krpc
             .call(
                 "device.register",
@@ -3248,6 +3527,7 @@ mod tests {
         let result = device_krpc.call("device.list", json!({})).await.unwrap();
         assert_eq!(result["items"].as_array().unwrap().len(), 1);
 
+        let registered_did_hostname = device_config.id.to_host_name();
         let result = device_krpc
             .call(
                 "deviceinfo.resolve_ood_by_did",
@@ -3258,6 +3538,23 @@ mod tests {
             .await
             .unwrap();
         let ood_info = serde_json::from_value::<OODInfo>(result).unwrap();
+        assert_eq!(ood_info.did_hostname, registered_did_hostname);
+        assert_eq!(ood_info.owner_id, REFACTOR_USER);
+        assert_eq!(ood_info.state, "active");
+        assert!(!ood_info.self_cert);
+
+        let bns_device_did = format!("did:bns:ood1.{}", REFACTOR_USER);
+        let result = device_krpc
+            .call(
+                "deviceinfo.resolve_ood_by_did",
+                json!({
+                    "source_device_id": bns_device_did
+                }),
+            )
+            .await
+            .unwrap();
+        let ood_info = serde_json::from_value::<OODInfo>(result).unwrap();
+        assert_eq!(ood_info.did_hostname, registered_did_hostname);
         assert_eq!(ood_info.owner_id, REFACTOR_USER);
         assert_eq!(ood_info.state, "active");
         assert!(!ood_info.self_cert);
