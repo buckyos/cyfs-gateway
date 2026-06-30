@@ -749,9 +749,9 @@ pub fn revoke_document_call(
     Ok(Bns::revokeDocumentCall {
         name: req.name.clone(),
         docType: req.doc_type.clone(),
-        fromVersion: req.from_version,
-        toVersion: req.to_version,
+        expectedVersion: req.expected_version,
         reasonHash: parse_b256_or_zero(&req.reason_hash, "reason_hash")?,
+        revokedBeforeIat: req.revoked_before_iat,
         authority: call_authority_to_evm(&req.authority)?,
         guard: mutation_guard_to_evm(req.guard),
     })

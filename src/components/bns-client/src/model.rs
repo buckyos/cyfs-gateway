@@ -789,8 +789,9 @@ pub enum RegistryEvent {
     DocumentRevoked {
         name: String,
         doc_type: String,
-        from_version: u64,
-        to_version: u64,
+        previous_version: u64,
+        new_version: u64,
+        revoked_before_iat: u64,
         reason_hash: String,
     },
     ControllerPolicyUpdated {

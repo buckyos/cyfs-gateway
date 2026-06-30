@@ -69,9 +69,11 @@ contract BnsEventsTest is BnsTestBase {
 
         s = _seq("alice");
         vm.expectEmit(true, true, true, true, address(bns));
-        emit DocumentRevoked(nh, "alice", "dns_txt", ALICE, 1, 1, keccak256("reason"));
+        emit DocumentRevoked(nh, "alice", "dns_txt", ALICE, 1, 2, 1234, keccak256("reason"));
         vm.prank(ALICE);
-        bns.revokeDocument("alice", "dns_txt", 1, 1, keccak256("reason"), _ownerAuth(ALICE), _guard(s));
+        bns.revokeDocument(
+            "alice", "dns_txt", 1, keccak256("reason"), 1234, _ownerAuth(ALICE), _guard(s)
+        );
     }
 
     // --- controller / namespace / alias / payment -------------------------

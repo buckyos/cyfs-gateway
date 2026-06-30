@@ -373,15 +373,16 @@ pub struct BnsApplyMutationsResp {
 pub struct BnsRevokeDocumentReq {
     pub name: String,
     pub doc_type: String,
-    pub from_version: u64,
-    pub to_version: u64,
+    pub expected_version: u64,
     pub reason_hash: String,
+    pub revoked_before_iat: u64,
     pub authority: CallAuthority,
     pub guard: MutationGuard,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BnsRevokeDocumentResp {
+    pub document_version: u64,
     pub name_seq: u64,
 }
 

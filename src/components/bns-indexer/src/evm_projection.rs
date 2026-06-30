@@ -172,8 +172,9 @@ fn registry_event_from_contract_event(event: BnsEvent) -> BnsRegistryResult<Regi
         BnsEvent::DocumentRevoked(event) => Ok(RegistryEvent::DocumentRevoked {
             name: event.name,
             doc_type: event.docType,
-            from_version: event.fromVersion,
-            to_version: event.toVersion,
+            previous_version: event.previousVersion,
+            new_version: event.newVersion,
+            revoked_before_iat: event.revokedBeforeIat,
             reason_hash: hash_string(event.reasonHash),
         }),
         BnsEvent::ControllerPolicyUpdated(event) => Ok(RegistryEvent::ControllerPolicyUpdated {

@@ -164,17 +164,17 @@ fn revoke_document_call_round_trips() {
     let call = Bns::revokeDocumentCall {
         name: "alice".to_string(),
         docType: "device".to_string(),
-        fromVersion: 2,
-        toVersion: 5,
+        expectedVersion: 2,
         reasonHash: B256::repeat_byte(0xAB),
+        revokedBeforeIat: 1_700_000_000,
         authority: public_authority(),
         guard: empty_guard(),
     };
     let encoded = call.abi_encode();
     let decoded = Bns::revokeDocumentCall::abi_decode(&encoded).expect("decode revokeDocument");
-    assert_eq!(decoded.fromVersion, 2);
-    assert_eq!(decoded.toVersion, 5);
+    assert_eq!(decoded.expectedVersion, 2);
     assert_eq!(decoded.reasonHash, B256::repeat_byte(0xAB));
+    assert_eq!(decoded.revokedBeforeIat, 1_700_000_000);
     assert_eq!(
         decode_bns_call(&encoded).unwrap().selector(),
         Bns::revokeDocumentCall::SELECTOR

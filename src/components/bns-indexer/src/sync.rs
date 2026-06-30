@@ -375,15 +375,12 @@ where
             RegistryEvent::DocumentRevoked {
                 name,
                 doc_type,
-                from_version,
-                to_version,
+                new_version,
                 ..
             } => {
                 self.push_name_state(&mut write, name).await?;
-                for version in *from_version..=*to_version {
-                    self.push_document_state(&mut write, name, doc_type, version)
-                        .await?;
-                }
+                self.push_document_state(&mut write, name, doc_type, *new_version)
+                    .await?;
             }
             RegistryEvent::AuthorityKeysUpdated { name, .. } => {
                 let set = self.read_authority_set(name).await?;

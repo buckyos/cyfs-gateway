@@ -402,8 +402,9 @@ contract Bns {
         string name,
         string docType,
         address indexed actor,
-        uint64 fromVersion,
-        uint64 toVersion,
+        uint64 previousVersion,
+        uint64 newVersion,
+        uint64 revokedBeforeIat,
         bytes32 reasonHash
     );
 
@@ -1002,12 +1003,12 @@ contract Bns {
     function revokeDocument(
         string calldata name,
         string calldata docType,
-        uint64 fromVersion,
-        uint64 toVersion,
+        uint64 expectedVersion,
         bytes32 reasonHash,
+        uint64 revokedBeforeIat,
         CallAuthority calldata authority,
         MutationGuard calldata guard
-    ) external returns (uint64 nameSeq) {
+    ) external returns (uint64 newVersion, uint64 nameSeq) {
         bytes32 nameHash = _validateName(name);
         bytes32 docTypeHash = _validateDocType(docType);
         _requireActiveName(nameHash, name);
@@ -1024,29 +1025,47 @@ contract Bns {
         );
 
         uint64 current = _currentDocumentVersions[nameHash][docTypeHash];
-        if (fromVersion == 0 || fromVersion > toVersion || toVersion > current) {
-            revert StaleDocumentVersion(name, docType, toVersion, current);
+        if (current != expectedVersion) {
+            revert StaleDocumentVersion(name, docType, expectedVersion, current);
         }
 
         uint64 nowTs = _now();
-        for (uint64 version = fromVersion; version <= toVersion; version++) {
-            DocumentState storage document = _documents[nameHash][docTypeHash][version];
-            if (document.version == 0) {
-                revert DocumentNotFound(name, docType);
-            }
-            document.status = DocumentStatus.Revoked;
-            document.revokedAt = nowTs;
-            document.documentStateHash = _hashDocumentState(document);
+        newVersion = current + 1;
+        _currentDocumentVersions[nameHash][docTypeHash] = newVersion;
+
+        DocumentState storage document = _documents[nameHash][docTypeHash][newVersion];
+        document.name = name;
+        document.docType = docType;
+        document.version = newVersion;
+        document.previousVersion = current;
+        document.status = DocumentStatus.Revoked;
+        document.validFrom = nowTs;
+        document.expireAt = 0;
+        document.revokedAt = nowTs;
+        document.paymentTarget = address(0);
+        document.controllerPolicyHash = bytes32(0);
+        document.paymentPolicyHash = bytes32(0);
+        document.splitPolicyHash = bytes32(0);
+        document.pricePolicyHash = bytes32(0);
+        document.rightsPolicyHash = bytes32(0);
+        document.documentStateHash = _hashDocumentState(document);
+
+        if (keccak256(bytes(docType)) == keccak256(bytes("owner"))) {
+            state.ownerDocumentVersion = newVersion;
         }
 
         state.nameSeq += 1;
         state.updatedAt = nowTs;
         _commitEvent(
             EVENT_DOCUMENT_REVOKED,
-            keccak256(abi.encode(nameHash, docTypeHash, fromVersion, toVersion, reasonHash))
+            keccak256(
+                abi.encode(nameHash, docTypeHash, current, newVersion, revokedBeforeIat, reasonHash)
+            )
         );
-        emit DocumentRevoked(nameHash, name, docType, msg.sender, fromVersion, toVersion, reasonHash);
-        return state.nameSeq;
+        emit DocumentRevoked(
+            nameHash, name, docType, msg.sender, current, newVersion, revokedBeforeIat, reasonHash
+        );
+        return (newVersion, state.nameSeq);
     }
 
     function setControllerPolicy(

@@ -17,7 +17,7 @@ use crate::{
     validate_semantic_owner, AliasKind, AliasState, ApplyMutationsResult, AuthorityKey,
     AuthorityKeyStatus, AuthorityKeyUpdate, AuthorityRole, AuthoritySetState, BnsRegistryError,
     BnsRegistryResult, BnsRegistryStore, BnsRegistryStoreTx, BootstrapDocumentVersion,
-    BootstrapNameResult, CallAuthority, ControllerRule, DocumentState, DocumentStatus,
+    BootstrapNameResult, CallAuthority, ControllerRule, DocumentRef, DocumentState, DocumentStatus,
     DocumentUpdate, EventLogRecord, LogCheckpoint, MutationGuard, NameState, NameStatus,
     OwnerResolution, OwnerSource, PaymentTargetResolution, Principal, PrincipalKind,
     PurchaseContext, RegisterOptions, RegistryEvent, ReleaseMode, ResolveResult,
@@ -215,19 +215,22 @@ where
         &self,
         req: BnsRevokeDocumentReq,
     ) -> BnsClientResult<BnsRevokeDocumentResp> {
-        let name_seq = self
+        let (document_version, name_seq) = self
             .registry
             .revoke_document(
                 &req.name,
                 &req.doc_type,
-                req.from_version,
-                req.to_version,
+                req.expected_version,
                 &req.reason_hash,
+                req.revoked_before_iat,
                 req.authority,
                 req.guard,
             )
             .map_err(BnsClientError::from)?;
-        Ok(BnsRevokeDocumentResp { name_seq })
+        Ok(BnsRevokeDocumentResp {
+            document_version,
+            name_seq,
+        })
     }
 
     async fn set_controller_policy(
@@ -354,26 +357,27 @@ where
             let name_state = self
                 .load_materialized_name(tx, &name)?
                 .ok_or_else(|| BnsRegistryError::NameNotFound { name: name.clone() })?;
-            let document_state = tx.get_current_document(&name, &doc_type)?.ok_or_else(|| {
-                BnsRegistryError::DocumentNotFound {
-                    name: name.clone(),
-                    doc_type: doc_type.clone(),
-                }
-            })?;
             let owner = self.resolve_owner_for_name(tx, &name)?;
-            self.ensure_document_consistent(
-                &name,
-                &doc_type,
-                &document_state,
-                &owner.effective_owner,
-            )?;
             let alias = tx.get_alias(&name)?;
             let proof_root = self.current_proof_root(tx)?;
-            let effective_controller = if document_state.controller.is_unset() {
+            let document_state = tx
+                .get_current_document(&name, &doc_type)?
+                .unwrap_or_else(|| missing_document_state(&name, &doc_type));
+            let effective_controller = if document_state.status == DocumentStatus::Missing
+                || document_state.controller.is_unset()
+            {
                 owner.effective_owner.clone()
             } else {
                 document_state.controller.clone()
             };
+            if document_state.status != DocumentStatus::Missing {
+                self.ensure_document_consistent(
+                    &name,
+                    &doc_type,
+                    &document_state,
+                    &owner.effective_owner,
+                )?;
+            }
 
             Ok(ResolveResult {
                 status: document_state.status,
@@ -1200,21 +1204,16 @@ where
         &self,
         name: &str,
         doc_type: &str,
-        from_version: u64,
-        to_version: u64,
+        expected_version: u64,
         reason_hash: &str,
+        revoked_before_iat: u64,
         authority: CallAuthority,
         guard: MutationGuard,
-    ) -> BnsRegistryResult<u64> {
+    ) -> BnsRegistryResult<(u64, u64)> {
         self.ensure_write_path("revoke_document")?;
         let name = canonical_bns_name(name)?;
         let doc_type = canonical_doc_type(doc_type)?;
         validate_hash(reason_hash)?;
-        if from_version == 0 || from_version > to_version {
-            return Err(BnsRegistryError::InvalidMutation(
-                "invalid revoke version range".to_string(),
-            ));
-        }
 
         self.store.transact(|tx| {
             let now = now_timestamp();
@@ -1228,32 +1227,44 @@ where
                 &authority,
                 &guard,
             )?;
-            let current = tx.get_current_document(&name, &doc_type)?.ok_or_else(|| {
-                BnsRegistryError::DocumentNotFound {
-                    name: name.clone(),
-                    doc_type: doc_type.clone(),
-                }
-            })?;
-            if to_version > current.version {
+
+            let current = tx.get_current_document(&name, &doc_type)?;
+            let actual_version = current.as_ref().map_or(0, |state| state.version);
+            if actual_version != expected_version {
                 return Err(BnsRegistryError::StaleDocumentVersion {
                     name: name.clone(),
                     doc_type: doc_type.clone(),
-                    expected: to_version,
-                    actual: current.version,
+                    expected: expected_version,
+                    actual: actual_version,
                 });
             }
 
-            for version in from_version..=to_version {
-                let mut doc = tx.get_document(&name, &doc_type, version)?.ok_or_else(|| {
-                    BnsRegistryError::DocumentNotFound {
-                        name: name.clone(),
-                        doc_type: doc_type.clone(),
-                    }
-                })?;
-                doc.status = DocumentStatus::Revoked;
-                doc.revoked_at = now;
-                doc.document_state_hash = document_state_hash(&doc)?;
-                tx.put_document(&doc)?;
+            let new_version = actual_version + 1;
+            let mut document = DocumentState {
+                name: name.clone(),
+                doc_type: doc_type.clone(),
+                version: new_version,
+                previous_version: actual_version,
+                status: DocumentStatus::Revoked,
+                document: DocumentRef::new(ZERO_HASH, "", ZERO_HASH),
+                controller: Principal::unset(),
+                beneficiary: Principal::unset(),
+                payment_target: String::new(),
+                valid_from: now,
+                expire_at: 0,
+                revoked_at: now,
+                controller_policy_hash: ZERO_HASH.to_string(),
+                payment_policy_hash: ZERO_HASH.to_string(),
+                split_policy_hash: ZERO_HASH.to_string(),
+                price_policy_hash: ZERO_HASH.to_string(),
+                rights_policy_hash: ZERO_HASH.to_string(),
+                document_state_hash: ZERO_HASH.to_string(),
+            };
+            document.document_state_hash = document_state_hash(&document)?;
+            tx.put_document(&document)?;
+
+            if doc_type == "owner" {
+                name_state.owner_document_version = new_version;
             }
 
             name_state.name_seq += 1;
@@ -1264,13 +1275,14 @@ where
                 &RegistryEvent::DocumentRevoked {
                     name,
                     doc_type,
-                    from_version,
-                    to_version,
+                    previous_version: actual_version,
+                    new_version,
+                    revoked_before_iat,
                     reason_hash: reason_hash.to_string(),
                 },
                 now,
             )?;
-            Ok(name_state.name_seq)
+            Ok((new_version, name_state.name_seq))
         })
     }
 
@@ -2043,6 +2055,29 @@ where
         } else {
             Err(BnsRegistryError::NoConcreteSigner)
         }
+    }
+}
+
+fn missing_document_state(name: &str, doc_type: &str) -> DocumentState {
+    DocumentState {
+        name: name.to_string(),
+        doc_type: doc_type.to_string(),
+        version: 0,
+        previous_version: 0,
+        status: DocumentStatus::Missing,
+        document: DocumentRef::new(ZERO_HASH, "", ZERO_HASH),
+        controller: Principal::unset(),
+        beneficiary: Principal::unset(),
+        payment_target: String::new(),
+        valid_from: 0,
+        expire_at: 0,
+        revoked_at: 0,
+        controller_policy_hash: ZERO_HASH.to_string(),
+        payment_policy_hash: ZERO_HASH.to_string(),
+        split_policy_hash: ZERO_HASH.to_string(),
+        price_policy_hash: ZERO_HASH.to_string(),
+        rights_policy_hash: ZERO_HASH.to_string(),
+        document_state_hash: ZERO_HASH.to_string(),
     }
 }
 

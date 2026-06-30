@@ -130,8 +130,9 @@ contract BnsTestBase {
         string name,
         string docType,
         address indexed actor,
-        uint64 fromVersion,
-        uint64 toVersion,
+        uint64 previousVersion,
+        uint64 newVersion,
+        uint64 revokedBeforeIat,
         bytes32 reasonHash
     );
     event ControllerPolicyUpdated(
