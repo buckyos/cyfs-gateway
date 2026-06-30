@@ -41,6 +41,7 @@ use serde_json::{json, Map, Value};
 use sfo_js::object::builtins::JsArray;
 use sfo_js::{JsEngine, JsPkg, JsPkgManager, JsPkgManagerRef, JsString, JsValue, NativeFunction};
 use sha2::Digest;
+use std::future::Future;
 use tokio::fs::create_dir_all;
 use url::Url;
 
@@ -3130,11 +3131,30 @@ struct StartTemplateParams {
     args: Option<Vec<String>>,
 }
 
+pub type GatewayExternalCmdHandlerRef = Arc<dyn GatewayExternalCmdHandler>;
+
+#[async_trait::async_trait]
+pub trait GatewayExternalCmdHandler: Send + Sync + 'static {
+    async fn handle(&self, gateway: Arc<Gateway>, params: Value) -> ControlResult<Value>;
+}
+
+#[async_trait::async_trait]
+impl<F, Fut> GatewayExternalCmdHandler for F
+where
+    F: Fn(Arc<Gateway>, Value) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = ControlResult<Value>> + Send + 'static,
+{
+    async fn handle(&self, gateway: Arc<Gateway>, params: Value) -> ControlResult<Value> {
+        self(gateway, params).await
+    }
+}
+
 pub struct GatewayCmdHandler {
     gateway: Mutex<Option<Weak<Gateway>>>,
     config_file: Option<PathBuf>,
     parser: GatewayConfigParserRef,
     started_at: Instant,
+    external_cmd_handlers: RwLock<HashMap<String, GatewayExternalCmdHandlerRef>>,
 }
 
 impl GatewayCmdHandler {
@@ -3144,6 +3164,7 @@ impl GatewayCmdHandler {
             config_file,
             parser,
             started_at: Instant::now(),
+            external_cmd_handlers: RwLock::new(HashMap::new()),
         })
     }
 
@@ -3160,6 +3181,98 @@ impl GatewayCmdHandler {
         } else {
             None
         }
+    }
+
+    fn is_builtin_cmd(method: &str) -> bool {
+        matches!(
+            method,
+            "get_config"
+                | "get_init_config"
+                | "get_system_info"
+                | "collection_list"
+                | "collection_get"
+                | "collection_set_add"
+                | "collection_set_del"
+                | "collection_map_put"
+                | "collection_map_del"
+                | "save_config"
+                | "remove_rule"
+                | "get_connections"
+                | "get_connection_devices"
+                | "query_tunnel_url_statuses"
+                | "tunnels_probe"
+                | "/tunnels/probe"
+                | "add_name_provider"
+                | "add-name-provider"
+                | "add_rule"
+                | "add_dispatch"
+                | "remove_dispatch"
+                | "add_router"
+                | "remove_router"
+                | "append_rule"
+                | "insert_rule"
+                | "move_rule"
+                | "set_rule"
+                | "reload"
+                | "start"
+                | "external_cmds"
+                | "cmd_help"
+        )
+    }
+
+    pub fn register_external_cmd(
+        &self,
+        method: impl Into<String>,
+        handler: GatewayExternalCmdHandlerRef,
+    ) -> ControlResult<()> {
+        let method = method.into();
+        if method.trim().is_empty() {
+            return Err(cmd_err!(
+                ControlErrorCode::InvalidParams,
+                "external cmd method is empty"
+            ));
+        }
+        if Self::is_builtin_cmd(method.as_str()) {
+            return Err(cmd_err!(
+                ControlErrorCode::InvalidParams,
+                "external cmd conflicts with builtin method: {}",
+                method
+            ));
+        }
+
+        let mut handlers = self.external_cmd_handlers.write().unwrap();
+        if handlers.contains_key(method.as_str()) {
+            return Err(cmd_err!(
+                ControlErrorCode::InvalidParams,
+                "external cmd already registered: {}",
+                method
+            ));
+        }
+        handlers.insert(method, handler);
+        Ok(())
+    }
+
+    pub fn unregister_external_cmd(&self, method: &str) -> Option<GatewayExternalCmdHandlerRef> {
+        self.external_cmd_handlers.write().unwrap().remove(method)
+    }
+
+    async fn handle_registered_external_cmd(
+        &self,
+        gateway: Arc<Gateway>,
+        method: &str,
+        params: Value,
+    ) -> ControlResult<Option<Value>> {
+        let handler = {
+            self.external_cmd_handlers
+                .read()
+                .unwrap()
+                .get(method)
+                .cloned()
+        };
+        let Some(handler) = handler else {
+            return Ok(None);
+        };
+        Ok(Some(handler.handle(gateway, params).await?))
     }
 
     async fn start_template(&self, template_id: &str, args: Vec<String>) -> ControlResult<Value> {
@@ -4063,11 +4176,19 @@ impl GatewayControlCmdHandler for GatewayCmdHandler {
                 Ok(serde_json::to_value(help)
                     .map_err(into_cmd_err!(ControlErrorCode::SerializeFailed))?)
             }
-            v => Err(cmd_err!(
-                ControlErrorCode::InvalidMethod,
-                "Invalid method: {}",
-                v
-            )),
+            v => {
+                if let Some(result) = self
+                    .handle_registered_external_cmd(gateway.clone(), v, params)
+                    .await?
+                {
+                    return Ok(result);
+                }
+                Err(cmd_err!(
+                    ControlErrorCode::InvalidMethod,
+                    "Invalid method: {}",
+                    v
+                ))
+            }
         }
     }
 }
@@ -4284,6 +4405,7 @@ mod tests {
     use serde_json::json;
     use std::io::{Read, Write};
     use std::path::PathBuf;
+    use std::sync::Arc;
     use tempfile::TempDir;
 
     pub struct TempKeyStore {
@@ -4337,6 +4459,56 @@ mod tests {
                 .unwrap();
             Ok(())
         }
+    }
+
+    fn test_external_cmd_handler() -> GatewayExternalCmdHandlerRef {
+        Arc::new(|_gateway: Arc<Gateway>, _params: Value| async move { Ok(Value::Null) })
+    }
+
+    #[test]
+    fn external_cmd_registry_rejects_builtin_method() {
+        let handler = GatewayCmdHandler::new(
+            None,
+            Arc::new(crate::config_loader::GatewayConfigParser::new()),
+        );
+
+        let err = handler
+            .register_external_cmd("reload", test_external_cmd_handler())
+            .unwrap_err();
+
+        assert_eq!(err.code(), ControlErrorCode::InvalidParams);
+    }
+
+    #[test]
+    fn external_cmd_registry_rejects_duplicate_method() {
+        let handler = GatewayCmdHandler::new(
+            None,
+            Arc::new(crate::config_loader::GatewayConfigParser::new()),
+        );
+
+        handler
+            .register_external_cmd("custom_status", test_external_cmd_handler())
+            .unwrap();
+        let err = handler
+            .register_external_cmd("custom_status", test_external_cmd_handler())
+            .unwrap_err();
+
+        assert_eq!(err.code(), ControlErrorCode::InvalidParams);
+    }
+
+    #[test]
+    fn external_cmd_registry_unregisters_method() {
+        let handler = GatewayCmdHandler::new(
+            None,
+            Arc::new(crate::config_loader::GatewayConfigParser::new()),
+        );
+
+        handler
+            .register_external_cmd("custom_status", test_external_cmd_handler())
+            .unwrap();
+
+        assert!(handler.unregister_external_cmd("custom_status").is_some());
+        assert!(handler.unregister_external_cmd("custom_status").is_none());
     }
 
     #[tokio::test]
