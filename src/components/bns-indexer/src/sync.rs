@@ -359,6 +359,7 @@ where
             | RegistryEvent::NameAssetTransferred { name, .. }
             | RegistryEvent::NameOwnerUpdated { name, .. }
             | RegistryEvent::NameReleased { name, .. }
+            | RegistryEvent::OwnerDocumentIatFloorUpdated { name, .. }
             | RegistryEvent::NamespacePolicyUpdated { name, .. } => {
                 self.push_name_state(&mut write, name).await?;
             }
@@ -375,15 +376,12 @@ where
             RegistryEvent::DocumentRevoked {
                 name,
                 doc_type,
-                from_version,
-                to_version,
+                new_version,
                 ..
             } => {
                 self.push_name_state(&mut write, name).await?;
-                for version in *from_version..=*to_version {
-                    self.push_document_state(&mut write, name, doc_type, version)
-                        .await?;
-                }
+                self.push_document_state(&mut write, name, doc_type, *new_version)
+                    .await?;
             }
             RegistryEvent::AuthorityKeysUpdated { name, .. } => {
                 let set = self.read_authority_set(name).await?;
@@ -642,6 +640,8 @@ fn name_state_from_evm(state: EvmNameState) -> BnsRegistryResult<NameState> {
         updated_at: state.updatedAt,
         name_seq: state.nameSeq,
         owner_document_version: state.ownerDocumentVersion,
+        min_document_iat: state.minDocumentIat,
+        owner_policy_seq: state.ownerPolicySeq,
         lineage_epoch: state.lineageEpoch,
         renewable: state.renewable,
         transferable: state.transferable,

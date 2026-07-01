@@ -3,7 +3,7 @@ use crate::sn_resolver::{
     SnResolverResult,
 };
 use async_trait::async_trait;
-use bns_client::{BnsClientError, BnsIndexerApi, BnsIndexerClient};
+use bns_client::{BnsClientError, BnsIndexerApi, BnsIndexerClient, DocumentStatus};
 use serde_json::Value;
 
 pub struct BnsIndexerDocumentReader {
@@ -33,11 +33,16 @@ impl BnsIndexerDocumentReader {
 
     async fn owner_config(&self, name: &str) -> SnResolverResult<Option<Value>> {
         match self.client.resolve_document(name, "owner").await {
-            Ok(result) => Ok(Self::decode_inline_document_value(
-                result.document_state.document.inline_document.as_slice(),
-                name,
-                "owner",
-            )?),
+            Ok(result) => {
+                if result.status != DocumentStatus::Active {
+                    return Ok(None);
+                }
+                Ok(Self::decode_inline_document_value(
+                    result.document_state.document.inline_document.as_slice(),
+                    name,
+                    "owner",
+                )?)
+            }
             Err(error) if Self::is_document_not_found(&error) => Ok(None),
             Err(error) => Err(Self::backend_error(
                 format!("resolve BNS owner document {}", name).as_str(),
@@ -137,6 +142,9 @@ impl BnsDocumentReader for BnsIndexerDocumentReader {
         };
 
         let state = result.document_state;
+        if result.status != DocumentStatus::Active {
+            return Ok(None);
+        }
         let content = Self::decode_document_content(
             state.name.as_str(),
             state.doc_type.as_str(),

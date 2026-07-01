@@ -2,8 +2,9 @@ use crate::dns_document::{self, DnsTxtRecord, DNS_TXT_DOC_TYPE};
 use crate::{
     canonical_bns_name, canonical_doc_type, controller_rule, default_document_update, hash_json,
     policy_hash_from_rules, AuthorityKeyUpdate, AuthorityRole, AuthoritySetState, BnsRegistryError,
-    CallAuthority, DocumentRef, DocumentState, DocumentUpdate, MutationGuard, NameState, Principal,
-    PrincipalKind, RegisterOptions, PERMISSION_PUBLISH_DOCUMENT, ZERO_HASH,
+    CallAuthority, DocumentRef, DocumentState, DocumentStatus, DocumentUpdate, MutationGuard,
+    NameState, OwnerPolicyUpdate, Principal, PrincipalKind, RegisterOptions,
+    PERMISSION_PUBLISH_DOCUMENT, ZERO_HASH,
 };
 use crate::{
     BnsApplyMutationsReq, BnsClientError, BnsDocumentVersion, BnsEvmControllerClient,
@@ -719,6 +720,7 @@ impl SnBnsController {
                         name: params.name.clone(),
                         authority_key_updates: Vec::new(),
                         documents: updates.clone(),
+                        owner_policy: OwnerPolicyUpdate::none(),
                         authority: params.authority.clone(),
                         guard,
                     })
@@ -986,6 +988,7 @@ impl SnBnsController {
         doc_type: &str,
     ) -> SnBnsControllerResult<Option<DocumentState>> {
         match self.client.resolve_document(name, doc_type).await {
+            Ok(result) if result.status == DocumentStatus::Missing => Ok(None),
             Ok(result) => Ok(Some(result.document_state)),
             Err(error) if error.is_registry_code("DOCUMENT_NOT_FOUND") => Ok(None),
             Err(error) => Err(error.into()),

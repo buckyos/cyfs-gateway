@@ -4,8 +4,8 @@ use std::sync::{Arc, Mutex};
 
 use crate::{
     AuthorityKey, AuthorityKeyStatus, AuthorityKeyUpdate, AuthorityRole, CallAuthority,
-    ControllerRule, DocumentRef, DocumentUpdate, MutationGuard, Principal, PrincipalKind,
-    RegisterOptions,
+    ControllerRule, DocumentRef, DocumentUpdate, MutationGuard, OwnerPolicyUpdate, Principal,
+    PrincipalKind, RegisterOptions,
 };
 use async_trait::async_trait;
 use bns_evm::{
@@ -15,8 +15,9 @@ use bns_evm::{
     BnsEvmError, Bytes, CallAuthority as EvmCallAuthority, ControllerRule as EvmControllerRule,
     DocumentRef as EvmDocumentRef, DocumentUpdate as EvmDocumentUpdate, Eip1559TxParams,
     EthRpcClient, EthTransactionReceipt, MutationGuard as EvmMutationGuard,
-    Principal as EvmPrincipal, PrincipalKind as EvmPrincipalKind,
-    RegisterOptions as EvmRegisterOptions, SignedEip1559Tx, SolCall, TxEip1559, B256, U256,
+    OwnerPolicyUpdate as EvmOwnerPolicyUpdate, Principal as EvmPrincipal,
+    PrincipalKind as EvmPrincipalKind, RegisterOptions as EvmRegisterOptions, SignedEip1559Tx,
+    SolCall, TxEip1559, B256, U256,
 };
 use serde::{Deserialize, Serialize};
 use tokio::time::{sleep, Duration, Instant};
@@ -24,7 +25,7 @@ use tokio::time::{sleep, Duration, Instant};
 use crate::{
     BnsApplyMutationsReq, BnsBootstrapNameReq, BnsClientError, BnsClientResult, BnsIndexerApi,
     BnsPublishDocumentReq, BnsRegisterNameReq, BnsRevokeDocumentReq, BnsSetControllerPolicyReq,
-    BnsSubmitRawTxReq, BnsUpdateAuthorityKeysReq,
+    BnsSetMinDocumentIatReq, BnsSubmitRawTxReq, BnsUpdateAuthorityKeysReq,
 };
 
 impl From<BnsEvmError> for BnsClientError {
@@ -133,6 +134,7 @@ pub enum BnsEvmWriteOperation {
     ApplyMutations,
     PublishDocument,
     RevokeDocument,
+    SetMinDocumentIat,
     SetControllerPolicy,
     UpdateAuthorityKeys,
 }
@@ -146,6 +148,7 @@ impl BnsEvmWriteOperation {
             Self::ApplyMutations => "apply_mutations",
             Self::PublishDocument => "publish_document",
             Self::RevokeDocument => "revoke_document",
+            Self::SetMinDocumentIat => "set_min_document_iat",
             Self::SetControllerPolicy => "set_controller_policy",
             Self::UpdateAuthorityKeys => "update_authority_keys",
         }
@@ -597,6 +600,19 @@ impl BnsEvmControllerClient {
             .await
     }
 
+    pub async fn set_min_document_iat(
+        &self,
+        req: &BnsSetMinDocumentIatReq,
+    ) -> BnsClientResult<BnsEvmTxSubmission> {
+        let request = BnsEvmSignRequest::new(
+            BnsEvmWriteOperation::SetMinDocumentIat,
+            req.name.clone(),
+            req.authority.clone(),
+        );
+        self.sign_and_submit_with_request(&request, &set_min_document_iat_call(req)?)
+            .await
+    }
+
     pub async fn set_controller_policy(
         &self,
         req: &BnsSetControllerPolicyReq,
@@ -710,6 +726,7 @@ pub fn apply_mutations_call(
         name: req.name.clone(),
         authorityUpdates: authority_key_updates_to_evm(&req.authority_key_updates)?,
         documents: document_updates_to_evm(&req.documents)?,
+        ownerPolicy: owner_policy_update_to_evm(&req.owner_policy)?,
         authority: call_authority_to_evm(&req.authority)?,
         guard: mutation_guard_to_evm(req.guard),
     })
@@ -749,8 +766,19 @@ pub fn revoke_document_call(
     Ok(Bns::revokeDocumentCall {
         name: req.name.clone(),
         docType: req.doc_type.clone(),
-        fromVersion: req.from_version,
-        toVersion: req.to_version,
+        expectedVersion: req.expected_version,
+        reasonHash: parse_b256_or_zero(&req.reason_hash, "reason_hash")?,
+        authority: call_authority_to_evm(&req.authority)?,
+        guard: mutation_guard_to_evm(req.guard),
+    })
+}
+
+pub fn set_min_document_iat_call(
+    req: &BnsSetMinDocumentIatReq,
+) -> BnsClientResult<Bns::setMinDocumentIatCall> {
+    Ok(Bns::setMinDocumentIatCall {
+        name: req.name.clone(),
+        minDocumentIat: req.min_document_iat,
         reasonHash: parse_b256_or_zero(&req.reason_hash, "reason_hash")?,
         authority: call_authority_to_evm(&req.authority)?,
         guard: mutation_guard_to_evm(req.guard),
@@ -824,6 +852,14 @@ fn document_update_to_evm(update: &DocumentUpdate) -> BnsClientResult<EvmDocumen
         splitPolicyHash: parse_b256_or_zero(&update.split_policy_hash, "split_policy_hash")?,
         pricePolicyHash: parse_b256_or_zero(&update.price_policy_hash, "price_policy_hash")?,
         rightsPolicyHash: parse_b256_or_zero(&update.rights_policy_hash, "rights_policy_hash")?,
+    })
+}
+
+fn owner_policy_update_to_evm(update: &OwnerPolicyUpdate) -> BnsClientResult<EvmOwnerPolicyUpdate> {
+    Ok(EvmOwnerPolicyUpdate {
+        updateMinDocumentIat: update.update_min_document_iat,
+        minDocumentIat: update.min_document_iat,
+        reasonHash: parse_b256_or_zero(&update.reason_hash, "reason_hash")?,
     })
 }
 

@@ -53,7 +53,9 @@ contract BnsControllerPolicyTest is BnsTestBase {
         s = _seq();
         vm.prank(CTRL);
         vm.expectPartialRevert(ControllerScopeDenied.selector);
-        bns.revokeDocument("alice", "dns_txt", 1, 1, keccak256("r"), _controllerAuth(CTRL), _guard(s));
+        bns.revokeDocument(
+            "alice", "dns_txt", 1, keccak256("r"), _controllerAuth(CTRL), _guard(s)
+        );
     }
 
     function testRevokePermissionBit() public {
@@ -62,7 +64,9 @@ contract BnsControllerPolicyTest is BnsTestBase {
 
         uint64 s = _seq();
         vm.prank(CTRL);
-        bns.revokeDocument("alice", "dns_txt", 1, 1, keccak256("r"), _controllerAuth(CTRL), _guard(s));
+        bns.revokeDocument(
+            "alice", "dns_txt", 1, keccak256("r"), _controllerAuth(CTRL), _guard(s)
+        );
         assertTrue(
             bns.resolveDocument("alice", "dns_txt").status == DocumentStatus.Revoked, "revoked"
         );
@@ -72,7 +76,7 @@ contract BnsControllerPolicyTest is BnsTestBase {
         s = _seq();
         vm.prank(CTRL);
         vm.expectPartialRevert(ControllerScopeDenied.selector);
-        _publishDoc("alice", "dns_txt", 1, r, _controllerAuth(CTRL), _guard(s));
+        _publishDoc("alice", "dns_txt", 2, r, _controllerAuth(CTRL), _guard(s));
     }
 
     function testSetPaymentPermissionBit() public {

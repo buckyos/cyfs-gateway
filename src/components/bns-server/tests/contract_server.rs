@@ -134,6 +134,8 @@ fn seeded_store() -> SqliteBnsRegistryStore {
                 updated_at: 2,
                 name_seq: 1,
                 owner_document_version: 0,
+                min_document_iat: 0,
+                owner_policy_seq: 0,
                 lineage_epoch: 0,
                 renewable: true,
                 transferable: true,

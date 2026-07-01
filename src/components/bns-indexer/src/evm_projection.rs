@@ -172,10 +172,20 @@ fn registry_event_from_contract_event(event: BnsEvent) -> BnsRegistryResult<Regi
         BnsEvent::DocumentRevoked(event) => Ok(RegistryEvent::DocumentRevoked {
             name: event.name,
             doc_type: event.docType,
-            from_version: event.fromVersion,
-            to_version: event.toVersion,
+            previous_version: event.previousVersion,
+            new_version: event.newVersion,
             reason_hash: hash_string(event.reasonHash),
         }),
+        BnsEvent::OwnerDocumentIatFloorUpdated(event) => {
+            Ok(RegistryEvent::OwnerDocumentIatFloorUpdated {
+                name: event.name,
+                previous_min_document_iat: event.previousMinDocumentIat,
+                new_min_document_iat: event.newMinDocumentIat,
+                owner_policy_seq: event.ownerPolicySeq,
+                name_seq: event.nameSeq,
+                reason_hash: hash_string(event.reasonHash),
+            })
+        }
         BnsEvent::ControllerPolicyUpdated(event) => Ok(RegistryEvent::ControllerPolicyUpdated {
             name: event.name,
             policy_hash: hash_string(event.policyHash),

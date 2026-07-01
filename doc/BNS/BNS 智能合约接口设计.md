@@ -975,23 +975,23 @@ function publishDocument(
 function revokeDocument(
     string calldata name,
     string calldata docType,
-    uint64 fromVersion,
-    uint64 toVersion,
+    uint64 expectedVersion,
     bytes32 reasonHash,
+    uint64 revokedBeforeIat,
     CallAuthority calldata authority,
     MutationGuard calldata guard
-) external returns (uint64 nameSeq);
+) external returns (uint64 newVersion, uint64 nameSeq);
 ```
 
-owner 或具有 revoke permission 的 controller 可以吊销文档。吊销不删除历史。
+owner 或具有 revoke permission 的 controller 可以吊销当前文档状态。吊销不删除历史，也不原地修改旧版本。
 
 current 指针语义（防静默降级）：
 
-- 吊销一个**不含**当前版本的历史区间时，current 指针不变。
-- 吊销区间**包含**当前版本时，current 指针**停留在该被吊销的版本**，状态置为 `Revoked`，**绝不自动回滚**到任何更早的 Active 版本。
-- 此后 `resolveDocument` 必须返回 `status = Revoked`，让客户端明确看到「当前版本已被吊销、暂无可信当前文档」，而不是悄悄拿到一个旧版本。
+- `expectedVersion` 只作为并发保护，必须等于当前版本。
+- `expectedVersion = 0` 表示此前没有链上文档，允许首次发布负声明（`Missing -> Revoked v1`）。
+- 吊销总是创建新的当前版本，例如 `Active v1 -> Revoked v2`。
+- `resolveDocument` 必须返回当前 `status = Revoked`，绝不自动回滚到任何更早的 Active 版本。
 - 要恢复一个可用的当前版本，必须显式 `publishDocument` 发布新版本；新版本的 `version` 仍单调递增，不复用旧号。
-- `fromVersion`/`toVersion` 必须满足 `fromVersion <= toVersion <= 当前版本`，且不得吊销 `version = 0`。
 
 ### setControllerPolicy
 
@@ -1292,10 +1292,13 @@ event DocumentPublished(
 );
 
 event DocumentRevoked(
-    string indexed name,
+    bytes32 indexed nameHash,
+    string name,
     string docType,
-    uint64 fromVersion,
-    uint64 toVersion,
+    address indexed actor,
+    uint64 previousVersion,
+    uint64 newVersion,
+    uint64 revokedBeforeIat,
     bytes32 reasonHash
 );
 

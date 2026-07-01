@@ -290,7 +290,6 @@ fn controller_policy_scopes_document_operations() {
             "alice",
             "owner",
             1,
-            1,
             ZERO_HASH,
             CallAuthority::controller(Principal::chain_account(CONTROLLER), ""),
             guard(4),
@@ -346,7 +345,6 @@ fn revoke_current_document_keeps_current_pointer_revoked() {
             "alice",
             "owner",
             2,
-            2,
             ZERO_HASH,
             chain_owner(3, OWNER_A).0,
             chain_owner(3, OWNER_A).1,
@@ -354,7 +352,15 @@ fn revoke_current_document_keeps_current_pointer_revoked() {
         .unwrap();
 
     let resolved = registry.resolve_document("alice", "owner").unwrap();
-    assert_eq!(resolved.document_state.version, 2);
+    assert_eq!(resolved.document_state.version, 3);
+    assert_eq!(
+        registry
+            .get_document_version("alice", "owner", 2)
+            .unwrap()
+            .unwrap()
+            .status,
+        DocumentStatus::Active
+    );
     assert_eq!(resolved.status, DocumentStatus::Revoked);
 }
 
@@ -538,7 +544,6 @@ fn released_and_tombstoned_names_reject_state_writes() {
             registry.revoke_document(
                 name,
                 "owner",
-                1,
                 1,
                 ZERO_HASH,
                 chain_owner(2, OWNER_A).0,
@@ -860,10 +865,9 @@ fn did_and_doc_type_resolve_distinct_zone_device_agent_and_app_documents() {
         .unwrap();
     assert!(inline_body(&app).contains(r#""package":"obj:filebrowser-v1""#));
 
-    assert!(matches!(
-        registry.resolve_did("did:bns:ood1.alice", "zone"),
-        Err(BnsRegistryError::DocumentNotFound { .. })
-    ));
+    let missing = registry.resolve_did("did:bns:ood1.alice", "zone").unwrap();
+    assert_eq!(missing.status, DocumentStatus::Missing);
+    assert_eq!(missing.document_state.version, 0);
 }
 
 #[test]

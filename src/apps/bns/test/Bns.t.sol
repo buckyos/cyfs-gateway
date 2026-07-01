@@ -238,14 +238,13 @@ contract BnsTest {
             "alice",
             "owner",
             1,
-            1,
             keccak256("bad-owner-doc"),
             _ownerAuth(address(this)),
             MutationGuard({ expectedNameSeq: state.nameSeq, expectedParentNameSeq: 0 })
         );
 
         ResolveResult memory resolved = bns.resolveDocument("alice", "owner");
-        require(resolved.documentState.version == 1, "current pointer");
+        require(resolved.documentState.version == 2, "current pointer");
         require(resolved.status == DocumentStatus.Revoked, "current is revoked");
     }
 

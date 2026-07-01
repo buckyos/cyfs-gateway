@@ -15,8 +15,8 @@ use bns_evm::{AuthorityRole as EvmAuthorityRole, PrincipalKind as EvmPrincipalKi
 use bns_indexer::dns_document::{self, DNS_TXT_DOC_TYPE};
 use bns_indexer::{
     controller_rule, default_document_update, policy_hash_from_rules, CallAuthority,
-    CentralizedBnsIndexerHandler, CentralizedBnsRegistry, DocumentRef, MutationGuard, Principal,
-    RegisterOptions, SqliteBnsRegistryStore, PERMISSION_PUBLISH_DOCUMENT,
+    CentralizedBnsIndexerHandler, CentralizedBnsRegistry, DocumentRef, DocumentStatus,
+    MutationGuard, Principal, RegisterOptions, SqliteBnsRegistryStore, PERMISSION_PUBLISH_DOCUMENT,
 };
 use serde_json::json;
 use std::net::{IpAddr, Ipv4Addr};
@@ -193,6 +193,7 @@ impl SnBnsEvmSubmitter for ApplyingEvmSubmitter {
                 req.name.as_str(),
                 req.authority_key_updates.clone(),
                 req.documents.clone(),
+                req.owner_policy.clone(),
                 req.authority.clone(),
                 req.guard,
             )
@@ -678,9 +679,13 @@ async fn sn_controller_cannot_publish_owner_scoped_device_doc() {
 
     assert_eq!(error.code(), "INVALID_INPUT");
     assert!(error.to_string().contains("requires owner authority"));
-    assert!(registry
-        .resolve_document("alice", DEVICE_MINI_DOC_TYPE)
-        .is_err());
+    assert_eq!(
+        registry
+            .resolve_document("alice", DEVICE_MINI_DOC_TYPE)
+            .unwrap()
+            .status,
+        DocumentStatus::Missing
+    );
 }
 
 #[tokio::test]
@@ -721,9 +726,13 @@ async fn sn_controller_rejects_controller_doc_type_outside_configured_scope() {
     assert!(error
         .to_string()
         .contains("not allowed to publish doc_type"));
-    assert!(registry
-        .resolve_document("alice", RELAY_ASSIGNMENT_DOC_TYPE)
-        .is_err());
+    assert_eq!(
+        registry
+            .resolve_document("alice", RELAY_ASSIGNMENT_DOC_TYPE)
+            .unwrap()
+            .status,
+        DocumentStatus::Missing
+    );
 }
 
 #[tokio::test]

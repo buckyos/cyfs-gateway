@@ -32,6 +32,25 @@ SN 是 BNS 早期可用性的过渡服务，最终目标不是生态化，而是
 - SN controller / bns-controller 只属于 Web2 兼容产品路径，用于照顾日常不使用钱包的用户；它不是 Web3 核心路径。
 - 官方 SN 的长期目标不是承载更多流量，而是随着 user-owned gateway 普及逐步降低依赖，最终可以下线。
 
+## 什么情况下需要 SN
+
+基本判据：如果一个 Zone（尤其是 Zone 的 gateway 节点）无法获得一个**固定的公网 IP**，就需要 SN。
+
+固定 IP 可以是 IPv4，也可以是 IPv6。只有在 gateway 拥有固定公网 IP、并把该 IP 写入 Zone Config（即 `zone` 文档的 `gateway_ips`）之后，才能完全依赖 BNS 做 DNS 解析，从而替代传统 DNS 解析。这正对应 DNS 查询一节里"优先返回 `zone` 文档 `gateway_ips`、命中即直接返回"的那条路径：地址固定且已上链，解析就不需要 SN 参与。
+
+需要 SN 的情况主要包括：
+
+1. **gateway 在 NAT 后面**：拿不到公网入口，流量必须经 SN relay 中转。对应 DNS 查询里设备 `is_wan_device == false` 时注入 SN 出口地址（`sn_ips` 或 `server_ip`）的逻辑。
+2. **有公网 IP 但 IP 会变动**：虽然可以不走中转，但地址不固定，无法静态写入 Zone Config。这种情况下若解析依赖类似 DDNS 的定期上报机制（设备 `update_ood_info` 上报、SN 按在线态返回当前可达 IP），仍然需要 SN 充当这个上报与解析中介。
+
+反过来，一个 Zone 不再需要 SN（SN 可以对其退出历史舞台）的条件是：
+
+- Zone 的 gateway 拥有固定公网 IP（IPv4 或 IPv6 均可）。
+- 该固定 IP 已写入 `zone` 文档的 `gateway_ips`。
+- DNS 解析因此完全由 BNS 提供，不再依赖 SN 的在线态上报或 relay 中转。
+
+满足上述条件后，该 Zone 对 SN 的依赖即可降为 0。当所有（或绝大多数）Zone 都迁移到 user-owned gateway + 固定 IP 之后，官方 SN 即可整体下线。
+
 ## 设计目标
 
 新版本 SN 基于 `bns-indexer` 的最终状态构造。BNS 负责名字、文档、controller key、controller policy 等权威状态；SN 作为过渡服务，现阶段负责账号、设备在线信息、传统域名绑定、边缘 relay 分配和流量转发。
@@ -126,15 +145,13 @@ BNS 中的 `device_mini_doc` 是设备身份和基础配置的权威文档；`sn
 
 ### sn_relay_manager
 
-过渡 relay 调度与准入。负责：
+管理 relay 调度与准入。负责：
 
-- zone -> sn_relay 的分配关系。
-- relay 节点健康状态。
-- keep_tunnel 准入。
+- 管理 zone -> sn_relay 的分配关系。（创建/查询)
+- Zone只能和一个sn-relay绑定，家庭集群没有GLB的需求（企业级buckyos必然不依赖SN，通过多zone gateway实现GLB）
 - relay 迁移和手工调整。
-- 判断某个 zone/device 是否应该接入当前 relay 节点。
-
-`sn_relay_manager` 不应被设计成长期 SN 服务商市场的调度中心。它的职责是管理过渡期 fallback relay 资源，并为后续迁移到 user-owned gateway 保留清晰的退出路径。
+- relay 节点健康状态。
+- 准入,判断某个 zone/device 是否应该接入(keep-tunnel)当前 relay 节点。
 
 不单独设计 `sn_tunnel_registry`。每个 zone 的 device 都走该 zone 当前分配的 `sn_relay`，本地 tunnel 状态由 relay 节点运行时维护；跨节点只需要 `sn_relay_manager` 管理 zone -> relay 的关系。
 
@@ -203,6 +220,33 @@ BNS 中的 `device_mini_doc` 是设备身份和基础配置的权威文档；`sn
 
 - hostname 到 gateway device 的映射不能长期写死为 `ood1`，应该来自 `zone` 或 `boot` 文档。
 - `sn_device_info` 只提供在线态和 IP，不决定 gateway device 的权威身份。
+
+### 返回 IP 地址的构成（结合现有实现）
+
+A/AAAA 查询返回的 IP 不是单一来源，而是 `sn_resolver` 按优先级从多个来源合成、再做协议与可导出过滤后得到的列表。对应实现主要在 `sn_resolver::resolve_dns` 和 `resolve_gateway_addresses`。
+
+按优先级，命中即返回：
+
+1. **SN 自身域名**：查询目标是 SN 自己的 hostname 时，直接返回 `config.server_ip`。
+2. **user_domain 显式记录**：非 BNS 域名若在兼容存储里配置了显式 A/AAAA，直接返回该记录，不再走后续合成。
+3. **zone 文档 `gateway_ips`**：BNS `zone` 文档显式声明了 `gateway_ips` 时，直接返回这些 IP（即用户自有 public gateway 的地址），`source = BnsDocument`。
+4. **gateway device 在线态合成**：以上都没有时，才根据 `zone`/`boot` 指定的 gateway device（缺省回退到 `legacy_gateway_device_name`，即旧的 `ood1`），从 `sn_device_info` 在线态合成地址，`source = DeviceOnlineInfo`。
+
+第 4 步的地址合成顺序（全部叠加，不是互斥），核心区别在于设备是否公网可达：
+
+- 先并入 `zone` 文档里的 `gateway_ips`。
+- **设备不是 WAN 设备（`is_wan_device == false`，即在 NAT/内网后没有公网入口）时**：注入 SN relay 出口地址——优先用该 zone 分配的 `zone_info.sn_ips`（`get_user_sn_ips`），若为空则回退到 `config.server_ip`。这是"NAT 后设备默认把流量引到 SN 兜底中转"的关键：返回的不是设备自己的地址，而是 SN 的地址。
+- **设备是 WAN 设备时**：跳过 SN 注入，直接用设备自己的公网地址。
+- 再依次并入设备上报的 `public_ips`、`private_ips`、`active_endpoints` 中的 host，以及兼容设备文档和 `device_mini_doc` 内 `ip`/`ips`/`all_ip`/`addresses` 字段里的地址。
+
+其中 WAN/公网 判定不是查询时算的，而是 `update_ood_info` 上报时定下来的：`sn_device_info` 把设备 `reported_ip`、`reported_ips` 和 SN 实际观测到的 `from_ip`（请求真实来源 IP）一起做公网/私网分类，只要其中存在一个公网 IP，就置 `wan_ip` 并令 `is_wan_device = true`。因此 `from_ip` 是"设备是否真正公网直达"的关键信号，不依赖设备自报。
+
+最后所有候选地址都经过过滤再返回：
+
+- 按记录类型过滤：A 只保留 IPv4，AAAA 只保留 IPv6。
+- 丢弃不可导出地址：loopback、Docker 网桥地址（`172.16.0.0/12`）会被剔除，并去重。
+
+因此返回 IP 的"构成"可概括为：用户有自有公网入口时返回其声明地址或 user_domain 显式记录；gateway device 公网直达时返回设备自身公网 IP；设备在 NAT 后时返回 SN 的中转地址（zone 分配的 `sn_ips` 或 `server_ip`），同时附带设备 LAN 地址作为同网段可达补充。这与 SN 作为 fallback relay 的定位一致——能直连就给真实地址，不能直连才把流量兜到 SN。
 
 ## 注册管理
 
