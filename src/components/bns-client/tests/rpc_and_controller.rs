@@ -193,6 +193,7 @@ impl SnBnsEvmSubmitter for ApplyingEvmSubmitter {
                 req.name.as_str(),
                 req.authority_key_updates.clone(),
                 req.documents.clone(),
+                req.owner_policy.clone(),
                 req.authority.clone(),
                 req.guard,
             )

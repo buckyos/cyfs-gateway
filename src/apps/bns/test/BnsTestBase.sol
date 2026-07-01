@@ -132,7 +132,16 @@ contract BnsTestBase {
         address indexed actor,
         uint64 previousVersion,
         uint64 newVersion,
-        uint64 revokedBeforeIat,
+        bytes32 reasonHash
+    );
+    event OwnerDocumentIatFloorUpdated(
+        bytes32 indexed nameHash,
+        string name,
+        address indexed actor,
+        uint64 previousMinDocumentIat,
+        uint64 newMinDocumentIat,
+        uint64 ownerPolicySeq,
+        uint64 nameSeq,
         bytes32 reasonHash
     );
     event ControllerPolicyUpdated(
@@ -231,6 +240,14 @@ contract BnsTestBase {
 
     function _guard(uint64 nameSeq, uint64 parentSeq) internal pure returns (MutationGuard memory) {
         return MutationGuard({ expectedNameSeq: nameSeq, expectedParentNameSeq: parentSeq });
+    }
+
+    function _noOwnerPolicyUpdate() internal pure returns (OwnerPolicyUpdate memory) {
+        return OwnerPolicyUpdate({
+            updateMinDocumentIat: false,
+            minDocumentIat: 0,
+            reasonHash: ZERO
+        });
     }
 
     // --- document builders -------------------------------------------------

@@ -82,7 +82,6 @@ contract BnsDocumentTest is BnsTestBase {
             "dns_txt",
             0,
             keccak256("lost-before-publish"),
-            1234,
             _ownerAuth(ALICE),
             _guard(s)
         );
@@ -110,7 +109,7 @@ contract BnsDocumentTest is BnsTestBase {
         s = _seq();
         vm.prank(ALICE);
         (uint64 version, uint64 nameSeq) = bns.revokeDocument(
-            "alice", "dns_txt", 1, keccak256("bad"), 2222, _ownerAuth(ALICE), _guard(s)
+            "alice", "dns_txt", 1, keccak256("bad"), _ownerAuth(ALICE), _guard(s)
         );
 
         assertEqUint(version, 2, "revoke creates v2");
@@ -141,7 +140,7 @@ contract BnsDocumentTest is BnsTestBase {
         vm.prank(ALICE);
         vm.expectPartialRevert(StaleDocumentVersion.selector);
         bns.revokeDocument(
-            "alice", "dns_txt", 0, keccak256("stale"), 0, _ownerAuth(ALICE), _guard(s)
+            "alice", "dns_txt", 0, keccak256("stale"), _ownerAuth(ALICE), _guard(s)
         );
     }
 
@@ -149,7 +148,7 @@ contract BnsDocumentTest is BnsTestBase {
         uint64 s = _seq();
         vm.prank(ALICE);
         bns.revokeDocument(
-            "alice", "dns_txt", 0, keccak256("lost"), 1000, _ownerAuth(ALICE), _guard(s)
+            "alice", "dns_txt", 0, keccak256("lost"), _ownerAuth(ALICE), _guard(s)
         ); // v1
 
         DocumentRef memory r = _inlineDoc(bytes("[{\"v\":2}]"));
@@ -177,7 +176,7 @@ contract BnsDocumentTest is BnsTestBase {
         s = _seq();
         vm.prank(ALICE);
         bns.revokeDocument(
-            "alice", "dns_txt", 1, keccak256("bad"), 1000, _ownerAuth(ALICE), _guard(s)
+            "alice", "dns_txt", 1, keccak256("bad"), _ownerAuth(ALICE), _guard(s)
         ); // v2
 
         ResolveResult memory resolved = bns.resolveDocument("alice", "dns_txt");
@@ -215,7 +214,6 @@ contract BnsDocumentTest is BnsTestBase {
             "device",
             0,
             keccak256("lost-laptop"),
-            1000,
             _ownerAuth(ALICE),
             _guard(s)
         );

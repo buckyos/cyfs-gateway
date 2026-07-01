@@ -54,7 +54,7 @@ contract BnsControllerPolicyTest is BnsTestBase {
         vm.prank(CTRL);
         vm.expectPartialRevert(ControllerScopeDenied.selector);
         bns.revokeDocument(
-            "alice", "dns_txt", 1, keccak256("r"), 0, _controllerAuth(CTRL), _guard(s)
+            "alice", "dns_txt", 1, keccak256("r"), _controllerAuth(CTRL), _guard(s)
         );
     }
 
@@ -65,7 +65,7 @@ contract BnsControllerPolicyTest is BnsTestBase {
         uint64 s = _seq();
         vm.prank(CTRL);
         bns.revokeDocument(
-            "alice", "dns_txt", 1, keccak256("r"), 0, _controllerAuth(CTRL), _guard(s)
+            "alice", "dns_txt", 1, keccak256("r"), _controllerAuth(CTRL), _guard(s)
         );
         assertTrue(
             bns.resolveDocument("alice", "dns_txt").status == DocumentStatus.Revoked, "revoked"

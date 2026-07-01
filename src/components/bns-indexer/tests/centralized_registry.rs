@@ -291,7 +291,6 @@ fn controller_policy_scopes_document_operations() {
             "owner",
             1,
             ZERO_HASH,
-            0,
             CallAuthority::controller(Principal::chain_account(CONTROLLER), ""),
             guard(4),
         ),
@@ -347,7 +346,6 @@ fn revoke_current_document_keeps_current_pointer_revoked() {
             "owner",
             2,
             ZERO_HASH,
-            0,
             chain_owner(3, OWNER_A).0,
             chain_owner(3, OWNER_A).1,
         )
@@ -548,7 +546,6 @@ fn released_and_tombstoned_names_reject_state_writes() {
                 "owner",
                 1,
                 ZERO_HASH,
-                0,
                 chain_owner(2, OWNER_A).0,
                 guard(2),
             ),

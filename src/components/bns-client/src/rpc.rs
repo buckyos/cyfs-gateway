@@ -1,7 +1,8 @@
 use crate::{
     AuthorityKey, AuthorityKeyUpdate, AuthoritySetState, BnsRegistryError, BnsRegistryResult,
     CallAuthority, ControllerRule, DocumentState, DocumentUpdate, EventLogRecord, LogCheckpoint,
-    MutationGuard, NameState, OwnerResolution, Principal, RegisterOptions, ResolveResult,
+    MutationGuard, NameState, OwnerPolicyUpdate, OwnerResolution, Principal, RegisterOptions,
+    ResolveResult,
 };
 use ::kRPC::{kRPC, RPCErrors, RPCHandler, RPCRequest, RPCResponse, RPCResult};
 use async_trait::async_trait;
@@ -27,6 +28,7 @@ pub const METHOD_BOOTSTRAP_NAME: &str = "name.bootstrap";
 pub const METHOD_APPLY_MUTATIONS: &str = "mutation.apply";
 pub const METHOD_PUBLISH_DOCUMENT: &str = "document.publish";
 pub const METHOD_REVOKE_DOCUMENT: &str = "document.revoke";
+pub const METHOD_SET_MIN_DOCUMENT_IAT: &str = "owner.set_min_document_iat";
 pub const METHOD_SET_CONTROLLER_POLICY: &str = "controller.set_policy";
 pub const METHOD_UPDATE_AUTHORITY_KEYS: &str = "authority.update_keys";
 pub const METHOD_LIST_EVENTS: &str = "events.list";
@@ -358,6 +360,8 @@ pub struct BnsApplyMutationsReq {
     pub name: String,
     pub authority_key_updates: Vec<AuthorityKeyUpdate>,
     pub documents: Vec<DocumentUpdate>,
+    #[serde(default)]
+    pub owner_policy: OwnerPolicyUpdate,
     pub authority: CallAuthority,
     pub guard: MutationGuard,
 }
@@ -367,6 +371,7 @@ pub struct BnsApplyMutationsResp {
     pub name_seq: u64,
     pub documents: Vec<BnsDocumentVersion>,
     pub authority_set: AuthoritySetState,
+    pub owner_policy_seq: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -375,7 +380,6 @@ pub struct BnsRevokeDocumentReq {
     pub doc_type: String,
     pub expected_version: u64,
     pub reason_hash: String,
-    pub revoked_before_iat: u64,
     pub authority: CallAuthority,
     pub guard: MutationGuard,
 }
@@ -384,6 +388,21 @@ pub struct BnsRevokeDocumentReq {
 pub struct BnsRevokeDocumentResp {
     pub document_version: u64,
     pub name_seq: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BnsSetMinDocumentIatReq {
+    pub name: String,
+    pub min_document_iat: u64,
+    pub reason_hash: String,
+    pub authority: CallAuthority,
+    pub guard: MutationGuard,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BnsSetMinDocumentIatResp {
+    pub name_seq: u64,
+    pub owner_policy_seq: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -478,6 +497,15 @@ pub trait BnsIndexerApi: Send + Sync {
         &self,
         req: BnsRevokeDocumentReq,
     ) -> BnsClientResult<BnsRevokeDocumentResp>;
+
+    async fn set_min_document_iat(
+        &self,
+        _req: BnsSetMinDocumentIatReq,
+    ) -> BnsClientResult<BnsSetMinDocumentIatResp> {
+        Err(BnsClientError::unsupported(
+            "bns-indexer set_min_document_iat handler is not configured",
+        ))
+    }
 
     async fn set_controller_policy(
         &self,
@@ -688,6 +716,16 @@ impl BnsIndexerApi for BnsIndexerClient {
         }
     }
 
+    async fn set_min_document_iat(
+        &self,
+        req: BnsSetMinDocumentIatReq,
+    ) -> BnsClientResult<BnsSetMinDocumentIatResp> {
+        match self {
+            Self::InProcess(handler) => handler.set_min_document_iat(req).await,
+            Self::KRPC(_) => self.call(METHOD_SET_MIN_DOCUMENT_IAT, &req).await,
+        }
+    }
+
     async fn set_controller_policy(
         &self,
         req: BnsSetControllerPolicyReq,
@@ -816,6 +854,11 @@ where
                 let parsed: BnsRevokeDocumentReq =
                     parse_req(req.params.clone(), "BnsRevokeDocumentReq")?;
                 rpc_envelope_response(self.0.revoke_document(parsed).await, &req)
+            }
+            METHOD_SET_MIN_DOCUMENT_IAT | "set_min_document_iat" => {
+                let parsed: BnsSetMinDocumentIatReq =
+                    parse_req(req.params.clone(), "BnsSetMinDocumentIatReq")?;
+                rpc_envelope_response(self.0.set_min_document_iat(parsed).await, &req)
             }
             METHOD_SET_CONTROLLER_POLICY | "set_controller_policy" => {
                 let parsed: BnsSetControllerPolicyReq =

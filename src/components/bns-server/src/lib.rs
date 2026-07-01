@@ -17,10 +17,12 @@ use bns_client::{
     BnsIndexerApi, BnsIndexerRpcHandler, BnsListEventsReq, BnsNameReq, BnsPublishDocumentReq,
     BnsPublishDocumentResp, BnsRegisterNameReq, BnsRegisterNameResp, BnsRevokeDocumentReq,
     BnsRevokeDocumentResp, BnsRpcEnvelope, BnsSetControllerPolicyReq, BnsSetControllerPolicyResp,
-    BnsSubmitRawTxReq, BnsSubmitRawTxResp, BnsUpdateAuthorityKeysReq, BnsUpdateAuthorityKeysResp,
-    BNS_INDEXER_RPC_PATH, BNS_SERVER_RPC_PATH, METHOD_GET_AUTHORITY_KEY, METHOD_GET_AUTHORITY_SET,
+    BnsSetMinDocumentIatReq, BnsSetMinDocumentIatResp, BnsSubmitRawTxReq, BnsSubmitRawTxResp,
+    BnsUpdateAuthorityKeysReq, BnsUpdateAuthorityKeysResp, BNS_INDEXER_RPC_PATH,
+    BNS_SERVER_RPC_PATH, METHOD_GET_AUTHORITY_KEY, METHOD_GET_AUTHORITY_SET,
     METHOD_GET_DOCUMENT_VERSION, METHOD_LATEST_CHECKPOINT, METHOD_LIST_EVENTS,
-    METHOD_QUERY_NAME_STATE, METHOD_RESOLVE_DOCUMENT, METHOD_RESOLVE_OWNER, METHOD_SUBMIT_RAW_TX,
+    METHOD_QUERY_NAME_STATE, METHOD_RESOLVE_DOCUMENT, METHOD_RESOLVE_OWNER,
+    METHOD_SET_MIN_DOCUMENT_IAT, METHOD_SUBMIT_RAW_TX,
 };
 use bns_evm::EthRpcClient;
 use bns_indexer::{
@@ -193,6 +195,13 @@ where
         self.unsupported_call_authority_write("document.revoke")
     }
 
+    async fn set_min_document_iat(
+        &self,
+        _req: BnsSetMinDocumentIatReq,
+    ) -> BnsClientResult<BnsSetMinDocumentIatResp> {
+        self.unsupported_call_authority_write("owner.set_min_document_iat")
+    }
+
     async fn set_controller_policy(
         &self,
         _req: BnsSetControllerPolicyReq,
@@ -285,6 +294,11 @@ where
             METHOD_SUBMIT_RAW_TX | "submit_raw_tx" => {
                 let parsed: BnsSubmitRawTxReq = parse_req(req.params.clone(), "BnsSubmitRawTxReq")?;
                 rpc_envelope_response(self.0.submit_raw_tx(parsed).await, &req)
+            }
+            METHOD_SET_MIN_DOCUMENT_IAT | "set_min_document_iat" => {
+                let parsed: BnsSetMinDocumentIatReq =
+                    parse_req(req.params.clone(), "BnsSetMinDocumentIatReq")?;
+                rpc_envelope_response(self.0.set_min_document_iat(parsed).await, &req)
             }
             METHOD_LIST_EVENTS | "list_events" => {
                 let parsed: BnsListEventsReq = parse_req(req.params.clone(), "BnsListEventsReq")?;
@@ -1050,6 +1064,8 @@ mod tests {
                     updated_at: 2,
                     name_seq: 1,
                     owner_document_version: 0,
+                    min_document_iat: 0,
+                    owner_policy_seq: 0,
                     lineage_epoch: 0,
                     renewable: true,
                     transferable: true,

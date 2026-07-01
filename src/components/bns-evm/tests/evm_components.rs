@@ -166,7 +166,6 @@ fn revoke_document_call_round_trips() {
         docType: "device".to_string(),
         expectedVersion: 2,
         reasonHash: B256::repeat_byte(0xAB),
-        revokedBeforeIat: 1_700_000_000,
         authority: public_authority(),
         guard: empty_guard(),
     };
@@ -174,10 +173,30 @@ fn revoke_document_call_round_trips() {
     let decoded = Bns::revokeDocumentCall::abi_decode(&encoded).expect("decode revokeDocument");
     assert_eq!(decoded.expectedVersion, 2);
     assert_eq!(decoded.reasonHash, B256::repeat_byte(0xAB));
-    assert_eq!(decoded.revokedBeforeIat, 1_700_000_000);
     assert_eq!(
         decode_bns_call(&encoded).unwrap().selector(),
         Bns::revokeDocumentCall::SELECTOR
+    );
+}
+
+#[test]
+fn set_min_document_iat_call_round_trips() {
+    let call = Bns::setMinDocumentIatCall {
+        name: "alice".to_string(),
+        minDocumentIat: 1_770_000_000,
+        reasonHash: B256::repeat_byte(0xA7),
+        authority: owner_authority(ANVIL_ADDR_0),
+        guard: empty_guard(),
+    };
+    let encoded = call.abi_encode();
+    let decoded =
+        Bns::setMinDocumentIatCall::abi_decode(&encoded).expect("decode setMinDocumentIat");
+    assert_eq!(decoded.name, "alice");
+    assert_eq!(decoded.minDocumentIat, 1_770_000_000);
+    assert_eq!(decoded.reasonHash, B256::repeat_byte(0xA7));
+    assert_eq!(
+        decode_bns_call(&encoded).unwrap().selector(),
+        Bns::setMinDocumentIatCall::SELECTOR
     );
 }
 

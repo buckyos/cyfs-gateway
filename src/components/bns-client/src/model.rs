@@ -440,6 +440,10 @@ pub struct NameState {
     pub updated_at: u64,
     pub name_seq: u64,
     pub owner_document_version: u64,
+    #[serde(default)]
+    pub min_document_iat: u64,
+    #[serde(default)]
+    pub owner_policy_seq: u64,
     pub lineage_epoch: u64,
     pub renewable: bool,
     pub transferable: bool,
@@ -625,6 +629,36 @@ impl DocumentUpdate {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OwnerPolicyUpdate {
+    pub update_min_document_iat: bool,
+    pub min_document_iat: u64,
+    pub reason_hash: String,
+}
+
+impl Default for OwnerPolicyUpdate {
+    fn default() -> Self {
+        Self::none()
+    }
+}
+
+impl OwnerPolicyUpdate {
+    pub fn none() -> Self {
+        Self {
+            update_min_document_iat: false,
+            min_document_iat: 0,
+            reason_hash: ZERO_HASH.to_string(),
+        }
+    }
+
+    pub fn validate(&self) -> BnsRegistryResult<()> {
+        if self.update_min_document_iat || !self.reason_hash.is_empty() {
+            validate_hash(&self.reason_hash)?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OwnerResolution {
     pub effective_owner: Principal,
     pub source: OwnerSource,
@@ -665,6 +699,7 @@ pub struct ApplyMutationsResult {
     pub name_seq: u64,
     pub documents: Vec<BootstrapDocumentVersion>,
     pub authority_set: AuthoritySetState,
+    pub owner_policy_seq: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -791,7 +826,14 @@ pub enum RegistryEvent {
         doc_type: String,
         previous_version: u64,
         new_version: u64,
-        revoked_before_iat: u64,
+        reason_hash: String,
+    },
+    OwnerDocumentIatFloorUpdated {
+        name: String,
+        previous_min_document_iat: u64,
+        new_min_document_iat: u64,
+        owner_policy_seq: u64,
+        name_seq: u64,
         reason_hash: String,
     },
     ControllerPolicyUpdated {
@@ -838,6 +880,7 @@ impl RegistryEvent {
             Self::NameReleased { .. } => "name_released",
             Self::DocumentPublished { .. } => "document_published",
             Self::DocumentRevoked { .. } => "document_revoked",
+            Self::OwnerDocumentIatFloorUpdated { .. } => "owner_iat_floor_updated",
             Self::ControllerPolicyUpdated { .. } => "controller_policy_updated",
             Self::NamespacePolicyUpdated { .. } => "namespace_policy_updated",
             Self::DidAliasSet { .. } => "did_alias_set",

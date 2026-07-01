@@ -261,6 +261,8 @@ fn evm_name_state(name: &str, seq: u64) -> bns_evm::NameState {
         updatedAt: 2,
         nameSeq: seq,
         ownerDocumentVersion: 0,
+        minDocumentIat: 0,
+        ownerPolicySeq: 0,
         lineageEpoch: 0,
         renewable: true,
         transferable: true,
@@ -996,6 +998,11 @@ async fn sync_backfills_authority_keys_from_apply_mutations_call() {
         name: "alice".to_string(),
         authorityUpdates: vec![bns_evm::AuthorityKeyUpdate { key, active: true }],
         documents: vec![],
+        ownerPolicy: bns_evm::OwnerPolicyUpdate {
+            updateMinDocumentIat: false,
+            minDocumentIat: 0,
+            reasonHash: B256::ZERO,
+        },
         authority: bns_evm::CallAuthority {
             role: bns_evm::AuthorityRole::Owner,
             actor: bns_evm::Principal {
@@ -1250,6 +1257,8 @@ fn sample_name_state() -> bns_indexer::NameState {
         updated_at: 2,
         name_seq: 1,
         owner_document_version: 0,
+        min_document_iat: 0,
+        owner_policy_seq: 0,
         lineage_epoch: 0,
         renewable: true,
         transferable: true,

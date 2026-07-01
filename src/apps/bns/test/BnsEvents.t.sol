@@ -69,10 +69,25 @@ contract BnsEventsTest is BnsTestBase {
 
         s = _seq("alice");
         vm.expectEmit(true, true, true, true, address(bns));
-        emit DocumentRevoked(nh, "alice", "dns_txt", ALICE, 1, 2, 1234, keccak256("reason"));
+        emit DocumentRevoked(nh, "alice", "dns_txt", ALICE, 1, 2, keccak256("reason"));
         vm.prank(ALICE);
         bns.revokeDocument(
-            "alice", "dns_txt", 1, keccak256("reason"), 1234, _ownerAuth(ALICE), _guard(s)
+            "alice", "dns_txt", 1, keccak256("reason"), _ownerAuth(ALICE), _guard(s)
+        );
+    }
+
+    function testEmitOwnerDocumentIatFloorUpdated() public {
+        _registerRoot("alice", ALICE);
+        bytes32 nh = _nameHash("alice");
+        uint64 s = _seq("alice");
+
+        vm.expectEmit(true, true, true, true, address(bns));
+        emit OwnerDocumentIatFloorUpdated(
+            nh, "alice", ALICE, 0, 1_770_000_000, 1, s + 1, keccak256("compromised")
+        );
+        vm.prank(ALICE);
+        bns.setMinDocumentIat(
+            "alice", 1_770_000_000, keccak256("compromised"), _ownerAuth(ALICE), _guard(s)
         );
     }
 

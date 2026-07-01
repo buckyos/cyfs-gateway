@@ -7,7 +7,8 @@ use bns_client::{
     BnsClientError, BnsClientResult, BnsDocumentVersion, BnsIndexerApi, BnsPublishDocumentReq,
     BnsPublishDocumentResp, BnsRegisterNameReq, BnsRegisterNameResp, BnsRevokeDocumentReq,
     BnsRevokeDocumentResp, BnsSetControllerPolicyReq, BnsSetControllerPolicyResp,
-    BnsUpdateAuthorityKeysReq, BnsUpdateAuthorityKeysResp,
+    BnsSetMinDocumentIatReq, BnsSetMinDocumentIatResp, BnsUpdateAuthorityKeysReq,
+    BnsUpdateAuthorityKeysResp,
 };
 use serde_json::Value;
 
@@ -19,8 +20,8 @@ use crate::{
     BnsRegistryResult, BnsRegistryStore, BnsRegistryStoreTx, BootstrapDocumentVersion,
     BootstrapNameResult, CallAuthority, ControllerRule, DocumentRef, DocumentState, DocumentStatus,
     DocumentUpdate, EventLogRecord, LogCheckpoint, MutationGuard, NameState, NameStatus,
-    OwnerResolution, OwnerSource, PaymentTargetResolution, Principal, PrincipalKind,
-    PurchaseContext, RegisterOptions, RegistryEvent, ReleaseMode, ResolveResult,
+    OwnerPolicyUpdate, OwnerResolution, OwnerSource, PaymentTargetResolution, Principal,
+    PrincipalKind, PurchaseContext, RegisterOptions, RegistryEvent, ReleaseMode, ResolveResult,
     KEY_PURPOSE_AUTHENTICATION, MAX_OWNER_REF_DEPTH, PERMISSION_PUBLISH_DOCUMENT,
     PERMISSION_REVOKE_DOCUMENT, PERMISSION_SET_ALIAS, PERMISSION_SET_NAMESPACE,
     PERMISSION_SET_PAYMENT, STORAGE_TYPE_INLINE, ZERO_HASH,
@@ -144,6 +145,7 @@ where
                 &req.name,
                 req.authority_key_updates,
                 req.documents,
+                req.owner_policy,
                 req.authority,
                 req.guard,
             )
@@ -161,6 +163,7 @@ where
                 })
                 .collect(),
             authority_set: result.authority_set,
+            owner_policy_seq: result.owner_policy_seq,
         })
     }
 
@@ -222,7 +225,6 @@ where
                 &req.doc_type,
                 req.expected_version,
                 &req.reason_hash,
-                req.revoked_before_iat,
                 req.authority,
                 req.guard,
             )
@@ -230,6 +232,26 @@ where
         Ok(BnsRevokeDocumentResp {
             document_version,
             name_seq,
+        })
+    }
+
+    async fn set_min_document_iat(
+        &self,
+        req: BnsSetMinDocumentIatReq,
+    ) -> BnsClientResult<BnsSetMinDocumentIatResp> {
+        let (name_seq, owner_policy_seq) = self
+            .registry
+            .set_min_document_iat(
+                &req.name,
+                req.min_document_iat,
+                &req.reason_hash,
+                req.authority,
+                req.guard,
+            )
+            .map_err(BnsClientError::from)?;
+        Ok(BnsSetMinDocumentIatResp {
+            name_seq,
+            owner_policy_seq,
         })
     }
 
@@ -560,6 +582,8 @@ where
                 updated_at: now,
                 name_seq: next_seq,
                 owner_document_version: 0,
+                min_document_iat: 0,
+                owner_policy_seq: 0,
                 lineage_epoch,
                 renewable: options.renewable,
                 transferable: options.transferable,
@@ -680,6 +704,8 @@ where
                 updated_at: now,
                 name_seq: next_seq,
                 owner_document_version: 0,
+                min_document_iat: 0,
+                owner_policy_seq: 0,
                 lineage_epoch,
                 renewable: options.renewable,
                 transferable: options.transferable,
@@ -1059,16 +1085,21 @@ where
         name: &str,
         authority_updates: Vec<AuthorityKeyUpdate>,
         documents: Vec<DocumentUpdate>,
+        owner_policy: OwnerPolicyUpdate,
         authority: CallAuthority,
         guard: MutationGuard,
     ) -> BnsRegistryResult<ApplyMutationsResult> {
         self.ensure_write_path("apply_mutations")?;
-        if authority_updates.is_empty() && documents.is_empty() {
+        if authority_updates.is_empty()
+            && documents.is_empty()
+            && !owner_policy.update_min_document_iat
+        {
             return Err(BnsRegistryError::InvalidMutation(
                 "mutation batch must not be empty".to_string(),
             ));
         }
         let name = canonical_bns_name(name)?;
+        owner_policy.validate()?;
         for update in &authority_updates {
             update.key.validate()?;
         }
@@ -1088,18 +1119,22 @@ where
             let state = self.required_active_name(tx, &name)?;
             self.check_guard(&state, &guard)?;
 
-            if !authority_updates.is_empty() {
+            let owner_only = !authority_updates.is_empty()
+                || owner_policy.update_min_document_iat
+                || documents.iter().any(|update| update.doc_type == "owner");
+            if owner_only {
                 self.authorize_owner_for_loaded(tx, &state, &authority)?;
-            }
-            for update in &documents {
-                self.authorize_update_no_guard(
-                    tx,
-                    &state,
-                    &update.doc_type,
-                    PERMISSION_PUBLISH_DOCUMENT,
-                    "publish_document",
-                    &authority,
-                )?;
+            } else {
+                for update in &documents {
+                    self.authorize_update_no_guard(
+                        tx,
+                        &state,
+                        &update.doc_type,
+                        PERMISSION_PUBLISH_DOCUMENT,
+                        "publish_document",
+                        &authority,
+                    )?;
+                }
             }
 
             if !authority_updates.is_empty() {
@@ -1107,13 +1142,15 @@ where
             }
 
             let mut document_versions = Vec::with_capacity(documents.len());
-            if !documents.is_empty() {
+            if !documents.is_empty() || owner_policy.update_min_document_iat {
                 let mut state = self.required_active_name(tx, &name)?;
                 state.name_seq += 1;
                 state.updated_at = now;
                 state = self.materialize_name_state(tx, state)?;
                 tx.put_name(&state)?;
+            }
 
+            if !documents.is_empty() {
                 for update in documents {
                     let doc_type = update.doc_type.clone();
                     let version = self.publish_document_internal(tx, &name, update, false, now)?;
@@ -1132,12 +1169,23 @@ where
                     });
                 }
             }
+            if owner_policy.update_min_document_iat {
+                self.set_min_document_iat_internal(
+                    tx,
+                    &name,
+                    owner_policy.min_document_iat,
+                    &owner_policy.reason_hash,
+                    false,
+                    now,
+                )?;
+            }
 
             let state = self.required_active_name(tx, &name)?;
             Ok(ApplyMutationsResult {
                 name_seq: state.name_seq,
                 documents: document_versions,
                 authority_set: self.authority_set(tx, &name)?,
+                owner_policy_seq: state.owner_policy_seq,
             })
         })
     }
@@ -1206,7 +1254,6 @@ where
         doc_type: &str,
         expected_version: u64,
         reason_hash: &str,
-        revoked_before_iat: u64,
         authority: CallAuthority,
         guard: MutationGuard,
     ) -> BnsRegistryResult<(u64, u64)> {
@@ -1277,12 +1324,32 @@ where
                     doc_type,
                     previous_version: actual_version,
                     new_version,
-                    revoked_before_iat,
                     reason_hash: reason_hash.to_string(),
                 },
                 now,
             )?;
             Ok((new_version, name_state.name_seq))
+        })
+    }
+
+    pub fn set_min_document_iat(
+        &self,
+        name: &str,
+        min_document_iat: u64,
+        reason_hash: &str,
+        authority: CallAuthority,
+        guard: MutationGuard,
+    ) -> BnsRegistryResult<(u64, u64)> {
+        self.ensure_write_path("set_min_document_iat")?;
+        let name = canonical_bns_name(name)?;
+        validate_hash(reason_hash)?;
+
+        self.store.transact(|tx| {
+            let now = now_timestamp();
+            let state = self.required_active_name(tx, &name)?;
+            self.check_guard(&state, &guard)?;
+            self.authorize_owner_for_loaded(tx, &state, &authority)?;
+            self.set_min_document_iat_internal(tx, &name, min_document_iat, reason_hash, true, now)
         })
     }
 
@@ -1622,6 +1689,44 @@ where
             now,
         )?;
         Ok(version)
+    }
+
+    fn set_min_document_iat_internal(
+        &self,
+        tx: &mut dyn BnsRegistryStoreTx,
+        name: &str,
+        min_document_iat: u64,
+        reason_hash: &str,
+        bump_name_seq: bool,
+        now: u64,
+    ) -> BnsRegistryResult<(u64, u64)> {
+        let mut state = self.required_active_name(tx, name)?;
+        if min_document_iat < state.min_document_iat {
+            return Err(BnsRegistryError::InvalidMutation(
+                "min_document_iat cannot decrease".to_string(),
+            ));
+        }
+        let previous_min_document_iat = state.min_document_iat;
+        if bump_name_seq {
+            state.name_seq += 1;
+        }
+        state.min_document_iat = min_document_iat;
+        state.owner_policy_seq += 1;
+        state.updated_at = now;
+        state = self.materialize_name_state(tx, state)?;
+        tx.put_name(&state)?;
+        tx.append_event(
+            &RegistryEvent::OwnerDocumentIatFloorUpdated {
+                name: name.to_string(),
+                previous_min_document_iat,
+                new_min_document_iat: min_document_iat,
+                owner_policy_seq: state.owner_policy_seq,
+                name_seq: state.name_seq,
+                reason_hash: reason_hash.to_string(),
+            },
+            now,
+        )?;
+        Ok((state.name_seq, state.owner_policy_seq))
     }
 
     fn authorize_update(

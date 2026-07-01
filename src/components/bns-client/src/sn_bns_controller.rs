@@ -3,7 +3,8 @@ use crate::{
     canonical_bns_name, canonical_doc_type, controller_rule, default_document_update, hash_json,
     policy_hash_from_rules, AuthorityKeyUpdate, AuthorityRole, AuthoritySetState, BnsRegistryError,
     CallAuthority, DocumentRef, DocumentState, DocumentStatus, DocumentUpdate, MutationGuard,
-    NameState, Principal, PrincipalKind, RegisterOptions, PERMISSION_PUBLISH_DOCUMENT, ZERO_HASH,
+    NameState, OwnerPolicyUpdate, Principal, PrincipalKind, RegisterOptions,
+    PERMISSION_PUBLISH_DOCUMENT, ZERO_HASH,
 };
 use crate::{
     BnsApplyMutationsReq, BnsClientError, BnsDocumentVersion, BnsEvmControllerClient,
@@ -719,6 +720,7 @@ impl SnBnsController {
                         name: params.name.clone(),
                         authority_key_updates: Vec::new(),
                         documents: updates.clone(),
+                        owner_policy: OwnerPolicyUpdate::none(),
                         authority: params.authority.clone(),
                         guard,
                     })

@@ -83,13 +83,21 @@ contract BnsAtomicBatchTest is BnsTestBase {
         docs[1] = _docUpdate("boot", 0, _inlineDoc(bytes("{\"boot\":1}")));
 
         vm.prank(ALICE);
-        (uint64 nameSeq, uint64 authoritySeq, bytes32 authorityRoot) =
-            bns.applyMutations("alice", _emptyAuthorityUpdates(), docs, _ownerAuth(ALICE), _guard(seqBefore));
+        (uint64 nameSeq, uint64 authoritySeq, bytes32 authorityRoot, uint64 ownerPolicySeq) =
+            bns.applyMutations(
+                "alice",
+                _emptyAuthorityUpdates(),
+                docs,
+                _noOwnerPolicyUpdate(),
+                _ownerAuth(ALICE),
+                _guard(seqBefore)
+            );
 
         assertEqUint(nameSeq, seqBefore + 1, "batch bumps nameSeq once");
         assertEqUint(bns.queryNameState("alice").nameSeq, seqBefore + 1, "stored nameSeq");
         assertEqUint(authoritySeq, 0, "authority unchanged");
         assertEqBytes32(authorityRoot, ZERO, "authority root unchanged");
+        assertEqUint(ownerPolicySeq, 0, "owner policy unchanged");
         assertEqUint(bns.getDocumentVersion("alice", "zone", 1).version, 1, "zone v1");
         assertEqUint(bns.getDocumentVersion("alice", "boot", 1).version, 1, "boot v1");
         assertEqUint(bns.globalEventSeq(), eventsBefore + 2, "per-document ProtocolEvent");
@@ -104,11 +112,14 @@ contract BnsAtomicBatchTest is BnsTestBase {
         DocumentUpdate[] memory noDocs = new DocumentUpdate[](0);
 
         vm.prank(ALICE);
-        (uint64 nameSeq, uint64 authoritySeq,) =
-            bns.applyMutations("alice", keys, noDocs, _ownerAuth(ALICE), _guard(seqBefore));
+        (uint64 nameSeq, uint64 authoritySeq,, uint64 ownerPolicySeq) =
+            bns.applyMutations(
+                "alice", keys, noDocs, _noOwnerPolicyUpdate(), _ownerAuth(ALICE), _guard(seqBefore)
+            );
 
         assertEqUint(nameSeq, seqBefore, "authority-only batch does not bump nameSeq");
         assertEqUint(authoritySeq, 1, "authority updated");
+        assertEqUint(ownerPolicySeq, 0, "owner policy unchanged");
         assertEqUint(bns.queryNameState("alice").nameSeq, seqBefore, "stored nameSeq unchanged");
     }
 
@@ -124,11 +135,19 @@ contract BnsAtomicBatchTest is BnsTestBase {
         docs[0] = _docUpdate("owner", 0, ownerRef);
 
         vm.prank(CAROL);
-        (uint64 nameSeq, uint64 authoritySeq,) =
-            bns.applyMutations("org", keys, docs, _ownerAuthName("org", KID), _guard(seqBefore));
+        (uint64 nameSeq, uint64 authoritySeq,, uint64 ownerPolicySeq) =
+            bns.applyMutations(
+                "org",
+                keys,
+                docs,
+                _noOwnerPolicyUpdate(),
+                _ownerAuthName("org", KID),
+                _guard(seqBefore)
+            );
 
         assertEqUint(nameSeq, seqBefore + 1, "owner document bumps nameSeq once");
         assertEqUint(authoritySeq, 2, "authority rotated");
+        assertEqUint(ownerPolicySeq, 0, "owner policy unchanged");
         assertTrue(
             bns.getAuthorityKey("org", KID).status == AuthorityKeyStatus.Revoked,
             "old key revoked"
@@ -146,7 +165,14 @@ contract BnsAtomicBatchTest is BnsTestBase {
 
         vm.prank(ALICE);
         vm.expectPartialRevert(InvalidMutation.selector);
-        bns.applyMutations("alice", _emptyAuthorityUpdates(), noDocs, _ownerAuth(ALICE), _guard(1));
+        bns.applyMutations(
+            "alice",
+            _emptyAuthorityUpdates(),
+            noDocs,
+            _noOwnerPolicyUpdate(),
+            _ownerAuth(ALICE),
+            _guard(1)
+        );
     }
 
     function testApplyMutationsRejectsDuplicateDocTypes() public {
@@ -157,6 +183,13 @@ contract BnsAtomicBatchTest is BnsTestBase {
 
         vm.prank(ALICE);
         vm.expectPartialRevert(InvalidMutation.selector);
-        bns.applyMutations("alice", _emptyAuthorityUpdates(), docs, _ownerAuth(ALICE), _guard(1));
+        bns.applyMutations(
+            "alice",
+            _emptyAuthorityUpdates(),
+            docs,
+            _noOwnerPolicyUpdate(),
+            _ownerAuth(ALICE),
+            _guard(1)
+        );
     }
 }

@@ -239,7 +239,6 @@ contract BnsTest {
             "owner",
             1,
             keccak256("bad-owner-doc"),
-            0,
             _ownerAuth(address(this)),
             MutationGuard({ expectedNameSeq: state.nameSeq, expectedParentNameSeq: 0 })
         );

@@ -119,6 +119,8 @@ struct NameState {
     uint64 updatedAt;
     uint64 nameSeq;
     uint64 ownerDocumentVersion;
+    uint64 minDocumentIat;
+    uint64 ownerPolicySeq;
     uint64 lineageEpoch;
     bool renewable;
     bool transferable;
@@ -184,6 +186,12 @@ struct DocumentUpdate {
     bytes32 splitPolicyHash;
     bytes32 pricePolicyHash;
     bytes32 rightsPolicyHash;
+}
+
+struct OwnerPolicyUpdate {
+    bool updateMinDocumentIat;
+    uint64 minDocumentIat;
+    bytes32 reasonHash;
 }
 
 struct OwnerResolution {
@@ -286,6 +294,8 @@ contract Bns {
     bytes32 private constant EVENT_NAME_RELEASED = keccak256("name_released");
     bytes32 private constant EVENT_DOCUMENT_PUBLISHED = keccak256("document_published");
     bytes32 private constant EVENT_DOCUMENT_REVOKED = keccak256("document_revoked");
+    bytes32 private constant EVENT_OWNER_IAT_FLOOR_UPDATED =
+        keccak256("owner_iat_floor_updated");
     bytes32 private constant EVENT_CONTROLLER_POLICY = keccak256("controller_policy_updated");
     bytes32 private constant EVENT_NAMESPACE_POLICY = keccak256("namespace_policy_updated");
     bytes32 private constant EVENT_DID_ALIAS = keccak256("did_alias_set");
@@ -304,6 +314,8 @@ contract Bns {
     bytes32 private constant ERR_MUTATION_BATCH_TOO_LARGE = keccak256("MUTATION_BATCH_TOO_LARGE");
     bytes32 private constant ERR_BATCH_INLINE_TOO_LARGE = keccak256("BATCH_INLINE_TOO_LARGE");
     bytes32 private constant ERR_DUPLICATE_DOC_TYPE = keccak256("DUPLICATE_DOC_TYPE");
+    bytes32 private constant ERR_MIN_DOCUMENT_IAT_REGRESSION =
+        keccak256("MIN_DOCUMENT_IAT_REGRESSION");
 
     mapping(bytes32 => NameState) private _names;
     mapping(bytes32 => bool) private _knownNameHash;
@@ -404,7 +416,17 @@ contract Bns {
         address indexed actor,
         uint64 previousVersion,
         uint64 newVersion,
-        uint64 revokedBeforeIat,
+        bytes32 reasonHash
+    );
+
+    event OwnerDocumentIatFloorUpdated(
+        bytes32 indexed nameHash,
+        string name,
+        address indexed actor,
+        uint64 previousMinDocumentIat,
+        uint64 newMinDocumentIat,
+        uint64 ownerPolicySeq,
+        uint64 nameSeq,
         bytes32 reasonHash
     );
 
@@ -904,17 +926,41 @@ contract Bns {
         return (set.authoritySeq, set.authorityRoot);
     }
 
+    function setMinDocumentIat(
+        string calldata name,
+        uint64 minDocumentIat,
+        bytes32 reasonHash,
+        CallAuthority calldata authority,
+        MutationGuard calldata guard
+    ) external returns (uint64 nameSeq, uint64 ownerPolicySeq) {
+        bytes32 nameHash = _validateName(name);
+        _requireActiveName(nameHash, name);
+        NameState storage state = _names[nameHash];
+        _checkGuard(state, guard, name);
+        _authorizeOwner(nameHash, name, state, authority);
+        return _setMinDocumentIatInternal(nameHash, name, minDocumentIat, reasonHash, true);
+    }
+
     function applyMutations(
         string calldata name,
         AuthorityKeyUpdate[] calldata authorityUpdates,
         DocumentUpdate[] calldata documents,
+        OwnerPolicyUpdate calldata ownerPolicy,
         CallAuthority calldata authority,
         MutationGuard calldata guard
-    ) external returns (uint64 nameSeq, uint64 authoritySeq, bytes32 authorityRoot) {
-        if (authorityUpdates.length == 0 && documents.length == 0) {
+    )
+        external
+        returns (uint64 nameSeq, uint64 authoritySeq, bytes32 authorityRoot, uint64 ownerPolicySeq)
+    {
+        if (
+            authorityUpdates.length == 0 && documents.length == 0
+                && !ownerPolicy.updateMinDocumentIat
+        ) {
             revert InvalidMutation(ERR_EMPTY_MUTATION_BATCH);
         }
-        _validateBatchBounds(authorityUpdates.length, documents);
+        _validateBatchBounds(
+            authorityUpdates.length + (ownerPolicy.updateMinDocumentIat ? 1 : 0), documents
+        );
         _validateUniqueDocumentTypes(documents);
 
         bytes32 nameHash = _validateName(name);
@@ -922,33 +968,44 @@ contract Bns {
         NameState storage state = _names[nameHash];
         _checkGuard(state, guard, name);
 
-        if (authorityUpdates.length != 0) {
+        bool ownerOnly = authorityUpdates.length != 0 || ownerPolicy.updateMinDocumentIat
+            || _containsOwnerDocument(documents);
+        if (ownerOnly) {
             _authorizeOwner(nameHash, name, state, authority);
-        }
-        for (uint256 i = 0; i < documents.length; i++) {
-            _authorizeUpdateNoGuard(
-                nameHash,
-                name,
-                state,
-                documents[i].docType,
-                PERMISSION_PUBLISH_DOCUMENT,
-                OP_PUBLISH_DOCUMENT,
-                authority
-            );
+        } else {
+            for (uint256 i = 0; i < documents.length; i++) {
+                _authorizeUpdateNoGuard(
+                    nameHash,
+                    name,
+                    state,
+                    documents[i].docType,
+                    PERMISSION_PUBLISH_DOCUMENT,
+                    OP_PUBLISH_DOCUMENT,
+                    authority
+                );
+            }
         }
 
         if (authorityUpdates.length != 0) {
             _applyAuthorityUpdates(nameHash, name, authorityUpdates);
         }
-        if (documents.length != 0) {
+        if (documents.length != 0 || ownerPolicy.updateMinDocumentIat) {
             state.nameSeq += 1;
+            state.updatedAt = _now();
+        }
+        if (documents.length != 0) {
             for (uint256 i = 0; i < documents.length; i++) {
                 _publishDocumentUpdateInternal(nameHash, name, documents[i], false);
             }
         }
+        if (ownerPolicy.updateMinDocumentIat) {
+            _setMinDocumentIatInternal(
+                nameHash, name, ownerPolicy.minDocumentIat, ownerPolicy.reasonHash, false
+            );
+        }
 
         AuthoritySetState memory finalSet = _authoritySets[nameHash];
-        return (state.nameSeq, finalSet.authoritySeq, finalSet.authorityRoot);
+        return (state.nameSeq, finalSet.authoritySeq, finalSet.authorityRoot, state.ownerPolicySeq);
     }
 
     function publishDocument(
@@ -1005,7 +1062,6 @@ contract Bns {
         string calldata docType,
         uint64 expectedVersion,
         bytes32 reasonHash,
-        uint64 revokedBeforeIat,
         CallAuthority calldata authority,
         MutationGuard calldata guard
     ) external returns (uint64 newVersion, uint64 nameSeq) {
@@ -1058,13 +1114,9 @@ contract Bns {
         state.updatedAt = nowTs;
         _commitEvent(
             EVENT_DOCUMENT_REVOKED,
-            keccak256(
-                abi.encode(nameHash, docTypeHash, current, newVersion, revokedBeforeIat, reasonHash)
-            )
+            keccak256(abi.encode(nameHash, docTypeHash, current, newVersion, reasonHash))
         );
-        emit DocumentRevoked(
-            nameHash, name, docType, msg.sender, current, newVersion, revokedBeforeIat, reasonHash
-        );
+        emit DocumentRevoked(nameHash, name, docType, msg.sender, current, newVersion, reasonHash);
         return (newVersion, state.nameSeq);
     }
 
@@ -1277,6 +1329,8 @@ contract Bns {
         existing.updatedAt = nowTs;
         existing.nameSeq = nextSeq;
         existing.ownerDocumentVersion = 0;
+        existing.minDocumentIat = 0;
+        existing.ownerPolicySeq = 0;
         existing.lineageEpoch = lineageEpoch;
         existing.renewable = options.renewable;
         existing.transferable = options.transferable;
@@ -1432,6 +1486,52 @@ contract Bns {
         _commitEvent(EVENT_CONTROLLER_POLICY, keccak256(abi.encode(nameHash, policyHash, state.nameSeq)));
         emit ControllerPolicyUpdated(nameHash, name, msg.sender, policyHash, state.nameSeq);
         return state.nameSeq;
+    }
+
+    function _setMinDocumentIatInternal(
+        bytes32 nameHash,
+        string memory name,
+        uint64 minDocumentIat,
+        bytes32 reasonHash,
+        bool bumpNameSeq
+    ) internal returns (uint64 nameSeq, uint64 ownerPolicySeq) {
+        NameState storage state = _names[nameHash];
+        uint64 previous = state.minDocumentIat;
+        if (minDocumentIat < previous) {
+            revert InvalidMutation(ERR_MIN_DOCUMENT_IAT_REGRESSION);
+        }
+
+        if (bumpNameSeq) {
+            state.nameSeq += 1;
+        }
+        state.minDocumentIat = minDocumentIat;
+        state.ownerPolicySeq += 1;
+        state.updatedAt = _now();
+
+        _commitEvent(
+            EVENT_OWNER_IAT_FLOOR_UPDATED,
+            keccak256(
+                abi.encode(
+                    nameHash,
+                    previous,
+                    minDocumentIat,
+                    state.ownerPolicySeq,
+                    state.nameSeq,
+                    reasonHash
+                )
+            )
+        );
+        emit OwnerDocumentIatFloorUpdated(
+            nameHash,
+            name,
+            msg.sender,
+            previous,
+            minDocumentIat,
+            state.ownerPolicySeq,
+            state.nameSeq,
+            reasonHash
+        );
+        return (state.nameSeq, state.ownerPolicySeq);
     }
 
     function _applyAuthorityUpdates(
@@ -1784,6 +1884,19 @@ contract Bns {
             }
             seen[i] = docTypeHash;
         }
+    }
+
+    function _containsOwnerDocument(DocumentUpdate[] calldata documents)
+        internal
+        pure
+        returns (bool)
+    {
+        for (uint256 i = 0; i < documents.length; i++) {
+            if (keccak256(bytes(documents[i].docType)) == keccak256(bytes("owner"))) {
+                return true;
+            }
+        }
+        return false;
     }
 
     function _validateDocumentRef(DocumentRef calldata documentRef) internal pure {

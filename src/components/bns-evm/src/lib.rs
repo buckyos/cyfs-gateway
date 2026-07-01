@@ -17,8 +17,8 @@ pub use bindings::{
     AliasKind, AliasState, AuthorityKey, AuthorityKeyStatus, AuthorityKeyUpdate, AuthorityRole,
     AuthoritySetState, Bns, CallAuthority, ControllerRule, DocumentRef, DocumentState,
     DocumentStatus, DocumentUpdate, LogCheckpoint, MutationGuard, NameState, NameStatus,
-    OwnerResolution, OwnerSource, Principal, PrincipalKind, PurchaseContext, RegisterOptions,
-    ReleaseMode, ResolveResult,
+    OwnerPolicyUpdate, OwnerResolution, OwnerSource, Principal, PrincipalKind, PurchaseContext,
+    RegisterOptions, ReleaseMode, ResolveResult,
 };
 pub use rpc::{
     BlockRange, EthLog, EthRpcClient, EthTransaction, EthTransactionReceipt, RpcLogFilter,
