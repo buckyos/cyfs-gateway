@@ -443,6 +443,7 @@ impl RTcpInner {
     async fn resolve_handshake_identity(
         remote_did: &DID,
     ) -> Result<ResolvedHandshakeIdentity, String> {
+        validate_rtcp_hostname_form_did(remote_did, "rtcp handshake did")?;
         debug!(
             "resolve handshake identity for remote device {}",
             remote_did.to_string()
@@ -1338,6 +1339,13 @@ impl RTcpInner {
                 return;
             }
         };
+        if let Err(e) = validate_rtcp_hostname_form_did(&source_did, "rtcp hello from_id") {
+            warn!(
+                "reject rtcp tunnel from {} {}: {}",
+                source_device_id, source_addr_log, e
+            );
+            return;
+        }
         let (initiator_xpub_bytes, hello_payload) = match RTcpInner::verify_hello_token(
             &token,
             &source_public_key,
@@ -1554,14 +1562,12 @@ impl RTcpInner {
             ));
         }
         let tunnel_stack_id = tunnel_stack_id.unwrap();
-        let remote_stack = parse_rtcp_stack_id(tunnel_stack_id);
-        if remote_stack.is_none() {
-            return Err(TunnelError::ConnectError(format!(
-                "invalid remote stack id:{:?}",
-                remote_stack
-            )));
-        }
-        let remote_stack: RTcpTargetStackEP = remote_stack.unwrap();
+        let remote_stack = parse_rtcp_stack_id_checked(tunnel_stack_id).map_err(|e| {
+            TunnelError::ConnectError(format!(
+                "invalid remote stack id '{}': {}",
+                tunnel_stack_id, e
+            ))
+        })?;
         let target_device_id = remote_stack.did.to_string();
         let remote_dev_did = self
             .resolve_remote_tunnel_dev_did(&remote_stack.did)
@@ -1859,15 +1865,15 @@ impl RTcpInner {
                 "rtcp url has no remote stack id".to_string(),
             ));
         }
-        let remote_stack = match parse_rtcp_stack_id(stack_id) {
-            Some(s) => s,
-            None => {
+        let remote_stack = match parse_rtcp_stack_id_checked(stack_id) {
+            Ok(s) => s,
+            Err(e) => {
                 return Ok(unreachable_status(
                     url,
                     &normalized,
                     now,
                     TunnelUrlStatusSource::FreshProbe,
-                    format!("invalid rtcp stack id '{}'", stack_id),
+                    format!("invalid rtcp stack id '{}': {}", stack_id, e),
                 ));
             }
         };
@@ -3714,11 +3720,7 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(
-            err.contains("not this device"),
-            "unexpected error: {}",
-            err
-        );
+        assert!(err.contains("not this device"), "unexpected error: {}", err);
     }
 
     #[test]

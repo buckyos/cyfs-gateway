@@ -20,7 +20,9 @@ use crate::forward::ForwardPlan;
 use crate::global_process_chains::{
     GlobalProcessChainsRef, create_process_chain_executor, execute_chain,
 };
-use crate::rtcp::{AsyncStreamWithDatagram, RTcpTunnelDatagramClient};
+use crate::rtcp::{
+    AsyncStreamWithDatagram, RTcpTunnelDatagramClient, validate_rtcp_hostname_form_did,
+};
 use crate::stack::limiter::Limiter;
 use crate::stack::{
     datagram_forward, datagram_forward_group, get_limit_info, get_source_addr_from_req_env,
@@ -1225,6 +1227,20 @@ fn build_rtcp_identity_roots(
     Ok(roots)
 }
 
+fn require_rtcp_hostname_form_did(did: &DID, context: &str) -> StackResult<()> {
+    if let Err(e) = validate_rtcp_hostname_form_did(did, context) {
+        return Err(stack_err!(StackErrorCode::InvalidConfig, "{}", e));
+    }
+    Ok(())
+}
+
+fn require_rtcp_identity_material_hostname_form(
+    material: RtcpIdentityMaterial,
+) -> StackResult<RtcpIdentityMaterial> {
+    require_rtcp_hostname_form_did(&material.device_config.id, "rtcp identity")?;
+    Ok(material)
+}
+
 fn has_legacy_rtcp_identity_config(config: &RtcpStackConfig) -> bool {
     config.key_path.is_some() || config.device_config_path.is_some() || config.name.is_some()
 }
@@ -1302,7 +1318,8 @@ async fn load_legacy_rtcp_identity_material(
         public_key,
     };
 
-    apply_explicit_device_doc_jwt(material, config.device_doc_jwt.as_deref())
+    let material = apply_explicit_device_doc_jwt(material, config.device_doc_jwt.as_deref())?;
+    require_rtcp_identity_material_hostname_form(material)
 }
 
 async fn load_rtcp_identity_from_manager(
@@ -1322,6 +1339,7 @@ async fn load_rtcp_identity_from_manager(
         "invalid rtcp identity {}",
         identity
     ))?;
+    require_rtcp_hostname_form_did(&expected_did, "rtcp identity")?;
     let roots = build_rtcp_identity_roots(identity_manager)?;
     let private_key_path = roots
         .security_file(
@@ -1358,7 +1376,7 @@ async fn load_rtcp_identity_from_manager(
             &material.device_config,
             material.device_doc_jwt.as_ref(),
         )?;
-        return Ok(material);
+        return require_rtcp_identity_material_hostname_form(material);
     }
 
     let device_doc_jwt_path = roots
@@ -1419,7 +1437,7 @@ async fn load_rtcp_identity_from_manager(
         &material.device_config,
         material.device_doc_jwt.as_ref(),
     )?;
-    Ok(material)
+    require_rtcp_identity_material_hostname_form(material)
 }
 
 impl RtcpStack {
@@ -5707,6 +5725,19 @@ mod tests {
         let ret = load_rtcp_identity_material(&config).await;
         let err = ret.as_ref().err().unwrap().to_string();
         assert!(err.contains("device_doc_jwt"), "unexpected error: {}", err);
+    }
+
+    #[tokio::test]
+    async fn test_rtcp_identity_rejects_did_url_path_form() {
+        let temp = tempfile::tempdir().unwrap();
+        let roots = IdentityRoots::new(temp.path().join("identity"), temp.path().join("security"));
+        let identity = "did:web:logical-device.example.com:user:alice";
+        let config =
+            build_rtcp_identity_config("logical-path-did", "127.0.0.1:0", identity, &roots);
+
+        let ret = load_rtcp_identity_material(&config).await;
+        let err = ret.as_ref().err().unwrap().to_string();
+        assert!(err.contains("hostname-form"), "unexpected error: {}", err);
     }
 
     #[tokio::test]
