@@ -576,28 +576,46 @@ impl RTcpInner {
         }
     }
 
-    async fn validate_hello_target(token_to: &str, this_host: &str) -> Result<(), String> {
+    async fn validate_hello_target(
+        token_to: &str,
+        this_host: &str,
+        this_dev_did: &DID,
+    ) -> Result<(), String> {
         if token_to == this_host {
             return Ok(());
         }
 
         let target_did = DID::from_str(token_to)
             .map_err(|e| format!("token.to {} is not a valid DID: {}", token_to, e))?;
+        // token.to 指向当前 stack 的 did(did 字符串形式)或当前 stack 的
+        // did:dev:xxx 规范形式(字符串或 host_name 形式)都可以接受。
+        if target_did == *this_dev_did || target_did.to_host_name() == this_host {
+            return Ok(());
+        }
+
         if target_did.method != "web" {
             return Err(format!(
-                "token.to {} is not this device {} and is not a web alias",
-                token_to, this_host
+                "token.to {} is not this device {} ({}) and is not a web alias",
+                token_to,
+                this_host,
+                this_dev_did.to_string()
             ));
         }
 
         let resolved_identity = Self::resolve_handshake_identity(&target_did).await?;
+        if resolved_identity.did == *this_dev_did {
+            return Ok(());
+        }
         let resolved_host = resolved_identity.did.to_host_name();
         if resolved_host == this_host {
             Ok(())
         } else {
             Err(format!(
-                "token.to {} resolves to {}, not this device {}",
-                token_to, resolved_host, this_host
+                "token.to {} resolves to {}, not this device {} ({})",
+                token_to,
+                resolved_host,
+                this_host,
+                this_dev_did.to_string()
             ))
         }
     }
@@ -1020,6 +1038,23 @@ impl RTcpInner {
             let ed25519_pk = jwk_to_ed25519_pk(&default_key).map_err(|e| {
                 TunnelError::DocumentError(format!("decode device_doc_jwt public key failed:{}", e))
             })?;
+            // 验证通过的 device_doc 写入 name_client 的 DID doc cache,后续
+            // resolve_did / resolve_auth_key 可以直接命中。只缓存 DID 文档,
+            // 不能调用 add_device_info_cache 更新 device_info。缓存失败不影响
+            // 本次握手(验证已经完成)。
+            if let Err(e) = update_did_cache(
+                verified_doc.id.clone(),
+                None,
+                EncodedDocument::Jwt(device_doc_jwt.clone()),
+            )
+            .await
+            {
+                warn!(
+                    "cache verified device_doc for {} failed: {}",
+                    verified_doc.id.to_string(),
+                    e
+                );
+            }
             let from_public_key = DecodingKey::from_ed_der(&ed25519_pk);
             return Ok(VerifiedSourceDevice {
                 source_device_id: verified_doc.id.to_string(),
@@ -1037,6 +1072,15 @@ impl RTcpInner {
         let from_did = DID::from_str(hello_body.from_id.as_str()).map_err(|_e| {
             TunnelError::DocumentError("invalid from device is not did".to_string())
         })?;
+        // from 是逻辑名字(非 did:dev:xxx)时必须带 device_doc_jwt:逻辑名字
+        // 的 key 只能由 owner 签名的 device_doc 证明,不允许在握手时反向
+        // 依赖名字解析结果来认证对端。
+        if from_did.method != "dev" {
+            return Err(TunnelError::DocumentError(format!(
+                "hello from_id {} is a logical name (not did:dev), device_doc_jwt is required",
+                hello_body.from_id
+            )));
+        }
         let ed25519_pk = resolve_ed25519_exchange_key(&from_did)
             .await
             .map_err(|op| {
@@ -1312,7 +1356,10 @@ impl RTcpInner {
         // §14.2 anti-replay: every Hello token must bind this responder
         // and must not be replayed within its exp window.
         let this_host = self.this_device_did.to_host_name();
-        if let Err(e) = Self::validate_hello_target(&hello_payload.to, &this_host).await {
+        if let Err(e) =
+            Self::validate_hello_target(&hello_payload.to, &this_host, &self.this_device_dev_did)
+                .await
+        {
             warn!(
                 "reject rtcp tunnel from {} {}: token.to {} not accepted for this device {}: {}",
                 source_device_id, source_addr_log, hello_payload.to, this_host, e
@@ -3472,9 +3519,13 @@ mod tests {
             Some(server_id.to_host_name().as_str())
         );
         assert_eq!(state.responder_did, server_id.to_host_name());
-        RTcpInner::validate_hello_target("sn.devtests.org", server_id.to_host_name().as_str())
-            .await
-            .unwrap();
+        RTcpInner::validate_hello_target(
+            "sn.devtests.org",
+            server_id.to_host_name().as_str(),
+            &server_id,
+        )
+        .await
+        .unwrap();
     }
 
     fn ed25519_test_keys() -> (EncodingKey, DecodingKey) {
@@ -3612,15 +3663,59 @@ mod tests {
     #[tokio::test]
     async fn test_rtcp_validate_hello_target_rejects_non_web_alias() {
         let this_host = "did:web:this.example.com";
-        RTcpInner::validate_hello_target(this_host, this_host)
+        let this_dev_did = DID::new("dev", "hello-target-reject-dev");
+        RTcpInner::validate_hello_target(this_host, this_host, &this_dev_did)
             .await
             .unwrap();
 
-        let err = RTcpInner::validate_hello_target("did:test:other", this_host)
+        let err = RTcpInner::validate_hello_target("did:test:other", this_host, &this_dev_did)
             .await
             .unwrap_err();
         assert!(
             err.contains("not this device") || err.contains("not a valid DID"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn test_rtcp_validate_hello_target_accepts_this_dev_did_forms() {
+        // stack 配置了逻辑 did(this_host 为其 host_name 形式),token.to 用
+        // 当前 stack 的 did:dev:xxx 形式(字符串或 host_name)也必须通过。
+        let (device_config, _pkcs8_bytes) = test_device_config("hello-target-dev");
+        let this_dev_did = device_config.id.clone();
+        let this_host = "sn.devtests.org";
+
+        RTcpInner::validate_hello_target(
+            this_dev_did.to_string().as_str(),
+            this_host,
+            &this_dev_did,
+        )
+        .await
+        .unwrap();
+        RTcpInner::validate_hello_target(
+            this_dev_did.to_host_name().as_str(),
+            this_host,
+            &this_dev_did,
+        )
+        .await
+        .unwrap();
+        // 逻辑 did 的字符串形式(this_host 的 did:web 形式)同样接受。
+        RTcpInner::validate_hello_target("did:web:sn.devtests.org", this_host, &this_dev_did)
+            .await
+            .unwrap();
+
+        // 其它设备的 did:dev 仍然拒绝。
+        let (other_config, _other_pkcs8_bytes) = test_device_config("hello-target-other");
+        let err = RTcpInner::validate_hello_target(
+            other_config.id.to_string().as_str(),
+            this_host,
+            &this_dev_did,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.contains("not this device"),
             "unexpected error: {}",
             err
         );
@@ -4511,6 +4606,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_rtcp_logical_from_requires_and_caches_device_doc_jwt() {
+        let _ = init_name_lib_for_test(&HashMap::new()).await;
+
+        let (owner_signing_key, owner_pkcs8_bytes) = generate_ed25519_key();
+        let owner_jwk = encode_ed25519_sk_to_pk_jwk(&owner_signing_key);
+        let owner_config =
+            DeviceConfig::new_by_jwk("owner", serde_json::from_value(owner_jwk).unwrap());
+        let owner_did = owner_config.id.clone();
+        let owner_private_key = EncodingKey::from_ed_der(&owner_pkcs8_bytes);
+
+        // 设备文档的 id 是逻辑名字(非 did:dev),default key 是设备自身的 key。
+        // method 用 "test" 保证没有 provider 能解析它,resolve 只能靠 cache。
+        let (client_signing_key, _client_pkcs8_bytes) = generate_ed25519_key();
+        let client_jwk = encode_ed25519_sk_to_pk_jwk(&client_signing_key);
+        let mut client_device_config =
+            DeviceConfig::new_by_jwk("client", serde_json::from_value(client_jwk).unwrap());
+        let client_dev_did = client_device_config.id.clone();
+        let client_logical_did = DID::new("test", "rtcp-logical-client");
+        client_device_config.id = client_logical_did.clone();
+        client_device_config.owner = owner_did.clone();
+        let client_device_doc_jwt = match client_device_config
+            .encode(Some(&owner_private_key))
+            .unwrap()
+        {
+            EncodedDocument::Jwt(jwt) => jwt,
+            _ => panic!("device config encode should return jwt"),
+        };
+
+        // 逻辑名字不带 device_doc_jwt 必须被拒绝。
+        let hello_body_without_jwt = RTcpHelloBody {
+            from_id: client_logical_did.to_string(),
+            to_id: "did:web:server.devtests.org".to_string(),
+            my_port: 19065,
+            tunnel_token: Some("unused".to_string()),
+            device_doc_jwt: None,
+        };
+        let err = match RTcpInner::resolve_source_device_info(&hello_body_without_jwt).await {
+            Ok(_) => panic!("logical from without device_doc_jwt must be rejected"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("device_doc_jwt is required"),
+            "unexpected error: {}",
+            err
+        );
+
+        // 带 device_doc_jwt 验证通过,且 device_doc 被写入 name_client 的
+        // DID doc cache(resolve_did 可以命中)。
+        let hello_body = RTcpHelloBody {
+            from_id: client_logical_did.to_string(),
+            to_id: "did:web:server.devtests.org".to_string(),
+            my_port: 19065,
+            tunnel_token: Some("unused".to_string()),
+            device_doc_jwt: Some(client_device_doc_jwt.clone()),
+        };
+        let source_device = RTcpInner::resolve_source_device_info(&hello_body)
+            .await
+            .unwrap();
+        assert_eq!(
+            source_device.source_device_id,
+            client_logical_did.to_string()
+        );
+        assert_eq!(source_device.canonical_dev_did, client_dev_did);
+
+        let cached_doc = resolve_did(&client_logical_did, None).await.unwrap();
+        assert_eq!(cached_doc, EncodedDocument::Jwt(client_device_doc_jwt));
+    }
+
+    #[tokio::test]
     async fn test_rtcp_stream() {
         let _ = init_name_lib_for_test(&HashMap::new()).await;
         let (signing_key, pkcs8_bytes) = generate_ed25519_key();
@@ -5024,7 +5188,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_rtcp_datagram() {
-        let _ = init_name_lib_for_test(&HashMap::new()).await.unwrap();
+        let _ = init_name_lib_for_test(&HashMap::new()).await;
         let (signing_key, pkcs8_bytes) = generate_ed25519_key();
         let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
         let device_config = DeviceConfig::new_by_jwk("test1", serde_json::from_value(jwk).unwrap());
