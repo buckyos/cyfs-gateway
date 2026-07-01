@@ -1,22 +1,25 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, Weak};
 
-use anyhow::{anyhow, Result};
-use buckyos_kit::AsyncStream;
+use anyhow::{Result, anyhow};
+use buckyos_kit::{
+    AsyncStream, apply_params_to_json, get_buckyos_service_data_dir, get_buckyos_system_etc_dir,
+};
 use cyfs_gateway_lib::{
-    create_process_chain_executor, get_external_commands, normalize_config_file_path,
     GlobalCollectionManager, GlobalCollectionManagerRef, GlobalProcessChains,
     GlobalProcessChainsRef, JsExternalsManager, JsExternalsManagerRef, ProcessChainConfig,
-    ProcessChainConfigs,
+    ProcessChainConfigs, create_process_chain_executor, get_external_commands,
+    normalize_all_path_value_config, normalize_config_file_path,
 };
 use cyfs_process_chain::{
     CollectionValue, CommandControl, CommandResult, MemoryMapCollection, MemorySetCollection,
 };
 use serde::Deserialize;
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 
-use crate::config_loader::parse_collections_from_raw_config;
-use crate::{get_default_config_path, load_config_from_file, set_gateway_main_config_dir};
+use crate::{
+    ConfigMerger, GATEWAY_CONTROL_SERVER_CONFIG, merge, parse_collections_from_raw_config,
+};
 
 async fn build_js_externals_from_raw_config(
     base_dir: &Path,
@@ -403,16 +406,45 @@ fn resolve_debug_config_file_path(config_file: Option<&str>) -> PathBuf {
         requested_path
     };
     let real_config_file = resolved_path.canonicalize().unwrap_or(resolved_path);
-    let config_dir = if real_config_file.is_dir() {
-        real_config_file.clone()
-    } else {
-        real_config_file
-            .parent()
-            .unwrap_or(base_dir.as_path())
-            .to_path_buf()
-    };
-    set_gateway_main_config_dir(&config_dir);
     real_config_file
+}
+
+fn get_default_config_path() -> PathBuf {
+    let mut default_config = get_buckyos_system_etc_dir().join("cyfs_gateway.yaml");
+    if !default_config.exists() {
+        default_config = get_buckyos_system_etc_dir().join("cyfs_gateway.json");
+    }
+    default_config.canonicalize().unwrap_or(default_config)
+}
+
+async fn get_gateway_remote_config_cache_path() -> PathBuf {
+    let cache_dir = get_buckyos_service_data_dir("cyfs_gateway").join("config_cache");
+    if !cache_dir.exists() {
+        let _ = tokio::fs::create_dir_all(cache_dir.clone()).await;
+    }
+    cache_dir
+}
+
+async fn load_debug_config_from_file(config_file: &Path) -> Result<Value> {
+    let config_dir = config_file
+        .parent()
+        .ok_or_else(|| anyhow!("cannot get config dir: {:?}", config_file))?;
+    let cache_dir = get_gateway_remote_config_cache_path().await;
+    let config_json = ConfigMerger::load_dir_with_root(config_dir, config_file, None, &cache_dir)
+        .await
+        .map_err(|e| {
+            anyhow!(
+                "local config {} failed {:?}",
+                config_file.to_string_lossy(),
+                e
+            )
+        })?;
+    let mut cmd_config: Value = serde_yaml_ng::from_str(GATEWAY_CONTROL_SERVER_CONFIG)?;
+    merge(&mut cmd_config, &config_json);
+    let mut config_json = apply_params_to_json(&cmd_config, None)
+        .map_err(|e| anyhow!("apply params to config json failed: {}", e))?;
+    normalize_all_path_value_config(&mut config_json, config_dir);
+    Ok(config_json)
 }
 
 fn resolve_req_file_base_dir(req_file: &str) -> PathBuf {
@@ -673,8 +705,7 @@ async fn build_debug_result(
 
     let req_base_dir = resolve_req_file_base_dir(req_file);
     let config_file = resolve_debug_config_file_path(config_file);
-    let loaded_config = load_config_from_file(config_file.as_path()).await?;
-    let config_json = loaded_config.effective_config;
+    let config_json = load_debug_config_from_file(config_file.as_path()).await?;
 
     let collections = parse_collections_from_raw_config(&config_json)?;
     let global_process_chain_configs = parse_global_process_chains_from_raw_config(&config_json)?;

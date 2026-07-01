@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use httpdate::{fmt_http_date, parse_http_date};
 use log::*;
 use reqwest::header::{IF_MODIFIED_SINCE, LAST_MODIFIED};
