@@ -104,15 +104,16 @@ pub(crate) fn parse_rtcp_stack_id(stack_id: &str) -> Option<RTcpTargetStackEP> {
         None => (None, stack_id),
     };
 
-    let mut stack_port = DEFAULT_RTCP_STACK_PORT;
-    let target_did = if remote_part.contains(':') {
-        let mut parts = remote_part.split(':');
-        let target_host_name = parts.next().unwrap();
-        stack_port = parts.next().unwrap().parse::<u16>().ok()?;
-        DID::from_str(target_host_name)
-    } else {
-        DID::from_str(remote_part)
+    let (target_host_name, stack_port) = match remote_part.rsplit_once(':') {
+        Some((host, port)) if !host.is_empty() && !port.is_empty() => match port.parse::<u16>() {
+            Ok(port) => (host, port),
+            Err(_) if remote_part.starts_with("did:") => (remote_part, DEFAULT_RTCP_STACK_PORT),
+            Err(_) => return None,
+        },
+        Some(_) => return None,
+        None => (remote_part, DEFAULT_RTCP_STACK_PORT),
     };
+    let target_did = DID::from_str(target_host_name);
     if target_did.is_err() {
         return None;
     }
@@ -179,6 +180,18 @@ mod tests {
         let ep = parse_rtcp_stack_id("remote.com").expect("parse");
         assert_eq!(ep.stack_port, DEFAULT_RTCP_STACK_PORT);
         assert!(ep.bootstrap_stream_url.is_none());
+    }
+
+    #[test]
+    fn parse_dev_did_with_and_without_port() {
+        let dev_did = "did:dev:abcdefghijklmnopqrstuvwxyzABCDE";
+        let ep = parse_rtcp_stack_id(dev_did).expect("parse");
+        assert_eq!(ep.did.to_string(), dev_did);
+        assert_eq!(ep.stack_port, DEFAULT_RTCP_STACK_PORT);
+
+        let ep = parse_rtcp_stack_id(&format!("{}:2981", dev_did)).expect("parse");
+        assert_eq!(ep.did.to_string(), dev_did);
+        assert_eq!(ep.stack_port, 2981);
     }
 
     #[test]
