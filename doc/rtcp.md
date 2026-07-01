@@ -699,8 +699,9 @@ RTCP stack 的 `device_config_path` 当前支持两类文件内容：
 
 行为差异：
 
-- 如果本地加载的是 JSON，RTCP 仍能工作，但发起 `Hello` 时不会自动携带 `device_doc_jwt`。
+- 如果本地加载的是 JSON 且设备 DID 是 `did:dev:<pkx>`，RTCP 仍能工作，但发起 `Hello` 时不会自动携带 `device_doc_jwt`。
 - 如果本地加载的是 JWT，发起 `Hello` 时会自动把它塞进 `device_doc_jwt` 字段。
+- 如果 stack 的设备 DID 是逻辑名字（非 `did:dev:<pkx>`），初始化时必须提供 `device_doc_jwt`，并且发起 `Hello` 时必定携带该 JWT。
 
 因此，跨 zone 首次接入若希望让对端在“尚未知晓本设备公钥”的前提下完成准入，应该配置 JWT 形式的设备文档。
 
@@ -729,12 +730,13 @@ stacks:
 - 设备文档 JSON：`<public_root>/<encoded-did>/did.json`
 - 设备认证私钥：`<security_root>/<encoded-did>/authentication.private.pem`
 
-如果同时存在 `device.doc.jwt` 和 `did.json`，RTCP 优先使用 `device.doc.jwt`。这样发起 `Hello` 时可以继续携带 `device_doc_jwt`，便于对端在尚未缓存本设备公钥时完成身份校验。
+如果同时存在 `device.doc.jwt` 和 `did.json`，RTCP 优先使用 `device.doc.jwt`。这样发起 `Hello` 时可以继续携带 `device_doc_jwt`，便于对端在尚未缓存本设备公钥时完成身份校验。若 `identity` 是逻辑名字（非 `did:dev:<pkx>`），`device.doc.jwt` 是必需的；只有 `did.json` 会被拒绝。
 
 落地约束：
 
 - 一个 RTCP stack 只允许配置一个本端 DID；多 RTCP stack 暂不支持。当前 RTCP 设备身份语义仍是单设备身份、单 stack。
 - 加载出的私钥公钥必须与设备文档 default/authentication key 一致；加载出的设备文档 ID 必须与配置 DID 一致。
+- 逻辑名字 DID 必须能加载出 `device_doc_jwt`；该 JWT 会随每个新建 tunnel 的 `Hello` 包发送。
 - 热更新时不允许静默切换 DID 或私钥；这类变更会被拒绝，要求重启 RTCP stack。
 
 ## 13. 当前实现与文义设计的差异
