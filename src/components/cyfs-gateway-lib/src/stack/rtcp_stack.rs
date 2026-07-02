@@ -1161,6 +1161,70 @@ fn normalize_device_doc_jwt(value: &str) -> StackResult<String> {
     Ok(value.to_string())
 }
 
+// buckyos 节点(node_daemon/make_config)落盘的设备文档 JWT 文件名;
+// name-client IdentityRoots 的约定名是 device.jwt,两者都要探测。
+const BUCKYOS_DEVICE_DOC_JWT_FILE_NAME: &str = "device_doc.jwt";
+
+// 逻辑名(非 did:dev)的 rtcp stack 必须持有 owner 签名的 device doc jwt
+// 才能向对端证明身份,但 boot_gateway.yaml 等 legacy 配置的
+// device_config_path 指向的是未签名的 did.json。buckyos 的身份布局把
+// owner 签名的 device_doc.jwt 写在同一目录,这里按约定探测并采用它,
+// 避免要求所有存量配置改写。探测失败只告警不报错:did:dev 栈不需要
+// jwt,逻辑名栈随后会被 require_device_doc_jwt_for_logical_did 拦下。
+fn probe_sibling_device_doc_jwt(
+    device_config_path: &Path,
+    public_key: &str,
+    expected_did: &DID,
+) -> Option<(DeviceConfig, String)> {
+    let dir = device_config_path.parent()?;
+    for file_name in [BUCKYOS_DEVICE_DOC_JWT_FILE_NAME, "device.jwt"] {
+        let candidate = dir.join(file_name);
+        if !candidate.exists() {
+            continue;
+        }
+        let content = match std::fs::read_to_string(candidate.as_path()) {
+            Ok(content) => content,
+            Err(e) => {
+                warn!(
+                    "read sibling device doc jwt {} failed: {}",
+                    candidate.display(),
+                    e
+                );
+                continue;
+            }
+        };
+        match load_device_config_from_path(
+            content.as_str(),
+            candidate.to_string_lossy().as_ref(),
+            public_key,
+            Some(expected_did),
+        ) {
+            Ok((device_config, Some(jwt))) => {
+                info!(
+                    "loaded device doc jwt for {} from {}",
+                    expected_did.to_string(),
+                    candidate.display()
+                );
+                return Some((device_config, jwt));
+            }
+            Ok((_, None)) => {
+                warn!(
+                    "sibling device doc {} is not a jwt, ignored",
+                    candidate.display()
+                );
+            }
+            Err(e) => {
+                warn!(
+                    "sibling device doc jwt {} rejected: {}",
+                    candidate.display(),
+                    e
+                );
+            }
+        }
+    }
+    None
+}
+
 fn require_device_doc_jwt_for_logical_did(
     device_config: &DeviceConfig,
     device_doc_jwt: Option<&String>,
@@ -1294,7 +1358,21 @@ async fn load_legacy_rtcp_identity_material(
                 "load device config {} failed",
                 path
             ))?;
-        load_device_config_from_path(content.as_str(), path, &public_key, None)?
+        let (device_config, device_doc_jwt) =
+            load_device_config_from_path(content.as_str(), path, &public_key, None)?;
+        // 只在逻辑名(必须有 jwt 才能启动)时探测:did:dev 的 hello 不带
+        // doc_jwt 时对端零解析成本即可验证,不要平白增加 owner 解析负担。
+        if device_doc_jwt.is_none()
+            && config.device_doc_jwt.is_none()
+            && device_config.id.method != "dev"
+        {
+            match probe_sibling_device_doc_jwt(Path::new(path), &public_key, &device_config.id) {
+                Some((device_config, jwt)) => (device_config, Some(jwt)),
+                None => (device_config, None),
+            }
+        } else {
+            (device_config, device_doc_jwt)
+        }
     } else if let Some(device_doc_jwt) = config.device_doc_jwt.as_deref() {
         let device_doc_jwt = normalize_device_doc_jwt(device_doc_jwt)?;
         load_device_config_from_path(device_doc_jwt.as_str(), "device_doc_jwt", &public_key, None)?
@@ -1389,6 +1467,15 @@ async fn load_rtcp_identity_from_manager(
             StackErrorCode::InvalidConfig,
             "resolve rtcp identity device doc jwt failed"
         ))?;
+    // buckyos 落盘用的是 device_doc.jwt(见 buckyos-api device_identity),
+    // 与 name-client 的 device.jwt 约定并存,两个名字都探测。
+    let buckyos_device_doc_jwt_path = roots
+        .public_dir(identity)
+        .map_err(into_stack_err!(
+            StackErrorCode::InvalidConfig,
+            "resolve rtcp identity public dir failed"
+        ))?
+        .join(BUCKYOS_DEVICE_DOC_JWT_FILE_NAME);
     let did_json_path = roots
         .public_file(
             identity,
@@ -1402,6 +1489,8 @@ async fn load_rtcp_identity_from_manager(
 
     let (document_path, prefer_jwt) = if device_doc_jwt_path.exists() {
         (device_doc_jwt_path, true)
+    } else if buckyos_device_doc_jwt_path.exists() {
+        (buckyos_device_doc_jwt_path, true)
     } else {
         (did_json_path, false)
     };
@@ -5772,6 +5861,169 @@ mod tests {
         );
 
         let config = build_rtcp_identity_config("logical-jwt", "127.0.0.1:0", &identity, &roots);
+        let material = load_rtcp_identity_material(&config).await.unwrap();
+        assert_eq!(
+            material.device_config.id,
+            DID::new("web", "logical-device.example.com")
+        );
+        assert_eq!(
+            material.device_doc_jwt.as_deref(),
+            Some(device_doc_jwt.as_str())
+        );
+    }
+
+    fn build_legacy_rtcp_identity_config(
+        id: &str,
+        key_path: &std::path::Path,
+        device_config_path: &std::path::Path,
+    ) -> RtcpStackConfig {
+        RtcpStackConfig {
+            id: id.to_string(),
+            protocol: StackProtocol::Rtcp,
+            bind: "127.0.0.1:0".to_string(),
+            hook_point: vec![],
+            keep_tunnel: vec![],
+            on_new_tunnel_hook_point: None,
+            identity: None,
+            identity_manager: None,
+            key_path: Some(key_path.to_string_lossy().to_string()),
+            device_config_path: Some(device_config_path.to_string_lossy().to_string()),
+            device_doc_jwt: None,
+            name: None,
+            io_dump_file: None,
+            io_dump_rotate_size: None,
+            io_dump_rotate_max_files: None,
+            io_dump_max_upload_bytes_per_conn: None,
+            io_dump_max_download_bytes_per_conn: None,
+            reuse_address: None,
+        }
+    }
+
+    // buckyos OOD 布局:did.json(未签名) 与 owner 签名的 device_doc.jwt
+    // 同目录。legacy 配置只给 device_config_path 时必须能拾取 sibling jwt,
+    // 否则逻辑名 stack 无法启动(boot_gateway.yaml 回归场景)。
+    #[tokio::test]
+    async fn test_legacy_rtcp_identity_loads_sibling_device_doc_jwt() {
+        let temp = tempfile::tempdir().unwrap();
+        let (private_key_pem, public_jwk) = generate_ed25519_key_pair();
+
+        let (owner_signing_key, owner_pkcs8_bytes) = generate_ed25519_key();
+        let owner_jwk = encode_ed25519_sk_to_pk_jwk(&owner_signing_key);
+        let owner_config =
+            DeviceConfig::new_by_jwk("owner", serde_json::from_value(owner_jwk).unwrap());
+        let owner_private_key = EncodingKey::from_ed_der(&owner_pkcs8_bytes);
+
+        let mut device_config =
+            DeviceConfig::new_by_jwk("ood1", serde_json::from_value(public_jwk).unwrap());
+        device_config.id = DID::new("bns", "ood1.alice");
+        device_config.owner = owner_config.id.clone();
+        let device_doc_jwt = match device_config.encode(Some(&owner_private_key)).unwrap() {
+            EncodedDocument::Jwt(jwt) => jwt,
+            _ => panic!("device config encode should return jwt"),
+        };
+
+        let key_path = temp.path().join("authentication.private.pem");
+        std::fs::write(&key_path, &private_key_pem).unwrap();
+        let did_json_path = temp.path().join("did.json");
+        std::fs::write(
+            &did_json_path,
+            serde_json::to_string(&device_config).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(temp.path().join("device_doc.jwt"), &device_doc_jwt).unwrap();
+
+        let config =
+            build_legacy_rtcp_identity_config("legacy-sibling-jwt", &key_path, &did_json_path);
+        let material = load_rtcp_identity_material(&config).await.unwrap();
+        assert_eq!(material.device_config.id, DID::new("bns", "ood1.alice"));
+        assert_eq!(
+            material.device_doc_jwt.as_deref(),
+            Some(device_doc_jwt.as_str())
+        );
+    }
+
+    // sibling jwt 的 id 与 did.json 不一致时必须被忽略,逻辑名 stack 仍然
+    // 因缺少可信 jwt 而拒绝启动,不能拿错误身份顶包。
+    #[tokio::test]
+    async fn test_legacy_rtcp_identity_ignores_mismatched_sibling_jwt() {
+        let temp = tempfile::tempdir().unwrap();
+        let (private_key_pem, public_jwk) = generate_ed25519_key_pair();
+
+        let (owner_signing_key, owner_pkcs8_bytes) = generate_ed25519_key();
+        let owner_jwk = encode_ed25519_sk_to_pk_jwk(&owner_signing_key);
+        let owner_config =
+            DeviceConfig::new_by_jwk("owner", serde_json::from_value(owner_jwk).unwrap());
+        let owner_private_key = EncodingKey::from_ed_der(&owner_pkcs8_bytes);
+
+        let mut device_config =
+            DeviceConfig::new_by_jwk("ood1", serde_json::from_value(public_jwk.clone()).unwrap());
+        device_config.id = DID::new("bns", "ood1.alice");
+        device_config.owner = owner_config.id.clone();
+
+        let mut other_device_config =
+            DeviceConfig::new_by_jwk("ood2", serde_json::from_value(public_jwk).unwrap());
+        other_device_config.id = DID::new("bns", "ood2.alice");
+        other_device_config.owner = owner_config.id.clone();
+        let mismatched_jwt = match other_device_config.encode(Some(&owner_private_key)).unwrap() {
+            EncodedDocument::Jwt(jwt) => jwt,
+            _ => panic!("device config encode should return jwt"),
+        };
+
+        let key_path = temp.path().join("authentication.private.pem");
+        std::fs::write(&key_path, &private_key_pem).unwrap();
+        let did_json_path = temp.path().join("did.json");
+        std::fs::write(
+            &did_json_path,
+            serde_json::to_string(&device_config).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(temp.path().join("device_doc.jwt"), &mismatched_jwt).unwrap();
+
+        let config =
+            build_legacy_rtcp_identity_config("legacy-mismatch-jwt", &key_path, &did_json_path);
+        let err = load_rtcp_identity_material(&config)
+            .await
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(err.contains("device_doc_jwt"), "unexpected error: {}", err);
+    }
+
+    // buckyos 落盘的文件名是 device_doc.jwt(而不是 name-client 约定的
+    // device.jwt),identity 配置也必须能找到它。
+    #[tokio::test]
+    async fn test_identity_manager_loads_buckyos_device_doc_jwt_file_name() {
+        let temp = tempfile::tempdir().unwrap();
+        let roots = IdentityRoots::new(temp.path().join("identity"), temp.path().join("security"));
+        let (private_key_pem, public_jwk) = generate_ed25519_key_pair();
+
+        let (owner_signing_key, owner_pkcs8_bytes) = generate_ed25519_key();
+        let owner_jwk = encode_ed25519_sk_to_pk_jwk(&owner_signing_key);
+        let owner_config =
+            DeviceConfig::new_by_jwk("owner", serde_json::from_value(owner_jwk).unwrap());
+        let owner_private_key = EncodingKey::from_ed_der(&owner_pkcs8_bytes);
+
+        let mut device_config = DeviceConfig::new_by_jwk(
+            "logical-device",
+            serde_json::from_value(public_jwk).unwrap(),
+        );
+        device_config.id = DID::new("web", "logical-device.example.com");
+        device_config.owner = owner_config.id.clone();
+        let identity = device_config.id.to_string();
+        let device_doc_jwt = match device_config.encode(Some(&owner_private_key)).unwrap() {
+            EncodedDocument::Jwt(jwt) => jwt,
+            _ => panic!("device config encode should return jwt"),
+        };
+
+        write_rtcp_identity_files(&roots, &identity, &private_key_pem, None, None);
+        let buckyos_jwt_path = roots
+            .public_dir(&identity)
+            .unwrap()
+            .join(super::BUCKYOS_DEVICE_DOC_JWT_FILE_NAME);
+        std::fs::write(buckyos_jwt_path, &device_doc_jwt).unwrap();
+
+        let config =
+            build_rtcp_identity_config("buckyos-jwt-name", "127.0.0.1:0", &identity, &roots);
         let material = load_rtcp_identity_material(&config).await.unwrap();
         assert_eq!(
             material.device_config.id,

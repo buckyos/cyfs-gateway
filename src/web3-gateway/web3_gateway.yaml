@@ -11,7 +11,16 @@ servers:
     owner_pkx: "{{sn_owner_pk}}"
     device_jwt: ["{{sn_device_jwt}}"]
     ip: "{{sn_ip}}"
-    bns_indexer_url: "{{bns_server_url}}"
+    # bns_dv 由同目录 start.py 固定拉起在 127.0.0.1:18080(BNS_LISTEN),
+    # 不是环境参数;写死避免依赖 provision 生成的 params.json 提供该 key。
+    # bns_dv 只暴露 /kapi/bns(server RPC,兼容 indexer 方法),要带显式
+    # 路径;裸 host 会被补成 /kapi/bns-indexer 导致 404 传输错误,解析
+    # 链会因 backend error 中止而不回退 legacy(sn db)数据。
+    bns_indexer_url: "http://127.0.0.1:18080/kapi/bns"
+    # bns_write_enabled 缺省跟随 bns_indexer_url 开启,但 BNS 写入必须经
+    # EVM 合约;devtest 环境没有 EVM 链(bns_dv 的 8545 未部署),只用
+    # 解析路径,显式关闭写入。接入真实链时改为 true 并补 bns_evm 配置。
+    bns_write_enabled: false
 
   local_dns:
     type: local_dns
@@ -68,7 +77,12 @@ stacks:
   main_rtcp:
     bind: 0.0.0.0:2980
     protocol: rtcp
-    identity: "{{sn_device_did}}"
+    # provision(createSnConfigs) 只生成平铺的 sn_private_key.pem /
+    # sn_device_config.json,没有 IdentityRoots 布局,所以这里走 legacy
+    # 身份配置。stack DID 为 did:dev 规范形式,发起方 create_tunnel 会把
+    # hello.to 规范化为 did:dev,SN 无需解析别名即可接受。
+    key_path: ./sn_private_key.pem
+    device_config_path: ./sn_device_config.json
     hook_point:
       main:
         id: main

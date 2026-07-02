@@ -885,18 +885,32 @@ where
     }
 }
 
+// URL 已带显式路径时原样使用:允许把 client 指到非默认挂载点,例如
+// bns_dv 这类 server/indexer 合体服务只暴露 /kapi/bns,indexer client
+// 配置成 http://host:port/kapi/bns 即可。裸 host(或仅根路径)才补默认路径。
+fn has_explicit_path(url: &str) -> bool {
+    let rest = match url.split_once("://") {
+        Some((_, rest)) => rest,
+        None => url,
+    };
+    match rest.split_once('/') {
+        Some((_, path)) => !path.trim_end_matches('/').is_empty(),
+        None => false,
+    }
+}
+
 pub fn normalize_bns_indexer_url(indexer_url: &str) -> String {
     let trimmed = indexer_url.trim_end_matches('/');
-    if let Some(base) = trimmed.strip_suffix(BNS_INDEXER_RPC_PATH) {
-        return format!("{}{}", base, BNS_INDEXER_RPC_PATH);
+    if has_explicit_path(trimmed) {
+        return trimmed.to_string();
     }
     format!("{}{}", trimmed, BNS_INDEXER_RPC_PATH)
 }
 
 pub fn normalize_bns_server_url(server_url: &str) -> String {
     let trimmed = server_url.trim_end_matches('/');
-    if let Some(base) = trimmed.strip_suffix(BNS_SERVER_RPC_PATH) {
-        return format!("{}{}", base, BNS_SERVER_RPC_PATH);
+    if has_explicit_path(trimmed) {
+        return trimmed.to_string();
     }
     format!("{}{}", trimmed, BNS_SERVER_RPC_PATH)
 }
@@ -922,4 +936,39 @@ fn rpc_envelope_response<T: Serialize>(
 
 pub fn registry_result<T>(result: BnsRegistryResult<T>) -> BnsClientResult<T> {
     result.map_err(BnsClientError::from)
+}
+
+#[cfg(test)]
+mod url_tests {
+    use super::*;
+
+    #[test]
+    fn test_normalize_bns_urls() {
+        // 裸 host 补默认路径
+        assert_eq!(
+            normalize_bns_indexer_url("http://127.0.0.1:18080"),
+            "http://127.0.0.1:18080/kapi/bns-indexer"
+        );
+        assert_eq!(
+            normalize_bns_indexer_url("http://127.0.0.1:18080/"),
+            "http://127.0.0.1:18080/kapi/bns-indexer"
+        );
+        assert_eq!(
+            normalize_bns_server_url("https://bns.example.com"),
+            "https://bns.example.com/kapi/bns"
+        );
+        // 显式路径原样保留(bns_dv 只暴露 /kapi/bns)
+        assert_eq!(
+            normalize_bns_indexer_url("http://127.0.0.1:18080/kapi/bns"),
+            "http://127.0.0.1:18080/kapi/bns"
+        );
+        assert_eq!(
+            normalize_bns_indexer_url("http://127.0.0.1:18080/kapi/bns-indexer"),
+            "http://127.0.0.1:18080/kapi/bns-indexer"
+        );
+        assert_eq!(
+            normalize_bns_server_url("http://127.0.0.1:18080/custom/rpc/"),
+            "http://127.0.0.1:18080/custom/rpc"
+        );
+    }
 }
