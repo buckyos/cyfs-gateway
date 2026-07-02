@@ -9,7 +9,8 @@ use jsonwebtoken::DecodingKey;
 use log::{debug, warn};
 use name_client::{NameInfo, RecordType};
 use name_lib::{
-    decode_json_from_jwt_with_pk, DeviceConfig, DeviceMiniConfig, EncodedDocument, DID,
+    decode_json_from_jwt_with_pk, DeviceDocument, DeviceMiniDocument as NameDeviceMiniDocument,
+    EncodedDocument, DID,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -2558,8 +2559,12 @@ pub(crate) fn device_config_from_mini_jwt(
         )
     })?;
 
-    let device_config =
-        DeviceConfig::new_by_mini_config(&mini_config_jwt.to_string(), &mini, zone_did, owner_did);
+    let device_config = DeviceDocument::new_by_mini_document(
+        &mini_config_jwt.to_string(),
+        &mini,
+        zone_did,
+        owner_did,
+    );
 
     serde_json::to_value(device_config).map_err(|e| {
         SnResolverError::new(
@@ -2572,8 +2577,8 @@ pub(crate) fn device_config_from_mini_jwt(
 fn decode_mini_config_with_schema_compat(
     mini_config_jwt: &str,
     user_public_key: &DecodingKey,
-) -> Result<DeviceMiniConfig, String> {
-    match DeviceMiniConfig::from_jwt(mini_config_jwt, user_public_key) {
+) -> Result<NameDeviceMiniDocument, String> {
+    match NameDeviceMiniDocument::from_jwt(mini_config_jwt, user_public_key) {
         Ok(config) => Ok(config),
         Err(primary_err) => {
             let primary_err = primary_err.to_string();
@@ -2614,7 +2619,7 @@ fn decode_mini_config_with_schema_compat(
                 }
             }
 
-            serde_json::from_value::<DeviceMiniConfig>(claims)
+            serde_json::from_value::<NameDeviceMiniDocument>(claims)
                 .map_err(|e| format!("fallback mini_config parse failed: {}", e))
         }
     }

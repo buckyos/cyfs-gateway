@@ -2758,7 +2758,7 @@ mod tests {
             "exp": now.duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs() + 3600,
             "iat": now.duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs(),
         });
-        let zone_boot_config: ZoneBootConfig = serde_json::from_value(zone_boot_config).unwrap();
+        let zone_boot_config: ZoneBootDocument = serde_json::from_value(zone_boot_config).unwrap();
         let zone_jwt = zone_boot_config
             .encode(Some(&user_encoding_key))
             .unwrap()
@@ -2778,8 +2778,9 @@ mod tests {
             .to_string();
         let (signing_key, pkcs8_bytes) = generate_ed25519_key();
         let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
-        let device_config = DeviceConfig::new_by_jwk("ood1", serde_json::from_value(jwk).unwrap());
-        let mini_config_jwt = DeviceMiniConfig::new_by_device_config(&device_config);
+        let device_config =
+            DeviceDocument::new_by_jwk("ood1", serde_json::from_value(jwk).unwrap());
+        let mini_config_jwt = DeviceMiniDocument::new_by_device_document(&device_config);
         let mini_config_jwt = mini_config_jwt
             .to_jwt(&user_encoding_key)
             .unwrap()
@@ -2804,7 +2805,7 @@ mod tests {
         let (signing_key2, pkcs8_bytes2) = generate_ed25519_key();
         let jwk2 = encode_ed25519_sk_to_pk_jwk(&signing_key2);
         let device_config2 =
-            DeviceConfig::new_by_jwk("ood2", serde_json::from_value(jwk2).unwrap());
+            DeviceDocument::new_by_jwk("ood2", serde_json::from_value(jwk2).unwrap());
 
         let encoding_key2 = jsonwebtoken::EncodingKey::from_ed_der(pkcs8_bytes2.as_slice());
         let (_token2, mut session2) =
@@ -3460,7 +3461,8 @@ mod tests {
 
         let (signing_key, _pkcs8_bytes) = generate_ed25519_key();
         let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
-        let device_config = DeviceConfig::new_by_jwk("ood1", serde_json::from_value(jwk).unwrap());
+        let device_config =
+            DeviceDocument::new_by_jwk("ood1", serde_json::from_value(jwk).unwrap());
         let device_info = DeviceInfo::from_device_doc(&device_config);
 
         let sn_factory = SnServerFactory::new();
@@ -3719,7 +3721,7 @@ mod tests {
             "exp": now.duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs() + 3600,
             "iat": now.duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs(),
         });
-        let zone_boot_config: ZoneBootConfig = serde_json::from_value(zone_boot_config).unwrap();
+        let zone_boot_config: ZoneBootDocument = serde_json::from_value(zone_boot_config).unwrap();
         let zone_jwt = zone_boot_config
             .encode(Some(&user_encoding_key))
             .unwrap()
@@ -3727,8 +3729,9 @@ mod tests {
 
         let (signing_key, _pkcs8_bytes) = generate_ed25519_key();
         let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
-        let device_config = DeviceConfig::new_by_jwk("ood1", serde_json::from_value(jwk).unwrap());
-        let mini_config_jwt = DeviceMiniConfig::new_by_device_config(&device_config)
+        let device_config =
+            DeviceDocument::new_by_jwk("ood1", serde_json::from_value(jwk).unwrap());
+        let mini_config_jwt = DeviceMiniDocument::new_by_device_document(&device_config)
             .to_jwt(&user_encoding_key)
             .unwrap()
             .to_string();

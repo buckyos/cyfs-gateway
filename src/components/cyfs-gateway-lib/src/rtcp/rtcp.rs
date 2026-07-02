@@ -1001,14 +1001,13 @@ impl RTcpInner {
     ) -> Result<VerifiedSourceDevice, TunnelError> {
         if let Some(device_doc_jwt) = hello_body.device_doc_jwt.as_ref() {
             let unverified_doc =
-                DeviceConfig::decode(&EncodedDocument::Jwt(device_doc_jwt.clone()), None).map_err(
-                    |e| {
+                DeviceDocument::decode(&EncodedDocument::Jwt(device_doc_jwt.clone()), None)
+                    .map_err(|e| {
                         TunnelError::DocumentError(format!(
                             "decode device_doc_jwt without verify failed:{}",
                             e
                         ))
-                    },
-                )?;
+                    })?;
             let owner_public_key = resolve_auth_key(&unverified_doc.owner, None)
                 .await
                 .map_err(|e| {
@@ -1018,7 +1017,7 @@ impl RTcpInner {
                         e
                     ))
                 })?;
-            let verified_doc = DeviceConfig::decode(
+            let verified_doc = DeviceDocument::decode(
                 &EncodedDocument::Jwt(device_doc_jwt.clone()),
                 Some(&owner_public_key),
             )
@@ -3492,12 +3491,12 @@ mod tests {
         let (client_signing_key, client_pkcs8_bytes) = generate_ed25519_key();
         let client_jwk = encode_ed25519_sk_to_pk_jwk(&client_signing_key);
         let client_device_config =
-            DeviceConfig::new_by_jwk("client", serde_json::from_value(client_jwk).unwrap());
+            DeviceDocument::new_by_jwk("client", serde_json::from_value(client_jwk).unwrap());
 
         let (server_signing_key, _server_pkcs8_bytes) = generate_ed25519_key();
         let server_jwk = encode_ed25519_sk_to_pk_jwk(&server_signing_key);
         let server_device_config =
-            DeviceConfig::new_by_jwk("server", serde_json::from_value(server_jwk).unwrap());
+            DeviceDocument::new_by_jwk("server", serde_json::from_value(server_jwk).unwrap());
         let server_id = server_device_config.id.clone();
 
         let mut name_info = NameInfo::new("sn.devtests.org");
@@ -3538,7 +3537,7 @@ mod tests {
         let (signing_key, pkcs8_bytes) = generate_ed25519_key();
         let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
         let device_config =
-            DeviceConfig::new_by_jwk("key-test", serde_json::from_value(jwk).unwrap());
+            DeviceDocument::new_by_jwk("key-test", serde_json::from_value(jwk).unwrap());
         let default_key = device_config.get_default_key().unwrap();
         let public_key = jwk_to_ed25519_pk(&default_key).unwrap();
         (
@@ -3743,11 +3742,11 @@ mod tests {
         assert!(true);
     }
 
-    fn test_device_config(name: &str) -> (DeviceConfig, [u8; 48]) {
+    fn test_device_config(name: &str) -> (DeviceDocument, [u8; 48]) {
         let (signing_key, pkcs8_bytes) = generate_ed25519_key();
         let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
         (
-            DeviceConfig::new_by_jwk(name, serde_json::from_value(jwk).unwrap()),
+            DeviceDocument::new_by_jwk(name, serde_json::from_value(jwk).unwrap()),
             pkcs8_bytes,
         )
     }
@@ -4285,7 +4284,8 @@ mod tests {
         let _ = init_name_lib_for_test(&HashMap::new()).await;
         let (signing_key, pkcs8_bytes) = generate_ed25519_key();
         let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
-        let device_config = DeviceConfig::new_by_jwk("test1", serde_json::from_value(jwk).unwrap());
+        let device_config =
+            DeviceDocument::new_by_jwk("test1", serde_json::from_value(jwk).unwrap());
         let _id1 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
@@ -4313,7 +4313,8 @@ mod tests {
 
         let (signing_key, pkcs8_bytes) = generate_ed25519_key();
         let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
-        let device_config = DeviceConfig::new_by_jwk("test2", serde_json::from_value(jwk).unwrap());
+        let device_config =
+            DeviceDocument::new_by_jwk("test2", serde_json::from_value(jwk).unwrap());
         let id2 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
@@ -4369,7 +4370,8 @@ mod tests {
         let _ = init_name_lib_for_test(&HashMap::new()).await;
         let (signing_key, pkcs8_bytes) = generate_ed25519_key();
         let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
-        let device_config = DeviceConfig::new_by_jwk("test1", serde_json::from_value(jwk).unwrap());
+        let device_config =
+            DeviceDocument::new_by_jwk("test1", serde_json::from_value(jwk).unwrap());
         let _id1 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
@@ -4397,7 +4399,8 @@ mod tests {
 
         let (signing_key, pkcs8_bytes) = generate_ed25519_key();
         let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
-        let device_config = DeviceConfig::new_by_jwk("test2", serde_json::from_value(jwk).unwrap());
+        let device_config =
+            DeviceDocument::new_by_jwk("test2", serde_json::from_value(jwk).unwrap());
         let id2 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
@@ -4448,7 +4451,7 @@ mod tests {
         let (signing_key, pkcs8_bytes) = generate_ed25519_key();
         let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
         let device_config =
-            DeviceConfig::new_by_jwk("probe1", serde_json::from_value(jwk).unwrap());
+            DeviceDocument::new_by_jwk("probe1", serde_json::from_value(jwk).unwrap());
         let _id1 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
@@ -4477,7 +4480,7 @@ mod tests {
         let (signing_key, pkcs8_bytes) = generate_ed25519_key();
         let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
         let device_config =
-            DeviceConfig::new_by_jwk("probe2", serde_json::from_value(jwk).unwrap());
+            DeviceDocument::new_by_jwk("probe2", serde_json::from_value(jwk).unwrap());
         let id2 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
@@ -4536,20 +4539,20 @@ mod tests {
         let (server_signing_key, server_pkcs8_bytes) = generate_ed25519_key();
         let server_jwk = encode_ed25519_sk_to_pk_jwk(&server_signing_key);
         let server_device_config =
-            DeviceConfig::new_by_jwk("server", serde_json::from_value(server_jwk).unwrap());
+            DeviceDocument::new_by_jwk("server", serde_json::from_value(server_jwk).unwrap());
         let server_id = server_device_config.id.clone();
 
         let (owner_signing_key, owner_pkcs8_bytes) = generate_ed25519_key();
         let owner_jwk = encode_ed25519_sk_to_pk_jwk(&owner_signing_key);
         let owner_config =
-            DeviceConfig::new_by_jwk("owner", serde_json::from_value(owner_jwk).unwrap());
+            DeviceDocument::new_by_jwk("owner", serde_json::from_value(owner_jwk).unwrap());
         let owner_did = owner_config.id.clone();
         let owner_private_key = EncodingKey::from_ed_der(&owner_pkcs8_bytes);
 
         let (client_signing_key, client_pkcs8_bytes) = generate_ed25519_key();
         let client_jwk = encode_ed25519_sk_to_pk_jwk(&client_signing_key);
         let mut client_device_config =
-            DeviceConfig::new_by_jwk("client", serde_json::from_value(client_jwk).unwrap());
+            DeviceDocument::new_by_jwk("client", serde_json::from_value(client_jwk).unwrap());
         client_device_config.owner = owner_did.clone();
         let client_id = client_device_config.id.clone();
         let client_device_doc_jwt = match client_device_config
@@ -4614,7 +4617,7 @@ mod tests {
         let (owner_signing_key, owner_pkcs8_bytes) = generate_ed25519_key();
         let owner_jwk = encode_ed25519_sk_to_pk_jwk(&owner_signing_key);
         let owner_config =
-            DeviceConfig::new_by_jwk("owner", serde_json::from_value(owner_jwk).unwrap());
+            DeviceDocument::new_by_jwk("owner", serde_json::from_value(owner_jwk).unwrap());
         let owner_did = owner_config.id.clone();
         let owner_private_key = EncodingKey::from_ed_der(&owner_pkcs8_bytes);
 
@@ -4623,7 +4626,7 @@ mod tests {
         let (client_signing_key, _client_pkcs8_bytes) = generate_ed25519_key();
         let client_jwk = encode_ed25519_sk_to_pk_jwk(&client_signing_key);
         let mut client_device_config =
-            DeviceConfig::new_by_jwk("client", serde_json::from_value(client_jwk).unwrap());
+            DeviceDocument::new_by_jwk("client", serde_json::from_value(client_jwk).unwrap());
         let client_dev_did = client_device_config.id.clone();
         let client_logical_did = DID::new("test", "rtcp-logical-client");
         client_device_config.id = client_logical_did.clone();
@@ -4681,7 +4684,8 @@ mod tests {
         let _ = init_name_lib_for_test(&HashMap::new()).await;
         let (signing_key, pkcs8_bytes) = generate_ed25519_key();
         let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
-        let device_config = DeviceConfig::new_by_jwk("test1", serde_json::from_value(jwk).unwrap());
+        let device_config =
+            DeviceDocument::new_by_jwk("test1", serde_json::from_value(jwk).unwrap());
         let id1 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
@@ -4709,7 +4713,8 @@ mod tests {
 
         let (signing_key, pkcs8_bytes) = generate_ed25519_key();
         let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
-        let device_config = DeviceConfig::new_by_jwk("test2", serde_json::from_value(jwk).unwrap());
+        let device_config =
+            DeviceDocument::new_by_jwk("test2", serde_json::from_value(jwk).unwrap());
         let id2 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
@@ -4796,7 +4801,7 @@ mod tests {
 
         let (signing_key, pkcs8_bytes) = generate_ed25519_key();
         let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
-        let device_config = DeviceConfig::new_by_jwk(
+        let device_config = DeviceDocument::new_by_jwk(
             format!("{}-a", test_name).as_str(),
             serde_json::from_value(jwk).unwrap(),
         );
@@ -4837,7 +4842,7 @@ mod tests {
 
         let (signing_key, pkcs8_bytes) = generate_ed25519_key();
         let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
-        let device_config = DeviceConfig::new_by_jwk(
+        let device_config = DeviceDocument::new_by_jwk(
             format!("{}-b", test_name).as_str(),
             serde_json::from_value(jwk).unwrap(),
         );
@@ -4868,7 +4873,7 @@ mod tests {
 
         let (signing_key, pkcs8_bytes) = generate_ed25519_key();
         let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
-        let device_config = DeviceConfig::new_by_jwk(
+        let device_config = DeviceDocument::new_by_jwk(
             format!("{}-c", test_name).as_str(),
             serde_json::from_value(jwk).unwrap(),
         );
@@ -5193,7 +5198,8 @@ mod tests {
         let _ = init_name_lib_for_test(&HashMap::new()).await;
         let (signing_key, pkcs8_bytes) = generate_ed25519_key();
         let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
-        let device_config = DeviceConfig::new_by_jwk("test1", serde_json::from_value(jwk).unwrap());
+        let device_config =
+            DeviceDocument::new_by_jwk("test1", serde_json::from_value(jwk).unwrap());
         let id1 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
@@ -5221,7 +5227,8 @@ mod tests {
 
         let (signing_key, pkcs8_bytes) = generate_ed25519_key();
         let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
-        let device_config = DeviceConfig::new_by_jwk("test2", serde_json::from_value(jwk).unwrap());
+        let device_config =
+            DeviceDocument::new_by_jwk("test2", serde_json::from_value(jwk).unwrap());
         let id2 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);

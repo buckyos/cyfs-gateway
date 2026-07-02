@@ -1487,7 +1487,7 @@ pub async fn cyfs_gateway_main() {
 
             let (private_key, public_key) = generate_ed25519_key_pair();
             let device_config =
-                DeviceConfig::new_by_jwk(name, serde_json::from_value(public_key).unwrap());
+                DeviceDocument::new_by_jwk(name, serde_json::from_value(public_key).unwrap());
             let sk_file = key_dir.join("device.key.pem");
             std::fs::write(&sk_file, private_key).unwrap();
             println!("Private key saved to: {:?}", sk_file);
