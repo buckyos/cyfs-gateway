@@ -748,7 +748,7 @@ pub fn spawn_listener(
 //
 // `GET /1.0/identifiers/{did}?type={doc_type}[&iat={unix_ts}]` answers with a
 // W3C DID Resolution Result envelope carrying the `didDocumentMetadata.buckyos`
-// extension block that `name-client`'s `HttpsProvider::resolve_published_state`
+// extension block that `name-client`'s `BaseHttpProvider::resolve_published_state`
 // parses. This resolver is only authoritative for `did:bns:*`.
 // ---------------------------------------------------------------------------
 
@@ -1958,7 +1958,7 @@ mod tests {
         .await;
 
         // Protocol §5 NotApplicable: 404 without `buckyos.documentStatus`,
-        // which `HttpsProvider::parse_published_state_body` maps to Ok(None).
+        // which `BaseHttpProvider::parse_published_state_body` maps to Ok(None).
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert!(body.is_object());
         assert!(body["didDocumentMetadata"].get("buckyos").is_none());
