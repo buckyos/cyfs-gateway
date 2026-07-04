@@ -1,3 +1,4 @@
+use crate::sn_did_resolver::{SnDidDocumentSource, SnDidResolveResponse, SnDidResolverProfile};
 use crate::{
     RelayAssignment, RelayAssignmentState, SNUserInfo, SnAuthDBRef, SnDeviceInfoDBRef,
     SnDeviceStateView, SnRelayManagerRef, ZoneInfo,
@@ -42,7 +43,6 @@ pub enum SnResolverErrorKind {
     NameNotFound,
     DocumentNotFound,
     DeviceNotFound,
-    DeviceOffline,
     UnsupportedRecordType,
     UnsupportedDidMethod,
     InvalidHostname,
@@ -89,8 +89,7 @@ impl SnResolverError {
             SnResolverErrorKind::NotManaged
             | SnResolverErrorKind::NameNotFound
             | SnResolverErrorKind::DocumentNotFound
-            | SnResolverErrorKind::DeviceNotFound
-            | SnResolverErrorKind::DeviceOffline => ServerErrorCode::NotFound,
+            | SnResolverErrorKind::DeviceNotFound => ServerErrorCode::NotFound,
             SnResolverErrorKind::BackendUnavailable => ServerErrorCode::ProcessChainError,
         };
 
@@ -161,14 +160,6 @@ pub enum DnsResolutionSource {
     BnsDocument,
     DeviceOnlineInfo,
     SnSelf,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
-pub enum DidResolutionSource {
-    BnsDocument,
-    DeviceMiniDocument,
-    DeviceOnlineInfo,
-    LegacyLocalDidDocument,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
@@ -407,14 +398,6 @@ pub struct DnsResolution {
     pub addresses: Vec<IpAddr>,
     pub txt: Vec<String>,
     pub source: DnsResolutionSource,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct DidResolution {
-    pub did: String,
-    pub doc_type: String,
-    pub document: EncodedDocument,
-    pub source: DidResolutionSource,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
@@ -1175,7 +1158,7 @@ impl SnResolver {
         did: &DID,
         doc_type: Option<&str>,
         _from_ip: Option<IpAddr>,
-    ) -> SnResolverResult<DidResolution> {
+    ) -> SnResolverResult<SnDidResolveResponse> {
         let doc_type = normalize_doc_type(doc_type);
         match did.method.as_str() {
             "web" => self.resolve_web_did(did, doc_type.as_deref()).await,
@@ -1564,7 +1547,7 @@ impl SnResolver {
         &self,
         did: &DID,
         doc_type: Option<&str>,
-    ) -> SnResolverResult<DidResolution> {
+    ) -> SnResolverResult<SnDidResolveResponse> {
         let id = normalize_host_lossy(did.id.as_str());
         let user = self.auth.get_user_by_domain(id.as_str()).await?;
         let Some(user) = user else {
@@ -1609,7 +1592,7 @@ impl SnResolver {
         &self,
         did: &DID,
         doc_type: Option<&str>,
-    ) -> SnResolverResult<DidResolution> {
+    ) -> SnResolverResult<SnDidResolveResponse> {
         let id = did.id.as_str();
         if let Some((obj_name, tail)) = id.split_once('.') {
             let zone_name = if tail.contains('.') {
@@ -1636,12 +1619,12 @@ impl SnResolver {
         let zone_name = normalize_bns_name(id)?;
         let doc_type = doc_type.unwrap_or(BNS_DOC_ZONE);
         if let Some(document) = self.bns.get_document(zone_name.as_str(), doc_type).await? {
-            return Ok(DidResolution {
-                did: did.to_string(),
-                doc_type: doc_type.to_string(),
-                document: document.content.to_encoded_document(),
-                source: DidResolutionSource::BnsDocument,
-            });
+            return Ok(did_response(
+                did,
+                doc_type,
+                document.content.to_encoded_document(),
+                SnDidDocumentSource::BnsDocument,
+            ));
         }
 
         match doc_type {
@@ -1653,12 +1636,12 @@ impl SnResolver {
                     } else {
                         json!({ "boot": user.zone_config })
                     };
-                    return Ok(DidResolution {
-                        did: did.to_string(),
-                        doc_type: doc_type.to_string(),
-                        document: EncodedDocument::JsonLd(document),
-                        source: DidResolutionSource::LegacyLocalDidDocument,
-                    });
+                    return Ok(did_response(
+                        did,
+                        doc_type,
+                        EncodedDocument::JsonLd(document),
+                        SnDidDocumentSource::LegacyCompatibilityStore,
+                    ));
                 }
 
                 let kind = if self.bns.resolve_owner(zone_name.as_str()).await?.is_some() {
@@ -1678,12 +1661,12 @@ impl SnResolver {
                 {
                     let document =
                         device_document_or_fallback(device_doc, compatibility_device.as_ref());
-                    return Ok(DidResolution {
-                        did: did.to_string(),
-                        doc_type: device_name.to_string(),
-                        document: EncodedDocument::JsonLd(document),
-                        source: DidResolutionSource::DeviceMiniDocument,
-                    });
+                    return Ok(did_response(
+                        did,
+                        device_name,
+                        EncodedDocument::JsonLd(document),
+                        SnDidDocumentSource::DeviceMiniDocument,
+                    ));
                 }
 
                 self.resolve_legacy_local_did_doc(
@@ -1703,7 +1686,7 @@ impl SnResolver {
         zone_name: &str,
         obj_name: &str,
         doc_type: &str,
-    ) -> SnResolverResult<DidResolution> {
+    ) -> SnResolverResult<SnDidResolveResponse> {
         match doc_type {
             "doc" => {
                 let (device_doc, compatibility_device) = self
@@ -1711,12 +1694,12 @@ impl SnResolver {
                     .await?;
                 let document =
                     device_document_or_fallback(device_doc, compatibility_device.as_ref());
-                Ok(DidResolution {
-                    did: did.to_string(),
-                    doc_type: doc_type.to_string(),
-                    document: EncodedDocument::JsonLd(document),
-                    source: DidResolutionSource::DeviceMiniDocument,
-                })
+                Ok(did_response(
+                    did,
+                    doc_type,
+                    EncodedDocument::JsonLd(document),
+                    SnDidDocumentSource::DeviceMiniDocument,
+                ))
             }
             "info" => {
                 if let Some(online) = self
@@ -1724,27 +1707,27 @@ impl SnResolver {
                     .get_device_state_by_name(zone_name, obj_name)
                     .await?
                 {
-                    return Ok(DidResolution {
-                        did: did.to_string(),
-                        doc_type: doc_type.to_string(),
-                        document: EncodedDocument::JsonLd(device_online_info_document(&online)),
-                        source: DidResolutionSource::DeviceOnlineInfo,
-                    });
+                    return Ok(did_response(
+                        did,
+                        doc_type,
+                        EncodedDocument::JsonLd(device_online_info_document(&online)),
+                        SnDidDocumentSource::DeviceOnlineInfo,
+                    ));
                 }
 
                 if let Ok((device_doc, compatibility_device)) = self
                     .resolve_device_mini_doc(zone_name, obj_name, None)
                     .await
                 {
-                    return Ok(DidResolution {
-                        did: did.to_string(),
-                        doc_type: doc_type.to_string(),
-                        document: EncodedDocument::JsonLd(device_offline_info_document(
+                    return Ok(did_response(
+                        did,
+                        doc_type,
+                        EncodedDocument::JsonLd(device_offline_info_document(
                             &device_doc,
                             compatibility_device.as_ref(),
                         )),
-                        source: DidResolutionSource::DeviceMiniDocument,
-                    });
+                        SnDidDocumentSource::DeviceMiniDocument,
+                    ));
                 }
 
                 let compatibility_device = self
@@ -1757,24 +1740,24 @@ impl SnResolver {
                             format!("device {}.{} not found", obj_name, zone_name),
                         )
                     })?;
-                Ok(DidResolution {
-                    did: did.to_string(),
-                    doc_type: doc_type.to_string(),
-                    document: EncodedDocument::JsonLd(device_info_document_or_fallback(
+                Ok(did_response(
+                    did,
+                    doc_type,
+                    EncodedDocument::JsonLd(device_info_document_or_fallback(
                         &compatibility_device,
                     )),
-                    source: DidResolutionSource::LegacyLocalDidDocument,
-                })
+                    SnDidDocumentSource::LegacyCompatibilityStore,
+                ))
             }
             other => {
                 let child_name = format!("{}.{}", obj_name, zone_name);
                 if let Some(document) = self.bns.get_document(child_name.as_str(), other).await? {
-                    return Ok(DidResolution {
-                        did: did.to_string(),
-                        doc_type: other.to_string(),
-                        document: document.content.to_encoded_document(),
-                        source: DidResolutionSource::BnsDocument,
-                    });
+                    return Ok(did_response(
+                        did,
+                        other,
+                        document.content.to_encoded_document(),
+                        SnDidDocumentSource::BnsDocument,
+                    ));
                 }
                 self.resolve_legacy_local_did_doc(did, zone_name, obj_name, Some(other))
                     .await
@@ -1786,7 +1769,7 @@ impl SnResolver {
         &self,
         did: &DID,
         doc_type: Option<&str>,
-    ) -> SnResolverResult<DidResolution> {
+    ) -> SnResolverResult<SnDidResolveResponse> {
         let doc_type = doc_type.unwrap_or("doc");
         let did_str = did.to_string();
         let online = self
@@ -1795,12 +1778,12 @@ impl SnResolver {
             .await?;
         if doc_type == "info" {
             if let Some(online) = online {
-                return Ok(DidResolution {
-                    did: did_str,
-                    doc_type: doc_type.to_string(),
-                    document: EncodedDocument::JsonLd(device_online_info_document(&online)),
-                    source: DidResolutionSource::DeviceOnlineInfo,
-                });
+                return Ok(did_response_str(
+                    did_str,
+                    doc_type,
+                    EncodedDocument::JsonLd(device_online_info_document(&online)),
+                    SnDidDocumentSource::DeviceOnlineInfo,
+                ));
             }
         }
 
@@ -1810,23 +1793,23 @@ impl SnResolver {
             .await?;
         if let Some(compatibility_device) = compatibility_device {
             return match doc_type {
-                "doc" => Ok(DidResolution {
-                    did: did_str,
-                    doc_type: doc_type.to_string(),
-                    document: EncodedDocument::JsonLd(device_document_or_fallback(
+                "doc" => Ok(did_response_str(
+                    did_str,
+                    doc_type,
+                    EncodedDocument::JsonLd(device_document_or_fallback(
                         compatibility_device.to_device_mini_document(),
                         Some(&compatibility_device),
                     )),
-                    source: DidResolutionSource::DeviceMiniDocument,
-                }),
-                "info" => Ok(DidResolution {
-                    did: did_str,
-                    doc_type: doc_type.to_string(),
-                    document: EncodedDocument::JsonLd(device_info_document_or_fallback(
+                    SnDidDocumentSource::DeviceMiniDocument,
+                )),
+                "info" => Ok(did_response_str(
+                    did_str,
+                    doc_type,
+                    EncodedDocument::JsonLd(device_info_document_or_fallback(
                         &compatibility_device,
                     )),
-                    source: DidResolutionSource::LegacyLocalDidDocument,
-                }),
+                    SnDidDocumentSource::LegacyCompatibilityStore,
+                )),
                 other => Err(SnResolverError::new(
                     SnResolverErrorKind::DocumentNotFound,
                     format!("unsupported doc_type {} for {}", other, did_str),
@@ -1843,10 +1826,10 @@ impl SnResolver {
                         None,
                     )
                     .await?;
-                return Ok(DidResolution {
-                    did: did_str,
-                    doc_type: doc_type.to_string(),
-                    document: EncodedDocument::JsonLd(device_doc.document.unwrap_or_else(|| {
+                return Ok(did_response_str(
+                    did_str,
+                    doc_type,
+                    EncodedDocument::JsonLd(device_doc.document.unwrap_or_else(|| {
                         json!({
                             "id": device_doc.did,
                             "name": device_doc.device_name,
@@ -1854,8 +1837,8 @@ impl SnResolver {
                             "mini_config_jwt": device_doc.mini_config_jwt,
                         })
                     })),
-                    source: DidResolutionSource::DeviceMiniDocument,
-                });
+                    SnDidDocumentSource::DeviceMiniDocument,
+                ));
             }
         }
 
@@ -1871,7 +1854,7 @@ impl SnResolver {
         owner_user: &str,
         obj_name: &str,
         doc_type: Option<&str>,
-    ) -> SnResolverResult<DidResolution> {
+    ) -> SnResolverResult<SnDidResolveResponse> {
         let Some(did_document) = self
             .compatibility
             .query_user_did_document(owner_user, obj_name, doc_type)
@@ -1894,14 +1877,40 @@ impl SnResolver {
             })?
         };
 
-        Ok(DidResolution {
-            did: did.to_string(),
-            doc_type: did_document
+        Ok(did_response(
+            did,
+            did_document
                 .doc_type
                 .unwrap_or_else(|| doc_type.unwrap_or("doc").to_string()),
-            document: EncodedDocument::JsonLd(value),
-            source: DidResolutionSource::LegacyLocalDidDocument,
-        })
+            EncodedDocument::JsonLd(value),
+            SnDidDocumentSource::LegacyCompatibilityStore,
+        ))
+    }
+}
+
+fn did_response(
+    did: &DID,
+    doc_type: impl Into<String>,
+    document: EncodedDocument,
+    source: SnDidDocumentSource,
+) -> SnDidResolveResponse {
+    did_response_str(did.to_string(), doc_type, document, source)
+}
+
+fn did_response_str(
+    did: impl Into<String>,
+    doc_type: impl Into<String>,
+    document: EncodedDocument,
+    source: SnDidDocumentSource,
+) -> SnDidResolveResponse {
+    SnDidResolveResponse {
+        did: did.into(),
+        doc_type: doc_type.into(),
+        document,
+        source,
+        profile: SnDidResolverProfile::PublicSupplement,
+        document_status: None,
+        metadata: Value::Null,
     }
 }
 
@@ -3234,7 +3243,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(resolved.source, DidResolutionSource::BnsDocument);
+        assert_eq!(resolved.source, SnDidDocumentSource::BnsDocument);
         assert_eq!(resolved.doc_type, BNS_DOC_ZONE);
     }
 
@@ -3356,7 +3365,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(resolved.source, DidResolutionSource::DeviceMiniDocument);
+        assert_eq!(resolved.source, SnDidDocumentSource::DeviceMiniDocument);
         assert_eq!(resolved.doc_type, "ood1");
     }
 
@@ -3390,7 +3399,7 @@ mod tests {
             EncodedDocument::Jwt(_) => panic!("expected json document"),
         };
 
-        assert_eq!(resolved.source, DidResolutionSource::DeviceMiniDocument);
+        assert_eq!(resolved.source, SnDidDocumentSource::DeviceMiniDocument);
         assert_eq!(value["state"], "offline");
         assert_eq!(value["did"], "did:dev:abc");
     }

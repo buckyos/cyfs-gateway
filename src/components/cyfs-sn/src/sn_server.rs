@@ -4,12 +4,12 @@ use crate::sn_auth_manager::SnAuthManager;
 use crate::sn_bns_reader::BnsIndexerDocumentReader;
 use crate::sn_compat_store::{SNDeviceInfo, SnCompatibilityStoreRef, SqliteSnCompatibilityStore};
 use crate::sn_did_resolver::{
-    normalize_sn_did_doc_type, SnDidDocumentSource, SnDidResolveRequest, SnDidResolveResponse,
-    SnDidResolver, SnDidResolverProfile, SnDidResolverRef, SN_DID_RESOLVER_ROUTE_PREFIX,
+    normalize_sn_did_doc_type, SnDidResolveRequest, SnDidResolveResponse, SnDidResolver,
+    SnDidResolverProfile, SnDidResolverRef, SN_DID_RESOLVER_ROUTE_PREFIX,
 };
 use crate::sn_resolver::{
-    device_config_from_mini_jwt, DidResolutionSource, ResolverCompatibilityReader,
-    ResolverDeviceDocument, ResolverDidDocument, SnAuthResolverReader, SnDeviceInfoResolverReader,
+    device_config_from_mini_jwt, ResolverCompatibilityReader, ResolverDeviceDocument,
+    ResolverDidDocument, SnAuthResolverReader, SnDeviceInfoResolverReader,
     SnRelayManagerResolverReader, SnResolver, SnResolverConfig, SnResolverError,
     SnResolverErrorKind, SnResolverRef, SnResolverResult,
 };
@@ -469,17 +469,6 @@ impl LegacySnDidResolver {
     fn new(resolver: SnResolverRef) -> Self {
         Self { resolver }
     }
-
-    fn map_source(source: DidResolutionSource) -> SnDidDocumentSource {
-        match source {
-            DidResolutionSource::BnsDocument => SnDidDocumentSource::BnsDocument,
-            DidResolutionSource::DeviceMiniDocument => SnDidDocumentSource::DeviceMiniDocument,
-            DidResolutionSource::DeviceOnlineInfo => SnDidDocumentSource::DeviceOnlineInfo,
-            DidResolutionSource::LegacyLocalDidDocument => {
-                SnDidDocumentSource::LegacyCompatibilityStore
-            }
-        }
-    }
 }
 
 #[async_trait]
@@ -488,26 +477,18 @@ impl SnDidResolver for LegacySnDidResolver {
         &self,
         request: SnDidResolveRequest,
     ) -> SnResolverResult<SnDidResolveResponse> {
-        let resolution = self
+        let mut resolution = self
             .resolver
             .resolve_did(&request.did, request.doc_type(), request.from_ip)
             .await?;
-        let document_status = match request.profile {
+        resolution.profile = request.profile;
+        resolution.document_status = match request.profile {
             SnDidResolverProfile::PublicSupplement => None,
             SnDidResolverProfile::InternalZoneResolver => {
                 Some(crate::sn_did_resolver::SnDidDocumentStatus::Active)
             }
         };
-
-        Ok(SnDidResolveResponse {
-            did: resolution.did,
-            doc_type: resolution.doc_type,
-            document: resolution.document,
-            source: Self::map_source(resolution.source),
-            profile: request.profile,
-            document_status,
-            metadata: Value::Null,
-        })
+        Ok(resolution)
     }
 }
 
@@ -1845,8 +1826,7 @@ impl HttpServer for SNServer {
                         SnResolverErrorKind::NotManaged
                         | SnResolverErrorKind::NameNotFound
                         | SnResolverErrorKind::DocumentNotFound
-                        | SnResolverErrorKind::DeviceNotFound
-                        | SnResolverErrorKind::DeviceOffline => StatusCode::NOT_FOUND,
+                        | SnResolverErrorKind::DeviceNotFound => StatusCode::NOT_FOUND,
                         SnResolverErrorKind::InvalidHostname
                         | SnResolverErrorKind::InvalidDid
                         | SnResolverErrorKind::UnsupportedRecordType
