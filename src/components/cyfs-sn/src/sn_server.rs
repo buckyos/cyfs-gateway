@@ -3,9 +3,13 @@ use crate::name_info_cache::{NameInfoCache, NameInfoCacheQueryResult, NameInfoCa
 use crate::sn_auth_manager::SnAuthManager;
 use crate::sn_bns_reader::BnsIndexerDocumentReader;
 use crate::sn_compat_store::{SNDeviceInfo, SnCompatibilityStoreRef, SqliteSnCompatibilityStore};
+use crate::sn_did_resolver::{
+    normalize_sn_did_doc_type, SnDidDocumentSource, SnDidResolveRequest, SnDidResolveResponse,
+    SnDidResolver, SnDidResolverProfile, SnDidResolverRef, SN_DID_RESOLVER_ROUTE_PREFIX,
+};
 use crate::sn_resolver::{
-    device_config_from_mini_jwt, ResolverCompatibilityReader, ResolverDeviceDocument,
-    ResolverDidDocument, SnAuthResolverReader, SnDeviceInfoResolverReader,
+    device_config_from_mini_jwt, DidResolutionSource, ResolverCompatibilityReader,
+    ResolverDeviceDocument, ResolverDidDocument, SnAuthResolverReader, SnDeviceInfoResolverReader,
     SnRelayManagerResolverReader, SnResolver, SnResolverConfig, SnResolverError,
     SnResolverErrorKind, SnResolverRef, SnResolverResult,
 };
@@ -457,6 +461,56 @@ struct RegisteredDeviceKey {
     device_name: String,
 }
 
+struct LegacySnDidResolver {
+    resolver: SnResolverRef,
+}
+
+impl LegacySnDidResolver {
+    fn new(resolver: SnResolverRef) -> Self {
+        Self { resolver }
+    }
+
+    fn map_source(source: DidResolutionSource) -> SnDidDocumentSource {
+        match source {
+            DidResolutionSource::BnsDocument => SnDidDocumentSource::BnsDocument,
+            DidResolutionSource::DeviceMiniDocument => SnDidDocumentSource::DeviceMiniDocument,
+            DidResolutionSource::DeviceOnlineInfo => SnDidDocumentSource::DeviceOnlineInfo,
+            DidResolutionSource::LegacyLocalDidDocument => {
+                SnDidDocumentSource::LegacyCompatibilityStore
+            }
+        }
+    }
+}
+
+#[async_trait]
+impl SnDidResolver for LegacySnDidResolver {
+    async fn resolve(
+        &self,
+        request: SnDidResolveRequest,
+    ) -> SnResolverResult<SnDidResolveResponse> {
+        let resolution = self
+            .resolver
+            .resolve_did(&request.did, request.doc_type(), request.from_ip)
+            .await?;
+        let document_status = match request.profile {
+            SnDidResolverProfile::PublicSupplement => None,
+            SnDidResolverProfile::InternalZoneResolver => {
+                Some(crate::sn_did_resolver::SnDidDocumentStatus::Active)
+            }
+        };
+
+        Ok(SnDidResolveResponse {
+            did: resolution.did,
+            doc_type: resolution.doc_type,
+            document: resolution.document,
+            source: Self::map_source(resolution.source),
+            profile: request.profile,
+            document_status,
+            metadata: Value::Null,
+        })
+    }
+}
+
 #[derive(Clone)]
 pub struct SNServer {
     id: String,
@@ -467,6 +521,7 @@ pub struct SNServer {
     auth: Arc<SnAuthManager>,
     name_info_cache: NameInfoCacheRef,
     resolver: SnResolverRef,
+    did_resolver: SnDidResolverRef,
     bns_controller: Option<Arc<SnBnsController>>,
 }
 
@@ -638,6 +693,7 @@ impl SNServer {
             );
         }
         let resolver = Arc::new(resolver);
+        let did_resolver = Arc::new(LegacySnDidResolver::new(resolver.clone()));
 
         SNServer {
             id: server_config.id,
@@ -648,6 +704,7 @@ impl SNServer {
             auth,
             name_info_cache: NameInfoCache::new_ref(),
             resolver,
+            did_resolver,
             bns_controller,
         }
     }
@@ -658,6 +715,10 @@ impl SNServer {
 
     pub fn resolver(&self) -> SnResolverRef {
         self.resolver.clone()
+    }
+
+    pub fn did_resolver(&self) -> SnDidResolverRef {
+        self.did_resolver.clone()
     }
 
     pub(crate) fn bns_controller(&self) -> Option<Arc<SnBnsController>> {
@@ -1271,14 +1332,23 @@ impl SNServer {
         if did.method != "bns" && did.method != "web" {
             return Ok(None);
         }
+        let did_string = did.to_string();
 
-        let resolution = match self.resolver.resolve_did(&did, Some("doc"), None).await {
+        let resolution = match self
+            .did_resolver
+            .resolve(SnDidResolveRequest::new(
+                did,
+                Some("doc".to_string()),
+                None,
+                SnDidResolverProfile::InternalZoneResolver,
+            ))
+            .await
+        {
             Ok(resolution) => resolution,
             Err(e) => {
                 debug!(
                     "skip canonical device DID check for {}: resolver failed: {}",
-                    did.to_string(),
-                    e
+                    did_string, e
                 );
                 return Ok(None);
             }
@@ -1289,8 +1359,7 @@ impl SNServer {
             Err(e) => {
                 debug!(
                     "skip canonical device DID check for {}: document decode failed: {}",
-                    did.to_string(),
-                    e
+                    did_string, e
                 );
                 return Ok(None);
             }
@@ -1502,98 +1571,6 @@ impl SNServer {
             .unwrap())
     }
 
-    fn normalize_resolve_type(resolve_type: Option<String>) -> Option<String> {
-        match resolve_type {
-            None => None,
-            Some(t) if t.trim().is_empty() => None,
-            Some(t) => Some(t),
-        }
-    }
-
-    pub async fn handle_http_did_resolve_request(
-        &self,
-        query_str: &str,
-        info: StreamInfo,
-    ) -> ServerResult<http::Response<BoxBody<Bytes, ServerError>>> {
-        //query_str is like "did:bns:xxxx[?type=boot]"
-        let (did_part, query_part) = match query_str.split_once('?') {
-            Some((did, query)) => (did, Some(query)),
-            None => (query_str, None),
-        };
-
-        let did = match DID::from_str(did_part) {
-            Ok(did) => did,
-            Err(e) => {
-                let msg = format!("invalid did '{}': {}", did_part, e);
-                warn!("invalid did '{}': {}", did_part, e);
-                return Self::builder_error_http_response(StatusCode::BAD_REQUEST, msg);
-            }
-        };
-
-        let did_method = did.method.as_str();
-        if did_method != "bns" && did_method != "dev" && did_method != "web" {
-            let msg = format!("unsupported did method '{}'", did_method);
-            warn!("unsupported did method '{}'", did_method);
-            return Self::builder_error_http_response(StatusCode::BAD_REQUEST, msg);
-        }
-
-        let mut resolve_type: Option<String> = None;
-        if let Some(query) = query_part {
-            for pair in query.split('&') {
-                if pair.is_empty() {
-                    continue;
-                }
-                if let Some((k, v)) = pair.split_once('=') {
-                    if k == "type" && !v.is_empty() {
-                        resolve_type = Some(v.to_string());
-                    }
-                } else if pair == "type" {
-                    resolve_type = Some(String::new());
-                }
-            }
-        }
-        let resolve_type = Self::normalize_resolve_type(resolve_type);
-
-        // Treat HTTP `type` as NameServer::query_did doc_type.
-        let doc_type = resolve_type.as_deref();
-
-        let from_ip = info
-            .real_src_addr
-            .as_deref()
-            .and_then(parse_ip_or_socket_addr)
-            .or_else(|| info.src_addr.as_deref().and_then(parse_ip_or_socket_addr));
-
-        match self.query_did(&did, doc_type, from_ip).await {
-            Ok(doc) => {
-                let body = doc.to_string();
-                let content_type = match doc {
-                    EncodedDocument::JsonLd(_) => "application/json",
-                    EncodedDocument::Jwt(_) => "application/jwt",
-                };
-                Ok(Response::builder()
-                    .status(StatusCode::OK)
-                    .header("Access-Control-Allow-Origin", "*")
-                    .header("Content-Type", content_type)
-                    .body(BoxBody::new(
-                        Full::new(Bytes::from(body))
-                            .map_err(|never| match never {})
-                            .boxed(),
-                    ))
-                    .unwrap())
-            }
-            Err(e) => {
-                let (status, msg) = match e.code() {
-                    ServerErrorCode::NotFound => (StatusCode::NOT_FOUND, e.to_string()),
-                    ServerErrorCode::BadRequest | ServerErrorCode::InvalidParam => {
-                        (StatusCode::BAD_REQUEST, e.to_string())
-                    }
-                    _ => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
-                };
-                Self::builder_error_http_response(status, msg)
-            }
-        }
-    }
-
     pub(crate) fn auth_db(&self) -> &SnAuthDBRef {
         &self.auth_db
     }
@@ -1745,8 +1722,13 @@ impl NameServer for SNServer {
         doc_type: Option<&str>,
         from_ip: Option<IpAddr>,
     ) -> ServerResult<EncodedDocument> {
-        self.resolver
-            .resolve_did(did, doc_type, from_ip)
+        self.did_resolver
+            .resolve(SnDidResolveRequest::new(
+                did.clone(),
+                normalize_sn_did_doc_type(doc_type),
+                from_ip,
+                SnDidResolverProfile::InternalZoneResolver,
+            ))
             .await
             .map(|resolution| resolution.document)
             .map_err(|e| e.to_server_error())
@@ -1790,8 +1772,10 @@ impl HttpServer for SNServer {
         }
 
         let path = request.uri().path().to_string();
-        if path.starts_with("/1.0/identifiers/") && request.method() == Method::GET {
-            let did_str = path.trim_start_matches("/1.0/identifiers/").to_string();
+        if path.starts_with(SN_DID_RESOLVER_ROUTE_PREFIX) && request.method() == Method::GET {
+            let did_str = path
+                .trim_start_matches(SN_DID_RESOLVER_ROUTE_PREFIX)
+                .to_string();
             if did_str.is_empty() {
                 return Err(server_err!(
                     ServerErrorCode::BadRequest,
@@ -1799,19 +1783,21 @@ impl HttpServer for SNServer {
                 ));
             }
 
-            // parse doc_type from query string (?type=xxx)
             let mut doc_type: Option<String> = None;
+            let mut iat: Option<String> = None;
             if let Some(query) = request.uri().query() {
-                for pair in query.split('&') {
-                    if pair.is_empty() {
-                        continue;
-                    }
-                    if let Some((k, v)) = pair.split_once('=') {
-                        if k == "type" && !v.trim().is_empty() {
-                            doc_type = Some(v.trim().to_string());
+                for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
+                    match key.as_ref() {
+                        "type" => {
+                            doc_type = normalize_sn_did_doc_type(Some(value.as_ref()));
                         }
-                    } else if pair == "type" {
-                        doc_type = Some(String::new());
+                        "iat" => {
+                            let value = value.trim();
+                            if !value.is_empty() {
+                                iat = Some(value.to_string());
+                            }
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -1826,36 +1812,50 @@ impl HttpServer for SNServer {
             })?;
 
             let from_ip = get_request_client_ip(&request, &info);
+            let accept = request
+                .headers()
+                .get(http::header::ACCEPT)
+                .and_then(|value| value.to_str().ok())
+                .map(|value| value.to_string());
 
-            let doc = self.query_did(&did, doc_type.as_deref(), from_ip).await;
-            match doc {
-                Ok(doc) => {
-                    let body = doc.to_string();
-                    // keep existing behavior: always JSON for JsonLd; JWT is also returned as text
-                    let content_type = match doc {
-                        EncodedDocument::JsonLd(_) => "application/json",
-                        EncodedDocument::Jwt(_) => "application/jwt",
-                    };
+            let mut resolve_request = SnDidResolveRequest::new(
+                did,
+                doc_type,
+                from_ip,
+                SnDidResolverProfile::PublicSupplement,
+            );
+            resolve_request.accept = accept;
+            resolve_request.iat = iat;
+
+            match self.did_resolver.resolve(resolve_request).await {
+                Ok(resolution) => {
                     return Ok(Response::builder()
                         .status(StatusCode::OK)
                         .header("Access-Control-Allow-Origin", "*")
-                        .header("Content-Type", content_type)
+                        .header("Content-Type", resolution.content_type())
                         .body(BoxBody::new(
-                            Full::new(Bytes::from(body))
+                            Full::new(Bytes::from(resolution.body()))
                                 .map_err(|never| match never {})
                                 .boxed(),
                         ))
                         .unwrap());
                 }
                 Err(e) => {
-                    let (status, msg) = match e.code() {
-                        ServerErrorCode::NotFound => (StatusCode::NOT_FOUND, e.to_string()),
-                        ServerErrorCode::BadRequest | ServerErrorCode::InvalidParam => {
-                            (StatusCode::BAD_REQUEST, e.to_string())
+                    let status = match e.kind() {
+                        SnResolverErrorKind::NotManaged
+                        | SnResolverErrorKind::NameNotFound
+                        | SnResolverErrorKind::DocumentNotFound
+                        | SnResolverErrorKind::DeviceNotFound
+                        | SnResolverErrorKind::DeviceOffline => StatusCode::NOT_FOUND,
+                        SnResolverErrorKind::InvalidHostname
+                        | SnResolverErrorKind::InvalidDid
+                        | SnResolverErrorKind::UnsupportedRecordType
+                        | SnResolverErrorKind::UnsupportedDidMethod => StatusCode::BAD_REQUEST,
+                        SnResolverErrorKind::BackendUnavailable => {
+                            StatusCode::INTERNAL_SERVER_ERROR
                         }
-                        _ => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
                     };
-                    return Self::builder_error_http_response(status, msg);
+                    return Self::builder_error_http_response(status, e.to_string());
                 }
             }
         }
@@ -3587,6 +3587,23 @@ mod tests {
 
         let result = device_krpc.call("device.list", json!({})).await.unwrap();
         assert_eq!(result["items"].as_array().unwrap().len(), 1);
+
+        let did_resp = reqwest::Client::new()
+            .get(format!(
+                "{}/1.0/identifiers/{}?type=info",
+                base_url,
+                device_config.id.to_string()
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert!(did_resp.status().is_success());
+        let did_info: Value = did_resp.json().await.unwrap();
+        assert_eq!(did_info["device_name"].as_str().unwrap(), "ood1");
+        assert_eq!(
+            did_info["did"].as_str().unwrap(),
+            device_config.id.to_string()
+        );
 
         let registered_did_hostname = device_config.id.to_host_name();
         let result = device_krpc

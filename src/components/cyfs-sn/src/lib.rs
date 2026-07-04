@@ -8,6 +8,7 @@ mod sn_authority;
 mod sn_bns_reader;
 mod sn_compat_store;
 mod sn_device_info;
+pub mod sn_did_resolver;
 pub mod sn_resolver;
 mod sn_server;
 
@@ -17,6 +18,7 @@ pub use s2s_api::*;
 pub use sn_auth::*;
 pub use sn_compat_store::*;
 pub use sn_device_info::*;
+pub use sn_did_resolver::*;
 pub use sn_resolver::*;
 pub use sn_server::*;
 

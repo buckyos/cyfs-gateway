@@ -1,6 +1,9 @@
 # Agent Guide (cyfs-gateway)
 
+Current Version Beta2.2 is breaking change version.
+
 This file is for autonomous coding agents working in this repository.
+
 
 Repository layout
 - Rust workspace root: `src/` (Cargo workspace in `src/Cargo.toml`)

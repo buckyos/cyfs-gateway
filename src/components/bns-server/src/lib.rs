@@ -804,7 +804,11 @@ async fn serve_did_resolver_request<T: BnsIndexerApi>(
     let (doc_type, iat) = match parse_did_resolver_query(query) {
         Ok(parsed) => parsed,
         Err(reason) => {
-            return did_resolution_error_response(StatusCode::BAD_REQUEST, "invalidRequest", &reason)
+            return did_resolution_error_response(
+                StatusCode::BAD_REQUEST,
+                "invalidRequest",
+                &reason,
+            )
         }
     };
     let doc_type = match canonical_doc_type(&doc_type) {
@@ -845,11 +849,20 @@ async fn serve_did_resolver_request<T: BnsIndexerApi>(
         }
         // The projection reports "this (did, doc_type) was never published"
         // as an error; that is the authoritative Missing verdict of the
-        // protocol (strong negative evidence), not a server failure.
-        Err(error)
-            if error.is_registry_code("NAME_NOT_FOUND")
-                || error.is_registry_code("DOCUMENT_NOT_FOUND") =>
-        {
+        // protocol (strong negative evidence), not a server failure. A
+        // tombstoned name still overrides it: every doc_type under a
+        // destroyed name must keep answering 410 tombstoned (protocol §4),
+        // never flip back to a 404 that a later publish could overturn.
+        Err(error) if error.is_registry_code("DOCUMENT_NOT_FOUND") => {
+            match api.query_name_state(&name).await {
+                Ok(Some(state)) if state.status == NameStatus::Tombstoned => {
+                    did_resolution_state_response(&doc_type, DocumentStatus::Tombstoned, None)
+                }
+                Ok(_) => did_resolution_state_response(&doc_type, DocumentStatus::Missing, None),
+                Err(error) => did_resolution_failure_response(did, &doc_type, &error),
+            }
+        }
+        Err(error) if error.is_registry_code("NAME_NOT_FOUND") => {
             did_resolution_state_response(&doc_type, DocumentStatus::Missing, None)
         }
         Err(error)
@@ -860,21 +873,31 @@ async fn serve_did_resolver_request<T: BnsIndexerApi>(
         }
         // Anything else is a resolver/dependency failure and must surface as
         // 5xx — never as Missing/Revoked (protocol §5).
-        Err(error) => {
-            warn!("did resolver dependency failure for {did}#{doc_type}: {error}");
-            let status = match &error {
-                BnsClientError::Transport(_) => StatusCode::BAD_GATEWAY,
-                _ => StatusCode::INTERNAL_SERVER_ERROR,
-            };
-            did_resolution_error_response(status, "internalError", &error.to_string())
-        }
+        Err(error) => did_resolution_failure_response(did, &doc_type, &error),
     }
+}
+
+fn did_resolution_failure_response(
+    did: &str,
+    doc_type: &str,
+    error: &BnsClientError,
+) -> ServerResult<Response<BoxBody<Bytes, ServerError>>> {
+    warn!("did resolver dependency failure for {did}#{doc_type}: {error}");
+    let status = match error {
+        BnsClientError::Transport(_) => StatusCode::BAD_GATEWAY,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    did_resolution_error_response(status, "internalError", &error.to_string())
 }
 
 fn parse_did_resolver_query(query: Option<&str>) -> Result<(String, Option<u64>), String> {
     let mut doc_type = DID_RESOLVER_DEFAULT_DOC_TYPE.to_string();
     let mut iat = None;
-    for pair in query.unwrap_or("").split('&').filter(|pair| !pair.is_empty()) {
+    for pair in query
+        .unwrap_or("")
+        .split('&')
+        .filter(|pair| !pair.is_empty())
+    {
         let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
         match key {
             "type" => doc_type = value.to_string(),
@@ -897,33 +920,40 @@ fn did_resolver_document_status(result: &ResolveResult, now: u64) -> DocumentSta
     if result.name_state.status == NameStatus::Tombstoned {
         return DocumentStatus::Tombstoned;
     }
-    match result.status {
-        DocumentStatus::Active => {
-            if result.alias_kind == AliasKind::MigratedTo && !result.alias_target_did.is_empty() {
-                DocumentStatus::Migrated
-            } else if matches!(
-                result.name_state.status,
-                NameStatus::Expired | NameStatus::Released
-            ) || (result.document_state.expire_at != 0
-                && now >= result.document_state.expire_at)
-            {
-                // Registration lapsed or the document outlived its own
-                // validity window. The chain has no timers, so this must be
-                // derived at read time; expired stays 200 + last known
-                // content and the fallback decision belongs to client policy.
-                DocumentStatus::Expired
-            } else {
-                DocumentStatus::Active
-            }
-        }
-        other => other,
+    if result.status != DocumentStatus::Active {
+        return result.status;
     }
+    if result.alias_kind == AliasKind::MigratedTo {
+        // A migrated answer must always carry its migrationTarget (protocol
+        // §4), so an alias row whose target is not a DID cannot be served as
+        // migrated; it degrades to the underlying document status instead.
+        if result.alias_target_did.starts_with("did:") {
+            return DocumentStatus::Migrated;
+        }
+        warn!(
+            "MigratedTo alias on `{}` has non-DID target `{}`; ignoring the alias",
+            result.name_state.name, result.alias_target_did
+        );
+    }
+    if matches!(
+        result.name_state.status,
+        NameStatus::Expired | NameStatus::Released
+    ) || (result.document_state.expire_at != 0 && now >= result.document_state.expire_at)
+    {
+        // Registration lapsed or the document outlived its own validity
+        // window. The chain has no timers, so this must be derived at read
+        // time; expired stays 200 + last known content and the fallback
+        // decision belongs to client policy.
+        return DocumentStatus::Expired;
+    }
+    DocumentStatus::Active
 }
 
 /// Build the DID Resolution Result envelope for an authoritative BNS answer.
 /// `result` is `None` when the verdict came from a NameNotFound /
-/// DocumentNotFound error, i.e. an authoritative Missing without projection
-/// state to describe.
+/// DocumentNotFound error, i.e. an authoritative Missing (or Tombstoned, for
+/// unpublished doc_types under a destroyed name) without projection state to
+/// describe.
 fn did_resolution_state_response(
     doc_type: &str,
     status: DocumentStatus,
@@ -948,6 +978,10 @@ fn did_resolution_state_response(
         _ => (None, None),
     };
 
+    // Only the fields of the trimmed protocol table are emitted; the old
+    // draft's previousVersion / lineageEpoch / ownerSource / authorityRoot /
+    // nextVersionId / canonicalId / equivalentId are no longer consumed by
+    // any client and stay off the wire.
     let mut buckyos = Map::new();
     buckyos.insert("docType".to_string(), json!(doc_type));
     buckyos.insert("documentStatus".to_string(), json!(status.as_str()));
@@ -958,17 +992,7 @@ fn did_resolution_state_response(
                 "documentVersion".to_string(),
                 json!(result.document_state.version),
             );
-            if result.document_state.previous_version != 0 {
-                buckyos.insert(
-                    "previousVersion".to_string(),
-                    json!(result.document_state.previous_version),
-                );
-            }
         }
-        buckyos.insert(
-            "lineageEpoch".to_string(),
-            json!(result.name_state.lineage_epoch),
-        );
         buckyos.insert(
             "authoritySeq".to_string(),
             json!(result.owner.authority_seq),
@@ -976,20 +1000,19 @@ fn did_resolution_state_response(
         if let Some(owner_did) = principal_did_string(&result.owner.effective_owner) {
             buckyos.insert("effectiveOwner".to_string(), json!(owner_did));
         }
-        buckyos.insert(
-            "ownerSource".to_string(),
-            json!(owner_source_wire(result.owner.source)),
-        );
-        buckyos.insert(
-            "authorityRoot".to_string(),
-            json!(result.owner.authority_root),
-        );
+        // `did_resolver_document_status` only reports Migrated when the alias
+        // target is a DID, so the mandatory migrationTarget is always usable.
         if status == DocumentStatus::Migrated {
             buckyos.insert(
                 "migrationTarget".to_string(),
-                migration_target_value(result),
+                json!(result.alias_target_did),
             );
         }
+        // `docHash` is deliberately not emitted: the store anchors the raw
+        // stored bytes while protocol §6 anchors the encoded document string
+        // clients re-serialize from `didDocument`; for re-encoded JSON bodies
+        // the two disagree and a wrong anchor would make clients discard
+        // valid documents. Inline answers need no anchor.
     }
 
     let mut metadata = Map::new();
@@ -1001,9 +1024,6 @@ fn did_resolution_state_response(
             );
         }
     }
-    metadata.insert("nextVersionId".to_string(), Value::Null);
-    metadata.insert("canonicalId".to_string(), Value::Null);
-    metadata.insert("equivalentId".to_string(), json!([]));
     metadata.insert("deactivated".to_string(), json!(deactivated));
     metadata.insert("buckyos".to_string(), Value::Object(buckyos));
 
@@ -1059,28 +1079,6 @@ fn principal_did_string(principal: &Principal) -> Option<String> {
     }
 }
 
-/// Every registry-backed owner resolution is method authority to the outside
-/// world; the internal distinction (asset-owner fallback / explicit semantic
-/// owner / parent inheritance) only describes *which* registry rule answered.
-fn owner_source_wire(source: OwnerSource) -> &'static str {
-    match source {
-        OwnerSource::AssetOwnerFallback
-        | OwnerSource::ExplicitSemanticOwner
-        | OwnerSource::ParentInherited => "methodAuthority",
-        OwnerSource::None => "unknown",
-    }
-}
-
-fn migration_target_value(result: &ResolveResult) -> Value {
-    // alias_target_did is stored as a full DID string; guard anyway so a
-    // malformed projection row cannot poison client-side DID parsing.
-    if result.alias_target_did.starts_with("did:") {
-        json!(result.alias_target_did)
-    } else {
-        Value::Null
-    }
-}
-
 /// Protocol §5 NotApplicable: reuse 404 but omit `buckyos.documentStatus`,
 /// so clients map the answer to "no opinion" instead of the strong Missing.
 fn did_resolution_not_applicable_response() -> ServerResult<Response<BoxBody<Bytes, ServerError>>> {
@@ -1127,6 +1125,11 @@ fn did_resolution_json_response(
     let mut response = Response::builder()
         .status(status)
         .header(http::header::CONTENT_TYPE, DID_RESOLUTION_CONTENT_TYPE)
+        // Protocol §2: the resolver controls cache TTL so a stale 200/404 can
+        // never outlive a later Revoked/Tombstoned verdict. 200/404/410 are
+        // all heuristically cacheable by default (RFC 9111), so opt out
+        // entirely until a validator-based story exists.
+        .header(http::header::CACHE_CONTROL, "no-store")
         .body(full_body(body.into()))
         .map_err(|e| {
             server_err!(
@@ -1855,6 +1858,12 @@ mod tests {
             headers.get(http::header::CONTENT_TYPE).unwrap(),
             "application/did-resolution+json"
         );
+        // Protocol §2: stale answers must not survive in caches past a
+        // revocation, so every resolver response opts out of caching.
+        assert_eq!(
+            headers.get(http::header::CACHE_CONTROL).unwrap(),
+            "no-store"
+        );
         assert!(headers.contains_key(http::header::ACCESS_CONTROL_ALLOW_ORIGIN));
 
         assert_eq!(
@@ -1869,12 +1878,23 @@ mod tests {
         assert_eq!(buckyos["docType"], "owner");
         assert_eq!(buckyos["documentStatus"], "active");
         assert_eq!(buckyos["documentVersion"], 3);
-        assert_eq!(buckyos["previousVersion"], 2);
-        assert_eq!(buckyos["lineageEpoch"], 1);
-        assert_eq!(buckyos["ownerSource"], "methodAuthority");
+        assert_eq!(buckyos["authoritySeq"], 0);
         // Chain-account owners have no DID form yet: the field must be
         // omitted, never serialized as the internal principal JSON.
         assert!(buckyos.get("effectiveOwner").is_none());
+        // Old-draft fields were dropped from the trimmed protocol and must
+        // stay off the wire.
+        for legacy in [
+            "previousVersion",
+            "lineageEpoch",
+            "ownerSource",
+            "authorityRoot",
+        ] {
+            assert!(buckyos.get(legacy).is_none(), "legacy field {legacy}");
+        }
+        for legacy in ["nextVersionId", "canonicalId", "equivalentId"] {
+            assert!(metadata.get(legacy).is_none(), "legacy field {legacy}");
+        }
     }
 
     #[tokio::test]
@@ -1945,17 +1965,29 @@ mod tests {
             "tombstoned"
         );
         assert_eq!(body["didDocumentMetadata"]["deactivated"], true);
+
+        // ...including doc_types that were never published under it: the
+        // DocumentNotFound projection error must not downgrade the destroyed
+        // name to a 404 Missing that a later publish could overturn.
+        let (status, body, _) = resolver_request(
+            &server,
+            Method::GET,
+            "/1.0/identifiers/did:bns:gone?type=boot",
+        )
+        .await;
+        assert_eq!(status, StatusCode::GONE);
+        assert_eq!(
+            body["didDocumentMetadata"]["buckyos"]["documentStatus"],
+            "tombstoned"
+        );
+        assert_eq!(body["didDocumentMetadata"]["deactivated"], true);
     }
 
     #[tokio::test]
     async fn did_resolver_non_bns_did_is_not_applicable() {
         let server = resolver_contract_server();
-        let (status, body, _) = resolver_request(
-            &server,
-            Method::GET,
-            "/1.0/identifiers/did:web:example.com",
-        )
-        .await;
+        let (status, body, _) =
+            resolver_request(&server, Method::GET, "/1.0/identifiers/did:web:example.com").await;
 
         // Protocol §5 NotApplicable: 404 without `buckyos.documentStatus`,
         // which `BaseHttpProvider::parse_published_state_body` maps to Ok(None).
@@ -1993,7 +2025,6 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         let buckyos = &body["didDocumentMetadata"]["buckyos"];
         assert_eq!(buckyos["effectiveOwner"], "did:bns:alice");
-        assert_eq!(buckyos["ownerSource"], "methodAuthority");
     }
 
     #[tokio::test]
@@ -2209,6 +2240,22 @@ mod tests {
         assert_eq!(
             body["didDocumentMetadata"]["buckyos"]["documentStatus"],
             "missing"
+        );
+
+        // ...and both flavours answer tombstoned for unpublished doc_types
+        // under a destroyed name (the contract flavour reaches it through the
+        // DocumentNotFound error path, the registry flavour through the
+        // Missing placeholder + name-status override).
+        let (status, body, _) = resolver_request(
+            &indexer_server,
+            Method::GET,
+            "/1.0/identifiers/did:bns:gone?type=boot",
+        )
+        .await;
+        assert_eq!(status, StatusCode::GONE);
+        assert_eq!(
+            body["didDocumentMetadata"]["buckyos"]["documentStatus"],
+            "tombstoned"
         );
     }
 }
