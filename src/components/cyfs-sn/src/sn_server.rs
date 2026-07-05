@@ -464,7 +464,6 @@ struct RegisteredDeviceKey {
 #[derive(Clone)]
 pub struct SNServer {
     id: String,
-    server_host: String,
     auth_db: SnAuthDBRef,
     device_info_db: SnDeviceInfoDBRef,
     compat_store: SnCompatibilityStoreRef,
@@ -571,23 +570,6 @@ impl SNServer {
         }
     }
 
-    fn extract_missing_field_name(err: &str) -> Option<String> {
-        for marker in ["missing field `", "missing field '"] {
-            if let Some(start) = err.find(marker) {
-                let value_start = start + marker.len();
-                let tail = &err[value_start..];
-                if let Some(end) = tail.find(['`', '\'']) {
-                    let field = tail[..end].trim();
-                    if !field.is_empty() {
-                        return Some(field.to_string());
-                    }
-                }
-            }
-        }
-
-        None
-    }
-
     pub async fn new(
         server_config: SNServerConfig,
         auth_db: SnAuthDBRef,
@@ -637,7 +619,7 @@ impl SNServer {
             )));
         } else {
             warn!(
-                "bns_indexer_url is not configured; SN resolver will use legacy local cache only and cannot lazy-load BNS contract state"
+                "bns_indexer_url is not configured; SN resolver cannot lazy-load BNS contract state"
             );
         }
         let resolver = Arc::new(resolver);
@@ -645,7 +627,6 @@ impl SNServer {
 
         SNServer {
             id: server_config.id,
-            server_host,
             auth_db,
             device_info_db,
             compat_store,
@@ -860,66 +841,6 @@ impl SNServer {
             &req,
         );
         Ok(resp)
-    }
-
-    async fn get_device_info(
-        &self,
-        owner_id: &str,
-        device_name: &str,
-    ) -> ServerResult<Option<(DeviceInfo, IpAddr)>> {
-        let key = format!("{}_{}", owner_id, device_name);
-        let device_json = self
-            .compat_store
-            .query_device_by_name(owner_id, device_name)
-            .await;
-        if device_json.is_err() {
-            warn!(
-                "failed to query device info for {} from db: {:?}",
-                key,
-                device_json.err().unwrap()
-            );
-            return Ok(None);
-        };
-        let device_json = device_json.unwrap();
-        if device_json.is_none() {
-            warn!("device info not found for {} in db", key);
-            return Ok(None);
-        }
-        let device_json = device_json.unwrap();
-        let sn_ip = &device_json.ip;
-        let sn_ip = IpAddr::from_str(sn_ip.as_str()).unwrap();
-        let device_info_json: String = device_json.description.clone();
-        //info!("device info json: {}",device_info_json);
-        let device_info = serde_json::from_str::<DeviceInfo>(device_info_json.as_str());
-        if device_info.is_err() {
-            let parse_err = device_info.err().unwrap();
-            let parse_err_str = parse_err.to_string();
-            if let Some(field) = Self::extract_missing_field_name(parse_err_str.as_str()) {
-                warn!(
-                    "[schema_compat] failed to parse device info for {}: missing required field `{}`; raw_error={}; please refresh device registration",
-                    key,
-                    field,
-                    parse_err_str
-                );
-            }
-            warn!(
-                "failed to parse device info from db for {}: {} (schema/version mismatch)",
-                key, parse_err_str
-            );
-            return Err(server_err!(
-                ServerErrorCode::InvalidData,
-                "device info schema mismatch for {}: {}",
-                key,
-                parse_err_str
-            ));
-        }
-        let device_info = device_info.unwrap();
-        Ok(Some((device_info.clone(), sn_ip)))
-    }
-    //return (subhost,username)
-    pub fn get_user_subhost_from_host(host: &str, server_host: &str) -> Option<(String, String)> {
-        SnResolver::get_user_subhost_from_host(host, server_host)
-            .map(|parts| (parts.sub_host, parts.username))
     }
 
     pub(crate) async fn handle_namespaced_rpc_call(
@@ -1394,114 +1315,7 @@ impl SNServer {
             }
             Err(_) => {}
         }
-
-        let get_result = SNServer::get_user_subhost_from_host(req_host, &self.server_host);
-        if get_result.is_some() {
-            let (_, username) = get_result.unwrap();
-            let user_info = self.auth_db.get_user_info(username.as_str()).await;
-            if user_info.is_err() {
-                warn!("get user info error: {}", user_info.err().unwrap());
-                return None;
-            }
-            let user_info = user_info.unwrap();
-            if user_info.is_none() {
-                warn!("user info not found for {}", username);
-                return None;
-            }
-            let user_info = user_info.unwrap();
-
-            let device_info = match self.get_device_info(username.as_str(), "ood1").await {
-                Ok(info) => info,
-                Err(e) => {
-                    warn!("ood1 device info parse failed for {}: {}", username, e);
-                    None
-                }
-            };
-            if device_info.is_some() {
-                info!("ood1 device info found for {} in sn server", username);
-                //let device_did = device_info.unwrap().0.did;
-                let (device_info, _) = device_info.unwrap();
-                let did_hostname = device_info.id.to_host_name();
-                let ood_info = OODInfo {
-                    did_hostname: did_hostname,
-                    owner_id: username.clone(),
-                    self_cert: user_info.self_cert,
-                    state: "active".to_string(),
-                };
-                return Some(ood_info);
-            } else {
-                warn!("ood1 device info not found for {} in sn server", username);
-            }
-        } else {
-            let user_info = self.auth_db.get_user_by_domain(req_host).await;
-            if user_info.is_err() {
-                info!(
-                    "failed to get user info by domain: {}",
-                    user_info.err().unwrap()
-                );
-                return None;
-            }
-            let user_info = user_info.unwrap();
-            if user_info.is_none() {
-                return None;
-            }
-            let user_info = user_info.unwrap();
-            let username = user_info.username.as_ref().unwrap();
-            let device_info = match self.get_device_info(username.as_str(), "ood1").await {
-                Ok(info) => info,
-                Err(e) => {
-                    warn!("ood1 device info parse failed for {}: {}", username, e);
-                    None
-                }
-            };
-            if device_info.is_some() {
-                //info!("ood1 device info found for {} in sn server",username);
-                //let device_did = device_info.unwrap().0.did;
-                let device_did = device_info.as_ref().unwrap().0.id.clone();
-                let did_hostname = device_did.to_host_name();
-                let ood_info = OODInfo {
-                    did_hostname: did_hostname,
-                    owner_id: username.to_string(),
-                    self_cert: user_info.self_cert,
-                    state: "active".to_string(),
-                };
-                //info!("select device {} for http upstream:{}",device_did.as_str(),result_str.as_str());
-                return Some(ood_info);
-            } else {
-                warn!("ood1 device info not found for {} in sn server", username);
-            }
-        }
-
-        return None;
-    }
-
-    pub fn create_name_info_from_zone_config(
-        &self,
-        zone_config: &str,
-        public_key: &str,
-        device_jwt: Option<&String>,
-    ) -> NameInfo {
-        let mut name_info = NameInfo::default();
-        if public_key.starts_with("{") {
-            let public_key_json = serde_json::from_str(public_key);
-            if public_key_json.is_ok() {
-                let public_key_json: Value = public_key_json.unwrap();
-                let x = public_key_json.get("x");
-                if x.is_some() {
-                    let x = x.unwrap().as_str().unwrap();
-                    name_info.txt.push(format!("PKX={};", x));
-                }
-            }
-        } else {
-            name_info.txt.push(format!("PKX={};", public_key));
-        }
-        name_info.txt.push(format!("BOOT={};", zone_config));
-        if device_jwt.is_some() {
-            name_info
-                .txt
-                .push(format!("DEV={};", device_jwt.as_ref().unwrap().as_str()));
-        }
-        return name_info;
+        None
     }
 
     fn builder_error_http_response(
@@ -2531,48 +2345,6 @@ mod tests {
     }
 
     #[test]
-    fn test_get_user_subhost_from_host() {
-        let server_host = "buckyos.io".to_string();
-        let req_host = "home.lzc.web3.buckyos.io".to_string();
-        let (sub_host, username) =
-            SNServer::get_user_subhost_from_host(&req_host, &server_host).unwrap();
-        assert_eq!(sub_host, "home.lzc".to_string());
-        assert_eq!(username, "lzc".to_string());
-
-        let req_host = "www-lzc.web3.buckyos.io".to_string();
-        let (sub_host, username) =
-            SNServer::get_user_subhost_from_host(&req_host, &server_host).unwrap();
-        assert_eq!(sub_host, "www-lzc".to_string());
-        assert_eq!(username, "lzc".to_string());
-
-        let req_host = "buckyos-filebrowser-lzc.web3.buckyos.io".to_string();
-        let (sub_host, username) =
-            SNServer::get_user_subhost_from_host(&req_host, &server_host).unwrap();
-        assert_eq!(sub_host, "buckyos-filebrowser-lzc".to_string());
-        assert_eq!(username, "lzc".to_string());
-
-        let server_host = "devtests.org".to_string();
-        let req_host = "alice.web3.devtests.org".to_string();
-        let (sub_host, username) =
-            SNServer::get_user_subhost_from_host(&req_host, &server_host).unwrap();
-        assert_eq!(sub_host, "alice".to_string());
-        assert_eq!(username, "alice".to_string());
-
-        let req_host = "public.alice.web3.devtests.org".to_string();
-        let (sub_host, username) =
-            SNServer::get_user_subhost_from_host(&req_host, &server_host).unwrap();
-        assert_eq!(sub_host, "public.alice".to_string());
-        assert_eq!(username, "alice".to_string());
-
-        let server_host = "sn.devtests.org".to_string();
-        let req_host = "public.alice.web3.devtests.org".to_string();
-        let (sub_host, username) =
-            SNServer::get_user_subhost_from_host(&req_host, &server_host).unwrap();
-        assert_eq!(sub_host, "public.alice".to_string());
-        assert_eq!(username, "alice".to_string());
-    }
-
-    #[test]
     fn test_validate_registration_username() {
         for username in ["validuser", "my-device"] {
             assert!(
@@ -3591,7 +3363,7 @@ mod tests {
         assert!(!ood_info.self_cert);
 
         let nested_web3_host = format!("public.{}.web3.buckyos.ai", REFACTOR_USER);
-        let result = device_krpc
+        let err = device_krpc
             .call(
                 "deviceinfo.resolve_ood_by_hostname",
                 json!({
@@ -3599,12 +3371,9 @@ mod tests {
                 }),
             )
             .await
-            .unwrap();
-        let ood_info = serde_json::from_value::<OODInfo>(result).unwrap();
-        assert_eq!(ood_info.did_hostname, registered_did_hostname);
-        assert_eq!(ood_info.owner_id, REFACTOR_USER);
-        assert_eq!(ood_info.state, "active");
-        assert!(!ood_info.self_cert);
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("hostname_not_found"));
 
         let result = auth_user_krpc
             .call(

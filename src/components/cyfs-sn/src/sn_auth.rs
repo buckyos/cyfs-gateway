@@ -650,9 +650,6 @@ impl SqliteSnAuthDB {
         .await
         .map_err(|e| Self::db_err("create account_sessions index failed", e))?;
 
-        self.backfill_user_domain_history().await?;
-        self.backfill_zone_info().await?;
-
         Ok(())
     }
 
@@ -758,92 +755,6 @@ impl SqliteSnAuthDB {
                 .execute(&self.pool)
                 .await
                 .map_err(|e| Self::db_err(format!("add {}.{} failed", table, column), e))?;
-        }
-        Ok(())
-    }
-
-    async fn backfill_user_domain_history(&self) -> SnResult<()> {
-        let rows = sqlx::query(
-            "SELECT username, user_domain FROM users
-             WHERE user_domain IS NOT NULL AND user_domain != ''",
-        )
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| Self::db_err("query existing user_domain history failed", e))?;
-        let now = Self::now_secs() as i64;
-        for row in rows {
-            let username: String = row
-                .try_get("username")
-                .map_err(|e| Self::db_err("read username failed", e))?;
-            let user_domain: String = row
-                .try_get("user_domain")
-                .map_err(|e| Self::db_err("read user_domain failed", e))?;
-            if let Some(canonical_domain) = Self::canonical_user_domain(user_domain.as_str()) {
-                sqlx::query(
-                    "INSERT OR IGNORE INTO user_domain_history (domain, owner, created_at)
-                     VALUES (?1, ?2, ?3)",
-                )
-                .bind(canonical_domain)
-                .bind(username)
-                .bind(now)
-                .execute(&self.pool)
-                .await
-                .map_err(|e| Self::db_err("backfill user_domain_history failed", e))?;
-            }
-        }
-        Ok(())
-    }
-
-    async fn backfill_zone_info(&self) -> SnResult<()> {
-        let rows = sqlx::query(
-            "SELECT username, bns_name, zone_config, self_cert, sn_ips, updated_at FROM users",
-        )
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| Self::db_err("query users for zone_info backfill failed", e))?;
-
-        let now = Self::now_secs() as i64;
-        for row in rows {
-            let username: String = row
-                .try_get("username")
-                .map_err(|e| Self::db_err("read username failed", e))?;
-            let bns_name: Option<String> = row
-                .try_get("bns_name")
-                .map_err(|e| Self::db_err("read bns_name failed", e))?;
-            let zone_config: Option<String> = row
-                .try_get("zone_config")
-                .map_err(|e| Self::db_err("read zone_config failed", e))?;
-            let self_cert: Option<i64> = row
-                .try_get("self_cert")
-                .map_err(|e| Self::db_err("read self_cert failed", e))?;
-            let sn_ips: Option<String> = row
-                .try_get("sn_ips")
-                .map_err(|e| Self::db_err("read sn_ips failed", e))?;
-            let updated_at: Option<i64> = row
-                .try_get("updated_at")
-                .map_err(|e| Self::db_err("read updated_at failed", e))?;
-            let zone = zone_config.and_then(|value| {
-                if value.trim().is_empty() {
-                    None
-                } else {
-                    Some(value)
-                }
-            });
-            sqlx::query(
-                "INSERT OR IGNORE INTO zone_info
-                    (username, bns_name, zone, relay_sn, self_cert, cert_checked_at,
-                     cert_expires_at, sn_ips, source_version, updated_at)
-                 VALUES (?1, ?2, ?3, NULL, ?4, NULL, NULL, ?5, NULL, ?6)",
-            )
-            .bind(username.as_str())
-            .bind(bns_name.unwrap_or_else(|| username.clone()))
-            .bind(zone)
-            .bind(self_cert.unwrap_or(0))
-            .bind(sn_ips)
-            .bind(updated_at.filter(|v| *v > 0).unwrap_or(now))
-            .execute(&self.pool)
-            .await
-            .map_err(|e| Self::db_err("backfill zone_info failed", e))?;
         }
         Ok(())
     }
@@ -1580,25 +1491,6 @@ impl SnAuthDB for SqliteSnAuthDB {
         .await
         .map_err(|e| Self::db_err("query user by domain failed", e))?;
 
-        if row.is_some() {
-            return row.as_ref().map(Self::user_from_row).transpose();
-        }
-
-        let row = sqlx::query(
-            "SELECT username, state, public_key, activation_code, zone_config,
-                    self_cert, user_domain, sn_ips
-             FROM users
-             WHERE user_domain IS NOT NULL
-               AND user_domain != ''
-               AND (?1 = user_domain OR ?1 LIKE '%.' || user_domain)
-             ORDER BY length(user_domain) DESC
-             LIMIT 1",
-        )
-        .bind(canonical_domain.as_str())
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|e| Self::db_err("query legacy user_domain failed", e))?;
-
         row.as_ref().map(Self::user_from_row).transpose()
     }
 
@@ -2126,19 +2018,7 @@ impl SnAuthDB for SqliteSnAuthDB {
             return Self::zone_info_from_row(row).map(Some);
         }
 
-        let Some(user) = self.get_user_info(username).await? else {
-            return Ok(Some(ZoneInfo::default_for(username)));
-        };
-
-        let mut zone_info = ZoneInfo::default_for(username);
-        zone_info.zone = if user.zone_config.trim().is_empty() {
-            None
-        } else {
-            Some(user.zone_config)
-        };
-        zone_info.self_cert = user.self_cert;
-        zone_info.sn_ips = user.sn_ips;
-        Ok(Some(zone_info))
+        Ok(Some(ZoneInfo::default_for(username)))
     }
 
     async fn update_zone_info(&self, username: &str, patch: ZoneInfoPatch) -> SnResult<()> {
@@ -3017,9 +2897,9 @@ mod tests {
         Ok(())
     }
 
-    /// `get_user_by_domain`：active binding 最长匹配 + legacy `users.user_domain` 回退。
+    /// `get_user_by_domain`：只查询 active binding，旧 `users.user_domain` 不再作为回退。
     #[tokio::test]
-    async fn test_get_user_by_domain_longest_match_and_legacy_fallback() -> SnResult<()> {
+    async fn test_get_user_by_domain_longest_match_without_legacy_fallback() -> SnResult<()> {
         let (_tmp_dir, db) = new_test_db().await?;
         db.insert_activation_code("alice-code").await?;
         assert!(
@@ -3051,7 +2931,7 @@ mod tests {
         );
         assert!(db.get_user_by_domain("unrelated.org").await?.is_none());
 
-        // legacy 回退：bob 仅在 users.user_domain 留有遗留域名、无 binding 行。
+        // breaking change：bob 仅在 users.user_domain 留有遗留域名、无 binding 行，不再命中。
         db.insert_activation_code("bob-code").await?;
         assert!(
             db.register_user("bob-code", "bob", "h", "s", "pbkdf2")
@@ -3061,14 +2941,7 @@ mod tests {
             .execute(&db.pool)
             .await
             .map_err(|e| SqliteSnAuthDB::db_err("set legacy domain failed", e))?;
-        assert_eq!(
-            db.get_user_by_domain("host.legacy.test")
-                .await?
-                .unwrap()
-                .username
-                .as_deref(),
-            Some("bob")
-        );
+        assert!(db.get_user_by_domain("host.legacy.test").await?.is_none());
 
         Ok(())
     }
@@ -3117,9 +2990,9 @@ mod tests {
         Ok(())
     }
 
-    /// `get_zone_info` 在缺 zone_info 行时从 `users` 回退派生（backfill 分支）。
+    /// `get_zone_info` 缺 zone_info 行时返回默认值，不再从 `users.zone_config` 派生。
     #[tokio::test]
-    async fn test_get_zone_info_backfills_from_users() -> SnResult<()> {
+    async fn test_get_zone_info_without_legacy_user_cache_fallback() -> SnResult<()> {
         let (_tmp_dir, db) = new_test_db().await?;
         db.insert_activation_code("zone-code").await?;
         assert!(
@@ -3127,7 +3000,7 @@ mod tests {
                 .await?
         );
 
-        // 删 zone_info 行，并在 users 上留下 zone_config / self_cert。
+        // 删 zone_info 行，并在 users 上留下旧 zone_config / self_cert。
         sqlx::query("DELETE FROM zone_info WHERE username = 'alice'")
             .execute(&db.pool)
             .await
@@ -3142,8 +3015,8 @@ mod tests {
         let zone = db.get_zone_info("alice").await?.unwrap();
         assert_eq!(zone.username, "alice");
         assert_eq!(zone.bns_name, "alice");
-        assert_eq!(zone.zone.as_deref(), Some("did:zone:legacy"));
-        assert!(zone.self_cert);
+        assert!(zone.zone.is_none());
+        assert!(!zone.self_cert);
 
         // 完全未知用户 → 默认值（不报错）。
         let zone = db.get_zone_info("ghost").await?.unwrap();

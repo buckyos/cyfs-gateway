@@ -23,38 +23,12 @@ pub struct SNDeviceInfo {
 
 #[async_trait::async_trait]
 pub trait SnCompatibilityStore: Send + Sync + 'static {
-    async fn register_device(
-        &self,
-        username: &str,
-        device_name: &str,
-        did: &str,
-        mini_config_jwt: &str,
-        ip: &str,
-        description: &str,
-    ) -> SnResult<()>;
-    async fn update_device_by_name(
-        &self,
-        username: &str,
-        device_name: &str,
-        did: &str,
-        mini_config_jwt: &str,
-        ip: &str,
-        description: &str,
-    ) -> SnResult<()>;
-    async fn update_device_info_by_name(
-        &self,
-        username: &str,
-        device_name: &str,
-        ip: &str,
-        description: &str,
-    ) -> SnResult<()>;
     async fn query_device_by_name(
         &self,
         username: &str,
         device_name: &str,
     ) -> SnResult<Option<SNDeviceInfo>>;
     async fn query_device_by_did(&self, did: &str) -> SnResult<Option<SNDeviceInfo>>;
-    async fn list_user_devices(&self, username: &str) -> SnResult<Vec<SNDeviceInfo>>;
     async fn add_user_domain(
         &self,
         username: &str,
@@ -74,19 +48,10 @@ pub trait SnCompatibilityStore: Send + Sync + 'static {
         domain: &str,
         record_type: &str,
     ) -> SnResult<Option<(String, u32)>>;
-    async fn query_domain_records(&self, domain: &str) -> SnResult<Vec<(String, String, u32)>>;
     async fn query_user_domain_records(
         &self,
         username: &str,
     ) -> SnResult<Vec<(String, String, String, u32)>>;
-    async fn insert_user_did_document(
-        &self,
-        obj_id: &str,
-        owner_user: &str,
-        obj_name: &str,
-        did_document: &str,
-        doc_type: Option<&str>,
-    ) -> SnResult<()>;
     async fn query_user_did_document(
         &self,
         owner_user: &str,
@@ -249,92 +214,6 @@ impl SqliteSnCompatibilityStore {
 
 #[async_trait::async_trait]
 impl SnCompatibilityStore for SqliteSnCompatibilityStore {
-    async fn register_device(
-        &self,
-        username: &str,
-        device_name: &str,
-        did: &str,
-        mini_config_jwt: &str,
-        ip: &str,
-        description: &str,
-    ) -> SnResult<()> {
-        let now = Self::now_secs() as i64;
-        sqlx::query(
-            "INSERT INTO devices
-                (owner, device_name, did, ip, description, mini_config_jwt, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)",
-        )
-        .bind(username)
-        .bind(device_name)
-        .bind(did)
-        .bind(ip)
-        .bind(description)
-        .bind(mini_config_jwt)
-        .bind(now)
-        .execute(&self.pool)
-        .await
-        .map_err(into_sn_err!(SnErrorCode::DBError, "insert device failed"))?;
-        Ok(())
-    }
-
-    async fn update_device_by_name(
-        &self,
-        username: &str,
-        device_name: &str,
-        did: &str,
-        mini_config_jwt: &str,
-        ip: &str,
-        description: &str,
-    ) -> SnResult<()> {
-        let now = Self::now_secs() as i64;
-        sqlx::query(
-            "UPDATE devices
-             SET did = ?1, mini_config_jwt = ?2, ip = ?3, description = ?4, updated_at = ?5
-             WHERE device_name = ?6 AND owner = ?7",
-        )
-        .bind(did)
-        .bind(mini_config_jwt)
-        .bind(ip)
-        .bind(description)
-        .bind(now)
-        .bind(device_name)
-        .bind(username)
-        .execute(&self.pool)
-        .await
-        .map_err(into_sn_err!(
-            SnErrorCode::DBError,
-            "update device by name failed"
-        ))?;
-        Ok(())
-    }
-
-    async fn update_device_info_by_name(
-        &self,
-        username: &str,
-        device_name: &str,
-        ip: &str,
-        description: &str,
-    ) -> SnResult<()> {
-        let now = Self::now_secs() as i64;
-        sqlx::query(
-            "UPDATE devices
-             SET ip = ?1, description = ?2, updated_at = ?3
-             WHERE device_name = ?4 AND owner = ?5",
-        )
-        .bind(ip)
-        .bind(description)
-        .bind(now)
-        .bind(device_name)
-        .bind(username)
-        .execute(&self.pool)
-        .await
-        .map_err(into_sn_err!(
-            SnErrorCode::DBError,
-            "update device info by name failed"
-        ))?;
-        Ok(())
-    }
-
     async fn query_device_by_name(
         &self,
         username: &str,
@@ -368,21 +247,6 @@ impl SnCompatibilityStore for SqliteSnCompatibilityStore {
             "query device by did failed"
         ))?;
         Ok(row.map(Self::device_from_row))
-    }
-
-    async fn list_user_devices(&self, username: &str) -> SnResult<Vec<SNDeviceInfo>> {
-        let rows = sqlx::query(
-            "SELECT owner, device_name, mini_config_jwt, did, ip, description, created_at, updated_at
-             FROM devices WHERE owner = ?1 ORDER BY device_name ASC",
-        )
-        .bind(username)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(into_sn_err!(
-            SnErrorCode::DBError,
-            "list user devices failed"
-        ))?;
-        Ok(rows.into_iter().map(Self::device_from_row).collect())
     }
 
     async fn add_user_domain(
@@ -459,22 +323,6 @@ impl SnCompatibilityStore for SqliteSnCompatibilityStore {
             .transpose()
     }
 
-    async fn query_domain_records(&self, domain: &str) -> SnResult<Vec<(String, String, u32)>> {
-        let rows =
-            sqlx::query("SELECT record_type, record, ttl FROM user_dns_records WHERE domain = ?1")
-                .bind(domain)
-                .fetch_all(&self.pool)
-                .await
-                .map_err(into_sn_err!(
-                    SnErrorCode::DBError,
-                    "query user dns records failed"
-                ))?;
-        Ok(rows
-            .into_iter()
-            .map(|row| (row.get(0), row.get(1), row.get::<i64, _>(2).max(0) as u32))
-            .collect())
-    }
-
     async fn query_user_domain_records(
         &self,
         username: &str,
@@ -500,35 +348,6 @@ impl SnCompatibilityStore for SqliteSnCompatibilityStore {
                 )
             })
             .collect())
-    }
-
-    async fn insert_user_did_document(
-        &self,
-        obj_id: &str,
-        owner_user: &str,
-        obj_name: &str,
-        did_document: &str,
-        doc_type: Option<&str>,
-    ) -> SnResult<()> {
-        let now = Self::now_secs() as i64;
-        sqlx::query(
-            "INSERT INTO did_documents
-                (obj_id, owner_user, obj_name, did_document, doc_type, update_time)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        )
-        .bind(obj_id)
-        .bind(owner_user)
-        .bind(obj_name)
-        .bind(did_document)
-        .bind(doc_type)
-        .bind(now)
-        .execute(&self.pool)
-        .await
-        .map_err(into_sn_err!(
-            SnErrorCode::DBError,
-            "insert did document failed"
-        ))?;
-        Ok(())
     }
 
     async fn query_user_did_document(
