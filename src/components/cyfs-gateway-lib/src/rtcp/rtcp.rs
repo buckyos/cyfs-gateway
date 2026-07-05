@@ -1046,6 +1046,7 @@ impl RTcpInner {
                 verified_doc.id.clone(),
                 None,
                 EncodedDocument::Jwt(device_doc_jwt.clone()),
+                None,
             )
             .await
             {

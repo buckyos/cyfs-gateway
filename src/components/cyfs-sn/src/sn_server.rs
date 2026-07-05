@@ -4,8 +4,8 @@ use crate::sn_auth_manager::SnAuthManager;
 use crate::sn_bns_reader::BnsIndexerDocumentReader;
 use crate::sn_compat_store::{SNDeviceInfo, SnCompatibilityStoreRef, SqliteSnCompatibilityStore};
 use crate::sn_did_resolver::{
-    normalize_sn_did_doc_type, SnDidResolveRequest, SnDidResolveResponse, SnDidResolver,
-    SnDidResolverProfile, SnDidResolverRef, SN_DID_RESOLVER_ROUTE_PREFIX,
+    normalize_sn_did_doc_type, SnDidResolveRequest, SnDidResolverProfile, SnDidResolverRef,
+    SnResolverBackedDidResolver, SN_DID_RESOLVER_ROUTE_PREFIX,
 };
 use crate::sn_resolver::{
     device_config_from_mini_jwt, ResolverCompatibilityReader, ResolverDeviceDocument,
@@ -461,37 +461,6 @@ struct RegisteredDeviceKey {
     device_name: String,
 }
 
-struct LegacySnDidResolver {
-    resolver: SnResolverRef,
-}
-
-impl LegacySnDidResolver {
-    fn new(resolver: SnResolverRef) -> Self {
-        Self { resolver }
-    }
-}
-
-#[async_trait]
-impl SnDidResolver for LegacySnDidResolver {
-    async fn resolve(
-        &self,
-        request: SnDidResolveRequest,
-    ) -> SnResolverResult<SnDidResolveResponse> {
-        let mut resolution = self
-            .resolver
-            .resolve_did(&request.did, request.doc_type(), request.from_ip)
-            .await?;
-        resolution.profile = request.profile;
-        resolution.document_status = match request.profile {
-            SnDidResolverProfile::PublicSupplement => None,
-            SnDidResolverProfile::InternalZoneResolver => {
-                Some(crate::sn_did_resolver::SnDidDocumentStatus::Active)
-            }
-        };
-        Ok(resolution)
-    }
-}
-
 #[derive(Clone)]
 pub struct SNServer {
     id: String,
@@ -648,21 +617,19 @@ impl SNServer {
             device_jwt,
         )
         .with_aliases(server_aliases);
-        let mut resolver = SnResolver::new(
-            resolver_config,
-            Arc::new(SnAuthResolverReader::new(auth_db.clone())),
-        )
-        .with_device_online_reader(Arc::new(SnDeviceInfoResolverReader::new(
-            device_info_db.clone(),
-        )))
-        .with_relay_reader(Arc::new(SnRelayManagerResolverReader::new(
-            relay_manager.clone(),
-        )))
-        .with_compatibility_reader(Arc::new(LegacyResolverCompatibilityReader::new(
-            auth_db.clone(),
-            device_info_db.clone(),
-            compat_store.clone(),
-        )));
+        let auth_reader = Arc::new(SnAuthResolverReader::new(auth_db.clone()));
+        let mut resolver = SnResolver::new(resolver_config, auth_reader.clone())
+            .with_device_online_reader(Arc::new(SnDeviceInfoResolverReader::new(
+                device_info_db.clone(),
+            )))
+            .with_relay_reader(Arc::new(SnRelayManagerResolverReader::new(
+                relay_manager.clone(),
+            )))
+            .with_compatibility_reader(Arc::new(LegacyResolverCompatibilityReader::new(
+                auth_db.clone(),
+                device_info_db.clone(),
+                compat_store.clone(),
+            )));
         if let Some(indexer_url) = bns_indexer_url.as_deref() {
             resolver = resolver.with_bns_reader(Arc::new(BnsIndexerDocumentReader::new(
                 indexer_url,
@@ -674,7 +641,7 @@ impl SNServer {
             );
         }
         let resolver = Arc::new(resolver);
-        let did_resolver = Arc::new(LegacySnDidResolver::new(resolver.clone()));
+        let did_resolver = SnResolverBackedDidResolver::new_ref(resolver.clone(), auth_reader);
 
         SNServer {
             id: server_config.id,
@@ -1807,17 +1774,23 @@ impl HttpServer for SNServer {
             );
             resolve_request.accept = accept;
             resolve_request.iat = iat;
+            let response_accept = resolve_request.accept.clone();
 
             match self.did_resolver.resolve(resolve_request).await {
                 Ok(resolution) => {
                     return Ok(Response::builder()
                         .status(StatusCode::OK)
                         .header("Access-Control-Allow-Origin", "*")
-                        .header("Content-Type", resolution.content_type())
+                        .header(
+                            "Content-Type",
+                            resolution.content_type_for_accept(response_accept.as_deref()),
+                        )
                         .body(BoxBody::new(
-                            Full::new(Bytes::from(resolution.body()))
-                                .map_err(|never| match never {})
-                                .boxed(),
+                            Full::new(Bytes::from(
+                                resolution.body_for_accept(response_accept.as_deref()),
+                            ))
+                            .map_err(|never| match never {})
+                            .boxed(),
                         ))
                         .unwrap());
                 }
