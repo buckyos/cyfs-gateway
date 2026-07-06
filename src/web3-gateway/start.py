@@ -1,12 +1,14 @@
 #!/usr/bin/env -S uv run
 
+import json
+import os
 import signal
 import subprocess
 import sys
 import time
 from pathlib import Path
 from urllib.error import URLError
-from urllib.request import urlopen
+from urllib.request import Request, urlopen
 
 MAX_START_ATTEMPTS = 30
 STARTUP_STABLE_SECONDS = 5
@@ -15,15 +17,18 @@ BNS_HEALTH_TIMEOUT_SECONDS = 30
 BNS_HEALTH_INTERVAL_SECONDS = 0.5
 PROCESS_STOP_TIMEOUT_SECONDS = 10
 
-BNS_RPC_ENDPOINT = "http://127.0.0.1:8545"
-BNS_CONTRACT_ADDRESS = "0x8464135c8F25Da09e49BC8782676a84730C318bC"
-BNS_CHAIN_ID = "31337"
+BNS_RPC_ENDPOINT = os.environ.get("BNS_RPC_ENDPOINT", "http://127.0.0.1:8545")
+BNS_CONTRACT_ADDRESS = os.environ.get(
+    "BNS_CONTRACT_ADDRESS", "0x8464135c8F25Da09e49BC8782676a84730C318bC"
+)
+BNS_CHAIN_ID = os.environ.get("BNS_CHAIN_ID", "31337")
 BNS_LISTEN = "127.0.0.1:18080"
 BNS_SERVER_URL = "http://127.0.0.1:18080"
 BNS_INDEXER_DB = "bns_indexer.sqlite"
 BNS_START_BLOCK = "0"
 BNS_CONFIRMATIONS = "0"
 BNS_INTERVAL_MS = "1000"
+BNS_DEPLOYMENT_FILE = "bns-deployment.json"
 
 children: list[subprocess.Popen] = []
 
@@ -39,9 +44,15 @@ def terminate_process(process: subprocess.Popen) -> None:
         process.wait()
 
 
-def signal_handler(signum: int, _frame) -> None:
-    for process in list(children):
+def terminate_all_children() -> None:
+    for process in reversed(list(children)):
         terminate_process(process)
+        if process in children:
+            children.remove(process)
+
+
+def signal_handler(signum: int, _frame) -> None:
+    terminate_all_children()
     raise SystemExit(128 + signum)
 
 
@@ -58,14 +69,84 @@ def run_child(cmd: list[str], cwd: Path) -> int:
 BNS_SEED_CONFIG_FILE = "bns_dv_seed.yaml"
 
 
-def start_bns_server(current_dir: Path) -> subprocess.Popen:
+def json_rpc(method: str, params: list | None = None) -> dict:
+    payload = json.dumps(
+        {
+            "jsonrpc": "2.0",
+            "method": method,
+            "params": params or [],
+            "id": 1,
+        }
+    ).encode("utf-8")
+    request = Request(
+        BNS_RPC_ENDPOINT,
+        data=payload,
+        headers={"content-type": "application/json"},
+        method="POST",
+    )
+    with urlopen(request, timeout=2) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def anvil_chain_id_ok() -> bool:
+    try:
+        response = json_rpc("eth_chainId")
+        return int(response.get("result", "0"), 16) == int(BNS_CHAIN_ID)
+    except (OSError, URLError, ValueError, json.JSONDecodeError):
+        return False
+
+
+def contract_deployed(contract: str) -> bool:
+    if not contract:
+        return False
+    try:
+        response = json_rpc("eth_getCode", [contract, "latest"])
+        code = response.get("result", "")
+        return isinstance(code, str) and code not in ("", "0x")
+    except (OSError, URLError, ValueError, json.JSONDecodeError):
+        return False
+
+
+def load_deployed_contract(current_dir: Path) -> str | None:
+    deployment_path = current_dir / BNS_DEPLOYMENT_FILE
+    if deployment_path.exists():
+        try:
+            deployed = json.loads(deployment_path.read_text()).get("deployedTo")
+            if isinstance(deployed, str) and contract_deployed(deployed):
+                return deployed
+        except (OSError, json.JSONDecodeError):
+            pass
+
+    if contract_deployed(BNS_CONTRACT_ADDRESS):
+        return BNS_CONTRACT_ADDRESS
+
+    return None
+
+
+def ensure_bns_contract(current_dir: Path) -> str:
+    if not anvil_chain_id_ok():
+        raise RuntimeError(
+            f"BNS anvil RPC is not healthy at {BNS_RPC_ENDPOINT}; run init_anvil.py first"
+        )
+
+    contract = load_deployed_contract(current_dir)
+    if contract is not None:
+        return contract
+
+    raise RuntimeError(
+        "BNS contract is not deployed or has no code on the current chain; "
+        "run init_anvil.py first"
+    )
+
+
+def start_bns_server(current_dir: Path, contract: str) -> subprocess.Popen:
     cmd = [
         str(current_dir / "bns_dv"),
         "serve",
         "--rpc",
         BNS_RPC_ENDPOINT,
         "--contract",
-        BNS_CONTRACT_ADDRESS,
+        contract,
         "--chain-id",
         BNS_CHAIN_ID,
         "--db",
@@ -119,7 +200,8 @@ def main() -> int:
     args = sys.argv[1:]
 
     current_dir = Path(__file__).resolve().parent
-    bns_process = start_bns_server(current_dir)
+    contract = ensure_bns_contract(current_dir)
+    bns_process = start_bns_server(current_dir, contract)
     config_file = current_dir / "web3_gateway.yaml"
     cmd = [str(current_dir / "web3_gateway"), "--config_file", str(config_file)]
     if "debug" in args:
@@ -138,9 +220,7 @@ def main() -> int:
                 return returncode
             time.sleep(RETRY_DELAY_SECONDS)
     finally:
-        if bns_process in children:
-            children.remove(bns_process)
-        terminate_process(bns_process)
+        terminate_all_children()
 
     return 1
 
@@ -150,6 +230,5 @@ if __name__ == "__main__":
         raise SystemExit(main())
     except Exception as err:
         print(f"start.py error: {err}", file=sys.stderr)
-        for process in list(children):
-            terminate_process(process)
+        terminate_all_children()
         raise SystemExit(1)

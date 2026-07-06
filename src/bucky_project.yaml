@@ -29,6 +29,7 @@ apps:
       cyfs_gateway: web3_gateway
       bns_dv: bns_dv
       web3_gateway_config: web3_gateway.yaml
+      init_anvil.py: init_anvil.py
       start.py: start.py
       stop.py: stop.py
     data_paths:

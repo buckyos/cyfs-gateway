@@ -4,14 +4,16 @@ use crate::sn_auth_manager::SnAuthManager;
 use crate::sn_bns_reader::BnsIndexerDocumentReader;
 use crate::sn_compat_store::{SNDeviceInfo, SnCompatibilityStoreRef, SqliteSnCompatibilityStore};
 use crate::sn_did_resolver::{
-    normalize_sn_did_doc_type, SnDidResolveRequest, SnDidResolverProfile, SnDidResolverRef,
-    SnResolverBackedDidResolver, SN_DID_RESOLVER_ROUTE_PREFIX,
+    key_like_string_to_jwk, normalize_sn_did_doc_type, owner_key_from_config, SnDidResolveRequest,
+    SnDidResolverProfile, SnDidResolverRef, SnResolverBackedDidResolver,
+    SN_DID_RESOLVER_ROUTE_PREFIX,
 };
+use crate::sn_dns_proof::{DnsTxtResolverRef, DohDnsTxtResolver, DEFAULT_PKX_DOH_URL};
 use crate::sn_resolver::{
-    device_config_from_mini_jwt, ResolverCompatibilityReader, ResolverDeviceDocument,
-    ResolverDidDocument, SnAuthResolverReader, SnDeviceInfoResolverReader,
-    SnRelayManagerResolverReader, SnResolver, SnResolverConfig, SnResolverError,
-    SnResolverErrorKind, SnResolverRef, SnResolverResult,
+    device_config_from_mini_jwt, BnsDocumentReader, ResolverCompatibilityReader,
+    ResolverDeviceDocument, ResolverDidDocument, SnAuthResolverReader,
+    SnDeviceInfoResolverReader, SnRelayManagerResolverReader, SnResolver, SnResolverConfig,
+    SnResolverError, SnResolverErrorKind, SnResolverRef, SnResolverResult,
 };
 use crate::{
     SnAuthDBRef, SnDeviceEndpointUpdate, SnDeviceInfoDBRef, SnDeviceRole, SnDeviceState,
@@ -472,6 +474,10 @@ pub struct SNServer {
     resolver: SnResolverRef,
     did_resolver: SnDidResolverRef,
     bns_controller: Option<Arc<SnBnsController>>,
+    /// user_domain PKX proof 专用的外部 DNS 查询（不走 SN 自身解析路径）。
+    pkx_txt_resolver: DnsTxtResolverRef,
+    /// `did:bns:<username>` owner document / authority key 读取（PKX 权威来源）。
+    bns_owner_reader: Option<Arc<BnsIndexerDocumentReader>>,
 }
 
 impl SNServer {
@@ -492,10 +498,9 @@ impl SNServer {
             | "user.add_dns_record"
             | "user.remove_dns_record"
             | "user.list_dns_records"
+            | "domain.bind"
             | "domain.begin_verify"
-            | "domain.create_pkx_binding"
             | "domain.verify"
-            | "domain.verify_pkx_binding"
             | "domain.unbind" => SnRpcPath::Auth,
             "device.register"
             | "device.update"
@@ -612,8 +617,13 @@ impl SNServer {
                 device_info_db.clone(),
                 compat_store.clone(),
             )));
+        let mut bns_owner_reader = None;
         if let Some(indexer_url) = bns_indexer_url.as_deref() {
             resolver = resolver.with_bns_reader(Arc::new(BnsIndexerDocumentReader::new(
+                indexer_url,
+                bns_session_token.clone(),
+            )));
+            bns_owner_reader = Some(Arc::new(BnsIndexerDocumentReader::new(
                 indexer_url,
                 bns_session_token,
             )));
@@ -624,6 +634,12 @@ impl SNServer {
         }
         let resolver = Arc::new(resolver);
         let did_resolver = SnResolverBackedDidResolver::new_ref(resolver.clone(), auth_reader);
+        let pkx_txt_resolver = DohDnsTxtResolver::new_ref(
+            server_config
+                .pkx_doh_url
+                .as_deref()
+                .unwrap_or(DEFAULT_PKX_DOH_URL),
+        );
 
         SNServer {
             id: server_config.id,
@@ -635,6 +651,8 @@ impl SNServer {
             resolver,
             did_resolver,
             bns_controller,
+            pkx_txt_resolver,
+            bns_owner_reader,
         }
     }
 
@@ -652,6 +670,87 @@ impl SNServer {
 
     pub(crate) fn bns_controller(&self) -> Option<Arc<SnBnsController>> {
         self.bns_controller.clone()
+    }
+
+    pub(crate) fn pkx_txt_resolver(&self) -> &DnsTxtResolverRef {
+        &self.pkx_txt_resolver
+    }
+
+    fn jwk_x_component(jwk: &jsonwebtoken::jwk::Jwk) -> Option<String> {
+        match &jwk.algorithm {
+            jsonwebtoken::jwk::AlgorithmParameters::OctetKeyPair(params) => {
+                Some(params.x.clone())
+            }
+            _ => None,
+        }
+    }
+
+    /// ed25519 公钥 x 分量的合理性检查（base64url 无 padding 解码为 32 字节）。
+    fn is_plausible_ed25519_x(value: &str) -> bool {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine;
+        URL_SAFE_NO_PAD
+            .decode(value)
+            .map(|bytes| bytes.len() == 32)
+            .unwrap_or(false)
+    }
+
+    /// 计算 user_domain 绑定期望的 `PKX(sn_user.pkx)` 及其来源。
+    ///
+    /// 权威优先级：`did:bns:<username>` 链上 owner document / authority key →
+    /// 本地 `users.public_key` 缓存 → 确定性 `sn-user:<username>` 标签（无
+    /// owner key 的账号仍能证明「DNS owner 同意绑定到该 SN 账号」的意图）。
+    ///
+    /// BNS reader 已配置但暂不可达时返回 RemoteError（可重试），不静默回落
+    /// 本地缓存，避免期望 PKX 随链路抖动来回变化。绑定流程不提供修改 PKX
+    /// 的入口。
+    pub(crate) async fn expected_user_domain_pkx(
+        &self,
+        username: &str,
+        user: &crate::SNUserInfo,
+    ) -> SnResult<(String, &'static str)> {
+        if let Some(reader) = self.bns_owner_reader.as_ref() {
+            match reader.resolve_owner(username).await {
+                Ok(Some(owner)) => {
+                    if let Some(x) = owner
+                        .owner_config
+                        .as_ref()
+                        .and_then(owner_key_from_config)
+                        .as_ref()
+                        .and_then(Self::jwk_x_component)
+                    {
+                        return Ok((crate::pkx_value(x.as_str())?, "bns-owner-config"));
+                    }
+                    if let Some(x) = owner
+                        .effective_owner
+                        .as_deref()
+                        .and_then(key_like_string_to_jwk)
+                        .as_ref()
+                        .and_then(Self::jwk_x_component)
+                        .filter(|x| Self::is_plausible_ed25519_x(x.as_str()))
+                    {
+                        return Ok((crate::pkx_value(x.as_str())?, "bns-effective-owner"));
+                    }
+                    // 链上存在该名字但没有可用的 ed25519 authority key（例如
+                    // ChainAccount owner 且 owner_config 无 key）→ 本地回落。
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    return Err(crate::sn_err!(
+                        crate::SnErrorCode::RemoteError,
+                        "resolve BNS owner for {} failed: {}",
+                        username,
+                        e
+                    ));
+                }
+            }
+        }
+
+        if let Some(source) = crate::pkx_source_of(user.public_key.as_str()) {
+            return Ok((format!("PKX({})", source), "local-public-key"));
+        }
+
+        Ok((format!("PKX(sn-user:{})", username), "sn-user-label"))
     }
 
     pub fn add_name_info_cache(
@@ -881,11 +980,7 @@ impl SNServer {
             "user.list_dns_records" => {
                 handle_dns(self, Self::rewrite_rpc_method(req, "list_records")).await
             }
-            "domain.begin_verify"
-            | "domain.create_pkx_binding"
-            | "domain.verify"
-            | "domain.verify_pkx_binding"
-            | "domain.unbind" => {
+            "domain.bind" | "domain.begin_verify" | "domain.verify" | "domain.unbind" => {
                 let bare_method = req
                     .method
                     .strip_prefix("domain.")
@@ -1800,6 +1895,13 @@ pub struct SNServerConfig {
     pub bns_indexer_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bns_session_token: Option<String>,
+    /// user_domain PKX proof 的外部 DoH resolver。默认 Google Public DNS
+    /// `https://dns.google/dns-query`（RFC 8484 wire 格式）；URL path 以
+    /// `/resolve` 结尾时按 dns.google JSON API 查询。只用于 `domain.bind`
+    /// 的服务端 DNS TXT 校验，不影响 SN 自身解析。
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pkx_doh_url: Option<String>,
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bns_write_enabled: Option<bool>,
@@ -2249,6 +2351,135 @@ mod tests {
     const ANVIL_PRIVATE_KEY: &str =
         "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
     const ANVIL_ADDRESS: &str = "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266";
+
+    /// RFC 8484 wire 格式的 mock DoH 端点：`domain.bind` 的外部 DNS proof
+    /// 在测试里通过 `pkx_doh_url` 指到这里；TXT 记录由测试用例动态发布，
+    /// 模拟「用户在传统 DNS 配置 PKX TXT」。
+    struct MockDohServer {
+        records: std::sync::Mutex<std::collections::HashMap<String, Vec<String>>>,
+    }
+
+    impl MockDohServer {
+        fn new() -> Self {
+            Self {
+                records: std::sync::Mutex::new(Default::default()),
+            }
+        }
+
+        fn record_key(name: &str) -> String {
+            name.trim().trim_end_matches('.').to_ascii_lowercase()
+        }
+
+        fn set_txt(&self, name: &str, values: Vec<String>) {
+            self.records
+                .lock()
+                .unwrap()
+                .insert(Self::record_key(name), values);
+        }
+
+        fn remove_txt(&self, name: &str) {
+            self.records
+                .lock()
+                .unwrap()
+                .remove(Self::record_key(name).as_str());
+        }
+    }
+
+    #[async_trait]
+    impl HttpServer for MockDohServer {
+        async fn serve_request(
+            &self,
+            request: http::Request<BoxBody<Bytes, ServerError>>,
+            _info: StreamInfo,
+        ) -> ServerResult<http::Response<BoxBody<Bytes, ServerError>>> {
+            use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+            use base64::Engine;
+            use hickory_proto::op::{Message, MessageType, ResponseCode};
+            use hickory_proto::rr::{rdata::TXT, RData, Record};
+
+            let dns_param = request
+                .uri()
+                .query()
+                .unwrap_or_default()
+                .split('&')
+                .find_map(|kv| kv.strip_prefix("dns="))
+                .expect("mock doh expects RFC 8484 GET with dns param")
+                .to_string();
+            let raw = URL_SAFE_NO_PAD
+                .decode(dns_param.as_bytes())
+                .expect("decode dns param");
+            let query_message =
+                Message::from_vec(raw.as_slice()).expect("parse dns query message");
+            let question = query_message
+                .queries()
+                .first()
+                .cloned()
+                .expect("dns query question");
+            let name_key = Self::record_key(question.name().to_utf8().as_str());
+
+            let mut response = Message::new();
+            response
+                .set_id(query_message.id())
+                .set_message_type(MessageType::Response)
+                .set_op_code(query_message.op_code())
+                .set_recursion_desired(true)
+                .set_recursion_available(true);
+            response.add_query(question.clone());
+            match self.records.lock().unwrap().get(name_key.as_str()) {
+                Some(values) => {
+                    response.set_response_code(ResponseCode::NoError);
+                    for value in values {
+                        response.add_answer(Record::from_rdata(
+                            question.name().clone(),
+                            60,
+                            RData::TXT(TXT::new(vec![value.clone()])),
+                        ));
+                    }
+                }
+                None => {
+                    response.set_response_code(ResponseCode::NXDomain);
+                }
+            }
+
+            let body = response.to_vec().expect("encode dns response");
+            Ok(Response::builder()
+                .status(StatusCode::OK)
+                .header("Content-Type", "application/dns-message")
+                .header("Content-Length", body.len())
+                .body(
+                    Full::new(Bytes::from(body))
+                        .map_err(|never| match never {})
+                        .boxed(),
+                )
+                .unwrap())
+        }
+
+        fn id(&self) -> String {
+            "mock-doh".to_string()
+        }
+
+        fn http_version(&self) -> http::Version {
+            http::Version::HTTP_11
+        }
+
+        fn http3_port(&self) -> Option<u16> {
+            None
+        }
+    }
+
+    /// 从 domain.bind 的 proof 失败错误里取出期望 pkx（错误 message 是
+    /// 含 pkx_record_name/pkx 的 JSON，即给用户的「挑战」信息）。
+    fn extract_pkx_from_proof_error(error: &str) -> String {
+        let start = error.find('{').expect("proof error carries JSON payload");
+        let end = error.rfind('}').expect("proof error carries JSON payload");
+        let value: Value =
+            serde_json::from_str(&error[start..=end]).expect("parse proof error JSON");
+        assert_eq!(value["retryable"].as_bool(), Some(true));
+        value["pkx"]
+            .as_str()
+            .expect("pkx in proof error")
+            .to_string()
+    }
 
     async fn spawn_test_http_server(http_server: Arc<dyn HttpServer>) -> SocketAddr {
         let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
@@ -3221,6 +3452,9 @@ mod tests {
             DeviceDocument::new_by_jwk("ood1", serde_json::from_value(jwk).unwrap());
         let device_info = DeviceInfo::from_device_doc(&device_config);
 
+        const TAKEOVER_USER: &str = "takeoveruser";
+        const TAKEOVER_ACTIVE_CODE: &str = "kO3pQ4rS5tU6vW7xY8zA";
+
         let sn_factory = SnServerFactory::new();
         let db = tempfile::NamedTempFile::with_suffix(".db").unwrap();
         let auth_dir = tempfile::tempdir().unwrap();
@@ -3233,7 +3467,14 @@ mod tests {
             db.insert_activation_code(CLEAR_STATE_ACTIVE_CODE)
                 .await
                 .unwrap();
+            db.insert_activation_code(TAKEOVER_ACTIVE_CODE)
+                .await
+                .unwrap();
         }
+
+        // domain.bind 的外部 DNS proof path 指向本地 mock DoH（RFC 8484）。
+        let mock_doh = Arc::new(MockDohServer::new());
+        let doh_addr = spawn_test_http_server(mock_doh.clone()).await;
 
         let config = json!({
             "id": "test-refactor",
@@ -3245,6 +3486,7 @@ mod tests {
             "db_type": "sqlite",
             "db_path": db.path().to_str().unwrap(),
             "auth_data_dir": auth_dir.path().to_str().unwrap(),
+            "pkx_doh_url": format!("http://{}/dns-query", doh_addr),
         });
         let config: SNServerConfig = serde_json::from_value(config).unwrap();
         let servers = sn_factory.create(Arc::new(config), None).await.unwrap();
@@ -3430,21 +3672,66 @@ mod tests {
         assert!(profile["self_cert"].as_bool().unwrap());
 
         let user_domain = format!("{}.buckyos.ai", REFACTOR_USER);
-        let challenge = auth_user_krpc
-            .call("domain.begin_verify", json!({ "domain": user_domain }))
+        let pkx_record = format!("_pkx.{}", user_domain);
+
+        // §user_domain：外部 DNS 尚未配置 TXT 时，一站式 domain.bind 返回可
+        // 重试错误；错误 payload 即「挑战」——携带待配置的 pkx_record_name
+        // 与期望 pkx，不写入任何 binding。
+        let bind_err = auth_user_krpc
+            .call("domain.bind", json!({ "domain": user_domain }))
             .await
-            .unwrap();
-        let pkx = challenge["pkx"].as_str().unwrap();
-        auth_user_krpc
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(bind_err.contains("[SN:1016:domain_proof_failed]"));
+        assert!(bind_err.contains(pkx_record.as_str()));
+        let expected_pkx = extract_pkx_from_proof_error(bind_err.as_str());
+
+        // 客户端传入 txt_records 不再是信任边界：伪造 proof 无法激活绑定
+        //（domain.verify 已是 domain.bind 的 alias，服务端只认自己的 DNS 查询）。
+        let forged_err = auth_user_krpc
             .call(
                 "domain.verify",
                 json!({
                     "domain": user_domain,
-                    "txt_records": [pkx]
+                    "txt_records": [expected_pkx]
                 }),
             )
             .await
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(forged_err.contains("[SN:1016:domain_proof_failed]"));
+        let profile = auth_user_krpc
+            .call("user.get_profile", json!({}))
+            .await
             .unwrap();
+        assert!(profile["user_domain"].is_null());
+
+        // 在「外部 DNS」（mock DoH）发布 PKX TXT 后，一站式 bind 成功激活。
+        mock_doh.set_txt(
+            pkx_record.as_str(),
+            vec![format!("\"{}\"", expected_pkx)],
+        );
+        let bound = auth_user_krpc
+            .call("domain.bind", json!({ "domain": user_domain }))
+            .await
+            .unwrap();
+        assert_eq!(bound["code"].as_i64().unwrap(), 0);
+        assert_eq!(bound["domain"].as_str().unwrap(), user_domain);
+        assert_eq!(bound["pkx"].as_str().unwrap(), expected_pkx);
+        assert_eq!(bound["pkx_record_name"].as_str().unwrap(), pkx_record);
+
+        // 绑定生效后 SN-DNS 侧可解析 user_domain 下的设备主机名。
+        let result = device_krpc
+            .call(
+                "deviceinfo.resolve_ood_by_hostname",
+                json!({ "dest_host": format!("ood1.{}", user_domain) }),
+            )
+            .await
+            .unwrap();
+        let ood_info = serde_json::from_value::<OODInfo>(result).unwrap();
+        assert_eq!(ood_info.owner_id, REFACTOR_USER);
 
         let result = auth_user_krpc
             .call(
@@ -3466,6 +3753,72 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result["items"].as_array().unwrap().len(), 1);
+
+        // §域名转让：新 DNS owner 完成自己的 PKX proof 即可接管同一 canonical
+        // domain（历史绑定只作审计，不阻止），无需旧 owner 先 unbind。
+        let result = auth_krpc
+            .call(
+                "auth.register",
+                json!({
+                    "name": TAKEOVER_USER,
+                    "pwd_hash": "87654321",
+                    "active_code": TAKEOVER_ACTIVE_CODE
+                }),
+            )
+            .await
+            .unwrap();
+        let takeover_token = result["access_token"].as_str().unwrap().to_string();
+        let takeover_krpc = kRPC::new(auth_url.as_str(), Some(takeover_token));
+
+        let takeover_err = takeover_krpc
+            .call("domain.bind", json!({ "domain": user_domain }))
+            .await
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(takeover_err.contains("[SN:1016:domain_proof_failed]"));
+        let takeover_pkx = extract_pkx_from_proof_error(takeover_err.as_str());
+        assert_ne!(takeover_pkx, expected_pkx);
+
+        // 新 owner 控制传统 DNS：替换 TXT 为自己的 PKX。
+        mock_doh.set_txt(pkx_record.as_str(), vec![takeover_pkx.clone()]);
+        let takeover_bound = takeover_krpc
+            .call("domain.bind", json!({ "domain": user_domain }))
+            .await
+            .unwrap();
+        assert_eq!(takeover_bound["code"].as_i64().unwrap(), 0);
+        assert_eq!(takeover_bound["pkx"].as_str().unwrap(), takeover_pkx);
+
+        // 旧 owner 的 user_domain 兼容缓存已被清理。
+        let profile = auth_user_krpc
+            .call("user.get_profile", json!({}))
+            .await
+            .unwrap();
+        assert!(profile["user_domain"].is_null());
+        let profile = takeover_krpc
+            .call("user.get_profile", json!({}))
+            .await
+            .unwrap();
+        assert_eq!(profile["user_domain"].as_str().unwrap(), user_domain);
+
+        // §unbind：解绑后 SN-DNS 不再响应该 user_domain 及其子域名。
+        takeover_krpc
+            .call("domain.unbind", json!({ "domain": user_domain }))
+            .await
+            .unwrap();
+        let profile = takeover_krpc
+            .call("user.get_profile", json!({}))
+            .await
+            .unwrap();
+        assert!(profile["user_domain"].is_null());
+        assert!(device_krpc
+            .call(
+                "deviceinfo.resolve_ood_by_hostname",
+                json!({ "dest_host": format!("ood1.{}", user_domain) }),
+            )
+            .await
+            .is_err());
+        mock_doh.remove_txt(pkx_record.as_str());
 
         let admin_on_auth = auth_user_krpc
             .call("admin.clear_state_by_active_code", json!({}))

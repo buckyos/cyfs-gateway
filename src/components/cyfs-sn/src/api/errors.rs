@@ -17,6 +17,10 @@ pub(crate) enum SnApiErrorCode {
     DevicePermissionDenied = 1013,
     InvalidDeviceDid = 1014,
     InvalidDomain = 1015,
+    /// user_domain PKX proof 未通过（DNS TXT 缺失/不匹配或外部 DNS 查询失败）。
+    /// message 为 JSON：含 `pkx_record_name` / `pkx` / `retryable` / `reason`，
+    /// 客户端按提示配置 TXT 后可重试 `domain.bind`。
+    DomainProofFailed = 1016,
     HostnameNotFound = 1017,
     CrossUserAccessDenied = 1018,
     UnsupportedPasswordAlgo = 1019,
@@ -48,6 +52,7 @@ impl SnApiErrorCode {
             Self::DevicePermissionDenied => "device_permission_denied",
             Self::InvalidDeviceDid => "invalid_device_did",
             Self::InvalidDomain => "invalid_domain",
+            Self::DomainProofFailed => "domain_proof_failed",
             Self::HostnameNotFound => "hostname_not_found",
             Self::CrossUserAccessDenied => "cross_user_access_denied",
             Self::UnsupportedPasswordAlgo => "unsupported_password_algo",

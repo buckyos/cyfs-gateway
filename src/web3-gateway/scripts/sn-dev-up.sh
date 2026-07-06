@@ -148,9 +148,8 @@ wait_for "contract code at $CONTRACT" 30 contract_deployed "$CONTRACT"
 
 # --- 4) rootfs 模板 + dv-env.json + make_sn_config --seed-v2 --dev-local ---
 # 仅 fresh 时构造 rootfs：--resume 语义是"不动 seed 重启"（T5），不得重跑
-# make_sn_config——其 legacy 步骤 replaceGeneratedSnDb 会重建 sn.sqlite3，
-# 破坏"已种子化 DB 上幂等重放零写入"的验证前提。产物稳定性（重跑
-# make_sn_config diff 干净）由 e2e_sn_seed 用独立 scratch rootfs 验证。
+# make_sn_config 以免重写 rootfs/seed 产物。产物稳定性（重跑 make_sn_config
+# diff 干净）由 e2e_sn_seed 用独立 scratch rootfs 验证。
 if [ "$MODE" = "fresh" ]; then
   echo "[sn-dev-up] staging rootfs templates into $ROOTFS"
   for f in web3_gateway.yaml local_dns.toml website.yaml params.json; do

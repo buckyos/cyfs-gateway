@@ -343,7 +343,7 @@ pub async fn import_sn_seed(
         }
         // user_domain 种子是开发捷径：register_user_with_owner_key 会把域名
         // 绑定直接置 verified/active（绕过 domain proof 流程）——仅 seed 路径
-        // 允许这么做，线上绑定必须走 create_pkx_binding + verify_pkx_binding。
+        // 允许这么做，线上绑定必须走 domain.bind 的服务端外部 DNS PKX proof。
         let registered = auth_db
             .register_user_with_owner_key(
                 code.as_str(),

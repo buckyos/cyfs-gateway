@@ -91,8 +91,8 @@
 
 ### 2.3 切换与退役
 
-- [x] 任务 1 + 3 验证通过后：seed-v2 行为已转为默认，旧路径挂 `--legacy` 保留一个过渡版本（devtest VM 尚无 EVM 链，`dev_configs/sn_test` 显式 `--legacy` 过渡，待 buckyos-devtest 补 DV 链后移除）。
-- [ ] （过渡版本后）删除脚本内 legacy 块：`initializeSnDatabaseSchema` / `backfillSnDerivedTables` / `syncSnDatabase` / `preregisterDevUsers`，并去掉 websdk `registerUserToSn/registerDeviceToSn`（DevSnDb 直写）依赖。
+- [x] 任务 1 + 3 验证通过后：seed-v2 行为已转为默认，`--seed-v2` 仅保留为 no-op 兼容参数。
+- [x] 删除脚本内 legacy 块：`initializeSnDatabaseSchema` / `backfillSnDerivedTables` / `syncSnDatabase` / `preregisterDevUsers`，并去掉 websdk `registerUserToSn/registerDeviceToSn`（DevSnDb 直写）依赖。
 - [ ] 跨仓库收尾：buckyos `src/make_sn_configs.ts` 与其 deno task 退役；buckyos-devtest 的 `web3-gateway.build_all` 改指本仓库脚本（buckyos 侧提交，单独 PR）。
 
 ---

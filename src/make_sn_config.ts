@@ -18,24 +18,24 @@
 //
 // Iteration direction:
 // Keep this script short and owned by the SN/web3-gateway boundary. It may write
-// minimal SN service parameters, SN identity material, and seed registrations in
-// the SN database. Runtime-derived data, compatibility shims, caches, and state
-// that belongs to OOD-side services should live in the owning module's lazy/seed
-// initialization path. When a version cannot start from the old seed data, treat
-// that as a data-format compatibility signal to review before release.
+// minimal SN service parameters, SN identity material, and component seed config
+// files. Runtime-derived data, compatibility shims, caches, and state that
+// belongs to OOD-side services should live in the owning module's lazy/seed
+// initialization path. When a version cannot start from the current seed data,
+// treat that as a data-format compatibility signal to review before release.
 //
-// Runtime: Deno >= 2.2 (node:sqlite). websdk import mapped in src/deno.json.
+// Runtime: Deno >= 2.2. websdk import mapped in src/deno.json.
 //
 // Usage: deno run --allow-all src/make_sn_config.ts
 //          [--rootfs <dir>] [--ca <dir>] [--sn_ip <ip>]
 //          [--sn_base_host <host>] [--env_root <dir>] [--dev-local]
-//          [--legacy [--no-preregister]]   (seed-v2 已是默认行为)
+//          [--seed-v2]   (seed-v2 已是唯一行为，flag 保留为 no-op)
 //
 // Output layout:
 //   <rootfs>/sn_device_config.json    SN server device config
 //   <rootfs>/sn_private_key.pem       device private key (rtcp stack)
 //   <rootfs>/params.json              SN service parameters (incl. sn_ip)
-//   <rootfs>/sn.sqlite3               SN sqlite database with pre-registered users
+//   <rootfs>/sn.sqlite3               SN sqlite database runtime path (created by cyfs-sn)
 //   <rootfs>/sn_token_key/            server JWT signing key directory
 //   <rootfs>/fullchain.cert/.pem      TLS cert+key for sn.$base, web3.$base, *.web3.$base
 //   <rootfs>/ca/                      dev CA cert+key (client trust install)
@@ -43,30 +43,26 @@
 //   <rootfs>/web3_gateway.yaml        patched when present to load sn.sqlite3
 // Still created manually/by app template: website.yaml, local_dns.toml.
 //
-// User pre-registration: alice.ood1 / bob.ood1 / charlie.ood1 dev zones are
-// registered into sn.sqlite3. Their user envs are reused from <env_root> when
-// present (so JWTs match rootfs built by make_config.ts) and generated there
-// otherwise (DEV_TEST_KEYS are deterministic, so devices still verify).
+// Seed users: alice.ood1 / bob.ood1 / charlie.ood1 / dave.ood1 dev zones are
+// materialized as bns_dv_seed.yaml and sn_seed.yaml. Their user envs are reused
+// from <env_root> when present (so JWTs match rootfs built by make_config.ts)
+// and generated there otherwise (DEV_TEST_KEYS are deterministic, so devices
+// still verify). cyfs-sn imports sn_seed.yaml at startup; this script no longer
+// writes SN-private user/device tables.
 
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
 import { Buffer } from "node:buffer";
 import { createHash, createPrivateKey, createPublicKey } from "node:crypto";
-import { DatabaseSync } from "node:sqlite";
 import { parseArgs } from "node:util";
 import {
   assertProvisionRuntime,
   createCertFromCa,
   createSnConfigs,
   ensureCa,
-  registerDeviceToSn,
-  registerUserToSn,
 } from "buckyos/provision";
-import {
-  createNodeConfigs,
-  createUserEnv,
-} from "buckyos/provision";
+import { createNodeConfigs, createUserEnv } from "buckyos/provision";
 import {
   ENV_ROOT_DIR,
   getParamsFromGroupName,
@@ -163,18 +159,14 @@ export async function buildUserEnv(
 
 const DEFAULT_SN_BASE_HOST = "devtests.org";
 const DEFAULT_CA_NAME = "buckyos_test_ca";
-const PREREGISTER_GROUPS = ["alice.ood1", "bob.ood1", "charlie.ood1"];
-const LEGACY_SN_DB_FILE = "sn_db.sqlite3";
+const PROVISION_SN_DB_FILE = "sn_db.sqlite3";
 const SN_DB_FILE = "sn.sqlite3";
 const SN_AUTH_DATA_DIR = "sn_token_key";
 const WEB3_GATEWAY_CONFIG_FILE = "web3_gateway.yaml";
 
-type SqliteValue = string | number | bigint | null;
-type SqliteRow = Record<string, SqliteValue>;
-
 function printUsage(log: (message?: unknown) => void = console.error): void {
   log(
-    "usage: make_sn_config.ts [--rootfs <dir>] [--ca <dir>] [--sn_ip <ip>] [--sn_base_host <host>] [--env_root <dir>] [--dev-local] [--legacy [--no-preregister]]",
+    "usage: make_sn_config.ts [--rootfs <dir>] [--ca <dir>] [--sn_ip <ip>] [--sn_base_host <host>] [--env_root <dir>] [--dev-local] [--seed-v2]",
   );
 }
 
@@ -207,435 +199,20 @@ function readJson(file: string): Record<string, unknown> {
   return JSON.parse(fs.readFileSync(file, "utf8"));
 }
 
-function sqliteRows(db: DatabaseSync, sql: string): SqliteRow[] {
-  return db.prepare(sql).all() as SqliteRow[];
+function isProvisionSnDbFile(name: string): boolean {
+  return name === PROVISION_SN_DB_FILE ||
+    name === `${PROVISION_SN_DB_FILE}-shm` ||
+    name === `${PROVISION_SN_DB_FILE}-wal`;
 }
 
-function ensureColumn(
-  db: DatabaseSync,
-  table: string,
-  column: string,
-  definition: string,
-): void {
-  const rows = sqliteRows(db, `PRAGMA table_info(${table})`);
-  const exists = rows.some((row) => row.name === column);
-  if (!exists) {
-    db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
-  }
-}
-
-function tableExists(db: DatabaseSync, table: string): boolean {
-  const rows = db.prepare(
-    "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?",
-  ).all(table) as SqliteRow[];
-  return rows.length > 0;
-}
-
-function migrateLegacyUserAuthTable(db: DatabaseSync): void {
-  if (!tableExists(db, "user_auth_v2")) {
-    return;
-  }
-  db.exec(`
-    INSERT OR IGNORE INTO user_auth
-      (username, password_hash, password_salt, password_algo,
-       created_at, updated_at, last_login_at)
-    SELECT
-      username, password_hash, password_salt, password_algo,
-      created_at, updated_at, last_login_at
-    FROM user_auth_v2;
-
-    DROP TABLE user_auth_v2;
-  `);
-}
-
-// LEGACY（仅 --legacy 过渡路径）：本函数与 backfillSnDerivedTables/
-// syncSnDatabase/preregisterDevUsers 是对 cyfs-sn 私有 schema 的副本维护 +
-// 派生态回填 + DevSnDb 直写。seed-v2（默认）已由组件自行幂等导入替代；
-// 本块只为 devtest VM（尚无 EVM 链，bns_dv 种子 tx 无处提交）保留一个
-// 过渡版本，等 buckyos-devtest 把 DV 链纳入 VM 环境构造后连同 websdk
-// registerUserToSn/registerDeviceToSn 依赖一起删除。
-function initializeSnDatabaseSchema(db: DatabaseSync): void {
-  db.exec(`
-    PRAGMA foreign_keys = ON;
-
-    CREATE TABLE IF NOT EXISTS activation_codes (
-      code TEXT PRIMARY KEY,
-      used INTEGER NOT NULL DEFAULT 0
-    );
-
-    CREATE TABLE IF NOT EXISTS users (
-      username TEXT PRIMARY KEY,
-      state TEXT NOT NULL DEFAULT 'active',
-      bns_name TEXT,
-      public_key TEXT NOT NULL DEFAULT '',
-      activation_code TEXT,
-      owner_key_ref TEXT,
-      zone_config TEXT NOT NULL DEFAULT '',
-      self_cert INTEGER NOT NULL DEFAULT 0,
-      user_domain TEXT,
-      sn_ips TEXT,
-      created_at INTEGER NOT NULL DEFAULT 0,
-      updated_at INTEGER NOT NULL DEFAULT 0,
-      last_login_at INTEGER NULL
-    );
-
-    CREATE TABLE IF NOT EXISTS user_auth (
-      username TEXT PRIMARY KEY,
-      password_hash TEXT NOT NULL,
-      password_salt TEXT NOT NULL,
-      password_algo TEXT NOT NULL,
-      created_at INTEGER NOT NULL,
-      updated_at INTEGER NOT NULL,
-      last_login_at INTEGER NULL
-    );
-
-    CREATE TABLE IF NOT EXISTS user_domain_history (
-      domain TEXT PRIMARY KEY,
-      owner TEXT NOT NULL,
-      created_at INTEGER NOT NULL
-    );
-
-    CREATE TABLE IF NOT EXISTS user_domain_bindings (
-      domain TEXT PRIMARY KEY,
-      owner TEXT NOT NULL,
-      state TEXT NOT NULL,
-      pkx TEXT NOT NULL,
-      pkx_record_name TEXT NOT NULL,
-      verified_at INTEGER NULL,
-      created_at INTEGER NOT NULL,
-      updated_at INTEGER NOT NULL
-    );
-
-    CREATE INDEX IF NOT EXISTS idx_user_domain_bindings_owner_state
-      ON user_domain_bindings (owner, state);
-
-    CREATE TABLE IF NOT EXISTS zone_info (
-      username TEXT PRIMARY KEY,
-      bns_name TEXT NOT NULL,
-      zone TEXT NULL,
-      relay_sn TEXT NULL,
-      self_cert INTEGER NOT NULL DEFAULT 0,
-      cert_checked_at INTEGER NULL,
-      cert_expires_at INTEGER NULL,
-      sn_ips TEXT NULL,
-      source_version TEXT NULL,
-      updated_at INTEGER NOT NULL
-    );
-
-    CREATE TABLE IF NOT EXISTS account_sessions (
-      session_id TEXT PRIMARY KEY,
-      username TEXT NOT NULL,
-      token_aud TEXT NOT NULL,
-      state TEXT NOT NULL,
-      issued_at INTEGER NOT NULL,
-      expires_at INTEGER NOT NULL,
-      revoked_at INTEGER NULL
-    );
-
-    CREATE INDEX IF NOT EXISTS idx_account_sessions_username_state
-      ON account_sessions (username, state);
-
-    CREATE TABLE IF NOT EXISTS devices (
-      owner TEXT NOT NULL,
-      device_name TEXT NOT NULL,
-      did TEXT PRIMARY KEY,
-      ip TEXT NOT NULL,
-      description TEXT NOT NULL,
-      mini_config_jwt TEXT NOT NULL,
-      created_at INTEGER NOT NULL,
-      updated_at INTEGER NOT NULL,
-      UNIQUE(owner, device_name)
-    );
-
-    CREATE TABLE IF NOT EXISTS user_dns_records (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      owner TEXT NOT NULL,
-      domain TEXT NOT NULL,
-      record_type TEXT NOT NULL,
-      record TEXT NOT NULL,
-      ttl INTEGER NOT NULL,
-      created_at INTEGER NOT NULL,
-      updated_at INTEGER NOT NULL
-    );
-
-    CREATE UNIQUE INDEX IF NOT EXISTS idx_user_domain_record_type
-      ON user_dns_records (owner, domain, record_type);
-
-    CREATE INDEX IF NOT EXISTS user_dns_records_domain_index
-      ON user_dns_records (domain, id);
-
-    CREATE TABLE IF NOT EXISTS did_documents (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      obj_id TEXT NOT NULL,
-      owner_user TEXT NOT NULL,
-      obj_name TEXT NOT NULL,
-      did_document TEXT NOT NULL,
-      doc_type TEXT NULL,
-      update_time INTEGER NOT NULL
-    );
-
-    CREATE INDEX IF NOT EXISTS idx_did_documents_owner_obj
-      ON did_documents (owner_user, obj_name, update_time);
-
-    CREATE TABLE IF NOT EXISTS device_indexes (
-      did TEXT PRIMARY KEY,
-      zone TEXT NOT NULL,
-      device_name TEXT NOT NULL,
-      device_role TEXT NOT NULL DEFAULT 'unknown',
-      created_at INTEGER NOT NULL,
-      updated_at INTEGER NOT NULL,
-      UNIQUE(zone, device_name)
-    );
-
-    CREATE TABLE IF NOT EXISTS device_runtime_states (
-      did TEXT PRIMARY KEY,
-      state TEXT NOT NULL,
-      reported_ip TEXT NULL,
-      reported_ips TEXT NULL,
-      from_ip TEXT NULL,
-      wan_ip TEXT NULL,
-      lan_ips TEXT NULL,
-      nat_type TEXT NOT NULL DEFAULT 'unknown',
-      is_wan_device INTEGER NOT NULL DEFAULT 0,
-      last_seen_at INTEGER NULL,
-      last_report_at INTEGER NULL,
-      expires_at INTEGER NULL,
-      report_seq INTEGER NULL,
-      raw_report TEXT NULL,
-      created_at INTEGER NOT NULL,
-      updated_at INTEGER NOT NULL,
-      FOREIGN KEY(did) REFERENCES device_indexes(did)
-    );
-
-    CREATE TABLE IF NOT EXISTS device_endpoints (
-      did TEXT NOT NULL,
-      endpoint_id TEXT NOT NULL,
-      protocol TEXT NOT NULL,
-      host TEXT NOT NULL,
-      port INTEGER NULL,
-      scope TEXT NOT NULL DEFAULT 'unknown',
-      priority INTEGER NOT NULL DEFAULT 100,
-      source TEXT NOT NULL,
-      state TEXT NOT NULL,
-      last_seen_at INTEGER NULL,
-      expires_at INTEGER NULL,
-      created_at INTEGER NOT NULL,
-      updated_at INTEGER NOT NULL,
-      PRIMARY KEY(did, endpoint_id),
-      FOREIGN KEY(did) REFERENCES device_indexes(did)
-    );
-
-    CREATE TABLE IF NOT EXISTS device_state_events (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      did TEXT NOT NULL,
-      event_type TEXT NOT NULL,
-      old_state TEXT NULL,
-      new_state TEXT NULL,
-      reason TEXT NULL,
-      event_at INTEGER NOT NULL,
-      detail TEXT NULL
-    );
-
-    CREATE INDEX IF NOT EXISTS idx_device_indexes_zone_name
-      ON device_indexes(zone, device_name);
-
-    CREATE INDEX IF NOT EXISTS idx_device_runtime_state_expires
-      ON device_runtime_states(state, expires_at);
-
-    CREATE INDEX IF NOT EXISTS idx_device_endpoints_did_state_priority
-      ON device_endpoints(did, state, priority);
-
-    CREATE INDEX IF NOT EXISTS idx_device_state_events_did_time
-      ON device_state_events(did, event_at);
-
-    CREATE TABLE IF NOT EXISTS relay_nodes (
-      relay_id TEXT PRIMARY KEY,
-      relay_sn TEXT NOT NULL UNIQUE,
-      public_host TEXT NOT NULL,
-      http_endpoint TEXT NULL,
-      rtcp_endpoint TEXT NULL,
-      region TEXT NULL,
-      isp TEXT NULL,
-      tags TEXT NULL,
-      capabilities TEXT NOT NULL,
-      status TEXT NOT NULL,
-      capacity_score INTEGER NOT NULL DEFAULT 100,
-      current_load INTEGER NOT NULL DEFAULT 0,
-      last_heartbeat_at INTEGER NULL,
-      drain_until INTEGER NULL,
-      created_at INTEGER NOT NULL,
-      updated_at INTEGER NOT NULL
-    );
-
-    CREATE TABLE IF NOT EXISTS relay_assignments (
-      zone TEXT PRIMARY KEY,
-      relay_id TEXT NOT NULL,
-      relay_sn TEXT NOT NULL,
-      state TEXT NOT NULL,
-      source TEXT NOT NULL,
-      reason TEXT NULL,
-      generation INTEGER NOT NULL,
-      backup_relay_id TEXT NULL,
-      sticky_until INTEGER NULL,
-      lease_expires_at INTEGER NULL,
-      migrated_from TEXT NULL,
-      migration_deadline INTEGER NULL,
-      source_version TEXT NULL,
-      created_at INTEGER NOT NULL,
-      updated_at INTEGER NOT NULL
-    );
-
-    CREATE INDEX IF NOT EXISTS idx_relay_assignments_relay
-      ON relay_assignments(relay_id, state);
-
-    CREATE TABLE IF NOT EXISTS relay_admission_events (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      request_id TEXT NULL,
-      relay_id TEXT NOT NULL,
-      zone TEXT NOT NULL,
-      device_name TEXT NULL,
-      did TEXT NULL,
-      decision TEXT NOT NULL,
-      reason TEXT NOT NULL,
-      expected_relay_sn TEXT NULL,
-      assignment_generation INTEGER NULL,
-      observed_ip TEXT NULL,
-      created_at INTEGER NOT NULL
-    );
-
-    CREATE INDEX IF NOT EXISTS idx_relay_admission_events_zone_time
-      ON relay_admission_events(zone, created_at);
-  `);
-
-  ensureColumn(db, "users", "bns_name", "TEXT");
-  ensureColumn(db, "users", "owner_key_ref", "TEXT");
-  ensureColumn(db, "users", "created_at", "INTEGER NOT NULL DEFAULT 0");
-  ensureColumn(db, "users", "updated_at", "INTEGER NOT NULL DEFAULT 0");
-  ensureColumn(db, "users", "last_login_at", "INTEGER NULL");
-  migrateLegacyUserAuthTable(db);
-}
-
-function backfillSnDerivedTables(db: DatabaseSync): void {
-  const now = Math.floor(Date.now() / 1000);
-  db.prepare(`
-    INSERT OR IGNORE INTO user_domain_history (domain, owner, created_at)
-    SELECT lower(trim(user_domain)), username, ?
-    FROM users
-    WHERE user_domain IS NOT NULL AND trim(user_domain) != ''
-  `).run(now);
-
-  db.prepare(`
-    INSERT OR IGNORE INTO zone_info
-      (username, bns_name, zone, relay_sn, self_cert, cert_checked_at,
-       cert_expires_at, sn_ips, source_version, updated_at)
-    SELECT
-      username,
-      COALESCE(NULLIF(bns_name, ''), username),
-      CASE WHEN trim(COALESCE(zone_config, '')) = '' THEN NULL ELSE zone_config END,
-      NULL,
-      COALESCE(self_cert, 0),
-      NULL,
-      NULL,
-      sn_ips,
-      NULL,
-      CASE WHEN COALESCE(updated_at, 0) > 0 THEN updated_at ELSE ? END
-    FROM users
-  `).run(now);
-
-  const devices = sqliteRows(
-    db,
-    "SELECT owner, device_name, did, ip, description, created_at, updated_at FROM devices",
-  );
-  const insertIndex = db.prepare(`
-    INSERT INTO device_indexes
-      (did, zone, device_name, device_role, created_at, updated_at)
-    VALUES (?, ?, ?, ?, ?, ?)
-    ON CONFLICT(did) DO UPDATE SET
-      zone = excluded.zone,
-      device_name = excluded.device_name,
-      device_role = excluded.device_role,
-      updated_at = excluded.updated_at
-  `);
-  const insertState = db.prepare(`
-    INSERT INTO device_runtime_states
-      (did, state, reported_ip, reported_ips, from_ip, wan_ip, lan_ips, nat_type,
-       is_wan_device, last_seen_at, last_report_at, expires_at, report_seq,
-       raw_report, created_at, updated_at)
-    VALUES (?, 'offline', NULL, '[]', NULL, NULL, '[]', 'unknown', 0,
-            NULL, NULL, NULL, NULL, NULL, ?, ?)
-    ON CONFLICT(did) DO UPDATE SET
-      state = 'offline',
-      reported_ip = NULL,
-      reported_ips = '[]',
-      from_ip = NULL,
-      wan_ip = NULL,
-      lan_ips = '[]',
-      nat_type = 'unknown',
-      is_wan_device = 0,
-      last_seen_at = NULL,
-      last_report_at = NULL,
-      expires_at = NULL,
-      report_seq = NULL,
-      raw_report = NULL,
-      updated_at = excluded.updated_at
-  `);
-  const deleteProvisionedEndpoint = db.prepare(`
-    DELETE FROM device_endpoints
-    WHERE did = ? AND endpoint_id = 'provisioned' AND source = 'admin'
-  `);
-  const hasDeviceReportEndpoint = db.prepare(`
-    SELECT 1 FROM device_endpoints
-    WHERE did = ? AND source = 'device_report'
-    LIMIT 1
-  `);
-
-  for (const device of devices) {
-    const did = String(device.did ?? "");
-    const owner = String(device.owner ?? "");
-    const deviceName = String(device.device_name ?? "");
-    if (!did || !owner || !deviceName) {
-      continue;
-    }
-    const createdAt = Number(device.created_at ?? 0) || now;
-    const updatedAt = Number(device.updated_at ?? 0) || now;
-    const role = deviceName === "ood1" ? "ood" : "normal";
-
-    insertIndex.run(did, owner, deviceName, role, createdAt, updatedAt);
-    deleteProvisionedEndpoint.run(did);
-    if (!hasDeviceReportEndpoint.get(did)) {
-      insertState.run(did, createdAt, updatedAt);
-    }
-  }
-}
-
-function syncSnDatabase(dbPath: string): void {
-  const db = new DatabaseSync(dbPath);
-  try {
-    initializeSnDatabaseSchema(db);
-    backfillSnDerivedTables(db);
-  } finally {
-    db.close();
-  }
-}
-
-function replaceGeneratedSnDb(targetDir: string): string {
-  const legacyDbPath = path.join(targetDir, LEGACY_SN_DB_FILE);
-  const snDbPath = path.join(targetDir, SN_DB_FILE);
-  if (!fs.existsSync(legacyDbPath)) {
-    throw new Error(`generated SN database not found: ${legacyDbPath}`);
-  }
+function discardProvisionSnDb(targetDir: string): string {
   for (const suffix of ["", "-shm", "-wal"]) {
-    fs.rmSync(`${snDbPath}${suffix}`, { force: true });
+    fs.rmSync(path.join(targetDir, `${PROVISION_SN_DB_FILE}${suffix}`), {
+      force: true,
+    });
   }
-  fs.renameSync(legacyDbPath, snDbPath);
-  for (const suffix of ["-shm", "-wal"]) {
-    const legacySidecar = `${legacyDbPath}${suffix}`;
-    if (fs.existsSync(legacySidecar)) {
-      fs.renameSync(legacySidecar, `${snDbPath}${suffix}`);
-    }
-  }
-  console.log(`Move database: ${LEGACY_SN_DB_FILE} -> ${SN_DB_FILE}`);
-  syncSnDatabase(snDbPath);
+  const snDbPath = path.join(targetDir, SN_DB_FILE);
+  console.log(`SN database runtime path: ${snDbPath}`);
   return snDbPath;
 }
 
@@ -811,6 +388,11 @@ async function makeSnConfigs(
     for (const name of fs.readdirSync(snServerDir)) {
       const src = path.join(snServerDir, name);
       if (fs.statSync(src).isFile()) {
+        if (isProvisionSnDbFile(name)) {
+          fs.rmSync(src, { force: true });
+          console.log(`Discard provision database: ${name}`);
+          continue;
+        }
         fs.renameSync(src, path.join(targetDir, name));
         console.log(`Move file: ${name} -> ${targetDir}/`);
       }
@@ -820,7 +402,7 @@ async function makeSnConfigs(
     }
   }
 
-  const snDbPath = replaceGeneratedSnDb(targetDir);
+  const snDbPath = discardProvisionSnDb(targetDir);
   const authDataDir = ensureDir(path.join(targetDir, SN_AUTH_DATA_DIR));
   updateParamsJson(targetDir, snDbPath, authDataDir, stagedParams);
   patchWeb3GatewayConfig(targetDir);
@@ -853,35 +435,8 @@ async function makeSnConfigs(
   console.log(`  - ${path.join(caOutputDir, `${caName}_ca_cert.pem`)}`);
 }
 
-async function preregisterDevUsers(
-  envRoot: string,
-  snDbPath: string,
-): Promise<void> {
-  console.log("# Step 3: Pre-register dev users to SN database...");
-  for (const groupName of PREREGISTER_GROUPS) {
-    const params = getParamsFromGroupName(groupName);
-    const userDir = path.join(envRoot, params.zone_id);
-    if (
-      !fs.existsSync(path.join(userDir, params.node_name, "node_identity.json"))
-    ) {
-      console.log(`user env missing, generate: ${userDir}`);
-      await buildUserEnv(params, envRoot);
-    } else {
-      console.log(`reuse existing user env: ${userDir}`);
-    }
-    await registerUserToSn(envRoot, params.zone_id, snDbPath);
-    await registerDeviceToSn(
-      envRoot,
-      params.zone_id,
-      params.node_name,
-      snDbPath,
-    );
-    syncSnDatabase(snDbPath);
-  }
-}
-
 // ===========================================================================
-// seed-v2（默认行为）：cyfs-sn 新架构下的种子构造
+// seed-v2：cyfs-sn 新架构下的种子构造
 // ===========================================================================
 //
 // 需求来源：
@@ -911,9 +466,6 @@ async function preregisterDevUsers(
 //
 // 验证入口：scripts/sn-dev-up.sh + sn-dev-smoke.sh（本机三件套）与
 // `cargo test -p cyfs_gateway --test e2e_sn_seed -- --ignored`（T1-T6）。
-// 待退役（--legacy 过渡版本结束后删除）：initializeSnDatabaseSchema /
-// backfillSnDerivedTables / syncSnDatabase / preregisterDevUsers，以及
-// registerUserToSn/registerDeviceToSn 的 DevSnDb 直写。
 
 /** 种子用户的 SN 侧视图描述（真值仍来自 devenv_config.ts 的组定义）。 */
 export interface SnSeedUserSpec {
@@ -1286,9 +838,7 @@ export async function makeSnAuthSeedConfig(
     "# sn_seed.yaml —— make_sn_config.ts (seed-v2) 生成。格式真值：cyfs-sn",
     "# src/sn_seed.rs SnSeedConfig；幂等语义 ensure-exists，见 doc/SN/SN-Seed-Config.md。",
     "# 仅 C 类：激活码 / sn_user 账号 / user_domain 绑定。明文密码仅限 devtest。",
-    `activation_codes: [${
-      seed.activation_codes.map(yamlQuote).join(", ")
-    }]`,
+    `activation_codes: [${seed.activation_codes.map(yamlQuote).join(", ")}]`,
     "users:",
   ];
   for (const user of seed.users) {
@@ -1438,9 +988,8 @@ export function makeDevtestLocalDns(targetDir: string): void {
 }
 
 /**
- * seed-v2 目标编排（默认行为），替代 preregisterDevUsers + syncSnDatabase
- * （二者退入 --legacy 过渡路径）。SN 自身身份/TLS/params 闭环仍由
- * makeSnConfigs 负责，此处只补各组件的种子配置产物。
+ * seed-v2 目标编排。SN 自身身份/TLS/params 闭环仍由 makeSnConfigs 负责，
+ * 此处只补各组件的种子配置产物。
  */
 export async function makeSnSeedV2(
   targetDir: string,
@@ -1462,9 +1011,7 @@ async function main(): Promise<void> {
     sn_ip?: string;
     sn_base_host?: string;
     env_root?: string;
-    "no-preregister"?: boolean;
     "seed-v2"?: boolean;
-    legacy?: boolean;
     "dev-local"?: boolean;
     help?: boolean;
   };
@@ -1478,9 +1025,7 @@ async function main(): Promise<void> {
         sn_ip: { type: "string" },
         sn_base_host: { type: "string" },
         env_root: { type: "string" },
-        "no-preregister": { type: "boolean" },
         "seed-v2": { type: "boolean" },
-        legacy: { type: "boolean" },
         "dev-local": { type: "boolean" },
         help: { type: "boolean", short: "h" },
       },
@@ -1492,9 +1037,7 @@ async function main(): Promise<void> {
         sn_ip?: string;
         sn_base_host?: string;
         env_root?: string;
-        "no-preregister"?: boolean;
         "seed-v2"?: boolean;
-        legacy?: boolean;
         "dev-local"?: boolean;
         help?: boolean;
       };
@@ -1527,7 +1070,7 @@ async function main(): Promise<void> {
     console.error(
       `runtime check failed: ${e instanceof Error ? e.message : e}`,
     );
-    console.error("make_sn_config.ts requires Deno >= 2.2 (node:sqlite)");
+    console.error("make_sn_config.ts requires Deno >= 2.2");
     Deno.exit(1);
   }
 
@@ -1542,30 +1085,7 @@ async function main(): Promise<void> {
 
   await makeSnConfigs(targetDir, snBaseHost, snIp, caDir, DEFAULT_CA_NAME);
   const snDbPath = path.join(targetDir, SN_DB_FILE);
-
-  if (values["seed-v2"] && values.legacy) {
-    console.error("argument error: --seed-v2 and --legacy are mutually exclusive");
-    printUsage();
-    Deno.exit(1);
-  }
-  // seed-v2 已是默认行为（--seed-v2 flag 保留为兼容 no-op）。--legacy 走
-  // DevSnDb 直写老路径，仅保留一个过渡版本：devtest VM 尚无 EVM 链
-  // （bns_dv 的种子 tx 无处提交），等 buckyos-devtest 把 DV 链纳入 VM
-  // 环境构造后删除本分支及下方 legacy 块。
-  if (!values.legacy) {
-    // seed-v2 目标编排：只产各组件的种子配置文件（bns_dv_seed.yaml /
-    // sn_seed.yaml / params 对齐），不直写 SN DB、不做派生表回填——导入由
-    // 组件启动时幂等完成（bns_dv --seed-config / cyfs-sn seed_path）。
-    await makeSnSeedV2(targetDir, envRoot);
-  } else {
-    if (!values["no-preregister"]) {
-      await preregisterDevUsers(envRoot, snDbPath);
-    }
-    syncSnDatabase(snDbPath);
-    // web3_gateway.yaml 的 bns_indexer_url 已参数化，legacy 路径同样要保证
-    // params.json 提供该 key（旧部署的 staged params.json 可能缺失）。
-    alignBnsRuntimeParams(targetDir);
-  }
+  await makeSnSeedV2(targetDir, envRoot);
   applyBindParams(targetDir, devLocal);
 
   console.log("\n[OK] SN configuration files generation completed!");
