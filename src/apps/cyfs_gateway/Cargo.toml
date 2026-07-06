@@ -61,3 +61,4 @@ hickory-resolver = { version = "0.24", features = ["tokio"] }
 async-compression = { version = "0.4", features = ["tokio", "gzip", "deflate", "brotli"] }
 bns-indexer = { path = "../../components/bns-indexer" }
 bns-server = { path = "../../components/bns-server" }
+sqlx.workspace = true

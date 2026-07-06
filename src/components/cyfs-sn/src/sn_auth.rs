@@ -653,6 +653,19 @@ impl SqliteSnAuthDB {
         Ok(())
     }
 
+    /// seed 导入用：激活码是否存在（含已使用的码；`get_activation_codes`
+    /// 只返回未使用的）。
+    pub async fn has_activation_code(&self, code: &str) -> SnResult<bool> {
+        let count = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM activation_codes WHERE code = ?1",
+        )
+        .bind(code)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| Self::db_err("query activation code failed", e))?;
+        Ok(count > 0)
+    }
+
     fn now_secs() -> u64 {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)

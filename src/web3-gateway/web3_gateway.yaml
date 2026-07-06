@@ -11,16 +11,19 @@ servers:
     owner_pkx: "{{sn_owner_pk}}"
     device_jwt: ["{{sn_device_jwt}}"]
     ip: "{{sn_ip}}"
-    # bns_dv 由同目录 start.py 固定拉起在 127.0.0.1:18080(BNS_LISTEN),
-    # 不是环境参数;写死避免依赖 provision 生成的 params.json 提供该 key。
-    # bns_dv 只暴露 /kapi/bns(server RPC,兼容 indexer 方法),要带显式
-    # 路径;裸 host 会被补成 /kapi/bns-indexer 导致 404 传输错误,解析
-    # 链会因 backend error 中止而不回退 legacy(sn db)数据。
-    bns_indexer_url: "http://127.0.0.1:18080/kapi/bns"
+    # 由 params.json 提供(仓库 staged 缺省 = start.py 内置拓扑
+    # 127.0.0.1:18080;make_sn_config 的 alignBnsRuntimeParams 在存在
+    # dv-env.json 时以其为准覆写)。注意值必须带显式 /kapi/bns 路径;
+    # 裸 host 会被补成 /kapi/bns-indexer 导致 404 传输错误,解析链会因
+    # backend error 中止而不回退 legacy(sn db)数据。
+    bns_indexer_url: "{{bns_indexer_url}}"
     # bns_write_enabled 缺省跟随 bns_indexer_url 开启,但 BNS 写入必须经
     # EVM 合约;devtest 环境没有 EVM 链(bns_dv 的 8545 未部署),只用
     # 解析路径,显式关闭写入。接入真实链时改为 true 并补 bns_evm 配置。
     bns_write_enabled: false
+    # C 类种子(激活码/sn_user 账号/user_domain 绑定)幂等导入;相对路径按
+    # 配置目录解析,文件不存在时自动跳过(部署目录没有种子也能正常启动)。
+    seed_path: "sn_seed.yaml"
 
   local_dns:
     type: local_dns
@@ -61,7 +64,7 @@ servers:
               return "forward rtcp://${ANSWER.did_hostname}/:80";
 stacks:
   dns_udp:
-    bind: 0.0.0.0:53
+    bind: "{{dns_bind}}"
     protocol: udp
     hook_point:
       main:
@@ -75,7 +78,7 @@ stacks:
               return "server main_dns";
 
   main_rtcp:
-    bind: 0.0.0.0:2980
+    bind: "{{rtcp_bind}}"
     protocol: rtcp
     # provision(createSnConfigs) 只生成平铺的 sn_private_key.pem /
     # sn_device_config.json,没有 IdentityRoots 布局,所以这里走 legacy
@@ -113,7 +116,7 @@ stacks:
               reject;
 
   main_http_tcp:
-    bind: 0.0.0.0:80
+    bind: "{{http_bind}}"
     protocol: tcp
     hook_point:
       main:
@@ -127,18 +130,18 @@ stacks:
               return "server main_http";
   
   main_tls:
-    bind: 0.0.0.0:3443
+    bind: "{{tls_bind}}"
     protocol: tls
     hosts:
       - host: "sn.{{sn_host}}"
-        cert_path: /opt/web3-gateway/{{sn_cer}}
-        key_path: /opt/web3-gateway/{{sn_pem}}
+        cert_path: "{{sn_cer}}"
+        key_path: "{{sn_pem}}"
       - host: "web3.{{sn_host}}"
-        cert_path: /opt/web3-gateway/{{web3_cer}}
-        key_path: /opt/web3-gateway/{{web3_pem}}
+        cert_path: "{{web3_cer}}"
+        key_path: "{{web3_pem}}"
       - host: "*.web3.{{sn_host}}"
-        cert_path: /opt/web3-gateway/{{web3_cer}}
-        key_path: /opt/web3-gateway/{{web3_pem}}
+        cert_path: "{{web3_cer}}"
+        key_path: "{{web3_pem}}"
     hook_point:
       main:
         id: main
@@ -151,7 +154,7 @@ stacks:
               return "server main_http";
 
   tls_raw_forward:
-    bind: 0.0.0.0:443
+    bind: "{{sni_bind}}"
     protocol: tcp
     hook_point:
       main:
@@ -165,14 +168,14 @@ stacks:
               call https-sni-probe || reject; 
               map-create "REQ.ext";
               map-add "REQ.ext" "proxy_source_addr" "${REQ.source_addr}";
-              eq ${REQ.dest_host} "sn.{{sn_host}}" && return "forward tcp:///:3443";
-              eq ${REQ.dest_host} "www.{{sn_host}}" && return "forward tcp:///:3443";
-              eq ${REQ.dest_host} "{{sn_host}}" && return "forward tcp:///:3443";
-              eq ${REQ.dest_host} "web3.{{sn_host}}" && return "forward tcp:///:3443";
+              eq ${REQ.dest_host} "sn.{{sn_host}}" && return "forward tcp:///:{{tls_port}}";
+              eq ${REQ.dest_host} "www.{{sn_host}}" && return "forward tcp:///:{{tls_port}}";
+              eq ${REQ.dest_host} "{{sn_host}}" && return "forward tcp:///:{{tls_port}}";
+              eq ${REQ.dest_host} "web3.{{sn_host}}" && return "forward tcp:///:{{tls_port}}";
               map-create "QUESTION" && map-add "QUESTION" "dest_host" "${REQ.dest_host}" && map-add "QUESTION" "method" "deviceinfo.resolve_ood_by_hostname";
               call qa "web3_sn" "QUESTION";
               eq ${ANSWER.self_cert} "true" && return "forward rtcp://${ANSWER.did_hostname}/:443";
               match ${REQ.dest_host} "*.*.web3.{{sn_host}}" && eq ${ANSWER.self_cert} "false" && error --from chain "self_cert=false for ${REQ.dest_host}; enable self_cert to use nested web3 host over HTTPS";
-              match ${REQ.dest_host} "*.web3.{{sn_host}}" && return "forward tcp:///:3443";
+              match ${REQ.dest_host} "*.web3.{{sn_host}}" && return "forward tcp:///:{{tls_port}}";
               reject;
   

@@ -9,6 +9,13 @@
         "sn_pem": "fullchain.pem",
         "web3_cer": "fullchain.cert",
         "web3_pem": "fullchain.pem",
-        "bns_server_url": "http://127.0.0.1:18080"
+        "bns_server_url": "http://127.0.0.1:18080",
+        "bns_indexer_url": "http://127.0.0.1:18080/kapi/bns",
+        "dns_bind": "0.0.0.0:53",
+        "http_bind": "0.0.0.0:80",
+        "rtcp_bind": "0.0.0.0:2980",
+        "tls_bind": "0.0.0.0:3443",
+        "sni_bind": "0.0.0.0:443",
+        "tls_port": "3443"
     }
 }

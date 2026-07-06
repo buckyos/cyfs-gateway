@@ -33,7 +33,7 @@ NODE_LOG="$VAR/bns-dv.log"
 ANVIL_HOST="${ANVIL_HOST:-127.0.0.1}"
 ANVIL_PORT="${ANVIL_PORT:-8545}"
 CHAIN_ID="${ANVIL_CHAIN_ID:-31337}"
-BLOCK_TIME="${ANVIL_BLOCK_TIME:-1}"
+BLOCK_TIME="${ANVIL_BLOCK_TIME:-}"
 SERVER_PORT="${BNS_DV_SERVER_PORT:-18080}"
 RPC="http://${ANVIL_HOST}:${ANVIL_PORT}"
 SERVER_URL="http://127.0.0.1:${SERVER_PORT}"
@@ -115,15 +115,22 @@ else
   [ -f "$DEPLOY_JSON" ] || { echo "no deployment to resume ($DEPLOY_JSON); run --fresh" >&2; exit 1; }
 fi
 
-# --- 2) 起 anvil（--state 持久化/自动加载）---
-echo "[dv-up] starting anvil on $RPC (chain $CHAIN_ID, block-time ${BLOCK_TIME}s)"
-anvil \
+ANVIL_ARGS=(
   --host "$ANVIL_HOST" --port "$ANVIL_PORT" \
   --chain-id "$CHAIN_ID" \
   --mnemonic "$MNEMONIC" \
-  --block-time "$BLOCK_TIME" \
   --disable-code-size-limit \
-  --state "$ANVIL_STATE" >"$ANVIL_LOG" 2>&1 &
+  --state "$ANVIL_STATE"
+)
+MINING_MODE="auto"
+if [ -n "$BLOCK_TIME" ]; then
+  ANVIL_ARGS+=(--block-time "$BLOCK_TIME")
+  MINING_MODE="interval ${BLOCK_TIME}s"
+fi
+
+# --- 2) 起 anvil（--state 持久化/自动加载）---
+echo "[dv-up] starting anvil on $RPC (chain $CHAIN_ID, mining ${MINING_MODE})"
+anvil "${ANVIL_ARGS[@]}" >"$ANVIL_LOG" 2>&1 &
 echo $! > "$ANVIL_PID"
 wait_for "anvil eth_chainId" 30 anvil_chain_id_ok
 

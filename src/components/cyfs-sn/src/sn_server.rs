@@ -1791,6 +1791,11 @@ pub struct SNServerConfig {
     pub aliases: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub auth_data_dir: Option<String>,
+    /// C 类种子文件（sn_seed.yaml）路径；相对路径按网关主配置目录解析
+    /// （与 local_dns 的 file_path 同语义）。文件缺失时跳过导入。
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub seed_path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bns_indexer_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2125,6 +2130,32 @@ impl ServerFactory for SnServerFactory {
                 e
             )
         })?;
+
+        // C 类种子幂等导入（ensure-exists）。文件缺失 → 跳过；解析/导入失败 →
+        // 启动失败（坏种子不能静默）。语义见 sn_seed.rs 模块注释。
+        if let Some(seed_path) = config.seed_path.as_deref() {
+            let resolved = crate::resolve_sn_seed_path(seed_path);
+            match crate::import_sn_seed_from_path(&auth_db, resolved.as_path()).await {
+                Ok(None) => {
+                    info!(
+                        "sn seed config {} not found; skip seed import",
+                        resolved.display()
+                    );
+                }
+                Ok(Some(report)) => {
+                    info!("sn seed imported from {}: {}", resolved.display(), report);
+                }
+                Err(e) => {
+                    return Err(server_err!(
+                        ServerErrorCode::InvalidConfig,
+                        "import sn seed config {} failed: {}",
+                        resolved.display(),
+                        e
+                    ));
+                }
+            }
+        }
+
         let auth_db: SnAuthDBRef = Arc::new(auth_db);
 
         let device_info_db = SqliteSnDeviceInfoDB::new_by_path(db_path.as_str())
@@ -3362,8 +3393,12 @@ mod tests {
         assert_eq!(ood_info.state, "active");
         assert!(!ood_info.self_cert);
 
+        // BNS 兼容域名（SN-Resolver.md）：嵌套 `public.<user>.web3.<host>` 同样
+        // 映射到该用户 zone——main_http/tls_raw_forward 链对 `*.*.web3.<host>`
+        // 的 self_cert 门控依赖这里能解析出 ANSWER（旧行为是 hostname_not_found，
+        // 导致嵌套主机永远走不到 self_cert 判定）。
         let nested_web3_host = format!("public.{}.web3.buckyos.ai", REFACTOR_USER);
-        let err = device_krpc
+        let result = device_krpc
             .call(
                 "deviceinfo.resolve_ood_by_hostname",
                 json!({
@@ -3371,9 +3406,11 @@ mod tests {
                 }),
             )
             .await
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("hostname_not_found"));
+            .unwrap();
+        let nested_info = serde_json::from_value::<OODInfo>(result).unwrap();
+        assert_eq!(nested_info.did_hostname, registered_did_hostname);
+        assert_eq!(nested_info.owner_id, REFACTOR_USER);
+        assert!(!nested_info.self_cert);
 
         let result = auth_user_krpc
             .call(

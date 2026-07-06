@@ -997,7 +997,9 @@ impl SnResolver {
             .await?;
         let mut addresses = Vec::new();
         for ip in gateway.addresses.iter().copied() {
-            push_dns_address(&mut addresses, ip, record_type);
+            // 设备来源的 IP 已在 resolve_gateway_addresses 内做过 zonegate
+            // 过滤；SN 中继回退地址不再过滤（dev-local 下是 127.0.0.1）。
+            push_dns_address_unfiltered(&mut addresses, ip, record_type);
         }
 
         Ok(DnsResolution {
@@ -1064,10 +1066,32 @@ impl SnResolver {
                 .await;
         }
 
+        // BNS 兼容域名（SN-Resolver.md "BNS 兼容域名"）：
+        //   alice.web3.<server_host>       -> BNS name alice
+        //   home.alice.web3.<server_host>  -> BNS name alice（sub_host 只作
+        //   relay 上下文，不决定 owner，这里取 web3 前缀的末级 label）。
+        // 旧 URL 的 `www-alice` 连字符规则不在此实现（用户名可含 '-'，
+        // 会误切；需要时由显式 dns record 覆盖）。
+        if let Some(bns_name) = self.bns_compat_name_of(hostname.as_str()) {
+            return self
+                .resolve_zone_by_bns_name(
+                    bns_name.as_str(),
+                    hostname.as_str(),
+                    ZoneResolutionSource::BnsName,
+                    None,
+                )
+                .await;
+        }
+
         Err(SnResolverError::new(
             SnResolverErrorKind::NotManaged,
             format!("hostname {} is not managed by this SN", hostname),
         ))
+    }
+
+    /// `<...>.<name>.web3.<server_host>` -> `<name>`；不匹配返回 None。
+    fn bns_compat_name_of(&self, hostname: &str) -> Option<String> {
+        bns_compat_name_for(self.config.server_host.as_str(), hostname)
     }
 
     pub async fn resolve_zone_by_bns_name(
@@ -1402,6 +1426,31 @@ impl SnResolver {
         if let Some(value) = device_doc.document.as_ref() {
             for key in ["ip", "ips", "all_ip", "addresses"] {
                 collect_ips_from_value_path(value, &[key], &mut addresses);
+            }
+        }
+
+        if addresses.is_empty() {
+            // 没有任何直接可达地址（设备离线的 LAN/relay 型 zone，或文档
+            // 未带 IP）：回退 SN 中继地址（用户 sn_ips 优先，否则本 SN
+            // server_ip），与上面"在线但非 WAN 设备"分支同语义——流量落到
+            // SN 后经 rtcp 隧道转发。空答案（NXDOMAIN）会让 *.web3 域名在
+            // 设备未上线时完全不可达。SN 自身地址与 resolve_self_dns 同
+            // 信任级，不做 zonegate 回环过滤（dev-local 的 sn_ip 就是
+            // 127.0.0.1）。
+            let sn_ips = self
+                .auth
+                .get_user_sn_ips(zone.zone_name.as_str())
+                .await
+                .unwrap_or_default();
+            let relay_ips = if sn_ips.is_empty() {
+                vec![self.config.server_ip]
+            } else {
+                sn_ips
+            };
+            for ip in relay_ips {
+                if !addresses.contains(&ip) {
+                    addresses.push(ip);
+                }
             }
         }
 
@@ -2579,6 +2628,21 @@ fn parse_ip_or_socket_addr(value: &str) -> Option<IpAddr> {
         .or_else(|| value.parse::<SocketAddr>().ok().map(|addr| addr.ip()))
 }
 
+/// BNS 兼容域名映射（SN-Resolver.md "BNS 兼容域名"）：
+/// `<name>.web3.<server_host>` 及其子域 -> BNS name `<name>`。
+fn bns_compat_name_for(server_host: &str, hostname: &str) -> Option<String> {
+    let suffix = format!(".web3.{}", server_host);
+    let prefix = hostname.strip_suffix(suffix.as_str())?;
+    if prefix.is_empty() {
+        return None;
+    }
+    let name = prefix.rsplit('.').next().unwrap_or(prefix);
+    if name.is_empty() {
+        return None;
+    }
+    Some(name.to_string())
+}
+
 fn push_dns_address(addresses: &mut Vec<IpAddr>, ip: IpAddr, record_type: RecordType) {
     match record_type {
         RecordType::A if ip.is_ipv4() => push_exportable_ip(addresses, ip),
@@ -2673,6 +2737,27 @@ mod tests {
             Arc::new(EmptySnAuthReader),
         )
         .with_bns_reader(Arc::new(bns))
+    }
+
+    #[test]
+    fn bns_compat_name_extraction() {
+        // <name>.web3.<server_host> 与其子域都映射到末级 name。
+        assert_eq!(
+            bns_compat_name_for("devtests.org", "alice.web3.devtests.org").as_deref(),
+            Some("alice")
+        );
+        assert_eq!(
+            bns_compat_name_for("devtests.org", "home.alice.web3.devtests.org").as_deref(),
+            Some("alice")
+        );
+        // web3.<server_host> 本体不是 BNS 兼容域名（属 SN 自身 hostname 域）。
+        assert_eq!(bns_compat_name_for("devtests.org", "web3.devtests.org"), None);
+        // 其他后缀不误判。
+        assert_eq!(bns_compat_name_for("devtests.org", "alice.example.com"), None);
+        assert_eq!(
+            bns_compat_name_for("devtests.org", "alice.web3.other.org"),
+            None
+        );
     }
 
     #[test]

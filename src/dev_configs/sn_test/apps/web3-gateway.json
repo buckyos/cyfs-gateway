@@ -13,7 +13,7 @@
       ],
       "build_all": [
         "cd {{system.base_dir}}/src && uv run ./build.py aarch64",
-        "cd {{system.base_dir}}/src && uv run ./make_sn_config.py sn_server"
+        "cd {{system.base_dir}}/src && deno run -A ./make_sn_config.ts --legacy"
       ],
       "install": [
         "sudo chmod +x /opt/web3-gateway/web3_gateway"

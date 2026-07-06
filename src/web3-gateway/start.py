@@ -55,6 +55,9 @@ def run_child(cmd: list[str], cwd: Path) -> int:
             children.remove(process)
 
 
+BNS_SEED_CONFIG_FILE = "bns_dv_seed.yaml"
+
+
 def start_bns_server(current_dir: Path) -> subprocess.Popen:
     cmd = [
         str(current_dir / "bns_dv"),
@@ -76,6 +79,11 @@ def start_bns_server(current_dir: Path) -> subprocess.Popen:
         "--interval-ms",
         BNS_INTERVAL_MS,
     ]
+    # 部署目录带 BNS 种子（make_sn_config.ts --seed-v2 产物）时交给 bns_dv
+    # 幂等重放（if_exists=apply_mutations），把种子用户的权威文档上链。
+    seed_config = current_dir / BNS_SEED_CONFIG_FILE
+    if seed_config.exists():
+        cmd += ["--seed-config", str(seed_config)]
     process = subprocess.Popen(cmd, cwd=current_dir)
     children.append(process)
     try:

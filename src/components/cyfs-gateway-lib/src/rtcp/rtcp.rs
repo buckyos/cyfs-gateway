@@ -996,78 +996,182 @@ impl RTcpInner {
         Ok((xpub_bytes, payload))
     }
 
+    // device_doc_jwt 验证分两级(doc/verify-did-document-jwt.md"RTCP 迁移示例"):
+    //
+    // 1. 权威锚定:name-client 的 verify_device_document_jwt(AuthSubject +
+    //    CurrentActive + cache_result)。验签 owner 只能来自权威 owner 绑定或
+    //    method 名字结构(expected_owner),绝不来自 payload 自声明;验证通过由
+    //    name-client 按证据等级受控写入 Verified/Published 缓存,后续 strict
+    //    resolve_did 可直接命中。
+    // 2. 回落:自声明 owner 验证 + 观察缓存写入(见
+    //    verify_source_device_doc_self_declared)。rtcp stack 层只做认证,授权由
+    //    buckyos on_new_tunnel 配置层锚定权威 owner,离线 LAN / 首次组网不能因
+    //    权威不可达拒绝握手,所以只有 Definite 类失败(候选本身被证明有问题或被
+    //    权威源明确否定)拒绝握手;信任链暂时评估不了的 Unavailable 类(权威没
+    //    回答、method 未注册、owner 文档拿不到,以及 NotCurrentActive 这类无法与
+    //    "权威没回答"区分的混装档)回落到第 2 级。
+    //
+    // 代价与取舍:权威把文档标成 Revoked/Tombstoned 时错误码同为 NotCurrentActive,
+    // stack 层会回落放行——吊销强制执行留给授权层与 strict resolve(verify 失败时
+    // 上游已写入负缓存,可信解析面看得到吊销)。
+    fn is_definite_verify_rejection(err: &NSError) -> bool {
+        matches!(
+            VerifyDidJwtErrorCode::of(err),
+            Some(
+                VerifyDidJwtErrorCode::DocumentIdMismatch
+                    | VerifyDidJwtErrorCode::DeclaredOwnerMismatch
+                    | VerifyDidJwtErrorCode::DetachedOwnerRejected
+                    | VerifyDidJwtErrorCode::SignatureVerificationFailed
+                    | VerifyDidJwtErrorCode::RevokedByOwnerPolicy
+            )
+        )
+    }
+
+    // 第 2 级回落:用 payload 自声明 owner 验签 + 观察缓存写入。只能证明"JWT 能
+    // 被它自己声明的 owner 验过",不建立权威 owner 绑定;仅在权威锚定验证
+    // Unavailable 时使用。
+    async fn verify_source_device_doc_self_declared(
+        hello_body: &RTcpHelloBody,
+        device_doc_jwt: &str,
+    ) -> Result<VerifiedSourceDevice, TunnelError> {
+        let unverified_doc =
+            DeviceDocument::decode(&EncodedDocument::Jwt(device_doc_jwt.to_string()), None)
+                .map_err(|e| {
+                    TunnelError::DocumentError(format!(
+                        "decode device_doc_jwt without verify failed:{}",
+                        e
+                    ))
+                })?;
+        let owner_public_key = resolve_auth_key(&unverified_doc.owner, None)
+            .await
+            .map_err(|e| {
+                TunnelError::DocumentError(format!(
+                    "resolve owner auth key for {} failed:{}",
+                    unverified_doc.owner.to_string(),
+                    e
+                ))
+            })?;
+        let verified_doc = DeviceDocument::decode(
+            &EncodedDocument::Jwt(device_doc_jwt.to_string()),
+            Some(&owner_public_key),
+        )
+        .map_err(|e| TunnelError::DocumentError(format!("verify device_doc_jwt failed:{}", e)))?;
+        //注意:此时不能使用did:dev:xxx的形式，必须用name did的形式
+        if verified_doc.id.to_string() != hello_body.from_id {
+            return Err(TunnelError::DocumentError(format!(
+                "hello from_id {} not match device_doc_jwt id {}",
+                hello_body.from_id,
+                verified_doc.id.to_string()
+            )));
+        }
+        let default_key = verified_doc.get_default_key().ok_or_else(|| {
+            TunnelError::DocumentError("device_doc_jwt missing default key".to_string())
+        })?;
+        let ed25519_pk = jwk_to_ed25519_pk(&default_key).map_err(|e| {
+            TunnelError::DocumentError(format!("decode device_doc_jwt public key failed:{}", e))
+        })?;
+        // 把 device_doc 写入 name_client 的观察缓存(Observed/Unverified,
+        // doc/update-did-cache.md):update_did_cache 不提升信任等级,后续
+        // strict resolve_did 命中时会先经 lazy verify(权威可达且文档在当前
+        // 发布集合内才 promote 返回);离线/无权威场景需要 resolve_did_ex
+        // 的 allow_unverified_cache_when_unavailable 宽松策略才能取回。
+        // 只缓存 DID 文档,不能调用 add_device_info_cache 更新 device_info。
+        // 缓存失败不影响本次握手(验证已经完成)。
+        if let Err(e) = update_did_cache(
+            verified_doc.id.clone(),
+            None,
+            EncodedDocument::Jwt(device_doc_jwt.to_string()),
+            None,
+        )
+        .await
+        {
+            warn!(
+                "cache verified device_doc for {} failed: {}",
+                verified_doc.id.to_string(),
+                e
+            );
+        }
+        let from_public_key = DecodingKey::from_ed_der(&ed25519_pk);
+        Ok(VerifiedSourceDevice {
+            source_device_id: verified_doc.id.to_string(),
+            canonical_dev_did: canonical_dev_did_from_ed25519_pk(&ed25519_pk),
+            source_device_info: Some(RTcpSourceDeviceInfo {
+                device_doc_jwt: Some(device_doc_jwt.to_string()),
+                name: Some(verified_doc.name.clone()),
+                owner: Some(verified_doc.owner.to_string()),
+                zone_did: verified_doc.zone_did.map(|did| did.to_string()),
+            }),
+            public_key: from_public_key,
+        })
+    }
+
     async fn resolve_source_device_info(
         hello_body: &RTcpHelloBody,
     ) -> Result<VerifiedSourceDevice, TunnelError> {
         if let Some(device_doc_jwt) = hello_body.device_doc_jwt.as_ref() {
-            let unverified_doc =
-                DeviceDocument::decode(&EncodedDocument::Jwt(device_doc_jwt.clone()), None)
-                    .map_err(|e| {
-                        TunnelError::DocumentError(format!(
-                            "decode device_doc_jwt without verify failed:{}",
-                            e
-                        ))
-                    })?;
-            let owner_public_key = resolve_auth_key(&unverified_doc.owner, None)
+            // 第 1 级:权威锚定验证。from_id 解析不了 DID 时直接走回落,由旧的
+            // 文档 id 字符串比对给出与迁移前一致的错误。
+            if let Ok(from_did) = DID::from_str(hello_body.from_id.as_str()) {
+                match verify_device_document_jwt(
+                    &from_did,
+                    device_doc_jwt,
+                    VerifyDidDocumentJwtOptions::default(),
+                )
                 .await
-                .map_err(|e| {
-                    TunnelError::DocumentError(format!(
-                        "resolve owner auth key for {} failed:{}",
-                        unverified_doc.owner.to_string(),
-                        e
-                    ))
-                })?;
-            let verified_doc = DeviceDocument::decode(
-                &EncodedDocument::Jwt(device_doc_jwt.clone()),
-                Some(&owner_public_key),
-            )
-            .map_err(|e| {
-                TunnelError::DocumentError(format!("verify device_doc_jwt failed:{}", e))
-            })?;
-            //注意:此时不能使用did:dev:xxx的形式，必须用name did的形式
-            if verified_doc.id.to_string() != hello_body.from_id {
-                return Err(TunnelError::DocumentError(format!(
-                    "hello from_id {} not match device_doc_jwt id {}",
-                    hello_body.from_id,
-                    verified_doc.id.to_string()
-                )));
+                {
+                    Ok((device_doc, verified)) => {
+                        // DID::from_str 对裸 host 形式宽容;保持旧契约:from_id
+                        // 必须是文档 id 的规范 DID 字符串。
+                        if verified.subject_did.to_string() != hello_body.from_id {
+                            return Err(TunnelError::DocumentError(format!(
+                                "hello from_id {} not match device_doc_jwt id {}",
+                                hello_body.from_id,
+                                verified.subject_did.to_string()
+                            )));
+                        }
+                        let default_key = device_doc.get_default_key().ok_or_else(|| {
+                            TunnelError::DocumentError(
+                                "device_doc_jwt missing default key".to_string(),
+                            )
+                        })?;
+                        let ed25519_pk = jwk_to_ed25519_pk(&default_key).map_err(|e| {
+                            TunnelError::DocumentError(format!(
+                                "decode device_doc_jwt public key failed:{}",
+                                e
+                            ))
+                        })?;
+                        // source owner 用 authz_owner(AuthSubject 成功时必为
+                        // Some,等于 expected_owner),不用 payload 自声明 owner。
+                        // 受控缓存写入(Verified/Published)已由 verify 入口完成,
+                        // 不再调 update_did_cache(那是 Unverified 旁路)。
+                        return Ok(VerifiedSourceDevice {
+                            source_device_id: verified.subject_did.to_string(),
+                            canonical_dev_did: canonical_dev_did_from_ed25519_pk(&ed25519_pk),
+                            source_device_info: Some(RTcpSourceDeviceInfo {
+                                device_doc_jwt: Some(device_doc_jwt.clone()),
+                                name: Some(device_doc.name.clone()),
+                                owner: verified.authz_owner.map(|did| did.to_string()),
+                                zone_did: device_doc.zone_did.map(|did| did.to_string()),
+                            }),
+                            public_key: DecodingKey::from_ed_der(&ed25519_pk),
+                        });
+                    }
+                    Err(err) => {
+                        if Self::is_definite_verify_rejection(&err) {
+                            return Err(TunnelError::DocumentError(format!(
+                                "verify device_doc_jwt for {} rejected: {}",
+                                hello_body.from_id, err
+                            )));
+                        }
+                        info!(
+                            "authoritative verify of device_doc_jwt for {} unavailable, \
+                             falling back to self-declared owner verification: {}",
+                            hello_body.from_id, err
+                        );
+                    }
+                }
             }
-            let default_key = verified_doc.get_default_key().ok_or_else(|| {
-                TunnelError::DocumentError("device_doc_jwt missing default key".to_string())
-            })?;
-            let ed25519_pk = jwk_to_ed25519_pk(&default_key).map_err(|e| {
-                TunnelError::DocumentError(format!("decode device_doc_jwt public key failed:{}", e))
-            })?;
-            // 验证通过的 device_doc 写入 name_client 的 DID doc cache,后续
-            // resolve_did / resolve_auth_key 可以直接命中。只缓存 DID 文档,
-            // 不能调用 add_device_info_cache 更新 device_info。缓存失败不影响
-            // 本次握手(验证已经完成)。
-            if let Err(e) = update_did_cache(
-                verified_doc.id.clone(),
-                None,
-                EncodedDocument::Jwt(device_doc_jwt.clone()),
-                None,
-            )
-            .await
-            {
-                warn!(
-                    "cache verified device_doc for {} failed: {}",
-                    verified_doc.id.to_string(),
-                    e
-                );
-            }
-            let from_public_key = DecodingKey::from_ed_der(&ed25519_pk);
-            return Ok(VerifiedSourceDevice {
-                source_device_id: verified_doc.id.to_string(),
-                canonical_dev_did: canonical_dev_did_from_ed25519_pk(&ed25519_pk),
-                source_device_info: Some(RTcpSourceDeviceInfo {
-                    device_doc_jwt: Some(device_doc_jwt.clone()),
-                    name: Some(verified_doc.name.clone()),
-                    owner: Some(verified_doc.owner.to_string()),
-                    zone_did: verified_doc.zone_did.map(|did| did.to_string()),
-                }),
-                public_key: from_public_key,
-            });
+            return Self::verify_source_device_doc_self_declared(hello_body, device_doc_jwt).await;
         }
 
         let from_did = DID::from_str(hello_body.from_id.as_str()).map_err(|_e| {
@@ -4290,7 +4394,7 @@ mod tests {
         let _id1 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        update_did_cache(device_config.id.clone(), None, encoded_doc)
+        update_did_cache(device_config.id.clone(), None, encoded_doc, None)
             .await
             .unwrap();
         add_nameinfo_cache(
@@ -4319,7 +4423,7 @@ mod tests {
         let id2 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        update_did_cache(device_config.id.clone(), None, encoded_doc)
+        update_did_cache(device_config.id.clone(), None, encoded_doc, None)
             .await
             .unwrap();
         add_nameinfo_cache(
@@ -4376,7 +4480,7 @@ mod tests {
         let _id1 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        update_did_cache(device_config.id.clone(), None, encoded_doc)
+        update_did_cache(device_config.id.clone(), None, encoded_doc, None)
             .await
             .unwrap();
         add_nameinfo_cache(
@@ -4405,7 +4509,7 @@ mod tests {
         let id2 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        update_did_cache(device_config.id.clone(), None, encoded_doc)
+        update_did_cache(device_config.id.clone(), None, encoded_doc, None)
             .await
             .unwrap();
         add_nameinfo_cache(
@@ -4456,7 +4560,7 @@ mod tests {
         let _id1 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        update_did_cache(device_config.id.clone(), None, encoded_doc)
+        update_did_cache(device_config.id.clone(), None, encoded_doc, None)
             .await
             .unwrap();
         add_nameinfo_cache(
@@ -4485,7 +4589,7 @@ mod tests {
         let id2 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        update_did_cache(device_config.id.clone(), None, encoded_doc)
+        update_did_cache(device_config.id.clone(), None, encoded_doc, None)
             .await
             .unwrap();
         add_nameinfo_cache(
@@ -4623,7 +4727,11 @@ mod tests {
         let owner_private_key = EncodingKey::from_ed_der(&owner_pkcs8_bytes);
 
         // 设备文档的 id 是逻辑名字(非 did:dev),default key 是设备自身的 key。
-        // method 用 "test" 保证没有 provider 能解析它,resolve 只能靠 cache。
+        // method 用 "test" 保证没有 provider 能解析它:权威锚定验证
+        // (verify_device_document_jwt)因 method 未注册而 Unavailable,握手回落
+        // 到自声明 owner 验证,文档只能来自回落路径写入的观察缓存
+        // (Observed/Unverified)。本测试即回落路径的契约;权威锚定成功路径见
+        // test_rtcp_authority_anchored_device_doc_jwt_hits_trusted_cache。
         let (client_signing_key, _client_pkcs8_bytes) = generate_ed25519_key();
         let client_jwk = encode_ed25519_sk_to_pk_jwk(&client_signing_key);
         let mut client_device_config =
@@ -4658,8 +4766,9 @@ mod tests {
             err
         );
 
-        // 带 device_doc_jwt 验证通过,且 device_doc 被写入 name_client 的
-        // DID doc cache(resolve_did 可以命中)。
+        // 带 device_doc_jwt 时回落验证通过,且 device_doc 以 Observed
+        // (Unverified)等级写入 name_client 的观察缓存
+        // (doc/update-did-cache.md:系统收到过 != 系统信任它)。
         let hello_body = RTcpHelloBody {
             from_id: client_logical_did.to_string(),
             to_id: "did:web:server.devtests.org".to_string(),
@@ -4676,8 +4785,223 @@ mod tests {
         );
         assert_eq!(source_device.canonical_dev_did, client_dev_did);
 
-        let cached_doc = resolve_did(&client_logical_did, None).await.unwrap();
-        assert_eq!(cached_doc, EncodedDocument::Jwt(client_device_doc_jwt));
+        // strict resolve_did 对无 provider 的 method 无法完成 lazy verify,
+        // 观察缓存等同 miss,不能被当成可信解析结果返回。
+        assert!(
+            resolve_did(&client_logical_did, None).await.is_err(),
+            "strict resolve_did must not return the unverified observed doc"
+        );
+        // 显式宽松策略才能取回观察缓存,且带 ObservedFallback/Unavailable 打标。
+        let mut lenient_policy = ResolvePolicy::default();
+        lenient_policy.allow_unverified_cache_when_unavailable = true;
+        let observed = resolve_did_ex(&client_logical_did, None, lenient_policy)
+            .await
+            .unwrap();
+        assert_eq!(
+            observed.document,
+            EncodedDocument::Jwt(client_device_doc_jwt)
+        );
+    }
+
+    // 测试用权威 provider:按 (did, doc_type) 返回预注册的发布状态与文档本体;
+    // offline 置位后所有查询报传输错误,模拟权威源断网。
+    struct TestAuthorityProvider {
+        states: Vec<PublishedState>,
+        docs: Vec<(DID, String, EncodedDocument)>,
+        offline: Arc<AtomicBool>,
+    }
+
+    #[async_trait]
+    impl NsProvider for TestAuthorityProvider {
+        fn get_id(&self) -> String {
+            "rtcp-test-authority".to_string()
+        }
+
+        async fn query(
+            &self,
+            _name: &str,
+            _record_type: Option<RecordType>,
+            _from_ip: Option<std::net::IpAddr>,
+        ) -> NSResult<NameInfo> {
+            Err(NSError::NotFound("not implemented".to_string()))
+        }
+
+        async fn query_did(
+            &self,
+            did: &DID,
+            doc_type: Option<DidDocType>,
+            _from_ip: Option<std::net::IpAddr>,
+        ) -> NSResult<EncodedDocument> {
+            if self.offline.load(Ordering::SeqCst) {
+                return Err(NSError::Failed("authority offline (test)".to_string()));
+            }
+            let wanted = doc_type.unwrap_or_default();
+            self.docs
+                .iter()
+                .find(|(candidate, doc_type, _)| candidate == did && doc_type == wanted.as_str())
+                .map(|(_, _, doc)| doc.clone())
+                .ok_or_else(|| NSError::NotFound("no matching doc".to_string()))
+        }
+
+        async fn resolve_published_state(
+            &self,
+            did: &DID,
+            doc_type: &DidDocType,
+        ) -> NSResult<Option<PublishedState>> {
+            if self.offline.load(Ordering::SeqCst) {
+                return Err(NSError::Failed("authority offline (test)".to_string()));
+            }
+            Ok(self
+                .states
+                .iter()
+                .find(|state| state.did == *did && state.doc_type == doc_type.as_str())
+                .cloned())
+        }
+    }
+
+    // 权威锚定成功路径(doc/verify-did-document-jwt.md"RTCP 迁移示例"):
+    // 权威源给出 owner 绑定与当前发布集合证明时,resolve_source_device_info 走
+    // name-client 的 verify_device_document_jwt,source owner 取 authz_owner
+    // (权威绑定,不是 payload 自声明),文档按受控证据等级(Published)写入
+    // 缓存——之后即使权威源断网,strict resolve_did 也能命中,不再需要
+    // allow_unverified_cache_when_unavailable 宽松策略。
+    #[tokio::test]
+    async fn test_rtcp_authority_anchored_device_doc_jwt_hits_trusted_cache() {
+        let _ = init_name_lib_for_test(&HashMap::new()).await;
+
+        let (owner_signing_key, owner_pkcs8_bytes) = generate_ed25519_key();
+        let owner_jwk = encode_ed25519_sk_to_pk_jwk(&owner_signing_key);
+        let owner_did = DID::new("rtcpauth", "owner1");
+        let owner_private_key = EncodingKey::from_ed_der(&owner_pkcs8_bytes);
+        let owner_doc = OwnerDocument::new(
+            owner_did.clone(),
+            "owner1".to_string(),
+            "owner1@rtcpauth".to_string(),
+            serde_json::from_value(owner_jwk).unwrap(),
+        );
+        let owner_doc_encoded = owner_doc.encode(Some(&owner_private_key)).unwrap();
+
+        let (device_signing_key, _device_pkcs8_bytes) = generate_ed25519_key();
+        let device_jwk = encode_ed25519_sk_to_pk_jwk(&device_signing_key);
+        let mut device_config =
+            DeviceDocument::new_by_jwk("dev1", serde_json::from_value(device_jwk).unwrap());
+        let device_dev_did = device_config.id.clone();
+        let device_did = DID::new("rtcpauth", "dev1");
+        device_config.id = device_did.clone();
+        device_config.owner = owner_did.clone();
+        let device_doc_jwt = match device_config.encode(Some(&owner_private_key)).unwrap() {
+            EncodedDocument::Jwt(jwt) => jwt,
+            _ => panic!("device config encode should return jwt"),
+        };
+
+        // 越权候选:权威 owner 绑定是 owner1,文档却自声明一个 did:dev owner
+        // 并用它的 key 签名。旧的自声明验证会放行("JWT 能被它自己声明的 owner
+        // 验过"),权威锚定验证必须以 DeclaredOwnerMismatch 拒绝且不回落。
+        let (rogue_owner_signing_key, rogue_owner_pkcs8_bytes) = generate_ed25519_key();
+        let rogue_owner_jwk = encode_ed25519_sk_to_pk_jwk(&rogue_owner_signing_key);
+        let rogue_owner_config = DeviceDocument::new_by_jwk(
+            "rogue-owner",
+            serde_json::from_value(rogue_owner_jwk).unwrap(),
+        );
+        let rogue_owner_private_key = EncodingKey::from_ed_der(&rogue_owner_pkcs8_bytes);
+        let (rogue_device_signing_key, _) = generate_ed25519_key();
+        let rogue_device_jwk = encode_ed25519_sk_to_pk_jwk(&rogue_device_signing_key);
+        let mut rogue_device_config =
+            DeviceDocument::new_by_jwk("dev2", serde_json::from_value(rogue_device_jwk).unwrap());
+        let rogue_device_did = DID::new("rtcpauth", "dev2");
+        rogue_device_config.id = rogue_device_did.clone();
+        rogue_device_config.owner = rogue_owner_config.id.clone();
+        let rogue_device_doc_jwt = match rogue_device_config
+            .encode(Some(&rogue_owner_private_key))
+            .unwrap()
+        {
+            EncodedDocument::Jwt(jwt) => jwt,
+            _ => panic!("device config encode should return jwt"),
+        };
+
+        // 权威源:owner 文档锚定发布;device 文档 Active + effective_owner 绑定
+        // + 内联 body(外部候选与当前发布集合一致 → membership 成立 → Published)。
+        let mut device_state = PublishedState::active(
+            device_did.clone(),
+            "device".to_string(),
+            EncodedDocument::Jwt(device_doc_jwt.clone()),
+        );
+        device_state.effective_owner = Some(owner_did.clone());
+        let mut rogue_device_state = PublishedState::active(
+            rogue_device_did.clone(),
+            "device".to_string(),
+            EncodedDocument::Jwt(rogue_device_doc_jwt.clone()),
+        );
+        rogue_device_state.effective_owner = Some(owner_did.clone());
+        let provider = TestAuthorityProvider {
+            states: vec![
+                PublishedState::active(
+                    owner_did.clone(),
+                    "owner".to_string(),
+                    owner_doc_encoded.clone(),
+                ),
+                device_state,
+                rogue_device_state,
+            ],
+            docs: vec![
+                (owner_did.clone(), "owner".to_string(), owner_doc_encoded),
+                (
+                    device_did.clone(),
+                    "device".to_string(),
+                    EncodedDocument::Jwt(device_doc_jwt.clone()),
+                ),
+            ],
+            offline: Arc::new(AtomicBool::new(false)),
+        };
+        let offline = provider.offline.clone();
+        GLOBAL_NAME_CLIENT
+            .get()
+            .unwrap()
+            .set_method_authority("rtcpauth", Box::new(provider))
+            .await;
+
+        let hello_body = RTcpHelloBody {
+            from_id: device_did.to_string(),
+            to_id: "did:web:server.devtests.org".to_string(),
+            my_port: 19067,
+            tunnel_token: Some("unused".to_string()),
+            device_doc_jwt: Some(device_doc_jwt.clone()),
+        };
+        let source_device = RTcpInner::resolve_source_device_info(&hello_body)
+            .await
+            .unwrap();
+        assert_eq!(source_device.source_device_id, device_did.to_string());
+        assert_eq!(source_device.canonical_dev_did, device_dev_did);
+        let info = source_device.source_device_info.unwrap();
+        assert_eq!(info.owner, Some(owner_did.to_string()));
+
+        // 越权候选被 Definite 拒绝,不回落:若错误来自回落路径,消息会是
+        // "resolve owner auth key ... failed"(甚至因 did:dev owner 可本地验签
+        // 而放行),而不是带稳定错误码的 rejected。
+        let rogue_hello_body = RTcpHelloBody {
+            from_id: rogue_device_did.to_string(),
+            to_id: "did:web:server.devtests.org".to_string(),
+            my_port: 19067,
+            tunnel_token: Some("unused".to_string()),
+            device_doc_jwt: Some(rogue_device_doc_jwt),
+        };
+        let err = match RTcpInner::resolve_source_device_info(&rogue_hello_body).await {
+            Ok(_) => panic!("declared owner mismatching authority binding must be rejected"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("DeclaredOwnerMismatch"),
+            "unexpected error: {}",
+            err
+        );
+
+        // 受控缓存写入在权威源断网后仍可被 strict resolve_did 命中,与上一个
+        // 测试的 Observed/Unverified(strict 下等同 miss)形成对照。
+        offline.store(true, Ordering::SeqCst);
+        let resolved = resolve_did(&device_did, Some(DidDocType::Device))
+            .await
+            .expect("strict resolve_did must hit the controlled cache entry");
+        assert_eq!(resolved, EncodedDocument::Jwt(device_doc_jwt));
     }
 
     #[tokio::test]
@@ -4690,7 +5014,7 @@ mod tests {
         let id1 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        update_did_cache(device_config.id.clone(), None, encoded_doc)
+        update_did_cache(device_config.id.clone(), None, encoded_doc, None)
             .await
             .unwrap();
         add_nameinfo_cache(
@@ -4719,7 +5043,7 @@ mod tests {
         let id2 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        update_did_cache(device_config.id.clone(), None, encoded_doc)
+        update_did_cache(device_config.id.clone(), None, encoded_doc, None)
             .await
             .unwrap();
         add_nameinfo_cache(
@@ -4809,7 +5133,7 @@ mod tests {
         let id_a = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        update_did_cache(device_config.id.clone(), None, encoded_doc)
+        update_did_cache(device_config.id.clone(), None, encoded_doc, None)
             .await
             .unwrap();
         add_nameinfo_cache(
@@ -4850,7 +5174,7 @@ mod tests {
         let id_b = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        update_did_cache(device_config.id.clone(), None, encoded_doc)
+        update_did_cache(device_config.id.clone(), None, encoded_doc, None)
             .await
             .unwrap();
         add_nameinfo_cache(
@@ -4881,7 +5205,7 @@ mod tests {
         let id_c = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        update_did_cache(device_config.id.clone(), None, encoded_doc)
+        update_did_cache(device_config.id.clone(), None, encoded_doc, None)
             .await
             .unwrap();
         add_nameinfo_cache(
@@ -5204,7 +5528,7 @@ mod tests {
         let id1 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        update_did_cache(device_config.id.clone(), None, encoded_doc)
+        update_did_cache(device_config.id.clone(), None, encoded_doc, None)
             .await
             .unwrap();
         add_nameinfo_cache(
@@ -5233,7 +5557,7 @@ mod tests {
         let id2 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        update_did_cache(device_config.id.clone(), None, encoded_doc)
+        update_did_cache(device_config.id.clone(), None, encoded_doc, None)
             .await
             .unwrap();
         add_nameinfo_cache(

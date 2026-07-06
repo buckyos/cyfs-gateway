@@ -10,6 +10,7 @@ mod sn_compat_store;
 mod sn_device_info;
 pub mod sn_did_resolver;
 pub mod sn_resolver;
+mod sn_seed;
 mod sn_server;
 
 pub use name_info_cache::*;
@@ -20,6 +21,7 @@ pub use sn_compat_store::*;
 pub use sn_device_info::*;
 pub use sn_did_resolver::*;
 pub use sn_resolver::*;
+pub use sn_seed::*;
 pub use sn_server::*;
 
 pub use sfo_result::err as sn_err;

@@ -110,6 +110,12 @@ struct InitDocumentConfig {
     inline_json_file: Option<String>,
     #[serde(default)]
     inline_json: Option<Value>,
+    /// 原样上链的文本文档（如 owner key 签名的 boot JWT——boot 的规范模型
+    /// 是独立原子文档，内容就是 JWT 本身，不做 JSON 包装）。
+    #[serde(default)]
+    inline_text_file: Option<String>,
+    #[serde(default)]
+    inline_text: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -640,27 +646,45 @@ fn prepare_init_document(
     doc: &InitDocumentConfig,
     config_dir: &Path,
 ) -> Result<PreparedInitDocument, DynError> {
-    let has_file = doc.inline_json_file.is_some();
-    let has_inline = doc.inline_json.is_some();
-    if has_file == has_inline {
+    let sources = [
+        doc.inline_json_file.is_some(),
+        doc.inline_json.is_some(),
+        doc.inline_text_file.is_some(),
+        doc.inline_text.is_some(),
+    ];
+    if sources.iter().filter(|set| **set).count() != 1 {
         return Err(format!(
-            "initial_documents[{index}] must set exactly one of inline_json_file or inline_json"
+            "initial_documents[{index}] must set exactly one of inline_json_file, inline_json, inline_text_file or inline_text"
         )
         .into());
     }
-    let value = if let Some(file) = &doc.inline_json_file {
+
+    let inline_document = if let Some(file) = &doc.inline_json_file {
         let path = resolve_config_path(config_dir, file);
         let text = std::fs::read_to_string(&path)
             .map_err(|e| format!("failed to read inline_json_file {}: {e}", path.display()))?;
-        serde_json::from_str::<Value>(&text)
-            .map_err(|e| format!("failed to parse JSON {}: {e}", path.display()))?
+        let value = serde_json::from_str::<Value>(&text)
+            .map_err(|e| format!("failed to parse JSON {}: {e}", path.display()))?;
+        serde_json::to_vec(&value)?
+    } else if let Some(value) = &doc.inline_json {
+        serde_json::to_vec(value)?
+    } else if let Some(file) = &doc.inline_text_file {
+        let path = resolve_config_path(config_dir, file);
+        let text = std::fs::read_to_string(&path)
+            .map_err(|e| format!("failed to read inline_text_file {}: {e}", path.display()))?;
+        text.trim().as_bytes().to_vec()
     } else {
-        doc.inline_json.clone().expect("checked inline_json")
+        doc.inline_text
+            .as_deref()
+            .expect("checked inline_text")
+            .trim()
+            .as_bytes()
+            .to_vec()
     };
 
     Ok(PreparedInitDocument {
         doc_type: doc.doc_type.clone(),
-        inline_document: serde_json::to_vec(&value)?,
+        inline_document,
     })
 }
 

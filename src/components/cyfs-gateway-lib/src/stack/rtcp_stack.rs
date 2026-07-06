@@ -2439,7 +2439,7 @@ mod tests {
         let id1 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        update_did_cache(device_config.id.clone(), None, encoded_doc)
+        update_did_cache(device_config.id.clone(), None, encoded_doc, None)
             .await
             .unwrap();
         add_nameinfo_cache(
@@ -2497,7 +2497,7 @@ mod tests {
         let _id2 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        update_did_cache(device_config.id.clone(), None, encoded_doc)
+        update_did_cache(device_config.id.clone(), None, encoded_doc, None)
             .await
             .unwrap();
         add_nameinfo_cache(
@@ -2576,7 +2576,7 @@ mod tests {
         let id1 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        update_did_cache(device_config.id.clone(), None, encoded_doc)
+        update_did_cache(device_config.id.clone(), None, encoded_doc, None)
             .await
             .unwrap();
         add_nameinfo_cache(
@@ -2632,7 +2632,7 @@ mod tests {
         let _id2 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        update_did_cache(device_config.id.clone(), None, encoded_doc)
+        update_did_cache(device_config.id.clone(), None, encoded_doc, None)
             .await
             .unwrap();
         add_nameinfo_cache(
@@ -2711,7 +2711,7 @@ mod tests {
         let id1 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        update_did_cache(device_config.id.clone(), None, encoded_doc)
+        update_did_cache(device_config.id.clone(), None, encoded_doc, None)
             .await
             .unwrap();
         add_nameinfo_cache(
@@ -2767,7 +2767,7 @@ mod tests {
         let _id2 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        update_did_cache(device_config.id.clone(), None, encoded_doc)
+        update_did_cache(device_config.id.clone(), None, encoded_doc, None)
             .await
             .unwrap();
         add_nameinfo_cache(
@@ -2859,7 +2859,7 @@ mod tests {
         let id1 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        update_did_cache(device_config.id.clone(), None, encoded_doc)
+        update_did_cache(device_config.id.clone(), None, encoded_doc, None)
             .await
             .unwrap();
         add_nameinfo_cache(
@@ -2915,7 +2915,7 @@ mod tests {
         let _id2 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        update_did_cache(device_config.id.clone(), None, encoded_doc)
+        update_did_cache(device_config.id.clone(), None, encoded_doc, None)
             .await
             .unwrap();
         add_nameinfo_cache(
@@ -3021,7 +3021,7 @@ mod tests {
         let id1 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        update_did_cache(device_config.id.clone(), None, encoded_doc)
+        update_did_cache(device_config.id.clone(), None, encoded_doc, None)
             .await
             .unwrap();
         add_nameinfo_cache(
@@ -3083,7 +3083,7 @@ mod tests {
         let _id2 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        update_did_cache(device_config.id.clone(), None, encoded_doc)
+        update_did_cache(device_config.id.clone(), None, encoded_doc, None)
             .await
             .unwrap();
         add_nameinfo_cache(
@@ -3167,6 +3167,7 @@ mod tests {
             d1.id.clone(),
             None,
             EncodedDocument::JsonLd(serde_json::to_value(&d1).unwrap()),
+            None,
         )
         .await
         .unwrap();
@@ -3230,6 +3231,7 @@ mod tests {
             d2.id.clone(),
             None,
             EncodedDocument::JsonLd(serde_json::to_value(&d2).unwrap()),
+            None,
         )
         .await
         .unwrap();
@@ -3292,6 +3294,7 @@ mod tests {
             d1.id.clone(),
             None,
             EncodedDocument::JsonLd(serde_json::to_value(&d1).unwrap()),
+            None,
         )
         .await
         .unwrap();
@@ -3355,6 +3358,7 @@ mod tests {
             d2.id.clone(),
             None,
             EncodedDocument::JsonLd(serde_json::to_value(&d2).unwrap()),
+            None,
         )
         .await
         .unwrap();
@@ -3457,6 +3461,7 @@ mod tests {
             d1.id.clone(),
             None,
             EncodedDocument::JsonLd(serde_json::to_value(&d1).unwrap()),
+            None,
         )
         .await
         .unwrap();
@@ -3519,6 +3524,7 @@ mod tests {
             d2.id.clone(),
             None,
             EncodedDocument::JsonLd(serde_json::to_value(&d2).unwrap()),
+            None,
         )
         .await
         .unwrap();
@@ -3594,6 +3600,7 @@ mod tests {
             d1.id.clone(),
             None,
             EncodedDocument::JsonLd(serde_json::to_value(&d1).unwrap()),
+            None,
         )
         .await
         .unwrap();
@@ -3656,6 +3663,7 @@ mod tests {
             d2.id.clone(),
             None,
             EncodedDocument::JsonLd(serde_json::to_value(&d2).unwrap()),
+            None,
         )
         .await
         .unwrap();
@@ -3716,7 +3724,7 @@ mod tests {
         let id1 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        update_did_cache(device_config.id.clone(), None, encoded_doc)
+        update_did_cache(device_config.id.clone(), None, encoded_doc, None)
             .await
             .unwrap();
         add_nameinfo_cache(
@@ -3773,7 +3781,7 @@ mod tests {
         let _id2 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        update_did_cache(device_config.id.clone(), None, encoded_doc)
+        update_did_cache(device_config.id.clone(), None, encoded_doc, None)
             .await
             .unwrap();
         add_nameinfo_cache(
@@ -3850,7 +3858,7 @@ mod tests {
         let id1 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        update_did_cache(device_config.id.clone(), None, encoded_doc)
+        update_did_cache(device_config.id.clone(), None, encoded_doc, None)
             .await
             .unwrap();
         add_nameinfo_cache(
@@ -3907,7 +3915,7 @@ mod tests {
         let _id2 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        update_did_cache(device_config.id.clone(), None, encoded_doc)
+        update_did_cache(device_config.id.clone(), None, encoded_doc, None)
             .await
             .unwrap();
         add_nameinfo_cache(
@@ -3984,7 +3992,7 @@ mod tests {
         let id1 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        update_did_cache(device_config.id.clone(), None, encoded_doc)
+        update_did_cache(device_config.id.clone(), None, encoded_doc, None)
             .await
             .unwrap();
         add_nameinfo_cache(
@@ -4041,7 +4049,7 @@ mod tests {
         let _id2 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        update_did_cache(device_config.id.clone(), None, encoded_doc)
+        update_did_cache(device_config.id.clone(), None, encoded_doc, None)
             .await
             .unwrap();
         add_nameinfo_cache(
@@ -4132,7 +4140,7 @@ mod tests {
         let id1 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        update_did_cache(device_config.id.clone(), None, encoded_doc)
+        update_did_cache(device_config.id.clone(), None, encoded_doc, None)
             .await
             .unwrap();
         add_nameinfo_cache(
@@ -4189,7 +4197,7 @@ mod tests {
         let _id2 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        update_did_cache(device_config.id.clone(), None, encoded_doc)
+        update_did_cache(device_config.id.clone(), None, encoded_doc, None)
             .await
             .unwrap();
         add_nameinfo_cache(
@@ -4267,7 +4275,7 @@ mod tests {
         let id1 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        update_did_cache(device_config.id.clone(), None, encoded_doc)
+        update_did_cache(device_config.id.clone(), None, encoded_doc, None)
             .await
             .unwrap();
         add_nameinfo_cache(
@@ -4332,7 +4340,7 @@ mod tests {
         let _id2 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        update_did_cache(device_config.id.clone(), None, encoded_doc)
+        update_did_cache(device_config.id.clone(), None, encoded_doc, None)
             .await
             .unwrap();
         add_nameinfo_cache(
@@ -4417,7 +4425,7 @@ mod tests {
         let id1 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        update_did_cache(device_config.id.clone(), None, encoded_doc)
+        update_did_cache(device_config.id.clone(), None, encoded_doc, None)
             .await
             .unwrap();
         add_nameinfo_cache(
@@ -4483,7 +4491,7 @@ mod tests {
         let _id2 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        update_did_cache(device_config.id.clone(), None, encoded_doc)
+        update_did_cache(device_config.id.clone(), None, encoded_doc, None)
             .await
             .unwrap();
         add_nameinfo_cache(
@@ -4571,7 +4579,7 @@ mod tests {
         let id1 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        update_did_cache(device_config.id.clone(), None, encoded_doc)
+        update_did_cache(device_config.id.clone(), None, encoded_doc, None)
             .await
             .unwrap();
         add_nameinfo_cache(
@@ -4644,7 +4652,7 @@ mod tests {
         let _id2 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        update_did_cache(device_config.id.clone(), None, encoded_doc)
+        update_did_cache(device_config.id.clone(), None, encoded_doc, None)
             .await
             .unwrap();
         add_nameinfo_cache(
@@ -4732,7 +4740,7 @@ mod tests {
         let id1 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        update_did_cache(device_config.id.clone(), None, encoded_doc)
+        update_did_cache(device_config.id.clone(), None, encoded_doc, None)
             .await
             .unwrap();
         add_nameinfo_cache(
@@ -4805,7 +4813,7 @@ mod tests {
         let _id2 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        update_did_cache(device_config.id.clone(), None, encoded_doc)
+        update_did_cache(device_config.id.clone(), None, encoded_doc, None)
             .await
             .unwrap();
         add_nameinfo_cache(
@@ -4915,7 +4923,7 @@ mod tests {
         let id1 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        update_did_cache(device_config.id.clone(), None, encoded_doc)
+        update_did_cache(device_config.id.clone(), None, encoded_doc, None)
             .await
             .unwrap();
         add_nameinfo_cache(
@@ -4975,7 +4983,7 @@ mod tests {
         let _id2 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        update_did_cache(device_config.id.clone(), None, encoded_doc)
+        update_did_cache(device_config.id.clone(), None, encoded_doc, None)
             .await
             .unwrap();
         add_nameinfo_cache(
@@ -5053,7 +5061,7 @@ mod tests {
         let id1 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        update_did_cache(device_config.id.clone(), None, encoded_doc)
+        update_did_cache(device_config.id.clone(), None, encoded_doc, None)
             .await
             .unwrap();
         add_nameinfo_cache(
@@ -5115,7 +5123,7 @@ mod tests {
         let _id2 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        update_did_cache(device_config.id.clone(), None, encoded_doc)
+        update_did_cache(device_config.id.clone(), None, encoded_doc, None)
             .await
             .unwrap();
         add_nameinfo_cache(
@@ -5214,7 +5222,7 @@ mod tests {
         let id1 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        update_did_cache(device_config.id.clone(), None, encoded_doc)
+        update_did_cache(device_config.id.clone(), None, encoded_doc, None)
             .await
             .unwrap();
         add_nameinfo_cache(
@@ -5278,7 +5286,7 @@ mod tests {
         let _id2 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        update_did_cache(device_config.id.clone(), None, encoded_doc)
+        update_did_cache(device_config.id.clone(), None, encoded_doc, None)
             .await
             .unwrap();
         add_nameinfo_cache(
@@ -5367,7 +5375,7 @@ mod tests {
         let id1 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        update_did_cache(device_config.id.clone(), None, encoded_doc)
+        update_did_cache(device_config.id.clone(), None, encoded_doc, None)
             .await
             .unwrap();
         add_nameinfo_cache(
@@ -5438,7 +5446,7 @@ mod tests {
         let _id2 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        update_did_cache(device_config.id.clone(), None, encoded_doc)
+        update_did_cache(device_config.id.clone(), None, encoded_doc, None)
             .await
             .unwrap();
         add_nameinfo_cache(
@@ -5527,7 +5535,7 @@ mod tests {
         let id1 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        update_did_cache(device_config.id.clone(), None, encoded_doc)
+        update_did_cache(device_config.id.clone(), None, encoded_doc, None)
             .await
             .unwrap();
         add_nameinfo_cache(
@@ -5598,7 +5606,7 @@ mod tests {
         let _id2 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        update_did_cache(device_config.id.clone(), None, encoded_doc)
+        update_did_cache(device_config.id.clone(), None, encoded_doc, None)
             .await
             .unwrap();
         add_nameinfo_cache(

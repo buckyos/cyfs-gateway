@@ -23,6 +23,7 @@ SN 当前由两条主线组成：
 | Gateway + SN/BNS 读取集成 | 验证 gateway 中 SN 服务能通过 BNS indexer 读取 BNS 文档并对外解析 | `cd src && cargo test -p cyfs_gateway --test test_sn_bns_integration -- --test-threads=1` |
 | 真 EVM 集成 | 验证 anvil + 合约部署 + Controller 写入 + indexer 同步 + server/client 读取闭环 | `cd src && cargo test -p bns-client --test e2e_anvil -- --ignored --test-threads=1` |
 | DV 冒烟 | 验证本地开发环境 fresh/resume、BNS Server、indexer 轮询和最小写读链路 | `cd src/apps/bns && scripts/dv-up.sh --fresh && scripts/dv-smoke.sh` |
+| SN seed 集成 | 验证 make_sn_config seed-v2 产物经 bns_dv `--seed-config` 上链、cyfs-sn `sn_seed.yaml` 幂等导入后，账号/DNS/链上/域名种子全部生效（T1-T6，含幂等重放与产物确定性） | `cd src && cargo test -p cyfs_gateway --test e2e_sn_seed -- --ignored --test-threads=1`；手工环境：`cd src/web3-gateway && scripts/sn-dev-up.sh --fresh && scripts/sn-dev-smoke.sh` |
 
 说明：
 
@@ -134,6 +135,10 @@ BNS 合约测试用于钉住链上规则，而不是验证 Rust 侧实现细节�
 - indexer 的 confirmations、游标推进、source 隔离和合约重部署重放在真实链环境中成立。
 - `dv-up.sh --fresh` 能初始化完整开发环境；`--resume` 能复用 anvil state、合约地址和 indexer 游标。
 - `dv-smoke.sh` 能通过 BNS Server 完成最小注册、发布、同步、读取闭环。
+- `sn-dev-up.sh --fresh` 能在本机（非 VM）拉起 anvil + bns_dv（带 `--seed-config`）+
+  web3_gateway 全栈，seed 产物真实生效；`--resume` 是"不动 seed 重启"，验证
+  bns_dv 链上幂等重放与 cyfs-sn ensure-exists 重放的零写入契约（属"真集成，
+  默认跳过"层，入口 `e2e_sn_seed`，见 §1）。
 
 真 EVM 测试不要求覆盖所有业务分支；业务分支应优先留在 §2-§4 的快速测试中。
 
@@ -177,6 +182,20 @@ cd src/apps/bns && scripts/dv-up.sh --fresh && scripts/dv-smoke.sh && scripts/dv
 
 ```bash
 cd src/apps/bns && scripts/dv-up.sh --resume && scripts/dv-smoke.sh && scripts/dv-down.sh
+```
+
+涉及 SN seed（make_sn_config seed-v2 / sn_seed.rs / bns_dv seed）时运行：
+
+```bash
+cd src && cargo test -p cyfs-sn sn_seed -- --test-threads=1
+cd src && cargo test -p cyfs_gateway --test e2e_sn_seed -- --ignored --test-threads=1
+```
+
+手工调试 SN 本机环境（三件套，仿 bns dv）：
+
+```bash
+cd src/web3-gateway && scripts/sn-dev-up.sh --fresh && scripts/sn-dev-smoke.sh
+cd src/web3-gateway && scripts/sn-dev-down.sh --purge
 ```
 
 ## 7. 当前缺口
