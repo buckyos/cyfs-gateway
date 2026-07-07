@@ -20,6 +20,9 @@
     "install": [
       "sudo chmod +x /opt/web3-gateway/web3_gateway /opt/web3-gateway/init_anvil.py"
     ],
+    "update": [
+      "sudo chmod +x /opt/web3-gateway/web3_gateway"
+    ],
     "init_anvil": ["cd /opt/web3-gateway && sudo uv run ./init_anvil.py"],
     "init_anvil_fresh": ["cd /opt/web3-gateway && sudo uv run ./init_anvil.py --fresh --install-foundry"],
     "start": ["sudo uv run /opt/web3-gateway/start.py"],
