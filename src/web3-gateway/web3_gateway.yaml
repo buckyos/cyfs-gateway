@@ -94,10 +94,13 @@ stacks:
           default:
             id: default
             priority: 1
-            # REQ里已经有了很多信息，所以直接设置 method 为 deviceinfo.resolve_ood_by_did 并调用 qa 来查询是否是认证设备
+            # REQ里已经有了很多信息，所以直接设置 method 为 deviceinfo.resolve_ood_by_did 并调用 qa 来查询是否是认证设备。
+            # 判定是"注册设备且未被 ban"而不是 state=active（online）：
+            # RTCP 连接正是设备变得可达的手段，online 与否由 device.update
+            # 上报驱动，把它作为前置会造成设备重启后首连必拒的鸡生蛋问题。
             block: |
               map-add "REQ" "method" "deviceinfo.resolve_ood_by_did"
-              call qa "web3_sn" "REQ" && eq ${ANSWER.state} "active" && accept;
+              call qa "web3_sn" "REQ" && !eq ${ANSWER.state} "banned" && accept;
               reject;
 
     on_new_tunnel_hook_point:
@@ -109,10 +112,13 @@ stacks:
             id: default
             priority: 1
             # 隧道建立时校验 source_device_id 是否为认证设备，只允许认证设备 keep-tunnel
-            # 从转发的角度，也支持所有device.owner是合法用户的连接
+            # 从转发的角度，也支持所有device.owner是合法用户的连接。
+            # 与上面的 stream 级判定一致：resolve 成功=注册设备（认证已在
+            # RTCP 验证层完成），仅排除 banned；不要求 online（keep-tunnel
+            # 本身就是设备上线的前提，不能反过来依赖在线状态）。
             block: |
               map-add "REQ" "method" "deviceinfo.resolve_ood_by_did"
-              call qa "web3_sn" "REQ" && eq ${ANSWER.state} "active" && accept;
+              call qa "web3_sn" "REQ" && !eq ${ANSWER.state} "banned" && accept;
               reject;
 
   main_http_tcp:

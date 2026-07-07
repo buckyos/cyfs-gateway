@@ -1302,6 +1302,22 @@ impl SnResolver {
         })
     }
 
+    /// 按 (zone, device_name) 解析 zone 权威侧登记的设备身份文档，返回其中的
+    /// 设备 DID（通常是 `did:dev:<x>`，公钥内嵌）。来源优先级与内部设备解析
+    /// 一致：BNS `<device>.<zone>` 单文档 → zone 级 `device_mini_doc` 聚合 →
+    /// zone doc devices → 兼容期 devices 表。`sn_authority` 用它锚定设备
+    /// token 的公钥，不存在时返回 `DeviceNotFound`。
+    pub async fn resolve_zone_device_did(
+        &self,
+        zone_name: &str,
+        device_name: &str,
+    ) -> SnResolverResult<String> {
+        let (device_doc, _) = self
+            .resolve_device_mini_doc(zone_name, device_name, None)
+            .await?;
+        Ok(device_doc.did)
+    }
+
     async fn resolve_device_mini_doc(
         &self,
         zone_name: &str,

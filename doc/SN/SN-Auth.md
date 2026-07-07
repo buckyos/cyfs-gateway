@@ -39,6 +39,42 @@ SN Auth 的核心权限边界是：
 
 `sn_authority` 应统一验证 token 和签名，并输出权限上下文。业务模块不应散落解析 token。`sn_auth` 只负责签发/存储 SN 用户会话和提供账号资料。
 
+## 设备级凭证（device token）
+
+设备在线态上报接口（`device.register` / `device.update`）接受两种凭证：SN 账号
+access token（激活/管理面，可上报该账号名下任意设备）与设备级 device token
+（node_daemon 周期上报，只能上报凭证锚定的那台设备）。device token 由设备私钥
+签名，`sn_authority::require_sn_device` 校验后输出
+`AuthContext::Device { zone, device_name, did }`（2026-07 落地）。
+
+token 形状（签发方 `cyfs_gateway_api::generate_sn_device_token`，BuckyOS 侧
+node_daemon 经该 helper 生成）：
+
+- `sub`: 设备 key DID（`did:dev:<ed25519-x>`），公钥内嵌，签名自证持有设备私钥。
+- `iss`: 设备的 zone 域名层级 DID（如 `did:bns:ood1.alice`、`did:web:ood1.charlie.me`）。
+- `aud`: `sn-device`。与账号 token 的 `sn` 域隔离：`verify_access_session` 拒绝
+  `sn-device`，`require_sn_device` 拒绝非 `sn-device`，两类 token 互不通用。
+- `exp`: 短期有效（客户端默认 10 分钟，服务端硬上限 24h）。
+
+校验链（sn_authority.rs `require_sn_device`）：
+
+1. `aud` 必须是 `sn-device`；`sub` 必须是合法 `did:dev`（x 可解码为 32 字节
+   ed25519 公钥），用 `sub` 内嵌公钥验 EdDSA 签名与 `exp`。
+2. `iss` 经 `registered_device_key_from_did` 解析为 (zone, device_name)：
+   `did:bns:<dev>.<短名>` → username；`did:bns:<dev>.<带点域名>` / `did:web:*`
+   → `user_domain` 反查。
+3. zone 用户存在且 state=active。
+4. 信任锚定：`SnResolver::resolve_zone_device_did(zone, device_name)` 读取 zone
+   权威侧登记的设备身份（BNS `<dev>.<zone>` 单文档 → zone 级 `device_mini_doc`
+   聚合 → zone doc devices → 兼容 devices 表/在线索引），其公钥必须与 `sub`
+   一致。锚定不上即拒绝：不做 TOFU，"第一个来报的 key"不能自动成为设备身份。
+
+权限边界：Device 上下文只能上报凭证锚定的那台设备（`api/device.rs`
+`ReportIdentity::enforce_reported_device` 强制 device_name/DID 一致），不能访问
+账号面接口（`device.get` / `device.list` 等仍要求 SnUser）。设备的首次登记仍由
+激活流程的账号 token 或 BNS 文档发布完成，device token 不承担登记职责。
+e2e 覆盖见 sn_server.rs `test_sn_device_token_report_paths`。
+
 ## 核心对象
 
 ### sn_user
@@ -388,7 +424,7 @@ TODO（阶段二，2026-07-06 完成）：
 
 - 阶段一已完成：`update_zone_info` 提供 patch 写入，`update_user_self_cert` 走该统一入口（sn_auth.rs:1407-1416、1916-2014）。
 - 待实现（阶段二，绕过风险）：`user.set_self_cert` V2 用裸 access token 即可把 `self_cert` 置 true（user.rs:59-67），`dns.add_record` / `dns.remove_record` 在 `has_cert=true` 时同样置 true（dns.rs:88-93、121-127），均无证书校验或可信 device 证明。
-- 旧 `set_user_self_cert` 支持 device-signed token，会按 (user, device_name) 解析设备并用设备 DID 的 ed25519 key 校验 token 签名（sn_server.rs:2209-2232），但只产生本地效果，不产生 `Device(zone,device,did)` 上下文。
+- 旧 `set_user_self_cert` 的 device-signed token 分支已随旧代码移除；`Device(zone,device,did)` 上下文现由 `sn_authority::require_sn_device` 提供（见「设备级凭证」小节），但 `user.set_self_cert` 尚未接入该上下文。
 - 目标实现应把这些入口收敛到 `sn_authority + update_zone_info`，并记录审计事件。
 
 ## Admin 能力
@@ -513,7 +549,7 @@ RPC 层可以使用 breaking API，不要求保留旧 method alias。内部不�
 
 ### 阶段二待实现（主要差距）
 
-- `sn_authority` 统一鉴权上下文尚不完整：已有 `AuthContext::SnUser`（含 session 撤销校验，V2 统一走 `require_account_username`→`sn_authority::require_sn_user`，common.rs:177-186、sn_authority.rs:8-43），但 `Owner(name)`/`Controller(name,scope)`/`Device(zone,device,did)` 上下文仍不存在，旧接口仍各自 `RPCSessionToken::from_string(...).verify_by_key(...)`（sn_server.rs:1114-1132 等）。
+- `sn_authority` 统一鉴权上下文尚不完整：已有 `AuthContext::SnUser`（含 session 撤销校验，V2 统一走 `require_account_username`→`sn_authority::require_sn_user`，common.rs:177-186）与 `AuthContext::Device(zone,device,did)`（2026-07 落地，见「设备级凭证」小节，device.register/update 经 `require_sn_user_or_device` 接入），但 `Owner(name)`/`Controller(name,scope)` 上下文仍不存在，旧接口仍各自 `RPCSessionToken::from_string(...).verify_by_key(...)`（sn_server.rs:1114-1132 等）。
 - 注册流程还没有和 `sn_bns_controller` 提交 BNS 合约注册 TX 串成一个幂等流程（无 `request_id`，无 BNS owner 创建/恢复）。
 - ~~PKX proof 在 DB 层已实现但无 RPC handler、无 DNS TXT 查询接线，端到端不可达。~~ 已完成：一站式 `domain.bind` + 外部 DoH proof path（见 user_domain 小节）。
 - ~~绕过风险：`register_user_with_owner_key` 能不经 proof 把 `user_domain` 置 active~~ 已收窄为 seed/import trusted 路径（不在对外 RPC 暴露）；`self_cert` 仍可被 `dns.*` 的 `has_cert=true` 置 true（无证书校验），待收敛。
@@ -538,7 +574,7 @@ RPC 层可以使用 breaking API，不要求保留旧 method alias。内部不�
 阶段二待办：
 
 6. 把 `zone.bind_config` 拆成 owner authority 校验、BNS document 发布、`zone_info` 缓存更新三段。
-7. 引入 `sn_authority` 统一鉴权上下文，把 BNS 修改类请求统一接入，禁止业务 handler 自行把 SN access token 当 owner token 使用。
+7. 引入 `sn_authority` 统一鉴权上下文，把 BNS 修改类请求统一接入，禁止业务 handler 自行把 SN access token 当 owner token 使用。（部分完成：`Device` 上下文已落地并接入 device.register/update；`Owner`/`Controller` 仍待实现。）
 8. 把 `self_cert` 更新入口收敛为可信 ACME/device 上报 + 证书校验，并记录来源和审计日志。
 9. 补齐传统账号安全（change password、reset、限流），并写入 `owner_key_ref`。
 10. 删除旧 RPC method alias 或让旧 alias 显式失败，内部只走新的 authority 和 store API。

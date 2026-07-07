@@ -2,6 +2,7 @@
 
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -67,6 +68,41 @@ def run_child(cmd: list[str], cwd: Path) -> int:
 
 
 BNS_SEED_CONFIG_FILE = "bns_dv_seed.yaml"
+MACHINE_CONFIG_FILE = "machine.json"
+
+
+def install_machine_config(current_dir: Path) -> None:
+    # web3_gateway 在启动时读 {BUCKYOS_ROOT:-/opt/buckyos}/etc/machine.json
+    # 初始化 name-client 的 web3_bridge；不装这份文件时 bns 权威落到内置默认
+    # web3.buckyos.ai（生产环境），SN 对 keep-tunnel 来源设备的 DID 验证会
+    # 打到生产环境而失败。machine.json 由 make_sn_config.ts 生成在部署目录。
+    src = current_dir / MACHINE_CONFIG_FILE
+    if not src.exists():
+        return
+    etc_dir = Path(os.environ.get("BUCKYOS_ROOT", "/opt/buckyos")) / "etc"
+    etc_dir.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(src, etc_dir / MACHINE_CONFIG_FILE)
+    print(f"installed {src} -> {etc_dir / MACHINE_CONFIG_FILE}")
+
+
+def install_dev_ca(current_dir: Path) -> None:
+    # SN 进程用 https 回访自己的 resolver（machine.json 的 bns bridge 指向
+    # web3.<sn_host>，证书由 dev CA 签发）。web3_gateway 的 reqwest 走
+    # rustls-native-roots（读系统 CA bundle），所以把部署目录 ca/ 下的
+    # dev CA 装入系统信任；非 Linux 或无 CA 文件时静默跳过。
+    ca_dir = current_dir / "ca"
+    if not ca_dir.is_dir() or not Path("/usr/local/share/ca-certificates").is_dir():
+        return
+    installed = False
+    for cert in sorted(ca_dir.glob("*_ca_cert.pem")):
+        target = Path("/usr/local/share/ca-certificates") / (cert.stem + ".crt")
+        if target.exists() and target.read_bytes() == cert.read_bytes():
+            continue
+        shutil.copyfile(cert, target)
+        installed = True
+        print(f"installed dev CA {cert} -> {target}")
+    if installed:
+        subprocess.run(["update-ca-certificates"], check=False)
 
 
 def json_rpc(method: str, params: list | None = None) -> dict:
@@ -200,6 +236,8 @@ def main() -> int:
     args = sys.argv[1:]
 
     current_dir = Path(__file__).resolve().parent
+    install_machine_config(current_dir)
+    install_dev_ca(current_dir)
     contract = ensure_bns_contract(current_dir)
     bns_process = start_bns_server(current_dir, contract)
     config_file = current_dir / "web3_gateway.yaml"

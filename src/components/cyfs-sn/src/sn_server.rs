@@ -458,9 +458,9 @@ pub struct OODInfo {
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
-struct RegisteredDeviceKey {
-    zone: String,
-    device_name: String,
+pub(crate) struct RegisteredDeviceKey {
+    pub(crate) zone: String,
+    pub(crate) device_name: String,
 }
 
 #[derive(Clone)]
@@ -686,7 +686,7 @@ impl SNServer {
     }
 
     /// ed25519 公钥 x 分量的合理性检查（base64url 无 padding 解码为 32 字节）。
-    fn is_plausible_ed25519_x(value: &str) -> bool {
+    pub(crate) fn is_plausible_ed25519_x(value: &str) -> bool {
         use base64::engine::general_purpose::URL_SAFE_NO_PAD;
         use base64::Engine;
         URL_SAFE_NO_PAD
@@ -1187,7 +1187,7 @@ impl SNServer {
         })
     }
 
-    async fn registered_device_key_from_did(
+    pub(crate) async fn registered_device_key_from_did(
         &self,
         did: &str,
     ) -> Result<Option<RegisteredDeviceKey>, RPCErrors> {
@@ -3834,6 +3834,225 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result["code"].as_i64().unwrap(), 0);
+    }
+
+    /// 设备级凭证（device token）驱动 device.register / device.update 的
+    /// 端到端路径：node_daemon 侧按 `cyfs_gateway_api::generate_sn_device_token`
+    /// 签发，SN 侧 `sn_authority::require_sn_device` 校验并锚定 zone 登记的
+    /// 设备公钥。覆盖 SN-Auth.md 的 `Device(zone, device, did)` 上下文。
+    #[tokio::test]
+    async fn test_sn_device_token_report_paths() {
+        init_logging("sn", false);
+        const DEVTOKEN_USER: &str = "devtokenuser";
+
+        let (device_signing_key, device_pkcs8_bytes) = generate_ed25519_key();
+        let device_jwk = encode_ed25519_sk_to_pk_jwk(&device_signing_key);
+        let device_config =
+            DeviceDocument::new_by_jwk("ood1", serde_json::from_value(device_jwk).unwrap());
+        let device_info = DeviceInfo::from_device_doc(&device_config);
+        let device_encoding_key =
+            jsonwebtoken::EncodingKey::from_ed_der(device_pkcs8_bytes.as_slice());
+        let device_key_did = device_config.id.to_string();
+        let device_scoped_did = format!("did:bns:ood1.{}", DEVTOKEN_USER);
+
+        let sn_factory = SnServerFactory::new();
+        let db = tempfile::NamedTempFile::with_suffix(".db").unwrap();
+        let auth_dir = tempfile::tempdir().unwrap();
+        {
+            let db = SqliteSnAuthDB::new_by_path(db.path().to_str().unwrap())
+                .await
+                .unwrap();
+            db.initialize_database().await.unwrap();
+            db.insert_activation_code(CLEAR_STATE_ACTIVE_CODE)
+                .await
+                .unwrap();
+        }
+        let config = json!({
+            "id": "test-device-token",
+            "host": "buckyos.ai",
+            "ip": "127.0.0.1",
+            "boot_jwt": "",
+            "owner_pkx": "",
+            "device_jwt": [],
+            "db_type": "sqlite",
+            "db_path": db.path().to_str().unwrap(),
+            "auth_data_dir": auth_dir.path().to_str().unwrap(),
+        });
+        let config: SNServerConfig = serde_json::from_value(config).unwrap();
+        let servers = sn_factory.create(Arc::new(config), None).await.unwrap();
+        let http_server = servers
+            .iter()
+            .find_map(|server| match server {
+                Server::Http(server) => Some(server.clone()),
+                _ => None,
+            })
+            .unwrap();
+        let http_addr = spawn_test_http_server(http_server).await;
+        let base_url = format!("http://{}", http_addr);
+        let auth_url = format!("{}/kapi/sn/auth", base_url);
+        let deviceinfo_url = format!("{}/kapi/sn/deviceinfo", base_url);
+
+        let device_token = cyfs_gateway_api::generate_sn_device_token(
+            device_key_did.as_str(),
+            device_scoped_did.as_str(),
+            None,
+            &device_encoding_key,
+        )
+        .unwrap();
+        let device_token_krpc = kRPC::new(deviceinfo_url.as_str(), Some(device_token.clone()));
+        let update_params = json!({
+            "device_name": "ood1",
+            "device_ip": "127.0.0.1",
+            "device_info": serde_json::to_string(&device_info).unwrap(),
+            "ttl": 600
+        });
+
+        // zone 用户还不存在：设备 token 被拒（zone 归属无从谈起）。
+        let err = device_token_krpc
+            .call("device.update", update_params.clone())
+            .await
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(err.contains("device_permission_denied"), "{}", err);
+
+        let auth_krpc = kRPC::new(auth_url.as_str(), None);
+        let result = auth_krpc
+            .call(
+                "auth.register",
+                json!({
+                    "name": DEVTOKEN_USER,
+                    "pwd_hash": "12345678",
+                    "active_code": CLEAR_STATE_ACTIVE_CODE
+                }),
+            )
+            .await
+            .unwrap();
+        let access_token = result["access_token"].as_str().unwrap().to_string();
+
+        // zone 权威侧尚无该设备的登记（无 BNS 文档、无历史登记）：拒绝，
+        // 不允许"第一个来报的 key 自动成为锚"。
+        let err = device_token_krpc
+            .call("device.update", update_params.clone())
+            .await
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(err.contains("device_permission_denied"), "{}", err);
+        assert!(err.contains("is not registered"), "{}", err);
+
+        // 激活流程用账号 token 完成设备首次登记（现状协议，保持不变）。
+        let account_krpc = kRPC::new(deviceinfo_url.as_str(), Some(access_token.clone()));
+        let result = account_krpc
+            .call(
+                "device.register",
+                json!({
+                    "device_name": "ood1",
+                    "device_did": device_key_did,
+                    "device_ip": "127.0.0.1",
+                    "device_info": serde_json::to_string(&device_info).unwrap(),
+                    "ttl": 600
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["code"].as_i64().unwrap(), 0);
+        assert_eq!(result["zone"].as_str().unwrap(), DEVTOKEN_USER);
+
+        // 设备 token 驱动周期上报（node_daemon 主循环路径）：device_did 缺省
+        // 由凭证强制补齐。
+        let result = device_token_krpc
+            .call("device.update", update_params.clone())
+            .await
+            .unwrap();
+        assert_eq!(result["code"].as_i64().unwrap(), 0);
+        assert_eq!(result["zone"].as_str().unwrap(), DEVTOKEN_USER);
+        assert_eq!(result["did"].as_str().unwrap(), device_key_did);
+
+        let result = device_token_krpc
+            .call(
+                "deviceinfo.resolve_ood_by_did",
+                json!({ "source_device_id": device_key_did }),
+            )
+            .await
+            .unwrap();
+        let ood_info = serde_json::from_value::<OODInfo>(result).unwrap();
+        assert_eq!(ood_info.owner_id, DEVTOKEN_USER);
+        assert_eq!(ood_info.state, "active");
+
+        // 越权：ood1 的设备 token 不能冒名上报 ood2。
+        let err = device_token_krpc
+            .call(
+                "device.update",
+                json!({
+                    "device_name": "ood2",
+                    "device_ip": "127.0.0.1",
+                    "device_info": serde_json::to_string(&device_info).unwrap(),
+                }),
+            )
+            .await
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(err.contains("device_permission_denied"), "{}", err);
+        assert!(err.contains("cannot report device ood2"), "{}", err);
+
+        // 冒名：另一把 key 自签 sub，与 zone 登记的设备公钥锚定不上。
+        let (rogue_signing_key, rogue_pkcs8_bytes) = generate_ed25519_key();
+        let rogue_jwk = encode_ed25519_sk_to_pk_jwk(&rogue_signing_key);
+        let rogue_x = rogue_jwk["x"].as_str().unwrap().to_string();
+        let rogue_encoding_key =
+            jsonwebtoken::EncodingKey::from_ed_der(rogue_pkcs8_bytes.as_slice());
+        let rogue_token = cyfs_gateway_api::generate_sn_device_token(
+            format!("did:dev:{}", rogue_x).as_str(),
+            device_scoped_did.as_str(),
+            None,
+            &rogue_encoding_key,
+        )
+        .unwrap();
+        let rogue_krpc = kRPC::new(deviceinfo_url.as_str(), Some(rogue_token));
+        let err = rogue_krpc
+            .call("device.update", update_params.clone())
+            .await
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(err.contains("device_permission_denied"), "{}", err);
+        assert!(err.contains("does not match the registered key"), "{}", err);
+
+        // 签名与 sub 不符（拿别人的 sub、用自己的 key 签）：验签直接失败。
+        let forged_token = cyfs_gateway_api::generate_sn_device_token(
+            device_key_did.as_str(),
+            device_scoped_did.as_str(),
+            None,
+            &rogue_encoding_key,
+        )
+        .unwrap();
+        let forged_krpc = kRPC::new(deviceinfo_url.as_str(), Some(forged_token));
+        let err = forged_krpc
+            .call("device.update", update_params.clone())
+            .await
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(err.contains("invalid_token"), "{}", err);
+
+        // 设备 token 只代表设备，不是账号：账号侧接口拒绝。
+        let err = device_token_krpc
+            .call("device.list", json!({}))
+            .await
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(err.contains("invalid_token"), "{}", err);
+
+        // 账号 token 的 device.update 路径不受影响（激活/管理面继续可用）。
+        let result = account_krpc
+            .call("device.update", update_params.clone())
+            .await
+            .unwrap();
+        assert_eq!(result["code"].as_i64().unwrap(), 0);
+        assert_eq!(result["zone"].as_str().unwrap(), DEVTOKEN_USER);
     }
 
     #[tokio::test]

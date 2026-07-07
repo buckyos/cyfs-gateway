@@ -35,6 +35,7 @@ buckyos-kit.workspace = true
 kRPC.workspace = true
 name-client.workspace = true
 name-lib.workspace = true
+cyfs-gateway-api = { path = "../cyfs-gateway-api" }
 cyfs-gateway-lib = { path = "../cyfs-gateway-lib" }
 bns-client = { path = "../bns-client" }
 bns-indexer = { path = "../bns-indexer" }

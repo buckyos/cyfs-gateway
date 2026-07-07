@@ -71,8 +71,10 @@ import {
 
 // ---------------------------------------------------------------------------
 // local helpers（原从 buckyos make_config.ts 导入；本仓库不携带该脚本，
-// 这里保留同语义的薄实现。machine.json 步骤已删除：web3_gateway 进程不
-// 消费 machine.json（旧 make_sn_config.py 注释亦断言 SN 不需要）。
+// 这里保留同语义的薄实现。machine.json 由 writeMachineConfig 生成：旧
+// "web3_gateway 进程不消费 machine.json" 的断言已被证伪——cyfs_gateway
+// 启动时用它初始化 name-client 的 web3_bridge（gateway.rs Gateway::start），
+// RTCP keep-tunnel 对来源设备的权威验证依赖 bns 权威指向本 SN。
 // ---------------------------------------------------------------------------
 
 export function ensureDir(dirPath: string): string {
@@ -197,6 +199,29 @@ function writeJson(file: string, data: unknown): void {
 
 function readJson(file: string): Record<string, unknown> {
   return JSON.parse(fs.readFileSync(file, "utf8"));
+}
+
+// SN 进程内 name-client 的 bns method 权威必须指向本 SN 自己：不写这份
+// machine.json 时 cyfs_gateway 落到内置默认 web3.buckyos.ai（生产环境），
+// devtest 的 zone 在那边不存在，RTCP keep-tunnel 会在 SN 侧被拒绝
+// （rtcp.rs resolve_source_device_info 的两级验证全部失败）。
+// 值必须是纯 host（不能带 scheme）：bns bridge 根域同时承担
+// did:bns:<name> ↔ <name>.<bridge> 的 hostname 映射（bns_provider.rs），
+// 带 scheme 会让 RTCP DID hostname 校验失败。https 信任由部署侧安装
+// dev CA 解决（web3-gateway/start.py install_dev_ca）。
+// 部署侧由 web3-gateway/start.py 装载到 {BUCKYOS_ROOT}/etc/machine.json。
+function writeMachineConfig(targetDir: string, snBaseHost: string): void {
+  const machineConfigPath = path.join(targetDir, "machine.json");
+  writeJson(machineConfigPath, {
+    web3_bridge: { bns: `web3.${snBaseHost}` },
+    force_https: false,
+    trust_did: [
+      "did:web:buckyos.org",
+      "did:web:buckyos.ai",
+      "did:web:buckyos.io",
+    ],
+  });
+  console.log(`  machine.json bns bridge -> web3.${snBaseHost}`);
 }
 
 function isProvisionSnDbFile(name: string): boolean {
@@ -406,6 +431,7 @@ async function makeSnConfigs(
   const authDataDir = ensureDir(path.join(targetDir, SN_AUTH_DATA_DIR));
   updateParamsJson(targetDir, snDbPath, authDataDir, stagedParams);
   patchWeb3GatewayConfig(targetDir);
+  writeMachineConfig(targetDir, snBaseHost);
 
   // 2. TLS certificates for sn.$base and *.web3.$base
   console.log("# Step 2: Generate TLS certificates...");
@@ -680,6 +706,47 @@ function yamlQuote(value: string): string {
   return JSON.stringify(value);
 }
 
+// 链上 zone 文档必须满足 name-lib ZoneDocument 的 schema（id /
+// verificationMethod / authentication / iat 必填）：SN 对 RTCP keep-tunnel
+// 来源设备验证的回落路径用 resolve_auth_key(owner) 解析 owner DID，name-lib
+// 按 oods 字段识别为 ZoneDocument 后从 verificationMethod[0] 取 owner 公钥
+// 验 device_doc_jwt 签名。env 的 <zone>.zone.json 只有 oods/sn/exp（BuckyOS
+// boot 面形状），直接上链会让 SN 侧 parse 失败并拒绝 keep-tunnel。BuckyOS
+// 侧 boot/zone 消费面对新增字段宽容，补全无影响。
+const SEED_ZONE_DOC_IAT = 1735689600; // 2025-01-01T00:00:00Z，devtest 确定性时间戳
+
+function toZoneDocumentJson(
+  username: string,
+  env: SeedUserEnvView,
+): Record<string, unknown> {
+  const zone: Record<string, unknown> = { ...env.zoneBootJson };
+  const zoneDid = `did:bns:${username}`;
+  zone.id = zoneDid;
+  zone.owner = zoneDid;
+  zone.verificationMethod = [
+    {
+      type: "Ed25519VerificationKey2020",
+      id: "#owner",
+      controller: zoneDid,
+      publicKeyJwk: { kty: "OKP", crv: "Ed25519", x: env.pkx },
+    },
+  ];
+  zone.authentication = ["#owner"];
+  zone.boot_jwt = env.bootConfigJwt;
+  if (zone.hostname === undefined) {
+    // devtest zone 的 web 主机名：sn 字段形如 sn.<base>，zone host 挂在
+    // <user>.web3.<base>；没有 sn 字段时退回 DID 规范 host。
+    const sn = typeof zone.sn === "string" ? zone.sn : "";
+    zone.hostname = sn.startsWith("sn.")
+      ? `${username}.web3.${sn.slice("sn.".length)}`
+      : `${username}.bns.did`;
+  }
+  if (zone.iat === undefined) {
+    zone.iat = SEED_ZONE_DOC_IAT;
+  }
+  return zone;
+}
+
 /**
  * 产出 bns_dv 的启动种子配置，让种子用户的 BNS 权威文档真正上链：
  *   <targetDir>/bns_dv_seed.yaml             BnsDvSeedConfig
@@ -692,7 +759,7 @@ function yamlQuote(value: string): string {
  *
  * 文档形状与 resolver 消费面对齐（test_sn_bns_integration 同款）：
  *   owner            {"id":"did:bns:<u>","x":<pkx>}          PKX TXT / resolve_owner
- *   zone             env 的 <zone>.zone.json（oods/sn/exp）   规范模型，不内嵌 boot_jwt
+ *   zone             env zone.json 补全 ZoneDocument 必填字段  见 toZoneDocumentJson
  *   boot             签名 boot JWT 原文（inline_text_file）    原子文档；BOOT= TXT 取 jwt
  *   device_mini_doc  {"devices":{"<ood>":{payload+jwt}}}      设备解析 + DEV= TXT
  * did:web 用户（userDomain）只上链 owner——其 ZoneDocument 权威在 SN 的
@@ -725,7 +792,10 @@ export async function makeBnsDvSeedConfig(
 
     if (!user.userDomain) {
       const zoneRel = `${docsRootName}/${user.username}/zone.json`;
-      writeJson(path.join(userDocsDir, "zone.json"), env.zoneBootJson);
+      writeJson(
+        path.join(userDocsDir, "zone.json"),
+        toZoneDocumentJson(user.username, env),
+      );
       docLines.push(
         `      - doc_type: zone`,
         `        inline_json_file: ${yamlQuote(zoneRel)}`,
@@ -764,6 +834,10 @@ export async function makeBnsDvSeedConfig(
         `  - type: register_name`,
         `    name: ${yamlQuote(user.username)}`,
         `    asset_owner: ${yamlQuote(evm.address)}`,
+        // 注册后 owner 已锚定用户地址，重放 apply_mutations（种子文档变更）
+        // 合约只认 owner 本人签名——托管 key 发会 EVM revert。anvil 账户表
+        // 私钥是公开知识，仅限 devtest。
+        `    asset_owner_key: ${yamlQuote(evm.privateKey)}`,
         `    if_exists: apply_mutations`,
         `    initial_documents:`,
         ...docLines,
@@ -775,8 +849,9 @@ export async function makeBnsDvSeedConfig(
   const yaml = [
     "# bns_dv_seed.yaml —— make_sn_config.ts (seed-v2) 生成，格式真值见",
     "# bns_dv.rs BnsDvInitConfig。种子经 bns_dv 托管 key 代发（等价 Web2 代",
-    "# 注册），asset_owner 锚定各用户 EVM 地址（anvil 固定助记词账户表）。",
-    "# 仅限 devtest：托管 key 是公开的 anvil account[0]。",
+    "# 注册），asset_owner 锚定各用户 EVM 地址（anvil 固定助记词账户表）；",
+    "# asset_owner_key 供重启重放：文档变更时合约只认 owner 本人签名的",
+    "# apply_mutations。仅限 devtest：托管 key 与账户表私钥都是公开知识。",
     "seed:",
     `  private_key: ${yamlQuote(BNS_DV_SEED_SENDER.privateKey)}`,
     "  if_exists: apply_mutations",

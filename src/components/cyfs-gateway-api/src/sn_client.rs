@@ -1,15 +1,60 @@
 use ::kRPC::*;
 use async_trait::async_trait;
+use jsonwebtoken::EncodingKey;
 use log::warn;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::HashMap;
 use std::net::IpAddr;
 use std::result::Result;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 const SN_ROOT_PATH: &str = "/kapi/sn";
 const SN_AUTH_PATH: &str = "/kapi/sn/auth";
 const SN_DEVICEINFO_PATH: &str = "/kapi/sn/deviceinfo";
 const LEGACY_SN_BNS_PATH: &str = "/kapi/sn/bns";
+
+/// `aud` claim of a device-signed SN access token. SN 账号 token 的 aud 是
+/// `sn`，设备 token 用独立 aud 隔离，两边的校验路径互不接受对方的 token。
+pub const SN_DEVICE_TOKEN_AUD: &str = "sn-device";
+/// 设备 token 默认有效期。设备上报周期是秒级，token 只需覆盖单次调用；
+/// SN 侧对 exp 有硬上限（见 cyfs-sn sn_authority），不要设置长寿命 token。
+pub const SN_DEVICE_TOKEN_DEFAULT_TTL_SECS: u64 = 600;
+
+/// 生成设备级 SN 凭证（JWT，设备私钥 EdDSA 签名）。
+///
+/// claims 约定（SN 侧 `sn_authority::require_sn_device` 按此校验）：
+/// - `sub`: 设备 key DID（`did:dev:<ed25519-x>`），公钥内嵌，签名自证；
+/// - `iss`: 设备的 zone 域名层级 DID（如 `did:bns:ood1.alice`、
+///   `did:web:ood1.charlie.me`），SN 由此定位 (zone, device_name) 并用
+///   zone 权威文档（BNS device_mini_doc / zone doc / 兼容设备表）锚定
+///   `sub` 中的公钥，锚定不上则拒绝；
+/// - `aud`: [`SN_DEVICE_TOKEN_AUD`]；
+/// - `exp`: 过期时间戳。
+pub fn generate_sn_device_token(
+    device_key_did: &str,
+    device_scoped_did: &str,
+    ttl_secs: Option<u64>,
+    device_private_key: &EncodingKey,
+) -> Result<String, RPCErrors> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let session_token = RPCSessionToken {
+        token_type: RPCSessionTokenType::JWT,
+        token: None,
+        aud: Some(SN_DEVICE_TOKEN_AUD.to_string()),
+        exp: Some(now + ttl_secs.unwrap_or(SN_DEVICE_TOKEN_DEFAULT_TTL_SECS)),
+        iss: Some(device_scoped_did.to_string()),
+        jti: None,
+        sub: Some(device_key_did.to_string()),
+        appid: None,
+        sudo: false,
+        extra: HashMap::new(),
+    };
+    session_token.generate_jwt(None, device_private_key)
+}
 
 #[derive(Clone, Copy)]
 enum SnRpcTarget {

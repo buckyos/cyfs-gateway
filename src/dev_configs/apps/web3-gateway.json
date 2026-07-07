@@ -9,13 +9,13 @@
   },
   "commands": {
     "build": [
-      "cd {{system.base_dir}} && uv run ./build.py aarch64",
-      "rm -rf /opt/web3-gateway/bns && mkdir -p /opt/web3-gateway/bns && cp {{system.base_dir}}/apps/bns/foundry.toml /opt/web3-gateway/bns/ && cp -R {{system.base_dir}}/apps/bns/src /opt/web3-gateway/bns/"
+      "cd {{app.dir}}/../.. && uv run ./build.py aarch64",
+      "rm -rf /opt/web3-gateway/bns && mkdir -p /opt/web3-gateway/bns && cp {{app.dir}}/../../apps/bns/foundry.toml /opt/web3-gateway/bns/ && cp -R {{app.dir}}/../../apps/bns/src /opt/web3-gateway/bns/"
     ],
     "build_all": [
-      "cd {{system.base_dir}} && uv run ./build.py aarch64",
-      "rm -rf /opt/web3-gateway/bns && mkdir -p /opt/web3-gateway/bns && cp {{system.base_dir}}/apps/bns/foundry.toml /opt/web3-gateway/bns/ && cp -R {{system.base_dir}}/apps/bns/src /opt/web3-gateway/bns/",
-      "cd {{system.base_dir}} && deno run -A ./make_sn_config.ts --seed-v2 --sn_ip {{sn.ip}}"
+      "cd {{app.dir}}/../.. && uv run ./build.py aarch64",
+      "rm -rf /opt/web3-gateway/bns && mkdir -p /opt/web3-gateway/bns && cp {{app.dir}}/../../apps/bns/foundry.toml /opt/web3-gateway/bns/ && cp -R {{app.dir}}/../../apps/bns/src /opt/web3-gateway/bns/",
+      "cd {{app.dir}}/../.. && deno run -A ./make_sn_config.ts --seed-v2 --sn_ip {{sn.ip}}"
     ],
     "install": [
       "sudo chmod +x /opt/web3-gateway/web3_gateway /opt/web3-gateway/init_anvil.py"
