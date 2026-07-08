@@ -1,6 +1,6 @@
 use crate::{
-    sn_err, AccountSession, DomainBinding, PkxBindingChallenge, SNUserInfo, SnAuthDB, SnAuthInfo,
-    SnClearStateResult, SnError, SnErrorCode, SnResult, UserState, ZoneInfo, ZoneInfoPatch,
+    sn_err, AccountSession, DomainBinding, SNUserInfo, SnAuthDB, SnAuthInfo, SnClearStateResult,
+    SnError, SnErrorCode, SnResult, UserState, ZoneInfo, ZoneInfoPatch,
 };
 use ::kRPC::{kRPC, RPCErrors, RPCHandler, RPCRequest, RPCResponse, RPCResult};
 use async_trait::async_trait;
@@ -31,8 +31,7 @@ pub const METHOD_UPDATE_USER_DOMAIN: &str = "sn_auth_db.update_user_domain";
 pub const METHOD_GET_USER_SN_IPS: &str = "sn_auth_db.get_user_sn_ips";
 pub const METHOD_GET_AUTH: &str = "sn_auth_db.get_auth";
 pub const METHOD_UPDATE_LAST_LOGIN: &str = "sn_auth_db.update_last_login";
-pub const METHOD_CREATE_PKX_BINDING: &str = "sn_auth_db.create_pkx_binding";
-pub const METHOD_VERIFY_PKX_BINDING: &str = "sn_auth_db.verify_pkx_binding";
+pub const METHOD_ACTIVATE_USER_DOMAIN_BINDING: &str = "sn_auth_db.activate_user_domain_binding";
 pub const METHOD_UNBIND_USER_DOMAIN: &str = "sn_auth_db.unbind_user_domain";
 pub const METHOD_GET_ZONE_INFO: &str = "sn_auth_db.get_zone_info";
 pub const METHOD_UPDATE_ZONE_INFO: &str = "sn_auth_db.update_zone_info";
@@ -421,39 +420,22 @@ impl SnAuthDbUpdateLastLoginReq {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SnAuthDbCreatePkxBindingReq {
+pub struct SnAuthDbActivateUserDomainBindingReq {
     pub username: String,
     pub domain: String,
+    pub pkx: String,
 }
 
-impl SnAuthDbCreatePkxBindingReq {
-    pub fn new(username: &str, domain: &str) -> Self {
+impl SnAuthDbActivateUserDomainBindingReq {
+    pub fn new(username: &str, domain: &str, pkx: &str) -> Self {
         Self {
             username: username.to_string(),
             domain: domain.to_string(),
+            pkx: pkx.to_string(),
         }
     }
 
-    impl_req_from_json!(SnAuthDbCreatePkxBindingReq);
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SnAuthDbVerifyPkxBindingReq {
-    pub username: String,
-    pub domain: String,
-    pub txt_records: Vec<String>,
-}
-
-impl SnAuthDbVerifyPkxBindingReq {
-    pub fn new(username: &str, domain: &str, txt_records: &[String]) -> Self {
-        Self {
-            username: username.to_string(),
-            domain: domain.to_string(),
-            txt_records: txt_records.to_vec(),
-        }
-    }
-
-    impl_req_from_json!(SnAuthDbVerifyPkxBindingReq);
+    impl_req_from_json!(SnAuthDbActivateUserDomainBindingReq);
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -969,39 +951,22 @@ impl SnAuthDB for SnAuthDbClient {
         }
     }
 
-    async fn create_pkx_binding(
+    async fn activate_user_domain_binding(
         &self,
         username: &str,
         domain: &str,
-    ) -> SnResult<PkxBindingChallenge> {
-        match self {
-            Self::InProcess(handler) => handler.create_pkx_binding(username, domain).await,
-            Self::KRPC(_) => {
-                self.call(
-                    METHOD_CREATE_PKX_BINDING,
-                    &SnAuthDbCreatePkxBindingReq::new(username, domain),
-                )
-                .await
-            }
-        }
-    }
-
-    async fn verify_pkx_binding(
-        &self,
-        username: &str,
-        domain: &str,
-        txt_records: &[String],
+        pkx: &str,
     ) -> SnResult<DomainBinding> {
         match self {
             Self::InProcess(handler) => {
                 handler
-                    .verify_pkx_binding(username, domain, txt_records)
+                    .activate_user_domain_binding(username, domain, pkx)
                     .await
             }
             Self::KRPC(_) => {
                 self.call(
-                    METHOD_VERIFY_PKX_BINDING,
-                    &SnAuthDbVerifyPkxBindingReq::new(username, domain, txt_records),
+                    METHOD_ACTIVATE_USER_DOMAIN_BINDING,
+                    &SnAuthDbActivateUserDomainBindingReq::new(username, domain, pkx),
                 )
                 .await
             }
@@ -1300,20 +1265,15 @@ where
                     &req,
                 )
             }
-            METHOD_CREATE_PKX_BINDING | "create_pkx_binding" => {
-                let parsed = SnAuthDbCreatePkxBindingReq::from_json(req.params.clone())?;
+            METHOD_ACTIVATE_USER_DOMAIN_BINDING | "activate_user_domain_binding" => {
+                let parsed = SnAuthDbActivateUserDomainBindingReq::from_json(req.params.clone())?;
                 rpc_envelope_response(
                     self.0
-                        .create_pkx_binding(&parsed.username, &parsed.domain)
-                        .await,
-                    &req,
-                )
-            }
-            METHOD_VERIFY_PKX_BINDING | "verify_pkx_binding" => {
-                let parsed = SnAuthDbVerifyPkxBindingReq::from_json(req.params.clone())?;
-                rpc_envelope_response(
-                    self.0
-                        .verify_pkx_binding(&parsed.username, &parsed.domain, &parsed.txt_records)
+                        .activate_user_domain_binding(
+                            &parsed.username,
+                            &parsed.domain,
+                            &parsed.pkx,
+                        )
                         .await,
                     &req,
                 )

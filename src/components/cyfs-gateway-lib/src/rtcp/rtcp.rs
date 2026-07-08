@@ -15,6 +15,7 @@ use crate::{
 };
 use anyhow::Result;
 use async_trait::async_trait;
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use buckyos_kit::{AsyncStream, buckyos_get_unix_timestamp};
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use hex::ToHex;
@@ -244,6 +245,13 @@ struct ResolvedHandshakeIdentity {
     ed25519_pk_der: [u8; 32],
 }
 
+struct VerifiedSourceDevice {
+    source_device_id: String,
+    canonical_dev_did: DID,
+    source_device_info: Option<RTcpSourceDeviceInfo>,
+    public_key: DecodingKey,
+}
+
 // Decode a hex-encoded 32-byte X25519 public key. Used by both Hello and
 // HelloAck JWT verification paths.
 fn decode_x25519_pub_hex(hex_str: &str) -> Result<[u8; 32], TunnelError> {
@@ -254,6 +262,11 @@ fn decode_x25519_pub_hex(hex_str: &str) -> Result<[u8; 32], TunnelError> {
     })
 }
 
+fn canonical_dev_did_from_ed25519_pk(ed25519_pk_der: &[u8; 32]) -> DID {
+    let pkx = URL_SAFE_NO_PAD.encode(ed25519_pk_der);
+    DID::new("dev", &pkx)
+}
+
 struct RTcpInner {
     tunnel_map: RTcpTunnelMap,
     stream_helper: RTcpStreamBuildHelper,
@@ -262,6 +275,7 @@ struct RTcpInner {
     bind_addr: String,
     reuse_address: bool,
     this_device_did: DID, //name or did
+    this_device_dev_did: DID,
     this_device_ed25519_sk: Option<EncodingKey>,
     this_device_doc_jwt: Option<String>,
     // Used by create_tunnel to build a bootstrap stream through the tunnel
@@ -429,6 +443,7 @@ impl RTcpInner {
     async fn resolve_handshake_identity(
         remote_did: &DID,
     ) -> Result<ResolvedHandshakeIdentity, String> {
+        validate_rtcp_hostname_form_did(remote_did, "rtcp handshake did")?;
         debug!(
             "resolve handshake identity for remote device {}",
             remote_did.to_string()
@@ -521,28 +536,87 @@ impl RTcpInner {
         }
     }
 
-    async fn validate_hello_target(token_to: &str, this_host: &str) -> Result<(), String> {
+    async fn resolve_remote_tunnel_dev_did(&self, remote_did: &DID) -> TunnelResult<DID> {
+        let identity = Self::resolve_handshake_identity(remote_did)
+            .await
+            .map_err(|e| {
+                TunnelError::DocumentError(format!(
+                    "resolve remote device {} canonical did:dev failed: {}",
+                    remote_did.to_string(),
+                    e
+                ))
+            })?;
+        let canonical_dev_did = canonical_dev_did_from_ed25519_pk(&identity.ed25519_pk_der);
+        if identity.did.to_string() != canonical_dev_did.to_string() {
+            debug!(
+                "rtcp remote {} resolved to canonical tunnel device {}",
+                remote_did.to_string(),
+                canonical_dev_did.to_string()
+            );
+        }
+        Ok(canonical_dev_did)
+    }
+
+    fn format_tunnel_key(
+        &self,
+        remote_dev_did: &DID,
+        bootstrap_stream_url: Option<&str>,
+    ) -> String {
+        match bootstrap_stream_url {
+            Some(bootstrap_url) => format!(
+                "{}_{}|bootstrap={}",
+                self.this_device_dev_did.to_string(),
+                remote_dev_did.to_string(),
+                bootstrap_url
+            ),
+            None => format!(
+                "{}_{}",
+                self.this_device_dev_did.to_string(),
+                remote_dev_did.to_string()
+            ),
+        }
+    }
+
+    async fn validate_hello_target(
+        token_to: &str,
+        this_host: &str,
+        this_dev_did: &DID,
+    ) -> Result<(), String> {
         if token_to == this_host {
             return Ok(());
         }
 
         let target_did = DID::from_str(token_to)
             .map_err(|e| format!("token.to {} is not a valid DID: {}", token_to, e))?;
+        // token.to 指向当前 stack 的 did(did 字符串形式)或当前 stack 的
+        // did:dev:xxx 规范形式(字符串或 host_name 形式)都可以接受。
+        if target_did == *this_dev_did || target_did.to_host_name() == this_host {
+            return Ok(());
+        }
+
         if target_did.method != "web" {
             return Err(format!(
-                "token.to {} is not this device {} and is not a web alias",
-                token_to, this_host
+                "token.to {} is not this device {} ({}) and is not a web alias",
+                token_to,
+                this_host,
+                this_dev_did.to_string()
             ));
         }
 
         let resolved_identity = Self::resolve_handshake_identity(&target_did).await?;
+        if resolved_identity.did == *this_dev_did {
+            return Ok(());
+        }
         let resolved_host = resolved_identity.did.to_host_name();
         if resolved_host == this_host {
             Ok(())
         } else {
             Err(format!(
-                "token.to {} resolves to {}, not this device {}",
-                token_to, resolved_host, this_host
+                "token.to {} resolves to {}, not this device {} ({})",
+                token_to,
+                resolved_host,
+                this_host,
+                this_dev_did.to_string()
             ))
         }
     }
@@ -699,6 +773,18 @@ impl RTcpInner {
         let this_device_ed25519_sk = private_key_pkcs8_bytes
             .as_ref()
             .map(|bytes| EncodingKey::from_ed_der(bytes));
+        let this_device_dev_did = private_key_pkcs8_bytes
+            .as_ref()
+            .map(|bytes| DID::new("dev", &encode_ed25519_pkcs8_sk_to_pk(bytes)))
+            .unwrap_or_else(|| {
+                if this_device_did.method != "dev" {
+                    warn!(
+                        "rtcp {} has no private key; tunnel key local side cannot be canonicalized to did:dev",
+                        this_device_did.to_string()
+                    );
+                }
+                this_device_did.clone()
+            });
 
         let result = RTcpInner {
             tunnel_map: RTcpTunnelMap::new(),
@@ -708,6 +794,7 @@ impl RTcpInner {
             bind_addr,
             reuse_address: false,
             this_device_did,
+            this_device_dev_did,
             this_device_ed25519_sk, //for sign tunnel token
             this_device_doc_jwt,
             tunnel_manager: None,
@@ -909,65 +996,196 @@ impl RTcpInner {
         Ok((xpub_bytes, payload))
     }
 
-    async fn resolve_source_device_info(
+    // device_doc_jwt 验证分两级(doc/verify-did-document-jwt.md"RTCP 迁移示例"):
+    //
+    // 1. 权威锚定:name-client 的 verify_device_document_jwt(AuthSubject +
+    //    CurrentActive + cache_result)。验签 owner 只能来自权威 owner 绑定或
+    //    method 名字结构(expected_owner),绝不来自 payload 自声明;验证通过由
+    //    name-client 按证据等级受控写入 Verified/Published 缓存,后续 strict
+    //    resolve_did 可直接命中。
+    // 2. 回落:自声明 owner 验证 + 观察缓存写入(见
+    //    verify_source_device_doc_self_declared)。rtcp stack 层只做认证,授权由
+    //    buckyos on_new_tunnel 配置层锚定权威 owner,离线 LAN / 首次组网不能因
+    //    权威不可达拒绝握手,所以只有 Definite 类失败(候选本身被证明有问题或被
+    //    权威源明确否定)拒绝握手;信任链暂时评估不了的 Unavailable 类(权威没
+    //    回答、method 未注册、owner 文档拿不到,以及 NotCurrentActive 这类无法与
+    //    "权威没回答"区分的混装档)回落到第 2 级。
+    //
+    // 代价与取舍:权威把文档标成 Revoked/Tombstoned 时错误码同为 NotCurrentActive,
+    // stack 层会回落放行——吊销强制执行留给授权层与 strict resolve(verify 失败时
+    // 上游已写入负缓存,可信解析面看得到吊销)。
+    fn is_definite_verify_rejection(err: &NSError) -> bool {
+        matches!(
+            VerifyDidJwtErrorCode::of(err),
+            Some(
+                VerifyDidJwtErrorCode::DocumentIdMismatch
+                    | VerifyDidJwtErrorCode::DeclaredOwnerMismatch
+                    | VerifyDidJwtErrorCode::DetachedOwnerRejected
+                    | VerifyDidJwtErrorCode::SignatureVerificationFailed
+                    | VerifyDidJwtErrorCode::RevokedByOwnerPolicy
+            )
+        )
+    }
+
+    // 第 2 级回落:用 payload 自声明 owner 验签 + 观察缓存写入。只能证明"JWT 能
+    // 被它自己声明的 owner 验过",不建立权威 owner 绑定;仅在权威锚定验证
+    // Unavailable 时使用。
+    async fn verify_source_device_doc_self_declared(
         hello_body: &RTcpHelloBody,
-    ) -> Result<(String, Option<RTcpSourceDeviceInfo>, DecodingKey), TunnelError> {
-        if let Some(device_doc_jwt) = hello_body.device_doc_jwt.as_ref() {
-            let unverified_doc =
-                DeviceConfig::decode(&EncodedDocument::Jwt(device_doc_jwt.clone()), None).map_err(
-                    |e| {
-                        TunnelError::DocumentError(format!(
-                            "decode device_doc_jwt without verify failed:{}",
-                            e
-                        ))
-                    },
-                )?;
-            let owner_public_key = resolve_auth_key(&unverified_doc.owner, None)
-                .await
+        device_doc_jwt: &str,
+    ) -> Result<VerifiedSourceDevice, TunnelError> {
+        let unverified_doc =
+            DeviceDocument::decode(&EncodedDocument::Jwt(device_doc_jwt.to_string()), None)
                 .map_err(|e| {
                     TunnelError::DocumentError(format!(
-                        "resolve owner auth key for {} failed:{}",
-                        unverified_doc.owner.to_string(),
+                        "decode device_doc_jwt without verify failed:{}",
                         e
                     ))
                 })?;
-            let verified_doc = DeviceConfig::decode(
-                &EncodedDocument::Jwt(device_doc_jwt.clone()),
-                Some(&owner_public_key),
-            )
+        let owner_public_key = resolve_auth_key(&unverified_doc.owner, None)
+            .await
             .map_err(|e| {
-                TunnelError::DocumentError(format!("verify device_doc_jwt failed:{}", e))
+                TunnelError::DocumentError(format!(
+                    "resolve owner auth key for {} failed:{}",
+                    unverified_doc.owner.to_string(),
+                    e
+                ))
             })?;
-            //注意:此时不能使用did:dev:xxx的形式，必须用name did的形式
-            if verified_doc.id.to_string() != hello_body.from_id {
-                return Err(TunnelError::DocumentError(format!(
-                    "hello from_id {} not match device_doc_jwt id {}",
-                    hello_body.from_id,
-                    verified_doc.id.to_string()
-                )));
-            }
-            let default_key = verified_doc.get_default_key().ok_or_else(|| {
-                TunnelError::DocumentError("device_doc_jwt missing default key".to_string())
-            })?;
-            let ed25519_pk = jwk_to_ed25519_pk(&default_key).map_err(|e| {
-                TunnelError::DocumentError(format!("decode device_doc_jwt public key failed:{}", e))
-            })?;
-            let from_public_key = DecodingKey::from_ed_der(&ed25519_pk);
-            return Ok((
+        let verified_doc = DeviceDocument::decode(
+            &EncodedDocument::Jwt(device_doc_jwt.to_string()),
+            Some(&owner_public_key),
+        )
+        .map_err(|e| TunnelError::DocumentError(format!("verify device_doc_jwt failed:{}", e)))?;
+        //注意:此时不能使用did:dev:xxx的形式，必须用name did的形式
+        if verified_doc.id.to_string() != hello_body.from_id {
+            return Err(TunnelError::DocumentError(format!(
+                "hello from_id {} not match device_doc_jwt id {}",
+                hello_body.from_id,
+                verified_doc.id.to_string()
+            )));
+        }
+        let default_key = verified_doc.get_default_key().ok_or_else(|| {
+            TunnelError::DocumentError("device_doc_jwt missing default key".to_string())
+        })?;
+        let ed25519_pk = jwk_to_ed25519_pk(&default_key).map_err(|e| {
+            TunnelError::DocumentError(format!("decode device_doc_jwt public key failed:{}", e))
+        })?;
+        // 把 device_doc 写入 name_client 的观察缓存(Observed/Unverified,
+        // doc/update-did-cache.md):update_did_cache 不提升信任等级,后续
+        // strict resolve_did 命中时会先经 lazy verify(权威可达且文档在当前
+        // 发布集合内才 promote 返回);离线/无权威场景需要 resolve_did_ex
+        // 的 allow_unverified_cache_when_unavailable 宽松策略才能取回。
+        // 只缓存 DID 文档,不能调用 add_device_info_cache 更新 device_info。
+        // 缓存失败不影响本次握手(验证已经完成)。
+        if let Err(e) = update_did_cache(
+            verified_doc.id.clone(),
+            None,
+            EncodedDocument::Jwt(device_doc_jwt.to_string()),
+            None,
+        )
+        .await
+        {
+            warn!(
+                "cache verified device_doc for {} failed: {}",
                 verified_doc.id.to_string(),
-                Some(RTcpSourceDeviceInfo {
-                    device_doc_jwt: Some(device_doc_jwt.clone()),
-                    name: Some(verified_doc.name.clone()),
-                    owner: Some(verified_doc.owner.to_string()),
-                    zone_did: verified_doc.zone_did.map(|did| did.to_string()),
-                }),
-                from_public_key,
-            ));
+                e
+            );
+        }
+        let from_public_key = DecodingKey::from_ed_der(&ed25519_pk);
+        Ok(VerifiedSourceDevice {
+            source_device_id: verified_doc.id.to_string(),
+            canonical_dev_did: canonical_dev_did_from_ed25519_pk(&ed25519_pk),
+            source_device_info: Some(RTcpSourceDeviceInfo {
+                device_doc_jwt: Some(device_doc_jwt.to_string()),
+                name: Some(verified_doc.name.clone()),
+                owner: Some(verified_doc.owner.to_string()),
+                zone_did: verified_doc.zone_did.map(|did| did.to_string()),
+            }),
+            public_key: from_public_key,
+        })
+    }
+
+    async fn resolve_source_device_info(
+        hello_body: &RTcpHelloBody,
+    ) -> Result<VerifiedSourceDevice, TunnelError> {
+        if let Some(device_doc_jwt) = hello_body.device_doc_jwt.as_ref() {
+            // 第 1 级:权威锚定验证。from_id 解析不了 DID 时直接走回落,由旧的
+            // 文档 id 字符串比对给出与迁移前一致的错误。
+            if let Ok(from_did) = DID::from_str(hello_body.from_id.as_str()) {
+                match verify_device_document_jwt(
+                    &from_did,
+                    device_doc_jwt,
+                    VerifyDidDocumentJwtOptions::default(),
+                )
+                .await
+                {
+                    Ok((device_doc, verified)) => {
+                        // DID::from_str 对裸 host 形式宽容;保持旧契约:from_id
+                        // 必须是文档 id 的规范 DID 字符串。
+                        if verified.subject_did.to_string() != hello_body.from_id {
+                            return Err(TunnelError::DocumentError(format!(
+                                "hello from_id {} not match device_doc_jwt id {}",
+                                hello_body.from_id,
+                                verified.subject_did.to_string()
+                            )));
+                        }
+                        let default_key = device_doc.get_default_key().ok_or_else(|| {
+                            TunnelError::DocumentError(
+                                "device_doc_jwt missing default key".to_string(),
+                            )
+                        })?;
+                        let ed25519_pk = jwk_to_ed25519_pk(&default_key).map_err(|e| {
+                            TunnelError::DocumentError(format!(
+                                "decode device_doc_jwt public key failed:{}",
+                                e
+                            ))
+                        })?;
+                        // source owner 用 authz_owner(AuthSubject 成功时必为
+                        // Some,等于 expected_owner),不用 payload 自声明 owner。
+                        // 受控缓存写入(Verified/Published)已由 verify 入口完成,
+                        // 不再调 update_did_cache(那是 Unverified 旁路)。
+                        return Ok(VerifiedSourceDevice {
+                            source_device_id: verified.subject_did.to_string(),
+                            canonical_dev_did: canonical_dev_did_from_ed25519_pk(&ed25519_pk),
+                            source_device_info: Some(RTcpSourceDeviceInfo {
+                                device_doc_jwt: Some(device_doc_jwt.clone()),
+                                name: Some(device_doc.name.clone()),
+                                owner: verified.authz_owner.map(|did| did.to_string()),
+                                zone_did: device_doc.zone_did.map(|did| did.to_string()),
+                            }),
+                            public_key: DecodingKey::from_ed_der(&ed25519_pk),
+                        });
+                    }
+                    Err(err) => {
+                        if Self::is_definite_verify_rejection(&err) {
+                            return Err(TunnelError::DocumentError(format!(
+                                "verify device_doc_jwt for {} rejected: {}",
+                                hello_body.from_id, err
+                            )));
+                        }
+                        info!(
+                            "authoritative verify of device_doc_jwt for {} unavailable, \
+                             falling back to self-declared owner verification: {}",
+                            hello_body.from_id, err
+                        );
+                    }
+                }
+            }
+            return Self::verify_source_device_doc_self_declared(hello_body, device_doc_jwt).await;
         }
 
         let from_did = DID::from_str(hello_body.from_id.as_str()).map_err(|_e| {
             TunnelError::DocumentError("invalid from device is not did".to_string())
         })?;
+        // from 是逻辑名字(非 did:dev:xxx)时必须带 device_doc_jwt:逻辑名字
+        // 的 key 只能由 owner 签名的 device_doc 证明,不允许在握手时反向
+        // 依赖名字解析结果来认证对端。
+        if from_did.method != "dev" {
+            return Err(TunnelError::DocumentError(format!(
+                "hello from_id {} is a logical name (not did:dev), device_doc_jwt is required",
+                hello_body.from_id
+            )));
+        }
         let ed25519_pk = resolve_ed25519_exchange_key(&from_did)
             .await
             .map_err(|op| {
@@ -978,7 +1196,12 @@ impl RTcpInner {
                 ))
             })?;
         let from_public_key = DecodingKey::from_ed_der(&ed25519_pk);
-        Ok((hello_body.from_id.clone(), None, from_public_key))
+        Ok(VerifiedSourceDevice {
+            source_device_id: hello_body.from_id.clone(),
+            canonical_dev_did: canonical_dev_did_from_ed25519_pk(&ed25519_pk),
+            source_device_info: None,
+            public_key: from_public_key,
+        })
     }
 
     // v2 session-key derivation. Replaces the old SHA256(shared_secret)
@@ -1204,7 +1427,11 @@ impl RTcpInner {
             );
             return;
         }
-        let (source_device_id, source_device_info, source_public_key) = source_device.unwrap();
+        let source_device = source_device.unwrap();
+        let source_device_id = source_device.source_device_id;
+        let source_device_info = source_device.source_device_info;
+        let source_public_key = source_device.public_key;
+        let source_dev_did = source_device.canonical_dev_did;
         let token = hello_package.body.tunnel_token.as_ref().unwrap().clone();
         let source_did = match DID::from_str(source_device_id.as_str()) {
             Ok(did) => did,
@@ -1216,6 +1443,13 @@ impl RTcpInner {
                 return;
             }
         };
+        if let Err(e) = validate_rtcp_hostname_form_did(&source_did, "rtcp hello from_id") {
+            warn!(
+                "reject rtcp tunnel from {} {}: {}",
+                source_device_id, source_addr_log, e
+            );
+            return;
+        }
         let (initiator_xpub_bytes, hello_payload) = match RTcpInner::verify_hello_token(
             &token,
             &source_public_key,
@@ -1234,7 +1468,10 @@ impl RTcpInner {
         // §14.2 anti-replay: every Hello token must bind this responder
         // and must not be replayed within its exp window.
         let this_host = self.this_device_did.to_host_name();
-        if let Err(e) = Self::validate_hello_target(&hello_payload.to, &this_host).await {
+        if let Err(e) =
+            Self::validate_hello_target(&hello_payload.to, &this_host, &self.this_device_dev_did)
+                .await
+        {
             warn!(
                 "reject rtcp tunnel from {} {}: token.to {} not accepted for this device {}: {}",
                 source_device_id, source_addr_log, hello_payload.to, this_host, e
@@ -1250,10 +1487,11 @@ impl RTcpInner {
         // defeating the anti-replay guarantee. See regression test
         // nonce_cache_retains_entry_past_exp_within_leeway.
         let retain_until = hello_payload.exp.saturating_add(JWT_LEEWAY_SECS);
+        let source_dev_device_id = source_dev_did.to_string();
         let fresh = self
             .nonce_cache
             .insert_if_fresh(
-                &source_device_id,
+                source_dev_device_id.as_str(),
                 &hello_payload.nonce,
                 retain_until,
                 now_ts,
@@ -1385,12 +1623,7 @@ impl RTcpInner {
             self.listener.clone(),
         );
 
-        //TODO:这里是否应该归一化成，必须使用devcie公钥来做key？
-        let tunnel_key = format!(
-            "{}_{}",
-            self.this_device_did.to_string(),
-            source_device_id.as_str()
-        );
+        let tunnel_key = self.format_tunnel_key(&source_dev_did, None);
         {
             //info!("accept tunnel from {} try get lock",hello_package.body.from_id.as_str());
             if self
@@ -1433,36 +1666,24 @@ impl RTcpInner {
             ));
         }
         let tunnel_stack_id = tunnel_stack_id.unwrap();
-        let remote_stack = parse_rtcp_stack_id(tunnel_stack_id);
-        if remote_stack.is_none() {
-            return Err(TunnelError::ConnectError(format!(
-                "invalid remote stack id:{:?}",
-                remote_stack
-            )));
-        }
-        let remote_stack: RTcpTargetStackEP = remote_stack.unwrap();
-        let remote_device_id = remote_stack.did.to_string();
-
-        // Bootstrap-backed tunnels must NOT collide with direct ones (or with
-        // each other across different bootstrap transports), or routing,
-        // credentials and isolation semantics from one bootstrap path could
-        // bleed into another reusing the same remote did. Tag the reuse key
-        // with the bootstrap URL when present.
-        let tunnel_key = match remote_stack.bootstrap_stream_url.as_ref() {
-            Some(bootstrap_url) => format!(
-                "{}_{}|bootstrap={}",
-                self.this_device_did.to_string(),
-                remote_device_id.as_str(),
-                bootstrap_url
-            ),
-            None => format!(
-                "{}_{}",
-                self.this_device_did.to_string(),
-                remote_device_id.as_str()
-            ),
-        };
+        let remote_stack = parse_rtcp_stack_id_checked(tunnel_stack_id).map_err(|e| {
+            TunnelError::ConnectError(format!(
+                "invalid remote stack id '{}': {}",
+                tunnel_stack_id, e
+            ))
+        })?;
+        let target_device_id = remote_stack.did.to_string();
+        let remote_dev_did = self
+            .resolve_remote_tunnel_dev_did(&remote_stack.did)
+            .await?;
+        let remote_device_id = remote_dev_did.to_string();
+        let tunnel_key = self.format_tunnel_key(
+            &remote_dev_did,
+            remote_stack.bootstrap_stream_url.as_deref(),
+        );
         debug!(
-            "will create tunnel to {} ,tunnel key is {},try reuse",
+            "will create tunnel to {} (canonical {}), tunnel key is {}, try reuse",
+            target_device_id.as_str(),
             remote_device_id.as_str(),
             tunnel_key.as_str()
         );
@@ -1498,7 +1719,7 @@ impl RTcpInner {
                 .map_err(|e| {
                     let msg = format!(
                         "open bootstrap stream '{}' for {} failed: {}",
-                        bootstrap_url, remote_device_id, e
+                        bootstrap_url, target_device_id, e
                     );
                     error!("{}", msg);
                     TunnelError::ConnectError(msg)
@@ -1610,8 +1831,8 @@ impl RTcpInner {
         // address ordering based on its RFC 8305 / addr-rtt policy.
         let resolve_name = remote_stack.did.to_string();
         debug!(
-            "resolve remote device {} ips by {}",
-            remote_device_id, resolve_name
+            "resolve remote device {} (canonical {}) ips by {}",
+            target_device_id, remote_device_id, resolve_name
         );
 
         let candidate_ips = match resolve_ips(resolve_name.as_str()).await {
@@ -1619,7 +1840,7 @@ impl RTcpInner {
             Ok(_) => {
                 let msg = format!(
                     "cann't resolve remote device {} ip by {}: empty address list",
-                    remote_device_id, resolve_name
+                    target_device_id, resolve_name
                 );
                 error!("{}", msg);
                 return Err(TunnelError::DocumentError(msg));
@@ -1627,7 +1848,7 @@ impl RTcpInner {
             Err(err) => {
                 let msg = format!(
                     "cann't resolve remote device {} ip by {}: {}",
-                    remote_device_id, resolve_name, err
+                    target_device_id, resolve_name, err
                 );
                 error!("{}", msg);
                 return Err(TunnelError::DocumentError(msg));
@@ -1716,25 +1937,19 @@ impl RTcpInner {
 
         Err(TunnelError::ConnectError(format!(
             "connect to remote {} failed after trying all candidates: {}",
-            remote_device_id,
+            target_device_id,
             connect_errors.join("; ")
         )))
     }
 
-    fn compute_tunnel_key(&self, remote_stack: &RTcpTargetStackEP) -> String {
-        match remote_stack.bootstrap_stream_url.as_ref() {
-            Some(bootstrap_url) => format!(
-                "{}_{}|bootstrap={}",
-                self.this_device_did.to_string(),
-                remote_stack.did.to_string(),
-                bootstrap_url
-            ),
-            None => format!(
-                "{}_{}",
-                self.this_device_did.to_string(),
-                remote_stack.did.to_string()
-            ),
-        }
+    async fn compute_tunnel_key(&self, remote_stack: &RTcpTargetStackEP) -> TunnelResult<String> {
+        let remote_dev_did = self
+            .resolve_remote_tunnel_dev_did(&remote_stack.did)
+            .await?;
+        Ok(self.format_tunnel_key(
+            &remote_dev_did,
+            remote_stack.bootstrap_stream_url.as_deref(),
+        ))
     }
 
     pub async fn probe_url(
@@ -1754,19 +1969,30 @@ impl RTcpInner {
                 "rtcp url has no remote stack id".to_string(),
             ));
         }
-        let remote_stack = match parse_rtcp_stack_id(stack_id) {
-            Some(s) => s,
-            None => {
+        let remote_stack = match parse_rtcp_stack_id_checked(stack_id) {
+            Ok(s) => s,
+            Err(e) => {
                 return Ok(unreachable_status(
                     url,
                     &normalized,
                     now,
                     TunnelUrlStatusSource::FreshProbe,
-                    format!("invalid rtcp stack id '{}'", stack_id),
+                    format!("invalid rtcp stack id '{}': {}", stack_id, e),
                 ));
             }
         };
-        let tunnel_key = self.compute_tunnel_key(&remote_stack);
+        let tunnel_key = match self.compute_tunnel_key(&remote_stack).await {
+            Ok(key) => key,
+            Err(e) => {
+                return Ok(unreachable_status(
+                    url,
+                    &normalized,
+                    now,
+                    TunnelUrlStatusSource::FreshProbe,
+                    format!("compute_tunnel_key: {}", e),
+                ));
+            }
+        };
         let timeout_dur = Duration::from_millis(options.timeout_ms_or_default());
 
         // 1. Existing tunnel: ping it (force_probe just bypasses the
@@ -3370,12 +3596,12 @@ mod tests {
         let (client_signing_key, client_pkcs8_bytes) = generate_ed25519_key();
         let client_jwk = encode_ed25519_sk_to_pk_jwk(&client_signing_key);
         let client_device_config =
-            DeviceConfig::new_by_jwk("client", serde_json::from_value(client_jwk).unwrap());
+            DeviceDocument::new_by_jwk("client", serde_json::from_value(client_jwk).unwrap());
 
         let (server_signing_key, _server_pkcs8_bytes) = generate_ed25519_key();
         let server_jwk = encode_ed25519_sk_to_pk_jwk(&server_signing_key);
         let server_device_config =
-            DeviceConfig::new_by_jwk("server", serde_json::from_value(server_jwk).unwrap());
+            DeviceDocument::new_by_jwk("server", serde_json::from_value(server_jwk).unwrap());
         let server_id = server_device_config.id.clone();
 
         let mut name_info = NameInfo::new("sn.devtests.org");
@@ -3403,16 +3629,20 @@ mod tests {
             Some(server_id.to_host_name().as_str())
         );
         assert_eq!(state.responder_did, server_id.to_host_name());
-        RTcpInner::validate_hello_target("sn.devtests.org", server_id.to_host_name().as_str())
-            .await
-            .unwrap();
+        RTcpInner::validate_hello_target(
+            "sn.devtests.org",
+            server_id.to_host_name().as_str(),
+            &server_id,
+        )
+        .await
+        .unwrap();
     }
 
     fn ed25519_test_keys() -> (EncodingKey, DecodingKey) {
         let (signing_key, pkcs8_bytes) = generate_ed25519_key();
         let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
         let device_config =
-            DeviceConfig::new_by_jwk("key-test", serde_json::from_value(jwk).unwrap());
+            DeviceDocument::new_by_jwk("key-test", serde_json::from_value(jwk).unwrap());
         let default_key = device_config.get_default_key().unwrap();
         let public_key = jwk_to_ed25519_pk(&default_key).unwrap();
         (
@@ -3543,11 +3773,12 @@ mod tests {
     #[tokio::test]
     async fn test_rtcp_validate_hello_target_rejects_non_web_alias() {
         let this_host = "did:web:this.example.com";
-        RTcpInner::validate_hello_target(this_host, this_host)
+        let this_dev_did = DID::new("dev", "hello-target-reject-dev");
+        RTcpInner::validate_hello_target(this_host, this_host, &this_dev_did)
             .await
             .unwrap();
 
-        let err = RTcpInner::validate_hello_target("did:test:other", this_host)
+        let err = RTcpInner::validate_hello_target("did:test:other", this_host, &this_dev_did)
             .await
             .unwrap_err();
         assert!(
@@ -3555,6 +3786,45 @@ mod tests {
             "unexpected error: {}",
             err
         );
+    }
+
+    #[tokio::test]
+    async fn test_rtcp_validate_hello_target_accepts_this_dev_did_forms() {
+        // stack 配置了逻辑 did(this_host 为其 host_name 形式),token.to 用
+        // 当前 stack 的 did:dev:xxx 形式(字符串或 host_name)也必须通过。
+        let (device_config, _pkcs8_bytes) = test_device_config("hello-target-dev");
+        let this_dev_did = device_config.id.clone();
+        let this_host = "sn.devtests.org";
+
+        RTcpInner::validate_hello_target(
+            this_dev_did.to_string().as_str(),
+            this_host,
+            &this_dev_did,
+        )
+        .await
+        .unwrap();
+        RTcpInner::validate_hello_target(
+            this_dev_did.to_host_name().as_str(),
+            this_host,
+            &this_dev_did,
+        )
+        .await
+        .unwrap();
+        // 逻辑 did 的字符串形式(this_host 的 did:web 形式)同样接受。
+        RTcpInner::validate_hello_target("did:web:sn.devtests.org", this_host, &this_dev_did)
+            .await
+            .unwrap();
+
+        // 其它设备的 did:dev 仍然拒绝。
+        let (other_config, _other_pkcs8_bytes) = test_device_config("hello-target-other");
+        let err = RTcpInner::validate_hello_target(
+            other_config.id.to_string().as_str(),
+            this_host,
+            &this_dev_did,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("not this device"), "unexpected error: {}", err);
     }
 
     #[test]
@@ -3577,13 +3847,29 @@ mod tests {
         assert!(true);
     }
 
+    fn test_device_config(name: &str) -> (DeviceDocument, [u8; 48]) {
+        let (signing_key, pkcs8_bytes) = generate_ed25519_key();
+        let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
+        (
+            DeviceDocument::new_by_jwk(name, serde_json::from_value(jwk).unwrap()),
+            pkcs8_bytes,
+        )
+    }
+
+    async fn add_rtcp_alias(name: &str, dev_did: &DID) {
+        let mut name_info = NameInfo::from_address(name, "127.0.0.1".parse().unwrap());
+        name_info.txt.push(format!("PKX={};", dev_did.id));
+        add_nameinfo_cache(name, name_info).await.unwrap();
+    }
+
     #[tokio::test]
     async fn test_rtcp_bootstrap_url_requires_tunnel_manager() {
         let bootstrap_url = Url::parse("tcp://127.0.0.1:9/bootstrap").unwrap();
-        let remote = DID::new("web", "remote.example.com").to_host_name();
+        let (remote_config, _) = test_device_config("bootstrap-remote");
+        let remote = remote_config.id.to_string();
         let stack_id = build_rtcp_nested_remote_stack_id(&bootstrap_url, &remote, Some(2981));
         let inner = RTcpInner::new(
-            DID::new("web", "local.example.com"),
+            DID::new("dev", "local-dev-without-sk-for-bootstrap-test"),
             "127.0.0.1:0".to_string(),
             None,
             None,
@@ -3603,7 +3889,12 @@ mod tests {
         assert!(
             inner
                 .tunnel_map
-                .get_tunnel(&inner.compute_tunnel_key(&parse_rtcp_stack_id(&stack_id).unwrap()))
+                .get_tunnel(
+                    &inner
+                        .compute_tunnel_key(&parse_rtcp_stack_id(&stack_id).unwrap())
+                        .await
+                        .unwrap()
+                )
                 .await
                 .is_none(),
             "failed bootstrap setup must not register a tunnel"
@@ -3624,10 +3915,11 @@ mod tests {
         );
 
         let bootstrap_url = Url::parse("mockfail://bootstrap.example/rtcp-bearing").unwrap();
-        let remote = DID::new("web", "remote.example.com").to_host_name();
+        let (remote_config, _) = test_device_config("bootstrap-fail-remote");
+        let remote = remote_config.id.to_string();
         let stack_id = build_rtcp_nested_remote_stack_id(&bootstrap_url, &remote, Some(2981));
         let mut inner = RTcpInner::new(
-            DID::new("web", "local.example.com"),
+            DID::new("dev", "local-dev-without-sk-for-bootstrap-fail-test"),
             "127.0.0.1:0".to_string(),
             None,
             None,
@@ -3650,23 +3942,30 @@ mod tests {
         assert!(
             inner
                 .tunnel_map
-                .get_tunnel(&inner.compute_tunnel_key(&parse_rtcp_stack_id(&stack_id).unwrap()))
+                .get_tunnel(
+                    &inner
+                        .compute_tunnel_key(&parse_rtcp_stack_id(&stack_id).unwrap())
+                        .await
+                        .unwrap()
+                )
                 .await
                 .is_none(),
             "failed bootstrap stream setup must not register a tunnel"
         );
     }
 
-    #[test]
-    fn test_rtcp_tunnel_key_separates_direct_and_bootstrap_paths() {
+    #[tokio::test]
+    async fn test_rtcp_tunnel_key_separates_direct_and_bootstrap_paths() {
+        let (local_config, local_pkcs8_bytes) = test_device_config("key-local");
+        let (remote_config, _) = test_device_config("key-remote");
         let inner = RTcpInner::new(
-            DID::new("web", "local.example.com"),
+            local_config.id.clone(),
             "127.0.0.1:0".to_string(),
-            None,
+            Some(local_pkcs8_bytes),
             None,
             Arc::new(MockRTcpListener::new()),
         );
-        let remote = DID::new("web", "remote.example.com").to_host_name();
+        let remote = remote_config.id.to_string();
         let direct = parse_rtcp_stack_id(&format!("{}:2981", remote)).unwrap();
         let bootstrap_a = Url::parse("rtcp://relay-a.example.com:2993/remote:2981").unwrap();
         let bootstrap_b = Url::parse("rtcp://relay-b.example.com:2993/remote:2981").unwrap();
@@ -3683,15 +3982,181 @@ mod tests {
         ))
         .unwrap();
 
-        let direct_key = inner.compute_tunnel_key(&direct);
-        let nested_a_key = inner.compute_tunnel_key(&nested_a);
-        let nested_b_key = inner.compute_tunnel_key(&nested_b);
+        let direct_key = inner.compute_tunnel_key(&direct).await.unwrap();
+        let nested_a_key = inner.compute_tunnel_key(&nested_a).await.unwrap();
+        let nested_b_key = inner.compute_tunnel_key(&nested_b).await.unwrap();
 
         assert_ne!(direct_key, nested_a_key);
         assert_ne!(nested_a_key, nested_b_key);
+        assert_eq!(
+            direct_key,
+            format!(
+                "{}_{}",
+                local_config.id.to_string(),
+                remote_config.id.to_string()
+            )
+        );
         assert!(!direct_key.contains("|bootstrap="));
         assert!(nested_a_key.contains("|bootstrap=rtcp://relay-a.example.com:2993/remote:2981"));
         assert!(nested_b_key.contains("|bootstrap=rtcp://relay-b.example.com:2993/remote:2981"));
+    }
+
+    #[tokio::test]
+    async fn test_rtcp_tunnel_key_uses_resolved_dev_did_for_name_reset() {
+        let _ = init_name_lib_for_test(&HashMap::new()).await;
+
+        let (local_config, local_pkcs8_bytes) = test_device_config("name-reset-local");
+        let (dev_a_config, dev_a_pkcs8_bytes) = test_device_config("name-reset-a");
+        let (dev_b_config, dev_b_pkcs8_bytes) = test_device_config("name-reset-b");
+        let alias = "rtcp-name-reset.devtests.org";
+
+        let (port_local, port_a, port_b) = {
+            let local = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            let a = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            let b = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            (
+                local.local_addr().unwrap().port(),
+                a.local_addr().unwrap().port(),
+                b.local_addr().unwrap().port(),
+            )
+        };
+
+        let mut rtcp_local = RTcp::new(
+            local_config.id.clone(),
+            format!("127.0.0.1:{}", port_local),
+            Some(local_pkcs8_bytes),
+            None,
+            Arc::new(MockRTcpListener::new()),
+        );
+        rtcp_local.start().await.unwrap();
+
+        let mut rtcp_a = RTcp::new(
+            dev_a_config.id.clone(),
+            format!("127.0.0.1:{}", port_a),
+            Some(dev_a_pkcs8_bytes),
+            None,
+            Arc::new(MockRTcpListener::new()),
+        );
+        rtcp_a.start().await.unwrap();
+
+        add_rtcp_alias(alias, &dev_a_config.id).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let stack_id_a = format!("{}:{}", alias, port_a);
+        let tunnel_a = rtcp_local
+            .create_tunnel(Some(stack_id_a.as_str()))
+            .await
+            .unwrap();
+        tunnel_a.ping().await.unwrap();
+        let key_a = rtcp_local
+            .inner
+            .compute_tunnel_key(&parse_rtcp_stack_id(&stack_id_a).unwrap())
+            .await
+            .unwrap();
+        assert!(key_a.ends_with(dev_a_config.id.to_string().as_str()));
+
+        let mut rtcp_b = RTcp::new(
+            dev_b_config.id.clone(),
+            format!("127.0.0.1:{}", port_b),
+            Some(dev_b_pkcs8_bytes),
+            None,
+            Arc::new(MockRTcpListener::new()),
+        );
+        rtcp_b.start().await.unwrap();
+        add_rtcp_alias(alias, &dev_b_config.id).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let stack_id_b = format!("{}:{}", alias, port_b);
+        let tunnel_b = rtcp_local
+            .create_tunnel(Some(stack_id_b.as_str()))
+            .await
+            .unwrap();
+        tunnel_b.ping().await.unwrap();
+        let key_b = rtcp_local
+            .inner
+            .compute_tunnel_key(&parse_rtcp_stack_id(&stack_id_b).unwrap())
+            .await
+            .unwrap();
+
+        assert_ne!(key_a, key_b);
+        assert!(key_b.ends_with(dev_b_config.id.to_string().as_str()));
+        assert!(
+            rtcp_local
+                .inner
+                .tunnel_map
+                .get_tunnel(&key_a)
+                .await
+                .is_some()
+        );
+        assert!(
+            rtcp_local
+                .inner
+                .tunnel_map
+                .get_tunnel(&key_b)
+                .await
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_rtcp_name_and_dev_did_share_tunnel_key_for_same_device() {
+        let _ = init_name_lib_for_test(&HashMap::new()).await;
+        let (local_config, local_pkcs8_bytes) = test_device_config("name-dev-key-local");
+        let (remote_config, _) = test_device_config("name-dev-key-remote");
+        let alias = "rtcp-same-dev.devtests.org";
+        add_rtcp_alias(alias, &remote_config.id).await;
+
+        let inner = RTcpInner::new(
+            local_config.id.clone(),
+            "127.0.0.1:0".to_string(),
+            Some(local_pkcs8_bytes),
+            None,
+            Arc::new(MockRTcpListener::new()),
+        );
+        let by_name = parse_rtcp_stack_id(&format!("{}:2981", alias)).unwrap();
+        let by_dev =
+            parse_rtcp_stack_id(&format!("{}:2981", remote_config.id.to_string())).unwrap();
+        let by_dev_host =
+            parse_rtcp_stack_id(&format!("{}:2981", remote_config.id.to_host_name())).unwrap();
+
+        let key_by_name = inner.compute_tunnel_key(&by_name).await.unwrap();
+        assert_eq!(
+            key_by_name,
+            inner.compute_tunnel_key(&by_dev).await.unwrap()
+        );
+        assert_eq!(
+            key_by_name,
+            inner.compute_tunnel_key(&by_dev_host).await.unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_rtcp_multiple_names_to_same_dev_share_key_by_design() {
+        let _ = init_name_lib_for_test(&HashMap::new()).await;
+        let (local_config, local_pkcs8_bytes) = test_device_config("multi-name-key-local");
+        let (remote_config, _) = test_device_config("multi-name-key-remote");
+        let alias_a = "rtcp-alias-a.devtests.org";
+        let alias_b = "rtcp-alias-b.devtests.org";
+        add_rtcp_alias(alias_a, &remote_config.id).await;
+        add_rtcp_alias(alias_b, &remote_config.id).await;
+
+        let inner = RTcpInner::new(
+            local_config.id.clone(),
+            "127.0.0.1:0".to_string(),
+            Some(local_pkcs8_bytes),
+            None,
+            Arc::new(MockRTcpListener::new()),
+        );
+        let by_alias_a = parse_rtcp_stack_id(&format!("{}:2981", alias_a)).unwrap();
+        let by_alias_b = parse_rtcp_stack_id(&format!("{}:2981", alias_b)).unwrap();
+
+        // This is intentionally not a compatibility fallback: two logical
+        // device names resolving to the same DEV DID are invalid device
+        // modeling, and RTCP treats them as the same device identity.
+        assert_eq!(
+            inner.compute_tunnel_key(&by_alias_a).await.unwrap(),
+            inner.compute_tunnel_key(&by_alias_b).await.unwrap()
+        );
     }
 
     // Mock实现用于测试
@@ -3924,11 +4389,12 @@ mod tests {
         let _ = init_name_lib_for_test(&HashMap::new()).await;
         let (signing_key, pkcs8_bytes) = generate_ed25519_key();
         let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
-        let device_config = DeviceConfig::new_by_jwk("test1", serde_json::from_value(jwk).unwrap());
+        let device_config =
+            DeviceDocument::new_by_jwk("test1", serde_json::from_value(jwk).unwrap());
         let _id1 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        update_did_cache(device_config.id.clone(), None, encoded_doc)
+        update_did_cache(device_config.id.clone(), None, encoded_doc, None)
             .await
             .unwrap();
         add_nameinfo_cache(
@@ -3952,11 +4418,12 @@ mod tests {
 
         let (signing_key, pkcs8_bytes) = generate_ed25519_key();
         let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
-        let device_config = DeviceConfig::new_by_jwk("test2", serde_json::from_value(jwk).unwrap());
+        let device_config =
+            DeviceDocument::new_by_jwk("test2", serde_json::from_value(jwk).unwrap());
         let id2 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        update_did_cache(device_config.id.clone(), None, encoded_doc)
+        update_did_cache(device_config.id.clone(), None, encoded_doc, None)
             .await
             .unwrap();
         add_nameinfo_cache(
@@ -4008,11 +4475,12 @@ mod tests {
         let _ = init_name_lib_for_test(&HashMap::new()).await;
         let (signing_key, pkcs8_bytes) = generate_ed25519_key();
         let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
-        let device_config = DeviceConfig::new_by_jwk("test1", serde_json::from_value(jwk).unwrap());
+        let device_config =
+            DeviceDocument::new_by_jwk("test1", serde_json::from_value(jwk).unwrap());
         let _id1 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        update_did_cache(device_config.id.clone(), None, encoded_doc)
+        update_did_cache(device_config.id.clone(), None, encoded_doc, None)
             .await
             .unwrap();
         add_nameinfo_cache(
@@ -4036,11 +4504,12 @@ mod tests {
 
         let (signing_key, pkcs8_bytes) = generate_ed25519_key();
         let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
-        let device_config = DeviceConfig::new_by_jwk("test2", serde_json::from_value(jwk).unwrap());
+        let device_config =
+            DeviceDocument::new_by_jwk("test2", serde_json::from_value(jwk).unwrap());
         let id2 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        update_did_cache(device_config.id.clone(), None, encoded_doc)
+        update_did_cache(device_config.id.clone(), None, encoded_doc, None)
             .await
             .unwrap();
         add_nameinfo_cache(
@@ -4087,11 +4556,11 @@ mod tests {
         let (signing_key, pkcs8_bytes) = generate_ed25519_key();
         let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
         let device_config =
-            DeviceConfig::new_by_jwk("probe1", serde_json::from_value(jwk).unwrap());
+            DeviceDocument::new_by_jwk("probe1", serde_json::from_value(jwk).unwrap());
         let _id1 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        update_did_cache(device_config.id.clone(), None, encoded_doc)
+        update_did_cache(device_config.id.clone(), None, encoded_doc, None)
             .await
             .unwrap();
         add_nameinfo_cache(
@@ -4116,11 +4585,11 @@ mod tests {
         let (signing_key, pkcs8_bytes) = generate_ed25519_key();
         let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
         let device_config =
-            DeviceConfig::new_by_jwk("probe2", serde_json::from_value(jwk).unwrap());
+            DeviceDocument::new_by_jwk("probe2", serde_json::from_value(jwk).unwrap());
         let id2 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        update_did_cache(device_config.id.clone(), None, encoded_doc)
+        update_did_cache(device_config.id.clone(), None, encoded_doc, None)
             .await
             .unwrap();
         add_nameinfo_cache(
@@ -4175,20 +4644,20 @@ mod tests {
         let (server_signing_key, server_pkcs8_bytes) = generate_ed25519_key();
         let server_jwk = encode_ed25519_sk_to_pk_jwk(&server_signing_key);
         let server_device_config =
-            DeviceConfig::new_by_jwk("server", serde_json::from_value(server_jwk).unwrap());
+            DeviceDocument::new_by_jwk("server", serde_json::from_value(server_jwk).unwrap());
         let server_id = server_device_config.id.clone();
 
         let (owner_signing_key, owner_pkcs8_bytes) = generate_ed25519_key();
         let owner_jwk = encode_ed25519_sk_to_pk_jwk(&owner_signing_key);
         let owner_config =
-            DeviceConfig::new_by_jwk("owner", serde_json::from_value(owner_jwk).unwrap());
+            DeviceDocument::new_by_jwk("owner", serde_json::from_value(owner_jwk).unwrap());
         let owner_did = owner_config.id.clone();
         let owner_private_key = EncodingKey::from_ed_der(&owner_pkcs8_bytes);
 
         let (client_signing_key, client_pkcs8_bytes) = generate_ed25519_key();
         let client_jwk = encode_ed25519_sk_to_pk_jwk(&client_signing_key);
         let mut client_device_config =
-            DeviceConfig::new_by_jwk("client", serde_json::from_value(client_jwk).unwrap());
+            DeviceDocument::new_by_jwk("client", serde_json::from_value(client_jwk).unwrap());
         client_device_config.owner = owner_did.clone();
         let client_id = client_device_config.id.clone();
         let client_device_doc_jwt = match client_device_config
@@ -4225,13 +4694,13 @@ mod tests {
             tunnel_token: Some(state.token.clone()),
             device_doc_jwt: Some(client_device_doc_jwt),
         };
-        let (source_device_id, source_device_info, source_public_key) =
-            RTcpInner::resolve_source_device_info(&hello_body)
-                .await
-                .unwrap();
-        assert_eq!(source_device_id, client_id.to_string());
+        let source_device = RTcpInner::resolve_source_device_info(&hello_body)
+            .await
+            .unwrap();
+        assert_eq!(source_device.source_device_id, client_id.to_string());
+        assert_eq!(source_device.canonical_dev_did, client_id.clone());
         assert_eq!(
-            source_device_info.unwrap().owner,
+            source_device.source_device_info.unwrap().owner,
             Some(owner_did.to_string())
         );
         // server_inner is exercised here just to make sure the test
@@ -4240,10 +4709,299 @@ mod tests {
 
         RTcpInner::verify_hello_token(
             &state.token,
-            &source_public_key,
+            &source_device.public_key,
             Some(client_id.to_host_name().as_str()),
         )
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_rtcp_logical_from_requires_and_caches_device_doc_jwt() {
+        let _ = init_name_lib_for_test(&HashMap::new()).await;
+
+        let (owner_signing_key, owner_pkcs8_bytes) = generate_ed25519_key();
+        let owner_jwk = encode_ed25519_sk_to_pk_jwk(&owner_signing_key);
+        let owner_config =
+            DeviceDocument::new_by_jwk("owner", serde_json::from_value(owner_jwk).unwrap());
+        let owner_did = owner_config.id.clone();
+        let owner_private_key = EncodingKey::from_ed_der(&owner_pkcs8_bytes);
+
+        // 设备文档的 id 是逻辑名字(非 did:dev),default key 是设备自身的 key。
+        // method 用 "test" 保证没有 provider 能解析它:权威锚定验证
+        // (verify_device_document_jwt)因 method 未注册而 Unavailable,握手回落
+        // 到自声明 owner 验证,文档只能来自回落路径写入的观察缓存
+        // (Observed/Unverified)。本测试即回落路径的契约;权威锚定成功路径见
+        // test_rtcp_authority_anchored_device_doc_jwt_hits_trusted_cache。
+        let (client_signing_key, _client_pkcs8_bytes) = generate_ed25519_key();
+        let client_jwk = encode_ed25519_sk_to_pk_jwk(&client_signing_key);
+        let mut client_device_config =
+            DeviceDocument::new_by_jwk("client", serde_json::from_value(client_jwk).unwrap());
+        let client_dev_did = client_device_config.id.clone();
+        let client_logical_did = DID::new("test", "rtcp-logical-client");
+        client_device_config.id = client_logical_did.clone();
+        client_device_config.owner = owner_did.clone();
+        let client_device_doc_jwt = match client_device_config
+            .encode(Some(&owner_private_key))
+            .unwrap()
+        {
+            EncodedDocument::Jwt(jwt) => jwt,
+            _ => panic!("device config encode should return jwt"),
+        };
+
+        // 逻辑名字不带 device_doc_jwt 必须被拒绝。
+        let hello_body_without_jwt = RTcpHelloBody {
+            from_id: client_logical_did.to_string(),
+            to_id: "did:web:server.devtests.org".to_string(),
+            my_port: 19065,
+            tunnel_token: Some("unused".to_string()),
+            device_doc_jwt: None,
+        };
+        let err = match RTcpInner::resolve_source_device_info(&hello_body_without_jwt).await {
+            Ok(_) => panic!("logical from without device_doc_jwt must be rejected"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("device_doc_jwt is required"),
+            "unexpected error: {}",
+            err
+        );
+
+        // 带 device_doc_jwt 时回落验证通过,且 device_doc 以 Observed
+        // (Unverified)等级写入 name_client 的观察缓存
+        // (doc/update-did-cache.md:系统收到过 != 系统信任它)。
+        let hello_body = RTcpHelloBody {
+            from_id: client_logical_did.to_string(),
+            to_id: "did:web:server.devtests.org".to_string(),
+            my_port: 19065,
+            tunnel_token: Some("unused".to_string()),
+            device_doc_jwt: Some(client_device_doc_jwt.clone()),
+        };
+        let source_device = RTcpInner::resolve_source_device_info(&hello_body)
+            .await
+            .unwrap();
+        assert_eq!(
+            source_device.source_device_id,
+            client_logical_did.to_string()
+        );
+        assert_eq!(source_device.canonical_dev_did, client_dev_did);
+
+        // strict resolve_did 对无 provider 的 method 无法完成 lazy verify,
+        // 观察缓存等同 miss,不能被当成可信解析结果返回。
+        assert!(
+            resolve_did(&client_logical_did, None).await.is_err(),
+            "strict resolve_did must not return the unverified observed doc"
+        );
+        // 显式宽松策略才能取回观察缓存,且带 ObservedFallback/Unavailable 打标。
+        let mut lenient_policy = ResolvePolicy::default();
+        lenient_policy.allow_unverified_cache_when_unavailable = true;
+        let observed = resolve_did_ex(&client_logical_did, None, lenient_policy)
+            .await
+            .unwrap();
+        assert_eq!(
+            observed.document,
+            EncodedDocument::Jwt(client_device_doc_jwt)
+        );
+    }
+
+    // 测试用权威 provider:按 (did, doc_type) 返回预注册的发布状态与文档本体;
+    // offline 置位后所有查询报传输错误,模拟权威源断网。
+    struct TestAuthorityProvider {
+        states: Vec<PublishedState>,
+        docs: Vec<(DID, String, EncodedDocument)>,
+        offline: Arc<AtomicBool>,
+    }
+
+    #[async_trait]
+    impl NsProvider for TestAuthorityProvider {
+        fn get_id(&self) -> String {
+            "rtcp-test-authority".to_string()
+        }
+
+        async fn query(
+            &self,
+            _name: &str,
+            _record_type: Option<RecordType>,
+            _from_ip: Option<std::net::IpAddr>,
+        ) -> NSResult<NameInfo> {
+            Err(NSError::NotFound("not implemented".to_string()))
+        }
+
+        async fn query_did(
+            &self,
+            did: &DID,
+            doc_type: Option<DidDocType>,
+            _from_ip: Option<std::net::IpAddr>,
+        ) -> NSResult<EncodedDocument> {
+            if self.offline.load(Ordering::SeqCst) {
+                return Err(NSError::Failed("authority offline (test)".to_string()));
+            }
+            let wanted = doc_type.unwrap_or_default();
+            self.docs
+                .iter()
+                .find(|(candidate, doc_type, _)| candidate == did && doc_type == wanted.as_str())
+                .map(|(_, _, doc)| doc.clone())
+                .ok_or_else(|| NSError::NotFound("no matching doc".to_string()))
+        }
+
+        async fn resolve_published_state(
+            &self,
+            did: &DID,
+            doc_type: &DidDocType,
+        ) -> NSResult<Option<PublishedState>> {
+            if self.offline.load(Ordering::SeqCst) {
+                return Err(NSError::Failed("authority offline (test)".to_string()));
+            }
+            Ok(self
+                .states
+                .iter()
+                .find(|state| state.did == *did && state.doc_type == doc_type.as_str())
+                .cloned())
+        }
+    }
+
+    // 权威锚定成功路径(doc/verify-did-document-jwt.md"RTCP 迁移示例"):
+    // 权威源给出 owner 绑定与当前发布集合证明时,resolve_source_device_info 走
+    // name-client 的 verify_device_document_jwt,source owner 取 authz_owner
+    // (权威绑定,不是 payload 自声明),文档按受控证据等级(Published)写入
+    // 缓存——之后即使权威源断网,strict resolve_did 也能命中,不再需要
+    // allow_unverified_cache_when_unavailable 宽松策略。
+    #[tokio::test]
+    async fn test_rtcp_authority_anchored_device_doc_jwt_hits_trusted_cache() {
+        let _ = init_name_lib_for_test(&HashMap::new()).await;
+
+        let (owner_signing_key, owner_pkcs8_bytes) = generate_ed25519_key();
+        let owner_jwk = encode_ed25519_sk_to_pk_jwk(&owner_signing_key);
+        let owner_did = DID::new("rtcpauth", "owner1");
+        let owner_private_key = EncodingKey::from_ed_der(&owner_pkcs8_bytes);
+        let owner_doc = OwnerDocument::new(
+            owner_did.clone(),
+            "owner1".to_string(),
+            "owner1@rtcpauth".to_string(),
+            serde_json::from_value(owner_jwk).unwrap(),
+        );
+        let owner_doc_encoded = owner_doc.encode(Some(&owner_private_key)).unwrap();
+
+        let (device_signing_key, _device_pkcs8_bytes) = generate_ed25519_key();
+        let device_jwk = encode_ed25519_sk_to_pk_jwk(&device_signing_key);
+        let mut device_config =
+            DeviceDocument::new_by_jwk("dev1", serde_json::from_value(device_jwk).unwrap());
+        let device_dev_did = device_config.id.clone();
+        let device_did = DID::new("rtcpauth", "dev1");
+        device_config.id = device_did.clone();
+        device_config.owner = owner_did.clone();
+        let device_doc_jwt = match device_config.encode(Some(&owner_private_key)).unwrap() {
+            EncodedDocument::Jwt(jwt) => jwt,
+            _ => panic!("device config encode should return jwt"),
+        };
+
+        // 越权候选:权威 owner 绑定是 owner1,文档却自声明一个 did:dev owner
+        // 并用它的 key 签名。旧的自声明验证会放行("JWT 能被它自己声明的 owner
+        // 验过"),权威锚定验证必须以 DeclaredOwnerMismatch 拒绝且不回落。
+        let (rogue_owner_signing_key, rogue_owner_pkcs8_bytes) = generate_ed25519_key();
+        let rogue_owner_jwk = encode_ed25519_sk_to_pk_jwk(&rogue_owner_signing_key);
+        let rogue_owner_config = DeviceDocument::new_by_jwk(
+            "rogue-owner",
+            serde_json::from_value(rogue_owner_jwk).unwrap(),
+        );
+        let rogue_owner_private_key = EncodingKey::from_ed_der(&rogue_owner_pkcs8_bytes);
+        let (rogue_device_signing_key, _) = generate_ed25519_key();
+        let rogue_device_jwk = encode_ed25519_sk_to_pk_jwk(&rogue_device_signing_key);
+        let mut rogue_device_config =
+            DeviceDocument::new_by_jwk("dev2", serde_json::from_value(rogue_device_jwk).unwrap());
+        let rogue_device_did = DID::new("rtcpauth", "dev2");
+        rogue_device_config.id = rogue_device_did.clone();
+        rogue_device_config.owner = rogue_owner_config.id.clone();
+        let rogue_device_doc_jwt = match rogue_device_config
+            .encode(Some(&rogue_owner_private_key))
+            .unwrap()
+        {
+            EncodedDocument::Jwt(jwt) => jwt,
+            _ => panic!("device config encode should return jwt"),
+        };
+
+        // 权威源:owner 文档锚定发布;device 文档 Active + effective_owner 绑定
+        // + 内联 body(外部候选与当前发布集合一致 → membership 成立 → Published)。
+        let mut device_state = PublishedState::active(
+            device_did.clone(),
+            "device".to_string(),
+            EncodedDocument::Jwt(device_doc_jwt.clone()),
+        );
+        device_state.effective_owner = Some(owner_did.clone());
+        let mut rogue_device_state = PublishedState::active(
+            rogue_device_did.clone(),
+            "device".to_string(),
+            EncodedDocument::Jwt(rogue_device_doc_jwt.clone()),
+        );
+        rogue_device_state.effective_owner = Some(owner_did.clone());
+        let provider = TestAuthorityProvider {
+            states: vec![
+                PublishedState::active(
+                    owner_did.clone(),
+                    "owner".to_string(),
+                    owner_doc_encoded.clone(),
+                ),
+                device_state,
+                rogue_device_state,
+            ],
+            docs: vec![
+                (owner_did.clone(), "owner".to_string(), owner_doc_encoded),
+                (
+                    device_did.clone(),
+                    "device".to_string(),
+                    EncodedDocument::Jwt(device_doc_jwt.clone()),
+                ),
+            ],
+            offline: Arc::new(AtomicBool::new(false)),
+        };
+        let offline = provider.offline.clone();
+        GLOBAL_NAME_CLIENT
+            .get()
+            .unwrap()
+            .set_method_authority("rtcpauth", Box::new(provider))
+            .await;
+
+        let hello_body = RTcpHelloBody {
+            from_id: device_did.to_string(),
+            to_id: "did:web:server.devtests.org".to_string(),
+            my_port: 19067,
+            tunnel_token: Some("unused".to_string()),
+            device_doc_jwt: Some(device_doc_jwt.clone()),
+        };
+        let source_device = RTcpInner::resolve_source_device_info(&hello_body)
+            .await
+            .unwrap();
+        assert_eq!(source_device.source_device_id, device_did.to_string());
+        assert_eq!(source_device.canonical_dev_did, device_dev_did);
+        let info = source_device.source_device_info.unwrap();
+        assert_eq!(info.owner, Some(owner_did.to_string()));
+
+        // 越权候选被 Definite 拒绝,不回落:若错误来自回落路径,消息会是
+        // "resolve owner auth key ... failed"(甚至因 did:dev owner 可本地验签
+        // 而放行),而不是带稳定错误码的 rejected。
+        let rogue_hello_body = RTcpHelloBody {
+            from_id: rogue_device_did.to_string(),
+            to_id: "did:web:server.devtests.org".to_string(),
+            my_port: 19067,
+            tunnel_token: Some("unused".to_string()),
+            device_doc_jwt: Some(rogue_device_doc_jwt),
+        };
+        let err = match RTcpInner::resolve_source_device_info(&rogue_hello_body).await {
+            Ok(_) => panic!("declared owner mismatching authority binding must be rejected"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("DeclaredOwnerMismatch"),
+            "unexpected error: {}",
+            err
+        );
+
+        // 受控缓存写入在权威源断网后仍可被 strict resolve_did 命中,与上一个
+        // 测试的 Observed/Unverified(strict 下等同 miss)形成对照。
+        offline.store(true, Ordering::SeqCst);
+        let resolved = resolve_did(&device_did, Some(DidDocType::Device))
+            .await
+            .expect("strict resolve_did must hit the controlled cache entry");
+        assert_eq!(resolved, EncodedDocument::Jwt(device_doc_jwt));
     }
 
     #[tokio::test]
@@ -4251,11 +5009,12 @@ mod tests {
         let _ = init_name_lib_for_test(&HashMap::new()).await;
         let (signing_key, pkcs8_bytes) = generate_ed25519_key();
         let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
-        let device_config = DeviceConfig::new_by_jwk("test1", serde_json::from_value(jwk).unwrap());
+        let device_config =
+            DeviceDocument::new_by_jwk("test1", serde_json::from_value(jwk).unwrap());
         let id1 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        update_did_cache(device_config.id.clone(), None, encoded_doc)
+        update_did_cache(device_config.id.clone(), None, encoded_doc, None)
             .await
             .unwrap();
         add_nameinfo_cache(
@@ -4279,11 +5038,12 @@ mod tests {
 
         let (signing_key, pkcs8_bytes) = generate_ed25519_key();
         let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
-        let device_config = DeviceConfig::new_by_jwk("test2", serde_json::from_value(jwk).unwrap());
+        let device_config =
+            DeviceDocument::new_by_jwk("test2", serde_json::from_value(jwk).unwrap());
         let id2 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        update_did_cache(device_config.id.clone(), None, encoded_doc)
+        update_did_cache(device_config.id.clone(), None, encoded_doc, None)
             .await
             .unwrap();
         add_nameinfo_cache(
@@ -4366,14 +5126,14 @@ mod tests {
 
         let (signing_key, pkcs8_bytes) = generate_ed25519_key();
         let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
-        let device_config = DeviceConfig::new_by_jwk(
+        let device_config = DeviceDocument::new_by_jwk(
             format!("{}-a", test_name).as_str(),
             serde_json::from_value(jwk).unwrap(),
         );
         let id_a = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        update_did_cache(device_config.id.clone(), None, encoded_doc)
+        update_did_cache(device_config.id.clone(), None, encoded_doc, None)
             .await
             .unwrap();
         add_nameinfo_cache(
@@ -4407,14 +5167,14 @@ mod tests {
 
         let (signing_key, pkcs8_bytes) = generate_ed25519_key();
         let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
-        let device_config = DeviceConfig::new_by_jwk(
+        let device_config = DeviceDocument::new_by_jwk(
             format!("{}-b", test_name).as_str(),
             serde_json::from_value(jwk).unwrap(),
         );
         let id_b = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        update_did_cache(device_config.id.clone(), None, encoded_doc)
+        update_did_cache(device_config.id.clone(), None, encoded_doc, None)
             .await
             .unwrap();
         add_nameinfo_cache(
@@ -4438,14 +5198,14 @@ mod tests {
 
         let (signing_key, pkcs8_bytes) = generate_ed25519_key();
         let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
-        let device_config = DeviceConfig::new_by_jwk(
+        let device_config = DeviceDocument::new_by_jwk(
             format!("{}-c", test_name).as_str(),
             serde_json::from_value(jwk).unwrap(),
         );
         let id_c = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        update_did_cache(device_config.id.clone(), None, encoded_doc)
+        update_did_cache(device_config.id.clone(), None, encoded_doc, None)
             .await
             .unwrap();
         add_nameinfo_cache(
@@ -4760,14 +5520,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_rtcp_datagram() {
-        let _ = init_name_lib_for_test(&HashMap::new()).await.unwrap();
+        let _ = init_name_lib_for_test(&HashMap::new()).await;
         let (signing_key, pkcs8_bytes) = generate_ed25519_key();
         let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
-        let device_config = DeviceConfig::new_by_jwk("test1", serde_json::from_value(jwk).unwrap());
+        let device_config =
+            DeviceDocument::new_by_jwk("test1", serde_json::from_value(jwk).unwrap());
         let id1 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        update_did_cache(device_config.id.clone(), None, encoded_doc)
+        update_did_cache(device_config.id.clone(), None, encoded_doc, None)
             .await
             .unwrap();
         add_nameinfo_cache(
@@ -4791,11 +5552,12 @@ mod tests {
 
         let (signing_key, pkcs8_bytes) = generate_ed25519_key();
         let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
-        let device_config = DeviceConfig::new_by_jwk("test2", serde_json::from_value(jwk).unwrap());
+        let device_config =
+            DeviceDocument::new_by_jwk("test2", serde_json::from_value(jwk).unwrap());
         let id2 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        update_did_cache(device_config.id.clone(), None, encoded_doc)
+        update_did_cache(device_config.id.clone(), None, encoded_doc, None)
             .await
             .unwrap();
         add_nameinfo_cache(

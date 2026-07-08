@@ -11,13 +11,88 @@ use std::time::{SystemTime, UNIX_EPOCH};
 const ACTIVATION_CODE_LEN: usize = 32;
 const ACTIVATION_CODE_CHARS: &[u8] =
     b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
-const DOMAIN_BINDING_PENDING_PKX: &str = "pending_pkx";
 const DOMAIN_BINDING_ACTIVE: &str = "active";
 const DOMAIN_BINDING_REVOKED: &str = "revoked";
+const DOMAIN_BINDING_SUPERSEDED: &str = "superseded";
 const SESSION_ACTIVE: &str = "active";
 const SESSION_REVOKED: &str = "revoked";
 
 pub type SnAuthDBRef = Arc<dyn SnAuthDB>;
+
+/// user_domain 规范化：trim、去尾部 `.`、小写、去可选 `*.` 前缀。
+/// 空结果（空串、仅点、仅通配）返回 None。
+pub fn canonical_user_domain(domain: &str) -> Option<String> {
+    let normalized = domain.trim().trim_end_matches('.').to_ascii_lowercase();
+    if normalized.is_empty() {
+        return None;
+    }
+
+    let canonical = normalized
+        .strip_prefix("*.")
+        .unwrap_or(normalized.as_str())
+        .to_string();
+    if canonical.is_empty() || canonical == "*" {
+        None
+    } else {
+        Some(canonical)
+    }
+}
+
+/// PKX proof TXT 的固定 DNS name：`_pkx.<canonical-domain>`。
+pub fn pkx_record_name(canonical_domain: &str) -> String {
+    format!("_pkx.{}", canonical_domain)
+}
+
+/// 从 owner key 材料中提取 `sn_user.pkx`（公开身份）：
+/// - JWK JSON（`{`开头）→ `x` 分量；
+/// - `PKX=<x>[:...][;]` 形式 → `<x>`；
+/// - 其余原样 trim（兼容已是裸 x 或测试占位串的输入）。
+///
+/// 空输入返回 None。
+pub fn pkx_source_of(key_material: &str) -> Option<String> {
+    let trimmed = key_material.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed.starts_with('{') {
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) {
+            if let Some(x) = value.get("x").and_then(|v| v.as_str()) {
+                let x = x.trim();
+                if !x.is_empty() {
+                    return Some(x.to_string());
+                }
+            }
+        }
+        return Some(trimmed.to_string());
+    }
+    if let Some(rest) = trimmed.strip_prefix("PKX=") {
+        let x = rest.split([':', ';']).next().unwrap_or("").trim();
+        return if x.is_empty() {
+            None
+        } else {
+            Some(x.to_string())
+        };
+    }
+    Some(trimmed.trim_end_matches(';').to_string())
+}
+
+/// PKX 记录值的唯一生成 helper：`PKX(<sn_user.pkx>)`。
+/// 稳定状态、无 nonce/exp；SN 接管 DNS 后继续发布同一值。
+pub fn pkx_value(key_material: &str) -> SnResult<String> {
+    let source = pkx_source_of(key_material).ok_or_else(|| {
+        sn_err!(
+            SnErrorCode::InvalidInput,
+            "owner key ref or public key is required before creating PKX binding"
+        )
+    })?;
+    Ok(format!("PKX({})", source))
+}
+
+/// TXT 值与期望 PKX 的比对：容忍首尾空白与包裹引号。
+/// 多条 TXT / 多段拼接由外部 DNS 查询层归一后逐条传入。
+pub fn txt_matches_pkx(txt: &str, expected_pkx: &str) -> bool {
+    txt.trim().trim_matches('"').trim() == expected_pkx
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -84,17 +159,6 @@ pub struct SnAuthInfo {
     pub created_at: u64,
     pub updated_at: u64,
     pub last_login_at: Option<u64>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PkxBindingChallenge {
-    pub username: String,
-    pub domain: String,
-    pub pkx: String,
-    pub pkx_record_name: String,
-    pub state: String,
-    pub created_at: u64,
-    pub updated_at: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -183,6 +247,8 @@ pub trait SnAuthDB: Send + Sync + 'static {
         password_algo: &str,
     ) -> SnResult<bool>;
     async fn is_user_exist(&self, username: &str) -> SnResult<bool>;
+    /// trusted 路径（seed/import）专用：不经 DNS PKX proof 直接注册并激活
+    /// `user_domain` 绑定。不得从对外 RPC 直接暴露。
     async fn register_user_with_owner_key(
         &self,
         active_code: &str,
@@ -202,6 +268,9 @@ pub trait SnAuthDB: Send + Sync + 'static {
     async fn update_user_public_key(&self, username: &str, public_key: &str) -> SnResult<()>;
     async fn update_user_zone_config(&self, username: &str, zone_config: &str) -> SnResult<()>;
     async fn update_user_self_cert(&self, username: &str, self_cert: bool) -> SnResult<()>;
+    /// trusted 路径（seed/import）专用：不经 DNS PKX proof 直接把 `user_domain`
+    /// 置 active（或传 None 撤销全部 active 绑定）。不得从对外 RPC 直接暴露；
+    /// 线上绑定必须走 `domain.bind` 的服务端 DNS proof + `activate_user_domain_binding`。
     async fn update_user_domain(&self, username: &str, user_domain: Option<String>)
         -> SnResult<()>;
     async fn get_user_sn_ips(&self, username: &str) -> SnResult<Option<String>>;
@@ -227,16 +296,17 @@ pub trait SnAuthDB: Send + Sync + 'static {
     async fn get_auth(&self, username: &str) -> SnResult<Option<SnAuthInfo>>;
     async fn update_last_login(&self, username: &str, last_login_at: u64) -> SnResult<()>;
 
-    async fn create_pkx_binding(
+    /// 外部 DNS PKX proof 成功后的激活入口。信任边界：调用方（SN 服务端
+    /// `domain.bind`）必须已完成服务端侧 DNS TXT 校验，本方法不做 proof。
+    ///
+    /// 同一事务内：supersede 同一 canonical domain 的旧 active binding（并清理
+    /// 旧 owner 的 `users.user_domain` 兼容缓存）、写入当前 active binding、
+    /// 更新本用户 `users.user_domain`、追加 `user_domain_history` 审计记录。
+    async fn activate_user_domain_binding(
         &self,
         username: &str,
         domain: &str,
-    ) -> SnResult<PkxBindingChallenge>;
-    async fn verify_pkx_binding(
-        &self,
-        username: &str,
-        domain: &str,
-        txt_records: &[String],
+        pkx: &str,
     ) -> SnResult<DomainBinding>;
     async fn unbind_user_domain(&self, username: &str, domain: &str) -> SnResult<()>;
 
@@ -425,22 +495,14 @@ impl SnAuthDB for RemoteSnAuthDB {
         self.client.update_last_login(username, last_login_at).await
     }
 
-    async fn create_pkx_binding(
+    async fn activate_user_domain_binding(
         &self,
         username: &str,
         domain: &str,
-    ) -> SnResult<PkxBindingChallenge> {
-        self.client.create_pkx_binding(username, domain).await
-    }
-
-    async fn verify_pkx_binding(
-        &self,
-        username: &str,
-        domain: &str,
-        txt_records: &[String],
+        pkx: &str,
     ) -> SnResult<DomainBinding> {
         self.client
-            .verify_pkx_binding(username, domain, txt_records)
+            .activate_user_domain_binding(username, domain, pkx)
             .await
     }
 
@@ -576,9 +638,12 @@ impl SqliteSnAuthDB {
         .await
         .map_err(|e| Self::db_err("create user_auth table failed", e))?;
 
+        // 审计事件表：每次绑定获得（新建/接管）追加一行；历史仅审计，
+        // 不参与冲突判定。旧 schema（domain 主键）会被迁移重建。
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS user_domain_history (
-                domain TEXT PRIMARY KEY,
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                domain TEXT NOT NULL,
                 owner TEXT NOT NULL,
                 created_at INTEGER NOT NULL
             )",
@@ -586,10 +651,30 @@ impl SqliteSnAuthDB {
         .execute(&self.pool)
         .await
         .map_err(|e| Self::db_err("create user_domain_history table failed", e))?;
+        self.migrate_legacy_user_domain_table(
+            "user_domain_history",
+            "id INTEGER PRIMARY KEY AUTOINCREMENT,
+             domain TEXT NOT NULL,
+             owner TEXT NOT NULL,
+             created_at INTEGER NOT NULL",
+            "domain, owner, created_at",
+            None,
+        )
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_user_domain_history_domain
+             ON user_domain_history (domain)",
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| Self::db_err("create user_domain_history index failed", e))?;
 
+        // 绑定状态表：state ∈ active|revoked|superseded；同一 canonical domain
+        // 至多一行 active（部分唯一索引），revoked/superseded 行保留作状态审计。
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS user_domain_bindings (
-                domain TEXT PRIMARY KEY,
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                domain TEXT NOT NULL,
                 owner TEXT NOT NULL,
                 state TEXT NOT NULL,
                 pkx TEXT NOT NULL,
@@ -602,6 +687,30 @@ impl SqliteSnAuthDB {
         .execute(&self.pool)
         .await
         .map_err(|e| Self::db_err("create user_domain_bindings table failed", e))?;
+        // 旧 schema（domain 主键、含 pending_pkx 挑战态）迁移重建；
+        // pending_pkx 是已移除的中间态，直接丢弃。
+        self.migrate_legacy_user_domain_table(
+            "user_domain_bindings",
+            "id INTEGER PRIMARY KEY AUTOINCREMENT,
+             domain TEXT NOT NULL,
+             owner TEXT NOT NULL,
+             state TEXT NOT NULL,
+             pkx TEXT NOT NULL,
+             pkx_record_name TEXT NOT NULL,
+             verified_at INTEGER NULL,
+             created_at INTEGER NOT NULL,
+             updated_at INTEGER NOT NULL",
+            "domain, owner, state, pkx, pkx_record_name, verified_at, created_at, updated_at",
+            Some("state != 'pending_pkx'"),
+        )
+        .await?;
+        sqlx::query(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_user_domain_bindings_domain_active
+             ON user_domain_bindings (domain) WHERE state = 'active'",
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| Self::db_err("create user_domain_bindings active index failed", e))?;
         sqlx::query(
             "CREATE INDEX IF NOT EXISTS idx_user_domain_bindings_owner_state
              ON user_domain_bindings (owner, state)",
@@ -650,10 +759,20 @@ impl SqliteSnAuthDB {
         .await
         .map_err(|e| Self::db_err("create account_sessions index failed", e))?;
 
-        self.backfill_user_domain_history().await?;
-        self.backfill_zone_info().await?;
-
         Ok(())
+    }
+
+    /// seed 导入用：激活码是否存在（含已使用的码；`get_activation_codes`
+    /// 只返回未使用的）。
+    pub async fn has_activation_code(&self, code: &str) -> SnResult<bool> {
+        let count = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM activation_codes WHERE code = ?1",
+        )
+        .bind(code)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| Self::db_err("query activation code failed", e))?;
+        Ok(count > 0)
     }
 
     fn now_secs() -> u64 {
@@ -687,38 +806,6 @@ impl SqliteSnAuthDB {
         }
 
         Ok(())
-    }
-
-    fn canonical_user_domain(domain: &str) -> Option<String> {
-        let normalized = domain.trim().trim_end_matches('.').to_ascii_lowercase();
-        if normalized.is_empty() {
-            return None;
-        }
-
-        Some(
-            normalized
-                .strip_prefix("*.")
-                .unwrap_or(normalized.as_str())
-                .to_string(),
-        )
-    }
-
-    fn pkx_record_name(canonical_domain: &str) -> String {
-        format!("_pkx.{}", canonical_domain)
-    }
-
-    fn pkx_value(pkx_source: &str) -> SnResult<String> {
-        let pkx_source = pkx_source.trim();
-        if pkx_source.is_empty() {
-            return Err(Self::invalid_input(
-                "owner key ref or public key is required before creating PKX binding",
-            ));
-        }
-        Ok(format!("PKX({})", pkx_source))
-    }
-
-    fn txt_matches_pkx(txt: &str, expected_pkx: &str) -> bool {
-        txt.trim().trim_matches('"') == expected_pkx
     }
 
     fn i64_to_u64(value: i64) -> u64 {
@@ -762,89 +849,65 @@ impl SqliteSnAuthDB {
         Ok(())
     }
 
-    async fn backfill_user_domain_history(&self) -> SnResult<()> {
-        let rows = sqlx::query(
-            "SELECT username, user_domain FROM users
-             WHERE user_domain IS NOT NULL AND user_domain != ''",
-        )
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| Self::db_err("query existing user_domain history failed", e))?;
-        let now = Self::now_secs() as i64;
-        for row in rows {
-            let username: String = row
-                .try_get("username")
-                .map_err(|e| Self::db_err("read username failed", e))?;
-            let user_domain: String = row
-                .try_get("user_domain")
-                .map_err(|e| Self::db_err("read user_domain failed", e))?;
-            if let Some(canonical_domain) = Self::canonical_user_domain(user_domain.as_str()) {
-                sqlx::query(
-                    "INSERT OR IGNORE INTO user_domain_history (domain, owner, created_at)
-                     VALUES (?1, ?2, ?3)",
-                )
-                .bind(canonical_domain)
-                .bind(username)
-                .bind(now)
-                .execute(&self.pool)
-                .await
-                .map_err(|e| Self::db_err("backfill user_domain_history failed", e))?;
-            }
-        }
-        Ok(())
-    }
-
-    async fn backfill_zone_info(&self) -> SnResult<()> {
-        let rows = sqlx::query(
-            "SELECT username, bns_name, zone_config, self_cert, sn_ips, updated_at FROM users",
-        )
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| Self::db_err("query users for zone_info backfill failed", e))?;
-
-        let now = Self::now_secs() as i64;
-        for row in rows {
-            let username: String = row
-                .try_get("username")
-                .map_err(|e| Self::db_err("read username failed", e))?;
-            let bns_name: Option<String> = row
-                .try_get("bns_name")
-                .map_err(|e| Self::db_err("read bns_name failed", e))?;
-            let zone_config: Option<String> = row
-                .try_get("zone_config")
-                .map_err(|e| Self::db_err("read zone_config failed", e))?;
-            let self_cert: Option<i64> = row
-                .try_get("self_cert")
-                .map_err(|e| Self::db_err("read self_cert failed", e))?;
-            let sn_ips: Option<String> = row
-                .try_get("sn_ips")
-                .map_err(|e| Self::db_err("read sn_ips failed", e))?;
-            let updated_at: Option<i64> = row
-                .try_get("updated_at")
-                .map_err(|e| Self::db_err("read updated_at failed", e))?;
-            let zone = zone_config.and_then(|value| {
-                if value.trim().is_empty() {
-                    None
-                } else {
-                    Some(value)
-                }
-            });
-            sqlx::query(
-                "INSERT OR IGNORE INTO zone_info
-                    (username, bns_name, zone, relay_sn, self_cert, cert_checked_at,
-                     cert_expires_at, sn_ips, source_version, updated_at)
-                 VALUES (?1, ?2, ?3, NULL, ?4, NULL, NULL, ?5, NULL, ?6)",
-            )
-            .bind(username.as_str())
-            .bind(bns_name.unwrap_or_else(|| username.clone()))
-            .bind(zone)
-            .bind(self_cert.unwrap_or(0))
-            .bind(sn_ips)
-            .bind(updated_at.filter(|v| *v > 0).unwrap_or(now))
-            .execute(&self.pool)
+    /// 旧 user_domain 表（domain 主键、无 `id` 列）→ 新 id 主键 schema 的重建
+    /// 迁移。以 `id` 列缺失作为旧 schema 判据；`copy_filter` 用于丢弃已移除的
+    /// 状态（如 `pending_pkx`）。
+    async fn migrate_legacy_user_domain_table(
+        &self,
+        table: &str,
+        columns_def: &str,
+        copy_columns: &str,
+        copy_filter: Option<&str>,
+    ) -> SnResult<()> {
+        let pragma = format!("PRAGMA table_info({})", table);
+        let rows = sqlx::query(pragma.as_str())
+            .fetch_all(&self.pool)
             .await
-            .map_err(|e| Self::db_err("backfill zone_info failed", e))?;
+            .map_err(|e| Self::db_err(format!("query {} columns failed", table), e))?;
+        let has_id = rows.iter().any(|row| {
+            row.try_get::<String, _>("name")
+                .map(|name| name == "id")
+                .unwrap_or(false)
+        });
+        if has_id {
+            return Ok(());
         }
+
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| Self::db_err("begin transaction failed", e))?;
+        let legacy = format!("{}_legacy", table);
+        sqlx::query(format!("ALTER TABLE {} RENAME TO {}", table, legacy).as_str())
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| Self::db_err(format!("rename legacy {} failed", table), e))?;
+        sqlx::query(format!("CREATE TABLE {} ({})", table, columns_def).as_str())
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| Self::db_err(format!("recreate {} failed", table), e))?;
+        let filter = copy_filter
+            .map(|clause| format!(" WHERE {}", clause))
+            .unwrap_or_default();
+        sqlx::query(
+            format!(
+                "INSERT INTO {} ({}) SELECT {} FROM {}{}",
+                table, copy_columns, copy_columns, legacy, filter
+            )
+            .as_str(),
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| Self::db_err(format!("copy legacy {} rows failed", table), e))?;
+        sqlx::query(format!("DROP TABLE {}", legacy).as_str())
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| Self::db_err(format!("drop legacy {} failed", table), e))?;
+        tx.commit()
+            .await
+            .map_err(|e| Self::db_err("commit transaction failed", e))?;
+        log::info!("migrated legacy {} table to id-keyed schema", table);
         Ok(())
     }
 
@@ -941,66 +1004,112 @@ impl SqliteSnAuthDB {
         Ok(())
     }
 
-    async fn check_domain_conflicts_tx(
+    /// 激活绑定的共享事务逻辑（调用方保证已完成 proof 或走 trusted 路径）。
+    ///
+    /// 冲突规则（Beta2.2）：`user_domain_history` 仅审计、不阻止绑定；同一
+    /// canonical domain 的旧 active binding 被 supersede（旧 owner 的
+    /// `users.user_domain` 兼容缓存同步清空）；父/子域名互不排斥，解析按最长
+    /// active binding 匹配。同 owner 重复激活仅刷新 pkx/verified_at，不追加审计。
+    async fn activate_binding_tx(
         tx: &mut Transaction<'_, Sqlite>,
         username: &str,
         canonical_domain: &str,
+        pkx: &str,
+        now: i64,
     ) -> SnResult<()> {
-        let descendant_pattern = format!("%.{}", canonical_domain);
-        let history_conflicts = sqlx::query(
-            "SELECT domain, owner FROM user_domain_history
-             WHERE owner != ?1
-               AND (domain = ?2 OR domain LIKE ?3 OR ?2 LIKE '%.' || domain)",
+        let record_name = pkx_record_name(canonical_domain);
+        let existing = sqlx::query(
+            "SELECT id, owner FROM user_domain_bindings
+             WHERE domain = ?1 AND state = ?2",
         )
-        .bind(username)
         .bind(canonical_domain)
-        .bind(descendant_pattern.as_str())
-        .fetch_all(&mut **tx)
+        .bind(DOMAIN_BINDING_ACTIVE)
+        .fetch_optional(&mut **tx)
         .await
-        .map_err(|e| Self::db_err("query user_domain history failed", e))?;
-        if let Some(conflict) = history_conflicts.first() {
-            let conflict_domain: String = conflict
-                .try_get("domain")
-                .map_err(|e| Self::db_err("read conflict domain failed", e))?;
-            let conflict_owner: String = conflict
+        .map_err(|e| Self::db_err("query active user_domain binding failed", e))?;
+
+        let mut refreshed = false;
+        if let Some(row) = existing {
+            let binding_id: i64 = row
+                .try_get("id")
+                .map_err(|e| Self::db_err("read binding id failed", e))?;
+            let owner: String = row
                 .try_get("owner")
-                .map_err(|e| Self::db_err("read conflict owner failed", e))?;
-            return Err(sn_err!(
-                SnErrorCode::Conflict,
-                "user_domain {} conflicts with historical domain {} owned by {}",
-                canonical_domain,
-                conflict_domain,
-                conflict_owner
-            ));
+                .map_err(|e| Self::db_err("read binding owner failed", e))?;
+            if owner == username {
+                sqlx::query(
+                    "UPDATE user_domain_bindings
+                     SET pkx = ?1, pkx_record_name = ?2, verified_at = ?3, updated_at = ?3
+                     WHERE id = ?4",
+                )
+                .bind(pkx)
+                .bind(record_name.as_str())
+                .bind(now)
+                .bind(binding_id)
+                .execute(&mut **tx)
+                .await
+                .map_err(|e| Self::db_err("refresh user_domain binding failed", e))?;
+                refreshed = true;
+            } else {
+                sqlx::query(
+                    "UPDATE user_domain_bindings
+                     SET state = ?1, updated_at = ?2
+                     WHERE id = ?3",
+                )
+                .bind(DOMAIN_BINDING_SUPERSEDED)
+                .bind(now)
+                .bind(binding_id)
+                .execute(&mut **tx)
+                .await
+                .map_err(|e| Self::db_err("supersede user_domain binding failed", e))?;
+                sqlx::query(
+                    "UPDATE users
+                     SET user_domain = NULL, updated_at = ?1
+                     WHERE username = ?2 AND user_domain = ?3",
+                )
+                .bind(now)
+                .bind(owner.as_str())
+                .bind(canonical_domain)
+                .execute(&mut **tx)
+                .await
+                .map_err(|e| Self::db_err("clear superseded user_domain cache failed", e))?;
+            }
         }
 
-        let active_conflicts = sqlx::query(
-            "SELECT domain, owner FROM user_domain_bindings
-             WHERE owner != ?1
-               AND state IN ('pending_pkx', 'active')
-               AND (domain = ?2 OR domain LIKE ?3 OR ?2 LIKE '%.' || domain)",
-        )
-        .bind(username)
-        .bind(canonical_domain)
-        .bind(descendant_pattern.as_str())
-        .fetch_all(&mut **tx)
-        .await
-        .map_err(|e| Self::db_err("query user_domain bindings failed", e))?;
-        if let Some(conflict) = active_conflicts.first() {
-            let conflict_domain: String = conflict
-                .try_get("domain")
-                .map_err(|e| Self::db_err("read conflict domain failed", e))?;
-            let conflict_owner: String = conflict
-                .try_get("owner")
-                .map_err(|e| Self::db_err("read conflict owner failed", e))?;
-            return Err(sn_err!(
-                SnErrorCode::Conflict,
-                "user_domain {} conflicts with pending/active domain {} owned by {}",
-                canonical_domain,
-                conflict_domain,
-                conflict_owner
-            ));
+        if !refreshed {
+            sqlx::query(
+                "INSERT INTO user_domain_bindings
+                    (domain, owner, state, pkx, pkx_record_name, verified_at, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, ?6)",
+            )
+            .bind(canonical_domain)
+            .bind(username)
+            .bind(DOMAIN_BINDING_ACTIVE)
+            .bind(pkx)
+            .bind(record_name.as_str())
+            .bind(now)
+            .execute(&mut **tx)
+            .await
+            .map_err(|e| Self::db_err("insert user_domain binding failed", e))?;
+            sqlx::query(
+                "INSERT INTO user_domain_history (domain, owner, created_at)
+                 VALUES (?1, ?2, ?3)",
+            )
+            .bind(canonical_domain)
+            .bind(username)
+            .bind(now)
+            .execute(&mut **tx)
+            .await
+            .map_err(|e| Self::db_err("insert user_domain history failed", e))?;
         }
+
+        sqlx::query("UPDATE users SET user_domain = ?1, updated_at = ?2 WHERE username = ?3")
+            .bind(canonical_domain)
+            .bind(now)
+            .bind(username)
+            .execute(&mut **tx)
+            .await
+            .map_err(|e| Self::db_err("update user_domain failed", e))?;
 
         Ok(())
     }
@@ -1429,10 +1538,7 @@ impl SnAuthDB for SqliteSnAuthDB {
             return Ok(false);
         }
 
-        let canonical_domain = user_domain.as_deref().and_then(Self::canonical_user_domain);
-        if let Some(domain) = canonical_domain.as_deref() {
-            Self::check_domain_conflicts_tx(&mut tx, username, domain).await?;
-        }
+        let canonical_domain = user_domain.as_deref().and_then(canonical_user_domain);
 
         let now = Self::now_secs() as i64;
         sqlx::query(
@@ -1474,39 +1580,9 @@ impl SnAuthDB for SqliteSnAuthDB {
         .map_err(|e| Self::db_err("insert zone info failed", e))?;
 
         if let Some(domain) = canonical_domain.as_deref() {
-            let pkx = Self::pkx_value(public_key)?;
-            let pkx_record_name = Self::pkx_record_name(domain);
-            sqlx::query(
-                "INSERT INTO user_domain_bindings
-                    (domain, owner, state, pkx, pkx_record_name, verified_at, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, ?6)
-                 ON CONFLICT(domain) DO UPDATE SET
-                    owner = excluded.owner,
-                    state = excluded.state,
-                    pkx = excluded.pkx,
-                    pkx_record_name = excluded.pkx_record_name,
-                    verified_at = excluded.verified_at,
-                    updated_at = excluded.updated_at",
-            )
-            .bind(domain)
-            .bind(username)
-            .bind(DOMAIN_BINDING_ACTIVE)
-            .bind(pkx.as_str())
-            .bind(pkx_record_name.as_str())
-            .bind(now)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| Self::db_err("upsert user_domain binding failed", e))?;
-            sqlx::query(
-                "INSERT OR IGNORE INTO user_domain_history (domain, owner, created_at)
-                 VALUES (?1, ?2, ?3)",
-            )
-            .bind(domain)
-            .bind(username)
-            .bind(now)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| Self::db_err("insert user_domain history failed", e))?;
+            // seed/import 捷径：不经 DNS proof 直接激活（含 supersede 语义）。
+            let pkx = pkx_value(public_key)?;
+            Self::activate_binding_tx(&mut tx, username, domain, pkx.as_str(), now).await?;
         }
 
         sqlx::query("UPDATE activation_codes SET used = 1 WHERE code = ?1")
@@ -1561,7 +1637,7 @@ impl SnAuthDB for SqliteSnAuthDB {
     }
 
     async fn get_user_by_domain(&self, domain: &str) -> SnResult<Option<SNUserInfo>> {
-        let canonical_domain = match Self::canonical_user_domain(domain) {
+        let canonical_domain = match canonical_user_domain(domain) {
             Some(domain) => domain,
             None => return Ok(None),
         };
@@ -1579,25 +1655,6 @@ impl SnAuthDB for SqliteSnAuthDB {
         .fetch_optional(&self.pool)
         .await
         .map_err(|e| Self::db_err("query user by domain failed", e))?;
-
-        if row.is_some() {
-            return row.as_ref().map(Self::user_from_row).transpose();
-        }
-
-        let row = sqlx::query(
-            "SELECT username, state, public_key, activation_code, zone_config,
-                    self_cert, user_domain, sn_ips
-             FROM users
-             WHERE user_domain IS NOT NULL
-               AND user_domain != ''
-               AND (?1 = user_domain OR ?1 LIKE '%.' || user_domain)
-             ORDER BY length(user_domain) DESC
-             LIMIT 1",
-        )
-        .bind(canonical_domain.as_str())
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|e| Self::db_err("query legacy user_domain failed", e))?;
 
         row.as_ref().map(Self::user_from_row).transpose()
     }
@@ -1666,10 +1723,9 @@ impl SnAuthDB for SqliteSnAuthDB {
             .map_err(|e| Self::db_err("begin transaction failed", e))?;
         let now = Self::now_secs() as i64;
 
-        let canonical_domain = user_domain.as_deref().and_then(Self::canonical_user_domain);
+        let canonical_domain = user_domain.as_deref().and_then(canonical_user_domain);
 
         if let Some(domain) = canonical_domain.as_deref() {
-            Self::check_domain_conflicts_tx(&mut tx, username, domain).await?;
             let user =
                 sqlx::query("SELECT public_key, owner_key_ref FROM users WHERE username = ?1")
                     .bind(username)
@@ -1689,43 +1745,13 @@ impl SnAuthDB for SqliteSnAuthDB {
                 .filter(|value| !value.trim().is_empty())
                 .or_else(|| public_key.filter(|value| !value.trim().is_empty()))
                 .unwrap_or_default();
+            // trusted import 特例：允许无 owner key 的空 pkx 绑定。
             let pkx = if pkx_source.trim().is_empty() {
                 String::new()
             } else {
-                Self::pkx_value(pkx_source.as_str())?
+                pkx_value(pkx_source.as_str())?
             };
-            let pkx_record_name = Self::pkx_record_name(domain);
-            sqlx::query(
-                "INSERT INTO user_domain_bindings
-                    (domain, owner, state, pkx, pkx_record_name, verified_at, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, ?6)
-                 ON CONFLICT(domain) DO UPDATE SET
-                    owner = excluded.owner,
-                    state = excluded.state,
-                    pkx = excluded.pkx,
-                    pkx_record_name = excluded.pkx_record_name,
-                    verified_at = excluded.verified_at,
-                    updated_at = excluded.updated_at",
-            )
-            .bind(domain)
-            .bind(username)
-            .bind(DOMAIN_BINDING_ACTIVE)
-            .bind(pkx.as_str())
-            .bind(pkx_record_name.as_str())
-            .bind(now)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| Self::db_err("upsert user_domain binding failed", e))?;
-            sqlx::query(
-                "INSERT OR IGNORE INTO user_domain_history (domain, owner, created_at)
-                 VALUES (?1, ?2, ?3)",
-            )
-            .bind(domain)
-            .bind(username)
-            .bind(now)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| Self::db_err("insert user_domain history failed", e))?;
+            Self::activate_binding_tx(&mut tx, username, domain, pkx.as_str(), now).await?;
         } else {
             sqlx::query(
                 "UPDATE user_domain_bindings
@@ -1739,15 +1765,13 @@ impl SnAuthDB for SqliteSnAuthDB {
             .execute(&mut *tx)
             .await
             .map_err(|e| Self::db_err("revoke user_domain bindings failed", e))?;
+            sqlx::query("UPDATE users SET user_domain = NULL, updated_at = ?1 WHERE username = ?2")
+                .bind(now)
+                .bind(username)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| Self::db_err("update user_domain failed", e))?;
         }
-
-        sqlx::query("UPDATE users SET user_domain = ?1, updated_at = ?2 WHERE username = ?3")
-            .bind(canonical_domain.as_deref())
-            .bind(now)
-            .bind(username)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| Self::db_err("update user_domain failed", e))?;
 
         tx.commit()
             .await
@@ -1849,13 +1873,16 @@ impl SnAuthDB for SqliteSnAuthDB {
         Ok(())
     }
 
-    async fn create_pkx_binding(
+    async fn activate_user_domain_binding(
         &self,
         username: &str,
         domain: &str,
-    ) -> SnResult<PkxBindingChallenge> {
-        let canonical_domain = Self::canonical_user_domain(domain)
+        pkx: &str,
+    ) -> SnResult<DomainBinding> {
+        let canonical_domain = canonical_user_domain(domain)
             .ok_or_else(|| Self::invalid_input("domain is empty"))?;
+        let pkx = pkx.trim();
+        Self::check_non_empty(pkx, "pkx")?;
         let _locker =
             async_named_locker::Locker::get_locker(Self::USER_DOMAIN_BINDING_LOCK.to_string())
                 .await;
@@ -1865,13 +1892,12 @@ impl SnAuthDB for SqliteSnAuthDB {
             .await
             .map_err(|e| Self::db_err("begin transaction failed", e))?;
 
-        let user =
-            sqlx::query("SELECT state, public_key, owner_key_ref FROM users WHERE username = ?1")
-                .bind(username)
-                .fetch_optional(&mut *tx)
-                .await
-                .map_err(|e| Self::db_err("query user failed", e))?
-                .ok_or_else(|| sn_err!(SnErrorCode::NotFound, "user not found: {}", username))?;
+        let user = sqlx::query("SELECT state FROM users WHERE username = ?1")
+            .bind(username)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| Self::db_err("query user failed", e))?
+            .ok_or_else(|| sn_err!(SnErrorCode::NotFound, "user not found: {}", username))?;
         let state: Option<String> = user
             .try_get("state")
             .map_err(|e| Self::db_err("read state failed", e))?;
@@ -1882,179 +1908,9 @@ impl SnAuthDB for SqliteSnAuthDB {
                 username
             ));
         }
-        let owner_key_ref: Option<String> = user
-            .try_get("owner_key_ref")
-            .map_err(|e| Self::db_err("read owner_key_ref failed", e))?;
-        let public_key: Option<String> = user
-            .try_get("public_key")
-            .map_err(|e| Self::db_err("read public_key failed", e))?;
-        let pkx_source = owner_key_ref
-            .filter(|value| !value.trim().is_empty())
-            .or_else(|| public_key.filter(|value| !value.trim().is_empty()))
-            .unwrap_or_else(|| format!("sn-user:{}", username));
-
-        Self::check_domain_conflicts_tx(&mut tx, username, canonical_domain.as_str()).await?;
-
-        if let Some(existing) =
-            sqlx::query("SELECT owner FROM user_domain_bindings WHERE domain = ?1")
-                .bind(canonical_domain.as_str())
-                .fetch_optional(&mut *tx)
-                .await
-                .map_err(|e| Self::db_err("query user_domain binding failed", e))?
-        {
-            let owner: String = existing
-                .try_get("owner")
-                .map_err(|e| Self::db_err("read binding owner failed", e))?;
-            if owner != username {
-                return Err(sn_err!(
-                    SnErrorCode::Conflict,
-                    "user_domain {} is owned by {}",
-                    canonical_domain,
-                    owner
-                ));
-            }
-        }
 
         let now = Self::now_secs() as i64;
-        let pkx = Self::pkx_value(pkx_source.as_str())?;
-        let pkx_record_name = Self::pkx_record_name(canonical_domain.as_str());
-        sqlx::query(
-            "INSERT INTO user_domain_bindings
-                (domain, owner, state, pkx, pkx_record_name, verified_at, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?6)
-             ON CONFLICT(domain) DO UPDATE SET
-                state = excluded.state,
-                pkx = excluded.pkx,
-                pkx_record_name = excluded.pkx_record_name,
-                verified_at = NULL,
-                updated_at = excluded.updated_at",
-        )
-        .bind(canonical_domain.as_str())
-        .bind(username)
-        .bind(DOMAIN_BINDING_PENDING_PKX)
-        .bind(pkx.as_str())
-        .bind(pkx_record_name.as_str())
-        .bind(now)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| Self::db_err("upsert user_domain binding failed", e))?;
-
-        tx.commit()
-            .await
-            .map_err(|e| Self::db_err("commit transaction failed", e))?;
-
-        Ok(PkxBindingChallenge {
-            username: username.to_string(),
-            domain: canonical_domain,
-            pkx,
-            pkx_record_name,
-            state: DOMAIN_BINDING_PENDING_PKX.to_string(),
-            created_at: now as u64,
-            updated_at: now as u64,
-        })
-    }
-
-    async fn verify_pkx_binding(
-        &self,
-        username: &str,
-        domain: &str,
-        txt_records: &[String],
-    ) -> SnResult<DomainBinding> {
-        let canonical_domain = Self::canonical_user_domain(domain)
-            .ok_or_else(|| Self::invalid_input("domain is empty"))?;
-        let _locker =
-            async_named_locker::Locker::get_locker(Self::USER_DOMAIN_BINDING_LOCK.to_string())
-                .await;
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|e| Self::db_err("begin transaction failed", e))?;
-
-        let binding = sqlx::query(
-            "SELECT owner, state, pkx, pkx_record_name
-             FROM user_domain_bindings WHERE domain = ?1",
-        )
-        .bind(canonical_domain.as_str())
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(|e| Self::db_err("query user_domain binding failed", e))?
-        .ok_or_else(|| {
-            sn_err!(
-                SnErrorCode::NotFound,
-                "user_domain binding not found: {}",
-                canonical_domain
-            )
-        })?;
-
-        let owner: String = binding
-            .try_get("owner")
-            .map_err(|e| Self::db_err("read binding owner failed", e))?;
-        if owner != username {
-            return Err(sn_err!(
-                SnErrorCode::Conflict,
-                "user_domain {} is owned by {}",
-                canonical_domain,
-                owner
-            ));
-        }
-        let state: String = binding
-            .try_get("state")
-            .map_err(|e| Self::db_err("read binding state failed", e))?;
-        if state != DOMAIN_BINDING_PENDING_PKX && state != DOMAIN_BINDING_ACTIVE {
-            return Err(sn_err!(
-                SnErrorCode::Blocked,
-                "user_domain {} is not pending PKX",
-                canonical_domain
-            ));
-        }
-        let pkx: String = binding
-            .try_get("pkx")
-            .map_err(|e| Self::db_err("read binding pkx failed", e))?;
-        if !txt_records
-            .iter()
-            .any(|txt| Self::txt_matches_pkx(txt.as_str(), pkx.as_str()))
-        {
-            return Err(sn_err!(
-                SnErrorCode::InvalidInput,
-                "PKX TXT record does not match expected value for {}",
-                canonical_domain
-            ));
-        }
-        Self::check_domain_conflicts_tx(&mut tx, username, canonical_domain.as_str()).await?;
-
-        let now = Self::now_secs() as i64;
-        sqlx::query(
-            "UPDATE user_domain_bindings
-             SET state = ?1, verified_at = ?2, updated_at = ?2
-             WHERE domain = ?3 AND owner = ?4",
-        )
-        .bind(DOMAIN_BINDING_ACTIVE)
-        .bind(now)
-        .bind(canonical_domain.as_str())
-        .bind(username)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| Self::db_err("activate user_domain binding failed", e))?;
-
-        sqlx::query("UPDATE users SET user_domain = ?1, updated_at = ?2 WHERE username = ?3")
-            .bind(canonical_domain.as_str())
-            .bind(now)
-            .bind(username)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| Self::db_err("update user_domain failed", e))?;
-
-        sqlx::query(
-            "INSERT OR IGNORE INTO user_domain_history (domain, owner, created_at)
-             VALUES (?1, ?2, ?3)",
-        )
-        .bind(canonical_domain.as_str())
-        .bind(username)
-        .bind(now)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| Self::db_err("insert user_domain history failed", e))?;
+        Self::activate_binding_tx(&mut tx, username, canonical_domain.as_str(), pkx, now).await?;
 
         tx.commit()
             .await
@@ -2062,17 +1918,15 @@ impl SnAuthDB for SqliteSnAuthDB {
 
         Ok(DomainBinding {
             username: username.to_string(),
+            pkx_record_name: pkx_record_name(canonical_domain.as_str()),
             domain: canonical_domain,
-            pkx,
-            pkx_record_name: binding
-                .try_get("pkx_record_name")
-                .map_err(|e| Self::db_err("read binding pkx_record_name failed", e))?,
+            pkx: pkx.to_string(),
             verified_at: now as u64,
         })
     }
 
     async fn unbind_user_domain(&self, username: &str, domain: &str) -> SnResult<()> {
-        let canonical_domain = Self::canonical_user_domain(domain)
+        let canonical_domain = canonical_user_domain(domain)
             .ok_or_else(|| Self::invalid_input("domain is empty"))?;
         let _locker =
             async_named_locker::Locker::get_locker(Self::USER_DOMAIN_BINDING_LOCK.to_string())
@@ -2086,12 +1940,13 @@ impl SnAuthDB for SqliteSnAuthDB {
         sqlx::query(
             "UPDATE user_domain_bindings
              SET state = ?1, updated_at = ?2
-             WHERE domain = ?3 AND owner = ?4",
+             WHERE domain = ?3 AND owner = ?4 AND state = ?5",
         )
         .bind(DOMAIN_BINDING_REVOKED)
         .bind(now)
         .bind(canonical_domain.as_str())
         .bind(username)
+        .bind(DOMAIN_BINDING_ACTIVE)
         .execute(&mut *tx)
         .await
         .map_err(|e| Self::db_err("revoke user_domain binding failed", e))?;
@@ -2126,19 +1981,7 @@ impl SnAuthDB for SqliteSnAuthDB {
             return Self::zone_info_from_row(row).map(Some);
         }
 
-        let Some(user) = self.get_user_info(username).await? else {
-            return Ok(Some(ZoneInfo::default_for(username)));
-        };
-
-        let mut zone_info = ZoneInfo::default_for(username);
-        zone_info.zone = if user.zone_config.trim().is_empty() {
-            None
-        } else {
-            Some(user.zone_config)
-        };
-        zone_info.self_cert = user.self_cert;
-        zone_info.sn_ips = user.sn_ips;
-        Ok(Some(zone_info))
+        Ok(Some(ZoneInfo::default_for(username)))
     }
 
     async fn update_zone_info(&self, username: &str, patch: ZoneInfoPatch) -> SnResult<()> {
@@ -2435,7 +2278,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_pkx_binding_flow_and_domain_conflicts() -> SnResult<()> {
+    async fn test_activate_binding_flow_and_supersede() -> SnResult<()> {
         let (_tmp_dir, db) = new_test_db().await?;
         db.insert_activation_code("alice-code").await?;
         db.insert_activation_code("bob-code").await?;
@@ -2448,30 +2291,12 @@ mod tests {
                 .await?
         );
 
-        sqlx::query("UPDATE users SET public_key = ?1 WHERE username = 'alice'")
-            .bind("alice-owner-key")
-            .execute(&db.pool)
-            .await
-            .map_err(|e| SqliteSnAuthDB::db_err("bind test public key failed", e))?;
-        sqlx::query("UPDATE users SET public_key = ?1 WHERE username = 'bob'")
-            .bind("bob-owner-key")
-            .execute(&db.pool)
-            .await
-            .map_err(|e| SqliteSnAuthDB::db_err("bind test public key failed", e))?;
-
-        let challenge = db.create_pkx_binding("alice", "*.Example.COM.").await?;
-        assert_eq!(challenge.domain, "example.com");
-        assert_eq!(challenge.pkx_record_name, "_pkx.example.com");
-        assert_eq!(challenge.pkx, "PKX(alice-owner-key)");
-
-        assert!(db
-            .verify_pkx_binding("alice", "example.com", &[String::from("wrong")])
-            .await
-            .is_err());
         let binding = db
-            .verify_pkx_binding("alice", "example.com", &[challenge.pkx.clone()])
+            .activate_user_domain_binding("alice", "*.Example.COM.", "PKX(alice-owner-key)")
             .await?;
         assert_eq!(binding.domain, "example.com");
+        assert_eq!(binding.pkx_record_name, "_pkx.example.com");
+        assert_eq!(binding.pkx, "PKX(alice-owner-key)");
         assert_eq!(
             db.get_user_by_domain("api.example.com")
                 .await?
@@ -2480,12 +2305,43 @@ mod tests {
                 .as_deref(),
             Some("alice")
         );
+        assert_eq!(
+            db.get_user_info("alice").await?.unwrap().user_domain.as_deref(),
+            Some("example.com")
+        );
 
-        let err = db.create_pkx_binding("bob", "api.example.com").await;
-        assert!(err.is_err());
+        // 域名转让：bob 完成自己的 DNS proof（由服务端校验后调用），无需
+        // alice 先手工 unbind；旧 active binding 被 supersede、旧缓存清空。
+        let takeover = db
+            .activate_user_domain_binding("bob", "example.com", "PKX(bob-owner-key)")
+            .await?;
+        assert_eq!(takeover.domain, "example.com");
+        assert_eq!(
+            db.get_user_by_domain("api.example.com")
+                .await?
+                .unwrap()
+                .username
+                .as_deref(),
+            Some("bob")
+        );
+        assert_eq!(
+            binding_state(&db, "example.com", "alice").await?,
+            DOMAIN_BINDING_SUPERSEDED
+        );
+        assert!(db
+            .get_user_info("alice")
+            .await?
+            .unwrap()
+            .user_domain
+            .is_none());
 
-        db.unbind_user_domain("alice", "example.com").await?;
+        db.unbind_user_domain("bob", "example.com").await?;
         assert!(db.get_user_by_domain("api.example.com").await?.is_none());
+        // unbind 只影响 bob 的 active 行，alice 的 superseded 审计态保持不变。
+        assert_eq!(
+            binding_state(&db, "example.com", "alice").await?,
+            DOMAIN_BINDING_SUPERSEDED
+        );
 
         Ok(())
     }
@@ -2872,87 +2728,80 @@ mod tests {
     fn test_user_domain_helpers_are_stable() {
         // 去 `*.` 前缀、小写、去尾点。
         assert_eq!(
-            SqliteSnAuthDB::canonical_user_domain("*.Example.COM."),
+            canonical_user_domain("*.Example.COM."),
             Some("example.com".to_string())
         );
         assert_eq!(
-            SqliteSnAuthDB::canonical_user_domain("  API.Example.com  "),
+            canonical_user_domain("  API.Example.com  "),
             Some("api.example.com".to_string())
         );
         assert_eq!(
-            SqliteSnAuthDB::canonical_user_domain("example.com"),
+            canonical_user_domain("example.com"),
             Some("example.com".to_string())
         );
         // 空 / 仅点 / 仅通配 → None。
-        assert_eq!(SqliteSnAuthDB::canonical_user_domain("   "), None);
-        assert_eq!(SqliteSnAuthDB::canonical_user_domain("."), None);
+        assert_eq!(canonical_user_domain("   "), None);
+        assert_eq!(canonical_user_domain("."), None);
+        assert_eq!(canonical_user_domain("*."), None);
 
         // 派生 helper 同输入恒等（无 nonce / exp）。
+        assert_eq!(pkx_record_name("example.com"), "_pkx.example.com");
+        assert_eq!(pkx_value("owner-key").unwrap(), pkx_value("owner-key").unwrap());
+        assert_eq!(pkx_value("  owner-key  ").unwrap(), "PKX(owner-key)");
+        assert!(pkx_value("   ").is_err());
+
+        // `sn_user.pkx` 归一：JWK JSON → x 分量；`PKX=<x>[:...];` → <x>。
         assert_eq!(
-            SqliteSnAuthDB::pkx_record_name("example.com"),
-            "_pkx.example.com"
+            pkx_value(r#"{"crv":"Ed25519","kty":"OKP","x":"alice-x-component"}"#).unwrap(),
+            "PKX(alice-x-component)"
         );
         assert_eq!(
-            SqliteSnAuthDB::pkx_value("owner-key").unwrap(),
-            SqliteSnAuthDB::pkx_value("owner-key").unwrap()
+            pkx_source_of("PKX=alice-x-component:bns:alice;").as_deref(),
+            Some("alice-x-component")
         );
-        assert_eq!(
-            SqliteSnAuthDB::pkx_value("  owner-key  ").unwrap(),
-            "PKX(owner-key)"
-        );
-        assert!(SqliteSnAuthDB::pkx_value("   ").is_err());
+        assert_eq!(pkx_source_of("raw-x;").as_deref(), Some("raw-x"));
+        assert_eq!(pkx_source_of("  "), None);
 
         // TXT 比较容忍包裹引号与首尾空白。
-        assert!(SqliteSnAuthDB::txt_matches_pkx(
-            "  \"PKX(owner-key)\"  ",
-            "PKX(owner-key)"
-        ));
-        assert!(!SqliteSnAuthDB::txt_matches_pkx(
-            "PKX(other)",
-            "PKX(owner-key)"
-        ));
+        assert!(txt_matches_pkx("  \"PKX(owner-key)\"  ", "PKX(owner-key)"));
+        assert!(!txt_matches_pkx("PKX(other)", "PKX(owner-key)"));
     }
 
-    /// PKX 状态机：create → pending、verify → active、unbind → revoked，history 保留。
+    /// 状态机：activate → active + history；同 owner 重复激活仅刷新（无重复
+    /// 审计行）；unbind → revoked；重新激活 → 新 active 行 + 新审计行。
     #[tokio::test]
-    async fn test_pkx_binding_state_transitions_and_history() -> SnResult<()> {
+    async fn test_activate_binding_state_transitions_and_history() -> SnResult<()> {
         let (_tmp_dir, db) = new_test_db().await?;
         db.insert_activation_code("alice-code").await?;
         assert!(
             db.register_user("alice-code", "alice", "h", "s", "pbkdf2")
                 .await?
         );
-        db.update_user_public_key("alice", "alice-owner-key")
-            .await?;
 
-        // create → pending_pkx，返回固定的 record name / pkx。
-        let challenge = db.create_pkx_binding("alice", "Example.com.").await?;
-        assert_eq!(challenge.domain, "example.com");
-        assert_eq!(challenge.pkx_record_name, "_pkx.example.com");
-        assert_eq!(challenge.pkx, "PKX(alice-owner-key)");
-        assert_eq!(
-            binding_state(&db, "example.com").await?,
-            DOMAIN_BINDING_PENDING_PKX
-        );
-        // pending 未被 get_user_by_domain 命中。
-        assert!(db.get_user_by_domain("example.com").await?.is_none());
-
-        // 重新 create 幂等：record name / pkx 不变。
-        let challenge2 = db.create_pkx_binding("alice", "example.com").await?;
-        assert_eq!(challenge2.pkx, challenge.pkx);
-        assert_eq!(challenge2.pkx_record_name, challenge.pkx_record_name);
-
-        // verify TXT 匹配 → active。
         let binding = db
-            .verify_pkx_binding("alice", "example.com", &[challenge.pkx.clone()])
+            .activate_user_domain_binding("alice", "Example.com.", "PKX(alice-owner-key)")
             .await?;
         assert_eq!(binding.domain, "example.com");
+        assert_eq!(binding.pkx_record_name, "_pkx.example.com");
         assert_eq!(
-            binding_state(&db, "example.com").await?,
+            binding_state(&db, "example.com", "alice").await?,
             DOMAIN_BINDING_ACTIVE
         );
+        assert_eq!(history_count(&db, "example.com", "alice").await?, 1);
+
+        // 同 owner 重复激活：幂等刷新（pkx 可轮换），不追加审计行、不新增绑定行。
+        db.activate_user_domain_binding("alice", "example.com", "PKX(alice-rotated-key)")
+            .await?;
+        assert_eq!(history_count(&db, "example.com", "alice").await?, 1);
+        let active_rows: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM user_domain_bindings WHERE domain = 'example.com'",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .map_err(|e| SqliteSnAuthDB::db_err("count binding rows failed", e))?;
+        assert_eq!(active_rows, 1);
         assert_eq!(
-            db.get_user_by_domain("api.example.com")
+            db.get_user_by_domain("example.com")
                 .await?
                 .unwrap()
                 .username
@@ -2960,85 +2809,127 @@ mod tests {
             Some("alice")
         );
 
-        // unbind → revoked，但 history 仍保留。
+        // unbind → revoked，history 保留；SN-DNS 侧 get_user_by_domain 不再命中
+        // 该域名及其子域名。
         db.unbind_user_domain("alice", "example.com").await?;
         assert_eq!(
-            binding_state(&db, "example.com").await?,
+            binding_state(&db, "example.com", "alice").await?,
             DOMAIN_BINDING_REVOKED
         );
+        assert!(db.get_user_by_domain("example.com").await?.is_none());
         assert!(db.get_user_by_domain("api.example.com").await?.is_none());
-        let history: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM user_domain_history WHERE domain = 'example.com' AND owner = 'alice'",
-        )
-        .fetch_one(&db.pool)
-        .await
-        .map_err(|e| SqliteSnAuthDB::db_err("count history failed", e))?;
-        assert_eq!(history, 1, "history must be retained after unbind");
+        assert_eq!(history_count(&db, "example.com", "alice").await?, 1);
+        assert!(db
+            .get_user_info("alice")
+            .await?
+            .unwrap()
+            .user_domain
+            .is_none());
+
+        // 重新完成 proof 后再次激活：新 active 行 + 新审计行。
+        db.activate_user_domain_binding("alice", "example.com", "PKX(alice-owner-key)")
+            .await?;
+        assert_eq!(
+            binding_state(&db, "example.com", "alice").await?,
+            DOMAIN_BINDING_ACTIVE
+        );
+        assert_eq!(history_count(&db, "example.com", "alice").await?, 2);
 
         Ok(())
     }
 
-    /// 域名冲突：相同 / 祖先 / 子域名被他人历史绑定 → Conflict；本人则允许。
+    /// Beta2.2 冲突规则：history 仅审计，不阻止接管；同域名旧 active binding
+    /// 被新 DNS owner supersede；父/子域名不互斥。非 active 用户不能激活。
     #[tokio::test]
-    async fn test_domain_conflict_rules() -> SnResult<()> {
+    async fn test_history_is_audit_only_and_domains_are_not_exclusive() -> SnResult<()> {
         let (_tmp_dir, db) = new_test_db().await?;
         for (code, user) in [("a-code", "alice"), ("b-code", "bob")] {
             db.insert_activation_code(code).await?;
             assert!(db.register_user(code, user, "h", "s", "pbkdf2").await?);
         }
-        db.update_user_public_key("alice", "alice-key").await?;
-        db.update_user_public_key("bob", "bob-key").await?;
 
-        // alice 激活 example.com。
-        db.create_pkx_binding("alice", "example.com").await?;
-        db.verify_pkx_binding("alice", "example.com", &[String::from("PKX(alice-key)")])
+        // alice 激活 example.com 后 unbind：留下 history 与 revoked 行。
+        db.activate_user_domain_binding("alice", "example.com", "PKX(alice-key)")
+            .await?;
+        db.unbind_user_domain("alice", "example.com").await?;
+
+        // history 不构成硬冲突：bob 能通过自己的 DNS proof 接管同一域名。
+        db.activate_user_domain_binding("bob", "example.com", "PKX(bob-key)")
+            .await?;
+        assert_eq!(
+            db.get_user_by_domain("example.com")
+                .await?
+                .unwrap()
+                .username
+                .as_deref(),
+            Some("bob")
+        );
+
+        // 祖先/子域名不再互斥：alice 可绑定 bob 域名的子域，反向亦然。
+        db.activate_user_domain_binding("alice", "api.example.com", "PKX(alice-key)")
+            .await?;
+        db.activate_user_domain_binding("alice", "com", "PKX(alice-key)")
             .await?;
 
-        // bob：相同域名冲突。
-        let err = db
-            .create_pkx_binding("bob", "example.com")
-            .await
-            .unwrap_err();
-        assert_eq!(err.code(), SnErrorCode::Conflict);
-        // bob：子域名（descendant）冲突。
-        let err = db
-            .create_pkx_binding("bob", "api.example.com")
-            .await
-            .unwrap_err();
-        assert_eq!(err.code(), SnErrorCode::Conflict);
-        // bob：祖先域名（ancestor）冲突。
-        let err = db.create_pkx_binding("bob", "com").await.unwrap_err();
-        assert_eq!(err.code(), SnErrorCode::Conflict);
+        // 解析按最长 active binding 匹配。
+        assert_eq!(
+            db.get_user_by_domain("host.api.example.com")
+                .await?
+                .unwrap()
+                .username
+                .as_deref(),
+            Some("alice")
+        );
+        assert_eq!(
+            db.get_user_by_domain("www.example.com")
+                .await?
+                .unwrap()
+                .username
+                .as_deref(),
+            Some("bob")
+        );
+        assert_eq!(
+            db.get_user_by_domain("other.com")
+                .await?
+                .unwrap()
+                .username
+                .as_deref(),
+            Some("alice")
+        );
 
-        // alice 本人的子域名允许（owner 相同被排除）。
-        let challenge = db.create_pkx_binding("alice", "sub.example.com").await?;
-        assert_eq!(challenge.domain, "sub.example.com");
+        // 非 active 用户不能激活绑定。
+        db.set_user_state("bob", UserState::Suspended).await?;
+        let err = db
+            .activate_user_domain_binding("bob", "blocked.example.org", "PKX(bob-key)")
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), SnErrorCode::Blocked);
+
+        // 空 pkx 不能激活（proof 值必须由服务端算出）。
+        let err = db
+            .activate_user_domain_binding("alice", "empty.example.org", "  ")
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), SnErrorCode::InvalidInput);
 
         Ok(())
     }
 
-    /// `get_user_by_domain`：active binding 最长匹配 + legacy `users.user_domain` 回退。
+    /// `get_user_by_domain`：只查询 active binding，旧 `users.user_domain` 不再作为回退。
     #[tokio::test]
-    async fn test_get_user_by_domain_longest_match_and_legacy_fallback() -> SnResult<()> {
+    async fn test_get_user_by_domain_longest_match_without_legacy_fallback() -> SnResult<()> {
         let (_tmp_dir, db) = new_test_db().await?;
         db.insert_activation_code("alice-code").await?;
         assert!(
             db.register_user("alice-code", "alice", "h", "s", "pbkdf2")
                 .await?
         );
-        db.update_user_public_key("alice", "alice-key").await?;
 
         // alice 同时激活 example.com 与更具体的 sub.example.com。
-        db.create_pkx_binding("alice", "example.com").await?;
-        db.verify_pkx_binding("alice", "example.com", &[String::from("PKX(alice-key)")])
+        db.activate_user_domain_binding("alice", "example.com", "PKX(alice-key)")
             .await?;
-        db.create_pkx_binding("alice", "sub.example.com").await?;
-        db.verify_pkx_binding(
-            "alice",
-            "sub.example.com",
-            &[String::from("PKX(alice-key)")],
-        )
-        .await?;
+        db.activate_user_domain_binding("alice", "sub.example.com", "PKX(alice-key)")
+            .await?;
 
         // host.sub.example.com → 命中最长的 sub.example.com binding（同样属 alice）。
         assert_eq!(
@@ -3051,7 +2942,7 @@ mod tests {
         );
         assert!(db.get_user_by_domain("unrelated.org").await?.is_none());
 
-        // legacy 回退：bob 仅在 users.user_domain 留有遗留域名、无 binding 行。
+        // breaking change：bob 仅在 users.user_domain 留有遗留域名、无 binding 行，不再命中。
         db.insert_activation_code("bob-code").await?;
         assert!(
             db.register_user("bob-code", "bob", "h", "s", "pbkdf2")
@@ -3061,8 +2952,95 @@ mod tests {
             .execute(&db.pool)
             .await
             .map_err(|e| SqliteSnAuthDB::db_err("set legacy domain failed", e))?;
+        assert!(db.get_user_by_domain("host.legacy.test").await?.is_none());
+
+        Ok(())
+    }
+
+    /// 旧 schema（domain 主键 + pending_pkx 行）迁移：active/revoked 行保留，
+    /// pending_pkx 行丢弃，迁移后 supersede/多行审计可用。
+    #[tokio::test]
+    async fn test_legacy_user_domain_schema_migration() -> SnResult<()> {
+        let tmp_dir = tempfile::tempdir()
+            .map_err(|e| sn_err!(SnErrorCode::DBError, "create temp dir failed: {}", e))?;
+        let db_path = tmp_dir.path().join("sn_auth.sqlite3");
+        let db_path_str = db_path.to_string_lossy().to_string();
+
+        {
+            // 手工构造旧 schema。
+            let db = SqliteSnAuthDB::new_by_path(db_path_str.as_str()).await?;
+            for sql in [
+                "CREATE TABLE user_domain_history (
+                    domain TEXT PRIMARY KEY,
+                    owner TEXT NOT NULL,
+                    created_at INTEGER NOT NULL
+                )",
+                "CREATE TABLE user_domain_bindings (
+                    domain TEXT PRIMARY KEY,
+                    owner TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    pkx TEXT NOT NULL,
+                    pkx_record_name TEXT NOT NULL,
+                    verified_at INTEGER NULL,
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL
+                )",
+                "INSERT INTO user_domain_history (domain, owner, created_at)
+                 VALUES ('active.test', 'alice', 1)",
+                "INSERT INTO user_domain_bindings
+                    (domain, owner, state, pkx, pkx_record_name, verified_at, created_at, updated_at)
+                 VALUES ('active.test', 'alice', 'active', 'PKX(alice-key)', '_pkx.active.test', 1, 1, 1)",
+                "INSERT INTO user_domain_bindings
+                    (domain, owner, state, pkx, pkx_record_name, verified_at, created_at, updated_at)
+                 VALUES ('pending.test', 'alice', 'pending_pkx', 'PKX(alice-key)', '_pkx.pending.test', NULL, 1, 1)",
+            ] {
+                sqlx::query(sql)
+                    .execute(&db.pool)
+                    .await
+                    .map_err(|e| SqliteSnAuthDB::db_err("seed legacy schema failed", e))?;
+            }
+        }
+
+        let db = SqliteSnAuthDB::new_by_path(db_path_str.as_str()).await?;
+        db.initialize_database().await?;
+
+        db.insert_activation_code("alice-code").await?;
+        assert!(
+            db.register_user("alice-code", "alice", "h", "s", "pbkdf2")
+                .await?
+        );
+        db.insert_activation_code("bob-code").await?;
+        assert!(
+            db.register_user("bob-code", "bob", "h", "s", "pbkdf2")
+                .await?
+        );
+
+        // 旧 active 行仍可解析；pending_pkx 行被丢弃。
         assert_eq!(
-            db.get_user_by_domain("host.legacy.test")
+            db.get_user_by_domain("active.test")
+                .await?
+                .unwrap()
+                .username
+                .as_deref(),
+            Some("alice")
+        );
+        let pending_rows: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM user_domain_bindings WHERE domain = 'pending.test'",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .map_err(|e| SqliteSnAuthDB::db_err("count pending rows failed", e))?;
+        assert_eq!(pending_rows, 0);
+
+        // 迁移后的表支持 supersede（多行同域名）。
+        db.activate_user_domain_binding("bob", "active.test", "PKX(bob-key)")
+            .await?;
+        assert_eq!(
+            binding_state(&db, "active.test", "alice").await?,
+            DOMAIN_BINDING_SUPERSEDED
+        );
+        assert_eq!(
+            db.get_user_by_domain("active.test")
                 .await?
                 .unwrap()
                 .username
@@ -3117,9 +3095,9 @@ mod tests {
         Ok(())
     }
 
-    /// `get_zone_info` 在缺 zone_info 行时从 `users` 回退派生（backfill 分支）。
+    /// `get_zone_info` 缺 zone_info 行时返回默认值，不再从 `users.zone_config` 派生。
     #[tokio::test]
-    async fn test_get_zone_info_backfills_from_users() -> SnResult<()> {
+    async fn test_get_zone_info_without_legacy_user_cache_fallback() -> SnResult<()> {
         let (_tmp_dir, db) = new_test_db().await?;
         db.insert_activation_code("zone-code").await?;
         assert!(
@@ -3127,7 +3105,7 @@ mod tests {
                 .await?
         );
 
-        // 删 zone_info 行，并在 users 上留下 zone_config / self_cert。
+        // 删 zone_info 行，并在 users 上留下旧 zone_config / self_cert。
         sqlx::query("DELETE FROM zone_info WHERE username = 'alice'")
             .execute(&db.pool)
             .await
@@ -3142,8 +3120,8 @@ mod tests {
         let zone = db.get_zone_info("alice").await?.unwrap();
         assert_eq!(zone.username, "alice");
         assert_eq!(zone.bns_name, "alice");
-        assert_eq!(zone.zone.as_deref(), Some("did:zone:legacy"));
-        assert!(zone.self_cert);
+        assert!(zone.zone.is_none());
+        assert!(!zone.self_cert);
 
         // 完全未知用户 → 默认值（不报错）。
         let zone = db.get_zone_info("ghost").await?.unwrap();
@@ -3200,11 +3178,28 @@ mod tests {
         Ok(())
     }
 
-    async fn binding_state(db: &SqliteSnAuthDB, domain: &str) -> SnResult<String> {
-        sqlx::query_scalar("SELECT state FROM user_domain_bindings WHERE domain = ?1")
-            .bind(domain)
-            .fetch_one(&db.pool)
-            .await
-            .map_err(|e| SqliteSnAuthDB::db_err("read binding state failed", e))
+    /// 指定 (domain, owner) 最新一行绑定的状态。
+    async fn binding_state(db: &SqliteSnAuthDB, domain: &str, owner: &str) -> SnResult<String> {
+        sqlx::query_scalar(
+            "SELECT state FROM user_domain_bindings
+             WHERE domain = ?1 AND owner = ?2
+             ORDER BY id DESC LIMIT 1",
+        )
+        .bind(domain)
+        .bind(owner)
+        .fetch_one(&db.pool)
+        .await
+        .map_err(|e| SqliteSnAuthDB::db_err("read binding state failed", e))
+    }
+
+    async fn history_count(db: &SqliteSnAuthDB, domain: &str, owner: &str) -> SnResult<i64> {
+        sqlx::query_scalar(
+            "SELECT COUNT(*) FROM user_domain_history WHERE domain = ?1 AND owner = ?2",
+        )
+        .bind(domain)
+        .bind(owner)
+        .fetch_one(&db.pool)
+        .await
+        .map_err(|e| SqliteSnAuthDB::db_err("count history failed", e))
     }
 }

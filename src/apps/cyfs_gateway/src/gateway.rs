@@ -3445,7 +3445,7 @@ impl GatewayCmdHandler {
                 "name client has not been initialized"
             )
         })?;
-        let provider = HttpsProvider::new_with_config(json!({
+        let provider = BaseHttpProvider::new_with_config(json!({
             "resolver_host": resolver_host,
             "scheme": scheme,
         }))

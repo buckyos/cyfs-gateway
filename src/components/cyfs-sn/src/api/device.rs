@@ -1,14 +1,93 @@
 use super::common::{
-    ok_response, parse_params, require_account_username, resolve_self_scoped_username,
-    IntoRpcResult, QueryByDidReq, QueryByHostnameReq, RpcCallResult,
+    ok_response, parse_params, resolve_self_scoped_username, IntoRpcResult, QueryByDidReq,
+    QueryByHostnameReq, RpcCallResult,
 };
 use super::errors::{parse_error, SnApiErrorCode};
+use crate::sn_authority::{require_sn_user_or_device, AuthContext};
 use crate::{
     SNServer, SnDeviceEndpointUpdate, SnDeviceListOptions, SnDeviceState, SnDeviceStateView,
 };
 use ::kRPC::{RPCErrors, RPCRequest, RPCResponse};
 use serde::Deserialize;
 use serde_json::{json, Value};
+
+/// device.register / device.update 的上报者身份：SN 账号 token（可上报该
+/// 账号名下任意设备）或设备 token（只能上报凭证锚定的那台设备）。
+enum ReportIdentity {
+    Account {
+        username: String,
+    },
+    Device {
+        zone: String,
+        device_name: String,
+        did: String,
+    },
+}
+
+impl ReportIdentity {
+    fn username(&self) -> &str {
+        match self {
+            Self::Account { username } => username,
+            Self::Device { zone, .. } => zone,
+        }
+    }
+
+    /// 设备凭证时校验请求参数没有越出凭证边界（设备名/DID 必须一致），
+    /// 并返回强制使用的上报 DID；账号凭证不做设备级约束，返回 None。
+    fn enforce_reported_device(
+        &self,
+        params_device_name: &str,
+        params_device_did: Option<&str>,
+    ) -> RpcCallResult<Option<String>> {
+        let Self::Device {
+            zone,
+            device_name,
+            did,
+        } = self
+        else {
+            return Ok(None);
+        };
+        if params_device_name != device_name.as_str() {
+            return Err(parse_error(
+                SnApiErrorCode::DevicePermissionDenied,
+                format!(
+                    "device token of {}.{} cannot report device {}",
+                    device_name, zone, params_device_name
+                ),
+            ));
+        }
+        if let Some(params_did) = params_device_did.filter(|did| !did.trim().is_empty()) {
+            if params_did.trim() != did.as_str() {
+                return Err(parse_error(
+                    SnApiErrorCode::DevicePermissionDenied,
+                    format!(
+                        "device token of {} cannot report did {}",
+                        did, params_did
+                    ),
+                ));
+            }
+        }
+        Ok(Some(did.clone()))
+    }
+}
+
+async fn require_report_identity(
+    server: &SNServer,
+    req: &RPCRequest,
+) -> RpcCallResult<ReportIdentity> {
+    match require_sn_user_or_device(server, req).await? {
+        AuthContext::SnUser { username, .. } => Ok(ReportIdentity::Account { username }),
+        AuthContext::Device {
+            zone,
+            device_name,
+            did,
+        } => Ok(ReportIdentity::Device {
+            zone,
+            device_name,
+            did,
+        }),
+    }
+}
 
 pub(crate) async fn handle_device(
     server: &SNServer,
@@ -17,13 +96,19 @@ pub(crate) async fn handle_device(
 ) -> RpcCallResult<RPCResponse> {
     match req.method.as_str() {
         "register" => {
-            let username = require_account_username(server, &req).await?;
+            let identity = require_report_identity(server, &req).await?;
             let params: DeviceOnlineRegisterReq = parse_params(&req)?;
+            let device_did = identity
+                .enforce_reported_device(
+                    params.device_name.as_str(),
+                    Some(params.device_did.as_str()),
+                )?
+                .unwrap_or_else(|| params.device_did.clone());
             let view = report_device_online_state(
                 server,
-                username.as_str(),
+                identity.username(),
                 params.device_name.as_str(),
-                params.device_did.as_str(),
+                device_did.as_str(),
                 params.device_ip.as_str(),
                 &params.device_info,
                 Some(ip_from),
@@ -35,7 +120,7 @@ pub(crate) async fn handle_device(
             ok_response(&req, online_state_response(view))
         }
         "update" => {
-            let username = require_account_username(server, &req).await?;
+            let identity = require_report_identity(server, &req).await?;
             let params: DeviceOnlineUpdateReq = parse_params(&req)?;
             if params.mini_config_jwt.is_some() {
                 return Err(parse_error(
@@ -43,16 +128,24 @@ pub(crate) async fn handle_device(
                     "device identity document updates moved to /kapi/bns",
                 ));
             }
-            let device_did = resolve_report_did(
-                server,
-                username.as_str(),
+            let device_did = match identity.enforce_reported_device(
                 params.device_name.as_str(),
                 params.device_did.as_deref(),
-            )
-            .await?;
+            )? {
+                Some(did) => did,
+                None => {
+                    resolve_report_did(
+                        server,
+                        identity.username(),
+                        params.device_name.as_str(),
+                        params.device_did.as_deref(),
+                    )
+                    .await?
+                }
+            };
             let view = report_device_online_state(
                 server,
-                username.as_str(),
+                identity.username(),
                 params.device_name.as_str(),
                 device_did.as_str(),
                 params.device_ip.as_str(),

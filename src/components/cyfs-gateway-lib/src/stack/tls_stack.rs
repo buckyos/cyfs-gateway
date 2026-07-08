@@ -1195,7 +1195,7 @@ mod tests {
     use http_body_util::Full;
     use hyper::body::Bytes;
     use hyper_util::rt::{TokioExecutor, TokioIo};
-    use name_lib::{DeviceConfig, encode_ed25519_sk_to_pk_jwk, generate_ed25519_key};
+    use name_lib::{DeviceDocument, encode_ed25519_sk_to_pk_jwk, generate_ed25519_key};
     use rcgen::{
         BasicConstraints, CertificateParams, IsCa, Issuer, KeyPair, generate_simple_self_signed,
     };
@@ -2115,7 +2115,8 @@ mod tests {
 
         let (signing_key, _pkcs8_bytes) = generate_ed25519_key();
         let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
-        let _device_config = DeviceConfig::new_by_jwk("test", serde_json::from_value(jwk).unwrap());
+        let _device_config =
+            DeviceDocument::new_by_jwk("test", serde_json::from_value(jwk).unwrap());
 
         let config =
             ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
@@ -2227,7 +2228,8 @@ mod tests {
 
         let (signing_key, _pkcs8_bytes) = generate_ed25519_key();
         let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
-        let _device_config = DeviceConfig::new_by_jwk("test", serde_json::from_value(jwk).unwrap());
+        let _device_config =
+            DeviceDocument::new_by_jwk("test", serde_json::from_value(jwk).unwrap());
 
         let config =
             ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))

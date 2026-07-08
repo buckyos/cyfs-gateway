@@ -2,7 +2,7 @@
 
 > RTCP是Reverse Tcp的缩写，对应核心的协议动作ROpen
 
-本文基于当前代码实现整理，目标是说明 `cyfs-gateway` 中 RTCP 的实际线协议、建链流程、开流流程和关键字段语义。实现入口主要在：
+本文基于当前代码实现和近期语义修订整理，目标是说明 `cyfs-gateway` 中 RTCP 的线协议、建链流程、开流流程和关键字段语义。实现入口主要在：
 
 - `src/components/cyfs-gateway-lib/src/rtcp/package.rs`
 - `src/components/cyfs-gateway-lib/src/rtcp/rtcp.rs`
@@ -140,12 +140,13 @@ RTCP 在线上有两种首部格式。
 字段说明：
 
 - `from_id`
-  - 发起端设备 ID。
-  - 接收端会把它作为来源设备身份。
-  - 如果同时携带 `device_doc_jwt`，则要求 `device_doc_jwt` 解出的 `id` 与它完全一致。
+  - 发起端声明的逻辑来源设备身份。
+  - 可以是 `did:dev:<pkx>`，也可以是 `did:web` / `did:bns` / hostname 这类名字身份。
+  - 线协议上应尽量保留这个逻辑语义；从名字身份解析到 `did:dev` 是 RTCP 内部的认证和 key 归一化步骤，不要求调用方预先把名字改写成 `did:dev`。
+  - 如果同时携带 `device_doc_jwt`，则要求它能证明 `from_id` 对应的 canonical `did:dev` 设备身份，而不是简单做字符串相等比较。
 - `to_id`
-  - 目标设备 ID。
-  - 当前实现会记录日志，但不会据此校验“是否就是本机”。
+  - 发起端声明的逻辑目标设备身份。
+  - 同样可以是 `did:dev` 或名字身份。`to_id` 的语义应保留“我要连哪个逻辑设备”，内部再自动解析到 canonical `did:dev` 做验签、keying 和 tunnel 复用判断。
 - `my_port`
   - 发起端 RTCP 栈监听端口。
   - 接收端后续会把它当成“回连该设备 RTCP 端口”的目标端口。
@@ -154,7 +155,7 @@ RTCP 在线上有两种首部格式。
   - 一个 EdDSA JWT，里面携带本次 tunnel 的临时密钥交换信息。
 - `device_doc_jwt`
   - 可选。
-  - 跨 zone 首次接入时很重要，允许接收端在还不知道 `from_id` 对应设备公钥时完成准入和 token 验签。
+  - 跨 zone 首次接入时很重要，允许接收端在还不知道 `from_id` 对应设备公钥时完成名字身份到 canonical `did:dev` 的证明、准入和 token 验签。
 
 ### 4.2 tunnel_token 载荷
 
@@ -163,8 +164,8 @@ RTCP 在线上有两种首部格式。
 ```json
 {
   "aud": "buckyos-rtcp-v2-hello",
-  "to": "<target did hostname>",
-  "from": "<source did hostname>",
+  "to": "<target logical did hostname>",
+  "from": "<source logical did hostname>",
   "xpub": "<hex encoded 32-byte x25519 public key>",
   "exp": 1711111111,
   "nonce": "<hex encoded 16-byte random>"
@@ -179,11 +180,11 @@ RTCP 在线上有两种首部格式。
   - 与 `HelloAck` 用的 `buckyos-rtcp-v2-ack` 互不兼容，杜绝“confused deputy”——一条捕获到的 Hello token 不能被重放成 ack，反之亦然。
   - 同时是协议版本号：未来不兼容升级会改 `aud` 后缀，旧实现自然解码失败，无需带外协商版本。
 - `to`
-  - 发起端认为的目标设备 host name。
-  - 接收端会显式校验 `to == <自身 did hostname>`；不匹配直接拒绝，防止把针对 A 的 token 重放到 B。
+  - 发起端认为的目标逻辑设备 host name。
+  - 接收端不应只做原始字符串比较；它应把 `to` 自动解析到 canonical `did:dev`，并确认该 DEV DID 等于本机设备身份。这样 `did:web` / `did:bns` 形式仍保留业务语义，同时不会削弱“token 只能给本机使用”的校验。
 - `from`
-  - 发起端设备 host name。
-  - 接收端会校验它与已确认的来源设备 ID 一致。
+  - 发起端逻辑设备 host name。
+  - 接收端会校验它与 `Hello.from_id` 表达的是同一个设备身份；比较时以解析后的 canonical `did:dev` 为准。
 - `xpub`
   - 发起端本次握手的**一次性** X25519 公钥，16 进制编码。
   - v2 中该公钥与设备长期身份完全无关——每次 `create_tunnel()` 都现场生成新的 `EphemeralSecret`/`PublicKey`，握手结束后即丢弃。
@@ -193,7 +194,7 @@ RTCP 在线上有两种首部格式。
   - 当前生成时为“当前时间 + `TUNNEL_TOKEN_EXP_SECS`（60 秒）”；接收端的 `Validation` 显式设 `leeway = JWT_LEEWAY_SECS`（同为 60 秒），所以实际签名接受窗口是 `[exp - leeway, exp + leeway]`。
 - `nonce`
   - 必填。16 字节随机数，16 进制编码。
-  - 接收端维护 `(from_id, nonce)` 的短期 cache（容量上限 16 KiB）；每条记录的保留期固定为 `exp + JWT_LEEWAY_SECS`，与签名接受窗口的上界对齐，杜绝“签名仍合法但 nonce 已被清理”的重放缝隙。
+  - 接收端维护 `(source_dev_did, nonce)` 的短期 cache（容量上限 16 KiB）；每条记录的保留期固定为 `exp + JWT_LEEWAY_SECS`，与签名接受窗口的上界对齐，杜绝“签名仍合法但 nonce 已被清理”的重放缝隙。
   - 不再是可选字段；缺失 `nonce` 的 token 在 JWT 解码阶段就会失败。
 
 ### 4.3 HelloAck / HelloAckConfirm
@@ -204,7 +205,7 @@ RTCP 在线上有两种首部格式。
 {
   "ack_token": "<eddsa jwt signed by responder>",
   "challenge": "<hex encoded 16-byte random>",
-  "responder_id": "<responder did hostname>"
+  "responder_id": "<responder logical did hostname>"
 }
 ```
 
@@ -213,8 +214,8 @@ RTCP 在线上有两种首部格式。
 ```json
 {
   "aud": "buckyos-rtcp-v2-ack",
-  "to": "<initiator did hostname>",
-  "from": "<responder did hostname>",
+  "to": "<initiator logical did hostname>",
+  "from": "<responder logical did hostname>",
   "xpub": "<hex encoded 32-byte responder ephemeral x25519 public key>",
   "peer_xpub": "<echo of Hello.tunnel_token.xpub>",
   "exp": 1711111111,
@@ -238,11 +239,12 @@ RTCP 在线上有两种首部格式。
   - `ack_token`
     - 接收端用自己长期 Ed25519 私钥签发的 EdDSA JWT，承担 v2 中“证明该临时公钥确实属于这个 responder”的职责（旧版靠静态 X25519 提供这层身份锚定，v2 把它移到这条 JWT 上）。
     - `aud` 必须等于 `buckyos-rtcp-v2-ack`；与 Hello 的 `aud` 隔离。
+    - `from` / `to` 仍保留 responder / initiator 的逻辑设备语义；校验时解析到 canonical DEV DID 后比较，避免名字字符串差异影响身份判断。
     - `xpub` 是接收端为本次握手新生成的临时 X25519 公钥；与设备长期 X25519 无关。
     - `peer_xpub` 必须 echo 发起端 Hello 中的 `xpub`，从而把 ack 绑死到这一次握手——即便攻击者拿到同一台 responder 在另一次会话中签出的合法 ack，也无法拼接到本次握手里冒用。
     - `exp`、`nonce` 行为与 Hello token 一致，复用同一个 `TUNNEL_TOKEN_EXP_SECS` / `JWT_LEEWAY_SECS`。
   - `challenge` 是接收端为本次握手随机生成的 16 字节十六进制串，发起端必须在 `HelloAckConfirm` 里原样回写。
-  - `responder_id` 用于发起端确认连到的确实是预期 DID；发起端要求它等于 `create_tunnel()` 解析出的目标 DID hostname，否则终止握手。
+  - `responder_id` 用于日志和 sanity check，不是身份认证锚点；如需校验，也应按 canonical DEV DID 比较，而不是要求它与 `create_tunnel()` 的原始目标名字字符串完全一致。
 - `HelloAckConfirm`
   - 发起端在收到并通过 `ack_token` 校验后，先用 `(initiator_eph, responder_eph)` 完成 ECDH，HKDF 派生出本次会话的 `(aes_key, iv)`（详见 §5.4），然后才把承载流包成 `EncryptedStream`，并以 AEAD 记录形式发出 `HelloAckConfirm`。
   - 接收端收到此 AEAD 记录后，用自己派生的同一把 `(aes_key, iv)` 解密：解密成功即意味着对端确实持有 `responder_eph` 派生的会话密钥，且 `challenge_echo` 必须与自己发出的 challenge 完全一致，才会真正接纳 tunnel。
@@ -349,10 +351,11 @@ RTCP v2 的认证锚点是双方设备的长期 Ed25519 身份；会话密钥则
 
 发起侧 `create_tunnel()` 时执行：
 
-1. 解析目标设备 DID。
-2. 解析目标设备的长期 Ed25519 验签公钥：
+1. 解析目标逻辑设备 DID。输入可以是 `did:dev`，也可以是 `did:web` / `did:bns` / hostname。
+2. 将目标逻辑 DID 解析到 canonical `did:dev` 设备身份，并取出该设备的长期 Ed25519 验签公钥：
    - 默认走 `resolve_ed25519_exchange_key(remote_did)`。
-   - 如果是 `did:web` 且 DID doc 路径失败，当前实现会 fallback 到 web host 的 TXT 记录，依次尝试 `DEV=` JWT 和 `PKX=` 字段提取设备公钥。
+   - 如果是 `did:web` 且 DID doc 路径失败，当前实现会 fallback 到 web host 的 TXT 记录，依次尝试 `DEV=` JWT 和 `PKX=` 字段提取设备公钥，并据此得到 canonical `did:dev`。
+   - `did:bns` / `did:web` 这类名字 DID 的作用是表达逻辑目标；转换成 `did:dev` 是协议栈内部步骤，不改变调用方的 `from` / `to` 语义。
    - 该 Ed25519 公钥会随 `InitiatorHandshakeState` 一起持有到收到 `HelloAck` 时再用——v2 会用它直接验证 `ack_token` 的签名，因此不需要二次解析。
 3. 现场生成一次性 X25519 密钥对 `(my_secret, my_public)`（`EphemeralSecret::random()`）；私钥仅在收到 `HelloAck` 后用于一次性的 ECDH，之后被消耗。
 4. 生成 16 字节随机 `nonce`。
@@ -369,13 +372,15 @@ RTCP v2 的认证锚点是双方设备的长期 Ed25519 身份；会话密钥则
    - 先不验签解析 JWT，拿到 `owner`。
    - 解析 owner 的 auth key。
    - 用 owner 公钥正式验证 `device_doc_jwt`。
-   - 校验 `device_doc_jwt.id == hello.from_id`。
+   - 校验 `device_doc_jwt` 证明出的 canonical `did:dev` 与 `hello.from_id` 解析出的 canonical `did:dev` 是同一设备。
    - 从设备文档的默认 key 提取设备 Ed25519 公钥。
    - 用这个设备公钥验证 `tunnel_token`。
 
 2. `device_doc_jwt` 不存在
-   - 直接根据 `hello.from_id` 解析设备公钥。
+   - 直接根据 `hello.from_id` 解析 canonical `did:dev` 和设备公钥。
    - 用该设备公钥验证 `tunnel_token`。
+
+无论 `from_id` 使用名字还是 `did:dev`，认证成功后 RTCP 内部都会得到一个 canonical source DEV DID。这个 DEV DID 用于 nonce cache、tunnel key 和会话身份锚定；原始名字身份仍保留其逻辑语义，供日志、策略和上层业务理解。
 
 #### 5.3.1 关于匿名访问：为什么 `did:dev:xxx` 直接放行不是漏洞
 
@@ -385,7 +390,7 @@ RTCP v2 的认证锚点是双方设备的长期 Ed25519 身份；会话密钥则
 - **“放行”不等于“可访问服务”。** 是否接受这条连接、能访问什么，由上层 `on_new_tunnel_hook_point` 策略决定（见 §11、§12）。认证层只是把“可信的事实”交给策略层，准入是策略层的事。
 - **匿名访问是被刻意支持的一等模式，不是疏忽。** BuckyOS 的取向是“默认用正确身份，但要让匿名访问 zone 外 / 非熟人服务很容易打开”：
   - 随手起的客户端（如 `rtcp_get`）用一次性 `did:dev` 即可零成本访问，走路径 2；
-  - 严肃 app 访问自己的 app service，用带 `device_doc_jwt` 的实名身份，走路径 1，让接收侧策略能识别 `owner` / `zone`。
+  - 严肃 app 访问自己的 app service，用名字 DID + `device_doc_jwt` 的实名身份，走路径 1，让接收侧策略能识别 `owner` / `zone`，同时内部仍锚定到 canonical `did:dev`。
 - **两条路径喂给策略层的字段，信任级别不同**，写策略时务必区分：
   - `owner` 是权威的（路径 1 真查名字系统并用 owner 公钥验了签）；
   - `zone_did` / `name` 只随 owner——当 owner 是自证的 `did:dev` 时它们可被任意填写。
@@ -409,7 +414,7 @@ v2 的会话密钥派生过程是双方对称的，完全由现场生成的临�
 发起侧（initiator）在收到明文 `HelloAck` 后：
 
 1. 用 `state.responder_ed25519_pk_der`（即 §5.2 步骤 2 解析到的 responder 长期 Ed25519 公钥）验证 `ack_token` 的 EdDSA 签名。
-2. 校验 `ack_token.from / to / aud / nonce / exp`，并显式校验 `peer_xpub == 自己 Hello 中的 xpub_hex`——这一步杜绝把别的会话里 responder 签出的合法 ack 拼接到本次握手。
+2. 校验 `ack_token.from / to / aud / nonce / exp`，其中 `from` / `to` 按 canonical DEV DID 比较；并显式校验 `peer_xpub == 自己 Hello 中的 xpub_hex`——这一步杜绝把别的会话里 responder 签出的合法 ack 拼接到本次握手。
 3. 用 `state.my_secret` 与 `ack_token.xpub` 解码出的 32 字节做 ECDH，得到与 responder 完全相同的 `shared_secret`。
 4. 走 §5.4.1 的 HKDF 派生 `(aes_key, iv)`，把承载流包成 `EncryptedStream`（initiator 方向）。
 5. 在该加密流上发出 AEAD 形式的 `HelloAckConfirm { challenge_echo }`，作为对持有同一把 `(aes_key, iv)` 的证明。
@@ -468,11 +473,11 @@ IV/nonce 选择规则：
 
 ## 6. Tunnel 建立流程
 
-下面描述的是当前真实实现，而不是早期设计。
+下面描述的是当前协议语义和实现目标，而不是早期设计。
 
 ### 6.1 发起端 A
 
-1. 解析目标 `rtcp://<did>[:port]`。
+1. 解析目标 `rtcp://<did>[:port]`，其中 `<did>` 是调用方表达的逻辑目标，可以是名字 DID 或 `did:dev`。
 2. 调用 `name_client::resolve_ips(remote_did)` 得到候选 IP 列表。候选名展开（stack id host、`to_host_name()`、`to_raw_host_name()`、`to_string()`）、DID info 文档的 `ip`/`ips`/`all_ip` 字段、以及地址排序（scope / 家族偏好 / 历史 RTT）全部由 name-client 负责，RTCP 不再自行组装或排序。
 3. 对候选 IP 采用 **Happy Eyeballs 风格的并发竞速**（详见 §10），而非串行尝试：
    - 先对首个地址发起 attempt；
@@ -481,7 +486,7 @@ IV/nonce 选择规则：
 4. 每条 attempt 各自独立：TCP connect 成功后，该 attempt 单独生成 `tunnel_token`、一次性 X25519 密钥对（`InitiatorHandshakeState`）、随机 `nonce`；握手材料不跨 attempt 复用。AES key/IV **不在此时派生**，要等到收到对应的 `HelloAck`。
 5. 在该 TCP 连接上发送明文 `Hello`。
 6. 在仍未加密的承载流上读取明文 `HelloAck`，验证 `ack_token`（含 `peer_xpub` 必须 echo 自己 Hello 的 `xpub`）；通过后用 `(my_secret, ack_token.xpub)` 完成 ECDH，走 §5.4.1 的 HKDF 派生 `(aes_key, iv)`，把承载流包成 `EncryptedStream`（initiator 方向），并以 AEAD 形式发出 `HelloAckConfirm`。
-7. **首个** 走完 `Hello` → `HelloAck` 验证 → `HelloAckConfirm` 写出的 attempt 获胜：注册成 tunnel，标记 `can_direct = true`，加入 `tunnel_map`；其余 in-flight attempt 随 `FuturesUnordered` 被 drop 而取消。
+7. **首个** 走完 `Hello` → `HelloAck` 验证 → `HelloAckConfirm` 写出的 attempt 获胜：以解析后的 canonical local DEV DID + canonical remote DEV DID 注册成 tunnel，标记 `can_direct = true`，加入 `tunnel_map`；其余 in-flight attempt 随 `FuturesUnordered` 被 drop 而取消。
 8. 获胜 attempt 的 Hello RTT 通过 `name_client::record_connection_outcome`（`MeasurementLayer::Application`）回写给 name-client，作为下次排序依据；失败 attempt 则按失败原因记录 `Unreachable` 或 `Timeout`。
 9. 启动 tunnel 读循环。
 
@@ -491,13 +496,13 @@ IV/nonce 选择规则：
 2. 读取首包。
 3. 若首包是 `Hello`，进入 tunnel 建立流程。
 4. 校验来源身份和 `tunnel_token`（`aud == "buckyos-rtcp-v2-hello"`、签名、`from`），并执行 §14.2 的 anti-replay 检查：
-   - token payload 里的 `to` 必须等于本机 did hostname。
-   - `(from_id, nonce)` 必须尚未出现过。
+   - token payload 里的 `to` 必须解析到本机 canonical DEV DID。
+   - `(source_dev_did, nonce)` 必须尚未出现过。
 5. 从 `Hello.my_port` 提取对端后续回连所需的 RTCP 监听端口。
 6. 现场生成一次性 X25519 密钥对 `(resp_secret, resp_public)` 和随机 `challenge`，签发 `ack_token`（`aud == "buckyos-rtcp-v2-ack"`，`peer_xpub == Hello.xpub`），并以**明文**形式把 `HelloAck { ack_token, challenge, responder_id }` 发到承载流上。
 7. 用 `(resp_secret, Hello.xpub)` 做 ECDH，走 §5.4.1 的 HKDF 派生 `(aes_key, iv)`；把承载流包成 `EncryptedStream`（responder 方向），等待 AEAD 形式的 `HelloAckConfirm` 并校验 `challenge_echo`。
 8. 只有 key-confirmation 成功后，才调用 `listener.on_new_tunnel(...)` 做准入控制。
-9. 准入通过后，才把这条连接包装成 tunnel，标记 `can_direct = false`，并注册到 `tunnel_map`。
+9. 准入通过后，才把这条连接包装成 tunnel，标记 `can_direct = false`，并按 canonical DEV DID 注册到 `tunnel_map`。
 10. 启动 tunnel 读循环。
 
 ### 6.3 当前实现上的重要事实
@@ -505,9 +510,20 @@ IV/nonce 选择规则：
 - `Hello` 之后还有一次 `HelloAck`（明文）/ `HelloAckConfirm`（AEAD）的往返，必须成功才算 tunnel 建立；详见 §14.2。
 - **TCP 三次握手成功不等于 tunnel 建立成功**。当前实现的建链完成点是“协议层 key-confirmation 成功”，不是 `TcpStream::connect()` 返回。
 - `can_direct` 的设置时机也在 key-confirmation 之后，而不是刚拿到一条 TCP 连接时。
-- `Hello.to_id` 本身仍只用于日志；真正被接收端严格校验的是 token payload 里的 `to` + `aud`，它们必须分别等于本机 did hostname 和 `buckyos-rtcp-v2-hello`，否则接收端直接拒绝 tunnel。
+- `Hello.from_id` / `Hello.to_id` 承载逻辑来源和逻辑目标语义；真正的身份校验会把它们解析到 canonical `did:dev` 后再比较。名字到 DEV 的转换是内部动作，不应要求调用方在协议语义上放弃 `did:web` / `did:bns`。
 - 对端后续回连端口来自 `Hello.my_port`，不是当前 TCP 连接的源端口。
 - v2 的 AES key/IV 完全派生自双方临时 X25519 密钥对，与设备长期密钥无关——即便长期 Ed25519 私钥之后被泄露，也无法解密任何已经结束的会话。
+
+### 6.4 Tunnel Key 与设备唯一性
+
+RTCP 的 tunnel key 只用于协议栈内部复用和去重，不是对外 URL 语义。它必须基于 canonical DEV DID，而不是用户传入的名字：
+
+- direct tunnel key: `<local_dev_did>_<remote_dev_did>`
+- bootstrap-backed tunnel key: `<local_dev_did>_<remote_dev_did>|bootstrap=<bootstrap_url>`
+
+这个规则保证“从当前 stack 到另一个真实设备 stack 有且仅有一条 tunnel”。名字 DID 的公钥发生变化时，解析出的 remote DEV DID 也会变化，旧 tunnel 不应继续被复用；协议栈应建立新 tunnel，并让旧 tunnel 自然断开或被清理。
+
+反过来，如果用户把同一个设备公钥绑定到多个名字，这些名字会解析到同一个 canonical DEV DID，并共享同一条 tunnel。对 RTCP 来说这是同一个设备，不是多个逻辑设备。用同一把设备公钥表达多个逻辑设备会导致 tunnel 复用、keep_tunnel 状态、准入策略和日志语义混淆；这违反“每个逻辑设备必须有不同设备公钥”的原则，不应通过 name-based tunnel key 兼容。
 
 ## 7. Open 流程
 
@@ -524,7 +540,7 @@ IV/nonce 选择规则：
 5. A 收到 `OpenResp(result=0)` 后，通过 `build_reconnect_stream()` 建立一条新的 stream leg。
 6. A 在这条新 stream leg 上发送 `HelloStream(streamid)`。
 7. B 的 RTCP listener 收到该新 stream leg，读到 `HelloStream(streamid)`，查找刚才登记的等待项。
-8. A 和 B 两边都把这条新 stream leg 包装成 `EncryptedStream`，AES key 复用 tunnel key，IV 使用 `streamid` 解出的 16 字节。
+8. A 和 B 两边都把这条新 stream leg 包装成 `EncryptedStream`，AES key 复用 tunnel 的会话 AES key，IV 使用 `streamid` 解出的 16 字节。
 9. B 把 stream 交给上层 `on_new_stream()` 或 `on_new_datagram()`。
 
 ### 7.2 关键点
@@ -554,7 +570,7 @@ IV/nonce 选择规则：
 6. 若回连成功，A 先回 `ROpenResp(seq, result=0)`。
 7. A 在新 stream leg 上发送 `HelloStream(streamid)`。
 8. B 的 listener 收到新 stream leg 并匹配等待项。
-9. A 和 B 两边都把这条新 stream leg 包装成 `EncryptedStream`，AES key 复用 tunnel key，IV 使用 `streamid`。
+9. A 和 B 两边都把这条新 stream leg 包装成 `EncryptedStream`，AES key 复用 tunnel 的会话 AES key，IV 使用 `streamid`。
 10. A 把 stream 交给本地上层，去连接自己这一侧的真实服务。
 
 ### 8.2 和 Open 的本质区别
@@ -683,8 +699,9 @@ RTCP stack 的 `device_config_path` 当前支持两类文件内容：
 
 行为差异：
 
-- 如果本地加载的是 JSON，RTCP 仍能工作，但发起 `Hello` 时不会自动携带 `device_doc_jwt`。
+- 如果本地加载的是 JSON 且设备 DID 是 `did:dev:<pkx>`，RTCP 仍能工作，但发起 `Hello` 时不会自动携带 `device_doc_jwt`。
 - 如果本地加载的是 JWT，发起 `Hello` 时会自动把它塞进 `device_doc_jwt` 字段。
+- 如果 stack 的设备 DID 是逻辑名字（非 `did:dev:<pkx>`），初始化时必须提供 `device_doc_jwt`，并且发起 `Hello` 时必定携带该 JWT。
 
 因此，跨 zone 首次接入若希望让对端在“尚未知晓本设备公钥”的前提下完成准入，应该配置 JWT 形式的设备文档。
 
@@ -713,12 +730,13 @@ stacks:
 - 设备文档 JSON：`<public_root>/<encoded-did>/did.json`
 - 设备认证私钥：`<security_root>/<encoded-did>/authentication.private.pem`
 
-如果同时存在 `device.doc.jwt` 和 `did.json`，RTCP 优先使用 `device.doc.jwt`。这样发起 `Hello` 时可以继续携带 `device_doc_jwt`，便于对端在尚未缓存本设备公钥时完成身份校验。
+如果同时存在 `device.doc.jwt` 和 `did.json`，RTCP 优先使用 `device.doc.jwt`。这样发起 `Hello` 时可以继续携带 `device_doc_jwt`，便于对端在尚未缓存本设备公钥时完成身份校验。若 `identity` 是逻辑名字（非 `did:dev:<pkx>`），`device.doc.jwt` 是必需的；只有 `did.json` 会被拒绝。
 
 落地约束：
 
 - 一个 RTCP stack 只允许配置一个本端 DID；多 RTCP stack 暂不支持。当前 RTCP 设备身份语义仍是单设备身份、单 stack。
 - 加载出的私钥公钥必须与设备文档 default/authentication key 一致；加载出的设备文档 ID 必须与配置 DID 一致。
+- 逻辑名字 DID 必须能加载出 `device_doc_jwt`；该 JWT 会随每个新建 tunnel 的 `Hello` 包发送。
 - 热更新时不允许静默切换 DID 或私钥；这类变更会被拒绝，要求重启 RTCP stack。
 
 ## 13. 当前实现与文义设计的差异
@@ -726,7 +744,8 @@ stacks:
 为了避免文档误导，下面这些点要特别说明：
 
 - `HelloAck` 是 v2 3-message handshake 的核心包：携带 responder 签名的 `ack_token`，明文发送，先于密钥派生；`HelloAckConfirm` 才是首条 AEAD 记录。
-- `Hello.to_id` 本身不作为身份校验依据；token payload 中的 `to` + `aud` 都会被严格校验，必须分别等于本机 did hostname 和 `buckyos-rtcp-v2-hello`。
+- `Hello.from_id` / `Hello.to_id` 保留逻辑设备语义；token payload 中的 `from` / `to` + `aud` 会被严格校验，但比较基准是解析后的 canonical DEV DID，而不是原始名字字符串。
+- tunnel key 语义以 §6.4 为准：内部复用和去重必须基于 canonical DEV DID。如果实现仍使用原始名字 DID / `remote_stack.did.to_string()` 作为 key，需要修正到 DEV-based key。
 - 设备的 X25519 私钥**已被废弃**：v2 中 ECDH 双方都用一次性 `EphemeralSecret`，长期 Ed25519 私钥仅用于签发 Hello/HelloAck JWT。
 - 会话密钥不再是 `SHA256(shared_secret)`，而是 HKDF（详见 §5.4.1），且把双方 DID/xpub/nonce 全部绑进 `info`。
 - `OpenResp.result` / `ROpenResp.result` 已经会被等待者读取并触发快速失败，但错误码集合仍然很小，不是完整错误模型。
@@ -769,7 +788,7 @@ stacks:
 - v1 引入了 AEAD 加密的 `HelloAck` / `HelloAckConfirm`，关闭了重放替换 tunnel 的窗口；但 ECDH 仍由发起端 ephemeral X25519 ↔ **responder 长期 X25519** 完成，长期密钥泄露后所有历史会话可被解密（无前向安全）。
 - v1 的会话密钥是 `SHA256(shared_secret)`，IV 直接取 `xpub` 前 16 字节——AES key 与 IV 共享同一个一次性公钥来源，对 RNG 碰撞没有缓冲。
 
-当前实现（v2 3-message handshake）：
+v2 3-message handshake 语义：
 
 1. **Hello（明文，initiator → responder）**
    - `tunnel_token` payload 形如 §4.2，必填 `aud = "buckyos-rtcp-v2-hello"`、`nonce` 与 `exp = now + 60s`。
@@ -777,19 +796,20 @@ stacks:
    - 接收端依次校验：
      - JWT EdDSA 签名合法。
      - `aud` 严格等于 `RTCP_HELLO_AUD`（`set_audience` + `required_spec_claims = ["exp", "aud"]`）。
-     - `from` 等于 `Hello.from_id` 对应的已验证设备身份。
-     - `to` 等于本机 did hostname——防止把针对 A 的 token 重放到 B。
-     - `(from_id, nonce)` 不在短期 cache 中（容量 16 KiB，按 `exp + JWT_LEEWAY_SECS` 自动过期）；命中即立刻拒绝。
+     - `from` 与 `Hello.from_id` 解析到同一个 canonical source DEV DID。
+     - `to` 解析到本机 canonical DEV DID——防止把针对 A 的 token 重放到 B。
+     - `(source_dev_did, nonce)` 不在短期 cache 中（容量 16 KiB，按 `exp + JWT_LEEWAY_SECS` 自动过期）；命中即立刻拒绝。
 2. **HelloAck（明文，responder → initiator）**
    - 接收端通过 §14.2 的 anti-replay 检查后，现场生成新的临时 X25519 密钥对 `(resp_secret, resp_public)` 和随机 16 字节 `challenge`。
    - 用本端 Ed25519 私钥签发 `ack_token`（payload 见 §4.3），关键字段：
      - `aud = "buckyos-rtcp-v2-ack"`，与 Hello 的 audience 严格隔离。
+     - `from` / `to` 分别表达 responder / initiator 的逻辑身份，校验时按 canonical DEV DID 比较。
      - `xpub = hex(resp_public)`，公开本端临时公钥。
      - `peer_xpub = Hello.xpub`，把这条 ack 绑到本次握手——攻击者即便拿到同一个 responder 在别的会话里签过的合法 ack，也因为 `peer_xpub` 不匹配而无法拼接到当前会话上。
    - 把 `RTcpHelloAckPackage { ack_token, challenge, responder_id }` 以**明文**形式写到承载流上。
    - 然后用 `(resp_secret, Hello.xpub)` 完成 ECDH，走 §5.4.1 的 HKDF 派生 `(aes_key, iv)`，把承载流包成 `EncryptedStream`（responder 方向），等待 AEAD 形式的 `HelloAckConfirm`。
 3. **HelloAckConfirm（AEAD，initiator → responder）**
-   - 发起端在仍未加密的承载流上读到明文 `HelloAck`，立即用 §5.2 步骤 2 缓存的 responder 长期 Ed25519 公钥验证 `ack_token`，并校验 `aud` / `from` / `to` / `peer_xpub == 自己 Hello.xpub`。
+   - 发起端在仍未加密的承载流上读到明文 `HelloAck`，立即用 §5.2 步骤 2 缓存的 responder 长期 Ed25519 公钥验证 `ack_token`，并校验 `aud` / `from` / `to` / `peer_xpub == 自己 Hello.xpub`；其中 `from` / `to` 按 canonical DEV DID 比较。
    - 任意一项不通过即终止握手，`peer_xpub` 不匹配是 v2 防 ack-splicing 的关键护栏。
    - 通过后用 `(my_secret, ack_token.xpub)` 完成 ECDH，与 responder 派生出**同一把** `(aes_key, iv)`；把承载流包成 `EncryptedStream`（initiator 方向）。
    - 在加密流上发出 `HelloAckConfirm { challenge_echo = ack.challenge }`。
@@ -884,9 +904,9 @@ remote 嵌套场景下，`Open` / `ROpen` 的建流动作必须与 tunnel 承载
   - direct tunnel：按 §10 的 direct stream reconnect 策略建立新 TCP 连接；首选上一次成功 IP，但每次 `Open` / `ROpen` 都要能在 250ms 后尝试后续候选 IP。
   - bootstrap-backed tunnel：调用 `tunnel_manager.open_stream_by_url(bootstrap_url)`，复用与 tunnel 承载流同一份 bootstrap 机制来拉出新的底层 stream。
 - `Open` / `ROpen` 的后续建流都改走这个入口：不再假设“peer 必然可直连”，也不再静默退回直连。
-- 对这条新 stream 的加密处理保持不变：AES key 复用 tunnel key，IV 使用 `streamid` 解出的 16 字节，方向仍按“谁 connect+发 HelloStream 谁是 initiator”区分。
+- 对这条新 stream 的加密处理保持不变：AES key 复用 tunnel 的会话 AES key，IV 使用 `streamid` 解出的 16 字节，方向仍按“谁 connect+发 HelloStream 谁是 initiator”区分。
 - `send_hello_stream` 由接收 `&mut TcpStream` 改为接收任意 `AsyncWrite + Unpin`，以便直接在 bootstrap-backed stream 上发送 HelloStream。
-- tunnel 复用键在 §14.4 已加入 `|bootstrap=<url>` 后缀；direct tunnel 与 bootstrap-backed tunnel、以及不同 bootstrap 路径之间不会互相复用。
+- tunnel 复用键按 §6.4 基于 canonical DEV DID 生成，并在 bootstrap-backed tunnel 上加入 `|bootstrap=<url>` 后缀；direct tunnel 与 bootstrap-backed tunnel、以及不同 bootstrap 路径之间不会互相复用。
 
 遗留语义：
 

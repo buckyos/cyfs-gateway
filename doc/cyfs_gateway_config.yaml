@@ -146,7 +146,8 @@ stacks:
   #   identity: did:web:device.example.com # 推荐；从 Gateway 级 identity_manager 加载本地身份
   #   # legacy explicit identity config is still supported:
   #   # key_path: ./sn_private_key.pem
-  #   # device_config_path: ./device.doc.jwt  # 也支持 JSON；只有配置 JWT 时，Hello 才会自动携带 device_doc_jwt
+  #   # device_config_path: ./device.doc.jwt  # did:dev 可用 JSON；逻辑 DID 必须配置 JWT，Hello 会携带 device_doc_jwt
+  #   # device_doc_jwt: <owner-signed-device-doc-jwt> # 可内联填写，替代 device_config_path/device.doc.jwt
   #   # name: optional_name
   #   hook_point: { }
 
