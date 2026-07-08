@@ -26,7 +26,23 @@ self_cert（运行时默认值，B 类）。
 
 ```yaml
 # sn_seed.yaml
-activation_codes: ["dev-code-1", "dev-code-2"]
+activation_codes:
+  - "dev-code-1"
+  - "dev-code-2"
+  - "dev-code-3"
+  - "dev-code-4"
+  - "dev-code-5"
+  - "dev-code-6"
+  - "dev-code-7"
+  - "dev-code-8"
+  - "dev-code-9"
+  - "dev-code-10"
+  - "dev-code-11"
+  - "dev-code-12"
+  - "dev-code-13"
+  - "dev-code-14"
+  - "dev-code-15"
+  - "dev-code-16"
 users:
   - username: alice            # 词汇沿用 devenv_config.ts
     password: "devtest-pwd"    # dev 明文，导入时走现有 PBKDF2 哈希路径

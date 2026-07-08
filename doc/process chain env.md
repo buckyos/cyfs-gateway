@@ -2,6 +2,40 @@
 
 cyfs_gateway中各个process chain执行位置都可以通过环境变量获取到当前请求的相关数据，以下为各个process chain能获取到的环境变量说明
 
+## REQ 来源变量命名约定
+
+不同 stack/server 的 `REQ` 字段应尽量使用同一套来源命名，方便 process chain 在 HTTP、TCP、TLS、UDP、RTCP 等入口之间复用规则。
+
+来源类字段按“来源层级前缀 + 来源属性”命名：
+
+| 前缀 | 语义 | 示例 |
+| --- | --- | --- |
+| `source_` | 当前 hook point 看到的有效来源。没有更精确来源时，通常就是直接连接来源；存在可信还原来源时，可以等同于 `real_source_` | `source_addr`、`source_ip`、`source_port`、`source_did` |
+| `conn_source_` | 连接层直接上一跳来源，不穿透 PROXY protocol、RTCP、可信 upstream 等多跳信息 | `conn_source_addr`、`conn_source_ip`、`conn_source_port` |
+| `real_source_` | 经过可信机制还原后的原始请求来源，表示跨 upstream/tunnel/proxy 之后仍希望保留的真实来源 | `real_source_addr`、`real_source_ip`、`real_source_port`、`real_source_did` |
+
+来源属性的后缀约定：
+
+| 后缀 | 语义 |
+| --- | --- |
+| `_addr` | Socket 地址，格式通常为 `IP:PORT` |
+| `_ip` | IP 地址 |
+| `_port` | 端口 |
+| `_did` | 可信身份 DID，例如 RTCP 握手验证出的来源 DID |
+| `_device_id` | 设备 ID。已有实现中可能表示 DID 或设备标识；新增字段优先使用更明确的 `_did` |
+| `_hostname` | 来源主机名 |
+| `_mac` | 来源 MAC |
+| `_app_id` | 来源应用 ID |
+| `_user_id` | 来源用户 ID |
+
+`real_` 前缀只用于可信来源：例如 PROXY protocol、RTCP 已认证身份、受信任 upstream 写入并经过网关信任边界确认的信息。普通 HTTP 请求头里的 `X-Forwarded-For`、`X-Real-IP` 属于输入数据，只有在明确配置该上一跳可信后，才应转换成 `real_source_ip` / `real_source_addr`。
+
+兼容说明：
+
+- HTTP server 当前已有 `REQ_remote_ip`、`REQ_conn_remote_ip`、`REQ_real_remote_ip` 等变量，语义分别对应当前有效来源、连接层来源、可信还原来源。
+- 新增跨协议字段时，推荐在 `REQ` Map 内使用 `source_*` / `conn_source_*` / `real_source_*`，其中 RTCP 身份信息使用 `real_source_did` 表达可信原始来源 DID。
+- HTTP 转发链路仍应保留标准头名 `X-Forwarded-For`、`X-Real-IP`、`X-Forwarded-Host`、`X-Forwarded-Proto`；这些是协议兼容头，不作为 process chain 通用字段命名前缀。
+
 ## HTTP Request 环境变量
 
 
@@ -291,5 +325,4 @@ cyfs_gateway中各个process chain执行位置都可以通过环境变量获取�
 | `source_mac`         | `String` | 源 MAC（可选）       |
 | `source_hostname`    | `String` | 源主机名（可选）        |
 | `source_online_secs` | `String` | 源设备当日在线秒数（可选）   |
-
 

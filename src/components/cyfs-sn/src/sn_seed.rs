@@ -440,11 +440,16 @@ mod tests {
     const BOB_X: &str = "iSMKakFEGzGAxLTlaB5TkqZ6d4wurObr-BpaQleoE2M";
     const CHARLIE_X: &str = "PY9uu16H74QYVRjstVxdWdAsgkoy10-74fvQhx4ddek";
     const CHARLIE_ZONE_JWT: &str = "eyJhbGciOiJFZERTQSJ9.charlie-zone-doc.sig";
+    const SAMPLE_ACTIVATION_CODE_COUNT: u64 = 16;
 
     fn sample_seed_yaml() -> String {
+        let activation_codes = (1..=SAMPLE_ACTIVATION_CODE_COUNT)
+            .map(|i| format!("\"dev-code-{i}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
         format!(
             r#"
-activation_codes: ["dev-code-1", "dev-code-2"]
+activation_codes: [{activation_codes}]
 users:
   - username: alice
     password: "devtest-pwd"
@@ -511,7 +516,7 @@ user_domains:
         let seed = parse_sn_seed_config(sample_seed_yaml().as_str()).expect("parse seed");
         let report = import_sn_seed(&db, &seed).await.expect("import seed");
 
-        assert_eq!(report.activation_codes_added, 2);
+        assert_eq!(report.activation_codes_added, SAMPLE_ACTIVATION_CODE_COUNT);
         assert_eq!(report.users_added, 3);
         // charlie 的绑定随注册完成，域名循环里应计入 existing 而非重复添加。
         assert_eq!(report.user_domains_added, 0);
@@ -534,8 +539,13 @@ user_domains:
         assert!(!verify_password("wrong-pwd", &auth).expect("verify"));
 
         // 种子激活码可用（未被种子用户注册消耗）。
-        assert!(db.check_active_code("dev-code-1").await.unwrap());
-        assert!(db.check_active_code("dev-code-2").await.unwrap());
+        for i in 1..=SAMPLE_ACTIVATION_CODE_COUNT {
+            let code = format!("dev-code-{i}");
+            assert!(
+                db.check_active_code(&code).await.unwrap(),
+                "{code} should be available"
+            );
+        }
 
         // user_domain 绑定存在且 ZoneDocument 就位。
         let charlie = db
@@ -560,7 +570,10 @@ user_domains:
 
         assert!(report.is_noop(), "second import must be a no-op: {report}");
         assert_eq!(report.users_existing, 3);
-        assert_eq!(report.activation_codes_existing, 2);
+        assert_eq!(
+            report.activation_codes_existing,
+            SAMPLE_ACTIVATION_CODE_COUNT
+        );
         assert_eq!(report.conflicts_skipped, 0);
         // 行数与 created_at/updated_at 快照完全不变（零写入）。
         assert_eq!(before, after);

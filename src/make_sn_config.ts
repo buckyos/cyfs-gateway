@@ -558,7 +558,11 @@ export interface SnSeedConfigMirror {
 
 /** 与 sn_seed.yaml 对齐的确定性 dev 测试密码/激活码（仅限 devtest）。 */
 export const DEV_TEST_PASSWORD = "devtest-pwd";
-export const SEED_ACTIVATION_CODES = ["dev-code-1", "dev-code-2"];
+export const SEED_ACTIVATION_CODE_COUNT = 16;
+export const SEED_ACTIVATION_CODES = Array.from(
+  { length: SEED_ACTIVATION_CODE_COUNT },
+  (_, index) => `dev-code-${index + 1}`,
+);
 
 // anvil 固定助记词 "test test ... junk"（路径 m/44'/60'/0'/0/i）的标准账户
 // 表，预展开硬编码——与 websdk DEV_TEST_KEYS 预置 ed25519 键、bns_dv 硬编码

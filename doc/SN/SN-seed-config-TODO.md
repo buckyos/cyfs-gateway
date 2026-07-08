@@ -20,7 +20,23 @@
 - [x] 新建 `cyfs-sn/src/sn_seed.rs`，定义 `SnSeedConfig` 作为格式真值（serde + YAML，workspace 已有 `serde_yaml_ng`）：
   ```yaml
   # sn_seed.yaml —— 仅 C 类：无合理默认值、必须显式创建的 SN-local 数据
-  activation_codes: ["dev-code-1", "dev-code-2"]
+  activation_codes:
+    - "dev-code-1"
+    - "dev-code-2"
+    - "dev-code-3"
+    - "dev-code-4"
+    - "dev-code-5"
+    - "dev-code-6"
+    - "dev-code-7"
+    - "dev-code-8"
+    - "dev-code-9"
+    - "dev-code-10"
+    - "dev-code-11"
+    - "dev-code-12"
+    - "dev-code-13"
+    - "dev-code-14"
+    - "dev-code-15"
+    - "dev-code-16"
   users:
     - username: alice          # 词汇沿用 devenv_config.ts（username/zone_id/user_domain）
       password: "devtest-pwd"  # dev 明文，导入时走现有 PBKDF2 哈希路径
