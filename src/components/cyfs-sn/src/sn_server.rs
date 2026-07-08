@@ -11,14 +11,15 @@ use crate::sn_did_resolver::{
 use crate::sn_dns_proof::{DnsTxtResolverRef, DohDnsTxtResolver, DEFAULT_PKX_DOH_URL};
 use crate::sn_resolver::{
     device_config_from_mini_jwt, BnsDocumentReader, ResolverCompatibilityReader,
-    ResolverDeviceDocument, ResolverDidDocument, SnAuthResolverReader,
-    SnDeviceInfoResolverReader, SnRelayManagerResolverReader, SnResolver, SnResolverConfig,
-    SnResolverError, SnResolverErrorKind, SnResolverRef, SnResolverResult,
+    ResolverDeviceDocument, ResolverDidDocument, SnAuthResolverReader, SnDeviceInfoResolverReader,
+    SnRelayManagerResolverReader, SnResolver, SnResolverConfig, SnResolverError,
+    SnResolverErrorKind, SnResolverRef, SnResolverResult,
 };
 use crate::{
-    SnAuthDBRef, SnDeviceEndpointUpdate, SnDeviceInfoDBRef, SnDeviceRole, SnDeviceState,
-    SnDeviceStateUpdate, SnEndpointProtocol, SnEndpointScope, SnEndpointSource, SnNatType,
-    SnRelayManagerRef, SnResult, SqliteSnAuthDB, SqliteSnDeviceInfoDB, SqliteSnRelayManager,
+    SnAuthDBRef, SnAuthDbClient, SnDeviceEndpointUpdate, SnDeviceInfoDBRef,
+    SnDeviceInfoDbClient, SnDeviceRole, SnDeviceState, SnDeviceStateUpdate, SnEndpointProtocol,
+    SnEndpointScope, SnEndpointSource, SnNatType, SnRelayManagerRef, SnResult, SqliteSnAuthDB,
+    SqliteSnDeviceInfoDB, SqliteSnRelayManager,
 };
 use ::kRPC::*;
 use async_trait::async_trait;
@@ -1965,29 +1966,123 @@ impl ServerConfig for SNServerConfig {
 
 pub struct SnServerFactory;
 
+struct SnPostgresDbConfig {
+    auth_db_url: String,
+    device_info_db_url: String,
+    provider_session_token: Option<String>,
+}
+
 impl SnServerFactory {
     pub fn new() -> Self {
         SnServerFactory
     }
 
-    fn sqlite_db_path(config: &SNServerConfig) -> String {
-        let configured = config.db_params.as_ref().and_then(|params| {
-            params
-                .get("db_path")
-                .or_else(|| {
-                    params
-                        .get("db_params")
-                        .and_then(|value| value.get("db_path"))
-                })
-                .and_then(Value::as_str)
-        });
+    fn db_param_scope(config: &SNServerConfig) -> Vec<&Value> {
+        let Some(params) = config.db_params.as_ref() else {
+            return Vec::new();
+        };
 
-        configured.map(ToString::to_string).unwrap_or_else(|| {
+        let mut scopes = Vec::new();
+        if let Some(db) = params.get("db") {
+            scopes.push(db);
+        }
+        scopes.push(params);
+        if let Some(nested) = params.get("db_params") {
+            scopes.push(nested);
+        }
+        scopes
+    }
+
+    fn db_param_str(config: &SNServerConfig, key: &str) -> Option<String> {
+        for scope in Self::db_param_scope(config) {
+            if let Some(value) = scope.get(key).and_then(Value::as_str) {
+                let value = value.trim();
+                if !value.is_empty() {
+                    return Some(value.to_string());
+                }
+            }
+        }
+        None
+    }
+
+    fn configured_db_type(config: &SNServerConfig) -> String {
+        config
+            .db_type
+            .clone()
+            .or_else(|| Self::db_param_str(config, "type"))
+            .unwrap_or_else(|| "sqlite".to_string())
+            .trim()
+            .to_ascii_lowercase()
+    }
+
+    fn sqlite_db_path(config: &SNServerConfig) -> String {
+        let configured = Self::db_param_str(config, "db_path");
+
+        configured.unwrap_or_else(|| {
             get_buckyos_service_data_dir("sn")
                 .join("sn.sqlite3")
                 .to_string_lossy()
                 .to_string()
         })
+    }
+
+    fn postgres_db_config(config: &SNServerConfig) -> ServerResult<SnPostgresDbConfig> {
+        let provider_base_url = Self::db_param_str(config, "provider_base_url")
+            .or_else(|| Self::db_param_str(config, "provider_url"));
+        let auth_db_url = Self::db_param_str(config, "auth_db_url")
+            .or_else(|| provider_base_url.clone())
+            .ok_or(server_err!(
+                ServerErrorCode::InvalidConfig,
+                "db_type=postgres requires auth_db_url or provider_base_url"
+            ))?;
+        let device_info_db_url = Self::db_param_str(config, "device_info_db_url")
+            .or(provider_base_url)
+            .ok_or(server_err!(
+                ServerErrorCode::InvalidConfig,
+                "db_type=postgres requires device_info_db_url or provider_base_url"
+            ))?;
+        let provider_session_token = if let Some(token) =
+            Self::db_param_str(config, "provider_session_token")
+                .or_else(|| Self::db_param_str(config, "provider_token"))
+        {
+            Some(token)
+        } else {
+            Self::read_provider_session_token_file(config).transpose()?
+        };
+
+        Ok(SnPostgresDbConfig {
+            auth_db_url,
+            device_info_db_url,
+            provider_session_token,
+        })
+    }
+
+    fn read_provider_session_token_file(config: &SNServerConfig) -> Option<ServerResult<String>> {
+        let path = Self::db_param_str(config, "provider_session_token_file")
+            .or_else(|| Self::db_param_str(config, "provider_token_file"))?;
+        Some(
+            fs::read_to_string(path.as_str())
+                .map(|token| token.trim().to_string())
+                .map_err(|e| {
+                    server_err!(
+                        ServerErrorCode::InvalidConfig,
+                        "read provider session token file {} failed: {}",
+                        path,
+                        e
+                    )
+                })
+                .and_then(|token| {
+                    if token.is_empty() {
+                        Err(server_err!(
+                            ServerErrorCode::InvalidConfig,
+                            "provider session token file {} is empty",
+                            path
+                        ))
+                    } else {
+                        Ok(token)
+                    }
+                }),
+        )
     }
 
     fn parse_sn_controller_principal(config: &SNServerConfig) -> ServerResult<Principal> {
@@ -2203,80 +2298,105 @@ impl ServerFactory for SnServerFactory {
                 config.server_type()
             ))?;
 
-        let db_type = config
-            .db_type
-            .clone()
-            .unwrap_or_else(|| "sqlite".to_string());
-        if db_type != "sqlite" {
-            return Err(server_err!(
-                ServerErrorCode::InvalidConfig,
-                "invalid db type {}",
-                db_type
-            ));
-        }
-
+        let db_type = Self::configured_db_type(config);
         let db_path = Self::sqlite_db_path(config);
-        let auth_db = SqliteSnAuthDB::new_by_path(db_path.as_str())
-            .await
-            .map_err(|e| {
-                server_err!(
-                    ServerErrorCode::InvalidConfig,
-                    "open sn auth db failed: {}",
-                    e
-                )
-            })?;
-        auth_db.initialize_database().await.map_err(|e| {
-            server_err!(
-                ServerErrorCode::InvalidConfig,
-                "initialize sn auth db failed: {}",
-                e
-            )
-        })?;
+        let (auth_db, device_info_db): (SnAuthDBRef, SnDeviceInfoDBRef) = match db_type.as_str() {
+            "sqlite" => {
+                let auth_db = SqliteSnAuthDB::new_by_path(db_path.as_str())
+                    .await
+                    .map_err(|e| {
+                        server_err!(
+                            ServerErrorCode::InvalidConfig,
+                            "open sn auth db failed: {}",
+                            e
+                        )
+                    })?;
+                auth_db.initialize_database().await.map_err(|e| {
+                    server_err!(
+                        ServerErrorCode::InvalidConfig,
+                        "initialize sn auth db failed: {}",
+                        e
+                    )
+                })?;
 
-        // C 类种子幂等导入（ensure-exists）。文件缺失 → 跳过；解析/导入失败 →
-        // 启动失败（坏种子不能静默）。语义见 sn_seed.rs 模块注释。
-        if let Some(seed_path) = config.seed_path.as_deref() {
-            let resolved = crate::resolve_sn_seed_path(seed_path);
-            match crate::import_sn_seed_from_path(&auth_db, resolved.as_path()).await {
-                Ok(None) => {
-                    info!(
-                        "sn seed config {} not found; skip seed import",
-                        resolved.display()
-                    );
+                // C 类种子幂等导入（ensure-exists）。文件缺失 → 跳过；解析/导入失败 →
+                // 启动失败（坏种子不能静默）。语义见 sn_seed.rs 模块注释。
+                if let Some(seed_path) = config.seed_path.as_deref() {
+                    let resolved = crate::resolve_sn_seed_path(seed_path);
+                    match crate::import_sn_seed_from_path(&auth_db, resolved.as_path()).await {
+                        Ok(None) => {
+                            info!(
+                                "sn seed config {} not found; skip seed import",
+                                resolved.display()
+                            );
+                        }
+                        Ok(Some(report)) => {
+                            info!("sn seed imported from {}: {}", resolved.display(), report);
+                        }
+                        Err(e) => {
+                            return Err(server_err!(
+                                ServerErrorCode::InvalidConfig,
+                                "import sn seed config {} failed: {}",
+                                resolved.display(),
+                                e
+                            ));
+                        }
+                    }
                 }
-                Ok(Some(report)) => {
-                    info!("sn seed imported from {}: {}", resolved.display(), report);
-                }
-                Err(e) => {
+
+                let device_info_db = SqliteSnDeviceInfoDB::new_by_path(db_path.as_str())
+                    .await
+                    .map_err(|e| {
+                        server_err!(
+                            ServerErrorCode::InvalidConfig,
+                            "open sn device info db failed: {}",
+                            e
+                        )
+                    })?;
+                device_info_db.initialize_database().await.map_err(|e| {
+                    server_err!(
+                        ServerErrorCode::InvalidConfig,
+                        "initialize sn device info db failed: {}",
+                        e
+                    )
+                })?;
+
+                (
+                    Arc::new(auth_db) as SnAuthDBRef,
+                    Arc::new(device_info_db) as SnDeviceInfoDBRef,
+                )
+            }
+            "postgres" | "postgresql" => {
+                if config.seed_path.is_some() {
                     return Err(server_err!(
                         ServerErrorCode::InvalidConfig,
-                        "import sn seed config {} failed: {}",
-                        resolved.display(),
-                        e
+                        "sn seed import is not supported for db_type=postgres; import seed data through the provider side"
                     ));
                 }
-            }
-        }
-
-        let auth_db: SnAuthDBRef = Arc::new(auth_db);
-
-        let device_info_db = SqliteSnDeviceInfoDB::new_by_path(db_path.as_str())
-            .await
-            .map_err(|e| {
-                server_err!(
-                    ServerErrorCode::InvalidConfig,
-                    "open sn device info db failed: {}",
-                    e
+                let remote = Self::postgres_db_config(config)?;
+                info!(
+                    "sn server uses remote postgres provider: auth_db_url={}, device_info_db_url={}",
+                    remote.auth_db_url, remote.device_info_db_url
+                );
+                (
+                    Arc::new(SnAuthDbClient::new_krpc_url(
+                        remote.auth_db_url.as_str(),
+                        remote.provider_session_token.clone(),
+                    )) as SnAuthDBRef,
+                    Arc::new(SnDeviceInfoDbClient::new_krpc_url(
+                        remote.device_info_db_url.as_str(),
+                        remote.provider_session_token,
+                    )) as SnDeviceInfoDBRef,
                 )
-            })?;
-        device_info_db.initialize_database().await.map_err(|e| {
-            server_err!(
-                ServerErrorCode::InvalidConfig,
-                "initialize sn device info db failed: {}",
-                e
-            )
-        })?;
-        let device_info_db: SnDeviceInfoDBRef = Arc::new(device_info_db);
+            }
+            _ => {
+                return Err(server_err!(
+                    ServerErrorCode::InvalidConfig,
+                    "invalid db type {}",
+                    db_type
+                ));
+            }
+        };
 
         let compat_store = SqliteSnCompatibilityStore::new_by_path(db_path.as_str())
             .await
