@@ -1,10 +1,8 @@
 [package]
-name = "cyfs_gateway"
+name = "web3_gateway"
 version.workspace = true
 edition = "2021"
-authors = ["BuckyOS DAO","@waterflier","@lurenpluto","@wugren"]
 build = "build.rs"
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
 thiserror.workspace = true
@@ -62,4 +60,3 @@ hickory-resolver = { version = "0.24", features = ["tokio"] }
 async-compression = { version = "0.4", features = ["tokio", "gzip", "deflate", "brotli"] }
 bns-indexer = { path = "../../components/bns-indexer" }
 bns-server = { path = "../../components/bns-server" }
-sqlx.workspace = true

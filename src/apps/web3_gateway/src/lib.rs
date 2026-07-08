@@ -854,8 +854,8 @@ async fn run_template_local(template_id: &str, args: Vec<String>) -> Result<()> 
     .await
 }
 
-pub async fn cyfs_gateway_main() {
-    let mut command = Command::new("CYFS Gateway Service")
+pub async fn web3_gateway_main() {
+    let mut command = Command::new("Web3 Gateway Service")
         .version(buckyos_kit::get_version())
         .disable_help_flag(true)
         .disable_help_subcommand(true)
@@ -1489,7 +1489,7 @@ pub async fn cyfs_gateway_main() {
 
             let (private_key, public_key) = generate_ed25519_key_pair();
             let device_config =
-                DeviceDocument::new_by_jwk(name, serde_json::from_value(public_key).unwrap());
+                DeviceConfig::new_by_jwk(name, serde_json::from_value(public_key).unwrap());
             let sk_file = key_dir.join("device.key.pem");
             std::fs::write(&sk_file, private_key).unwrap();
             println!("Private key saved to: {:?}", sk_file);
@@ -2348,7 +2348,7 @@ pub async fn cyfs_gateway_main() {
                     }
                 }
             }
-            info!("cyfs_gateway start...");
+            info!("web3_gateway start...");
 
             if matches.get_flag("debug") {
                 debug!("Debug mode enabled");
@@ -2369,7 +2369,7 @@ pub async fn cyfs_gateway_main() {
         }
         _ => {}
     }
-    info!("cyfs gateway service start...");
+    info!("web3 gateway service start...");
 
     if matches.get_flag("debug") {
         debug!("Debug mode enabled");

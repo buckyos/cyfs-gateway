@@ -35,5 +35,6 @@ local_rootfs
 .tmp_oss
 uv.lock
 src/apps/cyfs_gateway/acme_account.json
+acme_account.json
 src/web3-gateway/bns_dv
 src/deno.lock
