@@ -6,7 +6,7 @@ use cyfs_gateway_lib::{RtcpStackConfig, StackProtocol};
 use cyfs_sn::OODInfo;
 use kRPC::RPCSessionToken;
 use name_lib::{
-    encode_ed25519_pkcs8_sk_to_pk, get_x_from_jwk, load_raw_private_key, DeviceConfig, DID,
+    encode_ed25519_pkcs8_sk_to_pk, get_x_from_jwk, load_raw_private_key, DeviceDocument, DID,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -73,7 +73,7 @@ impl DnsProviderFactory for AcmeSnProviderFactory {
                     )
                 })?;
             let device_config =
-                serde_json::from_str::<DeviceConfig>(content.as_str()).map_err(|e| {
+                serde_json::from_str::<DeviceDocument>(content.as_str()).map_err(|e| {
                     anyhow!(
                         "parse device config {} failed.{}",
                         config.device_config_path.as_ref().unwrap(),
@@ -99,7 +99,7 @@ impl DnsProviderFactory for AcmeSnProviderFactory {
             }
             device_config
         } else {
-            DeviceConfig::new("cyfs_gateway", public_key)
+            DeviceDocument::new("cyfs_gateway", public_key)
         };
         let private_key = jsonwebtoken::EncodingKey::from_ed_der(private_key.as_slice());
 

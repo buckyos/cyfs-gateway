@@ -1,14 +1,13 @@
 use super::common::{
-    bns_default_asset_owner, build_profile_json, normalize_evm_address, normalize_username,
-    now_secs, ok_response, parse_params, require_account_username, ActiveCodeReq, IntoRpcResult,
-    LoginReq, NameReq, RefreshReq, RegisterReq, RpcCallResult,
+    build_profile_json, normalize_evm_address, normalize_username, now_secs, ok_response,
+    parse_params, require_account_username, ActiveCodeReq, IntoRpcResult, LoginReq, NameReq,
+    RefreshReq, RegisterReq, RpcCallResult,
 };
-use super::errors::{bns_write_error, parse_error, SnApiErrorCode};
+use super::errors::{bns_proxy_error, parse_error, SnApiErrorCode};
 use crate::sn_auth_manager::{hash_password, verify_password, PASSWORD_ALGO};
+use crate::sn_bns_proxy::SnBnsProxyRegisterParams;
 use crate::SNServer;
 use ::kRPC::{RPCErrors, RPCRequest, RPCResponse};
-use bns_client::RegisterNameParams;
-use bns_indexer::{CallAuthority, MutationGuard, RegisterOptions};
 use serde_json::{json, Value};
 
 async fn build_auth_success_response(
@@ -16,6 +15,7 @@ async fn build_auth_success_response(
     req: &RPCRequest,
     username: &str,
     need_bind_owner_key: bool,
+    bns: Option<Value>,
 ) -> RpcCallResult<RPCResponse> {
     let access_token = server.auth().issue_access_session(username)?;
     let refresh_token = server.auth().issue_refresh_session(username)?;
@@ -41,18 +41,19 @@ async fn build_auth_success_response(
         )
         .await
         .into_rpc()?;
-    ok_response(
-        req,
-        json!({
-            "code": 0,
-            "access_token": access_token.token,
-            "refresh_token": refresh_token.token,
-            "need_bind_owner_key": need_bind_owner_key
-        }),
-    )
+    let mut response = json!({
+        "code": 0,
+        "access_token": access_token.token,
+        "refresh_token": refresh_token.token,
+        "need_bind_owner_key": need_bind_owner_key
+    });
+    if let Some(bns) = bns {
+        response["bns"] = bns;
+    }
+    ok_response(req, response)
 }
 
-fn default_owner_config(username: &str) -> Value {
+pub(crate) fn default_owner_config(username: &str) -> Value {
     json!({
         "name": username,
         "created_by": "cyfs-sn",
@@ -137,35 +138,43 @@ pub(crate) async fn handle_auth(server: &SNServer, req: RPCRequest) -> RpcCallRe
                 ));
             }
             let (password_hash, password_salt) = hash_password(params.pwd_hash.as_str())?;
-            let need_bind_owner_key = server.bns_controller().is_none();
-            if let Some(controller) = server.bns_controller() {
+            let need_bind_owner_key = server.bns_proxy().is_none();
+            // BNS bootstrap 在本地建号之前执行：失败则不创建本地用户，避免
+            // 本地账号与 BNS name 不一致（同 request_id 重试幂等）。
+            let mut bns_info: Option<Value> = None;
+            if let Some(proxy) = server.bns_proxy() {
                 let asset_owner = match params.asset_owner.as_deref() {
                     Some(value) => normalize_evm_address(value, "asset_owner")?,
-                    None => bns_default_asset_owner(&controller)?,
+                    None if proxy.require_user_asset_owner() => {
+                        return Err(parse_error(
+                            SnApiErrorCode::InvalidParams,
+                            "asset_owner is required: upload the user's owner EVM address",
+                        ));
+                    }
+                    // devtest 回落：使用该用户绑定 controller 的地址。
+                    None => proxy
+                        .default_asset_owner_for_user(username.as_str())
+                        .await
+                        .map_err(bns_proxy_error)?,
                 };
-                controller
-                    .register_name(RegisterNameParams {
+                let outcome = proxy
+                    .register_bootstrap(SnBnsProxyRegisterParams {
                         request_id: params
                             .request_id
                             .clone()
                             .unwrap_or_else(|| format!("sn:register:{}", username)),
                         name: username.clone(),
                         asset_owner,
-                        register_options: RegisterOptions {
-                            ..RegisterOptions::default()
-                        },
                         owner_config: params
                             .owner_config
                             .clone()
                             .unwrap_or_else(|| default_owner_config(username.as_str())),
-                        owner_authority_keys: Vec::new(),
-                        semantic_owner_after_authority: None,
-                        initial_documents: Vec::new(),
-                        authority: CallAuthority::public(),
-                        guard: MutationGuard::default(),
+                        initial_documents: params.initial_documents.clone().unwrap_or_default(),
                     })
                     .await
-                    .map_err(bns_write_error)?;
+                    .map_err(bns_proxy_error)?;
+                server.invalidate_bns_name_dns_cache(username.as_str());
+                bns_info = Some(outcome.to_bns_json());
             }
             let ok = server
                 .auth_db()
@@ -184,7 +193,14 @@ pub(crate) async fn handle_auth(server: &SNServer, req: RPCRequest) -> RpcCallRe
                     "register failed, invalid activation code",
                 ));
             }
-            build_auth_success_response(server, &req, username.as_str(), need_bind_owner_key).await
+            build_auth_success_response(
+                server,
+                &req,
+                username.as_str(),
+                need_bind_owner_key,
+                bns_info,
+            )
+            .await
         }
         "login" => {
             let params: LoginReq = parse_params(&req)?;
@@ -226,7 +242,8 @@ pub(crate) async fn handle_auth(server: &SNServer, req: RPCRequest) -> RpcCallRe
                 server,
                 &req,
                 username.as_str(),
-                server.bns_controller().is_none() && user.public_key.trim().is_empty(),
+                server.bns_proxy().is_none() && user.public_key.trim().is_empty(),
+                None,
             )
             .await
         }

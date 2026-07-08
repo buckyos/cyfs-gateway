@@ -1,4 +1,5 @@
 use bns_client::{BnsClientError, SnBnsControllerError};
+use crate::sn_bns_proxy::SnBnsProxyError;
 use kRPC::RPCErrors;
 use serde_json::json;
 
@@ -29,6 +30,10 @@ pub(crate) enum SnApiErrorCode {
     BnsPermissionDenied = 1023,
     BnsNameAlreadyExists = 1024,
     BnsWriteFailed = 1025,
+    /// BNS proxy 未启用或该 operation 不在白名单内。
+    BnsProxyUnavailable = 1026,
+    /// 用户绑定的 controller 已不在当前配置（需人工迁移，不静默重分配）。
+    BnsControllerUnavailable = 1027,
     InternalError = 1099,
 }
 
@@ -61,6 +66,8 @@ impl SnApiErrorCode {
             Self::BnsPermissionDenied => "bns_permission_denied",
             Self::BnsNameAlreadyExists => "bns_name_already_exists",
             Self::BnsWriteFailed => "bns_write_failed",
+            Self::BnsProxyUnavailable => "bns_proxy_unavailable",
+            Self::BnsControllerUnavailable => "bns_controller_unavailable",
             Self::InternalError => "internal_error",
         }
     }
@@ -103,4 +110,21 @@ pub(crate) fn bns_write_error(error: SnBnsControllerError) -> RPCErrors {
         })
         .to_string(),
     )
+}
+
+pub(crate) fn bns_proxy_error(error: SnBnsProxyError) -> RPCErrors {
+    match error {
+        SnBnsProxyError::Write(inner) => bns_write_error(inner),
+        SnBnsProxyError::InvalidInput(message) => {
+            parse_error(SnApiErrorCode::InvalidParams, message)
+        }
+        SnBnsProxyError::OperationNotAllowed(operation) => reason_error(
+            SnApiErrorCode::BnsProxyUnavailable,
+            format!("bns proxy operation `{}` is not allowed", operation),
+        ),
+        error @ SnBnsProxyError::ControllerUnavailable { .. } => {
+            reason_error(SnApiErrorCode::BnsControllerUnavailable, error.to_string())
+        }
+        SnBnsProxyError::Store(message) => reason_error(SnApiErrorCode::InternalError, message),
+    }
 }

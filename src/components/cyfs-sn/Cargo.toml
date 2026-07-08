@@ -38,6 +38,7 @@ name-lib.workspace = true
 cyfs-gateway-api = { path = "../cyfs-gateway-api" }
 cyfs-gateway-lib = { path = "../cyfs-gateway-lib" }
 bns-client = { path = "../bns-client" }
+bns-evm = { path = "../bns-evm" }
 bns-indexer = { path = "../bns-indexer" }
 async-named-locker = "0.1"
 callback-trait = "0.1"

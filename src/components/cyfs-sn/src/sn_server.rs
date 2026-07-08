@@ -1,7 +1,16 @@
-use crate::api::{handle_auth, handle_device, handle_dns, handle_domain, handle_user};
+use crate::api::{
+    handle_auth, handle_bns_proxy, handle_device, handle_dns, handle_domain, handle_user,
+};
 use crate::name_info_cache::{NameInfoCache, NameInfoCacheQueryResult, NameInfoCacheRef};
 use crate::sn_auth_manager::SnAuthManager;
+use crate::sn_bns_proxy::{
+    SNBnsProxyConfig, SnBnsControllerBindingStoreRef, SnBnsProxy, SnBnsProxyController,
+    SqliteSnBnsControllerBindingStore,
+};
 use crate::sn_bns_reader::BnsIndexerDocumentReader;
+use crate::sn_bns_signer::{
+    BoundControllerKeyManager, SnBnsControllerKeySpec, SnBnsProxyOperation, SnBnsTxSigner,
+};
 use crate::sn_compat_store::{SNDeviceInfo, SnCompatibilityStoreRef, SqliteSnCompatibilityStore};
 use crate::sn_did_resolver::{
     key_like_string_to_jwk, normalize_sn_did_doc_type, owner_key_from_config, SnDidResolveRequest,
@@ -402,6 +411,7 @@ enum SnRpcPath {
     Root,
     Auth,
     DeviceInfo,
+    BnsProxy,
     InternalRoot,
 }
 
@@ -435,6 +445,7 @@ impl SnRpcPath {
             "/kapi/sn" => Some(Self::Root),
             "/kapi/sn/auth" => Some(Self::Auth),
             "/kapi/sn/deviceinfo" => Some(Self::DeviceInfo),
+            "/kapi/sn/bns-proxy" => Some(Self::BnsProxy),
             _ => None,
         }
     }
@@ -444,6 +455,7 @@ impl SnRpcPath {
             Self::Root => "/kapi/sn",
             Self::Auth => "/kapi/sn/auth",
             Self::DeviceInfo => "/kapi/sn/deviceinfo",
+            Self::BnsProxy => "/kapi/sn/bns-proxy",
             Self::InternalRoot => "/",
         }
     }
@@ -474,7 +486,7 @@ pub struct SNServer {
     name_info_cache: NameInfoCacheRef,
     resolver: SnResolverRef,
     did_resolver: SnDidResolverRef,
-    bns_controller: Option<Arc<SnBnsController>>,
+    bns_proxy: Option<Arc<SnBnsProxy>>,
     /// user_domain PKX proof 专用的外部 DNS 查询（不走 SN 自身解析路径）。
     pkx_txt_resolver: DnsTxtResolverRef,
     /// `did:bns:<username>` owner document / authority key 读取（PKX 权威来源）。
@@ -509,6 +521,11 @@ impl SNServer {
             | "device.list"
             | "deviceinfo.resolve_ood_by_did"
             | "deviceinfo.resolve_ood_by_hostname" => SnRpcPath::DeviceInfo,
+            "bns.publish_dns_txt" => SnRpcPath::BnsProxy,
+            // internal/admin only：不在外部 HTTP 路径开放（QA/loopback 通道可用）。
+            "bns.publish_relay_assignment" | "bns.register_name_bootstrap" => {
+                SnRpcPath::InternalRoot
+            }
             "admin.clear_state_by_active_code" => SnRpcPath::InternalRoot,
             _ => SnRpcPath::Root,
         }
@@ -569,9 +586,10 @@ impl SNServer {
 
     fn is_method_allowed_on_path(method: &str, path: SnRpcPath) -> bool {
         match path {
-            SnRpcPath::Auth | SnRpcPath::DeviceInfo | SnRpcPath::InternalRoot => {
-                Self::preferred_rpc_path(method) == path
-            }
+            SnRpcPath::Auth
+            | SnRpcPath::DeviceInfo
+            | SnRpcPath::BnsProxy
+            | SnRpcPath::InternalRoot => Self::preferred_rpc_path(method) == path,
             SnRpcPath::Root => false,
         }
     }
@@ -582,7 +600,7 @@ impl SNServer {
         device_info_db: SnDeviceInfoDBRef,
         compat_store: SnCompatibilityStoreRef,
         relay_manager: SnRelayManagerRef,
-        bns_controller: Option<Arc<SnBnsController>>,
+        bns_proxy: Option<Arc<SnBnsProxy>>,
     ) -> Self {
         let bns_indexer_url = server_config.bns_indexer_url.clone();
         let bns_session_token = server_config.bns_session_token.clone();
@@ -651,7 +669,7 @@ impl SNServer {
             name_info_cache: NameInfoCache::new_ref(),
             resolver,
             did_resolver,
-            bns_controller,
+            bns_proxy,
             pkx_txt_resolver,
             bns_owner_reader,
         }
@@ -669,8 +687,8 @@ impl SNServer {
         self.did_resolver.clone()
     }
 
-    pub(crate) fn bns_controller(&self) -> Option<Arc<SnBnsController>> {
-        self.bns_controller.clone()
+    pub(crate) fn bns_proxy(&self) -> Option<Arc<SnBnsProxy>> {
+        self.bns_proxy.clone()
     }
 
     pub(crate) fn pkx_txt_resolver(&self) -> &DnsTxtResolverRef {
@@ -777,6 +795,25 @@ impl SNServer {
 
     pub fn remove_name_info_cache(&self, name: &str, record_type: RecordType) {
         self.name_info_cache.remove(name, record_type);
+    }
+
+    /// BNS proxy 写投递成功后的本地 DNS 缓存失效（含 tombstone）。
+    /// 只失效缓存，不伪造 BNS 权威状态；下一次查询会经 resolver 重新读
+    /// `bns-indexer` 投影（indexer 未同步期间读到旧值属正常窗口）。
+    pub(crate) fn invalidate_bns_name_dns_cache(&self, username: &str) {
+        let resolver_config = self.resolver.config();
+        let mut names = vec![username.to_string()];
+        for host in std::iter::once(resolver_config.server_host.as_str())
+            .chain(resolver_config.aliases.iter().map(String::as_str))
+        {
+            names.push(format!("{}.{}", username, host));
+        }
+        for name in names {
+            let normalized = Self::normalize_query_name(name.as_str());
+            for record_type in [RecordType::TXT, RecordType::A, RecordType::AAAA] {
+                self.name_info_cache.remove(normalized.as_str(), record_type);
+            }
+        }
     }
 
     pub(crate) fn parse_name_record_type(record_type: &str) -> Option<RecordType> {
@@ -1016,6 +1053,14 @@ impl SNServer {
                     ip_from,
                 )
                 .await
+            }
+            "bns.publish_dns_txt" | "bns.publish_relay_assignment" | "bns.register_name_bootstrap" => {
+                let bare_method = req
+                    .method
+                    .strip_prefix("bns.")
+                    .unwrap_or(req.method.as_str())
+                    .to_string();
+                handle_bns_proxy(self, Self::rewrite_rpc_method(req, bare_method.as_str())).await
             }
             "admin.clear_state_by_active_code" => {
                 self.clear_state_by_active_code(Self::rewrite_rpc_method(
@@ -1918,6 +1963,11 @@ pub struct SNServerConfig {
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bns_evm: Option<SNBnsEvmConfig>,
+    /// BNS proxy 写链配置（多 controller key + 白名单 operation）。
+    /// 缺省时回落到旧 `bns_evm.controller_private_key*` 单 controller 模式。
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bns_proxy: Option<SNBnsProxyConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub db_type: Option<String>,
     #[serde(flatten)]
@@ -2206,55 +2256,107 @@ impl SnServerFactory {
             .filter(|value| !value.is_empty()))
     }
 
-    fn build_bns_controller(
+    /// 解析多 controller key 配置；无 `bns_proxy.controllers` 时回落旧
+    /// `bns_evm.controller_private_key*` 单 controller（id = "default"）。
+    /// 返回 (key specs, require_user_asset_owner, allowed_operations, legacy_mode)。
+    fn resolve_bns_proxy_key_specs(
+        config: &SNServerConfig,
+    ) -> ServerResult<(
+        Vec<SnBnsControllerKeySpec>,
+        bool,
+        HashSet<SnBnsProxyOperation>,
+        bool,
+    )> {
+        if let Some(proxy_config) = config
+            .bns_proxy
+            .as_ref()
+            .filter(|proxy| !proxy.controllers.is_empty())
+        {
+            let mut specs = Vec::with_capacity(proxy_config.controllers.len());
+            for key_config in &proxy_config.controllers {
+                let private_key = key_config.load_private_key().map_err(|e| {
+                    server_err!(ServerErrorCode::InvalidConfig, "{}", e)
+                })?;
+                specs.push(SnBnsControllerKeySpec {
+                    id: key_config.id.clone(),
+                    declared_address: key_config.address.clone(),
+                    private_key,
+                    weight: key_config.weight.unwrap_or(1),
+                });
+            }
+            let allowed_operations = proxy_config
+                .parse_allowed_operations()
+                .map_err(|e| server_err!(ServerErrorCode::InvalidConfig, "{}", e))?;
+            Ok((
+                specs,
+                proxy_config.require_user_asset_owner(),
+                allowed_operations,
+                false,
+            ))
+        } else {
+            // 旧配置兼容：单 controller；asset_owner 保持旧的 devtest 回落语义。
+            let private_key = Self::load_bns_evm_controller_private_key(config)?.ok_or(server_err!(
+                ServerErrorCode::InvalidConfig,
+                "bns_evm requires controller_private_key_env, controller_private_key_file or controller_private_key"
+            ))?;
+            let require_user_asset_owner = config
+                .bns_proxy
+                .as_ref()
+                .and_then(|proxy| proxy.require_user_asset_owner)
+                .unwrap_or(false);
+            Ok((
+                vec![SnBnsControllerKeySpec {
+                    id: "default".to_string(),
+                    declared_address: None,
+                    private_key,
+                    weight: 1,
+                }],
+                require_user_asset_owner,
+                SnBnsProxyOperation::all().into_iter().collect(),
+                true,
+            ))
+        }
+    }
+
+    async fn build_bns_proxy(
         config: &SNServerConfig,
         db_path: &str,
-    ) -> ServerResult<Option<Arc<SnBnsController>>> {
+    ) -> ServerResult<Option<Arc<SnBnsProxy>>> {
         let write_enabled = config
             .bns_write_enabled
             .unwrap_or_else(|| config.bns_indexer_url.is_some());
         if !write_enabled {
             return Ok(None);
         }
-        let evm_config = Self::parse_bns_evm_client_config(config)?;
-        let evm_controller = if let Some(evm_config) = evm_config {
-            let private_key = Self::load_bns_evm_controller_private_key(config)?.ok_or(server_err!(
-                ServerErrorCode::InvalidConfig,
-                "bns_evm requires controller_private_key_env, controller_private_key_file or controller_private_key"
-            ))?;
-            Some(Arc::new(
-                BnsEvmControllerClient::new(evm_config, private_key.as_str()).map_err(|e| {
-                    server_err!(
-                        ServerErrorCode::InvalidConfig,
-                        "create bns evm controller failed: {}",
-                        e
-                    )
-                })?,
-            ))
-        } else {
-            None
-        };
-
+        if let Some(proxy_config) = config.bns_proxy.as_ref() {
+            if !proxy_config.enabled {
+                info!("sn bns proxy is explicitly disabled by config");
+                return Ok(None);
+            }
+        }
+        let evm_config = Self::parse_bns_evm_client_config(config)?.ok_or(server_err!(
+            ServerErrorCode::InvalidConfig,
+            "bns_write_enabled requires bns_evm because SN BNS writes must go through the EVM contract"
+        ))?;
         let indexer_url = config.bns_indexer_url.as_deref().ok_or(server_err!(
             ServerErrorCode::InvalidConfig,
             "bns_write_enabled requires bns_indexer_url"
         ))?;
-        let principal = if config.sn_controller_principal.is_none() {
-            evm_controller
-                .as_ref()
-                .and_then(|controller| controller.default_signer_address())
-                .map(|address| Principal::chain_account(format!("{address:#x}")))
-                .unwrap_or(Self::parse_sn_controller_principal(config)?)
-        } else {
-            Self::parse_sn_controller_principal(config)?
-        };
-        let mut controller_config = SnBnsControllerConfig::new(
-            principal,
-            config.sn_controller_kid.clone().unwrap_or_default(),
+
+        let (key_specs, require_user_asset_owner, allowed_operations, legacy_mode) =
+            Self::resolve_bns_proxy_key_specs(config)?;
+        let signer_vault = Arc::new(
+            SnBnsTxSigner::new(&evm_config, allowed_operations.clone(), key_specs).map_err(
+                |e| {
+                    server_err!(
+                        ServerErrorCode::InvalidConfig,
+                        "create sn bns tx signer failed: {}",
+                        e
+                    )
+                },
+            )?,
         );
-        if let Some(doc_types) = config.allowed_controller_doc_types.clone() {
-            controller_config.allowed_controller_doc_types = doc_types;
-        }
+
         let client: Arc<dyn BnsIndexerApi> = Arc::new(BnsIndexerClient::new_krpc_url(
             indexer_url,
             config.bns_session_token.clone(),
@@ -2266,19 +2368,102 @@ impl SnServerFactory {
                 e
             )
         })?);
-        let evm_controller = evm_controller.ok_or(server_err!(
-            ServerErrorCode::InvalidConfig,
-            "bns_write_enabled requires bns_evm because SN BNS writes must go through the EVM contract"
-        ))?;
-        let controller = SnBnsController::new_evm(client, store, controller_config, evm_controller)
+
+        let mut controllers = Vec::new();
+        for info in signer_vault.controller_infos() {
+            let key_manager = BoundControllerKeyManager::new(signer_vault.clone(), info.id.as_str())
+                .map_err(|e| {
+                    server_err!(
+                        ServerErrorCode::InvalidConfig,
+                        "bind bns proxy controller `{}` failed: {}",
+                        info.id,
+                        e
+                    )
+                })?;
+            let evm_controller = Arc::new(BnsEvmControllerClient::new_with_key_manager(
+                evm_config.clone(),
+                Arc::new(key_manager),
+            ));
+            // principal：多 controller 模式恒为各自 key 的 chain account；
+            // 旧单 controller 模式保留显式 `sn_controller_principal` 覆盖。
+            let principal = if legacy_mode && config.sn_controller_principal.is_some() {
+                Self::parse_sn_controller_principal(config)?
+            } else {
+                if !legacy_mode && config.sn_controller_principal.is_some() {
+                    warn!(
+                        "sn_controller_principal is ignored when bns_proxy.controllers is configured; \
+                         each controller uses its own key address as principal"
+                    );
+                }
+                Principal::chain_account(info.address_hex.clone())
+            };
+            let mut controller_config = SnBnsControllerConfig::new(
+                principal.clone(),
+                config.sn_controller_kid.clone().unwrap_or_default(),
+            );
+            if let Some(doc_types) = config.allowed_controller_doc_types.clone() {
+                controller_config.allowed_controller_doc_types = doc_types;
+            }
+            let controller = SnBnsController::new_evm(
+                client.clone(),
+                store.clone(),
+                controller_config,
+                evm_controller,
+            )
             .map_err(|e| {
                 server_err!(
                     ServerErrorCode::InvalidConfig,
-                    "create sn bns controller failed: {}",
+                    "create sn bns controller `{}` failed: {}",
+                    info.id,
                     e
                 )
             })?;
-        Ok(Some(Arc::new(controller)))
+            controllers.push(SnBnsProxyController {
+                id: info.id,
+                address: info.address_hex,
+                principal,
+                weight: info.weight,
+                controller: Arc::new(controller),
+            });
+        }
+
+        let binding_store = SqliteSnBnsControllerBindingStore::new_by_path(db_path)
+            .await
+            .map_err(|e| {
+                server_err!(
+                    ServerErrorCode::InvalidConfig,
+                    "open sn bns controller binding store failed: {}",
+                    e
+                )
+            })?;
+        binding_store.initialize_database().await.map_err(|e| {
+            server_err!(
+                ServerErrorCode::InvalidConfig,
+                "initialize sn bns controller binding store failed: {}",
+                e
+            )
+        })?;
+        let bindings: SnBnsControllerBindingStoreRef = Arc::new(binding_store);
+
+        let proxy = SnBnsProxy::new(
+            controllers,
+            bindings,
+            allowed_operations,
+            require_user_asset_owner,
+        )
+        .map_err(|e| {
+            server_err!(
+                ServerErrorCode::InvalidConfig,
+                "create sn bns proxy failed: {}",
+                e
+            )
+        })?;
+        info!(
+            "sn bns proxy enabled: controllers={:?} require_user_asset_owner={}",
+            proxy.controller_addresses(),
+            require_user_asset_owner
+        );
+        Ok(Some(Arc::new(proxy)))
     }
 }
 
@@ -2435,7 +2620,7 @@ impl ServerFactory for SnServerFactory {
             )
         })?;
         let relay_manager: SnRelayManagerRef = Arc::new(relay_manager);
-        let bns_controller = Self::build_bns_controller(config, db_path.as_str())?;
+        let bns_proxy = Self::build_bns_proxy(config, db_path.as_str()).await?;
 
         let sn = Arc::new(
             SNServer::new(
@@ -2444,7 +2629,7 @@ impl ServerFactory for SnServerFactory {
                 device_info_db,
                 compat_store,
                 relay_manager,
-                bns_controller,
+                bns_proxy,
             )
             .await,
         );
@@ -2695,8 +2880,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn sn_bns_controller_uses_evm_signer_as_default_principal() {
+    #[tokio::test]
+    async fn sn_bns_legacy_config_maps_to_single_controller_proxy() {
         let db = tempfile::NamedTempFile::new().unwrap();
         let config = json!({
             "id": "test",
@@ -2715,15 +2900,557 @@ mod tests {
             }
         });
         let config: SNServerConfig = serde_json::from_value(config).unwrap();
-        let controller =
-            SnServerFactory::build_bns_controller(&config, db.path().to_str().unwrap())
-                .unwrap()
-                .unwrap();
+        let proxy = SnServerFactory::build_bns_proxy(&config, db.path().to_str().unwrap())
+            .await
+            .unwrap()
+            .unwrap();
 
+        // 旧单 key 配置 → 单 controller `default`，principal 派生自 EVM signer 地址，
+        // 且保持旧 devtest 语义（asset_owner 可缺省）。
         assert_eq!(
-            controller.config().sn_controller_principal,
-            Principal::chain_account(ANVIL_ADDRESS)
+            proxy.controller_addresses(),
+            vec![("default".to_string(), ANVIL_ADDRESS.to_string())]
         );
+        assert!(!proxy.require_user_asset_owner());
+        let binding = proxy.assign_controller_for_user("alice").await.unwrap();
+        assert_eq!(binding.controller_id, "default");
+        assert_eq!(binding.controller_address, ANVIL_ADDRESS);
+    }
+
+    #[tokio::test]
+    async fn sn_bns_proxy_config_builds_multi_controller_proxy() {
+        let db = tempfile::NamedTempFile::new().unwrap();
+        let config = json!({
+            "id": "test",
+            "host": "buckyos.ai",
+            "ip": "127.0.0.1",
+            "boot_jwt": "",
+            "owner_pkx": "",
+            "device_jwt": [],
+            "bns_write_enabled": true,
+            "bns_indexer_url": "http://127.0.0.1:18080",
+            "bns_evm": {
+                "rpc_endpoint": "http://127.0.0.1:8545",
+                "chain_id": 31337,
+                "contract_address": "0x2222222222222222222222222222222222222222"
+            },
+            "bns_proxy": {
+                "controllers": [
+                    {
+                        "id": "controller-a",
+                        "address": ANVIL_ADDRESS,
+                        "private_key": ANVIL_PRIVATE_KEY
+                    },
+                    {
+                        "id": "controller-b",
+                        "private_key": "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d"
+                    }
+                ],
+                "allowed_operations": ["register_name_bootstrap", "publish_dns_txt"]
+            }
+        });
+        let config: SNServerConfig = serde_json::from_value(config).unwrap();
+        let proxy = SnServerFactory::build_bns_proxy(&config, db.path().to_str().unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(proxy.controller_count(), 2);
+        // bns_proxy 配置块存在 → 生产默认：注册必须携带用户 asset_owner。
+        assert!(proxy.require_user_asset_owner());
+        assert!(proxy.allows(crate::SnBnsProxyOperation::PublishDnsTxt));
+        assert!(!proxy.allows(crate::SnBnsProxyOperation::PublishRelayAssignment));
+    }
+
+    /// 模拟「链 + indexer 同步完成」的 EVM 提交器：直接把 TX 应用到
+    /// 内存 BNS 状态机（与 bns-client tests 的 ApplyingEvmSubmitter 同构）。
+    struct TestApplyingEvmSubmitter {
+        registry: Arc<bns_indexer::CentralizedBnsRegistry<bns_indexer::SqliteBnsRegistryStore>>,
+        next_nonce: std::sync::Mutex<u64>,
+    }
+
+    impl TestApplyingEvmSubmitter {
+        fn new(
+            registry: Arc<bns_indexer::CentralizedBnsRegistry<bns_indexer::SqliteBnsRegistryStore>>,
+        ) -> Self {
+            Self {
+                registry,
+                next_nonce: std::sync::Mutex::new(0),
+            }
+        }
+
+        fn submission(&self) -> bns_client::BnsEvmTxSubmission {
+            let mut next_nonce = self.next_nonce.lock().unwrap();
+            let nonce = *next_nonce;
+            *next_nonce += 1;
+            bns_client::BnsEvmTxSubmission {
+                tx_hash: format!("0x{nonce:064x}"),
+                raw_tx: format!("0x{nonce:02x}"),
+                from: "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266".to_string(),
+                nonce,
+                chain_id: 31_337,
+                receipt_status: None,
+                receipt_block_number: None,
+                receipt_confirmations: None,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl bns_client::SnBnsEvmSubmitter for TestApplyingEvmSubmitter {
+        async fn register_name(
+            &self,
+            req: &bns_client::BnsRegisterNameReq,
+        ) -> bns_client::BnsClientResult<bns_client::BnsEvmTxSubmission> {
+            if req.authority_key_updates.is_empty()
+                && req.semantic_owner_after_authority.is_none()
+                && req.controller_policy.is_empty()
+            {
+                self.registry
+                    .register_name(
+                        req.name.as_str(),
+                        req.asset_owner.as_str(),
+                        req.options.clone(),
+                        req.initial_documents.clone(),
+                        req.authority.clone(),
+                        req.guard,
+                    )
+                    .map_err(bns_client::BnsClientError::from)?;
+            } else {
+                self.registry
+                    .bootstrap_name(
+                        req.name.as_str(),
+                        req.asset_owner.as_str(),
+                        req.options.clone(),
+                        req.initial_documents.clone(),
+                        req.authority_key_updates.clone(),
+                        req.semantic_owner_after_authority.clone(),
+                        req.controller_policy.clone(),
+                        req.controller_policy_hash.as_str(),
+                        req.authority.clone(),
+                        req.guard,
+                    )
+                    .map_err(bns_client::BnsClientError::from)?;
+            }
+            Ok(self.submission())
+        }
+
+        async fn apply_mutations(
+            &self,
+            req: &bns_client::BnsApplyMutationsReq,
+        ) -> bns_client::BnsClientResult<bns_client::BnsEvmTxSubmission> {
+            self.registry
+                .apply_mutations(
+                    req.name.as_str(),
+                    req.authority_key_updates.clone(),
+                    req.documents.clone(),
+                    req.owner_policy.clone(),
+                    req.authority.clone(),
+                    req.guard,
+                )
+                .map_err(bns_client::BnsClientError::from)?;
+            Ok(self.submission())
+        }
+
+        async fn publish_document(
+            &self,
+            req: &bns_client::BnsPublishDocumentReq,
+        ) -> bns_client::BnsClientResult<bns_client::BnsEvmTxSubmission> {
+            self.registry
+                .publish_document(
+                    req.name.as_str(),
+                    req.update.clone(),
+                    req.authority.clone(),
+                    req.guard,
+                )
+                .map_err(bns_client::BnsClientError::from)?;
+            Ok(self.submission())
+        }
+    }
+
+    const PROXY_CONTROLLER_A: &str = "0xcccccccccccccccccccccccccccccccccccccc01";
+    const PROXY_CONTROLLER_B: &str = "0xcccccccccccccccccccccccccccccccccccccc02";
+    const PROXY_USER_OWNER: &str = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    /// 构建带 in-process BNS 状态机的 SNServer + 双 controller proxy。
+    async fn build_sn_with_bns_proxy(
+        db_path: &str,
+        auth_dir: &std::path::Path,
+        require_user_asset_owner: bool,
+    ) -> (
+        Arc<SNServer>,
+        Arc<bns_indexer::CentralizedBnsRegistry<bns_indexer::SqliteBnsRegistryStore>>,
+    ) {
+        let auth_db = SqliteSnAuthDB::new_by_path(db_path).await.unwrap();
+        auth_db.initialize_database().await.unwrap();
+        auth_db
+            .insert_activation_code(CLEAR_STATE_ACTIVE_CODE)
+            .await
+            .unwrap();
+        auth_db.insert_activation_code("bnsProxyCode2").await.unwrap();
+        let auth_db: SnAuthDBRef = Arc::new(auth_db);
+
+        let device_info_db = SqliteSnDeviceInfoDB::new_by_path(db_path).await.unwrap();
+        device_info_db.initialize_database().await.unwrap();
+        let device_info_db: SnDeviceInfoDBRef = Arc::new(device_info_db);
+
+        let compat_store = SqliteSnCompatibilityStore::new_by_path(db_path).await.unwrap();
+        compat_store.initialize_database().await.unwrap();
+        let compat_store: SnCompatibilityStoreRef = Arc::new(compat_store);
+
+        let relay_manager = SqliteSnRelayManager::new_by_path(db_path)
+            .await
+            .unwrap()
+            .with_auth_db(auth_db.clone())
+            .with_device_info_db(device_info_db.clone());
+        relay_manager.initialize_database().await.unwrap();
+        let relay_manager: SnRelayManagerRef = Arc::new(relay_manager);
+
+        let registry = Arc::new(bns_indexer::CentralizedBnsRegistry::new_legacy_state_machine(
+            bns_indexer::SqliteBnsRegistryStore::open_memory().unwrap(),
+        ));
+        let submitter = Arc::new(TestApplyingEvmSubmitter::new(registry.clone()));
+        let write_request_store = Arc::new(bns_client::MemorySnBnsWriteRequestStore::new());
+
+        let mut controllers = Vec::new();
+        for (id, address) in [
+            ("controller-a", PROXY_CONTROLLER_A),
+            ("controller-b", PROXY_CONTROLLER_B),
+        ] {
+            let handler: Arc<dyn BnsIndexerApi> = Arc::new(
+                bns_indexer::CentralizedBnsIndexerHandler::new(registry.clone()),
+            );
+            let controller = SnBnsController::new_with_evm_submitter(
+                Arc::new(BnsIndexerClient::new_in_process(handler)),
+                write_request_store.clone(),
+                SnBnsControllerConfig::new(Principal::chain_account(address), ""),
+                submitter.clone(),
+            )
+            .unwrap();
+            controllers.push(crate::SnBnsProxyController {
+                id: id.to_string(),
+                address: address.to_string(),
+                principal: Principal::chain_account(address),
+                weight: 1,
+                controller: Arc::new(controller),
+            });
+        }
+        let proxy = crate::SnBnsProxy::new(
+            controllers,
+            Arc::new(crate::MemorySnBnsControllerBindingStore::new()),
+            crate::SnBnsProxyOperation::all().into_iter().collect(),
+            require_user_asset_owner,
+        )
+        .unwrap();
+
+        let config = json!({
+            "id": "test-bns-proxy",
+            "host": "buckyos.ai",
+            "ip": "127.0.0.1",
+            "boot_jwt": "",
+            "owner_pkx": "",
+            "device_jwt": [],
+            "auth_data_dir": auth_dir.to_str().unwrap(),
+        });
+        let config: SNServerConfig = serde_json::from_value(config).unwrap();
+        let sn = Arc::new(
+            SNServer::new(
+                config,
+                auth_db,
+                device_info_db,
+                compat_store,
+                relay_manager,
+                Some(Arc::new(proxy)),
+            )
+            .await,
+        );
+        (sn, registry)
+    }
+
+    #[tokio::test]
+    async fn test_sn_bns_proxy_rpc_paths() {
+        init_logging("sn", false);
+        const PROXY_USER: &str = "bnsproxyuser";
+
+        let db = tempfile::NamedTempFile::with_suffix(".db").unwrap();
+        let auth_dir = tempfile::tempdir().unwrap();
+        let (sn, _registry) =
+            build_sn_with_bns_proxy(db.path().to_str().unwrap(), auth_dir.path(), true).await;
+
+        let http_server: Arc<dyn HttpServer> = sn.clone();
+        let http_addr = spawn_test_http_server(http_server).await;
+        let base_url = format!("http://{}", http_addr);
+        let auth_url = format!("{}/kapi/sn/auth", base_url);
+        let bns_proxy_url = format!("{}/kapi/sn/bns-proxy", base_url);
+        let internal_url = format!("{}/", base_url);
+
+        // --- 生产模式：缺 asset_owner 注册失败，且不创建本地用户 ---
+        let auth_krpc = kRPC::new(auth_url.as_str(), None);
+        let missing_owner_err = auth_krpc
+            .call(
+                "auth.register",
+                json!({
+                    "name": PROXY_USER,
+                    "pwd_hash": "12345678",
+                    "active_code": CLEAR_STATE_ACTIVE_CODE
+                }),
+            )
+            .await
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(missing_owner_err.contains("[SN:1000:invalid_params]"));
+        assert!(missing_owner_err.contains("asset_owner is required"));
+
+        let result = auth_krpc
+            .call("auth.check_username", json!({ "name": PROXY_USER }))
+            .await
+            .unwrap();
+        assert!(
+            result["valid"].as_bool().unwrap(),
+            "user must not be created when bns bootstrap is rejected"
+        );
+
+        // --- 带用户 asset_owner 注册成功，响应携带 BNS TX 信息 ---
+        let result = auth_krpc
+            .call(
+                "auth.register",
+                json!({
+                    "name": PROXY_USER,
+                    "pwd_hash": "12345678",
+                    "active_code": CLEAR_STATE_ACTIVE_CODE,
+                    "asset_owner": PROXY_USER_OWNER,
+                    "initial_documents": {
+                        "dns_txt": [ { "ttl": 600, "value": "pkx=bootstrap" } ]
+                    }
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["code"].as_i64().unwrap(), 0);
+        assert!(!result["need_bind_owner_key"].as_bool().unwrap());
+        let access_token = result["access_token"].as_str().unwrap().to_string();
+        let bns = result["bns"].as_object().unwrap();
+        assert_eq!(bns["status"].as_str().unwrap(), "submitted");
+        assert_eq!(bns["operation"].as_str().unwrap(), "register_name_bootstrap");
+        assert_eq!(bns["asset_owner"].as_str().unwrap(), PROXY_USER_OWNER);
+        assert!(bns["tx_hash"].as_str().unwrap().starts_with("0x"));
+        assert!(bns["raw_tx"].as_str().unwrap().starts_with("0x"));
+        assert!(bns["nonce"].is_u64());
+        assert_eq!(bns["chain_id"].as_u64().unwrap(), 31_337);
+        let bound_controller = bns["controller_address"].as_str().unwrap().to_string();
+        assert!(
+            bound_controller == PROXY_CONTROLLER_A || bound_controller == PROXY_CONTROLLER_B,
+            "controller_address must come from SN-side binding"
+        );
+
+        // 链上（状态机）验证：assetOwner 是用户地址，绑定 controller 可写 dns_txt。
+        let owner = sn
+            .bns_proxy()
+            .unwrap()
+            .controller_for_user(PROXY_USER)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(owner.controller_address, bound_controller);
+
+        // --- publish_dns_txt：token + 本人 name → submitted ---
+        let bns_krpc = kRPC::new(bns_proxy_url.as_str(), Some(access_token.clone()));
+        let result = bns_krpc
+            .call(
+                "bns.publish_dns_txt",
+                json!({
+                    "name": PROXY_USER,
+                    "mode": "add",
+                    "ttl": 300,
+                    "value": "pkx=updated"
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["code"].as_i64().unwrap(), 0);
+        assert_eq!(result["status"].as_str().unwrap(), "submitted");
+        assert_eq!(result["doc_type"].as_str().unwrap(), "dns_txt");
+        assert_eq!(result["controller_address"].as_str().unwrap(), bound_controller);
+        assert!(result["tx_hash"].as_str().unwrap().starts_with("0x"));
+        // 响应不等待 receipt：没有 receipt 字段，document_version 是预期版本。
+        assert_eq!(result["document_version"].as_u64().unwrap(), 2);
+
+        // --- 跨用户 name 拒绝 ---
+        let cross_user_err = bns_krpc
+            .call(
+                "bns.publish_dns_txt",
+                json!({
+                    "name": "otheruser",
+                    "mode": "add",
+                    "value": "pkx=evil"
+                }),
+            )
+            .await
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(cross_user_err.contains("[SN:1018:cross_user_access_denied]"));
+
+        // --- 客户端不能指定 controller_address（未知字段直接拒绝）---
+        let unknown_field_err = bns_krpc
+            .call(
+                "bns.publish_dns_txt",
+                json!({
+                    "name": PROXY_USER,
+                    "mode": "add",
+                    "value": "pkx=x",
+                    "controller_address": PROXY_CONTROLLER_A
+                }),
+            )
+            .await
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(unknown_field_err.contains("[SN:1000:invalid_params]"));
+        assert!(unknown_field_err.contains("controller_address"));
+
+        // --- 无 token 拒绝 ---
+        let no_token_err = kRPC::new(bns_proxy_url.as_str(), None)
+            .call(
+                "bns.publish_dns_txt",
+                json!({ "name": PROXY_USER, "mode": "add", "value": "pkx=x" }),
+            )
+            .await
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(no_token_err.contains("[SN:1006:auth_required]"));
+
+        // --- internal-only 方法不暴露在外部 HTTP 路径 ---
+        for method in ["bns.publish_relay_assignment", "bns.register_name_bootstrap"] {
+            let err = bns_krpc
+                .call(method, json!({ "name": PROXY_USER }))
+                .await
+                .err()
+                .unwrap()
+                .to_string();
+            assert!(
+                err.contains("not available on /kapi/sn/bns-proxy"),
+                "{method} must be internal-only, got: {err}"
+            );
+        }
+
+        // --- internal 路径（"/"）：relay assignment / bootstrap 恢复可用 ---
+        let internal_krpc = kRPC::new(internal_url.as_str(), None);
+        let result = internal_krpc
+            .call(
+                "bns.publish_relay_assignment",
+                json!({
+                    "name": PROXY_USER,
+                    "relay_assignment": { "relays": ["relay1.buckyos.ai"] }
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["code"].as_i64().unwrap(), 0);
+        assert_eq!(result["status"].as_str().unwrap(), "submitted");
+        assert_eq!(result["doc_type"].as_str().unwrap(), "relay_assignment");
+
+        const RECOVER_USER: &str = "bnsrecoveruser";
+        let result = internal_krpc
+            .call(
+                "bns.register_name_bootstrap",
+                json!({
+                    "request_id": "sn:register:bnsrecoveruser",
+                    "name": RECOVER_USER,
+                    "asset_owner": PROXY_USER_OWNER
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["code"].as_i64().unwrap(), 0);
+        assert_eq!(result["status"].as_str().unwrap(), "submitted");
+        assert_eq!(result["reused"].as_bool().unwrap(), false);
+        let first_tx_hash = result["tx_hash"].as_str().unwrap().to_string();
+
+        // 同 request_id 幂等重放：返回同一笔 TX，reused=true。
+        let replay = internal_krpc
+            .call(
+                "bns.register_name_bootstrap",
+                json!({
+                    "request_id": "sn:register:bnsrecoveruser",
+                    "name": RECOVER_USER,
+                    "asset_owner": PROXY_USER_OWNER
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(replay["tx_hash"].as_str().unwrap(), first_tx_hash);
+        assert!(replay["reused"].as_bool().unwrap());
+
+        // --- 登录路径回归：proxy 存在时 need_bind_owner_key = false ---
+        let result = auth_krpc
+            .call(
+                "auth.login",
+                json!({ "name": PROXY_USER, "pwd_hash": "12345678" }),
+            )
+            .await
+            .unwrap();
+        assert!(!result["need_bind_owner_key"].as_bool().unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_sn_bns_proxy_dns_txt_projection_visible_after_submit() {
+        init_logging("sn", false);
+        const PROXY_USER: &str = "bnsprojuser";
+
+        let db = tempfile::NamedTempFile::with_suffix(".db").unwrap();
+        let auth_dir = tempfile::tempdir().unwrap();
+        let (sn, registry) =
+            build_sn_with_bns_proxy(db.path().to_str().unwrap(), auth_dir.path(), false).await;
+
+        let http_server: Arc<dyn HttpServer> = sn.clone();
+        let http_addr = spawn_test_http_server(http_server).await;
+        let base_url = format!("http://{}", http_addr);
+        let auth_url = format!("{}/kapi/sn/auth", base_url);
+        let bns_proxy_url = format!("{}/kapi/sn/bns-proxy", base_url);
+
+        // devtest 模式：asset_owner 缺省回落为绑定 controller 地址。
+        let auth_krpc = kRPC::new(auth_url.as_str(), None);
+        let result = auth_krpc
+            .call(
+                "auth.register",
+                json!({
+                    "name": PROXY_USER,
+                    "pwd_hash": "12345678",
+                    "active_code": CLEAR_STATE_ACTIVE_CODE
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["code"].as_i64().unwrap(), 0);
+        let access_token = result["access_token"].as_str().unwrap().to_string();
+        let bns = result["bns"].as_object().unwrap();
+        let bound_controller = bns["controller_address"].as_str().unwrap().to_string();
+        assert_eq!(bns["asset_owner"].as_str().unwrap(), bound_controller);
+
+        let bns_krpc = kRPC::new(bns_proxy_url.as_str(), Some(access_token));
+        let result = bns_krpc
+            .call(
+                "bns.publish_dns_txt",
+                json!({
+                    "name": PROXY_USER,
+                    "mode": "add",
+                    "value": "pkx=projection"
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["status"].as_str().unwrap(), "submitted");
+
+        // 权威状态经「链→indexer 投影」可见（测试里状态机即投影源）。
+        let handler: Arc<dyn BnsIndexerApi> =
+            Arc::new(bns_indexer::CentralizedBnsIndexerHandler::new(registry));
+        let reader = BnsIndexerClient::new_in_process(handler);
+        let resolved = reader.resolve_document(PROXY_USER, "dns_txt").await.unwrap();
+        let inline = String::from_utf8(resolved.document_state.document.inline_document).unwrap();
+        assert!(inline.contains("pkx=projection"), "{inline}");
     }
 
     #[test]

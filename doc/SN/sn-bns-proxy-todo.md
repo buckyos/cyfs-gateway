@@ -2,6 +2,47 @@
 
 本文记录 SN 侧 BNS proxy 写链改造。目标是让没有 gas 的用户也能通过 SN 完成 BNS name 初始化和受限 document 发布；SN 负责构造、签名和投递 EVM TX，BNS 的最终权威状态仍以合约和 `bns-indexer` 投影为准。
 
+## 实施状态（2026-07-08，已完成）
+
+代码落点（`src/components/cyfs-sn/`）：
+
+- `src/sn_bns_signer.rs` — `SnBnsTxSigner` 签名保管库（多 key、白名单校验：chain id /
+  contract / method selector / operation×doc_type / gas 上限，未知一律拒签；Debug 全部
+  redact 私钥）。对 bns-client 的插入点是既有 `BnsEvmKeyManager` trait，由
+  `BoundControllerKeyManager` 按 controller 绑定实现——因此没有另发明新 trait，
+  「`SnBnsTxSigner` trait」以 vault + bound key manager 的组合落地。
+- `src/sn_bns_proxy.rs` — `SnBnsProxy` 编排器：每把 controller key 一个
+  `SnBnsController` 实例（controllerPolicy / controller authority 天然锚定实例
+  principal）、`sn_bns_controller_bindings` 持久化绑定（sqlite，与
+  `sn_bns_write_requests` 同库）、审计日志。分配策略用 **带权重 rendezvous hashing**
+  （优于草案的 `hash % N`：增删 controller 只迁移落到新节点的用户；`weight: 0` 表示
+  排水，不接新用户但既有绑定继续可用）。
+- `src/api/bns_proxy.rs` — `/kapi/sn/bns-proxy` RPC handler；所有参数
+  `deny_unknown_fields`（客户端塞 `controller_address` 直接 InvalidParams）。
+- `auth.register` 接线在 `src/api/auth.rs`；配置/路由/工厂在 `src/sn_server.rs`
+  （`SNBnsProxyConfig`、`SnRpcPath::BnsProxy`、`build_bns_proxy`）。
+
+与草案的差异：
+
+- 配置块里不重复 chain 参数：`bns_evm` 继续承载 rpc_endpoint/chain_id/contract/gas
+  上限，`bns_proxy` 只加 controllers / allowed_operations / require_user_asset_owner /
+  enabled。草案中的 `bns_indexer_url`/`tx_submit_url` 即既有顶层 `bns_indexer_url`
+  （读 + guard）与 `bns_evm.rpc_endpoint`（TX 投递）。
+- `require_user_asset_owner` 缺省：配置了 `bns_proxy` 块 → **true**（生产语义）；
+  纯旧配置（仅 `bns_evm.controller_private_key*`）→ false，保持 devtest 兼容，此时
+  asset_owner 缺省回落为**该用户绑定 controller** 的地址。
+- internal/admin 方法（`bns.publish_relay_assignment` / `bns.register_name_bootstrap`）
+  与 `admin.clear_state_by_active_code` 同机制：钉在 InternalRoot(`/`)，外部
+  `/kapi/sn/bns-proxy` HTTP 路径不可达。
+- 绑定表在 SN 本地 sqlite（与 `sn_bns_write_requests` 账本同文件）；db_type=postgres
+  时同样落本地（与写请求账本现状一致）。多实例 SN 共享 postgres 部署时，绑定表
+  需要共享盘或后续挪到 provider 侧——单独议题，不在本次范围。
+
+测试：`cargo test -p cyfs-sn`（单元 + RPC 集成，见 `sn_bns_signer.rs` /
+`sn_bns_proxy.rs` 测试模块与 `sn_server.rs` 的 `test_sn_bns_proxy_*`）；真链
+e2e `cargo test -p cyfs-sn --test e2e_sn_bns_proxy -- --ignored`（需 Foundry，
+已在 anvil 上跑通完整验收链路，含 owner 清空 policy 后 controller 再写 revert）。
+
 ## 背景结论
 
 - BNS 合约层支持 SN 代付 gas 注册 name：root name 的 `registerName` 使用 `AuthorityRole.None`，`assetOwner` 可以填用户 EVM 地址，`msg.sender` 可以是 SN signer。
@@ -309,53 +350,53 @@ client -> sn-bns-proxy-rpc
 
 ### 1. 配置与 signer 抽象
 
-- [ ] 在 `SNServerConfig` 增加 `bns_proxy` 配置块。
-- [ ] 建立多 controller config 结构和校验逻辑。
-- [ ] 新增 `SnBnsTxSigner` trait，只暴露白名单 operation 的签名接口。
-- [ ] 接入 nonce manager，覆盖同一 controller 并发签名。
-- [ ] 兼容旧单 controller `bns_evm` 配置。
+- [x] 在 `SNServerConfig` 增加 `bns_proxy` 配置块。
+- [x] 建立多 controller config 结构和校验逻辑。
+- [x] 新增 `SnBnsTxSigner` trait，只暴露白名单 operation 的签名接口。
+- [x] 接入 nonce manager，覆盖同一 controller 并发签名。
+- [x] 兼容旧单 controller `bns_evm` 配置。
 
 ### 2. controller 分配与持久化
 
-- [ ] 新增 `sn_bns_controller_bindings` 表。
-- [ ] 实现 `assign_controller_for_user(username)`。
-- [ ] 实现 `controller_for_user(username)`。
-- [ ] 注册流程写入绑定；已存在绑定不得静默覆盖。
+- [x] 新增 `sn_bns_controller_bindings` 表。
+- [x] 实现 `assign_controller_for_user(username)`。
+- [x] 实现 `controller_for_user(username)`。
+- [x] 注册流程写入绑定；已存在绑定不得静默覆盖。
 
 ### 3. 注册接线
 
-- [ ] `auth.register` 生产模式要求 `asset_owner`。
-- [ ] 注册时使用用户 `asset_owner`，不再默认 SN controller 地址。
-- [ ] 构造带 `controllerPolicy` 和 `initialDocuments` 的 `registerName`。
-- [ ] 返回 BNS TX 信息。
-- [ ] 失败时不落本地用户，或显式落可恢复 pending 状态。
+- [x] `auth.register` 生产模式要求 `asset_owner`。
+- [x] 注册时使用用户 `asset_owner`，不再默认 SN controller 地址。
+- [x] 构造带 `controllerPolicy` 和 `initialDocuments` 的 `registerName`。
+- [x] 返回 BNS TX 信息。
+- [x] 失败时不落本地用户，或显式落可恢复 pending 状态。
 
 ### 4. Proxy RPC
 
-- [ ] 新增 `/kapi/sn/bns-proxy` 路由。
-- [ ] 增加 `bns.publish_dns_txt`。
-- [ ] 增加 internal/admin `bns.publish_relay_assignment`。
-- [ ] 明确拒绝未知 operation、未知 doc type、跨用户 name。
-- [ ] 所有成功响应返回 tx 信息，不等待 receipt。
+- [x] 新增 `/kapi/sn/bns-proxy` 路由。
+- [x] 增加 `bns.publish_dns_txt`。
+- [x] 增加 internal/admin `bns.publish_relay_assignment`。
+- [x] 明确拒绝未知 operation、未知 doc type、跨用户 name。
+- [x] 所有成功响应返回 tx 信息，不等待 receipt。
 
 ### 5. 读侧与缓存
 
-- [ ] proxy 写入成功投递后只做 cache invalidation，不直接更新 BNS 权威状态缓存。
-- [ ] resolver 继续通过 `bns-indexer` 读取最终状态。
-- [ ] stale/indexer 未同步时，客户端应看到“TX submitted but state not projected yet”的正常窗口。
+- [x] proxy 写入成功投递后只做 cache invalidation，不直接更新 BNS 权威状态缓存。
+- [x] resolver 继续通过 `bns-indexer` 读取最终状态。
+- [x] stale/indexer 未同步时，客户端应看到“TX submitted but state not projected yet”的正常窗口。
 
 ### 6. 测试
 
-- [ ] 单元测试：signer 拒绝未知 method selector / contract / chain id。
-- [ ] 单元测试：业务层无法读取私钥。
-- [ ] 单元测试：同一用户 controller 分配稳定。
-- [ ] 单元测试：不同用户可分配到不同 controller。
-- [ ] 单元测试：注册请求生成 `assetOwner = 用户地址`、`controllerPolicy.actor = 分配 controller`。
-- [ ] 单元测试：`asset_owner` 缺失在生产配置下失败。
-- [ ] RPC 测试：`bns.publish_dns_txt` 返回 `submitted` tx，不等待 receipt。
-- [ ] RPC 测试：跨用户 name 被拒绝。
-- [ ] RPC 测试：客户端不能指定 controller address。
-- [ ] 真链路 ignored e2e：注册 -> wait receipt -> indexer sync -> owner 是用户地址 -> controller 可写 `dns_txt` -> 用户 owner 清空 controller policy -> controller 再写失败。
+- [x] 单元测试：signer 拒绝未知 method selector / contract / chain id。
+- [x] 单元测试：业务层无法读取私钥。
+- [x] 单元测试：同一用户 controller 分配稳定。
+- [x] 单元测试：不同用户可分配到不同 controller。
+- [x] 单元测试：注册请求生成 `assetOwner = 用户地址`、`controllerPolicy.actor = 分配 controller`。
+- [x] 单元测试：`asset_owner` 缺失在生产配置下失败。
+- [x] RPC 测试：`bns.publish_dns_txt` 返回 `submitted` tx，不等待 receipt。
+- [x] RPC 测试：跨用户 name 被拒绝。
+- [x] RPC 测试：客户端不能指定 controller address。
+- [x] 真链路 ignored e2e：注册 -> wait receipt -> indexer sync -> owner 是用户地址 -> controller 可写 `dns_txt` -> 用户 owner 清空 controller policy -> controller 再写失败。
 
 ## 验收标准
 

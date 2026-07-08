@@ -1,7 +1,5 @@
 use crate::SNServer;
 use ::kRPC::*;
-use bns_client::SnBnsController;
-use bns_indexer::PrincipalKind;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -37,10 +35,15 @@ pub(crate) struct RegisterReq {
     pub(crate) active_code: String,
     #[serde(default)]
     pub(crate) request_id: Option<String>,
+    /// 用户 owner EVM 地址。bns proxy 生产模式必填；devtest
+    /// （require_user_asset_owner=false）缺省时回落为绑定 controller 地址。
     #[serde(default)]
     pub(crate) asset_owner: Option<String>,
     #[serde(default)]
     pub(crate) owner_config: Option<Value>,
+    /// 注册时随 registerName 原子发布的初始 documents（zone/boot/dns_txt）。
+    #[serde(default)]
+    pub(crate) initial_documents: Option<crate::sn_bns_proxy::SnBnsProxyInitialDocuments>,
 }
 
 #[derive(Deserialize)]
@@ -148,18 +151,6 @@ pub(crate) fn normalize_evm_address(value: &str, field: &str) -> RpcCallResult<S
             format!("{field} must be a 0x-prefixed EVM address"),
         ))
     }
-}
-
-pub(crate) fn bns_default_asset_owner(controller: &SnBnsController) -> RpcCallResult<String> {
-    let principal = &controller.config().sn_controller_principal;
-    if principal.kind != PrincipalKind::ChainAccount {
-        return Err(parse_error(
-            SnApiErrorCode::InvalidParams,
-            "asset_owner is required when SN controller principal is not a chain account",
-        ));
-    }
-
-    normalize_evm_address(principal.value.as_str(), "sn_controller_principal.value")
 }
 
 pub(crate) fn build_profile_json(username: &str, user: &crate::SNUserInfo) -> Value {

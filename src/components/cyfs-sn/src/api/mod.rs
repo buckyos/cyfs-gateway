@@ -1,4 +1,5 @@
 mod auth;
+mod bns_proxy;
 mod common;
 mod device;
 mod dns;
@@ -7,6 +8,7 @@ mod errors;
 mod user;
 
 pub(crate) use auth::handle_auth;
+pub(crate) use bns_proxy::handle_bns_proxy;
 pub(crate) use common::RpcCallResult;
 pub(crate) use device::handle_device;
 pub(crate) use dns::handle_dns;
