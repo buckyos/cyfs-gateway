@@ -15,7 +15,10 @@
 #   S3 链上种子  GET /1.0/identifiers/did:bns:alice 经 indexer 投影解析成功
 #   S4 user_domain 种子  GET /1.0/identifiers/did:web:charlie.me 解析成功
 #   S5 纯 Web3 位  did:bns:dave（无 sn_user 行）仍可经 BNS 路径解析
-#   S6 keep-tunnel  OOD peer 到 SN 的 RTCP keep-tunnel 处于 ESTABLISHED
+#   S6 BNS proxy   auth.register 用户只给 asset_owner，SN 代付 gas 注册 BNS；
+#                  再用 access token 经 bns.publish_dns_txt 代理写 dns_txt，
+#                  最后从 DNS TXT 读回 indexer 投影。
+#   S7 keep-tunnel  OOD peer 到 SN 的 RTCP keep-tunnel 处于 ESTABLISHED
 #      （仅 --vm；经 buckyos-devtest <group> run sn 检查 rtcp 端口的入站长
 #      连接。tunnel 断开时该 case 必须失败；单节点 group 用 --no-keep-tunnel
 #      显式关闭。）
@@ -47,7 +50,8 @@ Options:
   --devtest-dir <dir>  Directory to run buckyos-devtest from (must contain dev_configs/<group>.json);
                        auto-detected from this repo and the sibling buckyos checkout.
   --rtcp-port <port>   SN RTCP listen port for the keep-tunnel check; default 2980.
-  --no-keep-tunnel     Skip S6 (single-node groups without an OOD peer).
+  --no-bns-proxy       Skip S6 (older dev environments without bns_proxy enabled).
+  --no-keep-tunnel     Skip S7 (single-node groups without an OOD peer).
 EOF
 }
 
@@ -96,6 +100,7 @@ DEVTEST_GROUP="${SN_DEV_DEVTEST_GROUP:-sntest}"
 DEVTEST_DIR="${SN_DEV_DEVTEST_DIR:-}"
 RTCP_PORT="${SN_DEV_RTCP_PORT:-2980}"
 KEEP_TUNNEL_CHECK="${SN_DEV_KEEP_TUNNEL_CHECK:-1}"
+BNS_PROXY_CHECK="${SN_DEV_BNS_PROXY_CHECK:-1}"
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -125,6 +130,7 @@ while [ "$#" -gt 0 ]; do
     --rtcp-port)
       [ "$#" -ge 2 ] || { echo "--rtcp-port requires a value" >&2; exit 2; }
       RTCP_PORT="$2"; shift 2 ;;
+    --no-bns-proxy) BNS_PROXY_CHECK=0; shift ;;
     --no-keep-tunnel) KEEP_TUNNEL_CHECK=0; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "unknown argument: $1" >&2; usage >&2; exit 2 ;;
@@ -133,6 +139,9 @@ done
 
 require_tool curl
 require_tool dig
+if [ "$BNS_PROXY_CHECK" = "1" ]; then
+  require_tool python3
+fi
 
 case "$MODE" in
   local)
@@ -229,6 +238,177 @@ identifiers_ok() { # identifiers_ok <did>
   # 任一形态都说明 resolver 成功返回了可用文档。
   curl -fsS --connect-timeout 3 --max-time 10 -H "Host: $SN_HTTP_HOST" "$HTTP_ORIGIN/1.0/identifiers/$1" | grep -Eq '"(boot|user_name|id|oods)"'
 }
+bns_proxy_real_path_ok() {
+  SN_HOST="$SN_HOST" \
+  SN_HTTP_HOST="$SN_HTTP_HOST" \
+  HTTP_ORIGIN="$HTTP_ORIGIN" \
+  DNS_SERVER="$DNS_SERVER" \
+  DNS_PORT="$DNS_PORT" \
+  SMOKE_RETRIES="$SMOKE_RETRIES" \
+  SMOKE_RETRY_DELAY="$SMOKE_RETRY_DELAY" \
+  python3 <<'PY'
+import json
+import os
+import subprocess
+import time
+import urllib.error
+import urllib.request
+
+sn_host = os.environ["SN_HOST"]
+sn_http_host = os.environ["SN_HTTP_HOST"]
+http_origin = os.environ["HTTP_ORIGIN"].rstrip("/")
+dns_server = os.environ["DNS_SERVER"]
+dns_port = os.environ["DNS_PORT"]
+retries = int(os.environ.get("SMOKE_RETRIES", "10"))
+delay = float(os.environ.get("SMOKE_RETRY_DELAY", "2"))
+
+active_code = "zX6cV7bN8mK9lJ0hG1fD"
+asset_owner = os.environ.get(
+    "SN_DEV_BNS_PROXY_ASSET_OWNER",
+    "0x90F79bf6EB2c4f870365E785982E1f101E93b906",
+)
+username = os.environ.get("SN_DEV_BNS_PROXY_USER")
+if not username:
+    username = f"smokebns{int(time.time()) % 1_000_000_000}"
+password = "smoke-pwd"
+initial_marker = f"PKX=smoke-init-{username}"
+live_marker = f"PKX=smoke-live-{username}"
+
+
+def rpc(path, method, params, token=None):
+    body = {"method": method, "params": params, "sys": [1]}
+    if token:
+        body["token"] = token
+        body["sys"] = [1, token]
+    request = urllib.request.Request(
+        f"{http_origin}{path}",
+        data=json.dumps(body).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            "Host": sn_http_host,
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            payload = response.read().decode("utf-8")
+    except urllib.error.HTTPError as err:
+        payload = err.read().decode("utf-8", "replace")
+        raise RuntimeError(f"{method} HTTP {err.code}: {payload}") from err
+    data = json.loads(payload)
+    if "error" in data:
+        raise RuntimeError(f"{method} failed: {data['error']}")
+    if "result" not in data:
+        raise RuntimeError(f"{method} response has no result: {data}")
+    result = data["result"]
+    if isinstance(result, dict) and "Success" in result:
+        return result["Success"]
+    if isinstance(result, dict) and "Failed" in result:
+        raise RuntimeError(f"{method} failed: {result['Failed']}")
+    if isinstance(result, str):
+        raise RuntimeError(f"{method} failed: {result}")
+    return result
+
+
+def assert_tx_result(label, result):
+    if result.get("status") != "submitted":
+        raise RuntimeError(f"{label} status is not submitted: {result}")
+    tx_hash = result.get("tx_hash")
+    if not isinstance(tx_hash, str) or not tx_hash.startswith("0x"):
+        raise RuntimeError(f"{label} missing tx_hash: {result}")
+    controller = result.get("controller_address", "")
+    if controller.lower() == asset_owner.lower():
+        raise RuntimeError(f"{label} used asset_owner as controller: {result}")
+
+
+def dig_txt():
+    host = f"{username}.web3.{sn_host}"
+    output = subprocess.run(
+        [
+            "dig",
+            "+short",
+            "+time=3",
+            "+tries=1",
+            f"@{dns_server}",
+            "-p",
+            str(dns_port),
+            host,
+            "TXT",
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        check=False,
+    )
+    return output.stdout
+
+
+def wait_txt_contains(*markers):
+    last = ""
+    for _ in range(retries):
+        last = dig_txt()
+        if all(marker in last for marker in markers):
+            return
+        time.sleep(delay)
+    raise RuntimeError(f"DNS TXT for {username}.web3.{sn_host} did not contain {markers}: {last}")
+
+
+# Reset the dedicated test activation code through the same internal admin path
+# used by Rust integration tests. The BNS name stays unique per run, so old chain
+# state cannot conflict with this registration.
+rpc("/", "admin.clear_state_by_active_code", {})
+
+register = rpc(
+    "/kapi/sn/auth",
+    "auth.register",
+    {
+        "name": username,
+        "pwd_hash": password,
+        "active_code": active_code,
+        "request_id": f"sn:smoke-register:{username}",
+        "asset_owner": asset_owner,
+        "initial_documents": {
+            "dns_txt": [{"ttl": 600, "value": initial_marker}],
+        },
+    },
+)
+if register.get("code") != 0:
+    raise RuntimeError(f"auth.register returned non-zero code: {register}")
+token = register.get("access_token")
+if not isinstance(token, str) or not token:
+    raise RuntimeError(f"auth.register returned no access_token: {register}")
+bns = register.get("bns")
+if not isinstance(bns, dict):
+    raise RuntimeError(f"auth.register did not return bns tx info; bns_proxy may be disabled: {register}")
+if bns.get("operation") != "register_name_bootstrap":
+    raise RuntimeError(f"unexpected register bns operation: {bns}")
+if bns.get("asset_owner", "").lower() != asset_owner.lower():
+    raise RuntimeError(f"register asset_owner mismatch: {bns}")
+assert_tx_result("auth.register bns", bns)
+
+wait_txt_contains(initial_marker)
+
+publish = rpc(
+    "/kapi/sn/bns-proxy",
+    "bns.publish_dns_txt",
+    {
+        "name": username,
+        "request_id": f"sn:smoke-dns:{username}",
+        "mode": "add",
+        "ttl": 300,
+        "value": live_marker,
+    },
+    token=token,
+)
+if publish.get("code") != 0:
+    raise RuntimeError(f"bns.publish_dns_txt returned non-zero code: {publish}")
+if publish.get("operation") != "publish_dns_txt" or publish.get("doc_type") != "dns_txt":
+    raise RuntimeError(f"unexpected publish result: {publish}")
+assert_tx_result("bns.publish_dns_txt", publish)
+
+wait_txt_contains(initial_marker, live_marker)
+PY
+}
 keep_tunnel_established() {
   # OOD -> SN 的 RTCP keep-tunnel 是一条常驻 TCP 长连接；SN 侧 rtcp 端口
   # 存在非本机来源的 ESTABLISHED 即视为 keep-tunnel 在线。tunnel 断开时
@@ -252,9 +432,12 @@ check "S2 DNS TXT contains DEV=" dns_txt_has "DEV="
 check "S3 resolve did:bns:alice via indexer projection" identifiers_ok "did:bns:alice"
 check "S4 resolve did:web:charlie.me via user_domain seed" identifiers_ok "did:web:charlie.me"
 check "S5 resolve did:bns:dave (pure Web3, no sn_user row)" identifiers_ok "did:bns:dave"
+if [ "$BNS_PROXY_CHECK" = "1" ]; then
+  check "S6 auth.register + bns.publish_dns_txt via SN-paid BNS proxy" bns_proxy_real_path_ok
+fi
 if [ "$MODE" = "vm" ] && [ "$KEEP_TUNNEL_CHECK" = "1" ]; then
   echo "[sn-dev-smoke] keep-tunnel via: buckyos-devtest $DEVTEST_GROUP (cwd $DEVTEST_DIR)"
-  check "S6 OOD keep-tunnel to SN rtcp :$RTCP_PORT is ESTABLISHED" keep_tunnel_established
+  check "S7 OOD keep-tunnel to SN rtcp :$RTCP_PORT is ESTABLISHED" keep_tunnel_established
 fi
 
 echo "[sn-dev-smoke] $PASS passed, $FAIL failed"

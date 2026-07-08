@@ -605,6 +605,14 @@ const ANVIL_DEV_ACCOUNTS: { address: string; privateKey: string }[] = [
 /** bns_dv 托管代发 key（anvil account[0]），显式写进 seed.private_key。 */
 const BNS_DV_SEED_SENDER = ANVIL_DEV_ACCOUNTS[0];
 
+// SN BNS proxy dev-local controller keys（anvil account[2]/[4]）。仅写入
+// --dev-local 生成的临时 rootfs，用来覆盖 auth.register -> bns_proxy 的
+// 用户无手续费真实写链路径。
+const SN_DEV_BNS_PROXY_CONTROLLERS = [
+  { id: "controller-a", account: ANVIL_DEV_ACCOUNTS[2] },
+  { id: "controller-b", account: ANVIL_DEV_ACCOUNTS[4] },
+];
+
 // 用户名 -> anvil 账户索引的固定映射（新种子用户在此登记，保持确定性）。
 const SEED_USER_EVM_INDEX: Record<string, number> = {
   alice: 1,
@@ -1042,6 +1050,62 @@ export function alignBnsRuntimeParams(targetDir: string): void {
   writeJson(paramsPath, json);
 }
 
+/**
+ * --dev-local 的 sn-dev-up.sh 会先写 dv-env.json，再运行 make_sn_config。
+ * 这里把真实 anvil/BNS 合约参数注入 SN 配置，打开 auth.register ->
+ * SnBnsProxy -> EVM 合约的写链路径；模板默认仍保持 read-only。
+ */
+export function enableDevLocalBnsProxy(targetDir: string): void {
+  const gatewayPath = path.join(targetDir, WEB3_GATEWAY_CONFIG_FILE);
+  if (!fs.existsSync(gatewayPath)) {
+    return;
+  }
+  const params = readStagedParams(targetDir);
+  const rpcEndpoint = String(params.bns_rpc_endpoint ?? "");
+  const chainId = String(params.bns_chain_id ?? "");
+  const contractAddress = String(params.bns_contract_address ?? "");
+  if (!rpcEndpoint || !chainId || !contractAddress) {
+    console.warn(
+      "skip dev-local bns_proxy injection: missing bns_rpc_endpoint/bns_chain_id/bns_contract_address",
+    );
+    return;
+  }
+
+  const proxyBlock = [
+    "    bns_write_enabled: true",
+    "    bns_evm:",
+    `      rpc_endpoint: ${yamlQuote(rpcEndpoint)}`,
+    `      chain_id: ${chainId}`,
+    `      contract_address: ${yamlQuote(contractAddress)}`,
+    "      gas_limit: 3000000",
+    "      max_fee_per_gas: 1000000000",
+    "      max_priority_fee_per_gas: 100000000",
+    "    bns_proxy:",
+    "      require_user_asset_owner: true",
+    "      allowed_operations: [register_name_bootstrap, publish_dns_txt, publish_relay_assignment]",
+    "      controllers:",
+    ...SN_DEV_BNS_PROXY_CONTROLLERS.flatMap(({ id, account }) => [
+      `        - id: ${id}`,
+      `          address: ${yamlQuote(account.address)}`,
+      `          private_key: ${yamlQuote(account.privateKey)}`,
+      "          weight: 1",
+    ]),
+  ].join("\n");
+
+  const before = fs.readFileSync(gatewayPath, "utf8");
+  if (before.includes("bns_proxy:\n      require_user_asset_owner: true")) {
+    return;
+  }
+  const after = before.replace(/^    bns_write_enabled: false$/m, proxyBlock);
+  if (after === before) {
+    throw new Error(
+      `failed to inject dev-local bns_proxy into ${gatewayPath}: bns_write_enabled marker not found`,
+    );
+  }
+  fs.writeFileSync(gatewayPath, after);
+  console.log("  dev-local bns_proxy enabled for auth.register smoke path");
+}
+
 // P1 骨架的占位错误（P0 seed-v2 主链路已实现，下面两个函数维持骨架）。
 const SEED_V2_P1_TODO = "TODO(seed-v2 P1): not implemented";
 
@@ -1166,6 +1230,9 @@ async function main(): Promise<void> {
   const snDbPath = path.join(targetDir, SN_DB_FILE);
   await makeSnSeedV2(targetDir, envRoot);
   applyBindParams(targetDir, devLocal);
+  if (devLocal) {
+    enableDevLocalBnsProxy(targetDir);
+  }
 
   console.log("\n[OK] SN configuration files generation completed!");
   console.log(`  Output directory: ${targetDir}`);

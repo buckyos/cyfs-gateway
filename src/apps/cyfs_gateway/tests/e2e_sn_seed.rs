@@ -302,7 +302,8 @@ async fn e2e_sn_seed_full_stack() {
             json!({
                 "name": "erindevtest",
                 "pwd_hash": "erin-pwd",
-                "active_code": "dev-code-1"
+                "active_code": "dev-code-1",
+                "asset_owner": "0x9965507D1a55bcC2695C58ba16FB37d819B0A4dc"
             }),
         )
         .await;
