@@ -194,6 +194,12 @@ dns record 覆盖）。同时 `resolve_gateway_addresses` 在无任何直接可�
 回退 SN 中继地址（用户 sn_ips 优先，否则 server_ip，不做回环过滤）——设备
 离线的 LAN/relay 型 zone 的 A 记录由此指向 SN。覆盖用例：`e2e_sn_seed` T2。
 
+过渡期内，用户还可以用 `user.add_dns_record` 在自己的
+`<username>.web3.<server_host>` 及其子域写入 SN 本地显式记录；解析时该记录优先于
+BNS bridge 合成结果。该例外用于避免 ACME 等短期记录产生链上 gas，未来在
+`did:bns:xxx` 不再依赖 web3 bridge、或 DNS 服务已广泛原生支持该名字后，应让
+BNS 名称的写入回归链上。具体 API 边界见 `SN-API.md` 的 `user.*` 小节。
+
 ### user_domain
 
 `user_domain` 是传统 DNS 域名到 SN 用户或 BNS name 的绑定关系，第一阶段仍存放在 `sn_auth`。

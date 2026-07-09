@@ -4579,6 +4579,74 @@ mod tests {
         let result = device_krpc.call("device.list", json!({})).await.unwrap();
         assert_eq!(result["items"].as_array().unwrap().len(), 1);
 
+        // `user.add_dns_record` keeps the SN-provided web3 bridge namespace in
+        // the local compatibility store even before a traditional user_domain
+        // is bound. ACME can therefore create and remove its short-lived TXT
+        // challenge without publishing a BNS document on chain.
+        let bridge_challenge = format!("_acme-challenge.{}.web3.buckyos.ai", REFACTOR_USER);
+        let result = auth_user_krpc
+            .call(
+                "user.add_dns_record",
+                json!({
+                    "device_did": device_config.id.to_string(),
+                    "domain": bridge_challenge,
+                    "record_type": "TXT",
+                    "record": "temporary-acme-proof",
+                    "ttl": 60
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["device_name"].as_str().unwrap(), "ood1");
+
+        let result = auth_user_krpc
+            .call("user.list_dns_records", json!({}))
+            .await
+            .unwrap();
+        let bridge_record = result["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["domain"].as_str() == Some(bridge_challenge.as_str()))
+            .unwrap();
+        assert_eq!(
+            bridge_record["record"].as_str().unwrap(),
+            "temporary-acme-proof"
+        );
+
+        let other_bridge_err = auth_user_krpc
+            .call(
+                "user.add_dns_record",
+                json!({
+                    "device_did": device_config.id.to_string(),
+                    "domain": "_acme-challenge.other.web3.buckyos.ai",
+                    "record_type": "TXT",
+                    "record": "not-owned"
+                }),
+            )
+            .await
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(other_bridge_err.contains("[SN:1015:invalid_domain]"));
+
+        auth_user_krpc
+            .call(
+                "user.remove_dns_record",
+                json!({
+                    "device_did": device_config.id.to_string(),
+                    "domain": bridge_challenge,
+                    "record_type": "TXT"
+                }),
+            )
+            .await
+            .unwrap();
+        let result = auth_user_krpc
+            .call("user.list_dns_records", json!({}))
+            .await
+            .unwrap();
+        assert!(result["items"].as_array().unwrap().is_empty());
+
         let did_resp = reqwest::Client::new()
             .get(format!(
                 "{}/1.0/identifiers/{}?type=info",

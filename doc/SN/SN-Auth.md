@@ -401,9 +401,11 @@ TODO（阶段二，2026-07-06 完成）：
 域名授权规则：
 
 - 如果用户已完成 active PKX 绑定，只能管理该 domain 或其子域名。
-- 如果没有 active `user_domain`，不能通过 `user_domain` 路径管理传统 DNS 域名。
-- 默认 BNS/web3 命名空间不属于传统 `user_domain` 证明范围，应走 BNS `dns_txt` 或其他 BNS 文档流程。
+- 如果没有 active `user_domain`，不能通过 `user_domain` 路径管理传统 DNS 域名；但可以管理当前账号自己的 `<username>.web3.<server_host>` 及其子域。
+- 不能管理其他账号的 web3 bridge 域名。除上述 bridge 兼容范围外，BNS DNS 内容仍应走 BNS `dns_txt` 或其他 BNS 文档流程。
 - ACME challenge 记录应只允许写入符合该用户域名边界的 `_acme-challenge.*`，不能借设备 token 写入任意域名。
+
+`<username>.web3.<server_host>` 允许写入 SN 本地 `user_dns_records` 是过渡设计，主要避免 ACME 短期 TXT 记录触发链上发布并产生额外 gas。该调用不写 BNS 文档。未来用户不再依赖 web3 bridge 解析 `did:bns:xxx`，或传统 DNS 解析服务已广泛原生支持 `did:bns:xxx` 后，应删除这项兼容例外，使 BNS 名称的 `add_dns_record` 回归链上发布；传统 `user_domain` 记录仍保持本地授权语义。
 
 ## zone_info 更新
 

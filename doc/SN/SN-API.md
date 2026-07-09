@@ -97,11 +97,18 @@ RPC method 必须使用 `namespace.method` 形式。当前实现不再做 legacy
 |--------|--------|--------|------|
 | `user.get_profile` | `{}` | `code`, `name`, `owner_key_bound`, `user_domain`, `self_cert`, `sn_ips`, `zone_config` | 返回当前用户 profile。 |
 | `user.set_self_cert` | `self_cert: bool`, `device_did?` | `code` | 开启 `self_cert` 时必须提供属于当前用户的在线设备 DID。关闭时不需要 DID。 |
-| `user.add_dns_record` | `device_did`, `domain`, `record_type`, `record`, `ttl?`, `has_cert?` | `code`, `device_name` | 只管理当前用户已绑定 `user_domain` 及其子域的本地 DNS 记录。 |
-| `user.remove_dns_record` | `device_did`, `domain`, `record_type`, `has_cert?` | `code` | 删除当前用户 `user_domain` 范围内的本地 DNS 记录。 |
+| `user.add_dns_record` | `device_did`, `domain`, `record_type`, `record`, `ttl?`, `has_cert?` | `code`, `device_name` | 管理当前用户 `user_domain` 或 SN 提供的 `<username>.web3.<server_host>` 范围内的本地 DNS 记录。 |
+| `user.remove_dns_record` | `device_did`, `domain`, `record_type`, `has_cert?` | `code` | 删除上述范围内的本地 DNS 记录。 |
 | `user.list_dns_records` | `{}` | `code`, `items[]` | 列出当前用户本地 DNS 记录。 |
 
-`user.add_dns_record` / `user.remove_dns_record` 要求 `device_did` 属于当前用户。`record_type` 主要面向 `A`、`AAAA`、`TXT`；记录保存在 SN compatibility store，并由 SN DNS NameServer 解析。它不是 BNS `dns_txt` 写入接口。
+`user.add_dns_record` / `user.remove_dns_record` 要求 `device_did` 属于当前用户，并允许管理以下两个范围：
+
+- 已完成 active PKX 绑定的传统 `user_domain` 及其子域；
+- 当前账号自己的 `<username>.web3.<server_host>` 及其子域，例如 `_acme-challenge.alice.web3.<server_host>`。不能写入其他账号的 web3 bridge 域名。
+
+`record_type` 主要面向 `A`、`AAAA`、`TXT`。这两个范围的记录都保存在 SN compatibility store，由 SN DNS NameServer 优先解析；调用不会发布 BNS `dns_txt`、不会发起链上交易，也不会产生 gas 成本。因此 ACME 可以通过同一 API 创建和删除短期 challenge TXT 记录，而不必为临时状态上链。
+
+> **过渡设计：** `<username>.web3.<server_host>` 的本地写入是 web3 bridge 仍承担 `did:bns:<username>` 到传统 DNS 名称转换期间的兼容措施。未来如果用户不再通过 web3 bridge 解析 `did:bns:xxx`，或者已有足够多 DNS 解析服务原生支持 `did:bns:xxx`，应移除这个本地例外，让 BNS 名称的 `add_dns_record` 重新回归 BNS 链上发布。传统 `user_domain` 的本地记录不受这一迁移方向影响。
 
 `items[]` 结构：
 

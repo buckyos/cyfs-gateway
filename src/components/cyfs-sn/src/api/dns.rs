@@ -15,22 +15,39 @@ fn is_same_or_subdomain(domain: &str, zone: &str) -> bool {
     domain == zone || domain.ends_with(format!(".{}", zone).as_str())
 }
 
-fn ensure_user_dns_domain(user_domain: Option<&str>, domain: &str) -> RpcCallResult<()> {
+fn ensure_user_dns_domain(
+    username: &str,
+    user_domain: Option<&str>,
+    server_host: &str,
+    domain: &str,
+) -> RpcCallResult<()> {
     let domain = normalize_domain(domain);
-    let Some(user_domain) = user_domain else {
-        return Err(parse_error(
-            SnApiErrorCode::InvalidDomain,
-            "user_domain is required for user DNS records",
-        ));
-    };
-    let user_domain = normalize_domain(user_domain);
-    if !user_domain.is_empty() && is_same_or_subdomain(domain.as_str(), user_domain.as_str()) {
+    if let Some(user_domain) = user_domain {
+        let user_domain = normalize_domain(user_domain);
+        if !user_domain.is_empty() && is_same_or_subdomain(domain.as_str(), user_domain.as_str()) {
+            return Ok(());
+        }
+    }
+
+    // Transitional web3 bridge compatibility: records under the SN-provided
+    // `<username>.web3.<server_host>` namespace stay in the local compatibility
+    // store. In particular, ACME challenges must not require a temporary BNS
+    // document update and its associated on-chain gas cost.
+    let bridge_domain = format!(
+        "{}.web3.{}",
+        normalize_domain(username),
+        normalize_domain(server_host)
+    );
+    if is_same_or_subdomain(domain.as_str(), bridge_domain.as_str()) {
         return Ok(());
     }
 
     Err(parse_error(
         SnApiErrorCode::InvalidDomain,
-        format!("invalid domain, expect {} or its subdomain", user_domain),
+        format!(
+            "invalid domain, expect {} or its subdomain, or an active user_domain",
+            bridge_domain
+        ),
     ))
 }
 
@@ -48,7 +65,12 @@ pub(crate) async fn handle_dns(server: &SNServer, req: RPCRequest) -> RpcCallRes
             let device_name =
                 ensure_owned_runtime_device(server, username.as_str(), params.device_did.as_str())
                     .await?;
-            ensure_user_dns_domain(user.user_domain.as_deref(), params.domain.as_str())?;
+            ensure_user_dns_domain(
+                username.as_str(),
+                user.user_domain.as_deref(),
+                server.resolver().config().server_host.as_str(),
+                params.domain.as_str(),
+            )?;
             server
                 .compat_store()
                 .add_user_domain(
@@ -91,7 +113,12 @@ pub(crate) async fn handle_dns(server: &SNServer, req: RPCRequest) -> RpcCallRes
             let params: RemoveDnsRecordReq = parse_params(&req)?;
             ensure_owned_runtime_device(server, username.as_str(), params.device_did.as_str())
                 .await?;
-            ensure_user_dns_domain(user.user_domain.as_deref(), params.domain.as_str())?;
+            ensure_user_dns_domain(
+                username.as_str(),
+                user.user_domain.as_deref(),
+                server.resolver().config().server_host.as_str(),
+                params.domain.as_str(),
+            )?;
             if params.has_cert.unwrap_or(false) {
                 server
                     .auth_db()
@@ -183,8 +210,19 @@ mod tests {
     use super::ensure_user_dns_domain;
 
     #[test]
-    fn test_ensure_user_dns_domain_requires_user_domain() {
-        let err = ensure_user_dns_domain(None, "home.alice.web3.buckyos.ai")
+    fn test_ensure_user_dns_domain_allows_own_web3_bridge_domain_without_user_domain() {
+        assert!(
+            ensure_user_dns_domain("alice", None, "buckyos.ai", "alice.web3.buckyos.ai").is_ok()
+        );
+        assert!(ensure_user_dns_domain(
+            "alice",
+            None,
+            "buckyos.ai",
+            "_acme-challenge.alice.web3.buckyos.ai"
+        )
+        .is_ok());
+
+        let err = ensure_user_dns_domain("alice", None, "buckyos.ai", "home.bob.web3.buckyos.ai")
             .unwrap_err()
             .to_string();
         assert!(err.contains("[SN:1015:invalid_domain]"));
@@ -192,14 +230,29 @@ mod tests {
 
     #[test]
     fn test_ensure_user_dns_domain_for_custom_user_domain() {
-        assert!(
-            ensure_user_dns_domain(Some("alice.example.com"), "home.alice.example.com",).is_ok()
-        );
-        assert!(ensure_user_dns_domain(Some("alice.example.com"), "alice.example.com",).is_ok());
+        assert!(ensure_user_dns_domain(
+            "alice",
+            Some("alice.example.com"),
+            "buckyos.ai",
+            "home.alice.example.com",
+        )
+        .is_ok());
+        assert!(ensure_user_dns_domain(
+            "alice",
+            Some("alice.example.com"),
+            "buckyos.ai",
+            "alice.example.com",
+        )
+        .is_ok());
 
-        let err = ensure_user_dns_domain(Some("alice.example.com"), "home.bob.example.com")
-            .unwrap_err()
-            .to_string();
+        let err = ensure_user_dns_domain(
+            "alice",
+            Some("alice.example.com"),
+            "buckyos.ai",
+            "home.bob.example.com",
+        )
+        .unwrap_err()
+        .to_string();
         assert!(err.contains("[SN:1015:invalid_domain]"));
     }
 }
