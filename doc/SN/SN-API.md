@@ -370,4 +370,4 @@ BNS 写入错误会从任意 bns-proxy 写路径冒出：`auth.register` 的 BNS
 | `query.resolve_did` / `query.resolve_hostname` / `query.resolve_device` | DID 和域名解析改用 W3C DID Resolver / DNS NameServer；OOD 建连信息改用 `deviceinfo.resolve_ood_by_*`。 |
 | `user.bind_owner_key` / `user.get_owner_key` | 已移除。owner/controller 权限管理走 BNS 侧流程（生产路径见 bns-proxy 的 `auth.register`）。 |
 
-`cyfs-gateway-api::SnClient` 已按新路径封装 auth 与 deviceinfo 两个 target；传入旧 `/kapi/sn` 或 `/kapi/sn/bns` 后缀的 base URL 时，会自动归一化到新路径。`SnClient` 尚未封装 `bns-proxy` target：`SnAuthRegisterReq` 已带 `asset_owner`/`owner_config`（暂缺 `initial_documents`），但没有 `publish_dns_txt` 等便捷方法；调用 `bns.*` 目前需要调用方自建 kRPC 客户端指向 `/kapi/sn/bns-proxy`。
+`cyfs-gateway-api::SnClient` 已按新路径封装 auth、deviceinfo 与 bns-proxy 三个 target；传入旧 `/kapi/sn` 或 `/kapi/sn/bns` 后缀的 base URL 时，会自动归一化到目标方法对应的新路径。`SnAuthRegisterReq` 支持 `asset_owner`、`owner_config` 与 `initial_documents`，客户端也提供 `publish_dns_txt`、`publish_document` 便捷方法。

@@ -12,6 +12,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 const SN_ROOT_PATH: &str = "/kapi/sn";
 const SN_AUTH_PATH: &str = "/kapi/sn/auth";
 const SN_DEVICEINFO_PATH: &str = "/kapi/sn/deviceinfo";
+const SN_BNS_PROXY_PATH: &str = "/kapi/sn/bns-proxy";
 const LEGACY_SN_BNS_PATH: &str = "/kapi/sn/bns";
 
 /// `aud` claim of a device-signed SN access token. SN 账号 token 的 aud 是
@@ -60,16 +61,19 @@ pub fn generate_sn_device_token(
 enum SnRpcTarget {
     Auth,
     DeviceInfo,
+    BnsProxy,
 }
 
 fn normalize_sn_url(sn_url: &str, target: SnRpcTarget) -> String {
     let path = match target {
         SnRpcTarget::Auth => SN_AUTH_PATH,
         SnRpcTarget::DeviceInfo => SN_DEVICEINFO_PATH,
+        SnRpcTarget::BnsProxy => SN_BNS_PROXY_PATH,
     };
 
     let trimmed = sn_url.trim_end_matches('/');
     for known_suffix in [
+        SN_BNS_PROXY_PATH,
         SN_DEVICEINFO_PATH,
         SN_AUTH_PATH,
         LEGACY_SN_BNS_PATH,
@@ -99,6 +103,9 @@ pub struct SnAuthRegisterReq {
     pub asset_owner: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub owner_config: Option<Value>,
+    /// 随 BNS `registerName` 原子发布的初始 zone/boot/dns_txt documents。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub initial_documents: Option<SnBnsProxyInitialDocuments>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -137,11 +144,96 @@ pub struct SnDnsRecordReq {
     pub has_cert: Option<bool>,
 }
 
+/// `auth.register` 可携带的 BNS 初始 documents。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SnBnsProxyInitialDocuments {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub zone: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub boot: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dns_txt: Option<Vec<SnBnsDnsTxtRecord>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SnBnsDnsTxtRecord {
+    pub ttl: u32,
+    pub value: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SnBnsPublishDnsTxtRecord {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ttl: Option<u32>,
+    pub value: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SnBnsDnsTxtMode {
+    Add,
+    Remove,
+    Replace,
+}
+
+/// `/kapi/sn/bns-proxy` 的 `bns.publish_dns_txt` 参数。
+///
+/// `add` 需要 `value`（`ttl` 缺省 600），`remove` 需要 `value`，
+/// `replace` 需要 `records`。无关字段应保持为 `None`。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SnBnsPublishDnsTxtReq {
+    pub name: String,
+    pub mode: SnBnsDnsTxtMode,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ttl: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub records: Option<Vec<SnBnsPublishDnsTxtRecord>>,
+}
+
+/// `/kapi/sn/bns-proxy` 的 `bns.publish_document` 参数。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SnBnsPublishDocumentReq {
+    pub name: String,
+    pub doc_type: String,
+    pub document: Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SnDeviceState {
+    Online,
+    Offline,
+    Stale,
+    Blocked,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SnDeviceListReq {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub state: Option<SnDeviceState>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub offset: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit: Option<usize>,
+}
+
 pub enum SnClient {
     InProcess(Box<dyn SnHandler>),
     KRPC {
         auth: Box<kRPC>,
         deviceinfo: Box<kRPC>,
+        bns_proxy: Box<kRPC>,
     },
 }
 
@@ -153,7 +245,8 @@ impl SnClient {
     pub fn new_krpc(sn_url: &str, session_token: Option<String>) -> Self {
         Self::KRPC {
             auth: new_sn_krpc(sn_url, session_token.clone(), SnRpcTarget::Auth),
-            deviceinfo: new_sn_krpc(sn_url, session_token, SnRpcTarget::DeviceInfo),
+            deviceinfo: new_sn_krpc(sn_url, session_token.clone(), SnRpcTarget::DeviceInfo),
+            bns_proxy: new_sn_krpc(sn_url, session_token, SnRpcTarget::BnsProxy),
         }
     }
 
@@ -168,6 +261,13 @@ impl SnClient {
         match self {
             Self::InProcess(handler) => handler.handle_sn_rpc(method, params).await,
             Self::KRPC { deviceinfo, .. } => deviceinfo.call(method, params).await,
+        }
+    }
+
+    async fn call_bns_proxy(&self, method: &str, params: Value) -> Result<Value, RPCErrors> {
+        match self {
+            Self::InProcess(handler) => handler.handle_sn_rpc(method, params).await,
+            Self::KRPC { bns_proxy, .. } => bns_proxy.call(method, params).await,
         }
     }
 
@@ -260,6 +360,26 @@ impl SnClient {
             .await
     }
 
+    pub async fn bind_domain(&self, domain: &str) -> Result<Value, RPCErrors> {
+        self.call_auth(
+            "domain.bind",
+            serde_json::json!({
+                "domain": domain
+            }),
+        )
+        .await
+    }
+
+    pub async fn unbind_domain(&self, domain: &str) -> Result<Value, RPCErrors> {
+        self.call_auth(
+            "domain.unbind",
+            serde_json::json!({
+                "domain": domain
+            }),
+        )
+        .await
+    }
+
     pub async fn register_device_online(
         &self,
         req: SnDeviceOnlineReportReq,
@@ -292,7 +412,15 @@ impl SnClient {
     }
 
     pub async fn list_devices_online(&self) -> Result<Value, RPCErrors> {
-        self.call_deviceinfo("device.list", serde_json::json!({}))
+        self.list_devices_online_with_options(SnDeviceListReq::default())
+            .await
+    }
+
+    pub async fn list_devices_online_with_options(
+        &self,
+        req: SnDeviceListReq,
+    ) -> Result<Value, RPCErrors> {
+        self.call_deviceinfo("device.list", to_value(req, "SnDeviceListReq")?)
             .await
     }
 
@@ -312,6 +440,22 @@ impl SnClient {
             serde_json::json!({
                 "dest_host": dest_host
             }),
+        )
+        .await
+    }
+
+    pub async fn publish_dns_txt(&self, req: SnBnsPublishDnsTxtReq) -> Result<Value, RPCErrors> {
+        self.call_bns_proxy(
+            "bns.publish_dns_txt",
+            to_value(req, "SnBnsPublishDnsTxtReq")?,
+        )
+        .await
+    }
+
+    pub async fn publish_document(&self, req: SnBnsPublishDocumentReq) -> Result<Value, RPCErrors> {
+        self.call_bns_proxy(
+            "bns.publish_document",
+            to_value(req, "SnBnsPublishDocumentReq")?,
         )
         .await
     }
@@ -434,4 +578,107 @@ pub async fn get_real_sn_host_name(
     let host_name = sn_config["host"].as_str().unwrap();
     warn!("get sn real host from {} success! => {}", url, host_name);
     Ok(host_name.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn normalize_sn_url_routes_every_known_base_to_the_requested_target() {
+        let known_bases = [
+            "https://sn.example",
+            "https://sn.example/kapi/sn",
+            "https://sn.example/kapi/sn/",
+            "https://sn.example/kapi/sn/auth",
+            "https://sn.example/kapi/sn/deviceinfo",
+            "https://sn.example/kapi/sn/bns-proxy",
+            "https://sn.example/kapi/sn/bns",
+        ];
+
+        for base in known_bases {
+            assert_eq!(
+                normalize_sn_url(base, SnRpcTarget::Auth),
+                "https://sn.example/kapi/sn/auth"
+            );
+            assert_eq!(
+                normalize_sn_url(base, SnRpcTarget::DeviceInfo),
+                "https://sn.example/kapi/sn/deviceinfo"
+            );
+            assert_eq!(
+                normalize_sn_url(base, SnRpcTarget::BnsProxy),
+                "https://sn.example/kapi/sn/bns-proxy"
+            );
+        }
+    }
+
+    #[test]
+    fn register_request_serializes_initial_documents() {
+        let request = SnAuthRegisterReq {
+            name: "alice".to_string(),
+            pwd_hash: "hash".to_string(),
+            active_code: "code".to_string(),
+            request_id: Some("sn:register:alice".to_string()),
+            asset_owner: Some("0x0000000000000000000000000000000000000001".to_string()),
+            owner_config: Some(json!({ "display_name": "Alice" })),
+            initial_documents: Some(SnBnsProxyInitialDocuments {
+                zone: Some(json!({ "gateway": "ood1" })),
+                boot: None,
+                dns_txt: Some(vec![SnBnsDnsTxtRecord {
+                    ttl: 600,
+                    value: "pkx=alice".to_string(),
+                }]),
+            }),
+        };
+
+        assert_eq!(
+            serde_json::to_value(request).unwrap(),
+            json!({
+                "name": "alice",
+                "pwd_hash": "hash",
+                "active_code": "code",
+                "request_id": "sn:register:alice",
+                "asset_owner": "0x0000000000000000000000000000000000000001",
+                "owner_config": { "display_name": "Alice" },
+                "initial_documents": {
+                    "zone": { "gateway": "ood1" },
+                    "dns_txt": [{ "ttl": 600, "value": "pkx=alice" }]
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn bns_and_device_requests_serialize_documented_values() {
+        let publish = SnBnsPublishDnsTxtReq {
+            name: "alice".to_string(),
+            mode: SnBnsDnsTxtMode::Replace,
+            request_id: None,
+            ttl: None,
+            value: None,
+            records: Some(vec![SnBnsPublishDnsTxtRecord {
+                ttl: Some(300),
+                value: "hello".to_string(),
+            }]),
+        };
+        assert_eq!(
+            serde_json::to_value(publish).unwrap(),
+            json!({
+                "name": "alice",
+                "mode": "replace",
+                "records": [{ "ttl": 300, "value": "hello" }]
+            })
+        );
+
+        let list = SnDeviceListReq {
+            state: Some(SnDeviceState::Stale),
+            offset: Some(10),
+            limit: Some(20),
+        };
+        assert_eq!(
+            serde_json::to_value(list).unwrap(),
+            json!({ "state": "stale", "offset": 10, "limit": 20 })
+        );
+    }
 }
