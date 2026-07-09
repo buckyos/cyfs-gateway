@@ -36,6 +36,7 @@ pub enum SnBnsProxyOperation {
     RegisterNameBootstrap,
     PublishDnsTxt,
     PublishRelayAssignment,
+    PublishDocument,
 }
 
 impl SnBnsProxyOperation {
@@ -44,6 +45,7 @@ impl SnBnsProxyOperation {
             Self::RegisterNameBootstrap => "register_name_bootstrap",
             Self::PublishDnsTxt => "publish_dns_txt",
             Self::PublishRelayAssignment => "publish_relay_assignment",
+            Self::PublishDocument => "publish_document",
         }
     }
 
@@ -52,15 +54,17 @@ impl SnBnsProxyOperation {
             "register_name_bootstrap" => Some(Self::RegisterNameBootstrap),
             "publish_dns_txt" => Some(Self::PublishDnsTxt),
             "publish_relay_assignment" => Some(Self::PublishRelayAssignment),
+            "publish_document" => Some(Self::PublishDocument),
             _ => None,
         }
     }
 
-    pub fn all() -> [Self; 3] {
+    pub fn all() -> [Self; 4] {
         [
             Self::RegisterNameBootstrap,
             Self::PublishDnsTxt,
             Self::PublishRelayAssignment,
+            Self::PublishDocument,
         ]
     }
 }
@@ -391,11 +395,12 @@ impl SnBnsTxSigner {
             match request.doc_type.as_deref() {
                 Some(DNS_TXT_DOC_TYPE) => SnBnsProxyOperation::PublishDnsTxt,
                 Some(RELAY_ASSIGNMENT_DOC_TYPE) => SnBnsProxyOperation::PublishRelayAssignment,
-                Some(other) => {
-                    return Err(refuse(format!(
-                        "refuse to sign publishDocument for doc_type `{other}`"
-                    )));
+                Some("") => {
+                    return Err(refuse(
+                        "refuse to sign publishDocument without doc_type".to_string(),
+                    ));
                 }
+                Some(_) => SnBnsProxyOperation::PublishDocument,
                 None => {
                     return Err(refuse(
                         "refuse to sign publishDocument without doc_type".to_string(),
@@ -658,14 +663,39 @@ mod tests {
     }
 
     #[test]
-    fn rejects_publish_document_for_high_risk_doc_type() {
+    fn signs_generic_publish_document_when_operation_is_allowed() {
         let vault = vault();
+        let call = publish_document_call(&publish_req("zone")).unwrap();
+        let tx = unsigned_tx_with(&evm_config(), &call);
+        vault
+            .sign_for_controller("controller-a", &publish_sign_request("zone"), tx)
+            .unwrap();
+    }
+
+    #[test]
+    fn rejects_generic_publish_document_outside_allow_list() {
+        let vault = SnBnsTxSigner::new(
+            &evm_config(),
+            [SnBnsProxyOperation::PublishDnsTxt].into_iter().collect(),
+            vec![SnBnsControllerKeySpec {
+                id: "controller-a".to_string(),
+                declared_address: None,
+                private_key: ANVIL_PRIVATE_KEY.to_string(),
+                weight: 1,
+            }],
+        )
+        .unwrap();
         let call = publish_document_call(&publish_req("zone")).unwrap();
         let tx = unsigned_tx_with(&evm_config(), &call);
         let error = vault
             .sign_for_controller("controller-a", &publish_sign_request("zone"), tx)
             .unwrap_err();
-        assert!(error.to_string().contains("doc_type `zone`"), "{error}");
+        assert!(
+            error
+                .to_string()
+                .contains("operation `publish_document` is not in the allowed operation list"),
+            "{error}"
+        );
     }
 
     #[test]

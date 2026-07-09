@@ -43,6 +43,151 @@
 e2e `cargo test -p cyfs-sn --test e2e_sn_bns_proxy -- --ignored`（需 Foundry，
 已在 anvil 上跑通完整验收链路，含 owner 清空 policy 后 controller 再写 revert）。
 
+## 独立 `publish_document`（2026-07-09，已完成）
+
+实际接入后发现的产品流程：客户端通常先 `auth.register`（此时可能还没准备好
+OOD/zone 信息），随后才在独立一步里发布 `zone` document（以及后续
+`boot`、`device_mini_doc`、补充 `dns_txt` 等）。改造前 bns-proxy 只有
+`bns.publish_dns_txt` 覆盖“注册后独立发布”这条路径，且限定 `dns_txt` 一种
+doc_type；其它 doc_type 只能在注册时通过 `initial_documents` 一次性带上，
+注册之后没有独立入口。本节记录补齐这个缺口所需的接口和权限改造；实现与
+测试已完成，见“实施步骤”第 7 节。
+
+结论（根据实际使用反馈）：
+
+1. 新增 `bns.publish_document`，doc_type 基本不做产品级限制——`zone` /
+   `boot` / `device_mini_doc` / 未来的自定义 doc_type 都可以通过它发布。
+2. 唯一的强制例外是 `doc_type = "owner"`：允许调用，但服务端必须校验
+   “不能修改 owner，只能修改内容”（规则见下）。
+3. `doc_type = "relay_assignment"` 仍然保留给 `bns.publish_relay_assignment`
+   （internal/admin only），不能因为 `publish_document` 放开 doc_type 就
+   绕过这道边界。
+
+这是对 `doc/BNS/SN-BNS-Contoller.md`“第一版不允许 SN controller 写
+owner/zone/boot/device_mini_doc”“不要使用 `doc_type = ""` 的通配 controller
+rule 授权 SN”两条既有原则的**有意收窄，而不是推翻**：zone/boot/
+device_mini_doc 从“完全不允许 controller 写”改为“允许，owner 走受保护的
+专用路径”；
+通配不会直接不受限地下放到链上 `ControllerRule` 语义之外，SN 应用层在多处
+（bns-client 普通内容方法、owner 身份字段保护、SN proxy 编排）把普通内容
+路径与 owner 路径隔离，使得即便 controller policy 因为通配在链上“有能力”
+写 owner，也只能通过读取现有 owner document 并锁定身份字段的受保护路径构造
+TX。`SN-BNS-Contoller.md` 本身是
+2026-06-28 的旧文档，且部分内容已经与当前实现不一致（例如它认为
+`auth.register` 仍是 compat-shim、未接入 `SnBnsController`，但当前
+`sn_bns_proxy.rs` 已经接好并有 e2e 验证）；后续应单独同步那份文档，本次
+先只改这一份。
+
+### 为什么现在能做：controller policy 的 doc_type 通配
+
+`bns-client::ControllerRule::permits`（`src/components/bns-client/src/model.rs:548`）
+本身已经支持 `doc_type` 通配（空字符串匹配任意 doc_type）。改造前
+`SnBnsControllerConfig::validate()`
+（`src/components/bns-client/src/sn_bns_controller.rs:357`）显式拒绝
+SN 侧配置里出现通配 doc_type。要开放 `publish_document`：
+
+- 需要放宽这条校验（或加显式 opt-in），允许 SN controller policy 里出现
+  `doc_type = ""`。
+- 现有 `SnBnsController::publish_document`（bns-client 的通用方法）是
+  owner-authority-only 的：`ensure_owner_authority` 要求
+  `authority.role == Owner`，而 `bns-indexer` 的 `authorize_owner_for_loaded`
+  （`src/components/bns-indexer/src/registry.rs:1660`）进一步要求
+  `authority.actor == effective_owner`。生产模式下 SN controller 的
+  principal 不可能等于用户自己的 asset owner，所以这个方法、以及同样
+  owner-authority-only 的 `bind_zone_documents` / `publish_device_mini_doc`，
+  SN 目前去调用一定会被拒绝（链上/状态机层面）。新能力必须走一个新的、
+  controller-authority 版本的通用发布方法（同 `upsert_dns_txt` /
+  `publish_relay_assignment` 的模式，用 `ensure_authority_can_publish`），
+  而不是复用现有的 owner-only `publish_document`。
+- 新方法必须在 bns-client 层就硬编码拒绝 `doc_type == OWNER_DOC_TYPE`
+  （不依赖调用方记得排除），和 `register_name` 对 `initial_documents` 里
+  owner 的处理方式一致（`sn_bns_controller.rs:572-576`）。
+- 注册时构造的 controllerPolicy（`SnBnsProxy::register_bootstrap` →
+  `sn_controller_policy()`）需要从固定的 `[dns_txt, relay_assignment]`
+  换成通配（或至少把 `zone`/`boot`/`device_mini_doc` 加进去）。**这只影响
+  新注册用户**：存量用户的 controllerPolicy 是注册时写入链上的，不会因为
+  改配置自动变化，需要本人用 owner 地址执行一次 `setControllerPolicy` 才能
+  升级；本次不含存量迁移方案。
+
+### `bns.publish_document`
+
+用途：通过用户绑定的 SN controller 发布任意 `doc_type` 的 document（典型
+场景：注册之后补发 `zone`/`boot`/`device_mini_doc`，或其它自定义内容型
+doc_type）。
+
+参数：
+
+```json
+{
+  "request_id": "zone-alice-1",
+  "name": "alice",
+  "doc_type": "zone",
+  "document": { "oods": ["ood1"], "...": "..." }
+}
+```
+
+权限与校验：
+
+- 需要 SN access token；`name` 必须等于 token 所属用户（同
+  `bns.publish_dns_txt`），公网路径同样是 `/kapi/sn/bns-proxy`。
+- `doc_type = "relay_assignment"` 一律拒绝（`invalid_params`），提示改走
+  内网 `bns.publish_relay_assignment`。
+- `doc_type = "owner"`：允许，但触发下面的身份字段保护；其余 doc_type
+  默认放行，不做产品级白名单。
+- `document` 必须是 JSON object；除 `owner` 外服务端不做 doc_type 相关
+  schema 校验（`zone`/`boot`/`device_mini_doc` 目前仍是不透明 `Value`，
+  与现状一致）。
+- SN 自动读取当前 document 版本作为 `expected_version`（同
+  `bind_zone_documents`/`publish_device_mini_doc` 的模式），stale 时按
+  `upsert_dns_txt` 的重试策略处理，客户端不需要传版本号。
+
+`doc_type = "owner"` 的身份字段保护（“不能修改 owner，只能修改内容”）：
+
+- 发布前 SN 必须读取该 name 当前已发布的 `owner` document（`bns-client`
+  已有对应能力：`current_document_state`，`sn_bns_controller.rs:985`）。
+- 身份字段 = 当前 `owner_config` 中用于派生可验证公钥的字段，与
+  `sn_did_resolver::owner_key_from_config` 读取的路径保持一致
+  （`src/components/cyfs-sn/src/sn_did_resolver.rs:702`）：`public_key`、
+  `owner_key`、`default_key`、`key`、`verificationMethod[0].publicKeyJwk`。
+- 若当前 document 里某个身份字段已存在，新 document 对应字段必须逐字节
+  相同，否则拒绝（`invalid_params`，不落 TX）——不允许通过
+  controller-authority 路径静默替换用户的验证公钥。
+- 若当前 document（例如注册时用的 `default_owner_config`，只有
+  `name`/`created_by`/`created_at`）还没有任何身份字段，允许首次补齐——
+  这正是“先注册、后补身份公钥”这条产品路径需要的行为，只锁定“已经存在”
+  的身份字段不可再变。
+- 除身份字段外，`owner` document 的其它字段可以自由更新。
+
+返回结构：复用现有 TX 投递结构（见 6.2），`doc_type`/`document_version`
+按实际发布的值填充。
+
+### 已同步的改造点
+
+- `bns-client`
+  - 新增 controller-authority 的通用发布方法（占位名
+    `publish_content_document`，最终命名由实现者确定），内部硬编码拒绝
+    `doc_type == OWNER_DOC_TYPE`，走 `ensure_authority_can_publish` +
+    `current_document_state` 读版本号。
+  - `SnBnsControllerConfig::validate()` 放宽 wildcard doc_type 限制（或加
+    显式 opt-in 字段）。
+  - 另增 `publish_guarded_owner_document` 实现 owner 身份字段保护的 diff 逻辑
+    （放在 bns-client 而不是 cyfs-sn，保证 SN owner 路径拿到这条保护）。
+- `cyfs-sn`
+  - `sn_bns_signer.rs`：`SnBnsProxyOperation` 新增 `PublishDocument` 分支；
+    `validate_request_tx` 的 `publishDocument` selector 分支从“三选一
+    白名单”改成“`dns_txt`/`relay_assignment` 保留专属 operation，其余归入
+    `PublishDocument`”，仍要求该 operation 在 `allowed_operations` 内才签。
+  - `sn_bns_proxy.rs`：新增 `SnBnsProxy::publish_document(...)`（同
+    `publish_dns_txt` 的编排模式），并在此处或 bns-client 内完成
+    `relay_assignment` 拒绝。
+  - `api/bns_proxy.rs`：新增 `publish_document` 请求结构
+    （`deny_unknown_fields`）和 handler 分支。
+  - `sn_server.rs`：`preferred_rpc_path` 把 `bns.publish_document` 归入
+    `SnRpcPath::BnsProxy`（公网、需 token，同 `publish_dns_txt`）；
+    `build_bns_proxy` 里给 SN controller 生成的 controllerPolicy 加上新
+    doc_type（通配或显式列表）。
+  - `doc/SN/SN-API.md` 第 6 节已补充 `bns.publish_document`。
+
 ## 背景结论
 
 - BNS 合约层支持 SN 代付 gas 注册 name：root name 的 `registerName` 使用 `AuthorityRole.None`，`assetOwner` 可以填用户 EVM 地址，`msg.sender` 可以是 SN signer。
@@ -113,6 +258,7 @@ bns_proxy:
     - register_name_bootstrap
     - publish_dns_txt
     - publish_relay_assignment
+    - publish_document
 ```
 
 兼容旧配置：
@@ -286,28 +432,37 @@ client -> sn-bns-proxy-rpc
 
 ### `bns.publish_document`
 
-不建议第一阶段提供通用方法。若必须提供，只允许 `allowed_doc_types` 白名单内 doc type，且服务端按 doc type 做 schema 校验。
+2026-07-09 更新：根据实际使用反馈（先注册、后补 `zone` 等 document 的产品
+路径），已决定提供这个通用方法，doc_type 基本不限制，`owner` 除外（附加
+身份字段保护）、`relay_assignment` 除外（保留 internal/admin only）。详细
+参数、权限和实现事项见前面“独立 `publish_document`”一节；本节原先
+“不建议第一阶段提供通用方法”的结论已被该节取代，现已实现。
 
-禁止：
+不变的约束：
 
-- 第一阶段不允许用户通过 controller 写 `owner`、`zone`、`boot`、`device_mini_doc`，除非对应产品流程和退出机制已经评审清楚。
 - 不允许传入任意 `CallAuthority`；authority 必须由服务端根据用户 controller 生成。
 
 ## 签名组件允许的 TX 类型
 
-第一阶段最小白名单：
+第一阶段最小白名单（已完成）：
 
 - `registerName` with bootstrap fields
 - `publishDocument` for `dns_txt`
 - `publishDocument` for `relay_assignment`（internal/admin only）
 
-第二阶段再评审：
+2026-07-09 新增（已完成，见“独立 `publish_document`”一节）：
+
+- `publishDocument` for 任意 doc_type，`owner`/`relay_assignment` 除外——
+  `owner` 走额外的身份字段保护，`relay_assignment` 仍保留 internal/admin
+  only。签名组件（`sn_bns_signer.rs`）需要把 doc_type → operation 的映射
+  从“三选一”改成“`dns_txt`/`relay_assignment` 专属 + 其余归入
+  `PublishDocument`”。
+
+仍然不在白名单内，继续再评审：
 
 - `applyMutations` for docs-only batch
-- `zone` / `boot` 初始化
-- `device_mini_doc`
 
-注意：合约层 `applyMutations` 中如果包含 owner document、authority update 或 owner policy，会进入 owner-only 路径，不能用 controller authority 代发。注册时的 `initialDocuments` 是初始化路径，不等同于后续 controller 可任意写 high-risk doc type。
+注意：合约层 `applyMutations` 中如果包含 owner document、authority update 或 owner policy，会进入 owner-only 路径，不能用 controller authority 代发。注册时的 `initialDocuments` 是初始化路径，不等同于后续 controller 可任意写 high-risk doc type。`zone`/`boot`/`device_mini_doc` 通过新的 `publish_document` 走 controller authority + doc_type 通配后，不再需要单独走“owner 授权 + `bind_zone_documents`/`publish_device_mini_doc`”这条路径来支持 SN 代发；这两个 bns-client 方法仍然保留给未来“owner 自己有 gas、直接发布”的场景使用。
 
 ## 安全要求
 
@@ -398,6 +553,25 @@ client -> sn-bns-proxy-rpc
 - [x] RPC 测试：客户端不能指定 controller address。
 - [x] 真链路 ignored e2e：注册 -> wait receipt -> indexer sync -> owner 是用户地址 -> controller 可写 `dns_txt` -> 用户 owner 清空 controller policy -> controller 再写失败。
 
+### 7. 独立 `publish_document`（doc_type 通用化，2026-07-09 已完成）
+
+- [x] `bns-client`：放宽 `SnBnsControllerConfig::validate()` 的 wildcard doc_type 限制。
+- [x] `bns-client`：新增 controller-authority 通用发布方法，硬编码拒绝 `doc_type == "owner"`。
+- [x] `bns-client`：实现 owner 文档身份字段读取 + diff + 拒绝逻辑，覆盖“首次补齐允许、已存在字段不可变”两种场景的单测。
+- [x] `cyfs-sn`：`SnBnsProxyOperation` 新增 `PublishDocument`；签名组件按 doc_type 分流的白名单更新。
+- [x] `cyfs-sn`：`SnBnsProxy::publish_document` 编排 + `relay_assignment` 拒绝。
+- [x] `cyfs-sn`：`/kapi/sn/bns-proxy` 新增 `publish_document` RPC，`deny_unknown_fields`，跨用户 name 拒绝。
+- [x] `cyfs-sn`：注册时 controllerPolicy 生成逻辑更新为通配（只影响新注册用户，存量用户不追溯）。
+- [x] 单元测试：`publish_document` 可以发布任意非保留 doc_type；`relay_assignment` 被拒绝；跨用户 name 被拒绝。
+- [x] 单元测试：`owner` 身份字段已存在时改值被拒绝；身份字段缺失时首次补齐成功；非身份字段任意时候都能改。
+- [x] 真链路 ignored e2e：注册（不带 `initial_documents.zone`）-> `bns.publish_document` 发布 `zone` -> `bns-indexer` 投影可见 -> 再次尝试改 `owner` 身份字段失败。
+
+验证命令（2026-07-09 已通过）：
+
+- `cargo test -p bns-client -- --test-threads=1`
+- `cargo test -p cyfs-sn -- --test-threads=1`
+- `cargo test -p cyfs-sn --test e2e_sn_bns_proxy -- --ignored --test-threads=1`
+
 ## 验收标准
 
 - 用户只提供 owner EVM 地址，不提供 gas，即可通过 SN 完成 BNS name bootstrap。
@@ -405,5 +579,6 @@ client -> sn-bns-proxy-rpc
 - 链上 controller policy 指向 SN 为该用户分配的 controller 地址。
 - 注册时必要 documents 已作为初始文档发布，或明确记录哪些文档后续由 proxy 发布。
 - BNS proxy 只返回 TX 提交结果，不假装链上成功。
+- 用户注册后无需 gas，即可通过 `bns.publish_document` 独立发布 `zone`/`boot`/`device_mini_doc` 等任意 doc_type；`relay_assignment` 仍只能走内网方法。
+- `doc_type = "owner"` 的发布不能改变已经存在的身份字段（验证公钥），只能补齐缺失字段或更新其它内容；违反时拒绝且不落 TX。
 - 用户用自己的 owner 地址发起 `setControllerPolicy` 清空 rules 后，SN controller 不能再发布该用户受保护 doc type。
-

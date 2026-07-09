@@ -17,11 +17,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use bns_client::{
-    hash_json, DnsTxtUpdate, RegisterNameParams, SnBnsController, SnBnsControllerError,
-    UpsertDnsTxtParams,
+    canonical_doc_type, hash_json, DnsTxtUpdate, PublishDocumentParams, RegisterNameParams,
+    SnBnsController, SnBnsControllerError, UpsertDnsTxtParams, OWNER_DOC_TYPE,
+    RELAY_ASSIGNMENT_DOC_TYPE,
 };
 use bns_client::{PublishRelayAssignmentParams, RegisterNameOutput};
-use bns_indexer::dns_document::DnsTxtRecord;
+use bns_indexer::dns_document::{DnsTxtRecord, DNS_TXT_DOC_TYPE};
 use bns_indexer::{
     default_document_update, CallAuthority, DocumentRef, DocumentUpdate, MutationGuard, Principal,
     RegisterOptions,
@@ -55,7 +56,8 @@ pub struct SNBnsProxyConfig {
     #[serde(default)]
     pub controllers: Vec<SNBnsProxyControllerKeyConfig>,
     /// 白名单 operation 列表；缺省 = 全部
-    /// （register_name_bootstrap / publish_dns_txt / publish_relay_assignment）。
+    /// （register_name_bootstrap / publish_dns_txt / publish_relay_assignment /
+    /// publish_document）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allowed_operations: Option<Vec<String>>,
 }
@@ -785,6 +787,80 @@ impl SnBnsProxy {
         Ok(outcome)
     }
 
+    /// 通过用户绑定的 controller 发布任意非保留 document。
+    ///
+    /// `owner` 走 bns-client 的身份字段保护路径；`relay_assignment` 始终拒绝，
+    /// 只能由 internal/admin 专用方法发布。
+    pub async fn publish_document(
+        &self,
+        username: &str,
+        request_id: String,
+        doc_type: String,
+        document: Value,
+    ) -> SnBnsProxyResult<SnBnsProxyTxOutcome> {
+        let doc_type = canonical_doc_type(&doc_type)
+            .map_err(|error| SnBnsProxyError::InvalidInput(error.to_string()))?;
+        if doc_type == RELAY_ASSIGNMENT_DOC_TYPE {
+            return Err(SnBnsProxyError::InvalidInput(
+                "relay_assignment is internal-only; use bns.publish_relay_assignment"
+                    .to_string(),
+            ));
+        }
+        if !document.is_object() {
+            return Err(SnBnsProxyError::InvalidInput(
+                "document must be a JSON object".to_string(),
+            ));
+        }
+
+        // dns_txt 保留既有专属 operation 白名单；其它 doc_type（含受保护的
+        // owner）统一归入 publish_document。
+        let required_operation = if doc_type == DNS_TXT_DOC_TYPE {
+            SnBnsProxyOperation::PublishDnsTxt
+        } else {
+            SnBnsProxyOperation::PublishDocument
+        };
+        self.ensure_operation(required_operation)?;
+
+        let binding = self.assign_controller_for_user(username).await?;
+        let entry = self.controller_entry(&binding)?;
+        let params = PublishDocumentParams {
+            request_id: request_id.clone(),
+            name: username.to_string(),
+            doc_type: doc_type.clone(),
+            document,
+            authority: entry.controller.sn_controller_authority(),
+        };
+        let payload_hash = hash_json(&params).unwrap_or_default();
+        let receipt = if doc_type == OWNER_DOC_TYPE {
+            entry
+                .controller
+                .publish_guarded_owner_document(params)
+                .await
+        } else {
+            entry.controller.publish_content_document(params).await
+        }
+        .map_err(SnBnsProxyError::Write)?;
+
+        let outcome = SnBnsProxyTxOutcome {
+            request_id,
+            operation: SnBnsProxyOperation::PublishDocument.as_str().to_string(),
+            name: username.to_string(),
+            controller_id: entry.id.clone(),
+            controller_address: entry.address.clone(),
+            asset_owner: None,
+            doc_type: receipt.doc_type.clone(),
+            document_version: receipt.document_version,
+            chain_id: receipt.evm_chain_id,
+            nonce: receipt.evm_nonce,
+            tx_hash: receipt.evm_tx_hash.clone(),
+            raw_tx: receipt.evm_raw_tx.clone(),
+            status: BNS_WRITE_STATUS_SUBMITTED.to_string(),
+            reused: receipt.created_or_reused,
+        };
+        self.audit(&outcome, payload_hash.as_str());
+        Ok(outcome)
+    }
+
     /// SN 内部发布 relay assignment（internal/admin only，由路由层限制）。
     pub async fn publish_relay_assignment(
         &self,
@@ -1275,6 +1351,35 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(error, SnBnsProxyError::OperationNotAllowed(_)));
+    }
+
+    #[tokio::test]
+    async fn generic_publish_rejects_relay_assignment_before_submission() {
+        let bindings: SnBnsControllerBindingStoreRef =
+            Arc::new(MemorySnBnsControllerBindingStore::new());
+        let submitter = Arc::new(RecordingEvmSubmitter::default());
+        let proxy = proxy_with(
+            vec![controller_entry(
+                "controller-a",
+                CONTROLLER_A,
+                1,
+                submitter.clone(),
+            )],
+            bindings,
+        );
+
+        let error = proxy
+            .publish_document(
+                "alice",
+                "publish-relay-via-generic".to_string(),
+                RELAY_ASSIGNMENT_DOC_TYPE.to_string(),
+                json!({"relay":"relay-a"}),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, SnBnsProxyError::InvalidInput(_)));
+        assert!(error.to_string().contains("internal-only"));
+        assert!(submitter.published.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

@@ -1,5 +1,5 @@
-use bns_client::{BnsClientError, SnBnsControllerError};
 use crate::sn_bns_proxy::SnBnsProxyError;
+use bns_client::{BnsClientError, SnBnsControllerError};
 use kRPC::RPCErrors;
 use serde_json::json;
 
@@ -114,6 +114,9 @@ pub(crate) fn bns_write_error(error: SnBnsControllerError) -> RPCErrors {
 
 pub(crate) fn bns_proxy_error(error: SnBnsProxyError) -> RPCErrors {
     match error {
+        SnBnsProxyError::Write(SnBnsControllerError::InvalidInput(message)) => {
+            parse_error(SnApiErrorCode::InvalidParams, message)
+        }
         SnBnsProxyError::Write(inner) => bns_write_error(inner),
         SnBnsProxyError::InvalidInput(message) => {
             parse_error(SnApiErrorCode::InvalidParams, message)

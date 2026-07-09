@@ -7,7 +7,7 @@
 - BNS proxy 编排/签名：`src/components/cyfs-sn/src/sn_bns_proxy.rs`、`src/components/cyfs-sn/src/sn_bns_signer.rs`
 - Rust 客户端：`src/components/cyfs-gateway-api/src/sn_client.rs`
 
-SN RPC 负责账号会话、user_domain 相关本地记录、设备在线运行态、OOD 连接信息查询，以及一个受限的 BNS 写代理（bns-proxy，见第 6 节）。完整的 BNS 文档读写（zone、DID document、device mini doc、任意 BNS DNS TXT 等）不属于 SN RPC，统一由独立 BNS API / `bns-client` 承担；bns-proxy 只覆盖 SN 产品路径需要的、由 SN 代付 gas 的白名单操作，不是通用 BNS 写口子。
+SN RPC 负责账号会话、user_domain 相关本地记录、设备在线运行态、OOD 连接信息查询，以及一个受限的 BNS 写代理（bns-proxy，见第 6 节）。BNS 的完整读写能力仍由独立 BNS API / `bns-client` 承担；bns-proxy 只覆盖 SN 产品路径需要的代付 gas 操作，包括注册后独立发布内容型 document，不提供自选 authority、任意 calldata、revoke 或 policy 管理能力。
 
 ## 1. 传输模型
 
@@ -34,7 +34,7 @@ RPC method 必须使用 `namespace.method` 形式。当前实现不再做 legacy
 | `/kapi/sn` | 公网 | SN 命名空间根，不承载 RPC 方法 | 无 |
 | `/kapi/sn/auth` | 公网 | 账号、会话、user profile、user_domain、user DNS record | `auth.*`、`user.*`、`domain.*` |
 | `/kapi/sn/deviceinfo` | 公网 | 设备在线态上报、在线态查询、OOD 连接信息解析 | `device.*`、`deviceinfo.*` |
-| `/kapi/sn/bns-proxy` | 公网 | SN 代付 gas 的受限 BNS 写代理 | `bns.publish_dns_txt` |
+| `/kapi/sn/bns-proxy` | 公网 | SN 代付 gas 的受限 BNS 写代理 | `bns.publish_dns_txt`、`bns.publish_document` |
 | `/` | 内网/管理面 | 运维管理、bns-proxy 内部/恢复方法 | `admin.clear_state_by_active_code`、`bns.publish_relay_assignment`、`bns.register_name_bootstrap` |
 
 路径是强约束。方法发到非首选路径会返回 unknown method，例如 `auth.check_username` 不能再发到 `/kapi/sn`；`bns.publish_relay_assignment` / `bns.register_name_bootstrap` 不能发到 `/kapi/sn/bns-proxy`，只能发到内网 `/`。
@@ -43,9 +43,9 @@ RPC method 必须使用 `namespace.method` 形式。当前实现不再做 legacy
 
 - `auth.check_username`、`auth.check_active_code`、`auth.register`、`auth.login`、`auth.refresh` 不需要 access token。
 - `auth.logout` 可同时吊销请求里的 access token 和参数里的 refresh token。
-- `auth.me`、`user.*`、`domain.*`、`device.register`、`device.update`、`device.get`、`device.list`、`bns.publish_dns_txt` 需要 SN access token。
+- `auth.me`、`user.*`、`domain.*`、`device.register`、`device.update`、`device.get`、`device.list`、`bns.publish_dns_txt`、`bns.publish_document` 需要 SN access token。
 - `deviceinfo.resolve_ood_by_did`、`deviceinfo.resolve_ood_by_hostname` 是匿名只读接口。
-- 带用户作用域的接口只允许访问 token 所属用户；即使参数里带 `name`，也必须等于当前登录用户。`bns.publish_dns_txt` 同样受此约束。
+- 带用户作用域的接口只允许访问 token 所属用户；即使参数里带 `name`，也必须等于当前登录用户。`bns.publish_dns_txt`、`bns.publish_document` 同样受此约束。
 - `bns.publish_relay_assignment`、`bns.register_name_bootstrap`、`admin.clear_state_by_active_code` 只在内网管理路径 `/` 可用，不做 SN access token 校验，靠网络边界隔离外部访问。
 
 `auth.register` 和 `auth.login` 返回 access/refresh token。access token 放在 kRPC request 的 `token` 字段中。
@@ -212,9 +212,9 @@ TXT 未配置或不匹配时返回可重试错误 `domain_proof_failed`（错误
 
 ## 6. `/kapi/sn/bns-proxy`
 
-SN 代付 gas 的受限 BNS 写代理：用户不需要持有 gas，就能通过 SN 完成 BNS name 注册和少量白名单 document 更新；SN 负责构造、签名（多把内部 controller key，业务代码接触不到明文私钥）、投递 EVM TX。完整设计与实施状态见 `doc/SN/sn-bns-proxy-todo.md`。
+SN 代付 gas 的受限 BNS 写代理：用户不需要持有 gas，就能通过 SN 完成 BNS name 注册和受控 document 更新；SN 负责构造、签名（多把内部 controller key，业务代码接触不到明文私钥）、投递 EVM TX。完整设计与实施状态见 `doc/SN/sn-bns-proxy-todo.md`。
 
-不要与已下线的 `/kapi/sn/bns` 混淆（见第 10 节）：旧路径曾承载通用文档读写代理，已完全移除；bns-proxy 只覆盖下面三个白名单操作，没有通用 `publish_document`。
+不要与已下线的 `/kapi/sn/bns` 混淆（见第 10 节）：旧路径曾承载通用文档读写代理，已完全移除；bns-proxy 只覆盖下面四个受控操作。`publish_document` 虽允许内容型 doc_type 通用化，但 authority、controller 和 TX 都由服务端构造，不能提交任意 calldata。
 
 只有 SN 配置了 BNS 写链路（`bns_write_enabled`/`bns_indexer_url` + `bns_evm`）时才启用；配置了 `bns_proxy` 块时还可以显式 `bns_proxy.enabled: false` 关闭。未启用时所有 `bns.*` 调用返回 `bns_proxy_unavailable`（1026），`auth.register` 回落为纯本地注册（不带 `bns` 字段）。
 
@@ -223,6 +223,7 @@ SN 代付 gas 的受限 BNS 写代理：用户不需要持有 gas，就能通过
 | Method | 可达路径 | Params | 说明 |
 |--------|----------|--------|------|
 | `bns.publish_dns_txt` | `/kapi/sn/bns-proxy`（需 SN access token） | `name`, `mode`, `request_id?`, `ttl?`, `value?`, `records?` | 通过当前用户绑定的 controller 更新 `dns_txt` document。`name` 必须等于 token 所属用户。 |
+| `bns.publish_document` | `/kapi/sn/bns-proxy`（需 SN access token） | `name`, `doc_type`, `document`, `request_id?` | 注册后独立发布 JSON object document；`name` 必须等于 token 所属用户。`relay_assignment` 禁止，`owner` 受身份字段保护。 |
 | `bns.publish_relay_assignment` | 仅内网 `/` | `name`, `relay_assignment`, `request_id?` | SN 内部发布 relay assignment，不经外部 HTTP 路径。 |
 | `bns.register_name_bootstrap` | 仅内网 `/` | `name`, `asset_owner`, `request_id?`, `owner_config?`, `initial_documents?` | 注册阶段以外的恢复/重放入口，不创建本地 SN 账号。 |
 
@@ -236,9 +237,14 @@ SN 代付 gas 的受限 BNS 写代理：用户不需要持有 gas，就能通过
 | `remove` | `value` | 删除匹配的 TXT 记录。 |
 | `replace` | `records: [{ttl?, value}]` | 整体替换 `dns_txt` document 的记录集合。 |
 
+`bns.publish_document` 的 `document` 必须是 JSON object，SN 会从当前投影读取版本并自动填写 `expected_version`；客户端不传版本号。除下面两个保留类型外，`zone`、`boot`、`device_mini_doc` 和自定义 doc_type 均不做产品级 schema 限制：
+
+- `relay_assignment`：返回 `invalid_params`，必须改走内网 `bns.publish_relay_assignment`。
+- `owner`：允许首次补齐身份字段，也允许更新其它内容；但当前 owner 文档里已经存在的 `public_key`、`owner_key`、`default_key`、`key`、`verificationMethod[0].publicKeyJwk` 不得改值或删除，否则返回 `invalid_params`，且不会构造/投递 TX。
+
 ### 6.2 返回结构
 
-三个方法成功时都返回同一种 TX 投递结果（`code: 0` + 以下字段）：
+四个方法成功时都返回同一种 TX 投递结果（`code: 0` + 以下字段）：
 
 ```json
 {
@@ -263,7 +269,7 @@ SN 代付 gas 的受限 BNS 写代理：用户不需要持有 gas，就能通过
 | 字段 | 说明 |
 |------|------|
 | `asset_owner` | 只在 `register_name_bootstrap` 有值。 |
-| `doc_type` / `document_version` | 只在 document 类操作（`publish_dns_txt` / `publish_relay_assignment`）有值；`document_version` 是 SN 提交前推算的目标版本号，不代表链上已确认。 |
+| `doc_type` / `document_version` | 只在 document 类操作（`publish_dns_txt` / `publish_document` / `publish_relay_assignment`）有值；`document_version` 是 SN 提交前推算的目标版本号，不代表链上已确认。 |
 | `status` | 恒为 `"submitted"`：SN 只保证已投递 TX，不等待 receipt。链上最终状态经 `bns-indexer` 投影，读侧可能有短暂延迟窗口。 |
 | `reused` | 命中同 `request_id` 幂等重放时为 `true`，返回上一次的 TX 结果而不重新提交。 |
 
@@ -285,7 +291,8 @@ SN 代付 gas 的受限 BNS 写代理：用户不需要持有 gas，就能通过
 
 - 私钥只存在于 SN 内部签名组件（`SnBnsTxSigner`）；RPC handler、日志、DB、错误信息都不会出现明文私钥或原始 calldata。
 - 每个部署可配置多把 controller key（`bns_proxy.controllers`，带 `weight`；`weight: 0` 表示排水，不接新用户但已绑定用户不受影响）；不配置 `bns_proxy.controllers` 时回落旧版单 controller（`bns_evm.controller_private_key*`，id 固定为 `default`）。
-- `bns_proxy.allowed_operations` 是服务端白名单（缺省 = 全部三个操作）；命中白名单外操作同样返回 `bns_proxy_unavailable`。签名组件另有一层独立白名单（chain id / contract / method selector / operation×doc_type / gas 上限），未知一律拒签，双重防护。
+- `bns_proxy.allowed_operations` 是服务端白名单（缺省 = 全部四个操作）；命中白名单外操作同样返回 `bns_proxy_unavailable`。`dns_txt` 和 `relay_assignment` 仍映射到各自专属 operation，其余 doc_type 映射到 `publish_document`。签名组件另有一层独立白名单（chain id / contract / method selector / operation×doc_type / gas 上限），未知一律拒签，双重防护。
+- 新注册用户的 controller policy 使用空 doc_type 通配规则，以承载注册后新增的内容型 document；SN 应用层继续硬隔离 relay 专用入口，并通过受保护的 owner 路径锁定已经存在的身份字段。存量用户的链上 policy 不会自动升级。
 - `bns_proxy.require_user_asset_owner`：配置了 `bns_proxy.controllers`（生产多 controller 模式）缺省 `true`；仅旧版单 controller 配置缺省 `false`（devtest，`asset_owner` 缺省回落为该用户绑定 controller 的地址）。
 
 ## 7. 内网管理 RPC
@@ -341,7 +348,7 @@ SN 仍然提供两个标准解析面，但它们不是 SN RPC：
 
 `domain_proof_failed` 只从 `domain.bind`（含 `begin_verify`/`verify` alias）冒出，message 是 JSON，见 4.3。
 
-BNS 写入错误会从任意 bns-proxy 写路径冒出：`auth.register` 的 BNS 代注册、`bns.publish_dns_txt`、`bns.publish_relay_assignment`、`bns.register_name_bootstrap`。`CONTROLLER_SCOPE_DENIED` / `NOT_EFFECTIVE_OWNER` 映射为 `bns_permission_denied`，`NAME_ALREADY_EXISTS` 映射为 `bns_name_already_exists`，其他 BNS 写入错误映射为 `bns_write_failed`。`bns_proxy_unavailable` 对应「bns-proxy 未启用」或「operation 不在白名单内」；`bns_controller_unavailable` 对应「用户绑定的 controller 已不在当前配置」，需要人工迁移，不会静默重分配。
+BNS 写入错误会从任意 bns-proxy 写路径冒出：`auth.register` 的 BNS 代注册、`bns.publish_dns_txt`、`bns.publish_document`、`bns.publish_relay_assignment`、`bns.register_name_bootstrap`。`CONTROLLER_SCOPE_DENIED` / `NOT_EFFECTIVE_OWNER` 映射为 `bns_permission_denied`，`NAME_ALREADY_EXISTS` 映射为 `bns_name_already_exists`，其他 BNS 写入错误映射为 `bns_write_failed`；请求结构、保留 doc_type 和 owner 身份字段保护失败映射为 `invalid_params`。`bns_proxy_unavailable` 对应「bns-proxy 未启用」或「operation 不在白名单内」；`bns_controller_unavailable` 对应「用户绑定的 controller 已不在当前配置」，需要人工迁移，不会静默重分配。
 
 ## 10. 从旧 SN API 迁移
 
@@ -350,7 +357,7 @@ BNS 写入错误会从任意 bns-proxy 写路径冒出：`auth.register` 的 BNS
 | `/kapi/sn` 上调用任意 RPC | 按方法改发 `/kapi/sn/auth` 或 `/kapi/sn/deviceinfo`；`/kapi/sn` 不再承载 RPC。 |
 | `/kapi/sn/bns` | 不再属于 SN。BNS 文档、zone、DID、device mini doc、BNS DNS TXT 写入改用 `/kapi/bns` 或 `bns-client`。新 `/kapi/sn/bns-proxy`（第 6 节）是不同的东西——SN 代付 gas 的白名单写代理，不是该路径复活。 |
 | 裸方法名，如 `register`、`get`、`bind_zone_config` | 改为 namespaced method，例如 `auth.register`、`device.get`。 |
-| `zone.bind_config`、`zone.get` | 改用 BNS API；SN 解析侧会通过 BNS reader 和标准 resolver 读取结果。 |
+| `zone.bind_config`、`zone.get` | SN 代付发布可用 `bns.publish_document`（`doc_type=zone`）；owner 直写仍用 BNS API。读取走 BNS reader 和标准 resolver。 |
 | `did.set_document`、`did.get_document` | 写/读文档改用 BNS API；解析 DID 用 `GET /1.0/identifiers/{did}`。 |
 | `device.register` 发布 `mini_config_jwt` | 设备身份文档改用 BNS API；SN 的 `device.register/update` 只上报在线态。 |
 | `dns.add_record` / `dns.remove_record` | user_domain 本地记录改为 `user.add_dns_record` / `user.remove_dns_record`；BNS Domain 的 TXT/记录改用 BNS API 或 bns-proxy 的 `bns.publish_dns_txt`。 |

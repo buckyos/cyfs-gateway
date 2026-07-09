@@ -6,6 +6,8 @@
 //! 注册（SN 代付 gas，assetOwner=用户地址）
 //!   -> wait receipt -> indexer sync
 //!   -> 链上 assetOwner 是用户地址
+//!   -> 独立 publish_document 发布 zone，indexer 投影可见
+//!   -> controller 不能替换 owner 文档中已存在的身份字段
 //!   -> 绑定 controller 可写 dns_txt
 //!   -> 用户用自己的 owner key `setControllerPolicy` 清空 SN controller 权限
 //!   -> controller 再写 dns_txt：TX 可投递但链上 revert（status 0x0），投影不变。
@@ -266,7 +268,7 @@ fn build_proxy(
 
 #[tokio::test]
 #[ignore = "requires Foundry (anvil/forge); run with --ignored"]
-async fn e2e_register_dns_txt_then_owner_exits_sn_custody() {
+async fn e2e_register_publish_document_then_owner_exits_sn_custody() {
     if !foundry_available() {
         eprintln!("skipping: anvil/forge not on PATH");
         return;
@@ -296,7 +298,11 @@ async fn e2e_register_dns_txt_then_owner_exits_sn_custody() {
             request_id: format!("sn:register:{USER_NAME}"),
             name: USER_NAME.to_string(),
             asset_owner: USER_OWNER_ADDR.to_string(),
-            owner_config: json!({ "name": USER_NAME, "created_by": "cyfs-sn" }),
+            owner_config: json!({
+                "name": USER_NAME,
+                "created_by": "cyfs-sn",
+                "public_key": {"kty":"OKP","crv":"Ed25519","x":"alice-key"}
+            }),
             initial_documents: SnBnsProxyInitialDocuments {
                 zone: None,
                 boot: None,
@@ -337,7 +343,46 @@ async fn e2e_register_dns_txt_then_owner_exits_sn_custody() {
     assert_eq!(initial_dns.status, DocumentStatus::Active);
     assert!(String::from_utf8_lossy(&initial_dns.document.inline_document).contains("pkx=seed"));
 
-    // --- 3. 绑定 controller 可写 dns_txt ---
+    // --- 3. 注册后独立发布 zone，indexer 投影可见 ---
+    let zone_outcome = proxy
+        .publish_document(
+            USER_NAME,
+            "sn:document:alice:zone:1".to_string(),
+            "zone".to_string(),
+            json!({"oods":["ood1"]}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(zone_outcome.status, "submitted");
+    assert_eq!(zone_outcome.controller_address, bound_controller);
+    let zone_tx = zone_outcome.tx_hash.clone().unwrap();
+    assert_eq!(receipt_status(&wait_receipt(&rpc, zone_tx.as_str()).await), "0x1");
+    sync_once().await;
+    let zone_doc = registry
+        .store()
+        .transact(|tx| Ok(tx.get_current_document(USER_NAME, "zone")?.unwrap()))
+        .unwrap();
+    assert_eq!(zone_doc.version, 1);
+    let zone_body: serde_json::Value =
+        serde_json::from_slice(&zone_doc.document.inline_document).unwrap();
+    assert_eq!(zone_body["oods"], json!(["ood1"]));
+
+    // owner 文档已有身份字段时，替换 key 在构造/签名前即被拒绝，不落 TX。
+    let owner_change_error = proxy
+        .publish_document(
+            USER_NAME,
+            "sn:document:alice:owner:change".to_string(),
+            "owner".to_string(),
+            json!({
+                "name": USER_NAME,
+                "public_key": {"kty":"OKP","crv":"Ed25519","x":"evil-key"}
+            }),
+        )
+        .await
+        .unwrap_err();
+    assert!(owner_change_error.to_string().contains("cannot be changed"));
+
+    // --- 4. 绑定 controller 可写 dns_txt ---
     let publish_outcome = proxy
         .publish_dns_txt(
             USER_NAME,
@@ -351,10 +396,10 @@ async fn e2e_register_dns_txt_then_owner_exits_sn_custody() {
         .unwrap();
     assert_eq!(publish_outcome.status, "submitted");
     assert_eq!(publish_outcome.controller_address, bound_controller);
-    // 同一 controller 连续两笔写 nonce 递增。
+    // 同一 controller 的 register -> zone -> dns_txt nonce 连续递增。
     assert_eq!(
         publish_outcome.nonce.unwrap(),
-        register_outcome.nonce.unwrap() + 1
+        register_outcome.nonce.unwrap() + 2
     );
     let publish_tx = publish_outcome.tx_hash.clone().unwrap();
     assert_eq!(receipt_status(&wait_receipt(&rpc, publish_tx.as_str()).await), "0x1");
@@ -368,7 +413,7 @@ async fn e2e_register_dns_txt_then_owner_exits_sn_custody() {
     let dns_body = String::from_utf8_lossy(&dns_doc.document.inline_document).to_string();
     assert!(dns_body.contains("pkx=seed") && dns_body.contains("pkx=live"), "{dns_body}");
 
-    // --- 4. 用户用自己的 owner key 清空 controller policy，退出 SN 托管 ---
+    // --- 5. 用户用自己的 owner key 清空 controller policy，退出 SN 托管 ---
     // guard 用投影里的最新 name_seq（上一步 sync 已含 publish 后状态）。
     let fresh_seq = registry
         .store()
@@ -396,7 +441,7 @@ async fn e2e_register_dns_txt_then_owner_exits_sn_custody() {
     );
     sync_once().await;
 
-    // --- 5. controller 再写：TX 可投递但链上 revert，投影不变 ---
+    // --- 6. controller 再写：TX 可投递但链上 revert，投影不变 ---
     let denied_outcome = proxy
         .publish_dns_txt(
             USER_NAME,

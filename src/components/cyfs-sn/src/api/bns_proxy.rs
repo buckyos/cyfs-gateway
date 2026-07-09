@@ -1,6 +1,7 @@
 //! `/kapi/sn/bns-proxy` RPC：SN 代付 gas 的受限 BNS 写入口。
 //!
-//! - `publish_dns_txt`：需要 SN access token，`name` 必须等于 token 用户；
+//! - `publish_dns_txt` / `publish_document`：需要 SN access token，`name` 必须
+//!   等于 token 用户；
 //! - `publish_relay_assignment` / `register_name_bootstrap`：internal/admin
 //!   only（`preferred_rpc_path` 钉在 InternalRoot，外部 HTTP 路径不可达）。
 //!
@@ -13,7 +14,7 @@ use super::common::{
     resolve_self_scoped_username, RpcCallResult,
 };
 use super::errors::{bns_proxy_error, parse_error, reason_error, SnApiErrorCode};
-use crate::sn_bns_proxy::{SnBnsProxyInitialDocuments, SnBnsProxyRegisterParams, SnBnsProxy};
+use crate::sn_bns_proxy::{SnBnsProxy, SnBnsProxyInitialDocuments, SnBnsProxyRegisterParams};
 use crate::SNServer;
 use ::kRPC::{RPCErrors, RPCRequest, RPCResponse};
 use bns_client::DnsTxtUpdate;
@@ -39,6 +40,17 @@ struct PublishDnsTxtReq {
     value: Option<String>,
     #[serde(default)]
     records: Option<Vec<PublishDnsTxtRecord>>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PublishDocumentReq {
+    #[serde(default)]
+    request_id: Option<String>,
+    #[allow(dead_code)]
+    name: String,
+    doc_type: String,
+    document: Value,
 }
 
 #[derive(Clone, Deserialize)]
@@ -154,6 +166,34 @@ pub(crate) async fn handle_bns_proxy(
                 .await
                 .map_err(bns_proxy_error)?;
             // 投递成功只做本地 DNS 缓存失效；权威状态等 bns-indexer 投影。
+            server.invalidate_bns_name_dns_cache(username.as_str());
+            ok_response(&req, outcome.to_response_json())
+        }
+        "publish_document" => {
+            let params: PublishDocumentReq = parse_params(&req)?;
+            // token 必须存在且 `name` == token 用户（cross-user 一律拒绝）。
+            let username = resolve_self_scoped_username(server, &req, false).await?;
+            if !params.document.is_object() {
+                return Err(parse_error(
+                    SnApiErrorCode::InvalidParams,
+                    "document must be a JSON object",
+                ));
+            }
+            let request_id = params
+                .request_id
+                .clone()
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| generate_request_id("document", username.as_str()));
+            let proxy = require_bns_proxy(server)?;
+            let outcome = proxy
+                .publish_document(
+                    username.as_str(),
+                    request_id,
+                    params.doc_type,
+                    params.document,
+                )
+                .await
+                .map_err(bns_proxy_error)?;
             server.invalidate_bns_name_dns_cache(username.as_str());
             ok_response(&req, outcome.to_response_json())
         }

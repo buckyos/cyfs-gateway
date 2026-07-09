@@ -6,10 +6,10 @@ use bns_client::{
     BnsEvmStandardClient, BnsEvmTxSubmission, BnsEvmWriteOperation, BnsIndexerApi,
     BnsIndexerClient, BnsIndexerRpcHandler, BnsPublishDocumentReq, BnsRegisterNameReq,
     BnsWriteReceiptStatus, BootstrapNameParams, DnsTxtUpdate, MemorySnBnsWriteRequestStore,
-    PublishDeviceMiniDocParams, PublishRelayAssignmentParams, SnBnsController,
-    SnBnsControllerConfig, SnBnsControllerError, SnBnsEvmSubmitter, StaticBnsEvmKeyManager,
-    UpsertDnsTxtParams, BOOT_DOC_TYPE, DEVICE_MINI_DOC_TYPE, RELAY_ASSIGNMENT_DOC_TYPE,
-    ZONE_DOC_TYPE,
+    PublishDeviceMiniDocParams, PublishDocumentParams, PublishRelayAssignmentParams,
+    SnBnsController, SnBnsControllerConfig, SnBnsControllerError, SnBnsEvmSubmitter,
+    StaticBnsEvmKeyManager, UpsertDnsTxtParams, BOOT_DOC_TYPE, DEVICE_MINI_DOC_TYPE,
+    OWNER_DOC_TYPE, RELAY_ASSIGNMENT_DOC_TYPE, ZONE_DOC_TYPE,
 };
 use bns_evm::{AuthorityRole as EvmAuthorityRole, PrincipalKind as EvmPrincipalKind, SolCall};
 use bns_indexer::dns_document::{self, DNS_TXT_DOC_TYPE};
@@ -387,13 +387,19 @@ async fn legacy_write_rpc_is_not_registered() {
 }
 
 #[test]
-fn sn_controller_config_rejects_high_risk_doc_type_scope() {
+fn sn_controller_config_accepts_wildcard_and_content_doc_types_but_rejects_explicit_owner() {
     let mut config = SnBnsControllerConfig::new(Principal::chain_account(SN_CONTROLLER), "");
     config.allowed_controller_doc_types = vec![DEVICE_MINI_DOC_TYPE.to_string()];
+    config.validate().unwrap();
+
+    config.allowed_controller_doc_types = vec![String::new()];
+    config.validate().unwrap();
+
+    config.allowed_controller_doc_types = vec![OWNER_DOC_TYPE.to_string()];
 
     let error = config.validate().unwrap_err();
     assert_eq!(error.code(), "INVALID_INPUT");
-    assert!(error.to_string().contains("high-risk doc_type"));
+    assert!(error.to_string().contains("owner doc_type"));
 }
 
 #[tokio::test]
@@ -424,7 +430,137 @@ async fn sn_controller_register_name_submits_controller_policy() {
     assert_eq!(registrations.len(), 1);
     assert_eq!(registrations[0].initial_documents.len(), 1);
     assert_eq!(registrations[0].initial_documents[0].doc_type, "owner");
-    assert_eq!(registrations[0].controller_policy.len(), 2);
+    assert_eq!(registrations[0].controller_policy.len(), 1);
+    assert_eq!(registrations[0].controller_policy[0].doc_type, "");
+}
+
+#[tokio::test]
+async fn sn_controller_publishes_arbitrary_content_document_with_wildcard_policy() {
+    let registry = registry();
+    let controller = sn_controller_with_applying_submitter(registry.clone());
+    controller
+        .register_name(BootstrapNameParams {
+            request_id: "bootstrap-content".to_string(),
+            name: "alice".to_string(),
+            asset_owner: OWNER.to_string(),
+            register_options: RegisterOptions::default(),
+            owner_config: json!({"name":"alice"}),
+            owner_authority_keys: vec![],
+            semantic_owner_after_authority: None,
+            initial_documents: vec![],
+            authority: CallAuthority::public(),
+            guard: MutationGuard::default(),
+        })
+        .await
+        .unwrap();
+
+    let receipt = controller
+        .publish_content_document(PublishDocumentParams {
+            request_id: "publish-zone".to_string(),
+            name: "alice".to_string(),
+            doc_type: ZONE_DOC_TYPE.to_string(),
+            document: json!({"oods":["ood1"]}),
+            authority: sn_controller_authority(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(receipt.doc_type.as_deref(), Some(ZONE_DOC_TYPE));
+    assert_eq!(receipt.document_version, Some(1));
+
+    let resolved = registry.resolve_document("alice", ZONE_DOC_TYPE).unwrap();
+    let body: serde_json::Value =
+        serde_json::from_slice(&resolved.document_state.document.inline_document).unwrap();
+    assert_eq!(body["oods"], json!(["ood1"]));
+
+    let owner_error = controller
+        .publish_content_document(PublishDocumentParams {
+            request_id: "publish-owner-unguarded".to_string(),
+            name: "alice".to_string(),
+            doc_type: OWNER_DOC_TYPE.to_string(),
+            document: json!({"public_key":"replacement"}),
+            authority: sn_controller_authority(),
+        })
+        .await
+        .unwrap_err();
+    assert!(owner_error
+        .to_string()
+        .contains("must use guarded owner publishing"));
+}
+
+#[tokio::test]
+async fn guarded_owner_publish_allows_first_identity_and_content_updates_but_locks_identity() {
+    let registry = registry();
+    let controller = sn_controller_with_applying_submitter(registry.clone());
+    controller
+        .register_name(BootstrapNameParams {
+            request_id: "bootstrap-owner".to_string(),
+            name: "alice".to_string(),
+            asset_owner: OWNER.to_string(),
+            register_options: RegisterOptions::default(),
+            owner_config: json!({"name":"alice","created_by":"cyfs-sn"}),
+            owner_authority_keys: vec![],
+            semantic_owner_after_authority: None,
+            initial_documents: vec![],
+            authority: CallAuthority::public(),
+            guard: MutationGuard::default(),
+        })
+        .await
+        .unwrap();
+
+    let public_key = json!({"kty":"OKP","crv":"Ed25519","x":"alice-key"});
+    let first = controller
+        .publish_guarded_owner_document(PublishDocumentParams {
+            request_id: "owner-first-key".to_string(),
+            name: "alice".to_string(),
+            doc_type: OWNER_DOC_TYPE.to_string(),
+            document: json!({"name":"alice","public_key":public_key.clone()}),
+            authority: sn_controller_authority(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(first.document_version, Some(2));
+
+    let content_update = controller
+        .publish_guarded_owner_document(PublishDocumentParams {
+            request_id: "owner-content-update".to_string(),
+            name: "alice".to_string(),
+            doc_type: OWNER_DOC_TYPE.to_string(),
+            document: json!({
+                "name":"alice",
+                "public_key":public_key,
+                "display_name":"Alice"
+            }),
+            authority: sn_controller_authority(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(content_update.document_version, Some(3));
+
+    let changed_identity = controller
+        .publish_guarded_owner_document(PublishDocumentParams {
+            request_id: "owner-change-key".to_string(),
+            name: "alice".to_string(),
+            doc_type: OWNER_DOC_TYPE.to_string(),
+            document: json!({
+                "name":"alice",
+                "public_key":{"kty":"OKP","crv":"Ed25519","x":"mallory-key"},
+                "display_name":"Mallory"
+            }),
+            authority: sn_controller_authority(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(changed_identity.code(), "INVALID_INPUT");
+    assert!(changed_identity
+        .to_string()
+        .contains("owner identity field `public_key` cannot be changed"));
+
+    let resolved = registry.resolve_document("alice", OWNER_DOC_TYPE).unwrap();
+    assert_eq!(resolved.document_state.version, 3);
+    let body: serde_json::Value =
+        serde_json::from_slice(&resolved.document_state.document.inline_document).unwrap();
+    assert_eq!(body["display_name"], "Alice");
+    assert_eq!(body["public_key"]["x"], "alice-key");
 }
 
 #[tokio::test]

@@ -1082,7 +1082,7 @@ export function enableDevLocalBnsProxy(targetDir: string): void {
     "      max_priority_fee_per_gas: 100000000",
     "    bns_proxy:",
     "      require_user_asset_owner: true",
-    "      allowed_operations: [register_name_bootstrap, publish_dns_txt, publish_relay_assignment]",
+    "      allowed_operations: [register_name_bootstrap, publish_dns_txt, publish_relay_assignment, publish_document]",
     "      controllers:",
     ...SN_DEV_BNS_PROXY_CONTROLLERS.flatMap(({ id, account }) => [
       `        - id: ${id}`,

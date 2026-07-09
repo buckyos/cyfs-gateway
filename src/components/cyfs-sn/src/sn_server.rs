@@ -521,7 +521,7 @@ impl SNServer {
             | "device.list"
             | "deviceinfo.resolve_ood_by_did"
             | "deviceinfo.resolve_ood_by_hostname" => SnRpcPath::DeviceInfo,
-            "bns.publish_dns_txt" => SnRpcPath::BnsProxy,
+            "bns.publish_dns_txt" | "bns.publish_document" => SnRpcPath::BnsProxy,
             // internal/admin only：不在外部 HTTP 路径开放（QA/loopback 通道可用）。
             "bns.publish_relay_assignment" | "bns.register_name_bootstrap" => {
                 SnRpcPath::InternalRoot
@@ -1054,7 +1054,10 @@ impl SNServer {
                 )
                 .await
             }
-            "bns.publish_dns_txt" | "bns.publish_relay_assignment" | "bns.register_name_bootstrap" => {
+            "bns.publish_dns_txt"
+            | "bns.publish_document"
+            | "bns.publish_relay_assignment"
+            | "bns.register_name_bootstrap" => {
                 let bare_method = req
                     .method
                     .strip_prefix("bns.")
@@ -3174,7 +3177,7 @@ mod tests {
 
         let db = tempfile::NamedTempFile::with_suffix(".db").unwrap();
         let auth_dir = tempfile::tempdir().unwrap();
-        let (sn, _registry) =
+        let (sn, registry) =
             build_sn_with_bns_proxy(db.path().to_str().unwrap(), auth_dir.path(), true).await;
 
         let http_server: Arc<dyn HttpServer> = sn.clone();
@@ -3276,6 +3279,102 @@ mod tests {
         // 响应不等待 receipt：没有 receipt 字段，document_version 是预期版本。
         assert_eq!(result["document_version"].as_u64().unwrap(), 2);
 
+        // --- publish_document：注册后可独立补发任意内容型 document ---
+        let result = bns_krpc
+            .call(
+                "bns.publish_document",
+                json!({
+                    "request_id": "publish-zone-1",
+                    "name": PROXY_USER,
+                    "doc_type": "zone",
+                    "document": { "oods": ["ood1"] }
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["code"].as_i64().unwrap(), 0);
+        assert_eq!(result["operation"].as_str().unwrap(), "publish_document");
+        assert_eq!(result["doc_type"].as_str().unwrap(), "zone");
+        assert_eq!(result["document_version"].as_u64().unwrap(), 1);
+        let projected_zone = registry.resolve_document(PROXY_USER, "zone").unwrap();
+        let projected_zone: serde_json::Value = serde_json::from_slice(
+            &projected_zone.document_state.document.inline_document,
+        )
+        .unwrap();
+        assert_eq!(projected_zone["oods"], json!(["ood1"]));
+
+        // owner 首次补身份字段允许；保持身份字段时其它内容可改；换 key 拒绝且不落 TX。
+        let owner_key = json!({"kty":"OKP","crv":"Ed25519","x":"proxy-user-key"});
+        let first_owner = bns_krpc
+            .call(
+                "bns.publish_document",
+                json!({
+                    "request_id": "publish-owner-key-1",
+                    "name": PROXY_USER,
+                    "doc_type": "owner",
+                    "document": { "name": PROXY_USER, "public_key": owner_key.clone() }
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(first_owner["document_version"].as_u64().unwrap(), 2);
+        let owner_content = bns_krpc
+            .call(
+                "bns.publish_document",
+                json!({
+                    "request_id": "publish-owner-content-2",
+                    "name": PROXY_USER,
+                    "doc_type": "owner",
+                    "document": {
+                        "name": PROXY_USER,
+                        "public_key": owner_key,
+                        "display_name": "Proxy User"
+                    }
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(owner_content["document_version"].as_u64().unwrap(), 3);
+
+        let changed_owner_err = bns_krpc
+            .call(
+                "bns.publish_document",
+                json!({
+                    "request_id": "publish-owner-change-3",
+                    "name": PROXY_USER,
+                    "doc_type": "owner",
+                    "document": {
+                        "name": PROXY_USER,
+                        "public_key": {"kty":"OKP","crv":"Ed25519","x":"evil-key"}
+                    }
+                }),
+            )
+            .await
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(changed_owner_err.contains("[SN:1000:invalid_params]"));
+        assert!(changed_owner_err.contains("cannot be changed"));
+        let projected_owner = registry.resolve_document(PROXY_USER, "owner").unwrap();
+        assert_eq!(projected_owner.document_state.version, 3);
+
+        // relay_assignment 仍不能借通用入口绕过 internal/admin 边界。
+        let reserved_doc_err = bns_krpc
+            .call(
+                "bns.publish_document",
+                json!({
+                    "name": PROXY_USER,
+                    "doc_type": "relay_assignment",
+                    "document": { "relays": ["relay1.buckyos.ai"] }
+                }),
+            )
+            .await
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(reserved_doc_err.contains("[SN:1000:invalid_params]"));
+        assert!(reserved_doc_err.contains("internal-only"));
+
         // --- 跨用户 name 拒绝 ---
         let cross_user_err = bns_krpc
             .call(
@@ -3291,6 +3390,21 @@ mod tests {
             .unwrap()
             .to_string();
         assert!(cross_user_err.contains("[SN:1018:cross_user_access_denied]"));
+
+        let cross_user_document_err = bns_krpc
+            .call(
+                "bns.publish_document",
+                json!({
+                    "name": "otheruser",
+                    "doc_type": "zone",
+                    "document": { "oods": ["evil"] }
+                }),
+            )
+            .await
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(cross_user_document_err.contains("[SN:1018:cross_user_access_denied]"));
 
         // --- 客户端不能指定 controller_address（未知字段直接拒绝）---
         let unknown_field_err = bns_krpc
@@ -3310,6 +3424,23 @@ mod tests {
         assert!(unknown_field_err.contains("[SN:1000:invalid_params]"));
         assert!(unknown_field_err.contains("controller_address"));
 
+        let unknown_document_field_err = bns_krpc
+            .call(
+                "bns.publish_document",
+                json!({
+                    "name": PROXY_USER,
+                    "doc_type": "zone",
+                    "document": { "oods": ["ood1"] },
+                    "authority": {}
+                }),
+            )
+            .await
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(unknown_document_field_err.contains("[SN:1000:invalid_params]"));
+        assert!(unknown_document_field_err.contains("authority"));
+
         // --- 无 token 拒绝 ---
         let no_token_err = kRPC::new(bns_proxy_url.as_str(), None)
             .call(
@@ -3321,6 +3452,21 @@ mod tests {
             .unwrap()
             .to_string();
         assert!(no_token_err.contains("[SN:1006:auth_required]"));
+
+        let no_token_document_err = kRPC::new(bns_proxy_url.as_str(), None)
+            .call(
+                "bns.publish_document",
+                json!({
+                    "name": PROXY_USER,
+                    "doc_type": "zone",
+                    "document": { "oods": ["ood1"] }
+                }),
+            )
+            .await
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(no_token_document_err.contains("[SN:1006:auth_required]"));
 
         // --- internal-only 方法不暴露在外部 HTTP 路径 ---
         for method in ["bns.publish_relay_assignment", "bns.register_name_bootstrap"] {
