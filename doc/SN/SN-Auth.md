@@ -163,7 +163,7 @@ PKX 是 `user_domain` 唯一的证明方法。它不是一次性随机挑战，�
 - `users.user_domain` 只作兼容/主域名缓存；supersede 接管时事务内同步清空旧 owner 的同名缓存（sn_auth.rs:1013-1119），后续可考虑移除该缓存字段。
 - `user_domain_history` 改为追加式审计事件表（每次绑定获得记一行），不参与任何冲突判定（sn_auth.rs:644-672）。
 - 统一 helper：`canonical_user_domain`（去 `*.` 前缀、小写、去尾点）、`pkx_record_name`、`pkx_source_of`（JWK JSON / `PKX=<x>` / 裸值 → `sn_user.pkx`）、`pkx_value`、`txt_matches_pkx`（sn_auth.rs:24-100），全部为模块级 pub 函数，DB 层 / RPC 层 / DNS proof 层共用。
-- 一站式 `domain.bind` RPC：服务端主动查外部 DNS TXT，命中后调用 `activate_user_domain_binding` 在同一事务内激活（api/domain.rs:62-153；sn_auth.rs:1876-1927）。`domain.begin_verify` / `domain.verify` 保留为 `domain.bind` 的 alias。
+- 一站式 `domain.bind` RPC：服务端主动查外部 DNS TXT，命中后调用 `activate_user_domain_binding` 在同一事务内激活（api/domain.rs:62-153；sn_auth.rs:1876-1927）。两阶段的 `domain.begin_verify` / `domain.verify` 已删除。
 - 外部 DNS proof path：`sn_dns_proof.rs` 的 `DnsTxtResolver` trait + `DohDnsTxtResolver`（默认 `https://dns.google/dns-query`，RFC 8484；`pkx_doh_url` 配置可替换，path 以 `/resolve` 结尾时走 dns.google JSON API）。
 - 期望 `PKX(sn_user.pkx)` 来源：`did:bns:<username>` 链上 owner document / authority key 优先（owner_config key → effective_owner key），链已配置但暂不可达时返回可重试错误而不静默回落；名字不在链上时回落本地 `users.public_key`，无 owner key 的账号回落确定性 `sn-user:<username>` 标签（sn_server.rs:707-770，`expected_user_domain_pkx`）。
 
@@ -361,15 +361,15 @@ active 绑定默认持续有效，不做周期性 DNS TXT 复验。用户可手�
 
 ### 当前实现差异
 
-阶段二 user_domain TODO 已全部落地（对应实现见「当前实现映射」小节），实现上的两个明确取舍：
+阶段二 user_domain TODO 已全部落地（对应实现见「当前实现映射」小节），实现上的明确取舍：
 
 - 无 owner key 的账号（V2 密码注册、未接链）期望 PKX 回落为确定性 `sn-user:<username>` 标签：TXT 值仍能证明「DNS owner 同意绑定到该 SN 账号」的意图，保住 VM 无链部署的 user_domain 能力；账号补齐 owner key / 接入 BNS 后重新 `domain.bind` 即可升级为 key 锚定的 PKX。
-- `domain.begin_verify` / `domain.verify` 未删除，改为 `domain.bind` 的 alias：begin_verify 在 TXT 未配置时的失败响应即「挑战」（错误 payload 含 `pkx_record_name` / `pkx`），配置后重试即完成绑定；`create_pkx_binding` / `verify_pkx_binding` 两个 RPC 名与 DB 方法已删除。
+- Beta2.2 不保留两阶段验证兼容入口：`domain.begin_verify` / `domain.verify` / `create_pkx_binding` / `verify_pkx_binding` 的 RPC 名已删除，统一使用 `domain.bind`。
 
 TODO（阶段二，2026-07-06 完成）：
 
 - [x] 将 `domain.bind` 改为一站式服务端主动验证入口：规范化域名、检查用户状态、从 `did:bns:<username>` 链上 owner document / authority key 计算 `PKX(sn_user.pkx)`，然后由 SN 自己查询 DNS TXT。→ api/domain.rs:62-153 `handle_bind` + sn_server.rs `expected_user_domain_pkx`。
-- [x] 移除 `pending_pkx` 目标语义；`domain.begin_verify` / `domain.verify` / `create_pkx_binding` / `verify_pkx_binding` 可以删除、改成 `domain.bind` alias，或仅保留为测试/内部接口。→ `pending_pkx` 状态与两个 `*_pkx_binding` 接口已删除（含 S2S API），begin_verify/verify 为 bind alias；旧库中的 `pending_pkx` 行随 schema 迁移丢弃。
+- [x] 移除 `pending_pkx` 目标语义与 `domain.begin_verify` / `domain.verify` / `create_pkx_binding` / `verify_pkx_binding` RPC。→ 对应 S2S/DB 方法和兼容 alias 均已删除；旧库中的 `pending_pkx` 行随 schema 迁移丢弃。
 - [x] 移除外部客户端传入 `txt_records` 作为 proof 的信任边界。→ `DomainReq` 只接受 `domain`，携带 `txt_records` 的旧请求被忽略；e2e 断言伪造 `txt_records` 不能激活绑定。
 - [x] 修改冲突规则：`user_domain_history` 仅审计；同一 canonical domain 的旧 active binding 可被当前 DNS proof 成功的新 owner supersede；父子域名按最长 active binding 匹配，不因历史记录互斥。→ `check_domain_conflicts_tx` 已删除，`activate_binding_tx` 实现 supersede（sn_auth.rs:1013-1119）。
 - [x] DNS 查询必须走外部 DNS proof path，不能复用 SN 自己的权威/合成解析路径，不能读取 `user_dns_records`、BNS fallback 或本地 name cache。→ 独立 `sn_dns_proof.rs` 模块，仅出站 DoH。
@@ -513,7 +513,7 @@ RPC 层可以使用 breaking API，不要求保留旧 method alias。内部不�
 - `user.get_profile`
 - `zone.get`
 - `zone.bind_config`
-- `domain.bind`（一站式绑定；`domain.begin_verify` / `domain.verify` 为 alias）
+- `domain.bind`（一站式绑定）
 - `domain.unbind`
 - `dns.add_record`
 - `dns.remove_record`

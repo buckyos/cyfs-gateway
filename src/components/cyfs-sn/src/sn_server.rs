@@ -512,8 +512,6 @@ impl SNServer {
             | "user.remove_dns_record"
             | "user.list_dns_records"
             | "domain.bind"
-            | "domain.begin_verify"
-            | "domain.verify"
             | "domain.unbind" => SnRpcPath::Auth,
             "device.register"
             | "device.update"
@@ -1018,7 +1016,7 @@ impl SNServer {
             "user.list_dns_records" => {
                 handle_dns(self, Self::rewrite_rpc_method(req, "list_records")).await
             }
-            "domain.bind" | "domain.begin_verify" | "domain.verify" | "domain.unbind" => {
+            "domain.bind" | "domain.unbind" => {
                 let bare_method = req
                     .method
                     .strip_prefix("domain.")
@@ -4748,11 +4746,11 @@ mod tests {
         assert!(bind_err.contains(pkx_record.as_str()));
         let expected_pkx = extract_pkx_from_proof_error(bind_err.as_str());
 
-        // 客户端传入 txt_records 不再是信任边界：伪造 proof 无法激活绑定
-        //（domain.verify 已是 domain.bind 的 alias，服务端只认自己的 DNS 查询）。
+        // 客户端传入 txt_records 不再是信任边界：伪造 proof 无法激活绑定，
+        // 服务端只认自己的 DNS 查询。
         let forged_err = auth_user_krpc
             .call(
-                "domain.verify",
+                "domain.bind",
                 json!({
                     "domain": user_domain,
                     "txt_records": [expected_pkx]
@@ -4768,6 +4766,17 @@ mod tests {
             .await
             .unwrap();
         assert!(profile["user_domain"].is_null());
+
+        // Beta2.2 不再保留两阶段验证 API 的兼容 alias。
+        for removed_method in ["domain.begin_verify", "domain.verify"] {
+            let removed_err = auth_user_krpc
+                .call(removed_method, json!({ "domain": user_domain }))
+                .await
+                .err()
+                .unwrap()
+                .to_string();
+            assert!(removed_err.contains("not available on /kapi/sn/auth"));
+        }
 
         // 在「外部 DNS」（mock DoH）发布 PKX TXT 后，一站式 bind 成功激活。
         mock_doh.set_txt(
@@ -5464,32 +5473,6 @@ mod tests {
         assert_eq!(result["name"].as_str().unwrap(), TEST_USER);
 
         let user_domain = format!("{}.buckyos.ai", TEST_USER);
-        let result = user_krpc
-            .call(
-                "domain.begin_verify",
-                json!({
-                    "domain": user_domain
-                }),
-            )
-            .await
-            .unwrap();
-        let pkx = result["pkx"].as_str().unwrap().to_string();
-        assert_eq!(
-            result["pkx_record_name"].as_str().unwrap(),
-            format!("_pkx.{}", user_domain)
-        );
-        let result = user_krpc
-            .call(
-                "domain.verify",
-                json!({
-                    "domain": user_domain,
-                    "txt_records": [pkx]
-                }),
-            )
-            .await
-            .unwrap();
-        assert_eq!(result["code"].as_i64().unwrap(), 0);
-
         let zone_krpc = kRPC::new(bns_url.as_str(), Some(login_access_token.clone()));
         let result = zone_krpc
             .call(

@@ -157,9 +157,7 @@ pub(crate) async fn handle_domain(
     req: RPCRequest,
 ) -> RpcCallResult<RPCResponse> {
     match req.method.as_str() {
-        // begin_verify / verify 保留为 bind 的 alias：begin_verify 未配置 TXT
-        // 时的失败响应即「挑战」（含 pkx_record_name / pkx），配置后重试即绑定。
-        "bind" | "begin_verify" | "verify" => handle_bind(server, req).await,
+        "bind" => handle_bind(server, req).await,
         "unbind" => {
             let username = require_account_username(server, &req).await?;
             let params: DomainReq = parse_params(&req)?;

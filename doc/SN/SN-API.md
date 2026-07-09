@@ -126,8 +126,6 @@ RPC method 必须使用 `namespace.method` 形式。当前实现不再做 legacy
 | Method | Params | Result | 说明 |
 |--------|--------|--------|------|
 | `domain.bind` | `domain` | `code`, `domain`, `pkx`, `pkx_record_name`, `pkx_source`, `verified_at` | 一站式绑定：校验用户 active → 从 `did:bns:<username>` 链上 owner 文档解析期望 PKX（取不到时按本地记录回落）→ SN 服务端自己查外部 DNS TXT → 命中后原子激活绑定（supersede 旧绑定）。 |
-| `domain.begin_verify` | 同 `domain.bind` | 同 `domain.bind` | `domain.bind` 的 alias，语义已合并，不再是单独的“发起挑战”步骤。 |
-| `domain.verify` | 同 `domain.bind` | 同 `domain.bind` | `domain.bind` 的 alias。 |
 | `domain.unbind` | `domain` | `code` | 解绑当前用户的 user_domain。 |
 
 `domain.*` 管的是 SN 账号的 `user_domain`，不是 BNS Domain 所有权变更。
@@ -144,7 +142,7 @@ TXT 未配置或不匹配时返回可重试错误 `domain_proof_failed`（错误
 }
 ```
 
-客户端按 `pkx_record_name` / `pkx` 配置好 TXT 记录后重新调用 `domain.bind`（或 alias）即可完成绑定。breaking change：客户端不能再提交 `txt_records` / `txt_record` / `record` 参数来影响校验结果——SN 只信任自己发起的外部 DNS 查询（`pkx_doh_url` 配置的 DoH resolver），未知字段会被忽略而不是拒绝。`domain.create_pkx_binding` / `domain.verify_pkx_binding` 已删除，见第 10 节。
+客户端按 `pkx_record_name` / `pkx` 配置好 TXT 记录后重新调用 `domain.bind` 即可完成绑定。breaking change：客户端不能再提交 `txt_records` / `txt_record` / `record` 参数来影响校验结果——SN 只信任自己发起的外部 DNS 查询（`pkx_doh_url` 配置的 DoH resolver），未知字段会被忽略而不是拒绝。`domain.begin_verify` / `domain.verify` / `domain.create_pkx_binding` / `domain.verify_pkx_binding` 已删除，见第 10 节。
 
 ## 5. `/kapi/sn/deviceinfo`
 
@@ -353,7 +351,7 @@ SN 仍然提供两个标准解析面，但它们不是 SN RPC：
 | 1027 | `bns_controller_unavailable` |
 | 1099 | `internal_error` |
 
-`domain_proof_failed` 只从 `domain.bind`（含 `begin_verify`/`verify` alias）冒出，message 是 JSON，见 4.3。
+`domain_proof_failed` 只从 `domain.bind` 冒出，message 是 JSON，见 4.3。
 
 BNS 写入错误会从任意 bns-proxy 写路径冒出：`auth.register` 的 BNS 代注册、`bns.publish_dns_txt`、`bns.publish_document`、`bns.publish_relay_assignment`、`bns.register_name_bootstrap`。`CONTROLLER_SCOPE_DENIED` / `NOT_EFFECTIVE_OWNER` 映射为 `bns_permission_denied`，`NAME_ALREADY_EXISTS` 映射为 `bns_name_already_exists`，其他 BNS 写入错误映射为 `bns_write_failed`；请求结构、保留 doc_type 和 owner 身份字段保护失败映射为 `invalid_params`。`bns_proxy_unavailable` 对应「bns-proxy 未启用」或「operation 不在白名单内」；`bns_controller_unavailable` 对应「用户绑定的 controller 已不在当前配置」，需要人工迁移，不会静默重分配。
 
@@ -368,7 +366,7 @@ BNS 写入错误会从任意 bns-proxy 写路径冒出：`auth.register` 的 BNS
 | `did.set_document`、`did.get_document` | 写/读文档改用 BNS API；解析 DID 用 `GET /1.0/identifiers/{did}`。 |
 | `device.register` 发布 `mini_config_jwt` | 设备身份文档改用 BNS API；SN 的 `device.register/update` 只上报在线态。 |
 | `dns.add_record` / `dns.remove_record` | user_domain 本地记录改为 `user.add_dns_record` / `user.remove_dns_record`；BNS Domain 的 TXT/记录改用 BNS API 或 bns-proxy 的 `bns.publish_dns_txt`。 |
-| `domain.create_pkx_binding` / `domain.verify_pkx_binding` | 已删除（含对应 DB 方法）。改用 `domain.bind`；`begin_verify` / `verify` 仍保留为 alias，但已合并为一次性绑定语义，不再接受客户端提交的 `txt_records` / `txt_record` / `record`。 |
+| `domain.begin_verify` / `domain.verify` / `domain.create_pkx_binding` / `domain.verify_pkx_binding` | 已删除（含对应 DB 方法）。改用一站式 `domain.bind`；服务端不接受客户端提交的 `txt_records` / `txt_record` / `record` 作为 proof。 |
 | `query.resolve_did` / `query.resolve_hostname` / `query.resolve_device` | DID 和域名解析改用 W3C DID Resolver / DNS NameServer；OOD 建连信息改用 `deviceinfo.resolve_ood_by_*`。 |
 | `user.bind_owner_key` / `user.get_owner_key` | 已移除。owner/controller 权限管理走 BNS 侧流程（生产路径见 bns-proxy 的 `auth.register`）。 |
 
