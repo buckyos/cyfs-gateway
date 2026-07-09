@@ -49,6 +49,7 @@ impl SqliteBnsRegistryStore {
             r#"
             CREATE TABLE IF NOT EXISTS bns_names (
                 name TEXT PRIMARY KEY,
+                asset_owner TEXT NOT NULL,
                 status TEXT NOT NULL,
                 name_seq INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL,
@@ -128,10 +129,37 @@ impl SqliteBnsRegistryStore {
                 updated_at INTEGER NOT NULL,
                 payload_json TEXT NOT NULL
             );
-
-            PRAGMA user_version = 1;
             "#,
         )?;
+
+        if !has_column(&conn, "bns_names", "asset_owner")? {
+            conn.execute(
+                "ALTER TABLE bns_names ADD COLUMN asset_owner TEXT NOT NULL DEFAULT ''",
+                [],
+            )?;
+        }
+        // Run the backfill whenever empty index values remain so an interrupted
+        // migration can safely resume on the next open.
+        let rows = {
+            let mut stmt =
+                conn.prepare("SELECT name, payload_json FROM bns_names WHERE asset_owner = ''")?;
+            let mapped = stmt.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            mapped.collect::<Result<Vec<_>, _>>()?
+        };
+        for (name, payload) in rows {
+            let state: NameState = from_json(&payload)?;
+            conn.execute(
+                "UPDATE bns_names SET asset_owner = ?1 WHERE name = ?2",
+                params![state.asset_owner, name],
+            )?;
+        }
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_bns_names_asset_owner_name ON bns_names (asset_owner, name)",
+            [],
+        )?;
+        conn.pragma_update(None, "user_version", 2)?;
         Ok(())
     }
 
@@ -187,9 +215,10 @@ impl BnsRegistryStoreTx for SqliteStoreTx<'_> {
         self.tx.execute(
             r#"
             INSERT INTO bns_names
-                (name, status, name_seq, updated_at, payload_json)
-            VALUES (?1, ?2, ?3, ?4, ?5)
+                (name, asset_owner, status, name_seq, updated_at, payload_json)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6)
             ON CONFLICT(name) DO UPDATE SET
+                asset_owner = excluded.asset_owner,
                 status = excluded.status,
                 name_seq = excluded.name_seq,
                 updated_at = excluded.updated_at,
@@ -197,6 +226,7 @@ impl BnsRegistryStoreTx for SqliteStoreTx<'_> {
             "#,
             params![
                 state.name,
+                state.asset_owner,
                 state.status.as_str(),
                 to_i64(state.name_seq, "name_seq")?,
                 to_i64(state.updated_at, "updated_at")?,
@@ -212,6 +242,47 @@ impl BnsRegistryStoreTx for SqliteStoreTx<'_> {
             .prepare("SELECT payload_json FROM bns_names ORDER BY name")?;
         let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
         collect_json_rows(rows)
+    }
+
+    fn list_names_by_asset_owner(
+        &mut self,
+        asset_owner: &str,
+        after_name: Option<&str>,
+        limit: usize,
+    ) -> BnsRegistryResult<Vec<String>> {
+        let limit = to_i64(limit as u64, "limit")?;
+        let mut names = Vec::new();
+        if let Some(after_name) = after_name {
+            let after_name = canonical_bns_name(after_name)?;
+            let mut stmt = self.tx.prepare(
+                r#"
+                SELECT name
+                FROM bns_names
+                WHERE asset_owner = ?1 AND name > ?2
+                ORDER BY name
+                LIMIT ?3
+                "#,
+            )?;
+            let rows = stmt.query_map(params![asset_owner, after_name, limit], |row| row.get(0))?;
+            for row in rows {
+                names.push(row?);
+            }
+        } else {
+            let mut stmt = self.tx.prepare(
+                r#"
+                SELECT name
+                FROM bns_names
+                WHERE asset_owner = ?1
+                ORDER BY name
+                LIMIT ?2
+                "#,
+            )?;
+            let rows = stmt.query_map(params![asset_owner, limit], |row| row.get(0))?;
+            for row in rows {
+                names.push(row?);
+            }
+        }
+        Ok(names)
     }
 
     fn get_document(
@@ -742,6 +813,17 @@ fn collect_json_rows<T: DeserializeOwned>(
     Ok(values)
 }
 
+fn has_column(conn: &Connection, table: &str, column: &str) -> BnsRegistryResult<bool> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let columns = stmt.query_map([], |row| row.get::<_, String>(1))?;
+    for candidate in columns {
+        if candidate? == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 fn to_i64(value: u64, field: &'static str) -> BnsRegistryResult<i64> {
     if value > i64::MAX as u64 {
         return Err(BnsRegistryError::IntegerOutOfRange { field, value });
@@ -756,4 +838,87 @@ fn document_key_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DocumentKe
         doc_type: row.get(1)?,
         version: version as u64,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{NameStatus, OwnerSource, Principal};
+
+    const OWNER: &str = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    fn name_state() -> NameState {
+        NameState {
+            name: "alice".to_string(),
+            asset_owner: OWNER.to_string(),
+            semantic_owner: Principal::unset(),
+            effective_owner: Principal::chain_account(OWNER),
+            owner_source: OwnerSource::AssetOwnerFallback,
+            standard_transfer_enabled: true,
+            status: NameStatus::Active,
+            registered_at: 1,
+            expire_at: 100,
+            grace_until: 200,
+            updated_at: 2,
+            name_seq: 1,
+            owner_document_version: 0,
+            min_document_iat: 0,
+            owner_policy_seq: 0,
+            lineage_epoch: 0,
+            renewable: true,
+            transferable: true,
+            allow_delegated_subnames: false,
+            namespace_policy_hash: ZERO_HASH.to_string(),
+            payment_policy_hash: ZERO_HASH.to_string(),
+            alias_state_hash: ZERO_HASH.to_string(),
+        }
+    }
+
+    #[test]
+    fn schema_v2_backfills_asset_owner_index() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("bns.sqlite");
+        let state = name_state();
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                r#"
+                CREATE TABLE bns_names (
+                    name TEXT PRIMARY KEY,
+                    status TEXT NOT NULL,
+                    name_seq INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL,
+                    payload_json TEXT NOT NULL
+                );
+                PRAGMA user_version = 1;
+                "#,
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO bns_names (name, status, name_seq, updated_at, payload_json) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    &state.name,
+                    state.status.as_str(),
+                    1i64,
+                    2i64,
+                    serde_json::to_string(&state).unwrap(),
+                ],
+            )
+            .unwrap();
+        }
+
+        let store = SqliteBnsRegistryStore::open(&path).unwrap();
+        let names = store
+            .transact(|tx| tx.list_names_by_asset_owner(OWNER, None, 10))
+            .unwrap();
+        assert_eq!(names, ["alice"]);
+        assert_eq!(
+            store
+                .conn()
+                .unwrap()
+                .pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))
+                .unwrap(),
+            2
+        );
+    }
 }

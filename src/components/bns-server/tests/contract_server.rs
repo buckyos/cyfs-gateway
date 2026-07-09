@@ -3,7 +3,7 @@
 //! 覆盖测试计划 doc/SN/SN-测试计划.md §2.3：
 //! - 写路径 `tx.submit_raw`：合法 raw TX → 转发 `eth_sendRawTransaction`（断言收到的 raw 字节一致），返回 tx hash；非法 hex / 空 → 明确错误。
 //! - 不解释 payload / 不鉴权：构造签名无效的 raw TX，server 仍原样转发（拒绝在链上发生）。
-//! - 旧写 RPC 禁用：旧 `CallAuthority` 写方法返回 `UNSUPPORTED_OPERATION`。
+//! - 旧写 RPC 已移除：旧 method 返回 `UnknownMethod`。
 //! - 读路径：投影查询经 envelope 包装正确。
 //! - RPC 路由：`METHOD_SUBMIT_RAW_TX` 与别名 `submit_raw_tx` 都命中；未知 method → 错误。
 //!
@@ -12,13 +12,12 @@
 use std::sync::{Arc, Mutex};
 
 use bns_client::{
-    BnsIndexerApi, BnsNameReq, BnsRegisterNameReq, BnsRpcEnvelope, BnsSubmitRawTxReq,
+    BnsIndexerApi, BnsNameReq, BnsRpcEnvelope, BnsSubmitRawTxReq, BnsTxExecutionState,
     METHOD_QUERY_NAME_STATE, METHOD_SUBMIT_RAW_TX,
 };
 use bns_indexer::{
-    BnsRegistryStore, CallAuthority, DocumentRef, DocumentState, DocumentStatus, MutationGuard,
-    NameState, NameStatus, OwnerSource, Principal, RegisterOptions, SqliteBnsRegistryStore,
-    ZERO_HASH,
+    BnsRegistryStore, DocumentRef, DocumentState, DocumentStatus, NameState, NameStatus,
+    OwnerSource, Principal, SqliteBnsRegistryStore, ZERO_HASH,
 };
 use bns_server::{BnsContractServerHandler, BnsContractServerRpcHandler};
 use kRPC::{RPCErrors, RPCHandler, RPCRequest, RPCResult};
@@ -80,6 +79,52 @@ impl MockEthRpc {
 
     fn received(&self) -> Vec<String> {
         self.received_raw_txs.lock().unwrap().clone()
+    }
+}
+
+struct MockTxStateRpc;
+
+impl MockTxStateRpc {
+    async fn start(receipt: serde_json::Value, transaction: serde_json::Value) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = match listener.accept().await {
+                    Ok(pair) => pair,
+                    Err(_) => break,
+                };
+                let receipt = receipt.clone();
+                let transaction = transaction.clone();
+                tokio::spawn(async move {
+                    let request = read_http_request(&mut stream).await;
+                    let body = request
+                        .split_once("\r\n\r\n")
+                        .map(|(_, body)| body)
+                        .unwrap_or_default();
+                    let request: serde_json::Value = serde_json::from_str(body).unwrap();
+                    let result = match request["method"].as_str().unwrap_or_default() {
+                        "eth_getTransactionReceipt" => receipt,
+                        "eth_getTransactionByHash" => transaction,
+                        "eth_blockNumber" => serde_json::json!("0xa"),
+                        method => panic!("unexpected EVM RPC method {method}"),
+                    };
+                    let body = serde_json::to_string(&serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": request["id"],
+                        "result": result,
+                    }))
+                    .unwrap();
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+        endpoint
     }
 }
 
@@ -243,32 +288,6 @@ async fn submit_raw_tx_rejects_empty() {
     assert!(!err.code().is_empty());
 }
 
-// ---- 旧写 RPC 禁用 ----
-
-#[tokio::test]
-async fn legacy_call_authority_writes_are_unsupported() {
-    let handler = BnsContractServerHandler::new(
-        SqliteBnsRegistryStore::open_memory().unwrap(),
-        "http://127.0.0.1:1",
-    );
-    let err = handler
-        .register_name(BnsRegisterNameReq {
-            name: "bob".to_string(),
-            asset_owner: OWNER.to_string(),
-            options: RegisterOptions::default(),
-            authority_key_updates: vec![],
-            semantic_owner_after_authority: None,
-            controller_policy: vec![],
-            controller_policy_hash: String::new(),
-            initial_documents: vec![],
-            authority: CallAuthority::public(),
-            guard: MutationGuard::default(),
-        })
-        .await
-        .unwrap_err();
-    assert_eq!(err.code(), "UNSUPPORTED_OPERATION");
-}
-
 #[tokio::test]
 async fn legacy_write_methods_are_not_routed_by_rpc() {
     let handler = BnsContractServerHandler::new(
@@ -323,6 +342,79 @@ async fn read_path_resolve_document_returns_seeded_projection() {
         resolved.owner.effective_owner,
         Principal::chain_account(OWNER)
     );
+}
+
+#[tokio::test]
+async fn query_names_by_address_uses_asset_owner_index() {
+    let handler = BnsContractServerHandler::new(seeded_store(), "http://127.0.0.1:1");
+    let page = handler
+        .query_names_by_address(OWNER, None, 100)
+        .await
+        .unwrap();
+    assert_eq!(page.names, ["alice"]);
+    assert_eq!(page.next_cursor, None);
+}
+
+#[tokio::test]
+async fn query_tx_state_reports_receipt_pending_and_not_found_states() {
+    let succeeded_rpc = MockTxStateRpc::start(
+        serde_json::json!({
+            "transactionHash": TX_HASH,
+            "blockNumber": "0x8",
+            "status": "0x1"
+        }),
+        serde_json::Value::Null,
+    )
+    .await;
+    let succeeded = BnsContractServerHandler::new(
+        SqliteBnsRegistryStore::open_memory().unwrap(),
+        succeeded_rpc,
+    )
+    .query_tx_state(TX_HASH)
+    .await
+    .unwrap();
+    assert_eq!(succeeded.state, BnsTxExecutionState::Succeeded);
+    assert_eq!(succeeded.block_number, Some(8));
+    assert_eq!(succeeded.confirmations, 3);
+
+    let reverted_rpc = MockTxStateRpc::start(
+        serde_json::json!({
+            "transactionHash": TX_HASH,
+            "blockNumber": "0xa",
+            "status": "0x0"
+        }),
+        serde_json::Value::Null,
+    )
+    .await;
+    let reverted =
+        BnsContractServerHandler::new(SqliteBnsRegistryStore::open_memory().unwrap(), reverted_rpc)
+            .query_tx_state(TX_HASH)
+            .await
+            .unwrap();
+    assert_eq!(reverted.state, BnsTxExecutionState::Reverted);
+    assert_eq!(reverted.confirmations, 1);
+
+    let pending_rpc = MockTxStateRpc::start(
+        serde_json::Value::Null,
+        serde_json::json!({"hash": TX_HASH}),
+    )
+    .await;
+    let pending =
+        BnsContractServerHandler::new(SqliteBnsRegistryStore::open_memory().unwrap(), pending_rpc)
+            .query_tx_state(TX_HASH)
+            .await
+            .unwrap();
+    assert_eq!(pending.state, BnsTxExecutionState::Pending);
+    assert_eq!(pending.confirmations, 0);
+
+    let missing_rpc = MockTxStateRpc::start(serde_json::Value::Null, serde_json::Value::Null).await;
+    let missing =
+        BnsContractServerHandler::new(SqliteBnsRegistryStore::open_memory().unwrap(), missing_rpc)
+            .query_tx_state(TX_HASH)
+            .await
+            .unwrap();
+    assert_eq!(missing.state, BnsTxExecutionState::NotFound);
+    assert_eq!(missing.block_number, None);
 }
 
 // ---- RPC 路由：别名 + 未知 method ----

@@ -112,7 +112,7 @@ interface BnsRpcErrorInfo {
 
 ## 2. 当前接口总览
 
-当前 `/kapi/bns` 有 9 个可用方法：8 个投影读取方法和 1 个 raw TX 写方法。
+当前 `/kapi/bns` 有 11 个可用方法：10 个读取方法和 1 个 raw TX 写方法。
 
 | method | 兼容别名 | params | 信封内 `result` | 状态 |
 | --- | --- | --- | --- | --- |
@@ -122,20 +122,13 @@ interface BnsRpcErrorInfo {
 | `authority.get_key` | `get_authority_key` | `BnsAuthorityKeyReq` | `AuthorityKey \| null` | 可用 |
 | `document.resolve` | `resolve_document` | `BnsDocumentReq` | `ResolveResult` | 可用 |
 | `document.get_version` | `get_document_version` | `BnsDocumentVersionReq` | `DocumentState \| null` | 可用 |
+| `name.query_by_addr` | `query_names_by_address`、`query_by_addr` | `BnsAddressReq` | `BnsNamePage` | 可用 |
+| `tx.query_state` | `query_tx_state` | `BnsTxHashReq` | `BnsTxState` | 可用 |
 | `tx.submit_raw` | `submit_raw_tx` | `BnsSubmitRawTxReq` | `BnsSubmitRawTxResp` | 可用 |
 | `events.list` | `list_events` | `BnsListEventsReq` | `EventLogRecord[]` | 可用 |
 | `checkpoint.latest` | `latest_checkpoint` | `{}` | `LogCheckpoint \| null` | 可用 |
-| `owner.set_min_document_iat` | `set_min_document_iat` | `BnsSetMinDocumentIatReq` | 无 | 已注册但固定返回 `UNSUPPORTED_OPERATION` |
 
 BNS-Client 始终使用点号形式的 canonical method；下划线别名只用于兼容旧调用方。
-
-计划增加以下读方法。它们目前只记录接口意图，尚未在 BNS-Client、BNS-Indexer 或
-BNS-Server 中实现：
-
-| method | 用途 | 建议的 `params` | 建议的信封内 `result` | 状态 |
-| --- | --- | --- | --- | --- |
-| `name.query_by_addr` | 按 EVM 地址查询该地址持有的名称 | `BnsAddressReq` | `BnsNamePage` | **TODO** |
-| `tx.query_state` | 查询已提交交易的执行状态 | `BnsTxHashReq` | `BnsTxState` | **TODO** |
 
 ## 3. 读取接口
 
@@ -242,12 +235,12 @@ BNS-Server 中实现：
 
 返回 `LogCheckpoint | null`；还没有 checkpoint 时底层结果为 `null`。
 
-### 3.9 `name.query_by_addr`（TODO）
+### 3.9 `name.query_by_addr`
 
-通过一个 EVM 地址查询该地址持有的 name 列表。建议按 `NameState.asset_owner` 建立反向索引，
-而不是按可能继承或指向 BNS name 的 `effective_owner` 查询。
+通过一个 EVM 地址查询该地址持有的 name 列表。“持有”严格指当前 `NameState.asset_owner`，
+不按可能继承或指向 BNS name 的 `effective_owner` 查询。
 
-建议请求：
+请求：
 
 ```json
 {
@@ -257,7 +250,7 @@ BNS-Server 中实现：
 }
 ```
 
-建议返回：
+返回：
 
 ```json
 {
@@ -266,14 +259,16 @@ BNS-Server 中实现：
 }
 ```
 
-TODO：
+分页规则：
 
-- 在 BNS-Indexer 中增加 `asset_owner -> name` 反向索引和分页查询；
-- 在 BNS-Client 中增加 method 常量、请求/响应类型、trait 方法及 kRPC 调用；
-- 在 BNS-Server 中增加 RPC route；
-- 最终确认“持有”是否严格指 `asset_owner`，以及 cursor 的编码和稳定排序规则。
+- EVM 地址会解析并规范化为小写 `0x` 十六进制地址；非法地址返回 `INVALID_ADDRESS`。
+- SQLite 投影使用 `(asset_owner, name)` 联合索引，结果按 canonical name 的字典序稳定排序。
+- `cursor` 是上一页最后一个 canonical name；下一页查询 `name > cursor`，不重复返回 cursor
+  对应项。cursor 格式非法时返回 `INVALID_NAME`。
+- `limit` 必须在 `1..=1000`；否则返回 `INVALID_LIMIT`。
+- 只有确实存在下一页时 `next_cursor` 才有值，其值为本页最后一个 name。
 
-建议类型：
+类型：
 
 ```ts
 interface BnsAddressReq {
@@ -288,12 +283,12 @@ interface BnsNamePage {
 }
 ```
 
-### 3.10 `tx.query_state`（TODO）
+### 3.10 `tx.query_state`
 
 按交易 hash 查询交易是否仍在 pending、已经成功执行、已经 revert，或者链节点尚未找到该交易。
-建议返回非 nullable 的状态对象，以避免 `result: null` 与 BNS 信封缺少 result 的现有歧义。
+返回非 nullable 的状态对象，以避免 `result: null` 与 BNS 信封缺少 result 的现有歧义。
 
-建议请求：
+请求：
 
 ```json
 {
@@ -301,7 +296,7 @@ interface BnsNamePage {
 }
 ```
 
-建议返回：
+返回：
 
 ```json
 {
@@ -312,7 +307,7 @@ interface BnsNamePage {
 }
 ```
 
-建议类型：
+类型：
 
 ```ts
 type BnsTxExecutionState = "not_found" | "pending" | "succeeded" | "reverted";
@@ -329,15 +324,21 @@ interface BnsTxState {
 }
 ```
 
-TODO：
+判定规则：
 
-- 在 BNS-Server 中组合上游 EVM RPC 的 `eth_getTransactionByHash`、
-  `eth_getTransactionReceipt` 和 `eth_blockNumber`；
-- 在 BNS-Client 中增加 method 常量、类型、trait 方法和 kRPC 调用；
-- 明确 `not_found` 与已从 mempool 丢弃/替换交易的区分能力，以及确认数定义。
+- receipt 存在且 `status == 0`：`reverted`；其他 receipt 状态：`succeeded`。
+- receipt 不存在、但 `eth_getTransactionByHash` 找到交易：`pending`。
+- receipt 和 transaction 都找不到：`not_found`。
+- 已入块交易的确认数定义为 `latest_block - receipt_block + 1`；pending、not found 或 receipt
+  缺少 block number 时为 `0`。
+
+`not_found` 只表示当前上游节点没有该 transaction 和 receipt，无法区分“从未见过”、mempool
+丢弃、同 nonce 替换或节点裁剪历史。需要这种区分时，调用方应自行保存提交记录和 replacement
+关系。
 
 当前 `BnsEvmControllerClient::wait_for_receipt` 已能由 Client 直连链节点轮询 receipt，并可通过
-`with_receipt_wait(...)` 在提交后等待指定确认数；这不是 BNS-Server RPC，不能替代上述 TODO。
+`with_receipt_wait(...)` 在提交后等待指定确认数；它适合提交方主动等待，`tx.query_state` 则适合
+任意 BNS-Client 后续查询。
 
 ## 4. 写接口
 
@@ -396,11 +397,15 @@ TODO：
 | `max_fee_per_gas` | `2_000_000_000` | wei/gas，即 2 gwei |
 | `max_priority_fee_per_gas` | `1_000_000_000` | wei/gas，即 1 gwei |
 
-`EthRpcClient` 已提供 `eth_gasPrice` 和 `eth_maxPriorityFeePerGas` helper，但当前交易构造流程没有
-自动使用它们，也没有 `eth_estimateGas` helper。生产环境调用方目前需要在创建
-`BnsEvmClientConfig` 时自行提供合适的 gas limit 和 EIP-1559 fee cap。
+`EthRpcClient` 提供 `gas_price`、`max_priority_fee_per_gas`、`estimate_gas` 和
+`suggest_eip1559_fees`。动态 fee cap 使用
+`2 * eth_gasPrice + eth_maxPriorityFeePerGas`，为短期 base fee 增长保留余量。
 
-TODO：增加动态 fee suggestion 与 `eth_estimateGas`，避免生产环境沿用 Anvil 的固定默认值。
+`BnsEvmStandardClient::build_unsigned_tx_with_suggestion(call, from, nonce)` 会调用上述 helper，
+给 `eth_estimateGas` 结果增加向上取整的 20% buffer，并同时返回 unsigned TX 和
+`BnsEvmTxSuggestion`。`BnsEvmControllerClient` 可通过 `with_dynamic_tx_params(true)` 对每笔交易
+启用相同流程。该选项默认关闭，以保留 Anvil 测试和自定义 fee policy 的确定性；生产调用方应
+显式开启，或继续自行提供经过评估的静态配置。
 
 ### 4.2 交易构造、签名与提交 helper
 
@@ -411,6 +416,7 @@ TODO：增加动态 fee suggestion 与 `eth_estimateGas`，避免生产环境沿
 | 合约调用对象 | `register_name_call`、`bootstrap_name_call`、`apply_mutations_call`、`publish_document_call`、`revoke_document_call`、`set_min_document_iat_call`、`set_controller_policy_call`、`update_authority_keys_call` | 把 BNS 请求结构转换为 Alloy `SolCall` |
 | calldata | `BnsEvmStandardClient::build_calldata` | ABI 编码一个 `SolCall` |
 | unsigned TX | `BnsEvmStandardClient::build_unsigned_tx` | 使用 config 和调用方传入的 nonce 构造 `TxEip1559` |
+| 动态 unsigned TX | `BnsEvmStandardClient::build_unsigned_tx_with_suggestion` | 使用 `eth_estimateGas` 和动态 EIP-1559 fee suggestion 构造交易 |
 | 签名 | `BnsEvmKeyManager::sign_transaction`、`StaticBnsEvmKeyManager` | 对 `TxEip1559` 签名并生成 raw TX |
 | 完整流程 | `BnsEvmControllerClient::sign_and_submit` 及各业务方法 | 获取 nonce、构造、签名、提交，并可选等待 receipt |
 
@@ -623,6 +629,8 @@ interface LogCheckpoint {
 - `name` 不能带 `did:bns:` 前缀，总长最多 253 字节；只允许小写 ASCII 字母、数字、`-` 和
   `.`；每个 label 最多 126 字节，不能为空且不能以 `-` 开头或结尾。
 - `doc_type` 最长 32 字节；只允许小写 ASCII 字母、数字、`-` 和 `_`。
+- `name.query_by_addr.address` 必须是 20 字节 EVM 地址；`tx.query_state.tx_hash` 必须是 32 字节
+  transaction hash。
 
 常见错误码：
 
@@ -630,32 +638,36 @@ interface LogCheckpoint {
 | --- | --- |
 | `INVALID_NAME` | 名称格式非法 |
 | `INVALID_DOC_TYPE` | 文档类型格式非法 |
+| `INVALID_ADDRESS` | EVM 地址格式非法 |
+| `INVALID_LIMIT` | 分页 limit 不在 `1..=1000` |
 | `NAME_NOT_FOUND` | 名称不存在 |
 | `DOCUMENT_NOT_FOUND` | 当前文档不存在 |
 | `DOCUMENT_INCONSISTENT` | 投影文档与链上状态不一致 |
-| `SERIALIZATION_ERROR` | Client/Server JSON 或 raw TX hex 编解码失败 |
+| `SERIALIZATION_ERROR` | Client/Server JSON、raw TX hex 或 transaction hash 编解码失败 |
 | `RPC_TRANSPORT_ERROR` | HTTP/kRPC 或上游 EVM RPC 调用失败 |
 | `SQLITE_ERROR` / `DB_LOCK_POISONED` | 本地投影存储失败 |
-| `UNSUPPORTED_OPERATION` | 调用了当前 Server 禁用的旧写操作 |
 
 `error.name`、`error.doc_type`、`error.expected`、`error.actual` 仅在对应错误包含这些上下文时
 有值，其余情况下为 `null`。
 
-## 7. BNS-Client 中保留但当前 BNS-Server 不提供的写 RPC
+## 7. 已删除的遗留写 RPC
 
-`BnsIndexerApi` 为兼容遗留中心化 registry，以及供 EVM calldata/签名流程复用请求结构，仍声明
-了以下 `CallAuthority` 写方法。它们不是当前 `/kapi/bns` 的可用写接口。
+Beta2.2 已从 BNS-Client 和 BNS-Server 删除遗留中心化写 RPC 的 method 常量、响应类型、
+`BnsIndexerApi` trait 方法、kRPC client 调用和 server/indexer route。以下 method 现在统一由 kRPC
+返回 `UnknownMethod`：
 
-| method | BNS-Client 请求/响应类型 | 当前 `/kapi/bns` 行为 |
-| --- | --- | --- |
-| `name.register` | `BnsRegisterNameReq` / `BnsRegisterNameResp` | method 未注册，kRPC `UnknownMethod` |
-| `name.bootstrap` | `BnsBootstrapNameReq` / `BnsBootstrapNameResp` | method 未注册，kRPC `UnknownMethod` |
-| `mutation.apply` | `BnsApplyMutationsReq` / `BnsApplyMutationsResp` | method 未注册，kRPC `UnknownMethod` |
-| `document.publish` | `BnsPublishDocumentReq` / `BnsPublishDocumentResp` | method 未注册，kRPC `UnknownMethod` |
-| `document.revoke` | `BnsRevokeDocumentReq` / `BnsRevokeDocumentResp` | method 未注册，kRPC `UnknownMethod` |
-| `owner.set_min_document_iat` | `BnsSetMinDocumentIatReq` / `BnsSetMinDocumentIatResp` | 已注册，但固定返回 `UNSUPPORTED_OPERATION` |
-| `controller.set_policy` | `BnsSetControllerPolicyReq` / `BnsSetControllerPolicyResp` | method 未注册，kRPC `UnknownMethod` |
-| `authority.update_keys` | `BnsUpdateAuthorityKeysReq` / `BnsUpdateAuthorityKeysResp` | method 未注册，kRPC `UnknownMethod` |
+- `name.register`
+- `name.bootstrap`
+- `mutation.apply`
+- `document.publish`
+- `document.revoke`
+- `owner.set_min_document_iat`
+- `controller.set_policy`
+- `authority.update_keys`
+
+`BnsRegisterNameReq`、`BnsBootstrapNameReq`、`BnsApplyMutationsReq`、`BnsPublishDocumentReq` 等请求
+结构仍保留，因为 EVM calldata 构造、签名管理器和 SN BNS Controller 会复用这些业务参数；保留
+请求结构不代表存在同名 RPC。
 
 正确写入流程为：
 
@@ -671,7 +683,8 @@ BNS-Controller / 外部签名方
 ## 8. 当前实现注意事项
 
 1. 读接口返回的是 Indexer 投影，不保证与链 tip 同步；需要结合 Indexer 同步状态判断新鲜度。
-2. `tx.submit_raw` 不等待 receipt；方法成功不能替代交易成功确认。
+2. `tx.submit_raw` 不等待 receipt；方法成功不能替代交易成功确认。可随后调用
+   `tx.query_state`，或由提交方使用 `wait_for_receipt`。
 3. `BnsRpcEnvelope<T>` 用 `Option<T>` 同时表示“信封是否有 result”和“业务结果可为空”。对于
    `NameState | null`、`AuthorityKey | null`、`DocumentState | null`、`LogCheckpoint | null`
    这类结果，Server 可以在线上返回 `ok: true, result: null`，但当前 Rust

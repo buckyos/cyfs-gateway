@@ -1,15 +1,10 @@
 use std::collections::{HashMap, HashSet};
+use std::str::FromStr;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use bns_client::{
-    BnsApplyMutationsReq, BnsApplyMutationsResp, BnsBootstrapNameReq, BnsBootstrapNameResp,
-    BnsClientError, BnsClientResult, BnsDocumentVersion, BnsIndexerApi, BnsPublishDocumentReq,
-    BnsPublishDocumentResp, BnsRegisterNameReq, BnsRegisterNameResp, BnsRevokeDocumentReq,
-    BnsRevokeDocumentResp, BnsSetControllerPolicyReq, BnsSetControllerPolicyResp,
-    BnsSetMinDocumentIatReq, BnsSetMinDocumentIatResp, BnsUpdateAuthorityKeysReq,
-    BnsUpdateAuthorityKeysResp,
-};
+use bns_client::{BnsClientResult, BnsIndexerApi, BnsNamePage, MAX_BNS_NAMES_PAGE_SIZE};
+use bns_evm::Address;
 use serde_json::Value;
 
 use crate::{
@@ -101,189 +96,15 @@ where
             .map_err(Into::into)
     }
 
-    async fn register_name(&self, req: BnsRegisterNameReq) -> BnsClientResult<BnsRegisterNameResp> {
-        let has_bootstrap_fields = !req.authority_key_updates.is_empty()
-            || req.semantic_owner_after_authority.is_some()
-            || !req.controller_policy.is_empty()
-            || (!req.controller_policy_hash.is_empty() && req.controller_policy_hash != ZERO_HASH);
-        let name_seq = if has_bootstrap_fields {
-            self.registry
-                .bootstrap_name(
-                    &req.name,
-                    &req.asset_owner,
-                    req.options,
-                    req.initial_documents,
-                    req.authority_key_updates,
-                    req.semantic_owner_after_authority,
-                    req.controller_policy,
-                    &req.controller_policy_hash,
-                    req.authority,
-                    req.guard,
-                )
-                .map(|result| result.name_seq)
-        } else {
-            self.registry.register_name(
-                &req.name,
-                &req.asset_owner,
-                req.options,
-                req.initial_documents,
-                req.authority,
-                req.guard,
-            )
-        }
-        .map_err(BnsClientError::from)?;
-        Ok(BnsRegisterNameResp { name_seq })
-    }
-
-    async fn apply_mutations(
+    async fn query_names_by_address(
         &self,
-        req: BnsApplyMutationsReq,
-    ) -> BnsClientResult<BnsApplyMutationsResp> {
-        let result = self
-            .registry
-            .apply_mutations(
-                &req.name,
-                req.authority_key_updates,
-                req.documents,
-                req.owner_policy,
-                req.authority,
-                req.guard,
-            )
-            .map_err(BnsClientError::from)?;
-        Ok(BnsApplyMutationsResp {
-            name_seq: result.name_seq,
-            documents: result
-                .documents
-                .into_iter()
-                .map(|document| BnsDocumentVersion {
-                    doc_type: document.doc_type,
-                    version: document.version,
-                    content_hash: document.content_hash,
-                    document_state_hash: document.document_state_hash,
-                })
-                .collect(),
-            authority_set: result.authority_set,
-            owner_policy_seq: result.owner_policy_seq,
-        })
-    }
-
-    async fn bootstrap_name(
-        &self,
-        req: BnsBootstrapNameReq,
-    ) -> BnsClientResult<BnsBootstrapNameResp> {
-        let result = self
-            .registry
-            .bootstrap_name(
-                &req.name,
-                &req.asset_owner,
-                req.options,
-                req.initial_documents,
-                req.authority_key_updates,
-                req.semantic_owner_after_authority,
-                req.controller_policy,
-                &req.controller_policy_hash,
-                req.authority,
-                req.guard,
-            )
-            .map_err(BnsClientError::from)?;
-        Ok(BnsBootstrapNameResp {
-            name_seq: result.name_seq,
-            initial_documents: result
-                .initial_documents
-                .into_iter()
-                .map(|document| BnsDocumentVersion {
-                    doc_type: document.doc_type,
-                    version: document.version,
-                    content_hash: document.content_hash,
-                    document_state_hash: document.document_state_hash,
-                })
-                .collect(),
-            authority_set: result.authority_set,
-            controller_policy_hash: result.controller_policy_hash,
-        })
-    }
-
-    async fn publish_document(
-        &self,
-        req: BnsPublishDocumentReq,
-    ) -> BnsClientResult<BnsPublishDocumentResp> {
-        let document_version = self
-            .registry
-            .publish_document(&req.name, req.update, req.authority, req.guard)
-            .map_err(BnsClientError::from)?;
-        Ok(BnsPublishDocumentResp { document_version })
-    }
-
-    async fn revoke_document(
-        &self,
-        req: BnsRevokeDocumentReq,
-    ) -> BnsClientResult<BnsRevokeDocumentResp> {
-        let (document_version, name_seq) = self
-            .registry
-            .revoke_document(
-                &req.name,
-                &req.doc_type,
-                req.expected_version,
-                &req.reason_hash,
-                req.authority,
-                req.guard,
-            )
-            .map_err(BnsClientError::from)?;
-        Ok(BnsRevokeDocumentResp {
-            document_version,
-            name_seq,
-        })
-    }
-
-    async fn set_min_document_iat(
-        &self,
-        req: BnsSetMinDocumentIatReq,
-    ) -> BnsClientResult<BnsSetMinDocumentIatResp> {
-        let (name_seq, owner_policy_seq) = self
-            .registry
-            .set_min_document_iat(
-                &req.name,
-                req.min_document_iat,
-                &req.reason_hash,
-                req.authority,
-                req.guard,
-            )
-            .map_err(BnsClientError::from)?;
-        Ok(BnsSetMinDocumentIatResp {
-            name_seq,
-            owner_policy_seq,
-        })
-    }
-
-    async fn set_controller_policy(
-        &self,
-        req: BnsSetControllerPolicyReq,
-    ) -> BnsClientResult<BnsSetControllerPolicyResp> {
-        let name_seq = self
-            .registry
-            .set_controller_policy(
-                &req.name,
-                req.rules,
-                &req.policy_hash,
-                req.authority,
-                req.guard,
-            )
-            .map_err(BnsClientError::from)?;
-        Ok(BnsSetControllerPolicyResp {
-            name_seq,
-            policy_hash: req.policy_hash,
-        })
-    }
-
-    async fn update_authority_keys(
-        &self,
-        req: BnsUpdateAuthorityKeysReq,
-    ) -> BnsClientResult<BnsUpdateAuthorityKeysResp> {
-        let authority_set = self
-            .registry
-            .update_authority_keys(&req.name, req.updates, req.authority, req.guard)
-            .map_err(BnsClientError::from)?;
-        Ok(BnsUpdateAuthorityKeysResp { authority_set })
+        address: &str,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> BnsClientResult<BnsNamePage> {
+        self.registry
+            .query_names_by_address(address, cursor, limit)
+            .map_err(Into::into)
     }
 
     async fn list_events(
@@ -340,6 +161,37 @@ where
             tx.get_name(&name)?
                 .map(|state| self.materialize_name_state(tx, state))
                 .transpose()
+        })
+    }
+
+    pub fn query_names_by_address(
+        &self,
+        address: &str,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> BnsRegistryResult<BnsNamePage> {
+        if limit == 0 || limit > MAX_BNS_NAMES_PAGE_SIZE {
+            return Err(BnsRegistryError::InvalidLimit {
+                limit,
+                max: MAX_BNS_NAMES_PAGE_SIZE,
+            });
+        }
+        let address = Address::from_str(address.trim()).map_err(|error| {
+            BnsRegistryError::InvalidAddress {
+                address: address.to_string(),
+                reason: error.to_string(),
+            }
+        })?;
+        let address = format!("{address:#x}");
+        let fetch_limit = limit.saturating_add(1);
+        self.store.transact(|tx| {
+            let mut names = tx.list_names_by_asset_owner(&address, cursor, fetch_limit)?;
+            let has_more = names.len() > limit;
+            if has_more {
+                names.truncate(limit);
+            }
+            let next_cursor = has_more.then(|| names.last().cloned()).flatten();
+            Ok(BnsNamePage { names, next_cursor })
         })
     }
 

@@ -119,6 +119,12 @@ pub struct EthTransactionReceipt {
     pub gas_used: Option<u64>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Eip1559FeeSuggestion {
+    pub max_fee_per_gas: u128,
+    pub max_priority_fee_per_gas: u128,
+}
+
 #[derive(Debug, Clone)]
 pub struct EthRpcClient {
     endpoint: String,
@@ -165,6 +171,37 @@ impl EthRpcClient {
     pub async fn max_priority_fee_per_gas(&self) -> BnsEvmResult<u128> {
         let value: String = self.call("eth_maxPriorityFeePerGas", json!([])).await?;
         parse_quantity(&value).map(u128::from)
+    }
+
+    /// Suggest EIP-1559 fee caps from the node's current gas price and priority
+    /// fee. The doubled gas price leaves room for short-term base-fee growth.
+    pub async fn suggest_eip1559_fees(&self) -> BnsEvmResult<Eip1559FeeSuggestion> {
+        let gas_price = self.gas_price().await?;
+        let priority_fee = self.max_priority_fee_per_gas().await?;
+        Ok(Eip1559FeeSuggestion {
+            max_fee_per_gas: gas_price.saturating_mul(2).saturating_add(priority_fee),
+            max_priority_fee_per_gas: priority_fee,
+        })
+    }
+
+    pub async fn estimate_gas(
+        &self,
+        from: Address,
+        to: Address,
+        calldata: &[u8],
+    ) -> BnsEvmResult<u64> {
+        let value: String = self
+            .call(
+                "eth_estimateGas",
+                json!([{
+                    "from": hex_address(from),
+                    "to": hex_address(to),
+                    "data": format!("0x{}", hex::encode(calldata)),
+                    "value": "0x0",
+                }]),
+            )
+            .await?;
+        parse_quantity(&value)
     }
 
     pub async fn send_raw_transaction(&self, raw_tx: &[u8]) -> BnsEvmResult<B256> {

@@ -1,15 +1,15 @@
-use ::kRPC::{RPCHandler, RPCRequest, RPCResult};
+use ::kRPC::{RPCErrors, RPCHandler, RPCRequest};
 use async_trait::async_trait;
 use bns_client::{
     publish_document_call, register_name_call, BindZoneDocumentsParams, BnsApplyMutationsReq,
     BnsClientError, BnsClientResult, BnsEvmClientConfig, BnsEvmKeyManager, BnsEvmSignRequest,
     BnsEvmStandardClient, BnsEvmTxSubmission, BnsEvmWriteOperation, BnsIndexerApi,
     BnsIndexerClient, BnsIndexerRpcHandler, BnsPublishDocumentReq, BnsRegisterNameReq,
-    BnsRegisterNameResp, BnsRpcEnvelope, BnsWriteReceiptStatus, BootstrapNameParams, DnsTxtUpdate,
-    MemorySnBnsWriteRequestStore, PublishDeviceMiniDocParams, PublishRelayAssignmentParams,
-    SnBnsController, SnBnsControllerConfig, SnBnsControllerError, SnBnsEvmSubmitter,
-    StaticBnsEvmKeyManager, UpsertDnsTxtParams, BOOT_DOC_TYPE, DEVICE_MINI_DOC_TYPE,
-    METHOD_REGISTER_NAME, RELAY_ASSIGNMENT_DOC_TYPE, ZONE_DOC_TYPE,
+    BnsWriteReceiptStatus, BootstrapNameParams, DnsTxtUpdate, MemorySnBnsWriteRequestStore,
+    PublishDeviceMiniDocParams, PublishRelayAssignmentParams, SnBnsController,
+    SnBnsControllerConfig, SnBnsControllerError, SnBnsEvmSubmitter, StaticBnsEvmKeyManager,
+    UpsertDnsTxtParams, BOOT_DOC_TYPE, DEVICE_MINI_DOC_TYPE, RELAY_ASSIGNMENT_DOC_TYPE,
+    ZONE_DOC_TYPE,
 };
 use bns_evm::{AuthorityRole as EvmAuthorityRole, PrincipalKind as EvmPrincipalKind, SolCall};
 use bns_indexer::dns_document::{self, DNS_TXT_DOC_TYPE};
@@ -374,34 +374,16 @@ async fn static_evm_key_manager_signs_tx_for_authority_context() {
 }
 
 #[tokio::test]
-async fn rpc_handler_wraps_registry_result_in_envelope() {
+async fn legacy_write_rpc_is_not_registered() {
     let handler = BnsIndexerRpcHandler::new(CentralizedBnsIndexerHandler::new(registry()));
-    let req = BnsRegisterNameReq {
-        name: "alice".to_string(),
-        asset_owner: OWNER.to_string(),
-        options: RegisterOptions::default(),
-        authority_key_updates: vec![],
-        semantic_owner_after_authority: None,
-        controller_policy: vec![],
-        controller_policy_hash: String::new(),
-        initial_documents: vec![],
-        authority: CallAuthority::public(),
-        guard: MutationGuard::default(),
-    };
-    let rpc_req = RPCRequest::new(METHOD_REGISTER_NAME, serde_json::to_value(req).unwrap());
-
-    let response = handler
-        .handle_rpc_call(rpc_req, IpAddr::V4(Ipv4Addr::LOCALHOST))
+    let error = handler
+        .handle_rpc_call(
+            RPCRequest::new("name.register", json!({})),
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+        )
         .await
-        .unwrap();
-    let value = match response.result {
-        RPCResult::Success(value) => value,
-        RPCResult::Failed(error) => panic!("unexpected rpc failure: {error}"),
-    };
-    let envelope: BnsRpcEnvelope<BnsRegisterNameResp> = serde_json::from_value(value).unwrap();
-
-    assert!(envelope.ok);
-    assert_eq!(envelope.into_result().unwrap().name_seq, 1);
+        .unwrap_err();
+    assert!(matches!(error, RPCErrors::UnknownMethod(method) if method == "name.register"));
 }
 
 #[test]
@@ -738,32 +720,27 @@ async fn sn_controller_rejects_controller_doc_type_outside_configured_scope() {
 #[tokio::test]
 async fn bns_client_preserves_stale_guard_error_codes() {
     let registry = registry();
-    let client = in_process_client(registry);
-    client
-        .register_name(BnsRegisterNameReq {
-            name: "alice".to_string(),
-            asset_owner: OWNER.to_string(),
-            options: RegisterOptions::default(),
-            authority_key_updates: vec![],
-            semantic_owner_after_authority: None,
-            controller_policy: vec![],
-            controller_policy_hash: String::new(),
-            initial_documents: vec![],
-            authority: CallAuthority::public(),
-            guard: MutationGuard::default(),
-        })
-        .await
+    registry
+        .register_name(
+            "alice",
+            OWNER,
+            RegisterOptions::default(),
+            vec![],
+            CallAuthority::public(),
+            MutationGuard::default(),
+        )
         .unwrap();
 
-    let stale_name_seq = client
-        .publish_document(BnsPublishDocumentReq {
-            name: "alice".to_string(),
-            update: inline_update("zone", 0, r#"{"version":1}"#),
-            authority: owner_authority(),
-            guard: guard(0),
-        })
-        .await
-        .unwrap_err();
+    let stale_name_seq = BnsClientError::from(
+        registry
+            .publish_document(
+                "alice",
+                inline_update("zone", 0, r#"{"version":1}"#),
+                owner_authority(),
+                guard(0),
+            )
+            .unwrap_err(),
+    );
     assert_eq!(stale_name_seq.code(), "STALE_NAME_SEQ");
     match stale_name_seq {
         BnsClientError::Registry(info) => {
@@ -774,26 +751,26 @@ async fn bns_client_preserves_stale_guard_error_codes() {
         other => panic!("unexpected error: {other:?}"),
     }
 
-    let published = client
-        .publish_document(BnsPublishDocumentReq {
-            name: "alice".to_string(),
-            update: inline_update("zone", 0, r#"{"version":1}"#),
-            authority: owner_authority(),
-            guard: guard(1),
-        })
-        .await
+    let published = registry
+        .publish_document(
+            "alice",
+            inline_update("zone", 0, r#"{"version":1}"#),
+            owner_authority(),
+            guard(1),
+        )
         .unwrap();
-    assert_eq!(published.document_version, 1);
+    assert_eq!(published, 1);
 
-    let stale_document_version = client
-        .publish_document(BnsPublishDocumentReq {
-            name: "alice".to_string(),
-            update: inline_update("zone", 0, r#"{"version":2}"#),
-            authority: owner_authority(),
-            guard: guard(2),
-        })
-        .await
-        .unwrap_err();
+    let stale_document_version = BnsClientError::from(
+        registry
+            .publish_document(
+                "alice",
+                inline_update("zone", 0, r#"{"version":2}"#),
+                owner_authority(),
+                guard(2),
+            )
+            .unwrap_err(),
+    );
     assert_eq!(stale_document_version.code(), "STALE_DOCUMENT_VERSION");
     match stale_document_version {
         BnsClientError::Registry(info) => {

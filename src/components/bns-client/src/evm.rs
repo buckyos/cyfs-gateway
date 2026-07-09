@@ -107,6 +107,14 @@ pub struct BnsEvmTxReceipt {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BnsEvmTxSuggestion {
+    pub estimated_gas: u64,
+    pub gas_limit: u64,
+    pub max_fee_per_gas: u128,
+    pub max_priority_fee_per_gas: u128,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BnsEvmReceiptWaitConfig {
     pub timeout_ms: u64,
     pub poll_interval_ms: u64,
@@ -315,6 +323,49 @@ impl BnsEvmStandardClient {
             self.config.tx_params(nonce)?,
         ))
     }
+
+    /// Build a transaction from live node estimates. A 20% buffer is added to
+    /// `eth_estimateGas`; fee caps come from the node's EIP-1559 suggestion.
+    pub async fn build_unsigned_tx_with_suggestion<C: SolCall>(
+        &self,
+        call: &C,
+        from: Address,
+        nonce: u64,
+    ) -> BnsClientResult<(TxEip1559, BnsEvmTxSuggestion)> {
+        let to = self.config.contract()?;
+        let calldata = self.build_calldata(call);
+        let estimated_gas = self
+            .rpc
+            .estimate_gas(from, to, &calldata)
+            .await
+            .map_err(BnsClientError::from)?;
+        let gas_buffer = estimated_gas / 5 + u64::from(estimated_gas % 5 != 0);
+        let gas_limit = estimated_gas.saturating_add(gas_buffer);
+        let fees = self
+            .rpc
+            .suggest_eip1559_fees()
+            .await
+            .map_err(BnsClientError::from)?;
+        let suggestion = BnsEvmTxSuggestion {
+            estimated_gas,
+            gas_limit,
+            max_fee_per_gas: fees.max_fee_per_gas,
+            max_priority_fee_per_gas: fees.max_priority_fee_per_gas,
+        };
+        let tx = build_eip1559_contract_tx(
+            call,
+            Eip1559TxParams {
+                chain_id: self.config.chain_id,
+                nonce,
+                to,
+                gas_limit: suggestion.gas_limit,
+                max_fee_per_gas: suggestion.max_fee_per_gas,
+                max_priority_fee_per_gas: suggestion.max_priority_fee_per_gas,
+                value: U256::ZERO,
+            },
+        );
+        Ok((tx, suggestion))
+    }
 }
 
 pub struct BnsEvmControllerClient {
@@ -325,6 +376,7 @@ pub struct BnsEvmControllerClient {
     next_nonces: Mutex<HashMap<Address, u64>>,
     submission_lock: tokio::sync::Mutex<()>,
     receipt_wait: Option<BnsEvmReceiptWaitConfig>,
+    dynamic_tx_params: bool,
 }
 
 impl BnsEvmControllerClient {
@@ -378,6 +430,7 @@ impl BnsEvmControllerClient {
             next_nonces: Mutex::new(HashMap::new()),
             submission_lock: tokio::sync::Mutex::new(()),
             receipt_wait: None,
+            dynamic_tx_params: false,
         }
     }
 
@@ -411,6 +464,14 @@ impl BnsEvmControllerClient {
         self
     }
 
+    /// Opt into live `eth_estimateGas` and fee suggestions for each signed
+    /// transaction. Static config values remain useful for deterministic Anvil
+    /// tests and callers that manage fee policy themselves.
+    pub fn with_dynamic_tx_params(mut self, enabled: bool) -> Self {
+        self.dynamic_tx_params = enabled;
+        self
+    }
+
     pub fn signer_address(&self) -> Option<Address> {
         self.default_signer_address
     }
@@ -436,7 +497,21 @@ impl BnsEvmControllerClient {
         let signer_address = self.key_manager.signer_address(request).await?;
         let _submission_guard = self.submission_lock.lock().await;
         let nonce = self.next_nonce(signer_address).await?;
-        let tx = self.standard.build_unsigned_tx(call, nonce)?;
+        let tx = if self.dynamic_tx_params {
+            self.standard
+                .build_unsigned_tx_with_suggestion(call, signer_address, nonce)
+                .await
+                .map(|(tx, _)| tx)
+        } else {
+            self.standard.build_unsigned_tx(call, nonce)
+        };
+        let tx = match tx {
+            Ok(tx) => tx,
+            Err(error) => {
+                self.reset_nonce(signer_address);
+                return Err(error);
+            }
+        };
         let signed = match self.key_manager.sign_transaction(request, tx).await {
             Ok(signed) => signed,
             Err(error) => {

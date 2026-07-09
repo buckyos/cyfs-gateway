@@ -14,6 +14,12 @@ pub trait BnsRegistryStoreTx {
     fn get_name(&mut self, name: &str) -> BnsRegistryResult<Option<NameState>>;
     fn put_name(&mut self, state: &NameState) -> BnsRegistryResult<()>;
     fn list_names(&mut self) -> BnsRegistryResult<Vec<NameState>>;
+    fn list_names_by_asset_owner(
+        &mut self,
+        asset_owner: &str,
+        after_name: Option<&str>,
+        limit: usize,
+    ) -> BnsRegistryResult<Vec<String>>;
 
     fn get_document(
         &mut self,

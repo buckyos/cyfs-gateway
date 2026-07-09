@@ -8,6 +8,12 @@ pub enum BnsRegistryError {
     #[error("invalid BNS document type `{doc_type}`: {reason}")]
     InvalidDocType { doc_type: String, reason: String },
 
+    #[error("invalid EVM address `{address}`: {reason}")]
+    InvalidAddress { address: String, reason: String },
+
+    #[error("invalid page limit {limit}; expected 1..={max}")]
+    InvalidLimit { limit: usize, max: usize },
+
     #[error("invalid BNS hash `{value}`: {reason}")]
     InvalidHash { value: String, reason: String },
 
@@ -152,6 +158,8 @@ impl BnsRegistryError {
         match self {
             Self::InvalidName { .. } => "INVALID_NAME",
             Self::InvalidDocType { .. } => "INVALID_DOC_TYPE",
+            Self::InvalidAddress { .. } => "INVALID_ADDRESS",
+            Self::InvalidLimit { .. } => "INVALID_LIMIT",
             Self::InvalidHash { .. } => "INVALID_HASH",
             Self::InvalidPrincipal { .. } => "INVALID_PRINCIPAL",
             Self::InvalidKid { .. } => "INVALID_KID",
