@@ -240,7 +240,7 @@ SN 代付 gas 的受限 BNS 写代理：用户不需要持有 gas，就能通过
 | Method | 可达路径 | Params | 说明 |
 |--------|----------|--------|------|
 | `bns.publish_dns_txt` | `/kapi/sn/bns-proxy`（需 SN access token） | `name`, `mode`, `request_id?`, `ttl?`, `value?`, `records?` | 通过当前用户绑定的 controller 更新 `dns_txt` document。`name` 必须等于 token 所属用户。 |
-| `bns.publish_document` | `/kapi/sn/bns-proxy`（需 SN access token） | `name`, `doc_type`, `document`, `request_id?` | 注册后独立发布 JSON object document；`name` 必须等于 token 所属用户。`relay_assignment` 禁止，`owner` 受身份字段保护。 |
+| `bns.publish_document` | `/kapi/sn/bns-proxy`（需 SN access token） | `name`, `doc_type`, `document`, `request_id?` | 注册后独立发布 JSON object 或 compact JWT string document；`name` 必须等于 token 所属用户。`relay_assignment` 禁止，`owner` 受身份字段保护。 |
 | `bns.publish_relay_assignment` | 仅内网 `/` | `name`, `relay_assignment`, `request_id?` | SN 内部发布 relay assignment，不经外部 HTTP 路径。 |
 | `bns.register_name_bootstrap` | 仅内网 `/` | `name`, `asset_owner`, `request_id?`, `owner_config?`, `initial_documents?` | 注册阶段以外的恢复/重放入口，不创建本地 SN 账号。 |
 
@@ -254,10 +254,10 @@ SN 代付 gas 的受限 BNS 写代理：用户不需要持有 gas，就能通过
 | `remove` | `value` | 删除匹配的 TXT 记录。 |
 | `replace` | `records: [{ttl?, value}]` | 整体替换 `dns_txt` document 的记录集合。 |
 
-`bns.publish_document` 的 `document` 必须是 JSON object，SN 会从当前投影读取版本并自动填写 `expected_version`；客户端不传版本号。除下面两个保留类型外，`zone`、`boot`、`device_mini_doc` 和自定义 doc_type 均不做产品级 schema 限制：
+`bns.publish_document` 的 `document` 必须是 JSON object 或非空 compact JWT string；其它 JSON scalar 和 array 均拒绝。JSON object 按其 JSON bytes 发布，JWT string 按 UTF-8 原文发布，不会额外包裹 JSON 引号。单个 inline document 上限 4KB。SN 会从当前投影读取版本并自动填写 `expected_version`；客户端不传版本号。成功响应的 `status=submitted` 只表示 TX 已投递，调用方必须等待 bns-indexer 投影并读回相同原文后才能把业务标记为完成。除下面两个保留类型外，`zone`、`boot`、`device_mini_doc` 和自定义 doc_type 均不做产品级 schema 限制：
 
 - `relay_assignment`：返回 `invalid_params`，必须改走内网 `bns.publish_relay_assignment`。
-- `owner`：允许首次补齐身份字段，也允许更新其它内容；但当前 owner 文档里已经存在的 `public_key`、`owner_key`、`default_key`、`key`、`verificationMethod[0].publicKeyJwk` 不得改值或删除，否则返回 `invalid_params`，且不会构造/投递 TX。
+- `owner`：只接受 JSON object，不接受 JWT string；允许首次补齐身份字段，也允许更新其它内容；但当前 owner 文档里已经存在的 `public_key`、`owner_key`、`default_key`、`key`、`verificationMethod[0].publicKeyJwk` 不得改值或删除，否则返回 `invalid_params`，且不会构造/投递 TX。
 
 ### 6.2 返回结构
 

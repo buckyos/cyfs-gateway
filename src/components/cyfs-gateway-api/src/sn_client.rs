@@ -3,7 +3,7 @@ use async_trait::async_trait;
 use jsonwebtoken::EncodingKey;
 use log::warn;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Map, Value};
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::result::Result;
@@ -201,11 +201,18 @@ pub struct SnBnsPublishDnsTxtReq {
 
 /// `/kapi/sn/bns-proxy` 的 `bns.publish_document` 参数。
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum SnBnsPublishDocumentContent {
+    JsonObject(Map<String, Value>),
+    Jwt(String),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SnBnsPublishDocumentReq {
     pub name: String,
     pub doc_type: String,
-    pub document: Value,
+    pub document: SnBnsPublishDocumentContent,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub request_id: Option<String>,
 }

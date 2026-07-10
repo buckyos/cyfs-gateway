@@ -681,9 +681,14 @@ impl SnBnsController {
                 "relay_assignment must use publish_relay_assignment".to_string(),
             ));
         }
-        if !params.document.is_object() {
+        if !params.document.is_object()
+            && !params
+                .document
+                .as_str()
+                .is_some_and(|value| !value.trim().is_empty())
+        {
             return Err(SnBnsControllerError::InvalidInput(
-                "document must be a JSON object".to_string(),
+                "document must be a JSON object or non-empty text string".to_string(),
             ));
         }
         self.ensure_authority_can_publish(&params.authority, &params.doc_type)?;
@@ -698,7 +703,7 @@ impl SnBnsController {
                 let mut attempt = 0;
                 loop {
                     let result = self
-                        .publish_json_document_once(
+                        .publish_inline_document_once(
                             &params.request_id,
                             BnsWriteOperation::PublishDocument,
                             &params.name,
@@ -949,7 +954,7 @@ impl SnBnsController {
             Some(RELAY_ASSIGNMENT_DOC_TYPE),
             &params,
             || async {
-                self.publish_json_document_once(
+                self.publish_inline_document_once(
                     &params.request_id,
                     BnsWriteOperation::PublishRelayAssignment,
                     &params.name,
@@ -1031,6 +1036,22 @@ impl SnBnsController {
             authority,
         )
         .await
+    }
+
+    async fn publish_inline_document_once(
+        &self,
+        request_id: &str,
+        operation: BnsWriteOperation,
+        name: &str,
+        doc_type: &str,
+        document: &Value,
+        authority: CallAuthority,
+    ) -> SnBnsControllerResult<BnsWriteReceipt> {
+        let current = self.current_document_state(name, doc_type).await?;
+        let expected_version = current.as_ref().map_or(0, |state| state.version);
+        let update = self.inline_content_update(doc_type, expected_version, document)?;
+        self.publish_document_update_once(request_id, operation, name, update, authority)
+            .await
     }
 
     async fn publish_guarded_owner_document_once(
@@ -1145,6 +1166,34 @@ impl SnBnsController {
         canonical_doc_type(doc_type).map_err(SnBnsControllerError::from)?;
         let bytes = serde_json::to_vec(document)?;
         if bytes.is_empty() || bytes.len() > self.config.max_inline_document_size {
+            return Err(SnBnsControllerError::InvalidInput(format!(
+                "inline document `{}` is {} bytes, max {}",
+                doc_type,
+                bytes.len(),
+                self.config.max_inline_document_size
+            )));
+        }
+        default_document_update(doc_type, expected_version, DocumentRef::inline(bytes))
+            .map_err(SnBnsControllerError::from)
+    }
+
+    fn inline_content_update(
+        &self,
+        doc_type: &str,
+        expected_version: u64,
+        document: &Value,
+    ) -> SnBnsControllerResult<DocumentUpdate> {
+        canonical_doc_type(doc_type).map_err(SnBnsControllerError::from)?;
+        let bytes = match document {
+            Value::Object(_) => serde_json::to_vec(document)?,
+            Value::String(text) if !text.trim().is_empty() => text.as_bytes().to_vec(),
+            _ => {
+                return Err(SnBnsControllerError::InvalidInput(
+                    "document must be a JSON object or non-empty text string".to_string(),
+                ));
+            }
+        };
+        if bytes.len() > self.config.max_inline_document_size {
             return Err(SnBnsControllerError::InvalidInput(format!(
                 "inline document `{}` is {} bytes, max {}",
                 doc_type,

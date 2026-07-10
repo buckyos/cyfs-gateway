@@ -25,10 +25,10 @@ use crate::sn_resolver::{
     SnResolverErrorKind, SnResolverRef, SnResolverResult,
 };
 use crate::{
-    SnAuthDBRef, SnAuthDbClient, SnDeviceEndpointUpdate, SnDeviceInfoDBRef,
-    SnDeviceInfoDbClient, SnDeviceRole, SnDeviceState, SnDeviceStateUpdate, SnEndpointProtocol,
-    SnEndpointScope, SnEndpointSource, SnNatType, SnRelayManagerRef, SnResult, SqliteSnAuthDB,
-    SqliteSnDeviceInfoDB, SqliteSnRelayManager,
+    SnAuthDBRef, SnAuthDbClient, SnDeviceEndpointUpdate, SnDeviceInfoDBRef, SnDeviceInfoDbClient,
+    SnDeviceRole, SnDeviceState, SnDeviceStateUpdate, SnEndpointProtocol, SnEndpointScope,
+    SnEndpointSource, SnNatType, SnRelayManagerRef, SnResult, SqliteSnAuthDB, SqliteSnDeviceInfoDB,
+    SqliteSnRelayManager,
 };
 use ::kRPC::*;
 use async_trait::async_trait;
@@ -695,9 +695,7 @@ impl SNServer {
 
     fn jwk_x_component(jwk: &jsonwebtoken::jwk::Jwk) -> Option<String> {
         match &jwk.algorithm {
-            jsonwebtoken::jwk::AlgorithmParameters::OctetKeyPair(params) => {
-                Some(params.x.clone())
-            }
+            jsonwebtoken::jwk::AlgorithmParameters::OctetKeyPair(params) => Some(params.x.clone()),
             _ => None,
         }
     }
@@ -809,7 +807,8 @@ impl SNServer {
         for name in names {
             let normalized = Self::normalize_query_name(name.as_str());
             for record_type in [RecordType::TXT, RecordType::A, RecordType::AAAA] {
-                self.name_info_cache.remove(normalized.as_str(), record_type);
+                self.name_info_cache
+                    .remove(normalized.as_str(), record_type);
             }
         }
     }
@@ -1848,8 +1847,6 @@ impl HttpServer for SNServer {
             }
         };
 
-        info!("|==>recv kRPC req: {}", body_str);
-
         let rpc_request: RPCRequest = match serde_json::from_str(body_str.as_str()) {
             Ok(rpc_request) => rpc_request,
             Err(e) => {
@@ -1867,6 +1864,8 @@ impl HttpServer for SNServer {
                     .unwrap());
             }
         };
+
+        info!("|==>recv kRPC req: method={}", rpc_request.method);
 
         let canonical_method = Self::canonical_method_name(rpc_request.method.as_str());
         let prefer_rpc_failed = canonical_method.contains('.');
@@ -2275,9 +2274,9 @@ impl SnServerFactory {
         {
             let mut specs = Vec::with_capacity(proxy_config.controllers.len());
             for key_config in &proxy_config.controllers {
-                let private_key = key_config.load_private_key().map_err(|e| {
-                    server_err!(ServerErrorCode::InvalidConfig, "{}", e)
-                })?;
+                let private_key = key_config
+                    .load_private_key()
+                    .map_err(|e| server_err!(ServerErrorCode::InvalidConfig, "{}", e))?;
                 specs.push(SnBnsControllerKeySpec {
                     id: key_config.id.clone(),
                     declared_address: key_config.address.clone(),
@@ -2372,15 +2371,17 @@ impl SnServerFactory {
 
         let mut controllers = Vec::new();
         for info in signer_vault.controller_infos() {
-            let key_manager = BoundControllerKeyManager::new(signer_vault.clone(), info.id.as_str())
-                .map_err(|e| {
-                    server_err!(
-                        ServerErrorCode::InvalidConfig,
-                        "bind bns proxy controller `{}` failed: {}",
-                        info.id,
-                        e
-                    )
-                })?;
+            let key_manager =
+                BoundControllerKeyManager::new(signer_vault.clone(), info.id.as_str()).map_err(
+                    |e| {
+                        server_err!(
+                            ServerErrorCode::InvalidConfig,
+                            "bind bns proxy controller `{}` failed: {}",
+                            info.id,
+                            e
+                        )
+                    },
+                )?;
             let evm_controller = Arc::new(BnsEvmControllerClient::new_with_key_manager(
                 evm_config.clone(),
                 Arc::new(key_manager),
@@ -2714,8 +2715,7 @@ mod tests {
             let raw = URL_SAFE_NO_PAD
                 .decode(dns_param.as_bytes())
                 .expect("decode dns param");
-            let query_message =
-                Message::from_vec(raw.as_slice()).expect("parse dns query message");
+            let query_message = Message::from_vec(raw.as_slice()).expect("parse dns query message");
             let question = query_message
                 .queries()
                 .first()
@@ -3088,14 +3088,19 @@ mod tests {
             .insert_activation_code(CLEAR_STATE_ACTIVE_CODE)
             .await
             .unwrap();
-        auth_db.insert_activation_code("bnsProxyCode2").await.unwrap();
+        auth_db
+            .insert_activation_code("bnsProxyCode2")
+            .await
+            .unwrap();
         let auth_db: SnAuthDBRef = Arc::new(auth_db);
 
         let device_info_db = SqliteSnDeviceInfoDB::new_by_path(db_path).await.unwrap();
         device_info_db.initialize_database().await.unwrap();
         let device_info_db: SnDeviceInfoDBRef = Arc::new(device_info_db);
 
-        let compat_store = SqliteSnCompatibilityStore::new_by_path(db_path).await.unwrap();
+        let compat_store = SqliteSnCompatibilityStore::new_by_path(db_path)
+            .await
+            .unwrap();
         compat_store.initialize_database().await.unwrap();
         let compat_store: SnCompatibilityStoreRef = Arc::new(compat_store);
 
@@ -3107,9 +3112,11 @@ mod tests {
         relay_manager.initialize_database().await.unwrap();
         let relay_manager: SnRelayManagerRef = Arc::new(relay_manager);
 
-        let registry = Arc::new(bns_indexer::CentralizedBnsRegistry::new_legacy_state_machine(
-            bns_indexer::SqliteBnsRegistryStore::open_memory().unwrap(),
-        ));
+        let registry = Arc::new(
+            bns_indexer::CentralizedBnsRegistry::new_legacy_state_machine(
+                bns_indexer::SqliteBnsRegistryStore::open_memory().unwrap(),
+            ),
+        );
         let submitter = Arc::new(TestApplyingEvmSubmitter::new(registry.clone()));
         let write_request_store = Arc::new(bns_client::MemorySnBnsWriteRequestStore::new());
 
@@ -3235,7 +3242,10 @@ mod tests {
         let access_token = result["access_token"].as_str().unwrap().to_string();
         let bns = result["bns"].as_object().unwrap();
         assert_eq!(bns["status"].as_str().unwrap(), "submitted");
-        assert_eq!(bns["operation"].as_str().unwrap(), "register_name_bootstrap");
+        assert_eq!(
+            bns["operation"].as_str().unwrap(),
+            "register_name_bootstrap"
+        );
         assert_eq!(bns["asset_owner"].as_str().unwrap(), PROXY_USER_OWNER);
         assert!(bns["tx_hash"].as_str().unwrap().starts_with("0x"));
         assert!(bns["raw_tx"].as_str().unwrap().starts_with("0x"));
@@ -3274,7 +3284,10 @@ mod tests {
         assert_eq!(result["code"].as_i64().unwrap(), 0);
         assert_eq!(result["status"].as_str().unwrap(), "submitted");
         assert_eq!(result["doc_type"].as_str().unwrap(), "dns_txt");
-        assert_eq!(result["controller_address"].as_str().unwrap(), bound_controller);
+        assert_eq!(
+            result["controller_address"].as_str().unwrap(),
+            bound_controller
+        );
         assert!(result["tx_hash"].as_str().unwrap().starts_with("0x"));
         // 响应不等待 receipt：没有 receipt 字段，document_version 是预期版本。
         assert_eq!(result["document_version"].as_u64().unwrap(), 2);
@@ -3297,11 +3310,104 @@ mod tests {
         assert_eq!(result["doc_type"].as_str().unwrap(), "zone");
         assert_eq!(result["document_version"].as_u64().unwrap(), 1);
         let projected_zone = registry.resolve_document(PROXY_USER, "zone").unwrap();
-        let projected_zone: serde_json::Value = serde_json::from_slice(
-            &projected_zone.document_state.document.inline_document,
-        )
-        .unwrap();
+        let projected_zone: serde_json::Value =
+            serde_json::from_slice(&projected_zone.document_state.document.inline_document)
+                .unwrap();
         assert_eq!(projected_zone["oods"], json!(["ood1"]));
+
+        let zone_jwt = "eyJhbGciOiJFZERTQSJ9.eyJpZCI6ImRpZDpibnM6cHJveHl1c2VyIn0.signature";
+        let jwt_result = bns_krpc
+            .call(
+                "bns.publish_document",
+                json!({
+                    "request_id": "publish-zone-jwt-2",
+                    "name": PROXY_USER,
+                    "doc_type": "zone",
+                    "document": zone_jwt
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(jwt_result["document_version"].as_u64().unwrap(), 2);
+        let projected_zone_jwt = registry.resolve_document(PROXY_USER, "zone").unwrap();
+        assert_eq!(
+            projected_zone_jwt.document_state.document.inline_document,
+            zone_jwt.as_bytes()
+        );
+
+        let reused = bns_krpc
+            .call(
+                "bns.publish_document",
+                json!({
+                    "request_id": "publish-zone-jwt-2",
+                    "name": PROXY_USER,
+                    "doc_type": "zone",
+                    "document": zone_jwt
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(reused["reused"].as_bool().unwrap());
+
+        let idempotency_error = bns_krpc
+            .call(
+                "bns.publish_document",
+                json!({
+                    "request_id": "publish-zone-jwt-2",
+                    "name": PROXY_USER,
+                    "doc_type": "zone",
+                    "document": "eyJhbGciOiJFZERTQSJ9.eyJpZCI6ImRpZDp3ZWI6ZXhhbXBsZS5jb20ifQ.signature"
+                }),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(idempotency_error.contains("idempotency"));
+
+        for invalid_document in [json!(["not", "allowed"]), json!(42), json!(true)] {
+            let error = bns_krpc
+                .call(
+                    "bns.publish_document",
+                    json!({
+                        "name": PROXY_USER,
+                        "doc_type": "zone",
+                        "document": invalid_document
+                    }),
+                )
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("[SN:1000:invalid_params]"));
+        }
+
+        let owner_jwt_error = bns_krpc
+            .call(
+                "bns.publish_document",
+                json!({
+                    "name": PROXY_USER,
+                    "doc_type": "owner",
+                    "document": zone_jwt
+                }),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(owner_jwt_error.contains("owner document must be a JSON object"));
+
+        let oversized_jwt = format!("header.{}.signature", "x".repeat(4096));
+        let oversized_error = bns_krpc
+            .call(
+                "bns.publish_document",
+                json!({
+                    "name": PROXY_USER,
+                    "doc_type": "zone",
+                    "document": oversized_jwt
+                }),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(oversized_error.contains("max 4096"));
 
         // owner 首次补身份字段允许；保持身份字段时其它内容可改；换 key 拒绝且不落 TX。
         let owner_key = json!({"kty":"OKP","crv":"Ed25519","x":"proxy-user-key"});
@@ -3469,7 +3575,10 @@ mod tests {
         assert!(no_token_document_err.contains("[SN:1006:auth_required]"));
 
         // --- internal-only 方法不暴露在外部 HTTP 路径 ---
-        for method in ["bns.publish_relay_assignment", "bns.register_name_bootstrap"] {
+        for method in [
+            "bns.publish_relay_assignment",
+            "bns.register_name_bootstrap",
+        ] {
             let err = bns_krpc
                 .call(method, json!({ "name": PROXY_USER }))
                 .await
@@ -3595,7 +3704,10 @@ mod tests {
         let handler: Arc<dyn BnsIndexerApi> =
             Arc::new(bns_indexer::CentralizedBnsIndexerHandler::new(registry));
         let reader = BnsIndexerClient::new_in_process(handler);
-        let resolved = reader.resolve_document(PROXY_USER, "dns_txt").await.unwrap();
+        let resolved = reader
+            .resolve_document(PROXY_USER, "dns_txt")
+            .await
+            .unwrap();
         let inline = String::from_utf8(resolved.document_state.document.inline_document).unwrap();
         assert!(inline.contains("pkx=projection"), "{inline}");
     }
@@ -4831,10 +4943,7 @@ mod tests {
         }
 
         // 在「外部 DNS」（mock DoH）发布 PKX TXT 后，一站式 bind 成功激活。
-        mock_doh.set_txt(
-            pkx_record.as_str(),
-            vec![format!("\"{}\"", expected_pkx)],
-        );
+        mock_doh.set_txt(pkx_record.as_str(), vec![format!("\"{}\"", expected_pkx)]);
         let bound = auth_user_krpc
             .call("domain.bind", json!({ "domain": user_domain }))
             .await

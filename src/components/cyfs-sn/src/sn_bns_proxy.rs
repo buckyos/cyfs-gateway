@@ -526,7 +526,10 @@ impl SnBnsProxy {
             ));
         }
         for (index, entry) in controllers.iter().enumerate() {
-            if controllers[..index].iter().any(|other| other.id == entry.id) {
+            if controllers[..index]
+                .iter()
+                .any(|other| other.id == entry.id)
+            {
                 return Err(sn_err!(
                     SnErrorCode::InvalidInput,
                     "duplicated bns proxy controller id `{}`",
@@ -619,7 +622,10 @@ impl SnBnsProxy {
                 username: binding.username.clone(),
                 controller_id: binding.controller_id.clone(),
             })?;
-        if !entry.address.eq_ignore_ascii_case(binding.controller_address.as_str()) {
+        if !entry
+            .address
+            .eq_ignore_ascii_case(binding.controller_address.as_str())
+        {
             warn!(
                 "sn bns proxy controller `{}` address changed: binding={} configured={}",
                 binding.controller_id, binding.controller_address, entry.address
@@ -666,10 +672,7 @@ impl SnBnsProxy {
     }
 
     /// devtest 回落：asset_owner 缺省时使用该用户绑定 controller 的地址。
-    pub async fn default_asset_owner_for_user(
-        &self,
-        username: &str,
-    ) -> SnBnsProxyResult<String> {
+    pub async fn default_asset_owner_for_user(&self, username: &str) -> SnBnsProxyResult<String> {
         if self.require_user_asset_owner {
             return Err(SnBnsProxyError::InvalidInput(
                 "asset_owner is required".to_string(),
@@ -686,19 +689,20 @@ impl SnBnsProxy {
         params: SnBnsProxyRegisterParams,
     ) -> SnBnsProxyResult<SnBnsProxyTxOutcome> {
         self.ensure_operation(SnBnsProxyOperation::RegisterNameBootstrap)?;
-        let asset_owner = normalize_evm_address(params.asset_owner.as_str())
-            .ok_or_else(|| {
-                SnBnsProxyError::InvalidInput(
-                    "asset_owner must be a 0x-prefixed EVM address".to_string(),
-                )
-            })?;
+        let asset_owner = normalize_evm_address(params.asset_owner.as_str()).ok_or_else(|| {
+            SnBnsProxyError::InvalidInput(
+                "asset_owner must be a 0x-prefixed EVM address".to_string(),
+            )
+        })?;
         if !params.owner_config.is_object() {
             return Err(SnBnsProxyError::InvalidInput(
                 "owner_config must be a JSON object".to_string(),
             ));
         }
 
-        let binding = self.assign_controller_for_user(params.name.as_str()).await?;
+        let binding = self
+            .assign_controller_for_user(params.name.as_str())
+            .await?;
         let entry = self.controller_entry(&binding)?;
         let initial_documents = build_initial_documents(&params.initial_documents)?;
 
@@ -725,7 +729,9 @@ impl SnBnsProxy {
         let receipt = &output.receipt;
         let outcome = SnBnsProxyTxOutcome {
             request_id: params.request_id,
-            operation: SnBnsProxyOperation::RegisterNameBootstrap.as_str().to_string(),
+            operation: SnBnsProxyOperation::RegisterNameBootstrap
+                .as_str()
+                .to_string(),
             name: params.name,
             controller_id: entry.id.clone(),
             controller_address: entry.address.clone(),
@@ -802,13 +808,21 @@ impl SnBnsProxy {
             .map_err(|error| SnBnsProxyError::InvalidInput(error.to_string()))?;
         if doc_type == RELAY_ASSIGNMENT_DOC_TYPE {
             return Err(SnBnsProxyError::InvalidInput(
-                "relay_assignment is internal-only; use bns.publish_relay_assignment"
-                    .to_string(),
+                "relay_assignment is internal-only; use bns.publish_relay_assignment".to_string(),
             ));
         }
-        if !document.is_object() {
+        if !document.is_object()
+            && !document
+                .as_str()
+                .is_some_and(|value| !value.trim().is_empty())
+        {
             return Err(SnBnsProxyError::InvalidInput(
-                "document must be a JSON object".to_string(),
+                "document must be a JSON object or non-empty text string".to_string(),
+            ));
+        }
+        if doc_type == OWNER_DOC_TYPE && !document.is_object() {
+            return Err(SnBnsProxyError::InvalidInput(
+                "owner document must be a JSON object".to_string(),
             ));
         }
 
@@ -917,8 +931,12 @@ impl SnBnsProxy {
             outcome.doc_type.as_deref().unwrap_or("-"),
             outcome.controller_id,
             outcome.controller_address,
-            outcome.chain_id.map_or_else(|| "-".to_string(), |v| v.to_string()),
-            outcome.nonce.map_or_else(|| "-".to_string(), |v| v.to_string()),
+            outcome
+                .chain_id
+                .map_or_else(|| "-".to_string(), |v| v.to_string()),
+            outcome
+                .nonce
+                .map_or_else(|| "-".to_string(), |v| v.to_string()),
             outcome.tx_hash.as_deref().unwrap_or("-"),
             outcome.request_id,
             payload_hash,
@@ -960,8 +978,8 @@ fn build_initial_documents(
 }
 
 fn inline_document_update(doc_type: &str, document: &Value) -> SnBnsProxyResult<DocumentUpdate> {
-    let bytes = serde_json::to_vec(document)
-        .map_err(|e| SnBnsProxyError::InvalidInput(e.to_string()))?;
+    let bytes =
+        serde_json::to_vec(document).map_err(|e| SnBnsProxyError::InvalidInput(e.to_string()))?;
     if bytes.is_empty() || bytes.len() > bns_client::MAX_INLINE_DOCUMENT {
         return Err(SnBnsProxyError::InvalidInput(format!(
             "initial document `{}` is {} bytes, max {}",
@@ -995,13 +1013,12 @@ fn now_secs() -> u64 {
 mod tests {
     use super::*;
     use bns_client::{
-        BnsApplyMutationsReq, BnsClientResult, BnsEvmTxSubmission, BnsIndexerApi,
-        BnsIndexerClient, BnsPublishDocumentReq, BnsRegisterNameReq, MemorySnBnsWriteRequestStore,
+        BnsApplyMutationsReq, BnsClientResult, BnsEvmTxSubmission, BnsIndexerApi, BnsIndexerClient,
+        BnsPublishDocumentReq, BnsRegisterNameReq, MemorySnBnsWriteRequestStore,
         SnBnsControllerConfig, SnBnsEvmSubmitter,
     };
     use bns_indexer::{
-        CentralizedBnsIndexerHandler, CentralizedBnsRegistry, PrincipalKind,
-        SqliteBnsRegistryStore,
+        CentralizedBnsIndexerHandler, CentralizedBnsRegistry, PrincipalKind, SqliteBnsRegistryStore,
     };
     use std::sync::Mutex;
 
@@ -1306,12 +1323,7 @@ mod tests {
 
         let submitter = Arc::new(RecordingEvmSubmitter::default());
         let devtest = SnBnsProxy::new(
-            vec![controller_entry(
-                "controller-a",
-                CONTROLLER_A,
-                1,
-                submitter,
-            )],
+            vec![controller_entry("controller-a", CONTROLLER_A, 1, submitter)],
             Arc::new(MemorySnBnsControllerBindingStore::new()),
             SnBnsProxyOperation::all().into_iter().collect(),
             false,
@@ -1329,12 +1341,7 @@ mod tests {
             Arc::new(MemorySnBnsControllerBindingStore::new());
         let submitter = Arc::new(RecordingEvmSubmitter::default());
         let proxy = SnBnsProxy::new(
-            vec![controller_entry(
-                "controller-a",
-                CONTROLLER_A,
-                1,
-                submitter,
-            )],
+            vec![controller_entry("controller-a", CONTROLLER_A, 1, submitter)],
             bindings,
             [SnBnsProxyOperation::PublishDnsTxt].into_iter().collect(),
             true,
@@ -1385,10 +1392,9 @@ mod tests {
     #[tokio::test]
     async fn sqlite_binding_store_round_trip_and_no_overwrite() {
         let file = tempfile::NamedTempFile::with_suffix(".db").unwrap();
-        let store =
-            SqliteSnBnsControllerBindingStore::new_by_path(file.path().to_str().unwrap())
-                .await
-                .unwrap();
+        let store = SqliteSnBnsControllerBindingStore::new_by_path(file.path().to_str().unwrap())
+            .await
+            .unwrap();
         store.initialize_database().await.unwrap();
 
         assert!(store.get_binding("alice").await.unwrap().is_none());

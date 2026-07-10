@@ -2362,10 +2362,21 @@ fn device_jwts_from_bns_document(document: &BnsDocument) -> Vec<String> {
 
     if let Some(devices) = value.get("devices").and_then(|v| v.as_object()) {
         for device in devices.values() {
-            if let Some(jwt) = find_string_path(device, &["mini_config_jwt"]) {
+            if let Some(jwt) = find_string_path(device, &["device_mini_document_jwt"])
+                .or_else(|| find_string_path(device, &["mini_config_jwt"]))
+            {
                 result.push(jwt);
             }
         }
+    }
+
+    if let Some(mini_device_jwts) = value.get("mini_device_jwts").and_then(Value::as_object) {
+        result.extend(
+            mini_device_jwts
+                .values()
+                .filter_map(Value::as_str)
+                .map(ToString::to_string),
+        );
     }
 
     if let Some(jwt) = find_string_path(&value, &["mini_config_jwt"]) {
@@ -2378,7 +2389,9 @@ fn device_jwts_from_bns_document(document: &BnsDocument) -> Vec<String> {
 fn device_jwts_from_map(devices: &HashMap<String, Value>) -> Vec<String> {
     let mut result = Vec::new();
     for device in devices.values() {
-        if let Some(jwt) = find_string_path(device, &["mini_config_jwt"]) {
+        if let Some(jwt) = find_string_path(device, &["device_mini_document_jwt"])
+            .or_else(|| find_string_path(device, &["mini_config_jwt"]))
+        {
             result.push(jwt);
         }
     }
@@ -2445,13 +2458,22 @@ fn device_doc_from_aggregate(
         .and_then(|devices| devices.get(device_name))
         .or_else(|| value.get(device_name))?;
 
-    device_doc_from_value(
+    let mut result = device_doc_from_value(
         zone_name,
         device_name,
         device_value,
         document.meta.ttl,
         document.meta.version,
-    )
+    )?;
+    if result.mini_config_jwt.is_none() {
+        result.mini_config_jwt = value
+            .get("mini_device_jwts")
+            .and_then(Value::as_object)
+            .and_then(|jwts| jwts.get(device_name))
+            .and_then(Value::as_str)
+            .map(ToString::to_string);
+    }
+    Some(result)
 }
 
 fn device_doc_from_single(
@@ -2484,11 +2506,14 @@ fn device_doc_from_value(
         .or_else(|| find_string_path(value, &["name"]))
         .or_else(|| find_string_path(value, &["n"]))
         .unwrap_or_else(|| fallback_device_name.to_string());
-    let did = find_string_path(value, &["did"])
+    let did = device_public_key_x(value)
+        .map(|x| format!("did:dev:{}", x))
+        .or_else(|| find_string_path(value, &["did"]))
         .or_else(|| find_string_path(value, &["id"]))
         .or_else(|| find_string_path(value, &["x"]).map(|x| format!("did:dev:{}", x)))?;
     let mini_config_jwt = find_string_path(value, &["mini_config_jwt"])
-        .or_else(|| find_string_path(value, &["device_mini_config_jwt"]));
+        .or_else(|| find_string_path(value, &["device_mini_config_jwt"]))
+        .or_else(|| find_string_path(value, &["device_mini_document_jwt"]));
 
     Some(DeviceMiniDocument {
         zone_name: zone_name.to_string(),
@@ -2499,6 +2524,18 @@ fn device_doc_from_value(
         ttl,
         version,
     })
+}
+
+fn device_public_key_x(value: &Value) -> Option<String> {
+    value
+        .get("verificationMethod")
+        .and_then(Value::as_array)
+        .and_then(|methods| {
+            methods
+                .iter()
+                .find_map(|method| find_string_path(method, &["publicKeyJwk", "x"]))
+        })
+        .or_else(|| find_string_path(value, &["public_key", "x"]))
 }
 
 fn build_legacy_zone_config_json(username: &str, user: &SNUserInfo) -> Value {
@@ -2767,9 +2804,15 @@ mod tests {
             Some("alice")
         );
         // web3.<server_host> 本体不是 BNS 兼容域名（属 SN 自身 hostname 域）。
-        assert_eq!(bns_compat_name_for("devtests.org", "web3.devtests.org"), None);
+        assert_eq!(
+            bns_compat_name_for("devtests.org", "web3.devtests.org"),
+            None
+        );
         // 其他后缀不误判。
-        assert_eq!(bns_compat_name_for("devtests.org", "alice.example.com"), None);
+        assert_eq!(
+            bns_compat_name_for("devtests.org", "alice.example.com"),
+            None
+        );
         assert_eq!(
             bns_compat_name_for("devtests.org", "alice.web3.other.org"),
             None
@@ -2882,6 +2925,89 @@ mod tests {
         assert_eq!(device.device_name, "gw1");
         assert_eq!(device.did, "did:dev:abc");
         assert_eq!(device.mini_config_jwt.as_deref(), Some("jwt"));
+    }
+
+    #[test]
+    fn parses_canonical_zone_document_device_and_mini_jwt_fields() {
+        let doc = BnsDocument::json(
+            "testuser",
+            BNS_DOC_ZONE,
+            json!({
+                "devices": {
+                    "ood1": {
+                        "id": "did:dev:canonical",
+                        "name": "ood1"
+                    }
+                },
+                "mini_device_jwts": {
+                    "ood1": "canonical-mini-jwt"
+                }
+            }),
+        );
+
+        let device = device_doc_from_aggregate("testuser", "ood1", &doc).unwrap();
+        assert_eq!(device.did, "did:dev:canonical");
+        assert_eq!(
+            device.mini_config_jwt.as_deref(),
+            Some("canonical-mini-jwt")
+        );
+        assert_eq!(
+            device_jwts_from_bns_document(&doc),
+            vec!["canonical-mini-jwt"]
+        );
+    }
+
+    #[tokio::test]
+    async fn resolves_device_key_did_from_canonical_zone_document_jwt() {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine;
+
+        let device_x = "T4Quc1L6Ogu4N2tTKOvneV1yYnBcmhP89B_RsuFsJZ8";
+        let payload = json!({
+            "boot_jwt": "canonical-boot-jwt",
+            "oods": ["ood1"],
+            "devices": {
+                "ood1": {
+                    "id": "did:bns:ood1.testuser",
+                    "name": "ood1",
+                    "verificationMethod": [{
+                        "publicKeyJwk": {
+                            "kty": "OKP",
+                            "crv": "Ed25519",
+                            "x": device_x
+                        }
+                    }],
+                    "device_mini_document_jwt": "canonical-mini-jwt"
+                }
+            },
+            "mini_device_jwts": {
+                "ood1": "canonical-mini-jwt"
+            }
+        });
+        let zone_jwt = format!(
+            "{}.{}.signature",
+            URL_SAFE_NO_PAD.encode(br#"{"alg":"EdDSA"}"#),
+            URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload).unwrap())
+        );
+        let document = BnsDocument::jwt("testuser", BNS_DOC_ZONE, zone_jwt);
+        let zone = ZoneDocument::from_bns_document(&document);
+        assert_eq!(zone.boot_jwt.as_deref(), Some("canonical-boot-jwt"));
+        assert_eq!(zone.gateway_device_name.as_deref(), Some("ood1"));
+        assert!(device_jwts_from_bns_document(&document)
+            .iter()
+            .all(|jwt| jwt == "canonical-mini-jwt"));
+
+        let mut bns = StaticBnsReader::default();
+        bns.documents
+            .insert(("testuser".to_string(), BNS_DOC_ZONE.to_string()), document);
+        let resolver = test_resolver_with_bns(bns);
+        assert_eq!(
+            resolver
+                .resolve_zone_device_did("testuser", "ood1")
+                .await
+                .unwrap(),
+            format!("did:dev:{}", device_x)
+        );
     }
 
     #[tokio::test]

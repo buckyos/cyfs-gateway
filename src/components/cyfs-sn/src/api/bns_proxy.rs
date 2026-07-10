@@ -102,24 +102,32 @@ fn generate_request_id(operation: &str, name: &str) -> String {
 fn dns_txt_update_from_params(params: &PublishDnsTxtReq) -> RpcCallResult<DnsTxtUpdate> {
     match params.mode.trim() {
         "add" => {
-            let value = params.value.clone().filter(|v| !v.is_empty()).ok_or_else(|| {
-                parse_error(
-                    SnApiErrorCode::InvalidParams,
-                    "publish_dns_txt mode=add requires value",
-                )
-            })?;
+            let value = params
+                .value
+                .clone()
+                .filter(|v| !v.is_empty())
+                .ok_or_else(|| {
+                    parse_error(
+                        SnApiErrorCode::InvalidParams,
+                        "publish_dns_txt mode=add requires value",
+                    )
+                })?;
             Ok(DnsTxtUpdate::Add {
                 ttl: params.ttl.unwrap_or(DEFAULT_DNS_TXT_TTL),
                 value,
             })
         }
         "remove" => {
-            let value = params.value.clone().filter(|v| !v.is_empty()).ok_or_else(|| {
-                parse_error(
-                    SnApiErrorCode::InvalidParams,
-                    "publish_dns_txt mode=remove requires value",
-                )
-            })?;
+            let value = params
+                .value
+                .clone()
+                .filter(|v| !v.is_empty())
+                .ok_or_else(|| {
+                    parse_error(
+                        SnApiErrorCode::InvalidParams,
+                        "publish_dns_txt mode=remove requires value",
+                    )
+                })?;
             Ok(DnsTxtUpdate::Remove { value })
         }
         "replace" => {
@@ -173,10 +181,21 @@ pub(crate) async fn handle_bns_proxy(
             let params: PublishDocumentReq = parse_params(&req)?;
             // token 必须存在且 `name` == token 用户（cross-user 一律拒绝）。
             let username = resolve_self_scoped_username(server, &req, false).await?;
-            if !params.document.is_object() {
+            let is_object = params.document.is_object();
+            let is_jwt = params
+                .document
+                .as_str()
+                .is_some_and(is_non_empty_compact_jwt);
+            if !is_object && !is_jwt {
                 return Err(parse_error(
                     SnApiErrorCode::InvalidParams,
-                    "document must be a JSON object",
+                    "document must be a JSON object or non-empty compact JWT string",
+                ));
+            }
+            if params.doc_type.trim().eq_ignore_ascii_case("owner") && !is_object {
+                return Err(parse_error(
+                    SnApiErrorCode::InvalidParams,
+                    "owner document must be a JSON object",
                 ));
             }
             let request_id = params
@@ -250,4 +269,13 @@ pub(crate) async fn handle_bns_proxy(
         }
         _ => Err(RPCErrors::UnknownMethod(req.method)),
     }
+}
+
+fn is_non_empty_compact_jwt(value: &str) -> bool {
+    let mut parts = value.trim().split('.');
+    matches!(
+        (parts.next(), parts.next(), parts.next(), parts.next()),
+        (Some(header), Some(payload), Some(signature), None)
+            if !header.is_empty() && !payload.is_empty() && !signature.is_empty()
+    )
 }
