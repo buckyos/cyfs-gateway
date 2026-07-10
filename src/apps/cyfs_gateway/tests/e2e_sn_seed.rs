@@ -301,6 +301,7 @@ async fn e2e_sn_seed_full_stack() {
             "auth.register",
             json!({
                 "name": "erindevtest",
+                "email": "erindevtest@example.com",
                 "pwd_hash": "erin-pwd",
                 "active_code": "dev-code-1",
                 "asset_owner": "0x9965507D1a55bcC2695C58ba16FB37d819B0A4dc"

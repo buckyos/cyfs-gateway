@@ -19,6 +19,7 @@ pub const METHOD_CLEAR_STATE_BY_ACTIVE_CODE: &str = "sn_auth_db.clear_state_by_a
 pub const METHOD_REGISTER_USER: &str = "sn_auth_db.register_user";
 pub const METHOD_CREATE_AUTH: &str = "sn_auth_db.create_auth";
 pub const METHOD_IS_USER_EXIST: &str = "sn_auth_db.is_user_exist";
+pub const METHOD_GET_USER_BY_EMAIL: &str = "sn_auth_db.get_user_by_email";
 pub const METHOD_REGISTER_USER_WITH_OWNER_KEY: &str = "sn_auth_db.register_user_with_owner_key";
 pub const METHOD_GET_USER_BY_PUBLIC_KEY: &str = "sn_auth_db.get_user_by_public_key";
 pub const METHOD_GET_USER_INFO: &str = "sn_auth_db.get_user_info";
@@ -189,6 +190,7 @@ impl SnAuthDbClearStateByActiveCodeReq {
 pub struct SnAuthDbRegisterUserReq {
     pub active_code: String,
     pub username: String,
+    pub email: String,
     pub password_hash: String,
     pub password_salt: String,
     pub password_algo: String,
@@ -198,6 +200,7 @@ impl SnAuthDbRegisterUserReq {
     pub fn new(
         active_code: &str,
         username: &str,
+        email: &str,
         password_hash: &str,
         password_salt: &str,
         password_algo: &str,
@@ -205,6 +208,7 @@ impl SnAuthDbRegisterUserReq {
         Self {
             active_code: active_code.to_string(),
             username: username.to_string(),
+            email: email.to_string(),
             password_hash: password_hash.to_string(),
             password_salt: password_salt.to_string(),
             password_algo: password_algo.to_string(),
@@ -243,6 +247,21 @@ impl SnAuthDbCreateAuthReq {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SnAuthDbUsernameReq {
     pub username: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SnAuthDbEmailReq {
+    pub email: String,
+}
+
+impl SnAuthDbEmailReq {
+    pub fn new(email: &str) -> Self {
+        Self {
+            email: email.to_string(),
+        }
+    }
+
+    impl_req_from_json!(SnAuthDbEmailReq);
 }
 
 impl SnAuthDbUsernameReq {
@@ -702,6 +721,7 @@ impl SnAuthDB for SnAuthDbClient {
         &self,
         active_code: &str,
         username: &str,
+        email: &str,
         password_hash: &str,
         password_salt: &str,
         password_algo: &str,
@@ -712,6 +732,7 @@ impl SnAuthDB for SnAuthDbClient {
                     .register_user(
                         active_code,
                         username,
+                        email,
                         password_hash,
                         password_salt,
                         password_algo,
@@ -724,6 +745,7 @@ impl SnAuthDB for SnAuthDbClient {
                     &SnAuthDbRegisterUserReq::new(
                         active_code,
                         username,
+                        email,
                         password_hash,
                         password_salt,
                         password_algo,
@@ -767,6 +789,16 @@ impl SnAuthDB for SnAuthDbClient {
             Self::InProcess(handler) => handler.is_user_exist(username).await,
             Self::KRPC(_) => {
                 self.call(METHOD_IS_USER_EXIST, &SnAuthDbUsernameReq::new(username))
+                    .await
+            }
+        }
+    }
+
+    async fn get_user_by_email(&self, email: &str) -> SnResult<Option<SNUserInfo>> {
+        match self {
+            Self::InProcess(handler) => handler.get_user_by_email(email).await,
+            Self::KRPC(_) => {
+                self.call(METHOD_GET_USER_BY_EMAIL, &SnAuthDbEmailReq::new(email))
                     .await
             }
         }
@@ -1148,6 +1180,7 @@ where
                         .register_user(
                             &parsed.active_code,
                             &parsed.username,
+                            &parsed.email,
                             &parsed.password_hash,
                             &parsed.password_salt,
                             &parsed.password_algo,
@@ -1173,6 +1206,10 @@ where
             METHOD_IS_USER_EXIST | "is_user_exist" => {
                 let parsed = SnAuthDbUsernameReq::from_json(req.params.clone())?;
                 rpc_envelope_response(self.0.is_user_exist(&parsed.username).await, &req)
+            }
+            METHOD_GET_USER_BY_EMAIL | "get_user_by_email" => {
+                let parsed = SnAuthDbEmailReq::from_json(req.params.clone())?;
+                rpc_envelope_response(self.0.get_user_by_email(&parsed.email).await, &req)
             }
             METHOD_REGISTER_USER_WITH_OWNER_KEY | "register_user_with_owner_key" => {
                 let parsed = SnAuthDbRegisterUserWithOwnerKeyReq::from_json(req.params.clone())?;

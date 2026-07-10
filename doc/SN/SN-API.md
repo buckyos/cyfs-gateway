@@ -1,6 +1,6 @@
 # SN-RPC-API
 
-本文定义当前 `cyfs-sn` 对外暴露的 SN RPC API。本文以现有实现为准：
+本文定义当前 `cyfs-sn` 对外暴露的 SN RPC API。除明确标记为 TODO 的本版本目标外，本文以现有实现为准：
 
 - 服务端路由：`src/components/cyfs-sn/src/sn_server.rs`
 - RPC handler：`src/components/cyfs-sn/src/api/*.rs`
@@ -58,11 +58,23 @@ RPC method 必须使用 `namespace.method` 形式。当前实现不再做 legacy
 |--------|--------|--------|------|
 | `auth.check_username` | `name: string` | `valid`, `reason`, `message`, `normalized_name` | 检查用户名格式、保留名和是否已存在。用户名会 trim + lowercase。 |
 | `auth.check_active_code` | `active_code: string` | `valid: bool` | 检查激活码是否可用。 |
-| `auth.register` | `name`, `pwd_hash`, `active_code`, `request_id?`, `asset_owner?`, `owner_config?`, `initial_documents?` | `code`, `access_token`, `refresh_token`, `need_bind_owner_key`, `bns?` | 注册 SN 用户。SN 启用 bns-proxy 时会先原子性注册同名 BNS name，再建本地账号，并在响应里带上 `bns` TX 信息（见下）。 |
+| `auth.register` | `name`, `email`, `pwd_hash`, `active_code`, `request_id?`, `asset_owner?`, `owner_config?`, `initial_documents?` | `code`, `access_token`, `refresh_token`, `need_bind_owner_key`, `bns?` | 注册 SN 用户。`email` 是本版本新增的必填字段，且一个规范化邮箱地址只能绑定一个 SN 账号。SN 启用 bns-proxy 时会先原子性注册同名 BNS name，再建本地账号，并在响应里带上 `bns` TX 信息（见下）。 |
 | `auth.login` | `name`, `pwd_hash` | `code`, `access_token`, `refresh_token`, `need_bind_owner_key` | 登录已激活用户。 |
 | `auth.refresh` | `refresh_token` | `code`, `access_token` | 用 refresh token 换新 access token。 |
 | `auth.logout` | `refresh_token?` | `code` | 吊销当前 access token 和/或给定 refresh token。 |
 | `auth.me` | `{}` | 同 `user.get_profile` | 返回当前登录用户 profile。 |
+
+#### 注册邮箱（已实现）与密码找回 TODO
+
+- `auth.register.email` 必填。服务端应先 trim，再按产品规则统一大小写并校验基本邮箱格式；唯一性判断和存储都必须使用同一个规范化结果。
+- 一个规范化邮箱地址全局只能绑定一个 SN 账号。该约束必须同时由注册事务和数据库唯一约束保证，不能只依赖注册前查询。
+- 邮箱属于 SN 本地账号和密码找回数据，不属于 BNS owner/controller 身份，也不得写入公开 BNS 文档。
+- 本版本不要求注册邮箱验证码、邮箱所有权验证或 `email_verified` 状态；但仅知道邮箱地址不能成为直接修改密码的凭证。
+- 密码找回是本版本要求，找回入口应按规范化邮箱定位唯一账号。重置 token、邮件投递和消费流程仍需单独设计并实现，不得改变 BNS owner/controller 权限。
+- 已完成：服务端 `RegisterReq`、客户端 `SnAuthRegisterReq`、用户模型和 SQLite schema 已增加 `email`；存量账号迁移后暂保留 `NULL` 等待可信补录，新 `auth.register` 强制传入邮箱；已增加规范化、唯一索引和并发重复邮箱注册测试。
+- 已完成：新增稳定的 `invalid_email`、`email_already_bound` 错误名并分配错误码。TODO：新增密码找回 RPC、一次性重置凭证及 session 撤销逻辑。
+
+当前代码已实现注册邮箱字段和约束，并分配 `invalid_email` / `email_already_bound` 稳定错误码；密码找回 RPC、重置凭证、邮件投递和消费后的 session 撤销仍待实现。
 
 `auth.register` 的 BNS 行为取决于 SN 是否启用了 bns-proxy（`bns_write_enabled`/`bns_indexer_url` + `bns_evm`，可选 `bns_proxy` 多 controller 配置块；完整配置见 `doc/SN/sn-bns-proxy-todo.md`）：
 
@@ -349,6 +361,8 @@ SN 仍然提供两个标准解析面，但它们不是 SN RPC：
 | 1025 | `bns_write_failed` |
 | 1026 | `bns_proxy_unavailable` |
 | 1027 | `bns_controller_unavailable` |
+| 1028 | `invalid_email` |
+| 1029 | `email_already_bound` |
 | 1099 | `internal_error` |
 
 `domain_proof_failed` 只从 `domain.bind` 冒出，message 是 JSON，见 4.3。
@@ -370,4 +384,4 @@ BNS 写入错误会从任意 bns-proxy 写路径冒出：`auth.register` 的 BNS
 | `query.resolve_did` / `query.resolve_hostname` / `query.resolve_device` | DID 和域名解析改用 W3C DID Resolver / DNS NameServer；OOD 建连信息改用 `deviceinfo.resolve_ood_by_*`。 |
 | `user.bind_owner_key` / `user.get_owner_key` | 已移除。owner/controller 权限管理走 BNS 侧流程（生产路径见 bns-proxy 的 `auth.register`）。 |
 
-`cyfs-gateway-api::SnClient` 已按新路径封装 auth、deviceinfo 与 bns-proxy 三个 target；传入旧 `/kapi/sn` 或 `/kapi/sn/bns` 后缀的 base URL 时，会自动归一化到目标方法对应的新路径。`SnAuthRegisterReq` 支持 `asset_owner`、`owner_config` 与 `initial_documents`，客户端也提供 `publish_dns_txt`、`publish_document` 便捷方法。
+`cyfs-gateway-api::SnClient` 已按新路径封装 auth、deviceinfo 与 bns-proxy 三个 target；传入旧 `/kapi/sn` 或 `/kapi/sn/bns` 后缀的 base URL 时，会自动归一化到目标方法对应的新路径。`SnAuthRegisterReq` 已支持必填 `email` 以及 `asset_owner`、`owner_config` 与 `initial_documents`；客户端也提供 `publish_dns_txt`、`publish_document` 便捷方法。

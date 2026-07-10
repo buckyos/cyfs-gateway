@@ -19,6 +19,90 @@ const SESSION_REVOKED: &str = "revoked";
 
 pub type SnAuthDBRef = Arc<dyn SnAuthDB>;
 
+/// 注册邮箱规范化与基本格式校验。
+///
+/// SN 把邮箱作为本地账号找回标识，不写入 BNS。当前产品规则是 trim 后将
+/// ASCII 地址整体转成小写；不接受 quoted local-part、非 ASCII 地址或非法的
+/// DNS label。所有唯一性查询和持久化都必须使用本函数的返回值。
+pub fn canonical_email(email: &str) -> SnResult<String> {
+    let email = email.trim();
+    if email.is_empty() || email.len() > 254 || !email.is_ascii() {
+        return Err(sn_err!(
+            SnErrorCode::InvalidInput,
+            "email must be a non-empty ASCII address no longer than 254 bytes"
+        ));
+    }
+
+    let (local, domain) = email.split_once('@').ok_or_else(|| {
+        sn_err!(
+            SnErrorCode::InvalidInput,
+            "email must contain exactly one @ separator"
+        )
+    })?;
+    if local.is_empty()
+        || local.len() > 64
+        || domain.is_empty()
+        || domain.len() > 253
+        || domain.contains('@')
+    {
+        return Err(sn_err!(
+            SnErrorCode::InvalidInput,
+            "email local part or domain is invalid"
+        ));
+    }
+    if local.starts_with('.')
+        || local.ends_with('.')
+        || local.contains("..")
+        || !local.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(
+                    byte,
+                    b'!'
+                        | b'#'
+                        | b'$'
+                        | b'%'
+                        | b'&'
+                        | b'\''
+                        | b'*'
+                        | b'+'
+                        | b'-'
+                        | b'.'
+                        | b'/'
+                        | b'='
+                        | b'?'
+                        | b'^'
+                        | b'_'
+                        | b'`'
+                        | b'{'
+                        | b'|'
+                        | b'}'
+                        | b'~'
+                )
+        })
+    {
+        return Err(sn_err!(
+            SnErrorCode::InvalidInput,
+            "email local part has invalid syntax"
+        ));
+    }
+    if domain.split('.').any(|label| {
+        label.is_empty()
+            || label.len() > 63
+            || label.starts_with('-')
+            || label.ends_with('-')
+            || !label
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    }) {
+        return Err(sn_err!(
+            SnErrorCode::InvalidInput,
+            "email domain has invalid syntax"
+        ));
+    }
+
+    Ok(email.to_ascii_lowercase())
+}
+
 /// user_domain 规范化：trim、去尾部 `.`、小写、去可选 `*.` 前缀。
 /// 空结果（空串、仅点、仅通配）返回 None。
 pub fn canonical_user_domain(domain: &str) -> Option<String> {
@@ -132,6 +216,9 @@ impl UserState {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SNUserInfo {
     pub username: Option<String>,
+    /// 存量/seed 账号在补录前为 None；所有 `auth.register` 新账号必有值。
+    #[serde(default)]
+    pub email: Option<String>,
     pub state: UserState,
     pub public_key: String,
     pub activation_code: Option<String>,
@@ -235,6 +322,7 @@ pub trait SnAuthDB: Send + Sync + 'static {
         &self,
         active_code: &str,
         username: &str,
+        email: &str,
         password_hash: &str,
         password_salt: &str,
         password_algo: &str,
@@ -247,6 +335,7 @@ pub trait SnAuthDB: Send + Sync + 'static {
         password_algo: &str,
     ) -> SnResult<bool>;
     async fn is_user_exist(&self, username: &str) -> SnResult<bool>;
+    async fn get_user_by_email(&self, email: &str) -> SnResult<Option<SNUserInfo>>;
     /// trusted 路径（seed/import）专用：不经 DNS PKX proof 直接注册并激活
     /// `user_domain` 绑定。不得从对外 RPC 直接暴露。
     async fn register_user_with_owner_key(
@@ -388,6 +477,7 @@ impl SnAuthDB for RemoteSnAuthDB {
         &self,
         active_code: &str,
         username: &str,
+        email: &str,
         password_hash: &str,
         password_salt: &str,
         password_algo: &str,
@@ -396,6 +486,7 @@ impl SnAuthDB for RemoteSnAuthDB {
             .register_user(
                 active_code,
                 username,
+                email,
                 password_hash,
                 password_salt,
                 password_algo,
@@ -417,6 +508,10 @@ impl SnAuthDB for RemoteSnAuthDB {
 
     async fn is_user_exist(&self, username: &str) -> SnResult<bool> {
         self.client.is_user_exist(username).await
+    }
+
+    async fn get_user_by_email(&self, email: &str) -> SnResult<Option<SNUserInfo>> {
+        self.client.get_user_by_email(email).await
     }
 
     async fn register_user_with_owner_key(
@@ -604,6 +699,7 @@ impl SqliteSnAuthDB {
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS users (
                 username TEXT PRIMARY KEY,
+                email TEXT NULL,
                 state TEXT NOT NULL DEFAULT 'active',
                 bns_name TEXT,
                 public_key TEXT NOT NULL DEFAULT '',
@@ -622,6 +718,15 @@ impl SqliteSnAuthDB {
         .await
         .map_err(|e| Self::db_err("create users table failed", e))?;
         self.ensure_user_columns().await?;
+        // SQLite 允许 UNIQUE 索引中存在多行 NULL：存量/seed 账号可以先不补录，
+        // 但所有带邮箱的新注册都由数据库保证全局一对一。
+        sqlx::query(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email_unique
+             ON users (email) WHERE email IS NOT NULL",
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| Self::db_err("create users email unique index failed", e))?;
 
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS user_auth (
@@ -800,6 +905,28 @@ impl SqliteSnAuthDB {
         sn_err!(SnErrorCode::InvalidInput, "{}", context.as_ref())
     }
 
+    fn email_already_bound(email: &str) -> SnError {
+        sn_err!(
+            SnErrorCode::Conflict,
+            "email already bound: {}",
+            email
+        )
+    }
+
+    fn insert_user_err(email: &str, error: sqlx::Error) -> SnError {
+        let is_email_unique_violation = error
+            .as_database_error()
+            .is_some_and(|db_error| {
+                db_error.is_unique_violation()
+                    && db_error.message().to_ascii_lowercase().contains("users.email")
+            });
+        if is_email_unique_violation {
+            Self::email_already_bound(email)
+        } else {
+            Self::db_err("insert user failed", error)
+        }
+    }
+
     fn check_non_empty(value: &str, field: &str) -> SnResult<()> {
         if value.trim().is_empty() {
             return Err(Self::invalid_input(format!("{} is empty", field)));
@@ -817,6 +944,9 @@ impl SqliteSnAuthDB {
     }
 
     async fn ensure_user_columns(&self) -> SnResult<()> {
+        // Breaking-change migration policy: legacy rows keep NULL until a separate,
+        // authenticated backfill flow is introduced. Public auth.register never writes NULL.
+        self.ensure_column("users", "email", "TEXT NULL").await?;
         self.ensure_column("users", "bns_name", "TEXT").await?;
         self.ensure_column("users", "owner_key_ref", "TEXT").await?;
         self.ensure_column("users", "created_at", "INTEGER NOT NULL DEFAULT 0")
@@ -1126,6 +1256,9 @@ impl SqliteSnAuthDB {
                 row.try_get("username")
                     .map_err(|e| Self::db_err("read username failed", e))?,
             ),
+            email: row
+                .try_get("email")
+                .map_err(|e| Self::db_err("read email failed", e))?,
             state: UserState::from_str(state_str.as_deref()),
             public_key: row
                 .try_get::<Option<String>, _>("public_key")
@@ -1348,12 +1481,17 @@ impl SnAuthDB for SqliteSnAuthDB {
         &self,
         active_code: &str,
         username: &str,
+        email: &str,
         password_hash: &str,
         password_salt: &str,
         password_algo: &str,
     ) -> SnResult<bool> {
+        let email = canonical_email(email)?;
         let _locker =
             async_named_locker::Locker::get_locker(format!("active_code_{}", active_code)).await;
+        // 同进程内尽早串行化同邮箱注册，数据库 UNIQUE 索引仍是跨进程/竞态兜底。
+        let _email_locker =
+            async_named_locker::Locker::get_locker(format!("sn_email_{}", email)).await;
         let mut tx = self
             .pool
             .begin()
@@ -1391,21 +1529,32 @@ impl SnAuthDB for SqliteSnAuthDB {
             return Ok(false);
         }
 
+        let email_count =
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM users WHERE email = ?1")
+                .bind(email.as_str())
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(|e| Self::db_err("query email count failed", e))?;
+        if email_count > 0 {
+            return Err(Self::email_already_bound(email.as_str()));
+        }
+
         let now = Self::now_secs() as i64;
         sqlx::query(
             "INSERT INTO users
-                (username, state, bns_name, public_key, activation_code, owner_key_ref,
+                (username, email, state, bns_name, public_key, activation_code, owner_key_ref,
                  zone_config, user_domain, self_cert, sn_ips, created_at, updated_at, last_login_at)
-             VALUES (?1, ?2, ?3, '', ?4, NULL, '', NULL, 0, NULL, ?5, ?5, NULL)",
+             VALUES (?1, ?2, ?3, ?4, '', ?5, NULL, '', NULL, 0, NULL, ?6, ?6, NULL)",
         )
         .bind(username)
+        .bind(email.as_str())
         .bind(UserState::Active.to_string())
         .bind(username)
         .bind(active_code)
         .bind(now)
         .execute(&mut *tx)
         .await
-        .map_err(|e| Self::db_err("insert user failed", e))?;
+        .map_err(|e| Self::insert_user_err(email.as_str(), e))?;
 
         sqlx::query(
             "INSERT INTO user_auth
@@ -1490,6 +1639,21 @@ impl SnAuthDB for SqliteSnAuthDB {
             .await
             .map_err(|e| Self::db_err("query user failed", e))?;
         Ok(count > 0)
+    }
+
+    async fn get_user_by_email(&self, email: &str) -> SnResult<Option<SNUserInfo>> {
+        let email = canonical_email(email)?;
+        let row = sqlx::query(
+            "SELECT username, email, state, public_key, activation_code, zone_config,
+                    self_cert, user_domain, sn_ips
+             FROM users WHERE email = ?1",
+        )
+        .bind(email.as_str())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| Self::db_err("query user by email failed", e))?;
+
+        row.as_ref().map(Self::user_from_row).transpose()
     }
 
     async fn register_user_with_owner_key(
@@ -1624,7 +1788,7 @@ impl SnAuthDB for SqliteSnAuthDB {
 
     async fn get_user_info(&self, username: &str) -> SnResult<Option<SNUserInfo>> {
         let row = sqlx::query(
-            "SELECT username, state, public_key, activation_code, zone_config,
+            "SELECT username, email, state, public_key, activation_code, zone_config,
                     self_cert, user_domain, sn_ips
              FROM users WHERE username = ?1",
         )
@@ -1642,7 +1806,7 @@ impl SnAuthDB for SqliteSnAuthDB {
             None => return Ok(None),
         };
         let row = sqlx::query(
-            "SELECT u.username, u.state, u.public_key, u.activation_code, u.zone_config,
+            "SELECT u.username, u.email, u.state, u.public_key, u.activation_code, u.zone_config,
                     u.self_cert, u.user_domain, u.sn_ips
              FROM user_domain_bindings b
              JOIN users u ON u.username = b.owner
@@ -2231,6 +2395,187 @@ mod tests {
         Ok((tmp_dir, db))
     }
 
+    #[test]
+    fn test_canonical_email_validation() {
+        assert_eq!(
+            canonical_email("  Alice.Recovery+SN@Example.COM  ").unwrap(),
+            "alice.recovery+sn@example.com"
+        );
+        for invalid in [
+            "",
+            "missing-at.example.com",
+            "two@@example.com",
+            ".alice@example.com",
+            "alice..sn@example.com",
+            "alice@-example.com",
+            "alice@example..com",
+            "爱丽丝@example.com",
+        ] {
+            assert!(canonical_email(invalid).is_err(), "must reject {invalid:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_register_email_is_normalized_queryable_and_unique() -> SnResult<()> {
+        let (_tmp_dir, db) = new_test_db().await?;
+        db.insert_activation_code("email-code-1").await?;
+        db.insert_activation_code("email-code-2").await?;
+
+        assert!(
+            db.register_user(
+                "email-code-1",
+                "alice",
+                "  Alice.Recovery@Example.COM  ",
+                "hash",
+                "salt",
+                "pbkdf2",
+            )
+            .await?
+        );
+        let by_name = db.get_user_info("alice").await?.unwrap();
+        assert_eq!(by_name.email.as_deref(), Some("alice.recovery@example.com"));
+        let by_email = db
+            .get_user_by_email("ALICE.RECOVERY@EXAMPLE.COM")
+            .await?
+            .unwrap();
+        assert_eq!(by_email.username.as_deref(), Some("alice"));
+
+        let duplicate = db
+            .register_user(
+                "email-code-2",
+                "bob",
+                "alice.recovery@example.com",
+                "hash",
+                "salt",
+                "pbkdf2",
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(duplicate.code(), SnErrorCode::Conflict);
+        assert!(duplicate.msg().starts_with("email already bound:"));
+        assert!(db.check_active_code("email-code-2").await?);
+        assert!(!db.is_user_exist("bob").await?);
+
+        // 应用层预查之外，SQLite 唯一索引也必须独立拒绝重复绑定。
+        let raw_duplicate = sqlx::query(
+            "INSERT INTO users (username, email, state) VALUES (?1, ?2, 'active')",
+        )
+        .bind("raw-duplicate")
+        .bind("alice.recovery@example.com")
+        .execute(&db.pool)
+        .await
+        .unwrap_err();
+        assert!(raw_duplicate
+            .as_database_error()
+            .is_some_and(|error| error.is_unique_violation()));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_registration_rejects_same_normalized_email() -> SnResult<()> {
+        let (_tmp_dir, db) = new_test_db().await?;
+        db.insert_activation_code("email-race-code-1").await?;
+        db.insert_activation_code("email-race-code-2").await?;
+        let db = Arc::new(db);
+
+        let alice = {
+            let db = db.clone();
+            tokio::spawn(async move {
+                db.register_user(
+                    "email-race-code-1",
+                    "alice",
+                    "Recovery@Example.COM",
+                    "hash",
+                    "salt",
+                    "pbkdf2",
+                )
+                .await
+            })
+        };
+        let bob = {
+            let db = db.clone();
+            tokio::spawn(async move {
+                db.register_user(
+                    "email-race-code-2",
+                    "bob",
+                    " recovery@example.com ",
+                    "hash",
+                    "salt",
+                    "pbkdf2",
+                )
+                .await
+            })
+        };
+
+        let outcomes = [
+            alice.await.expect("alice registration task panicked"),
+            bob.await.expect("bob registration task panicked"),
+        ];
+        let mut successes = 0;
+        let mut conflicts = 0;
+        for outcome in outcomes {
+            match outcome {
+                Ok(true) => successes += 1,
+                Err(error) if error.code() == SnErrorCode::Conflict => conflicts += 1,
+                other => panic!("unexpected concurrent registration outcome: {other:?}"),
+            }
+        }
+        assert_eq!(successes, 1);
+        assert_eq!(conflicts, 1);
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM users WHERE email = ?1")
+                .bind("recovery@example.com")
+                .fetch_one(&db.pool)
+                .await
+                .map_err(|e| SqliteSnAuthDB::db_err("count registered email failed", e))?,
+            1
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_legacy_users_migration_keeps_account_without_email() -> SnResult<()> {
+        let tmp_dir = tempfile::tempdir()
+            .map_err(|e| sn_err!(SnErrorCode::DBError, "create temp dir failed: {}", e))?;
+        let db_path = tmp_dir.path().join("legacy-sn-auth.sqlite3");
+        let db = SqliteSnAuthDB::new_by_path(db_path.to_string_lossy().as_ref()).await?;
+        sqlx::query(
+            "CREATE TABLE users (
+                username TEXT PRIMARY KEY,
+                state TEXT NOT NULL DEFAULT 'active',
+                public_key TEXT NOT NULL DEFAULT '',
+                activation_code TEXT,
+                zone_config TEXT NOT NULL DEFAULT '',
+                self_cert INTEGER NOT NULL DEFAULT 0,
+                user_domain TEXT,
+                sn_ips TEXT
+            )",
+        )
+        .execute(&db.pool)
+        .await
+        .map_err(|e| SqliteSnAuthDB::db_err("create legacy users table failed", e))?;
+        sqlx::query("INSERT INTO users (username) VALUES ('legacy-user')")
+            .execute(&db.pool)
+            .await
+            .map_err(|e| SqliteSnAuthDB::db_err("insert legacy user failed", e))?;
+
+        db.initialize_database().await?;
+
+        let legacy = db.get_user_info("legacy-user").await?.unwrap();
+        assert!(legacy.email.is_none());
+        let email_column_count = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM pragma_table_info('users') WHERE name = 'email'",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .map_err(|e| SqliteSnAuthDB::db_err("query migrated email column failed", e))?;
+        assert_eq!(email_column_count, 1);
+
+        Ok(())
+    }
+
     #[tokio::test]
     async fn test_activation_code_and_auth_flow() -> SnResult<()> {
         let (_tmp_dir, db) = new_test_db().await?;
@@ -2241,18 +2586,33 @@ mod tests {
         let active_code = codes[0].as_str();
         assert!(db.check_active_code(active_code).await?);
         assert!(
-            db.register_user(active_code, "alice", "hash", "salt", "pbkdf2")
+            db.register_user(
+                active_code,
+                "alice",
+                "alice@example.com",
+                "hash",
+                "salt",
+                "pbkdf2",
+            )
                 .await?
         );
         assert!(!db.check_active_code(active_code).await?);
         assert!(
-            !db.register_user(active_code, "bob", "hash2", "salt2", "pbkdf2")
+            !db.register_user(
+                active_code,
+                "bob",
+                "bob@example.com",
+                "hash2",
+                "salt2",
+                "pbkdf2",
+            )
                 .await?
         );
         assert!(db.is_user_exist("alice").await?);
 
         let user = db.get_user_info("alice").await?.unwrap();
         assert_eq!(user.username.as_deref(), Some("alice"));
+        assert_eq!(user.email.as_deref(), Some("alice@example.com"));
         assert_eq!(user.activation_code.as_deref(), Some(active_code));
         assert_eq!(user.public_key, "");
         assert!(!user.self_cert);
@@ -2283,11 +2643,25 @@ mod tests {
         db.insert_activation_code("alice-code").await?;
         db.insert_activation_code("bob-code").await?;
         assert!(
-            db.register_user("alice-code", "alice", "hash", "salt", "pbkdf2")
+            db.register_user(
+                "alice-code",
+                "alice",
+                "alice@example.com",
+                "hash",
+                "salt",
+                "pbkdf2",
+            )
                 .await?
         );
         assert!(
-            db.register_user("bob-code", "bob", "hash", "salt", "pbkdf2")
+            db.register_user(
+                "bob-code",
+                "bob",
+                "bob@example.com",
+                "hash",
+                "salt",
+                "pbkdf2",
+            )
                 .await?
         );
 
@@ -2351,7 +2725,14 @@ mod tests {
         let (_tmp_dir, db) = new_test_db().await?;
         db.insert_activation_code("zone-code").await?;
         assert!(
-            db.register_user("zone-code", "alice", "hash", "salt", "pbkdf2")
+            db.register_user(
+                "zone-code",
+                "alice",
+                "alice@example.com",
+                "hash",
+                "salt",
+                "pbkdf2",
+            )
                 .await?
         );
 
@@ -2399,7 +2780,14 @@ mod tests {
         let (_tmp_dir, db) = new_test_db().await?;
         db.insert_activation_code("clear-me").await?;
         assert!(
-            db.register_user("clear-me", "alice", "hash", "salt", "pbkdf2")
+            db.register_user(
+                "clear-me",
+                "alice",
+                "alice@example.com",
+                "hash",
+                "salt",
+                "pbkdf2",
+            )
                 .await?
         );
 
@@ -2468,7 +2856,10 @@ mod tests {
 
         let code = codes[0].as_str();
         assert!(db.check_active_code(code).await?);
-        assert!(db.register_user(code, "alice", "h", "s", "pbkdf2").await?);
+        assert!(
+            db.register_user(code, "alice", "alice@example.com", "h", "s", "pbkdf2")
+                .await?
+        );
 
         // 注册后事务内 used=1。
         let used: i64 = sqlx::query_scalar("SELECT used FROM activation_codes WHERE code = ?1")
@@ -2480,7 +2871,10 @@ mod tests {
         assert!(!db.check_active_code(code).await?);
 
         // 二次使用被拒（既不创建用户，也不报错，按契约返回 false）。
-        assert!(!db.register_user(code, "bob", "h", "s", "pbkdf2").await?);
+        assert!(
+            !db.register_user(code, "bob", "bob@example.com", "h", "s", "pbkdf2")
+                .await?
+        );
         assert!(!db.is_user_exist("bob").await?);
 
         Ok(())
@@ -2492,7 +2886,14 @@ mod tests {
         let (_tmp_dir, db) = new_test_db().await?;
         db.insert_activation_code("code-1").await?;
         assert!(
-            db.register_user("code-1", "alice", "hash", "salt", "pbkdf2")
+            db.register_user(
+                "code-1",
+                "alice",
+                "alice@example.com",
+                "hash",
+                "salt",
+                "pbkdf2",
+            )
                 .await?
         );
 
@@ -2517,7 +2918,14 @@ mod tests {
         // 同名二次注册（换激活码）被拒，且不破坏已有行。
         db.insert_activation_code("code-2").await?;
         assert!(
-            !db.register_user("code-2", "alice", "h2", "s2", "pbkdf2")
+            !db.register_user(
+                "code-2",
+                "alice",
+                "alice2@example.com",
+                "h2",
+                "s2",
+                "pbkdf2",
+            )
                 .await?
         );
         // code-2 未被消费。
@@ -2545,6 +2953,7 @@ mod tests {
                 db.register_user(
                     "shared-code",
                     &format!("user-{i}"),
+                    &format!("user-{i}@example.com"),
                     "hash",
                     "salt",
                     "pbkdf2",
@@ -2629,7 +3038,14 @@ mod tests {
         let (_tmp_dir, db) = new_test_db().await?;
         db.insert_activation_code("state-code").await?;
         assert!(
-            db.register_user("state-code", "alice", "h", "s", "pbkdf2")
+            db.register_user(
+                "state-code",
+                "alice",
+                "alice@example.com",
+                "h",
+                "s",
+                "pbkdf2",
+            )
                 .await?
         );
 
@@ -2774,7 +3190,14 @@ mod tests {
         let (_tmp_dir, db) = new_test_db().await?;
         db.insert_activation_code("alice-code").await?;
         assert!(
-            db.register_user("alice-code", "alice", "h", "s", "pbkdf2")
+            db.register_user(
+                "alice-code",
+                "alice",
+                "alice@example.com",
+                "h",
+                "s",
+                "pbkdf2",
+            )
                 .await?
         );
 
@@ -2845,7 +3268,17 @@ mod tests {
         let (_tmp_dir, db) = new_test_db().await?;
         for (code, user) in [("a-code", "alice"), ("b-code", "bob")] {
             db.insert_activation_code(code).await?;
-            assert!(db.register_user(code, user, "h", "s", "pbkdf2").await?);
+            assert!(
+                db.register_user(
+                    code,
+                    user,
+                    &format!("{user}@example.com"),
+                    "h",
+                    "s",
+                    "pbkdf2",
+                )
+                .await?
+            );
         }
 
         // alice 激活 example.com 后 unbind：留下 history 与 revoked 行。
@@ -2921,7 +3354,14 @@ mod tests {
         let (_tmp_dir, db) = new_test_db().await?;
         db.insert_activation_code("alice-code").await?;
         assert!(
-            db.register_user("alice-code", "alice", "h", "s", "pbkdf2")
+            db.register_user(
+                "alice-code",
+                "alice",
+                "alice@example.com",
+                "h",
+                "s",
+                "pbkdf2",
+            )
                 .await?
         );
 
@@ -2945,7 +3385,14 @@ mod tests {
         // breaking change：bob 仅在 users.user_domain 留有遗留域名、无 binding 行，不再命中。
         db.insert_activation_code("bob-code").await?;
         assert!(
-            db.register_user("bob-code", "bob", "h", "s", "pbkdf2")
+            db.register_user(
+                "bob-code",
+                "bob",
+                "bob@example.com",
+                "h",
+                "s",
+                "pbkdf2",
+            )
                 .await?
         );
         sqlx::query("UPDATE users SET user_domain = 'legacy.test' WHERE username = 'bob'")
@@ -3006,12 +3453,26 @@ mod tests {
 
         db.insert_activation_code("alice-code").await?;
         assert!(
-            db.register_user("alice-code", "alice", "h", "s", "pbkdf2")
+            db.register_user(
+                "alice-code",
+                "alice",
+                "alice@example.com",
+                "h",
+                "s",
+                "pbkdf2",
+            )
                 .await?
         );
         db.insert_activation_code("bob-code").await?;
         assert!(
-            db.register_user("bob-code", "bob", "h", "s", "pbkdf2")
+            db.register_user(
+                "bob-code",
+                "bob",
+                "bob@example.com",
+                "h",
+                "s",
+                "pbkdf2",
+            )
                 .await?
         );
 
@@ -3059,7 +3520,14 @@ mod tests {
         let (_tmp_dir, db) = new_test_db().await?;
         db.insert_activation_code("zone-code").await?;
         assert!(
-            db.register_user("zone-code", "alice", "h", "s", "pbkdf2")
+            db.register_user(
+                "zone-code",
+                "alice",
+                "alice@example.com",
+                "h",
+                "s",
+                "pbkdf2",
+            )
                 .await?
         );
 
@@ -3101,7 +3569,14 @@ mod tests {
         let (_tmp_dir, db) = new_test_db().await?;
         db.insert_activation_code("zone-code").await?;
         assert!(
-            db.register_user("zone-code", "alice", "h", "s", "pbkdf2")
+            db.register_user(
+                "zone-code",
+                "alice",
+                "alice@example.com",
+                "h",
+                "s",
+                "pbkdf2",
+            )
                 .await?
         );
 
@@ -3138,7 +3613,14 @@ mod tests {
         let (_tmp_dir, db) = new_test_db().await?;
         db.insert_activation_code("zone-code").await?;
         assert!(
-            db.register_user("zone-code", "alice", "h", "s", "pbkdf2")
+            db.register_user(
+                "zone-code",
+                "alice",
+                "alice@example.com",
+                "h",
+                "s",
+                "pbkdf2",
+            )
                 .await?
         );
 

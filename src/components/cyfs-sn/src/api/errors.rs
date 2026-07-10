@@ -34,6 +34,8 @@ pub(crate) enum SnApiErrorCode {
     BnsProxyUnavailable = 1026,
     /// 用户绑定的 controller 已不在当前配置（需人工迁移，不静默重分配）。
     BnsControllerUnavailable = 1027,
+    InvalidEmail = 1028,
+    EmailAlreadyBound = 1029,
     InternalError = 1099,
 }
 
@@ -68,6 +70,8 @@ impl SnApiErrorCode {
             Self::BnsWriteFailed => "bns_write_failed",
             Self::BnsProxyUnavailable => "bns_proxy_unavailable",
             Self::BnsControllerUnavailable => "bns_controller_unavailable",
+            Self::InvalidEmail => "invalid_email",
+            Self::EmailAlreadyBound => "email_already_bound",
             Self::InternalError => "internal_error",
         }
     }

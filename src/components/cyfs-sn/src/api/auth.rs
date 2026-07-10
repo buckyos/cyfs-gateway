@@ -3,7 +3,7 @@ use super::common::{
     parse_params, require_account_username, ActiveCodeReq, IntoRpcResult, LoginReq, NameReq,
     RefreshReq, RegisterReq, RpcCallResult,
 };
-use super::errors::{bns_proxy_error, parse_error, SnApiErrorCode};
+use super::errors::{bns_proxy_error, parse_error, reason_error, SnApiErrorCode};
 use crate::sn_auth_manager::{hash_password, verify_password, PASSWORD_ALGO};
 use crate::sn_bns_proxy::SnBnsProxyRegisterParams;
 use crate::SNServer;
@@ -109,6 +109,15 @@ pub(crate) async fn handle_auth(server: &SNServer, req: RPCRequest) -> RpcCallRe
             let username = normalize_username(params.name.as_str())?;
             SNServer::validate_registration_username(username.as_str())
                 .map_err(|message| parse_error(SnApiErrorCode::InvalidUsername, message))?;
+            let email = crate::canonical_email(params.email.as_str())
+                .map_err(|error| parse_error(SnApiErrorCode::InvalidEmail, error.msg()))?;
+            // 锁覆盖预查、可选 BNS bootstrap 和本地事务，避免同进程并发请求
+            // 在邮箱冲突已知前产生两次外部注册副作用。SQLite UNIQUE 索引仍兜底。
+            let _email_locker = async_named_locker::Locker::get_locker(format!(
+                "sn_auth_register_email_{}",
+                email
+            ))
+            .await;
             if server
                 .auth_db()
                 .is_user_exist(username.as_str())
@@ -124,6 +133,18 @@ pub(crate) async fn handle_auth(server: &SNServer, req: RPCRequest) -> RpcCallRe
                 return Err(parse_error(
                     SnApiErrorCode::UsernameAlreadyExists,
                     format!("username {} already exists", username),
+                ));
+            }
+            if server
+                .auth_db()
+                .get_user_by_email(email.as_str())
+                .await
+                .into_rpc()?
+                .is_some()
+            {
+                return Err(parse_error(
+                    SnApiErrorCode::EmailAlreadyBound,
+                    "email is already bound to another account",
                 ));
             }
             if !server
@@ -181,12 +202,24 @@ pub(crate) async fn handle_auth(server: &SNServer, req: RPCRequest) -> RpcCallRe
                 .register_user(
                     params.active_code.as_str(),
                     username.as_str(),
+                    email.as_str(),
                     password_hash.as_str(),
                     password_salt.as_str(),
                     PASSWORD_ALGO,
                 )
                 .await
-                .into_rpc()?;
+                .map_err(|error| {
+                    if error.code() == crate::SnErrorCode::Conflict
+                        && error.msg().starts_with("email already bound:")
+                    {
+                        parse_error(
+                            SnApiErrorCode::EmailAlreadyBound,
+                            "email is already bound to another account",
+                        )
+                    } else {
+                        reason_error(SnApiErrorCode::InternalError, error.to_string())
+                    }
+                })?;
             if !ok {
                 return Err(parse_error(
                     SnApiErrorCode::InvalidActiveCode,

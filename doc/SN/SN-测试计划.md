@@ -91,6 +91,8 @@ BNS 合约测试用于钉住链上规则，而不是验证 Rust 侧实现细节�
 目标是保证账号和权限模型可恢复、可撤销、可审计：
 
 - 激活码、注册、密码哈希、登录、refresh、logout、session 查询与撤销语义正确。
+- TODO（本版本）：注册必须拒绝缺失/格式非法的邮箱；邮箱按统一规范化结果存储，并通过数据库唯一约束保证大小写或首尾空白变体以及并发请求都不能绑定到多个账号。
+- TODO（本版本）：密码找回应覆盖不存在邮箱不泄露账号、重置凭证过期与单次消费、成功重置后撤销已有 sessions，以及不改变 BNS owner/controller 权限；注册邮箱验证码不在本轮测试范围内。
 - 用户状态变化能立即影响已有 session。
 - 用户域名绑定必须经过 PKX 校验；域名冲突、最长匹配、解绑和历史保留要稳定。
 - zone 信息 patch、relay_sn 更新、self_cert 权限检查要符合账号/设备权限。
@@ -200,6 +202,7 @@ cd src/web3-gateway && scripts/sn-dev-down.sh --purge
 
 ## 7. 当前缺口
 
+- TODO（本版本）：SN Auth 尚无注册邮箱字段、邮箱唯一绑定、存量账号迁移和密码找回测试；实现时需要同时补 DB、RPC、并发和端到端覆盖。
 - SN 服务层尚缺一个“`bns_write_enabled=true` + 真 BNS EVM/indexer/server”的完整业务端到端测试，用来覆盖 `auth.register`、`zone.bind_config`、`did.set_document` 通过 BNS Controller 写链后，再由 SN Resolver 读回的闭环。
 - 真链 reorg 场景目前主要由 mock RPC 覆盖；如果未来要支持生产级 reorg 回滚策略，需要增加更接近真实节点行为的集成验证。
 - SN Auth DB 的 remote S2S 适配已有接口，但缺少像 DeviceInfo 一样的 local/remote 同批用例一致性测试。

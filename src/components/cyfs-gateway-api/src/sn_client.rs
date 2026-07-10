@@ -95,6 +95,7 @@ fn new_sn_krpc(sn_url: &str, session_token: Option<String>, target: SnRpcTarget)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SnAuthRegisterReq {
     pub name: String,
+    pub email: String,
     pub pwd_hash: String,
     pub active_code: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -617,6 +618,7 @@ mod tests {
     fn register_request_serializes_initial_documents() {
         let request = SnAuthRegisterReq {
             name: "alice".to_string(),
+            email: "alice@example.com".to_string(),
             pwd_hash: "hash".to_string(),
             active_code: "code".to_string(),
             request_id: Some("sn:register:alice".to_string()),
@@ -636,6 +638,7 @@ mod tests {
             serde_json::to_value(request).unwrap(),
             json!({
                 "name": "alice",
+                "email": "alice@example.com",
                 "pwd_hash": "hash",
                 "active_code": "code",
                 "request_id": "sn:register:alice",

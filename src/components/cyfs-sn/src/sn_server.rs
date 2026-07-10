@@ -3192,6 +3192,7 @@ mod tests {
                 "auth.register",
                 json!({
                     "name": PROXY_USER,
+                    "email": "proxy-user@example.com",
                     "pwd_hash": "12345678",
                     "active_code": CLEAR_STATE_ACTIVE_CODE
                 }),
@@ -3218,6 +3219,7 @@ mod tests {
                 "auth.register",
                 json!({
                     "name": PROXY_USER,
+                    "email": "proxy-user@example.com",
                     "pwd_hash": "12345678",
                     "active_code": CLEAR_STATE_ACTIVE_CODE,
                     "asset_owner": PROXY_USER_OWNER,
@@ -3562,6 +3564,7 @@ mod tests {
                 "auth.register",
                 json!({
                     "name": PROXY_USER,
+                    "email": "proxy-user@example.com",
                     "pwd_hash": "12345678",
                     "active_code": CLEAR_STATE_ACTIVE_CODE
                 }),
@@ -4445,6 +4448,7 @@ mod tests {
 
         const TAKEOVER_USER: &str = "takeoveruser";
         const TAKEOVER_ACTIVE_CODE: &str = "kO3pQ4rS5tU6vW7xY8zA";
+        const EMAIL_CONFLICT_ACTIVE_CODE: &str = "email-conflict-active-code";
 
         let sn_factory = SnServerFactory::new();
         let db = tempfile::NamedTempFile::with_suffix(".db").unwrap();
@@ -4459,6 +4463,9 @@ mod tests {
                 .await
                 .unwrap();
             db.insert_activation_code(TAKEOVER_ACTIVE_CODE)
+                .await
+                .unwrap();
+            db.insert_activation_code(EMAIL_CONFLICT_ACTIVE_CODE)
                 .await
                 .unwrap();
         }
@@ -4510,7 +4517,7 @@ mod tests {
             .unwrap();
         assert!(result["valid"].as_bool().unwrap());
 
-        let result = auth_krpc
+        let missing_email_err = auth_krpc
             .call(
                 "auth.register",
                 json!({
@@ -4520,8 +4527,53 @@ mod tests {
                 }),
             )
             .await
+            .unwrap_err()
+            .to_string();
+        assert!(missing_email_err.contains("[SN:1028:invalid_email]"));
+
+        let invalid_email_err = auth_krpc
+            .call(
+                "auth.register",
+                json!({
+                    "name": REFACTOR_USER,
+                    "email": "not-an-email",
+                    "pwd_hash": "12345678",
+                    "active_code": CLEAR_STATE_ACTIVE_CODE
+                }),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(invalid_email_err.contains("[SN:1028:invalid_email]"));
+
+        let result = auth_krpc
+            .call(
+                "auth.register",
+                json!({
+                    "name": REFACTOR_USER,
+                    "email": "refactor-user@example.com",
+                    "pwd_hash": "12345678",
+                    "active_code": CLEAR_STATE_ACTIVE_CODE
+                }),
+            )
+            .await
             .unwrap();
         let access_token = result["access_token"].as_str().unwrap().to_string();
+
+        let duplicate_email_err = auth_krpc
+            .call(
+                "auth.register",
+                json!({
+                    "name": "emaildupeuser",
+                    "email": "  REFACTOR-USER@EXAMPLE.COM  ",
+                    "pwd_hash": "different-password",
+                    "active_code": EMAIL_CONFLICT_ACTIVE_CODE
+                }),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(duplicate_email_err.contains("[SN:1029:email_already_bound]"));
 
         let auth_user_krpc = kRPC::new(auth_url.as_str(), Some(access_token.clone()));
         let removed_owner_key = auth_user_krpc
@@ -4831,6 +4883,7 @@ mod tests {
                 "auth.register",
                 json!({
                     "name": TAKEOVER_USER,
+                    "email": "takeover-user@example.com",
                     "pwd_hash": "87654321",
                     "active_code": TAKEOVER_ACTIVE_CODE
                 }),
@@ -4992,6 +5045,7 @@ mod tests {
                 "auth.register",
                 json!({
                     "name": DEVTOKEN_USER,
+                    "email": "device-token-user@example.com",
                     "pwd_hash": "12345678",
                     "active_code": CLEAR_STATE_ACTIVE_CODE
                 }),
@@ -5301,6 +5355,7 @@ mod tests {
                 "auth.register",
                 json!({
                     "name": "sub.domain",
+                    "email": "sub-domain@example.com",
                     "pwd_hash": "12345678",
                     "active_code": CLEAR_STATE_ACTIVE_CODE
                 }),
@@ -5315,6 +5370,7 @@ mod tests {
                 "auth.register",
                 json!({
                     "name": TEST_USER,
+                    "email": "test-user@example.com",
                     "pwd_hash": "12345678",
                     "active_code": CLEAR_STATE_ACTIVE_CODE
                 }),
@@ -5391,6 +5447,7 @@ mod tests {
                 "auth.register",
                 json!({
                     "name": "short",
+                    "email": "short@example.com",
                     "pwd_hash": "12345678",
                     "active_code": CLEAR_STATE_ACTIVE_CODE
                 }),
@@ -5713,6 +5770,7 @@ mod tests {
                 "auth.register",
                 json!({
                     "name": REG_USER,
+                    "email": "registration-user@example.com",
                     "pwd_hash": "12345678",
                     "active_code": CLEAR_STATE_ACTIVE_CODE
                 }),

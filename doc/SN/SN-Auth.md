@@ -8,7 +8,7 @@
 
 `sn_auth` 负责：
 
-- 用户名、密码凭证、激活码和登录 token。
+- 用户名、唯一绑定的电子邮箱、密码凭证、激活码和登录 token。
 - `sn_user` 的本地状态，例如 active、suspended、deleted、banned。
 - `sn_user <-> user_domain` 的绑定关系、历史冲突检查和 PKX proof 状态。
 - `zone_info` 中的本地运行态，例如 `self_cert`、当前 `relay_sn` 分配结果、历史实现中的 `sn_ips`。
@@ -84,6 +84,7 @@ e2e 覆盖见 sn_server.rs `test_sn_device_token_report_paths`。
 目标字段：
 
 - `username`: 规范化后的唯一用户名。
+- `email`: 规范化后的必填电子邮箱；一个邮箱地址只能绑定一个 `sn_user`，用于账号识别和密码找回。
 - `state`: `active | suspended | deleted | banned`。
 - `bns_name`: 绑定的 BNS name，默认等于 `username`。
 - `activation_code`: 注册或测试清理使用的许可码。
@@ -92,9 +93,10 @@ e2e 覆盖见 sn_server.rs `test_sn_device_token_report_paths`。
 
 当前实现映射：
 
-- `src/components/cyfs-sn/src/sn_auth.rs:294-308` 的 `users` 表已含全部目标字段：`username`、`state`、`bns_name`、`public_key`、`activation_code`、`owner_key_ref`、`zone_config`、`self_cert`、`user_domain`、`sn_ips`、`created_at`、`updated_at`、`last_login_at`。
+- `src/components/cyfs-sn/src/sn_auth.rs` 的 `users` 表已含 `email` 及现有目标字段：`username`、`state`、`bns_name`、`public_key`、`activation_code`、`owner_key_ref`、`zone_config`、`self_cert`、`user_domain`、`sn_ips`、`created_at`、`updated_at`、`last_login_at`。
 - `state` 枚举（active/suspended/deleted/banned）已建模（sn_auth.rs:21-53）。
 - `public_key` 当前存 JWK 字符串，未来应视为本地缓存，不作为 BNS authority 的最终来源。
+- 已完成：`SNUserInfo` 和 `users` 表已增加 `email`，新注册统一 trim + ASCII lowercase 并校验基本格式，数据库部分唯一索引保证规范化邮箱与账号一对一绑定。迁移时存量账号暂保留 `NULL`，等待后续可信邮箱补录流程；不允许通过公开注册接口创建无邮箱账号。
 - 待实现（阶段二）：`owner_key_ref` 列虽已建，但所有 insert 路径都置 NULL，从不写入（sn_auth.rs:1041、1206）；`public_key` 仍是事实上的 owner key 来源。
 
 ### password_credential
@@ -194,7 +196,7 @@ PKX 是 `user_domain` 唯一的证明方法。它不是一次性随机挑战，�
 属于 `sn_auth` 的数据：
 
 - 激活码及使用状态。
-- SN 用户、密码凭证、登录态元数据。
+- SN 用户、唯一邮箱绑定、密码凭证、密码找回状态和登录态元数据。
 - 用户状态、传统账号恢复状态、冻结/解冻状态。
 - `user_domain` 绑定、历史冲突记录和 PKX proof 状态。
 - `zone_info` 本地运行态，例如 `self_cert`、`relay_sn`、`sn_ips`。
@@ -214,6 +216,7 @@ PKX 是 `user_domain` 唯一的证明方法。它不是一次性随机挑战，�
 目标输入：
 
 - `username`
+- `email`，必填；规范化后必须全局唯一。
 - owner public keys，至少包含 BNS/ETH owner key 和后续文档签名所需 key。
 - `owner_config`
 - `password` 或明确约定的 password credential。
@@ -223,23 +226,26 @@ PKX 是 `user_domain` 唯一的证明方法。它不是一次性随机挑战，�
 目标流程：
 
 1. `sn_auth` 规范化并校验 `username`。
-2. `sn_auth` 检查 `active_code` 未使用。
-3. `sn_auth` 检查本地账号不存在。
-4. `sn_bns_controller` 构造并用托管 owner/controller 私钥签名 BNS 合约注册 TX，经 BNS-Server 提交 raw TX 创建 BNS name。
-5. BNS 创建阶段同步发布 owner_config，并设置 SN controller key 和受限 controller policy。
-6. BNS 注册成功后，`sn_auth.register` 在一个本地事务中写入 `sn_user`、`password_credential`，并标记激活码已使用。
-7. 返回 access token、refresh token 和 BNS name 状态。
+2. `sn_auth` trim、规范化并校验 `email` 基本格式。
+3. `sn_auth` 检查 `active_code` 未使用。
+4. `sn_auth` 检查本地账号和规范化邮箱都不存在。
+5. `sn_bns_controller` 构造并用托管 owner/controller 私钥签名 BNS 合约注册 TX，经 BNS-Server 提交 raw TX 创建 BNS name。
+6. BNS 创建阶段同步发布 owner_config，并设置 SN controller key 和受限 controller policy。
+7. BNS 注册成功后，`sn_auth.register` 在一个本地事务中写入 `sn_user`、唯一邮箱绑定和 `password_credential`，并标记激活码已使用。
+8. 返回 access token、refresh token 和 BNS name 状态。
 
 一致性要求：
 
 - BNS 注册请求必须有幂等 key。
 - `sn_auth` 本地写入必须是事务性的。
+- 邮箱唯一性必须由数据库唯一约束兜底；两个并发注册不能把同一个规范化邮箱绑定给不同账号。
 - 如果 BNS name 已存在但 `sn_auth` 未完成，应进入明确恢复流程：继续补齐本地账号，或由 admin 标记人工处理。
 - 不能出现本地账号注册成功但 BNS name 未创建、且系统误认为用户拥有 BNS owner 权限的状态。
 
 当前实现：
 
 - 阶段一已完成：`register_user` 在命名锁下用事务完成 `users`、`user_auth`、`zone_info`、`activation_codes.used` 的一致写入（sn_auth.rs:989-1091），返回 access+refresh token 并提示 `need_bind_owner_key=true`（auth.rs:89）。
+- 已完成：`auth.register`/`register_user` 接收并保存规范化 `email`，服务端和客户端 DTO、schema 迁移、数据库唯一索引、稳定冲突错误和并发测试均已落地。注册邮箱暂不做验证码或所有权验证。
 - 待实现（阶段二）：V2 `auth.register` 只写本地 DB，没有调用 `sn_bns_controller` 提交 BNS 合约注册 TX（`bns_indexer_url` 只接入了 resolver 读路径，sn_server.rs:688-693），没有 `request_id` 幂等 key，也没有“BNS name 已存在但本地未完成”的恢复流程。
 
 ### public key 注册
@@ -275,6 +281,19 @@ PKX 是 `user_domain` 唯一的证明方法。它不是一次性随机挑战，�
 
 - 阶段一已完成：V2 `auth.login` 不再依赖 `active_code`。`LoginReq.active_code` 已改为可选且 login 分支从不读取它，只做用户 active 校验 + 密码校验 + 更新 `last_login_at`（auth.rs:91-133，common.rs:39-45）。`need_bind_owner_key` 由 `public_key` 是否为空推导。
 - 阶段二已完成（2026-07）：`auth.logout` 基于 `jti` 撤销 access 与 refresh session，签发/刷新/校验路径均已接 `account_sessions`（见 account_session 小节）。
+
+## 密码找回流程
+
+本版本要求支持密码找回。注册时保存的唯一规范化邮箱是账号定位与找回通知地址，但邮箱地址本身不是授权凭证。
+
+目标要求：
+
+1. 按规范化邮箱查询唯一 SN 账号；对外响应不得泄露该邮箱是否已注册。
+2. 生成短时、一次性的密码重置凭证，并通过受控邮件通道交付。
+3. 消费重置凭证时更新 `password_credential`，使该凭证立即失效，并撤销该账号现有 access/refresh sessions。
+4. 密码找回只能恢复 SN 登录能力，不能修改或轮换 BNS owner key、controller key 或 controller policy。
+
+TODO（本版本）：定义密码找回 RPC、重置凭证 schema/过期与单次消费规则、邮件投递接口、限流与审计，并完成端到端测试。本版本注册流程不要求邮箱验证码或注册时邮箱所有权验证；在重置凭证交付机制完成前，禁止仅凭 `username + email` 直接重置密码。
 
 ## owner key 绑定
 
@@ -454,14 +473,14 @@ TODO（阶段二，2026-07-06 完成）：
 属于 `sn_auth` 的传统账号安全能力包括：
 
 - change password。
-- password reset。
+- password reset（本版本要求，使用注册时唯一绑定的邮箱定位账号）。
 - 账号冻结/解冻。
 - 登录失败次数、限流和风险控制。
 - session 撤销。
 
 这些能力只影响 SN 登录能力，不影响 BNS owner 权限。
 
-当前实现状态：账号冻结/解冻已实现（`set_user_state`，sn_auth.rs:1662-1675，置非 active 时撤销该用户全部 session），session 撤销已接线并在校验路径即时生效（见 account_session 小节）。待实现（阶段二）：change password、password reset、登录失败次数/限流/风控均缺失。
+当前实现状态：账号冻结/解冻已实现（`set_user_state`，sn_auth.rs:1662-1675，置非 active 时撤销该用户全部 session），session 撤销已接线并在校验路径即时生效（见 account_session 小节）。注册邮箱唯一绑定已实现；TODO（本版本）：password reset 尚未实现，change password、登录失败次数/限流/风控也仍缺失。验证码逻辑不在本轮要求内。
 
 ## 对外查询
 
@@ -485,6 +504,7 @@ trait SnAuthStore {
     async fn check_active_code(&self, code: &str) -> Result<bool>;
     async fn register_user(&self, req: RegisterSnUserRequest) -> Result<RegisterSnUserResult>;
     async fn get_user(&self, username: &str) -> Result<Option<SnUser>>;
+    async fn get_user_by_email(&self, normalized_email: &str) -> Result<Option<SnUser>>;
     async fn get_user_by_domain(&self, domain: &str) -> Result<Option<SnUser>>;
     async fn set_user_state(&self, username: &str, state: UserState) -> Result<()>;
 
@@ -508,6 +528,7 @@ RPC 层可以使用 breaking API，不要求保留旧 method alias。内部不�
 - `auth.refresh`
 - `auth.logout`
 - `auth.me`
+- TODO：密码找回申请和重置 RPC（具体 method 名及参数在实现前定稿）
 - `user.bind_owner_key`
 - `user.get_owner_key`
 - `user.get_profile`
@@ -557,7 +578,8 @@ RPC 层可以使用 breaking API，不要求保留旧 method alias。内部不�
 - ~~绕过风险：`register_user_with_owner_key` 能不经 proof 把 `user_domain` 置 active~~ 已收窄为 seed/import trusted 路径（不在对外 RPC 暴露）；`self_cert` 仍可被 `dns.*` 的 `has_cert=true` 置 true（无证书校验），待收敛。
 - owner 权限仍是“本地 `public_key` = owner”，不是 BNS authority；`owner_key_ref` 列从不写入。
 - ~~`auth.logout` 与 session 撤销表已建但未接线~~ 已接线：签发/刷新写 `account_sessions`、校验查撤销、logout 撤销 access+refresh session（见 account_session 小节）；剩余待办：token 无 `kid`、key rotation 未实现。
-- 传统账号安全大多缺失：change password、password reset、登录失败限流/风控未实现。
+- 注册邮箱已完成：`users`/`SNUserInfo`/注册 DTO 已有 email，并实现规范化、格式校验、唯一索引、按邮箱查询、存量数据兼容迁移和并发测试；TODO（本版本）：密码找回 RPC、重置凭证和邮件投递仍未实现。
+- 传统账号安全仍缺失：change password、登录失败限流/风控未实现。
 - `zone.bind_config` 还没有发布 BNS `zone` / `boot` 文档。
 
 ## 迁移步骤
@@ -578,5 +600,6 @@ RPC 层可以使用 breaking API，不要求保留旧 method alias。内部不�
 6. 把 `zone.bind_config` 拆成 owner authority 校验、BNS document 发布、`zone_info` 缓存更新三段。
 7. 引入 `sn_authority` 统一鉴权上下文，把 BNS 修改类请求统一接入，禁止业务 handler 自行把 SN access token 当 owner token 使用。（部分完成：`Device` 上下文已落地并接入 device.register/update；`Owner`/`Controller` 仍待实现。）
 8. 把 `self_cert` 更新入口收敛为可信 ACME/device 上报 + 证书校验，并记录来源和审计日志。
-9. 补齐传统账号安全（change password、reset、限流），并写入 `owner_key_ref`。
-10. 删除旧 RPC method alias 或让旧 alias 显式失败，内部只走新的 authority 和 store API。
+9. 注册强制传入 email、规范化邮箱唯一绑定、迁移和并发测试已完成；TODO（本版本）：实现基于该绑定的 password reset（不含注册邮箱验证码），重置后撤销现有 sessions。
+10. 补齐其余传统账号安全（change password、限流），并写入 `owner_key_ref`。
+11. 删除旧 RPC method alias 或让旧 alias 显式失败，内部只走新的 authority 和 store API。

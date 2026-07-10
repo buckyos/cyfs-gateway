@@ -98,7 +98,8 @@ Web2 兼容路径中，SN 对 BNS 写操作的产品封装层。它服务于没�
 
 账号与用户侧低频状态。负责：
 
-- 用户名、密码、登录 token。
+- 用户名、唯一绑定的电子邮箱、密码、登录 token。
+- 基于电子邮箱的密码找回；该流程只恢复 SN 登录能力。
 - `sn_user <-> user_domain` 绑定关系。
 - `zone_info` 中不适合放入 BNS 权威文档的运行状态，例如 `self_cert`、当前 relay 分配结果等。
 - user_domain 的冲突检查和后续 domain proof 流程。
@@ -189,7 +190,7 @@ BNS 中的 `device_mini_doc` 是设备身份和基础配置的权威文档；`sn
 
 ### SN 本地数据
 
-- 账号密码和登录态
+- 账号电子邮箱、密码和登录态
 - user_domain 绑定关系和 domain proof 状态
 - device 在线态、IP、from_ip、最近上报时间
 - zone_info 中的运行态，例如 self_cert、relay_sn 分配结果
@@ -281,6 +282,7 @@ A/AAAA 查询返回的 IP 不是单一来源，而是 `sn_resolver` 按优先级
 输入：
 
 - username
+- email（必填；规范化后一个邮箱地址只能绑定一个 SN 账号）
 - password_hash
 - active_code 或其它注册许可
 - 托管 owner/controller key、恢复策略或用户授权凭证
@@ -288,17 +290,21 @@ A/AAAA 查询返回的 IP 不是单一来源，而是 `sn_resolver` 按优先级
 
 流程：
 
-1. `sn_auth` 判断用户名是否合法、激活码是否可用。
-2. `sn_bns_controller` 调用 BNS Registry / 合约适配器创建 BNS name。
-3. BNS 创建阶段同步发布 owner_config，并设置必要的托管 controller key / controller policy。
-4. `sn_auth.register` 写入账号、密码和基础用户状态。
-5. 返回登录态、BNS name 状态和托管权限状态。
+1. `sn_auth` 判断用户名是否合法、激活码是否可用，并规范化、校验电子邮箱。
+2. `sn_auth` 检查规范化邮箱尚未绑定其他账号。
+3. `sn_bns_controller` 调用 BNS Registry / 合约适配器创建 BNS name。
+4. BNS 创建阶段同步发布 owner_config，并设置必要的托管 controller key / controller policy。
+5. `sn_auth.register` 在本地事务中写入账号、唯一邮箱绑定、密码和基础用户状态。
+6. 返回登录态、BNS name 状态和托管权限状态。
 
 需要保证：
 
 - `sn_bns_controller` 的注册请求要有幂等 key。
+- 邮箱唯一性必须由数据库唯一约束兜底，避免并发注册绕过检查。
 - 如果 BNS name 已存在但 `sn_auth` 未完成，应能通过明确的恢复流程继续绑定账号或人工处理。
 - 托管 controller policy 必须限制 doc type，不能给 SN 产品层全量 owner 权限。
+
+TODO（本版本）：当前注册 DTO、用户模型和数据库尚无 `email` 字段。需要增加必填邮箱、统一规范化/格式校验、唯一索引、存量账号迁移和并发注册测试。注册阶段暂不要求邮箱验证码或邮箱所有权验证。
 
 ### bind zone
 
@@ -497,9 +503,11 @@ publishDocument:
 
 ### 传统用户安全
 
-包括邮箱验证码、密码找回、账号冻结、账号恢复。
+本版本要求注册时强制绑定唯一电子邮箱，并支持基于该邮箱定位账号的密码找回。注册邮箱验证码和注册时邮箱所有权验证暂不要求。
 
 这些属于 `sn_auth`，不应影响 BNS owner 权限。账号恢复只能恢复 SN 登录能力，不能绕过 BNS owner key。
+
+TODO（本版本）：实现邮箱字段及唯一约束；定义密码找回 RPC、一次性重置凭证、邮件投递、过期/限流/审计和重置后 session 撤销。仅知道用户名和邮箱地址不能直接获得重置权限。
 
 ### 激活码管理
 

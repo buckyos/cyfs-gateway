@@ -31,6 +31,9 @@ pub(crate) struct ActiveCodeReq {
 #[derive(Deserialize)]
 pub(crate) struct RegisterReq {
     pub(crate) name: String,
+    /// 必填。使用 default 让缺字段也走稳定的 `invalid_email` 业务错误。
+    #[serde(default)]
+    pub(crate) email: String,
     pub(crate) pwd_hash: String,
     pub(crate) active_code: String,
     #[serde(default)]
