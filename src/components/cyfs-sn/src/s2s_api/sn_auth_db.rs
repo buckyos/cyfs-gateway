@@ -278,6 +278,7 @@ impl SnAuthDbUsernameReq {
 pub struct SnAuthDbRegisterUserWithOwnerKeyReq {
     pub active_code: String,
     pub username: String,
+    pub email: String,
     pub public_key: String,
     pub zone_config: String,
     pub user_domain: Option<String>,
@@ -288,6 +289,7 @@ impl SnAuthDbRegisterUserWithOwnerKeyReq {
     pub fn new(
         active_code: &str,
         username: &str,
+        email: &str,
         public_key: &str,
         zone_config: &str,
         user_domain: Option<String>,
@@ -296,6 +298,7 @@ impl SnAuthDbRegisterUserWithOwnerKeyReq {
         Self {
             active_code: active_code.to_string(),
             username: username.to_string(),
+            email: email.to_string(),
             public_key: public_key.to_string(),
             zone_config: zone_config.to_string(),
             user_domain,
@@ -808,6 +811,7 @@ impl SnAuthDB for SnAuthDbClient {
         &self,
         active_code: &str,
         username: &str,
+        email: &str,
         public_key: &str,
         zone_config: &str,
         user_domain: Option<String>,
@@ -819,6 +823,7 @@ impl SnAuthDB for SnAuthDbClient {
                     .register_user_with_owner_key(
                         active_code,
                         username,
+                        email,
                         public_key,
                         zone_config,
                         user_domain,
@@ -832,6 +837,7 @@ impl SnAuthDB for SnAuthDbClient {
                     &SnAuthDbRegisterUserWithOwnerKeyReq::new(
                         active_code,
                         username,
+                        email,
                         public_key,
                         zone_config,
                         user_domain,
@@ -1218,6 +1224,7 @@ where
                         .register_user_with_owner_key(
                             &parsed.active_code,
                             &parsed.username,
+                            &parsed.email,
                             &parsed.public_key,
                             &parsed.zone_config,
                             parsed.user_domain,

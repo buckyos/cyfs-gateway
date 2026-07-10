@@ -10,9 +10,9 @@
 
 - web3_gateway.yaml 核心配置文件，可以看成是代码的一部分
 - website.yaml 被web3_gatweay引用，提供https://sn.$sn_base 的常规网页需求。这个根据运维手工填写。默认为 {}
-- fullchain.cert,fullchain.pem 包含 sn.$sn_base, *.web3.$sn_base 的证书和对应的密钥。如果做全自拥有证书的逻辑就没有 *.web3的证书
+- fullchain.cert,fullchain.pem 包含 sn.$sn_base、bns.$sn_base、web3.$sn_base、*.web3.$sn_base 的证书和对应的密钥。如果做全自拥有证书的逻辑就没有 *.web3的证书
 - ca/ca_cert,ca_cert.pem 如果是测试环境，fullchain.cert是自签名的。这里保存用于于自签名的CA证书
-- dns_zone 手工配置的，DNS Zone文件。web3_gateway是DNS Server,会根据该配置处理返回值
+- local_dns.toml 是 DNS 本地记录源；make_sn_config.ts 会在部署副本中写入 bns.$sn_base -> sn_ip，使用 SN 作为 DNS 服务器的客户端可直接解析 BNS 域名
 - zone_zone 自动生成的，包含有buckyos定制的DNS TXT记录的DNS Zone文件
 - device.doc.jwt, device_private_key.pem rtcp协议栈用到的 DeviceConfig和对应的密钥文件
 - node_idenity.json （包含device.doc.jwt)，兼容buckyos的设备identity文件，目前暂没用到

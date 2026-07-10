@@ -342,6 +342,7 @@ pub trait SnAuthDB: Send + Sync + 'static {
         &self,
         active_code: &str,
         username: &str,
+        email: &str,
         public_key: &str,
         zone_config: &str,
         user_domain: Option<String>,
@@ -518,6 +519,7 @@ impl SnAuthDB for RemoteSnAuthDB {
         &self,
         active_code: &str,
         username: &str,
+        email: &str,
         public_key: &str,
         zone_config: &str,
         user_domain: Option<String>,
@@ -527,6 +529,7 @@ impl SnAuthDB for RemoteSnAuthDB {
             .register_user_with_owner_key(
                 active_code,
                 username,
+                email,
                 public_key,
                 zone_config,
                 user_domain,
@@ -1660,13 +1663,17 @@ impl SnAuthDB for SqliteSnAuthDB {
         &self,
         active_code: &str,
         username: &str,
+        email: &str,
         public_key: &str,
         zone_config: &str,
         user_domain: Option<String>,
         sn_ips: Option<String>,
     ) -> SnResult<bool> {
+        let email = canonical_email(email)?;
         let _locker =
             async_named_locker::Locker::get_locker(format!("active_code_{}", active_code)).await;
+        let _email_locker =
+            async_named_locker::Locker::get_locker(format!("sn_email_{}", email)).await;
         let _domain_locker = if user_domain.is_some() {
             Some(
                 async_named_locker::Locker::get_locker(Self::USER_DOMAIN_BINDING_LOCK.to_string())
@@ -1702,16 +1709,27 @@ impl SnAuthDB for SqliteSnAuthDB {
             return Ok(false);
         }
 
+        let email_count =
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM users WHERE email = ?1")
+                .bind(email.as_str())
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(|e| Self::db_err("query email count failed", e))?;
+        if email_count > 0 {
+            return Err(Self::email_already_bound(email.as_str()));
+        }
+
         let canonical_domain = user_domain.as_deref().and_then(canonical_user_domain);
 
         let now = Self::now_secs() as i64;
         sqlx::query(
             "INSERT INTO users
-                (username, state, bns_name, public_key, activation_code, owner_key_ref,
+                (username, email, state, bns_name, public_key, activation_code, owner_key_ref,
                  zone_config, user_domain, self_cert, sn_ips, created_at, updated_at, last_login_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7, 0, ?8, ?9, ?9, NULL)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7, ?8, 0, ?9, ?10, ?10, NULL)",
         )
         .bind(username)
+        .bind(email.as_str())
         .bind(UserState::Active.to_string())
         .bind(username)
         .bind(public_key)
@@ -1722,7 +1740,7 @@ impl SnAuthDB for SqliteSnAuthDB {
         .bind(now)
         .execute(&mut *tx)
         .await
-        .map_err(|e| Self::db_err("insert user failed", e))?;
+        .map_err(|e| Self::insert_user_err(email.as_str(), e))?;
 
         sqlx::query(
             "INSERT INTO zone_info

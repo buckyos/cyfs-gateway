@@ -14,8 +14,9 @@
 //! 用例映射（单个测试函数内顺序执行，避免重复拉环境）：
 //!   T1 账号种子：alice 用测试密码 auth.login 拿到 token；种子激活码走通
 //!      auth.register 新用户注册。
-//!   T2 DNS 种子：dev DNS 端口查 alice.web3.devtests.org A -> sn_ip；
-//!      TXT 含 BOOT=/PKX=/DEV=（zone/boot 内容）。
+//!   T2 DNS 种子：dev DNS 端口查 bns.devtests.org 和
+//!      alice.web3.devtests.org A -> sn_ip；用户域 TXT 含 BOOT=/PKX=/DEV=
+//!      （zone/boot 内容）。
 //!   T3 链上种子：GET /1.0/identifiers/did:bns:alice 经 indexer 投影解析
 //!      成功（bns_dv_seed.yaml 的 on_init_txs 已生效）。
 //!   T4 user_domain 种子：charlie.me 绑定可查询、did:web:charlie.me 解析生效。
@@ -326,6 +327,12 @@ async fn e2e_sn_seed_full_stack() {
     assert!(
         a_records.iter().any(|r| r == "127.0.0.1"),
         "T2: A records of {host} = {a_records:?}, expected sn_ip 127.0.0.1"
+    );
+    let bns_host = format!("bns.{}", env.sn_host());
+    let bns_a_records = env.dns_lookup(bns_host.as_str(), RecordType::A).await;
+    assert!(
+        bns_a_records.iter().any(|r| r == "127.0.0.1"),
+        "T2: A records of {bns_host} = {bns_a_records:?}, expected sn_ip 127.0.0.1"
     );
     let txt_records = env.dns_lookup(host.as_str(), RecordType::TXT).await;
     let txt_joined = txt_records.join(" ");

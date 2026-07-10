@@ -37,7 +37,8 @@
 //   <rootfs>/params.json              SN service parameters (incl. sn_ip)
 //   <rootfs>/sn.sqlite3               SN sqlite database runtime path (created by cyfs-sn)
 //   <rootfs>/sn_token_key/            server JWT signing key directory
-//   <rootfs>/fullchain.cert/.pem      TLS cert+key for sn.$base, web3.$base, *.web3.$base
+//   <rootfs>/fullchain.cert/.pem      TLS cert+key for sn.$base, bns.$base,
+//                                    web3.$base, *.web3.$base
 //   <rootfs>/ca/                      dev CA cert+key (client trust install)
 //   <rootfs>/sn_server/.buckycli/     sn admin owner config
 //   <rootfs>/web3_gateway.yaml        patched when present to load sn.sqlite3
@@ -165,6 +166,9 @@ const PROVISION_SN_DB_FILE = "sn_db.sqlite3";
 const SN_DB_FILE = "sn.sqlite3";
 const SN_AUTH_DATA_DIR = "sn_token_key";
 const WEB3_GATEWAY_CONFIG_FILE = "web3_gateway.yaml";
+const LOCAL_DNS_CONFIG_FILE = "local_dns.toml";
+const BNS_LOCAL_DNS_BEGIN = "# BEGIN make_sn_config:bns";
+const BNS_LOCAL_DNS_END = "# END make_sn_config:bns";
 
 function printUsage(log: (message?: unknown) => void = console.error): void {
   log(
@@ -387,6 +391,73 @@ function patchWeb3GatewayConfig(targetDir: string): void {
   }
 }
 
+/**
+ * local_dns.toml is loaded directly by LocalConfigDnsProvider and therefore is
+ * not rendered through params.json. Keep the staged template portable and
+ * materialize the deployment-specific bns.<sn_host> -> sn_ip record here.
+ */
+export function patchLocalDnsBnsRecord(
+  targetDir: string,
+  snBaseHost: string,
+  snIp: string,
+): void {
+  const configPath = path.join(targetDir, LOCAL_DNS_CONFIG_FILE);
+  if (!fs.existsSync(configPath)) {
+    console.log(
+      `skip ${LOCAL_DNS_CONFIG_FILE} BNS record: file not found in ${targetDir}`,
+    );
+    return;
+  }
+
+  const bnsHostname = `bns.${snBaseHost}`;
+  const original = fs.readFileSync(configPath, "utf8");
+  const lines = original.split(/\r?\n/);
+  let start = lines.findIndex((line) => line.trim() === BNS_LOCAL_DNS_BEGIN);
+  let end: number;
+
+  if (start >= 0) {
+    end = lines.findIndex(
+      (line, index) => index > start && line.trim() === BNS_LOCAL_DNS_END,
+    );
+    if (end < 0) {
+      throw new Error(
+        `${LOCAL_DNS_CONFIG_FILE}: missing ${BNS_LOCAL_DNS_END}`,
+      );
+    }
+    end += 1;
+  } else {
+    // Adopt a pre-existing exact record so rerunning the generator does not
+    // leave duplicate TOML tables behind.
+    const tableHeader = `[${JSON.stringify(bnsHostname)}]`;
+    start = lines.findIndex((line) => line.trim() === tableHeader);
+    if (start >= 0) {
+      end = start + 1;
+      while (end < lines.length && !/^\s*\[.*\]\s*$/.test(lines[end])) {
+        end += 1;
+      }
+    } else {
+      start = lines.length;
+      end = lines.length;
+    }
+  }
+
+  const managedBlock = [
+    BNS_LOCAL_DNS_BEGIN,
+    `[${JSON.stringify(bnsHostname)}]`,
+    "ttl = 60",
+    `address = [${JSON.stringify(snIp)}]`,
+    BNS_LOCAL_DNS_END,
+  ];
+  lines.splice(start, end - start, ...managedBlock);
+  while (lines.length > 0 && lines[lines.length - 1] === "") {
+    lines.pop();
+  }
+  fs.writeFileSync(configPath, `${lines.join("\n")}\n`);
+  console.log(
+    `Patched ${configPath}: ${bnsHostname} -> ${snIp}`,
+  );
+}
+
 async function makeSnConfigs(
   targetDir: string,
   snBaseHost: string,
@@ -431,9 +502,10 @@ async function makeSnConfigs(
   const authDataDir = ensureDir(path.join(targetDir, SN_AUTH_DATA_DIR));
   updateParamsJson(targetDir, snDbPath, authDataDir, stagedParams);
   patchWeb3GatewayConfig(targetDir);
+  patchLocalDnsBnsRecord(targetDir, snBaseHost, snIp);
   writeMachineConfig(targetDir, snBaseHost);
 
-  // 2. TLS certificates for sn.$base and *.web3.$base
+  // 2. TLS certificates for the SN, BNS, and web3 gateway public hosts
   console.log("# Step 2: Generate TLS certificates...");
   await ensureCa(caDir, caName);
   const snHostname = `sn.${snBaseHost}`;
@@ -443,6 +515,7 @@ async function makeSnConfigs(
     targetDir,
     [
       snHostname,
+      `bns.${snBaseHost}`,
       `web3.${snBaseHost}`,
       `*.web3.${snBaseHost}`,
     ],
@@ -498,6 +571,8 @@ export interface SnSeedUserSpec {
   /** devenv_config.ts OOD_GROUPS 的 key，如 "alice.ood1"。 */
   groupName: string;
   username: string;
+  /** SN 账号邮箱；devtest 统一使用 <username>@buckyos.org。 */
+  email: string;
   /** alice.bns.did（did:bns 型）或 charlie.me（自有域名型）。 */
   zoneId: string;
   /** true = Web2 注册用户（建 sn_user 账号）；false = 纯 Web3 用户（只上链）。 */
@@ -543,6 +618,7 @@ export interface SnSeedConfigMirror {
   activation_codes: string[];
   users: {
     username: string;
+    email: string;
     password: string;
     /** ed25519 owner 公钥（JWK x 分量）。 */
     owner_public_key: string;
@@ -642,6 +718,7 @@ export function getSeedUserSpecs(): SnSeedUserSpec[] {
     return {
       groupName,
       username: params.username,
+      email: `${params.username}@buckyos.org`,
       zoneId: params.zone_id,
       snAccount: params.sn_account !== false,
       userDomain: isBnsZone ? undefined : params.zone_id,
@@ -907,6 +984,7 @@ export async function makeSnAuthSeedConfig(
     const env = await loadSeedUserEnv(envRoot, user);
     seed.users.push({
       username: user.username,
+      email: user.email,
       password: DEV_TEST_PASSWORD,
       owner_public_key: env.pkx,
       bns_name: user.username,
@@ -931,6 +1009,7 @@ export async function makeSnAuthSeedConfig(
   for (const user of seed.users) {
     lines.push(
       `  - username: ${yamlQuote(user.username)}`,
+      `    email: ${yamlQuote(user.email)}`,
       `    password: ${yamlQuote(user.password)}`,
       `    owner_public_key: ${yamlQuote(user.owner_public_key)}`,
       `    bns_name: ${yamlQuote(user.bns_name ?? user.username)}`,

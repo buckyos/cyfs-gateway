@@ -45,6 +45,7 @@ activation_codes:
   - "dev-code-16"
 users:
   - username: alice            # 词汇沿用 devenv_config.ts
+    email: "alice@buckyos.org" # 必填；规范化后全局唯一
     password: "devtest-pwd"    # dev 明文，导入时走现有 PBKDF2 哈希路径
     owner_public_key: "uh7R..."  # ed25519 公钥（JWK x 分量，base64url）
     bns_name: alice            # sn_user <-> BNS name 绑定（仅绑定关系）
@@ -58,6 +59,8 @@ user_domains:
 ## 幂等语义：ensure-exists
 
 - 种子只保证"存在"；已存在的条目**不覆盖**。
+- 每个种子用户必须提供有效且全局唯一的邮箱；devtest 统一使用
+  `<username>@buckyos.org`。
 - 已存在且内容不一致 → `warn!` 并跳过（绝不覆盖运行中的账号/密码）。
 - 带相同 seed 二次启动 → 零写入、无副作用（行数与 `updated_at` 均不变）。
 - 需要变更种子内容时，dev 环境用 `--fresh` 重建，不原地覆盖。

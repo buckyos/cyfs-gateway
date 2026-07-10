@@ -55,6 +55,7 @@ servers:
             id: default
             priority: 1
             block: |
+              eq ${REQ.host} "bns.{{sn_host}}" && return "forward {{bns_server_url}}";
               eq ${REQ.host} "sn.{{sn_host}}" && match ${REQ.path} "/1.0/identifiers/*" && return "server web3_sn";
               eq ${REQ.host} "sn.{{sn_host}}" && return "server web3_sn";
               eq ${REQ.host} "web3.{{sn_host}}" && return "server web3_sn";
@@ -142,6 +143,9 @@ stacks:
       - host: "sn.{{sn_host}}"
         cert_path: "{{sn_cer}}"
         key_path: "{{sn_pem}}"
+      - host: "bns.{{sn_host}}"
+        cert_path: "{{sn_cer}}"
+        key_path: "{{sn_pem}}"
       - host: "web3.{{sn_host}}"
         cert_path: "{{web3_cer}}"
         key_path: "{{web3_pem}}"
@@ -174,6 +178,7 @@ stacks:
               call https-sni-probe || reject; 
               map-create "REQ.ext";
               map-add "REQ.ext" "proxy_source_addr" "${REQ.source_addr}";
+              eq ${REQ.dest_host} "bns.{{sn_host}}" && return "forward tcp:///:{{tls_port}}";
               eq ${REQ.dest_host} "sn.{{sn_host}}" && return "forward tcp:///:{{tls_port}}";
               eq ${REQ.dest_host} "www.{{sn_host}}" && return "forward tcp:///:{{tls_port}}";
               eq ${REQ.dest_host} "{{sn_host}}" && return "forward tcp:///:{{tls_port}}";

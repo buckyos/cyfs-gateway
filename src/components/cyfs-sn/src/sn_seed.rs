@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 use log::*;
 use serde::{Deserialize, Serialize};
 
-use crate::sn_auth::{SnAuthDB, SqliteSnAuthDB, ZoneInfoPatch};
+use crate::sn_auth::{canonical_email, SnAuthDB, SqliteSnAuthDB, ZoneInfoPatch};
 use crate::sn_auth_manager::{hash_password, PASSWORD_ALGO};
 use crate::{sn_err, SnErrorCode, SnResult};
 
@@ -42,6 +42,8 @@ pub struct SnSeedConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SnSeedUser {
     pub username: String,
+    /// 规范化后全局唯一的 SN 账号邮箱。
+    pub email: String,
     /// dev 明文测试密码；导入时走现有 PBKDF2 哈希路径（即登录时客户端提交的
     /// pwd_hash 值——dev 约定直接用明文）。
     pub password: String,
@@ -138,6 +140,7 @@ fn validate_sn_seed_config(seed: &SnSeedConfig) -> SnResult<()> {
     }
 
     let mut seen_users = std::collections::HashSet::new();
+    let mut seen_emails = std::collections::HashSet::new();
     for user in &seed.users {
         if user.username.trim().is_empty() {
             return Err(sn_err!(SnErrorCode::InvalidInput, "seed user username is empty"));
@@ -147,6 +150,21 @@ fn validate_sn_seed_config(seed: &SnSeedConfig) -> SnResult<()> {
                 SnErrorCode::InvalidInput,
                 "seed user {} password is empty",
                 user.username
+            ));
+        }
+        let email = canonical_email(user.email.as_str()).map_err(|e| {
+            sn_err!(
+                SnErrorCode::InvalidInput,
+                "seed user {} has invalid email: {}",
+                user.username,
+                e
+            )
+        })?;
+        if !seen_emails.insert(email.clone()) {
+            return Err(sn_err!(
+                SnErrorCode::InvalidInput,
+                "duplicated seed user email: {}",
+                email
             ));
         }
         if user.owner_public_key.trim().is_empty() {
@@ -281,6 +299,7 @@ pub async fn import_sn_seed(
     // 2. sn_user 账号。
     for user in &seed.users {
         let username = user.username.trim();
+        let email = canonical_email(user.email.as_str())?;
         let domain_entry = seed
             .user_domains
             .iter()
@@ -295,6 +314,9 @@ pub async fn import_sn_seed(
             let mut mismatches: Vec<&str> = Vec::new();
             if existing.public_key != public_key {
                 mismatches.push("owner_public_key");
+            }
+            if existing.email.as_deref() != Some(email.as_str()) {
+                mismatches.push("email");
             }
             if let Some(entry) = domain_entry {
                 if existing.user_domain.as_deref() != Some(entry.domain.trim()) {
@@ -314,6 +336,17 @@ pub async fn import_sn_seed(
                 );
                 report.conflicts_skipped += 1;
             }
+            continue;
+        }
+
+        if let Some(existing) = auth_db.get_user_by_email(email.as_str()).await? {
+            warn!(
+                "sn seed user {} email {} already belongs to {}; seed entry skipped",
+                username,
+                email,
+                existing.username.as_deref().unwrap_or("<unknown>")
+            );
+            report.conflicts_skipped += 1;
             continue;
         }
 
@@ -348,6 +381,7 @@ pub async fn import_sn_seed(
             .register_user_with_owner_key(
                 code.as_str(),
                 username,
+                email.as_str(),
                 public_key.as_str(),
                 zone_document_jwt.unwrap_or(""),
                 domain_entry.map(|entry| entry.domain.trim().to_string()),
@@ -452,13 +486,16 @@ mod tests {
 activation_codes: [{activation_codes}]
 users:
   - username: alice
+    email: "alice@buckyos.org"
     password: "devtest-pwd"
     owner_public_key: "{ALICE_X}"
     bns_name: alice
   - username: bob
+    email: "bob@buckyos.org"
     password: "devtest-pwd"
     owner_public_key: "{BOB_X}"
   - username: charlie
+    email: "charlie@buckyos.org"
     password: "devtest-pwd"
     owner_public_key: "{CHARLIE_X}"
 user_domains:
@@ -525,6 +562,7 @@ user_domains:
 
         // 账号可查、公钥为 canonical JWK JSON。
         let alice = db.get_user_info("alice").await.unwrap().expect("alice");
+        assert_eq!(alice.email.as_deref(), Some("alice@buckyos.org"));
         assert_eq!(
             alice.public_key,
             format!(r#"{{"crv":"Ed25519","kty":"OKP","x":"{}"}}"#, ALICE_X)
@@ -594,6 +632,7 @@ user_domains:
             .register_user_with_owner_key(
                 "pre-code",
                 "alice",
+                "alice@buckyos.org",
                 r#"{"crv":"Ed25519","kty":"OKP","x":"existing-different-key"}"#,
                 "existing-zone-cfg",
                 None,

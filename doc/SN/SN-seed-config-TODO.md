@@ -39,6 +39,7 @@
     - "dev-code-16"
   users:
     - username: alice          # 词汇沿用 devenv_config.ts（username/zone_id/user_domain）
+      email: "alice@buckyos.org" # 必填；规范化后全局唯一
       password: "devtest-pwd"  # dev 明文，导入时走现有 PBKDF2 哈希路径
       owner_public_key: "..."  # ed25519 公钥（jwk x），与用户 env 一致
       bns_name: alice          # sn_user <-> BNS name 绑定（仅绑定关系，非权威文档）
