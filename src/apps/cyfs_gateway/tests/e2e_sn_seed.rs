@@ -373,6 +373,25 @@ async fn e2e_sn_seed_full_stack() {
             !bound.zone_config.trim().is_empty(),
             "T4: charlie.me zone document jwt missing in sn db"
         );
+        for username in ["alice", "bob", "charlie"] {
+            let user = db
+                .get_user_info(username)
+                .await
+                .expect("query seed user")
+                .expect("seed user exists");
+            assert!(
+                user.self_cert,
+                "T4: {username} must have self_cert=true from the trusted dev seed"
+            );
+            assert!(
+                db.get_zone_info(username)
+                    .await
+                    .expect("query seed zone_info")
+                    .expect("seed zone_info exists")
+                    .self_cert,
+                "T4: {username} zone_info must project self_cert=true"
+            );
+        }
     }
 
     // ---- T6 纯 Web3 位：dave 无 sn_user 行，仍可经 BNS 路径解析 ----

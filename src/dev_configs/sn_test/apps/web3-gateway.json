@@ -2,20 +2,17 @@
     "name": "web3-gateway",
     "version": "latest",
     "directories": {
-        "source": "/opt/web3-gateway",
+        "source": "/tmp/buckyos-vmtest/cyfs-gateway/web3-gateway",
         "target": "/opt/web3-gateway",
-        "source_bin": "/opt/web3-gateway/web3_gateway",
+        "source_bin": "/tmp/buckyos-vmtest/cyfs-gateway/web3-gateway/web3_gateway",
         "target_bin": "/opt/web3-gateway/web3_gateway"
     },
     "commands": {
       "build": [
-        "cd {{system.base_dir}} && uv run ./build.py aarch64",
-        "rm -rf /opt/web3-gateway/bns && mkdir -p /opt/web3-gateway/bns && cp {{system.base_dir}}/apps/bns/foundry.toml /opt/web3-gateway/bns/ && cp -R {{system.base_dir}}/apps/bns/src /opt/web3-gateway/bns/"
+        "cd {{system.base_dir}}/../../cyfs-gateway/src && uv run ./dev_configs/web3_gateway_staging.py build --target aarch64"
       ],
       "build_all": [
-        "cd {{system.base_dir}} && uv run ./build.py aarch64",
-        "rm -rf /opt/web3-gateway/bns && mkdir -p /opt/web3-gateway/bns && cp {{system.base_dir}}/apps/bns/foundry.toml /opt/web3-gateway/bns/ && cp -R {{system.base_dir}}/apps/bns/src /opt/web3-gateway/bns/",
-        "cd {{system.base_dir}} && deno run -A ./make_sn_config.ts --seed-v2 --sn_ip {{sn.ip}}"
+        "cd {{system.base_dir}}/../../cyfs-gateway/src && uv run ./dev_configs/web3_gateway_staging.py build-all --target aarch64 --sn-ip {{sn.ip}}"
       ],
       "install": [
         "sudo chmod +x /opt/web3-gateway/web3_gateway /opt/web3-gateway/init_anvil.py"

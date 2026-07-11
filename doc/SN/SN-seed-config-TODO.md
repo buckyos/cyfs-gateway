@@ -6,8 +6,8 @@
 
 边界与原则：
 
-1. **只产种子，不写派生态**：SN 侧只有 lazy-init 分类中的 C 类（sn_user 账号等无默认值数据）进 seed；A 类（zone/boot/device_mini_doc）经 bns_dv seed 上链、由 indexer 投影；B 类（在线态/relay/self_cert）一律运行时默认值。分类见 [SN运行态lazy-init改造TODO.md](./SN运行态lazy-init改造TODO.md)。
-2. **幂等契约 = ensure-exists**：种子只保证"存在"；已存在的不覆盖（内容不同则告警）；带相同 seed 二次启动零写入、无副作用。
+1. **只产种子，不写派生态**：SN 侧只有 lazy-init 分类中的 C 类（sn_user 账号等无默认值数据）进 seed；A 类（zone/boot/device_mini_doc）经 bns_dv seed 上链、由 indexer 投影；B 类默认由运行时刷新。例外是离线 devtest 已预置证书且 ACME 不可用，因此可在可信 seed 中显式声明 `self_cert=true`；未声明时仍使用安全默认值 `false`。分类见 [SN运行态lazy-init改造TODO.md](./SN运行态lazy-init改造TODO.md)。
+2. **幂等契约 = ensure-exists**：种子只保证"存在"；已存在的账号内容不覆盖（内容不同则告警）；显式 devtest `self_cert` 会对齐两处状态投影；带相同 seed 二次启动零写入、无副作用。
 3. **schema 归组件所有**：make_sn_config 不再维护表结构副本，也不直写组件私有 DB。
 4. **环境构造出栈**：hosts / DNS 指向 / CA 信任 / VM 生命周期归 buckyos-devtest（见 buckyos `doc/CI/基于VM的开发环境构造.md`），本工具专注 seed config。
 

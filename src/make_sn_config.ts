@@ -234,15 +234,13 @@ function isProvisionSnDbFile(name: string): boolean {
     name === `${PROVISION_SN_DB_FILE}-wal`;
 }
 
-function discardProvisionSnDb(targetDir: string): string {
+function discardProvisionSnDb(targetDir: string): void {
   for (const suffix of ["", "-shm", "-wal"]) {
     fs.rmSync(path.join(targetDir, `${PROVISION_SN_DB_FILE}${suffix}`), {
       force: true,
     });
   }
-  const snDbPath = path.join(targetDir, SN_DB_FILE);
-  console.log(`SN database runtime path: ${snDbPath}`);
-  return snDbPath;
+  console.log(`SN database runtime path: ${SN_DB_FILE} (deployment-relative)`);
 }
 
 function readStagedParams(targetDir: string): Record<string, unknown> {
@@ -498,9 +496,16 @@ async function makeSnConfigs(
     }
   }
 
-  const snDbPath = discardProvisionSnDb(targetDir);
-  const authDataDir = ensureDir(path.join(targetDir, SN_AUTH_DATA_DIR));
-  updateParamsJson(targetDir, snDbPath, authDataDir, stagedParams);
+  discardProvisionSnDb(targetDir);
+  ensureDir(path.join(targetDir, SN_AUTH_DATA_DIR));
+  // params.json 会随部署目录整体复制到另一台机器，运行态路径必须相对于
+  // web3_gateway 的工作目录，不能泄漏 provision 时的宿主机输出路径。
+  updateParamsJson(
+    targetDir,
+    SN_DB_FILE,
+    SN_AUTH_DATA_DIR,
+    stagedParams,
+  );
   patchWeb3GatewayConfig(targetDir);
   patchLocalDnsBnsRecord(targetDir, snBaseHost, snIp);
   writeMachineConfig(targetDir, snBaseHost);
@@ -623,6 +628,8 @@ export interface SnSeedConfigMirror {
     /** ed25519 owner 公钥（JWK x 分量）。 */
     owner_public_key: string;
     bns_name?: string;
+    /** devtest 预置证书可用；测试环境不依赖 ACME 回写。 */
+    self_cert?: boolean;
   }[];
   user_domains: {
     domain: string;
@@ -958,10 +965,12 @@ export async function makeBnsDvSeedConfig(
  * 中无合理默认值、必须显式创建的部分：
  *   - activation_codes：若干未用激活码（Web2 注册流程测试）
  *   - sn_user 账号：username / 确定性测试密码 / owner 公钥 / bns_name 绑定
- *     （仅 snAccount=true 的用户；不含 zone_config——zone/boot 权威在 BNS）
+ *     / self_cert=true（仅 snAccount=true 的用户；devtest 已预置测试证书，
+ *     ACME 在离线测试环境不可用；不含 zone_config——zone/boot 权威在 BNS）
  *   - user_domain 绑定：charlie.me -> sn_user + PKX + ZoneDocument
  *     （did:web:$zoneid 的 ZoneDocument 按 devenv 注释走 user_domain 机制）
- * 不产出：zone_info 运行字段、device 在线态、relay 分配（B 类默认值）、
+ * 除了上述 devtest self_cert 例外，不产出：zone_info 运行字段、
+ * device 在线态、relay 分配（B 类默认值）、
  * device_mini_doc（A 类，已在 makeBnsDvSeedConfig 上链）。
  * 消费方：cyfs-sn 启动幂等导入（web3_gateway.yaml web3_sn.seed_path）。
  * 格式真值：cyfs-sn/src/sn_seed.rs SnSeedConfig（TS 镜像 SnSeedConfigMirror）。
@@ -988,6 +997,7 @@ export async function makeSnAuthSeedConfig(
       password: DEV_TEST_PASSWORD,
       owner_public_key: env.pkx,
       bns_name: user.username,
+      self_cert: true,
     });
     if (user.userDomain) {
       seed.user_domains.push({
@@ -1002,7 +1012,8 @@ export async function makeSnAuthSeedConfig(
   const lines: string[] = [
     "# sn_seed.yaml —— make_sn_config.ts (seed-v2) 生成。格式真值：cyfs-sn",
     "# src/sn_seed.rs SnSeedConfig；幂等语义 ensure-exists，见 doc/SN/SN-Seed-Config.md。",
-    "# 仅 C 类：激活码 / sn_user 账号 / user_domain 绑定。明文密码仅限 devtest。",
+    "# C 类数据 + devtest self_cert=true（测试证书已预置，不依赖 ACME）。",
+    "# 明文密码仅限 devtest。",
     `activation_codes: [${seed.activation_codes.map(yamlQuote).join(", ")}]`,
     "users:",
   ];
@@ -1013,6 +1024,7 @@ export async function makeSnAuthSeedConfig(
       `    password: ${yamlQuote(user.password)}`,
       `    owner_public_key: ${yamlQuote(user.owner_public_key)}`,
       `    bns_name: ${yamlQuote(user.bns_name ?? user.username)}`,
+      `    self_cert: ${user.self_cert === true ? "true" : "false"}`,
     );
   }
   if (seed.user_domains.length === 0) {

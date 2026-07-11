@@ -5,7 +5,8 @@
 //! - 内容**仅限 C 类**数据——无合理默认值、必须显式创建的 SN-local 数据：
 //!   激活码、sn_user 账号（密码 / owner 公钥 / bns_name 绑定）、user_domain 绑定。
 //!   不含 zone/boot/device_mini_doc（A 类，权威在 BNS，经 bns_dv seed 上链）、
-//!   不含在线态 / relay 分配 / self_cert（B 类，运行时默认值）。
+//!   不含在线态 / relay 分配。`self_cert` 通常仍是 B 类运行态，
+//!   但允许可信 dev seed 显式声明已预置测试证书（ACME 不可用的离线环境）。
 //! - **幂等契约 = ensure-exists**：种子只保证"存在"。已存在 → no-op；
 //!   已存在且内容不一致 → `warn!` 并跳过（绝不覆盖运行中的账号/密码）；
 //!   带相同 seed 二次启动零写入、无副作用。
@@ -54,6 +55,11 @@ pub struct SnSeedUser {
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bns_name: Option<String>,
+    /// 可信 dev seed 的证书状态。未声明时保持生产安全默认值 false；
+    /// 显式声明时导入器会幂等对齐 users/zone_info 两处投影。
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub self_cert: Option<bool>,
 }
 
 /// did:web 型 zone：ZoneDocument 走 SN 的 user_domain 机制保存（did:bns 的
@@ -77,6 +83,8 @@ pub struct SnSeedImportReport {
     pub activation_codes_existing: u64,
     pub users_added: u64,
     pub users_existing: u64,
+    /// 已存在的 seed 用户其显式运行态被对齐的数量。
+    pub users_updated: u64,
     pub user_domains_added: u64,
     pub user_domains_existing: u64,
     /// 已存在但内容与种子不一致而跳过的条目数（每条已 `warn!`）。
@@ -86,7 +94,10 @@ pub struct SnSeedImportReport {
 impl SnSeedImportReport {
     /// 本次导入是否零写入（幂等重放的期望结果）。
     pub fn is_noop(&self) -> bool {
-        self.activation_codes_added == 0 && self.users_added == 0 && self.user_domains_added == 0
+        self.activation_codes_added == 0
+            && self.users_added == 0
+            && self.users_updated == 0
+            && self.user_domains_added == 0
     }
 }
 
@@ -94,11 +105,12 @@ impl std::fmt::Display for SnSeedImportReport {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "codes +{}/{} users +{}/{} domains +{}/{} conflicts {}",
+            "codes +{}/{} users +{}/{} updated {} domains +{}/{} conflicts {}",
             self.activation_codes_added,
             self.activation_codes_added + self.activation_codes_existing,
             self.users_added,
             self.users_added + self.users_existing,
+            self.users_updated,
             self.user_domains_added,
             self.user_domains_added + self.user_domains_existing,
             self.conflicts_skipped,
@@ -327,6 +339,12 @@ pub async fn import_sn_seed(
                 }
             }
             if mismatches.is_empty() {
+                if let Some(self_cert) = user.self_cert {
+                    if existing.self_cert != self_cert {
+                        auth_db.update_user_self_cert(username, self_cert).await?;
+                        report.users_updated += 1;
+                    }
+                }
                 report.users_existing += 1;
             } else {
                 // ensure-exists：绝不覆盖运行中的账号/密码，只告警。
@@ -411,6 +429,11 @@ pub async fn import_sn_seed(
                     .await?;
             }
         }
+        if let Some(self_cert) = user.self_cert {
+            if self_cert {
+                auth_db.update_user_self_cert(username, true).await?;
+            }
+        }
         report.users_added += 1;
     }
 
@@ -490,14 +513,17 @@ users:
     password: "devtest-pwd"
     owner_public_key: "{ALICE_X}"
     bns_name: alice
+    self_cert: true
   - username: bob
     email: "bob@buckyos.org"
     password: "devtest-pwd"
     owner_public_key: "{BOB_X}"
+    self_cert: true
   - username: charlie
     email: "charlie@buckyos.org"
     password: "devtest-pwd"
     owner_public_key: "{CHARLIE_X}"
+    self_cert: true
 user_domains:
   - domain: charlie.me
     owner: charlie
@@ -569,6 +595,14 @@ user_domains:
         );
         assert!(alice.user_domain.is_none());
         assert_eq!(alice.zone_config, "");
+        assert!(alice.self_cert);
+        assert!(
+            db.get_zone_info("alice")
+                .await
+                .unwrap()
+                .expect("alice zone_info")
+                .self_cert
+        );
 
         // 测试密码可登录（走现有 PBKDF2 校验路径）。
         let auth = db.get_auth("alice").await.unwrap().expect("alice auth");
@@ -615,6 +649,59 @@ user_domains:
         assert_eq!(report.conflicts_skipped, 0);
         // 行数与 created_at/updated_at 快照完全不变（零写入）。
         assert_eq!(before, after);
+    }
+
+    #[tokio::test]
+    async fn test_sn_seed_omitted_self_cert_keeps_safe_default() {
+        let (_tmp, db, _db_path) = new_test_db().await;
+        let mut seed = parse_sn_seed_config(sample_seed_yaml().as_str()).expect("parse seed");
+        seed.users.truncate(1);
+        seed.users[0].self_cert = None;
+        seed.user_domains.clear();
+
+        import_sn_seed(&db, &seed).await.expect("import seed");
+
+        assert!(!db
+            .get_user_info("alice")
+            .await
+            .unwrap()
+            .expect("alice")
+            .self_cert);
+        assert!(!db
+            .get_zone_info("alice")
+            .await
+            .unwrap()
+            .expect("alice zone_info")
+            .self_cert);
+    }
+
+    #[tokio::test]
+    async fn test_sn_seed_explicit_self_cert_repairs_seed_user_projection() {
+        let (_tmp, db, _db_path) = new_test_db().await;
+        let seed = parse_sn_seed_config(sample_seed_yaml().as_str()).expect("parse seed");
+        import_sn_seed(&db, &seed).await.expect("first import");
+
+        db.update_user_self_cert("alice", false)
+            .await
+            .expect("clear self_cert");
+        let report = import_sn_seed(&db, &seed).await.expect("repair import");
+
+        assert_eq!(report.users_updated, 1);
+        assert!(!report.is_noop());
+        assert!(
+            db.get_user_info("alice")
+                .await
+                .unwrap()
+                .expect("alice")
+                .self_cert
+        );
+        assert!(
+            db.get_zone_info("alice")
+                .await
+                .unwrap()
+                .expect("alice zone_info")
+                .self_cert
+        );
     }
 
     #[tokio::test]

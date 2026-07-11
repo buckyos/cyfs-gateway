@@ -85,7 +85,7 @@ zone / boot / device_mini_doc 内容是 BNS 权威态的本地缓存。第一次
 
 ## 风险点
 
-- [ ] **默认值必须选幂等安全的一端**：`self_cert` 默认 `false`，绝不能默认 true 覆盖真实证书状态（呼应文档"区分本轮签发失败 vs 当前证书不可用"——lazy 模型下天然满足）。
+- [ ] **默认值必须选幂等安全的一端**：`self_cert` 默认 `false`，生产路径绝不能隐式默认 true 覆盖真实证书状态（呼应文档"区分本轮签发失败 vs 当前证书不可用"——lazy 模型下天然满足）。离线 devtest 已预置测试证书时，允许可信 seed 显式声明 `self_cert=true`。
 - [ ] **indexer 延迟**：写后立即读 indexer 可能尚未同步到新版本。lazy 模型下表现为"短暂返回旧/空态、随 indexer 追上自愈"，可接受；但需确认 resolver 缓存失效跟随 indexer 的 `name_seq`/document version（当前仅 [sn_bns_reader.rs:151](../../src/components/cyfs-sn/src/sn_bns_reader.rs:151)、[sn_resolver.rs:197](../../src/components/cyfs-sn/src/sn_resolver.rs:197) 读到 name_seq，未用于失效）。
 - [ ] **解析路径解除 sn_user 前提**：确认 `resolve_hostname`/`resolve_name_by_username` 等在没有 sn_user 行时也能只凭 BNS name + indexer 完成（C 类要求）。
 - [ ] **首次 relay 分配的触发点收敛**：原先在 bind_zone 时 `maybe_assign_zone_relay`（[zone.rs:138](../../src/components/cyfs-sn/src/api/zone.rs:138)），改造后需明确改到首次 keep_tunnel/上报，避免分配逻辑悬空。
