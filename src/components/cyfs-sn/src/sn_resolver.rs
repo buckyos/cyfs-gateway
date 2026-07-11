@@ -1407,22 +1407,32 @@ impl SnResolver {
             push_exportable_ip(&mut addresses, ip);
         }
 
-        if let Some(online) = online {
-            if !online.is_wan_device {
-                let sn_ips = self
-                    .auth
-                    .get_user_sn_ips(zone.zone_name.as_str())
-                    .await
-                    .unwrap_or_default();
-                if sn_ips.is_empty() {
-                    push_exportable_ip(&mut addresses, self.config.server_ip);
-                } else {
-                    for ip in sn_ips {
-                        push_exportable_ip(&mut addresses, ip);
-                    }
+        // net_id comes from the owner-signed device document and describes the
+        // intended ingress topology. Prefer it over IP-shape inference: a NAT
+        // device can legitimately report a global IPv6 address that is not an
+        // externally reachable gateway endpoint (for example, a host address
+        // observed while activating a VM). In that case the online-state
+        // heuristic marks the device as WAN, but DNS must still include the SN
+        // relay selected by the signed topology.
+        let requires_sn_relay = device_document_requires_sn_relay(device_doc)
+            .or_else(|| online.map(|online| !online.is_wan_device))
+            .unwrap_or(false);
+        if requires_sn_relay {
+            let sn_ips = self
+                .auth
+                .get_user_sn_ips(zone.zone_name.as_str())
+                .await
+                .unwrap_or_default();
+            if sn_ips.is_empty() {
+                push_exportable_ip(&mut addresses, self.config.server_ip);
+            } else {
+                for ip in sn_ips {
+                    push_exportable_ip(&mut addresses, ip);
                 }
             }
+        }
 
+        if let Some(online) = online {
             for value in online
                 .public_ips
                 .iter()
@@ -2534,6 +2544,21 @@ fn device_doc_from_value(
     })
 }
 
+fn device_document_requires_sn_relay(device_doc: &DeviceMiniDocument) -> Option<bool> {
+    let net_id = device_doc
+        .document
+        .as_ref()?
+        .get("net_id")?
+        .as_str()?
+        .trim()
+        .to_ascii_lowercase();
+    if net_id.is_empty() {
+        return None;
+    }
+
+    Some(!net_id.starts_with("wan"))
+}
+
 fn device_public_key_x(value: &Value) -> Option<String> {
     value
         .get("verificationMethod")
@@ -2867,6 +2892,92 @@ mod tests {
 
         let value = json!({ "oods": ["ood2.testuser"] });
         assert_eq!(find_gateway_device_name(&value).as_deref(), Some("ood2"));
+    }
+
+    #[test]
+    fn signed_device_net_id_controls_sn_relay_requirement() {
+        let device = |net_id: Option<&str>| DeviceMiniDocument {
+            zone_name: "testuser".to_string(),
+            device_name: "ood1".to_string(),
+            did: "did:dev:test-device".to_string(),
+            mini_config_jwt: None,
+            document: net_id.map(|net_id| json!({ "net_id": net_id })),
+            ttl: None,
+            version: None,
+        };
+
+        assert_eq!(
+            device_document_requires_sn_relay(&device(Some("nat"))),
+            Some(true)
+        );
+        assert_eq!(
+            device_document_requires_sn_relay(&device(Some("portmap"))),
+            Some(true)
+        );
+        assert_eq!(
+            device_document_requires_sn_relay(&device(Some("wan"))),
+            Some(false)
+        );
+        assert_eq!(
+            device_document_requires_sn_relay(&device(Some("wan_dyn"))),
+            Some(false)
+        );
+        assert_eq!(device_document_requires_sn_relay(&device(None)), None);
+    }
+
+    #[tokio::test]
+    async fn nat_device_includes_sn_even_when_online_state_looks_wan() {
+        let resolver = test_resolver_with_bns(StaticBnsReader::default());
+        let zone = ZoneResolution {
+            input: "testuser.web3.buckyos.test".to_string(),
+            canonical_name: "testuser".to_string(),
+            zone_name: "testuser".to_string(),
+            owner: BnsOwner {
+                name: "testuser".to_string(),
+                effective_owner: None,
+                owner_config: None,
+            },
+            zone_doc: ZoneDocument::empty(),
+            boot_doc: BootDocument::empty(),
+            user_domain: None,
+            self_cert: false,
+            relay_sn: None,
+            source: ZoneResolutionSource::BnsName,
+        };
+        let device_doc = DeviceMiniDocument {
+            zone_name: "testuser".to_string(),
+            device_name: "ood1".to_string(),
+            did: "did:dev:test-device".to_string(),
+            mini_config_jwt: None,
+            document: Some(json!({
+                "net_id": "nat",
+                "all_ip": ["2600:1700:1150:9440::49", "192.168.1.143"]
+            })),
+            ttl: None,
+            version: None,
+        };
+        let online = SnDeviceStateView {
+            did: device_doc.did.clone(),
+            zone: zone.zone_name.clone(),
+            device_name: device_doc.device_name.clone(),
+            device_role: crate::SnDeviceRole::Ood,
+            state: crate::SnDeviceState::Online,
+            public_ips: vec!["2600:1700:1150:9440::49".to_string()],
+            private_ips: vec!["192.168.1.143".to_string()],
+            active_endpoints: Vec::new(),
+            preferred_endpoint: None,
+            nat_type: crate::SnNatType::Unknown,
+            is_wan_device: true,
+            last_seen_at: None,
+            expires_at: None,
+        };
+
+        let addresses = resolver
+            .resolve_gateway_addresses(&zone, &device_doc, None, Some(&online))
+            .await;
+
+        assert!(addresses.contains(&"192.0.2.10".parse::<IpAddr>().unwrap()));
+        assert!(addresses.contains(&"2600:1700:1150:9440::49".parse::<IpAddr>().unwrap()));
     }
 
     #[test]

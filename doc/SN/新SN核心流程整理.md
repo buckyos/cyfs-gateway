@@ -236,11 +236,11 @@ A/AAAA 查询返回的 IP 不是单一来源，而是 `sn_resolver` 按优先级
 第 4 步的地址合成顺序（全部叠加，不是互斥），核心区别在于设备是否公网可达：
 
 - 先并入 `zone` 文档里的 `gateway_ips`。
-- **设备不是 WAN 设备（`is_wan_device == false`，即在 NAT/内网后没有公网入口）时**：注入 SN relay 出口地址——优先用该 zone 分配的 `zone_info.sn_ips`（`get_user_sn_ips`），若为空则回退到 `config.server_ip`。这是"NAT 后设备默认把流量引到 SN 兜底中转"的关键：返回的不是设备自己的地址，而是 SN 的地址。
-- **设备是 WAN 设备时**：跳过 SN 注入，直接用设备自己的公网地址。
+- **设备签名文档的 `net_id` 不以 `wan` 开头，或文档未声明 `net_id` 且在线态 `is_wan_device == false` 时**：注入 SN relay 出口地址——优先用该 zone 分配的 `zone_info.sn_ips`（`get_user_sn_ips`），若为空则回退到 `config.server_ip`。签名的 `net_id` 优先于公网 IP 形状推断，避免 NAT OOD 因上报宿主机全局 IPv6 而被误判为 WAN。这是"NAT 后设备默认把流量引到 SN 兜底中转"的关键。
+- **设备签名文档的 `net_id` 以 `wan` 开头，或文档未声明 `net_id` 且在线态判定为 WAN 时**：跳过 SN 注入，直接用设备自己的公网地址。
 - 再依次并入设备上报的 `public_ips`、`private_ips`、`active_endpoints` 中的 host，以及兼容设备文档和 `device_mini_doc` 内 `ip`/`ips`/`all_ip`/`addresses` 字段里的地址。
 
-其中 WAN/公网 判定不是查询时算的，而是 `update_ood_info` 上报时定下来的：`sn_device_info` 把设备 `reported_ip`、`reported_ips` 和 SN 实际观测到的 `from_ip`（请求真实来源 IP）一起做公网/私网分类，只要其中存在一个公网 IP，就置 `wan_ip` 并令 `is_wan_device = true`。因此 `from_ip` 是"设备是否真正公网直达"的关键信号，不依赖设备自报。
+当签名 device document 没有 `net_id` 时，WAN/公网回退判定来自 `update_ood_info` 上报时保存的在线态：`sn_device_info` 把设备 `reported_ip`、`reported_ips` 和 SN 实际观测到的 `from_ip`（请求真实来源 IP）一起做公网/私网分类，只要其中存在一个公网 IP，就置 `wan_ip` 并令 `is_wan_device = true`。这个启发式结果只在权威文档未声明拓扑时使用。
 
 最后所有候选地址都经过过滤再返回：
 

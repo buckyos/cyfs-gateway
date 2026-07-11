@@ -1163,7 +1163,11 @@ function injectDevBnsProxy(
   ].join("\n");
 
   const before = fs.readFileSync(gatewayPath, "utf8");
-  if (before.includes("bns_proxy:\n      require_user_asset_owner: true")) {
+  if (
+    before.includes(
+      "bns_proxy:\n      require_user_asset_owner: true\n      allowed_operations:",
+    )
+  ) {
     return;
   }
   const baseProxyBlock = [
@@ -1175,7 +1179,7 @@ function injectDevBnsProxy(
   const after = before.replace(baseProxyBlock, proxyBlock);
   if (after === before) {
     throw new Error(
-      `failed to inject dev-local bns_proxy into ${gatewayPath}: base proxy block not found`,
+      `failed to inject ${profile} bns_proxy into ${gatewayPath}: base proxy block not found`,
     );
   }
   fs.writeFileSync(gatewayPath, after);
@@ -1190,8 +1194,8 @@ export function enableDevLocalBnsProxy(targetDir: string): void {
 }
 
 /**
- * VM profile 的 Anvil/合约在部署到 VM 后才初始化，因此生成阶段先写参数占位符；
- * init_anvil.py 部署成功后再把真实值写入 params.json，web3_gateway 启动时渲染。
+ * VM profile 的 Anvil/BNS RPC 在部署到 VM 后才初始化；生成阶段写入 dev
+ * controller，init_anvil.py 再把 BNS RPC 地址写入 params.json。
  */
 export function enableDevVmBnsProxy(targetDir: string): void {
   injectDevBnsProxy(
