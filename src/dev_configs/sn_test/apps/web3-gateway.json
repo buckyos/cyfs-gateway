@@ -12,13 +12,13 @@
         "cd {{system.base_dir}}/../../cyfs-gateway/src && uv run ./dev_configs/web3_gateway_staging.py build --target aarch64"
       ],
       "build_all": [
-        "cd {{system.base_dir}}/../../cyfs-gateway/src && uv run ./dev_configs/web3_gateway_staging.py build-all --target aarch64 --sn-ip {{sn.ip}}"
+        "cd {{system.base_dir}}/../../cyfs-gateway/src && uv run ./dev_configs/web3_gateway_staging.py build-all --target aarch64 --sn-ip {{sn.ip}} --enable-bns-proxy"
       ],
       "install": [
         "sudo chmod +x /opt/web3-gateway/web3_gateway /opt/web3-gateway/init_anvil.py"
       ],
-      "init_anvil": ["cd /opt/web3-gateway && sudo uv run ./init_anvil.py"],
-      "init_anvil_fresh": ["cd /opt/web3-gateway && sudo uv run ./init_anvil.py --fresh --install-foundry"],
+      "init_anvil": ["cd /opt/web3-gateway && sudo uv run ./init_anvil.py --configure-sn-bns-proxy"],
+      "init_anvil_fresh": ["cd /opt/web3-gateway && sudo uv run ./init_anvil.py --fresh --install-foundry --configure-sn-bns-proxy"],
       "start": ["sudo uv run /opt/web3-gateway/start.py"],
       "start_bg": [
         "sudo systemd-run --unit=web3-gateway-dev --collect --working-directory=/opt/web3-gateway --property=StandardOutput=append:/opt/web3-gateway/start.log --property=StandardError=append:/opt/web3-gateway/start.log /usr/local/bin/uv run ./start.py"

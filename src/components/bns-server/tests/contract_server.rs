@@ -12,8 +12,8 @@
 use std::sync::{Arc, Mutex};
 
 use bns_client::{
-    BnsIndexerApi, BnsNameReq, BnsRpcEnvelope, BnsSubmitRawTxReq, BnsTxExecutionState,
-    METHOD_QUERY_NAME_STATE, METHOD_SUBMIT_RAW_TX,
+    BnsIndexerApi, BnsNameReq, BnsPrepareTxReq, BnsRpcEnvelope, BnsSubmitRawTxReq,
+    BnsTxExecutionState, METHOD_QUERY_NAME_STATE, METHOD_SUBMIT_RAW_TX,
 };
 use bns_indexer::{
     BnsRegistryStore, DocumentRef, DocumentState, DocumentStatus, NameState, NameStatus,
@@ -61,7 +61,28 @@ impl MockEthRpc {
                             }
                         }
                     }
-                    let body = format!(r#"{{"jsonrpc":"2.0","id":1,"result":"{TX_HASH}"}}"#);
+                    let result = request
+                        .find("\r\n\r\n")
+                        .and_then(|start| {
+                            serde_json::from_str::<serde_json::Value>(&request[start + 4..]).ok()
+                        })
+                        .and_then(
+                            |request| match request["method"].as_str().unwrap_or_default() {
+                                "eth_chainId" => Some(serde_json::json!("0x7a69")),
+                                "eth_getTransactionCount" => Some(serde_json::json!("0x5")),
+                                "eth_estimateGas" => Some(serde_json::json!("0x186a0")),
+                                "eth_gasPrice" => Some(serde_json::json!("0x3b9aca00")),
+                                "eth_maxPriorityFeePerGas" => Some(serde_json::json!("0x3b9aca00")),
+                                _ => Some(serde_json::json!(TX_HASH)),
+                            },
+                        )
+                        .unwrap();
+                    let body = serde_json::to_string(&serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "result": result,
+                    }))
+                    .unwrap();
                     let response = format!(
                         "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
                         body.len(),
@@ -80,6 +101,34 @@ impl MockEthRpc {
     fn received(&self) -> Vec<String> {
         self.received_raw_txs.lock().unwrap().clone()
     }
+}
+
+#[tokio::test]
+async fn system_info_and_tx_prepare_validate_chain_and_projection() {
+    let mock = MockEthRpc::start().await;
+    let handler = BnsContractServerHandler::new_with_chain_config(
+        seeded_store(),
+        &mock.endpoint,
+        OWNER,
+        31_337,
+    );
+
+    let info = handler.system_info().await.unwrap();
+    assert!(info.ready);
+    assert_eq!(info.chain_id, 31_337);
+    assert_eq!(info.contract_address, OWNER);
+
+    let prepared = handler
+        .prepare_tx(BnsPrepareTxReq::new(OWNER, &[0x12, 0x34]))
+        .await
+        .unwrap();
+    assert_eq!(prepared.nonce, 5);
+    assert_eq!(prepared.chain_id, 31_337);
+    assert_eq!(prepared.contract_address, OWNER);
+    assert_eq!(prepared.estimated_gas, 100_000);
+    assert_eq!(prepared.gas_limit, 120_000);
+    assert_eq!(prepared.max_priority_fee_per_gas, 1_000_000_000);
+    assert_eq!(prepared.max_fee_per_gas, 3_000_000_000);
 }
 
 struct MockTxStateRpc;

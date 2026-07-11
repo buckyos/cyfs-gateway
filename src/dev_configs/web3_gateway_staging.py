@@ -256,7 +256,7 @@ def copy_bns_source() -> None:
     print(f"[staging] copied BNS Foundry source: {target}")
 
 
-def make_sn_config(sn_ip: str) -> None:
+def make_sn_config(sn_ip: str, enable_bns_proxy: bool = False) -> None:
     command = [
         "deno",
         "run",
@@ -268,15 +268,17 @@ def make_sn_config(sn_ip: str) -> None:
         "--sn_ip",
         sn_ip,
     ]
+    if enable_bns_proxy:
+        command.append("--dev-vm")
     print(f"[staging] running: {' '.join(command)}")
     subprocess.run(command, cwd=SRC_ROOT, check=True)
 
 
-def build_all(target: str, sn_ip: str) -> None:
+def build_all(target: str, sn_ip: str, enable_bns_proxy: bool = False) -> None:
     recreate_staging()
     run_build(target)
     copy_bns_source()
-    make_sn_config(sn_ip)
+    make_sn_config(sn_ip, enable_bns_proxy)
     validate_complete_staging()
 
 
@@ -296,6 +298,7 @@ def parse_args() -> argparse.Namespace:
     )
     build_all_parser.add_argument("--target", default="aarch64")
     build_all_parser.add_argument("--sn-ip", required=True)
+    build_all_parser.add_argument("--enable-bns-proxy", action="store_true")
 
     subparsers.add_parser(
         "validate", help="Reject runtime data anywhere below the staging directory."
@@ -311,7 +314,7 @@ def main() -> int:
             run_build(args.target)
             validate_no_runtime_artifacts()
         elif args.command == "build-all":
-            build_all(args.target, args.sn_ip)
+            build_all(args.target, args.sn_ip, args.enable_bns_proxy)
         elif args.command == "validate":
             checked_staging_path()
             validate_complete_staging()

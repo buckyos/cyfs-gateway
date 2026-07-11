@@ -3,6 +3,7 @@
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -68,6 +69,11 @@ def parse_args() -> argparse.Namespace:
         "--install-foundry",
         action="store_true",
         help="install Foundry in this VM before starting anvil/deploying BNS",
+    )
+    parser.add_argument(
+        "--configure-sn-bns-proxy",
+        action="store_true",
+        help="write the deployed BNS runtime values into params.json for cyfs-sn",
     )
     return parser.parse_args()
 
@@ -435,6 +441,40 @@ def write_dv_env(current_dir: Path, contract: str) -> None:
     print(f"Wrote {path}")
 
 
+def configure_sn_bns_proxy(current_dir: Path, contract: str) -> None:
+    params_path = current_dir / "params.json"
+    if not params_path.is_file():
+        raise RuntimeError(
+            f"cannot configure SN BNS proxy: params.json not found at {params_path}"
+        )
+    try:
+        document = json.loads(params_path.read_text())
+    except json.JSONDecodeError as error:
+        raise RuntimeError(f"cannot parse {params_path}: {error}") from error
+    params = document.setdefault("params", {})
+    if not isinstance(params, dict):
+        raise RuntimeError(f"cannot configure SN BNS proxy: {params_path} params is not an object")
+    params.update(
+        {
+            "bns_rpc_endpoint": BNS_RPC_ENDPOINT,
+            "bns_chain_id": str(BNS_CHAIN_ID),
+            "bns_contract_address": contract,
+            "bns_server_url": BNS_SERVER_URL,
+            "bns_rpc_url": BNS_SERVER_URL,
+        }
+    )
+    temporary_path = params_path.with_suffix(".json.tmp")
+    temporary_path.write_text(json.dumps(document, indent=2) + "\n")
+    temporary_path.replace(params_path)
+
+    gateway_path = current_dir / "web3_gateway.yaml"
+    if not gateway_path.is_file():
+        raise RuntimeError(
+            f"cannot configure SN BNS proxy: gateway config not found at {gateway_path}"
+        )
+    print(f"Configured SN BNS RPC runtime value in {params_path}")
+
+
 def main() -> int:
     args = parse_args()
     if args.force_deploy and args.no_deploy:
@@ -460,6 +500,8 @@ def main() -> int:
 
     contract = ensure_bns_contract(current_dir, args.force_deploy)
     write_dv_env(current_dir, contract)
+    if args.configure_sn_bns_proxy:
+        configure_sn_bns_proxy(current_dir, contract)
     print("\nAnvil/BNS environment is ready")
     print(f"  rpc:      {BNS_RPC_ENDPOINT}")
     print(f"  chain_id: {BNS_CHAIN_ID}")

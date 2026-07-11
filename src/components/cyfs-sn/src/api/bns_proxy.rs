@@ -13,12 +13,12 @@ use super::common::{
     normalize_evm_address, normalize_username, ok_response, parse_params,
     resolve_self_scoped_username, RpcCallResult,
 };
-use super::errors::{bns_proxy_error, parse_error, reason_error, SnApiErrorCode};
+use super::errors::{bns_proxy_error, parse_error, SnApiErrorCode};
 use crate::sn_bns_proxy::{SnBnsProxy, SnBnsProxyInitialDocuments, SnBnsProxyRegisterParams};
 use crate::SNServer;
 use ::kRPC::{RPCErrors, RPCRequest, RPCResponse};
+use bns_client::dns_document::DnsTxtRecord;
 use bns_client::DnsTxtUpdate;
-use bns_indexer::dns_document::DnsTxtRecord;
 use rand::RngCore;
 use serde::Deserialize;
 use serde_json::Value;
@@ -84,12 +84,7 @@ struct RegisterNameBootstrapReq {
 }
 
 fn require_bns_proxy(server: &SNServer) -> RpcCallResult<Arc<SnBnsProxy>> {
-    server.bns_proxy().ok_or_else(|| {
-        reason_error(
-            SnApiErrorCode::BnsProxyUnavailable,
-            "bns proxy is not enabled on this SN",
-        )
-    })
+    Ok(server.bns_proxy())
 }
 
 /// request_id 是幂等键：客户端未提供时生成随机 id（每次调用视为新意图）。

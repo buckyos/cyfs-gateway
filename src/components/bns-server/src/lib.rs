@@ -15,12 +15,13 @@ use async_trait::async_trait;
 use bns_client::{
     BnsAddressReq, BnsAuthorityKeyReq, BnsClientError, BnsClientResult, BnsDocumentReq,
     BnsDocumentVersionReq, BnsIndexerApi, BnsIndexerRpcHandler, BnsListEventsReq, BnsNamePage,
-    BnsNameReq, BnsRpcEnvelope, BnsSubmitRawTxReq, BnsSubmitRawTxResp, BnsTxExecutionState,
-    BnsTxHashReq, BnsTxState, BNS_INDEXER_RPC_PATH, BNS_SERVER_RPC_PATH, MAX_BNS_NAMES_PAGE_SIZE,
-    METHOD_GET_AUTHORITY_KEY, METHOD_GET_AUTHORITY_SET, METHOD_GET_DOCUMENT_VERSION,
-    METHOD_LATEST_CHECKPOINT, METHOD_LIST_EVENTS, METHOD_QUERY_NAMES_BY_ADDRESS,
-    METHOD_QUERY_NAME_STATE, METHOD_QUERY_TX_STATE, METHOD_RESOLVE_DOCUMENT, METHOD_RESOLVE_OWNER,
-    METHOD_SUBMIT_RAW_TX,
+    BnsNameReq, BnsPrepareTxReq, BnsPrepareTxResp, BnsRpcEnvelope, BnsSubmitRawTxReq,
+    BnsSubmitRawTxResp, BnsSystemInfo, BnsTxExecutionState, BnsTxHashReq, BnsTxState,
+    BNS_INDEXER_RPC_PATH, BNS_SERVER_RPC_PATH, MAX_BNS_NAMES_PAGE_SIZE, METHOD_GET_AUTHORITY_KEY,
+    METHOD_GET_AUTHORITY_SET, METHOD_GET_DOCUMENT_VERSION, METHOD_LATEST_CHECKPOINT,
+    METHOD_LIST_EVENTS, METHOD_PREPARE_TX, METHOD_QUERY_NAMES_BY_ADDRESS, METHOD_QUERY_NAME_STATE,
+    METHOD_QUERY_TX_STATE, METHOD_RESOLVE_DOCUMENT, METHOD_RESOLVE_OWNER, METHOD_SUBMIT_RAW_TX,
+    METHOD_SYSTEM_INFO,
 };
 use bns_evm::{Address, EthRpcClient, B256};
 use bns_indexer::{
@@ -59,6 +60,8 @@ where
 {
     store: S,
     eth_rpc: EthRpcClient,
+    contract_address: Option<String>,
+    expected_chain_id: Option<u64>,
 }
 
 impl<S> BnsContractServerHandler<S>
@@ -69,6 +72,22 @@ where
         Self {
             store,
             eth_rpc: EthRpcClient::new(evm_rpc_endpoint),
+            contract_address: None,
+            expected_chain_id: None,
+        }
+    }
+
+    pub fn new_with_chain_config(
+        store: S,
+        evm_rpc_endpoint: impl Into<String>,
+        contract_address: impl Into<String>,
+        chain_id: u64,
+    ) -> Self {
+        Self {
+            store,
+            eth_rpc: EthRpcClient::new(evm_rpc_endpoint),
+            contract_address: Some(contract_address.into()),
+            expected_chain_id: Some(chain_id),
         }
     }
 
@@ -86,6 +105,38 @@ impl<S> BnsIndexerApi for BnsContractServerHandler<S>
 where
     S: BnsRegistryStore + 'static,
 {
+    async fn system_info(&self) -> BnsClientResult<BnsSystemInfo> {
+        let expected_chain_id = self
+            .expected_chain_id
+            .ok_or_else(|| BnsClientError::unsupported("BNS server chain_id is not configured"))?;
+        let contract = self.contract_address.as_deref().ok_or_else(|| {
+            BnsClientError::unsupported("BNS server contract_address is not configured")
+        })?;
+        let contract = Address::from_str(contract).map_err(|error| {
+            BnsClientError::Serialization(format!("invalid BNS contract_address: {error}"))
+        })?;
+        let actual_chain_id = self
+            .eth_rpc
+            .chain_id()
+            .await
+            .map_err(BnsClientError::from)?;
+        if actual_chain_id != expected_chain_id {
+            return Err(BnsClientError::Transport(format!(
+                "BNS chain id mismatch: configured {expected_chain_id}, RPC returned {actual_chain_id}"
+            )));
+        }
+        // Touch the projection store as part of readiness. An empty checkpoint is
+        // valid for a fresh deployment; a store error is not.
+        self.store
+            .transact(|tx| tx.latest_checkpoint())
+            .map_err(BnsClientError::from)?;
+        Ok(BnsSystemInfo {
+            ready: true,
+            chain_id: actual_chain_id,
+            contract_address: format!("{contract:#x}"),
+        })
+    }
+
     async fn query_name_state(&self, name: &str) -> BnsClientResult<Option<NameState>> {
         self.store
             .transact(|tx| projection_query_name_state(tx, name))
@@ -244,6 +295,42 @@ where
         })
     }
 
+    async fn prepare_tx(&self, req: BnsPrepareTxReq) -> BnsClientResult<BnsPrepareTxResp> {
+        let info = self.system_info().await?;
+        let from = Address::from_str(req.from.trim()).map_err(|error| {
+            BnsClientError::Serialization(format!("invalid transaction sender: {error}"))
+        })?;
+        let contract = Address::from_str(info.contract_address.as_str()).map_err(|error| {
+            BnsClientError::Serialization(format!("invalid BNS contract_address: {error}"))
+        })?;
+        let calldata = req.calldata_bytes()?;
+        let nonce = self
+            .eth_rpc
+            .transaction_count(from)
+            .await
+            .map_err(BnsClientError::from)?;
+        let estimated_gas = self
+            .eth_rpc
+            .estimate_gas(from, contract, calldata.as_slice())
+            .await
+            .map_err(BnsClientError::from)?;
+        let gas_buffer = estimated_gas / 5 + u64::from(estimated_gas % 5 != 0);
+        let fees = self
+            .eth_rpc
+            .suggest_eip1559_fees()
+            .await
+            .map_err(BnsClientError::from)?;
+        Ok(BnsPrepareTxResp {
+            nonce,
+            chain_id: info.chain_id,
+            contract_address: info.contract_address,
+            estimated_gas,
+            gas_limit: estimated_gas.saturating_add(gas_buffer),
+            max_fee_per_gas: fees.max_fee_per_gas,
+            max_priority_fee_per_gas: fees.max_priority_fee_per_gas,
+        })
+    }
+
     async fn list_events(
         &self,
         from_seq: u64,
@@ -280,6 +367,7 @@ where
         _ip_from: IpAddr,
     ) -> Result<RPCResponse, RPCErrors> {
         match req.method.as_str() {
+            METHOD_SYSTEM_INFO => rpc_envelope_response(self.0.system_info().await, &req),
             METHOD_QUERY_NAME_STATE | "query_name_state" => {
                 let parsed: BnsNameReq = parse_req(req.params.clone(), "BnsNameReq")?;
                 rpc_envelope_response(self.0.query_name_state(&parsed.name).await, &req)
@@ -339,6 +427,10 @@ where
             METHOD_SUBMIT_RAW_TX | "submit_raw_tx" => {
                 let parsed: BnsSubmitRawTxReq = parse_req(req.params.clone(), "BnsSubmitRawTxReq")?;
                 rpc_envelope_response(self.0.submit_raw_tx(parsed).await, &req)
+            }
+            METHOD_PREPARE_TX | "prepare_tx" => {
+                let parsed: BnsPrepareTxReq = parse_req(req.params.clone(), "BnsPrepareTxReq")?;
+                rpc_envelope_response(self.0.prepare_tx(parsed).await, &req)
             }
             METHOD_LIST_EVENTS | "list_events" => {
                 let parsed: BnsListEventsReq = parse_req(req.params.clone(), "BnsListEventsReq")?;
@@ -514,6 +606,23 @@ where
         Self::with_config(
             BnsContractServerHandler::new(store, evm_rpc_endpoint),
             config,
+        )
+    }
+
+    pub fn from_contract_store_with_chain_config(
+        store: S,
+        evm_rpc_endpoint: impl Into<String>,
+        contract_address: impl Into<String>,
+        chain_id: u64,
+    ) -> Self {
+        Self::with_config(
+            BnsContractServerHandler::new_with_chain_config(
+                store,
+                evm_rpc_endpoint,
+                contract_address,
+                chain_id,
+            ),
+            BnsIndexerHttpServerConfig::default().with_rpc_path(BNS_SERVER_RPC_PATH),
         )
     }
 }

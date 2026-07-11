@@ -8,7 +8,8 @@ use crate::{
 };
 use crate::{
     BnsApplyMutationsReq, BnsClientError, BnsDocumentVersion, BnsEvmControllerClient,
-    BnsEvmTxSubmission, BnsIndexerApi, BnsPublishDocumentReq, BnsRegisterNameReq, BnsRpcErrorInfo,
+    BnsEvmReceiptWaitConfig, BnsEvmTxReceipt, BnsEvmTxSubmission, BnsIndexerApi,
+    BnsPublishDocumentReq, BnsRegisterNameReq, BnsRpcErrorInfo,
 };
 use async_trait::async_trait;
 use serde::de::DeserializeOwned;
@@ -415,6 +416,17 @@ pub trait SnBnsEvmSubmitter: Send + Sync {
         &self,
         req: &BnsPublishDocumentReq,
     ) -> crate::BnsClientResult<BnsEvmTxSubmission>;
+
+    async fn wait_for_receipt(
+        &self,
+        tx_hash: &str,
+        config: BnsEvmReceiptWaitConfig,
+    ) -> crate::BnsClientResult<BnsEvmTxReceipt> {
+        let _ = (tx_hash, config);
+        Err(BnsClientError::Transport(
+            "EVM receipt waiting is not supported by this submitter".to_string(),
+        ))
+    }
 }
 
 #[async_trait]
@@ -439,6 +451,14 @@ impl SnBnsEvmSubmitter for BnsEvmControllerClient {
     ) -> crate::BnsClientResult<BnsEvmTxSubmission> {
         BnsEvmControllerClient::publish_document(self, req).await
     }
+
+    async fn wait_for_receipt(
+        &self,
+        tx_hash: &str,
+        config: BnsEvmReceiptWaitConfig,
+    ) -> crate::BnsClientResult<BnsEvmTxReceipt> {
+        BnsEvmControllerClient::wait_for_receipt(self, tx_hash, config).await
+    }
 }
 
 #[async_trait]
@@ -457,6 +477,12 @@ trait SnBnsWriteBackend: Send + Sync {
         &self,
         req: BnsPublishDocumentReq,
     ) -> SnBnsControllerResult<BnsEvmTxSubmission>;
+
+    async fn wait_for_receipt(
+        &self,
+        tx_hash: &str,
+        config: BnsEvmReceiptWaitConfig,
+    ) -> SnBnsControllerResult<BnsEvmTxReceipt>;
 }
 
 struct EvmSnBnsWriteBackend {
@@ -494,6 +520,17 @@ impl SnBnsWriteBackend for EvmSnBnsWriteBackend {
     ) -> SnBnsControllerResult<BnsEvmTxSubmission> {
         self.submitter
             .publish_document(&req)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn wait_for_receipt(
+        &self,
+        tx_hash: &str,
+        config: BnsEvmReceiptWaitConfig,
+    ) -> SnBnsControllerResult<BnsEvmTxReceipt> {
+        self.submitter
+            .wait_for_receipt(tx_hash, config)
             .await
             .map_err(Into::into)
     }
@@ -542,6 +579,14 @@ impl SnBnsController {
 
     pub fn sn_controller_policy(&self) -> SnBnsControllerResult<Vec<crate::ControllerRule>> {
         self.config.sn_controller_policy()
+    }
+
+    pub async fn wait_for_evm_receipt(
+        &self,
+        tx_hash: &str,
+        config: BnsEvmReceiptWaitConfig,
+    ) -> SnBnsControllerResult<BnsEvmTxReceipt> {
+        self.write_backend.wait_for_receipt(tx_hash, config).await
     }
 
     pub async fn bootstrap_name(

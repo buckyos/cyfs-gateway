@@ -7,7 +7,7 @@
 //! - 本模块负责「用户 → controller」持久化绑定、受限操作编排与审计日志。
 //!
 //! proxy 返回 `submitted` 只表示 SN 已投递 TX；BNS 权威状态仍以合约与
-//! `bns-indexer` 投影为准，读侧不做任何伪造。
+//! bns-rpc 投影为准，读侧不做任何伪造。
 
 use std::collections::HashSet;
 use std::fmt;
@@ -16,16 +16,15 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
+use bns_client::dns_document::{DnsTxtRecord, DNS_TXT_DOC_TYPE};
 use bns_client::{
-    canonical_doc_type, hash_json, DnsTxtUpdate, PublishDocumentParams, RegisterNameParams,
-    SnBnsController, SnBnsControllerError, UpsertDnsTxtParams, OWNER_DOC_TYPE,
+    canonical_doc_type, hash_json, BnsEvmReceiptWaitConfig, DnsTxtUpdate, PublishDocumentParams,
+    RegisterNameParams, SnBnsController, SnBnsControllerError, UpsertDnsTxtParams, OWNER_DOC_TYPE,
     RELAY_ASSIGNMENT_DOC_TYPE,
 };
-use bns_client::{PublishRelayAssignmentParams, RegisterNameOutput};
-use bns_indexer::dns_document::{DnsTxtRecord, DNS_TXT_DOC_TYPE};
-use bns_indexer::{
+use bns_client::{
     default_document_update, CallAuthority, DocumentRef, DocumentUpdate, MutationGuard, Principal,
-    RegisterOptions,
+    PublishRelayAssignmentParams, RegisterNameOutput, RegisterOptions,
 };
 use log::{info, warn};
 use serde::{Deserialize, Serialize};
@@ -38,6 +37,7 @@ use crate::sn_bns_signer::SnBnsProxyOperation;
 use crate::{sn_err, SnErrorCode, SnResult};
 
 const BNS_WRITE_STATUS_SUBMITTED: &str = "submitted";
+const BNS_WRITE_STATUS_CONFIRMED: &str = "confirmed";
 
 // ---------------------------------------------------------------------------
 // 配置
@@ -456,7 +456,8 @@ pub struct SnBnsProxyRegisterParams {
     pub initial_documents: SnBnsProxyInitialDocuments,
 }
 
-/// proxy 写操作的 TX 投递结果。`status = submitted` 只表示已投递，不代表上链成功。
+/// proxy 写操作结果。普通写返回 `submitted`；用户注册等待成功回执后返回
+/// `confirmed`。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SnBnsProxyTxOutcome {
     pub request_id: String,
@@ -746,6 +747,55 @@ impl SnBnsProxy {
             reused: receipt.created_or_reused,
         };
         self.audit(&outcome, payload_hash.as_str());
+        Ok(outcome)
+    }
+
+    /// 用户注册专用路径：提交 `registerName` 后等待成功的链上回执。
+    ///
+    /// 普通 BNS proxy 写接口仍只保证 `submitted`；只有本方法会阻塞到交易
+    /// 上链，确保调用方可以安全地继续创建本地账号和签发会话。幂等重试
+    /// 会复用原 tx_hash，并再次查询该交易的回执。
+    pub async fn register_bootstrap_and_wait(
+        &self,
+        params: SnBnsProxyRegisterParams,
+    ) -> SnBnsProxyResult<SnBnsProxyTxOutcome> {
+        let mut outcome = self.register_bootstrap(params).await?;
+        let tx_hash = outcome.tx_hash.clone().ok_or_else(|| {
+            SnBnsProxyError::InvalidInput(
+                "registerName submission did not return an EVM tx_hash".to_string(),
+            )
+        })?;
+        let entry = self
+            .controllers
+            .iter()
+            .find(|entry| entry.id == outcome.controller_id)
+            .ok_or_else(|| SnBnsProxyError::ControllerUnavailable {
+                username: outcome.name.clone(),
+                controller_id: outcome.controller_id.clone(),
+            })?;
+
+        info!(
+            "sn bns registerName waiting for chain receipt: name={} controller_id={} tx_hash={} request_id={} reused={}",
+            outcome.name, outcome.controller_id, tx_hash, outcome.request_id, outcome.reused
+        );
+        let receipt = entry
+            .controller
+            .wait_for_evm_receipt(tx_hash.as_str(), BnsEvmReceiptWaitConfig::included())
+            .await
+            .map_err(SnBnsProxyError::Write)?;
+        outcome.status = BNS_WRITE_STATUS_CONFIRMED.to_string();
+        info!(
+            "sn bns registerName confirmed on chain: name={} controller_id={} tx_hash={} block_number={} confirmations={} receipt_status={} request_id={}",
+            outcome.name,
+            outcome.controller_id,
+            tx_hash,
+            receipt.block_number,
+            receipt.confirmations,
+            receipt
+                .status
+                .map_or_else(|| "-".to_string(), |status| status.to_string()),
+            outcome.request_id
+        );
         Ok(outcome)
     }
 

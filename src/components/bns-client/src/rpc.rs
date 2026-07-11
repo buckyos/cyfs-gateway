@@ -26,6 +26,8 @@ pub const METHOD_GET_DOCUMENT_VERSION: &str = "document.get_version";
 pub const METHOD_QUERY_NAMES_BY_ADDRESS: &str = "name.query_by_addr";
 pub const METHOD_QUERY_TX_STATE: &str = "tx.query_state";
 pub const METHOD_SUBMIT_RAW_TX: &str = "tx.submit_raw";
+pub const METHOD_PREPARE_TX: &str = "tx.prepare";
+pub const METHOD_SYSTEM_INFO: &str = "system.info";
 pub const METHOD_LIST_EVENTS: &str = "events.list";
 pub const METHOD_LATEST_CHECKPOINT: &str = "checkpoint.latest";
 
@@ -312,6 +314,51 @@ pub struct BnsSubmitRawTxResp {
     pub tx_hash: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BnsSystemInfo {
+    pub ready: bool,
+    pub chain_id: u64,
+    pub contract_address: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BnsPrepareTxReq {
+    pub from: String,
+    pub calldata: String,
+}
+
+impl BnsPrepareTxReq {
+    pub fn new(from: impl Into<String>, calldata: &[u8]) -> Self {
+        Self {
+            from: from.into(),
+            calldata: format!("0x{}", hex::encode(calldata)),
+        }
+    }
+
+    pub fn calldata_bytes(&self) -> BnsClientResult<Vec<u8>> {
+        let value = self.calldata.trim();
+        let value = value.strip_prefix("0x").unwrap_or(value);
+        if value.is_empty() || value.len() % 2 != 0 {
+            return Err(BnsClientError::Serialization(
+                "calldata must be non-empty even-length hex".to_string(),
+            ));
+        }
+        hex::decode(value)
+            .map_err(|error| BnsClientError::Serialization(format!("invalid calldata: {error}")))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BnsPrepareTxResp {
+    pub nonce: u64,
+    pub chain_id: u64,
+    pub contract_address: String,
+    pub estimated_gas: u64,
+    pub gas_limit: u64,
+    pub max_fee_per_gas: u128,
+    pub max_priority_fee_per_gas: u128,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BnsRegisterNameReq {
     pub name: String,
@@ -423,6 +470,12 @@ pub struct BnsListEventsReq {
 
 #[async_trait]
 pub trait BnsIndexerApi: Send + Sync {
+    async fn system_info(&self) -> BnsClientResult<BnsSystemInfo> {
+        Err(BnsClientError::unsupported(
+            "BNS system readiness is not configured",
+        ))
+    }
+
     async fn query_name_state(&self, name: &str) -> BnsClientResult<Option<NameState>>;
 
     async fn resolve_owner(&self, name: &str) -> BnsClientResult<OwnerResolution>;
@@ -467,6 +520,12 @@ pub trait BnsIndexerApi: Send + Sync {
         ))
     }
 
+    async fn prepare_tx(&self, _req: BnsPrepareTxReq) -> BnsClientResult<BnsPrepareTxResp> {
+        Err(BnsClientError::unsupported(
+            "BNS transaction preparation is not configured",
+        ))
+    }
+
     async fn list_events(
         &self,
         from_seq: u64,
@@ -477,12 +536,12 @@ pub trait BnsIndexerApi: Send + Sync {
 }
 
 #[derive(Clone)]
-pub enum BnsIndexerClient {
+pub enum BnsRpcClient {
     InProcess(Arc<dyn BnsIndexerApi>),
     KRPC(Arc<kRPC>),
 }
 
-impl BnsIndexerClient {
+impl BnsRpcClient {
     pub fn new_in_process(handler: Arc<dyn BnsIndexerApi>) -> Self {
         Self::InProcess(handler)
     }
@@ -525,8 +584,21 @@ impl BnsIndexerClient {
     }
 }
 
+/// Compatibility name for callers that still target the legacy indexer path.
+pub type BnsIndexerClient = BnsRpcClient;
+
+/// Preferred trait name at the unified BNS RPC boundary.
+pub use BnsIndexerApi as BnsRpcApi;
+
 #[async_trait]
-impl BnsIndexerApi for BnsIndexerClient {
+impl BnsIndexerApi for BnsRpcClient {
+    async fn system_info(&self) -> BnsClientResult<BnsSystemInfo> {
+        match self {
+            Self::InProcess(handler) => handler.system_info().await,
+            Self::KRPC(_) => self.call(METHOD_SYSTEM_INFO, &json!({})).await,
+        }
+    }
+
     async fn query_name_state(&self, name: &str) -> BnsClientResult<Option<NameState>> {
         match self {
             Self::InProcess(handler) => handler.query_name_state(name).await,
@@ -658,6 +730,13 @@ impl BnsIndexerApi for BnsIndexerClient {
         }
     }
 
+    async fn prepare_tx(&self, req: BnsPrepareTxReq) -> BnsClientResult<BnsPrepareTxResp> {
+        match self {
+            Self::InProcess(handler) => handler.prepare_tx(req).await,
+            Self::KRPC(_) => self.call(METHOD_PREPARE_TX, &req).await,
+        }
+    }
+
     async fn list_events(
         &self,
         from_seq: u64,
@@ -699,6 +778,7 @@ where
         _ip_from: IpAddr,
     ) -> Result<RPCResponse, RPCErrors> {
         match req.method.as_str() {
+            METHOD_SYSTEM_INFO => rpc_envelope_response(self.0.system_info().await, &req),
             METHOD_QUERY_NAME_STATE | "query_name_state" => {
                 let parsed: BnsNameReq = parse_req(req.params.clone(), "BnsNameReq")?;
                 rpc_envelope_response(self.0.query_name_state(&parsed.name).await, &req)
@@ -758,6 +838,10 @@ where
             METHOD_SUBMIT_RAW_TX | "submit_raw_tx" => {
                 let parsed: BnsSubmitRawTxReq = parse_req(req.params.clone(), "BnsSubmitRawTxReq")?;
                 rpc_envelope_response(self.0.submit_raw_tx(parsed).await, &req)
+            }
+            METHOD_PREPARE_TX | "prepare_tx" => {
+                let parsed: BnsPrepareTxReq = parse_req(req.params.clone(), "BnsPrepareTxReq")?;
+                rpc_envelope_response(self.0.prepare_tx(parsed).await, &req)
             }
             METHOD_LIST_EVENTS | "list_events" => {
                 let parsed: BnsListEventsReq = parse_req(req.params.clone(), "BnsListEventsReq")?;

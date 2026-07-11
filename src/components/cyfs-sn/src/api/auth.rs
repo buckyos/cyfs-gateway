@@ -8,6 +8,7 @@ use crate::sn_auth_manager::{hash_password, verify_password, PASSWORD_ALGO};
 use crate::sn_bns_proxy::SnBnsProxyRegisterParams;
 use crate::SNServer;
 use ::kRPC::{RPCErrors, RPCRequest, RPCResponse};
+use log::info;
 use serde_json::{json, Value};
 
 async fn build_auth_success_response(
@@ -111,13 +112,26 @@ pub(crate) async fn handle_auth(server: &SNServer, req: RPCRequest) -> RpcCallRe
                 .map_err(|message| parse_error(SnApiErrorCode::InvalidUsername, message))?;
             let email = crate::canonical_email(params.email.as_str())
                 .map_err(|error| parse_error(SnApiErrorCode::InvalidEmail, error.msg()))?;
+            let request_id = params
+                .request_id
+                .clone()
+                .unwrap_or_else(|| format!("sn:register:{}", username));
+            info!(
+                "sn auth register started: username={} request_id={} bns_enabled={} asset_owner_supplied={} initial_documents_empty={}",
+                username,
+                request_id,
+                true,
+                params.asset_owner.is_some(),
+                params
+                    .initial_documents
+                    .as_ref()
+                    .map_or(true, |documents| documents.is_empty())
+            );
             // 锁覆盖预查、可选 BNS bootstrap 和本地事务，避免同进程并发请求
             // 在邮箱冲突已知前产生两次外部注册副作用。SQLite UNIQUE 索引仍兜底。
-            let _email_locker = async_named_locker::Locker::get_locker(format!(
-                "sn_auth_register_email_{}",
-                email
-            ))
-            .await;
+            let _email_locker =
+                async_named_locker::Locker::get_locker(format!("sn_auth_register_email_{}", email))
+                    .await;
             if server
                 .auth_db()
                 .is_user_exist(username.as_str())
@@ -158,12 +172,16 @@ pub(crate) async fn handle_auth(server: &SNServer, req: RPCRequest) -> RpcCallRe
                     "register failed, invalid activation code",
                 ));
             }
+            info!(
+                "sn auth register prechecks passed: username={} request_id={}",
+                username, request_id
+            );
             let (password_hash, password_salt) = hash_password(params.pwd_hash.as_str())?;
-            let need_bind_owner_key = server.bns_proxy().is_none();
+            let need_bind_owner_key = false;
             // BNS bootstrap 在本地建号之前执行：失败则不创建本地用户，避免
             // 本地账号与 BNS name 不一致（同 request_id 重试幂等）。
-            let mut bns_info: Option<Value> = None;
-            if let Some(proxy) = server.bns_proxy() {
+            let bns_info = {
+                let proxy = server.bns_proxy();
                 let asset_owner = match params.asset_owner.as_deref() {
                     Some(value) => normalize_evm_address(value, "asset_owner")?,
                     None if proxy.require_user_asset_owner() => {
@@ -178,12 +196,13 @@ pub(crate) async fn handle_auth(server: &SNServer, req: RPCRequest) -> RpcCallRe
                         .await
                         .map_err(bns_proxy_error)?,
                 };
+                info!(
+                    "sn auth register submitting BNS registerName: username={} request_id={}",
+                    username, request_id
+                );
                 let outcome = proxy
-                    .register_bootstrap(SnBnsProxyRegisterParams {
-                        request_id: params
-                            .request_id
-                            .clone()
-                            .unwrap_or_else(|| format!("sn:register:{}", username)),
+                    .register_bootstrap_and_wait(SnBnsProxyRegisterParams {
+                        request_id: request_id.clone(),
                         name: username.clone(),
                         asset_owner,
                         owner_config: params
@@ -195,8 +214,15 @@ pub(crate) async fn handle_auth(server: &SNServer, req: RPCRequest) -> RpcCallRe
                     .await
                     .map_err(bns_proxy_error)?;
                 server.invalidate_bns_name_dns_cache(username.as_str());
-                bns_info = Some(outcome.to_bns_json());
-            }
+                info!(
+                    "sn auth register BNS bootstrap confirmed: username={} request_id={} tx_hash={} reused={}",
+                    username,
+                    request_id,
+                    outcome.tx_hash.as_deref().unwrap_or("-"),
+                    outcome.reused
+                );
+                Some(outcome.to_bns_json())
+            };
             let ok = server
                 .auth_db()
                 .register_user(
@@ -226,14 +252,23 @@ pub(crate) async fn handle_auth(server: &SNServer, req: RPCRequest) -> RpcCallRe
                     "register failed, invalid activation code",
                 ));
             }
-            build_auth_success_response(
+            info!(
+                "sn auth register local account created: username={} request_id={}",
+                username, request_id
+            );
+            let response = build_auth_success_response(
                 server,
                 &req,
                 username.as_str(),
                 need_bind_owner_key,
                 bns_info,
             )
-            .await
+            .await?;
+            info!(
+                "sn auth register completed: username={} request_id={} need_bind_owner_key={}",
+                username, request_id, need_bind_owner_key
+            );
+            Ok(response)
         }
         "login" => {
             let params: LoginReq = parse_params(&req)?;
@@ -271,14 +306,7 @@ pub(crate) async fn handle_auth(server: &SNServer, req: RPCRequest) -> RpcCallRe
                 .update_last_login(username.as_str(), now_secs())
                 .await
                 .into_rpc()?;
-            build_auth_success_response(
-                server,
-                &req,
-                username.as_str(),
-                server.bns_proxy().is_none() && user.public_key.trim().is_empty(),
-                None,
-            )
-            .await
+            build_auth_success_response(server, &req, username.as_str(), false, None).await
         }
         "refresh" => {
             let params: RefreshReq = parse_params(&req)?;

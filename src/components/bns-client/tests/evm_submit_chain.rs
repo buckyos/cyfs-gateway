@@ -14,7 +14,8 @@ use async_trait::async_trait;
 use bns_client::{
     BnsClientError, BnsClientResult, BnsEvmClientConfig, BnsEvmControllerClient,
     BnsEvmRawTxSubmitter, BnsEvmReceiptWaitConfig, BnsEvmStandardClient, BnsIndexerApi,
-    BnsRegisterNameReq, BnsSubmitRawTxReq, BnsSubmitRawTxResp,
+    BnsPrepareTxReq, BnsPrepareTxResp, BnsRegisterNameReq, BnsSubmitRawTxReq, BnsSubmitRawTxResp,
+    BnsTxExecutionState, BnsTxState,
 };
 use bns_evm::{decode_signed_eip1559, Address};
 use bns_indexer::{
@@ -34,12 +35,14 @@ const SERVER_TX_HASH: &str = "0x444444444444444444444444444444444444444444444444
 
 struct CapturingBnsServer {
     received_raw_txs: Arc<Mutex<Vec<Vec<u8>>>>,
+    next_nonce: Mutex<u64>,
 }
 
 impl CapturingBnsServer {
     fn new() -> Self {
         Self {
             received_raw_txs: Arc::new(Mutex::new(Vec::new())),
+            next_nonce: Mutex::new(5),
         }
     }
 
@@ -93,6 +96,30 @@ impl BnsIndexerApi for CapturingBnsServer {
         self.received_raw_txs.lock().unwrap().push(raw);
         Ok(BnsSubmitRawTxResp {
             tx_hash: SERVER_TX_HASH.to_string(),
+        })
+    }
+
+    async fn prepare_tx(&self, _req: BnsPrepareTxReq) -> BnsClientResult<BnsPrepareTxResp> {
+        let mut next_nonce = self.next_nonce.lock().unwrap();
+        let nonce = *next_nonce;
+        *next_nonce += 1;
+        Ok(BnsPrepareTxResp {
+            nonce,
+            chain_id: 31_337,
+            contract_address: OWNER.to_string(),
+            estimated_gas: 100_000,
+            gas_limit: 120_000,
+            max_fee_per_gas: 3_000_000_000,
+            max_priority_fee_per_gas: 1_000_000_000,
+        })
+    }
+
+    async fn query_tx_state(&self, tx_hash: &str) -> BnsClientResult<BnsTxState> {
+        Ok(BnsTxState {
+            tx_hash: tx_hash.to_string(),
+            state: BnsTxExecutionState::Succeeded,
+            block_number: Some(8),
+            confirmations: 3,
         })
     }
 
@@ -424,6 +451,17 @@ async fn controller_resets_cached_nonce_after_submission_failure() {
             _req: BnsSubmitRawTxReq,
         ) -> BnsClientResult<BnsSubmitRawTxResp> {
             Err(BnsClientError::Transport("chain rejected".to_string()))
+        }
+        async fn prepare_tx(&self, _req: BnsPrepareTxReq) -> BnsClientResult<BnsPrepareTxResp> {
+            Ok(BnsPrepareTxResp {
+                nonce: 5,
+                chain_id: 31_337,
+                contract_address: OWNER.to_string(),
+                estimated_gas: 100_000,
+                gas_limit: 120_000,
+                max_fee_per_gas: 3_000_000_000,
+                max_priority_fee_per_gas: 1_000_000_000,
+            })
         }
         async fn list_events(&self, _f: u64, _l: usize) -> BnsClientResult<Vec<EventLogRecord>> {
             unused("list_events")

@@ -28,7 +28,7 @@
 //
 // Usage: deno run --allow-all src/make_sn_config.ts
 //          [--rootfs <dir>] [--ca <dir>] [--sn_ip <ip>]
-//          [--sn_base_host <host>] [--env_root <dir>] [--dev-local]
+//          [--sn_base_host <host>] [--env_root <dir>] [--dev-local|--dev-vm]
 //          [--seed-v2]   (seed-v2 已是唯一行为，flag 保留为 no-op)
 //
 // Output layout:
@@ -172,7 +172,7 @@ const BNS_LOCAL_DNS_END = "# END make_sn_config:bns";
 
 function printUsage(log: (message?: unknown) => void = console.error): void {
   log(
-    "usage: make_sn_config.ts [--rootfs <dir>] [--ca <dir>] [--sn_ip <ip>] [--sn_base_host <host>] [--env_root <dir>] [--dev-local] [--seed-v2]",
+    "usage: make_sn_config.ts [--rootfs <dir>] [--ca <dir>] [--sn_ip <ip>] [--sn_base_host <host>] [--env_root <dir>] [--dev-local|--dev-vm] [--seed-v2]",
   );
 }
 
@@ -565,7 +565,7 @@ async function makeSnConfigs(
 // 3. cyfs-sn web3_sn server【已实现】启动时从 sn_seed.yaml 幂等导入 C 类
 //    种子（激活码、sn_user 账号、user_domain 绑定），格式真值
 //    cyfs-sn/src/sn_seed.rs；schema 完全归 SN 所有。
-// 4. web3_gateway.yaml【已实现】bns_indexer_url 参数化为 {{bns_indexer_url}}，
+// 4. web3_gateway.yaml【已实现】bns_rpc_url 参数化为 {{bns_rpc_url}}，
 //    由 params.json 提供（alignBnsRuntimeParams 与 dv-env.json 对齐）。
 //
 // 验证入口：scripts/sn-dev-up.sh + sn-dev-smoke.sh（本机三件套）与
@@ -1094,11 +1094,11 @@ export function applyBindParams(targetDir: string, devLocal: boolean): void {
 
 /**
  * 把 BNS 运行参数收敛进 params.json，消除三处各自写死：start.py 的 RPC/合约
- * 常量、web3_gateway.yaml 写死的 bns_indexer_url、dv 环境实际产出的
+ * 常量、web3_gateway.yaml 写死的 bns_rpc_url、dv 环境实际产出的
  * dv-env.json（rpc_endpoint/chain_id/contract_address/server_url/
- * server_rpc_path）。存在 dv-env.json 时以其为准写入 bns_indexer_url /
+ * server_rpc_path）。存在 dv-env.json 时以其为准写入 bns_rpc_url /
  * bns_server_url 等 key；无 dv-env.json 时写 start.py 内置拓扑的缺省值
- * （web3_gateway.yaml 的 {{bns_indexer_url}} 必须始终有值）。
+ * （web3_gateway.yaml 的 {{bns_rpc_url}} 必须始终有值）。
  */
 export function alignBnsRuntimeParams(targetDir: string): void {
   const paramsPath = path.join(targetDir, "params.json");
@@ -1109,16 +1109,12 @@ export function alignBnsRuntimeParams(targetDir: string): void {
 
   // start.py 内置拓扑的缺省值（bns_dv 固定拉起在 127.0.0.1:18080）。
   let serverUrl = "http://127.0.0.1:18080";
-  let serverRpcPath = "/kapi/bns";
 
   const dvEnvPath = path.join(targetDir, "dv-env.json");
   if (fs.existsSync(dvEnvPath)) {
     const dvEnv = readJson(dvEnvPath);
     if (typeof dvEnv.server_url === "string" && dvEnv.server_url) {
       serverUrl = dvEnv.server_url;
-    }
-    if (typeof dvEnv.server_rpc_path === "string" && dvEnv.server_rpc_path) {
-      serverRpcPath = dvEnv.server_rpc_path;
     }
     for (
       const key of ["rpc_endpoint", "chain_id", "contract_address"] as const
@@ -1134,8 +1130,7 @@ export function alignBnsRuntimeParams(targetDir: string): void {
     console.log(`# params.json: BNS runtime params taken from ${dvEnvPath}`);
   }
 
-  // bns_dv 只暴露 /kapi/bns；裸 host 会被补成 /kapi/bns-indexer 导致 404。
-  params.bns_indexer_url = `${serverUrl}${serverRpcPath}`;
+  params.bns_rpc_url = serverUrl;
   params.bns_server_url = serverUrl;
   json.params = params;
   writeJson(paramsPath, json);
@@ -1144,33 +1139,17 @@ export function alignBnsRuntimeParams(targetDir: string): void {
 /**
  * --dev-local 的 sn-dev-up.sh 会先写 dv-env.json，再运行 make_sn_config。
  * 这里把真实 anvil/BNS 合约参数注入 SN 配置，打开 auth.register ->
- * SnBnsProxy -> EVM 合约的写链路径；模板默认仍保持 read-only。
+ * SnBnsProxy -> bns-rpc 的写链路径；模板默认要求通过 secret 提供 key。
  */
-export function enableDevLocalBnsProxy(targetDir: string): void {
+function injectDevBnsProxy(
+  targetDir: string,
+  profile: string,
+): void {
   const gatewayPath = path.join(targetDir, WEB3_GATEWAY_CONFIG_FILE);
   if (!fs.existsSync(gatewayPath)) {
     return;
   }
-  const params = readStagedParams(targetDir);
-  const rpcEndpoint = String(params.bns_rpc_endpoint ?? "");
-  const chainId = String(params.bns_chain_id ?? "");
-  const contractAddress = String(params.bns_contract_address ?? "");
-  if (!rpcEndpoint || !chainId || !contractAddress) {
-    console.warn(
-      "skip dev-local bns_proxy injection: missing bns_rpc_endpoint/bns_chain_id/bns_contract_address",
-    );
-    return;
-  }
-
   const proxyBlock = [
-    "    bns_write_enabled: true",
-    "    bns_evm:",
-    `      rpc_endpoint: ${yamlQuote(rpcEndpoint)}`,
-    `      chain_id: ${chainId}`,
-    `      contract_address: ${yamlQuote(contractAddress)}`,
-    "      gas_limit: 3000000",
-    "      max_fee_per_gas: 1000000000",
-    "      max_priority_fee_per_gas: 100000000",
     "    bns_proxy:",
     "      require_user_asset_owner: true",
     "      allowed_operations: [register_name_bootstrap, publish_dns_txt, publish_relay_assignment, publish_document]",
@@ -1187,26 +1166,50 @@ export function enableDevLocalBnsProxy(targetDir: string): void {
   if (before.includes("bns_proxy:\n      require_user_asset_owner: true")) {
     return;
   }
-  const after = before.replace(/^    bns_write_enabled: false$/m, proxyBlock);
+  const baseProxyBlock = [
+    "    bns_evm:",
+    "      controller_private_key_env: BNS_SN_CONTROLLER_PRIVATE_KEY",
+    "    bns_proxy:",
+    "      require_user_asset_owner: true",
+  ].join("\n");
+  const after = before.replace(baseProxyBlock, proxyBlock);
   if (after === before) {
     throw new Error(
-      `failed to inject dev-local bns_proxy into ${gatewayPath}: bns_write_enabled marker not found`,
+      `failed to inject dev-local bns_proxy into ${gatewayPath}: base proxy block not found`,
     );
   }
   fs.writeFileSync(gatewayPath, after);
-  console.log("  dev-local bns_proxy enabled for auth.register smoke path");
+  console.log(`  ${profile} bns_proxy enabled for auth.register smoke path`);
+}
+
+export function enableDevLocalBnsProxy(targetDir: string): void {
+  injectDevBnsProxy(
+    targetDir,
+    "dev-local",
+  );
+}
+
+/**
+ * VM profile 的 Anvil/合约在部署到 VM 后才初始化，因此生成阶段先写参数占位符；
+ * init_anvil.py 部署成功后再把真实值写入 params.json，web3_gateway 启动时渲染。
+ */
+export function enableDevVmBnsProxy(targetDir: string): void {
+  injectDevBnsProxy(
+    targetDir,
+    "dev-vm",
+  );
 }
 
 // P1 骨架的占位错误（P0 seed-v2 主链路已实现，下面两个函数维持骨架）。
 const SEED_V2_P1_TODO = "TODO(seed-v2 P1): not implemented";
 
 /**
- * P1：Web2 托管代发路径（bns_write_enabled=true）的 SN controller 身份种子。
+ * P1：Web2 托管代发路径的 SN controller 身份种子。
  * 生成/复用托管 EVM key，写 params.json 的 sn_controller_principal /
  * sn_controller_kid / allowed_controller_doc_types / bns_evm，并在种子 tx 里
  * 为相关 name 设置受限 controller policy（依赖组件侧需求 1 的 tx type 扩展）。
  * 对应 devenv 注释 add_dns_txt_record "代发 tx" 能力与 SN-测试计划 §7 的
- * bns_write_enabled=true 端到端缺口。
+ * controller policy 端到端缺口。
  */
 export async function makeSnControllerSeed(targetDir: string): Promise<void> {
   throw new Error(SEED_V2_P1_TODO);
@@ -1247,6 +1250,7 @@ async function main(): Promise<void> {
     env_root?: string;
     "seed-v2"?: boolean;
     "dev-local"?: boolean;
+    "dev-vm"?: boolean;
     help?: boolean;
   };
   let positionals: string[];
@@ -1261,6 +1265,7 @@ async function main(): Promise<void> {
         env_root: { type: "string" },
         "seed-v2": { type: "boolean" },
         "dev-local": { type: "boolean" },
+        "dev-vm": { type: "boolean" },
         help: { type: "boolean", short: "h" },
       },
       allowPositionals: true,
@@ -1273,6 +1278,7 @@ async function main(): Promise<void> {
         env_root?: string;
         "seed-v2"?: boolean;
         "dev-local"?: boolean;
+        "dev-vm"?: boolean;
         help?: boolean;
       };
       positionals: string[];
@@ -1312,6 +1318,13 @@ async function main(): Promise<void> {
   const snBaseHost = values.sn_base_host ?? DEFAULT_SN_BASE_HOST;
   // --dev-local：本机拉起 profile，SN IP 固定 127.0.0.1、高位端口。
   const devLocal = values["dev-local"] === true;
+  const devVm = values["dev-vm"] === true;
+  if (devLocal && devVm) {
+    console.error(
+      "argument error: --dev-local and --dev-vm are mutually exclusive",
+    );
+    Deno.exit(1);
+  }
   const snIp = values.sn_ip ??
     (devLocal ? "127.0.0.1" : Deno.env.get("BUCKYOS_SN_IP") ?? getLocalIp());
   const envRoot = values.env_root ?? ENV_ROOT_DIR;
@@ -1323,6 +1336,8 @@ async function main(): Promise<void> {
   applyBindParams(targetDir, devLocal);
   if (devLocal) {
     enableDevLocalBnsProxy(targetDir);
+  } else if (devVm) {
+    enableDevVmBnsProxy(targetDir);
   }
 
   console.log("\n[OK] SN configuration files generation completed!");

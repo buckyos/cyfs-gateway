@@ -233,10 +233,14 @@ async fn serve(flags: HashMap<String, String>) -> Result<(), DynError> {
 
     run_on_init_txs(&flags, &rpc, &contract, chain_id, &db).await?;
 
-    let server: Arc<dyn HttpServer> = Arc::new(BnsContractHttpServer::from_contract_store(
-        server_store,
-        rpc.clone(),
-    ));
+    let server: Arc<dyn HttpServer> = Arc::new(
+        BnsContractHttpServer::from_contract_store_with_chain_config(
+            server_store,
+            rpc.clone(),
+            contract.clone(),
+            chain_id,
+        ),
+    );
 
     eprintln!(
         "[serve] bns-dv ready\n  rpc={rpc}\n  contract={contract}\n  chain_id={chain_id}\n  \
@@ -1268,7 +1272,11 @@ on_init_txs:
         let server_url = format!("http://{listen}");
 
         let temp = tempfile::tempdir().unwrap();
-        let db = temp.path().join("indexer.sqlite").to_string_lossy().to_string();
+        let db = temp
+            .path()
+            .join("indexer.sqlite")
+            .to_string_lossy()
+            .to_string();
         let zone_file = temp.path().join("alice.zone.bns.json");
         let write_zone = |marker: &str| {
             std::fs::write(
@@ -1327,9 +1335,8 @@ on_init_txs:
         let doc = server_api.resolve_document("alice", "zone").await.unwrap();
         assert_eq!(doc.document_state.version, 1);
 
-        let replay_flags = |config: &PathBuf| {
-            flags(&[("config", config.to_string_lossy().to_string())])
-        };
+        let replay_flags =
+            |config: &PathBuf| flags(&[("config", config.to_string_lossy().to_string())]);
 
         // 阶段 2：文档未变的重放不发 tx，无 owner key 也成功。
         run_on_init_txs(
@@ -1378,7 +1385,10 @@ on_init_txs:
             "error should mention asset_owner_key: {message}"
         );
         let doc = server_api.resolve_document("alice", "zone").await.unwrap();
-        assert_eq!(doc.document_state.version, 2, "failed replay must not mutate documents");
+        assert_eq!(
+            doc.document_state.version, 2,
+            "failed replay must not mutate documents"
+        );
 
         server_task.abort();
         let _ = server_task.await;

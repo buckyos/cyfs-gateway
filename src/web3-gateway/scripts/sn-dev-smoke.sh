@@ -310,9 +310,9 @@ def rpc(path, method, params, token=None):
     return result
 
 
-def assert_tx_result(label, result):
-    if result.get("status") != "submitted":
-        raise RuntimeError(f"{label} status is not submitted: {result}")
+def assert_tx_result(label, result, expected_status="submitted"):
+    if result.get("status") != expected_status:
+        raise RuntimeError(f"{label} status is not {expected_status}: {result}")
     tx_hash = result.get("tx_hash")
     if not isinstance(tx_hash, str) or not tx_hash.startswith("0x"):
         raise RuntimeError(f"{label} missing tx_hash: {result}")
@@ -363,6 +363,7 @@ register = rpc(
     "auth.register",
     {
         "name": username,
+        "email": f"{username}@example.com",
         "pwd_hash": password,
         "active_code": active_code,
         "request_id": f"sn:smoke-register:{username}",
@@ -384,7 +385,7 @@ if bns.get("operation") != "register_name_bootstrap":
     raise RuntimeError(f"unexpected register bns operation: {bns}")
 if bns.get("asset_owner", "").lower() != asset_owner.lower():
     raise RuntimeError(f"register asset_owner mismatch: {bns}")
-assert_tx_result("auth.register bns", bns)
+assert_tx_result("auth.register bns", bns, expected_status="confirmed")
 
 wait_txt_contains(initial_marker)
 

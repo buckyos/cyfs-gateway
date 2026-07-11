@@ -765,10 +765,18 @@ pub struct SnResolver {
 
 impl SnResolver {
     pub fn new(config: SnResolverConfig, auth: SnAuthReaderRef) -> Self {
+        Self::new_with_bns(config, auth, Arc::new(EmptyBnsDocumentReader))
+    }
+
+    pub fn new_with_bns(
+        config: SnResolverConfig,
+        auth: SnAuthReaderRef,
+        bns: BnsDocumentReaderRef,
+    ) -> Self {
         Self {
             config,
             auth,
-            bns: Arc::new(EmptyBnsDocumentReader),
+            bns,
             device_online: Arc::new(EmptyDeviceOnlineReader),
             relay_reader: Arc::new(EmptyRelayAssignmentReader),
             compatibility: Arc::new(EmptyResolverCompatibilityReader),
@@ -2254,7 +2262,7 @@ fn find_gateway_device_name(value: &Value) -> Option<String> {
 fn find_boot_jwt(value: &Value) -> Option<String> {
     // Shared with the SN controller's write side so the embedded boot_jwt is read
     // back through the exact same locations it was written through.
-    bns_indexer::dns_document::extract_boot_jwt(value)
+    bns_client::dns_document::extract_boot_jwt(value)
 }
 
 fn find_device_mini_map(value: &Value) -> HashMap<String, Value> {

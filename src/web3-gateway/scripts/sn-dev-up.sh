@@ -156,7 +156,7 @@ if [ "$MODE" = "fresh" ]; then
     cp "$APP_DIR/$f" "$ROOTFS/$f"
   done
 
-  # alignBnsRuntimeParams 以 rootfs 里的 dv-env.json 为准写 bns_indexer_url 等。
+  # alignBnsRuntimeParams 以 rootfs 里的 dv-env.json 为准写 bns_rpc_url 等。
   cat > "$ROOTFS/dv-env.json" <<EOF
 {
   "rpc_endpoint": "$RPC",
