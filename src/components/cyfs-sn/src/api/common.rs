@@ -1,10 +1,10 @@
 use crate::SNServer;
 use ::kRPC::*;
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use super::errors::{parse_error, reason_error, SnApiErrorCode};
+use super::errors::{SnApiErrorCode, parse_error, reason_error};
 
 pub(crate) type RpcCallResult<T> = std::result::Result<T, RPCErrors>;
 
@@ -85,8 +85,8 @@ pub(crate) struct AddDnsRecordReq {
     pub(crate) record: String,
     #[serde(default)]
     pub(crate) ttl: Option<u32>,
-    #[serde(default)]
-    pub(crate) has_cert: Option<bool>,
+    #[serde(default, rename = "has_cert")]
+    pub(crate) _has_cert: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -95,7 +95,9 @@ pub(crate) struct RemoveDnsRecordReq {
     pub(crate) domain: String,
     pub(crate) record_type: String,
     #[serde(default)]
-    pub(crate) has_cert: Option<bool>,
+    pub(crate) record: Option<String>,
+    #[serde(default, rename = "has_cert")]
+    pub(crate) _has_cert: Option<bool>,
 }
 
 pub(crate) fn parse_params<T>(req: &RPCRequest) -> RpcCallResult<T>

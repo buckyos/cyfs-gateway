@@ -1,11 +1,12 @@
 use super::common::{
-    ok_response, parse_params, require_account_username, resolve_self_scoped_username,
-    AddDnsRecordReq, IntoRpcResult, RemoveDnsRecordReq, RpcCallResult,
+    AddDnsRecordReq, IntoRpcResult, RemoveDnsRecordReq, RpcCallResult, ok_response, parse_params,
+    resolve_self_scoped_username,
 };
-use super::errors::{parse_error, SnApiErrorCode};
+use super::errors::{SnApiErrorCode, parse_error};
 use crate::SNServer;
+use crate::sn_authority::{AuthContext, require_sn_user_or_device};
 use ::kRPC::{RPCErrors, RPCRequest, RPCResponse};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 fn normalize_domain(domain: &str) -> String {
     domain.trim().trim_end_matches('.').to_ascii_lowercase()
@@ -51,20 +52,67 @@ fn ensure_user_dns_domain(
     ))
 }
 
+struct DnsMutationIdentity {
+    username: String,
+    device_name: String,
+    is_device: bool,
+}
+
+async fn resolve_dns_mutation_identity(
+    server: &SNServer,
+    req: &RPCRequest,
+    requested_device_did: &str,
+) -> RpcCallResult<DnsMutationIdentity> {
+    match require_sn_user_or_device(server, req).await? {
+        AuthContext::SnUser { username, .. } => Ok(DnsMutationIdentity {
+            device_name: ensure_owned_runtime_device(server, &username, requested_device_did)
+                .await?,
+            username,
+            is_device: false,
+        }),
+        AuthContext::Device {
+            zone, device_name, ..
+        } => Ok(DnsMutationIdentity {
+            username: zone,
+            device_name,
+            is_device: true,
+        }),
+    }
+}
+
+fn ensure_device_acme_record(domain: &str, record_type: &str) -> RpcCallResult<()> {
+    if !record_type.eq_ignore_ascii_case("TXT") {
+        return Err(parse_error(
+            SnApiErrorCode::DevicePermissionDenied,
+            "device DNS mutation only allows TXT",
+        ));
+    }
+    let domain = normalize_domain(domain);
+    if !domain.starts_with("_acme-challenge.") || domain.len() == "_acme-challenge.".len() {
+        return Err(parse_error(
+            SnApiErrorCode::DevicePermissionDenied,
+            "device DNS mutation only allows _acme-challenge names",
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) async fn handle_dns(server: &SNServer, req: RPCRequest) -> RpcCallResult<RPCResponse> {
     match req.method.as_str() {
         "add_record" => {
-            let username = require_account_username(server, &req).await?;
+            let params: AddDnsRecordReq = parse_params(&req)?;
+            let identity =
+                resolve_dns_mutation_identity(server, &req, params.device_did.as_str()).await?;
+            let username = identity.username;
             let user = server
                 .auth_db()
                 .get_user_info(username.as_str())
                 .await
                 .into_rpc()?
                 .ok_or_else(|| parse_error(SnApiErrorCode::UserNotFound, "user not found"))?;
-            let params: AddDnsRecordReq = parse_params(&req)?;
-            let device_name =
-                ensure_owned_runtime_device(server, username.as_str(), params.device_did.as_str())
-                    .await?;
+            if identity.is_device {
+                ensure_device_acme_record(&params.domain, &params.record_type)?;
+            }
             ensure_user_dns_domain(
                 username.as_str(),
                 user.user_domain.as_deref(),
@@ -87,51 +135,47 @@ pub(crate) async fn handle_dns(server: &SNServer, req: RPCRequest) -> RpcCallRes
             {
                 server.remove_name_info_cache(params.domain.as_str(), record_type);
             }
-            if params.has_cert.unwrap_or(false) {
-                server
-                    .auth_db()
-                    .update_user_self_cert(username.as_str(), true)
-                    .await
-                    .into_rpc()?;
-            }
             ok_response(
                 &req,
                 json!({
                     "code": 0,
-                    "device_name": device_name,
+                    "device_name": identity.device_name,
                 }),
             )
         }
         "remove_record" => {
-            let username = require_account_username(server, &req).await?;
+            let params: RemoveDnsRecordReq = parse_params(&req)?;
+            let identity =
+                resolve_dns_mutation_identity(server, &req, params.device_did.as_str()).await?;
+            let username = identity.username;
             let user = server
                 .auth_db()
                 .get_user_info(username.as_str())
                 .await
                 .into_rpc()?
                 .ok_or_else(|| parse_error(SnApiErrorCode::UserNotFound, "user not found"))?;
-            let params: RemoveDnsRecordReq = parse_params(&req)?;
-            ensure_owned_runtime_device(server, username.as_str(), params.device_did.as_str())
-                .await?;
+            if identity.is_device {
+                ensure_device_acme_record(&params.domain, &params.record_type)?;
+                if params.record.as_deref().map(str::is_empty).unwrap_or(true) {
+                    return Err(parse_error(
+                        SnApiErrorCode::InvalidParams,
+                        "device DNS removal requires an exact record value",
+                    ));
+                }
+            }
             ensure_user_dns_domain(
                 username.as_str(),
                 user.user_domain.as_deref(),
                 server.resolver().config().server_host.as_str(),
                 params.domain.as_str(),
             )?;
-            if params.has_cert.unwrap_or(false) {
-                server
-                    .auth_db()
-                    .update_user_self_cert(username.as_str(), true)
-                    .await
-                    .into_rpc()?;
-            }
             server
                 .compat_store()
                 .remove_user_domain(
                     username.as_str(),
                     params.domain.as_str(),
                     params.record_type.as_str(),
+                    params.record.as_deref(),
                 )
                 .await
                 .into_rpc()?;
@@ -214,13 +258,15 @@ mod tests {
         assert!(
             ensure_user_dns_domain("alice", None, "buckyos.ai", "alice.web3.buckyos.ai").is_ok()
         );
-        assert!(ensure_user_dns_domain(
-            "alice",
-            None,
-            "buckyos.ai",
-            "_acme-challenge.alice.web3.buckyos.ai"
-        )
-        .is_ok());
+        assert!(
+            ensure_user_dns_domain(
+                "alice",
+                None,
+                "buckyos.ai",
+                "_acme-challenge.alice.web3.buckyos.ai"
+            )
+            .is_ok()
+        );
 
         let err = ensure_user_dns_domain("alice", None, "buckyos.ai", "home.bob.web3.buckyos.ai")
             .unwrap_err()
@@ -230,20 +276,24 @@ mod tests {
 
     #[test]
     fn test_ensure_user_dns_domain_for_custom_user_domain() {
-        assert!(ensure_user_dns_domain(
-            "alice",
-            Some("alice.example.com"),
-            "buckyos.ai",
-            "home.alice.example.com",
-        )
-        .is_ok());
-        assert!(ensure_user_dns_domain(
-            "alice",
-            Some("alice.example.com"),
-            "buckyos.ai",
-            "alice.example.com",
-        )
-        .is_ok());
+        assert!(
+            ensure_user_dns_domain(
+                "alice",
+                Some("alice.example.com"),
+                "buckyos.ai",
+                "home.alice.example.com",
+            )
+            .is_ok()
+        );
+        assert!(
+            ensure_user_dns_domain(
+                "alice",
+                Some("alice.example.com"),
+                "buckyos.ai",
+                "alice.example.com",
+            )
+            .is_ok()
+        );
 
         let err = ensure_user_dns_domain(
             "alice",

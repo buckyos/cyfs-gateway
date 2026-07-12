@@ -5486,6 +5486,65 @@ mod tests {
         assert_eq!(result["zone"].as_str().unwrap(), DEVTOKEN_USER);
         assert_eq!(result["did"].as_str().unwrap(), device_key_did);
 
+        // The same verified device identity may manage only exact ACME TXT
+        // values in its own zone. The payload's device_did is deliberately
+        // forged to prove authorization comes from the token context.
+        let device_auth_krpc = kRPC::new(auth_url.as_str(), Some(device_token.clone()));
+        let challenge = format!(
+            "_acme-challenge.{}.web3.buckyos.ai",
+            DEVTOKEN_USER
+        );
+        for value in ["root-order", "wildcard-order", "root-order"] {
+            device_auth_krpc
+                .call(
+                    "user.add_dns_record",
+                    json!({
+                        "device_did": "did:dev:forged-request-value",
+                        "domain": challenge,
+                        "record_type": "TXT",
+                        "record": value,
+                        "ttl": 600
+                    }),
+                )
+                .await
+                .unwrap();
+        }
+        device_auth_krpc
+            .call(
+                "user.remove_dns_record",
+                json!({
+                    "device_did": "did:dev:forged-request-value",
+                    "domain": challenge,
+                    "record_type": "TXT",
+                    "record": "root-order"
+                }),
+            )
+            .await
+            .unwrap();
+        let account_auth_krpc = kRPC::new(auth_url.as_str(), Some(access_token.clone()));
+        let records = account_auth_krpc
+            .call("user.list_dns_records", json!({}))
+            .await
+            .unwrap();
+        assert_eq!(records["items"].as_array().unwrap().len(), 1);
+        assert_eq!(records["items"][0]["record"], "wildcard-order");
+
+        let err = device_auth_krpc
+            .call(
+                "user.add_dns_record",
+                json!({
+                    "device_did": device_key_did,
+                    "domain": format!("www.{}.web3.buckyos.ai", DEVTOKEN_USER),
+                    "record_type": "A",
+                    "record": "127.0.0.1"
+                }),
+            )
+            .await
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(err.contains("device_permission_denied"), "{}", err);
+
         let result = device_token_krpc
             .call(
                 "deviceinfo.resolve_ood_by_did",

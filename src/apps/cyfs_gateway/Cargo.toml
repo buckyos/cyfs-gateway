@@ -37,6 +37,7 @@ name-lib.workspace = true
 kRPC.workspace = true
 
 cyfs-gateway-lib = { path = "../../components/cyfs-gateway-lib" }
+cyfs-gateway-api.workspace = true
 cyfs-gateway-app-lib = { path = "../../components/cyfs-gateway-app-lib" }
 cyfs-process-chain = { path = "../../components/cyfs-process-chain" }
 cyfs-acme = { path = "../../components/cyfs-acme" }

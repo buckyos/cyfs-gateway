@@ -405,9 +405,9 @@ TODO（阶段二，2026-07-06 完成）：
 
 当前实现有 `user_dns_records`，用于保存用户域名下的 DNS 记录：
 
-- `(owner, domain, record_type)` 唯一。
-- `add_user_domain` 用 upsert 写入 record 和 ttl。
-- `remove_user_domain` 删除指定 record type。
+- `(owner, domain, record_type, record)` 唯一，同名 TXT 可组成多值 RRset。
+- `add_user_domain` 对同一个 value 幂等，不覆盖同名的其他 value。
+- `remove_user_domain` 支持精确删除 value；整组删除仅保留给账号管理路径。
 - `dns.add_record` / `dns.remove_record` 会检查 domain 是否属于当前用户可管理范围。
 
 目标边界：
@@ -423,6 +423,7 @@ TODO（阶段二，2026-07-06 完成）：
 - 如果没有 active `user_domain`，不能通过 `user_domain` 路径管理传统 DNS 域名；但可以管理当前账号自己的 `<username>.web3.<server_host>` 及其子域。
 - 不能管理其他账号的 web3 bridge 域名。除上述 bridge 兼容范围外，BNS DNS 内容仍应走 BNS `dns_txt` 或其他 BNS 文档流程。
 - ACME challenge 记录应只允许写入符合该用户域名边界的 `_acme-challenge.*`，不能借设备 token 写入任意域名。
+- 已通过 `sn-device` 信任链验证的设备只能增删所属 zone 边界内的 `_acme-challenge.*` TXT；请求中的 `device_did` 不参与授权，删除必须携带精确 `record` value。
 
 `<username>.web3.<server_host>` 允许写入 SN 本地 `user_dns_records` 是过渡设计，主要避免 ACME 短期 TXT 记录触发链上发布并产生额外 gas。该调用不写 BNS 文档。未来用户不再依赖 web3 bridge 解析 `did:bns:xxx`，或传统 DNS 解析服务已广泛原生支持 `did:bns:xxx` 后，应删除这项兼容例外，使 BNS 名称的 `add_dns_record` 回归链上发布；传统 `user_domain` 记录仍保持本地授权语义。
 
@@ -444,7 +445,7 @@ TODO（阶段二，2026-07-06 完成）：
 当前实现：
 
 - 阶段一已完成：`update_zone_info` 提供 patch 写入，`update_user_self_cert` 走该统一入口（sn_auth.rs:1407-1416、1916-2014）。
-- 待实现（阶段二，绕过风险）：`user.set_self_cert` V2 用裸 access token 即可把 `self_cert` 置 true（user.rs:59-67），`dns.add_record` / `dns.remove_record` 在 `has_cert=true` 时同样置 true（dns.rs:88-93、121-127），均无证书校验或可信 device 证明。
+- 待实现（阶段二，绕过风险）：`user.set_self_cert` V2 用裸 access token 即可把 `self_cert` 置 true（user.rs:59-67）；DNS mutation 已停止消费客户端 `has_cert`，不会再修改 `self_cert`。
 - 旧 `set_user_self_cert` 的 device-signed token 分支已随旧代码移除；`Device(zone,device,did)` 上下文现由 `sn_authority::require_sn_device` 提供（见「设备级凭证」小节），但 `user.set_self_cert` 尚未接入该上下文。
 - 目标实现应把这些入口收敛到 `sn_authority + update_zone_info`，并记录审计事件。
 
