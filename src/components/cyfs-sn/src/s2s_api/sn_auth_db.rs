@@ -4,7 +4,8 @@ use crate::{
 };
 use ::kRPC::{kRPC, RPCErrors, RPCHandler, RPCRequest, RPCResponse, RPCResult};
 use async_trait::async_trait;
-use serde::{Deserialize, Serialize};
+use serde::de::{DeserializeOwned, Error as DeError};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -61,11 +62,52 @@ impl SnAuthDbRpcErrorInfo {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct SnAuthDbRpcEnvelope<T> {
     pub ok: bool,
     pub result: Option<T>,
     pub error: Option<SnAuthDbRpcErrorInfo>,
+}
+
+#[derive(Deserialize)]
+struct SnAuthDbRpcEnvelopeWire {
+    ok: bool,
+    #[serde(default, deserialize_with = "deserialize_present_json_value")]
+    result: Option<Value>,
+    error: Option<SnAuthDbRpcErrorInfo>,
+}
+
+fn deserialize_present_json_value<'de, D>(deserializer: D) -> Result<Option<Value>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Value::deserialize(deserializer).map(Some)
+}
+
+impl<'de, T> Deserialize<'de> for SnAuthDbRpcEnvelope<T>
+where
+    T: DeserializeOwned,
+{
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = SnAuthDbRpcEnvelopeWire::deserialize(deserializer)?;
+        let result = if wire.ok {
+            wire.result
+                .map(serde_json::from_value)
+                .transpose()
+                .map_err(DeError::custom)?
+        } else {
+            None
+        };
+
+        Ok(Self {
+            ok: wire.ok,
+            result,
+            error: wire.error,
+        })
+    }
 }
 
 impl<T> SnAuthDbRpcEnvelope<T> {
@@ -1419,4 +1461,54 @@ fn rpc_envelope_response<T: Serialize>(
         RPCErrors::ParserResponseError(format!("Failed to serialize SnAuthDB RPC envelope: {}", e))
     })?;
     Ok(RPCResponse::create_by_req(RPCResult::Success(value), req))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_normalize_sn_auth_db_url() {
+        assert_eq!(
+            normalize_sn_auth_db_url("http://127.0.0.1:8080"),
+            "http://127.0.0.1:8080/kapi/sn/s2s/auth-db"
+        );
+        assert_eq!(
+            normalize_sn_auth_db_url("http://127.0.0.1:8080/kapi/sn/s2s/auth-db/"),
+            "http://127.0.0.1:8080/kapi/sn/s2s/auth-db"
+        );
+    }
+
+    #[test]
+    fn test_unit_envelope_roundtrip_allows_null_result() {
+        let value = serde_json::to_value(SnAuthDbRpcEnvelope::success(())).unwrap();
+        let envelope: SnAuthDbRpcEnvelope<Value> = serde_json::from_value(value).unwrap();
+
+        assert!(envelope.into_result().is_ok());
+    }
+
+    #[test]
+    fn test_optional_envelope_roundtrip_preserves_null_success() {
+        let value = serde_json::to_value(SnAuthDbRpcEnvelope::success(None::<String>)).unwrap();
+        assert_eq!(value["result"], Value::Null);
+
+        let envelope: SnAuthDbRpcEnvelope<Option<String>> = serde_json::from_value(value).unwrap();
+
+        assert_eq!(envelope.into_result().unwrap(), None);
+    }
+
+    #[test]
+    fn test_error_envelope_null_result_does_not_parse_response_type() {
+        let value = serde_json::to_value(SnAuthDbRpcEnvelope::<String>::failure(sn_err!(
+            SnErrorCode::NotFound,
+            "missing"
+        )))
+        .unwrap();
+        assert_eq!(value["result"], Value::Null);
+
+        let envelope: SnAuthDbRpcEnvelope<String> = serde_json::from_value(value).unwrap();
+        let error = envelope.into_result().unwrap_err();
+
+        assert_eq!(error.code(), SnErrorCode::NotFound);
+    }
 }
