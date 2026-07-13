@@ -166,6 +166,9 @@ servers:
     type: http
     # version: "HTTP/1.1"         # 可选：HTTP/1.1、HTTP/2、HTTP/3，默认 HTTP/1.1
     # h3_port: 443                # 可选：HTTP/3 端口
+    # trusted_upstreams:          # 可选：可信上一跳 IP/CIDR 列表。仅当直接上一跳命中时，
+    #   - 127.0.0.1               # 其 X-Forwarded-For / X-Real-IP 才会被还原为
+    #   - 10.0.0.0/8              # real_source_*（默认不信任任何转发头）
     hook_point:
       main:
         priority: 1
