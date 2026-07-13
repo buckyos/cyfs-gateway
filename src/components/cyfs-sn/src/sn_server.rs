@@ -804,9 +804,16 @@ impl SNServer {
             return canonical_bns_name(normalized.as_str()).ok();
         }
 
-        let suffix = format!(".web3.{}", self.resolver.config().server_host);
-        let prefix = normalized.strip_suffix(suffix.as_str())?;
-        canonical_bns_name(prefix.rsplit('.').next()?).ok()
+        let resolver_config = self.resolver.config();
+        for host in std::iter::once(resolver_config.server_host.as_str())
+            .chain(resolver_config.aliases.iter().map(String::as_str))
+        {
+            let suffix = format!(".web3.{}", host);
+            if let Some(prefix) = normalized.strip_suffix(suffix.as_str()) {
+                return canonical_bns_name(prefix.rsplit('.').next()?).ok();
+            }
+        }
+        None
     }
 
     fn should_bypass_bns_dns_cache(&self, name: &str) -> bool {
@@ -858,8 +865,6 @@ impl SNServer {
             names.push(format!("{}.web3.{}", username, host));
             names.push(format!("{}.{}", username, host));
         }
-        let resolver_cache = self.resolver.cache();
-        resolver_cache.clear();
         for name in names {
             let normalized = Self::normalize_query_name(name.as_str());
             for record_type in [RecordType::TXT, RecordType::A, RecordType::AAAA] {
