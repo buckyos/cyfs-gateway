@@ -94,6 +94,13 @@ impl NameInfoCache {
         self.write_items().remove(&key).is_some()
     }
 
+    pub(crate) fn remove_matching_names(&self, mut matches: impl FnMut(&str) -> bool) -> usize {
+        let mut items = self.write_items();
+        let previous_len = items.len();
+        items.retain(|key, _| !matches(key.name.as_str()));
+        previous_len - items.len()
+    }
+
     pub fn clear(&self) {
         self.write_items().clear();
     }
@@ -247,5 +254,40 @@ mod tests {
             Duration::from_secs(MIN_NAME_INFO_CACHE_TTL_SECS as u64)
         );
         assert_eq!(cache.effective_ttl(Some(120)), Duration::from_secs(120));
+    }
+
+    #[test]
+    fn remove_matching_names_removes_all_record_types_and_subdomains() {
+        let cache = NameInfoCache::new();
+        let info = NameInfo::from_address(
+            "alice.web3.example.com",
+            IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+        );
+        cache.add(
+            "alice.web3.example.com",
+            RecordType::A,
+            info.clone(),
+            Some(600),
+        );
+        cache.add(
+            "home.alice.web3.example.com",
+            RecordType::TXT,
+            info.clone(),
+            Some(600),
+        );
+        cache.add("bob.web3.example.com", RecordType::A, info, Some(600));
+
+        let removed = cache.remove_matching_names(|name| {
+            name == "alice.web3.example.com" || name.ends_with(".alice.web3.example.com")
+        });
+
+        assert_eq!(removed, 2);
+        assert!(cache
+            .query("alice.web3.example.com", RecordType::A)
+            .is_none());
+        assert!(cache
+            .query("home.alice.web3.example.com", RecordType::TXT)
+            .is_none());
+        assert!(cache.query("bob.web3.example.com", RecordType::A).is_some());
     }
 }
