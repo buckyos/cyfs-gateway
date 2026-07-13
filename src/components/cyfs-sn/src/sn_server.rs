@@ -1,5 +1,6 @@
 use crate::api::{
     handle_auth, handle_bns_proxy, handle_device, handle_dns, handle_domain, handle_user,
+    handle_zone,
 };
 use crate::name_info_cache::{NameInfoCache, NameInfoCacheQueryResult, NameInfoCacheRef};
 use crate::sn_auth_manager::SnAuthManager;
@@ -511,6 +512,7 @@ impl SNServer {
             | "user.add_dns_record"
             | "user.remove_dns_record"
             | "user.list_dns_records"
+            | "zone.get_info"
             | "domain.bind"
             | "domain.unbind" => SnRpcPath::Auth,
             "device.register"
@@ -1015,6 +1017,7 @@ impl SNServer {
             "user.list_dns_records" => {
                 handle_dns(self, Self::rewrite_rpc_method(req, "list_records")).await
             }
+            "zone.get_info" => handle_zone(self, Self::rewrite_rpc_method(req, "get_info")).await,
             "domain.bind" | "domain.unbind" => {
                 let bare_method = req
                     .method
@@ -5629,6 +5632,65 @@ mod tests {
             .unwrap();
         assert_eq!(result["code"].as_i64().unwrap(), 0);
         assert_eq!(result["zone"].as_str().unwrap(), DEVTOKEN_USER);
+
+        // zone.get_info：账号 token 查询本 zone 运行态，zone 由服务端从
+        // token 推导；尚未分配 relay 时 relay_sn 为 null。
+        let result = account_auth_krpc
+            .call("zone.get_info", json!({}))
+            .await
+            .unwrap();
+        assert_eq!(result["code"].as_i64().unwrap(), 0);
+        assert_eq!(result["zone"].as_str().unwrap(), DEVTOKEN_USER);
+        assert_eq!(result["bns_name"].as_str().unwrap(), DEVTOKEN_USER);
+        assert!(result["relay_sn"].is_null());
+        assert!(!result["self_cert"].as_bool().unwrap());
+
+        // relay manager 分配后回写 relay_sn（经 auth 库，同一 sqlite 文件）；
+        // 设备 token 也能读到稳定 relay 名称，供 node_daemon 检测切换。
+        {
+            let relay_db = SqliteSnAuthDB::new_by_path(db.path().to_str().unwrap())
+                .await
+                .unwrap();
+            assert!(relay_db
+                .update_zone_relay_sn(DEVTOKEN_USER, "us-sn.buckyos.ai", Some("v2"))
+                .await
+                .unwrap());
+        }
+        let result = device_auth_krpc
+            .call("zone.get_info", json!({}))
+            .await
+            .unwrap();
+        assert_eq!(result["code"].as_i64().unwrap(), 0);
+        assert_eq!(result["zone"].as_str().unwrap(), DEVTOKEN_USER);
+        assert_eq!(result["relay_sn"].as_str().unwrap(), "us-sn.buckyos.ai");
+        assert_eq!(result["source_version"].as_str().unwrap(), "v2");
+
+        // 身份字段一律拒绝：不允许"看起来在查别的 zone"。
+        let err = account_auth_krpc
+            .call("zone.get_info", json!({ "zone": "otherzone" }))
+            .await
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(err.contains("invalid_params"), "{}", err);
+
+        // 匿名不可查询。
+        let err = kRPC::new(auth_url.as_str(), None)
+            .call("zone.get_info", json!({}))
+            .await
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(err.contains("auth_required"), "{}", err);
+
+        // 路径强约束：zone.* 只在 /kapi/sn/auth。
+        let err = device_token_krpc
+            .call("zone.get_info", json!({}))
+            .await
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(err.contains("not available on /kapi/sn/deviceinfo"), "{}", err);
     }
 
     #[tokio::test]

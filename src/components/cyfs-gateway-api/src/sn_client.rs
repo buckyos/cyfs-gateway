@@ -368,6 +368,15 @@ impl SnClient {
             .await
     }
 
+    /// `zone.get_info`：查询调用方所属 zone 的 SN 本地运行态（`relay_sn` 等）。
+    ///
+    /// 参数固定为空对象，zone 由服务端从已验证 token 推导；账号 access token
+    /// 与 `aud=sn-device` 设备 token 均可调用。node_daemon 周期调用该接口检测
+    /// `relay_sn` 变化后重建 `keep_tunnel`。尚未分配 relay 时 `relay_sn` 为 null。
+    pub async fn get_zone_info(&self) -> Result<Value, RPCErrors> {
+        self.call_auth("zone.get_info", serde_json::json!({})).await
+    }
+
     pub async fn bind_domain(&self, domain: &str) -> Result<Value, RPCErrors> {
         self.call_auth(
             "domain.bind",

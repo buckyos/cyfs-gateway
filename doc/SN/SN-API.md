@@ -32,7 +32,7 @@ RPC method 必须使用 `namespace.method` 形式。当前实现不再做 legacy
 | HTTP path | 公开性 | 职责 | 方法 |
 |-----------|--------|------|------|
 | `/kapi/sn` | 公网 | SN 命名空间根，不承载 RPC 方法 | 无 |
-| `/kapi/sn/auth` | 公网 | 账号、会话、user profile、user_domain、user DNS record | `auth.*`、`user.*`、`domain.*` |
+| `/kapi/sn/auth` | 公网 | 账号、会话、user/zone profile、user_domain、user DNS record | `auth.*`、`user.*`、`zone.*`、`domain.*` |
 | `/kapi/sn/deviceinfo` | 公网 | 设备在线态上报、在线态查询、OOD 连接信息解析 | `device.*`、`deviceinfo.*` |
 | `/kapi/sn/bns-proxy` | 公网 | SN 代付 gas 的受限 BNS 写代理 | `bns.publish_dns_txt`、`bns.publish_document` |
 | `/` | 内网/管理面 | 运维管理、bns-proxy 内部/恢复方法 | `admin.clear_state_by_active_code`、`bns.publish_relay_assignment`、`bns.register_name_bootstrap` |
@@ -44,6 +44,7 @@ RPC method 必须使用 `namespace.method` 形式。当前实现不再做 legacy
 - `auth.check_username`、`auth.check_active_code`、`auth.register`、`auth.login`、`auth.refresh` 不需要 access token。
 - `auth.logout` 可同时吊销请求里的 access token 和参数里的 refresh token。
 - `auth.me`、`user.*`、`domain.*`、`device.register`、`device.update`、`device.get`、`device.list`、`bns.publish_dns_txt`、`bns.publish_document` 需要 SN access token。
+- `zone.get_info` 接受账号 access token 或 `aud=sn-device` 的短期设备 token；服务端必须从已验证 token 推导 zone，不能接受客户端指定任意 zone。
 - `deviceinfo.resolve_ood_by_did`、`deviceinfo.resolve_ood_by_hostname` 是匿名只读接口。
 - 带用户作用域的接口只允许访问 token 所属用户；即使参数里带 `name`，也必须等于当前登录用户。`bns.publish_dns_txt`、`bns.publish_document` 同样受此约束。
 - `bns.publish_relay_assignment`、`bns.register_name_bootstrap`、`admin.clear_state_by_active_code` 只在内网管理路径 `/` 可用，不做 SN access token 校验，靠网络边界隔离外部访问。
@@ -135,7 +136,40 @@ RPC method 必须使用 `namespace.method` 形式。当前实现不再做 legacy
 }
 ```
 
-### 4.3 `domain.*`
+### 4.3 `zone.*`
+
+| Method | Params | Result | 说明 |
+|--------|--------|--------|------|
+| `zone.get_info` | `{}` | `code`, `zone`, `bns_name`, `relay_sn`, `self_cert`, `cert_checked_at`, `cert_expires_at`, `source_version`, `updated_at` | 返回调用方所属 zone 的 SN 本地运行态。 |
+
+返回结构：
+
+```json
+{
+  "code": 0,
+  "zone": "alice",
+  "bns_name": "alice",
+  "relay_sn": "us-sn.buckyos.ai",
+  "self_cert": false,
+  "cert_checked_at": null,
+  "cert_expires_at": null,
+  "source_version": "v2",
+  "updated_at": 1780000000
+}
+```
+
+查询和权限约束：
+
+- 账号 access token 使用 token 所属 username 作为 zone；设备 token 使用验证后的 `Device(zone, device_name, did)` 上下文中的 zone。
+- 请求参数固定为 `{}`。任何非空参数（包括 `zone`、`username` 等身份字段）都返回 `invalid_params` 而不是被忽略，避免"看起来在查别的 zone"的误用与跨 zone 查询。
+- handler 调用 auth 库的 `get_zone_info(zone)`，不直接向客户端暴露 relay manager 查询接口。
+- `relay_sn` 是客户端可见的稳定 relay 名称；`relay_id`、节点负载、容量、调度来源、backup relay 和迁移内部状态不通过该接口暴露。
+- 尚未分配 relay 时返回 `relay_sn: null`。查询操作只读，不应隐式创建或修改 relay assignment。
+- node_daemon 应周期调用该接口检测 `relay_sn` 变化并重新建立 `keep_tunnel`；连接到错误 relay 时，可再使用 relay admission 返回的 `expected_relay_sn` 做快速切换。
+
+该接口返回的是 SN 本地 `zone_info` 运行态，不是 BNS `zone` document。BNS zone document 仍通过 BNS reader / 标准 resolver 查询，不能用 `zone.get_info` 替代。
+
+### 4.4 `domain.*`
 
 | Method | Params | Result | 说明 |
 |--------|--------|--------|------|
@@ -367,7 +401,7 @@ SN 仍然提供两个标准解析面，但它们不是 SN RPC：
 | 1029 | `email_already_bound` |
 | 1099 | `internal_error` |
 
-`domain_proof_failed` 只从 `domain.bind` 冒出，message 是 JSON，见 4.3。
+`domain_proof_failed` 只从 `domain.bind` 冒出，message 是 JSON，见 4.4。
 
 BNS 写入错误会从任意 bns-proxy 写路径冒出：`auth.register` 的 BNS 代注册、`bns.publish_dns_txt`、`bns.publish_document`、`bns.publish_relay_assignment`、`bns.register_name_bootstrap`。`CONTROLLER_SCOPE_DENIED` / `NOT_EFFECTIVE_OWNER` 映射为 `bns_permission_denied`，`NAME_ALREADY_EXISTS` 映射为 `bns_name_already_exists`，其他 BNS 写入错误映射为 `bns_write_failed`；请求结构、保留 doc_type 和 owner 身份字段保护失败映射为 `invalid_params`。`bns_proxy_unavailable` 对应「bns-proxy 未启用」或「operation 不在白名单内」；`bns_controller_unavailable` 对应「用户绑定的 controller 已不在当前配置」，需要人工迁移，不会静默重分配。
 
@@ -386,4 +420,4 @@ BNS 写入错误会从任意 bns-proxy 写路径冒出：`auth.register` 的 BNS
 | `query.resolve_did` / `query.resolve_hostname` / `query.resolve_device` | DID 和域名解析改用 W3C DID Resolver / DNS NameServer；OOD 建连信息改用 `deviceinfo.resolve_ood_by_*`。 |
 | `user.bind_owner_key` / `user.get_owner_key` | 已移除。owner/controller 权限管理走 BNS 侧流程（生产路径见 bns-proxy 的 `auth.register`）。 |
 
-`cyfs-gateway-api::SnClient` 已按新路径封装 auth、deviceinfo 与 bns-proxy 三个 target；传入旧 `/kapi/sn` 或 `/kapi/sn/bns` 后缀的 base URL 时，会自动归一化到目标方法对应的新路径。`SnAuthRegisterReq` 已支持必填 `email` 以及 `asset_owner`、`owner_config` 与 `initial_documents`；客户端也提供 `publish_dns_txt`、`publish_document` 便捷方法。
+`cyfs-gateway-api::SnClient` 已按新路径封装 auth、deviceinfo 与 bns-proxy 三个 target；传入旧 `/kapi/sn` 或 `/kapi/sn/bns` 后缀的 base URL 时，会自动归一化到目标方法对应的新路径。`SnAuthRegisterReq` 已支持必填 `email` 以及 `asset_owner`、`owner_config` 与 `initial_documents`；客户端也提供 `get_zone_info`、`publish_dns_txt`、`publish_document` 便捷方法。
