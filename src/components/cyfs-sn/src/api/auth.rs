@@ -1,5 +1,5 @@
 use super::common::{
-    build_profile_json, normalize_evm_address, normalize_username, now_secs, ok_response,
+    build_profile_response, normalize_evm_address, normalize_username, now_secs, ok_response,
     parse_params, require_account_username, ActiveCodeReq, IntoRpcResult, LoginReq, NameReq,
     RefreshReq, RegisterReq, RpcCallResult,
 };
@@ -8,6 +8,10 @@ use crate::sn_auth_manager::{hash_password, verify_password, PASSWORD_ALGO};
 use crate::sn_bns_proxy::SnBnsProxyRegisterParams;
 use crate::SNServer;
 use ::kRPC::{RPCErrors, RPCRequest, RPCResponse};
+use cyfs_gateway_api::{
+    SnAuthRefreshResp, SnAuthSessionResp, SnBnsProxyTxOutcome, SnCheckUsernameReason,
+    SnCheckUsernameResp, SnSuccessResp,
+};
 use log::info;
 use serde_json::{json, Value};
 
@@ -16,7 +20,7 @@ async fn build_auth_success_response(
     req: &RPCRequest,
     username: &str,
     need_bind_owner_key: bool,
-    bns: Option<Value>,
+    bns: Option<SnBnsProxyTxOutcome>,
 ) -> RpcCallResult<RPCResponse> {
     let access_token = server.auth().issue_access_session(username)?;
     let refresh_token = server.auth().issue_refresh_session(username)?;
@@ -42,16 +46,16 @@ async fn build_auth_success_response(
         )
         .await
         .into_rpc()?;
-    let mut response = json!({
-        "code": 0,
-        "access_token": access_token.token,
-        "refresh_token": refresh_token.token,
-        "need_bind_owner_key": need_bind_owner_key
-    });
-    if let Some(bns) = bns {
-        response["bns"] = bns;
-    }
-    ok_response(req, response)
+    ok_response(
+        req,
+        SnAuthSessionResp {
+            code: 0,
+            access_token: access_token.token,
+            refresh_token: refresh_token.token,
+            need_bind_owner_key,
+            bns,
+        },
+    )
 }
 
 pub(crate) fn default_owner_config(username: &str) -> Value {
@@ -69,7 +73,7 @@ pub(crate) async fn handle_auth(server: &SNServer, req: RPCRequest) -> RpcCallRe
             let username = params.name.trim().to_lowercase();
             let (valid, reason, message) =
                 if let Err(message) = SNServer::validate_registration_username(username.as_str()) {
-                    (false, "invalid_username".to_string(), message)
+                    (false, SnCheckUsernameReason::InvalidUsername, message)
                 } else {
                     let exists = server
                         .auth_db()
@@ -79,22 +83,22 @@ pub(crate) async fn handle_auth(server: &SNServer, req: RPCRequest) -> RpcCallRe
                     if exists {
                         (
                             false,
-                            "already_exists".to_string(),
+                            SnCheckUsernameReason::AlreadyExists,
                             format!("username {} already exists", username),
                         )
                     } else {
-                        (true, "ok".to_string(), String::new())
+                        (true, SnCheckUsernameReason::Ok, String::new())
                     }
                 };
 
             ok_response(
                 &req,
-                json!({
-                    "valid": valid,
-                    "reason": reason,
-                    "message": message,
-                    "normalized_name": username,
-                }),
+                SnCheckUsernameResp {
+                    valid,
+                    reason,
+                    message,
+                    normalized_name: username,
+                },
             )
         }
         "check_active_code" => {
@@ -221,7 +225,7 @@ pub(crate) async fn handle_auth(server: &SNServer, req: RPCRequest) -> RpcCallRe
                     outcome.tx_hash.as_deref().unwrap_or("-"),
                     outcome.reused
                 );
-                Some(outcome.to_bns_json())
+                Some(outcome)
             };
             let ok = server
                 .auth_db()
@@ -336,10 +340,10 @@ pub(crate) async fn handle_auth(server: &SNServer, req: RPCRequest) -> RpcCallRe
                 .into_rpc()?;
             ok_response(
                 &req,
-                json!({
-                    "code": 0,
-                    "access_token": access_token.token,
-                }),
+                SnAuthRefreshResp {
+                    code: 0,
+                    access_token: access_token.token,
+                },
             )
         }
         "logout" => {
@@ -371,7 +375,7 @@ pub(crate) async fn handle_auth(server: &SNServer, req: RPCRequest) -> RpcCallRe
                     }
                 }
             }
-            ok_response(&req, json!({ "code": 0 }))
+            ok_response(&req, SnSuccessResp { code: 0 })
         }
         "me" => {
             let username = require_account_username(server, &req).await?;
@@ -381,7 +385,7 @@ pub(crate) async fn handle_auth(server: &SNServer, req: RPCRequest) -> RpcCallRe
                 .await
                 .into_rpc()?
                 .ok_or_else(|| parse_error(SnApiErrorCode::UserNotFound, "user not found"))?;
-            ok_response(&req, build_profile_json(username.as_str(), &user))
+            ok_response(&req, build_profile_response(username.as_str(), &user))
         }
         _ => Err(RPCErrors::UnknownMethod(req.method)),
     }

@@ -1,11 +1,11 @@
 use super::common::{
-    build_profile_json, ok_response, parse_params, require_account_username, IntoRpcResult,
+    build_profile_response, ok_response, parse_params, require_account_username, IntoRpcResult,
     RpcCallResult, SetSelfCertReq,
 };
 use super::errors::{parse_error, SnApiErrorCode};
 use crate::SNServer;
 use ::kRPC::{RPCErrors, RPCRequest, RPCResponse};
-use serde_json::json;
+use cyfs_gateway_api::SnSuccessResp;
 
 pub(crate) async fn handle_user(server: &SNServer, req: RPCRequest) -> RpcCallResult<RPCResponse> {
     match req.method.as_str() {
@@ -26,7 +26,7 @@ pub(crate) async fn handle_user(server: &SNServer, req: RPCRequest) -> RpcCallRe
                 .update_user_self_cert(username.as_str(), params.self_cert)
                 .await
                 .into_rpc()?;
-            ok_response(&req, json!({ "code": 0 }))
+            ok_response(&req, SnSuccessResp { code: 0 })
         }
         "get_profile" => {
             let username = require_account_username(server, &req).await?;
@@ -36,7 +36,7 @@ pub(crate) async fn handle_user(server: &SNServer, req: RPCRequest) -> RpcCallRe
                 .await
                 .into_rpc()?
                 .ok_or_else(|| parse_error(SnApiErrorCode::UserNotFound, "user not found"))?;
-            ok_response(&req, build_profile_json(username.as_str(), &user))
+            ok_response(&req, build_profile_response(username.as_str(), &user))
         }
         _ => Err(RPCErrors::UnknownMethod(req.method)),
     }

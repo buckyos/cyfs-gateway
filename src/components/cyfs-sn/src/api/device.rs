@@ -8,8 +8,9 @@ use crate::{
     SNServer, SnDeviceEndpointUpdate, SnDeviceListOptions, SnDeviceState, SnDeviceStateView,
 };
 use ::kRPC::{RPCErrors, RPCRequest, RPCResponse};
+use cyfs_gateway_api::{SnDeviceListResp, SnDeviceOnlineResp};
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::Value;
 
 /// device.register / device.update 的上报者身份：SN 账号 token（可上报该
 /// 账号名下任意设备）或设备 token（只能上报凭证锚定的那台设备）。
@@ -210,20 +211,14 @@ pub(crate) async fn handle_device(
                 )
                 .await
                 .into_rpc()?;
-            ok_response(
-                &req,
-                json!({
-                    "code": 0,
-                    "items": items,
-                }),
-            )
+            ok_response(&req, SnDeviceListResp { code: 0, items })
         }
         "resolve_ood_by_did" => {
             let params: QueryByDidReq = parse_params(&req)?;
             let ood_info = server
                 .resolve_ood_by_did(params.source_device_id.as_str())
                 .await?;
-            ok_response(&req, serde_json::to_value(ood_info).unwrap())
+            ok_response(&req, ood_info)
         }
         "resolve_ood_by_hostname" => {
             let params: QueryByHostnameReq = parse_params(&req)?;
@@ -233,7 +228,7 @@ pub(crate) async fn handle_device(
                 .ok_or_else(|| {
                     parse_error(SnApiErrorCode::HostnameNotFound, "hostname not found")
                 })?;
-            ok_response(&req, serde_json::to_value(ood_info).unwrap())
+            ok_response(&req, ood_info)
         }
         _ => Err(RPCErrors::UnknownMethod(req.method)),
     }
@@ -288,12 +283,8 @@ struct DeviceOnlineListReq {
     limit: Option<usize>,
 }
 
-fn online_state_response(view: SnDeviceStateView) -> Value {
-    let mut value = serde_json::to_value(view).unwrap_or_else(|_| json!({}));
-    if let Some(obj) = value.as_object_mut() {
-        obj.insert("code".to_string(), Value::Number(0.into()));
-    }
-    value
+fn online_state_response(device: SnDeviceStateView) -> SnDeviceOnlineResp {
+    SnDeviceOnlineResp { code: 0, device }
 }
 
 fn device_info_to_report_string(value: &Value) -> String {

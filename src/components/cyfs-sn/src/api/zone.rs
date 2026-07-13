@@ -3,7 +3,8 @@ use super::errors::{parse_error, SnApiErrorCode};
 use crate::sn_authority::{require_sn_user_or_device, AuthContext};
 use crate::{SNServer, ZoneInfo};
 use ::kRPC::{RPCErrors, RPCRequest, RPCResponse};
-use serde_json::{json, Value};
+use cyfs_gateway_api::SnZoneInfoResp;
+use serde_json::Value;
 
 /// `zone.get_info` 参数固定为 `{}`：zone 只能从已验证 token 推导。拒绝而非
 /// 忽略 `zone`/`username` 等字段，否则调用方会误以为查询了指定的 zone。
@@ -36,17 +37,17 @@ pub(crate) async fn handle_zone(server: &SNServer, req: RPCRequest) -> RpcCallRe
             // 调度内部状态不出现在该视图。
             ok_response(
                 &req,
-                json!({
-                    "code": 0,
-                    "zone": zone,
-                    "bns_name": info.bns_name,
-                    "relay_sn": info.relay_sn,
-                    "self_cert": info.self_cert,
-                    "cert_checked_at": info.cert_checked_at,
-                    "cert_expires_at": info.cert_expires_at,
-                    "source_version": info.source_version,
-                    "updated_at": info.updated_at,
-                }),
+                SnZoneInfoResp {
+                    code: 0,
+                    zone,
+                    bns_name: info.bns_name,
+                    relay_sn: info.relay_sn,
+                    self_cert: info.self_cert,
+                    cert_checked_at: info.cert_checked_at,
+                    cert_expires_at: info.cert_expires_at,
+                    source_version: info.source_version,
+                    updated_at: info.updated_at,
+                },
             )
         }
         _ => Err(RPCErrors::UnknownMethod(req.method)),

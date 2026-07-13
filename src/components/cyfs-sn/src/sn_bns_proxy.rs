@@ -26,18 +26,18 @@ use bns_client::{
     default_document_update, CallAuthority, DocumentRef, DocumentUpdate, MutationGuard, Principal,
     PublishRelayAssignmentParams, RegisterNameOutput, RegisterOptions,
 };
+pub use cyfs_gateway_api::{
+    SnBnsDnsTxtRecord, SnBnsProxyInitialDocuments, SnBnsProxyStatus, SnBnsProxyTxOutcome,
+};
 use log::{info, warn};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use sqlx::{Row, SqlitePool};
 
 use crate::sn_bns_signer::SnBnsProxyOperation;
 use crate::{sn_err, SnErrorCode, SnResult};
-
-const BNS_WRITE_STATUS_SUBMITTED: &str = "submitted";
-const BNS_WRITE_STATUS_CONFIRMED: &str = "confirmed";
 
 // ---------------------------------------------------------------------------
 // 配置
@@ -429,24 +429,6 @@ pub struct SnBnsProxyController {
     pub controller: Arc<SnBnsController>,
 }
 
-/// 注册阶段可携带的初始 documents（`initialDocuments` 初始化路径）。
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct SnBnsProxyInitialDocuments {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub zone: Option<Value>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub boot: Option<Value>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub dns_txt: Option<Vec<DnsTxtRecord>>,
-}
-
-impl SnBnsProxyInitialDocuments {
-    pub fn is_empty(&self) -> bool {
-        self.zone.is_none() && self.boot.is_none() && self.dns_txt.is_none()
-    }
-}
-
 pub struct SnBnsProxyRegisterParams {
     pub request_id: String,
     pub name: String,
@@ -454,50 +436,6 @@ pub struct SnBnsProxyRegisterParams {
     pub asset_owner: String,
     pub owner_config: Value,
     pub initial_documents: SnBnsProxyInitialDocuments,
-}
-
-/// proxy 写操作结果。普通写返回 `submitted`；用户注册等待成功回执后返回
-/// `confirmed`。
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SnBnsProxyTxOutcome {
-    pub request_id: String,
-    pub operation: String,
-    pub name: String,
-    pub controller_id: String,
-    pub controller_address: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub asset_owner: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub doc_type: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub document_version: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub chain_id: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub nonce: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tx_hash: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub raw_tx: Option<String>,
-    pub status: String,
-    /// 命中幂等重放（同 request_id 同 payload）时为 true。
-    pub reused: bool,
-}
-
-impl SnBnsProxyTxOutcome {
-    /// proxy RPC 的通用成功返回。
-    pub fn to_response_json(&self) -> Value {
-        let mut value = serde_json::to_value(self).unwrap_or_else(|_| json!({}));
-        if let Some(object) = value.as_object_mut() {
-            object.insert("code".to_string(), json!(0));
-        }
-        value
-    }
-
-    /// `auth.register` 返回里的 `bns` 子对象。
-    pub fn to_bns_json(&self) -> Value {
-        serde_json::to_value(self).unwrap_or_else(|_| json!({}))
-    }
 }
 
 pub struct SnBnsProxy {
@@ -743,7 +681,7 @@ impl SnBnsProxy {
             nonce: receipt.evm_nonce,
             tx_hash: receipt.evm_tx_hash.clone(),
             raw_tx: receipt.evm_raw_tx.clone(),
-            status: BNS_WRITE_STATUS_SUBMITTED.to_string(),
+            status: SnBnsProxyStatus::Submitted,
             reused: receipt.created_or_reused,
         };
         self.audit(&outcome, payload_hash.as_str());
@@ -783,7 +721,7 @@ impl SnBnsProxy {
             .wait_for_evm_receipt(tx_hash.as_str(), BnsEvmReceiptWaitConfig::included())
             .await
             .map_err(SnBnsProxyError::Write)?;
-        outcome.status = BNS_WRITE_STATUS_CONFIRMED.to_string();
+        outcome.status = SnBnsProxyStatus::Confirmed;
         info!(
             "sn bns registerName confirmed on chain: name={} controller_id={} tx_hash={} block_number={} confirmations={} receipt_status={} request_id={}",
             outcome.name,
@@ -836,7 +774,7 @@ impl SnBnsProxy {
             nonce: receipt.evm_nonce,
             tx_hash: receipt.evm_tx_hash.clone(),
             raw_tx: receipt.evm_raw_tx.clone(),
-            status: BNS_WRITE_STATUS_SUBMITTED.to_string(),
+            status: SnBnsProxyStatus::Submitted,
             reused: receipt.created_or_reused,
         };
         self.audit(&outcome, payload_hash.as_str());
@@ -918,7 +856,7 @@ impl SnBnsProxy {
             nonce: receipt.evm_nonce,
             tx_hash: receipt.evm_tx_hash.clone(),
             raw_tx: receipt.evm_raw_tx.clone(),
-            status: BNS_WRITE_STATUS_SUBMITTED.to_string(),
+            status: SnBnsProxyStatus::Submitted,
             reused: receipt.created_or_reused,
         };
         self.audit(&outcome, payload_hash.as_str());
@@ -963,7 +901,7 @@ impl SnBnsProxy {
             nonce: receipt.evm_nonce,
             tx_hash: receipt.evm_tx_hash.clone(),
             raw_tx: receipt.evm_raw_tx.clone(),
-            status: BNS_WRITE_STATUS_SUBMITTED.to_string(),
+            status: SnBnsProxyStatus::Submitted,
             reused: receipt.created_or_reused,
         };
         self.audit(&outcome, payload_hash.as_str());
@@ -1070,6 +1008,7 @@ mod tests {
     use bns_indexer::{
         CentralizedBnsIndexerHandler, CentralizedBnsRegistry, PrincipalKind, SqliteBnsRegistryStore,
     };
+    use serde_json::json;
     use std::sync::Mutex;
 
     const CONTROLLER_A: &str = "0xcccccccccccccccccccccccccccccccccccccc01";
@@ -1307,7 +1246,7 @@ mod tests {
                 initial_documents: SnBnsProxyInitialDocuments {
                     zone: Some(json!({"oods": ["ood1"]})),
                     boot: None,
-                    dns_txt: Some(vec![DnsTxtRecord {
+                    dns_txt: Some(vec![SnBnsDnsTxtRecord {
                         ttl: 600,
                         value: "pkx=abc".to_string(),
                     }]),
@@ -1316,7 +1255,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(outcome.status, "submitted");
+        assert_eq!(outcome.status, SnBnsProxyStatus::Submitted);
         assert!(outcome.tx_hash.is_some());
         assert!(outcome.raw_tx.is_some());
         assert_eq!(outcome.asset_owner.as_deref(), Some(USER_OWNER));

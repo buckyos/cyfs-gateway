@@ -26,7 +26,6 @@ use bns_client::{
     SnBnsControllerConfig,
 };
 use bns_evm::{Address, EthRpcClient};
-use bns_indexer::dns_document::DnsTxtRecord;
 use bns_indexer::{
     policy_hash_from_rules, sync_bns_contract_once, BnsBlockSyncSourceConfig,
     BnsIndexerSyncConfig, BnsRegistryStore, CallAuthority, CentralizedBnsIndexerHandler,
@@ -35,8 +34,8 @@ use bns_indexer::{
 };
 use cyfs_sn::{
     BoundControllerKeyManager, MemorySnBnsControllerBindingStore, SnBnsControllerKeySpec,
-    SnBnsProxy, SnBnsProxyController, SnBnsProxyInitialDocuments, SnBnsProxyOperation,
-    SnBnsProxyRegisterParams, SnBnsTxSigner,
+    SnBnsDnsTxtRecord, SnBnsProxy, SnBnsProxyController, SnBnsProxyInitialDocuments,
+    SnBnsProxyOperation, SnBnsProxyRegisterParams, SnBnsProxyStatus, SnBnsTxSigner,
 };
 use serde_json::json;
 use tokio::net::TcpListener;
@@ -306,7 +305,7 @@ async fn e2e_register_publish_document_then_owner_exits_sn_custody() {
             initial_documents: SnBnsProxyInitialDocuments {
                 zone: None,
                 boot: None,
-                dns_txt: Some(vec![DnsTxtRecord {
+                dns_txt: Some(vec![SnBnsDnsTxtRecord {
                     ttl: 600,
                     value: "pkx=seed".to_string(),
                 }]),
@@ -314,7 +313,7 @@ async fn e2e_register_publish_document_then_owner_exits_sn_custody() {
         })
         .await
         .unwrap();
-    assert_eq!(register_outcome.status, "submitted");
+    assert_eq!(register_outcome.status, SnBnsProxyStatus::Submitted);
     let register_tx = register_outcome.tx_hash.clone().unwrap();
     let bound_controller = register_outcome.controller_address.clone();
 
@@ -353,7 +352,7 @@ async fn e2e_register_publish_document_then_owner_exits_sn_custody() {
         )
         .await
         .unwrap();
-    assert_eq!(zone_outcome.status, "submitted");
+    assert_eq!(zone_outcome.status, SnBnsProxyStatus::Submitted);
     assert_eq!(zone_outcome.controller_address, bound_controller);
     let zone_tx = zone_outcome.tx_hash.clone().unwrap();
     assert_eq!(receipt_status(&wait_receipt(&rpc, zone_tx.as_str()).await), "0x1");
@@ -394,7 +393,7 @@ async fn e2e_register_publish_document_then_owner_exits_sn_custody() {
         )
         .await
         .unwrap();
-    assert_eq!(publish_outcome.status, "submitted");
+    assert_eq!(publish_outcome.status, SnBnsProxyStatus::Submitted);
     assert_eq!(publish_outcome.controller_address, bound_controller);
     // 同一 controller 的 register -> zone -> dns_txt nonce 连续递增。
     assert_eq!(
@@ -453,7 +452,7 @@ async fn e2e_register_publish_document_then_owner_exits_sn_custody() {
         )
         .await
         .unwrap();
-    assert_eq!(denied_outcome.status, "submitted");
+    assert_eq!(denied_outcome.status, SnBnsProxyStatus::Submitted);
     let denied_tx = denied_outcome.tx_hash.clone().unwrap();
     assert_eq!(
         receipt_status(&wait_receipt(&rpc, denied_tx.as_str()).await),

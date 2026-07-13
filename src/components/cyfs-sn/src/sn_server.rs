@@ -45,6 +45,8 @@ use cyfs_gateway_lib::{
     ServerConfig, ServerContextRef, ServerError, ServerErrorCode, ServerFactory, ServerResult,
     StreamInfo,
 };
+use cyfs_gateway_api::{SnCheckActiveCodeResp, SnOodState};
+pub use cyfs_gateway_api::SnOodInfo as OODInfo;
 use http::{Method, Response, StatusCode};
 use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full};
@@ -460,15 +462,6 @@ impl SnRpcPath {
             Self::InternalRoot => "/",
         }
     }
-}
-
-#[derive(Serialize, Deserialize)]
-pub struct OODInfo {
-    //pub device_info: DeviceInfo,
-    pub did_hostname: String,
-    pub owner_id: String,
-    pub self_cert: bool,
-    pub state: String, //active,suspended,disabled,banned
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -933,12 +926,9 @@ impl SNServer {
             return Err(RPCErrors::ReasonError(ret.err().unwrap().to_string()));
         }
         let valid = ret.unwrap();
-        let resp = RPCResponse::create_by_req(
-            RPCResult::Success(json!({
-                "valid":valid
-            })),
-            &req,
-        );
+        let value = serde_json::to_value(SnCheckActiveCodeResp { valid })
+            .map_err(|e| RPCErrors::ReasonError(e.to_string()))?;
+        let resp = RPCResponse::create_by_req(RPCResult::Success(value), &req);
         return Ok(resp);
     }
 
@@ -1214,7 +1204,7 @@ impl SNServer {
             did_hostname: Self::did_hostname(did_for_hostname),
             owner_id: view.zone,
             self_cert: user.map(|u| u.self_cert).unwrap_or(false),
-            state: Self::device_state_to_ood_state(view.state).to_string(),
+            state: Self::device_state_to_ood_state(view.state),
         })
     }
 
@@ -1232,7 +1222,7 @@ impl SNServer {
             did_hostname: Self::did_hostname(did_for_hostname),
             owner_id: device_info.owner,
             self_cert: user.map(|u| u.self_cert).unwrap_or(false),
-            state: "active".to_string(),
+            state: SnOodState::Active,
         })
     }
 
@@ -1428,11 +1418,11 @@ impl SNServer {
             .unwrap_or_else(|_| did.to_string())
     }
 
-    fn device_state_to_ood_state(state: SnDeviceState) -> &'static str {
+    fn device_state_to_ood_state(state: SnDeviceState) -> SnOodState {
         match state {
-            SnDeviceState::Online => "active",
-            SnDeviceState::Offline | SnDeviceState::Stale => "suspended",
-            SnDeviceState::Blocked => "banned",
+            SnDeviceState::Online => SnOodState::Active,
+            SnDeviceState::Offline | SnDeviceState::Stale => SnOodState::Suspended,
+            SnDeviceState::Blocked => SnOodState::Banned,
         }
     }
 
@@ -1446,12 +1436,12 @@ impl SNServer {
                     .online
                     .as_ref()
                     .map(|online| Self::device_state_to_ood_state(online.state))
-                    .unwrap_or("active");
+                    .unwrap_or(SnOodState::Active);
                 return Some(OODInfo {
                     did_hostname,
                     owner_id: gateway.zone_name,
                     self_cert: gateway.self_cert,
-                    state: state.to_string(),
+                    state,
                 });
             }
             Err(e) if e.kind() != SnResolverErrorKind::NotManaged => {
@@ -5120,7 +5110,7 @@ mod tests {
         let ood_info = serde_json::from_value::<OODInfo>(result).unwrap();
         assert_eq!(ood_info.did_hostname, registered_did_hostname);
         assert_eq!(ood_info.owner_id, REFACTOR_USER);
-        assert_eq!(ood_info.state, "active");
+        assert_eq!(ood_info.state, SnOodState::Active);
         assert!(!ood_info.self_cert);
 
         let bns_device_did = format!("did:bns:ood1.{}", REFACTOR_USER);
@@ -5136,7 +5126,7 @@ mod tests {
         let ood_info = serde_json::from_value::<OODInfo>(result).unwrap();
         assert_eq!(ood_info.did_hostname, registered_did_hostname);
         assert_eq!(ood_info.owner_id, REFACTOR_USER);
-        assert_eq!(ood_info.state, "active");
+        assert_eq!(ood_info.state, SnOodState::Active);
         assert!(!ood_info.self_cert);
 
         // BNS 兼容域名（SN-Resolver.md）：嵌套 `public.<user>.web3.<host>` 同样
@@ -5557,7 +5547,7 @@ mod tests {
             .unwrap();
         let ood_info = serde_json::from_value::<OODInfo>(result).unwrap();
         assert_eq!(ood_info.owner_id, DEVTOKEN_USER);
-        assert_eq!(ood_info.state, "active");
+        assert_eq!(ood_info.state, SnOodState::Active);
 
         // 越权：ood1 的设备 token 不能冒名上报 ood2。
         let err = device_token_krpc

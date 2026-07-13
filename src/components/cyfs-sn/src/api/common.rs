@@ -1,7 +1,8 @@
 use crate::SNServer;
 use ::kRPC::*;
-use serde::Deserialize;
-use serde_json::{Value, json};
+use cyfs_gateway_api::SnUserProfileResp;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::errors::{SnApiErrorCode, parse_error, reason_error};
@@ -112,7 +113,16 @@ where
     })
 }
 
-pub(crate) fn ok_response(req: &RPCRequest, value: Value) -> RpcCallResult<RPCResponse> {
+pub(crate) fn ok_response<T>(req: &RPCRequest, value: T) -> RpcCallResult<RPCResponse>
+where
+    T: Serialize,
+{
+    let value = serde_json::to_value(value).map_err(|e| {
+        reason_error(
+            SnApiErrorCode::InternalError,
+            format!("serialize {} response failed: {e}", req.method),
+        )
+    })?;
     Ok(RPCResponse::create_by_req(RPCResult::Success(value), req))
 }
 
@@ -158,16 +168,22 @@ pub(crate) fn normalize_evm_address(value: &str, field: &str) -> RpcCallResult<S
     }
 }
 
-pub(crate) fn build_profile_json(username: &str, user: &crate::SNUserInfo) -> Value {
-    json!({
-        "code": 0,
-        "name": username,
-        "owner_key_bound": !user.public_key.trim().is_empty(),
-        "user_domain": user.user_domain.clone(),
-        "self_cert": user.self_cert,
-        "sn_ips": user.sn_ips.as_ref().and_then(|v| serde_json::from_str::<Value>(v).ok()).unwrap_or(Value::Null),
-        "zone_config": user.zone_config.clone(),
-    })
+pub(crate) fn build_profile_response(
+    username: &str,
+    user: &crate::SNUserInfo,
+) -> SnUserProfileResp {
+    SnUserProfileResp {
+        code: 0,
+        name: username.to_string(),
+        owner_key_bound: !user.public_key.trim().is_empty(),
+        user_domain: user.user_domain.clone(),
+        self_cert: user.self_cert,
+        sn_ips: user
+            .sn_ips
+            .as_ref()
+            .and_then(|value| serde_json::from_str::<Vec<String>>(value).ok()),
+        zone_config: user.zone_config.clone(),
+    }
 }
 
 pub(crate) async fn require_account_username(

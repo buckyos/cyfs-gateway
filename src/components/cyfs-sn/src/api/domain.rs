@@ -5,6 +5,7 @@ use super::errors::{parse_error, reason_error, SnApiErrorCode};
 use crate::{canonical_user_domain, pkx_record_name, txt_matches_pkx};
 use crate::{SNServer, SnError, SnErrorCode};
 use ::kRPC::{RPCErrors, RPCRequest, RPCResponse};
+use cyfs_gateway_api::{SnBindDomainResp, SnSuccessResp};
 use serde::Deserialize;
 use serde_json::json;
 
@@ -141,14 +142,14 @@ async fn handle_bind(server: &SNServer, req: RPCRequest) -> RpcCallResult<RPCRes
     );
     ok_response(
         &req,
-        json!({
-            "code": 0,
-            "domain": binding.domain,
-            "pkx": binding.pkx,
-            "pkx_record_name": binding.pkx_record_name,
-            "pkx_source": pkx_source,
-            "verified_at": binding.verified_at,
-        }),
+        SnBindDomainResp {
+            code: 0,
+            domain: binding.domain,
+            pkx: binding.pkx,
+            pkx_record_name: binding.pkx_record_name,
+            pkx_source: pkx_source.to_string(),
+            verified_at: binding.verified_at,
+        },
     )
 }
 
@@ -166,7 +167,7 @@ pub(crate) async fn handle_domain(
                 .unbind_user_domain(username.as_str(), params.domain.as_str())
                 .await
                 .into_rpc()?;
-            ok_response(&req, json!({ "code": 0 }))
+            ok_response(&req, SnSuccessResp { code: 0 })
         }
         _ => Err(RPCErrors::UnknownMethod(req.method)),
     }

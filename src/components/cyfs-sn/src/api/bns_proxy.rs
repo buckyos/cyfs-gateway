@@ -19,6 +19,7 @@ use crate::SNServer;
 use ::kRPC::{RPCErrors, RPCRequest, RPCResponse};
 use bns_client::dns_document::DnsTxtRecord;
 use bns_client::DnsTxtUpdate;
+use cyfs_gateway_api::SnBnsProxyResp;
 use rand::RngCore;
 use serde::Deserialize;
 use serde_json::Value;
@@ -170,7 +171,7 @@ pub(crate) async fn handle_bns_proxy(
                 .map_err(bns_proxy_error)?;
             // 投递成功只做本地 DNS 缓存失效；权威状态等 bns-indexer 投影。
             server.invalidate_bns_name_dns_cache(username.as_str());
-            ok_response(&req, outcome.to_response_json())
+            ok_response(&req, SnBnsProxyResp { code: 0, outcome })
         }
         "publish_document" => {
             let params: PublishDocumentReq = parse_params(&req)?;
@@ -209,7 +210,7 @@ pub(crate) async fn handle_bns_proxy(
                 .await
                 .map_err(bns_proxy_error)?;
             server.invalidate_bns_name_dns_cache(username.as_str());
-            ok_response(&req, outcome.to_response_json())
+            ok_response(&req, SnBnsProxyResp { code: 0, outcome })
         }
         "publish_relay_assignment" => {
             let params: PublishRelayAssignmentReq = parse_params(&req)?;
@@ -231,7 +232,7 @@ pub(crate) async fn handle_bns_proxy(
                 .await
                 .map_err(bns_proxy_error)?;
             server.invalidate_bns_name_dns_cache(name.as_str());
-            ok_response(&req, outcome.to_response_json())
+            ok_response(&req, SnBnsProxyResp { code: 0, outcome })
         }
         "register_name_bootstrap" => {
             // internal/admin 恢复与重放路径：不创建本地 SN 用户，只补 BNS name。
@@ -260,7 +261,7 @@ pub(crate) async fn handle_bns_proxy(
                 .await
                 .map_err(bns_proxy_error)?;
             server.invalidate_bns_name_dns_cache(name.as_str());
-            ok_response(&req, outcome.to_response_json())
+            ok_response(&req, SnBnsProxyResp { code: 0, outcome })
         }
         _ => Err(RPCErrors::UnknownMethod(req.method)),
     }

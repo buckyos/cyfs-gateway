@@ -6,7 +6,7 @@ use super::errors::{SnApiErrorCode, parse_error};
 use crate::SNServer;
 use crate::sn_authority::{AuthContext, require_sn_user_or_device};
 use ::kRPC::{RPCErrors, RPCRequest, RPCResponse};
-use serde_json::{Value, json};
+use cyfs_gateway_api::{SnAddDnsRecordResp, SnDnsRecord, SnDnsRecordListResp, SnSuccessResp};
 
 fn normalize_domain(domain: &str) -> String {
     domain.trim().trim_end_matches('.').to_ascii_lowercase()
@@ -137,10 +137,10 @@ pub(crate) async fn handle_dns(server: &SNServer, req: RPCRequest) -> RpcCallRes
             }
             ok_response(
                 &req,
-                json!({
-                    "code": 0,
-                    "device_name": identity.device_name,
-                }),
+                SnAddDnsRecordResp {
+                    code: 0,
+                    device_name: identity.device_name,
+                },
             )
         }
         "remove_record" => {
@@ -184,7 +184,7 @@ pub(crate) async fn handle_dns(server: &SNServer, req: RPCRequest) -> RpcCallRes
             {
                 server.remove_name_info_cache(params.domain.as_str(), record_type);
             }
-            ok_response(&req, json!({ "code": 0 }))
+            ok_response(&req, SnSuccessResp { code: 0 })
         }
         "list_records" => {
             let username = resolve_self_scoped_username(server, &req, false).await?;
@@ -195,17 +195,18 @@ pub(crate) async fn handle_dns(server: &SNServer, req: RPCRequest) -> RpcCallRes
                 .into_rpc()?;
             ok_response(
                 &req,
-                json!({
-                    "code": 0,
-                    "items": items.into_iter().map(|(domain, record_type, record, ttl)| {
-                        json!({
-                            "domain": domain,
-                            "record_type": record_type,
-                            "record": record,
-                            "ttl": ttl,
+                SnDnsRecordListResp {
+                    code: 0,
+                    items: items
+                        .into_iter()
+                        .map(|(domain, record_type, record, ttl)| SnDnsRecord {
+                            domain,
+                            record_type,
+                            record,
+                            ttl,
                         })
-                    }).collect::<Vec<Value>>(),
-                }),
+                        .collect(),
+                },
             )
         }
         _ => Err(RPCErrors::UnknownMethod(req.method)),
