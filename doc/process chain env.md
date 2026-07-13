@@ -36,6 +36,15 @@ cyfs_gateway中各个process chain执行位置都可以通过环境变量获取�
 - 新增跨协议字段时，推荐在 `REQ` Map 内使用 `source_*` / `conn_source_*` / `real_source_*`，其中 RTCP 身份信息使用 `real_source_did` 表达可信原始来源 DID。
 - HTTP 转发链路仍应保留标准头名 `X-Forwarded-For`、`X-Real-IP`、`X-Forwarded-Host`、`X-Forwarded-Proto`；这些是协议兼容头，不作为 process chain 通用字段命名前缀。
 
+## 来源变量统一 TODO
+
+- [ ] HTTP server 在 `REQ` Map 中补齐 `source_addr` / `source_ip` / `source_port`、`conn_source_addr` / `conn_source_ip` / `conn_source_port`、`real_source_addr` / `real_source_ip` / `real_source_port`。继续保留现有 `REQ_remote_*`、`REQ_conn_remote_*`、`REQ_real_remote_*` 顶层变量作为兼容别名。
+- [ ] TCP、TLS、QUIC、UDP、RTCP 等入口统一提供能够可靠获得的 `conn_source_*` 和 `real_source_*` 字段。当前已有的 `source_addr` / `source_ip` / `source_port` 保持兼容；没有可信还原来源时，不构造或伪造 `real_source_*`。
+- [ ] RTCP 将握手认证得到的来源 DID 暴露为 `REQ.real_source_did`，并保留现有 `REQ.source_device_id`。需要当前有效身份别名时，可同时提供 `REQ.source_did`。
+- [ ] `forward ip_hash` 获取来源 IP 时，按 `REQ.real_source_ip`、`REQ.source_ip`、HTTP 兼容变量 `REQ_remote_ip` 的顺序回退，确保 HTTP 和非 HTTP process chain 无需手工补字段即可使用同一配置。
+- [ ] 明确 HTTP `X-Forwarded-For` / `X-Real-IP` 的可信 upstream 配置和解析规则。默认不信任普通客户端传入的转发头；只有直接上一跳属于可信 upstream 时，才允许将其转换为 `real_source_*`。
+- [ ] 为上述字段增加跨入口测试，至少覆盖直连、PROXY protocol、RTCP 已认证身份、可信 HTTP upstream 和伪造转发头，并验证旧变量在兼容期内保持原有语义。
+
 ## HTTP Request 环境变量
 
 
@@ -325,4 +334,3 @@ cyfs_gateway中各个process chain执行位置都可以通过环境变量获取�
 | `source_mac`         | `String` | 源 MAC（可选）       |
 | `source_hostname`    | `String` | 源主机名（可选）        |
 | `source_online_secs` | `String` | 源设备当日在线秒数（可选）   |
-

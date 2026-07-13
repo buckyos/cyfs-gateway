@@ -6,14 +6,15 @@ use super::common::{
 use super::errors::{bns_proxy_error, parse_error, reason_error, SnApiErrorCode};
 use crate::sn_auth_manager::{hash_password, verify_password, PASSWORD_ALGO};
 use crate::sn_bns_proxy::SnBnsProxyRegisterParams;
-use crate::SNServer;
+use crate::{AllocateZoneRelayReq, SNServer};
 use ::kRPC::{RPCErrors, RPCRequest, RPCResponse};
 use cyfs_gateway_api::{
     SnAuthRefreshResp, SnAuthSessionResp, SnBnsProxyTxOutcome, SnCheckUsernameReason,
     SnCheckUsernameResp, SnSuccessResp,
 };
-use log::info;
+use log::{info, warn};
 use serde_json::{json, Value};
+use std::net::IpAddr;
 
 async fn build_auth_success_response(
     server: &SNServer,
@@ -66,7 +67,11 @@ pub(crate) fn default_owner_config(username: &str) -> Value {
     })
 }
 
-pub(crate) async fn handle_auth(server: &SNServer, req: RPCRequest) -> RpcCallResult<RPCResponse> {
+pub(crate) async fn handle_auth(
+    server: &SNServer,
+    req: RPCRequest,
+    source_ip: Option<IpAddr>,
+) -> RpcCallResult<RPCResponse> {
     match req.method.as_str() {
         "check_username" => {
             let params: NameReq = parse_params(&req)?;
@@ -260,6 +265,31 @@ pub(crate) async fn handle_auth(server: &SNServer, req: RPCRequest) -> RpcCallRe
                 "sn auth register local account created: username={} request_id={}",
                 username, request_id
             );
+            // BNS 和本地账号创建都可能已产生不可回滚状态。Relay 暂不可用、
+            // GeoIP 失败或调度存储失败时只记录 pending，不让注册失败。
+            match server
+                .relay_manager()
+                .allocate_zone_relay(AllocateZoneRelayReq {
+                    zone: username.clone(),
+                    preferred_region: params.region,
+                    source_ip,
+                    reason: "register".to_string(),
+                    source_version: None,
+                })
+                .await
+            {
+                Ok(assignment) => info!(
+                    "sn auth register relay assigned: username={} request_id={} relay_id={} generation={}",
+                    username, request_id, assignment.relay_id, assignment.generation
+                ),
+                Err(error) => warn!(
+                    "sn auth register relay assignment pending: username={} request_id={} error_code={:?} error={}",
+                    username,
+                    request_id,
+                    error.code(),
+                    error.msg()
+                ),
+            }
             let response = build_auth_success_response(
                 server,
                 &req,

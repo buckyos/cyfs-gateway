@@ -101,6 +101,9 @@ pub struct SnAuthRegisterReq {
     pub email: String,
     pub pwd_hash: String,
     pub active_code: String,
+    /// Relay 调度的地区偏好。服务端会规范化并将其作为非可信提示；客户端不能指定 relay。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub region: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub request_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1065,6 +1068,7 @@ mod tests {
             email: "alice@example.com".to_string(),
             pwd_hash: "hash".to_string(),
             active_code: "code".to_string(),
+            region: Some("US-West".to_string()),
             request_id: Some("sn:register:alice".to_string()),
             asset_owner: Some("0x0000000000000000000000000000000000000001".to_string()),
             owner_config: Some(json!({ "display_name": "Alice" })),
@@ -1085,6 +1089,7 @@ mod tests {
                 "email": "alice@example.com",
                 "pwd_hash": "hash",
                 "active_code": "code",
+                "region": "US-West",
                 "request_id": "sn:register:alice",
                 "asset_owner": "0x0000000000000000000000000000000000000001",
                 "owner_config": { "display_name": "Alice" },

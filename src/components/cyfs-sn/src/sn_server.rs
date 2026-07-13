@@ -26,10 +26,11 @@ use crate::sn_resolver::{
     SnResolverErrorKind, SnResolverRef, SnResolverResult,
 };
 use crate::{
-    SnAuthDBRef, SnAuthDbClient, SnDeviceEndpointUpdate, SnDeviceInfoDBRef, SnDeviceInfoDbClient,
-    SnDeviceRole, SnDeviceState, SnDeviceStateUpdate, SnEndpointProtocol, SnEndpointScope,
-    SnEndpointSource, SnNatType, SnRelayManagerRef, SnResult, SqliteSnAuthDB, SqliteSnDeviceInfoDB,
-    SqliteSnRelayManager,
+    GeoIpResolverConfig, RelayAllocationConfig, SnAuthDBRef, SnAuthDbClient,
+    SnDeviceEndpointUpdate, SnDeviceInfoDBRef, SnDeviceInfoDbClient, SnDeviceRole, SnDeviceState,
+    SnDeviceStateUpdate, SnEndpointProtocol, SnEndpointScope, SnEndpointSource, SnNatType,
+    SnRelayManagerRef, SnResult, SqliteSnAuthDB, SqliteSnDeviceInfoDB, SqliteSnRelayManager,
+    XdbGeoIpResolver,
 };
 use ::kRPC::*;
 use async_trait::async_trait;
@@ -41,9 +42,9 @@ use bns_client::{
 use buckyos_kit::{get_buckyos_service_data_dir, is_valid_name, NameType};
 use cyfs_gateway_lib::server_err;
 use cyfs_gateway_lib::{
-    qa_json_to_rpc_request, HttpRequestProcessChainVars, HttpServer, NameServer, QAServer, Server,
-    ServerConfig, ServerContextRef, ServerError, ServerErrorCode, ServerFactory, ServerResult,
-    StreamInfo,
+    get_gateway_main_config_dir, qa_json_to_rpc_request, HttpRequestProcessChainVars, HttpServer,
+    NameServer, QAServer, Server, ServerConfig, ServerContextRef, ServerError, ServerErrorCode,
+    ServerFactory, ServerResult, StreamInfo,
 };
 use cyfs_gateway_api::{SnCheckActiveCodeResp, SnOodState};
 pub use cyfs_gateway_api::SnOodInfo as OODInfo;
@@ -476,6 +477,7 @@ pub struct SNServer {
     auth_db: SnAuthDBRef,
     device_info_db: SnDeviceInfoDBRef,
     compat_store: SnCompatibilityStoreRef,
+    relay_manager: SnRelayManagerRef,
     auth: Arc<SnAuthManager>,
     name_info_cache: NameInfoCacheRef,
     resolver: SnResolverRef,
@@ -660,6 +662,7 @@ impl SNServer {
             auth_db,
             device_info_db,
             compat_store,
+            relay_manager,
             auth,
             name_info_cache: NameInfoCache::new_ref(),
             resolver,
@@ -680,6 +683,10 @@ impl SNServer {
 
     pub fn did_resolver(&self) -> SnDidResolverRef {
         self.did_resolver.clone()
+    }
+
+    pub(crate) fn relay_manager(&self) -> &SnRelayManagerRef {
+        &self.relay_manager
     }
 
     pub(crate) fn bns_proxy(&self) -> Arc<SnBnsProxy> {
@@ -977,10 +984,20 @@ impl SNServer {
         info!("sn server handle rpc call: {}", req.method);
         match req.method.as_str() {
             "auth.check_active_code" => {
-                handle_auth(self, Self::rewrite_rpc_method(req, "check_active_code")).await
+                handle_auth(
+                    self,
+                    Self::rewrite_rpc_method(req, "check_active_code"),
+                    Some(ip_from),
+                )
+                .await
             }
             "auth.check_username" => {
-                handle_auth(self, Self::rewrite_rpc_method(req, "check_username")).await
+                handle_auth(
+                    self,
+                    Self::rewrite_rpc_method(req, "check_username"),
+                    Some(ip_from),
+                )
+                .await
             }
             "auth.register" | "auth.login" | "auth.refresh" | "auth.logout" | "auth.me" => {
                 let bare_method = req
@@ -988,7 +1005,12 @@ impl SNServer {
                     .strip_prefix("auth.")
                     .unwrap_or(req.method.as_str())
                     .to_string();
-                handle_auth(self, Self::rewrite_rpc_method(req, bare_method.as_str())).await
+                handle_auth(
+                    self,
+                    Self::rewrite_rpc_method(req, bare_method.as_str()),
+                    Some(ip_from),
+                )
+                .await
             }
             "user.get_profile" | "user.set_self_cert" => {
                 let bare_method = req
@@ -1941,6 +1963,10 @@ pub struct SNServerConfig {
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pkx_doh_url: Option<String>,
+    /// Relay 自动分配的有序规则、fallback 和可选 GeoIP XDB。
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub relay_allocation: Option<RelayAllocationConfig>,
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bns_write_enabled: Option<bool>,
@@ -2006,6 +2032,24 @@ struct SnPostgresDbConfig {
 impl SnServerFactory {
     pub fn new() -> Self {
         SnServerFactory
+    }
+
+    fn resolve_geoip_config(mut config: GeoIpResolverConfig) -> GeoIpResolverConfig {
+        fn resolve(path: String) -> String {
+            let path = PathBuf::from(path);
+            if path.is_absolute() {
+                path.to_string_lossy().to_string()
+            } else {
+                get_gateway_main_config_dir()
+                    .join(path)
+                    .to_string_lossy()
+                    .to_string()
+            }
+        }
+
+        config.ipv4_xdb_path = resolve(config.ipv4_xdb_path);
+        config.ipv6_xdb_path = config.ipv6_xdb_path.map(resolve);
+        config
     }
 
     async fn probe_bns_rpc(config: &SNServerConfig) -> ServerResult<(BnsRpcClient, BnsSystemInfo)> {
@@ -2602,7 +2646,12 @@ impl ServerFactory for SnServerFactory {
         })?;
         let compat_store: SnCompatibilityStoreRef = Arc::new(compat_store);
 
-        let relay_manager = SqliteSnRelayManager::new_by_path(db_path.as_str())
+        let mut allocation_config = config.relay_allocation.clone().unwrap_or_default();
+        allocation_config.geoip = allocation_config
+            .geoip
+            .take()
+            .map(Self::resolve_geoip_config);
+        let mut relay_manager = SqliteSnRelayManager::new_by_path(db_path.as_str())
             .await
             .map_err(|e| {
                 server_err!(
@@ -2612,7 +2661,24 @@ impl ServerFactory for SnServerFactory {
                 )
             })?
             .with_auth_db(auth_db.clone())
-            .with_device_info_db(device_info_db.clone());
+            .with_device_info_db(device_info_db.clone())
+            .with_allocation_config(allocation_config.clone());
+        if let Some(geoip_config) = allocation_config.geoip.as_ref() {
+            match XdbGeoIpResolver::new(geoip_config) {
+                Ok(resolver) => {
+                    relay_manager = relay_manager.with_geo_ip_resolver(Arc::new(resolver));
+                    info!("sn relay GeoIP resolver enabled");
+                }
+                Err(error) => {
+                    // GeoIP 是调度提示；数据库暂不可用时保留 preferred region/fallback。
+                    warn!(
+                        "sn relay GeoIP resolver disabled after load failure: error_code={:?} error={}",
+                        error.code(),
+                        error.msg()
+                    );
+                }
+            }
+        }
         relay_manager.initialize_database().await.map_err(|e| {
             server_err!(
                 ServerErrorCode::InvalidConfig,
@@ -3400,6 +3466,108 @@ mod tests {
             .unwrap(),
         );
         (sn, registry)
+    }
+
+    #[tokio::test]
+    async fn test_auth_register_assigns_relay_and_zone_info_reads_it_back() {
+        init_logging("sn", false);
+        let db = tempfile::NamedTempFile::with_suffix(".db").unwrap();
+        let auth_dir = tempfile::tempdir().unwrap();
+        let (sn, _) =
+            build_sn_with_bns_proxy(db.path().to_str().unwrap(), auth_dir.path(), true, false)
+                .await;
+        for (relay_id, relay_sn, region) in [
+            ("relay-eu", "relay-eu.example", "eu"),
+            ("relay-us", "relay-us.example", "us-west"),
+        ] {
+            sn.relay_manager()
+                .register_relay_node(crate::RelayNodeRegistration {
+                    relay_id: relay_id.to_string(),
+                    relay_sn: relay_sn.to_string(),
+                    public_host: relay_sn.to_string(),
+                    http_endpoint: Some(format!("https://{relay_sn}")),
+                    rtcp_endpoint: Some(format!("rtcp://{relay_sn}:443")),
+                    region: Some(region.to_string()),
+                    isp: None,
+                    tags: vec!["edge".to_string()],
+                    capabilities: vec!["rtcp_relay".to_string()],
+                    status: None,
+                    capacity_score: Some(100),
+                })
+                .await
+                .unwrap();
+        }
+
+        let http_server: Arc<dyn HttpServer> = sn.clone();
+        let http_addr = spawn_test_http_server(http_server).await;
+        let auth_url = format!("http://{http_addr}/kapi/sn/auth");
+        let auth_krpc = kRPC::new(auth_url.as_str(), None);
+
+        let region_result = auth_krpc
+            .call(
+                "auth.register",
+                json!({
+                    "name": "relayregionuser",
+                    "email": "relay-region@example.com",
+                    "pwd_hash": "12345678",
+                    "active_code": CLEAR_STATE_ACTIVE_CODE,
+                    "asset_owner": PROXY_USER_OWNER,
+                    "region": "US_WEST"
+                }),
+            )
+            .await
+            .unwrap();
+        let region_token = region_result["access_token"].as_str().unwrap().to_string();
+        let region_zone = kRPC::new(auth_url.as_str(), Some(region_token))
+            .call("zone.get_info", json!({}))
+            .await
+            .unwrap();
+        assert_eq!(region_zone["relay_sn"], "relay-us.example");
+        let region_assignment = sn
+            .relay_manager()
+            .get_zone_relay("relayregionuser")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(region_assignment.relay_sn, "relay-us.example");
+        assert_eq!(region_assignment.source, crate::RelayAssignmentSource::Auto);
+
+        // 未提供 region，实际连接源是 loopback，故稳定进入 fallback。客户端伪造的
+        // source_ip 字段不属于 RegisterReq，不会传给调度器。
+        let fallback_result = auth_krpc
+            .call(
+                "auth.register",
+                json!({
+                    "name": "relayfallbackuser",
+                    "email": "relay-fallback@example.com",
+                    "pwd_hash": "12345678",
+                    "active_code": "bnsProxyCode2",
+                    "asset_owner": PROXY_USER_OWNER,
+                    "source_ip": "8.8.8.8"
+                }),
+            )
+            .await
+            .unwrap();
+        let fallback_token = fallback_result["access_token"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let fallback_zone = kRPC::new(auth_url.as_str(), Some(fallback_token))
+            .call("zone.get_info", json!({}))
+            .await
+            .unwrap();
+        assert_eq!(fallback_zone["relay_sn"], "relay-eu.example");
+        let fallback_assignment = sn
+            .relay_manager()
+            .get_zone_relay("relayfallbackuser")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(fallback_assignment.relay_sn, "relay-eu.example");
+        assert_eq!(
+            fallback_assignment.reason.as_deref(),
+            Some("register;rule=fallback")
+        );
     }
 
     #[tokio::test]

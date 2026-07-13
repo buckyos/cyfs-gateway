@@ -42,6 +42,9 @@
 //   <rootfs>/ca/                      dev CA cert+key (client trust install)
 //   <rootfs>/sn_server/.buckycli/     sn admin owner config
 //   <rootfs>/web3_gateway.yaml        patched when present to load sn.sqlite3
+//   <rootfs>/web3_dns.yaml            独立部署拆分（DNS/relay/SN API），存在时
+//   <rootfs>/web3_relay.yaml          与 web3_gateway.yaml 打同样的 web3_sn
+//   <rootfs>/web3_sn_api.yaml         文本补丁（db 路径、dev bns_proxy 注入）
 // Still created manually/by app template: website.yaml, local_dns.toml.
 //
 // Seed users: alice.ood1 / bob.ood1 / charlie.ood1 / dave.ood1 dev zones are
@@ -166,6 +169,16 @@ const PROVISION_SN_DB_FILE = "sn_db.sqlite3";
 const SN_DB_FILE = "sn.sqlite3";
 const SN_AUTH_DATA_DIR = "sn_token_key";
 const WEB3_GATEWAY_CONFIG_FILE = "web3_gateway.yaml";
+// web3_gateway.yaml 的独立部署拆分（DNS / 流量转发 / SN API）。每个文件都有
+// 自己的 web3_sn server 块，provision 阶段的文本补丁（sn.sqlite3 db 路径、
+// dev profile 的 bns_proxy controller 注入）必须对存在的文件同步应用，否则
+// 拆分实例会各自落到不同的数据库/凭据来源。
+const WEB3_GATEWAY_ALL_CONFIG_FILES = [
+  WEB3_GATEWAY_CONFIG_FILE,
+  "web3_dns.yaml",
+  "web3_relay.yaml",
+  "web3_sn_api.yaml",
+];
 const LOCAL_DNS_CONFIG_FILE = "local_dns.toml";
 const BNS_LOCAL_DNS_BEGIN = "# BEGIN make_sn_config:bns";
 const BNS_LOCAL_DNS_END = "# END make_sn_config:bns";
@@ -365,27 +378,29 @@ function patchWeb3GatewayConfigText(text: string): string | null {
 }
 
 function patchWeb3GatewayConfig(targetDir: string): void {
-  const configPath = path.join(targetDir, WEB3_GATEWAY_CONFIG_FILE);
-  if (!fs.existsSync(configPath)) {
-    console.log(
-      `skip ${WEB3_GATEWAY_CONFIG_FILE} patch: file not found in ${targetDir}`,
-    );
-    return;
-  }
+  for (const configFile of WEB3_GATEWAY_ALL_CONFIG_FILES) {
+    const configPath = path.join(targetDir, configFile);
+    if (!fs.existsSync(configPath)) {
+      console.log(
+        `skip ${configFile} patch: file not found in ${targetDir}`,
+      );
+      continue;
+    }
 
-  const original = fs.readFileSync(configPath, "utf8");
-  const patched = patchWeb3GatewayConfigText(original);
-  if (patched === null) {
-    console.log(
-      `skip ${WEB3_GATEWAY_CONFIG_FILE} patch: web3_sn server block not found`,
-    );
-    return;
-  }
-  if (patched !== original) {
-    fs.writeFileSync(configPath, patched);
-    console.log(`Patched ${configPath} to use ${SN_DB_FILE}`);
-  } else {
-    console.log(`${configPath} already uses ${SN_DB_FILE}`);
+    const original = fs.readFileSync(configPath, "utf8");
+    const patched = patchWeb3GatewayConfigText(original);
+    if (patched === null) {
+      console.log(
+        `skip ${configFile} patch: web3_sn server block not found`,
+      );
+      continue;
+    }
+    if (patched !== original) {
+      fs.writeFileSync(configPath, patched);
+      console.log(`Patched ${configPath} to use ${SN_DB_FILE}`);
+    } else {
+      console.log(`${configPath} already uses ${SN_DB_FILE}`);
+    }
   }
 }
 
@@ -1145,10 +1160,6 @@ function injectDevBnsProxy(
   targetDir: string,
   profile: string,
 ): void {
-  const gatewayPath = path.join(targetDir, WEB3_GATEWAY_CONFIG_FILE);
-  if (!fs.existsSync(gatewayPath)) {
-    return;
-  }
   const proxyBlock = [
     "    bns_proxy:",
     "      require_user_asset_owner: true",
@@ -1161,29 +1172,39 @@ function injectDevBnsProxy(
       "          weight: 1",
     ]),
   ].join("\n");
-
-  const before = fs.readFileSync(gatewayPath, "utf8");
-  if (
-    before.includes(
-      "bns_proxy:\n      require_user_asset_owner: true\n      allowed_operations:",
-    )
-  ) {
-    return;
-  }
   const baseProxyBlock = [
     "    bns_evm:",
     "      controller_private_key_env: BNS_SN_CONTROLLER_PRIVATE_KEY",
     "    bns_proxy:",
     "      require_user_asset_owner: true",
   ].join("\n");
-  const after = before.replace(baseProxyBlock, proxyBlock);
-  if (after === before) {
-    throw new Error(
-      `failed to inject ${profile} bns_proxy into ${gatewayPath}: base proxy block not found`,
-    );
+
+  let injected = false;
+  for (const configFile of WEB3_GATEWAY_ALL_CONFIG_FILES) {
+    const gatewayPath = path.join(targetDir, configFile);
+    if (!fs.existsSync(gatewayPath)) {
+      continue;
+    }
+    const before = fs.readFileSync(gatewayPath, "utf8");
+    if (
+      before.includes(
+        "bns_proxy:\n      require_user_asset_owner: true\n      allowed_operations:",
+      )
+    ) {
+      continue;
+    }
+    const after = before.replace(baseProxyBlock, proxyBlock);
+    if (after === before) {
+      throw new Error(
+        `failed to inject ${profile} bns_proxy into ${gatewayPath}: base proxy block not found`,
+      );
+    }
+    fs.writeFileSync(gatewayPath, after);
+    injected = true;
   }
-  fs.writeFileSync(gatewayPath, after);
-  console.log(`  ${profile} bns_proxy enabled for auth.register smoke path`);
+  if (injected) {
+    console.log(`  ${profile} bns_proxy enabled for auth.register smoke path`);
+  }
 }
 
 export function enableDevLocalBnsProxy(targetDir: string): void {

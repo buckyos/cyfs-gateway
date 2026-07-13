@@ -2400,6 +2400,53 @@ mod tests {
     use super::merge_keep_tunnel_into_rtcp_stack_config;
     use serde_json::json;
 
+    /// web3_gateway.yaml 与三个独立部署拆分（web3_dns / web3_relay /
+    /// web3_sn_api）必须都能通过真实加载链路：includes 合并、{{param}}
+    /// 替换（params.json 缺 key 会在这里失败）、按 type 的类型化解析。
+    #[tokio::test]
+    async fn test_web3_gateway_configs_parse() {
+        use super::*;
+
+        let parser = GatewayConfigParser::new();
+        parser.register_stack_config_parser("tcp", Arc::new(TcpStackConfigParser::new()));
+        parser.register_stack_config_parser("udp", Arc::new(UdpStackConfigParser::new()));
+        parser.register_stack_config_parser("rtcp", Arc::new(RtcpStackConfigParser::new()));
+        parser.register_stack_config_parser("tls", Arc::new(TlsStackConfigParser::new()));
+        parser.register_stack_config_parser("quic", Arc::new(QuicStackConfigParser::new()));
+        parser.register_stack_config_parser("tun", Arc::new(TunStackConfigParser::new()));
+        parser.register_server_config_parser("http", Arc::new(HttpServerConfigParser::new()));
+        parser.register_server_config_parser("socks", Arc::new(SocksServerConfigParser::new()));
+        parser.register_server_config_parser("dns", Arc::new(DnsServerConfigParser::new()));
+        parser.register_server_config_parser("dir", Arc::new(DirServerConfigParser::new()));
+        parser
+            .register_server_config_parser("cyfs-dir", Arc::new(CyfsDirServerConfigParser::new()));
+        parser.register_server_config_parser("local_dns", Arc::new(LocalDnsConfigParser::new()));
+        parser.register_server_config_parser("sn", Arc::new(SNServerConfigParser::new()));
+        parser.register_server_config_parser(
+            "control_server",
+            Arc::new(GatewayControlServerConfigParser::new()),
+        );
+        parser.register_server_config_parser(
+            "acme_response",
+            Arc::new(AcmeHttpChallengeServerConfigParser::new()),
+        );
+
+        let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../web3-gateway");
+        for name in [
+            "web3_gateway.yaml",
+            "web3_dns.yaml",
+            "web3_relay.yaml",
+            "web3_sn_api.yaml",
+        ] {
+            let loaded = load_config_from_file(&base.join(name))
+                .await
+                .unwrap_or_else(|e| panic!("load {} failed: {}", name, e));
+            parser
+                .parse(loaded.effective_config)
+                .unwrap_or_else(|e| panic!("parse {} failed: {}", name, e.msg()));
+        }
+    }
+
     #[test]
     fn test_merge_keep_tunnel_into_rtcp_stack_config() {
         let config = json!({

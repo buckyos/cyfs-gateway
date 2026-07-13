@@ -59,7 +59,7 @@ RPC method 必须使用 `namespace.method` 形式。当前实现不再做 legacy
 |--------|--------|--------|------|
 | `auth.check_username` | `name: string` | `valid`, `reason`, `message`, `normalized_name` | 检查用户名格式、保留名和是否已存在。用户名会 trim + lowercase。 |
 | `auth.check_active_code` | `active_code: string` | `valid: bool` | 检查激活码是否可用。 |
-| `auth.register` | `name`, `email`, `pwd_hash`, `active_code`, `request_id?`, `asset_owner?`, `owner_config?`, `initial_documents?` | `code`, `access_token`, `refresh_token`, `need_bind_owner_key`, `bns?` | 注册 SN 用户。`email` 是本版本新增的必填字段，且一个规范化邮箱地址只能绑定一个 SN 账号。SN 启用 bns-proxy 时会先原子性注册同名 BNS name，再建本地账号，并在响应里带上 `bns` TX 信息（见下）。 |
+| `auth.register` | `name`, `email`, `pwd_hash`, `active_code`, `region?`, `request_id?`, `asset_owner?`, `owner_config?`, `initial_documents?` | `code`, `access_token`, `refresh_token`, `need_bind_owner_key`, `bns?` | 注册 SN 用户。`region` 是 relay 调度的非可信地区偏好；具体 relay 与可信 source IP 均不能由客户端指定。账号创建后会自动分配 relay，暂时无可用节点时注册仍成功。SN 启用 bns-proxy 时会先原子性注册同名 BNS name，再建本地账号，并在响应里带上 `bns` TX 信息（见下）。 |
 | `auth.login` | `name`, `pwd_hash` | `code`, `access_token`, `refresh_token`, `need_bind_owner_key` | 登录已激活用户。 |
 | `auth.refresh` | `refresh_token` | `code`, `access_token` | 用 refresh token 换新 access token。 |
 | `auth.logout` | `refresh_token?` | `code` | 吊销当前 access token 和/或给定 refresh token。 |
@@ -76,6 +76,13 @@ RPC method 必须使用 `namespace.method` 形式。当前实现不再做 legacy
 - 已完成：新增稳定的 `invalid_email`、`email_already_bound` 错误名并分配错误码。TODO：新增密码找回 RPC、一次性重置凭证及 session 撤销逻辑。
 
 当前代码已实现注册邮箱字段和约束，并分配 `invalid_email` / `email_already_bound` 稳定错误码；密码找回 RPC、重置凭证、邮件投递和消费后的 session 撤销仍待实现。
+
+#### 注册时的 relay 自动分配
+
+- `region` 可选，使用与 SN `relay_allocation` 配置相同的 region label 命名空间。服务端会 trim、转小写，并把空白、`_`、`/`、`.` 统一为 `-`；例如 `US_WEST` 规范化为 `us-west`。
+- `region` 只作为调度提示，不参与账号、zone 或 BNS 权限判断。非法值或没有匹配节点时继续使用 GeoIP 和 fallback，不会令注册失败。
+- source IP 只取 HTTP/连接上下文中的可信 real remote IP。RPC params 没有 `source_ip` 或 relay node 字段；即使客户端发送同名未知字段也不会进入调度请求。
+- relay 分配在本地账号创建后执行。成功时 `relay_assignments` 与 `zone_info.relay_sn` 同步完成，注册返回后可立即调用 `zone.get_info`；失败时记录 `relay_allocation_pending`，`relay_sn` 保持 `null`，注册仍正常返回。
 
 `auth.register` 的 BNS 行为取决于 SN 是否启用了 bns-proxy（`bns_write_enabled`/`bns_indexer_url` + `bns_evm`，可选 `bns_proxy` 多 controller 配置块；完整配置见 `doc/SN/sn-bns-proxy-todo.md`）：
 
@@ -420,4 +427,4 @@ BNS 写入错误会从任意 bns-proxy 写路径冒出：`auth.register` 的 BNS
 | `query.resolve_did` / `query.resolve_hostname` / `query.resolve_device` | DID 和域名解析改用 W3C DID Resolver / DNS NameServer；OOD 建连信息改用 `deviceinfo.resolve_ood_by_*`。 |
 | `user.bind_owner_key` / `user.get_owner_key` | 已移除。owner/controller 权限管理走 BNS 侧流程（生产路径见 bns-proxy 的 `auth.register`）。 |
 
-`cyfs-gateway-api::SnClient` 已按新路径封装 auth、deviceinfo 与 bns-proxy 三个 target；传入旧 `/kapi/sn` 或 `/kapi/sn/bns` 后缀的 base URL 时，会自动归一化到目标方法对应的新路径。`SnAuthRegisterReq` 已支持必填 `email` 以及 `asset_owner`、`owner_config` 与 `initial_documents`；客户端也提供 `get_zone_info`、`publish_dns_txt`、`publish_document` 便捷方法。
+`cyfs-gateway-api::SnClient` 已按新路径封装 auth、deviceinfo 与 bns-proxy 三个 target；传入旧 `/kapi/sn` 或 `/kapi/sn/bns` 后缀的 base URL 时，会自动归一化到目标方法对应的新路径。`SnAuthRegisterReq` 已支持必填 `email`、可选 relay 地区偏好 `region`，以及 `asset_owner`、`owner_config` 与 `initial_documents`；客户端也提供 `get_zone_info`、`publish_dns_txt`、`publish_document` 便捷方法。

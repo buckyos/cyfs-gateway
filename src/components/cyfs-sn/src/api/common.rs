@@ -37,6 +37,9 @@ pub(crate) struct RegisterReq {
     pub(crate) email: String,
     pub(crate) pwd_hash: String,
     pub(crate) active_code: String,
+    /// 非可信的 relay 地区偏好；具体节点只能由 relay manager 选择。
+    #[serde(default)]
+    pub(crate) region: Option<String>,
     #[serde(default)]
     pub(crate) request_id: Option<String>,
     /// 用户 owner EVM 地址。bns proxy 生产模式必填；devtest
