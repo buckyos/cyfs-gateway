@@ -1,5 +1,8 @@
 cache/
 out/
+artifacts/
+node_modules/
+typechain-types/
 broadcast/
 deployments/*.local.json
 var/

@@ -6,26 +6,49 @@ First EVM implementation of the BNS registry described in
 ## Layout
 
 - `src/Bns.sol`: registry contract and protocol structs.
-- `test/Bns.t.sol`: Solidity tests for authorization, guards, documents and events.
+- `test/*.sol`: Hardhat Solidity tests for authorization, guards, documents, events,
+  fuzz properties and invariants.
 - `script/Smoke.s.sol`: deploys a fresh contract to a local chain and runs a minimal write flow.
 - `scripts/anvil.sh`: starts a persistent local Anvil chain.
 - `scripts/deploy.sh`: builds and deploys `Bns.sol` to an RPC endpoint.
 
-## Local Chain
+## Contract Tests
 
-Install Foundry first if `forge`, `cast` and `anvil` are not on `PATH`:
+Hardhat 3 runs the existing Solidity test contracts, fuzz cases and invariants on
+its in-process EDR chain. Contract tests do not require Foundry or a separately
+running Anvil process. Node.js 22.13 or newer is required.
+
+```bash
+cd src/apps/bns
+npm install
+npm test
+```
+
+Compile the same Solidity source and synchronize the committed ABI used by
+Backend/deployment tooling:
+
+```bash
+cd src/apps/bns
+npm run compile
+npm run abi:check
+```
+
+`npm run compile` writes only the stable ABI array to
+`../../components/bns-evm/abi/Bns.json`. Hardhat artifacts and cache remain local.
+
+## Local Anvil Chain
+
+The current persistent DV chain and deployment scripts still use Foundry. Install
+it when running those workflows; replacing Anvil is a separate migration step.
 
 ```bash
 curl -L https://foundry.paradigm.xyz | bash
 foundryup
 ```
 
-Run tests:
-
-```bash
-cd src/apps/bns
-forge test
-```
+Scripts that target an existing Anvil instance can use `npm run run:anvil -- <script>`;
+override the default endpoint with `BNS_ANVIL_RPC_URL` and provide
+`BNS_ANVIL_PRIVATE_KEY` only when the script needs an account.
 
 Start a private chain:
 

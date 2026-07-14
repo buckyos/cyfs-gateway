@@ -164,6 +164,13 @@ contract BnsInvariantTest {
     Bns internal bns;
     BnsHandler internal handler;
 
+    /// Hardhat/Foundry invariant runners probe optional target/exclusion
+    /// getters. This suite only uses targetContracts(), so report an empty
+    /// list for every other optional dynamic-array getter.
+    fallback(bytes calldata) external returns (bytes memory) {
+        return abi.encode(new bytes32[](0));
+    }
+
     function setUp() public {
         bns = new Bns();
         handler = new BnsHandler(bns);

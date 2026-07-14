@@ -1,0 +1,20 @@
+{
+  "name": "@buckyos/bns-contract",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "scripts": {
+    "compile": "hardhat build && npm run abi:sync",
+    "test": "hardhat test solidity",
+    "abi:sync": "node hardhat-scripts/sync-abi.mjs",
+    "abi:check": "node hardhat-scripts/sync-abi.mjs --check",
+    "run:anvil": "hardhat run --network anvil"
+  },
+  "devDependencies": {
+    "@types/node": "^22.13.0",
+    "hardhat": "^3.9.1",
+    "typescript": "^5.9.0"
+  }
+}
