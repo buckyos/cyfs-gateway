@@ -80,14 +80,6 @@ async function assertOutputDoesNotExist(outputPath: string): Promise<void> {
   );
 }
 
-function parseConfirmations(): number {
-  const confirmations = Number(process.env.BNS_DEPLOY_CONFIRMATIONS ?? "2");
-  if (!Number.isSafeInteger(confirmations) || confirmations < 1 || confirmations > 64) {
-    throw new Error("BNS_DEPLOY_CONFIRMATIONS must be an integer between 1 and 64");
-  }
-  return confirmations;
-}
-
 async function main(): Promise<void> {
   const repoRoot = git(contractDirectory, ["rev-parse", "--show-toplevel"]);
   const commit = assertDeploymentInputsCommitted(repoRoot);
@@ -97,7 +89,6 @@ async function main(): Promise<void> {
     throw new Error("BNS_UPGRADE_ADMIN is required");
   }
   const upgradeAdmin = getAddress(upgradeAdminValue);
-  const confirmations = parseConfirmations();
 
   const connection = await hre.network.create();
   const { ethers } = connection;
@@ -144,7 +135,7 @@ async function main(): Promise<void> {
   if (proxyDeploymentTransaction === null) {
     throw new Error("The proxy deployment transaction is unavailable");
   }
-  const proxyReceipt = await proxyDeploymentTransaction.wait(confirmations);
+  const proxyReceipt = await proxyDeploymentTransaction.wait();
   if (proxyReceipt === null || proxyReceipt.status !== 1) {
     throw new Error(`BNS proxy deployment reverted: ${proxyDeploymentTransaction.hash}`);
   }

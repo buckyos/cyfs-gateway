@@ -83,8 +83,8 @@ BNS_DEPLOY_CONFIRMATION=opMainnet:10 \
 npm run deploy:op-mainnet
 ```
 
-`BNS_DEPLOY_CONFIRMATIONS` defaults to `2` and can be set to an integer from 1 to
-64. Before deployment, the script checks that:
+The script uses Ethers' default confirmation count when waiting for the proxy
+deployment transaction. Before deployment, it checks that:
 
 - `src/`, Hardhat config, package manifests, lockfile, and the deployment script are
   all tracked and clean at `HEAD`;
