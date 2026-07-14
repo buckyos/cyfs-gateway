@@ -2,6 +2,7 @@
 pragma solidity ^0.8.24;
 
 import "../src/Bns.sol";
+import "../src/BnsProxy.sol";
 
 contract BnsActor {
     function forward(address target, bytes calldata data) external returns (bool, bytes memory) {
@@ -22,7 +23,11 @@ contract BnsTest {
         0x6569703135352d6163636f756e74000000000000000000000000000000000000;
 
     function setUp() public {
-        bns = new Bns();
+        Bns implementation = new Bns();
+        BnsProxy proxy = new BnsProxy(
+            address(implementation), abi.encodeCall(Bns.initialize, (address(this)))
+        );
+        bns = Bns(address(proxy));
         actor = new BnsActor();
     }
 

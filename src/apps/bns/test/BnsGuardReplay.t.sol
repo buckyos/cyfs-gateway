@@ -75,7 +75,7 @@ contract BnsGuardReplayTest is BnsTestBase {
         (bytes32 rootA, bytes32 hashA) = _registerPublishGetRoot();
 
         // Identical calldata on a different contract address (same chainid).
-        bns = new Bns();
+        bns = _deployBnsProxy(address(this));
         (bytes32 rootB, bytes32 hashB) = _registerPublishGetRoot();
 
         assertTrue(rootA != rootB, "logRoot differs by address(this)");

@@ -1,6 +1,11 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
+import { OwnableUpgradeable } from
+    "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
+import { Initializable } from "@openzeppelin/contracts/proxy/utils/Initializable.sol";
+import { UUPSUpgradeable } from "@openzeppelin/contracts/proxy/utils/UUPSUpgradeable.sol";
+
 enum NameStatus {
     Available,
     Active,
@@ -262,7 +267,7 @@ error OwnerGraphTooDeep(uint256 maxDepth);
 error InlineDocumentTooLarge(uint256 len, uint256 max);
 error InvalidMutation(bytes32 reason);
 
-contract Bns {
+contract Bns is Initializable, OwnableUpgradeable, UUPSUpgradeable {
     uint64 public constant MAX_INLINE_DOCUMENT = 4 * 1024;
     uint8 public constant MAX_MUTATION_BATCH_ITEMS = 32;
     uint256 public constant MAX_MUTATION_BATCH_INLINE_DOCUMENTS = 64 * 1024;
@@ -335,6 +340,10 @@ contract Bns {
 
     uint64 public globalEventSeq;
     bytes32 public currentLogRoot;
+
+    // Existing fields must never be reordered. Add future fields immediately
+    // before this gap and reduce its length by the slots they consume.
+    uint256[50] private __gap;
 
     event ProtocolEvent(
         uint64 indexed seq,
@@ -474,6 +483,18 @@ contract Bns {
         uint64 issuedAt,
         bytes32 externalAnchor
     );
+
+    /// @custom:oz-upgrades-unsafe-allow constructor
+    constructor() {
+        _disableInitializers();
+    }
+
+    /// Initializes the proxy and assigns the account authorized to upgrade it.
+    function initialize(address upgradeAdmin) external initializer {
+        __Ownable_init(upgradeAdmin);
+    }
+
+    function _authorizeUpgrade(address) internal override onlyOwner {}
 
     function chainAccountPrincipal(address account) external pure returns (Principal memory) {
         return _chainAccountPrincipal(account);

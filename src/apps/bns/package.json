@@ -10,11 +10,16 @@
     "test": "hardhat test solidity",
     "abi:sync": "node hardhat-scripts/sync-abi.mjs",
     "abi:check": "node hardhat-scripts/sync-abi.mjs --check",
+    "deploy:op-mainnet": "hardhat run hardhat-scripts/deploy-op-mainnet.ts --network opMainnet",
     "run:anvil": "hardhat run --network anvil"
   },
   "devDependencies": {
+    "@nomicfoundation/hardhat-viem": "3.0.9",
+    "@openzeppelin/contracts": "5.6.1",
+    "@openzeppelin/contracts-upgradeable": "5.6.1",
     "@types/node": "^22.13.0",
     "hardhat": "^3.9.1",
-    "typescript": "^5.9.0"
+    "typescript": "^5.9.0",
+    "viem": "2.55.1"
   }
 }

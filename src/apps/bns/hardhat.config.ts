@@ -1,8 +1,10 @@
-import { defineConfig } from "hardhat/config";
+import hardhatViem from "@nomicfoundation/hardhat-viem";
+import { configVariable, defineConfig } from "hardhat/config";
 
 const privateKey = process.env.BNS_ANVIL_PRIVATE_KEY;
 
 export default defineConfig({
+  plugins: [hardhatViem],
   solidity: {
     version: "0.8.24",
     settings: {
@@ -40,6 +42,13 @@ export default defineConfig({
       chainType: "l1",
       url: process.env.BNS_ANVIL_RPC_URL ?? "http://127.0.0.1:8545",
       accounts: privateKey ? [privateKey] : "remote",
+    },
+    opMainnet: {
+      type: "http",
+      chainType: "op",
+      chainId: 10,
+      url: configVariable("BNS_OP_MAINNET_RPC_URL"),
+      accounts: [configVariable("BNS_DEPLOYER_PRIVATE_KEY")],
     },
   },
 });

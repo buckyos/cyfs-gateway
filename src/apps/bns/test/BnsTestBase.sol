@@ -2,6 +2,7 @@
 pragma solidity ^0.8.24;
 
 import "../src/Bns.sol";
+import "../src/BnsProxy.sol";
 
 /// Minimal subset of the Foundry cheatcode interface so the §1 suites stay
 /// dependency-free (no forge-std checkout required on CI). The cheatcode
@@ -182,8 +183,16 @@ contract BnsTestBase {
     );
 
     function setUp() public virtual {
-        bns = new Bns();
+        bns = _deployBnsProxy(address(this));
         ownerRef = _inlineDoc(DOC_OWNER_BODY);
+    }
+
+    function _deployBnsProxy(address upgradeAdmin) internal returns (Bns instance) {
+        Bns implementation = new Bns();
+        BnsProxy proxy = new BnsProxy(
+            address(implementation), abi.encodeCall(Bns.initialize, (upgradeAdmin))
+        );
+        return Bns(address(proxy));
     }
 
     // --- assertion helpers (forge-std-free) -------------------------------
