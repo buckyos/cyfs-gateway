@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 // Generated from the aggregate BNS JSON ABI and Hardhat enum AST by
-// src/apps/bns/hardhat-scripts/sync-abi.mjs. Do not edit.
+// hardhat-scripts/generate-bindings.mjs. Do not edit.
 pragma solidity ^0.8.24;
 
 enum NameStatus {

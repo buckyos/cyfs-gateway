@@ -91,7 +91,7 @@ BNS(合约) <-> BNS-Indexer <-> BNS-Server <-> BNS-Client <-> BNS-Controller
 ## 2. BNS 合约（Solidity）✅ 已完成（范围超出原计划）
 
 > 实际实现没有停在"第一版 5 个核心操作"，而是把完整闭环接口一次性写进 [src/Bns.sol](../src/apps/bns/src/Bns.sol)（约 1976 行）。
-> foundry 配置：solc `0.8.24`、`optimizer`、`via_ir`、`evm_version = paris`（[foundry.toml](../src/apps/bns/foundry.toml)）。
+> 当时的 Foundry 配置已随测试链迁移移除；当前 solc、optimizer、viaIR 和 EVM 版本以 [hardhat.config.ts](../../src/apps/bns/hardhat.config.ts) 为准。
 
 - [x] 写操作（**远超**原计划的 5 个）：
   - [x] `registerName`（[Bns.sol:625](../src/apps/bns/src/Bns.sol:625)）

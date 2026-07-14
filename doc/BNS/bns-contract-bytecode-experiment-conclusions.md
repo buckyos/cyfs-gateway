@@ -171,13 +171,15 @@ bytes，已经超限；完整 document 切片约 24,194 bytes，只剩 382 bytes
 
 Router 继续作为唯一的 UUPS implementation，通过命名 storage slot 保存 selector 表；所有
 业务 facet 继承同一 `BnsCore` storage layout。聚合 ABI 以 `IBns` 保持原业务调用和事件形状，
-并合并 Router/facet artifact 的继承事件与 error。Rust `bns-evm` 的绑定接口形状来自该聚合
-JSON ABI，enum 成员则从 Hardhat build-info AST 恢复，避免标准 JSON ABI 将 enum 降为
-`uint8` 后丢失 variants。
+并合并 Router/facet artifact 的继承事件与 error。生成器在内存中聚合标准 JSON ABI，再输出
+Rust `bns-evm` 使用的 Solidity binding；enum 成员从 Hardhat build-info AST 恢复，避免标准
+JSON ABI 将 enum 降为 `uint8` 后丢失 variants。合约仓库只生成本地 binding，跨仓库复制由
+显式 `abi:sync` 或 Backend 自己的构建脚本完成。
 
 Hardhat 已完成编译、97 个 Solidity 测试、28 个 selector 的完整性/冲突检查、Router 与全部
 facet 的递归 storage-layout 对比，以及 OpenZeppelin UUPS implementation validation；所有生产
-implementation 都低于 EIP-170 上限。Rust 聚合 ABI 保留了原有 enum 类型，Indexer 会忽略同一
+implementation 都低于 EIP-170 上限。Rust binding 保留了原有 enum 类型，Indexer 会忽略同一
 proxy 地址产生的 facet 管理事件以及 UUPS/Ownable 基础设施事件。`bns-evm`、`bns-client`、`bns-indexer` 共 101 个非忽略
-Rust 测试和全 workspace `cargo check` 通过；6 个依赖旧单体 `forge create` 的 Anvil e2e 仍为
-ignore，需随非阻塞 DV 环境另行迁移。本轮不需要安装额外第三方工具。
+Rust 测试和全 workspace `cargo check` 通过。原先依赖旧单体 `forge create` 的 9 个 Anvil
+e2e 已改为复用 Hardhat UUPS/facet 部署入口并全部通过；Foundry 仅保留 `anvil` 本地持久链。
+本轮不需要安装额外第三方工具。

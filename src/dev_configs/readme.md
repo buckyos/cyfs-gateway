@@ -55,7 +55,7 @@ uv run buckyos-devtest sn_test create_vms
 uv run buckyos-devtest sn_test snapshot init
 
 # 2. 构建并部署 web3-gateway。
-# build_all 会从零重建宿主机 staging、构建 Linux 产物、复制 BNS Foundry
+# build_all 会从零重建宿主机 staging、构建 Linux 产物、复制 BNS Hardhat
 # 工程、运行 make_sn_config.ts --seed-v2，并在 push 前拒绝运行态文件。
 uv run buckyos-devtest sn_test install sn --apps web3-gateway
 
@@ -227,7 +227,8 @@ multipass exec sn -- bash -lc "tail -200 /opt/web3-gateway/anvil.log"
 启动失败时先确认：
 
 - `/opt/web3-gateway/init_anvil.py --fresh` 已经在 VM 内成功执行。
-- VM 内有 `anvil`、`forge`；没有时重新执行 `init_anvil.py --install-foundry`。
+- VM 内有 `anvil`、`node` 和 `npm`；缺 `anvil` 时重新执行
+  `init_anvil.py --install-foundry`，Node.js/npm 需由 VM 环境提供。
 - `/opt/web3-gateway/bns_dv_seed.yaml` 和 `sn_seed.yaml` 来自最新
   `make_sn_config.ts --seed-v2`。
 - 宿主机访问 VM 时使用了当前 VM IP；重建 VM 后旧 IP 不可信。

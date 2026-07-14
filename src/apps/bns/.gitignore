@@ -1,6 +1,7 @@
 cache/
 out/
 artifacts/
+bindings/
 node_modules/
 typechain-types/
 broadcast/

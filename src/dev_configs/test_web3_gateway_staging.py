@@ -49,6 +49,37 @@ class Web3GatewayStagingTests(unittest.TestCase):
         self.assertIn("--dev-vm", command)
         self.assertNotIn("--dev-local", command)
 
+    def test_copy_bns_source_stages_hardhat_project(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source_root = root / "src"
+            source = source_root / "apps" / "bns"
+            source.mkdir(parents=True)
+            for filename in (
+                "package.json",
+                "package-lock.json",
+                "hardhat.config.ts",
+                "tsconfig.json",
+            ):
+                (source / filename).write_text(filename, encoding="utf-8")
+            for dirname in ("src", "hardhat-scripts"):
+                directory = source / dirname
+                directory.mkdir()
+                (directory / "marker").write_text(dirname, encoding="utf-8")
+
+            staging_dir = root / "staging"
+            with (
+                mock.patch.object(staging, "SRC_ROOT", source_root),
+                mock.patch.object(staging, "STAGING_DIR", staging_dir),
+            ):
+                staging.copy_bns_source()
+
+            target = staging_dir / "bns"
+            self.assertTrue((target / "package-lock.json").is_file())
+            self.assertTrue((target / "hardhat.config.ts").is_file())
+            self.assertTrue((target / "hardhat-scripts" / "marker").is_file())
+            self.assertTrue((target / "src" / "marker").is_file())
+
     def test_init_anvil_writes_sn_bns_runtime_params(self) -> None:
         module_path = staging.SRC_ROOT / "web3-gateway" / "init_anvil.py"
         spec = importlib.util.spec_from_file_location("web3_gateway_init_anvil", module_path)
@@ -83,6 +114,108 @@ class Web3GatewayStagingTests(unittest.TestCase):
             self.assertEqual(params["bns_rpc_url"], "http://127.0.0.1:18080")
             gateway = gateway_path.read_text()
             self.assertIn('bns_rpc_url: "{{bns_rpc_url}}"', gateway)
+
+    def test_init_anvil_deploys_bns_through_hardhat(self) -> None:
+        module_path = staging.SRC_ROOT / "web3-gateway" / "init_anvil.py"
+        spec = importlib.util.spec_from_file_location(
+            "web3_gateway_init_anvil_deploy", module_path
+        )
+        self.assertIsNotNone(spec)
+        self.assertIsNotNone(spec.loader)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            project = root / "bns"
+            project.mkdir()
+            calls = []
+
+            def run_checked(command, cwd, env=None):
+                calls.append((command, cwd, env))
+                stdout = ""
+                if command[-1] == "deploy:local":
+                    stdout = '{"deployedTo":"0x1234","transactionHash":"0xabcd"}'
+                return module.subprocess.CompletedProcess(command, 0, stdout, "")
+
+            with (
+                mock.patch.object(module, "find_executable", return_value="/usr/bin/npm"),
+                mock.patch.object(module, "find_bns_project_dir", return_value=project),
+                mock.patch.object(module, "run_checked", side_effect=run_checked),
+                mock.patch.object(module, "contract_deployed", return_value=True),
+                mock.patch.object(module, "BNS_RPC_ENDPOINT", "http://127.0.0.1:18545"),
+                mock.patch.object(module, "BNS_DEPLOYER_PRIVATE_KEY", "0xdeploy-key"),
+            ):
+                contract = module.deploy_bns_contract(root)
+
+            self.assertEqual(contract, "0x1234")
+            self.assertEqual(calls[0][0], ["/usr/bin/npm", "ci"])
+            self.assertEqual(
+                calls[1][0], ["/usr/bin/npm", "run", "--silent", "compile"]
+            )
+            self.assertEqual(
+                calls[2][0], ["/usr/bin/npm", "run", "--silent", "deploy:local"]
+            )
+            self.assertEqual(
+                calls[2][2]["BNS_ANVIL_RPC_URL"], "http://127.0.0.1:18545"
+            )
+            self.assertEqual(
+                calls[2][2]["BNS_ANVIL_PRIVATE_KEY"], "0xdeploy-key"
+            )
+
+    def test_init_anvil_deploys_with_hardhat_project(self) -> None:
+        module_path = staging.SRC_ROOT / "web3-gateway" / "init_anvil.py"
+        spec = importlib.util.spec_from_file_location("web3_gateway_init_anvil", module_path)
+        self.assertIsNotNone(spec)
+        self.assertIsNotNone(spec.loader)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            project = root / "bns"
+            hardhat = project / "node_modules" / ".bin" / "hardhat"
+            hardhat.parent.mkdir(parents=True)
+            hardhat.write_text("", encoding="utf-8")
+            deployed_to = "0x1234567890123456789012345678901234567890"
+            run_checked = mock.Mock(
+                side_effect=[
+                    mock.Mock(stdout="", stderr=""),
+                    mock.Mock(
+                        stdout=json.dumps({"deployedTo": deployed_to}),
+                        stderr="",
+                    ),
+                ]
+            )
+
+            with (
+                mock.patch.object(module, "find_executable", return_value="/usr/bin/npm"),
+                mock.patch.object(module, "find_bns_project_dir", return_value=project),
+                mock.patch.object(module, "run_checked", run_checked),
+                mock.patch.object(module, "contract_deployed", return_value=True),
+            ):
+                contract = module.deploy_bns_contract(root)
+
+            self.assertEqual(contract, deployed_to)
+            self.assertEqual(
+                run_checked.call_args_list[0].args,
+                (["/usr/bin/npm", "run", "--silent", "compile"], project),
+            )
+            deploy_call = run_checked.call_args_list[1]
+            self.assertEqual(
+                deploy_call.args,
+                (["/usr/bin/npm", "run", "--silent", "deploy:local"], project),
+            )
+            self.assertEqual(
+                deploy_call.kwargs["env"]["BNS_ANVIL_RPC_URL"],
+                module.BNS_RPC_ENDPOINT,
+            )
+            self.assertEqual(
+                deploy_call.kwargs["env"]["BNS_ANVIL_PRIVATE_KEY"],
+                module.BNS_DEPLOYER_PRIVATE_KEY,
+            )
+            deployment = json.loads((root / module.BNS_DEPLOYMENT_FILE).read_text())
+            self.assertEqual(deployment["deployedTo"], deployed_to)
 
     def test_recreate_staging_only_removes_expected_child(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

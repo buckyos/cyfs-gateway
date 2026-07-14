@@ -966,6 +966,7 @@ mod tests {
     use super::*;
 
     use std::process::Stdio;
+    use std::sync::OnceLock;
 
     use bns_evm::{Address, EthRpcClient};
     use name_client::{
@@ -980,7 +981,7 @@ mod tests {
     const CHAIN_ID: u64 = 31_337;
     const DEPLOYER_KEY: &str = "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d";
 
-    fn foundry_available() -> bool {
+    fn e2e_tools_available() -> bool {
         fn has(bin: &str) -> bool {
             std::process::Command::new(bin)
                 .arg("--version")
@@ -990,7 +991,12 @@ mod tests {
                 .map(|status| status.success())
                 .unwrap_or(false)
         }
-        has("anvil") && has("forge")
+        has("anvil") && has("node") && has("npm")
+    }
+
+    fn hardhat_lock() -> &'static tokio::sync::Mutex<()> {
+        static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
     }
 
     async fn allocate_free_port() -> u16 {
@@ -1012,7 +1018,7 @@ mod tests {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../apps/bns")
             .canonicalize()
-            .expect("bns foundry project should exist")
+            .expect("bns hardhat project should exist")
     }
 
     struct AnvilNode {
@@ -1057,37 +1063,52 @@ mod tests {
     }
 
     async fn deploy_bns(endpoint: &str) -> Address {
-        let output = Command::new("forge")
+        static COMPILED: OnceLock<()> = OnceLock::new();
+
+        let _guard = hardhat_lock().lock().await;
+        if COMPILED.get().is_none() {
+            let compile = Command::new("npm")
+                .current_dir(bns_app_dir())
+                .args(["run", "--silent", "compile:sync"])
+                .output()
+                .await
+                .expect("failed to run Hardhat compile:sync");
+            assert!(
+                compile.status.success(),
+                "Hardhat compile:sync failed:\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&compile.stdout),
+                String::from_utf8_lossy(&compile.stderr)
+            );
+            COMPILED
+                .set(())
+                .expect("Hardhat compile state should be empty");
+        }
+
+        let output = Command::new("npm")
             .current_dir(bns_app_dir())
-            .args([
-                "create",
-                "src/Bns.sol:Bns",
-                "--rpc-url",
-                endpoint,
-                "--private-key",
-                DEPLOYER_KEY,
-                "--broadcast",
-                "--json",
-            ])
+            .env("BNS_ANVIL_RPC_URL", endpoint)
+            .env("BNS_ANVIL_PRIVATE_KEY", DEPLOYER_KEY)
+            .args(["run", "--silent", "deploy:local"])
             .output()
             .await
-            .expect("failed to run forge create");
+            .expect("failed to run Hardhat local deployment");
         assert!(
             output.status.success(),
-            "forge create failed: {}",
+            "Hardhat local deployment failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
         let stdout = String::from_utf8_lossy(&output.stdout);
         let start = stdout
             .find('{')
-            .unwrap_or_else(|| panic!("forge create produced no JSON: {stdout}"));
+            .unwrap_or_else(|| panic!("Hardhat deployment produced no JSON: {stdout}"));
         let end = stdout
             .rfind('}')
-            .unwrap_or_else(|| panic!("forge create produced no JSON object: {stdout}"));
+            .unwrap_or_else(|| panic!("Hardhat deployment produced no JSON object: {stdout}"));
         let parsed: Value = serde_json::from_str(&stdout[start..=end]).unwrap();
         parsed["deployedTo"]
             .as_str()
-            .expect("forge create JSON missing deployedTo")
+            .expect("Hardhat deployment JSON missing deployedTo")
             .parse()
             .expect("invalid deployed contract address")
     }
@@ -1117,10 +1138,10 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires Foundry (anvil/forge); run with --ignored"]
+    #[ignore = "requires anvil/node/npm; run with --ignored"]
     async fn on_init_txs_seed_documents_are_readable_through_bns_http_resolver() {
-        if !foundry_available() {
-            eprintln!("skipping: anvil/forge not on PATH");
+        if !e2e_tools_available() {
+            eprintln!("skipping: anvil/node/npm not on PATH");
             return;
         }
 
@@ -1256,10 +1277,10 @@ on_init_txs:
     /// 3. 文档变更的重放用 asset_owner_key 以 owner 身份 apply_mutations；
     /// 4. 变更但缺 asset_owner_key 时报带指引的错误（而不是裸 EVM revert）。
     #[tokio::test]
-    #[ignore = "requires Foundry (anvil/forge); run with --ignored"]
+    #[ignore = "requires anvil/node/npm; run with --ignored"]
     async fn on_init_txs_replay_updates_changed_documents_with_asset_owner_key() {
-        if !foundry_available() {
-            eprintln!("skipping: anvil/forge not on PATH");
+        if !e2e_tools_available() {
+            eprintln!("skipping: anvil/node/npm not on PATH");
             return;
         }
 

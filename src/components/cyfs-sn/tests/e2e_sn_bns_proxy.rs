@@ -1,6 +1,6 @@
 //! SN BNS proxy 真链 e2e（doc/SN/sn-bns-proxy-todo.md §测试）。
 //!
-//! 在测试进程内拉起 anvil + `forge create` 部署 `Bns.sol`（与
+//! 在测试进程内拉起 anvil + Hardhat 部署 BNS UUPS proxy/facets（与
 //! bns-client/tests/e2e_anvil.rs 同一套自包含 harness），验证完整验收链路：
 //!
 //! 注册（SN 代付 gas，assetOwner=用户地址）
@@ -13,11 +13,11 @@
 //!   -> controller 再写 dns_txt：TX 可投递但链上 revert（status 0x0），投影不变。
 //!
 //! - `#[ignore]`：默认跳过；`cargo test -p cyfs-sn --test e2e_sn_bns_proxy -- --ignored` 运行。
-//! - 缺 Foundry（anvil/forge 不在 PATH）时优雅跳过。
+//! - 缺 Anvil 或 Node.js（anvil/node/npm 不在 PATH）时优雅跳过。
 
 use std::path::PathBuf;
 use std::process::Stdio;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use bns_client::{
@@ -61,7 +61,7 @@ const USER_OWNER_ADDR: &str = "0x90f79bf6eb2c4f870365e785982e1f101e93b906";
 
 const USER_NAME: &str = "alice";
 
-fn foundry_available() -> bool {
+fn e2e_tools_available() -> bool {
     fn has(bin: &str) -> bool {
         std::process::Command::new(bin)
             .arg("--version")
@@ -71,7 +71,12 @@ fn foundry_available() -> bool {
             .map(|s| s.success())
             .unwrap_or(false)
     }
-    has("anvil") && has("forge")
+    has("anvil") && has("node") && has("npm")
+}
+
+fn hardhat_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
 }
 
 fn bns_app_dir() -> PathBuf {
@@ -79,7 +84,7 @@ fn bns_app_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../apps/bns")
         .canonicalize()
-        .expect("bns foundry project should exist")
+        .expect("bns hardhat project should exist")
 }
 
 struct AnvilNode {
@@ -135,37 +140,52 @@ impl AnvilNode {
 }
 
 async fn deploy_bns(endpoint: &str, deployer_key: &str) -> Address {
-    let output = Command::new("forge")
+    static COMPILED: OnceLock<()> = OnceLock::new();
+
+    let _guard = hardhat_lock().lock().await;
+    if COMPILED.get().is_none() {
+        let compile = Command::new("npm")
+            .current_dir(bns_app_dir())
+            .args(["run", "--silent", "compile"])
+            .output()
+            .await
+            .expect("failed to run Hardhat compile");
+        assert!(
+            compile.status.success(),
+            "Hardhat compile failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&compile.stdout),
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        COMPILED
+            .set(())
+            .expect("Hardhat compile state should be empty");
+    }
+
+    let output = Command::new("npm")
         .current_dir(bns_app_dir())
-        .args([
-            "create",
-            "src/Bns.sol:Bns",
-            "--rpc-url",
-            endpoint,
-            "--private-key",
-            deployer_key,
-            "--broadcast",
-            "--json",
-        ])
+        .env("BNS_ANVIL_RPC_URL", endpoint)
+        .env("BNS_ANVIL_PRIVATE_KEY", deployer_key)
+        .args(["run", "--silent", "deploy:local"])
         .output()
         .await
-        .expect("failed to run forge create");
+        .expect("failed to run Hardhat local deployment");
     assert!(
         output.status.success(),
-        "forge create failed: {}",
+        "Hardhat local deployment failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     let start = stdout
         .find('{')
-        .unwrap_or_else(|| panic!("forge create produced no JSON: {stdout}"));
+        .unwrap_or_else(|| panic!("Hardhat deployment produced no JSON: {stdout}"));
     let end = stdout
         .rfind('}')
-        .unwrap_or_else(|| panic!("forge create produced no JSON object: {stdout}"));
+        .unwrap_or_else(|| panic!("Hardhat deployment produced no JSON object: {stdout}"));
     let parsed: serde_json::Value = serde_json::from_str(&stdout[start..=end]).unwrap();
     parsed["deployedTo"]
         .as_str()
-        .expect("forge create JSON missing deployedTo")
+        .expect("Hardhat deployment JSON missing deployedTo")
         .parse()
         .expect("invalid deployed contract address")
 }
@@ -265,10 +285,10 @@ fn build_proxy(
 }
 
 #[tokio::test]
-#[ignore = "requires Foundry (anvil/forge); run with --ignored"]
+#[ignore = "requires anvil/node/npm; run with --ignored"]
 async fn e2e_register_publish_document_then_owner_exits_sn_custody() {
-    if !foundry_available() {
-        eprintln!("skipping: anvil/forge not on PATH");
+    if !e2e_tools_available() {
+        eprintln!("skipping: anvil/node/npm not on PATH");
         return;
     }
     let node = AnvilNode::start().await;

@@ -136,7 +136,7 @@ fi
 # --- 2) 编译合约并同步 ABI（fresh）---
 if [ "$MODE" = "fresh" ]; then
   echo "[dv-up] compiling contracts and synchronizing ABI"
-  npm run --silent compile
+  npm run --silent compile:sync
 fi
 
 ANVIL_ARGS=(

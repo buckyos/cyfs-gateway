@@ -6,9 +6,11 @@
     "node": ">=22.13.0"
   },
   "scripts": {
-    "compile": "hardhat build && npm run facets:check && npm run abi:sync",
+    "compile": "hardhat build && npm run facets:check && npm run bindings:generate",
+    "compile:sync": "npm run compile && npm run abi:sync",
     "test": "hardhat test solidity",
     "facets:check": "node hardhat-scripts/check-facets.mjs",
+    "bindings:generate": "node hardhat-scripts/generate-bindings.mjs",
     "abi:sync": "node hardhat-scripts/sync-abi.mjs",
     "abi:check": "node hardhat-scripts/sync-abi.mjs --check",
     "validate:upgrade": "hardhat run hardhat-scripts/validate-upgrade.ts",

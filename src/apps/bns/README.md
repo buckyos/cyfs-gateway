@@ -33,24 +33,38 @@ npm install
 npm test
 ```
 
-Compile the same Solidity source, validate facet boundaries, and synchronize the
-committed ABI used by Backend/deployment tooling:
+Compile the Solidity source, validate facet boundaries, and generate the aggregate
+binding inside the contract project:
 
 ```bash
 cd src/apps/bns
-npm run compile
+npm run compile:sync
+# generated: bindings/BnsBindings.sol
+```
+
+`npm run compile:sync` checks all 28 routed selectors, the EIP-170 limit, and the complete
+Solidity storage layout shared by Router and facets. The binding generator starts with
+`IBns`, merges the complete Router/facet artifact ABIs so inherited UUPS/Ownable events
+and errors are not lost, and restores enum members from the compiler AST in Hardhat
+build-info. Standard JSON ABI retains enum names but cannot represent their variants.
+
+Generation and cross-project synchronization remain separate underlying actions. `compile`
+writes only `bindings/BnsBindings.sol` under this contract project and never modifies
+a Backend repository. In the current monorepo, explicitly copy that generated file to
+`bns-evm` with:
+
+```bash
+npm run abi:sync
 npm run abi:check
 ```
 
-`npm run compile` checks all 28 routed selectors, the EIP-170 limit, and the complete
-Solidity storage layout shared by Router and facets. It writes the stable aggregate
-JSON ABI and the Solidity source used for Rust code generation to
-`../../components/bns-evm/abi/`. The aggregate starts with `IBns`, then merges the
-complete Router/facet artifacts so inherited UUPS/Ownable events and errors are not
-lost. Its generated Solidity form takes calls/events/errors and struct shapes from the
-JSON ABI, while restoring enum members from the compiler AST in Hardhat build-info;
-standard JSON ABI retains enum names but cannot represent their variants. Hardhat
-artifacts and cache remain local.
+The default monorepo workflow uses `npm run compile:sync` to perform compile, generation,
+and synchronization in one command. If BNSContract later becomes a submodule of a
+separate Backend repository, the Backend should run `npm run compile` in the submodule
+and copy `bindings/BnsBindings.sol` with its own build script; the contract project does
+not need to know the Backend layout. Hardhat artifacts, cache, and generated local
+bindings remain ignored build outputs. `bns-evm` does not consume a JSON ABI, so no
+`Bns.json` copy is maintained.
 
 ## Upgradeability
 
@@ -215,8 +229,9 @@ persistent local chain state, but deployment now uses the same Hardhat UUPS/face
 as production and chain inspection uses JSON-RPC directly. It therefore requires the
 Foundry installation only for the `anvil` binary, not `forge` or `cast`.
 
-**(A) Self-contained Rust e2e** (recommended, CI-able). Spawns its own anvil + deploys
-in-process; `#[ignore]` by default, skipped gracefully when Foundry is absent:
+**(A) Self-contained Rust e2e** (recommended, CI-able). Spawns its own Anvil and deploys
+the UUPS proxy/facets through the shared Hardhat path; `#[ignore]` by default, skipped
+gracefully when `anvil`, `node`, or `npm` is absent:
 
 ```bash
 cd src
