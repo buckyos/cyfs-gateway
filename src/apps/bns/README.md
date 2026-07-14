@@ -43,15 +43,16 @@ The public deployment uses the OpenZeppelin UUPS pattern:
 - `Bns` inherits `Initializable`, `OwnableUpgradeable`, and `UUPSUpgradeable`;
 - the implementation constructor disables initializers;
 - OpenZeppelin Hardhat Upgrades deploys an ERC-1967 proxy and atomically calls
-  `initialize(upgradeAdmin)`;
+  `initialize(deployer)`;
 - only `owner()` (the configured upgrade admin) can call `upgradeToAndCall`;
 - business state is stored in the proxy and the v1 layout reserves a storage gap for
   future implementation versions.
 
-The upgrade admin should be a dedicated multisig or governance account, not the
-deployment hot wallet. Clients and indexers must always use the proxy address. The
-deployment uses `deployProxy(..., { kind: "uups" })`; future implementations should
-be checked and deployed with `upgradeProxy` or `prepareUpgrade` from the same plugin.
+The deployment account becomes both the initial owner and the UUPS upgrade admin.
+Ownership can be transferred later with `transferOwnership` if governance changes.
+Clients and indexers must always use the proxy address. The deployment uses
+`deployProxy(..., { kind: "uups" })`; future implementations should be checked and
+deployed with `upgradeProxy` or `prepareUpgrade` from the same plugin.
 The current implementation can be checked without deploying it:
 
 ```bash
@@ -66,7 +67,6 @@ derived from the selected Hardhat network name and the chain ID returned by its 
 
 ```bash
 cd src/apps/bns
-BNS_UPGRADE_ADMIN=0x... \
 BNS_DEPLOY_CONFIRMATION=anvil:31337 \
 npm run deploy -- --network anvil
 ```
@@ -78,7 +78,6 @@ from the environment. Its convenience command is:
 cd src/apps/bns
 BNS_OP_MAINNET_RPC_URL=https://your-op-mainnet-rpc \
 BNS_DEPLOYER_PRIVATE_KEY=0x... \
-BNS_UPGRADE_ADMIN=0x... \
 BNS_DEPLOY_CONFIRMATION=opMainnet:10 \
 npm run deploy:op-mainnet
 ```

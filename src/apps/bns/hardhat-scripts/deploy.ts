@@ -84,12 +84,6 @@ async function main(): Promise<void> {
   const repoRoot = git(contractDirectory, ["rev-parse", "--show-toplevel"]);
   const commit = assertDeploymentInputsCommitted(repoRoot);
 
-  const upgradeAdminValue = process.env.BNS_UPGRADE_ADMIN;
-  if (upgradeAdminValue === undefined) {
-    throw new Error("BNS_UPGRADE_ADMIN is required");
-  }
-  const upgradeAdmin = getAddress(upgradeAdminValue);
-
   const connection = await hre.network.create();
   const { ethers } = connection;
   const upgradesApi = await upgrades(hre, connection);
@@ -119,10 +113,11 @@ async function main(): Promise<void> {
     throw new Error(`No deployment account configured for network ${networkName}`);
   }
   const deployer = getAddress(await deployerSigner.getAddress());
+  const upgradeAdmin = deployer;
 
   console.log(`Network: ${networkName} (chain ID ${chainId})`);
   console.log(`Deploying from: ${deployer}`);
-  console.log(`Upgrade admin: ${upgradeAdmin}`);
+  console.log(`Owner / upgrade admin: ${upgradeAdmin}`);
   console.log(`Source commit: ${commit}`);
 
   const Bns = await ethers.getContractFactory("Bns", deployerSigner);
