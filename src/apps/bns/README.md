@@ -5,12 +5,21 @@ First EVM implementation of the BNS registry described in
 
 ## Layout
 
-- `src/Bns.sol`: registry contract and protocol structs.
+- `src/Bns.sol`: UUPS implementation and selector router.
+- `src/BnsCore.sol`: shared proxy storage layout and internal business helpers.
+- `src/BnsTypes.sol`, `src/BnsEvents.sol`, `src/IBns.sol`: protocol types,
+  events, and the aggregated public ABI.
+- `src/Bns*Facet.sol`: registration, atomic mutation, name, document, authority,
+  alias/payment, and resolver implementations executed with `delegatecall`.
 - `test/*.sol`: Hardhat Solidity tests for authorization, guards, documents, events,
   fuzz properties and invariants.
-- `script/Smoke.s.sol`: deploys a fresh contract to a local chain and runs a minimal write flow.
+- `hardhat-scripts/facet-manifest.json`: reviewed selector-to-facet assignment used by
+  tests and deployment.
+- `hardhat-scripts/check-facets.mjs`: runtime-size, selector coverage/collision, and
+  shared-storage-layout checks over Hardhat artifacts.
+- `hardhat-scripts/smoke.ts`: deploys a fresh Router/Facet proxy to Anvil and runs the
+  register/publish/resolve smoke flow.
 - `scripts/anvil.sh`: starts a persistent local Anvil chain.
-- `scripts/deploy.sh`: legacy local-chain direct deployment used by the existing DV flow.
 
 ## Contract Tests
 
@@ -24,8 +33,8 @@ npm install
 npm test
 ```
 
-Compile the same Solidity source and synchronize the committed ABI used by
-Backend/deployment tooling:
+Compile the same Solidity source, validate facet boundaries, and synchronize the
+committed ABI used by Backend/deployment tooling:
 
 ```bash
 cd src/apps/bns
@@ -33,8 +42,11 @@ npm run compile
 npm run abi:check
 ```
 
-`npm run compile` writes only the stable ABI array to
-`../../components/bns-evm/abi/Bns.json`. Hardhat artifacts and cache remain local.
+`npm run compile` checks all 28 routed selectors, the EIP-170 limit, and the complete
+Solidity storage layout shared by Router and facets. It writes the stable JSON ABI and
+the flattened Solidity source used for Rust code generation to
+`../../components/bns-evm/abi/`. The Solidity form preserves enum variant names that
+JSON ABI cannot represent. Hardhat artifacts and cache remain local.
 
 ## Upgradeability
 
@@ -45,8 +57,13 @@ The public deployment uses the OpenZeppelin UUPS pattern:
 - OpenZeppelin Hardhat Upgrades deploys an ERC-1967 proxy and atomically calls
   `initialize(deployer)`;
 - only `owner()` (the configured upgrade admin) can call `upgradeToAndCall`;
-- business state is stored in the proxy and the v1 layout reserves a storage gap for
-  future implementation versions.
+- the UUPS implementation routes business selectors to separately deployed facets;
+- facets execute with `delegatecall`, so business state, `msg.sender`, `address(this)`,
+  events, and the global log root all remain attached to the proxy;
+- business state uses one shared `BnsCore` layout and reserves a storage gap for
+  future versions;
+- the selector table uses the independent
+  `keccak256("buckyos.bns.router.storage.v1")` storage namespace.
 
 The deployment account becomes both the initial owner and the UUPS upgrade admin.
 Ownership can be transferred later with `transferOwnership` if governance changes.
@@ -61,13 +78,13 @@ npm run validate:upgrade
 
 ## Upgradeable Deployment
 
-`hardhat-scripts/deploy.ts` is network-independent. Select any network configured in
-`hardhat.config.ts` with Hardhat's `--network` option. The confirmation value is
-derived from the selected Hardhat network name and the chain ID returned by its RPC:
+`hardhat-scripts/deploy.ts` is network-independent and has no chain allowlist or
+extra deployment-confirmation environment variable. Select any EVM-compatible network
+configured in `hardhat.config.ts` with Hardhat's `--network` option; the script reads
+the actual chain ID from its RPC for the deployment record:
 
 ```bash
 cd src/apps/bns
-BNS_DEPLOY_CONFIRMATION=anvil:31337 \
 npm run deploy -- --network anvil
 ```
 
@@ -78,7 +95,6 @@ from the environment. Its convenience command is:
 cd src/apps/bns
 BNS_OP_MAINNET_RPC_URL=https://your-op-mainnet-rpc \
 BNS_DEPLOYER_PRIVATE_KEY=0x... \
-BNS_DEPLOY_CONFIRMATION=opMainnet:10 \
 npm run deploy:op-mainnet
 ```
 
@@ -88,81 +104,99 @@ deployment transaction. Before deployment, it checks that:
 - `src/`, Hardhat config, package manifests, lockfile, and the deployment script are
   all tracked and clean at `HEAD`;
 - the deployment output does not already exist;
-- `BNS_DEPLOY_CONFIRMATION` exactly matches `<networkName>:<chainId>`;
-- OpenZeppelin's upgrade-safety validation accepts the UUPS implementation.
+- OpenZeppelin's upgrade-safety validation accepts the UUPS implementation;
+- the facet manifest covers the complete business ABI without selector collisions,
+  every facet shares the Router's storage layout, and all runtime sizes are deployable.
 
-OpenZeppelin Hardhat Upgrades owns implementation/proxy deployment, initialization,
-ERC-1967 lookup, and its per-network manifest. The script verifies the on-chain
-upgrade admin before writing `deployments/<network-name>.json` (`op-mainnet.json` for
-the `opMainnet` config). The record contains at least:
+OpenZeppelin Hardhat Upgrades owns router implementation/proxy deployment,
+initialization, ERC-1967 lookup, and its per-network manifest. The deployment script
+also deploys every facet, rejects duplicate selectors or facet runtime larger than
+24,576 bytes, installs the selector manifest, and reads every selector back from the
+proxy. It verifies the on-chain upgrade admin before writing
+`deployments/<network-name>.json` (`op-mainnet.json` for the `opMainnet` config).
+The record contains at least:
 
 - `deployedAt`;
 - `deploymentCommitHash`;
 - `proxyAddress`;
 - `implementationAddress`;
-- network and chain ID, deployer, upgrade admin, bytecode size, proxy transaction
-  hash, and block number.
+- every facet address, runtime size, selectors, deployment transaction and block;
+- the selector-configuration transaction;
+- network and chain ID, deployer, upgrade admin, router bytecode size, proxy
+  transaction hash, and block number.
 
-The proxy and implementation addresses are also printed to the console. The private
-key is only read from the selected Hardhat network configuration and is never printed
-or written to the deployment record. OpenZeppelin also writes a network manifest
+The proxy, implementation, and facet addresses are also printed to the console. The
+private key is only read from the selected Hardhat network configuration and is never
+printed or written to the deployment record. OpenZeppelin also writes a network manifest
 under `.openzeppelin/`; commit manifests for persistent networks because later
 upgrade validation and implementation reuse depend on them. Ephemeral
 manifests for the common local chain IDs 1337 and 31337 are ignored.
 
-### Current deployment blocker
+### Runtime bytecode sizes
 
-After the UUPS conversion, the optimized BNS implementation runtime bytecode is
-41,079 bytes. OP Mainnet enforces the EIP-170 limit of 24,576 bytes, so the current
-implementation still cannot be deployed there. OpenZeppelin's deployment plugin does
-not change that limit. Contract splitting/size reduction remains a separate
-prerequisite for the actual mainnet deployment.
+With Solidity 0.8.24, `viaIR=true`, and optimizer `runs=20`, the deployable production
+contracts are:
+
+| Contract | Runtime bytes |
+| --- | ---: |
+| `Bns` UUPS Router | 4,562 |
+| `BnsResolverFacet` | 9,882 |
+| `BnsRegistrationFacet` | 17,244 |
+| `BnsAtomicMutationFacet` | 19,145 |
+| `BnsNameFacet` | 9,857 |
+| `BnsAuthorityFacet` | 6,670 |
+| `BnsDocumentFacet` | 13,835 |
+| `BnsAliasPaymentFacet` | 10,321 |
+
+Every implementation is below the EIP-170 24,576-byte runtime limit. The largest
+facet retains 5,431 bytes of upgrade headroom. The proxy remains the only address used
+by clients and indexers.
 
 ## Local Anvil Chain
 
-The current persistent DV chain and deployment scripts still use Foundry. Install
-it when running those workflows; replacing Anvil is a separate migration step.
+Anvil remains the persistent local development chain. Hardhat connects to its JSON-RPC
+endpoint for deployment and smoke execution; Hardhat Node is not involved. Install
+Foundry for the `anvil` binary only—the local contract smoke no longer uses `forge`.
 
 ```bash
 curl -L https://foundry.paradigm.xyz | bash
 foundryup
 ```
 
-Scripts that target an existing Anvil instance can use `npm run run:anvil -- <script>`;
-override the default endpoint with `BNS_ANVIL_RPC_URL` and provide
-`BNS_ANVIL_PRIVATE_KEY` only when the script needs an account.
-
-Start a private chain:
+Start the persistent chain:
 
 ```bash
 cd src/apps/bns
 ./scripts/anvil.sh
 ```
 
-Deploy in another terminal:
+In another terminal, run the complete deployment and contract smoke flow:
 
 ```bash
 cd src/apps/bns
-BNS_RPC_URL=http://127.0.0.1:8545 \
-BNS_DEPLOYER_PRIVATE_KEY=0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80 \
-./scripts/deploy.sh
+npm run smoke:anvil
 ```
 
-Run an on-chain smoke flow against Anvil:
+Override the endpoint when Anvil is not listening on the default
+`http://127.0.0.1:8545`. A private key is optional because Hardhat otherwise uses an
+unlocked Anvil account:
 
 ```bash
 cd src/apps/bns
-BNS_RPC_URL=http://127.0.0.1:8545 \
-BNS_PRIVATE_KEY=0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80 \
-forge script script/Smoke.s.sol:Smoke \
-  --rpc-url "$BNS_RPC_URL" \
-  --broadcast \
-  --disable-code-size-limit
+BNS_ANVIL_RPC_URL=http://127.0.0.1:9545 \
+BNS_ANVIL_PRIVATE_KEY=0x... \
+npm run smoke:anvil
 ```
 
-## DV Integration Environment (end-to-end)
+Each smoke run deploys seven facets plus a fresh UUPS Router proxy, installs all 28
+business selectors, registers `alice`, publishes its inline `owner` document, and
+resolves the active version from the proxy. Addresses and each successful phase are
+printed to the console; no separate local deployment step or record is required.
 
-See `doc/SN/SN-测试计划.md` §5. Two ways to exercise the full
+## Legacy DV Integration Environment (currently deferred)
+
+See `doc/SN/SN-测试计划.md` §5 for the historical flow. Both paths currently assume a
+directly deployed monolithic `Bns` and must be made facet-aware before they can exercise the full
 `BNS(contract) <-> Indexer <-> Server <-> Client <-> Controller` path against a real
 private chain (requires Foundry: `anvil`, `forge`, `cast`).
 
@@ -205,7 +239,6 @@ that struct. The contract derives the concrete signer from `msg.sender` and chec
 against either the effective chain-account owner or a registered BNS authority key.
 This is the intended signing boundary for the Anvil/private-chain V1.
 
-The V1 contract intentionally keeps the full closed-loop interface in one contract, so
-its bytecode is above the public-chain EIP-170 size limit. The Anvil script disables
-that limit for the private-chain workflow. Before a public-chain deployment, split the
-contract into facets/modules or move read-heavy helpers out of the write contract.
+The V1 public ABI remains available at one proxy address, while its implementation is
+split across deployable facets. Backend and Indexer code use the aggregated `IBns` ABI
+and do not need facet addresses for normal protocol calls or event synchronization.

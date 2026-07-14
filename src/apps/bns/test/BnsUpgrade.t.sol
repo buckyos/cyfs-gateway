@@ -1,11 +1,15 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
+import "../src/BnsTypes.sol";
+
 import { OwnableUpgradeable } from
     "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
 import { Initializable } from "@openzeppelin/contracts/proxy/utils/Initializable.sol";
 import { ERC1967Proxy } from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 
+import { Bns } from "../src/Bns.sol";
+import { IBns } from "../src/IBns.sol";
 import "./BnsTestBase.sol";
 
 contract BnsV2ForTest is Bns {
@@ -43,9 +47,9 @@ contract BnsUpgradeTest is BnsTestBase {
         BnsV2ForTest nextImplementation = new BnsV2ForTest();
         bns.upgradeToAndCall(address(nextImplementation), "");
 
-        BnsV2ForTest upgraded = BnsV2ForTest(address(bns));
+        BnsV2ForTest upgraded = BnsV2ForTest(payable(address(bns)));
         assertEqUint(upgraded.implementationVersion(), 2, "implementation not upgraded");
-        NameState memory afterUpgrade = upgraded.queryNameState("alice");
+        NameState memory afterUpgrade = IBns(address(upgraded)).queryNameState("alice");
         assertEqUint(afterUpgrade.nameSeq, beforeUpgrade.nameSeq, "name seq changed");
         assertTrue(afterUpgrade.assetOwner == beforeUpgrade.assetOwner, "asset owner changed");
         assertEqBytes32(upgraded.currentLogRoot(), logRootBefore, "log root changed");

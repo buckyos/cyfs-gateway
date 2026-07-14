@@ -13,10 +13,10 @@ EVM 客户端基础层与索引器事件投影已落地；BNS Server 已切到 r
 
 | 模块 | 状态 | 说明 |
 | --- | --- | --- |
-| 私链环境（Anvil 脚本） | ✅ 已完成 | [scripts/anvil.sh](../src/apps/bns/scripts/anvil.sh) / [scripts/deploy.sh](../src/apps/bns/scripts/deploy.sh) |
+| 私链环境（Anvil 脚本） | ✅ 已完成 | [scripts/anvil.sh](../src/apps/bns/scripts/anvil.sh) + Hardhat `smoke:anvil` |
 | BNS 合约 `Bns.sol` | ✅ 已完成（**超出原计划范围**） | 一次性实现了**完整闭环接口**，而非计划中的"先 5 个核心写操作"，见 [src/Bns.sol](../src/apps/bns/src/Bns.sol) |
 | `forge test` 合约单测 | ✅ 已完成 | 6 个用例，覆盖鉴权 / guard / 文档 / 事件，见 [test/Bns.t.sol](../src/apps/bns/test/Bns.t.sol) |
-| 链上 smoke 流程 | ✅ 已完成 | [script/Smoke.s.sol](../src/apps/bns/script/Smoke.s.sol)：部署 → registerName → publishDocument → resolveDocument |
+| 链上 smoke 流程 | ✅ 已完成 | [hardhat-scripts/smoke.ts](../src/apps/bns/hardhat-scripts/smoke.ts)：部署 Router/Facet → registerName → publishDocument → resolveDocument |
 | `bns-evm` crate（alloy 绑定 + TX 构造/签名） | ✅ 基础已完成 | 新增 [src/components/bns-evm](../src/components/bns-evm)：`sol!` ABI 绑定、calldata/event 解码、EIP-1559 TX 构造/签名、JSON-RPC helper、round-trip 测试 |
 | Standard / Controller 客户端 | ✅ 已完成 | `src/components/bns-client` 新增 EVM Standard/Controller client、raw TX 提交、unsigned TX helper、托管私钥签名；`sn_bns_controller.rs` 写路径**仅有** `EvmSnBnsWriteBackend` 一种实现（[sn_bns_controller.rs:466](../src/components/bns-client/src/sn_bns_controller.rs:466)），通过 Controller Client 自动签名提交，旧 RPC/CallAuthority 写 backend 已删除 |
 | `bns-indexer` → 事件索引器 | ✅ 已完成 | [sync.rs](../src/components/bns-indexer/src/sync.rs)：轮询 `eth_getLogs` 同步器、常驻 polling driver、last-synced-block+block-hash 游标、reorg 检测后重放、完整读投影重建（names/documents/authority/controller/alias/checkpoint）、`EventLogRecord` 写入；`CentralizedBnsRegistry::new` 默认只读，旧状态机写路径仅保留隐藏 legacy 测试入口 |
@@ -26,7 +26,7 @@ EVM 客户端基础层与索引器事件投影已落地；BNS Server 已切到 r
 ### 与原计划的两处关键偏差（需注意）
 
 1. **合约范围一次到顶，而非渐进式**：合约不是"先跑通 5 个写操作"，而是把**整套闭环接口**（注册 / 续期 / 转移 / owner / 释放 / 命名空间策略 / 授权密钥 / controller 策略 / 文档发布撤销 / 别名 / 支付目标 / 日志检查点 + 全部读 API）放进**单个 `Bns.sol`**。
-   - 代价：字节码**超过公链 EIP-170 大小上限**，私链脚本用 `--disable-code-size-limit` 绕过；上公链前需拆分 facet/module（README 已注明）。
+   - 当时代价：字节码**超过公链 EIP-170 大小上限**；现已拆为标准尺寸限制内的 Router/Facet，私链不再绕过尺寸限制。
 
 2. **`CallAuthority` 被保留在 ABI 中，但不被信任**：原计划是"删掉 `CallAuthority`，纯靠 `msg.sender`"。实际实现是：函数签名**仍接收 `CallAuthority` 入参**（用于区分 role=Owner/Controller 与选择 `kid`），但合约**只信任 `msg.sender`**——
    `_authenticateExpectedPrincipal`（[Bns.sol:1541](../src/apps/bns/src/Bns.sol:1541)）要求 `CallAuthority.actor` 解析出的地址 / 授权密钥地址 **必须等于 `msg.sender`**。即"签名边界"已经做到合约只认节点恢复出的 sender，但 ABI 形状暂未清理。
@@ -80,8 +80,8 @@ BNS(合约) <-> BNS-Indexer <-> BNS-Server <-> BNS-Client <-> BNS-Controller
 ## 1. 私链环境（Anvil）✅ 已完成
 
 - [x] 引入 **Foundry**：`forge`（写/编译/测合约）+ `anvil`（私链）。README 含安装指引。
-- [x] 起链脚本 [scripts/anvil.sh](../src/apps/bns/scripts/anvil.sh)：`--state var/anvil-state.json`（持久化）、`--block-time 1`、固定助记词 `test test ... junk`（确定性账户）、`--chain-id 31337`、`--disable-code-size-limit`。
-- [x] 部署脚本 [scripts/deploy.sh](../src/apps/bns/scripts/deploy.sh)：`forge build` + `forge create src/Bns.sol:Bns`，输出到 `deployments/anvil.local.json`。
+- [x] 起链脚本 [scripts/anvil.sh](../src/apps/bns/scripts/anvil.sh)：`--state var/anvil-state.json`（持久化）、`--block-time 1`、固定助记词 `test test ... junk`（确定性账户）、`--chain-id 31337`。
+- [x] 本地部署已合并进 Hardhat `smoke:anvil`，每轮部署新 Router/Facet proxy 后直接执行链上验证，不再需要独立本地部署步骤。
 - [x] "随时可改"工作流：改 `Bns.sol` → `forge build` → 重新部署。**中心化测试环境，零迁移负担**。
 - [x] 集成测试从 Rust 里自动拉起 anvil + 部署合约 + 跑端到端：[tests/e2e_anvil.rs](../src/components/bns-client/tests/e2e_anvil.rs)（7 个 `#[ignore]` 用例，缺 Foundry 时优雅跳过）。**实现差异**：用 `std::process::Command` 直接拉起 `anvil` + `forge create`，未使用 `alloy-node-bindings` 库。
 - [x] 配置项进 Rust 侧：链 RPC endpoint、chainId、合约地址、controller 私钥来源字段已进入 `SNServerConfig.bns_evm`。
@@ -116,7 +116,7 @@ BNS(合约) <-> BNS-Indexer <-> BNS-Server <-> BNS-Client <-> BNS-Controller
 - [x] 大对象走 `DocumentRef`：inline 上限 `MAX_INLINE_DOCUMENT = 4KB`（[Bns.sol:258](../src/apps/bns/src/Bns.sol:258)），inline 必须 `sha256(inlineDocument) == contentHash`；非 inline 走 `uri` + hash 引用。
 - [x] `MutationGuard`（`expectedNameSeq` + `expectedParentNameSeq`）作为参数进合约，`_checkGuard`（[Bns.sol:1663](../src/apps/bns/src/Bns.sol:1663)）`require(nameSeq == expected)`；`_hashDocumentState`（[Bns.sol:1945](../src/apps/bns/src/Bns.sol:1945)）/ `_commitEvent` 均混入 `block.chainid` + `address(this)` 防跨部署重放。
 - [x] `forge test` 写 Solidity 单测，覆盖鉴权 / guard / 文档 / 事件（见 §9）。
-- [ ] **上公链前的拆分**：当前单合约字节码超过 EIP-170 上限，仅私链 `--disable-code-size-limit` 可部署。上公链需拆 facet/module 或把读 helper 移出写合约。（README 已注明，留作后续。）
+- [x] **上公链前的拆分**：已拆为共享 storage 的 UUPS Router/Facet；全部生产 implementation 均低于 EIP-170 上限，私链也使用标准尺寸限制。
 
 ## 3. `bns-evm` crate（ABI 绑定 + TX 构造/签名）✅ 基础已完成
 
@@ -190,7 +190,7 @@ BNS(合约) <-> BNS-Indexer <-> BNS-Server <-> BNS-Client <-> BNS-Controller
   - `testControllerCanOnlyPublishAllowedDocType`（controller scope 限制）
   - `testBnsAuthorityKeyTakesOverFromAssetOwner`（BNS 授权密钥接管 assetOwner）
   - `testRevokeCurrentVersionKeepsCurrentPointerRevoked`（撤销当前版本）
-- [x] 链上 smoke：[script/Smoke.s.sol](../src/apps/bns/script/Smoke.s.sol) 部署 → registerName → publishDocument → resolveDocument。
+- [x] 链上 smoke：[hardhat-scripts/smoke.ts](../src/apps/bns/hardhat-scripts/smoke.ts) 部署 Router/Facet → registerName → publishDocument → resolveDocument。
 - [x] `bns-evm` calldata/TX round-trip + 独立 signer 恢复交叉验证。
 - [x] `bns-client` EVM call 转换与 unsigned TX 构造测试。
 - [x] `bns-indexer` 合约事件投影与 SQLite event 写入测试。
@@ -223,7 +223,7 @@ BNS(合约) <-> BNS-Indexer <-> BNS-Server <-> BNS-Client <-> BNS-Controller
 
 1. TX 类型 **EIP-1559** 还是 legacy？— **已按 EIP-1559 基础实现**（`bns-evm`）。
 2. 写路径：客户端**直连链 RPC** 还是经 **BNS Server 代理**？— **已澄清定位**（见 §0.1/§6）：无论直连还是经 BNS-Server，Server 层都只是**标准合约处理器**，仅做 raw TX 转发 + 读，不签名、不含 control 逻辑；自动签名/control 一律在 BNS-Client/BNS-Controller 完成。具体物理拓扑（直连 vs 经 Server）仍可后定。
-3. chainId 与合约地址如何分配/配置？— 私链已**默认 chainId = 31337**（`anvil.sh`，可经 `ANVIL_CHAIN_ID` 覆盖），合约地址由 `deploy.sh` 写入 `deployments/anvil.local.json`；Rust 侧已有 `SNServerConfig.bns_evm` 配置结构，生产分发方式仍待定。
+3. chainId 与合约地址如何分配/配置？— 私链已**默认 chainId = 31337**（`anvil.sh`，可经 `ANVIL_CHAIN_ID` 覆盖）；本地 smoke 每次部署新 proxy 并打印地址，生产部署由 `deploy.ts` 写部署记录；Rust 侧已有 `SNServerConfig.bns_evm` 配置结构，生产分发方式仍待定。
 4. controller 托管私钥存放方式（配置 / KMS / 环境变量）？— Rust 配置结构已预留环境变量 / 文件 / inline 字段；实际加载与 SN 写路径接入仍待完成。
 5. gas 字段：接受并忽略，还是强制 0？— `bns-evm`/`SNServerConfig.bns_evm` 已按 EIP-1559 gas 字段处理；具体生产策略仍需按部署环境确定。
 6. 第一批合约函数范围 — **已确定并超额完成**：实现直接覆盖了**全部闭环写操作 + 读 API**（见 §2），而非"先 register + publish"。

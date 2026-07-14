@@ -3,7 +3,7 @@
 #
 #   dv-up.sh [--fresh | --resume] [--keep-running]
 #
-# 编排：anvil（私链，--state 持久化）→ deploy.sh 部署 Bns.sol → bns-dv serve
+# 编排：anvil（私链，--state 持久化）→ forge create 部署旧单体 Bns.sol → bns-dv serve
 # （BNS-Indexer 轮询 sync_once + BNS-Server 读投影/写转发）。每步健康门控后才进入下一步，
 # 全部就绪后写出 dv-env.json。
 #
@@ -119,7 +119,6 @@ ANVIL_ARGS=(
   --host "$ANVIL_HOST" --port "$ANVIL_PORT" \
   --chain-id "$CHAIN_ID" \
   --mnemonic "$MNEMONIC" \
-  --disable-code-size-limit \
   --state "$ANVIL_STATE"
 )
 MINING_MODE="auto"

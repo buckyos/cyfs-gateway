@@ -1,8 +1,11 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
+import "../src/BnsTypes.sol";
+
+import { IBns } from "../src/IBns.sol";
 import "./BnsTestBase.sol";
-import { ERC1967Proxy } from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
+import { BnsTestDeployment } from "./BnsTestDeployment.sol";
 
 /// §1.8 — fuzz + invariant (optional enhancement).
 contract BnsFuzzTest is BnsTestBase {
@@ -66,7 +69,7 @@ contract BnsFuzzTest is BnsTestBase {
 /// (assetOwner == address(this)), so it can author owner documents without
 /// any cheatcode. Every successful mutation commits exactly one ProtocolEvent.
 contract BnsHandler {
-    Bns internal immutable bns;
+    IBns internal immutable bns;
     uint64 public expectedEvents;
 
     bytes32 constant ZERO = bytes32(0);
@@ -74,7 +77,7 @@ contract BnsHandler {
         0x696e6c696e650000000000000000000000000000000000000000000000000000;
     string[5] internal pool = ["na", "nb", "nc", "nd", "ne"];
 
-    constructor(Bns _bns) {
+    constructor(IBns _bns) {
         bns = _bns;
     }
 
@@ -161,8 +164,8 @@ contract BnsHandler {
 
 /// Invariant: globalEventSeq and the log chain stay consistent across any
 /// sequence of bounded mutations.
-contract BnsInvariantTest {
-    Bns internal bns;
+contract BnsInvariantTest is BnsTestDeployment {
+    IBns internal bns;
     BnsHandler internal handler;
 
     /// Hardhat/Foundry invariant runners probe optional target/exclusion
@@ -173,11 +176,7 @@ contract BnsInvariantTest {
     }
 
     function setUp() public {
-        Bns implementation = new Bns();
-        ERC1967Proxy proxy = new ERC1967Proxy(
-            address(implementation), abi.encodeCall(Bns.initialize, (address(this)))
-        );
-        bns = Bns(address(proxy));
+        bns = _deployBnsProxy(address(this));
         handler = new BnsHandler(bns);
     }
 

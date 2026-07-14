@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
-import "../src/Bns.sol";
-import { ERC1967Proxy } from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
+import { IBns } from "../src/IBns.sol";
+import "../src/BnsTypes.sol";
+import { BnsTestDeployment } from "./BnsTestDeployment.sol";
 
 /// Minimal subset of the Foundry cheatcode interface so the §1 suites stay
 /// dependency-free (no forge-std checkout required on CI). The cheatcode
@@ -36,10 +37,10 @@ interface Vm {
 
 /// Shared fixtures + builders for the BNS contract test suites. Concrete suites
 /// inherit this and add `test*` functions.
-contract BnsTestBase {
+contract BnsTestBase is BnsTestDeployment {
     Vm internal constant vm = Vm(address(uint160(uint256(keccak256("hevm cheat code")))));
 
-    Bns internal bns;
+    IBns internal bns;
 
     /// Reusable owner-doc body + its pre-hashed ref (built in setUp so no
     /// sha256 precompile call happens inside a pranked/expectRevert section).
@@ -185,14 +186,6 @@ contract BnsTestBase {
     function setUp() public virtual {
         bns = _deployBnsProxy(address(this));
         ownerRef = _inlineDoc(DOC_OWNER_BODY);
-    }
-
-    function _deployBnsProxy(address upgradeAdmin) internal returns (Bns instance) {
-        Bns implementation = new Bns();
-        ERC1967Proxy proxy = new ERC1967Proxy(
-            address(implementation), abi.encodeCall(Bns.initialize, (upgradeAdmin))
-        );
-        return Bns(address(proxy));
     }
 
     // --- assertion helpers (forge-std-free) -------------------------------

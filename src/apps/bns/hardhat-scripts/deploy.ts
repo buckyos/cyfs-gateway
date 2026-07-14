@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { mkdir, rename, stat, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, stat, writeFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 
@@ -9,6 +9,12 @@ import hre from "hardhat";
 
 const scriptDirectory = path.dirname(fileURLToPath(import.meta.url));
 const contractDirectory = path.resolve(scriptDirectory, "..");
+
+const facetFunctionNames = JSON.parse(
+  await readFile(path.join(scriptDirectory, "facet-manifest.json"), "utf8"),
+) as Record<string, readonly string[]>;
+
+const maxRuntimeBytecodeSize = 24_576;
 
 function git(repoRoot: string, args: string[]): string {
   return execFileSync("git", args, {
@@ -29,6 +35,8 @@ function assertDeploymentInputsCommitted(repoRoot: string): string {
     path.join(contractDirectory, "package.json"),
     path.join(contractDirectory, "package-lock.json"),
     fileURLToPath(import.meta.url),
+    path.join(scriptDirectory, "check-facets.mjs"),
+    path.join(scriptDirectory, "facet-manifest.json"),
   ].map((input) => toRepoPath(repoRoot, input));
 
   try {
@@ -83,6 +91,10 @@ async function assertOutputDoesNotExist(outputPath: string): Promise<void> {
 async function main(): Promise<void> {
   const repoRoot = git(contractDirectory, ["rev-parse", "--show-toplevel"]);
   const commit = assertDeploymentInputsCommitted(repoRoot);
+  execFileSync(process.execPath, [path.join(scriptDirectory, "check-facets.mjs")], {
+    cwd: contractDirectory,
+    stdio: "inherit",
+  });
 
   const connection = await hre.network.create();
   const { ethers } = connection;
@@ -94,12 +106,6 @@ async function main(): Promise<void> {
 
   const networkName = connection.networkName;
   const chainId = Number(network.chainId);
-  const expectedConfirmation = `${networkName}:${chainId}`;
-  if (process.env.BNS_DEPLOY_CONFIRMATION !== expectedConfirmation) {
-    throw new Error(
-      `Set BNS_DEPLOY_CONFIRMATION=${expectedConfirmation} to confirm this deployment.`,
-    );
-  }
 
   const outputPath = path.join(
     contractDirectory,
@@ -120,6 +126,55 @@ async function main(): Promise<void> {
   console.log(`Owner / upgrade admin: ${upgradeAdmin}`);
   console.log(`Source commit: ${commit}`);
 
+  const facets = [];
+  const assignedSelectors = new Set<string>();
+  for (const [contractName, functionNames] of Object.entries(
+    facetFunctionNames,
+  )) {
+    const factory = await ethers.getContractFactory(contractName, deployerSigner);
+    const facet = await factory.deploy();
+    await facet.waitForDeployment();
+    const deploymentTransaction = facet.deploymentTransaction();
+    if (deploymentTransaction === null) {
+      throw new Error(`${contractName} deployment transaction is unavailable`);
+    }
+    const receipt = await deploymentTransaction.wait();
+    if (receipt === null || receipt.status !== 1) {
+      throw new Error(`${contractName} deployment reverted: ${deploymentTransaction.hash}`);
+    }
+    const address = getAddress(await facet.getAddress());
+    const code = await ethers.provider.getCode(address);
+    const bytecodeSize = (code.length - 2) / 2;
+    if (bytecodeSize > maxRuntimeBytecodeSize) {
+      throw new Error(
+        `${contractName} runtime is ${bytecodeSize} bytes, exceeding ${maxRuntimeBytecodeSize}`,
+      );
+    }
+    const selectors = functionNames.map((functionName) => {
+      const fragment = facet.interface.getFunction(functionName);
+      if (fragment === null) {
+        throw new Error(`${contractName} has no function named ${functionName}`);
+      }
+      const selector = fragment.selector;
+      if (assignedSelectors.has(selector)) {
+        throw new Error(`Duplicate facet selector ${selector} (${functionName})`);
+      }
+      assignedSelectors.add(selector);
+      return selector;
+    });
+    facets.push({
+      contractName,
+      address,
+      bytecodeSize,
+      selectors,
+      deploymentTransaction: {
+        hash: deploymentTransaction.hash,
+        blockNumber: receipt.blockNumber.toString(),
+      },
+    });
+    console.log(`${contractName}: ${address} (${bytecodeSize} bytes)`);
+  }
+
   const Bns = await ethers.getContractFactory("Bns", deployerSigner);
   const proxy = await upgradesApi.deployProxy(Bns, [upgradeAdmin], {
     kind: "uups",
@@ -136,6 +191,28 @@ async function main(): Promise<void> {
   }
 
   const proxyAddress = getAddress(await proxy.getAddress());
+  const facetConfigurationTransaction = await proxy.addFacets(
+    facets.map((facet) => ({
+      facet: facet.address,
+      selectors: facet.selectors,
+    })),
+  );
+  const facetConfigurationReceipt = await facetConfigurationTransaction.wait();
+  if (facetConfigurationReceipt === null || facetConfigurationReceipt.status !== 1) {
+    throw new Error(
+      `BNS facet configuration reverted: ${facetConfigurationTransaction.hash}`,
+    );
+  }
+  for (const facet of facets) {
+    for (const selector of facet.selectors) {
+      const configuredFacet = getAddress(await proxy.facetForSelector(selector));
+      if (configuredFacet !== facet.address) {
+        throw new Error(
+          `Facet selector ${selector} mismatch: ${configuredFacet} != ${facet.address}`,
+        );
+      }
+    }
+  }
   const implementationAddress = getAddress(
     await upgradesApi.erc1967.getImplementationAddress(proxyAddress),
   );
@@ -149,7 +226,7 @@ async function main(): Promise<void> {
   const implementationCode = await ethers.provider.getCode(implementationAddress);
   const implementationBytecodeSize = (implementationCode.length - 2) / 2;
   const record = {
-    schemaVersion: 1,
+    schemaVersion: 2,
     network: networkName,
     chainId,
     deployedAt: new Date().toISOString(),
@@ -160,6 +237,11 @@ async function main(): Promise<void> {
     proxyAddress,
     implementationAddress,
     implementationBytecodeSize,
+    facets,
+    facetConfigurationTransaction: {
+      hash: facetConfigurationTransaction.hash,
+      blockNumber: facetConfigurationReceipt.blockNumber.toString(),
+    },
     proxyDeploymentTransaction: {
       hash: proxyDeploymentTransaction.hash,
       blockNumber: proxyReceipt.blockNumber.toString(),
@@ -177,6 +259,9 @@ async function main(): Promise<void> {
   console.log("BNS UUPS deployment completed");
   console.log(`Proxy address: ${record.proxyAddress}`);
   console.log(`Implementation address: ${record.implementationAddress}`);
+  for (const facet of record.facets) {
+    console.log(`${facet.contractName} address: ${facet.address}`);
+  }
   console.log(`Deployment record: ${outputPath}`);
 }
 
