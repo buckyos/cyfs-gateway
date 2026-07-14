@@ -5,6 +5,39 @@ use bns_indexer::{
 };
 
 #[test]
+fn projector_ignores_router_management_events() {
+    let mut projector = ContractEventProjector::new();
+    let projected = projector
+        .project_event(
+            BnsEvent::FacetSelectorAdded(Bns::FacetSelectorAdded {
+                selector: [0x12, 0x34, 0x56, 0x78].into(),
+                facet: address!("1000000000000000000000000000000000000001"),
+            }),
+            1234,
+        )
+        .unwrap();
+
+    assert!(matches!(projected, ProjectedContractEvent::Router));
+    assert_eq!(projector.pending_protocol_len(), 0);
+}
+
+#[test]
+fn projector_ignores_contract_infrastructure_events() {
+    let mut projector = ContractEventProjector::new();
+    let projected = projector
+        .project_event(
+            BnsEvent::Upgraded(Bns::Upgraded {
+                implementation: address!("1000000000000000000000000000000000000001"),
+            }),
+            1234,
+        )
+        .unwrap();
+
+    assert!(matches!(projected, ProjectedContractEvent::Infrastructure));
+    assert_eq!(projector.pending_protocol_len(), 0);
+}
+
+#[test]
 fn projector_pairs_protocol_event_with_registry_event() {
     let mut projector = ContractEventProjector::new();
     let previous = B256::from([1u8; 32]);

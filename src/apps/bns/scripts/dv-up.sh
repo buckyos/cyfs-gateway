@@ -3,7 +3,7 @@
 #
 #   dv-up.sh [--fresh | --resume] [--keep-running]
 #
-# 编排：anvil（私链，--state 持久化）→ forge create 部署旧单体 Bns.sol → bns-dv serve
+# 编排：anvil（私链，--state 持久化）→ Hardhat 部署 BNS UUPS + facets → bns-dv serve
 # （BNS-Indexer 轮询 sync_once + BNS-Server 读投影/写转发）。每步健康门控后才进入下一步，
 # 全部就绪后写出 dv-env.json。
 #
@@ -52,7 +52,7 @@ for arg in "$@"; do
   esac
 done
 
-for bin in anvil forge cast cargo; do
+for bin in anvil cargo curl node npm; do
   command -v "$bin" >/dev/null 2>&1 || { echo "missing required tool: $bin" >&2; exit 1; }
 done
 
@@ -81,8 +81,26 @@ wait_for() { # wait_for <desc> <timeout_s> <cmd...>
   done
 }
 
-anvil_chain_id_ok() { [ "$(cast chain-id --rpc-url "$RPC" 2>/dev/null)" = "$CHAIN_ID" ]; }
-contract_deployed() { local c="$1"; [ "$(cast code "$c" --rpc-url "$RPC" 2>/dev/null)" != "0x" ]; }
+rpc_result() { # rpc_result <method> [params-json]
+  local method="$1" params="${2:-[]}" response=""
+  response="$(curl -fsS \
+    -H 'content-type: application/json' \
+    --data "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"$method\",\"params\":$params}" \
+    "$RPC")" || return 1
+  printf '%s' "$response" | sed -n 's/.*"result"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p'
+}
+
+anvil_chain_id_ok() {
+  local chain_id_hex=""
+  chain_id_hex="$(rpc_result eth_chainId)" || return 1
+  [ -n "$chain_id_hex" ] && [ "$((chain_id_hex))" -eq "$CHAIN_ID" ]
+}
+
+contract_deployed() {
+  local c="$1" code=""
+  code="$(rpc_result eth_getCode "[\"$c\",\"latest\"]")" || return 1
+  [ -n "$code" ] && [ "$code" != "0x" ]
+}
 server_healthy() { [ "$(curl -fsS "$SERVER_URL/health" 2>/dev/null)" = "ok" ]; }
 
 clear_port() { # clear_port <port>
@@ -115,6 +133,12 @@ else
   [ -f "$DEPLOY_JSON" ] || { echo "no deployment to resume ($DEPLOY_JSON); run --fresh" >&2; exit 1; }
 fi
 
+# --- 2) 编译合约并同步 ABI（fresh）---
+if [ "$MODE" = "fresh" ]; then
+  echo "[dv-up] compiling contracts and synchronizing ABI"
+  npm run --silent compile
+fi
+
 ANVIL_ARGS=(
   --host "$ANVIL_HOST" --port "$ANVIL_PORT" \
   --chain-id "$CHAIN_ID" \
@@ -127,19 +151,19 @@ if [ -n "$BLOCK_TIME" ]; then
   MINING_MODE="interval ${BLOCK_TIME}s"
 fi
 
-# --- 2) 起 anvil（--state 持久化/自动加载）---
+# --- 3) 起 anvil（--state 持久化/自动加载）---
 echo "[dv-up] starting anvil on $RPC (chain $CHAIN_ID, mining ${MINING_MODE})"
 anvil "${ANVIL_ARGS[@]}" >"$ANVIL_LOG" 2>&1 &
 echo $! > "$ANVIL_PID"
 wait_for "anvil eth_chainId" 30 anvil_chain_id_ok
 
-# --- 3) 部署（fresh）或复用（resume）合约 ---
+# --- 4) 部署（fresh）或复用（resume）合约 ---
 if [ "$MODE" = "fresh" ]; then
-  echo "[dv-up] deploying Bns.sol"
-  forge create src/Bns.sol:Bns \
-    --rpc-url "$RPC" --private-key "$DEPLOYER_KEY" --broadcast --json >"$DEPLOY_JSON.tmp" 2>"$VAR/forge.err" \
-    || { echo "forge create failed:" >&2; cat "$VAR/forge.err" >&2; exit 1; }
-  # 取出 JSON 对象（forge 可能 pretty-print 多行）。
+  echo "[dv-up] deploying BNS UUPS proxy and facets with Hardhat"
+  BNS_ANVIL_RPC_URL="$RPC" BNS_ANVIL_PRIVATE_KEY="$DEPLOYER_KEY" \
+    npm run --silent deploy:local >"$DEPLOY_JSON.tmp" 2>"$VAR/deploy-local.err" \
+    || { echo "Hardhat local deployment failed:" >&2; cat "$VAR/deploy-local.err" >&2; exit 1; }
+  # deploy-local.ts 输出 forge create --json 兼容对象，保留现有 deployedTo 解析。
   sed -n '/{/,/}/p' "$DEPLOY_JSON.tmp" > "$DEPLOY_JSON"
   rm -f "$DEPLOY_JSON.tmp"
 fi
@@ -159,9 +183,13 @@ if [ "$MODE" = "resume" ] && [ -f "$ENV_JSON" ]; then
   fi
 fi
 
-DEPLOY_BLOCK="$(cast block-number --rpc-url "$RPC" 2>/dev/null || echo 0)"
+DEPLOY_BLOCK_HEX="$(rpc_result eth_blockNumber 2>/dev/null || true)"
+DEPLOY_BLOCK=0
+if [ -n "$DEPLOY_BLOCK_HEX" ]; then
+  DEPLOY_BLOCK="$((DEPLOY_BLOCK_HEX))"
+fi
 
-# --- 4) 起 bns-dv serve（indexer 轮询 + server 读/写）---
+# --- 5) 起 bns-dv serve（indexer 轮询 + server 读/写）---
 echo "[dv-up] building bns-dv"
 BNS_DV_BIN="$(cargo build -p bns-server --bin bns_dv --message-format=json 2>/dev/null \
   | grep -o '"executable":"[^"]*bns_dv"' | tail -1 | sed 's/.*:"//;s/"$//')"
@@ -180,7 +208,7 @@ echo "[dv-up] starting bns-dv serve on $SERVER_URL"
 echo $! > "$NODE_PID"
 wait_for "bns-dv /health" 30 server_healthy
 
-# --- 5) 写 dv-env.json ---
+# --- 6) 写 dv-env.json ---
 cat > "$ENV_JSON" <<EOF
 {
   "rpc_endpoint": "$RPC",

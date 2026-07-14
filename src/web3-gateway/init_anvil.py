@@ -231,7 +231,6 @@ def start_or_reuse_anvil(current_dir: Path) -> None:
         BNS_CHAIN_ID,
         "--mnemonic",
         ANVIL_MNEMONIC,
-        "--disable-code-size-limit",
         "--state",
         str(current_dir / ANVIL_STATE_FILE),
     ]

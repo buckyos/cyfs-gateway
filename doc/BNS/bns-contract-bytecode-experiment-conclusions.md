@@ -170,12 +170,14 @@ bytes，已经超限；完整 document 切片约 24,194 bytes，只剩 382 bytes
 | Alias/Payment | 10,321 | 14,255 |
 
 Router 继续作为唯一的 UUPS implementation，通过命名 storage slot 保存 selector 表；所有
-业务 facet 继承同一 `BnsCore` storage layout。聚合 `IBns` ABI 保持原业务调用和事件形状，
-Rust `bns-evm` 改为从同步后的聚合 JSON ABI 生成绑定。
+业务 facet 继承同一 `BnsCore` storage layout。聚合 ABI 以 `IBns` 保持原业务调用和事件形状，
+并合并 Router/facet artifact 的继承事件与 error。Rust `bns-evm` 的绑定接口形状来自该聚合
+JSON ABI，enum 成员则从 Hardhat build-info AST 恢复，避免标准 JSON ABI 将 enum 降为
+`uint8` 后丢失 variants。
 
 Hardhat 已完成编译、97 个 Solidity 测试、28 个 selector 的完整性/冲突检查、Router 与全部
 facet 的递归 storage-layout 对比，以及 OpenZeppelin UUPS implementation validation；所有生产
 implementation 都低于 EIP-170 上限。Rust 聚合 ABI 保留了原有 enum 类型，Indexer 会忽略同一
-proxy 地址产生的 facet 管理事件。`bns-evm`、`bns-client`、`bns-indexer` 共 100 个非忽略
+proxy 地址产生的 facet 管理事件以及 UUPS/Ownable 基础设施事件。`bns-evm`、`bns-client`、`bns-indexer` 共 101 个非忽略
 Rust 测试和全 workspace `cargo check` 通过；6 个依赖旧单体 `forge create` 的 Anvil e2e 仍为
 ignore，需随非阻塞 DV 环境另行迁移。本轮不需要安装额外第三方工具。

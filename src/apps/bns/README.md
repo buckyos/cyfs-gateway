@@ -43,10 +43,14 @@ npm run abi:check
 ```
 
 `npm run compile` checks all 28 routed selectors, the EIP-170 limit, and the complete
-Solidity storage layout shared by Router and facets. It writes the stable JSON ABI and
-the flattened Solidity source used for Rust code generation to
-`../../components/bns-evm/abi/`. The Solidity form preserves enum variant names that
-JSON ABI cannot represent. Hardhat artifacts and cache remain local.
+Solidity storage layout shared by Router and facets. It writes the stable aggregate
+JSON ABI and the Solidity source used for Rust code generation to
+`../../components/bns-evm/abi/`. The aggregate starts with `IBns`, then merges the
+complete Router/facet artifacts so inherited UUPS/Ownable events and errors are not
+lost. Its generated Solidity form takes calls/events/errors and struct shapes from the
+JSON ABI, while restoring enum members from the compiler AST in Hardhat build-info;
+standard JSON ABI retains enum names but cannot represent their variants. Hardhat
+artifacts and cache remain local.
 
 ## Upgradeability
 
@@ -86,6 +90,17 @@ the actual chain ID from its RPC for the deployment record:
 ```bash
 cd src/apps/bns
 npm run deploy -- --network anvil
+```
+
+For local automation, `deploy:local` reuses the same UUPS/facet deployment code but
+refuses RPC URLs whose host is not exactly `localhost` or `127.0.0.1`. Its stdout is
+compatible with `forge create --json` (`deployer`, `deployedTo`, and
+`transactionHash`), while deployment progress is written to stderr:
+
+```bash
+BNS_ANVIL_RPC_URL=http://127.0.0.1:8545 \
+BNS_ANVIL_PRIVATE_KEY=0x... \
+npm run --silent deploy:local
 ```
 
 For OP Mainnet, the existing `opMainnet` config reads its RPC URL and deployment key
@@ -193,12 +208,12 @@ business selectors, registers `alice`, publishes its inline `owner` document, an
 resolves the active version from the proxy. Addresses and each successful phase are
 printed to the console; no separate local deployment step or record is required.
 
-## Legacy DV Integration Environment (currently deferred)
+## DV Integration Environment
 
-See `doc/SN/SN-测试计划.md` §5 for the historical flow. Both paths currently assume a
-directly deployed monolithic `Bns` and must be made facet-aware before they can exercise the full
-`BNS(contract) <-> Indexer <-> Server <-> Client <-> Controller` path against a real
-private chain (requires Foundry: `anvil`, `forge`, `cast`).
+See `doc/SN/SN-测试计划.md` §5 for the full flow. The scripted path keeps Anvil for
+persistent local chain state, but deployment now uses the same Hardhat UUPS/facet code
+as production and chain inspection uses JSON-RPC directly. It therefore requires the
+Foundry installation only for the `anvil` binary, not `forge` or `cast`.
 
 **(A) Self-contained Rust e2e** (recommended, CI-able). Spawns its own anvil + deploys
 in-process; `#[ignore]` by default, skipped gracefully when Foundry is absent:
@@ -208,9 +223,10 @@ cd src
 cargo test -p bns-client --test e2e_anvil -- --ignored
 ```
 
-**(B) Scripted DV environment + smoke.** `dv-up.sh` brings up anvil, deploys `Bns.sol`,
-and runs `bns-dv serve` (indexer `sync_once` poll loop + contract server over a shared
-SQLite projection), then writes `dv-env.json`:
+**(B) Scripted DV environment + smoke.** `dv-up.sh` brings up Anvil, deploys the BNS
+UUPS proxy and all facets through `deploy:local`, and runs `bns-dv serve` (indexer
+`sync_once` poll loop + contract server over a shared SQLite projection), then writes
+`dv-env.json`:
 
 ```bash
 cd src/apps/bns

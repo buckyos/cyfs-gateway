@@ -128,7 +128,7 @@ mkdir -p "$ROOTFS" "$ENV_ROOT" "$VAR/buckyos_root"
 # --- 2) anvil ---
 echo "[sn-dev-up] starting anvil on $RPC (chain $CHAIN_ID)"
 anvil --host "$ANVIL_HOST" --port "$ANVIL_PORT" --chain-id "$CHAIN_ID" \
-  --mnemonic "$MNEMONIC" --disable-code-size-limit --state "$ANVIL_STATE" \
+  --mnemonic "$MNEMONIC" --state "$ANVIL_STATE" \
   >"$ANVIL_LOG" 2>&1 &
 echo $! > "$ANVIL_PID"
 wait_for "anvil eth_chainId" 30 anvil_chain_id_ok

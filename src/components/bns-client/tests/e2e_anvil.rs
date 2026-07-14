@@ -110,7 +110,6 @@ impl AnvilNode {
                 &CHAIN_ID.to_string(),
                 "--mnemonic",
                 "test test test test test test test test test test test junk",
-                "--disable-code-size-limit",
             ])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -143,7 +142,7 @@ impl AnvilNode {
     }
 }
 
-/// 用 `forge create` 部署 `Bns.sol`（与 scripts/deploy.sh 同路径），返回合约地址。
+/// 用旧的 `forge create` 路径部署单体 `Bns.sol`，返回合约地址。
 async fn deploy_bns(endpoint: &str, deployer_key: &str) -> Address {
     let _guard = forge_lock().lock().await;
     let output = Command::new("forge")

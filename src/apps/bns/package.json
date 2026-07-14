@@ -13,6 +13,7 @@
     "abi:check": "node hardhat-scripts/sync-abi.mjs --check",
     "validate:upgrade": "hardhat run hardhat-scripts/validate-upgrade.ts",
     "deploy": "hardhat run hardhat-scripts/deploy.ts",
+    "deploy:local": "hardhat run hardhat-scripts/deploy-local.ts --network anvil",
     "deploy:op-mainnet": "hardhat run hardhat-scripts/deploy.ts --network opMainnet",
     "smoke:anvil": "hardhat run hardhat-scripts/smoke.ts --network anvil",
     "run:anvil": "hardhat run --network anvil"

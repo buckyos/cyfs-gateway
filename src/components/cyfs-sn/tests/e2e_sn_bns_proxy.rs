@@ -103,7 +103,6 @@ impl AnvilNode {
                 &CHAIN_ID.to_string(),
                 "--mnemonic",
                 "test test test test test test test test test test test junk",
-                "--disable-code-size-limit",
             ])
             .stdout(Stdio::null())
             .stderr(Stdio::null())

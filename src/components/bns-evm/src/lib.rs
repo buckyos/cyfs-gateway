@@ -6,7 +6,7 @@ mod tx;
 pub mod bindings {
     use alloy_sol_types::sol;
 
-    sol!("../../apps/bns/src/Bns.sol");
+    sol!("abi/BnsBindings.sol");
 }
 
 pub use alloy_consensus::TxEip1559;

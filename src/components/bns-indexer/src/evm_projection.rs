@@ -23,6 +23,8 @@ pub struct ContractProtocolEvent {
 pub enum ProjectedContractEvent {
     Protocol(ContractProtocolEvent),
     Registry(EventLogRecord),
+    Router,
+    Infrastructure,
 }
 
 #[derive(Debug, Default)]
@@ -66,6 +68,12 @@ impl ContractEventProjector {
                 self.pending_protocol.push_back(protocol.clone());
                 Ok(ProjectedContractEvent::Protocol(protocol))
             }
+            BnsEvent::FacetSelectorAdded(_)
+            | BnsEvent::FacetSelectorReplaced(_)
+            | BnsEvent::FacetSelectorRemoved(_) => Ok(ProjectedContractEvent::Router),
+            BnsEvent::Initialized(_)
+            | BnsEvent::OwnershipTransferred(_)
+            | BnsEvent::Upgraded(_) => Ok(ProjectedContractEvent::Infrastructure),
             other => {
                 let registry_event = registry_event_from_contract_event(other)?;
                 let protocol = self.pending_protocol.pop_front().ok_or_else(|| {
@@ -217,6 +225,16 @@ fn registry_event_from_contract_event(event: BnsEvent) -> BnsRegistryResult<Regi
             issued_at: event.issuedAt,
             external_anchor: hash_string(event.externalAnchor),
         }),
+        BnsEvent::FacetSelectorAdded(_)
+        | BnsEvent::FacetSelectorReplaced(_)
+        | BnsEvent::FacetSelectorRemoved(_) => Err(BnsRegistryError::InvalidMutation(
+            "router management event cannot be projected as a registry event".to_string(),
+        )),
+        BnsEvent::Initialized(_) | BnsEvent::OwnershipTransferred(_) | BnsEvent::Upgraded(_) => {
+            Err(BnsRegistryError::InvalidMutation(
+                "contract infrastructure event cannot be projected as a registry event".to_string(),
+            ))
+        }
     }
 }
 
