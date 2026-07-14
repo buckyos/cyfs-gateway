@@ -6,7 +6,6 @@ First EVM implementation of the BNS registry described in
 ## Layout
 
 - `src/Bns.sol`: registry contract and protocol structs.
-- `src/BnsProxy.sol`: ERC-1967 proxy used by the UUPS deployment.
 - `test/*.sol`: Hardhat Solidity tests for authorization, guards, documents, events,
   fuzz properties and invariants.
 - `script/Smoke.s.sol`: deploys a fresh contract to a local chain and runs a minimal write flow.
@@ -43,59 +42,82 @@ The public deployment uses the OpenZeppelin UUPS pattern:
 
 - `Bns` inherits `Initializable`, `OwnableUpgradeable`, and `UUPSUpgradeable`;
 - the implementation constructor disables initializers;
-- the `BnsProxy` constructor atomically calls `initialize(upgradeAdmin)`;
+- OpenZeppelin Hardhat Upgrades deploys an ERC-1967 proxy and atomically calls
+  `initialize(upgradeAdmin)`;
 - only `owner()` (the configured upgrade admin) can call `upgradeToAndCall`;
 - business state is stored in the proxy and the v1 layout reserves a storage gap for
   future implementation versions.
 
 The upgrade admin should be a dedicated multisig or governance account, not the
-deployment hot wallet. Clients and indexers must always use the proxy address.
+deployment hot wallet. Clients and indexers must always use the proxy address. The
+deployment uses `deployProxy(..., { kind: "uups" })`; future implementations should
+be checked and deployed with `upgradeProxy` or `prepareUpgrade` from the same plugin.
+The current implementation can be checked without deploying it:
 
-## OP Mainnet Deployment
+```bash
+npm run validate:upgrade
+```
 
-The production deployment script targets OP Mainnet chain ID 10 and requires an
-explicit RPC URL, deployment key, upgrade admin, and confirmation guard:
+## Upgradeable Deployment
+
+`hardhat-scripts/deploy.ts` is network-independent. Select any network configured in
+`hardhat.config.ts` with Hardhat's `--network` option. The confirmation value is
+derived from the selected Hardhat network name and the chain ID returned by its RPC:
+
+```bash
+cd src/apps/bns
+BNS_UPGRADE_ADMIN=0x... \
+BNS_DEPLOY_CONFIRMATION=anvil:31337 \
+npm run deploy -- --network anvil
+```
+
+For OP Mainnet, the existing `opMainnet` config reads its RPC URL and deployment key
+from the environment. Its convenience command is:
 
 ```bash
 cd src/apps/bns
 BNS_OP_MAINNET_RPC_URL=https://your-op-mainnet-rpc \
 BNS_DEPLOYER_PRIVATE_KEY=0x... \
 BNS_UPGRADE_ADMIN=0x... \
-BNS_DEPLOY_CONFIRMATION=OP_MAINNET \
+BNS_DEPLOY_CONFIRMATION=opMainnet:10 \
 npm run deploy:op-mainnet
 ```
 
 `BNS_DEPLOY_CONFIRMATIONS` defaults to `2` and can be set to an integer from 1 to
-64. Before sending either transaction, the script checks that:
+64. Before deployment, the script checks that:
 
 - `src/`, Hardhat config, package manifests, lockfile, and the deployment script are
   all tracked and clean at `HEAD`;
-- the selected Hardhat network is `opMainnet` and the RPC reports chain ID 10;
 - the deployment output does not already exist;
-- the implementation runtime bytecode is within the EIP-170 24,576-byte limit;
-- `BNS_DEPLOY_CONFIRMATION` exactly matches `OP_MAINNET`.
+- `BNS_DEPLOY_CONFIRMATION` exactly matches `<networkName>:<chainId>`;
+- OpenZeppelin's upgrade-safety validation accepts the UUPS implementation.
 
-The script deploys the implementation first, then an initialized ERC-1967 proxy. It
-verifies the proxy implementation slot and the on-chain upgrade admin before writing
-`deployments/op-mainnet.json`. The record contains at least:
+OpenZeppelin Hardhat Upgrades owns implementation/proxy deployment, initialization,
+ERC-1967 lookup, and its per-network manifest. The script verifies the on-chain
+upgrade admin before writing `deployments/<network-name>.json` (`op-mainnet.json` for
+the `opMainnet` config). The record contains at least:
 
 - `deployedAt`;
 - `deploymentCommitHash`;
 - `proxyAddress`;
 - `implementationAddress`;
-- deployer, upgrade admin, bytecode size, transaction hashes, and block numbers.
+- network and chain ID, deployer, upgrade admin, bytecode size, proxy transaction
+  hash, and block number.
 
 The proxy and implementation addresses are also printed to the console. The private
-key is only read by Hardhat through `BNS_DEPLOYER_PRIVATE_KEY` and is never printed or
-written to the deployment record.
+key is only read from the selected Hardhat network configuration and is never printed
+or written to the deployment record. OpenZeppelin also writes a network manifest
+under `.openzeppelin/`; commit manifests for persistent networks because later
+upgrade validation and implementation reuse depend on them. Ephemeral
+manifests for the common local chain IDs 1337 and 31337 are ignored.
 
 ### Current deployment blocker
 
 After the UUPS conversion, the optimized BNS implementation runtime bytecode is
-41,079 bytes. OP Mainnet enforces the EIP-170 limit of 24,576 bytes, so the deployment
-script currently stops before connecting a wallet or sending a transaction. Contract
-splitting/size reduction is a separate prerequisite for the actual mainnet deployment;
-changing proxy type would not remove this implementation-size limit.
+41,079 bytes. OP Mainnet enforces the EIP-170 limit of 24,576 bytes, so the current
+implementation still cannot be deployed there. OpenZeppelin's deployment plugin does
+not change that limit. Contract splitting/size reduction remains a separate
+prerequisite for the actual mainnet deployment.
 
 ## Local Anvil Chain
 

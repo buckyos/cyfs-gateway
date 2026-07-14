@@ -6,5 +6,7 @@ typechain-types/
 broadcast/
 deployments/*.local.json
 deployments/*.tmp
+.openzeppelin/unknown-1337.json
+.openzeppelin/unknown-31337.json
 var/
 dv-env.json

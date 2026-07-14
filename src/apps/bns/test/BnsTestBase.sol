@@ -2,7 +2,7 @@
 pragma solidity ^0.8.24;
 
 import "../src/Bns.sol";
-import "../src/BnsProxy.sol";
+import { ERC1967Proxy } from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 
 /// Minimal subset of the Foundry cheatcode interface so the §1 suites stay
 /// dependency-free (no forge-std checkout required on CI). The cheatcode
@@ -189,7 +189,7 @@ contract BnsTestBase {
 
     function _deployBnsProxy(address upgradeAdmin) internal returns (Bns instance) {
         Bns implementation = new Bns();
-        BnsProxy proxy = new BnsProxy(
+        ERC1967Proxy proxy = new ERC1967Proxy(
             address(implementation), abi.encodeCall(Bns.initialize, (upgradeAdmin))
         );
         return Bns(address(proxy));

@@ -2,7 +2,7 @@
 pragma solidity ^0.8.24;
 
 import "./BnsTestBase.sol";
-import "../src/BnsProxy.sol";
+import { ERC1967Proxy } from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 
 /// §1.8 — fuzz + invariant (optional enhancement).
 contract BnsFuzzTest is BnsTestBase {
@@ -174,7 +174,7 @@ contract BnsInvariantTest {
 
     function setUp() public {
         Bns implementation = new Bns();
-        BnsProxy proxy = new BnsProxy(
+        ERC1967Proxy proxy = new ERC1967Proxy(
             address(implementation), abi.encodeCall(Bns.initialize, (address(this)))
         );
         bns = Bns(address(proxy));

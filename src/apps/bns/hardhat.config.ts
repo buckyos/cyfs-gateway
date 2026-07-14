@@ -1,10 +1,10 @@
-import hardhatViem from "@nomicfoundation/hardhat-viem";
+import hardhatUpgrades from "@openzeppelin/hardhat-upgrades";
 import { configVariable, defineConfig } from "hardhat/config";
 
 const privateKey = process.env.BNS_ANVIL_PRIVATE_KEY;
 
 export default defineConfig({
-  plugins: [hardhatViem],
+  plugins: [hardhatUpgrades],
   solidity: {
     version: "0.8.24",
     settings: {

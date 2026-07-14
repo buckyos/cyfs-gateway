@@ -4,6 +4,7 @@ pragma solidity ^0.8.24;
 import { OwnableUpgradeable } from
     "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
 import { Initializable } from "@openzeppelin/contracts/proxy/utils/Initializable.sol";
+import { ERC1967Proxy } from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 
 import "./BnsTestBase.sol";
 
@@ -29,7 +30,7 @@ contract BnsUpgradeTest is BnsTestBase {
     function testZeroUpgradeAdminIsRejected() public {
         Bns implementation = new Bns();
         vm.expectPartialRevert(OwnableUpgradeable.OwnableInvalidOwner.selector);
-        new BnsProxy(
+        new ERC1967Proxy(
             address(implementation), abi.encodeCall(Bns.initialize, (address(0)))
         );
     }

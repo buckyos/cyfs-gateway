@@ -2,7 +2,7 @@
 pragma solidity ^0.8.24;
 
 import "../src/Bns.sol";
-import "../src/BnsProxy.sol";
+import { ERC1967Proxy } from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 
 contract BnsActor {
     function forward(address target, bytes calldata data) external returns (bool, bytes memory) {
@@ -24,7 +24,7 @@ contract BnsTest {
 
     function setUp() public {
         Bns implementation = new Bns();
-        BnsProxy proxy = new BnsProxy(
+        ERC1967Proxy proxy = new ERC1967Proxy(
             address(implementation), abi.encodeCall(Bns.initialize, (address(this)))
         );
         bns = Bns(address(proxy));
