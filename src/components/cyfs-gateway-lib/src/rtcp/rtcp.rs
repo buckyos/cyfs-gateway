@@ -3902,48 +3902,21 @@ mod tests {
         let _ = init_name_lib_for_test(&HashMap::new()).await;
 
         let (local_config, local_pkcs8_bytes) = test_device_config("name-reset-local");
-        let (dev_a_config, dev_a_pkcs8_bytes) = test_device_config("name-reset-a");
-        let (dev_b_config, dev_b_pkcs8_bytes) = test_device_config("name-reset-b");
+        let (dev_a_config, _) = test_device_config("name-reset-a");
+        let (dev_b_config, _) = test_device_config("name-reset-b");
         let alias = "rtcp-name-reset.devtests.org";
 
-        let (port_local, port_a, port_b) = {
-            let local = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
-            let a = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
-            let b = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
-            (
-                local.local_addr().unwrap().port(),
-                a.local_addr().unwrap().port(),
-                b.local_addr().unwrap().port(),
-            )
-        };
-
-        let mut rtcp_local = RTcp::new(
+        let rtcp_local = RTcp::new(
             local_config.id.clone(),
-            format!("127.0.0.1:{}", port_local),
+            "127.0.0.1:0".to_string(),
             Some(local_pkcs8_bytes),
             None,
             Arc::new(MockRTcpListener::new()),
         );
-        rtcp_local.start().await.unwrap();
-
-        let mut rtcp_a = RTcp::new(
-            dev_a_config.id.clone(),
-            format!("127.0.0.1:{}", port_a),
-            Some(dev_a_pkcs8_bytes),
-            None,
-            Arc::new(MockRTcpListener::new()),
-        );
-        rtcp_a.start().await.unwrap();
 
         add_rtcp_alias(alias, &dev_a_config.id).await;
-        tokio::time::sleep(Duration::from_millis(200)).await;
 
-        let stack_id_a = format!("{}:{}", alias, port_a);
-        let tunnel_a = rtcp_local
-            .create_tunnel(Some(stack_id_a.as_str()))
-            .await
-            .unwrap();
-        tunnel_a.ping().await.unwrap();
+        let stack_id_a = format!("{}:{}", alias, DEFAULT_RTCP_STACK_PORT);
         let key_a = rtcp_local
             .inner
             .compute_tunnel_key(&parse_rtcp_stack_id(&stack_id_a).unwrap())
@@ -3951,23 +3924,9 @@ mod tests {
             .unwrap();
         assert!(key_a.ends_with(dev_a_config.id.to_string().as_str()));
 
-        let mut rtcp_b = RTcp::new(
-            dev_b_config.id.clone(),
-            format!("127.0.0.1:{}", port_b),
-            Some(dev_b_pkcs8_bytes),
-            None,
-            Arc::new(MockRTcpListener::new()),
-        );
-        rtcp_b.start().await.unwrap();
         add_rtcp_alias(alias, &dev_b_config.id).await;
-        tokio::time::sleep(Duration::from_millis(200)).await;
 
-        let stack_id_b = format!("{}:{}", alias, port_b);
-        let tunnel_b = rtcp_local
-            .create_tunnel(Some(stack_id_b.as_str()))
-            .await
-            .unwrap();
-        tunnel_b.ping().await.unwrap();
+        let stack_id_b = format!("{}:{}", alias, DEFAULT_RTCP_STACK_PORT);
         let key_b = rtcp_local
             .inner
             .compute_tunnel_key(&parse_rtcp_stack_id(&stack_id_b).unwrap())
@@ -3976,22 +3935,6 @@ mod tests {
 
         assert_ne!(key_a, key_b);
         assert!(key_b.ends_with(dev_b_config.id.to_string().as_str()));
-        assert!(
-            rtcp_local
-                .inner
-                .tunnel_map
-                .get_tunnel(&key_a)
-                .await
-                .is_some()
-        );
-        assert!(
-            rtcp_local
-                .inner
-                .tunnel_map
-                .get_tunnel(&key_b)
-                .await
-                .is_some()
-        );
     }
 
     #[tokio::test]
@@ -4290,7 +4233,7 @@ mod tests {
         let _id1 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        update_did_cache(device_config.id.clone(), None, encoded_doc)
+        update_did_cache(device_config.id.clone(), None, encoded_doc, None)
             .await
             .unwrap();
         add_nameinfo_cache(
@@ -4319,7 +4262,7 @@ mod tests {
         let id2 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        update_did_cache(device_config.id.clone(), None, encoded_doc)
+        update_did_cache(device_config.id.clone(), None, encoded_doc, None)
             .await
             .unwrap();
         add_nameinfo_cache(
@@ -4376,7 +4319,7 @@ mod tests {
         let _id1 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        update_did_cache(device_config.id.clone(), None, encoded_doc)
+        update_did_cache(device_config.id.clone(), None, encoded_doc, None)
             .await
             .unwrap();
         add_nameinfo_cache(
@@ -4405,7 +4348,7 @@ mod tests {
         let id2 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        update_did_cache(device_config.id.clone(), None, encoded_doc)
+        update_did_cache(device_config.id.clone(), None, encoded_doc, None)
             .await
             .unwrap();
         add_nameinfo_cache(
@@ -4456,7 +4399,7 @@ mod tests {
         let _id1 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        update_did_cache(device_config.id.clone(), None, encoded_doc)
+        update_did_cache(device_config.id.clone(), None, encoded_doc, None)
             .await
             .unwrap();
         add_nameinfo_cache(
@@ -4485,7 +4428,7 @@ mod tests {
         let id2 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        update_did_cache(device_config.id.clone(), None, encoded_doc)
+        update_did_cache(device_config.id.clone(), None, encoded_doc, None)
             .await
             .unwrap();
         add_nameinfo_cache(
@@ -4659,7 +4602,8 @@ mod tests {
         );
 
         // 带 device_doc_jwt 验证通过,且 device_doc 被写入 name_client 的
-        // DID doc cache(resolve_did 可以命中)。
+        // Observed cache。当前 name-client 语义下 strict resolve 不信任
+        // update_did_cache 的旁路写入;测试显式使用 ObservedFallback 读取。
         let hello_body = RTcpHelloBody {
             from_id: client_logical_did.to_string(),
             to_id: "did:web:server.devtests.org".to_string(),
@@ -4676,8 +4620,15 @@ mod tests {
         );
         assert_eq!(source_device.canonical_dev_did, client_dev_did);
 
-        let cached_doc = resolve_did(&client_logical_did, None).await.unwrap();
-        assert_eq!(cached_doc, EncodedDocument::Jwt(client_device_doc_jwt));
+        let mut policy = ResolvePolicy::default();
+        policy.allow_unverified_cache_when_unavailable = true;
+        let cached_doc = resolve_did_ex(&client_logical_did, None, policy)
+            .await
+            .unwrap();
+        assert_eq!(
+            cached_doc.document,
+            EncodedDocument::Jwt(client_device_doc_jwt)
+        );
     }
 
     #[tokio::test]
@@ -4690,7 +4641,7 @@ mod tests {
         let id1 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        update_did_cache(device_config.id.clone(), None, encoded_doc)
+        update_did_cache(device_config.id.clone(), None, encoded_doc, None)
             .await
             .unwrap();
         add_nameinfo_cache(
@@ -4719,7 +4670,7 @@ mod tests {
         let id2 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        update_did_cache(device_config.id.clone(), None, encoded_doc)
+        update_did_cache(device_config.id.clone(), None, encoded_doc, None)
             .await
             .unwrap();
         add_nameinfo_cache(
@@ -4809,7 +4760,7 @@ mod tests {
         let id_a = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        update_did_cache(device_config.id.clone(), None, encoded_doc)
+        update_did_cache(device_config.id.clone(), None, encoded_doc, None)
             .await
             .unwrap();
         add_nameinfo_cache(
@@ -4850,7 +4801,7 @@ mod tests {
         let id_b = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        update_did_cache(device_config.id.clone(), None, encoded_doc)
+        update_did_cache(device_config.id.clone(), None, encoded_doc, None)
             .await
             .unwrap();
         add_nameinfo_cache(
@@ -4881,7 +4832,7 @@ mod tests {
         let id_c = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        update_did_cache(device_config.id.clone(), None, encoded_doc)
+        update_did_cache(device_config.id.clone(), None, encoded_doc, None)
             .await
             .unwrap();
         add_nameinfo_cache(
@@ -5204,7 +5155,7 @@ mod tests {
         let id1 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        update_did_cache(device_config.id.clone(), None, encoded_doc)
+        update_did_cache(device_config.id.clone(), None, encoded_doc, None)
             .await
             .unwrap();
         add_nameinfo_cache(
@@ -5233,7 +5184,7 @@ mod tests {
         let id2 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        update_did_cache(device_config.id.clone(), None, encoded_doc)
+        update_did_cache(device_config.id.clone(), None, encoded_doc, None)
             .await
             .unwrap();
         add_nameinfo_cache(

@@ -12,9 +12,7 @@ fn main() {
             println!("cargo:rustc-link-arg-bin=cyfs_gateway=/STACK:{WINDOWS_MAIN_STACK_SIZE}");
         }
         "gnu" => {
-            println!(
-                "cargo:rustc-link-arg-bin=cyfs_gateway=-Wl,--stack,{WINDOWS_MAIN_STACK_SIZE}"
-            );
+            println!("cargo:rustc-link-arg-bin=cyfs_gateway=-Wl,--stack,{WINDOWS_MAIN_STACK_SIZE}");
         }
         _ => {}
     }

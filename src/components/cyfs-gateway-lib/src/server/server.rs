@@ -173,6 +173,9 @@ pub struct HttpRequestHeaderMap {
     transverse_counter: Arc<AtomicU32>, // Indicates if a traversal is currently happening
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct HttpRequestHostOverride;
+
 impl HttpRequestHeaderMap {
     pub fn new(request: http::Request<BoxBody<Bytes, ServerError>>) -> Self {
         Self {
@@ -264,7 +267,11 @@ impl MapCollection for HttpRequestHeaderMap {
             return Ok(false);
         }
 
+        let overrides_host = name == http::header::HOST;
         request.headers_mut().insert(name, header);
+        if overrides_host {
+            request.extensions_mut().insert(HttpRequestHostOverride);
+        }
         Ok(true)
     }
 
@@ -353,7 +360,11 @@ impl MapCollection for HttpRequestHeaderMap {
                 msg.to_string()
             })?;
 
+            let overrides_host = name == http::header::HOST;
             let prev = request.headers_mut().insert(name, header);
+            if overrides_host {
+                request.extensions_mut().insert(HttpRequestHostOverride);
+            }
             if let Some(prev_value) = prev {
                 let prev = match prev_value.to_str() {
                     Ok(s) => s.to_string(),
@@ -418,6 +429,9 @@ impl MapCollection for HttpRequestHeaderMap {
 
         let mut request = self.request.write().await;
         let prev = request.headers_mut().remove(key);
+        if key.eq_ignore_ascii_case(http::header::HOST.as_str()) {
+            request.extensions_mut().insert(HttpRequestHostOverride);
+        }
         if let Some(prev_value) = prev {
             let prev = match prev_value.to_str() {
                 Ok(s) => s.to_string(),
