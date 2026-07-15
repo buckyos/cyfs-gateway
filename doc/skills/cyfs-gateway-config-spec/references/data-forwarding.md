@@ -20,17 +20,21 @@
 根据 [implementation-checked.md](implementation-checked.md)，当前可以稳定确认：
 
 - `call-server` 是网关注册的外部命令，执行后返回 `server <id>` 控制动作
-- `forward` 是网关注册的外部命令，执行后返回 `forward "<selected_url>"` 控制动作
+- `forward` 是网关注册的外部命令；兼容模式返回 `forward "<selected_url>"`，有效的多候选 group 模式返回内部 `forward-group "<encoded_plan>"` 控制动作；单 URL 且未启用重试的 plan 默认仍会退化成普通 `forward`
 - `forward` 支持：
   - 缺省算法 `round_robin`
-  - 可选算法 `ip_hash`
+  - `ip_hash`、`hash`、`consistent_hash`、`least_time`
   - inline upstream 列表
   - `--map <map>` 形式的上游表
+  - `--backup-map <map>` 形式的备用上游表
   - `url,weight=N` 形式的权重
+  - `--next-upstream` / `--tries` / `--next-upstream-timeout` 执行阶段重试
+  - `--max-fails` / `--fail-timeout` 进程内临时失败状态
+  - HTTP 受限状态码重试和 `--max-body-buffer`
 - `forward` 对 inline upstream 和 `--map` key 的基础校验，只要求它们能被 `Url::parse(...)` 解析
-- HTTP server 当前会消费 `server` / `forward` 动作
-- TCP / RTCP stack 当前会消费 `server` / `forward` 动作
-- UDP stack 当前会消费 `server` / `forward` 动作
+- HTTP server 当前会消费 `server` / `forward` / `forward-group` 动作
+- TCP / TLS / QUIC / RTCP stream stack 当前会消费 `forward` / `forward-group` 动作
+- UDP / RTCP datagram stack 当前会消费 `forward` / `forward-group` 动作
 - `socks` server 的 `target` / `enable_tunnel` / `rule_config` 会进入代理接入执行路径
 
 因此，skill 可以把“数据转发”稳定拆成：
@@ -74,8 +78,7 @@ forward example.com:9000
 
 ## 2.2 “能解析”不等于“该入口一定支持”
 
-`forward` 命令只负责把参数解析成 URL 并选出一个目标。
-真正能不能工作，要看消费这个 `forward` 动作的运行时入口：
+`forward` 命令负责校验 URL；兼容模式直接选出一个目标，group 模式构造带候选顺序和重试策略的计划。真正能不能工作，要看消费 `forward` / `forward-group` 动作的运行时入口：
 
 - HTTP server
 - stream stack，如 TCP / TLS / RTCP
@@ -190,6 +193,44 @@ rtcp://sn.example/%72%74%63%70%3A%2F%2Fpeer.example%2F%3A443
 
 但这类写法属于高级场景，不建议在基础文档里当成默认示例。
 
+## 2.4 新版 group forward 的运行时语义
+
+旧多 URL 写法和新版 group 写法不是同一种失败语义：
+
+```text
+# 兼容模式：预先选择一个 URL；执行失败后不换目标
+forward round_robin tcp:///10.0.0.1:9000 tcp:///10.0.0.2:9000
+
+# group 模式：执行层可在同一次请求内尝试下一候选
+forward round_robin --map $PRIMARY \
+        --backup-map $BACKUP \
+        --next-upstream error,timeout \
+        --tries 3 \
+        --next-upstream-timeout 5s
+```
+
+group 模式的关键事实：
+
+- primary 先于 backup；达到 `max_fails` 的候选在 `fail_timeout` 内被排到健康候选之后
+- 失败状态按 `group + URL` 保存在当前进程内；`--group` 是状态分组名，不是 upstream registry 引用
+- 未指定 `--group` 时，运行时根据候选集合生成稳定 key
+- 配置非空 `--next-upstream` 条件但不指定 `--tries` 时，最多尝试全部候选；为了限制成本，正式配置仍建议显式写 `--tries` 和总时间预算
+- 只有重试条件非空且最终 `tries > 1` 时才会切换候选；单独使用 `--group`、`--max-fails` 或 `--tries` 不会打开重试
+- group 只会尝试显式配置的候选，不会自动发现或追加 relay / route
+
+不同入口的安全边界：
+
+- stream：只在目标 stream 建立阶段重试；开始双向复制后不切换
+- datagram：只在目标 datagram client 创建阶段重试；session 开始后不切换
+- HTTP `error` / `timeout`：仅在请求仍可安全交给下一候选时重试
+- HTTP 状态码：`http_5xx` 或指定的 `http_502` / `http_503` / `http_504` 需要缓冲并重放请求体
+- HTTP 状态码重试默认只允许 GET、HEAD、PUT、DELETE、OPTIONS、TRACE；`non_idempotent` 会显式放开 POST/PATCH 等方法，并带来重复提交风险
+- 状态码重试默认请求体缓冲上限为 64 KiB，可用 `--max-body-buffer` 修改；值为 0 时禁用状态码重试。请求体超过已启用的上限时，当前实现返回请求错误
+
+`invalid_header` 当前能被参数解析，但执行层尚未实现对应触发判断，不应作为可用的重试条件承诺。
+
+provider-first 的 `--server-map` / `--provider-retry-scope` 当前只完成模型解析和同 provider route 邻接排序；执行层尚未强制执行 provider retry 边界。并且命令预检目前仍要求同时存在 inline upstream、`--map` 或 `--backup-map`，不能把 `--server-map` 单独作为已稳定的用户入口。对有状态服务不能把它当成跨 provider 隔离保证。
+
 ## 3. 选型口径
 
 ### 3.1 什么时候用 `call-server`
@@ -211,12 +252,13 @@ rtcp://sn.example/%72%74%63%70%3A%2F%2Fpeer.example%2F%3A443
 
 - 目标是一个具体 upstream URL
 - 需要反向代理或四层直接转发
-- 需要多上游选择或按源 IP 做稳定映射
+- 需要多上游选择、按来源/业务 key 做稳定映射，或在安全边界内做候选故障切换
 
 推荐口径：
 
 - “这是 upstream 转发，目标是 URL，而不是 server id。”
-- “如果需要多个上游，可用 `round_robin` / `ip_hash` 与权重。”
+- “如果需要多个上游，可用 `round_robin` / `ip_hash` / `hash` / `consistent_hash` / `least_time` 与权重。”
+- “如果需要同一次请求内切换目标，必须显式配置 group 重试条件；仅列出多个 URL 仍是兼容选择模式。”
 - “先区分这是 HTTP 上游基地址、stream tunnel URL，还是 datagram tunnel URL。”
 
 ### 3.3 什么时候用 `socks`
@@ -321,20 +363,49 @@ stacks:
 
 ### 5.3 多上游转发
 
+只做请求前选择、不做同请求故障切换：
+
 ```txt
 forward ip_hash tcp:///10.0.0.21:9000,weight=3 tcp:///10.0.0.22:9000,weight=1
 ```
 
-或：
+需要执行阶段切换时，使用 map 构造 primary / backup 候选并显式开启重试：
 
 ```txt
-forward round_robin --map $UPSTREAMS
+map-create PRIMARY;
+map-add PRIMARY "tcp:///10.0.0.21:9000" 3;
+map-add PRIMARY "tcp:///10.0.0.22:9000" 1;
+
+map-create BACKUP;
+map-add BACKUP "rtcp://backup.example.zone/:9000" 1;
+
+forward round_robin --map $PRIMARY \
+        --backup-map $BACKUP \
+        --group app-stream \
+        --next-upstream error,timeout \
+        --tries 3 \
+        --next-upstream-timeout 5s \
+        --max-fails 1 \
+        --fail-timeout 10s;
 ```
 
 说明：
 
 - `ip_hash` 适合希望同一来源更稳定地命中同一上游
 - `round_robin` 适合普通轮询分担
+- `hash` / `consistent_hash` 配合 `--hash-key` 使用，适合已有 session / user key 的亲和需求
+- `least_time` 使用 tunnel manager 已有 RTT 历史排序，数据不足时保留原顺序
+- stream/datagram 的 retry 只覆盖建链阶段，不覆盖已经开始的数据传输
+
+HTTP 幂等请求如需对网关型 502/504 做受限重试：
+
+```txt
+forward round_robin --map $HTTP_UPSTREAMS \
+        --next-upstream error,timeout,http_502,http_504 \
+        --tries 3 \
+        --next-upstream-timeout 5s \
+        --max-body-buffer 64KB;
+```
 
 ### 5.3.1 upstream URL 速查
 
@@ -343,7 +414,7 @@ http://127.0.0.1:8080
 https://api.example.com:443
 tcp:///127.0.0.1:9000
 udp:///127.0.0.1:2300
-tls://example.com:443
+tls:///example.com:443
 rtcp://remote-stack-id/:80
 rudp://remote-stack-id:2998/test:80
 socks://user:pass@127.0.0.1:1080
@@ -389,6 +460,10 @@ servers:
 - 确认协议和端口正确
 - 如果是 HTTP server，确认是否符合“target_url + 原请求 URI”的拼接预期
 - 若是多上游，确认算法和权重来源清晰
+- 若需要同请求故障切换，确认 `--next-upstream` 非空且 `--tries > 1`
+- 确认 `--next-upstream-timeout` 能限制全部候选的总尝试成本
+- HTTP 状态码重试时，确认方法可重放且请求体不超过 `--max-body-buffer`
+- 确认 `--group` 没有被不相关的服务池复用
 - 实测请求或连接是否真正到达目标上游
 
 ### `socks`

@@ -51,7 +51,7 @@ servers:
               eq ${REQ.host} "sn.{{sn_host}}" && match ${REQ.path} "/1.0/identifiers/*" && return "server web3_sn";
               eq ${REQ.host} "sn.{{sn_host}}" && return "server web3_sn";
               eq ${REQ.host} "web3.{{sn_host}}" && return "server web3_sn";
-              return "error 404 unknown_host_${REQ.host}";
+              return "error 500 unknown_host_${REQ.host}";
 
 stacks:
   main_http_tcp:

@@ -2,16 +2,18 @@
 
 > **实现状态（2026-04-29）：本需求已完成落地。**
 >
+> 面向配置使用者的语法、示例和重试边界见 [forward 使用说明](forward使用说明.md)。
+>
 > 主要实现位置：
 >
-> - 数据模型（`ForwardPlan` / `ForwardTarget` / `NextUpstreamPolicy` / `BalanceMethod` / `ForwardServer` / `ProviderPolicy`）：[plan.rs](src/components/cyfs-gateway-lib/src/forward/plan.rs)
-> - selector（primary/backup 排序、fail_timeout 跳过、provider 邻接、least_time 重排）：[selector.rs](src/components/cyfs-gateway-lib/src/forward/selector.rs)
-> - group 内失败状态（§6.6，进程内、不落盘）：[failure_state.rs](src/components/cyfs-gateway-lib/src/forward/failure_state.rs)
-> - least_time / RTT 排序（消费 tunnel_mgr 历史，§4.1 / §8 阶段 4）：[least_time.rs](src/components/cyfs-gateway-lib/src/forward/least_time.rs)
-> - process-chain `forward` 命令（兼容单 URL 与 group 形态，支持 `--map` / `--backup-map` / `--server-map` / `--next-upstream` / `--tries` / `--next-upstream-timeout` / `--max-fails` / `--fail-timeout` / `--hash-key` / `--max-body-buffer` / `--provider-retry-scope` 等）：[cmds/forward.rs](src/components/cyfs-gateway-lib/src/cmds/forward.rs)
-> - stream / datagram 执行层连接阶段 next_upstream（§6.4 / §6.5）：[stack/mod.rs](src/components/cyfs-gateway-lib/src/stack/mod.rs)
-> - HTTP 入口连接阶段 retry 与受限的状态码 retry + 请求体缓冲（§6.3 / 阶段 3）：[server/http_server.rs](src/components/cyfs-gateway-lib/src/server/http_server.rs)
-> - tunnel_mgr URL history 业务回写（§6.7：`open_stream_by_url` / datagram client 创建时调用 `record_business_success` / `record_business_failure`，并按 §6.7.3 分类失败原因）：[tunnel_mgr.rs](src/components/cyfs-gateway-lib/src/tunnel_mgr.rs)
+> - 数据模型（`ForwardPlan` / `ForwardTarget` / `NextUpstreamPolicy` / `BalanceMethod` / `ForwardServer` / `ProviderPolicy`）：[plan.rs](../src/components/cyfs-gateway-lib/src/forward/plan.rs)
+> - selector（primary/backup 排序、fail_timeout 跳过、provider 邻接、least_time 重排）：[selector.rs](../src/components/cyfs-gateway-lib/src/forward/selector.rs)
+> - group 内失败状态（§6.6，进程内、不落盘）：[failure_state.rs](../src/components/cyfs-gateway-lib/src/forward/failure_state.rs)
+> - least_time / RTT 排序（消费 tunnel_mgr 历史，§4.1 / §8 阶段 4）：[least_time.rs](../src/components/cyfs-gateway-lib/src/forward/least_time.rs)
+> - process-chain `forward` 命令（兼容单 URL 与 group 形态，支持 `--map` / `--backup-map` / `--server-map` / `--next-upstream` / `--tries` / `--next-upstream-timeout` / `--max-fails` / `--fail-timeout` / `--hash-key` / `--max-body-buffer` / `--provider-retry-scope` 等）：[cmds/forward.rs](../src/components/cyfs-gateway-lib/src/cmds/forward.rs)
+> - stream / datagram 执行层连接阶段 next_upstream（§6.4 / §6.5）：[stack/mod.rs](../src/components/cyfs-gateway-lib/src/stack/mod.rs)
+> - HTTP 入口连接阶段 retry 与受限的状态码 retry + 请求体缓冲（§6.3 / 阶段 3）：[server/http_server.rs](../src/components/cyfs-gateway-lib/src/server/http_server.rs)
+> - tunnel_mgr URL history 业务回写（§6.7：`open_stream_by_url` / datagram client 创建时调用 `record_business_success` / `record_business_failure`，并按 §6.7.3 分类失败原因）：[tunnel_mgr.rs](../src/components/cyfs-gateway-lib/src/tunnel_mgr.rs)
 >
 > 下文保留需求背景，同时已按当前实现修正用户可见命令、内部模型和执行边界。
 
@@ -217,7 +219,7 @@ Nginx upstream: hash key -> server
 CYFS Gateway extension: hash key -> server -> route
 ```
 
-process-chain 中的当前落地入口是 `--server-map`：外层 map 是 `server_id -> route-map`，内层 route-map 是 `url -> weight`。
+process-chain 执行路径中的 provider-first 入口是 `--server-map`：外层 map 是 `server_id -> route-map`，内层 route-map 是 `url -> weight`。但当前 `Forward::check(...)` 的 upstream 预检没有把 `--server-map` 计入有效输入，仍要求同时存在 inline upstream、`--map` 或 `--backup-map`；因此下面只展示内部模型构造语法，`--server-map` 目前不能单独作为稳定的用户入口。
 
 ```text
 map-create node_a_routes;
@@ -238,7 +240,7 @@ forward consistent_hash --hash-key "$cookie_session_id" \
         --provider-retry-scope routes_only;
 ```
 
-上面的命令会构造 provider-first plan，并让同一个 `server_id` 的 routes 在尝试顺序中保持相邻。`--provider-retry-scope routes_only|across_servers` 当前会被解析并序列化进 `ForwardPlan`，但执行层尚未按该字段硬性截断 provider 边界；实际 retry 仍按 selector 产出的扁平候选顺序和 `--tries` 预算前进。因此它目前更接近 provider-first 排序/建模能力，而不是完整的“禁止跨 provider retry”执行保证。
+上面的命令在执行路径中会构造 provider-first plan，并让同一个 `server_id` 的 routes 在尝试顺序中保持相邻；但单独使用时会先受上述命令预检限制。`--provider-retry-scope routes_only|across_servers` 当前会被解析并序列化进 `ForwardPlan`，但执行层尚未按该字段硬性截断 provider 边界；实际 retry 仍按 selector 产出的扁平候选顺序和 `--tries` 预算前进。因此它目前更接近 provider-first 排序/建模能力，而不是完整的“禁止跨 provider retry”执行保证。
 
 对应的内部模型是：
 
@@ -368,7 +370,7 @@ forward round_robin --map $primary_peers \
 
 当前没有 `forward --plan $forward_plan` 这种用户命令。`ForwardPlan` 的 JSON/base64 是 `forward` 命令内部生成、执行层内部消费的协议，不要求 process-chain 脚本拼结构化 JSON。
 
-如果 process-chain collection 支持把 map 作为 value，当前已落地的结构化入口是 `--server-map`：
+如果 process-chain collection 支持把 map 作为 value，执行路径中已落地的结构化输入是 `--server-map`；但当前命令预检不允许只提供 `--server-map`，以下示例用于说明数据形态，不应视为可直接复制的稳定配置：
 
 ```text
 map-create node_a_routes;
@@ -599,7 +601,7 @@ build ordered ForwardPlan -> return forward-group "<base64-json-forward-plan>" -
 
 ### 阶段 1：数据模型和单 URL 兼容 — 已完成
 
-- 定义 `ForwardPlan`、`ForwardTarget`、`NextUpstreamPolicy`，见 [plan.rs](src/components/cyfs-gateway-lib/src/forward/plan.rs)。
+- 定义 `ForwardPlan`、`ForwardTarget`、`NextUpstreamPolicy`，见 [plan.rs](../src/components/cyfs-gateway-lib/src/forward/plan.rs)。
 - 保留并测试 `forward <url>`，单 URL 经 `ForwardPlan::single_url()` 退化为 `tries=1`、`next_upstream=off`。
 - group forward 已支持 primary / backup / weight / max_fails / fail_timeout 解析。
 - selector 已根据 `ForwardFailureRegistry` 在 `fail_timeout` 窗口内跳过候选。
@@ -623,4 +625,4 @@ build ordered ForwardPlan -> return forward-group "<base64-json-forward-plan>" -
 - `hash $key`、`consistent_hash` 已纳入 `BalanceMethod` 并在解析阶段校验。
 - provider-first 的 `server -> routes` 扩展：`ForwardServer` / `ProviderPolicy` 已建模，`--server-map` 支持构造带 `server_id` 的 plan，selector 会保持同一 provider 的 routes 相邻；`--provider-retry-scope` 已解析和序列化，但执行层尚未按 provider 边界硬截断 retry。
 - RTT / least-time 策略：`apply_least_time_via_tunnel_mgr()` 在执行入口以受限预算（默认 50ms）查询 tunnel_mgr URL history 后对候选重排，超时或失败退化为原顺序，不在 forward 内部维护独立 RTT 表。
-- Gateway Probe API 与 selector 通过 tunnel_mgr 共享同一份 URL history，详见 [tunnel_mgr基于url状态查询需求.md](doc/tunnel_mgr基于url状态查询需求.md)。
+- Gateway Probe API 与 selector 通过 tunnel_mgr 共享同一份 URL history，详见 [tunnel_mgr基于url状态查询需求.md](tunnel_mgr基于url状态查询需求.md)。

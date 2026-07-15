@@ -5,8 +5,9 @@
 
 ## 校验范围
 
-- 本地源码目录：`/mnt/f/work/cyfs-gateway`
-- 校验时 HEAD：`d9ff3b8`
+- 源码仓库：`cyfs-gateway`
+- 校验日期：2026-07-15
+- 校验时 HEAD：`f74ed4ed`
 
 ## 已校验的当前实现事实
 
@@ -172,14 +173,49 @@
 在 `src/components/cyfs-gateway-lib/src/cmds/forward.rs` 中，当前可以直接确认：
 
 - 默认算法是 `round_robin`
-- 显式支持 `round_robin` 与 `ip_hash`
+- 显式支持 `round_robin` / `rr`、`ip_hash`、`hash`、`consistent_hash`、`least_time`
 - 支持 inline upstream 列表
 - 支持 `--map <map>` 形式的 upstream 来源
+- 支持 `--backup-map <map>` 形式的 backup upstream 来源
 - inline upstream 支持 `url,weight=N`
 - `--map` 的 value 支持字符串或数字权重，且必须是正整数
-- 运行时会选出一个目标并返回 `forward "<selected_url>"`
+- 支持 `--next-upstream`、`--tries`、`--next-upstream-timeout`、`--max-fails`、`--fail-timeout`、`--group` 等 group 参数
+- 支持 HTTP 状态码 retry 条件与 `--max-body-buffer`
+- 支持 `--hash-key`，并在 process chain 执行时捕获已经解析出的 key value
+- 未启用 group 语义时，运行时选出一个目标并返回 `forward "<selected_url>"`
+- 启用 group 语义时，运行时构造 `ForwardPlan`；有效的多候选 plan 返回 `forward-group "<base64-json-plan>"`，单 URL 且未启用重试的 plan 默认退化为普通 `forward`，除非设置 `--force-group`
+- `--group` 只作为失败状态 key 的逻辑名称，不执行预定义 upstream registry lookup
 
-结论：skill 可以稳定宣称 `forward` 是“按算法从一个或多个 upstream 中选出目标 URL 的控制动作”。
+在 `src/components/cyfs-gateway-lib/src/forward/plan.rs`、`selector.rs`、`failure_state.rs` 中，当前可以直接确认：
+
+- 单 URL plan 等价于一次尝试、关闭 next upstream
+- primary 排在 backup 之前；处于失败窗口的候选被排到健康候选之后
+- `max_fails` 默认 1，`fail_timeout` 默认 10 秒
+- group 失败状态是当前进程内的 `group + URL` 状态，不落盘
+- `hash` / `consistent_hash` 使用捕获的业务 key；`ip_hash` 使用请求来源 IP
+- `least_time` 由执行入口读取 tunnel manager 已有 URL history 做受限 RTT 重排
+
+结论：skill 可以稳定宣称 `forward` 同时具备“兼容的单 URL / 预选一个 URL 模式”和“候选计划 + 执行阶段 next upstream 模式”。不能把旧多 URL 语法误写成自动故障切换；只有显式 group 语义和有效重试策略才会在同一次请求内尝试下一候选。
+
+### 11.1 group retry 的当前执行边界
+
+在 `src/components/cyfs-gateway-lib/src/stack/mod.rs` 中：
+
+- `stream_forward_group(...)` 只在 `open_stream_by_url(...)` 阶段重试；开始 `copy_bidirectional(...)` 后不切换
+- `datagram_forward_group(...)` 只在 `create_datagram_client_by_url(...)` 阶段重试；开始 datagram 双向复制后不切换
+- `next_upstream_timeout` 是所有候选共享的墙钟预算
+
+在 `src/components/cyfs-gateway-lib/src/server/http_server.rs` 中：
+
+- connect-only 路径只在请求尚可安全交给下一候选时重试
+- 状态码路径支持 `http_5xx`、`http_502`、`http_503`、`http_504`
+- 状态码 retry 需要缓冲并重放请求体
+- GET / HEAD / PUT / DELETE / OPTIONS / TRACE 被归为幂等；其他方法需要显式 `non_idempotent`
+- 配置状态码条件但省略 `--max-body-buffer` 时默认 64 KiB；0 表示不启用状态码 retry
+- 请求体超过已启用的缓冲上限时返回请求错误
+- `invalid_header` 当前只存在于条件模型和解析器中，状态判断没有对应实现
+
+在 provider-first 路径中，`--server-map` 会给 route 标记 `server_id`，selector 会保持同 provider route 相邻；但 `ProviderPolicy.retry_scope` 当前没有被 HTTP / stream / datagram executor 用来截断候选遍历。`Forward::check(...)` 的“至少一个 upstream”预检目前只统计 inline、`--map`、`--backup-map`，没有统计 `--server-map`，因此 `--server-map` 不能单独作为稳定的用户入口。skill 必须把这两个限制写明，不能承诺有状态业务不会跨 provider retry。
 
 ### 12. `call-server` 的当前语义
 
@@ -196,23 +232,30 @@
 
 - 消费 `server <id>`，并把请求交给目标 HTTP server
 - 消费 `forward <url>`，并调用 `handle_forward_upstream(...)`
+- 消费 `forward-group <plan>`，并调用 group HTTP upstream 处理路径
 
 在 `src/components/cyfs-gateway-lib/src/stack/tcp_stack.rs` 中，TCP stack 当前会：
 
 - 消费 `forward <url>`，并调用 `stream_forward(...)`
+- 消费 `forward-group <plan>`，并调用 `stream_forward_group(...)`
 - 消费 `server <id>`，并把连接交给目标 HTTP 或 stream server
+
+在 `src/components/cyfs-gateway-lib/src/stack/tls_stack.rs` 和 `quic_stack.rs` 中，TLS / QUIC stream stack 当前也会消费 `forward-group <plan>` 并进入 stream group 执行路径。
 
 在 `src/components/cyfs-gateway-lib/src/stack/rtcp_stack.rs` 中，RTCP stack 当前会：
 
 - 消费 `forward <url>`，并调用 `stream_forward(...)`
+- stream 入口消费 `forward-group <plan>`，并调用 `stream_forward_group(...)`
+- datagram 入口消费 `forward-group <plan>`，并调用 `datagram_forward_group(...)`
 - 消费 `server <id>`，并把连接交给目标 HTTP 或 stream server
 
 在 `src/components/cyfs-gateway-lib/src/stack/udp_stack.rs` 中，UDP stack 当前会：
 
 - 消费 `forward <url>`，并通过 `create_datagram_client_by_url(...)` 创建 datagram 转发客户端
+- 消费 `forward-group <plan>`，并调用 `datagram_forward_group(...)`
 - 消费 `server <id>`，并把 datagram 交给目标 datagram server
 
-结论：skill 可以稳定宣称“数据转发”不只存在于 HTTP 反向代理场景，还覆盖 TCP / RTCP / UDP 入口对 `server` / `forward` 控制动作的消费。
+结论：skill 可以稳定宣称“数据转发”不只存在于 HTTP 反向代理场景，还覆盖 HTTP、TCP、TLS、QUIC、RTCP、UDP 对普通 `forward` 或 group `forward` 控制动作的消费。不能泛化为所有入口：例如当前 `cyfs-tun` 的处理分支仍只有普通 `forward`，没有 `forward-group` 分支。
 
 ### 14. `tls` upstream URL 在当前 tunnel 实现中的形态
 

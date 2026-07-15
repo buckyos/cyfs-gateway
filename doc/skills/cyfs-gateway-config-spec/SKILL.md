@@ -66,9 +66,14 @@ description: 用于独立讲解、审查、设计和排查 cyfs-gateway 配置�
   `socks` server：让支持代理的应用经 `target` / `rule_config` / `enable_tunnel` 接入远端资源
 - 讨论 `forward` 时，只能使用本 skill 已校验的语义：
   缺省算法 `round_robin`
-  可选算法 `ip_hash`
-  支持 inline upstream 与 `--map`
+  可选算法 `ip_hash`、`hash`、`consistent_hash`、`least_time`
+  支持 inline upstream、`--map` 与 `--backup-map`
   upstream 权重必须是正整数
+  旧多 URL 语法默认只预选一个 URL，不等于同请求自动故障切换
+  group 形态通过 `--next-upstream`、`--tries`、`--next-upstream-timeout` 控制执行阶段重试
+  stream/datagram 只在建链阶段重试；开始传输后不切换
+  HTTP 状态码重试受幂等方法、`non_idempotent` 和请求体缓冲上限约束
+- 讨论 provider-first `--server-map` / `--provider-retry-scope` 时，必须说明当前只完成模型解析与同 provider route 邻接排序，执行层尚未强制截断跨 provider retry，而且命令预检不允许只提供 `--server-map`；不能把它写成稳定的独立入口或有状态业务隔离保证。
 - 不能把 `forward`、`call-server` 这种业务流量转发动作，和 `tun` 的 IP 级配置、宿主机 IP 转发、静态路由混成同一层概念。
 - 讨论 `tun` 时，必须区分两层：
   `bind` / `mask` / `mtu` / timeout 等 IP 级参数
