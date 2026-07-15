@@ -4019,6 +4019,9 @@ mod tests {
         assert_eq!(result["reused"].as_bool().unwrap(), false);
         let first_tx_hash = result["tx_hash"].as_str().unwrap().to_string();
 
+        // Cross the old second-based created_at boundary before replaying.
+        tokio::time::sleep(tokio::time::Duration::from_millis(1_100)).await;
+
         // 同 request_id 幂等重放：返回同一笔 TX，reused=true。
         let replay = internal_krpc
             .call(
