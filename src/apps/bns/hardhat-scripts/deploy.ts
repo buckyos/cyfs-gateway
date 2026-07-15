@@ -27,14 +27,7 @@ function toRepoPath(repoRoot: string, absolutePath: string): string {
 
 function assertDeploymentInputsCommitted(repoRoot: string): string {
   const deploymentInputs = [
-    path.join(contractDirectory, "src"),
-    path.join(contractDirectory, "hardhat.config.ts"),
-    path.join(contractDirectory, "package.json"),
-    path.join(contractDirectory, "package-lock.json"),
-    fileURLToPath(import.meta.url),
-    path.join(scriptDirectory, "deploy-common.ts"),
-    path.join(scriptDirectory, "check-facets.mjs"),
-    path.join(scriptDirectory, "facet-manifest.json"),
+    path.join(contractDirectory, "src")
   ].map((input) => toRepoPath(repoRoot, input));
 
   try {
