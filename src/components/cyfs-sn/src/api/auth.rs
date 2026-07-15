@@ -60,10 +60,11 @@ async fn build_auth_success_response(
 }
 
 pub(crate) fn default_owner_config(username: &str) -> Value {
+    // NameState.registered_at is authoritative. Keep this payload stable so a
+    // request_id replay produces the same idempotency hash.
     json!({
         "name": username,
         "created_by": "cyfs-sn",
-        "created_at": now_secs(),
     })
 }
 
@@ -418,5 +419,18 @@ pub(crate) async fn handle_auth(
             ok_response(&req, build_profile_response(username.as_str(), &user))
         }
         _ => Err(RPCErrors::UnknownMethod(req.method)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_owner_config_is_deterministic() {
+        assert_eq!(
+            default_owner_config("alice"),
+            json!({"name": "alice", "created_by": "cyfs-sn"})
+        );
     }
 }
