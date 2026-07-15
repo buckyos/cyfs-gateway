@@ -23,7 +23,7 @@
   - [ ] 本地 `forge script` 冒烟测试。
   - [ ] Rust 端到端测试可用 `alloy-node-bindings` 自动拉起 Anvil。
 - [ ] Anvil 可以使用固定 mnemonic、临时 state、快速重部署。
-- [ ] Anvil 的 `--disable-code-size-limit` 只能作为原型/测试便利，不能作为生产兼容性依据。
+- [x] Anvil 测试不再绕过 EVM 合约尺寸限制。
 
 ### 1.2 生产稳定期私链
 
@@ -54,7 +54,7 @@
 
 - [ ] 当前 `src/apps/bns/src/Bns.sol` 原型必须瘦身或拆分，确保在标准 EVM 限制下部署：
   - [ ] deployed bytecode <= 24 KiB。
-  - [ ] 不需要 `--disable-code-size-limit`。
+  - [x] 不需要额外的合约尺寸限制绕过参数。
   - [ ] 生产部署命令不含 Anvil-only 参数。
 - [ ] 明确合约拆分方式：
   - [ ] 单主合约 + 外部 view/helper library；
@@ -254,4 +254,3 @@
   - [ ] 拆分版合约上链；
   - [ ] migration contract；
   - [ ] 或继续私链生产并周期性公链锚定。
-

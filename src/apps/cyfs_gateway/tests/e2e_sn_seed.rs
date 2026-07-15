@@ -5,7 +5,7 @@
 //! 运行：
 //!   cargo test -p cyfs_gateway --test e2e_sn_seed -- --ignored --test-threads=1
 //!
-//! 依赖本机工具：anvil / forge / cast / cargo / deno / curl / dig
+//! 依赖本机工具：anvil / node / npm / cargo / deno / curl / dig
 //! （sn-dev-up.sh 会做工具检查）。内部拉起 3.2 的 sn-dev 三件套环境到独立
 //! VAR 目录（临时 rootfs / 临时 sqlite / 独立 env_root），结束后 --purge。
 //! 网关端口来自 make_sn_config --dev-local profile（15353/18081/...），

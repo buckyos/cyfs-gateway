@@ -222,6 +222,7 @@ where
                     })?;
                     registry_events_stored += 1;
                 }
+                ProjectedContractEvent::Router | ProjectedContractEvent::Infrastructure => {}
             }
         }
 

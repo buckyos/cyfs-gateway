@@ -17,7 +17,7 @@ SN 当前由两条主线组成：
 
 | 层级 | 测试目的 | 当前入口 |
 | --- | --- | --- |
-| BNS 合约 | 验证链上授权边界、权限策略、guard、防重放、文档生命周期、事件契约和关键不变量 | `cd src/apps/bns && forge test` |
+| BNS 合约 | 验证链上授权边界、权限策略、guard、防重放、文档生命周期、事件契约和关键不变量 | `cd src/apps/bns && npm test` |
 | BNS Rust 组件 | 验证 ABI/TX 边界、索引投影、同步游标、BNS Server 读写职责、Client/Controller 写入策略 | `cd src && cargo test -p bns-evm -p bns-indexer -p bns-server -p bns-client -- --test-threads=1` |
 | SN 组件 | 验证账号认证、DeviceInfo、Resolver、S2S DB 适配、SN HTTP/kRPC API 的业务语义 | `cd src && cargo test -p cyfs-sn -- --test-threads=1` |
 | Gateway + SN/BNS 读取集成 | 验证 gateway 中 SN 服务能通过 BNS indexer 读取 BNS 文档并对外解析 | `cd src && cargo test -p cyfs_gateway --test test_sn_bns_integration -- --test-threads=1` |
@@ -28,8 +28,8 @@ SN 当前由两条主线组成：
 说明：
 
 - `cargo test` 默认会跳过 `#[ignore]` 的真 EVM 集成测试；需要显式加 `--ignored`。
-- Foundry 相关测试需要本机安装 `forge`/`anvil`。缺 Foundry 时，Rust 的 ignored e2e 用例应跳过而不是阻断普通回归。
-- CI 基线仍以 `cd src && cargo test -- --test-threads=1` 为准；涉及 SN/BNS 改动时建议额外跑对应 Foundry 或 DV 测试。
+- BNS 合约编译和测试需要 Node.js/npm；真 EVM 集成环境仍需要 `anvil`。缺少集成环境工具时，Rust 的 ignored e2e 用例应跳过而不是阻断普通回归。
+- CI 基线仍以 `cd src && cargo test -- --test-threads=1` 为准；涉及 SN/BNS 改动时建议额外跑对应 Hardhat 或 DV 测试。
 
 ## 2. BNS 合约测试目的
 
@@ -44,7 +44,7 @@ BNS 合约测试用于钉住链上规则，而不是验证 Rust 侧实现细节�
 - **事件契约**：每类写操作都要发出索引器可消费的事件，事件字段必须能支撑链下投影。
 - **fuzz / invariant**：对权限、guard、authority key、事件序列等高风险组合做周期性增强。
 
-通过标准：`forge test` 通过；新增链上写函数或新事件时，同步补授权、guard、事件和至少一个成功路径。
+通过标准：`npm test` 通过；新增链上写函数或新事件时，同步补授权、guard、事件和至少一个成功路径。
 
 ## 3. BNS Rust 组件测试目的
 
@@ -157,7 +157,7 @@ cd src && cargo test -- --test-threads=1
 涉及 BNS 合约或 ABI 时额外运行：
 
 ```bash
-cd src/apps/bns && forge test
+cd src/apps/bns && npm test
 ```
 
 ### 定向回归

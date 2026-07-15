@@ -68,7 +68,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--install-foundry",
         action="store_true",
-        help="install Foundry in this VM before starting anvil/deploying BNS",
+        help="install Foundry in this VM before starting anvil",
     )
     parser.add_argument(
         "--configure-sn-bns-proxy",
@@ -231,7 +231,6 @@ def start_or_reuse_anvil(current_dir: Path) -> None:
         BNS_CHAIN_ID,
         "--mnemonic",
         ANVIL_MNEMONIC,
-        "--disable-code-size-limit",
         "--state",
         str(current_dir / ANVIL_STATE_FILE),
     ]
@@ -261,7 +260,7 @@ def start_or_reuse_anvil(current_dir: Path) -> None:
     print(f"Anvil ready at {BNS_RPC_ENDPOINT}, pid={process.pid}, log={log_path}")
 
 
-def parse_forge_create_output(output: str) -> dict:
+def parse_deployment_output(output: str) -> dict:
     try:
         return json.loads(output)
     except json.JSONDecodeError:
@@ -283,7 +282,11 @@ def find_bns_project_dir(current_dir: Path) -> Path | None:
         current_dir.parent / "src" / "apps" / "bns",
     ]
     for candidate in candidates:
-        if (candidate / "foundry.toml").exists() and (candidate / "src" / "Bns.sol").exists():
+        if (
+            (candidate / "package.json").exists()
+            and (candidate / "hardhat.config.ts").exists()
+            and (candidate / "hardhat-scripts" / "deploy-local.ts").exists()
+        ):
             return candidate
     return None
 
@@ -307,13 +310,16 @@ def load_current_deployment(current_dir: Path) -> str | None:
     return None
 
 
-def run_checked(cmd: list[str], cwd: Path) -> subprocess.CompletedProcess:
+def run_checked(
+    cmd: list[str], cwd: Path, env: dict[str, str] | None = None
+) -> subprocess.CompletedProcess:
     result = subprocess.run(
         cmd,
         cwd=cwd,
         text=True,
         capture_output=True,
         check=False,
+        env=env,
     )
     if result.returncode != 0:
         raise RuntimeError(
@@ -345,8 +351,8 @@ def run_checked_shell(command: str, cwd: Path) -> None:
 
 
 def install_foundry(current_dir: Path) -> None:
-    if find_executable(current_dir, "anvil") and find_executable(current_dir, "forge"):
-        print("Foundry already available")
+    if find_executable(current_dir, "anvil"):
+        print("Anvil already available")
         return
 
     if find_executable(current_dir, "curl") is None:
@@ -359,8 +365,8 @@ def install_foundry(current_dir: Path) -> None:
         raise RuntimeError("foundryup was not installed")
     run_checked([foundryup], current_dir)
 
-    if not (find_executable(current_dir, "anvil") and find_executable(current_dir, "forge")):
-        raise RuntimeError("Foundry install completed but anvil/forge are still unavailable")
+    if find_executable(current_dir, "anvil") is None:
+        raise RuntimeError("Foundry install completed but anvil is still unavailable")
 
 
 def write_deployment(current_dir: Path, deployment: dict) -> None:
@@ -373,41 +379,44 @@ def write_deployment(current_dir: Path, deployment: dict) -> None:
 
 
 def deploy_bns_contract(current_dir: Path) -> str:
-    forge = find_executable(current_dir, "forge")
+    npm = find_executable(current_dir, "npm")
     bns_project_dir = find_bns_project_dir(current_dir)
     missing = []
-    if forge is None:
-        missing.append("forge")
+    if npm is None:
+        missing.append("npm")
     if bns_project_dir is None:
-        missing.append("BNS Foundry project")
+        missing.append("BNS Hardhat project")
     if missing:
         raise RuntimeError(
             "cannot deploy BNS contract; missing "
-            f"{', '.join(missing)}. Install Foundry and/or set BNS_PROJECT_DIR."
+            f"{', '.join(missing)}. Install Node.js and/or set BNS_PROJECT_DIR."
         )
 
-    assert forge is not None
+    assert npm is not None
     assert bns_project_dir is not None
-    print(f"Building BNS contract in {bns_project_dir}")
-    run_checked([forge, "build"], bns_project_dir)
+    hardhat = bns_project_dir / "node_modules" / ".bin" / "hardhat"
+    if not hardhat.exists():
+        print(f"Installing BNS Node.js dependencies in {bns_project_dir}")
+        run_checked([npm, "ci"], bns_project_dir)
 
-    cmd = [
-        forge,
-        "create",
-        "src/Bns.sol:Bns",
-        "--rpc-url",
-        BNS_RPC_ENDPOINT,
-        "--private-key",
-        BNS_DEPLOYER_PRIVATE_KEY,
-        "--broadcast",
-        "--json",
-    ]
-    print("Deploying BNS contract")
-    result = run_checked(cmd, bns_project_dir)
-    deployment = parse_forge_create_output(result.stdout)
+    print(f"Compiling BNS contract in {bns_project_dir}")
+    run_checked([npm, "run", "--silent", "compile"], bns_project_dir)
+
+    deploy_env = {
+        **os.environ,
+        "BNS_ANVIL_RPC_URL": BNS_RPC_ENDPOINT,
+        "BNS_ANVIL_PRIVATE_KEY": BNS_DEPLOYER_PRIVATE_KEY,
+    }
+    print("Deploying BNS UUPS proxy and facets")
+    result = run_checked(
+        [npm, "run", "--silent", "deploy:local"],
+        bns_project_dir,
+        env=deploy_env,
+    )
+    deployment = parse_deployment_output(result.stdout)
     contract = deployment.get("deployedTo")
     if not isinstance(contract, str) or not contract:
-        raise RuntimeError(f"forge create output missing deployedTo: {result.stdout}")
+        raise RuntimeError(f"Hardhat deployment output missing deployedTo: {result.stdout}")
 
     deadline = time.monotonic() + CONTRACT_DEPLOY_TIMEOUT_SECONDS
     while time.monotonic() < deadline:
@@ -482,6 +491,8 @@ def main() -> int:
         return 2
 
     current_dir = Path(__file__).resolve().parent
+    if find_executable(current_dir, "node") is None:
+        raise RuntimeError("node is required to build and deploy the BNS contract")
     if args.install_foundry:
         install_foundry(current_dir)
 

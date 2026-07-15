@@ -55,7 +55,7 @@ VM target:   /opt/web3-gateway
 1. 校验 staging 路径并删除旧 staging。
 2. 创建空 staging 目录。
 3. 设置 `APPDATA` 为 staging 的父目录，执行 `uv run ./build.py aarch64`，让 `buckyos-update` 将 web3-gateway 模块写入 staging。
-4. 将 BNS `foundry.toml` 和 `src/` 复制到 staging 的 `bns/`。
+4. 将 BNS Hardhat 项目文件、`hardhat-scripts/` 和 `src/` 复制到 staging 的 `bns/`。
 5. 执行 `make_sn_config.ts` 时显式传入 `--rootfs <staging>`，不要依赖其 Unix 默认值 `/opt/web3-gateway`。
 6. 在 push 前执行 staging 内容校验，发现运行态文件时立即失败。
 

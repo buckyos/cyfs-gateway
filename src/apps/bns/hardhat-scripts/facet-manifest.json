@@ -1,0 +1,37 @@
+{
+  "BnsResolverFacet": [
+    "chainAccountPrincipal",
+    "bnsNamePrincipal",
+    "queryNameState",
+    "resolveOwner",
+    "isStandardTransferEnabled",
+    "getAuthoritySet",
+    "getAuthorityKey",
+    "resolveDocument",
+    "getDocumentVersion",
+    "getAlias",
+    "getPurchaseContext",
+    "resolvePaymentTarget",
+    "latestCheckpoint"
+  ],
+  "BnsRegistrationFacet": ["registerName"],
+  "BnsAtomicMutationFacet": ["transferName", "applyMutations"],
+  "BnsNameFacet": [
+    "renewName",
+    "setNameOwner",
+    "releaseName",
+    "setNamespacePolicy"
+  ],
+  "BnsAuthorityFacet": ["updateAuthorityKeys"],
+  "BnsDocumentFacet": [
+    "setMinDocumentIat",
+    "publishDocument",
+    "revokeDocument",
+    "setControllerPolicy"
+  ],
+  "BnsAliasPaymentFacet": [
+    "setDidAlias",
+    "setPaymentTarget",
+    "publishLogCheckpoint"
+  ]
+}

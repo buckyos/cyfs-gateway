@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
+import "../src/BnsTypes.sol";
+
 import "./BnsTestBase.sol";
 
 /// §1.5 — Documents & large objects: inline content-hash binding, the 4KB

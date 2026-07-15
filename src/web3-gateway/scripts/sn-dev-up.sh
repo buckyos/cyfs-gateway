@@ -4,7 +4,7 @@
 #   sn-dev-up.sh [--fresh | --resume] [--keep-running]
 #
 # 编排（仿 src/apps/bns/scripts/dv-up.sh 三件套）：
-#   anvil（私链，--state 持久化）→ forge 部署 Bns.sol → 写 dv-env.json →
+#   anvil（私链，--state 持久化）→ Hardhat 部署 BNS UUPS + facets → 写 dv-env.json →
 #   make_sn_config.ts --seed-v2 --dev-local（产 rootfs + 种子配置）→
 #   bns_dv serve --seed-config（种子上链 + indexer 投影，健康门控含种子完成）→
 #   web3_gateway（cyfs-sn 启动时幂等导入 sn_seed.yaml）→ 健康检查。
@@ -64,7 +64,7 @@ for arg in "$@"; do
   esac
 done
 
-for bin in anvil forge cast cargo deno curl dig; do
+for bin in anvil node npm cargo deno curl dig; do
   command -v "$bin" >/dev/null 2>&1 || { echo "missing required tool: $bin" >&2; exit 1; }
 done
 
@@ -87,8 +87,26 @@ wait_for() { # wait_for <desc> <timeout_s> <cmd...>
   done
 }
 
-anvil_chain_id_ok() { [ "$(cast chain-id --rpc-url "$RPC" 2>/dev/null)" = "$CHAIN_ID" ]; }
-contract_deployed() { local c="$1"; [ "$(cast code "$c" --rpc-url "$RPC" 2>/dev/null)" != "0x" ]; }
+rpc_result() { # rpc_result <method> [params-json]
+  local method="$1" params="${2:-[]}" response=""
+  response="$(curl -fsS \
+    -H 'content-type: application/json' \
+    --data "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"$method\",\"params\":$params}" \
+    "$RPC")" || return 1
+  printf '%s' "$response" | sed -n 's/.*"result"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p'
+}
+
+anvil_chain_id_ok() {
+  local chain_id_hex=""
+  chain_id_hex="$(rpc_result eth_chainId)" || return 1
+  [ -n "$chain_id_hex" ] && [ "$((chain_id_hex))" -eq "$CHAIN_ID" ]
+}
+
+contract_deployed() {
+  local c="$1" code=""
+  code="$(rpc_result eth_getCode "[\"$c\",\"latest\"]")" || return 1
+  [ -n "$code" ] && [ "$code" != "0x" ]
+}
 bns_healthy() { [ "$(curl -fsS "$BNS_SERVER_URL/health" 2>/dev/null)" = "ok" ]; }
 gw_http_up() { curl -fsS -o /dev/null -H "Host: sn.devtests.org" "http://127.0.0.1:${GW_HTTP_PORT}/kapi/sn" 2>/dev/null || [ "$(curl -s -o /dev/null -w '%{http_code}' -H "Host: sn.devtests.org" "http://127.0.0.1:${GW_HTTP_PORT}/kapi/sn" 2>/dev/null)" != "000" ]; }
 
@@ -125,20 +143,27 @@ else
 fi
 mkdir -p "$ROOTFS" "$ENV_ROOT" "$VAR/buckyos_root"
 
-# --- 2) anvil ---
+# --- 2) 编译合约并同步 ABI（fresh）---
+if [ "$MODE" = "fresh" ]; then
+  echo "[sn-dev-up] compiling contracts and synchronizing ABI"
+  (cd "$BNS_APP_DIR" && npm run --silent compile:sync)
+fi
+
+# --- 3) anvil ---
 echo "[sn-dev-up] starting anvil on $RPC (chain $CHAIN_ID)"
 anvil --host "$ANVIL_HOST" --port "$ANVIL_PORT" --chain-id "$CHAIN_ID" \
-  --mnemonic "$MNEMONIC" --disable-code-size-limit --state "$ANVIL_STATE" \
+  --mnemonic "$MNEMONIC" --state "$ANVIL_STATE" \
   >"$ANVIL_LOG" 2>&1 &
 echo $! > "$ANVIL_PID"
 wait_for "anvil eth_chainId" 30 anvil_chain_id_ok
 
-# --- 3) 部署/复用 Bns.sol ---
+# --- 4) 部署/复用 BNS UUPS proxy ---
 if [ "$MODE" = "fresh" ]; then
-  echo "[sn-dev-up] deploying Bns.sol"
-  (cd "$BNS_APP_DIR" && forge create src/Bns.sol:Bns \
-    --rpc-url "$RPC" --private-key "$DEPLOYER_KEY" --broadcast --json) >"$DEPLOY_JSON.tmp" 2>"$VAR/forge.err" \
-    || { echo "forge create failed:" >&2; cat "$VAR/forge.err" >&2; exit 1; }
+  echo "[sn-dev-up] deploying BNS UUPS proxy and facets with Hardhat"
+  (cd "$BNS_APP_DIR" && \
+    BNS_ANVIL_RPC_URL="$RPC" BNS_ANVIL_PRIVATE_KEY="$DEPLOYER_KEY" \
+    npm run --silent deploy:local) >"$DEPLOY_JSON.tmp" 2>"$VAR/deploy-local.err" \
+    || { echo "Hardhat local deployment failed:" >&2; cat "$VAR/deploy-local.err" >&2; exit 1; }
   sed -n '/{/,/}/p' "$DEPLOY_JSON.tmp" > "$DEPLOY_JSON"
   rm -f "$DEPLOY_JSON.tmp"
 fi
@@ -146,7 +171,7 @@ CONTRACT="$(json_get "$DEPLOY_JSON" deployedTo)"
 [ -n "$CONTRACT" ] || { echo "could not determine contract address from $DEPLOY_JSON" >&2; exit 1; }
 wait_for "contract code at $CONTRACT" 30 contract_deployed "$CONTRACT"
 
-# --- 4) rootfs 模板 + dv-env.json + make_sn_config --seed-v2 --dev-local ---
+# --- 5) rootfs 模板 + dv-env.json + make_sn_config --seed-v2 --dev-local ---
 # 仅 fresh 时构造 rootfs：--resume 语义是"不动 seed 重启"（T5），不得重跑
 # make_sn_config 以免重写 rootfs/seed 产物。产物稳定性（重跑 make_sn_config
 # diff 干净）由 e2e_sn_seed 用独立 scratch rootfs 验证。
@@ -178,7 +203,7 @@ else
   echo "[sn-dev-up] --resume: reusing rootfs and seed products as-is"
 fi
 
-# --- 5) 构建二进制 ---
+# --- 6) 构建二进制 ---
 echo "[sn-dev-up] building bns_dv + web3_gateway (cargo)"
 BNS_DV_BIN="$(cd "$SRC_DIR" && cargo build -p bns-server --bin bns_dv --message-format=json 2>/dev/null \
   | grep -o '"executable":"[^"]*bns_dv"' | tail -1 | sed 's/.*:"//;s/"$//')"
@@ -187,7 +212,7 @@ GW_BIN="$(cd "$SRC_DIR" && cargo build -p cyfs_gateway --bin cyfs_gateway --mess
   | grep -o '"executable":"[^"]*cyfs_gateway"' | tail -1 | sed 's/.*:"//;s/"$//')"
 [ -n "$GW_BIN" ] && [ -x "$GW_BIN" ] || { echo "failed to build cyfs_gateway (web3_gateway) binary" >&2; exit 1; }
 
-# --- 6) bns_dv serve --seed-config（种子上链完成后才开 HTTP，健康门控即种子门控）---
+# --- 7) bns_dv serve --seed-config（种子上链完成后才开 HTTP，健康门控即种子门控）---
 echo "[sn-dev-up] starting bns_dv serve on $BNS_SERVER_URL (with seed config)"
 "$BNS_DV_BIN" serve \
   --rpc "$RPC" --contract "$CONTRACT" --chain-id "$CHAIN_ID" \
@@ -197,7 +222,7 @@ echo "[sn-dev-up] starting bns_dv serve on $BNS_SERVER_URL (with seed config)"
 echo $! > "$BNS_PID"
 wait_for "bns-dv /health (incl. seed txs projected)" 120 bns_healthy
 
-# --- 7) web3_gateway ---
+# --- 8) web3_gateway ---
 echo "[sn-dev-up] starting web3_gateway (dns :$GW_DNS_PORT/udp, http :$GW_HTTP_PORT)"
 # 注意启动形态：subshell 内 exec 让 $! 就是网关本体，且网关的 fd 全部指向
 # 日志（不残留本脚本 stdout 管道——否则调用方等管道 EOF 会被长活进程挂死）。
@@ -209,7 +234,7 @@ echo "[sn-dev-up] starting web3_gateway (dns :$GW_DNS_PORT/udp, http :$GW_HTTP_P
 echo $! > "$GW_PID"
 wait_for "web3_gateway http :$GW_HTTP_PORT" 60 gw_http_up
 
-# --- 8) 写环境摘要 ---
+# --- 9) 写环境摘要 ---
 cat > "$ENV_JSON" <<EOF
 {
   "rootfs": "$ROOTFS",

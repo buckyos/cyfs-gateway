@@ -36,11 +36,15 @@ REQUIRED_FILES = (
     "start.py",
     "stop.py",
     "init_anvil.py",
-    "bns/foundry.toml",
+    "bns/package.json",
+    "bns/package-lock.json",
+    "bns/hardhat.config.ts",
+    "bns/tsconfig.json",
 )
 
 REQUIRED_DIRS = (
     "bns/src",
+    "bns/hardhat-scripts",
     "ca",
     "sn_token_key",
 )
@@ -251,9 +255,16 @@ def copy_bns_source() -> None:
     if target.exists():
         shutil.rmtree(target)
     target.mkdir(parents=True)
-    shutil.copy2(source / "foundry.toml", target / "foundry.toml")
-    shutil.copytree(source / "src", target / "src")
-    print(f"[staging] copied BNS Foundry source: {target}")
+    for filename in (
+        "package.json",
+        "package-lock.json",
+        "hardhat.config.ts",
+        "tsconfig.json",
+    ):
+        shutil.copy2(source / filename, target / filename)
+    for dirname in ("src", "hardhat-scripts"):
+        shutil.copytree(source / dirname, target / dirname)
+    print(f"[staging] copied BNS Hardhat project: {target}")
 
 
 def make_sn_config(sn_ip: str, enable_bns_proxy: bool = False) -> None:
