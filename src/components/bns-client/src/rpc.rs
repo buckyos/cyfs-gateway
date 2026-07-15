@@ -184,10 +184,14 @@ impl<T> BnsRpcEnvelope<T> {
     }
 
     pub fn into_result(self) -> BnsClientResult<T> {
+        self.into_optional_result()?.ok_or_else(|| {
+            BnsClientError::InvalidResponse("BNS RPC envelope missing result".to_string())
+        })
+    }
+
+    fn into_optional_result(self) -> BnsClientResult<Option<T>> {
         if self.ok {
-            self.result.ok_or_else(|| {
-                BnsClientError::InvalidResponse("BNS RPC envelope missing result".to_string())
-            })
+            Ok(self.result)
         } else {
             Err(BnsClientError::Registry(self.error.unwrap_or_else(|| {
                 BnsRpcErrorInfo::new("UNKNOWN_BNS_ERROR", "BNS RPC envelope missing error")
@@ -560,28 +564,60 @@ impl BnsRpcClient {
         Self::KRPC(Arc::new(kRPC::new(endpoint.as_str(), session_token)))
     }
 
+    async fn call_envelope<Req>(&self, method: &str, req: &Req) -> BnsClientResult<Value>
+    where
+        Req: Serialize + Sync,
+    {
+        let Self::KRPC(client) = self else {
+            return Err(BnsClientError::unsupported(
+                "generic call is only available for KRPC clients",
+            ));
+        };
+        let req_json =
+            serde_json::to_value(req).map_err(|e| BnsClientError::Serialization(e.to_string()))?;
+        client
+            .call(method, req_json)
+            .await
+            .map_err(|e| BnsClientError::Transport(e.to_string()))
+    }
+
     async fn call<Req, Resp>(&self, method: &str, req: &Req) -> BnsClientResult<Resp>
     where
         Req: Serialize + Sync,
         Resp: DeserializeOwned,
     {
-        match self {
-            Self::InProcess(_) => Err(BnsClientError::unsupported(
-                "generic call is only available for KRPC clients",
-            )),
-            Self::KRPC(client) => {
-                let req_json = serde_json::to_value(req)
-                    .map_err(|e| BnsClientError::Serialization(e.to_string()))?;
-                let result = client
-                    .call(method, req_json)
-                    .await
-                    .map_err(|e| BnsClientError::Transport(e.to_string()))?;
-                let envelope: BnsRpcEnvelope<Resp> = serde_json::from_value(result)
-                    .map_err(|e| BnsClientError::InvalidResponse(e.to_string()))?;
-                envelope.into_result()
-            }
-        }
+        let envelope: BnsRpcEnvelope<Resp> =
+            serde_json::from_value(self.call_envelope(method, req).await?)
+                .map_err(|e| BnsClientError::InvalidResponse(e.to_string()))?;
+        envelope.into_result()
     }
+
+    async fn call_optional<Req, Resp>(
+        &self,
+        method: &str,
+        req: &Req,
+    ) -> BnsClientResult<Option<Resp>>
+    where
+        Req: Serialize + Sync,
+        Resp: DeserializeOwned,
+    {
+        decode_optional_envelope(self.call_envelope(method, req).await?)
+    }
+}
+
+fn decode_optional_envelope<T: DeserializeOwned>(value: Value) -> BnsClientResult<Option<T>> {
+    let has_result = value
+        .as_object()
+        .is_some_and(|envelope| envelope.contains_key("result"));
+    if !has_result {
+        return Err(BnsClientError::InvalidResponse(
+            "BNS RPC envelope missing result".to_string(),
+        ));
+    }
+
+    let envelope: BnsRpcEnvelope<T> = serde_json::from_value(value)
+        .map_err(|e| BnsClientError::InvalidResponse(e.to_string()))?;
+    envelope.into_optional_result()
 }
 
 /// Compatibility name for callers that still target the legacy indexer path.
@@ -603,7 +639,7 @@ impl BnsIndexerApi for BnsRpcClient {
         match self {
             Self::InProcess(handler) => handler.query_name_state(name).await,
             Self::KRPC(_) => {
-                self.call(METHOD_QUERY_NAME_STATE, &BnsNameReq::new(name))
+                self.call_optional(METHOD_QUERY_NAME_STATE, &BnsNameReq::new(name))
                     .await
             }
         }
@@ -637,7 +673,7 @@ impl BnsIndexerApi for BnsRpcClient {
         match self {
             Self::InProcess(handler) => handler.get_authority_key(name, kid).await,
             Self::KRPC(_) => {
-                self.call(
+                self.call_optional(
                     METHOD_GET_AUTHORITY_KEY,
                     &BnsAuthorityKeyReq {
                         name: name.to_string(),
@@ -671,7 +707,7 @@ impl BnsIndexerApi for BnsRpcClient {
         match self {
             Self::InProcess(handler) => handler.get_document_version(name, doc_type, version).await,
             Self::KRPC(_) => {
-                self.call(
+                self.call_optional(
                     METHOD_GET_DOCUMENT_VERSION,
                     &BnsDocumentVersionReq {
                         name: name.to_string(),
@@ -754,7 +790,10 @@ impl BnsIndexerApi for BnsRpcClient {
     async fn latest_checkpoint(&self) -> BnsClientResult<Option<LogCheckpoint>> {
         match self {
             Self::InProcess(handler) => handler.latest_checkpoint().await,
-            Self::KRPC(_) => self.call(METHOD_LATEST_CHECKPOINT, &json!({})).await,
+            Self::KRPC(_) => {
+                self.call_optional(METHOD_LATEST_CHECKPOINT, &json!({}))
+                    .await
+            }
         }
     }
 }
@@ -943,5 +982,48 @@ mod url_tests {
             normalize_bns_server_url("http://127.0.0.1:18080/custom/rpc/"),
             "http://127.0.0.1:18080/custom/rpc"
         );
+    }
+
+    #[test]
+    fn optional_envelope_accepts_explicit_null_result() {
+        let result = decode_optional_envelope::<Value>(json!({
+            "ok": true,
+            "result": null,
+            "error": null
+        }))
+        .unwrap();
+
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn optional_envelope_rejects_missing_result_field() {
+        let error = decode_optional_envelope::<Value>(json!({
+            "ok": true,
+            "error": null
+        }))
+        .unwrap_err();
+
+        assert_eq!(error.code(), "INVALID_RESPONSE");
+        assert!(error.to_string().contains("missing result"));
+    }
+
+    #[test]
+    fn optional_envelope_preserves_registry_error() {
+        let error = decode_optional_envelope::<Value>(json!({
+            "ok": false,
+            "result": null,
+            "error": {
+                "code": "NAME_NOT_FOUND",
+                "message": "name was not found",
+                "name": "missing",
+                "doc_type": null,
+                "expected": null,
+                "actual": null
+            }
+        }))
+        .unwrap_err();
+
+        assert_eq!(error.code(), "NAME_NOT_FOUND");
     }
 }
