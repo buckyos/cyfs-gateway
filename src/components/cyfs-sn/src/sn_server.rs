@@ -442,6 +442,10 @@ fn get_request_client_ip(
         .or_else(|| info.src_addr.as_deref().and_then(parse_ip_or_socket_addr))
 }
 
+fn is_internal_rpc_client_allowed(client_ip: IpAddr) -> bool {
+    client_ip.is_loopback()
+}
+
 impl SnRpcPath {
     fn parse(path: &str) -> Option<Self> {
         match path {
@@ -1826,6 +1830,21 @@ impl HttpServer for SNServer {
             }
         };
 
+        if rpc_path == SnRpcPath::InternalRoot && !is_internal_rpc_client_allowed(client_ip) {
+            warn!(
+                "Rejected external request to SN internal RPC root from {}",
+                client_ip
+            );
+            return Ok(Response::builder()
+                .status(StatusCode::NOT_FOUND)
+                .body(BoxBody::new(
+                    Full::new(Bytes::from_static(b"Not Found"))
+                        .map_err(|never| match never {})
+                        .boxed(),
+                ))
+                .unwrap());
+        }
+
         let body_bytes = match request.collect().await {
             Ok(data) => data.to_bytes(),
             Err(e) => {
@@ -2726,6 +2745,18 @@ mod tests {
     const ANVIL_PRIVATE_KEY: &str =
         "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
     const ANVIL_ADDRESS: &str = "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266";
+
+    #[test]
+    fn internal_rpc_root_only_allows_loopback_clients() {
+        assert!(is_internal_rpc_client_allowed("127.0.0.1".parse().unwrap()));
+        assert!(is_internal_rpc_client_allowed("::1".parse().unwrap()));
+        assert!(!is_internal_rpc_client_allowed(
+            "10.0.0.10".parse().unwrap()
+        ));
+        assert!(!is_internal_rpc_client_allowed(
+            "198.51.100.10".parse().unwrap()
+        ));
+    }
 
     fn test_bns_system_info() -> BnsSystemInfo {
         BnsSystemInfo {
