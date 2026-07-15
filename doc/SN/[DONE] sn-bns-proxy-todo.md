@@ -32,8 +32,9 @@
   纯旧配置（仅 `bns_evm.controller_private_key*`）→ false，保持 devtest 兼容，此时
   asset_owner 缺省回落为**该用户绑定 controller** 的地址。
 - internal/admin 方法（`bns.publish_relay_assignment` / `bns.register_name_bootstrap`）
-  与 `admin.clear_state_by_active_code` 同机制：钉在 InternalRoot(`/`)，外部
-  `/kapi/sn/bns-proxy` HTTP 路径不可达。
+  与 `admin.clear_state_by_active_code` 同机制：钉在 InternalRoot(`/`)，仅允许
+  loopback 来源；非 loopback 请求返回 HTTP 404，外部 `/kapi/sn/bns-proxy`
+  HTTP 路径不可达。
 - 绑定表在 SN 本地 sqlite（与 `sn_bns_write_requests` 账本同文件）；db_type=postgres
   时同样落本地（与写请求账本现状一致）。多实例 SN 共享 postgres 部署时，绑定表
   需要共享盘或后续挪到 provider 侧——单独议题，不在本次范围。
