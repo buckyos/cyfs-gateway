@@ -12,6 +12,36 @@ cd src
 cargo run -p cyfs_gateway -- process_chain --all --file /tmp/cyfs-gateway-process-chain-command-ref.md
 ```
 
+## `forward`
+
+把请求、stream 或 datagram 直接转发到 upstream URL。新版机制同时支持：
+
+- 单 URL 转发：失败后不自动换目标
+- 多候选选择：`round_robin`、`ip_hash`、`hash`、`consistent_hash`、`least_time`
+- group 执行阶段故障切换：`--next-upstream`、`--tries`、`--next-upstream-timeout`
+- primary / backup 和临时失败窗口：`--map`、`--backup-map`、`--max-fails`、`--fail-timeout`
+- HTTP 受限状态码重试：`http_5xx`、`http_502`、`http_503`、`http_504`、`--max-body-buffer`
+
+最小 group 示例：
+
+```text
+map-create PRIMARY;
+map-add PRIMARY "tcp:///10.0.0.1:9000" 1;
+map-add PRIMARY "tcp:///10.0.0.2:9000" 1;
+
+map-create BACKUP;
+map-add BACKUP "rtcp://backup.example.zone/:9000" 1;
+
+forward round_robin \
+        --map $PRIMARY \
+        --backup-map $BACKUP \
+        --next-upstream error,timeout \
+        --tries 3 \
+        --next-upstream-timeout 5s;
+```
+
+旧多 URL 写法如果没有 group 选项，仍只会预先选择一个 URL，不会在建链失败后自动尝试下一个。完整参数、map 构造示例和各入口的重试边界见 [forward 使用说明](forward使用说明.md)。
+
 ## `verify-jwt`
 
 校验 JWT，并返回 payload map。

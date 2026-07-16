@@ -1235,3 +1235,53 @@ fn real_base32_named_objid_can_be_registered_as_second_level_name() {
     assert_eq!(resolved.document_state.name, name);
     assert!(inline_body(&resolved).contains(&did));
 }
+
+#[test]
+fn query_names_by_address_is_stable_and_paginated_by_asset_owner() {
+    let registry = registry();
+    for (name, owner) in [
+        ("charlie", OWNER_A),
+        ("alice", OWNER_A),
+        ("bob", OWNER_A),
+        ("other", OWNER_B),
+    ] {
+        registry
+            .register_name(
+                name,
+                owner,
+                RegisterOptions::default(),
+                vec![],
+                CallAuthority::public(),
+                MutationGuard::default(),
+            )
+            .unwrap();
+    }
+
+    let first = registry.query_names_by_address(OWNER_A, None, 2).unwrap();
+    assert_eq!(first.names, ["alice", "bob"]);
+    assert_eq!(first.next_cursor.as_deref(), Some("bob"));
+
+    let second = registry
+        .query_names_by_address(OWNER_A, first.next_cursor.as_deref(), 2)
+        .unwrap();
+    assert_eq!(second.names, ["charlie"]);
+    assert_eq!(second.next_cursor, None);
+
+    let other = registry.query_names_by_address(OWNER_B, None, 10).unwrap();
+    assert_eq!(other.names, ["other"]);
+
+    assert_eq!(
+        registry
+            .query_names_by_address("not-an-address", None, 10)
+            .unwrap_err()
+            .code(),
+        "INVALID_ADDRESS"
+    );
+    assert_eq!(
+        registry
+            .query_names_by_address(OWNER_A, None, 0)
+            .unwrap_err()
+            .code(),
+        "INVALID_LIMIT"
+    );
+}

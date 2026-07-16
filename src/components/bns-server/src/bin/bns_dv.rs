@@ -91,6 +91,11 @@ struct InitTxConfig {
     name: String,
     #[serde(default)]
     asset_owner: Option<String>,
+    /// asset_owner 的私钥（仅限 devtest，如公开的 anvil 助记词账户）。
+    /// 名字已注册且文档有变更时，合约只认 asset_owner 本人签名的
+    /// apply_mutations——托管 seed key 发会被 revert，重放更新必须用它。
+    #[serde(default)]
+    asset_owner_key: Option<String>,
     #[serde(default)]
     if_exists: Option<InitIfExists>,
     #[serde(default)]
@@ -110,6 +115,12 @@ struct InitDocumentConfig {
     inline_json_file: Option<String>,
     #[serde(default)]
     inline_json: Option<Value>,
+    /// 原样上链的文本文档（如 owner key 签名的 boot JWT——boot 的规范模型
+    /// 是独立原子文档，内容就是 JWT 本身，不做 JSON 包装）。
+    #[serde(default)]
+    inline_text_file: Option<String>,
+    #[serde(default)]
+    inline_text: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -222,10 +233,14 @@ async fn serve(flags: HashMap<String, String>) -> Result<(), DynError> {
 
     run_on_init_txs(&flags, &rpc, &contract, chain_id, &db).await?;
 
-    let server: Arc<dyn HttpServer> = Arc::new(BnsContractHttpServer::from_contract_store(
-        server_store,
-        rpc.clone(),
-    ));
+    let server: Arc<dyn HttpServer> = Arc::new(
+        BnsContractHttpServer::from_contract_store_with_chain_config(
+            server_store,
+            rpc.clone(),
+            contract.clone(),
+            chain_id,
+        ),
+    );
 
     eprintln!(
         "[serve] bns-dv ready\n  rpc={rpc}\n  contract={contract}\n  chain_id={chain_id}\n  \
@@ -272,11 +287,9 @@ async fn run_on_init_txs(
             runtime.signer
         );
     }
-    let controller = BnsEvmControllerClient::new(
-        BnsEvmClientConfig::anvil(rpc, contract, chain_id),
-        &runtime.private_key,
-    )?
-    .with_receipt_wait(Some(runtime.receipt_wait));
+    let evm_config = BnsEvmClientConfig::anvil(rpc, contract, chain_id);
+    let controller = BnsEvmControllerClient::new(evm_config.clone(), &runtime.private_key)?
+        .with_receipt_wait(Some(runtime.receipt_wait));
     let api: Arc<dyn BnsIndexerApi> = Arc::new(BnsContractServerHandler::new(
         SqliteBnsRegistryStore::open(db)?,
         rpc.to_string(),
@@ -298,6 +311,7 @@ async fn run_on_init_txs(
                     &config_dir,
                     &runtime,
                     &controller,
+                    &evm_config,
                     api.as_ref(),
                 )
                 .await?;
@@ -382,6 +396,7 @@ async fn run_register_name_init_tx(
     config_dir: &Path,
     runtime: &InitRuntimeConfig,
     controller: &BnsEvmControllerClient,
+    evm_config: &BnsEvmClientConfig,
     api: &dyn BnsIndexerApi,
 ) -> Result<(), DynError> {
     let name = tx.name.trim();
@@ -441,8 +456,18 @@ async fn run_register_name_init_tx(
                 )
                 .into());
             }
-            apply_init_document_mutations(index, name, documents, state, runtime, controller, api)
-                .await?;
+            apply_init_document_mutations(
+                index,
+                name,
+                documents,
+                state,
+                tx.asset_owner_key.as_deref(),
+                runtime,
+                controller,
+                evm_config,
+                api,
+            )
+            .await?;
         }
     }
 
@@ -482,8 +507,10 @@ async fn apply_init_document_mutations(
     name: &str,
     documents: Vec<PreparedInitDocument>,
     state: NameState,
+    asset_owner_key: Option<&str>,
     runtime: &InitRuntimeConfig,
     controller: &BnsEvmControllerClient,
+    evm_config: &BnsEvmClientConfig,
     api: &dyn BnsIndexerApi,
 ) -> Result<(), DynError> {
     let mut updates = Vec::new();
@@ -525,13 +552,20 @@ async fn apply_init_document_mutations(
         return Ok(());
     }
 
-    let submitted = controller
+    // 合约 _authorizeOwner 要求 msg.sender 与 authority.actor 都是链上
+    // asset_owner；种子经托管 key 代注册后 owner 已锚定用户地址，重放
+    // 更新必须换 owner key 签名（asset_owner_key），托管 key 发会 revert。
+    let (owner_controller, mutation_signer) =
+        resolve_mutation_signer(index, name, &state, asset_owner_key, runtime, evm_config)?;
+    let submitted = owner_controller
+        .as_ref()
+        .unwrap_or(controller)
         .apply_mutations(&BnsApplyMutationsReq {
             name: name.to_string(),
             authority_key_updates: vec![],
             documents: updates,
             owner_policy: OwnerPolicyUpdate::none(),
-            authority: CallAuthority::owner(Principal::chain_account(runtime.signer.clone()), ""),
+            authority: CallAuthority::owner(Principal::chain_account(mutation_signer), ""),
             guard: MutationGuard {
                 expected_name_seq: state.name_seq,
                 expected_parent_name_seq: 0,
@@ -549,6 +583,46 @@ async fn apply_init_document_mutations(
     .await?;
     log_projected_init("apply_mutations", index, name, &submitted, &projected);
     Ok(())
+}
+
+/// 选出能通过合约 owner 校验的 apply_mutations 签名者。返回
+/// `(Some(owner_controller), owner)` 表示要用 asset_owner_key 的专属
+/// controller；`(None, signer)` 表示种子托管 key 本身就是 owner，复用
+/// 既有 controller。
+fn resolve_mutation_signer(
+    index: usize,
+    name: &str,
+    state: &NameState,
+    asset_owner_key: Option<&str>,
+    runtime: &InitRuntimeConfig,
+    evm_config: &BnsEvmClientConfig,
+) -> Result<(Option<BnsEvmControllerClient>, String), DynError> {
+    if state.asset_owner.eq_ignore_ascii_case(&runtime.signer) {
+        return Ok((None, runtime.signer.clone()));
+    }
+    let Some(owner_key) = asset_owner_key else {
+        return Err(format!(
+            "on_init_txs[{index}] name `{name}` documents changed, but on-chain asset_owner {} \
+             differs from seed signer {} and the tx has no asset_owner_key; add the owner's \
+             private key as asset_owner_key (devtest), or reset the dev chain (init_anvil.py --fresh)",
+            state.asset_owner, runtime.signer
+        )
+        .into());
+    };
+    let key_manager = StaticBnsEvmKeyManager::new(owner_key.to_string())?;
+    let owner_signer = format!("{:#x}", key_manager.signer_address());
+    if !owner_signer.eq_ignore_ascii_case(&state.asset_owner) {
+        return Err(format!(
+            "on_init_txs[{index}] asset_owner_key of name `{name}` derives address {owner_signer}, \
+             which is not the on-chain asset_owner {}; fix asset_owner_key or reset the dev chain \
+             (init_anvil.py --fresh)",
+            state.asset_owner
+        )
+        .into());
+    }
+    let owner_controller = BnsEvmControllerClient::new(evm_config.clone(), owner_key)?
+        .with_receipt_wait(Some(runtime.receipt_wait));
+    Ok((Some(owner_controller), owner_signer))
 }
 
 async fn current_document(
@@ -640,27 +714,45 @@ fn prepare_init_document(
     doc: &InitDocumentConfig,
     config_dir: &Path,
 ) -> Result<PreparedInitDocument, DynError> {
-    let has_file = doc.inline_json_file.is_some();
-    let has_inline = doc.inline_json.is_some();
-    if has_file == has_inline {
+    let sources = [
+        doc.inline_json_file.is_some(),
+        doc.inline_json.is_some(),
+        doc.inline_text_file.is_some(),
+        doc.inline_text.is_some(),
+    ];
+    if sources.iter().filter(|set| **set).count() != 1 {
         return Err(format!(
-            "initial_documents[{index}] must set exactly one of inline_json_file or inline_json"
+            "initial_documents[{index}] must set exactly one of inline_json_file, inline_json, inline_text_file or inline_text"
         )
         .into());
     }
-    let value = if let Some(file) = &doc.inline_json_file {
+
+    let inline_document = if let Some(file) = &doc.inline_json_file {
         let path = resolve_config_path(config_dir, file);
         let text = std::fs::read_to_string(&path)
             .map_err(|e| format!("failed to read inline_json_file {}: {e}", path.display()))?;
-        serde_json::from_str::<Value>(&text)
-            .map_err(|e| format!("failed to parse JSON {}: {e}", path.display()))?
+        let value = serde_json::from_str::<Value>(&text)
+            .map_err(|e| format!("failed to parse JSON {}: {e}", path.display()))?;
+        serde_json::to_vec(&value)?
+    } else if let Some(value) = &doc.inline_json {
+        serde_json::to_vec(value)?
+    } else if let Some(file) = &doc.inline_text_file {
+        let path = resolve_config_path(config_dir, file);
+        let text = std::fs::read_to_string(&path)
+            .map_err(|e| format!("failed to read inline_text_file {}: {e}", path.display()))?;
+        text.trim().as_bytes().to_vec()
     } else {
-        doc.inline_json.clone().expect("checked inline_json")
+        doc.inline_text
+            .as_deref()
+            .expect("checked inline_text")
+            .trim()
+            .as_bytes()
+            .to_vec()
     };
 
     Ok(PreparedInitDocument {
         doc_type: doc.doc_type.clone(),
-        inline_document: serde_json::to_vec(&value)?,
+        inline_document,
     })
 }
 
@@ -874,6 +966,7 @@ mod tests {
     use super::*;
 
     use std::process::Stdio;
+    use std::sync::OnceLock;
 
     use bns_evm::{Address, EthRpcClient};
     use name_client::{
@@ -888,7 +981,7 @@ mod tests {
     const CHAIN_ID: u64 = 31_337;
     const DEPLOYER_KEY: &str = "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d";
 
-    fn foundry_available() -> bool {
+    fn e2e_tools_available() -> bool {
         fn has(bin: &str) -> bool {
             std::process::Command::new(bin)
                 .arg("--version")
@@ -898,7 +991,12 @@ mod tests {
                 .map(|status| status.success())
                 .unwrap_or(false)
         }
-        has("anvil") && has("forge")
+        has("anvil") && has("node") && has("npm")
+    }
+
+    fn hardhat_lock() -> &'static tokio::sync::Mutex<()> {
+        static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
     }
 
     async fn allocate_free_port() -> u16 {
@@ -920,7 +1018,7 @@ mod tests {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../apps/bns")
             .canonicalize()
-            .expect("bns foundry project should exist")
+            .expect("bns hardhat project should exist")
     }
 
     struct AnvilNode {
@@ -941,7 +1039,6 @@ mod tests {
                     &CHAIN_ID.to_string(),
                     "--mnemonic",
                     "test test test test test test test test test test test junk",
-                    "--disable-code-size-limit",
                 ])
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
@@ -966,37 +1063,52 @@ mod tests {
     }
 
     async fn deploy_bns(endpoint: &str) -> Address {
-        let output = Command::new("forge")
+        static COMPILED: OnceLock<()> = OnceLock::new();
+
+        let _guard = hardhat_lock().lock().await;
+        if COMPILED.get().is_none() {
+            let compile = Command::new("npm")
+                .current_dir(bns_app_dir())
+                .args(["run", "--silent", "compile:sync"])
+                .output()
+                .await
+                .expect("failed to run Hardhat compile:sync");
+            assert!(
+                compile.status.success(),
+                "Hardhat compile:sync failed:\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&compile.stdout),
+                String::from_utf8_lossy(&compile.stderr)
+            );
+            COMPILED
+                .set(())
+                .expect("Hardhat compile state should be empty");
+        }
+
+        let output = Command::new("npm")
             .current_dir(bns_app_dir())
-            .args([
-                "create",
-                "src/Bns.sol:Bns",
-                "--rpc-url",
-                endpoint,
-                "--private-key",
-                DEPLOYER_KEY,
-                "--broadcast",
-                "--json",
-            ])
+            .env("BNS_ANVIL_RPC_URL", endpoint)
+            .env("BNS_ANVIL_PRIVATE_KEY", DEPLOYER_KEY)
+            .args(["run", "--silent", "deploy:local"])
             .output()
             .await
-            .expect("failed to run forge create");
+            .expect("failed to run Hardhat local deployment");
         assert!(
             output.status.success(),
-            "forge create failed: {}",
+            "Hardhat local deployment failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
         let stdout = String::from_utf8_lossy(&output.stdout);
         let start = stdout
             .find('{')
-            .unwrap_or_else(|| panic!("forge create produced no JSON: {stdout}"));
+            .unwrap_or_else(|| panic!("Hardhat deployment produced no JSON: {stdout}"));
         let end = stdout
             .rfind('}')
-            .unwrap_or_else(|| panic!("forge create produced no JSON object: {stdout}"));
+            .unwrap_or_else(|| panic!("Hardhat deployment produced no JSON object: {stdout}"));
         let parsed: Value = serde_json::from_str(&stdout[start..=end]).unwrap();
         parsed["deployedTo"]
             .as_str()
-            .expect("forge create JSON missing deployedTo")
+            .expect("Hardhat deployment JSON missing deployedTo")
             .parse()
             .expect("invalid deployed contract address")
     }
@@ -1026,10 +1138,10 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires Foundry (anvil/forge); run with --ignored"]
+    #[ignore = "requires anvil/node/npm; run with --ignored"]
     async fn on_init_txs_seed_documents_are_readable_through_bns_http_resolver() {
-        if !foundry_available() {
-            eprintln!("skipping: anvil/forge not on PATH");
+        if !e2e_tools_available() {
+            eprintln!("skipping: anvil/node/npm not on PATH");
             return;
         }
 
@@ -1150,6 +1262,153 @@ on_init_txs:
         let (device_version, device) = resolve_json_doc(&provider, &did, "device_mini_doc").await;
         assert_eq!(device_version, 1);
         assert_eq!(device["devices"]["ood1"]["marker"], "device-from-on-init");
+
+        server_task.abort();
+        let _ = server_task.await;
+    }
+
+    // anvil account[1]（公开助记词账户表）：种子里用户名字的 asset_owner。
+    const OWNER_ADDRESS: &str = "0x70997970C51812dc3A010C7d01b50e0d17dc79C8";
+    const OWNER_KEY: &str = "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d";
+
+    /// devtest 种子重放（web3-gateway 重启）语义：
+    /// 1. 首次注册经托管 key 代发，asset_owner 锚定用户地址；
+    /// 2. 文档未变的重放不发 tx，也不需要 owner key；
+    /// 3. 文档变更的重放用 asset_owner_key 以 owner 身份 apply_mutations；
+    /// 4. 变更但缺 asset_owner_key 时报带指引的错误（而不是裸 EVM revert）。
+    #[tokio::test]
+    #[ignore = "requires anvil/node/npm; run with --ignored"]
+    async fn on_init_txs_replay_updates_changed_documents_with_asset_owner_key() {
+        if !e2e_tools_available() {
+            eprintln!("skipping: anvil/node/npm not on PATH");
+            return;
+        }
+
+        let node = AnvilNode::start().await;
+        let contract = deploy_bns(&node.endpoint).await;
+        let contract_hex = format!("{contract:#x}");
+        let listen_port = allocate_free_port().await;
+        let listen = format!("127.0.0.1:{listen_port}");
+        let server_url = format!("http://{listen}");
+
+        let temp = tempfile::tempdir().unwrap();
+        let db = temp
+            .path()
+            .join("indexer.sqlite")
+            .to_string_lossy()
+            .to_string();
+        let zone_file = temp.path().join("alice.zone.bns.json");
+        let write_zone = |marker: &str| {
+            std::fs::write(
+                &zone_file,
+                serde_json::to_vec(&json!({ "id": "did:bns:alice", "marker": marker })).unwrap(),
+            )
+            .unwrap();
+        };
+        write_zone("seed-v1");
+
+        let write_config = |file_name: &str, with_owner_key: bool| {
+            let path = temp.path().join(file_name);
+            let mut lines = vec![
+                "seed:".to_string(),
+                "  if_exists: apply_mutations".to_string(),
+                "  wait_timeout_ms: 30000".to_string(),
+                "  wait_poll_ms: 100".to_string(),
+                "on_init_txs:".to_string(),
+                "  - type: register_name".to_string(),
+                "    name: alice".to_string(),
+                format!("    asset_owner: \"{OWNER_ADDRESS}\""),
+            ];
+            if with_owner_key {
+                lines.push(format!("    asset_owner_key: \"{OWNER_KEY}\""));
+            }
+            lines.push("    initial_documents:".to_string());
+            lines.push("      - doc_type: zone".to_string());
+            lines.push(format!("        inline_json_file: {}", zone_file.display()));
+            std::fs::write(&path, lines.join("\n")).unwrap();
+            path
+        };
+        let config_without_key = write_config("seed_no_key.yaml", false);
+        let config_with_key = write_config("seed_with_key.yaml", true);
+
+        // 阶段 1：serve 启动 + 托管代注册（不需要 owner key）。
+        let serve_flags = flags(&[
+            ("rpc", node.endpoint.clone()),
+            ("contract", contract_hex.clone()),
+            ("chain-id", CHAIN_ID.to_string()),
+            ("db", db.clone()),
+            ("listen", listen.clone()),
+            ("start-block", "0".to_string()),
+            ("confirmations", "0".to_string()),
+            ("interval-ms", "100".to_string()),
+            ("config", config_without_key.to_string_lossy().to_string()),
+        ]);
+        let server_task = tokio::spawn(async move { serve(serve_flags).await });
+        wait_for_tcp(&listen).await;
+
+        let server_api = BnsIndexerClient::new_bns_server_url(&server_url, None);
+        let registered = server_api.query_name_state("alice").await.unwrap().unwrap();
+        assert_eq!(
+            registered.asset_owner.to_ascii_lowercase(),
+            OWNER_ADDRESS.to_ascii_lowercase()
+        );
+        let doc = server_api.resolve_document("alice", "zone").await.unwrap();
+        assert_eq!(doc.document_state.version, 1);
+
+        let replay_flags =
+            |config: &PathBuf| flags(&[("config", config.to_string_lossy().to_string())]);
+
+        // 阶段 2：文档未变的重放不发 tx，无 owner key 也成功。
+        run_on_init_txs(
+            &replay_flags(&config_without_key),
+            &node.endpoint,
+            &contract_hex,
+            CHAIN_ID,
+            &db,
+        )
+        .await
+        .unwrap();
+        let doc = server_api.resolve_document("alice", "zone").await.unwrap();
+        assert_eq!(doc.document_state.version, 1);
+
+        // 阶段 3：文档变更 + asset_owner_key，以 owner 身份 apply_mutations。
+        write_zone("seed-v2");
+        run_on_init_txs(
+            &replay_flags(&config_with_key),
+            &node.endpoint,
+            &contract_hex,
+            CHAIN_ID,
+            &db,
+        )
+        .await
+        .unwrap();
+        let doc = server_api.resolve_document("alice", "zone").await.unwrap();
+        assert_eq!(doc.document_state.version, 2);
+        let value: Value =
+            serde_json::from_slice(&doc.document_state.document.inline_document).unwrap();
+        assert_eq!(value["marker"], "seed-v2");
+
+        // 阶段 4：文档变更但缺 asset_owner_key，必须报带指引的错误。
+        write_zone("seed-v3");
+        let err = run_on_init_txs(
+            &replay_flags(&config_without_key),
+            &node.endpoint,
+            &contract_hex,
+            CHAIN_ID,
+            &db,
+        )
+        .await
+        .expect_err("changed documents without asset_owner_key must fail with guidance");
+        let message = err.to_string();
+        assert!(
+            message.contains("asset_owner_key"),
+            "error should mention asset_owner_key: {message}"
+        );
+        let doc = server_api.resolve_document("alice", "zone").await.unwrap();
+        assert_eq!(
+            doc.document_state.version, 2,
+            "failed replay must not mutate documents"
+        );
 
         server_task.abort();
         let _ = server_task.await;

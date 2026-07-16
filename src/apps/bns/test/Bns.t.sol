@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
-import "../src/Bns.sol";
+import "../src/BnsTypes.sol";
+
+import { IBns } from "../src/IBns.sol";
+import { BnsTestDeployment } from "./BnsTestDeployment.sol";
 
 contract BnsActor {
     function forward(address target, bytes calldata data) external returns (bool, bytes memory) {
@@ -9,8 +12,8 @@ contract BnsActor {
     }
 }
 
-contract BnsTest {
-    Bns private bns;
+contract BnsTest is BnsTestDeployment {
+    IBns private bns;
     BnsActor private actor;
 
     bytes32 private constant ZERO = bytes32(0);
@@ -22,7 +25,7 @@ contract BnsTest {
         0x6569703135352d6163636f756e74000000000000000000000000000000000000;
 
     function setUp() public {
-        bns = new Bns();
+        bns = _deployBnsProxy(address(this));
         actor = new BnsActor();
     }
 
@@ -51,7 +54,7 @@ contract BnsTest {
         _registerRoot("alice", address(this));
 
         bytes memory data = abi.encodeCall(
-            Bns.publishDocument,
+            IBns.publishDocument,
             (
                 "alice",
                 "owner",
@@ -98,7 +101,7 @@ contract BnsTest {
 
         nameState = bns.queryNameState("alice");
         bytes memory allowed = abi.encodeCall(
-            Bns.publishDocument,
+            IBns.publishDocument,
             (
                 "alice",
                 "dns_txt",
@@ -122,7 +125,7 @@ contract BnsTest {
 
         nameState = bns.queryNameState("alice");
         bytes memory denied = abi.encodeCall(
-            Bns.publishDocument,
+            IBns.publishDocument,
             (
                 "alice",
                 "owner",
@@ -182,7 +185,7 @@ contract BnsTest {
         require(!state.standardTransferEnabled, "standard transfer disabled");
 
         bytes memory byOldAssetOwner = abi.encodeCall(
-            Bns.publishDocument,
+            IBns.publishDocument,
             (
                 "org",
                 "owner",
@@ -205,7 +208,7 @@ contract BnsTest {
         require(!ok, "old asset owner lost authority");
 
         bytes memory byBnsAuthority = abi.encodeCall(
-            Bns.publishDocument,
+            IBns.publishDocument,
             (
                 "org",
                 "owner",

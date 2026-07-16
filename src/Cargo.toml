@@ -7,6 +7,7 @@ members = [
     "components/cyfs-socks",
     "components/cyfs-lookup",
     "components/cyfs-gateway-api",
+    "components/cyfs-gateway-app-lib",
     "components/cyfs-gateway-lib",
     "components/cyfs-traffic",
     "components/bns-evm",
@@ -17,6 +18,7 @@ members = [
     "components/cyfs-tun",
     "components/cyfs-acme",
     "apps/cyfs_gateway",
+    "apps/web3_gateway",
     "apps/test_server",
 ]
 

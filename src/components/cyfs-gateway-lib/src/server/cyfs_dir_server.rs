@@ -56,8 +56,9 @@ use std::collections::HashMap;
 use crate::global_process_chains::{GlobalProcessChainsRef, create_process_chain_executor};
 use crate::{
     GlobalCollectionManagerRef, HttpRequestHeaderMap, JsExternalsManagerRef, ProcessChainConfigs,
-    Server, ServerConfig, ServerContext, ServerContextRef, ServerErrorCode, ServerFactory,
-    ServerManagerWeakRef, ServerResult, get_external_commands, into_server_err, server_err,
+    RequestSourceInfo, Server, ServerConfig, ServerContext, ServerContextRef, ServerErrorCode,
+    ServerFactory, ServerManagerWeakRef, ServerResult, get_external_commands, into_server_err,
+    server_err,
 };
 
 const ENV_KEY_CYOBJ_META: &str = "RESP_cyobj_meta";
@@ -218,6 +219,7 @@ impl CyfsDirServer {
     async fn run_chain(
         &self,
         req: Request<BoxBody<Bytes, ServerError>>,
+        info: &StreamInfo,
     ) -> ServerResult<ChainOutcome> {
         let executor = match self.executor.as_ref() {
             Some(e) => e,
@@ -230,7 +232,8 @@ impl CyfsDirServer {
         // the chain runs.
         let global_env = executor.global_env().clone();
 
-        let req_map = HttpRequestHeaderMap::new(req);
+        let req_map =
+            HttpRequestHeaderMap::new_with_sources(req, RequestSourceInfo::from_stream_info(info));
         req_map
             .register_visitors(&global_env)
             .await
@@ -345,7 +348,7 @@ impl HttpServer for CyfsDirServer {
         req: Request<BoxBody<Bytes, ServerError>>,
         info: StreamInfo,
     ) -> Result<Response<BoxBody<Bytes, ServerError>>, ServerError> {
-        let req = match self.run_chain(req).await {
+        let req = match self.run_chain(req, &info).await {
             Ok(ChainOutcome::Response(resp)) => return Ok(resp),
             Ok(ChainOutcome::Resolved(req)) | Ok(ChainOutcome::PassThrough(req)) => req,
             Err(e) => {

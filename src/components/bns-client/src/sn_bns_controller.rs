@@ -8,7 +8,8 @@ use crate::{
 };
 use crate::{
     BnsApplyMutationsReq, BnsClientError, BnsDocumentVersion, BnsEvmControllerClient,
-    BnsEvmTxSubmission, BnsIndexerApi, BnsPublishDocumentReq, BnsRegisterNameReq, BnsRpcErrorInfo,
+    BnsEvmReceiptWaitConfig, BnsEvmTxReceipt, BnsEvmTxSubmission, BnsIndexerApi,
+    BnsPublishDocumentReq, BnsRegisterNameReq, BnsRpcErrorInfo,
 };
 use async_trait::async_trait;
 use serde::de::DeserializeOwned;
@@ -334,10 +335,10 @@ impl SnBnsControllerConfig {
         Self {
             sn_controller_principal,
             sn_controller_kid: sn_controller_kid.into(),
-            allowed_controller_doc_types: vec![
-                DNS_TXT_DOC_TYPE.to_string(),
-                RELAY_ASSIGNMENT_DOC_TYPE.to_string(),
-            ],
+            // SN proxy 的应用层入口会继续隔离 owner / relay_assignment；链上
+            // policy 使用 doc_type 通配，才能支持注册后补发 zone、boot、
+            // device_mini_doc 以及未来的自定义内容文档。
+            allowed_controller_doc_types: vec![String::new()],
             max_inline_document_size: crate::MAX_INLINE_DOCUMENT,
             write_retry_limit: 2,
         }
@@ -355,17 +356,12 @@ impl SnBnsControllerConfig {
 
         for doc_type in &self.allowed_controller_doc_types {
             if doc_type.is_empty() {
-                return Err(SnBnsControllerError::InvalidInput(
-                    "SN controller policy cannot contain wildcard doc_type".to_string(),
-                ));
+                continue;
             }
             canonical_doc_type(doc_type).map_err(SnBnsControllerError::from)?;
-            if matches!(
-                doc_type.as_str(),
-                OWNER_DOC_TYPE | ZONE_DOC_TYPE | BOOT_DOC_TYPE | DEVICE_MINI_DOC_TYPE
-            ) {
+            if doc_type == OWNER_DOC_TYPE {
                 return Err(SnBnsControllerError::InvalidInput(format!(
-                    "SN controller cannot be allowed to write high-risk doc_type `{}`",
+                    "SN controller cannot be explicitly allowed to write owner doc_type `{}`",
                     doc_type
                 )));
             }
@@ -420,6 +416,17 @@ pub trait SnBnsEvmSubmitter: Send + Sync {
         &self,
         req: &BnsPublishDocumentReq,
     ) -> crate::BnsClientResult<BnsEvmTxSubmission>;
+
+    async fn wait_for_receipt(
+        &self,
+        tx_hash: &str,
+        config: BnsEvmReceiptWaitConfig,
+    ) -> crate::BnsClientResult<BnsEvmTxReceipt> {
+        let _ = (tx_hash, config);
+        Err(BnsClientError::Transport(
+            "EVM receipt waiting is not supported by this submitter".to_string(),
+        ))
+    }
 }
 
 #[async_trait]
@@ -444,6 +451,14 @@ impl SnBnsEvmSubmitter for BnsEvmControllerClient {
     ) -> crate::BnsClientResult<BnsEvmTxSubmission> {
         BnsEvmControllerClient::publish_document(self, req).await
     }
+
+    async fn wait_for_receipt(
+        &self,
+        tx_hash: &str,
+        config: BnsEvmReceiptWaitConfig,
+    ) -> crate::BnsClientResult<BnsEvmTxReceipt> {
+        BnsEvmControllerClient::wait_for_receipt(self, tx_hash, config).await
+    }
 }
 
 #[async_trait]
@@ -462,6 +477,12 @@ trait SnBnsWriteBackend: Send + Sync {
         &self,
         req: BnsPublishDocumentReq,
     ) -> SnBnsControllerResult<BnsEvmTxSubmission>;
+
+    async fn wait_for_receipt(
+        &self,
+        tx_hash: &str,
+        config: BnsEvmReceiptWaitConfig,
+    ) -> SnBnsControllerResult<BnsEvmTxReceipt>;
 }
 
 struct EvmSnBnsWriteBackend {
@@ -499,6 +520,17 @@ impl SnBnsWriteBackend for EvmSnBnsWriteBackend {
     ) -> SnBnsControllerResult<BnsEvmTxSubmission> {
         self.submitter
             .publish_document(&req)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn wait_for_receipt(
+        &self,
+        tx_hash: &str,
+        config: BnsEvmReceiptWaitConfig,
+    ) -> SnBnsControllerResult<BnsEvmTxReceipt> {
+        self.submitter
+            .wait_for_receipt(tx_hash, config)
             .await
             .map_err(Into::into)
     }
@@ -547,6 +579,14 @@ impl SnBnsController {
 
     pub fn sn_controller_policy(&self) -> SnBnsControllerResult<Vec<crate::ControllerRule>> {
         self.config.sn_controller_policy()
+    }
+
+    pub async fn wait_for_evm_receipt(
+        &self,
+        tx_hash: &str,
+        config: BnsEvmReceiptWaitConfig,
+    ) -> SnBnsControllerResult<BnsEvmTxReceipt> {
+        self.write_backend.wait_for_receipt(tx_hash, config).await
     }
 
     pub async fn bootstrap_name(
@@ -662,6 +702,116 @@ impl SnBnsController {
                     params.authority.clone(),
                 )
                 .await
+            },
+        )
+        .await
+    }
+
+    /// 以 controller authority 发布普通内容文档。
+    ///
+    /// `owner` 必须走 [`Self::publish_guarded_owner_document`]，
+    /// `relay_assignment` 必须走 [`Self::publish_relay_assignment`]；把保留类型
+    /// 在这一层硬编码排除，避免其它调用方绕过上层 RPC 的产品边界。
+    pub async fn publish_content_document(
+        &self,
+        params: PublishDocumentParams,
+    ) -> SnBnsControllerResult<BnsWriteReceipt> {
+        if params.doc_type == OWNER_DOC_TYPE {
+            return Err(SnBnsControllerError::InvalidInput(
+                "owner document must use guarded owner publishing".to_string(),
+            ));
+        }
+        if params.doc_type == RELAY_ASSIGNMENT_DOC_TYPE {
+            return Err(SnBnsControllerError::InvalidInput(
+                "relay_assignment must use publish_relay_assignment".to_string(),
+            ));
+        }
+        if !params.document.is_object()
+            && !params
+                .document
+                .as_str()
+                .is_some_and(|value| !value.trim().is_empty())
+        {
+            return Err(SnBnsControllerError::InvalidInput(
+                "document must be a JSON object or non-empty text string".to_string(),
+            ));
+        }
+        self.ensure_authority_can_publish(&params.authority, &params.doc_type)?;
+
+        self.run_idempotent(
+            &params.request_id,
+            BnsWriteOperation::PublishDocument,
+            &params.name,
+            Some(&params.doc_type),
+            &params,
+            || async {
+                let mut attempt = 0;
+                loop {
+                    let result = self
+                        .publish_inline_document_once(
+                            &params.request_id,
+                            BnsWriteOperation::PublishDocument,
+                            &params.name,
+                            &params.doc_type,
+                            &params.document,
+                            params.authority.clone(),
+                        )
+                        .await;
+                    match result {
+                        Ok(receipt) => return Ok(receipt),
+                        Err(error)
+                            if error.is_stale_guard()
+                                && attempt < self.config.write_retry_limit =>
+                        {
+                            attempt += 1;
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
+            },
+        )
+        .await
+    }
+
+    /// 以 controller authority 更新 owner 文档，同时锁定已经存在的身份字段。
+    /// 缺失的身份字段可以首次补齐；一旦存在就不能删除或改值。
+    pub async fn publish_guarded_owner_document(
+        &self,
+        params: PublishDocumentParams,
+    ) -> SnBnsControllerResult<BnsWriteReceipt> {
+        if params.doc_type != OWNER_DOC_TYPE {
+            return Err(SnBnsControllerError::InvalidInput(format!(
+                "guarded owner publishing requires doc_type `{OWNER_DOC_TYPE}`"
+            )));
+        }
+        if !params.document.is_object() {
+            return Err(SnBnsControllerError::InvalidInput(
+                "owner document must be a JSON object".to_string(),
+            ));
+        }
+        self.ensure_authority_can_publish(&params.authority, OWNER_DOC_TYPE)?;
+
+        self.run_idempotent(
+            &params.request_id,
+            BnsWriteOperation::PublishDocument,
+            &params.name,
+            Some(OWNER_DOC_TYPE),
+            &params,
+            || async {
+                let mut attempt = 0;
+                loop {
+                    let result = self.publish_guarded_owner_document_once(&params).await;
+                    match result {
+                        Ok(receipt) => return Ok(receipt),
+                        Err(error)
+                            if error.is_stale_guard()
+                                && attempt < self.config.write_retry_limit =>
+                        {
+                            attempt += 1;
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
             },
         )
         .await
@@ -849,7 +999,7 @@ impl SnBnsController {
             Some(RELAY_ASSIGNMENT_DOC_TYPE),
             &params,
             || async {
-                self.publish_json_document_once(
+                self.publish_inline_document_once(
                     &params.request_id,
                     BnsWriteOperation::PublishRelayAssignment,
                     &params.name,
@@ -929,6 +1079,46 @@ impl SnBnsController {
             expected_version,
             document,
             authority,
+        )
+        .await
+    }
+
+    async fn publish_inline_document_once(
+        &self,
+        request_id: &str,
+        operation: BnsWriteOperation,
+        name: &str,
+        doc_type: &str,
+        document: &Value,
+        authority: CallAuthority,
+    ) -> SnBnsControllerResult<BnsWriteReceipt> {
+        let current = self.current_document_state(name, doc_type).await?;
+        let expected_version = current.as_ref().map_or(0, |state| state.version);
+        let update = self.inline_content_update(doc_type, expected_version, document)?;
+        self.publish_document_update_once(request_id, operation, name, update, authority)
+            .await
+    }
+
+    async fn publish_guarded_owner_document_once(
+        &self,
+        params: &PublishDocumentParams,
+    ) -> SnBnsControllerResult<BnsWriteReceipt> {
+        let current = self
+            .current_document_state(&params.name, OWNER_DOC_TYPE)
+            .await?;
+        if let Some(state) = current.as_ref() {
+            let current_document = self.parse_inline_document::<Value>(state)?;
+            ensure_owner_identity_fields_unchanged(&current_document, &params.document)?;
+        }
+        let expected_version = current.as_ref().map_or(0, |state| state.version);
+        self.publish_json_document_with_expected_once(
+            &params.request_id,
+            BnsWriteOperation::PublishDocument,
+            &params.name,
+            OWNER_DOC_TYPE,
+            expected_version,
+            &params.document,
+            params.authority.clone(),
         )
         .await
     }
@@ -1032,6 +1222,34 @@ impl SnBnsController {
             .map_err(SnBnsControllerError::from)
     }
 
+    fn inline_content_update(
+        &self,
+        doc_type: &str,
+        expected_version: u64,
+        document: &Value,
+    ) -> SnBnsControllerResult<DocumentUpdate> {
+        canonical_doc_type(doc_type).map_err(SnBnsControllerError::from)?;
+        let bytes = match document {
+            Value::Object(_) => serde_json::to_vec(document)?,
+            Value::String(text) if !text.trim().is_empty() => text.as_bytes().to_vec(),
+            _ => {
+                return Err(SnBnsControllerError::InvalidInput(
+                    "document must be a JSON object or non-empty text string".to_string(),
+                ));
+            }
+        };
+        if bytes.len() > self.config.max_inline_document_size {
+            return Err(SnBnsControllerError::InvalidInput(format!(
+                "inline document `{}` is {} bytes, max {}",
+                doc_type,
+                bytes.len(),
+                self.config.max_inline_document_size
+            )));
+        }
+        default_document_update(doc_type, expected_version, DocumentRef::inline(bytes))
+            .map_err(SnBnsControllerError::from)
+    }
+
     fn dns_txt_update(
         &self,
         expected_version: u64,
@@ -1107,7 +1325,7 @@ impl SnBnsController {
                     .config
                     .allowed_controller_doc_types
                     .iter()
-                    .any(|allowed| allowed == doc_type)
+                    .any(|allowed| allowed.is_empty() || allowed == doc_type)
                 {
                     return Err(SnBnsControllerError::InvalidInput(format!(
                         "SN controller is not allowed to publish doc_type `{}`",
@@ -1400,6 +1618,87 @@ impl Default for DeviceMiniDocCollection {
             version: 1,
             devices: BTreeMap::new(),
         }
+    }
+}
+
+const OWNER_IDENTITY_PATHS: [(&str, &[&str]); 5] = [
+    ("public_key", &["public_key"]),
+    ("owner_key", &["owner_key"]),
+    ("default_key", &["default_key"]),
+    ("key", &["key"]),
+    (
+        "verificationMethod[0].publicKeyJwk",
+        &["verificationMethod", "0", "publicKeyJwk"],
+    ),
+];
+
+fn value_at_path<'a>(value: &'a Value, path: &[&str]) -> Option<&'a Value> {
+    let mut current = value;
+    for segment in path {
+        if let Ok(index) = segment.parse::<usize>() {
+            current = current.as_array()?.get(index)?;
+        } else {
+            current = current.get(*segment)?;
+        }
+    }
+    Some(current)
+}
+
+fn ensure_owner_identity_fields_unchanged(
+    current: &Value,
+    next: &Value,
+) -> SnBnsControllerResult<()> {
+    for (label, path) in OWNER_IDENTITY_PATHS {
+        let Some(existing) = value_at_path(current, path) else {
+            continue;
+        };
+        if value_at_path(next, path) != Some(existing) {
+            return Err(SnBnsControllerError::InvalidInput(format!(
+                "owner identity field `{label}` cannot be changed or removed"
+            )));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod owner_identity_field_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn missing_identity_fields_can_be_filled_for_the_first_time() {
+        ensure_owner_identity_fields_unchanged(
+            &json!({"name":"alice","created_by":"cyfs-sn"}),
+            &json!({
+                "name":"alice",
+                "public_key":{"kty":"OKP","crv":"Ed25519","x":"alice-key"}
+            }),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn nested_verification_method_identity_cannot_change_or_disappear() {
+        let current = json!({
+            "verificationMethod":[{
+                "id":"did:bns:alice#default",
+                "publicKeyJwk":{"kty":"OKP","crv":"Ed25519","x":"alice-key"}
+            }]
+        });
+        let changed = json!({
+            "verificationMethod":[{
+                "id":"did:bns:alice#default",
+                "publicKeyJwk":{"kty":"OKP","crv":"Ed25519","x":"other-key"}
+            }]
+        });
+        let error = ensure_owner_identity_fields_unchanged(&current, &changed).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("verificationMethod[0].publicKeyJwk"));
+
+        let removed = json!({"verificationMethod":[{"id":"did:bns:alice#default"}]});
+        assert!(ensure_owner_identity_fields_unchanged(&current, &removed).is_err());
     }
 }
 

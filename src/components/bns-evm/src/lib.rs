@@ -6,7 +6,7 @@ mod tx;
 pub mod bindings {
     use alloy_sol_types::sol;
 
-    sol!("../../apps/bns/src/Bns.sol");
+    sol!("abi/BnsBindings.sol");
 }
 
 pub use alloy_consensus::TxEip1559;
@@ -21,7 +21,8 @@ pub use bindings::{
     RegisterOptions, ReleaseMode, ResolveResult,
 };
 pub use rpc::{
-    BlockRange, EthLog, EthRpcClient, EthTransaction, EthTransactionReceipt, RpcLogFilter,
+    BlockRange, Eip1559FeeSuggestion, EthLog, EthRpcClient, EthTransaction, EthTransactionReceipt,
+    RpcLogFilter,
 };
 pub use tx::{
     build_eip1559_contract_tx, decode_signed_eip1559, encode_call, sign_eip1559_tx,

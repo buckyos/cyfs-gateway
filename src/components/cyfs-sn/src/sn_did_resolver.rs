@@ -699,7 +699,7 @@ fn merge_buckyos_object(obj: &mut Map<String, Value>, value: Value) {
     }
 }
 
-fn owner_key_from_config(value: &Value) -> Option<Jwk> {
+pub(crate) fn owner_key_from_config(value: &Value) -> Option<Jwk> {
     first_jwk_path(
         value,
         &[
@@ -743,7 +743,7 @@ fn value_to_jwk(value: &Value) -> Option<Jwk> {
     }
 }
 
-fn key_like_string_to_jwk(value: &str) -> Option<Jwk> {
+pub(crate) fn key_like_string_to_jwk(value: &str) -> Option<Jwk> {
     let value = value.trim().trim_end_matches(';');
     if value.is_empty() {
         return None;

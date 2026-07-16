@@ -8,23 +8,22 @@
 
 use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
+use std::str::FromStr;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use bns_client::{
-    BnsApplyMutationsReq, BnsApplyMutationsResp, BnsAuthorityKeyReq, BnsBootstrapNameReq,
-    BnsBootstrapNameResp, BnsClientError, BnsClientResult, BnsDocumentReq, BnsDocumentVersionReq,
-    BnsIndexerApi, BnsIndexerRpcHandler, BnsListEventsReq, BnsNameReq, BnsPublishDocumentReq,
-    BnsPublishDocumentResp, BnsRegisterNameReq, BnsRegisterNameResp, BnsRevokeDocumentReq,
-    BnsRevokeDocumentResp, BnsRpcEnvelope, BnsSetControllerPolicyReq, BnsSetControllerPolicyResp,
-    BnsSetMinDocumentIatReq, BnsSetMinDocumentIatResp, BnsSubmitRawTxReq, BnsSubmitRawTxResp,
-    BnsUpdateAuthorityKeysReq, BnsUpdateAuthorityKeysResp, BNS_INDEXER_RPC_PATH,
-    BNS_SERVER_RPC_PATH, METHOD_GET_AUTHORITY_KEY, METHOD_GET_AUTHORITY_SET,
-    METHOD_GET_DOCUMENT_VERSION, METHOD_LATEST_CHECKPOINT, METHOD_LIST_EVENTS,
-    METHOD_QUERY_NAME_STATE, METHOD_RESOLVE_DOCUMENT, METHOD_RESOLVE_OWNER,
-    METHOD_SET_MIN_DOCUMENT_IAT, METHOD_SUBMIT_RAW_TX,
+    BnsAddressReq, BnsAuthorityKeyReq, BnsClientError, BnsClientResult, BnsDocumentReq,
+    BnsDocumentVersionReq, BnsIndexerApi, BnsIndexerRpcHandler, BnsListEventsReq, BnsNamePage,
+    BnsNameReq, BnsPrepareTxReq, BnsPrepareTxResp, BnsRpcEnvelope, BnsSubmitRawTxReq,
+    BnsSubmitRawTxResp, BnsSystemInfo, BnsTxExecutionState, BnsTxHashReq, BnsTxState,
+    BNS_INDEXER_RPC_PATH, BNS_SERVER_RPC_PATH, MAX_BNS_NAMES_PAGE_SIZE, METHOD_GET_AUTHORITY_KEY,
+    METHOD_GET_AUTHORITY_SET, METHOD_GET_DOCUMENT_VERSION, METHOD_LATEST_CHECKPOINT,
+    METHOD_LIST_EVENTS, METHOD_PREPARE_TX, METHOD_QUERY_NAMES_BY_ADDRESS, METHOD_QUERY_NAME_STATE,
+    METHOD_QUERY_TX_STATE, METHOD_RESOLVE_DOCUMENT, METHOD_RESOLVE_OWNER, METHOD_SUBMIT_RAW_TX,
+    METHOD_SYSTEM_INFO,
 };
-use bns_evm::EthRpcClient;
+use bns_evm::{Address, EthRpcClient, B256};
 use bns_indexer::{
     canonical_bns_name, canonical_doc_type, did_bns_from_name, is_top_level_name,
     name_from_did_bns, now_timestamp, parent_name, AliasKind, AuthorityKey, AuthoritySetState,
@@ -61,6 +60,8 @@ where
 {
     store: S,
     eth_rpc: EthRpcClient,
+    contract_address: Option<String>,
+    expected_chain_id: Option<u64>,
 }
 
 impl<S> BnsContractServerHandler<S>
@@ -71,6 +72,22 @@ where
         Self {
             store,
             eth_rpc: EthRpcClient::new(evm_rpc_endpoint),
+            contract_address: None,
+            expected_chain_id: None,
+        }
+    }
+
+    pub fn new_with_chain_config(
+        store: S,
+        evm_rpc_endpoint: impl Into<String>,
+        contract_address: impl Into<String>,
+        chain_id: u64,
+    ) -> Self {
+        Self {
+            store,
+            eth_rpc: EthRpcClient::new(evm_rpc_endpoint),
+            contract_address: Some(contract_address.into()),
+            expected_chain_id: Some(chain_id),
         }
     }
 
@@ -81,12 +98,6 @@ where
     pub fn evm_rpc(&self) -> &EthRpcClient {
         &self.eth_rpc
     }
-
-    fn unsupported_call_authority_write<T>(&self, operation: &str) -> BnsClientResult<T> {
-        Err(BnsClientError::unsupported(format!(
-            "BNS Server no longer accepts `{operation}` CallAuthority write RPC; submit a signed EVM raw TX with tx.submit_raw"
-        )))
-    }
 }
 
 #[async_trait]
@@ -94,6 +105,38 @@ impl<S> BnsIndexerApi for BnsContractServerHandler<S>
 where
     S: BnsRegistryStore + 'static,
 {
+    async fn system_info(&self) -> BnsClientResult<BnsSystemInfo> {
+        let expected_chain_id = self
+            .expected_chain_id
+            .ok_or_else(|| BnsClientError::unsupported("BNS server chain_id is not configured"))?;
+        let contract = self.contract_address.as_deref().ok_or_else(|| {
+            BnsClientError::unsupported("BNS server contract_address is not configured")
+        })?;
+        let contract = Address::from_str(contract).map_err(|error| {
+            BnsClientError::Serialization(format!("invalid BNS contract_address: {error}"))
+        })?;
+        let actual_chain_id = self
+            .eth_rpc
+            .chain_id()
+            .await
+            .map_err(BnsClientError::from)?;
+        if actual_chain_id != expected_chain_id {
+            return Err(BnsClientError::Transport(format!(
+                "BNS chain id mismatch: configured {expected_chain_id}, RPC returned {actual_chain_id}"
+            )));
+        }
+        // Touch the projection store as part of readiness. An empty checkpoint is
+        // valid for a fresh deployment; a store error is not.
+        self.store
+            .transact(|tx| tx.latest_checkpoint())
+            .map_err(BnsClientError::from)?;
+        Ok(BnsSystemInfo {
+            ready: true,
+            chain_id: actual_chain_id,
+            contract_address: format!("{contract:#x}"),
+        })
+    }
+
     async fn query_name_state(&self, name: &str) -> BnsClientResult<Option<NameState>> {
         self.store
             .transact(|tx| projection_query_name_state(tx, name))
@@ -149,6 +192,97 @@ where
             .map_err(Into::into)
     }
 
+    async fn query_names_by_address(
+        &self,
+        address: &str,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> BnsClientResult<BnsNamePage> {
+        if limit == 0 || limit > MAX_BNS_NAMES_PAGE_SIZE {
+            return Err(BnsRegistryError::InvalidLimit {
+                limit,
+                max: MAX_BNS_NAMES_PAGE_SIZE,
+            }
+            .into());
+        }
+        let address = Address::from_str(address.trim()).map_err(|error| {
+            BnsClientError::from(BnsRegistryError::InvalidAddress {
+                address: address.to_string(),
+                reason: error.to_string(),
+            })
+        })?;
+        let address = format!("{address:#x}");
+        self.store
+            .transact(|tx| {
+                let mut names =
+                    tx.list_names_by_asset_owner(&address, cursor, limit.saturating_add(1))?;
+                let has_more = names.len() > limit;
+                if has_more {
+                    names.truncate(limit);
+                }
+                let next_cursor = if has_more {
+                    names.last().cloned()
+                } else {
+                    None
+                };
+                Ok(BnsNamePage { names, next_cursor })
+            })
+            .map_err(Into::into)
+    }
+
+    async fn query_tx_state(&self, tx_hash: &str) -> BnsClientResult<BnsTxState> {
+        let hash = B256::from_str(tx_hash.trim()).map_err(|error| {
+            BnsClientError::Serialization(format!("invalid tx_hash `{tx_hash}`: {error}"))
+        })?;
+        let canonical_hash = format!("{hash:#x}");
+        if let Some(receipt) = self
+            .eth_rpc
+            .transaction_receipt(hash)
+            .await
+            .map_err(BnsClientError::from)?
+        {
+            let block_number = receipt.block_number;
+            let confirmations = match block_number {
+                Some(block_number) => self
+                    .eth_rpc
+                    .block_number()
+                    .await
+                    .map_err(BnsClientError::from)?
+                    .checked_sub(block_number)
+                    .map_or(0, |depth| depth.saturating_add(1)),
+                None => 0,
+            };
+            return Ok(BnsTxState {
+                tx_hash: canonical_hash,
+                state: if receipt.status == Some(0) {
+                    BnsTxExecutionState::Reverted
+                } else {
+                    BnsTxExecutionState::Succeeded
+                },
+                block_number,
+                confirmations,
+            });
+        }
+
+        let state = if self
+            .eth_rpc
+            .transaction_by_hash(hash)
+            .await
+            .map_err(BnsClientError::from)?
+            .is_some()
+        {
+            BnsTxExecutionState::Pending
+        } else {
+            BnsTxExecutionState::NotFound
+        };
+        Ok(BnsTxState {
+            tx_hash: canonical_hash,
+            state,
+            block_number: None,
+            confirmations: 0,
+        })
+    }
+
     async fn submit_raw_tx(&self, req: BnsSubmitRawTxReq) -> BnsClientResult<BnsSubmitRawTxResp> {
         let raw_tx = req.raw_tx_bytes()?;
         let tx_hash = self
@@ -161,60 +295,40 @@ where
         })
     }
 
-    async fn register_name(
-        &self,
-        _req: BnsRegisterNameReq,
-    ) -> BnsClientResult<BnsRegisterNameResp> {
-        self.unsupported_call_authority_write("name.register")
-    }
-
-    async fn bootstrap_name(
-        &self,
-        _req: BnsBootstrapNameReq,
-    ) -> BnsClientResult<BnsBootstrapNameResp> {
-        self.unsupported_call_authority_write("name.bootstrap")
-    }
-
-    async fn apply_mutations(
-        &self,
-        _req: BnsApplyMutationsReq,
-    ) -> BnsClientResult<BnsApplyMutationsResp> {
-        self.unsupported_call_authority_write("mutation.apply")
-    }
-
-    async fn publish_document(
-        &self,
-        _req: BnsPublishDocumentReq,
-    ) -> BnsClientResult<BnsPublishDocumentResp> {
-        self.unsupported_call_authority_write("document.publish")
-    }
-
-    async fn revoke_document(
-        &self,
-        _req: BnsRevokeDocumentReq,
-    ) -> BnsClientResult<BnsRevokeDocumentResp> {
-        self.unsupported_call_authority_write("document.revoke")
-    }
-
-    async fn set_min_document_iat(
-        &self,
-        _req: BnsSetMinDocumentIatReq,
-    ) -> BnsClientResult<BnsSetMinDocumentIatResp> {
-        self.unsupported_call_authority_write("owner.set_min_document_iat")
-    }
-
-    async fn set_controller_policy(
-        &self,
-        _req: BnsSetControllerPolicyReq,
-    ) -> BnsClientResult<BnsSetControllerPolicyResp> {
-        self.unsupported_call_authority_write("controller.set_policy")
-    }
-
-    async fn update_authority_keys(
-        &self,
-        _req: BnsUpdateAuthorityKeysReq,
-    ) -> BnsClientResult<BnsUpdateAuthorityKeysResp> {
-        self.unsupported_call_authority_write("authority.update_keys")
+    async fn prepare_tx(&self, req: BnsPrepareTxReq) -> BnsClientResult<BnsPrepareTxResp> {
+        let info = self.system_info().await?;
+        let from = Address::from_str(req.from.trim()).map_err(|error| {
+            BnsClientError::Serialization(format!("invalid transaction sender: {error}"))
+        })?;
+        let contract = Address::from_str(info.contract_address.as_str()).map_err(|error| {
+            BnsClientError::Serialization(format!("invalid BNS contract_address: {error}"))
+        })?;
+        let calldata = req.calldata_bytes()?;
+        let nonce = self
+            .eth_rpc
+            .transaction_count(from)
+            .await
+            .map_err(BnsClientError::from)?;
+        let estimated_gas = self
+            .eth_rpc
+            .estimate_gas(from, contract, calldata.as_slice())
+            .await
+            .map_err(BnsClientError::from)?;
+        let gas_buffer = estimated_gas / 5 + u64::from(estimated_gas % 5 != 0);
+        let fees = self
+            .eth_rpc
+            .suggest_eip1559_fees()
+            .await
+            .map_err(BnsClientError::from)?;
+        Ok(BnsPrepareTxResp {
+            nonce,
+            chain_id: info.chain_id,
+            contract_address: info.contract_address,
+            estimated_gas,
+            gas_limit: estimated_gas.saturating_add(gas_buffer),
+            max_fee_per_gas: fees.max_fee_per_gas,
+            max_priority_fee_per_gas: fees.max_priority_fee_per_gas,
+        })
     }
 
     async fn list_events(
@@ -253,6 +367,7 @@ where
         _ip_from: IpAddr,
     ) -> Result<RPCResponse, RPCErrors> {
         match req.method.as_str() {
+            METHOD_SYSTEM_INFO => rpc_envelope_response(self.0.system_info().await, &req),
             METHOD_QUERY_NAME_STATE | "query_name_state" => {
                 let parsed: BnsNameReq = parse_req(req.params.clone(), "BnsNameReq")?;
                 rpc_envelope_response(self.0.query_name_state(&parsed.name).await, &req)
@@ -292,14 +407,30 @@ where
                     &req,
                 )
             }
+            METHOD_QUERY_NAMES_BY_ADDRESS | "query_names_by_address" | "query_by_addr" => {
+                let parsed: BnsAddressReq = parse_req(req.params.clone(), "BnsAddressReq")?;
+                rpc_envelope_response(
+                    self.0
+                        .query_names_by_address(
+                            &parsed.address,
+                            parsed.cursor.as_deref(),
+                            parsed.limit,
+                        )
+                        .await,
+                    &req,
+                )
+            }
+            METHOD_QUERY_TX_STATE | "query_tx_state" => {
+                let parsed: BnsTxHashReq = parse_req(req.params.clone(), "BnsTxHashReq")?;
+                rpc_envelope_response(self.0.query_tx_state(&parsed.tx_hash).await, &req)
+            }
             METHOD_SUBMIT_RAW_TX | "submit_raw_tx" => {
                 let parsed: BnsSubmitRawTxReq = parse_req(req.params.clone(), "BnsSubmitRawTxReq")?;
                 rpc_envelope_response(self.0.submit_raw_tx(parsed).await, &req)
             }
-            METHOD_SET_MIN_DOCUMENT_IAT | "set_min_document_iat" => {
-                let parsed: BnsSetMinDocumentIatReq =
-                    parse_req(req.params.clone(), "BnsSetMinDocumentIatReq")?;
-                rpc_envelope_response(self.0.set_min_document_iat(parsed).await, &req)
+            METHOD_PREPARE_TX | "prepare_tx" => {
+                let parsed: BnsPrepareTxReq = parse_req(req.params.clone(), "BnsPrepareTxReq")?;
+                rpc_envelope_response(self.0.prepare_tx(parsed).await, &req)
             }
             METHOD_LIST_EVENTS | "list_events" => {
                 let parsed: BnsListEventsReq = parse_req(req.params.clone(), "BnsListEventsReq")?;
@@ -475,6 +606,23 @@ where
         Self::with_config(
             BnsContractServerHandler::new(store, evm_rpc_endpoint),
             config,
+        )
+    }
+
+    pub fn from_contract_store_with_chain_config(
+        store: S,
+        evm_rpc_endpoint: impl Into<String>,
+        contract_address: impl Into<String>,
+        chain_id: u64,
+    ) -> Self {
+        Self::with_config(
+            BnsContractServerHandler::new_with_chain_config(
+                store,
+                evm_rpc_endpoint,
+                contract_address,
+                chain_id,
+            ),
+            BnsIndexerHttpServerConfig::default().with_rpc_path(BNS_SERVER_RPC_PATH),
         )
     }
 }
@@ -1346,8 +1494,7 @@ fn projection_current_proof_root(tx: &mut dyn BnsRegistryStoreTx) -> BnsRegistry
 mod tests {
     use super::*;
     use bns_client::{
-        BnsIndexerApi, BnsIndexerClient, BnsNameReq, BnsRegisterNameReq, BnsRpcEnvelope,
-        BnsSubmitRawTxReq, METHOD_QUERY_NAME_STATE,
+        BnsIndexerApi, BnsNameReq, BnsRpcEnvelope, BnsSubmitRawTxReq, METHOD_QUERY_NAME_STATE,
     };
     use bns_indexer::{
         CallAuthority, DocumentRef, DocumentStatus, MutationGuard, NameStatus, RegisterOptions,
@@ -1388,31 +1535,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bns_indexer_rpc_rejects_legacy_writes_over_http() {
-        let server = Arc::new(SqliteBnsIndexerHttpServer::open_memory().unwrap());
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let handle = spawn_listener(listener, server).unwrap();
-        let endpoint = format!("http://{}", handle.local_addr());
-        let client = BnsIndexerClient::new_krpc_url(&endpoint, None);
-
-        let error = client
-            .register_name(BnsRegisterNameReq {
-                name: "alice".to_string(),
-                asset_owner: OWNER.to_string(),
-                options: RegisterOptions::default(),
-                authority_key_updates: vec![],
-                semantic_owner_after_authority: None,
-                controller_policy: vec![],
-                controller_policy_hash: String::new(),
-                initial_documents: vec![],
-                authority: CallAuthority::public(),
-                guard: MutationGuard::default(),
-            })
+    async fn bns_indexer_rpc_rejects_legacy_writes() {
+        let server = SqliteBnsIndexerHttpServer::open_memory().unwrap();
+        let error = server
+            .handle_rpc_call(
+                RPCRequest::new("name.register", serde_json::json!({})),
+                "127.0.0.1".parse().unwrap(),
+            )
             .await
             .unwrap_err();
-        assert_eq!(error.code(), "UNSUPPORTED_OPERATION");
-
-        handle.shutdown().await;
+        assert!(matches!(error, RPCErrors::UnknownMethod(method) if method == "name.register"));
     }
 
     #[tokio::test]
@@ -1470,7 +1602,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn contract_server_reads_projection_and_rejects_legacy_writes() {
+    async fn contract_server_reads_projection() {
         let store = SqliteBnsRegistryStore::open_memory().unwrap();
         store
             .transact(|tx| {
@@ -1534,23 +1666,6 @@ mod tests {
         );
         assert_eq!(resolved.document_state.version, 1);
         assert_eq!(resolved.proof_root, ZERO_HASH);
-
-        let error = handler
-            .register_name(BnsRegisterNameReq {
-                name: "bob".to_string(),
-                asset_owner: OWNER.to_string(),
-                options: RegisterOptions::default(),
-                authority_key_updates: vec![],
-                semantic_owner_after_authority: None,
-                controller_policy: vec![],
-                controller_policy_hash: String::new(),
-                initial_documents: vec![],
-                authority: CallAuthority::public(),
-                guard: MutationGuard::default(),
-            })
-            .await
-            .unwrap_err();
-        assert_eq!(error.code(), "UNSUPPORTED_OPERATION");
     }
 
     #[tokio::test]
@@ -2128,54 +2243,6 @@ mod tests {
             _version: u64,
         ) -> BnsClientResult<Option<DocumentState>> {
             Err(BnsClientError::Transport("indexer down".to_string()))
-        }
-        async fn register_name(
-            &self,
-            _req: BnsRegisterNameReq,
-        ) -> BnsClientResult<bns_client::BnsRegisterNameResp> {
-            Err(BnsClientError::unsupported("stub"))
-        }
-        async fn bootstrap_name(
-            &self,
-            _req: bns_client::BnsBootstrapNameReq,
-        ) -> BnsClientResult<bns_client::BnsBootstrapNameResp> {
-            Err(BnsClientError::unsupported("stub"))
-        }
-        async fn apply_mutations(
-            &self,
-            _req: bns_client::BnsApplyMutationsReq,
-        ) -> BnsClientResult<bns_client::BnsApplyMutationsResp> {
-            Err(BnsClientError::unsupported("stub"))
-        }
-        async fn publish_document(
-            &self,
-            _req: bns_client::BnsPublishDocumentReq,
-        ) -> BnsClientResult<bns_client::BnsPublishDocumentResp> {
-            Err(BnsClientError::unsupported("stub"))
-        }
-        async fn revoke_document(
-            &self,
-            _req: bns_client::BnsRevokeDocumentReq,
-        ) -> BnsClientResult<bns_client::BnsRevokeDocumentResp> {
-            Err(BnsClientError::unsupported("stub"))
-        }
-        async fn set_min_document_iat(
-            &self,
-            _req: bns_client::BnsSetMinDocumentIatReq,
-        ) -> BnsClientResult<bns_client::BnsSetMinDocumentIatResp> {
-            Err(BnsClientError::unsupported("stub"))
-        }
-        async fn set_controller_policy(
-            &self,
-            _req: bns_client::BnsSetControllerPolicyReq,
-        ) -> BnsClientResult<bns_client::BnsSetControllerPolicyResp> {
-            Err(BnsClientError::unsupported("stub"))
-        }
-        async fn update_authority_keys(
-            &self,
-            _req: bns_client::BnsUpdateAuthorityKeysReq,
-        ) -> BnsClientResult<bns_client::BnsUpdateAuthorityKeysResp> {
-            Err(BnsClientError::unsupported("stub"))
         }
         async fn list_events(
             &self,

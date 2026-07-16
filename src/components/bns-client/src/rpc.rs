@@ -15,6 +15,7 @@ use thiserror::Error;
 
 pub const BNS_INDEXER_RPC_PATH: &str = "/kapi/bns-indexer";
 pub const BNS_SERVER_RPC_PATH: &str = "/kapi/bns";
+pub const MAX_BNS_NAMES_PAGE_SIZE: usize = 1_000;
 
 pub const METHOD_QUERY_NAME_STATE: &str = "name.query_state";
 pub const METHOD_RESOLVE_OWNER: &str = "name.resolve_owner";
@@ -22,15 +23,11 @@ pub const METHOD_GET_AUTHORITY_SET: &str = "authority.get_set";
 pub const METHOD_GET_AUTHORITY_KEY: &str = "authority.get_key";
 pub const METHOD_RESOLVE_DOCUMENT: &str = "document.resolve";
 pub const METHOD_GET_DOCUMENT_VERSION: &str = "document.get_version";
+pub const METHOD_QUERY_NAMES_BY_ADDRESS: &str = "name.query_by_addr";
+pub const METHOD_QUERY_TX_STATE: &str = "tx.query_state";
 pub const METHOD_SUBMIT_RAW_TX: &str = "tx.submit_raw";
-pub const METHOD_REGISTER_NAME: &str = "name.register";
-pub const METHOD_BOOTSTRAP_NAME: &str = "name.bootstrap";
-pub const METHOD_APPLY_MUTATIONS: &str = "mutation.apply";
-pub const METHOD_PUBLISH_DOCUMENT: &str = "document.publish";
-pub const METHOD_REVOKE_DOCUMENT: &str = "document.revoke";
-pub const METHOD_SET_MIN_DOCUMENT_IAT: &str = "owner.set_min_document_iat";
-pub const METHOD_SET_CONTROLLER_POLICY: &str = "controller.set_policy";
-pub const METHOD_UPDATE_AUTHORITY_KEYS: &str = "authority.update_keys";
+pub const METHOD_PREPARE_TX: &str = "tx.prepare";
+pub const METHOD_SYSTEM_INFO: &str = "system.info";
 pub const METHOD_LIST_EVENTS: &str = "events.list";
 pub const METHOD_LATEST_CHECKPOINT: &str = "checkpoint.latest";
 
@@ -187,10 +184,14 @@ impl<T> BnsRpcEnvelope<T> {
     }
 
     pub fn into_result(self) -> BnsClientResult<T> {
+        self.into_optional_result()?.ok_or_else(|| {
+            BnsClientError::InvalidResponse("BNS RPC envelope missing result".to_string())
+        })
+    }
+
+    fn into_optional_result(self) -> BnsClientResult<Option<T>> {
         if self.ok {
-            self.result.ok_or_else(|| {
-                BnsClientError::InvalidResponse("BNS RPC envelope missing result".to_string())
-            })
+            Ok(self.result)
         } else {
             Err(BnsClientError::Registry(self.error.unwrap_or_else(|| {
                 BnsRpcErrorInfo::new("UNKNOWN_BNS_ERROR", "BNS RPC envelope missing error")
@@ -239,6 +240,42 @@ pub struct BnsDocumentVersionReq {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BnsAddressReq {
+    pub address: String,
+    #[serde(default)]
+    pub cursor: Option<String>,
+    pub limit: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BnsNamePage {
+    pub names: Vec<String>,
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BnsTxHashReq {
+    pub tx_hash: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BnsTxExecutionState {
+    NotFound,
+    Pending,
+    Succeeded,
+    Reverted,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BnsTxState {
+    pub tx_hash: String,
+    pub state: BnsTxExecutionState,
+    pub block_number: Option<u64>,
+    pub confirmations: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BnsSubmitRawTxReq {
     pub raw_tx: String,
 }
@@ -281,6 +318,51 @@ pub struct BnsSubmitRawTxResp {
     pub tx_hash: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BnsSystemInfo {
+    pub ready: bool,
+    pub chain_id: u64,
+    pub contract_address: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BnsPrepareTxReq {
+    pub from: String,
+    pub calldata: String,
+}
+
+impl BnsPrepareTxReq {
+    pub fn new(from: impl Into<String>, calldata: &[u8]) -> Self {
+        Self {
+            from: from.into(),
+            calldata: format!("0x{}", hex::encode(calldata)),
+        }
+    }
+
+    pub fn calldata_bytes(&self) -> BnsClientResult<Vec<u8>> {
+        let value = self.calldata.trim();
+        let value = value.strip_prefix("0x").unwrap_or(value);
+        if value.is_empty() || value.len() % 2 != 0 {
+            return Err(BnsClientError::Serialization(
+                "calldata must be non-empty even-length hex".to_string(),
+            ));
+        }
+        hex::decode(value)
+            .map_err(|error| BnsClientError::Serialization(format!("invalid calldata: {error}")))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BnsPrepareTxResp {
+    pub nonce: u64,
+    pub chain_id: u64,
+    pub contract_address: String,
+    pub estimated_gas: u64,
+    pub gas_limit: u64,
+    pub max_fee_per_gas: u128,
+    pub max_priority_fee_per_gas: u128,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BnsRegisterNameReq {
     pub name: String,
@@ -293,11 +375,6 @@ pub struct BnsRegisterNameReq {
     pub initial_documents: Vec<DocumentUpdate>,
     pub authority: CallAuthority,
     pub guard: MutationGuard,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BnsRegisterNameResp {
-    pub name_seq: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -335,24 +412,11 @@ pub struct BnsBootstrapNameReq {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BnsBootstrapNameResp {
-    pub name_seq: u64,
-    pub initial_documents: Vec<BnsDocumentVersion>,
-    pub authority_set: AuthoritySetState,
-    pub controller_policy_hash: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BnsPublishDocumentReq {
     pub name: String,
     pub update: DocumentUpdate,
     pub authority: CallAuthority,
     pub guard: MutationGuard,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BnsPublishDocumentResp {
-    pub document_version: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -367,14 +431,6 @@ pub struct BnsApplyMutationsReq {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BnsApplyMutationsResp {
-    pub name_seq: u64,
-    pub documents: Vec<BnsDocumentVersion>,
-    pub authority_set: AuthoritySetState,
-    pub owner_policy_seq: u64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BnsRevokeDocumentReq {
     pub name: String,
     pub doc_type: String,
@@ -382,12 +438,6 @@ pub struct BnsRevokeDocumentReq {
     pub reason_hash: String,
     pub authority: CallAuthority,
     pub guard: MutationGuard,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BnsRevokeDocumentResp {
-    pub document_version: u64,
-    pub name_seq: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -400,24 +450,12 @@ pub struct BnsSetMinDocumentIatReq {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BnsSetMinDocumentIatResp {
-    pub name_seq: u64,
-    pub owner_policy_seq: u64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BnsSetControllerPolicyReq {
     pub name: String,
     pub rules: Vec<ControllerRule>,
     pub policy_hash: String,
     pub authority: CallAuthority,
     pub guard: MutationGuard,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BnsSetControllerPolicyResp {
-    pub name_seq: u64,
-    pub policy_hash: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -429,11 +467,6 @@ pub struct BnsUpdateAuthorityKeysReq {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BnsUpdateAuthorityKeysResp {
-    pub authority_set: AuthoritySetState,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BnsListEventsReq {
     pub from_seq: u64,
     pub limit: usize,
@@ -441,6 +474,12 @@ pub struct BnsListEventsReq {
 
 #[async_trait]
 pub trait BnsIndexerApi: Send + Sync {
+    async fn system_info(&self) -> BnsClientResult<BnsSystemInfo> {
+        Err(BnsClientError::unsupported(
+            "BNS system readiness is not configured",
+        ))
+    }
+
     async fn query_name_state(&self, name: &str) -> BnsClientResult<Option<NameState>>;
 
     async fn resolve_owner(&self, name: &str) -> BnsClientResult<OwnerResolution>;
@@ -462,60 +501,34 @@ pub trait BnsIndexerApi: Send + Sync {
         version: u64,
     ) -> BnsClientResult<Option<DocumentState>>;
 
+    async fn query_names_by_address(
+        &self,
+        _address: &str,
+        _cursor: Option<&str>,
+        _limit: usize,
+    ) -> BnsClientResult<BnsNamePage> {
+        Err(BnsClientError::unsupported(
+            "BNS address lookup is not configured",
+        ))
+    }
+
+    async fn query_tx_state(&self, _tx_hash: &str) -> BnsClientResult<BnsTxState> {
+        Err(BnsClientError::unsupported(
+            "BNS transaction state lookup is not configured",
+        ))
+    }
+
     async fn submit_raw_tx(&self, _req: BnsSubmitRawTxReq) -> BnsClientResult<BnsSubmitRawTxResp> {
         Err(BnsClientError::unsupported(
             "BNS raw TX submission is not configured",
         ))
     }
 
-    async fn register_name(&self, req: BnsRegisterNameReq) -> BnsClientResult<BnsRegisterNameResp>;
-
-    async fn apply_mutations(
-        &self,
-        _req: BnsApplyMutationsReq,
-    ) -> BnsClientResult<BnsApplyMutationsResp> {
+    async fn prepare_tx(&self, _req: BnsPrepareTxReq) -> BnsClientResult<BnsPrepareTxResp> {
         Err(BnsClientError::unsupported(
-            "bns-indexer apply_mutations handler is not configured",
+            "BNS transaction preparation is not configured",
         ))
     }
-
-    async fn bootstrap_name(
-        &self,
-        _req: BnsBootstrapNameReq,
-    ) -> BnsClientResult<BnsBootstrapNameResp> {
-        Err(BnsClientError::unsupported(
-            "bns-indexer bootstrap_name handler is not configured",
-        ))
-    }
-
-    async fn publish_document(
-        &self,
-        req: BnsPublishDocumentReq,
-    ) -> BnsClientResult<BnsPublishDocumentResp>;
-
-    async fn revoke_document(
-        &self,
-        req: BnsRevokeDocumentReq,
-    ) -> BnsClientResult<BnsRevokeDocumentResp>;
-
-    async fn set_min_document_iat(
-        &self,
-        _req: BnsSetMinDocumentIatReq,
-    ) -> BnsClientResult<BnsSetMinDocumentIatResp> {
-        Err(BnsClientError::unsupported(
-            "bns-indexer set_min_document_iat handler is not configured",
-        ))
-    }
-
-    async fn set_controller_policy(
-        &self,
-        req: BnsSetControllerPolicyReq,
-    ) -> BnsClientResult<BnsSetControllerPolicyResp>;
-
-    async fn update_authority_keys(
-        &self,
-        req: BnsUpdateAuthorityKeysReq,
-    ) -> BnsClientResult<BnsUpdateAuthorityKeysResp>;
 
     async fn list_events(
         &self,
@@ -527,12 +540,12 @@ pub trait BnsIndexerApi: Send + Sync {
 }
 
 #[derive(Clone)]
-pub enum BnsIndexerClient {
+pub enum BnsRpcClient {
     InProcess(Arc<dyn BnsIndexerApi>),
     KRPC(Arc<kRPC>),
 }
 
-impl BnsIndexerClient {
+impl BnsRpcClient {
     pub fn new_in_process(handler: Arc<dyn BnsIndexerApi>) -> Self {
         Self::InProcess(handler)
     }
@@ -551,37 +564,82 @@ impl BnsIndexerClient {
         Self::KRPC(Arc::new(kRPC::new(endpoint.as_str(), session_token)))
     }
 
+    async fn call_envelope<Req>(&self, method: &str, req: &Req) -> BnsClientResult<Value>
+    where
+        Req: Serialize + Sync,
+    {
+        let Self::KRPC(client) = self else {
+            return Err(BnsClientError::unsupported(
+                "generic call is only available for KRPC clients",
+            ));
+        };
+        let req_json =
+            serde_json::to_value(req).map_err(|e| BnsClientError::Serialization(e.to_string()))?;
+        client
+            .call(method, req_json)
+            .await
+            .map_err(|e| BnsClientError::Transport(e.to_string()))
+    }
+
     async fn call<Req, Resp>(&self, method: &str, req: &Req) -> BnsClientResult<Resp>
     where
         Req: Serialize + Sync,
         Resp: DeserializeOwned,
     {
-        match self {
-            Self::InProcess(_) => Err(BnsClientError::unsupported(
-                "generic call is only available for KRPC clients",
-            )),
-            Self::KRPC(client) => {
-                let req_json = serde_json::to_value(req)
-                    .map_err(|e| BnsClientError::Serialization(e.to_string()))?;
-                let result = client
-                    .call(method, req_json)
-                    .await
-                    .map_err(|e| BnsClientError::Transport(e.to_string()))?;
-                let envelope: BnsRpcEnvelope<Resp> = serde_json::from_value(result)
-                    .map_err(|e| BnsClientError::InvalidResponse(e.to_string()))?;
-                envelope.into_result()
-            }
-        }
+        let envelope: BnsRpcEnvelope<Resp> =
+            serde_json::from_value(self.call_envelope(method, req).await?)
+                .map_err(|e| BnsClientError::InvalidResponse(e.to_string()))?;
+        envelope.into_result()
+    }
+
+    async fn call_optional<Req, Resp>(
+        &self,
+        method: &str,
+        req: &Req,
+    ) -> BnsClientResult<Option<Resp>>
+    where
+        Req: Serialize + Sync,
+        Resp: DeserializeOwned,
+    {
+        decode_optional_envelope(self.call_envelope(method, req).await?)
     }
 }
 
+fn decode_optional_envelope<T: DeserializeOwned>(value: Value) -> BnsClientResult<Option<T>> {
+    let has_result = value
+        .as_object()
+        .is_some_and(|envelope| envelope.contains_key("result"));
+    if !has_result {
+        return Err(BnsClientError::InvalidResponse(
+            "BNS RPC envelope missing result".to_string(),
+        ));
+    }
+
+    let envelope: BnsRpcEnvelope<T> = serde_json::from_value(value)
+        .map_err(|e| BnsClientError::InvalidResponse(e.to_string()))?;
+    envelope.into_optional_result()
+}
+
+/// Compatibility name for callers that still target the legacy indexer path.
+pub type BnsIndexerClient = BnsRpcClient;
+
+/// Preferred trait name at the unified BNS RPC boundary.
+pub use BnsIndexerApi as BnsRpcApi;
+
 #[async_trait]
-impl BnsIndexerApi for BnsIndexerClient {
+impl BnsIndexerApi for BnsRpcClient {
+    async fn system_info(&self) -> BnsClientResult<BnsSystemInfo> {
+        match self {
+            Self::InProcess(handler) => handler.system_info().await,
+            Self::KRPC(_) => self.call(METHOD_SYSTEM_INFO, &json!({})).await,
+        }
+    }
+
     async fn query_name_state(&self, name: &str) -> BnsClientResult<Option<NameState>> {
         match self {
             Self::InProcess(handler) => handler.query_name_state(name).await,
             Self::KRPC(_) => {
-                self.call(METHOD_QUERY_NAME_STATE, &BnsNameReq::new(name))
+                self.call_optional(METHOD_QUERY_NAME_STATE, &BnsNameReq::new(name))
                     .await
             }
         }
@@ -615,7 +673,7 @@ impl BnsIndexerApi for BnsIndexerClient {
         match self {
             Self::InProcess(handler) => handler.get_authority_key(name, kid).await,
             Self::KRPC(_) => {
-                self.call(
+                self.call_optional(
                     METHOD_GET_AUTHORITY_KEY,
                     &BnsAuthorityKeyReq {
                         name: name.to_string(),
@@ -649,12 +707,51 @@ impl BnsIndexerApi for BnsIndexerClient {
         match self {
             Self::InProcess(handler) => handler.get_document_version(name, doc_type, version).await,
             Self::KRPC(_) => {
-                self.call(
+                self.call_optional(
                     METHOD_GET_DOCUMENT_VERSION,
                     &BnsDocumentVersionReq {
                         name: name.to_string(),
                         doc_type: doc_type.to_string(),
                         version,
+                    },
+                )
+                .await
+            }
+        }
+    }
+
+    async fn query_names_by_address(
+        &self,
+        address: &str,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> BnsClientResult<BnsNamePage> {
+        match self {
+            Self::InProcess(handler) => {
+                handler.query_names_by_address(address, cursor, limit).await
+            }
+            Self::KRPC(_) => {
+                self.call(
+                    METHOD_QUERY_NAMES_BY_ADDRESS,
+                    &BnsAddressReq {
+                        address: address.to_string(),
+                        cursor: cursor.map(str::to_string),
+                        limit,
+                    },
+                )
+                .await
+            }
+        }
+    }
+
+    async fn query_tx_state(&self, tx_hash: &str) -> BnsClientResult<BnsTxState> {
+        match self {
+            Self::InProcess(handler) => handler.query_tx_state(tx_hash).await,
+            Self::KRPC(_) => {
+                self.call(
+                    METHOD_QUERY_TX_STATE,
+                    &BnsTxHashReq {
+                        tx_hash: tx_hash.to_string(),
                     },
                 )
                 .await
@@ -669,80 +766,10 @@ impl BnsIndexerApi for BnsIndexerClient {
         }
     }
 
-    async fn register_name(&self, req: BnsRegisterNameReq) -> BnsClientResult<BnsRegisterNameResp> {
+    async fn prepare_tx(&self, req: BnsPrepareTxReq) -> BnsClientResult<BnsPrepareTxResp> {
         match self {
-            Self::InProcess(handler) => handler.register_name(req).await,
-            Self::KRPC(_) => self.call(METHOD_REGISTER_NAME, &req).await,
-        }
-    }
-
-    async fn apply_mutations(
-        &self,
-        req: BnsApplyMutationsReq,
-    ) -> BnsClientResult<BnsApplyMutationsResp> {
-        match self {
-            Self::InProcess(handler) => handler.apply_mutations(req).await,
-            Self::KRPC(_) => self.call(METHOD_APPLY_MUTATIONS, &req).await,
-        }
-    }
-
-    async fn bootstrap_name(
-        &self,
-        req: BnsBootstrapNameReq,
-    ) -> BnsClientResult<BnsBootstrapNameResp> {
-        match self {
-            Self::InProcess(handler) => handler.bootstrap_name(req).await,
-            Self::KRPC(_) => self.call(METHOD_BOOTSTRAP_NAME, &req).await,
-        }
-    }
-
-    async fn publish_document(
-        &self,
-        req: BnsPublishDocumentReq,
-    ) -> BnsClientResult<BnsPublishDocumentResp> {
-        match self {
-            Self::InProcess(handler) => handler.publish_document(req).await,
-            Self::KRPC(_) => self.call(METHOD_PUBLISH_DOCUMENT, &req).await,
-        }
-    }
-
-    async fn revoke_document(
-        &self,
-        req: BnsRevokeDocumentReq,
-    ) -> BnsClientResult<BnsRevokeDocumentResp> {
-        match self {
-            Self::InProcess(handler) => handler.revoke_document(req).await,
-            Self::KRPC(_) => self.call(METHOD_REVOKE_DOCUMENT, &req).await,
-        }
-    }
-
-    async fn set_min_document_iat(
-        &self,
-        req: BnsSetMinDocumentIatReq,
-    ) -> BnsClientResult<BnsSetMinDocumentIatResp> {
-        match self {
-            Self::InProcess(handler) => handler.set_min_document_iat(req).await,
-            Self::KRPC(_) => self.call(METHOD_SET_MIN_DOCUMENT_IAT, &req).await,
-        }
-    }
-
-    async fn set_controller_policy(
-        &self,
-        req: BnsSetControllerPolicyReq,
-    ) -> BnsClientResult<BnsSetControllerPolicyResp> {
-        match self {
-            Self::InProcess(handler) => handler.set_controller_policy(req).await,
-            Self::KRPC(_) => self.call(METHOD_SET_CONTROLLER_POLICY, &req).await,
-        }
-    }
-
-    async fn update_authority_keys(
-        &self,
-        req: BnsUpdateAuthorityKeysReq,
-    ) -> BnsClientResult<BnsUpdateAuthorityKeysResp> {
-        match self {
-            Self::InProcess(handler) => handler.update_authority_keys(req).await,
-            Self::KRPC(_) => self.call(METHOD_UPDATE_AUTHORITY_KEYS, &req).await,
+            Self::InProcess(handler) => handler.prepare_tx(req).await,
+            Self::KRPC(_) => self.call(METHOD_PREPARE_TX, &req).await,
         }
     }
 
@@ -763,7 +790,10 @@ impl BnsIndexerApi for BnsIndexerClient {
     async fn latest_checkpoint(&self) -> BnsClientResult<Option<LogCheckpoint>> {
         match self {
             Self::InProcess(handler) => handler.latest_checkpoint().await,
-            Self::KRPC(_) => self.call(METHOD_LATEST_CHECKPOINT, &json!({})).await,
+            Self::KRPC(_) => {
+                self.call_optional(METHOD_LATEST_CHECKPOINT, &json!({}))
+                    .await
+            }
         }
     }
 }
@@ -787,6 +817,7 @@ where
         _ip_from: IpAddr,
     ) -> Result<RPCResponse, RPCErrors> {
         match req.method.as_str() {
+            METHOD_SYSTEM_INFO => rpc_envelope_response(self.0.system_info().await, &req),
             METHOD_QUERY_NAME_STATE | "query_name_state" => {
                 let parsed: BnsNameReq = parse_req(req.params.clone(), "BnsNameReq")?;
                 rpc_envelope_response(self.0.query_name_state(&parsed.name).await, &req)
@@ -826,49 +857,30 @@ where
                     &req,
                 )
             }
+            METHOD_QUERY_NAMES_BY_ADDRESS | "query_names_by_address" | "query_by_addr" => {
+                let parsed: BnsAddressReq = parse_req(req.params.clone(), "BnsAddressReq")?;
+                rpc_envelope_response(
+                    self.0
+                        .query_names_by_address(
+                            &parsed.address,
+                            parsed.cursor.as_deref(),
+                            parsed.limit,
+                        )
+                        .await,
+                    &req,
+                )
+            }
+            METHOD_QUERY_TX_STATE | "query_tx_state" => {
+                let parsed: BnsTxHashReq = parse_req(req.params.clone(), "BnsTxHashReq")?;
+                rpc_envelope_response(self.0.query_tx_state(&parsed.tx_hash).await, &req)
+            }
             METHOD_SUBMIT_RAW_TX | "submit_raw_tx" => {
                 let parsed: BnsSubmitRawTxReq = parse_req(req.params.clone(), "BnsSubmitRawTxReq")?;
                 rpc_envelope_response(self.0.submit_raw_tx(parsed).await, &req)
             }
-            METHOD_REGISTER_NAME | "register_name" => {
-                let parsed: BnsRegisterNameReq =
-                    parse_req(req.params.clone(), "BnsRegisterNameReq")?;
-                rpc_envelope_response(self.0.register_name(parsed).await, &req)
-            }
-            METHOD_APPLY_MUTATIONS | "apply_mutations" => {
-                let parsed: BnsApplyMutationsReq =
-                    parse_req(req.params.clone(), "BnsApplyMutationsReq")?;
-                rpc_envelope_response(self.0.apply_mutations(parsed).await, &req)
-            }
-            METHOD_BOOTSTRAP_NAME | "bootstrap_name" => {
-                let parsed: BnsBootstrapNameReq =
-                    parse_req(req.params.clone(), "BnsBootstrapNameReq")?;
-                rpc_envelope_response(self.0.bootstrap_name(parsed).await, &req)
-            }
-            METHOD_PUBLISH_DOCUMENT | "publish_document" => {
-                let parsed: BnsPublishDocumentReq =
-                    parse_req(req.params.clone(), "BnsPublishDocumentReq")?;
-                rpc_envelope_response(self.0.publish_document(parsed).await, &req)
-            }
-            METHOD_REVOKE_DOCUMENT | "revoke_document" => {
-                let parsed: BnsRevokeDocumentReq =
-                    parse_req(req.params.clone(), "BnsRevokeDocumentReq")?;
-                rpc_envelope_response(self.0.revoke_document(parsed).await, &req)
-            }
-            METHOD_SET_MIN_DOCUMENT_IAT | "set_min_document_iat" => {
-                let parsed: BnsSetMinDocumentIatReq =
-                    parse_req(req.params.clone(), "BnsSetMinDocumentIatReq")?;
-                rpc_envelope_response(self.0.set_min_document_iat(parsed).await, &req)
-            }
-            METHOD_SET_CONTROLLER_POLICY | "set_controller_policy" => {
-                let parsed: BnsSetControllerPolicyReq =
-                    parse_req(req.params.clone(), "BnsSetControllerPolicyReq")?;
-                rpc_envelope_response(self.0.set_controller_policy(parsed).await, &req)
-            }
-            METHOD_UPDATE_AUTHORITY_KEYS | "update_authority_keys" => {
-                let parsed: BnsUpdateAuthorityKeysReq =
-                    parse_req(req.params.clone(), "BnsUpdateAuthorityKeysReq")?;
-                rpc_envelope_response(self.0.update_authority_keys(parsed).await, &req)
+            METHOD_PREPARE_TX | "prepare_tx" => {
+                let parsed: BnsPrepareTxReq = parse_req(req.params.clone(), "BnsPrepareTxReq")?;
+                rpc_envelope_response(self.0.prepare_tx(parsed).await, &req)
             }
             METHOD_LIST_EVENTS | "list_events" => {
                 let parsed: BnsListEventsReq = parse_req(req.params.clone(), "BnsListEventsReq")?;
@@ -970,5 +982,48 @@ mod url_tests {
             normalize_bns_server_url("http://127.0.0.1:18080/custom/rpc/"),
             "http://127.0.0.1:18080/custom/rpc"
         );
+    }
+
+    #[test]
+    fn optional_envelope_accepts_explicit_null_result() {
+        let result = decode_optional_envelope::<Value>(json!({
+            "ok": true,
+            "result": null,
+            "error": null
+        }))
+        .unwrap();
+
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn optional_envelope_rejects_missing_result_field() {
+        let error = decode_optional_envelope::<Value>(json!({
+            "ok": true,
+            "error": null
+        }))
+        .unwrap_err();
+
+        assert_eq!(error.code(), "INVALID_RESPONSE");
+        assert!(error.to_string().contains("missing result"));
+    }
+
+    #[test]
+    fn optional_envelope_preserves_registry_error() {
+        let error = decode_optional_envelope::<Value>(json!({
+            "ok": false,
+            "result": null,
+            "error": {
+                "code": "NAME_NOT_FOUND",
+                "message": "name was not found",
+                "name": "missing",
+                "doc_type": null,
+                "expected": null,
+                "actual": null
+            }
+        }))
+        .unwrap_err();
+
+        assert_eq!(error.code(), "NAME_NOT_FOUND");
     }
 }

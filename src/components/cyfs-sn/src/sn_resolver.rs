@@ -765,10 +765,18 @@ pub struct SnResolver {
 
 impl SnResolver {
     pub fn new(config: SnResolverConfig, auth: SnAuthReaderRef) -> Self {
+        Self::new_with_bns(config, auth, Arc::new(EmptyBnsDocumentReader))
+    }
+
+    pub fn new_with_bns(
+        config: SnResolverConfig,
+        auth: SnAuthReaderRef,
+        bns: BnsDocumentReaderRef,
+    ) -> Self {
         Self {
             config,
             auth,
-            bns: Arc::new(EmptyBnsDocumentReader),
+            bns,
             device_online: Arc::new(EmptyDeviceOnlineReader),
             relay_reader: Arc::new(EmptyRelayAssignmentReader),
             compatibility: Arc::new(EmptyResolverCompatibilityReader),
@@ -997,7 +1005,9 @@ impl SnResolver {
             .await?;
         let mut addresses = Vec::new();
         for ip in gateway.addresses.iter().copied() {
-            push_dns_address(&mut addresses, ip, record_type);
+            // 设备来源的 IP 已在 resolve_gateway_addresses 内做过 zonegate
+            // 过滤；SN 中继回退地址不再过滤（dev-local 下是 127.0.0.1）。
+            push_dns_address_unfiltered(&mut addresses, ip, record_type);
         }
 
         Ok(DnsResolution {
@@ -1064,10 +1074,32 @@ impl SnResolver {
                 .await;
         }
 
+        // BNS 兼容域名（SN-Resolver.md "BNS 兼容域名"）：
+        //   alice.web3.<server_host>       -> BNS name alice
+        //   home.alice.web3.<server_host>  -> BNS name alice（sub_host 只作
+        //   relay 上下文，不决定 owner，这里取 web3 前缀的末级 label）。
+        // 旧 URL 的 `www-alice` 连字符规则不在此实现（用户名可含 '-'，
+        // 会误切；需要时由显式 dns record 覆盖）。
+        if let Some(bns_name) = self.bns_compat_name_of(hostname.as_str()) {
+            return self
+                .resolve_zone_by_bns_name(
+                    bns_name.as_str(),
+                    hostname.as_str(),
+                    ZoneResolutionSource::BnsName,
+                    None,
+                )
+                .await;
+        }
+
         Err(SnResolverError::new(
             SnResolverErrorKind::NotManaged,
             format!("hostname {} is not managed by this SN", hostname),
         ))
+    }
+
+    /// `<...>.<name>.web3.<server_host>` -> `<name>`；不匹配返回 None。
+    fn bns_compat_name_of(&self, hostname: &str) -> Option<String> {
+        bns_compat_name_for(self.config.server_host.as_str(), hostname)
     }
 
     pub async fn resolve_zone_by_bns_name(
@@ -1278,6 +1310,22 @@ impl SnResolver {
         })
     }
 
+    /// 按 (zone, device_name) 解析 zone 权威侧登记的设备身份文档，返回其中的
+    /// 设备 DID（通常是 `did:dev:<x>`，公钥内嵌）。来源优先级与内部设备解析
+    /// 一致：BNS `<device>.<zone>` 单文档 → zone 级 `device_mini_doc` 聚合 →
+    /// zone doc devices → 兼容期 devices 表。`sn_authority` 用它锚定设备
+    /// token 的公钥，不存在时返回 `DeviceNotFound`。
+    pub async fn resolve_zone_device_did(
+        &self,
+        zone_name: &str,
+        device_name: &str,
+    ) -> SnResolverResult<String> {
+        let (device_doc, _) = self
+            .resolve_device_mini_doc(zone_name, device_name, None)
+            .await?;
+        Ok(device_doc.did)
+    }
+
     async fn resolve_device_mini_doc(
         &self,
         zone_name: &str,
@@ -1359,22 +1407,32 @@ impl SnResolver {
             push_exportable_ip(&mut addresses, ip);
         }
 
-        if let Some(online) = online {
-            if !online.is_wan_device {
-                let sn_ips = self
-                    .auth
-                    .get_user_sn_ips(zone.zone_name.as_str())
-                    .await
-                    .unwrap_or_default();
-                if sn_ips.is_empty() {
-                    push_exportable_ip(&mut addresses, self.config.server_ip);
-                } else {
-                    for ip in sn_ips {
-                        push_exportable_ip(&mut addresses, ip);
-                    }
+        // net_id comes from the owner-signed device document and describes the
+        // intended ingress topology. Prefer it over IP-shape inference: a NAT
+        // device can legitimately report a global IPv6 address that is not an
+        // externally reachable gateway endpoint (for example, a host address
+        // observed while activating a VM). In that case the online-state
+        // heuristic marks the device as WAN, but DNS must still include the SN
+        // relay selected by the signed topology.
+        let requires_sn_relay = device_document_requires_sn_relay(device_doc)
+            .or_else(|| online.map(|online| !online.is_wan_device))
+            .unwrap_or(false);
+        if requires_sn_relay {
+            let sn_ips = self
+                .auth
+                .get_user_sn_ips(zone.zone_name.as_str())
+                .await
+                .unwrap_or_default();
+            if sn_ips.is_empty() {
+                push_exportable_ip(&mut addresses, self.config.server_ip);
+            } else {
+                for ip in sn_ips {
+                    push_exportable_ip(&mut addresses, ip);
                 }
             }
+        }
 
+        if let Some(online) = online {
             for value in online
                 .public_ips
                 .iter()
@@ -1402,6 +1460,31 @@ impl SnResolver {
         if let Some(value) = device_doc.document.as_ref() {
             for key in ["ip", "ips", "all_ip", "addresses"] {
                 collect_ips_from_value_path(value, &[key], &mut addresses);
+            }
+        }
+
+        if addresses.is_empty() {
+            // 没有任何直接可达地址（设备离线的 LAN/relay 型 zone，或文档
+            // 未带 IP）：回退 SN 中继地址（用户 sn_ips 优先，否则本 SN
+            // server_ip），与上面"在线但非 WAN 设备"分支同语义——流量落到
+            // SN 后经 rtcp 隧道转发。空答案（NXDOMAIN）会让 *.web3 域名在
+            // 设备未上线时完全不可达。SN 自身地址与 resolve_self_dns 同
+            // 信任级，不做 zonegate 回环过滤（dev-local 的 sn_ip 就是
+            // 127.0.0.1）。
+            let sn_ips = self
+                .auth
+                .get_user_sn_ips(zone.zone_name.as_str())
+                .await
+                .unwrap_or_default();
+            let relay_ips = if sn_ips.is_empty() {
+                vec![self.config.server_ip]
+            } else {
+                sn_ips
+            };
+            for ip in relay_ips {
+                if !addresses.contains(&ip) {
+                    addresses.push(ip);
+                }
             }
         }
 
@@ -2189,7 +2272,7 @@ fn find_gateway_device_name(value: &Value) -> Option<String> {
 fn find_boot_jwt(value: &Value) -> Option<String> {
     // Shared with the SN controller's write side so the embedded boot_jwt is read
     // back through the exact same locations it was written through.
-    bns_indexer::dns_document::extract_boot_jwt(value)
+    bns_client::dns_document::extract_boot_jwt(value)
 }
 
 fn find_device_mini_map(value: &Value) -> HashMap<String, Value> {
@@ -2297,10 +2380,21 @@ fn device_jwts_from_bns_document(document: &BnsDocument) -> Vec<String> {
 
     if let Some(devices) = value.get("devices").and_then(|v| v.as_object()) {
         for device in devices.values() {
-            if let Some(jwt) = find_string_path(device, &["mini_config_jwt"]) {
+            if let Some(jwt) = find_string_path(device, &["device_mini_document_jwt"])
+                .or_else(|| find_string_path(device, &["mini_config_jwt"]))
+            {
                 result.push(jwt);
             }
         }
+    }
+
+    if let Some(mini_device_jwts) = value.get("mini_device_jwts").and_then(Value::as_object) {
+        result.extend(
+            mini_device_jwts
+                .values()
+                .filter_map(Value::as_str)
+                .map(ToString::to_string),
+        );
     }
 
     if let Some(jwt) = find_string_path(&value, &["mini_config_jwt"]) {
@@ -2313,7 +2407,9 @@ fn device_jwts_from_bns_document(document: &BnsDocument) -> Vec<String> {
 fn device_jwts_from_map(devices: &HashMap<String, Value>) -> Vec<String> {
     let mut result = Vec::new();
     for device in devices.values() {
-        if let Some(jwt) = find_string_path(device, &["mini_config_jwt"]) {
+        if let Some(jwt) = find_string_path(device, &["device_mini_document_jwt"])
+            .or_else(|| find_string_path(device, &["mini_config_jwt"]))
+        {
             result.push(jwt);
         }
     }
@@ -2380,13 +2476,22 @@ fn device_doc_from_aggregate(
         .and_then(|devices| devices.get(device_name))
         .or_else(|| value.get(device_name))?;
 
-    device_doc_from_value(
+    let mut result = device_doc_from_value(
         zone_name,
         device_name,
         device_value,
         document.meta.ttl,
         document.meta.version,
-    )
+    )?;
+    if result.mini_config_jwt.is_none() {
+        result.mini_config_jwt = value
+            .get("mini_device_jwts")
+            .and_then(Value::as_object)
+            .and_then(|jwts| jwts.get(device_name))
+            .and_then(Value::as_str)
+            .map(ToString::to_string);
+    }
+    Some(result)
 }
 
 fn device_doc_from_single(
@@ -2419,11 +2524,14 @@ fn device_doc_from_value(
         .or_else(|| find_string_path(value, &["name"]))
         .or_else(|| find_string_path(value, &["n"]))
         .unwrap_or_else(|| fallback_device_name.to_string());
-    let did = find_string_path(value, &["did"])
+    let did = device_public_key_x(value)
+        .map(|x| format!("did:dev:{}", x))
+        .or_else(|| find_string_path(value, &["did"]))
         .or_else(|| find_string_path(value, &["id"]))
         .or_else(|| find_string_path(value, &["x"]).map(|x| format!("did:dev:{}", x)))?;
     let mini_config_jwt = find_string_path(value, &["mini_config_jwt"])
-        .or_else(|| find_string_path(value, &["device_mini_config_jwt"]));
+        .or_else(|| find_string_path(value, &["device_mini_config_jwt"]))
+        .or_else(|| find_string_path(value, &["device_mini_document_jwt"]));
 
     Some(DeviceMiniDocument {
         zone_name: zone_name.to_string(),
@@ -2434,6 +2542,33 @@ fn device_doc_from_value(
         ttl,
         version,
     })
+}
+
+fn device_document_requires_sn_relay(device_doc: &DeviceMiniDocument) -> Option<bool> {
+    let net_id = device_doc
+        .document
+        .as_ref()?
+        .get("net_id")?
+        .as_str()?
+        .trim()
+        .to_ascii_lowercase();
+    if net_id.is_empty() {
+        return None;
+    }
+
+    Some(!net_id.starts_with("wan"))
+}
+
+fn device_public_key_x(value: &Value) -> Option<String> {
+    value
+        .get("verificationMethod")
+        .and_then(Value::as_array)
+        .and_then(|methods| {
+            methods
+                .iter()
+                .find_map(|method| find_string_path(method, &["publicKeyJwk", "x"]))
+        })
+        .or_else(|| find_string_path(value, &["public_key", "x"]))
 }
 
 fn build_legacy_zone_config_json(username: &str, user: &SNUserInfo) -> Value {
@@ -2579,6 +2714,21 @@ fn parse_ip_or_socket_addr(value: &str) -> Option<IpAddr> {
         .or_else(|| value.parse::<SocketAddr>().ok().map(|addr| addr.ip()))
 }
 
+/// BNS 兼容域名映射（SN-Resolver.md "BNS 兼容域名"）：
+/// `<name>.web3.<server_host>` 及其子域 -> BNS name `<name>`。
+fn bns_compat_name_for(server_host: &str, hostname: &str) -> Option<String> {
+    let suffix = format!(".web3.{}", server_host);
+    let prefix = hostname.strip_suffix(suffix.as_str())?;
+    if prefix.is_empty() {
+        return None;
+    }
+    let name = prefix.rsplit('.').next().unwrap_or(prefix);
+    if name.is_empty() {
+        return None;
+    }
+    Some(name.to_string())
+}
+
 fn push_dns_address(addresses: &mut Vec<IpAddr>, ip: IpAddr, record_type: RecordType) {
     match record_type {
         RecordType::A if ip.is_ipv4() => push_exportable_ip(addresses, ip),
@@ -2676,6 +2826,33 @@ mod tests {
     }
 
     #[test]
+    fn bns_compat_name_extraction() {
+        // <name>.web3.<server_host> 与其子域都映射到末级 name。
+        assert_eq!(
+            bns_compat_name_for("devtests.org", "alice.web3.devtests.org").as_deref(),
+            Some("alice")
+        );
+        assert_eq!(
+            bns_compat_name_for("devtests.org", "home.alice.web3.devtests.org").as_deref(),
+            Some("alice")
+        );
+        // web3.<server_host> 本体不是 BNS 兼容域名（属 SN 自身 hostname 域）。
+        assert_eq!(
+            bns_compat_name_for("devtests.org", "web3.devtests.org"),
+            None
+        );
+        // 其他后缀不误判。
+        assert_eq!(
+            bns_compat_name_for("devtests.org", "alice.example.com"),
+            None
+        );
+        assert_eq!(
+            bns_compat_name_for("devtests.org", "alice.web3.other.org"),
+            None
+        );
+    }
+
+    #[test]
     fn dns_address_filter_removes_loopback_and_docker_bridge() {
         let mut addresses = Vec::new();
         push_dns_address(&mut addresses, "127.0.0.1".parse().unwrap(), RecordType::A);
@@ -2715,6 +2892,92 @@ mod tests {
 
         let value = json!({ "oods": ["ood2.testuser"] });
         assert_eq!(find_gateway_device_name(&value).as_deref(), Some("ood2"));
+    }
+
+    #[test]
+    fn signed_device_net_id_controls_sn_relay_requirement() {
+        let device = |net_id: Option<&str>| DeviceMiniDocument {
+            zone_name: "testuser".to_string(),
+            device_name: "ood1".to_string(),
+            did: "did:dev:test-device".to_string(),
+            mini_config_jwt: None,
+            document: net_id.map(|net_id| json!({ "net_id": net_id })),
+            ttl: None,
+            version: None,
+        };
+
+        assert_eq!(
+            device_document_requires_sn_relay(&device(Some("nat"))),
+            Some(true)
+        );
+        assert_eq!(
+            device_document_requires_sn_relay(&device(Some("portmap"))),
+            Some(true)
+        );
+        assert_eq!(
+            device_document_requires_sn_relay(&device(Some("wan"))),
+            Some(false)
+        );
+        assert_eq!(
+            device_document_requires_sn_relay(&device(Some("wan_dyn"))),
+            Some(false)
+        );
+        assert_eq!(device_document_requires_sn_relay(&device(None)), None);
+    }
+
+    #[tokio::test]
+    async fn nat_device_includes_sn_even_when_online_state_looks_wan() {
+        let resolver = test_resolver_with_bns(StaticBnsReader::default());
+        let zone = ZoneResolution {
+            input: "testuser.web3.buckyos.test".to_string(),
+            canonical_name: "testuser".to_string(),
+            zone_name: "testuser".to_string(),
+            owner: BnsOwner {
+                name: "testuser".to_string(),
+                effective_owner: None,
+                owner_config: None,
+            },
+            zone_doc: ZoneDocument::empty(),
+            boot_doc: BootDocument::empty(),
+            user_domain: None,
+            self_cert: false,
+            relay_sn: None,
+            source: ZoneResolutionSource::BnsName,
+        };
+        let device_doc = DeviceMiniDocument {
+            zone_name: "testuser".to_string(),
+            device_name: "ood1".to_string(),
+            did: "did:dev:test-device".to_string(),
+            mini_config_jwt: None,
+            document: Some(json!({
+                "net_id": "nat",
+                "all_ip": ["2600:1700:1150:9440::49", "192.168.1.143"]
+            })),
+            ttl: None,
+            version: None,
+        };
+        let online = SnDeviceStateView {
+            did: device_doc.did.clone(),
+            zone: zone.zone_name.clone(),
+            device_name: device_doc.device_name.clone(),
+            device_role: crate::SnDeviceRole::Ood,
+            state: crate::SnDeviceState::Online,
+            public_ips: vec!["2600:1700:1150:9440::49".to_string()],
+            private_ips: vec!["192.168.1.143".to_string()],
+            active_endpoints: Vec::new(),
+            preferred_endpoint: None,
+            nat_type: crate::SnNatType::Unknown,
+            is_wan_device: true,
+            last_seen_at: None,
+            expires_at: None,
+        };
+
+        let addresses = resolver
+            .resolve_gateway_addresses(&zone, &device_doc, None, Some(&online))
+            .await;
+
+        assert!(addresses.contains(&"192.0.2.10".parse::<IpAddr>().unwrap()));
+        assert!(addresses.contains(&"2600:1700:1150:9440::49".parse::<IpAddr>().unwrap()));
     }
 
     #[test]
@@ -2781,6 +3044,89 @@ mod tests {
         assert_eq!(device.device_name, "gw1");
         assert_eq!(device.did, "did:dev:abc");
         assert_eq!(device.mini_config_jwt.as_deref(), Some("jwt"));
+    }
+
+    #[test]
+    fn parses_canonical_zone_document_device_and_mini_jwt_fields() {
+        let doc = BnsDocument::json(
+            "testuser",
+            BNS_DOC_ZONE,
+            json!({
+                "devices": {
+                    "ood1": {
+                        "id": "did:dev:canonical",
+                        "name": "ood1"
+                    }
+                },
+                "mini_device_jwts": {
+                    "ood1": "canonical-mini-jwt"
+                }
+            }),
+        );
+
+        let device = device_doc_from_aggregate("testuser", "ood1", &doc).unwrap();
+        assert_eq!(device.did, "did:dev:canonical");
+        assert_eq!(
+            device.mini_config_jwt.as_deref(),
+            Some("canonical-mini-jwt")
+        );
+        assert_eq!(
+            device_jwts_from_bns_document(&doc),
+            vec!["canonical-mini-jwt"]
+        );
+    }
+
+    #[tokio::test]
+    async fn resolves_device_key_did_from_canonical_zone_document_jwt() {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine;
+
+        let device_x = "T4Quc1L6Ogu4N2tTKOvneV1yYnBcmhP89B_RsuFsJZ8";
+        let payload = json!({
+            "boot_jwt": "canonical-boot-jwt",
+            "oods": ["ood1"],
+            "devices": {
+                "ood1": {
+                    "id": "did:bns:ood1.testuser",
+                    "name": "ood1",
+                    "verificationMethod": [{
+                        "publicKeyJwk": {
+                            "kty": "OKP",
+                            "crv": "Ed25519",
+                            "x": device_x
+                        }
+                    }],
+                    "device_mini_document_jwt": "canonical-mini-jwt"
+                }
+            },
+            "mini_device_jwts": {
+                "ood1": "canonical-mini-jwt"
+            }
+        });
+        let zone_jwt = format!(
+            "{}.{}.signature",
+            URL_SAFE_NO_PAD.encode(br#"{"alg":"EdDSA"}"#),
+            URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload).unwrap())
+        );
+        let document = BnsDocument::jwt("testuser", BNS_DOC_ZONE, zone_jwt);
+        let zone = ZoneDocument::from_bns_document(&document);
+        assert_eq!(zone.boot_jwt.as_deref(), Some("canonical-boot-jwt"));
+        assert_eq!(zone.gateway_device_name.as_deref(), Some("ood1"));
+        assert!(device_jwts_from_bns_document(&document)
+            .iter()
+            .all(|jwt| jwt == "canonical-mini-jwt"));
+
+        let mut bns = StaticBnsReader::default();
+        bns.documents
+            .insert(("testuser".to_string(), BNS_DOC_ZONE.to_string()), document);
+        let resolver = test_resolver_with_bns(bns);
+        assert_eq!(
+            resolver
+                .resolve_zone_device_did("testuser", "ood1")
+                .await
+                .unwrap(),
+            format!("did:dev:{}", device_x)
+        );
     }
 
     #[tokio::test]

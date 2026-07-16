@@ -12,13 +12,10 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use bns_client::{
-    BnsApplyMutationsReq, BnsApplyMutationsResp, BnsAuthorityKeyReq, BnsBootstrapNameReq,
-    BnsBootstrapNameResp, BnsClientError, BnsClientResult, BnsDocumentReq, BnsDocumentVersionReq,
-    BnsEvmClientConfig, BnsEvmControllerClient, BnsEvmRawTxSubmitter, BnsEvmReceiptWaitConfig,
-    BnsEvmStandardClient, BnsIndexerApi, BnsNameReq, BnsPublishDocumentReq, BnsPublishDocumentResp,
-    BnsRegisterNameReq, BnsRegisterNameResp, BnsRevokeDocumentReq, BnsRevokeDocumentResp,
-    BnsSetControllerPolicyReq, BnsSetControllerPolicyResp, BnsSubmitRawTxReq, BnsSubmitRawTxResp,
-    BnsUpdateAuthorityKeysReq, BnsUpdateAuthorityKeysResp,
+    BnsClientError, BnsClientResult, BnsEvmClientConfig, BnsEvmControllerClient,
+    BnsEvmRawTxSubmitter, BnsEvmReceiptWaitConfig, BnsEvmStandardClient, BnsIndexerApi,
+    BnsPrepareTxReq, BnsPrepareTxResp, BnsRegisterNameReq, BnsSubmitRawTxReq, BnsSubmitRawTxResp,
+    BnsTxExecutionState, BnsTxState,
 };
 use bns_evm::{decode_signed_eip1559, Address};
 use bns_indexer::{
@@ -38,12 +35,14 @@ const SERVER_TX_HASH: &str = "0x444444444444444444444444444444444444444444444444
 
 struct CapturingBnsServer {
     received_raw_txs: Arc<Mutex<Vec<Vec<u8>>>>,
+    next_nonce: Mutex<u64>,
 }
 
 impl CapturingBnsServer {
     fn new() -> Self {
         Self {
             received_raw_txs: Arc::new(Mutex::new(Vec::new())),
+            next_nonce: Mutex::new(5),
         }
     }
 
@@ -100,42 +99,30 @@ impl BnsIndexerApi for CapturingBnsServer {
         })
     }
 
-    async fn register_name(
-        &self,
-        _req: BnsRegisterNameReq,
-    ) -> BnsClientResult<BnsRegisterNameResp> {
-        unused("register_name")
+    async fn prepare_tx(&self, _req: BnsPrepareTxReq) -> BnsClientResult<BnsPrepareTxResp> {
+        let mut next_nonce = self.next_nonce.lock().unwrap();
+        let nonce = *next_nonce;
+        *next_nonce += 1;
+        Ok(BnsPrepareTxResp {
+            nonce,
+            chain_id: 31_337,
+            contract_address: OWNER.to_string(),
+            estimated_gas: 100_000,
+            gas_limit: 120_000,
+            max_fee_per_gas: 3_000_000_000,
+            max_priority_fee_per_gas: 1_000_000_000,
+        })
     }
-    async fn apply_mutations(
-        &self,
-        _req: BnsApplyMutationsReq,
-    ) -> BnsClientResult<BnsApplyMutationsResp> {
-        unused("apply_mutations")
+
+    async fn query_tx_state(&self, tx_hash: &str) -> BnsClientResult<BnsTxState> {
+        Ok(BnsTxState {
+            tx_hash: tx_hash.to_string(),
+            state: BnsTxExecutionState::Succeeded,
+            block_number: Some(8),
+            confirmations: 3,
+        })
     }
-    async fn publish_document(
-        &self,
-        _req: BnsPublishDocumentReq,
-    ) -> BnsClientResult<BnsPublishDocumentResp> {
-        unused("publish_document")
-    }
-    async fn revoke_document(
-        &self,
-        _req: BnsRevokeDocumentReq,
-    ) -> BnsClientResult<BnsRevokeDocumentResp> {
-        unused("revoke_document")
-    }
-    async fn set_controller_policy(
-        &self,
-        _req: BnsSetControllerPolicyReq,
-    ) -> BnsClientResult<BnsSetControllerPolicyResp> {
-        unused("set_controller_policy")
-    }
-    async fn update_authority_keys(
-        &self,
-        _req: BnsUpdateAuthorityKeysReq,
-    ) -> BnsClientResult<BnsUpdateAuthorityKeysResp> {
-        unused("update_authority_keys")
-    }
+
     async fn list_events(
         &self,
         _from_seq: u64,
@@ -146,20 +133,6 @@ impl BnsIndexerApi for CapturingBnsServer {
     async fn latest_checkpoint(&self) -> BnsClientResult<Option<LogCheckpoint>> {
         unused("latest_checkpoint")
     }
-
-    // 让 BnsBootstrapNameReq / BnsBootstrapNameResp / BnsNameReq 等导入有意义，避免误删。
-}
-
-// 静默"可能未使用"的类型导入（这些类型用于 trait 方法签名稳定性/编译期契约）。
-#[allow(dead_code)]
-fn _type_anchors(
-    _a: Option<BnsBootstrapNameReq>,
-    _b: Option<BnsBootstrapNameResp>,
-    _c: Option<BnsNameReq>,
-    _d: Option<BnsAuthorityKeyReq>,
-    _e: Option<BnsDocumentReq>,
-    _f: Option<BnsDocumentVersionReq>,
-) {
 }
 
 // ===== mock eth JSON-RPC：回应 nonce 查询（eth_getTransactionCount）+ 捕获 sendRawTransaction =====
@@ -213,6 +186,11 @@ impl MockEthRpc {
                             "gasUsed": "0x5208"
                         }),
                         "eth_blockNumber" => serde_json::Value::String("0xa".to_string()),
+                        "eth_estimateGas" => serde_json::Value::String("0x186a0".to_string()),
+                        "eth_gasPrice" => serde_json::Value::String("0x3b9aca00".to_string()),
+                        "eth_maxPriorityFeePerGas" => {
+                            serde_json::Value::String("0x3b9aca00".to_string())
+                        }
                         _ => serde_json::Value::Null,
                     };
                     let payload = serde_json::json!({"jsonrpc":"2.0","id":id,"result":result});
@@ -294,6 +272,29 @@ fn register_req(name: &str) -> BnsRegisterNameReq {
         authority: CallAuthority::public(),
         guard: MutationGuard::default(),
     }
+}
+
+#[tokio::test]
+async fn standard_client_builds_tx_from_live_gas_and_fee_suggestions() {
+    let eth = MockEthRpc::start(5).await;
+    let client = BnsEvmStandardClient::new(config(&eth.endpoint));
+    let call = bns_client::register_name_call(&register_req("alice")).unwrap();
+
+    let (tx, suggestion) = client
+        .build_unsigned_tx_with_suggestion(&call, ANVIL_ADDRESS, 7)
+        .await
+        .unwrap();
+
+    assert_eq!(suggestion.estimated_gas, 100_000);
+    assert_eq!(suggestion.gas_limit, 120_000);
+    assert_eq!(suggestion.max_priority_fee_per_gas, 1_000_000_000);
+    assert_eq!(suggestion.max_fee_per_gas, 3_000_000_000);
+    assert_eq!(tx.gas_limit, suggestion.gas_limit);
+    assert_eq!(tx.max_fee_per_gas, suggestion.max_fee_per_gas);
+    assert_eq!(
+        tx.max_priority_fee_per_gas,
+        suggestion.max_priority_fee_per_gas
+    );
 }
 
 // ===== 测试 =====
@@ -451,41 +452,16 @@ async fn controller_resets_cached_nonce_after_submission_failure() {
         ) -> BnsClientResult<BnsSubmitRawTxResp> {
             Err(BnsClientError::Transport("chain rejected".to_string()))
         }
-        async fn register_name(
-            &self,
-            _r: BnsRegisterNameReq,
-        ) -> BnsClientResult<BnsRegisterNameResp> {
-            unused("register_name")
-        }
-        async fn apply_mutations(
-            &self,
-            _r: BnsApplyMutationsReq,
-        ) -> BnsClientResult<BnsApplyMutationsResp> {
-            unused("apply_mutations")
-        }
-        async fn publish_document(
-            &self,
-            _r: BnsPublishDocumentReq,
-        ) -> BnsClientResult<BnsPublishDocumentResp> {
-            unused("publish_document")
-        }
-        async fn revoke_document(
-            &self,
-            _r: BnsRevokeDocumentReq,
-        ) -> BnsClientResult<BnsRevokeDocumentResp> {
-            unused("revoke_document")
-        }
-        async fn set_controller_policy(
-            &self,
-            _r: BnsSetControllerPolicyReq,
-        ) -> BnsClientResult<BnsSetControllerPolicyResp> {
-            unused("set_controller_policy")
-        }
-        async fn update_authority_keys(
-            &self,
-            _r: BnsUpdateAuthorityKeysReq,
-        ) -> BnsClientResult<BnsUpdateAuthorityKeysResp> {
-            unused("update_authority_keys")
+        async fn prepare_tx(&self, _req: BnsPrepareTxReq) -> BnsClientResult<BnsPrepareTxResp> {
+            Ok(BnsPrepareTxResp {
+                nonce: 5,
+                chain_id: 31_337,
+                contract_address: OWNER.to_string(),
+                estimated_gas: 100_000,
+                gas_limit: 120_000,
+                max_fee_per_gas: 3_000_000_000,
+                max_priority_fee_per_gas: 1_000_000_000,
+            })
         }
         async fn list_events(&self, _f: u64, _l: usize) -> BnsClientResult<Vec<EventLogRecord>> {
             unused("list_events")

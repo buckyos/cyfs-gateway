@@ -307,6 +307,8 @@ impl TlsConnectionHandler {
             };
         let mut request = StreamRequest::new(request_stream, local_addr);
         request.source_addr = Some(request_source_addr);
+        request.conn_source_addr = Some(remote_addr);
+        request.real_source_addr = proxy_source_addr;
         request.dest_port = local_addr.port();
         request.dest_host = server_name;
         if let Some(device_info) = self

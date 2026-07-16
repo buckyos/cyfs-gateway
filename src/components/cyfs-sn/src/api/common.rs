@@ -1,12 +1,11 @@
 use crate::SNServer;
 use ::kRPC::*;
-use bns_client::SnBnsController;
-use bns_indexer::PrincipalKind;
-use serde::Deserialize;
-use serde_json::{json, Value};
+use cyfs_gateway_api::SnUserProfileResp;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use super::errors::{parse_error, reason_error, SnApiErrorCode};
+use super::errors::{SnApiErrorCode, parse_error, reason_error};
 
 pub(crate) type RpcCallResult<T> = std::result::Result<T, RPCErrors>;
 
@@ -33,14 +32,25 @@ pub(crate) struct ActiveCodeReq {
 #[derive(Deserialize)]
 pub(crate) struct RegisterReq {
     pub(crate) name: String,
+    /// 必填。使用 default 让缺字段也走稳定的 `invalid_email` 业务错误。
+    #[serde(default)]
+    pub(crate) email: String,
     pub(crate) pwd_hash: String,
     pub(crate) active_code: String,
+    /// 非可信的 relay 地区偏好；具体节点只能由 relay manager 选择。
+    #[serde(default)]
+    pub(crate) region: Option<String>,
     #[serde(default)]
     pub(crate) request_id: Option<String>,
+    /// 用户 owner EVM 地址。bns proxy 生产模式必填；devtest
+    /// （require_user_asset_owner=false）缺省时回落为绑定 controller 地址。
     #[serde(default)]
     pub(crate) asset_owner: Option<String>,
     #[serde(default)]
     pub(crate) owner_config: Option<Value>,
+    /// 注册时随 registerName 原子发布的初始 documents（zone/boot/dns_txt）。
+    #[serde(default)]
+    pub(crate) initial_documents: Option<crate::sn_bns_proxy::SnBnsProxyInitialDocuments>,
 }
 
 #[derive(Deserialize)]
@@ -79,8 +89,8 @@ pub(crate) struct AddDnsRecordReq {
     pub(crate) record: String,
     #[serde(default)]
     pub(crate) ttl: Option<u32>,
-    #[serde(default)]
-    pub(crate) has_cert: Option<bool>,
+    #[serde(default, rename = "has_cert")]
+    pub(crate) _has_cert: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -89,7 +99,9 @@ pub(crate) struct RemoveDnsRecordReq {
     pub(crate) domain: String,
     pub(crate) record_type: String,
     #[serde(default)]
-    pub(crate) has_cert: Option<bool>,
+    pub(crate) record: Option<String>,
+    #[serde(default, rename = "has_cert")]
+    pub(crate) _has_cert: Option<bool>,
 }
 
 pub(crate) fn parse_params<T>(req: &RPCRequest) -> RpcCallResult<T>
@@ -104,7 +116,16 @@ where
     })
 }
 
-pub(crate) fn ok_response(req: &RPCRequest, value: Value) -> RpcCallResult<RPCResponse> {
+pub(crate) fn ok_response<T>(req: &RPCRequest, value: T) -> RpcCallResult<RPCResponse>
+where
+    T: Serialize,
+{
+    let value = serde_json::to_value(value).map_err(|e| {
+        reason_error(
+            SnApiErrorCode::InternalError,
+            format!("serialize {} response failed: {e}", req.method),
+        )
+    })?;
     Ok(RPCResponse::create_by_req(RPCResult::Success(value), req))
 }
 
@@ -150,28 +171,22 @@ pub(crate) fn normalize_evm_address(value: &str, field: &str) -> RpcCallResult<S
     }
 }
 
-pub(crate) fn bns_default_asset_owner(controller: &SnBnsController) -> RpcCallResult<String> {
-    let principal = &controller.config().sn_controller_principal;
-    if principal.kind != PrincipalKind::ChainAccount {
-        return Err(parse_error(
-            SnApiErrorCode::InvalidParams,
-            "asset_owner is required when SN controller principal is not a chain account",
-        ));
+pub(crate) fn build_profile_response(
+    username: &str,
+    user: &crate::SNUserInfo,
+) -> SnUserProfileResp {
+    SnUserProfileResp {
+        code: 0,
+        name: username.to_string(),
+        owner_key_bound: !user.public_key.trim().is_empty(),
+        user_domain: user.user_domain.clone(),
+        self_cert: user.self_cert,
+        sn_ips: user
+            .sn_ips
+            .as_ref()
+            .and_then(|value| serde_json::from_str::<Vec<String>>(value).ok()),
+        zone_config: user.zone_config.clone(),
     }
-
-    normalize_evm_address(principal.value.as_str(), "sn_controller_principal.value")
-}
-
-pub(crate) fn build_profile_json(username: &str, user: &crate::SNUserInfo) -> Value {
-    json!({
-        "code": 0,
-        "name": username,
-        "owner_key_bound": !user.public_key.trim().is_empty(),
-        "user_domain": user.user_domain.clone(),
-        "self_cert": user.self_cert,
-        "sn_ips": user.sn_ips.as_ref().and_then(|v| serde_json::from_str::<Value>(v).ok()).unwrap_or(Value::Null),
-        "zone_config": user.zone_config.clone(),
-    })
 }
 
 pub(crate) async fn require_account_username(

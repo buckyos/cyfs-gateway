@@ -12,11 +12,11 @@ use crate::tunnel_url_status::TunnelFailureReason;
 use crate::{
     GlobalCollectionManagerRef, HttpRequestHeaderMap, HttpRequestHostOverride,
     HttpRequestProcessChainVars, HttpResponseHeaderMap, HttpServer, JsExternalsManagerRef,
-    ProcessChainConfigs, Server, ServerConfig, ServerContext, ServerContextRef, ServerError,
+    ProcessChainConfigs,RequestSourceInfo, Server, ServerConfig, ServerContext, ServerContextRef, ServerError,
     ServerErrorCode, ServerFactory, ServerManagerWeakRef, ServerResult, StreamInfo, TunnelManager,
     get_external_commands,
 };
-use cyfs_process_chain::{CollectionValue, CommandControl, ProcessChainLibExecutor};
+use cyfs_process_chain::{CollectionValue, CommandControl, EnvRef, ProcessChainLibExecutor};
 use http::Version;
 use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full};
@@ -43,12 +43,154 @@ use sfo_http_pool::{
 use std::collections::HashMap;
 use std::error::Error;
 use std::io;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use tokio::net::{TcpStream, lookup_host};
 use tokio::time::{Duration, timeout};
 use tokio_rustls::TlsConnector;
 use url::Url;
+
+/// A trusted upstream entry: a single IP (`10.0.0.1`) or a CIDR block
+/// (`10.0.0.0/8`, `fd00::/8`).
+#[derive(Debug, Clone)]
+pub struct TrustedUpstreamMatcher {
+    network: IpAddr,
+    prefix_len: u8,
+}
+
+impl TrustedUpstreamMatcher {
+    pub fn parse(pattern: &str) -> Result<Self, String> {
+        let pattern = pattern.trim();
+        let (addr_str, prefix) = match pattern.split_once('/') {
+            Some((addr, prefix)) => {
+                let prefix: u8 = prefix
+                    .parse()
+                    .map_err(|_| format!("invalid CIDR prefix in '{}'", pattern))?;
+                (addr, Some(prefix))
+            }
+            None => (pattern, None),
+        };
+        let network: IpAddr = addr_str
+            .trim()
+            .parse()
+            .map_err(|_| format!("invalid IP address in '{}'", pattern))?;
+        let max_prefix = match network {
+            IpAddr::V4(_) => 32,
+            IpAddr::V6(_) => 128,
+        };
+        let prefix_len = prefix.unwrap_or(max_prefix);
+        if prefix_len > max_prefix {
+            return Err(format!("CIDR prefix out of range in '{}'", pattern));
+        }
+        Ok(Self {
+            network,
+            prefix_len,
+        })
+    }
+
+    pub fn matches(&self, ip: &IpAddr) -> bool {
+        fn prefix_eq(a: &[u8], b: &[u8], prefix_len: u8) -> bool {
+            let full = (prefix_len / 8) as usize;
+            let rem = prefix_len % 8;
+            if a[..full] != b[..full] {
+                return false;
+            }
+            if rem == 0 {
+                return true;
+            }
+            let mask = 0xffu8 << (8 - rem);
+            (a[full] & mask) == (b[full] & mask)
+        }
+        match (&self.network, ip) {
+            (IpAddr::V4(net), IpAddr::V4(ip)) => {
+                prefix_eq(&net.octets(), &ip.octets(), self.prefix_len)
+            }
+            (IpAddr::V6(net), IpAddr::V6(ip)) => {
+                prefix_eq(&net.octets(), &ip.octets(), self.prefix_len)
+            }
+            _ => false,
+        }
+    }
+}
+
+pub fn parse_trusted_upstreams(patterns: &[String]) -> ServerResult<Vec<TrustedUpstreamMatcher>> {
+    patterns
+        .iter()
+        .map(|pattern| {
+            TrustedUpstreamMatcher::parse(pattern)
+                .map_err(|e| server_err!(ServerErrorCode::InvalidConfig, "{}", e))
+        })
+        .collect()
+}
+
+fn parse_forwarded_entry(entry: &str) -> Option<(String, IpAddr)> {
+    let entry = entry.trim();
+    if entry.is_empty() {
+        return None;
+    }
+    if let Ok(addr) = entry.parse::<SocketAddr>() {
+        return Some((entry.to_string(), addr.ip()));
+    }
+    if let Ok(ip) = entry.parse::<IpAddr>() {
+        return Some((entry.to_string(), ip));
+    }
+    None
+}
+
+/// Derive the original client address from forwarded headers sent by a
+/// trusted upstream. Walks `X-Forwarded-For` right-to-left, skipping trusted
+/// hops; the first untrusted entry is the client (if every entry is trusted,
+/// the leftmost one is used). A malformed entry poisons the whole header.
+/// Falls back to `X-Real-IP` (+ optional `X-Real-Port`).
+fn resolve_trusted_forwarded_source(
+    headers: &http::HeaderMap,
+    trusted: &[TrustedUpstreamMatcher],
+) -> Option<String> {
+    let mut entries: Vec<String> = Vec::new();
+    for value in headers.get_all("x-forwarded-for") {
+        if let Ok(value) = value.to_str() {
+            entries.extend(
+                value
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty()),
+            );
+        }
+    }
+
+    let mut candidate: Option<String> = None;
+    for entry in entries.iter().rev() {
+        match parse_forwarded_entry(entry) {
+            Some((addr, ip)) => {
+                candidate = Some(addr);
+                if !trusted.iter().any(|m| m.matches(&ip)) {
+                    break;
+                }
+            }
+            None => {
+                candidate = None;
+                break;
+            }
+        }
+    }
+    if candidate.is_some() {
+        return candidate;
+    }
+
+    let real_ip = headers.get("x-real-ip")?.to_str().ok()?.trim().to_string();
+    if let Ok(addr) = real_ip.parse::<SocketAddr>() {
+        return Some(addr.to_string());
+    }
+    let ip = real_ip.parse::<IpAddr>().ok()?;
+    if let Some(port) = headers
+        .get("x-real-port")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().parse::<u16>().ok())
+    {
+        return Some(SocketAddr::new(ip, port).to_string());
+    }
+    Some(ip.to_string())
+}
 
 pub struct ProcessChainHttpServerBuilder {
     id: Option<String>,
@@ -64,6 +206,7 @@ pub struct ProcessChainHttpServerBuilder {
     compression: HttpCompressionSettings,
     upstreams: HashMap<String, HttpNamedUpstream>,
     upstream_tls_config: Option<Arc<RustlsClientConfig>>,
+    trusted_upstreams: Vec<String>,
 }
 
 // Add setter methods for HttpServerBuilder
@@ -133,6 +276,14 @@ impl ProcessChainHttpServerBuilder {
 
     pub fn upstream_tls_config(mut self, tls_config: Arc<RustlsClientConfig>) -> Self {
         self.upstream_tls_config = Some(tls_config);
+        self
+    }
+
+    /// Upstream IPs/CIDRs whose `X-Forwarded-For` / `X-Real-IP` headers may be
+    /// converted into `real_source_*`. Forwarded headers from any other peer
+    /// are treated as plain input data.
+    pub fn trusted_upstreams(mut self, trusted_upstreams: Vec<String>) -> Self {
+        self.trusted_upstreams = trusted_upstreams;
         self
     }
 
@@ -313,6 +464,7 @@ pub struct ProcessChainHttpServer {
     upstreams: HashMap<String, HttpNamedUpstream>,
     pooled_http_clients: HashMap<String, PooledHttpClient>,
     upstream_tls_config: Arc<RustlsClientConfig>,
+    trusted_upstreams: Vec<TrustedUpstreamMatcher>,
 }
 
 #[derive(Clone, Debug)]
@@ -902,6 +1054,7 @@ impl ProcessChainHttpServer {
             compression: HttpCompressionSettings::default(),
             upstreams: HashMap::new(),
             upstream_tls_config: None,
+            trusted_upstreams: Vec::new(),
         }
     }
 
@@ -989,6 +1142,7 @@ impl ProcessChainHttpServer {
             upstream_tls_config.clone(),
         )
         .await?;
+        let trusted_upstreams = parse_trusted_upstreams(&builder.trusted_upstreams)?;
         Ok(ProcessChainHttpServer {
             id: builder.id.unwrap(),
             version,
@@ -1001,6 +1155,7 @@ impl ProcessChainHttpServer {
             upstreams,
             pooled_http_clients,
             upstream_tls_config,
+            trusted_upstreams,
         })
     }
 
@@ -2298,6 +2453,65 @@ impl ProcessChainHttpServer {
         Ok(response)
     }
 
+    /// Resolve the source variables for one request: stream info first, then
+    /// forwarded headers when (and only when) the direct previous hop is a
+    /// trusted upstream and no stronger mechanism already restored a source.
+    fn resolve_request_sources(
+        &self,
+        info: &StreamInfo,
+        headers: &http::HeaderMap,
+    ) -> RequestSourceInfo {
+        let mut sources = RequestSourceInfo::from_stream_info(info);
+        if self.trusted_upstreams.is_empty() {
+            return sources;
+        }
+        if sources.real_source_addr.is_some() {
+            // PROXY protocol / tunnel identity already restored the source;
+            // that mechanism outranks forwarded headers.
+            return sources;
+        }
+        let direct_hop = sources
+            .conn_source_ip
+            .as_deref()
+            .or(sources.source_ip.as_deref());
+        let Some(direct_hop_ip) = direct_hop.and_then(|ip| ip.parse::<IpAddr>().ok()) else {
+            return sources;
+        };
+        if !self
+            .trusted_upstreams
+            .iter()
+            .any(|m| m.matches(&direct_hop_ip))
+        {
+            return sources;
+        }
+        if let Some(real) = resolve_trusted_forwarded_source(headers, &self.trusted_upstreams) {
+            sources.set_real_source(&real);
+        }
+        sources
+    }
+
+    async fn create_source_env_vars(
+        global_env: &EnvRef,
+        sources: &RequestSourceInfo,
+    ) -> ServerResult<()> {
+        for (name, value) in [
+            ("REQ_remote_ip", sources.source_ip.as_ref()),
+            ("REQ_remote_port", sources.source_port.as_ref()),
+            ("REQ_conn_remote_ip", sources.conn_source_ip.as_ref()),
+            ("REQ_conn_remote_port", sources.conn_source_port.as_ref()),
+            ("REQ_real_remote_ip", sources.real_source_ip.as_ref()),
+            ("REQ_real_remote_port", sources.real_source_port.as_ref()),
+        ] {
+            if let Some(value) = value {
+                global_env
+                    .create(name, CollectionValue::String(value.clone()))
+                    .await
+                    .map_err(|e| server_err!(ServerErrorCode::ProcessChainError, "{}", e))?;
+            }
+        }
+        Ok(())
+    }
+
     // Post-hook rules:
     // - post_hook_point is optional; when absent, response is returned as-is.
     // - RESP is a header-only map (no status/version keys).
@@ -2306,6 +2520,7 @@ impl ProcessChainHttpServer {
         &self,
         resp: http::Response<BoxBody<Bytes, ServerError>>,
         info: Option<&StreamInfo>,
+        sources: Option<&RequestSourceInfo>,
     ) -> ServerResult<http::Response<BoxBody<Bytes, ServerError>>> {
         let post_executor = match &self.post_executor {
             Some(executor) => executor.lock().unwrap().fork(),
@@ -2314,61 +2529,10 @@ impl ProcessChainHttpServer {
 
         let resp_map = HttpResponseHeaderMap::new(resp);
         let global_env = post_executor.global_env();
+        if let Some(sources) = sources {
+            Self::create_source_env_vars(global_env, sources).await?;
+        }
         if let Some(info) = info {
-            if let Some(src_addr) = info.src_addr.as_ref() {
-                if let Ok(socket_addr) = src_addr.parse::<SocketAddr>() {
-                    global_env
-                        .create(
-                            "REQ_remote_ip",
-                            CollectionValue::String(socket_addr.ip().to_string()),
-                        )
-                        .await
-                        .map_err(|e| server_err!(ServerErrorCode::ProcessChainError, "{}", e))?;
-                    global_env
-                        .create(
-                            "REQ_remote_port",
-                            CollectionValue::String(socket_addr.port().to_string()),
-                        )
-                        .await
-                        .map_err(|e| server_err!(ServerErrorCode::ProcessChainError, "{}", e))?;
-                }
-            }
-            if let Some(src_addr) = info.conn_src_addr.as_ref() {
-                if let Ok(socket_addr) = src_addr.parse::<SocketAddr>() {
-                    global_env
-                        .create(
-                            "REQ_conn_remote_ip",
-                            CollectionValue::String(socket_addr.ip().to_string()),
-                        )
-                        .await
-                        .map_err(|e| server_err!(ServerErrorCode::ProcessChainError, "{}", e))?;
-                    global_env
-                        .create(
-                            "REQ_conn_remote_port",
-                            CollectionValue::String(socket_addr.port().to_string()),
-                        )
-                        .await
-                        .map_err(|e| server_err!(ServerErrorCode::ProcessChainError, "{}", e))?;
-                }
-            }
-            if let Some(src_addr) = info.real_src_addr.as_ref() {
-                if let Ok(socket_addr) = src_addr.parse::<SocketAddr>() {
-                    global_env
-                        .create(
-                            "REQ_real_remote_ip",
-                            CollectionValue::String(socket_addr.ip().to_string()),
-                        )
-                        .await
-                        .map_err(|e| server_err!(ServerErrorCode::ProcessChainError, "{}", e))?;
-                    global_env
-                        .create(
-                            "REQ_real_remote_port",
-                            CollectionValue::String(socket_addr.port().to_string()),
-                        )
-                        .await
-                        .map_err(|e| server_err!(ServerErrorCode::ProcessChainError, "{}", e))?;
-                }
-            }
             if let Some(dst_addr) = info.dst_addr.as_ref() {
                 if let Ok(socket_addr) = dst_addr.parse::<SocketAddr>() {
                     global_env
@@ -2443,10 +2607,11 @@ impl ProcessChainHttpServer {
         resp: ServerResult<http::Response<BoxBody<Bytes, ServerError>>>,
         req_info: &CompressionRequestInfo,
         info: Option<&StreamInfo>,
+        sources: Option<&RequestSourceInfo>,
     ) -> ServerResult<http::Response<BoxBody<Bytes, ServerError>>> {
         match resp {
             Ok(resp) => {
-                let resp = self.apply_post_chain(resp, info).await?;
+                let resp = self.apply_post_chain(resp, info, sources).await?;
                 apply_response_compression(resp, req_info, &self.compression)
             }
             Err(err) => Err(err),
@@ -2462,6 +2627,7 @@ impl HttpServer for ProcessChainHttpServer {
         info: StreamInfo,
     ) -> ServerResult<http::Response<BoxBody<Bytes, ServerError>>> {
         let req_info = CompressionRequestInfo::from_request(&req);
+        let sources = self.resolve_request_sources(&info, req.headers());
         let mut req = match apply_request_decompression(req, &self.compression) {
             Ok(req) => req,
             Err(err) => {
@@ -2472,7 +2638,7 @@ impl HttpServer for ProcessChainHttpServer {
                 );
                 *response.status_mut() = StatusCode::BAD_REQUEST;
                 return self
-                    .apply_post_chain_result(Ok(response), &req_info, Some(&info))
+                    .apply_post_chain_result(Ok(response), &req_info, Some(&info), Some(&sources))
                     .await;
             }
         };
@@ -2509,68 +2675,15 @@ impl HttpServer for ProcessChainHttpServer {
         let executor = { self.executor.lock().unwrap().fork() };
 
         let global_env = executor.global_env();
-        if let Some(src_addr) = info.src_addr.as_ref() {
-            if let Ok(socket_addr) = src_addr.parse::<SocketAddr>() {
-                process_chain_vars.req_remote_ip = Some(socket_addr.ip().to_string());
-                process_chain_vars.req_remote_port = Some(socket_addr.port().to_string());
-                global_env
-                    .create(
-                        "REQ_remote_ip",
-                        CollectionValue::String(socket_addr.ip().to_string()),
-                    )
-                    .await
-                    .map_err(|e| server_err!(ServerErrorCode::ProcessChainError, "{}", e))?;
-                global_env
-                    .create(
-                        "REQ_remote_port",
-                        CollectionValue::String(socket_addr.port().to_string()),
-                    )
-                    .await
-                    .map_err(|e| server_err!(ServerErrorCode::ProcessChainError, "{}", e))?;
-            }
-        }
-        if let Some(src_addr) = info.conn_src_addr.as_ref() {
-            if let Ok(socket_addr) = src_addr.parse::<SocketAddr>() {
-                process_chain_vars.req_conn_remote_ip = Some(socket_addr.ip().to_string());
-                process_chain_vars.req_conn_remote_port = Some(socket_addr.port().to_string());
-                global_env
-                    .create(
-                        "REQ_conn_remote_ip",
-                        CollectionValue::String(socket_addr.ip().to_string()),
-                    )
-                    .await
-                    .map_err(|e| server_err!(ServerErrorCode::ProcessChainError, "{}", e))?;
-                global_env
-                    .create(
-                        "REQ_conn_remote_port",
-                        CollectionValue::String(socket_addr.port().to_string()),
-                    )
-                    .await
-                    .map_err(|e| server_err!(ServerErrorCode::ProcessChainError, "{}", e))?;
-            }
-        }
-        if let Some(src_addr) = info.real_src_addr.as_ref() {
-            if let Ok(socket_addr) = src_addr.parse::<SocketAddr>() {
-                process_chain_vars.req_real_remote_ip = Some(socket_addr.ip().to_string());
-                process_chain_vars.req_real_remote_port = Some(socket_addr.port().to_string());
-                global_env
-                    .create(
-                        "REQ_real_remote_ip",
-                        CollectionValue::String(socket_addr.ip().to_string()),
-                    )
-                    .await
-                    .map_err(|e| server_err!(ServerErrorCode::ProcessChainError, "{}", e))?;
-                global_env
-                    .create(
-                        "REQ_real_remote_port",
-                        CollectionValue::String(socket_addr.port().to_string()),
-                    )
-                    .await
-                    .map_err(|e| server_err!(ServerErrorCode::ProcessChainError, "{}", e))?;
-            }
-        }
+        process_chain_vars.req_remote_ip = sources.source_ip.clone();
+        process_chain_vars.req_remote_port = sources.source_port.clone();
+        process_chain_vars.req_conn_remote_ip = sources.conn_source_ip.clone();
+        process_chain_vars.req_conn_remote_port = sources.conn_source_port.clone();
+        process_chain_vars.req_real_remote_ip = sources.real_source_ip.clone();
+        process_chain_vars.req_real_remote_port = sources.real_source_port.clone();
+        Self::create_source_env_vars(global_env, &sources).await?;
         req.extensions_mut().insert(process_chain_vars);
-        let req_map = HttpRequestHeaderMap::new(req);
+        let req_map = HttpRequestHeaderMap::new_with_sources(req, sources.clone());
         if let Some(dst_addr) = info.dst_addr.as_ref() {
             if let Ok(socket_addr) = dst_addr.parse::<SocketAddr>() {
                 global_env
@@ -2635,7 +2748,7 @@ impl HttpServer for ProcessChainHttpServer {
                         .boxed(),
                 );
                 return self
-                    .apply_post_chain_result(Ok(response), &req_info, Some(&info))
+                    .apply_post_chain_result(Ok(response), &req_info, Some(&info), Some(&sources))
                     .await;
             } else if ret.is_reject() {
                 debug!(
@@ -2646,7 +2759,7 @@ impl HttpServer for ProcessChainHttpServer {
                     http::Response::new(Full::new(Bytes::new()).map_err(|e| match e {}).boxed());
                 *response.status_mut() = StatusCode::FORBIDDEN;
                 return self
-                    .apply_post_chain_result(Ok(response), &req_info, Some(&info))
+                    .apply_post_chain_result(Ok(response), &req_info, Some(&info), Some(&sources))
                     .await;
             }
             if let Some(CommandControl::Error(ret)) = ret.as_control() {
@@ -2661,7 +2774,7 @@ impl HttpServer for ProcessChainHttpServer {
                 );
                 *response.status_mut() = StatusCode::BAD_GATEWAY;
                 return self
-                    .apply_post_chain_result(Ok(response), &req_info, Some(&info))
+                    .apply_post_chain_result(Ok(response), &req_info, Some(&info), Some(&sources))
                     .await;
             }
             if let Some(CommandControl::Return(ret)) = ret.as_control() {
@@ -2677,7 +2790,12 @@ impl HttpServer for ProcessChainHttpServer {
                     );
                     *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
                     return self
-                        .apply_post_chain_result(Ok(response), &req_info, Some(&info))
+                        .apply_post_chain_result(
+                            Ok(response),
+                            &req_info,
+                            Some(&info),
+                            Some(&sources),
+                        )
                         .await;
                 };
                 if let Some(list) = shlex::split(value.as_str()) {
@@ -2688,7 +2806,12 @@ impl HttpServer for ProcessChainHttpServer {
                         );
                         *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
                         return self
-                            .apply_post_chain_result(Ok(response), &req_info, Some(&info))
+                            .apply_post_chain_result(
+                                Ok(response),
+                                &req_info,
+                                Some(&info),
+                                Some(&sources),
+                            )
                             .await;
                     }
 
@@ -2711,7 +2834,12 @@ impl HttpServer for ProcessChainHttpServer {
                                 if let Some(service) = server_mgr.get_http_server(server_id) {
                                     let resp = service.serve_request(post_req, info.clone()).await;
                                     return self
-                                        .apply_post_chain_result(resp, &req_info, Some(&info))
+                                        .apply_post_chain_result(
+                                            resp,
+                                            &req_info,
+                                            Some(&info),
+                                            Some(&sources),
+                                        )
                                         .await;
                                 }
                             } else {
@@ -2731,7 +2859,12 @@ impl HttpServer for ProcessChainHttpServer {
                             })?;
                             let resp = self.handle_forward_upstream(post_req, target, &info).await;
                             return self
-                                .apply_post_chain_result(resp, &req_info, Some(&info))
+                                .apply_post_chain_result(
+                                    resp,
+                                    &req_info,
+                                    Some(&info),
+                                    Some(&sources),
+                                )
                                 .await;
                         }
                         "forward-group" => {
@@ -2756,7 +2889,12 @@ impl HttpServer for ProcessChainHttpServer {
                                 .handle_forward_group_upstream(post_req, &plan, &info)
                                 .await;
                             return self
-                                .apply_post_chain_result(resp, &req_info, Some(&info))
+                                .apply_post_chain_result(
+                                    resp,
+                                    &req_info,
+                                    Some(&info),
+                                    Some(&sources),
+                                )
                                 .await;
                         }
                         "redirect" => {
@@ -2778,7 +2916,12 @@ impl HttpServer for ProcessChainHttpServer {
                                 Self::parse_redirect_status_code(list.get(2).map(|v| v.as_str()))?;
                             let resp = self.build_redirect_response(location, status)?;
                             return self
-                                .apply_post_chain_result(Ok(resp), &req_info, Some(&info))
+                                .apply_post_chain_result(
+                                    Ok(resp),
+                                    &req_info,
+                                    Some(&info),
+                                    Some(&sources),
+                                )
                                 .await;
                         }
                         "error" => {
@@ -2792,7 +2935,12 @@ impl HttpServer for ProcessChainHttpServer {
                             let message = list.get(2).map(|v| v.as_str());
                             let resp = self.build_error_response(status, message)?;
                             return self
-                                .apply_post_chain_result(Ok(resp), &req_info, Some(&info))
+                                .apply_post_chain_result(
+                                    Ok(resp),
+                                    &req_info,
+                                    Some(&info),
+                                    Some(&sources),
+                                )
                                 .await;
                         }
                         _ => {
@@ -2813,7 +2961,7 @@ impl HttpServer for ProcessChainHttpServer {
         let mut response =
             http::Response::new(Full::new(Bytes::new()).map_err(|e| match e {}).boxed());
         *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
-        self.apply_post_chain_result(Ok(response), &req_info, Some(&info))
+        self.apply_post_chain_result(Ok(response), &req_info, Some(&info), Some(&sources))
             .await
     }
 
@@ -2927,6 +3075,11 @@ pub struct ProcessChainHttpServerConfig {
     pub hook_point: ProcessChainConfigs,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub post_hook_point: Option<ProcessChainConfigs>,
+    /// Upstream IPs/CIDRs whose `X-Forwarded-For` / `X-Real-IP` headers may be
+    /// converted into `real_source_*`. Empty (default) means forwarded headers
+    /// from any peer are treated as plain input data.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub trusted_upstreams: Vec<String>,
     #[serde(default)]
     pub proxy_ssl_verify: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3050,7 +3203,8 @@ impl ServerFactory for ProcessChainHttpServerFactory {
             .tunnel_manager(context.tunnel_manager.clone())
             .global_process_chains(context.global_process_chains.clone())
             .js_externals(context.js_externals.clone())
-            .global_collection_manager(context.global_collection_manager.clone());
+            .global_collection_manager(context.global_collection_manager.clone())
+            .trusted_upstreams(config.trusted_upstreams.clone());
         let compression = ProcessChainHttpServerBuilder::build_compression_settings(config)?;
         builder = builder.compression(compression);
         let upstream_tls_config = ProcessChainHttpServer::build_upstream_tls_config(
@@ -3189,6 +3343,300 @@ mod tests {
         fn http3_port(&self) -> Option<u16> {
             None
         }
+    }
+
+    /// Reflects every `x-test-*` request header back as a response header, so
+    /// process-chain `map-add REQ ...` effects become observable.
+    struct EchoHeadersServer {
+        id: String,
+    }
+
+    #[async_trait::async_trait]
+    impl HttpServer for EchoHeadersServer {
+        async fn serve_request(
+            &self,
+            req: http::Request<BoxBody<Bytes, ServerError>>,
+            _info: StreamInfo,
+        ) -> ServerResult<http::Response<BoxBody<Bytes, ServerError>>> {
+            let mut builder = http::Response::builder().status(StatusCode::OK);
+            for (name, value) in req.headers() {
+                if name.as_str().starts_with("x-test-") {
+                    builder = builder.header(name, value);
+                }
+            }
+            builder
+                .body(Full::new(Bytes::new()).map_err(|e| match e {}).boxed())
+                .map_err(|e| {
+                    server_err!(
+                        ServerErrorCode::BadRequest,
+                        "Failed to build response: {}",
+                        e
+                    )
+                })
+        }
+
+        fn id(&self) -> String {
+            self.id.clone()
+        }
+
+        fn http_version(&self) -> Version {
+            Version::HTTP_11
+        }
+
+        fn http3_port(&self) -> Option<u16> {
+            None
+        }
+    }
+
+    const SOURCE_VARS_CHAIN: &str = r#"
+- id: main
+  priority: 1
+  blocks:
+    - id: main
+      block: |
+        map-add REQ X-Test-Source "S:${REQ.source_ip}:${REQ.source_port}";
+        map-add REQ X-Test-Conn "C:${REQ.conn_source_ip}:${REQ.conn_source_port}";
+        map-add REQ X-Test-Real "R:${REQ.real_source_ip}:${REQ.real_source_port}";
+        map-add REQ X-Test-Remote "REM:${REQ_remote_ip}:${REQ_remote_port}";
+        map-add REQ X-Test-Real-Remote "RR:${REQ_real_remote_ip}";
+        return "server echo-headers";
+"#;
+
+    async fn build_source_vars_server(
+        trusted_upstreams: Vec<String>,
+    ) -> (ProcessChainHttpServer, Arc<ServerManager>) {
+        let mock_server_mgr = Arc::new(ServerManager::new());
+        mock_server_mgr
+            .add_server(Server::Http(Arc::new(EchoHeadersServer {
+                id: "echo-headers".to_string(),
+            })))
+            .unwrap();
+        let chains: ProcessChainConfigs = serde_yaml_ng::from_str(SOURCE_VARS_CHAIN).unwrap();
+        let server = ProcessChainHttpServer::builder()
+            .id("test_source_vars")
+            .version("HTTP/1.1".to_string())
+            .hook_point(chains)
+            .tunnel_manager(TunnelManager::new())
+            .server_mgr(Arc::downgrade(&mock_server_mgr))
+            .trusted_upstreams(trusted_upstreams)
+            .build()
+            .await
+            .unwrap();
+        (server, mock_server_mgr)
+    }
+
+    fn source_vars_request(headers: &[(&str, &str)]) -> http::Request<BoxBody<Bytes, ServerError>> {
+        let mut builder = http::Request::builder()
+            .method("GET")
+            .uri("http://localhost/");
+        for (name, value) in headers {
+            builder = builder.header(*name, *value);
+        }
+        builder
+            .body(Full::new(Bytes::new()).map_err(|e| match e {}).boxed())
+            .unwrap()
+    }
+
+    fn header_str<'a>(
+        resp: &'a http::Response<BoxBody<Bytes, ServerError>>,
+        name: &str,
+    ) -> &'a str {
+        resp.headers()
+            .get(name)
+            .map(|value| value.to_str().unwrap())
+            .unwrap_or("<missing>")
+    }
+
+    #[test]
+    fn test_trusted_upstream_matcher() {
+        let exact = TrustedUpstreamMatcher::parse("10.0.0.1").unwrap();
+        assert!(exact.matches(&"10.0.0.1".parse().unwrap()));
+        assert!(!exact.matches(&"10.0.0.2".parse().unwrap()));
+
+        let net = TrustedUpstreamMatcher::parse("10.0.0.0/8").unwrap();
+        assert!(net.matches(&"10.255.1.2".parse().unwrap()));
+        assert!(!net.matches(&"11.0.0.1".parse().unwrap()));
+
+        let narrow = TrustedUpstreamMatcher::parse("192.168.1.4/31").unwrap();
+        assert!(narrow.matches(&"192.168.1.4".parse().unwrap()));
+        assert!(narrow.matches(&"192.168.1.5".parse().unwrap()));
+        assert!(!narrow.matches(&"192.168.1.6".parse().unwrap()));
+
+        let v6 = TrustedUpstreamMatcher::parse("fd00::/8").unwrap();
+        assert!(v6.matches(&"fd12::1".parse().unwrap()));
+        assert!(!v6.matches(&"fe80::1".parse().unwrap()));
+        // Address family mismatch never matches.
+        assert!(!v6.matches(&"10.0.0.1".parse().unwrap()));
+
+        assert!(TrustedUpstreamMatcher::parse("not-an-ip").is_err());
+        assert!(TrustedUpstreamMatcher::parse("10.0.0.0/33").is_err());
+        assert!(TrustedUpstreamMatcher::parse("10.0.0.0/x").is_err());
+    }
+
+    #[test]
+    fn test_resolve_trusted_forwarded_source_cases() {
+        let trusted = vec![
+            TrustedUpstreamMatcher::parse("127.0.0.0/8").unwrap(),
+            TrustedUpstreamMatcher::parse("10.0.0.0/8").unwrap(),
+        ];
+
+        let mut headers = http::HeaderMap::new();
+        headers.insert("x-forwarded-for", "203.0.113.7, 10.1.2.3".parse().unwrap());
+        assert_eq!(
+            resolve_trusted_forwarded_source(&headers, &trusted),
+            Some("203.0.113.7".to_string())
+        );
+
+        // Rightmost untrusted entry wins even if further-left entries exist.
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            "x-forwarded-for",
+            "198.51.100.1, 203.0.113.7, 10.1.2.3".parse().unwrap(),
+        );
+        assert_eq!(
+            resolve_trusted_forwarded_source(&headers, &trusted),
+            Some("203.0.113.7".to_string())
+        );
+
+        // All entries trusted: leftmost is used.
+        let mut headers = http::HeaderMap::new();
+        headers.insert("x-forwarded-for", "10.9.9.9, 10.1.2.3".parse().unwrap());
+        assert_eq!(
+            resolve_trusted_forwarded_source(&headers, &trusted),
+            Some("10.9.9.9".to_string())
+        );
+
+        // Malformed entry poisons X-Forwarded-For; falls back to X-Real-IP.
+        let mut headers = http::HeaderMap::new();
+        headers.insert("x-forwarded-for", "garbage, 10.1.2.3".parse().unwrap());
+        headers.insert("x-real-ip", "198.51.100.9".parse().unwrap());
+        headers.insert("x-real-port", "7777".parse().unwrap());
+        assert_eq!(
+            resolve_trusted_forwarded_source(&headers, &trusted),
+            Some("198.51.100.9:7777".to_string())
+        );
+
+        // No forwarded info at all.
+        let headers = http::HeaderMap::new();
+        assert_eq!(resolve_trusted_forwarded_source(&headers, &trusted), None);
+
+        // Entry with a port is preserved as-is.
+        let mut headers = http::HeaderMap::new();
+        headers.insert("x-forwarded-for", "203.0.113.7:4443".parse().unwrap());
+        assert_eq!(
+            resolve_trusted_forwarded_source(&headers, &trusted),
+            Some("203.0.113.7:4443".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_http_source_vars_direct_connection() {
+        let (server, _mgr) = build_source_vars_server(vec![]).await;
+        // Forged headers must not leak into the reserved source keys.
+        let request = source_vars_request(&[
+            ("source_ip", "6.6.6.6"),
+            ("real_source_ip", "7.7.7.7"),
+            ("X-Forwarded-For", "8.8.8.8"),
+        ]);
+        let resp = server
+            .serve_request(request, StreamInfo::new("192.168.1.9:5555".to_string()))
+            .await
+            .unwrap();
+
+        assert_eq!(header_str(&resp, "X-Test-Source"), "S:192.168.1.9:5555");
+        assert_eq!(header_str(&resp, "X-Test-Conn"), "C:192.168.1.9:5555");
+        assert_eq!(header_str(&resp, "X-Test-Real"), "R::");
+        assert_eq!(header_str(&resp, "X-Test-Remote"), "REM:192.168.1.9:5555");
+        assert_eq!(header_str(&resp, "X-Test-Real-Remote"), "RR:");
+    }
+
+    #[tokio::test]
+    async fn test_http_source_vars_stream_restored_source() {
+        // A stack-level trusted mechanism (e.g. PROXY protocol) filled
+        // StreamInfo.real_src_addr; the HTTP layer must expose it untouched.
+        let (server, _mgr) = build_source_vars_server(vec![]).await;
+        let request = source_vars_request(&[]);
+        let info = StreamInfo::with_addrs(
+            Some("127.0.0.1:9000".to_string()),
+            Some("198.51.100.7:6001".to_string()),
+        );
+        let resp = server.serve_request(request, info).await.unwrap();
+
+        assert_eq!(header_str(&resp, "X-Test-Source"), "S:198.51.100.7:6001");
+        assert_eq!(header_str(&resp, "X-Test-Conn"), "C:127.0.0.1:9000");
+        assert_eq!(header_str(&resp, "X-Test-Real"), "R:198.51.100.7:6001");
+        assert_eq!(header_str(&resp, "X-Test-Remote"), "REM:198.51.100.7:6001");
+        assert_eq!(header_str(&resp, "X-Test-Real-Remote"), "RR:198.51.100.7");
+    }
+
+    #[tokio::test]
+    async fn test_http_source_vars_trusted_upstream_xff() {
+        let (server, _mgr) =
+            build_source_vars_server(vec!["127.0.0.0/8".to_string(), "10.0.0.0/8".to_string()])
+                .await;
+        let request = source_vars_request(&[("X-Forwarded-For", "203.0.113.7, 10.1.2.3")]);
+        let resp = server
+            .serve_request(request, StreamInfo::new("127.0.0.1:4000".to_string()))
+            .await
+            .unwrap();
+
+        // Trusted hops are skipped right-to-left; the client IP becomes the
+        // real (and effective) source; the conn source stays the direct hop.
+        assert_eq!(header_str(&resp, "X-Test-Source"), "S:203.0.113.7:");
+        assert_eq!(header_str(&resp, "X-Test-Conn"), "C:127.0.0.1:4000");
+        assert_eq!(header_str(&resp, "X-Test-Real"), "R:203.0.113.7:");
+        assert_eq!(header_str(&resp, "X-Test-Remote"), "REM:203.0.113.7:");
+        assert_eq!(header_str(&resp, "X-Test-Real-Remote"), "RR:203.0.113.7");
+    }
+
+    #[tokio::test]
+    async fn test_http_source_vars_untrusted_forwarded_headers_ignored() {
+        // The direct hop is NOT in the trusted set: forwarded headers stay
+        // plain input data and must not fabricate real_source_*.
+        let (server, _mgr) = build_source_vars_server(vec!["10.0.0.0/8".to_string()]).await;
+        let request = source_vars_request(&[
+            ("X-Forwarded-For", "203.0.113.7"),
+            ("X-Real-IP", "203.0.113.8"),
+        ]);
+        let resp = server
+            .serve_request(request, StreamInfo::new("127.0.0.1:4000".to_string()))
+            .await
+            .unwrap();
+
+        assert_eq!(header_str(&resp, "X-Test-Source"), "S:127.0.0.1:4000");
+        assert_eq!(header_str(&resp, "X-Test-Conn"), "C:127.0.0.1:4000");
+        assert_eq!(header_str(&resp, "X-Test-Real"), "R::");
+        assert_eq!(header_str(&resp, "X-Test-Remote"), "REM:127.0.0.1:4000");
+        assert_eq!(header_str(&resp, "X-Test-Real-Remote"), "RR:");
+    }
+
+    #[tokio::test]
+    async fn test_http_source_vars_trusted_x_real_ip_fallback() {
+        let (server, _mgr) = build_source_vars_server(vec!["127.0.0.0/8".to_string()]).await;
+        let request =
+            source_vars_request(&[("X-Real-IP", "198.51.100.9"), ("X-Real-Port", "7777")]);
+        let resp = server
+            .serve_request(request, StreamInfo::new("127.0.0.1:4000".to_string()))
+            .await
+            .unwrap();
+
+        assert_eq!(header_str(&resp, "X-Test-Real"), "R:198.51.100.9:7777");
+        assert_eq!(header_str(&resp, "X-Test-Source"), "S:198.51.100.9:7777");
+        assert_eq!(header_str(&resp, "X-Test-Remote"), "REM:198.51.100.9:7777");
+    }
+
+    #[tokio::test]
+    async fn test_http_source_vars_stream_mechanism_outranks_forwarded_headers() {
+        let (server, _mgr) = build_source_vars_server(vec!["127.0.0.0/8".to_string()]).await;
+        let request = source_vars_request(&[("X-Forwarded-For", "203.0.113.7")]);
+        let info = StreamInfo::with_addrs(
+            Some("127.0.0.1:4000".to_string()),
+            Some("198.51.100.7:6001".to_string()),
+        );
+        let resp = server.serve_request(request, info).await.unwrap();
+
+        assert_eq!(header_str(&resp, "X-Test-Real"), "R:198.51.100.7:6001");
+        assert_eq!(header_str(&resp, "X-Test-Source"), "S:198.51.100.7:6001");
     }
 
     async fn gzip_bytes(data: &[u8]) -> Bytes {
@@ -5372,6 +5820,7 @@ hook_point: []
             h3_port: None,
             hook_point: ProcessChainConfigs::default(),
             post_hook_point: None,
+            trusted_upstreams: vec![],
             proxy_ssl_verify: false,
             proxy_ssl_trusted_certificate: None,
             proxy_ssl_verify_depth: default_proxy_ssl_verify_depth(),
@@ -6728,6 +7177,7 @@ hook_point: []
             proxy_ssl_verify: false,
             proxy_ssl_trusted_certificate: None,
             proxy_ssl_verify_depth: default_proxy_ssl_verify_depth(),
+            trusted_upstreams: Vec::new(),
             gzip: false,
             gzip_types: Vec::new(),
             gzip_min_length: default_gzip_min_length(),

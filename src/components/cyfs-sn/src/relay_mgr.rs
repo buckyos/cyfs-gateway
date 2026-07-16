@@ -1,14 +1,19 @@
 use crate::{
     sn_err, SnAuthDBRef, SnDeviceInfoDBRef, SnDeviceState, SnError, SnErrorCode, SnResult,
 };
+use log::{debug, info, warn};
 use serde::{Deserialize, Serialize};
+use sfo_ip::{CachePolicy, Searcher};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteRow};
 use sqlx::{Row, SqlitePool};
+use std::cmp::Ordering;
 use std::collections::HashSet;
 use std::fmt;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::PathBuf;
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub type SnRelayManagerRef = Arc<dyn SnRelayManager>;
@@ -248,6 +253,243 @@ impl AssignZoneRelayReq {
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AllocateZoneRelayReq {
+    pub zone: String,
+    pub preferred_region: Option<String>,
+    pub source_ip: Option<IpAddr>,
+    pub reason: String,
+    pub source_version: Option<String>,
+}
+
+impl AllocateZoneRelayReq {
+    pub fn new(zone: impl Into<String>) -> Self {
+        Self {
+            zone: zone.into(),
+            preferred_region: None,
+            source_ip: None,
+            reason: "auto_assign".to_string(),
+            source_version: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct GeoIpInfo {
+    pub country_code: Option<String>,
+    pub country: Option<String>,
+    pub province: Option<String>,
+    pub city: Option<String>,
+    pub isp: Option<String>,
+}
+
+#[async_trait::async_trait]
+pub trait GeoIpResolver: Send + Sync + 'static {
+    async fn lookup(&self, ip: IpAddr) -> SnResult<Option<GeoIpInfo>>;
+}
+
+pub type GeoIpResolverRef = Arc<dyn GeoIpResolver>;
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct GeoIpResolverConfig {
+    pub ipv4_xdb_path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ipv6_xdb_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_policy: Option<String>,
+}
+
+/// 直接封装 ip2region XDB，不依赖 process-chain collection。
+pub struct XdbGeoIpResolver {
+    ipv4: RwLock<Searcher>,
+    ipv6: Option<RwLock<Searcher>>,
+}
+
+impl XdbGeoIpResolver {
+    pub fn new(config: &GeoIpResolverConfig) -> SnResult<Self> {
+        let cache_policy = match config
+            .cache_policy
+            .as_deref()
+            .unwrap_or("vector_index")
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "no_cache" => CachePolicy::NoCache,
+            "vector_index" => CachePolicy::VectorIndex,
+            "full_memory" => CachePolicy::FullMemory,
+            value => {
+                return Err(sn_err!(
+                    SnErrorCode::InvalidInput,
+                    "invalid geoip cache_policy: {}",
+                    value
+                ));
+            }
+        };
+        let ipv4 = Searcher::new(config.ipv4_xdb_path.clone(), cache_policy).map_err(|error| {
+            sn_err!(
+                SnErrorCode::InvalidInput,
+                "open GeoIP ipv4 XDB failed: {}",
+                error
+            )
+        })?;
+        let ipv6 = config
+            .ipv6_xdb_path
+            .as_ref()
+            .map(|path| {
+                Searcher::new(path.clone(), cache_policy)
+                    .map(RwLock::new)
+                    .map_err(|error| {
+                        sn_err!(
+                            SnErrorCode::InvalidInput,
+                            "open GeoIP ipv6 XDB failed: {}",
+                            error
+                        )
+                    })
+            })
+            .transpose()?;
+        Ok(Self {
+            ipv4: RwLock::new(ipv4),
+            ipv6,
+        })
+    }
+
+    fn clean_part(value: Option<&&str>) -> Option<String> {
+        value
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty() && *value != "0")
+            .map(ToString::to_string)
+    }
+
+    fn parse_record(record: &str) -> Option<GeoIpInfo> {
+        if record.trim().is_empty() {
+            return None;
+        }
+        let parts: Vec<&str> = record.split('|').collect();
+        Some(GeoIpInfo {
+            country: Self::clean_part(parts.first()),
+            province: Self::clean_part(parts.get(1)),
+            city: Self::clean_part(parts.get(2)),
+            isp: Self::clean_part(parts.get(3)),
+            country_code: Self::clean_part(parts.get(4)),
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl GeoIpResolver for XdbGeoIpResolver {
+    async fn lookup(&self, ip: IpAddr) -> SnResult<Option<GeoIpInfo>> {
+        let searcher = match ip {
+            IpAddr::V4(_) => &self.ipv4,
+            IpAddr::V6(_) => match self.ipv6.as_ref() {
+                Some(searcher) => searcher,
+                None => return Ok(None),
+            },
+        };
+        let searcher = searcher
+            .read()
+            .map_err(|_| sn_err!(SnErrorCode::Failed, "GeoIP XDB lock is poisoned"))?;
+        let value = searcher
+            .search(ip.to_string().as_str())
+            .map_err(|error| sn_err!(SnErrorCode::Failed, "GeoIP XDB lookup failed: {}", error))?;
+        Ok(Self::parse_record(value.as_str()))
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RelayMatchRule {
+    PreferredRegion,
+    GeoCountryCode,
+    GeoProvince,
+    GeoCity,
+    GeoIsp,
+}
+
+impl RelayMatchRule {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::PreferredRegion => "preferred_region",
+            Self::GeoCountryCode => "geo_country_code",
+            Self::GeoProvince => "geo_province",
+            Self::GeoCity => "geo_city",
+            Self::GeoIsp => "geo_isp",
+        }
+    }
+}
+
+fn default_match_rules() -> Vec<RelayMatchRule> {
+    vec![
+        RelayMatchRule::PreferredRegion,
+        RelayMatchRule::GeoCountryCode,
+        RelayMatchRule::GeoProvince,
+        RelayMatchRule::GeoCity,
+        RelayMatchRule::GeoIsp,
+    ]
+}
+
+fn default_fallback_relays() -> Vec<String> {
+    vec!["*".to_string()]
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RelayAllocationConfig {
+    /// 有序匹配规则，首个产生健康候选集的规则获胜。
+    #[serde(default = "default_match_rules")]
+    pub match_rules: Vec<RelayMatchRule>,
+    /// relay_id 或 relay_sn；`*` 表示所有健康节点。空数组表示禁用 fallback。
+    #[serde(default = "default_fallback_relays")]
+    pub fallback_relays: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub geoip: Option<GeoIpResolverConfig>,
+}
+
+impl Default for RelayAllocationConfig {
+    fn default() -> Self {
+        Self {
+            match_rules: default_match_rules(),
+            fallback_relays: default_fallback_relays(),
+            geoip: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct RelayAllocationPending {
+    pub zone: String,
+    pub preferred_region: Option<String>,
+    pub reason: String,
+    pub source_version: Option<String>,
+    pub attempts: u64,
+    pub last_error: String,
+    pub created_at: u64,
+    pub updated_at: u64,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Default)]
+pub struct RelayAllocationMetricsSnapshot {
+    pub attempts: u64,
+    pub successes: u64,
+    pub fallbacks: u64,
+    pub failures: u64,
+    pub geoip_failures: u64,
+}
+
+#[derive(Default)]
+struct RelayAllocationMetrics {
+    attempts: AtomicU64,
+    successes: AtomicU64,
+    fallbacks: AtomicU64,
+    failures: AtomicU64,
+    geoip_failures: AtomicU64,
+}
+
+struct RelaySelection {
+    node: RelayNode,
+    rule: &'static str,
+    fallback: bool,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RelayMigrationReq {
     pub zone: String,
     pub target_relay_id: Option<String>,
@@ -289,9 +531,11 @@ pub struct RelayAdmissionDecision {
 
 #[async_trait::async_trait]
 pub trait SnRelayManager: Send + Sync + 'static {
+    fn allocation_metrics(&self) -> RelayAllocationMetricsSnapshot;
     async fn register_relay_node(&self, node: RelayNodeRegistration) -> SnResult<RelayNode>;
     async fn heartbeat_relay_node(&self, heartbeat: RelayHeartbeat) -> SnResult<RelayNodeHealth>;
     async fn assign_zone_relay(&self, req: AssignZoneRelayReq) -> SnResult<RelayAssignment>;
+    async fn allocate_zone_relay(&self, req: AllocateZoneRelayReq) -> SnResult<RelayAssignment>;
     async fn get_zone_relay(&self, zone: &str) -> SnResult<Option<RelayAssignment>>;
     async fn check_relay_admission(
         &self,
@@ -306,6 +550,9 @@ pub struct SqliteSnRelayManager {
     auth_db: Option<SnAuthDBRef>,
     device_info_db: Option<SnDeviceInfoDBRef>,
     admission_ttl_secs: u64,
+    allocation_config: RelayAllocationConfig,
+    geo_ip_resolver: Option<GeoIpResolverRef>,
+    allocation_metrics: RelayAllocationMetrics,
 }
 
 impl SqliteSnRelayManager {
@@ -337,6 +584,9 @@ impl SqliteSnRelayManager {
             auth_db: None,
             device_info_db: None,
             admission_ttl_secs: DEFAULT_ADMISSION_TTL_SECS,
+            allocation_config: RelayAllocationConfig::default(),
+            geo_ip_resolver: None,
+            allocation_metrics: RelayAllocationMetrics::default(),
         })
     }
 
@@ -359,6 +609,41 @@ impl SqliteSnRelayManager {
     pub fn with_admission_ttl_secs(mut self, admission_ttl_secs: u64) -> Self {
         self.admission_ttl_secs = admission_ttl_secs;
         self
+    }
+
+    pub fn with_allocation_config(mut self, allocation_config: RelayAllocationConfig) -> Self {
+        self.allocation_config = allocation_config;
+        self
+    }
+
+    pub fn with_geo_ip_resolver(mut self, geo_ip_resolver: GeoIpResolverRef) -> Self {
+        self.geo_ip_resolver = Some(geo_ip_resolver);
+        self
+    }
+
+    pub fn allocation_metrics(&self) -> RelayAllocationMetricsSnapshot {
+        RelayAllocationMetricsSnapshot {
+            attempts: self
+                .allocation_metrics
+                .attempts
+                .load(AtomicOrdering::Relaxed),
+            successes: self
+                .allocation_metrics
+                .successes
+                .load(AtomicOrdering::Relaxed),
+            fallbacks: self
+                .allocation_metrics
+                .fallbacks
+                .load(AtomicOrdering::Relaxed),
+            failures: self
+                .allocation_metrics
+                .failures
+                .load(AtomicOrdering::Relaxed),
+            geoip_failures: self
+                .allocation_metrics
+                .geoip_failures
+                .load(AtomicOrdering::Relaxed),
+        }
     }
 
     pub async fn initialize_database(&self) -> SnResult<()> {
@@ -445,6 +730,22 @@ impl SqliteSnRelayManager {
         .await
         .map_err(|e| Self::db_err("create relay admission zone index failed", e))?;
 
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS relay_allocation_pending (
+                zone TEXT PRIMARY KEY,
+                preferred_region TEXT NULL,
+                reason TEXT NOT NULL,
+                source_version TEXT NULL,
+                attempts INTEGER NOT NULL DEFAULT 1,
+                last_error TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            )",
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| Self::db_err("create relay allocation pending table failed", e))?;
+
         Ok(())
     }
 
@@ -498,6 +799,32 @@ impl SqliteSnRelayManager {
                 assignment.state,
                 RelayAssignmentState::Active | RelayAssignmentState::Migrating
             ))
+    }
+
+    pub async fn get_pending_allocation(
+        &self,
+        zone: &str,
+    ) -> SnResult<Option<RelayAllocationPending>> {
+        Self::check_non_empty(zone, "zone")?;
+        let row = sqlx::query(
+            "SELECT zone, preferred_region, reason, source_version, attempts, last_error,
+                    created_at, updated_at
+             FROM relay_allocation_pending WHERE zone = ?1",
+        )
+        .bind(zone)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|error| Self::db_err("query pending relay allocation failed", error))?;
+        Ok(row.map(|row| RelayAllocationPending {
+            zone: row.get(0),
+            preferred_region: row.get(1),
+            reason: row.get(2),
+            source_version: row.get(3),
+            attempts: Self::i64_to_u64(row.get(4)),
+            last_error: row.get(5),
+            created_at: Self::i64_to_u64(row.get(6)),
+            updated_at: Self::i64_to_u64(row.get(7)),
+        }))
     }
 
     async fn choose_relay_node(&self, req: &AssignZoneRelayReq) -> SnResult<RelayNode> {
@@ -565,6 +892,360 @@ impl SqliteSnRelayManager {
         row.map(Self::relay_node_from_row)
             .transpose()?
             .ok_or_else(|| sn_err!(SnErrorCode::NotFound, "no active relay node is available"))
+    }
+
+    fn normalize_match_label(value: &str) -> Option<String> {
+        let value = value.trim();
+        if value.is_empty() || value.len() > 128 {
+            return None;
+        }
+
+        let mut normalized = String::with_capacity(value.len());
+        let mut separator_pending = false;
+        for character in value.chars() {
+            if character.is_alphanumeric() {
+                if separator_pending && !normalized.is_empty() {
+                    normalized.push('-');
+                }
+                separator_pending = false;
+                normalized.extend(character.to_lowercase());
+            } else if matches!(character, '-' | '_' | '/' | '.') || character.is_whitespace() {
+                separator_pending = !normalized.is_empty();
+            } else {
+                return None;
+            }
+        }
+        if normalized.is_empty() {
+            None
+        } else {
+            Some(normalized)
+        }
+    }
+
+    fn is_public_source_ip(ip: IpAddr) -> bool {
+        match ip {
+            IpAddr::V4(ip) => Self::is_public_ipv4(ip),
+            IpAddr::V6(ip) => {
+                if let Some(ipv4) = ip.to_ipv4() {
+                    return Self::is_public_ipv4(ipv4);
+                }
+                Self::is_public_ipv6(ip)
+            }
+        }
+    }
+
+    fn is_public_ipv4(ip: Ipv4Addr) -> bool {
+        let [a, b, c, _] = ip.octets();
+        !(a == 0
+            || a == 10
+            || a == 127
+            || (a == 100 && (64..=127).contains(&b))
+            || (a == 169 && b == 254)
+            || (a == 172 && (16..=31).contains(&b))
+            || (a == 192 && b == 0 && c == 0)
+            || (a == 192 && b == 0 && c == 2)
+            || (a == 192 && b == 88 && c == 99)
+            || (a == 192 && b == 168)
+            || (a == 198 && (b == 18 || b == 19))
+            || (a == 198 && b == 51 && c == 100)
+            || (a == 203 && b == 0 && c == 113)
+            || a >= 224)
+    }
+
+    fn is_public_ipv6(ip: Ipv6Addr) -> bool {
+        let segments = ip.segments();
+        !(ip.is_unspecified()
+            || ip.is_loopback()
+            || ip.is_multicast()
+            || (segments[0] & 0xfe00) == 0xfc00
+            || (segments[0] & 0xffc0) == 0xfe80
+            || (segments[0] == 0x2001 && segments[1] == 0x0db8))
+    }
+
+    fn normalized_tag_matches(node: &RelayNode, namespace: &str, value: &str) -> bool {
+        node.tags.iter().any(|tag| {
+            if let Some((tag_namespace, tag_value)) = tag.split_once(':') {
+                Self::normalize_match_label(tag_namespace).as_deref() == Some(namespace)
+                    && Self::normalize_match_label(tag_value).as_deref() == Some(value)
+            } else {
+                Self::normalize_match_label(tag).as_deref() == Some(value)
+            }
+        })
+    }
+
+    fn region_contains_label(region: &str, value: &str) -> bool {
+        region == value
+            || region.starts_with(format!("{}-", value).as_str())
+            || region.ends_with(format!("-{}", value).as_str())
+            || region.contains(format!("-{}-", value).as_str())
+    }
+
+    fn node_matches_rule(node: &RelayNode, rule: RelayMatchRule, value: &str) -> bool {
+        let region = node.region.as_deref().and_then(Self::normalize_match_label);
+        match rule {
+            RelayMatchRule::PreferredRegion => {
+                region.as_deref() == Some(value)
+                    || Self::normalized_tag_matches(node, "region", value)
+            }
+            RelayMatchRule::GeoCountryCode => {
+                region.as_deref().is_some_and(|region| {
+                    region == value || region.starts_with(format!("{}-", value).as_str())
+                }) || Self::normalized_tag_matches(node, "country", value)
+            }
+            RelayMatchRule::GeoProvince => {
+                region
+                    .as_deref()
+                    .is_some_and(|region| Self::region_contains_label(region, value))
+                    || Self::normalized_tag_matches(node, "province", value)
+            }
+            RelayMatchRule::GeoCity => {
+                region
+                    .as_deref()
+                    .is_some_and(|region| Self::region_contains_label(region, value))
+                    || Self::normalized_tag_matches(node, "city", value)
+            }
+            RelayMatchRule::GeoIsp => {
+                node.isp
+                    .as_deref()
+                    .and_then(Self::normalize_match_label)
+                    .as_deref()
+                    == Some(value)
+                    || Self::normalized_tag_matches(node, "isp", value)
+            }
+        }
+    }
+
+    fn compare_relay_load(left: &RelayNode, right: &RelayNode) -> Ordering {
+        let left_ratio = i128::from(left.current_load) * i128::from(right.capacity_score.max(1));
+        let right_ratio = i128::from(right.current_load) * i128::from(left.capacity_score.max(1));
+        left_ratio
+            .cmp(&right_ratio)
+            .then_with(|| right.capacity_score.cmp(&left.capacity_score))
+            .then_with(|| left.relay_id.cmp(&right.relay_id))
+    }
+
+    fn rule_value(
+        rule: RelayMatchRule,
+        preferred_region: Option<&String>,
+        geo: Option<&GeoIpInfo>,
+    ) -> Option<String> {
+        let value = match rule {
+            RelayMatchRule::PreferredRegion => preferred_region.map(String::as_str),
+            RelayMatchRule::GeoCountryCode => geo.and_then(|info| info.country_code.as_deref()),
+            RelayMatchRule::GeoProvince => geo.and_then(|info| info.province.as_deref()),
+            RelayMatchRule::GeoCity => geo.and_then(|info| info.city.as_deref()),
+            RelayMatchRule::GeoIsp => geo.and_then(|info| info.isp.as_deref()),
+        }?;
+        Self::normalize_match_label(value)
+    }
+
+    async fn lookup_geo_for_allocation(&self, source_ip: Option<IpAddr>) -> Option<GeoIpInfo> {
+        let Some(source_ip) = source_ip.filter(|ip| Self::is_public_source_ip(*ip)) else {
+            return None;
+        };
+        let Some(resolver) = self.geo_ip_resolver.as_ref() else {
+            return None;
+        };
+        match resolver.lookup(source_ip).await {
+            Ok(info) => info,
+            Err(error) => {
+                self.allocation_metrics
+                    .geoip_failures
+                    .fetch_add(1, AtomicOrdering::Relaxed);
+                // 不记录 IP；源地址可能属于敏感运行信息。
+                warn!(
+                    "relay allocation GeoIP lookup degraded: error_code={:?}",
+                    error.code()
+                );
+                None
+            }
+        }
+    }
+
+    async fn choose_automatic_relay(
+        &self,
+        preferred_region: Option<&String>,
+        geo: Option<&GeoIpInfo>,
+    ) -> SnResult<RelaySelection> {
+        let mut active_nodes = Vec::new();
+        for node in self.list_relay_nodes().await? {
+            if Self::is_assignable_node(&node) {
+                active_nodes.push(node);
+            } else {
+                debug!(
+                    "relay allocation candidate excluded: relay_id={} reason=status status={}",
+                    node.relay_id, node.status
+                );
+            }
+        }
+        active_nodes.sort_by(Self::compare_relay_load);
+
+        for rule in self.allocation_config.match_rules.iter().copied() {
+            let Some(value) = Self::rule_value(rule, preferred_region, geo) else {
+                continue;
+            };
+            for node in &active_nodes {
+                if Self::node_matches_rule(node, rule, value.as_str()) {
+                    return Ok(RelaySelection {
+                        node: node.clone(),
+                        rule: rule.as_str(),
+                        fallback: false,
+                    });
+                }
+                debug!(
+                    "relay allocation candidate excluded: relay_id={} rule={} reason=label_mismatch",
+                    node.relay_id,
+                    rule.as_str()
+                );
+            }
+            debug!(
+                "relay allocation rule produced no candidate: rule={} value={}",
+                rule.as_str(),
+                value
+            );
+        }
+
+        let fallback_all = self
+            .allocation_config
+            .fallback_relays
+            .iter()
+            .any(|relay| relay.trim() == "*");
+        let fallback = active_nodes.into_iter().find(|node| {
+            let included = fallback_all
+                || self.allocation_config.fallback_relays.iter().any(|relay| {
+                    let relay = relay.trim();
+                    relay == node.relay_id || relay == node.relay_sn
+                });
+            if !included {
+                debug!(
+                    "relay allocation candidate excluded: relay_id={} rule=fallback reason=not_configured",
+                    node.relay_id
+                );
+            }
+            included
+        });
+        fallback
+            .map(|node| RelaySelection {
+                node,
+                rule: "fallback",
+                fallback: true,
+            })
+            .ok_or_else(|| {
+                sn_err!(
+                    SnErrorCode::NotFound,
+                    "no_relay_available: no matching or fallback relay is healthy"
+                )
+            })
+    }
+
+    async fn record_pending_allocation(
+        &self,
+        req: &AllocateZoneRelayReq,
+        error: &SnError,
+    ) -> SnResult<()> {
+        let now = Self::now_secs();
+        let preferred_region = req
+            .preferred_region
+            .as_deref()
+            .and_then(Self::normalize_match_label);
+        sqlx::query(
+            "INSERT INTO relay_allocation_pending
+                (zone, preferred_region, reason, source_version, attempts, last_error,
+                 created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, 1, ?5, ?6, ?7)
+             ON CONFLICT(zone) DO UPDATE SET
+                preferred_region = excluded.preferred_region,
+                reason = excluded.reason,
+                source_version = excluded.source_version,
+                attempts = relay_allocation_pending.attempts + 1,
+                last_error = excluded.last_error,
+                updated_at = excluded.updated_at",
+        )
+        .bind(req.zone.trim())
+        .bind(preferred_region.as_deref())
+        .bind(req.reason.trim())
+        .bind(req.source_version.as_deref())
+        .bind(format!("{:?}: {}", error.code(), error.msg()))
+        .bind(Self::to_db_time(now, "created_at")?)
+        .bind(Self::to_db_time(now, "updated_at")?)
+        .execute(&self.pool)
+        .await
+        .map_err(|db_error| Self::db_err("record pending relay allocation failed", db_error))?;
+        Ok(())
+    }
+
+    async fn clear_pending_allocation(&self, zone: &str) -> SnResult<()> {
+        sqlx::query("DELETE FROM relay_allocation_pending WHERE zone = ?1")
+            .bind(zone)
+            .execute(&self.pool)
+            .await
+            .map_err(|error| Self::db_err("clear pending relay allocation failed", error))?;
+        Ok(())
+    }
+
+    async fn allocate_zone_relay_inner(
+        &self,
+        req: &AllocateZoneRelayReq,
+    ) -> SnResult<(RelayAssignment, bool)> {
+        Self::check_non_empty(req.zone.as_str(), "zone")?;
+        Self::check_non_empty(req.reason.as_str(), "reason")?;
+
+        // 自动分配以 zone 为幂等键。只要已有 assignment 的节点仍允许服务，
+        // 地区提示、GeoIP 或负载变化都不能令重试无故漂移。
+        if let Some(existing) = self.get_zone_relay(req.zone.as_str()).await? {
+            if existing.state == RelayAssignmentState::Active {
+                if let Some(node) = self.get_relay_node(existing.relay_id.as_str()).await? {
+                    if Self::is_assignable_node(&node) {
+                        self.sync_zone_relay_cache(&existing).await?;
+                        info!(
+                            "relay allocation reused sticky assignment: zone={} relay_id={} generation={} rule=sticky",
+                            req.zone, existing.relay_id, existing.generation
+                        );
+                        return Ok((existing, false));
+                    }
+                }
+            }
+        }
+
+        let preferred_region = req
+            .preferred_region
+            .as_deref()
+            .and_then(Self::normalize_match_label);
+        if req.preferred_region.is_some() && preferred_region.is_none() {
+            debug!(
+                "relay allocation ignored invalid preferred region: zone={}",
+                req.zone
+            );
+        }
+        let geo = self.lookup_geo_for_allocation(req.source_ip).await;
+        let selection = self
+            .choose_automatic_relay(preferred_region.as_ref(), geo.as_ref())
+            .await?;
+        let reason = format!("{};rule={}", req.reason.trim(), selection.rule);
+        let assignment = self
+            .assign_zone_relay(AssignZoneRelayReq {
+                zone: req.zone.trim().to_string(),
+                relay_id: Some(selection.node.relay_id.clone()),
+                relay_sn: None,
+                from_ip: None,
+                region: None,
+                source: RelayAssignmentSource::Auto,
+                reason: Some(reason),
+                sticky_until: None,
+                lease_expires_at: None,
+                backup_relay_id: None,
+                source_version: req.source_version.clone(),
+            })
+            .await?;
+        info!(
+            "relay allocation selected: zone={} relay_id={} generation={} rule={} fallback={}",
+            assignment.zone,
+            assignment.relay_id,
+            assignment.generation,
+            selection.rule,
+            selection.fallback
+        );
+        Ok((assignment, selection.fallback))
     }
 
     async fn get_relay_node_by_sn(&self, relay_sn: &str) -> SnResult<Option<RelayNode>> {
@@ -718,21 +1399,18 @@ impl SqliteSnRelayManager {
             return Ok(Some(assignment));
         }
 
-        let auto_req = AssignZoneRelayReq {
+        let auto_req = AllocateZoneRelayReq {
             zone: req.zone.clone(),
-            relay_id: None,
-            relay_sn: None,
-            from_ip: req.observed_ip.clone(),
-            region: None,
-            source: RelayAssignmentSource::Auto,
-            reason: Some("first_keep_tunnel".to_string()),
-            sticky_until: None,
-            lease_expires_at: None,
-            backup_relay_id: None,
+            preferred_region: None,
+            source_ip: req
+                .observed_ip
+                .as_deref()
+                .and_then(|value| value.parse::<IpAddr>().ok()),
+            reason: "first_keep_tunnel".to_string(),
             source_version: None,
         };
 
-        match self.assign_zone_relay(auto_req).await {
+        match self.allocate_zone_relay(auto_req).await {
             Ok(assignment) => Ok(Some(assignment)),
             Err(err) if err.code() == SnErrorCode::NotFound => Ok(None),
             Err(err) => Err(err),
@@ -1047,6 +1725,10 @@ impl SqliteSnRelayManager {
 
 #[async_trait::async_trait]
 impl SnRelayManager for SqliteSnRelayManager {
+    fn allocation_metrics(&self) -> RelayAllocationMetricsSnapshot {
+        SqliteSnRelayManager::allocation_metrics(self)
+    }
+
     async fn register_relay_node(&self, node: RelayNodeRegistration) -> SnResult<RelayNode> {
         Self::validate_registration(&node)?;
         self.ensure_relay_sn_unique(node.relay_id.as_str(), node.relay_sn.as_str())
@@ -1247,6 +1929,64 @@ impl SnRelayManager for SqliteSnRelayManager {
         self.upsert_assignment(&assignment).await?;
         self.sync_zone_relay_cache(&assignment).await?;
         Ok(assignment)
+    }
+
+    async fn allocate_zone_relay(&self, req: AllocateZoneRelayReq) -> SnResult<RelayAssignment> {
+        Self::check_non_empty(req.zone.as_str(), "zone")?;
+        Self::check_non_empty(req.reason.as_str(), "reason")?;
+        self.allocation_metrics
+            .attempts
+            .fetch_add(1, AtomicOrdering::Relaxed);
+        // 进程内并发注册/补偿按 zone 串行化；DB 的 zone 主键继续作为最终幂等约束。
+        let _zone_locker = async_named_locker::Locker::get_locker(format!(
+            "sn_relay_allocate_zone_{}",
+            req.zone.trim()
+        ))
+        .await;
+
+        match self.allocate_zone_relay_inner(&req).await {
+            Ok((assignment, fallback)) => {
+                self.allocation_metrics
+                    .successes
+                    .fetch_add(1, AtomicOrdering::Relaxed);
+                if fallback {
+                    self.allocation_metrics
+                        .fallbacks
+                        .fetch_add(1, AtomicOrdering::Relaxed);
+                }
+                if let Err(error) = self
+                    .clear_pending_allocation(assignment.zone.as_str())
+                    .await
+                {
+                    warn!(
+                        "relay allocation could not clear stale pending row: zone={} error={}",
+                        assignment.zone,
+                        error.msg()
+                    );
+                }
+                Ok(assignment)
+            }
+            Err(error) => {
+                self.allocation_metrics
+                    .failures
+                    .fetch_add(1, AtomicOrdering::Relaxed);
+                if let Err(pending_error) = self.record_pending_allocation(&req, &error).await {
+                    warn!(
+                        "relay allocation failed and pending row could not be recorded: zone={} error_code={:?} pending_error={}",
+                        req.zone,
+                        error.code(),
+                        pending_error.msg()
+                    );
+                }
+                warn!(
+                    "relay allocation pending: zone={} error_code={:?} error={}",
+                    req.zone,
+                    error.code(),
+                    error.msg()
+                );
+                Err(error)
+            }
+        }
     }
 
     async fn get_zone_relay(&self, zone: &str) -> SnResult<Option<RelayAssignment>> {
@@ -1459,6 +2199,43 @@ impl SnRelayManager for SqliteSnRelayManager {
 mod tests {
     use super::*;
     use crate::{SnAuthDB, SqliteSnAuthDB, ZoneInfoPatch};
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicUsizeOrdering};
+
+    struct TestGeoIpResolver {
+        info: Option<GeoIpInfo>,
+        fail: bool,
+        calls: AtomicUsize,
+    }
+
+    impl TestGeoIpResolver {
+        fn new(info: Option<GeoIpInfo>) -> Self {
+            Self {
+                info,
+                fail: false,
+                calls: AtomicUsize::new(0),
+            }
+        }
+
+        fn failing() -> Self {
+            Self {
+                info: None,
+                fail: true,
+                calls: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl GeoIpResolver for TestGeoIpResolver {
+        async fn lookup(&self, _ip: IpAddr) -> SnResult<Option<GeoIpInfo>> {
+            self.calls.fetch_add(1, AtomicUsizeOrdering::Relaxed);
+            if self.fail {
+                Err(sn_err!(SnErrorCode::Failed, "test GeoIP failure"))
+            } else {
+                Ok(self.info.clone())
+            }
+        }
+    }
 
     async fn temp_mgr() -> SnResult<(tempfile::TempDir, SqliteSnRelayManager)> {
         let tmp_dir = tempfile::tempdir()
@@ -1483,6 +2260,224 @@ mod tests {
             status: None,
             capacity_score: Some(100),
         }
+    }
+
+    fn allocation_req(
+        zone: &str,
+        preferred_region: Option<&str>,
+        source_ip: Option<IpAddr>,
+    ) -> AllocateZoneRelayReq {
+        AllocateZoneRelayReq {
+            zone: zone.to_string(),
+            preferred_region: preferred_region.map(ToString::to_string),
+            source_ip,
+            reason: "register".to_string(),
+            source_version: Some("test-v1".to_string()),
+        }
+    }
+
+    fn geo(country_code: &str, province: &str, city: &str, isp: &str) -> GeoIpInfo {
+        GeoIpInfo {
+            country_code: Some(country_code.to_string()),
+            country: None,
+            province: Some(province.to_string()),
+            city: Some(city.to_string()),
+            isp: Some(isp.to_string()),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_allocate_prefers_normalized_region_over_geoip() -> SnResult<()> {
+        let (_tmp_dir, base_mgr) = temp_mgr().await?;
+        let resolver = Arc::new(TestGeoIpResolver::new(Some(geo(
+            "DE",
+            "Berlin",
+            "Berlin",
+            "Example ISP",
+        ))));
+        let mgr = base_mgr.with_geo_ip_resolver(resolver.clone());
+        mgr.register_relay_node(node("relay-us", "relay-us.example", "us-west"))
+            .await?;
+        mgr.register_relay_node(node("relay-de", "relay-de.example", "de"))
+            .await?;
+
+        let assignment = mgr
+            .allocate_zone_relay(allocation_req(
+                "alice",
+                Some(" US_WEST "),
+                Some("8.8.8.8".parse().unwrap()),
+            ))
+            .await?;
+        assert_eq!(assignment.relay_id, "relay-us");
+        assert_eq!(assignment.source, RelayAssignmentSource::Auto);
+        assert_eq!(
+            assignment.reason.as_deref(),
+            Some("register;rule=preferred_region")
+        );
+        assert_eq!(resolver.calls.load(AtomicUsizeOrdering::Relaxed), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_allocate_uses_geoip_when_region_is_missing_or_unknown() -> SnResult<()> {
+        let (_tmp_dir, base_mgr) = temp_mgr().await?;
+        let resolver = Arc::new(TestGeoIpResolver::new(Some(geo(
+            "DE",
+            "Berlin",
+            "Berlin",
+            "Example ISP",
+        ))));
+        let mgr = base_mgr.with_geo_ip_resolver(resolver);
+        mgr.register_relay_node(node("relay-us", "relay-us.example", "us"))
+            .await?;
+        mgr.register_relay_node(node("relay-de", "relay-de.example", "de"))
+            .await?;
+
+        let missing = mgr
+            .allocate_zone_relay(allocation_req(
+                "alice",
+                None,
+                Some("8.8.8.8".parse().unwrap()),
+            ))
+            .await?;
+        let unknown = mgr
+            .allocate_zone_relay(allocation_req(
+                "bob",
+                Some("moon-1"),
+                Some("8.8.4.4".parse().unwrap()),
+            ))
+            .await?;
+        assert_eq!(missing.relay_id, "relay-de");
+        assert_eq!(unknown.relay_id, "relay-de");
+        assert_eq!(
+            unknown.reason.as_deref(),
+            Some("register;rule=geo_country_code")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_private_ip_skips_geoip_and_uses_configured_fallback() -> SnResult<()> {
+        let (_tmp_dir, base_mgr) = temp_mgr().await?;
+        let resolver = Arc::new(TestGeoIpResolver::new(Some(geo(
+            "US",
+            "California",
+            "San Francisco",
+            "Example ISP",
+        ))));
+        let mgr = base_mgr
+            .with_allocation_config(RelayAllocationConfig {
+                fallback_relays: vec!["relay-b".to_string()],
+                ..Default::default()
+            })
+            .with_geo_ip_resolver(resolver.clone());
+        mgr.register_relay_node(node("relay-a", "relay-a.example", "us"))
+            .await?;
+        mgr.register_relay_node(node("relay-b", "relay-b.example", "eu"))
+            .await?;
+
+        let assignment = mgr
+            .allocate_zone_relay(allocation_req(
+                "alice",
+                None,
+                Some("192.168.1.8".parse().unwrap()),
+            ))
+            .await?;
+        assert_eq!(assignment.relay_id, "relay-b");
+        assert_eq!(assignment.reason.as_deref(), Some("register;rule=fallback"));
+        assert_eq!(resolver.calls.load(AtomicUsizeOrdering::Relaxed), 0);
+        assert_eq!(mgr.allocation_metrics().fallbacks, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_geoip_failure_degrades_to_fallback() -> SnResult<()> {
+        let (_tmp_dir, base_mgr) = temp_mgr().await?;
+        let mgr = base_mgr.with_geo_ip_resolver(Arc::new(TestGeoIpResolver::failing()));
+        mgr.register_relay_node(node("relay-a", "relay-a.example", "us"))
+            .await?;
+        let assignment = mgr
+            .allocate_zone_relay(allocation_req(
+                "alice",
+                None,
+                Some("8.8.8.8".parse().unwrap()),
+            ))
+            .await?;
+        assert_eq!(assignment.relay_id, "relay-a");
+        assert_eq!(mgr.allocation_metrics().geoip_failures, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_unavailable_fallback_records_retryable_pending_state() -> SnResult<()> {
+        let (_tmp_dir, base_mgr) = temp_mgr().await?;
+        let mgr = base_mgr.with_allocation_config(RelayAllocationConfig {
+            fallback_relays: vec!["relay-b".to_string()],
+            ..Default::default()
+        });
+        mgr.register_relay_node(node("relay-a", "relay-a.example", "us"))
+            .await?;
+        mgr.register_relay_node(node("relay-b", "relay-b.example", "eu"))
+            .await?;
+        mgr.heartbeat_relay_node(RelayHeartbeat {
+            relay_id: "relay-b".to_string(),
+            status: Some(RelayNodeStatus::Disabled),
+            current_load: None,
+            capacity_score: None,
+            drain_until: None,
+            http_endpoint: None,
+            rtcp_endpoint: None,
+        })
+        .await?;
+
+        let error = mgr
+            .allocate_zone_relay(allocation_req("alice", Some("unknown"), None))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), SnErrorCode::NotFound);
+        assert!(error.msg().contains("no_relay_available"));
+        let pending = mgr.get_pending_allocation("alice").await?.unwrap();
+        assert_eq!(pending.attempts, 1);
+        assert_eq!(pending.preferred_region.as_deref(), Some("unknown"));
+        assert!(pending.last_error.contains("no_relay_available"));
+        assert_eq!(mgr.allocation_metrics().failures, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_allocate_is_idempotent_and_concurrent_per_zone() -> SnResult<()> {
+        let (_tmp_dir, mgr) = temp_mgr().await?;
+        mgr.register_relay_node(node("relay-us", "relay-us.example", "us"))
+            .await?;
+        mgr.register_relay_node(node("relay-eu", "relay-eu.example", "eu"))
+            .await?;
+        let mgr = Arc::new(mgr);
+
+        let first_mgr = mgr.clone();
+        let first = tokio::spawn(async move {
+            first_mgr
+                .allocate_zone_relay(allocation_req("alice", Some("us"), None))
+                .await
+        });
+        let second_mgr = mgr.clone();
+        let second = tokio::spawn(async move {
+            second_mgr
+                .allocate_zone_relay(allocation_req("alice", Some("eu"), None))
+                .await
+        });
+        let first = first.await.unwrap()?;
+        let second = second.await.unwrap()?;
+        assert_eq!(first.relay_id, second.relay_id);
+        assert_eq!(first.generation, 1);
+        assert_eq!(second.generation, 1);
+
+        let retry = mgr
+            .allocate_zone_relay(allocation_req("alice", Some("unknown"), None))
+            .await?;
+        assert_eq!(retry.relay_id, first.relay_id);
+        assert_eq!(retry.generation, 1);
+        assert!(mgr.get_pending_allocation("alice").await?.is_none());
+        Ok(())
     }
 
     #[tokio::test]
@@ -1696,7 +2691,14 @@ mod tests {
         auth_db.insert_activation_code("alice-code").await?;
         assert!(
             auth_db
-                .register_user("alice-code", "alice", "hash", "salt", "pbkdf2")
+                .register_user(
+                    "alice-code",
+                    "alice",
+                    "alice@example.com",
+                    "hash",
+                    "salt",
+                    "pbkdf2",
+                )
                 .await?
         );
         auth_db

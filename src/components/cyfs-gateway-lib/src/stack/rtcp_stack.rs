@@ -26,7 +26,8 @@ use crate::rtcp::{
 use crate::stack::limiter::Limiter;
 use crate::stack::{
     datagram_forward, datagram_forward_group, get_limit_info, get_source_addr_from_req_env,
-    probe_proxy_protocol_stream, stream_forward, stream_forward_group,
+    insert_req_source_addr_group, probe_proxy_protocol_stream, stream_forward,
+    stream_forward_group,
 };
 use crate::tunnel_url_status::{
     TunnelProbeOptions, TunnelUrlProber, TunnelUrlProberRef, TunnelUrlStatus,
@@ -191,8 +192,23 @@ impl RtcpConnectionHandler {
         )
         .await
         .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
+        insert_req_source_addr_group(&map, "conn_source_", source_addr).await?;
         map.insert(
             "source_device_id",
+            CollectionValue::String(endpoint.device_id.clone()),
+        )
+        .await
+        .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
+        // The RTCP handshake authenticated this DID; expose it as the trusted
+        // origin identity plus the current effective identity alias.
+        map.insert(
+            "real_source_did",
+            CollectionValue::String(endpoint.device_id.clone()),
+        )
+        .await
+        .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
+        map.insert(
+            "source_did",
             CollectionValue::String(endpoint.device_id.clone()),
         )
         .await
@@ -269,6 +285,20 @@ impl RtcpConnectionHandler {
         )
         .await
         .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
+        // The RTCP handshake authenticated this DID; expose it as the trusted
+        // origin identity plus the current effective identity alias.
+        map.insert(
+            "real_source_did",
+            CollectionValue::String(endpoint.device_id.clone()),
+        )
+        .await
+        .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
+        map.insert(
+            "source_did",
+            CollectionValue::String(endpoint.device_id.clone()),
+        )
+        .await
+        .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
         map.insert(
             "source_addr",
             CollectionValue::String(request_source_addr_str.clone()),
@@ -287,6 +317,10 @@ impl RtcpConnectionHandler {
         )
         .await
         .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
+        insert_req_source_addr_group(&map, "conn_source_", remote_addr).await?;
+        if let Some(proxy_source_addr) = proxy_source_addr {
+            insert_req_source_addr_group(&map, "real_source_", proxy_source_addr).await?;
+        }
         map.insert("dest_addr", CollectionValue::String(local_addr.to_string()))
             .await
             .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
@@ -537,6 +571,20 @@ impl RtcpConnectionHandler {
         )
         .await
         .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
+        // The RTCP handshake authenticated this DID; expose it as the trusted
+        // origin identity plus the current effective identity alias.
+        map.insert(
+            "real_source_did",
+            CollectionValue::String(endpoint.device_id.clone()),
+        )
+        .await
+        .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
+        map.insert(
+            "source_did",
+            CollectionValue::String(endpoint.device_id.clone()),
+        )
+        .await
+        .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
         map.insert(
             "source_addr",
             CollectionValue::String(remote_addr.to_string()),
@@ -555,6 +603,7 @@ impl RtcpConnectionHandler {
         )
         .await
         .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
+        insert_req_source_addr_group(&map, "conn_source_", remote_addr).await?;
         map.insert("dest_addr", CollectionValue::String(local_addr.to_string()))
             .await
             .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
@@ -2425,6 +2474,156 @@ mod tests {
             )
             .await;
         assert!(accepted.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_rtcp_on_new_tunnel_exposes_authenticated_did_and_conn_source() {
+        // The handshake-authenticated DID must be visible as the trusted
+        // real_source_did, with source_did as the effective-identity alias,
+        // alongside the connection-layer source group.
+        let on_new_tunnel_hook_point = r#"
+- id: main
+  priority: 1
+  blocks:
+    - id: main
+      block: |
+        !eq ${REQ.real_source_did} "did:dev:blocked" && !eq ${REQ.conn_source_ip} "10.9.9.9" && return "ok";
+        eq ${REQ.source_did} ${REQ.real_source_did} && eq ${REQ.source_device_id} ${REQ.real_source_did} && reject;
+        "#;
+        let on_new_tunnel_hook_point: ProcessChainConfigs =
+            serde_yaml_ng::from_str(on_new_tunnel_hook_point).unwrap();
+
+        let handler = RtcpConnectionHandler::create(
+            vec![],
+            Some(on_new_tunnel_hook_point),
+            build_stack_context(
+                Arc::new(ServerManager::new()),
+                TunnelManager::new(),
+                Arc::new(DefaultLimiterManager::new()),
+                StatManager::new(),
+                Some(Arc::new(GlobalProcessChains::new())),
+            ),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Matching DID: the second line proves source_did/source_device_id
+        // alias the authenticated DID (reject only fires when all eq hold).
+        let rejected = handler
+            .handle_new_tunnel(
+                TunnelEndpoint {
+                    device_id: "did:dev:blocked".to_string(),
+                    port: 2981,
+                },
+                "127.0.0.1:41002".parse().unwrap(),
+                None,
+            )
+            .await;
+        assert!(rejected.is_err());
+
+        // Same chain keyed on conn_source_ip: proves the connection-layer
+        // source group is populated.
+        let rejected = handler
+            .handle_new_tunnel(
+                TunnelEndpoint {
+                    device_id: "did:dev:other".to_string(),
+                    port: 2981,
+                },
+                "10.9.9.9:41003".parse().unwrap(),
+                None,
+            )
+            .await;
+        assert!(rejected.is_err());
+
+        let accepted = handler
+            .handle_new_tunnel(
+                TunnelEndpoint {
+                    device_id: "did:dev:other".to_string(),
+                    port: 2981,
+                },
+                "127.0.0.1:41004".parse().unwrap(),
+                None,
+            )
+            .await;
+        assert!(accepted.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_rtcp_stream_source_vars_with_proxy_protocol() {
+        // Streams over an authenticated RTCP tunnel expose:
+        // - real_source_did / source_did: the handshake-authenticated DID
+        // - conn_source_*: the tunnel peer socket address
+        // - real_source_* / source_*: the PROXY-protocol-restored origin
+        // The chain only forwards to the listener when all of them match, so
+        // a successful accept proves the whole set.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let echo_port = listener.local_addr().unwrap().port();
+
+        let chains = format!(
+            r#"
+- id: main
+  priority: 1
+  blocks:
+    - id: main
+      block: |
+        eq ${{REQ.real_source_did}} "did:dev:peer" && eq ${{REQ.source_did}} "did:dev:peer" && eq ${{REQ.real_source_ip}} "203.0.113.9" && eq ${{REQ.real_source_port}} "5678" && eq ${{REQ.conn_source_ip}} "127.0.0.1" && eq ${{REQ.conn_source_port}} "52000" && eq ${{REQ.source_ip}} "203.0.113.9" && forward tcp:///127.0.0.1:{echo_port};
+        drop;
+"#
+        );
+        let chains: ProcessChainConfigs = serde_yaml_ng::from_str(&chains).unwrap();
+
+        let handler = RtcpConnectionHandler::create(
+            chains,
+            None,
+            build_stack_context(
+                Arc::new(ServerManager::new()),
+                TunnelManager::new(),
+                Arc::new(DefaultLimiterManager::new()),
+                StatManager::new(),
+                Some(Arc::new(GlobalProcessChains::new())),
+            ),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let (near, mut far) = tokio::io::duplex(1024);
+        far.write_all(b"PROXY TCP4 203.0.113.9 127.0.0.1 5678 80\r\nhello")
+            .await
+            .unwrap();
+
+        let handle = tokio::spawn(async move {
+            handler
+                .handle_stream(
+                    Box::new(near),
+                    "tcp".to_string(),
+                    None,
+                    80,
+                    "".to_string(),
+                    TunnelEndpoint {
+                        device_id: "did:dev:peer".to_string(),
+                        port: 2981,
+                    },
+                    crate::MutComposedSpeedStat::new(),
+                    "127.0.0.1:52000".parse().unwrap(),
+                    "127.0.0.1:2981".parse().unwrap(),
+                )
+                .await
+        });
+
+        let accepted = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+            .await
+            .expect("process chain did not forward: source vars not exposed as expected");
+        let (mut conn, _) = accepted.unwrap();
+        let mut buf = [0u8; 5];
+        conn.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"hello");
+        drop(conn);
+        drop(far);
+        let _ = handle.await;
     }
 
     #[tokio::test]

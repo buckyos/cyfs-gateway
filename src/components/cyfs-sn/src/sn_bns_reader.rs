@@ -3,18 +3,16 @@ use crate::sn_resolver::{
     SnResolverResult,
 };
 use async_trait::async_trait;
-use bns_client::{BnsClientError, BnsIndexerApi, BnsIndexerClient, DocumentStatus};
+use bns_client::{BnsClientError, BnsRpcApi, BnsRpcClient, DocumentStatus};
 use serde_json::Value;
 
-pub struct BnsIndexerDocumentReader {
-    client: BnsIndexerClient,
+pub struct BnsRpcDocumentReader {
+    client: BnsRpcClient,
 }
 
-impl BnsIndexerDocumentReader {
-    pub fn new(indexer_url: &str, session_token: Option<String>) -> Self {
-        Self {
-            client: BnsIndexerClient::new_krpc_url(indexer_url, session_token),
-        }
+impl BnsRpcDocumentReader {
+    pub fn new(client: BnsRpcClient) -> Self {
+        Self { client }
     }
 
     fn is_name_not_found(error: &BnsClientError) -> bool {
@@ -98,7 +96,7 @@ impl BnsIndexerDocumentReader {
 }
 
 #[async_trait]
-impl BnsDocumentReader for BnsIndexerDocumentReader {
+impl BnsDocumentReader for BnsRpcDocumentReader {
     async fn resolve_owner(&self, name: &str) -> SnResolverResult<Option<BnsOwner>> {
         let owner = match self.client.resolve_owner(name).await {
             Ok(owner) => owner,

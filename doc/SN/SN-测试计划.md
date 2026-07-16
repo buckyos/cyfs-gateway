@@ -17,18 +17,19 @@ SN 当前由两条主线组成：
 
 | 层级 | 测试目的 | 当前入口 |
 | --- | --- | --- |
-| BNS 合约 | 验证链上授权边界、权限策略、guard、防重放、文档生命周期、事件契约和关键不变量 | `cd src/apps/bns && forge test` |
+| BNS 合约 | 验证链上授权边界、权限策略、guard、防重放、文档生命周期、事件契约和关键不变量 | `cd src/apps/bns && npm test` |
 | BNS Rust 组件 | 验证 ABI/TX 边界、索引投影、同步游标、BNS Server 读写职责、Client/Controller 写入策略 | `cd src && cargo test -p bns-evm -p bns-indexer -p bns-server -p bns-client -- --test-threads=1` |
 | SN 组件 | 验证账号认证、DeviceInfo、Resolver、S2S DB 适配、SN HTTP/kRPC API 的业务语义 | `cd src && cargo test -p cyfs-sn -- --test-threads=1` |
 | Gateway + SN/BNS 读取集成 | 验证 gateway 中 SN 服务能通过 BNS indexer 读取 BNS 文档并对外解析 | `cd src && cargo test -p cyfs_gateway --test test_sn_bns_integration -- --test-threads=1` |
 | 真 EVM 集成 | 验证 anvil + 合约部署 + Controller 写入 + indexer 同步 + server/client 读取闭环 | `cd src && cargo test -p bns-client --test e2e_anvil -- --ignored --test-threads=1` |
 | DV 冒烟 | 验证本地开发环境 fresh/resume、BNS Server、indexer 轮询和最小写读链路 | `cd src/apps/bns && scripts/dv-up.sh --fresh && scripts/dv-smoke.sh` |
+| SN seed 集成 | 验证 make_sn_config seed-v2 产物经 bns_dv `--seed-config` 上链、cyfs-sn `sn_seed.yaml` 幂等导入后，账号/DNS/链上/域名种子全部生效（T1-T6，含幂等重放与产物确定性） | `cd src && cargo test -p cyfs_gateway --test e2e_sn_seed -- --ignored --test-threads=1`；手工环境：`cd src/web3-gateway && scripts/sn-dev-up.sh --fresh && scripts/sn-dev-smoke.sh` |
 
 说明：
 
 - `cargo test` 默认会跳过 `#[ignore]` 的真 EVM 集成测试；需要显式加 `--ignored`。
-- Foundry 相关测试需要本机安装 `forge`/`anvil`。缺 Foundry 时，Rust 的 ignored e2e 用例应跳过而不是阻断普通回归。
-- CI 基线仍以 `cd src && cargo test -- --test-threads=1` 为准；涉及 SN/BNS 改动时建议额外跑对应 Foundry 或 DV 测试。
+- BNS 合约编译和测试需要 Node.js/npm；真 EVM 集成环境仍需要 `anvil`。缺少集成环境工具时，Rust 的 ignored e2e 用例应跳过而不是阻断普通回归。
+- CI 基线仍以 `cd src && cargo test -- --test-threads=1` 为准；涉及 SN/BNS 改动时建议额外跑对应 Hardhat 或 DV 测试。
 
 ## 2. BNS 合约测试目的
 
@@ -43,7 +44,7 @@ BNS 合约测试用于钉住链上规则，而不是验证 Rust 侧实现细节�
 - **事件契约**：每类写操作都要发出索引器可消费的事件，事件字段必须能支撑链下投影。
 - **fuzz / invariant**：对权限、guard、authority key、事件序列等高风险组合做周期性增强。
 
-通过标准：`forge test` 通过；新增链上写函数或新事件时，同步补授权、guard、事件和至少一个成功路径。
+通过标准：`npm test` 通过；新增链上写函数或新事件时，同步补授权、guard、事件和至少一个成功路径。
 
 ## 3. BNS Rust 组件测试目的
 
@@ -90,6 +91,8 @@ BNS 合约测试用于钉住链上规则，而不是验证 Rust 侧实现细节�
 目标是保证账号和权限模型可恢复、可撤销、可审计：
 
 - 激活码、注册、密码哈希、登录、refresh、logout、session 查询与撤销语义正确。
+- TODO（本版本）：注册必须拒绝缺失/格式非法的邮箱；邮箱按统一规范化结果存储，并通过数据库唯一约束保证大小写或首尾空白变体以及并发请求都不能绑定到多个账号。
+- TODO（本版本）：密码找回应覆盖不存在邮箱不泄露账号、重置凭证过期与单次消费、成功重置后撤销已有 sessions，以及不改变 BNS owner/controller 权限；注册邮箱验证码不在本轮测试范围内。
 - 用户状态变化能立即影响已有 session。
 - 用户域名绑定必须经过 PKX 校验；域名冲突、最长匹配、解绑和历史保留要稳定。
 - zone 信息 patch、relay_sn 更新、self_cert 权限检查要符合账号/设备权限。
@@ -134,6 +137,10 @@ BNS 合约测试用于钉住链上规则，而不是验证 Rust 侧实现细节�
 - indexer 的 confirmations、游标推进、source 隔离和合约重部署重放在真实链环境中成立。
 - `dv-up.sh --fresh` 能初始化完整开发环境；`--resume` 能复用 anvil state、合约地址和 indexer 游标。
 - `dv-smoke.sh` 能通过 BNS Server 完成最小注册、发布、同步、读取闭环。
+- `sn-dev-up.sh --fresh` 能在本机（非 VM）拉起 anvil + bns_dv（带 `--seed-config`）+
+  web3_gateway 全栈，seed 产物真实生效；`--resume` 是"不动 seed 重启"，验证
+  bns_dv 链上幂等重放与 cyfs-sn ensure-exists 重放的零写入契约（属"真集成，
+  默认跳过"层，入口 `e2e_sn_seed`，见 §1）。
 
 真 EVM 测试不要求覆盖所有业务分支；业务分支应优先留在 §2-§4 的快速测试中。
 
@@ -150,7 +157,7 @@ cd src && cargo test -- --test-threads=1
 涉及 BNS 合约或 ABI 时额外运行：
 
 ```bash
-cd src/apps/bns && forge test
+cd src/apps/bns && npm test
 ```
 
 ### 定向回归
@@ -179,8 +186,23 @@ cd src/apps/bns && scripts/dv-up.sh --fresh && scripts/dv-smoke.sh && scripts/dv
 cd src/apps/bns && scripts/dv-up.sh --resume && scripts/dv-smoke.sh && scripts/dv-down.sh
 ```
 
+涉及 SN seed（make_sn_config seed-v2 / sn_seed.rs / bns_dv seed）时运行：
+
+```bash
+cd src && cargo test -p cyfs-sn sn_seed -- --test-threads=1
+cd src && cargo test -p cyfs_gateway --test e2e_sn_seed -- --ignored --test-threads=1
+```
+
+手工调试 SN 本机环境（三件套，仿 bns dv）：
+
+```bash
+cd src/web3-gateway && scripts/sn-dev-up.sh --fresh && scripts/sn-dev-smoke.sh
+cd src/web3-gateway && scripts/sn-dev-down.sh --purge
+```
+
 ## 7. 当前缺口
 
+- TODO（本版本）：SN Auth 尚无注册邮箱字段、邮箱唯一绑定、存量账号迁移和密码找回测试；实现时需要同时补 DB、RPC、并发和端到端覆盖。
 - SN 服务层尚缺一个“`bns_write_enabled=true` + 真 BNS EVM/indexer/server”的完整业务端到端测试，用来覆盖 `auth.register`、`zone.bind_config`、`did.set_document` 通过 BNS Controller 写链后，再由 SN Resolver 读回的闭环。
 - 真链 reorg 场景目前主要由 mock RPC 覆盖；如果未来要支持生产级 reorg 回滚策略，需要增加更接近真实节点行为的集成验证。
 - SN Auth DB 的 remote S2S 适配已有接口，但缺少像 DeviceInfo 一样的 local/remote 同批用例一致性测试。

@@ -1,4 +1,8 @@
 use crate::{into_sn_err, sn_err, SnErrorCode, SnResult};
+pub use cyfs_gateway_api::{
+    SnDeviceEndpoint, SnDeviceEndpointUpdate, SnDeviceRole, SnDeviceState, SnDeviceStateView,
+    SnEndpointProtocol, SnEndpointScope, SnEndpointSource, SnEndpointState, SnNatType,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteRow};
@@ -44,124 +48,6 @@ macro_rules! string_enum {
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum SnDeviceRole {
-    Gateway,
-    Ood,
-    Normal,
-    Unknown,
-}
-
-string_enum!(SnDeviceRole {
-    Gateway => "gateway",
-    Ood => "ood",
-    Normal => "normal",
-    Unknown => "unknown",
-});
-
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SnDeviceState {
-    Online,
-    Offline,
-    Stale,
-    Blocked,
-}
-
-string_enum!(SnDeviceState {
-    Online => "online",
-    Offline => "offline",
-    Stale => "stale",
-    Blocked => "blocked",
-});
-
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SnNatType {
-    Public,
-    Private,
-    Symmetric,
-    Unknown,
-}
-
-string_enum!(SnNatType {
-    Public => "public",
-    Private => "private",
-    Symmetric => "symmetric",
-    Unknown => "unknown",
-});
-
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SnEndpointProtocol {
-    Tcp,
-    Udp,
-    Quic,
-    Rtcp,
-    Http,
-    Https,
-}
-
-string_enum!(SnEndpointProtocol {
-    Tcp => "tcp",
-    Udp => "udp",
-    Quic => "quic",
-    Rtcp => "rtcp",
-    Http => "http",
-    Https => "https",
-});
-
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SnEndpointScope {
-    Public,
-    Private,
-    Relay,
-    Loopback,
-    Unknown,
-}
-
-string_enum!(SnEndpointScope {
-    Public => "public",
-    Private => "private",
-    Relay => "relay",
-    Loopback => "loopback",
-    Unknown => "unknown",
-});
-
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SnEndpointSource {
-    DeviceReport,
-    FromIp,
-    RelayObserved,
-    Admin,
-}
-
-string_enum!(SnEndpointSource {
-    DeviceReport => "device_report",
-    FromIp => "from_ip",
-    RelayObserved => "relay_observed",
-    Admin => "admin",
-});
-
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SnEndpointState {
-    Active,
-    Stale,
-    Failed,
-    Disabled,
-}
-
-string_enum!(SnEndpointState {
-    Active => "active",
-    Stale => "stale",
-    Failed => "failed",
-    Disabled => "disabled",
-});
-
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
 pub enum SnDeviceStateEventType {
     Registered,
     Rebound,
@@ -197,35 +83,6 @@ pub struct SnDeviceIndex {
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
-pub struct SnDeviceEndpointUpdate {
-    pub endpoint_id: String,
-    pub protocol: SnEndpointProtocol,
-    pub host: String,
-    pub port: Option<u16>,
-    pub scope: SnEndpointScope,
-    pub priority: i64,
-    pub source: SnEndpointSource,
-    pub expires_at: Option<u64>,
-}
-
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
-pub struct SnDeviceEndpoint {
-    pub did: String,
-    pub endpoint_id: String,
-    pub protocol: SnEndpointProtocol,
-    pub host: String,
-    pub port: Option<u16>,
-    pub scope: SnEndpointScope,
-    pub priority: i64,
-    pub source: SnEndpointSource,
-    pub state: SnEndpointState,
-    pub last_seen_at: Option<u64>,
-    pub expires_at: Option<u64>,
-    pub created_at: u64,
-    pub updated_at: u64,
-}
-
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SnDeviceStateUpdate {
     pub did: String,
     pub reported_ip: Option<String>,
@@ -236,23 +93,6 @@ pub struct SnDeviceStateUpdate {
     pub report_seq: Option<u64>,
     pub ttl: u64,
     pub raw_report: Option<String>,
-}
-
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
-pub struct SnDeviceStateView {
-    pub did: String,
-    pub zone: String,
-    pub device_name: String,
-    pub device_role: SnDeviceRole,
-    pub state: SnDeviceState,
-    pub public_ips: Vec<String>,
-    pub private_ips: Vec<String>,
-    pub active_endpoints: Vec<SnDeviceEndpoint>,
-    pub preferred_endpoint: Option<SnDeviceEndpoint>,
-    pub nat_type: SnNatType,
-    pub is_wan_device: bool,
-    pub last_seen_at: Option<u64>,
-    pub expires_at: Option<u64>,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize, Default)]

@@ -1,6 +1,6 @@
 use crate::{
-    sn_err, AccountSession, DomainBinding, PkxBindingChallenge, SNUserInfo, SnAuthDB, SnAuthInfo,
-    SnClearStateResult, SnError, SnErrorCode, SnResult, UserState, ZoneInfo, ZoneInfoPatch,
+    sn_err, AccountSession, DomainBinding, SNUserInfo, SnAuthDB, SnAuthInfo, SnClearStateResult,
+    SnError, SnErrorCode, SnResult, UserState, ZoneInfo, ZoneInfoPatch,
 };
 use ::kRPC::{kRPC, RPCErrors, RPCHandler, RPCRequest, RPCResponse, RPCResult};
 use async_trait::async_trait;
@@ -19,6 +19,7 @@ pub const METHOD_CLEAR_STATE_BY_ACTIVE_CODE: &str = "sn_auth_db.clear_state_by_a
 pub const METHOD_REGISTER_USER: &str = "sn_auth_db.register_user";
 pub const METHOD_CREATE_AUTH: &str = "sn_auth_db.create_auth";
 pub const METHOD_IS_USER_EXIST: &str = "sn_auth_db.is_user_exist";
+pub const METHOD_GET_USER_BY_EMAIL: &str = "sn_auth_db.get_user_by_email";
 pub const METHOD_REGISTER_USER_WITH_OWNER_KEY: &str = "sn_auth_db.register_user_with_owner_key";
 pub const METHOD_GET_USER_BY_PUBLIC_KEY: &str = "sn_auth_db.get_user_by_public_key";
 pub const METHOD_GET_USER_INFO: &str = "sn_auth_db.get_user_info";
@@ -31,8 +32,7 @@ pub const METHOD_UPDATE_USER_DOMAIN: &str = "sn_auth_db.update_user_domain";
 pub const METHOD_GET_USER_SN_IPS: &str = "sn_auth_db.get_user_sn_ips";
 pub const METHOD_GET_AUTH: &str = "sn_auth_db.get_auth";
 pub const METHOD_UPDATE_LAST_LOGIN: &str = "sn_auth_db.update_last_login";
-pub const METHOD_CREATE_PKX_BINDING: &str = "sn_auth_db.create_pkx_binding";
-pub const METHOD_VERIFY_PKX_BINDING: &str = "sn_auth_db.verify_pkx_binding";
+pub const METHOD_ACTIVATE_USER_DOMAIN_BINDING: &str = "sn_auth_db.activate_user_domain_binding";
 pub const METHOD_UNBIND_USER_DOMAIN: &str = "sn_auth_db.unbind_user_domain";
 pub const METHOD_GET_ZONE_INFO: &str = "sn_auth_db.get_zone_info";
 pub const METHOD_UPDATE_ZONE_INFO: &str = "sn_auth_db.update_zone_info";
@@ -190,6 +190,7 @@ impl SnAuthDbClearStateByActiveCodeReq {
 pub struct SnAuthDbRegisterUserReq {
     pub active_code: String,
     pub username: String,
+    pub email: String,
     pub password_hash: String,
     pub password_salt: String,
     pub password_algo: String,
@@ -199,6 +200,7 @@ impl SnAuthDbRegisterUserReq {
     pub fn new(
         active_code: &str,
         username: &str,
+        email: &str,
         password_hash: &str,
         password_salt: &str,
         password_algo: &str,
@@ -206,6 +208,7 @@ impl SnAuthDbRegisterUserReq {
         Self {
             active_code: active_code.to_string(),
             username: username.to_string(),
+            email: email.to_string(),
             password_hash: password_hash.to_string(),
             password_salt: password_salt.to_string(),
             password_algo: password_algo.to_string(),
@@ -246,6 +249,21 @@ pub struct SnAuthDbUsernameReq {
     pub username: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SnAuthDbEmailReq {
+    pub email: String,
+}
+
+impl SnAuthDbEmailReq {
+    pub fn new(email: &str) -> Self {
+        Self {
+            email: email.to_string(),
+        }
+    }
+
+    impl_req_from_json!(SnAuthDbEmailReq);
+}
+
 impl SnAuthDbUsernameReq {
     pub fn new(username: &str) -> Self {
         Self {
@@ -260,6 +278,7 @@ impl SnAuthDbUsernameReq {
 pub struct SnAuthDbRegisterUserWithOwnerKeyReq {
     pub active_code: String,
     pub username: String,
+    pub email: String,
     pub public_key: String,
     pub zone_config: String,
     pub user_domain: Option<String>,
@@ -270,6 +289,7 @@ impl SnAuthDbRegisterUserWithOwnerKeyReq {
     pub fn new(
         active_code: &str,
         username: &str,
+        email: &str,
         public_key: &str,
         zone_config: &str,
         user_domain: Option<String>,
@@ -278,6 +298,7 @@ impl SnAuthDbRegisterUserWithOwnerKeyReq {
         Self {
             active_code: active_code.to_string(),
             username: username.to_string(),
+            email: email.to_string(),
             public_key: public_key.to_string(),
             zone_config: zone_config.to_string(),
             user_domain,
@@ -421,39 +442,22 @@ impl SnAuthDbUpdateLastLoginReq {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SnAuthDbCreatePkxBindingReq {
+pub struct SnAuthDbActivateUserDomainBindingReq {
     pub username: String,
     pub domain: String,
+    pub pkx: String,
 }
 
-impl SnAuthDbCreatePkxBindingReq {
-    pub fn new(username: &str, domain: &str) -> Self {
+impl SnAuthDbActivateUserDomainBindingReq {
+    pub fn new(username: &str, domain: &str, pkx: &str) -> Self {
         Self {
             username: username.to_string(),
             domain: domain.to_string(),
+            pkx: pkx.to_string(),
         }
     }
 
-    impl_req_from_json!(SnAuthDbCreatePkxBindingReq);
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SnAuthDbVerifyPkxBindingReq {
-    pub username: String,
-    pub domain: String,
-    pub txt_records: Vec<String>,
-}
-
-impl SnAuthDbVerifyPkxBindingReq {
-    pub fn new(username: &str, domain: &str, txt_records: &[String]) -> Self {
-        Self {
-            username: username.to_string(),
-            domain: domain.to_string(),
-            txt_records: txt_records.to_vec(),
-        }
-    }
-
-    impl_req_from_json!(SnAuthDbVerifyPkxBindingReq);
+    impl_req_from_json!(SnAuthDbActivateUserDomainBindingReq);
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -720,6 +724,7 @@ impl SnAuthDB for SnAuthDbClient {
         &self,
         active_code: &str,
         username: &str,
+        email: &str,
         password_hash: &str,
         password_salt: &str,
         password_algo: &str,
@@ -730,6 +735,7 @@ impl SnAuthDB for SnAuthDbClient {
                     .register_user(
                         active_code,
                         username,
+                        email,
                         password_hash,
                         password_salt,
                         password_algo,
@@ -742,6 +748,7 @@ impl SnAuthDB for SnAuthDbClient {
                     &SnAuthDbRegisterUserReq::new(
                         active_code,
                         username,
+                        email,
                         password_hash,
                         password_salt,
                         password_algo,
@@ -790,10 +797,21 @@ impl SnAuthDB for SnAuthDbClient {
         }
     }
 
+    async fn get_user_by_email(&self, email: &str) -> SnResult<Option<SNUserInfo>> {
+        match self {
+            Self::InProcess(handler) => handler.get_user_by_email(email).await,
+            Self::KRPC(_) => {
+                self.call(METHOD_GET_USER_BY_EMAIL, &SnAuthDbEmailReq::new(email))
+                    .await
+            }
+        }
+    }
+
     async fn register_user_with_owner_key(
         &self,
         active_code: &str,
         username: &str,
+        email: &str,
         public_key: &str,
         zone_config: &str,
         user_domain: Option<String>,
@@ -805,6 +823,7 @@ impl SnAuthDB for SnAuthDbClient {
                     .register_user_with_owner_key(
                         active_code,
                         username,
+                        email,
                         public_key,
                         zone_config,
                         user_domain,
@@ -818,6 +837,7 @@ impl SnAuthDB for SnAuthDbClient {
                     &SnAuthDbRegisterUserWithOwnerKeyReq::new(
                         active_code,
                         username,
+                        email,
                         public_key,
                         zone_config,
                         user_domain,
@@ -969,39 +989,22 @@ impl SnAuthDB for SnAuthDbClient {
         }
     }
 
-    async fn create_pkx_binding(
+    async fn activate_user_domain_binding(
         &self,
         username: &str,
         domain: &str,
-    ) -> SnResult<PkxBindingChallenge> {
-        match self {
-            Self::InProcess(handler) => handler.create_pkx_binding(username, domain).await,
-            Self::KRPC(_) => {
-                self.call(
-                    METHOD_CREATE_PKX_BINDING,
-                    &SnAuthDbCreatePkxBindingReq::new(username, domain),
-                )
-                .await
-            }
-        }
-    }
-
-    async fn verify_pkx_binding(
-        &self,
-        username: &str,
-        domain: &str,
-        txt_records: &[String],
+        pkx: &str,
     ) -> SnResult<DomainBinding> {
         match self {
             Self::InProcess(handler) => {
                 handler
-                    .verify_pkx_binding(username, domain, txt_records)
+                    .activate_user_domain_binding(username, domain, pkx)
                     .await
             }
             Self::KRPC(_) => {
                 self.call(
-                    METHOD_VERIFY_PKX_BINDING,
-                    &SnAuthDbVerifyPkxBindingReq::new(username, domain, txt_records),
+                    METHOD_ACTIVATE_USER_DOMAIN_BINDING,
+                    &SnAuthDbActivateUserDomainBindingReq::new(username, domain, pkx),
                 )
                 .await
             }
@@ -1183,6 +1186,7 @@ where
                         .register_user(
                             &parsed.active_code,
                             &parsed.username,
+                            &parsed.email,
                             &parsed.password_hash,
                             &parsed.password_salt,
                             &parsed.password_algo,
@@ -1209,6 +1213,10 @@ where
                 let parsed = SnAuthDbUsernameReq::from_json(req.params.clone())?;
                 rpc_envelope_response(self.0.is_user_exist(&parsed.username).await, &req)
             }
+            METHOD_GET_USER_BY_EMAIL | "get_user_by_email" => {
+                let parsed = SnAuthDbEmailReq::from_json(req.params.clone())?;
+                rpc_envelope_response(self.0.get_user_by_email(&parsed.email).await, &req)
+            }
             METHOD_REGISTER_USER_WITH_OWNER_KEY | "register_user_with_owner_key" => {
                 let parsed = SnAuthDbRegisterUserWithOwnerKeyReq::from_json(req.params.clone())?;
                 rpc_envelope_response(
@@ -1216,6 +1224,7 @@ where
                         .register_user_with_owner_key(
                             &parsed.active_code,
                             &parsed.username,
+                            &parsed.email,
                             &parsed.public_key,
                             &parsed.zone_config,
                             parsed.user_domain,
@@ -1300,20 +1309,15 @@ where
                     &req,
                 )
             }
-            METHOD_CREATE_PKX_BINDING | "create_pkx_binding" => {
-                let parsed = SnAuthDbCreatePkxBindingReq::from_json(req.params.clone())?;
+            METHOD_ACTIVATE_USER_DOMAIN_BINDING | "activate_user_domain_binding" => {
+                let parsed = SnAuthDbActivateUserDomainBindingReq::from_json(req.params.clone())?;
                 rpc_envelope_response(
                     self.0
-                        .create_pkx_binding(&parsed.username, &parsed.domain)
-                        .await,
-                    &req,
-                )
-            }
-            METHOD_VERIFY_PKX_BINDING | "verify_pkx_binding" => {
-                let parsed = SnAuthDbVerifyPkxBindingReq::from_json(req.params.clone())?;
-                rpc_envelope_response(
-                    self.0
-                        .verify_pkx_binding(&parsed.username, &parsed.domain, &parsed.txt_records)
+                        .activate_user_domain_binding(
+                            &parsed.username,
+                            &parsed.domain,
+                            &parsed.pkx,
+                        )
                         .await,
                     &req,
                 )

@@ -1,7 +1,7 @@
 //! §5.2(A) DV 集成测试（端到端，真 anvil 私链）。
 //!
-//! 覆盖测试计划 doc/SN/SN-测试计划.md §5.2(A)：在测试进程内拉起 anvil + 用 `forge create`
-//! 部署 `Bns.sol`（自包含，不依赖 §5.1 脚本），跑通真链路
+//! 覆盖测试计划 doc/SN/SN-测试计划.md §5.2(A)：在测试进程内拉起 anvil + 用 Hardhat
+//! 部署 BNS UUPS proxy/facets（自包含，不依赖 §5.1 脚本），跑通真链路
 //! `BNS(合约) <-> BNS-Indexer <-> BNS-Server(读投影/写转发) <-> BNS-Client <-> Controller`。
 //!
 //! 这些用例只验证"跨层拼接 + 真 EVM 暴露的问题"（selector/packing/revert/event topic/nonce/
@@ -9,7 +9,7 @@
 //!
 //! - 全部 `#[ignore]`：默认 `cargo test` 跳过，`cargo test -p bns-client --test e2e_anvil -- --ignored`
 //!   显式运行。
-//! - 缺 Foundry（`anvil`/`forge` 不在 PATH）时优雅跳过而非失败。
+//! - 缺 Anvil 或 Node.js（`anvil`/`node`/`npm` 不在 PATH）时优雅跳过而非失败。
 //!
 //! 覆盖项：
 //! - [x] 写读闭环：Controller 注册 name → publishDocument(inline) → sync_once → 读投影命中，
@@ -54,19 +54,19 @@ const CHAIN_ID: u64 = 31_337;
 // account[0]：Controller/owner 写账户（msg.sender）。
 const WRITER_KEY: &str = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
 const WRITER_ADDR: &str = "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266";
-// account[1]：仅用于 `forge create` 部署，nonce 与写账户独立，避免交错冲突。
+// account[1]：仅用于 Hardhat 部署，nonce 与写账户独立，避免交错冲突。
 const DEPLOYER_KEY: &str = "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d";
 // account[2]：controller-policy 用例里的受托 controller。
 const CONTROLLER_KEY: &str = "0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a";
 const CONTROLLER_ADDR: &str = "0x3c44cdddb6a900fa2b585dd299e03d12fa4293bc";
 
-// `forge create` 会触发增量编译并读写 out/、cache/；并发跑会破坏 build 缓存，串行化。
-fn forge_lock() -> &'static tokio::sync::Mutex<()> {
+// Hardhat 会读写 artifacts/cache；并发部署会破坏编译缓存，串行化并只 compile 一次。
+fn hardhat_lock() -> &'static tokio::sync::Mutex<()> {
     static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
 }
 
-fn foundry_available() -> bool {
+fn e2e_tools_available() -> bool {
     fn has(bin: &str) -> bool {
         std::process::Command::new(bin)
             .arg("--version")
@@ -76,7 +76,7 @@ fn foundry_available() -> bool {
             .map(|s| s.success())
             .unwrap_or(false)
     }
-    has("anvil") && has("forge")
+    has("anvil") && has("node") && has("npm")
 }
 
 fn bns_app_dir() -> PathBuf {
@@ -84,7 +84,7 @@ fn bns_app_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../apps/bns")
         .canonicalize()
-        .expect("bns foundry project should exist")
+        .expect("bns hardhat project should exist")
 }
 
 /// 进程内托管的 anvil 私链；Drop 时 kill。
@@ -110,7 +110,6 @@ impl AnvilNode {
                 &CHAIN_ID.to_string(),
                 "--mnemonic",
                 "test test test test test test test test test test test junk",
-                "--disable-code-size-limit",
             ])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -143,42 +142,55 @@ impl AnvilNode {
     }
 }
 
-/// 用 `forge create` 部署 `Bns.sol`（与 scripts/deploy.sh 同路径），返回合约地址。
+/// 用生产部署共用的 Hardhat 路径部署 UUPS proxy 和全部 facets，返回 proxy 地址。
 async fn deploy_bns(endpoint: &str, deployer_key: &str) -> Address {
-    let _guard = forge_lock().lock().await;
-    let output = Command::new("forge")
+    static COMPILED: OnceLock<()> = OnceLock::new();
+
+    let _guard = hardhat_lock().lock().await;
+    if COMPILED.get().is_none() {
+        let compile = Command::new("npm")
+            .current_dir(bns_app_dir())
+            .args(["run", "--silent", "compile"])
+            .output()
+            .await
+            .expect("failed to run Hardhat compile");
+        assert!(
+            compile.status.success(),
+            "Hardhat compile failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&compile.stdout),
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        COMPILED
+            .set(())
+            .expect("Hardhat compile state should be empty");
+    }
+
+    let output = Command::new("npm")
         .current_dir(bns_app_dir())
-        .args([
-            "create",
-            "src/Bns.sol:Bns",
-            "--rpc-url",
-            endpoint,
-            "--private-key",
-            deployer_key,
-            "--broadcast",
-            "--json",
-        ])
+        .env("BNS_ANVIL_RPC_URL", endpoint)
+        .env("BNS_ANVIL_PRIVATE_KEY", deployer_key)
+        .args(["run", "--silent", "deploy:local"])
         .output()
         .await
-        .expect("failed to run forge create");
+        .expect("failed to run Hardhat local deployment");
     assert!(
         output.status.success(),
-        "forge create failed: {}",
+        "Hardhat local deployment failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
-    // forge create --json 输出（可能多行 pretty-print）的 JSON 对象；编译日志走 stderr。
-    // 截取首个 '{' 到末个 '}' 的片段整体解析。
+    // deploy:local 输出 forge-compatible JSON；部署进度和校验日志走 stderr。
     let start = stdout
         .find('{')
-        .unwrap_or_else(|| panic!("forge create produced no JSON: {stdout}"));
+        .unwrap_or_else(|| panic!("Hardhat deployment produced no JSON: {stdout}"));
     let end = stdout
         .rfind('}')
-        .unwrap_or_else(|| panic!("forge create produced no JSON object: {stdout}"));
+        .unwrap_or_else(|| panic!("Hardhat deployment produced no JSON object: {stdout}"));
     let parsed: serde_json::Value = serde_json::from_str(&stdout[start..=end]).unwrap();
     let address = parsed["deployedTo"]
         .as_str()
-        .expect("forge create JSON missing deployedTo");
+        .expect("Hardhat deployment JSON missing deployedTo");
     address.parse().expect("invalid deployed contract address")
 }
 
@@ -265,10 +277,10 @@ fn sync_config(endpoint: &str, contract: Address, confirmations: u64) -> BnsInde
 // =====================================================================================
 
 #[tokio::test]
-#[ignore = "requires Foundry (anvil/forge); run with --ignored"]
+#[ignore = "requires anvil/node/npm; run with --ignored"]
 async fn e2e_write_read_closed_loop_matches_onchain_truth() {
-    if !foundry_available() {
-        eprintln!("skipping: anvil/forge not on PATH");
+    if !e2e_tools_available() {
+        eprintln!("skipping: anvil/node/npm not on PATH");
         return;
     }
     let node = AnvilNode::start().await;
@@ -358,10 +370,10 @@ async fn e2e_write_read_closed_loop_matches_onchain_truth() {
 // =====================================================================================
 
 #[tokio::test]
-#[ignore = "requires Foundry (anvil/forge); run with --ignored"]
+#[ignore = "requires anvil/node/npm; run with --ignored"]
 async fn e2e_signing_boundary_actor_mismatch_reverts_onchain() {
-    if !foundry_available() {
-        eprintln!("skipping: anvil/forge not on PATH");
+    if !e2e_tools_available() {
+        eprintln!("skipping: anvil/node/npm not on PATH");
         return;
     }
     let node = AnvilNode::start().await;
@@ -433,10 +445,10 @@ async fn e2e_signing_boundary_actor_mismatch_reverts_onchain() {
 // =====================================================================================
 
 #[tokio::test]
-#[ignore = "requires Foundry (anvil/forge); run with --ignored"]
+#[ignore = "requires anvil/node/npm; run with --ignored"]
 async fn e2e_nonce_replay_and_chain_id_rejection() {
-    if !foundry_available() {
-        eprintln!("skipping: anvil/forge not on PATH");
+    if !e2e_tools_available() {
+        eprintln!("skipping: anvil/node/npm not on PATH");
         return;
     }
     let node = AnvilNode::start().await;
@@ -493,10 +505,10 @@ async fn e2e_nonce_replay_and_chain_id_rejection() {
 // =====================================================================================
 
 #[tokio::test]
-#[ignore = "requires Foundry (anvil/forge); run with --ignored"]
+#[ignore = "requires anvil/node/npm; run with --ignored"]
 async fn e2e_confirmations_gate_and_cursor_advance() {
-    if !foundry_available() {
-        eprintln!("skipping: anvil/forge not on PATH");
+    if !e2e_tools_available() {
+        eprintln!("skipping: anvil/node/npm not on PATH");
         return;
     }
     let node = AnvilNode::start().await;
@@ -559,10 +571,10 @@ async fn e2e_confirmations_gate_and_cursor_advance() {
 // =====================================================================================
 
 #[tokio::test]
-#[ignore = "requires Foundry (anvil/forge); run with --ignored"]
+#[ignore = "requires anvil/node/npm; run with --ignored"]
 async fn e2e_redeploy_uses_isolated_source_and_replays_from_zero() {
-    if !foundry_available() {
-        eprintln!("skipping: anvil/forge not on PATH");
+    if !e2e_tools_available() {
+        eprintln!("skipping: anvil/node/npm not on PATH");
         return;
     }
     let node = AnvilNode::start().await;
@@ -633,10 +645,10 @@ async fn e2e_redeploy_uses_isolated_source_and_replays_from_zero() {
 // =====================================================================================
 
 #[tokio::test]
-#[ignore = "requires Foundry (anvil/forge); run with --ignored"]
+#[ignore = "requires anvil/node/npm; run with --ignored"]
 async fn e2e_controller_policy_scopes_doc_types_on_chain() {
-    if !foundry_available() {
-        eprintln!("skipping: anvil/forge not on PATH");
+    if !e2e_tools_available() {
+        eprintln!("skipping: anvil/node/npm not on PATH");
         return;
     }
     let node = AnvilNode::start().await;

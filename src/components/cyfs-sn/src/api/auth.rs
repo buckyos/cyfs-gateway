@@ -1,21 +1,27 @@
 use super::common::{
-    bns_default_asset_owner, build_profile_json, normalize_evm_address, normalize_username,
-    now_secs, ok_response, parse_params, require_account_username, ActiveCodeReq, IntoRpcResult,
-    LoginReq, NameReq, RefreshReq, RegisterReq, RpcCallResult,
+    build_profile_response, normalize_evm_address, normalize_username, now_secs, ok_response,
+    parse_params, require_account_username, ActiveCodeReq, IntoRpcResult, LoginReq, NameReq,
+    RefreshReq, RegisterReq, RpcCallResult,
 };
-use super::errors::{bns_write_error, parse_error, SnApiErrorCode};
+use super::errors::{bns_proxy_error, parse_error, reason_error, SnApiErrorCode};
 use crate::sn_auth_manager::{hash_password, verify_password, PASSWORD_ALGO};
-use crate::SNServer;
+use crate::sn_bns_proxy::SnBnsProxyRegisterParams;
+use crate::{AllocateZoneRelayReq, SNServer};
 use ::kRPC::{RPCErrors, RPCRequest, RPCResponse};
-use bns_client::RegisterNameParams;
-use bns_indexer::{CallAuthority, MutationGuard, RegisterOptions};
+use cyfs_gateway_api::{
+    SnAuthRefreshResp, SnAuthSessionResp, SnBnsProxyTxOutcome, SnCheckUsernameReason,
+    SnCheckUsernameResp, SnSuccessResp,
+};
+use log::{info, warn};
 use serde_json::{json, Value};
+use std::net::IpAddr;
 
 async fn build_auth_success_response(
     server: &SNServer,
     req: &RPCRequest,
     username: &str,
     need_bind_owner_key: bool,
+    bns: Option<SnBnsProxyTxOutcome>,
 ) -> RpcCallResult<RPCResponse> {
     let access_token = server.auth().issue_access_session(username)?;
     let refresh_token = server.auth().issue_refresh_session(username)?;
@@ -43,31 +49,37 @@ async fn build_auth_success_response(
         .into_rpc()?;
     ok_response(
         req,
-        json!({
-            "code": 0,
-            "access_token": access_token.token,
-            "refresh_token": refresh_token.token,
-            "need_bind_owner_key": need_bind_owner_key
-        }),
+        SnAuthSessionResp {
+            code: 0,
+            access_token: access_token.token,
+            refresh_token: refresh_token.token,
+            need_bind_owner_key,
+            bns,
+        },
     )
 }
 
-fn default_owner_config(username: &str) -> Value {
+pub(crate) fn default_owner_config(username: &str) -> Value {
+    // NameState.registered_at is authoritative. Keep this payload stable so a
+    // request_id replay produces the same idempotency hash.
     json!({
         "name": username,
         "created_by": "cyfs-sn",
-        "created_at": now_secs(),
     })
 }
 
-pub(crate) async fn handle_auth(server: &SNServer, req: RPCRequest) -> RpcCallResult<RPCResponse> {
+pub(crate) async fn handle_auth(
+    server: &SNServer,
+    req: RPCRequest,
+    source_ip: Option<IpAddr>,
+) -> RpcCallResult<RPCResponse> {
     match req.method.as_str() {
         "check_username" => {
             let params: NameReq = parse_params(&req)?;
             let username = params.name.trim().to_lowercase();
             let (valid, reason, message) =
                 if let Err(message) = SNServer::validate_registration_username(username.as_str()) {
-                    (false, "invalid_username".to_string(), message)
+                    (false, SnCheckUsernameReason::InvalidUsername, message)
                 } else {
                     let exists = server
                         .auth_db()
@@ -77,22 +89,22 @@ pub(crate) async fn handle_auth(server: &SNServer, req: RPCRequest) -> RpcCallRe
                     if exists {
                         (
                             false,
-                            "already_exists".to_string(),
+                            SnCheckUsernameReason::AlreadyExists,
                             format!("username {} already exists", username),
                         )
                     } else {
-                        (true, "ok".to_string(), String::new())
+                        (true, SnCheckUsernameReason::Ok, String::new())
                     }
                 };
 
             ok_response(
                 &req,
-                json!({
-                    "valid": valid,
-                    "reason": reason,
-                    "message": message,
-                    "normalized_name": username,
-                }),
+                SnCheckUsernameResp {
+                    valid,
+                    reason,
+                    message,
+                    normalized_name: username,
+                },
             )
         }
         "check_active_code" => {
@@ -108,6 +120,28 @@ pub(crate) async fn handle_auth(server: &SNServer, req: RPCRequest) -> RpcCallRe
             let username = normalize_username(params.name.as_str())?;
             SNServer::validate_registration_username(username.as_str())
                 .map_err(|message| parse_error(SnApiErrorCode::InvalidUsername, message))?;
+            let email = crate::canonical_email(params.email.as_str())
+                .map_err(|error| parse_error(SnApiErrorCode::InvalidEmail, error.msg()))?;
+            let request_id = params
+                .request_id
+                .clone()
+                .unwrap_or_else(|| format!("sn:register:{}", username));
+            info!(
+                "sn auth register started: username={} request_id={} bns_enabled={} asset_owner_supplied={} initial_documents_empty={}",
+                username,
+                request_id,
+                true,
+                params.asset_owner.is_some(),
+                params
+                    .initial_documents
+                    .as_ref()
+                    .map_or(true, |documents| documents.is_empty())
+            );
+            // 锁覆盖预查、可选 BNS bootstrap 和本地事务，避免同进程并发请求
+            // 在邮箱冲突已知前产生两次外部注册副作用。SQLite UNIQUE 索引仍兜底。
+            let _email_locker =
+                async_named_locker::Locker::get_locker(format!("sn_auth_register_email_{}", email))
+                    .await;
             if server
                 .auth_db()
                 .is_user_exist(username.as_str())
@@ -125,6 +159,18 @@ pub(crate) async fn handle_auth(server: &SNServer, req: RPCRequest) -> RpcCallRe
                     format!("username {} already exists", username),
                 ));
             }
+            if server
+                .auth_db()
+                .get_user_by_email(email.as_str())
+                .await
+                .into_rpc()?
+                .is_some()
+            {
+                return Err(parse_error(
+                    SnApiErrorCode::EmailAlreadyBound,
+                    "email is already bound to another account",
+                ));
+            }
             if !server
                 .auth_db()
                 .check_active_code(params.active_code.as_str())
@@ -136,55 +182,128 @@ pub(crate) async fn handle_auth(server: &SNServer, req: RPCRequest) -> RpcCallRe
                     "register failed, invalid activation code",
                 ));
             }
+            info!(
+                "sn auth register prechecks passed: username={} request_id={}",
+                username, request_id
+            );
             let (password_hash, password_salt) = hash_password(params.pwd_hash.as_str())?;
-            let need_bind_owner_key = server.bns_controller().is_none();
-            if let Some(controller) = server.bns_controller() {
+            let need_bind_owner_key = false;
+            // BNS bootstrap 在本地建号之前执行：失败则不创建本地用户，避免
+            // 本地账号与 BNS name 不一致（同 request_id 重试幂等）。
+            let bns_info = {
+                let proxy = server.bns_proxy();
                 let asset_owner = match params.asset_owner.as_deref() {
                     Some(value) => normalize_evm_address(value, "asset_owner")?,
-                    None => bns_default_asset_owner(&controller)?,
+                    None if proxy.require_user_asset_owner() => {
+                        return Err(parse_error(
+                            SnApiErrorCode::InvalidParams,
+                            "asset_owner is required: upload the user's owner EVM address",
+                        ));
+                    }
+                    // devtest 回落：使用该用户绑定 controller 的地址。
+                    None => proxy
+                        .default_asset_owner_for_user(username.as_str())
+                        .await
+                        .map_err(bns_proxy_error)?,
                 };
-                controller
-                    .register_name(RegisterNameParams {
-                        request_id: params
-                            .request_id
-                            .clone()
-                            .unwrap_or_else(|| format!("sn:register:{}", username)),
+                info!(
+                    "sn auth register submitting BNS registerName: username={} request_id={}",
+                    username, request_id
+                );
+                let outcome = proxy
+                    .register_bootstrap_and_wait(SnBnsProxyRegisterParams {
+                        request_id: request_id.clone(),
                         name: username.clone(),
                         asset_owner,
-                        register_options: RegisterOptions {
-                            ..RegisterOptions::default()
-                        },
                         owner_config: params
                             .owner_config
                             .clone()
                             .unwrap_or_else(|| default_owner_config(username.as_str())),
-                        owner_authority_keys: Vec::new(),
-                        semantic_owner_after_authority: None,
-                        initial_documents: Vec::new(),
-                        authority: CallAuthority::public(),
-                        guard: MutationGuard::default(),
+                        initial_documents: params.initial_documents.clone().unwrap_or_default(),
                     })
                     .await
-                    .map_err(bns_write_error)?;
-            }
+                    .map_err(bns_proxy_error)?;
+                server.invalidate_bns_name_dns_cache(username.as_str());
+                info!(
+                    "sn auth register BNS bootstrap confirmed: username={} request_id={} tx_hash={} reused={}",
+                    username,
+                    request_id,
+                    outcome.tx_hash.as_deref().unwrap_or("-"),
+                    outcome.reused
+                );
+                Some(outcome)
+            };
             let ok = server
                 .auth_db()
                 .register_user(
                     params.active_code.as_str(),
                     username.as_str(),
+                    email.as_str(),
                     password_hash.as_str(),
                     password_salt.as_str(),
                     PASSWORD_ALGO,
                 )
                 .await
-                .into_rpc()?;
+                .map_err(|error| {
+                    if error.code() == crate::SnErrorCode::Conflict
+                        && error.msg().starts_with("email already bound:")
+                    {
+                        parse_error(
+                            SnApiErrorCode::EmailAlreadyBound,
+                            "email is already bound to another account",
+                        )
+                    } else {
+                        reason_error(SnApiErrorCode::InternalError, error.to_string())
+                    }
+                })?;
             if !ok {
                 return Err(parse_error(
                     SnApiErrorCode::InvalidActiveCode,
                     "register failed, invalid activation code",
                 ));
             }
-            build_auth_success_response(server, &req, username.as_str(), need_bind_owner_key).await
+            info!(
+                "sn auth register local account created: username={} request_id={}",
+                username, request_id
+            );
+            // BNS 和本地账号创建都可能已产生不可回滚状态。Relay 暂不可用、
+            // GeoIP 失败或调度存储失败时只记录 pending，不让注册失败。
+            match server
+                .relay_manager()
+                .allocate_zone_relay(AllocateZoneRelayReq {
+                    zone: username.clone(),
+                    preferred_region: params.region,
+                    source_ip,
+                    reason: "register".to_string(),
+                    source_version: None,
+                })
+                .await
+            {
+                Ok(assignment) => info!(
+                    "sn auth register relay assigned: username={} request_id={} relay_id={} generation={}",
+                    username, request_id, assignment.relay_id, assignment.generation
+                ),
+                Err(error) => warn!(
+                    "sn auth register relay assignment pending: username={} request_id={} error_code={:?} error={}",
+                    username,
+                    request_id,
+                    error.code(),
+                    error.msg()
+                ),
+            }
+            let response = build_auth_success_response(
+                server,
+                &req,
+                username.as_str(),
+                need_bind_owner_key,
+                bns_info,
+            )
+            .await?;
+            info!(
+                "sn auth register completed: username={} request_id={} need_bind_owner_key={}",
+                username, request_id, need_bind_owner_key
+            );
+            Ok(response)
         }
         "login" => {
             let params: LoginReq = parse_params(&req)?;
@@ -222,13 +341,7 @@ pub(crate) async fn handle_auth(server: &SNServer, req: RPCRequest) -> RpcCallRe
                 .update_last_login(username.as_str(), now_secs())
                 .await
                 .into_rpc()?;
-            build_auth_success_response(
-                server,
-                &req,
-                username.as_str(),
-                server.bns_controller().is_none() && user.public_key.trim().is_empty(),
-            )
-            .await
+            build_auth_success_response(server, &req, username.as_str(), false, None).await
         }
         "refresh" => {
             let params: RefreshReq = parse_params(&req)?;
@@ -258,10 +371,10 @@ pub(crate) async fn handle_auth(server: &SNServer, req: RPCRequest) -> RpcCallRe
                 .into_rpc()?;
             ok_response(
                 &req,
-                json!({
-                    "code": 0,
-                    "access_token": access_token.token,
-                }),
+                SnAuthRefreshResp {
+                    code: 0,
+                    access_token: access_token.token,
+                },
             )
         }
         "logout" => {
@@ -293,7 +406,7 @@ pub(crate) async fn handle_auth(server: &SNServer, req: RPCRequest) -> RpcCallRe
                     }
                 }
             }
-            ok_response(&req, json!({ "code": 0 }))
+            ok_response(&req, SnSuccessResp { code: 0 })
         }
         "me" => {
             let username = require_account_username(server, &req).await?;
@@ -303,8 +416,21 @@ pub(crate) async fn handle_auth(server: &SNServer, req: RPCRequest) -> RpcCallRe
                 .await
                 .into_rpc()?
                 .ok_or_else(|| parse_error(SnApiErrorCode::UserNotFound, "user not found"))?;
-            ok_response(&req, build_profile_json(username.as_str(), &user))
+            ok_response(&req, build_profile_response(username.as_str(), &user))
         }
         _ => Err(RPCErrors::UnknownMethod(req.method)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_owner_config_is_deterministic() {
+        assert_eq!(
+            default_owner_config("alice"),
+            json!({"name": "alice", "created_by": "cyfs-sn"})
+        );
     }
 }

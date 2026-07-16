@@ -1,37 +1,53 @@
-use crate::api::{handle_auth, handle_device, handle_dns, handle_domain, handle_user};
+use crate::api::{
+    handle_auth, handle_bns_proxy, handle_device, handle_dns, handle_domain, handle_user,
+    handle_zone,
+};
 use crate::name_info_cache::{NameInfoCache, NameInfoCacheQueryResult, NameInfoCacheRef};
 use crate::sn_auth_manager::SnAuthManager;
-use crate::sn_bns_reader::BnsIndexerDocumentReader;
+use crate::sn_bns_proxy::{
+    SNBnsProxyConfig, SnBnsControllerBindingStoreRef, SnBnsProxy, SnBnsProxyController,
+    SqliteSnBnsControllerBindingStore,
+};
+use crate::sn_bns_reader::BnsRpcDocumentReader;
+use crate::sn_bns_signer::{
+    BoundControllerKeyManager, SnBnsControllerKeySpec, SnBnsProxyOperation, SnBnsTxSigner,
+};
 use crate::sn_compat_store::{SNDeviceInfo, SnCompatibilityStoreRef, SqliteSnCompatibilityStore};
 use crate::sn_did_resolver::{
-    normalize_sn_did_doc_type, SnDidResolveRequest, SnDidResolverProfile, SnDidResolverRef,
-    SnResolverBackedDidResolver, SN_DID_RESOLVER_ROUTE_PREFIX,
+    key_like_string_to_jwk, normalize_sn_did_doc_type, owner_key_from_config, SnDidResolveRequest,
+    SnDidResolverProfile, SnDidResolverRef, SnResolverBackedDidResolver,
+    SN_DID_RESOLVER_ROUTE_PREFIX,
 };
+use crate::sn_dns_proof::{DnsTxtResolverRef, DohDnsTxtResolver, DEFAULT_PKX_DOH_URL};
 use crate::sn_resolver::{
-    device_config_from_mini_jwt, ResolverCompatibilityReader, ResolverDeviceDocument,
-    ResolverDidDocument, SnAuthResolverReader, SnDeviceInfoResolverReader,
+    device_config_from_mini_jwt, BnsDocumentReader, ResolverCompatibilityReader,
+    ResolverDeviceDocument, ResolverDidDocument, SnAuthResolverReader, SnDeviceInfoResolverReader,
     SnRelayManagerResolverReader, SnResolver, SnResolverConfig, SnResolverError,
     SnResolverErrorKind, SnResolverRef, SnResolverResult,
 };
 use crate::{
-    SnAuthDBRef, SnDeviceEndpointUpdate, SnDeviceInfoDBRef, SnDeviceRole, SnDeviceState,
+    GeoIpResolverConfig, RelayAllocationConfig, SnAuthDBRef, SnAuthDbClient,
+    SnDeviceEndpointUpdate, SnDeviceInfoDBRef, SnDeviceInfoDbClient, SnDeviceRole, SnDeviceState,
     SnDeviceStateUpdate, SnEndpointProtocol, SnEndpointScope, SnEndpointSource, SnNatType,
     SnRelayManagerRef, SnResult, SqliteSnAuthDB, SqliteSnDeviceInfoDB, SqliteSnRelayManager,
+    XdbGeoIpResolver,
 };
 use ::kRPC::*;
 use async_trait::async_trait;
 use bns_client::{
-    canonical_bns_name, BnsEvmClientConfig, BnsEvmControllerClient, BnsIndexerApi,
-    BnsIndexerClient, SnBnsController, SnBnsControllerConfig, SqliteSnBnsWriteRequestStore,
+    canonical_bns_name, BnsEvmClientConfig, BnsEvmControllerClient, BnsRpcApi, BnsRpcClient,
+    BnsSystemInfo, Principal, PrincipalKind, SnBnsController, SnBnsControllerConfig,
+    SqliteSnBnsWriteRequestStore,
 };
-use bns_indexer::{Principal, PrincipalKind};
 use buckyos_kit::{get_buckyos_service_data_dir, is_valid_name, NameType};
 use cyfs_gateway_lib::server_err;
 use cyfs_gateway_lib::{
-    qa_json_to_rpc_request, HttpRequestProcessChainVars, HttpServer, NameServer, QAServer, Server,
-    ServerConfig, ServerContextRef, ServerError, ServerErrorCode, ServerFactory, ServerResult,
-    StreamInfo,
+    get_gateway_main_config_dir, qa_json_to_rpc_request, HttpRequestProcessChainVars, HttpServer,
+    NameServer, QAServer, Server, ServerConfig, ServerContextRef, ServerError, ServerErrorCode,
+    ServerFactory, ServerResult, StreamInfo,
 };
+use cyfs_gateway_api::{SnCheckActiveCodeResp, SnOodState};
+pub use cyfs_gateway_api::SnOodInfo as OODInfo;
 use http::{Method, Response, StatusCode};
 use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full};
@@ -399,6 +415,7 @@ enum SnRpcPath {
     Root,
     Auth,
     DeviceInfo,
+    BnsProxy,
     InternalRoot,
 }
 
@@ -432,6 +449,7 @@ impl SnRpcPath {
             "/kapi/sn" => Some(Self::Root),
             "/kapi/sn/auth" => Some(Self::Auth),
             "/kapi/sn/deviceinfo" => Some(Self::DeviceInfo),
+            "/kapi/sn/bns-proxy" => Some(Self::BnsProxy),
             _ => None,
         }
     }
@@ -441,24 +459,16 @@ impl SnRpcPath {
             Self::Root => "/kapi/sn",
             Self::Auth => "/kapi/sn/auth",
             Self::DeviceInfo => "/kapi/sn/deviceinfo",
+            Self::BnsProxy => "/kapi/sn/bns-proxy",
             Self::InternalRoot => "/",
         }
     }
 }
 
-#[derive(Serialize, Deserialize)]
-pub struct OODInfo {
-    //pub device_info: DeviceInfo,
-    pub did_hostname: String,
-    pub owner_id: String,
-    pub self_cert: bool,
-    pub state: String, //active,suspended,disabled,banned
-}
-
 #[derive(Debug, Clone, Eq, PartialEq)]
-struct RegisteredDeviceKey {
-    zone: String,
-    device_name: String,
+pub(crate) struct RegisteredDeviceKey {
+    pub(crate) zone: String,
+    pub(crate) device_name: String,
 }
 
 #[derive(Clone)]
@@ -467,11 +477,16 @@ pub struct SNServer {
     auth_db: SnAuthDBRef,
     device_info_db: SnDeviceInfoDBRef,
     compat_store: SnCompatibilityStoreRef,
+    relay_manager: SnRelayManagerRef,
     auth: Arc<SnAuthManager>,
     name_info_cache: NameInfoCacheRef,
     resolver: SnResolverRef,
     did_resolver: SnDidResolverRef,
-    bns_controller: Option<Arc<SnBnsController>>,
+    bns_proxy: Arc<SnBnsProxy>,
+    /// user_domain PKX proof 专用的外部 DNS 查询（不走 SN 自身解析路径）。
+    pkx_txt_resolver: DnsTxtResolverRef,
+    /// `did:bns:<username>` owner document / authority key 读取（PKX 权威来源）。
+    bns_owner_reader: Arc<BnsRpcDocumentReader>,
 }
 
 impl SNServer {
@@ -492,10 +507,8 @@ impl SNServer {
             | "user.add_dns_record"
             | "user.remove_dns_record"
             | "user.list_dns_records"
-            | "domain.begin_verify"
-            | "domain.create_pkx_binding"
-            | "domain.verify"
-            | "domain.verify_pkx_binding"
+            | "zone.get_info"
+            | "domain.bind"
             | "domain.unbind" => SnRpcPath::Auth,
             "device.register"
             | "device.update"
@@ -503,6 +516,11 @@ impl SNServer {
             | "device.list"
             | "deviceinfo.resolve_ood_by_did"
             | "deviceinfo.resolve_ood_by_hostname" => SnRpcPath::DeviceInfo,
+            "bns.publish_dns_txt" | "bns.publish_document" => SnRpcPath::BnsProxy,
+            // internal/admin only：不在外部 HTTP 路径开放（QA/loopback 通道可用）。
+            "bns.publish_relay_assignment" | "bns.register_name_bootstrap" => {
+                SnRpcPath::InternalRoot
+            }
             "admin.clear_state_by_active_code" => SnRpcPath::InternalRoot,
             _ => SnRpcPath::Root,
         }
@@ -563,9 +581,10 @@ impl SNServer {
 
     fn is_method_allowed_on_path(method: &str, path: SnRpcPath) -> bool {
         match path {
-            SnRpcPath::Auth | SnRpcPath::DeviceInfo | SnRpcPath::InternalRoot => {
-                Self::preferred_rpc_path(method) == path
-            }
+            SnRpcPath::Auth
+            | SnRpcPath::DeviceInfo
+            | SnRpcPath::BnsProxy
+            | SnRpcPath::InternalRoot => Self::preferred_rpc_path(method) == path,
             SnRpcPath::Root => false,
         }
     }
@@ -576,12 +595,18 @@ impl SNServer {
         device_info_db: SnDeviceInfoDBRef,
         compat_store: SnCompatibilityStoreRef,
         relay_manager: SnRelayManagerRef,
-        bns_controller: Option<Arc<SnBnsController>>,
-    ) -> Self {
-        let bns_indexer_url = server_config.bns_indexer_url.clone();
-        let bns_session_token = server_config.bns_session_token.clone();
+        bns_client: BnsRpcClient,
+        bns_proxy: Arc<SnBnsProxy>,
+    ) -> ServerResult<Self> {
         let server_host = server_config.host;
-        let server_ip = IpAddr::from_str(server_config.ip.as_str()).unwrap();
+        let server_ip = IpAddr::from_str(server_config.ip.as_str()).map_err(|error| {
+            server_err!(
+                ServerErrorCode::InvalidConfig,
+                "invalid SN server ip {}: {}",
+                server_config.ip,
+                error
+            )
+        })?;
         let server_aliases = server_config.aliases;
         let boot_jwt = server_config.boot_jwt;
         let owner_pkx = server_config.owner_pkx;
@@ -589,7 +614,13 @@ impl SNServer {
         let auth = Arc::new(
             SnAuthManager::new(server_config.auth_data_dir.as_deref())
                 .await
-                .expect("init sn auth manager"),
+                .map_err(|error| {
+                    server_err!(
+                        ServerErrorCode::InvalidConfig,
+                        "init sn auth manager failed: {}",
+                        error
+                    )
+                })?,
         );
         let resolver_config = SnResolverConfig::new(
             server_host.clone(),
@@ -600,42 +631,46 @@ impl SNServer {
         )
         .with_aliases(server_aliases);
         let auth_reader = Arc::new(SnAuthResolverReader::new(auth_db.clone()));
-        let mut resolver = SnResolver::new(resolver_config, auth_reader.clone())
-            .with_device_online_reader(Arc::new(SnDeviceInfoResolverReader::new(
-                device_info_db.clone(),
-            )))
-            .with_relay_reader(Arc::new(SnRelayManagerResolverReader::new(
-                relay_manager.clone(),
-            )))
-            .with_compatibility_reader(Arc::new(LegacyResolverCompatibilityReader::new(
-                auth_db.clone(),
-                device_info_db.clone(),
-                compat_store.clone(),
-            )));
-        if let Some(indexer_url) = bns_indexer_url.as_deref() {
-            resolver = resolver.with_bns_reader(Arc::new(BnsIndexerDocumentReader::new(
-                indexer_url,
-                bns_session_token,
-            )));
-        } else {
-            warn!(
-                "bns_indexer_url is not configured; SN resolver cannot lazy-load BNS contract state"
-            );
-        }
+        let bns_owner_reader = Arc::new(BnsRpcDocumentReader::new(bns_client));
+        let resolver = SnResolver::new_with_bns(
+            resolver_config,
+            auth_reader.clone(),
+            bns_owner_reader.clone(),
+        )
+        .with_device_online_reader(Arc::new(SnDeviceInfoResolverReader::new(
+            device_info_db.clone(),
+        )))
+        .with_relay_reader(Arc::new(SnRelayManagerResolverReader::new(
+            relay_manager.clone(),
+        )))
+        .with_compatibility_reader(Arc::new(LegacyResolverCompatibilityReader::new(
+            auth_db.clone(),
+            device_info_db.clone(),
+            compat_store.clone(),
+        )));
         let resolver = Arc::new(resolver);
         let did_resolver = SnResolverBackedDidResolver::new_ref(resolver.clone(), auth_reader);
+        let pkx_txt_resolver = DohDnsTxtResolver::new_ref(
+            server_config
+                .pkx_doh_url
+                .as_deref()
+                .unwrap_or(DEFAULT_PKX_DOH_URL),
+        );
 
-        SNServer {
+        Ok(SNServer {
             id: server_config.id,
             auth_db,
             device_info_db,
             compat_store,
+            relay_manager,
             auth,
             name_info_cache: NameInfoCache::new_ref(),
             resolver,
             did_resolver,
-            bns_controller,
-        }
+            bns_proxy,
+            pkx_txt_resolver,
+            bns_owner_reader,
+        })
     }
 
     pub fn name_info_cache(&self) -> NameInfoCacheRef {
@@ -650,8 +685,89 @@ impl SNServer {
         self.did_resolver.clone()
     }
 
-    pub(crate) fn bns_controller(&self) -> Option<Arc<SnBnsController>> {
-        self.bns_controller.clone()
+    pub(crate) fn relay_manager(&self) -> &SnRelayManagerRef {
+        &self.relay_manager
+    }
+
+    pub(crate) fn bns_proxy(&self) -> Arc<SnBnsProxy> {
+        self.bns_proxy.clone()
+    }
+
+    pub(crate) fn pkx_txt_resolver(&self) -> &DnsTxtResolverRef {
+        &self.pkx_txt_resolver
+    }
+
+    fn jwk_x_component(jwk: &jsonwebtoken::jwk::Jwk) -> Option<String> {
+        match &jwk.algorithm {
+            jsonwebtoken::jwk::AlgorithmParameters::OctetKeyPair(params) => Some(params.x.clone()),
+            _ => None,
+        }
+    }
+
+    /// ed25519 公钥 x 分量的合理性检查（base64url 无 padding 解码为 32 字节）。
+    pub(crate) fn is_plausible_ed25519_x(value: &str) -> bool {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine;
+        URL_SAFE_NO_PAD
+            .decode(value)
+            .map(|bytes| bytes.len() == 32)
+            .unwrap_or(false)
+    }
+
+    /// 计算 user_domain 绑定期望的 `PKX(sn_user.pkx)` 及其来源。
+    ///
+    /// 权威优先级：`did:bns:<username>` 链上 owner document / authority key →
+    /// 本地 `users.public_key` 缓存 → 确定性 `sn-user:<username>` 标签（无
+    /// owner key 的账号仍能证明「DNS owner 同意绑定到该 SN 账号」的意图）。
+    ///
+    /// BNS reader 已配置但暂不可达时返回 RemoteError（可重试），不静默回落
+    /// 本地缓存，避免期望 PKX 随链路抖动来回变化。绑定流程不提供修改 PKX
+    /// 的入口。
+    pub(crate) async fn expected_user_domain_pkx(
+        &self,
+        username: &str,
+        user: &crate::SNUserInfo,
+    ) -> SnResult<(String, &'static str)> {
+        match self.bns_owner_reader.resolve_owner(username).await {
+            Ok(Some(owner)) => {
+                if let Some(x) = owner
+                    .owner_config
+                    .as_ref()
+                    .and_then(owner_key_from_config)
+                    .as_ref()
+                    .and_then(Self::jwk_x_component)
+                {
+                    return Ok((crate::pkx_value(x.as_str())?, "bns-owner-config"));
+                }
+                if let Some(x) = owner
+                    .effective_owner
+                    .as_deref()
+                    .and_then(key_like_string_to_jwk)
+                    .as_ref()
+                    .and_then(Self::jwk_x_component)
+                    .filter(|x| Self::is_plausible_ed25519_x(x.as_str()))
+                {
+                    return Ok((crate::pkx_value(x.as_str())?, "bns-effective-owner"));
+                }
+                // 链上存在该名字但没有可用的 ed25519 authority key（例如
+                // ChainAccount owner 且 owner_config 无 key）→ 本地回落。
+            }
+            Ok(None) => {}
+            Err(e) => {
+                return Err(crate::sn_err!(
+                    crate::SnErrorCode::RemoteError,
+                    "resolve BNS owner for {} failed: {}",
+                    username,
+                    e
+                ));
+            }
+        }
+
+        if let Some(source) = crate::pkx_source_of(user.public_key.as_str()) {
+            return Ok((format!("PKX({})", source), "local-public-key"));
+        }
+
+        Ok((format!("PKX(sn-user:{})", username), "sn-user-label"))
     }
 
     pub fn add_name_info_cache(
@@ -677,6 +793,26 @@ impl SNServer {
 
     pub fn remove_name_info_cache(&self, name: &str, record_type: RecordType) {
         self.name_info_cache.remove(name, record_type);
+    }
+
+    /// BNS proxy 写投递成功后的本地 DNS 缓存失效（含 tombstone）。
+    /// 只失效缓存，不伪造 BNS 权威状态；下一次查询会经 resolver 重新读
+    /// bns-rpc 投影（投影未同步期间读到旧值属正常窗口）。
+    pub(crate) fn invalidate_bns_name_dns_cache(&self, username: &str) {
+        let resolver_config = self.resolver.config();
+        let mut names = vec![username.to_string()];
+        for host in std::iter::once(resolver_config.server_host.as_str())
+            .chain(resolver_config.aliases.iter().map(String::as_str))
+        {
+            names.push(format!("{}.{}", username, host));
+        }
+        for name in names {
+            let normalized = Self::normalize_query_name(name.as_str());
+            for record_type in [RecordType::TXT, RecordType::A, RecordType::AAAA] {
+                self.name_info_cache
+                    .remove(normalized.as_str(), record_type);
+            }
+        }
     }
 
     pub(crate) fn parse_name_record_type(record_type: &str) -> Option<RecordType> {
@@ -797,12 +933,9 @@ impl SNServer {
             return Err(RPCErrors::ReasonError(ret.err().unwrap().to_string()));
         }
         let valid = ret.unwrap();
-        let resp = RPCResponse::create_by_req(
-            RPCResult::Success(json!({
-                "valid":valid
-            })),
-            &req,
-        );
+        let value = serde_json::to_value(SnCheckActiveCodeResp { valid })
+            .map_err(|e| RPCErrors::ReasonError(e.to_string()))?;
+        let resp = RPCResponse::create_by_req(RPCResult::Success(value), &req);
         return Ok(resp);
     }
 
@@ -851,10 +984,20 @@ impl SNServer {
         info!("sn server handle rpc call: {}", req.method);
         match req.method.as_str() {
             "auth.check_active_code" => {
-                handle_auth(self, Self::rewrite_rpc_method(req, "check_active_code")).await
+                handle_auth(
+                    self,
+                    Self::rewrite_rpc_method(req, "check_active_code"),
+                    Some(ip_from),
+                )
+                .await
             }
             "auth.check_username" => {
-                handle_auth(self, Self::rewrite_rpc_method(req, "check_username")).await
+                handle_auth(
+                    self,
+                    Self::rewrite_rpc_method(req, "check_username"),
+                    Some(ip_from),
+                )
+                .await
             }
             "auth.register" | "auth.login" | "auth.refresh" | "auth.logout" | "auth.me" => {
                 let bare_method = req
@@ -862,7 +1005,12 @@ impl SNServer {
                     .strip_prefix("auth.")
                     .unwrap_or(req.method.as_str())
                     .to_string();
-                handle_auth(self, Self::rewrite_rpc_method(req, bare_method.as_str())).await
+                handle_auth(
+                    self,
+                    Self::rewrite_rpc_method(req, bare_method.as_str()),
+                    Some(ip_from),
+                )
+                .await
             }
             "user.get_profile" | "user.set_self_cert" => {
                 let bare_method = req
@@ -881,11 +1029,8 @@ impl SNServer {
             "user.list_dns_records" => {
                 handle_dns(self, Self::rewrite_rpc_method(req, "list_records")).await
             }
-            "domain.begin_verify"
-            | "domain.create_pkx_binding"
-            | "domain.verify"
-            | "domain.verify_pkx_binding"
-            | "domain.unbind" => {
+            "zone.get_info" => handle_zone(self, Self::rewrite_rpc_method(req, "get_info")).await,
+            "domain.bind" | "domain.unbind" => {
                 let bare_method = req
                     .method
                     .strip_prefix("domain.")
@@ -920,6 +1065,17 @@ impl SNServer {
                     ip_from,
                 )
                 .await
+            }
+            "bns.publish_dns_txt"
+            | "bns.publish_document"
+            | "bns.publish_relay_assignment"
+            | "bns.register_name_bootstrap" => {
+                let bare_method = req
+                    .method
+                    .strip_prefix("bns.")
+                    .unwrap_or(req.method.as_str())
+                    .to_string();
+                handle_bns_proxy(self, Self::rewrite_rpc_method(req, bare_method.as_str())).await
             }
             "admin.clear_state_by_active_code" => {
                 self.clear_state_by_active_code(Self::rewrite_rpc_method(
@@ -1070,7 +1226,7 @@ impl SNServer {
             did_hostname: Self::did_hostname(did_for_hostname),
             owner_id: view.zone,
             self_cert: user.map(|u| u.self_cert).unwrap_or(false),
-            state: Self::device_state_to_ood_state(view.state).to_string(),
+            state: Self::device_state_to_ood_state(view.state),
         })
     }
 
@@ -1088,11 +1244,11 @@ impl SNServer {
             did_hostname: Self::did_hostname(did_for_hostname),
             owner_id: device_info.owner,
             self_cert: user.map(|u| u.self_cert).unwrap_or(false),
-            state: "active".to_string(),
+            state: SnOodState::Active,
         })
     }
 
-    async fn registered_device_key_from_did(
+    pub(crate) async fn registered_device_key_from_did(
         &self,
         did: &str,
     ) -> Result<Option<RegisteredDeviceKey>, RPCErrors> {
@@ -1284,11 +1440,11 @@ impl SNServer {
             .unwrap_or_else(|_| did.to_string())
     }
 
-    fn device_state_to_ood_state(state: SnDeviceState) -> &'static str {
+    fn device_state_to_ood_state(state: SnDeviceState) -> SnOodState {
         match state {
-            SnDeviceState::Online => "active",
-            SnDeviceState::Offline | SnDeviceState::Stale => "suspended",
-            SnDeviceState::Blocked => "banned",
+            SnDeviceState::Online => SnOodState::Active,
+            SnDeviceState::Offline | SnDeviceState::Stale => SnOodState::Suspended,
+            SnDeviceState::Blocked => SnOodState::Banned,
         }
     }
 
@@ -1302,12 +1458,12 @@ impl SNServer {
                     .online
                     .as_ref()
                     .map(|online| Self::device_state_to_ood_state(online.state))
-                    .unwrap_or("active");
+                    .unwrap_or(SnOodState::Active);
                 return Some(OODInfo {
                     did_hostname,
                     owner_id: gateway.zone_name,
                     self_cert: gateway.self_cert,
-                    state: state.to_string(),
+                    state,
                 });
             }
             Err(e) if e.kind() != SnResolverErrorKind::NotManaged => {
@@ -1706,8 +1862,6 @@ impl HttpServer for SNServer {
             }
         };
 
-        info!("|==>recv kRPC req: {}", body_str);
-
         let rpc_request: RPCRequest = match serde_json::from_str(body_str.as_str()) {
             Ok(rpc_request) => rpc_request,
             Err(e) => {
@@ -1725,6 +1879,8 @@ impl HttpServer for SNServer {
                     .unwrap());
             }
         };
+
+        info!("|==>recv kRPC req: method={}", rpc_request.method);
 
         let canonical_method = Self::canonical_method_name(rpc_request.method.as_str());
         let prefer_rpc_failed = canonical_method.contains('.');
@@ -1791,10 +1947,26 @@ pub struct SNServerConfig {
     pub aliases: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub auth_data_dir: Option<String>,
+    /// C 类种子文件（sn_seed.yaml）路径；相对路径按网关主配置目录解析
+    /// （与 local_dns 的 file_path 同语义）。文件缺失时跳过导入。
+    #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub bns_indexer_url: Option<String>,
+    pub seed_path: Option<String>,
+    #[serde(default)]
+    pub bns_rpc_url: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bns_session_token: Option<String>,
+    /// user_domain PKX proof 的外部 DoH resolver。默认 Google Public DNS
+    /// `https://dns.google/dns-query`（RFC 8484 wire 格式）；URL path 以
+    /// `/resolve` 结尾时按 dns.google JSON API 查询。只用于 `domain.bind`
+    /// 的服务端 DNS TXT 校验，不影响 SN 自身解析。
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pkx_doh_url: Option<String>,
+    /// Relay 自动分配的有序规则、fallback 和可选 GeoIP XDB。
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub relay_allocation: Option<RelayAllocationConfig>,
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bns_write_enabled: Option<bool>,
@@ -1810,6 +1982,11 @@ pub struct SNServerConfig {
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bns_evm: Option<SNBnsEvmConfig>,
+    /// BNS proxy 写链配置（多 controller key + 白名单 operation）。
+    /// 缺省时回落到旧 `bns_evm.controller_private_key*` 单 controller 模式。
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bns_proxy: Option<SNBnsProxyConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub db_type: Option<String>,
     #[serde(flatten)]
@@ -1819,9 +1996,6 @@ pub struct SNServerConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SNBnsEvmConfig {
-    pub rpc_endpoint: String,
-    pub chain_id: u64,
-    pub contract_address: String,
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub controller_private_key_env: Option<String>,
@@ -1831,15 +2005,6 @@ pub struct SNBnsEvmConfig {
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub controller_private_key: Option<String>,
-    #[serde(default)]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub gas_limit: Option<u64>,
-    #[serde(default)]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub max_fee_per_gas: Option<u128>,
-    #[serde(default)]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub max_priority_fee_per_gas: Option<u128>,
 }
 
 impl ServerConfig for SNServerConfig {
@@ -1858,29 +2023,185 @@ impl ServerConfig for SNServerConfig {
 
 pub struct SnServerFactory;
 
+struct SnPostgresDbConfig {
+    auth_db_url: String,
+    device_info_db_url: String,
+    provider_session_token: Option<String>,
+}
+
 impl SnServerFactory {
     pub fn new() -> Self {
         SnServerFactory
     }
 
-    fn sqlite_db_path(config: &SNServerConfig) -> String {
-        let configured = config.db_params.as_ref().and_then(|params| {
-            params
-                .get("db_path")
-                .or_else(|| {
-                    params
-                        .get("db_params")
-                        .and_then(|value| value.get("db_path"))
-                })
-                .and_then(Value::as_str)
-        });
+    fn resolve_geoip_config(mut config: GeoIpResolverConfig) -> GeoIpResolverConfig {
+        fn resolve(path: String) -> String {
+            let path = PathBuf::from(path);
+            if path.is_absolute() {
+                path.to_string_lossy().to_string()
+            } else {
+                get_gateway_main_config_dir()
+                    .join(path)
+                    .to_string_lossy()
+                    .to_string()
+            }
+        }
 
-        configured.map(ToString::to_string).unwrap_or_else(|| {
+        config.ipv4_xdb_path = resolve(config.ipv4_xdb_path);
+        config.ipv6_xdb_path = config.ipv6_xdb_path.map(resolve);
+        config
+    }
+
+    async fn probe_bns_rpc(config: &SNServerConfig) -> ServerResult<(BnsRpcClient, BnsSystemInfo)> {
+        Self::probe_bns_rpc_with_timeout(config, std::time::Duration::from_secs(5)).await
+    }
+
+    async fn probe_bns_rpc_with_timeout(
+        config: &SNServerConfig,
+        timeout: std::time::Duration,
+    ) -> ServerResult<(BnsRpcClient, BnsSystemInfo)> {
+        let bns_rpc_url = config.bns_rpc_url.trim();
+        if bns_rpc_url.is_empty() {
+            return Err(server_err!(
+                ServerErrorCode::InvalidConfig,
+                "bns_rpc_url is required"
+            ));
+        }
+        let client =
+            BnsRpcClient::new_bns_server_url(bns_rpc_url, config.bns_session_token.clone());
+        let system_info = tokio::time::timeout(timeout, client.system_info())
+            .await
+            .map_err(|_| {
+                server_err!(
+                    ServerErrorCode::InvalidConfig,
+                    "BNS RPC readiness probe timed out: {}",
+                    bns_rpc_url
+                )
+            })?
+            .map_err(|error| {
+                server_err!(
+                    ServerErrorCode::InvalidConfig,
+                    "BNS RPC readiness probe failed for {}: {}",
+                    bns_rpc_url,
+                    error
+                )
+            })?;
+        if !system_info.ready {
+            return Err(server_err!(
+                ServerErrorCode::InvalidConfig,
+                "BNS RPC is not ready: {}",
+                bns_rpc_url
+            ));
+        }
+        Ok((client, system_info))
+    }
+
+    fn db_param_scope(config: &SNServerConfig) -> Vec<&Value> {
+        let Some(params) = config.db_params.as_ref() else {
+            return Vec::new();
+        };
+
+        let mut scopes = Vec::new();
+        if let Some(db) = params.get("db") {
+            scopes.push(db);
+        }
+        scopes.push(params);
+        if let Some(nested) = params.get("db_params") {
+            scopes.push(nested);
+        }
+        scopes
+    }
+
+    fn db_param_str(config: &SNServerConfig, key: &str) -> Option<String> {
+        for scope in Self::db_param_scope(config) {
+            if let Some(value) = scope.get(key).and_then(Value::as_str) {
+                let value = value.trim();
+                if !value.is_empty() {
+                    return Some(value.to_string());
+                }
+            }
+        }
+        None
+    }
+
+    fn configured_db_type(config: &SNServerConfig) -> String {
+        config
+            .db_type
+            .clone()
+            .or_else(|| Self::db_param_str(config, "type"))
+            .unwrap_or_else(|| "sqlite".to_string())
+            .trim()
+            .to_ascii_lowercase()
+    }
+
+    fn sqlite_db_path(config: &SNServerConfig) -> String {
+        let configured = Self::db_param_str(config, "db_path");
+
+        configured.unwrap_or_else(|| {
             get_buckyos_service_data_dir("sn")
                 .join("sn.sqlite3")
                 .to_string_lossy()
                 .to_string()
         })
+    }
+
+    fn postgres_db_config(config: &SNServerConfig) -> ServerResult<SnPostgresDbConfig> {
+        let provider_base_url = Self::db_param_str(config, "provider_base_url")
+            .or_else(|| Self::db_param_str(config, "provider_url"));
+        let auth_db_url = Self::db_param_str(config, "auth_db_url")
+            .or_else(|| provider_base_url.clone())
+            .ok_or(server_err!(
+                ServerErrorCode::InvalidConfig,
+                "db_type=postgres requires auth_db_url or provider_base_url"
+            ))?;
+        let device_info_db_url = Self::db_param_str(config, "device_info_db_url")
+            .or(provider_base_url)
+            .ok_or(server_err!(
+                ServerErrorCode::InvalidConfig,
+                "db_type=postgres requires device_info_db_url or provider_base_url"
+            ))?;
+        let provider_session_token = if let Some(token) =
+            Self::db_param_str(config, "provider_session_token")
+                .or_else(|| Self::db_param_str(config, "provider_token"))
+        {
+            Some(token)
+        } else {
+            Self::read_provider_session_token_file(config).transpose()?
+        };
+
+        Ok(SnPostgresDbConfig {
+            auth_db_url,
+            device_info_db_url,
+            provider_session_token,
+        })
+    }
+
+    fn read_provider_session_token_file(config: &SNServerConfig) -> Option<ServerResult<String>> {
+        let path = Self::db_param_str(config, "provider_session_token_file")
+            .or_else(|| Self::db_param_str(config, "provider_token_file"))?;
+        Some(
+            fs::read_to_string(path.as_str())
+                .map(|token| token.trim().to_string())
+                .map_err(|e| {
+                    server_err!(
+                        ServerErrorCode::InvalidConfig,
+                        "read provider session token file {} failed: {}",
+                        path,
+                        e
+                    )
+                })
+                .and_then(|token| {
+                    if token.is_empty() {
+                        Err(server_err!(
+                            ServerErrorCode::InvalidConfig,
+                            "provider session token file {} is empty",
+                            path
+                        ))
+                    } else {
+                        Ok(token)
+                    }
+                }),
+        )
     }
 
     fn parse_sn_controller_principal(config: &SNServerConfig) -> ServerResult<Principal> {
@@ -1925,29 +2246,6 @@ impl SnServerFactory {
                 other
             )),
         }
-    }
-
-    fn parse_bns_evm_client_config(
-        config: &SNServerConfig,
-    ) -> ServerResult<Option<BnsEvmClientConfig>> {
-        let Some(evm) = config.bns_evm.as_ref() else {
-            return Ok(None);
-        };
-        let mut client = BnsEvmClientConfig::anvil(
-            evm.rpc_endpoint.clone(),
-            evm.contract_address.clone(),
-            evm.chain_id,
-        );
-        if let Some(gas_limit) = evm.gas_limit {
-            client.gas_limit = gas_limit;
-        }
-        if let Some(max_fee_per_gas) = evm.max_fee_per_gas {
-            client.max_fee_per_gas = max_fee_per_gas;
-        }
-        if let Some(max_priority_fee_per_gas) = evm.max_priority_fee_per_gas {
-            client.max_priority_fee_per_gas = max_priority_fee_per_gas;
-        }
-        Ok(Some(client))
     }
 
     fn load_bns_evm_controller_private_key(
@@ -2004,59 +2302,105 @@ impl SnServerFactory {
             .filter(|value| !value.is_empty()))
     }
 
-    fn build_bns_controller(
+    /// 解析多 controller key 配置；无 `bns_proxy.controllers` 时回落旧
+    /// `bns_evm.controller_private_key*` 单 controller（id = "default"）。
+    /// 返回 (key specs, require_user_asset_owner, allowed_operations, legacy_mode)。
+    fn resolve_bns_proxy_key_specs(
         config: &SNServerConfig,
-        db_path: &str,
-    ) -> ServerResult<Option<Arc<SnBnsController>>> {
-        let write_enabled = config
-            .bns_write_enabled
-            .unwrap_or_else(|| config.bns_indexer_url.is_some());
-        if !write_enabled {
-            return Ok(None);
-        }
-        let evm_config = Self::parse_bns_evm_client_config(config)?;
-        let evm_controller = if let Some(evm_config) = evm_config {
+    ) -> ServerResult<(
+        Vec<SnBnsControllerKeySpec>,
+        bool,
+        HashSet<SnBnsProxyOperation>,
+        bool,
+    )> {
+        if let Some(proxy_config) = config
+            .bns_proxy
+            .as_ref()
+            .filter(|proxy| !proxy.controllers.is_empty())
+        {
+            let mut specs = Vec::with_capacity(proxy_config.controllers.len());
+            for key_config in &proxy_config.controllers {
+                let private_key = key_config
+                    .load_private_key()
+                    .map_err(|e| server_err!(ServerErrorCode::InvalidConfig, "{}", e))?;
+                specs.push(SnBnsControllerKeySpec {
+                    id: key_config.id.clone(),
+                    declared_address: key_config.address.clone(),
+                    private_key,
+                    weight: key_config.weight.unwrap_or(1),
+                });
+            }
+            let allowed_operations = proxy_config
+                .parse_allowed_operations()
+                .map_err(|e| server_err!(ServerErrorCode::InvalidConfig, "{}", e))?;
+            Ok((
+                specs,
+                proxy_config.require_user_asset_owner(),
+                allowed_operations,
+                false,
+            ))
+        } else {
+            // 旧配置兼容：单 controller；asset_owner 保持旧的 devtest 回落语义。
             let private_key = Self::load_bns_evm_controller_private_key(config)?.ok_or(server_err!(
                 ServerErrorCode::InvalidConfig,
                 "bns_evm requires controller_private_key_env, controller_private_key_file or controller_private_key"
             ))?;
-            Some(Arc::new(
-                BnsEvmControllerClient::new(evm_config, private_key.as_str()).map_err(|e| {
+            let require_user_asset_owner = config
+                .bns_proxy
+                .as_ref()
+                .and_then(|proxy| proxy.require_user_asset_owner)
+                .unwrap_or(false);
+            Ok((
+                vec![SnBnsControllerKeySpec {
+                    id: "default".to_string(),
+                    declared_address: None,
+                    private_key,
+                    weight: 1,
+                }],
+                require_user_asset_owner,
+                SnBnsProxyOperation::all().into_iter().collect(),
+                true,
+            ))
+        }
+    }
+
+    async fn build_bns_proxy(
+        config: &SNServerConfig,
+        db_path: &str,
+        client: BnsRpcClient,
+        system_info: &BnsSystemInfo,
+    ) -> ServerResult<Arc<SnBnsProxy>> {
+        if config.bns_write_enabled == Some(false) {
+            return Err(server_err!(
+                ServerErrorCode::InvalidConfig,
+                "bns_write_enabled=false is not supported: SN requires BNS registration"
+            ));
+        }
+        if let Some(proxy_config) = config.bns_proxy.as_ref() {
+            if !proxy_config.enabled {
+                return Err(server_err!(
+                    ServerErrorCode::InvalidConfig,
+                    "bns_proxy.enabled=false is not supported: SN requires BNS registration"
+                ));
+            }
+        }
+        let evm_config = BnsEvmClientConfig::from_system_info(system_info);
+
+        let (key_specs, require_user_asset_owner, allowed_operations, legacy_mode) =
+            Self::resolve_bns_proxy_key_specs(config)?;
+        let signer_vault = Arc::new(
+            SnBnsTxSigner::new(&evm_config, allowed_operations.clone(), key_specs).map_err(
+                |e| {
                     server_err!(
                         ServerErrorCode::InvalidConfig,
-                        "create bns evm controller failed: {}",
+                        "create sn bns tx signer failed: {}",
                         e
                     )
-                })?,
-            ))
-        } else {
-            None
-        };
-
-        let indexer_url = config.bns_indexer_url.as_deref().ok_or(server_err!(
-            ServerErrorCode::InvalidConfig,
-            "bns_write_enabled requires bns_indexer_url"
-        ))?;
-        let principal = if config.sn_controller_principal.is_none() {
-            evm_controller
-                .as_ref()
-                .and_then(|controller| controller.default_signer_address())
-                .map(|address| Principal::chain_account(format!("{address:#x}")))
-                .unwrap_or(Self::parse_sn_controller_principal(config)?)
-        } else {
-            Self::parse_sn_controller_principal(config)?
-        };
-        let mut controller_config = SnBnsControllerConfig::new(
-            principal,
-            config.sn_controller_kid.clone().unwrap_or_default(),
+                },
+            )?,
         );
-        if let Some(doc_types) = config.allowed_controller_doc_types.clone() {
-            controller_config.allowed_controller_doc_types = doc_types;
-        }
-        let client: Arc<dyn BnsIndexerApi> = Arc::new(BnsIndexerClient::new_krpc_url(
-            indexer_url,
-            config.bns_session_token.clone(),
-        ));
+
+        let client: Arc<dyn BnsRpcApi> = Arc::new(client);
         let store = Arc::new(SqliteSnBnsWriteRequestStore::open(db_path).map_err(|e| {
             server_err!(
                 ServerErrorCode::InvalidConfig,
@@ -2064,19 +2408,105 @@ impl SnServerFactory {
                 e
             )
         })?);
-        let evm_controller = evm_controller.ok_or(server_err!(
-            ServerErrorCode::InvalidConfig,
-            "bns_write_enabled requires bns_evm because SN BNS writes must go through the EVM contract"
-        ))?;
-        let controller = SnBnsController::new_evm(client, store, controller_config, evm_controller)
+
+        let mut controllers = Vec::new();
+        for info in signer_vault.controller_infos() {
+            let key_manager =
+                BoundControllerKeyManager::new(signer_vault.clone(), info.id.as_str()).map_err(
+                    |e| {
+                        server_err!(
+                            ServerErrorCode::InvalidConfig,
+                            "bind bns proxy controller `{}` failed: {}",
+                            info.id,
+                            e
+                        )
+                    },
+                )?;
+            let evm_controller = Arc::new(BnsEvmControllerClient::new_with_bns_server_submitter(
+                evm_config.clone(),
+                Arc::new(key_manager),
+                client.clone(),
+            ));
+            // principal：多 controller 模式恒为各自 key 的 chain account；
+            // 旧单 controller 模式保留显式 `sn_controller_principal` 覆盖。
+            let principal = if legacy_mode && config.sn_controller_principal.is_some() {
+                Self::parse_sn_controller_principal(config)?
+            } else {
+                if !legacy_mode && config.sn_controller_principal.is_some() {
+                    warn!(
+                        "sn_controller_principal is ignored when bns_proxy.controllers is configured; \
+                         each controller uses its own key address as principal"
+                    );
+                }
+                Principal::chain_account(info.address_hex.clone())
+            };
+            let mut controller_config = SnBnsControllerConfig::new(
+                principal.clone(),
+                config.sn_controller_kid.clone().unwrap_or_default(),
+            );
+            if let Some(doc_types) = config.allowed_controller_doc_types.clone() {
+                controller_config.allowed_controller_doc_types = doc_types;
+            }
+            let controller = SnBnsController::new_evm(
+                client.clone(),
+                store.clone(),
+                controller_config,
+                evm_controller,
+            )
             .map_err(|e| {
                 server_err!(
                     ServerErrorCode::InvalidConfig,
-                    "create sn bns controller failed: {}",
+                    "create sn bns controller `{}` failed: {}",
+                    info.id,
                     e
                 )
             })?;
-        Ok(Some(Arc::new(controller)))
+            controllers.push(SnBnsProxyController {
+                id: info.id,
+                address: info.address_hex,
+                principal,
+                weight: info.weight,
+                controller: Arc::new(controller),
+            });
+        }
+
+        let binding_store = SqliteSnBnsControllerBindingStore::new_by_path(db_path)
+            .await
+            .map_err(|e| {
+                server_err!(
+                    ServerErrorCode::InvalidConfig,
+                    "open sn bns controller binding store failed: {}",
+                    e
+                )
+            })?;
+        binding_store.initialize_database().await.map_err(|e| {
+            server_err!(
+                ServerErrorCode::InvalidConfig,
+                "initialize sn bns controller binding store failed: {}",
+                e
+            )
+        })?;
+        let bindings: SnBnsControllerBindingStoreRef = Arc::new(binding_store);
+
+        let proxy = SnBnsProxy::new(
+            controllers,
+            bindings,
+            allowed_operations,
+            require_user_asset_owner,
+        )
+        .map_err(|e| {
+            server_err!(
+                ServerErrorCode::InvalidConfig,
+                "create sn bns proxy failed: {}",
+                e
+            )
+        })?;
+        info!(
+            "sn bns proxy enabled: controllers={:?} require_user_asset_owner={}",
+            proxy.controller_addresses(),
+            require_user_asset_owner
+        );
+        Ok(Arc::new(proxy))
     }
 }
 
@@ -2096,54 +2526,107 @@ impl ServerFactory for SnServerFactory {
                 config.server_type()
             ))?;
 
-        let db_type = config
-            .db_type
-            .clone()
-            .unwrap_or_else(|| "sqlite".to_string());
-        if db_type != "sqlite" {
-            return Err(server_err!(
-                ServerErrorCode::InvalidConfig,
-                "invalid db type {}",
-                db_type
-            ));
-        }
+        let (bns_client, system_info) = Self::probe_bns_rpc(config).await?;
 
+        let db_type = Self::configured_db_type(config);
         let db_path = Self::sqlite_db_path(config);
-        let auth_db = SqliteSnAuthDB::new_by_path(db_path.as_str())
-            .await
-            .map_err(|e| {
-                server_err!(
-                    ServerErrorCode::InvalidConfig,
-                    "open sn auth db failed: {}",
-                    e
-                )
-            })?;
-        auth_db.initialize_database().await.map_err(|e| {
-            server_err!(
-                ServerErrorCode::InvalidConfig,
-                "initialize sn auth db failed: {}",
-                e
-            )
-        })?;
-        let auth_db: SnAuthDBRef = Arc::new(auth_db);
+        let (auth_db, device_info_db): (SnAuthDBRef, SnDeviceInfoDBRef) = match db_type.as_str() {
+            "sqlite" => {
+                let auth_db = SqliteSnAuthDB::new_by_path(db_path.as_str())
+                    .await
+                    .map_err(|e| {
+                        server_err!(
+                            ServerErrorCode::InvalidConfig,
+                            "open sn auth db failed: {}",
+                            e
+                        )
+                    })?;
+                auth_db.initialize_database().await.map_err(|e| {
+                    server_err!(
+                        ServerErrorCode::InvalidConfig,
+                        "initialize sn auth db failed: {}",
+                        e
+                    )
+                })?;
 
-        let device_info_db = SqliteSnDeviceInfoDB::new_by_path(db_path.as_str())
-            .await
-            .map_err(|e| {
-                server_err!(
-                    ServerErrorCode::InvalidConfig,
-                    "open sn device info db failed: {}",
-                    e
+                // C 类种子幂等导入（ensure-exists）。文件缺失 → 跳过；解析/导入失败 →
+                // 启动失败（坏种子不能静默）。语义见 sn_seed.rs 模块注释。
+                if let Some(seed_path) = config.seed_path.as_deref() {
+                    let resolved = crate::resolve_sn_seed_path(seed_path);
+                    match crate::import_sn_seed_from_path(&auth_db, resolved.as_path()).await {
+                        Ok(None) => {
+                            info!(
+                                "sn seed config {} not found; skip seed import",
+                                resolved.display()
+                            );
+                        }
+                        Ok(Some(report)) => {
+                            info!("sn seed imported from {}: {}", resolved.display(), report);
+                        }
+                        Err(e) => {
+                            return Err(server_err!(
+                                ServerErrorCode::InvalidConfig,
+                                "import sn seed config {} failed: {}",
+                                resolved.display(),
+                                e
+                            ));
+                        }
+                    }
+                }
+
+                let device_info_db = SqliteSnDeviceInfoDB::new_by_path(db_path.as_str())
+                    .await
+                    .map_err(|e| {
+                        server_err!(
+                            ServerErrorCode::InvalidConfig,
+                            "open sn device info db failed: {}",
+                            e
+                        )
+                    })?;
+                device_info_db.initialize_database().await.map_err(|e| {
+                    server_err!(
+                        ServerErrorCode::InvalidConfig,
+                        "initialize sn device info db failed: {}",
+                        e
+                    )
+                })?;
+
+                (
+                    Arc::new(auth_db) as SnAuthDBRef,
+                    Arc::new(device_info_db) as SnDeviceInfoDBRef,
                 )
-            })?;
-        device_info_db.initialize_database().await.map_err(|e| {
-            server_err!(
-                ServerErrorCode::InvalidConfig,
-                "initialize sn device info db failed: {}",
-                e
-            )
-        })?;
-        let device_info_db: SnDeviceInfoDBRef = Arc::new(device_info_db);
+            }
+            "postgres" | "postgresql" => {
+                if config.seed_path.is_some() {
+                    return Err(server_err!(
+                        ServerErrorCode::InvalidConfig,
+                        "sn seed import is not supported for db_type=postgres; import seed data through the provider side"
+                    ));
+                }
+                let remote = Self::postgres_db_config(config)?;
+                info!(
+                    "sn server uses remote postgres provider: auth_db_url={}, device_info_db_url={}",
+                    remote.auth_db_url, remote.device_info_db_url
+                );
+                (
+                    Arc::new(SnAuthDbClient::new_krpc_url(
+                        remote.auth_db_url.as_str(),
+                        remote.provider_session_token.clone(),
+                    )) as SnAuthDBRef,
+                    Arc::new(SnDeviceInfoDbClient::new_krpc_url(
+                        remote.device_info_db_url.as_str(),
+                        remote.provider_session_token,
+                    )) as SnDeviceInfoDBRef,
+                )
+            }
+            _ => {
+                return Err(server_err!(
+                    ServerErrorCode::InvalidConfig,
+                    "invalid db type {}",
+                    db_type
+                ));
+            }
+        };
 
         let compat_store = SqliteSnCompatibilityStore::new_by_path(db_path.as_str())
             .await
@@ -2163,7 +2646,12 @@ impl ServerFactory for SnServerFactory {
         })?;
         let compat_store: SnCompatibilityStoreRef = Arc::new(compat_store);
 
-        let relay_manager = SqliteSnRelayManager::new_by_path(db_path.as_str())
+        let mut allocation_config = config.relay_allocation.clone().unwrap_or_default();
+        allocation_config.geoip = allocation_config
+            .geoip
+            .take()
+            .map(Self::resolve_geoip_config);
+        let mut relay_manager = SqliteSnRelayManager::new_by_path(db_path.as_str())
             .await
             .map_err(|e| {
                 server_err!(
@@ -2173,7 +2661,24 @@ impl ServerFactory for SnServerFactory {
                 )
             })?
             .with_auth_db(auth_db.clone())
-            .with_device_info_db(device_info_db.clone());
+            .with_device_info_db(device_info_db.clone())
+            .with_allocation_config(allocation_config.clone());
+        if let Some(geoip_config) = allocation_config.geoip.as_ref() {
+            match XdbGeoIpResolver::new(geoip_config) {
+                Ok(resolver) => {
+                    relay_manager = relay_manager.with_geo_ip_resolver(Arc::new(resolver));
+                    info!("sn relay GeoIP resolver enabled");
+                }
+                Err(error) => {
+                    // GeoIP 是调度提示；数据库暂不可用时保留 preferred region/fallback。
+                    warn!(
+                        "sn relay GeoIP resolver disabled after load failure: error_code={:?} error={}",
+                        error.code(),
+                        error.msg()
+                    );
+                }
+            }
+        }
         relay_manager.initialize_database().await.map_err(|e| {
             server_err!(
                 ServerErrorCode::InvalidConfig,
@@ -2182,7 +2687,9 @@ impl ServerFactory for SnServerFactory {
             )
         })?;
         let relay_manager: SnRelayManagerRef = Arc::new(relay_manager);
-        let bns_controller = Self::build_bns_controller(config, db_path.as_str())?;
+        let bns_proxy =
+            Self::build_bns_proxy(config, db_path.as_str(), bns_client.clone(), &system_info)
+                .await?;
 
         let sn = Arc::new(
             SNServer::new(
@@ -2191,9 +2698,10 @@ impl ServerFactory for SnServerFactory {
                 device_info_db,
                 compat_store,
                 relay_manager,
-                bns_controller,
+                bns_client,
+                bns_proxy,
             )
-            .await,
+            .await?,
         );
         Ok(vec![
             Server::NameServer(sn.clone()),
@@ -2218,6 +2726,153 @@ mod tests {
     const ANVIL_PRIVATE_KEY: &str =
         "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
     const ANVIL_ADDRESS: &str = "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266";
+
+    fn test_bns_system_info() -> BnsSystemInfo {
+        BnsSystemInfo {
+            ready: true,
+            chain_id: 31_337,
+            contract_address: "0x2222222222222222222222222222222222222222".to_string(),
+        }
+    }
+
+    fn test_bns_client() -> BnsRpcClient {
+        let registry = Arc::new(
+            bns_indexer::CentralizedBnsRegistry::new_legacy_state_machine(
+                bns_indexer::SqliteBnsRegistryStore::open_memory().unwrap(),
+            ),
+        );
+        BnsRpcClient::new_in_process(Arc::new(bns_indexer::CentralizedBnsIndexerHandler::new(
+            registry,
+        )))
+    }
+
+    /// RFC 8484 wire 格式的 mock DoH 端点：`domain.bind` 的外部 DNS proof
+    /// 在测试里通过 `pkx_doh_url` 指到这里；TXT 记录由测试用例动态发布，
+    /// 模拟「用户在传统 DNS 配置 PKX TXT」。
+    struct MockDohServer {
+        records: std::sync::Mutex<std::collections::HashMap<String, Vec<String>>>,
+    }
+
+    impl MockDohServer {
+        fn new() -> Self {
+            Self {
+                records: std::sync::Mutex::new(Default::default()),
+            }
+        }
+
+        fn record_key(name: &str) -> String {
+            name.trim().trim_end_matches('.').to_ascii_lowercase()
+        }
+
+        fn set_txt(&self, name: &str, values: Vec<String>) {
+            self.records
+                .lock()
+                .unwrap()
+                .insert(Self::record_key(name), values);
+        }
+
+        fn remove_txt(&self, name: &str) {
+            self.records
+                .lock()
+                .unwrap()
+                .remove(Self::record_key(name).as_str());
+        }
+    }
+
+    #[async_trait]
+    impl HttpServer for MockDohServer {
+        async fn serve_request(
+            &self,
+            request: http::Request<BoxBody<Bytes, ServerError>>,
+            _info: StreamInfo,
+        ) -> ServerResult<http::Response<BoxBody<Bytes, ServerError>>> {
+            use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+            use base64::Engine;
+            use hickory_proto::op::{Message, MessageType, ResponseCode};
+            use hickory_proto::rr::{rdata::TXT, RData, Record};
+
+            let dns_param = request
+                .uri()
+                .query()
+                .unwrap_or_default()
+                .split('&')
+                .find_map(|kv| kv.strip_prefix("dns="))
+                .expect("mock doh expects RFC 8484 GET with dns param")
+                .to_string();
+            let raw = URL_SAFE_NO_PAD
+                .decode(dns_param.as_bytes())
+                .expect("decode dns param");
+            let query_message = Message::from_vec(raw.as_slice()).expect("parse dns query message");
+            let question = query_message
+                .queries()
+                .first()
+                .cloned()
+                .expect("dns query question");
+            let name_key = Self::record_key(question.name().to_utf8().as_str());
+
+            let mut response = Message::new();
+            response
+                .set_id(query_message.id())
+                .set_message_type(MessageType::Response)
+                .set_op_code(query_message.op_code())
+                .set_recursion_desired(true)
+                .set_recursion_available(true);
+            response.add_query(question.clone());
+            match self.records.lock().unwrap().get(name_key.as_str()) {
+                Some(values) => {
+                    response.set_response_code(ResponseCode::NoError);
+                    for value in values {
+                        response.add_answer(Record::from_rdata(
+                            question.name().clone(),
+                            60,
+                            RData::TXT(TXT::new(vec![value.clone()])),
+                        ));
+                    }
+                }
+                None => {
+                    response.set_response_code(ResponseCode::NXDomain);
+                }
+            }
+
+            let body = response.to_vec().expect("encode dns response");
+            Ok(Response::builder()
+                .status(StatusCode::OK)
+                .header("Content-Type", "application/dns-message")
+                .header("Content-Length", body.len())
+                .body(
+                    Full::new(Bytes::from(body))
+                        .map_err(|never| match never {})
+                        .boxed(),
+                )
+                .unwrap())
+        }
+
+        fn id(&self) -> String {
+            "mock-doh".to_string()
+        }
+
+        fn http_version(&self) -> http::Version {
+            http::Version::HTTP_11
+        }
+
+        fn http3_port(&self) -> Option<u16> {
+            None
+        }
+    }
+
+    /// 从 domain.bind 的 proof 失败错误里取出期望 pkx（错误 message 是
+    /// 含 pkx_record_name/pkx 的 JSON，即给用户的「挑战」信息）。
+    fn extract_pkx_from_proof_error(error: &str) -> String {
+        let start = error.find('{').expect("proof error carries JSON payload");
+        let end = error.rfind('}').expect("proof error carries JSON payload");
+        let value: Value =
+            serde_json::from_str(&error[start..=end]).expect("parse proof error JSON");
+        assert_eq!(value["retryable"].as_bool(), Some(true));
+        value["pkx"]
+            .as_str()
+            .expect("pkx in proof error")
+            .to_string()
+    }
 
     async fn spawn_test_http_server(http_server: Arc<dyn HttpServer>) -> SocketAddr {
         let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
@@ -2256,6 +2911,197 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Copy, Debug)]
+    enum ReadinessServerMode {
+        Ready,
+        Timeout,
+        Unauthorized,
+        InvalidEnvelope,
+    }
+
+    struct ReadinessTestServer {
+        mode: ReadinessServerMode,
+        next_nonce: std::sync::atomic::AtomicU64,
+    }
+
+    impl ReadinessTestServer {
+        fn new(mode: ReadinessServerMode) -> Self {
+            Self {
+                mode,
+                next_nonce: std::sync::atomic::AtomicU64::new(0),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl RPCHandler for ReadinessTestServer {
+        async fn handle_rpc_call(
+            &self,
+            req: RPCRequest,
+            _ip_from: IpAddr,
+        ) -> std::result::Result<RPCResponse, RPCErrors> {
+            if matches!(self.mode, ReadinessServerMode::Timeout) {
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            }
+            let value = if matches!(self.mode, ReadinessServerMode::InvalidEnvelope) {
+                json!({"unexpected": true})
+            } else if req.method == bns_client::METHOD_PREPARE_TX {
+                let nonce = self
+                    .next_nonce
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                serde_json::to_value(bns_client::BnsRpcEnvelope::success(
+                    bns_client::BnsPrepareTxResp {
+                        nonce,
+                        chain_id: 31_337,
+                        contract_address: "0x2222222222222222222222222222222222222222".to_string(),
+                        estimated_gas: 100_000,
+                        gas_limit: 120_000,
+                        max_fee_per_gas: 3_000_000_000,
+                        max_priority_fee_per_gas: 1_000_000_000,
+                    },
+                ))
+                .unwrap()
+            } else if req.method == bns_client::METHOD_SUBMIT_RAW_TX {
+                serde_json::to_value(bns_client::BnsRpcEnvelope::success(
+                    bns_client::BnsSubmitRawTxResp {
+                        tx_hash:
+                            "0x4444444444444444444444444444444444444444444444444444444444444444"
+                                .to_string(),
+                    },
+                ))
+                .unwrap()
+            } else if req.method == bns_client::METHOD_QUERY_TX_STATE {
+                serde_json::to_value(bns_client::BnsRpcEnvelope::success(
+                    bns_client::BnsTxState {
+                        tx_hash:
+                            "0x4444444444444444444444444444444444444444444444444444444444444444"
+                                .to_string(),
+                        state: bns_client::BnsTxExecutionState::Succeeded,
+                        block_number: Some(1),
+                        confirmations: 1,
+                    },
+                ))
+                .unwrap()
+            } else if req.method != bns_client::METHOD_SYSTEM_INFO {
+                serde_json::to_value(bns_client::BnsRpcEnvelope::<Value>::failure(
+                    bns_client::BnsClientError::registry("NAME_NOT_FOUND", "name not found"),
+                ))
+                .unwrap()
+            } else {
+                serde_json::to_value(bns_client::BnsRpcEnvelope::success(test_bns_system_info()))
+                    .unwrap()
+            };
+            Ok(RPCResponse::create_by_req(RPCResult::Success(value), &req))
+        }
+    }
+
+    #[async_trait]
+    impl HttpServer for ReadinessTestServer {
+        async fn serve_request(
+            &self,
+            req: http::Request<BoxBody<Bytes, ServerError>>,
+            info: StreamInfo,
+        ) -> ServerResult<http::Response<BoxBody<Bytes, ServerError>>> {
+            if matches!(self.mode, ReadinessServerMode::Unauthorized) {
+                return Ok(Response::builder()
+                    .status(StatusCode::UNAUTHORIZED)
+                    .body(
+                        Full::new(Bytes::from_static(b"unauthorized"))
+                            .map_err(|never| match never {})
+                            .boxed(),
+                    )
+                    .unwrap());
+            }
+            cyfs_gateway_lib::serve_http_by_rpc_handler(req, info, self).await
+        }
+
+        fn id(&self) -> String {
+            "readiness-test".to_string()
+        }
+
+        fn http_version(&self) -> http::Version {
+            http::Version::HTTP_11
+        }
+
+        fn http3_port(&self) -> Option<u16> {
+            None
+        }
+    }
+
+    fn readiness_config(url: &str) -> SNServerConfig {
+        serde_json::from_value(json!({
+            "id": "readiness-test",
+            "host": "sn.test",
+            "ip": "127.0.0.1",
+            "boot_jwt": "",
+            "owner_pkx": "",
+            "device_jwt": [],
+            "bns_rpc_url": url,
+        }))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn bns_rpc_readiness_is_a_hard_startup_dependency() {
+        let missing = SnServerFactory::probe_bns_rpc_with_timeout(
+            &readiness_config(""),
+            std::time::Duration::from_millis(50),
+        )
+        .await
+        .err()
+        .unwrap()
+        .to_string();
+        assert!(missing.contains("bns_rpc_url is required"), "{missing}");
+
+        let refused_addr = TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let refused = SnServerFactory::probe_bns_rpc_with_timeout(
+            &readiness_config(format!("http://{refused_addr}").as_str()),
+            std::time::Duration::from_millis(100),
+        )
+        .await
+        .err()
+        .unwrap()
+        .to_string();
+        assert!(refused.contains("readiness probe failed"), "{refused}");
+
+        for (mode, expected) in [
+            (ReadinessServerMode::Timeout, "timed out"),
+            (ReadinessServerMode::Unauthorized, "readiness probe failed"),
+            (
+                ReadinessServerMode::InvalidEnvelope,
+                "readiness probe failed",
+            ),
+        ] {
+            let addr = spawn_test_http_server(Arc::new(ReadinessTestServer::new(mode))).await;
+            let error = SnServerFactory::probe_bns_rpc_with_timeout(
+                &readiness_config(format!("http://{addr}").as_str()),
+                std::time::Duration::from_millis(50),
+            )
+            .await
+            .err()
+            .unwrap()
+            .to_string();
+            assert!(error.contains(expected), "{mode:?}: {error}");
+        }
+
+        let addr = spawn_test_http_server(Arc::new(ReadinessTestServer::new(
+            ReadinessServerMode::Ready,
+        )))
+        .await;
+        let (_, info) = SnServerFactory::probe_bns_rpc_with_timeout(
+            &readiness_config(format!("http://{addr}").as_str()),
+            std::time::Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        assert!(info.ready);
+        assert_eq!(info.chain_id, 31_337);
+    }
+
     #[test]
     fn test_split_host_name() {
         let req_host = "home.lzc.web3.buckyos.io".to_string();
@@ -2277,7 +3123,7 @@ mod tests {
     }
 
     #[test]
-    fn sn_config_accepts_bns_evm_settings() {
+    fn sn_config_accepts_bns_rpc_and_controller_key() {
         let config = json!({
             "id": "test",
             "host": "buckyos.ai",
@@ -2285,26 +3131,13 @@ mod tests {
             "boot_jwt": "",
             "owner_pkx": "",
             "device_jwt": [],
+            "bns_rpc_url": "http://127.0.0.1:18080",
             "bns_evm": {
-                "rpc_endpoint": "http://127.0.0.1:8545",
-                "chain_id": 31337,
-                "contract_address": "0x2222222222222222222222222222222222222222",
-                "controller_private_key": ANVIL_PRIVATE_KEY,
-                "gas_limit": 1234567
+                "controller_private_key": ANVIL_PRIVATE_KEY
             }
         });
         let config: SNServerConfig = serde_json::from_value(config).unwrap();
-        let evm = SnServerFactory::parse_bns_evm_client_config(&config)
-            .unwrap()
-            .unwrap();
-
-        assert_eq!(evm.rpc_endpoint, "http://127.0.0.1:8545");
-        assert_eq!(evm.chain_id, 31337);
-        assert_eq!(
-            evm.contract_address,
-            "0x2222222222222222222222222222222222222222"
-        );
-        assert_eq!(evm.gas_limit, 1234567);
+        assert_eq!(config.bns_rpc_url, "http://127.0.0.1:18080");
         assert_eq!(
             SnServerFactory::load_bns_evm_controller_private_key(&config)
                 .unwrap()
@@ -2313,8 +3146,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn sn_bns_controller_uses_evm_signer_as_default_principal() {
+    #[tokio::test]
+    async fn sn_bns_legacy_config_maps_to_single_controller_proxy() {
         let db = tempfile::NamedTempFile::new().unwrap();
         let config = json!({
             "id": "test",
@@ -2324,24 +3157,995 @@ mod tests {
             "owner_pkx": "",
             "device_jwt": [],
             "bns_write_enabled": true,
-            "bns_indexer_url": "http://127.0.0.1:18080",
+            "bns_rpc_url": "http://127.0.0.1:18080",
             "bns_evm": {
-                "rpc_endpoint": "http://127.0.0.1:8545",
-                "chain_id": 31337,
-                "contract_address": "0x2222222222222222222222222222222222222222",
                 "controller_private_key": ANVIL_PRIVATE_KEY
             }
         });
         let config: SNServerConfig = serde_json::from_value(config).unwrap();
-        let controller =
-            SnServerFactory::build_bns_controller(&config, db.path().to_str().unwrap())
-                .unwrap()
-                .unwrap();
+        let proxy = SnServerFactory::build_bns_proxy(
+            &config,
+            db.path().to_str().unwrap(),
+            test_bns_client(),
+            &test_bns_system_info(),
+        )
+        .await
+        .unwrap();
 
+        // 旧单 key 配置 → 单 controller `default`，principal 派生自 EVM signer 地址，
+        // 且保持旧 devtest 语义（asset_owner 可缺省）。
         assert_eq!(
-            controller.config().sn_controller_principal,
-            Principal::chain_account(ANVIL_ADDRESS)
+            proxy.controller_addresses(),
+            vec![("default".to_string(), ANVIL_ADDRESS.to_string())]
         );
+        assert!(!proxy.require_user_asset_owner());
+        let binding = proxy.assign_controller_for_user("alice").await.unwrap();
+        assert_eq!(binding.controller_id, "default");
+        assert_eq!(binding.controller_address, ANVIL_ADDRESS);
+    }
+
+    #[tokio::test]
+    async fn sn_bns_proxy_config_builds_multi_controller_proxy() {
+        let db = tempfile::NamedTempFile::new().unwrap();
+        let config = json!({
+            "id": "test",
+            "host": "buckyos.ai",
+            "ip": "127.0.0.1",
+            "boot_jwt": "",
+            "owner_pkx": "",
+            "device_jwt": [],
+            "bns_write_enabled": true,
+            "bns_rpc_url": "http://127.0.0.1:18080",
+            "bns_proxy": {
+                "controllers": [
+                    {
+                        "id": "controller-a",
+                        "address": ANVIL_ADDRESS,
+                        "private_key": ANVIL_PRIVATE_KEY
+                    },
+                    {
+                        "id": "controller-b",
+                        "private_key": "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d"
+                    }
+                ],
+                "allowed_operations": ["register_name_bootstrap", "publish_dns_txt"]
+            }
+        });
+        let config: SNServerConfig = serde_json::from_value(config).unwrap();
+        let proxy = SnServerFactory::build_bns_proxy(
+            &config,
+            db.path().to_str().unwrap(),
+            test_bns_client(),
+            &test_bns_system_info(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(proxy.controller_count(), 2);
+        // bns_proxy 配置块存在 → 生产默认：注册必须携带用户 asset_owner。
+        assert!(proxy.require_user_asset_owner());
+        assert!(proxy.allows(crate::SnBnsProxyOperation::PublishDnsTxt));
+        assert!(!proxy.allows(crate::SnBnsProxyOperation::PublishRelayAssignment));
+    }
+
+    /// 模拟「链 + indexer 同步完成」的 EVM 提交器：直接把 TX 应用到
+    /// 内存 BNS 状态机（与 bns-client tests 的 ApplyingEvmSubmitter 同构）。
+    struct TestApplyingEvmSubmitter {
+        registry: Arc<bns_indexer::CentralizedBnsRegistry<bns_indexer::SqliteBnsRegistryStore>>,
+        next_nonce: std::sync::Mutex<u64>,
+        fail_receipt_wait: bool,
+    }
+
+    impl TestApplyingEvmSubmitter {
+        fn new(
+            registry: Arc<bns_indexer::CentralizedBnsRegistry<bns_indexer::SqliteBnsRegistryStore>>,
+            fail_receipt_wait: bool,
+        ) -> Self {
+            Self {
+                registry,
+                next_nonce: std::sync::Mutex::new(0),
+                fail_receipt_wait,
+            }
+        }
+
+        fn submission(&self) -> bns_client::BnsEvmTxSubmission {
+            let mut next_nonce = self.next_nonce.lock().unwrap();
+            let nonce = *next_nonce;
+            *next_nonce += 1;
+            bns_client::BnsEvmTxSubmission {
+                tx_hash: format!("0x{nonce:064x}"),
+                raw_tx: format!("0x{nonce:02x}"),
+                from: "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266".to_string(),
+                nonce,
+                chain_id: 31_337,
+                receipt_status: None,
+                receipt_block_number: None,
+                receipt_confirmations: None,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl bns_client::SnBnsEvmSubmitter for TestApplyingEvmSubmitter {
+        async fn register_name(
+            &self,
+            req: &bns_client::BnsRegisterNameReq,
+        ) -> bns_client::BnsClientResult<bns_client::BnsEvmTxSubmission> {
+            if req.authority_key_updates.is_empty()
+                && req.semantic_owner_after_authority.is_none()
+                && req.controller_policy.is_empty()
+            {
+                self.registry
+                    .register_name(
+                        req.name.as_str(),
+                        req.asset_owner.as_str(),
+                        req.options.clone(),
+                        req.initial_documents.clone(),
+                        req.authority.clone(),
+                        req.guard,
+                    )
+                    .map_err(bns_client::BnsClientError::from)?;
+            } else {
+                self.registry
+                    .bootstrap_name(
+                        req.name.as_str(),
+                        req.asset_owner.as_str(),
+                        req.options.clone(),
+                        req.initial_documents.clone(),
+                        req.authority_key_updates.clone(),
+                        req.semantic_owner_after_authority.clone(),
+                        req.controller_policy.clone(),
+                        req.controller_policy_hash.as_str(),
+                        req.authority.clone(),
+                        req.guard,
+                    )
+                    .map_err(bns_client::BnsClientError::from)?;
+            }
+            Ok(self.submission())
+        }
+
+        async fn apply_mutations(
+            &self,
+            req: &bns_client::BnsApplyMutationsReq,
+        ) -> bns_client::BnsClientResult<bns_client::BnsEvmTxSubmission> {
+            self.registry
+                .apply_mutations(
+                    req.name.as_str(),
+                    req.authority_key_updates.clone(),
+                    req.documents.clone(),
+                    req.owner_policy.clone(),
+                    req.authority.clone(),
+                    req.guard,
+                )
+                .map_err(bns_client::BnsClientError::from)?;
+            Ok(self.submission())
+        }
+
+        async fn publish_document(
+            &self,
+            req: &bns_client::BnsPublishDocumentReq,
+        ) -> bns_client::BnsClientResult<bns_client::BnsEvmTxSubmission> {
+            self.registry
+                .publish_document(
+                    req.name.as_str(),
+                    req.update.clone(),
+                    req.authority.clone(),
+                    req.guard,
+                )
+                .map_err(bns_client::BnsClientError::from)?;
+            Ok(self.submission())
+        }
+
+        async fn wait_for_receipt(
+            &self,
+            tx_hash: &str,
+            config: bns_client::BnsEvmReceiptWaitConfig,
+        ) -> bns_client::BnsClientResult<bns_client::BnsEvmTxReceipt> {
+            if self.fail_receipt_wait {
+                return Err(bns_client::BnsClientError::Transport(format!(
+                    "timed out waiting for BNS EVM tx receipt {tx_hash}"
+                )));
+            }
+            Ok(bns_client::BnsEvmTxReceipt {
+                tx_hash: tx_hash.to_string(),
+                status: Some(1),
+                block_number: 1,
+                confirmations: config.confirmations.max(1),
+            })
+        }
+    }
+
+    const PROXY_CONTROLLER_A: &str = "0xcccccccccccccccccccccccccccccccccccccc01";
+    const PROXY_CONTROLLER_B: &str = "0xcccccccccccccccccccccccccccccccccccccc02";
+    const PROXY_USER_OWNER: &str = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    /// 构建带 in-process BNS 状态机的 SNServer + 双 controller proxy。
+    async fn build_sn_with_bns_proxy(
+        db_path: &str,
+        auth_dir: &std::path::Path,
+        require_user_asset_owner: bool,
+        fail_receipt_wait: bool,
+    ) -> (
+        Arc<SNServer>,
+        Arc<bns_indexer::CentralizedBnsRegistry<bns_indexer::SqliteBnsRegistryStore>>,
+    ) {
+        let auth_db = SqliteSnAuthDB::new_by_path(db_path).await.unwrap();
+        auth_db.initialize_database().await.unwrap();
+        auth_db
+            .insert_activation_code(CLEAR_STATE_ACTIVE_CODE)
+            .await
+            .unwrap();
+        auth_db
+            .insert_activation_code("bnsProxyCode2")
+            .await
+            .unwrap();
+        let auth_db: SnAuthDBRef = Arc::new(auth_db);
+
+        let device_info_db = SqliteSnDeviceInfoDB::new_by_path(db_path).await.unwrap();
+        device_info_db.initialize_database().await.unwrap();
+        let device_info_db: SnDeviceInfoDBRef = Arc::new(device_info_db);
+
+        let compat_store = SqliteSnCompatibilityStore::new_by_path(db_path)
+            .await
+            .unwrap();
+        compat_store.initialize_database().await.unwrap();
+        let compat_store: SnCompatibilityStoreRef = Arc::new(compat_store);
+
+        let relay_manager = SqliteSnRelayManager::new_by_path(db_path)
+            .await
+            .unwrap()
+            .with_auth_db(auth_db.clone())
+            .with_device_info_db(device_info_db.clone());
+        relay_manager.initialize_database().await.unwrap();
+        let relay_manager: SnRelayManagerRef = Arc::new(relay_manager);
+
+        let registry = Arc::new(
+            bns_indexer::CentralizedBnsRegistry::new_legacy_state_machine(
+                bns_indexer::SqliteBnsRegistryStore::open_memory().unwrap(),
+            ),
+        );
+        let submitter = Arc::new(TestApplyingEvmSubmitter::new(
+            registry.clone(),
+            fail_receipt_wait,
+        ));
+        let write_request_store = Arc::new(bns_client::MemorySnBnsWriteRequestStore::new());
+
+        let handler: Arc<dyn BnsRpcApi> = Arc::new(bns_indexer::CentralizedBnsIndexerHandler::new(
+            registry.clone(),
+        ));
+        let bns_client = BnsRpcClient::new_in_process(handler);
+        let mut controllers = Vec::new();
+        for (id, address) in [
+            ("controller-a", PROXY_CONTROLLER_A),
+            ("controller-b", PROXY_CONTROLLER_B),
+        ] {
+            let controller = SnBnsController::new_with_evm_submitter(
+                Arc::new(bns_client.clone()),
+                write_request_store.clone(),
+                SnBnsControllerConfig::new(Principal::chain_account(address), ""),
+                submitter.clone(),
+            )
+            .unwrap();
+            controllers.push(crate::SnBnsProxyController {
+                id: id.to_string(),
+                address: address.to_string(),
+                principal: Principal::chain_account(address),
+                weight: 1,
+                controller: Arc::new(controller),
+            });
+        }
+        let proxy = crate::SnBnsProxy::new(
+            controllers,
+            Arc::new(crate::MemorySnBnsControllerBindingStore::new()),
+            crate::SnBnsProxyOperation::all().into_iter().collect(),
+            require_user_asset_owner,
+        )
+        .unwrap();
+
+        let config = json!({
+            "id": "test-bns-proxy",
+            "host": "buckyos.ai",
+            "ip": "127.0.0.1",
+            "boot_jwt": "",
+            "owner_pkx": "",
+            "device_jwt": [],
+            "auth_data_dir": auth_dir.to_str().unwrap(),
+        });
+        let config: SNServerConfig = serde_json::from_value(config).unwrap();
+        let sn = Arc::new(
+            SNServer::new(
+                config,
+                auth_db,
+                device_info_db,
+                compat_store,
+                relay_manager,
+                bns_client,
+                Arc::new(proxy),
+            )
+            .await
+            .unwrap(),
+        );
+        (sn, registry)
+    }
+
+    #[tokio::test]
+    async fn test_auth_register_assigns_relay_and_zone_info_reads_it_back() {
+        init_logging("sn", false);
+        let db = tempfile::NamedTempFile::with_suffix(".db").unwrap();
+        let auth_dir = tempfile::tempdir().unwrap();
+        let (sn, _) =
+            build_sn_with_bns_proxy(db.path().to_str().unwrap(), auth_dir.path(), true, false)
+                .await;
+        for (relay_id, relay_sn, region) in [
+            ("relay-eu", "relay-eu.example", "eu"),
+            ("relay-us", "relay-us.example", "us-west"),
+        ] {
+            sn.relay_manager()
+                .register_relay_node(crate::RelayNodeRegistration {
+                    relay_id: relay_id.to_string(),
+                    relay_sn: relay_sn.to_string(),
+                    public_host: relay_sn.to_string(),
+                    http_endpoint: Some(format!("https://{relay_sn}")),
+                    rtcp_endpoint: Some(format!("rtcp://{relay_sn}:443")),
+                    region: Some(region.to_string()),
+                    isp: None,
+                    tags: vec!["edge".to_string()],
+                    capabilities: vec!["rtcp_relay".to_string()],
+                    status: None,
+                    capacity_score: Some(100),
+                })
+                .await
+                .unwrap();
+        }
+
+        let http_server: Arc<dyn HttpServer> = sn.clone();
+        let http_addr = spawn_test_http_server(http_server).await;
+        let auth_url = format!("http://{http_addr}/kapi/sn/auth");
+        let auth_krpc = kRPC::new(auth_url.as_str(), None);
+
+        let region_result = auth_krpc
+            .call(
+                "auth.register",
+                json!({
+                    "name": "relayregionuser",
+                    "email": "relay-region@example.com",
+                    "pwd_hash": "12345678",
+                    "active_code": CLEAR_STATE_ACTIVE_CODE,
+                    "asset_owner": PROXY_USER_OWNER,
+                    "region": "US_WEST"
+                }),
+            )
+            .await
+            .unwrap();
+        let region_token = region_result["access_token"].as_str().unwrap().to_string();
+        let region_zone = kRPC::new(auth_url.as_str(), Some(region_token))
+            .call("zone.get_info", json!({}))
+            .await
+            .unwrap();
+        assert_eq!(region_zone["relay_sn"], "relay-us.example");
+        let region_assignment = sn
+            .relay_manager()
+            .get_zone_relay("relayregionuser")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(region_assignment.relay_sn, "relay-us.example");
+        assert_eq!(region_assignment.source, crate::RelayAssignmentSource::Auto);
+
+        // 未提供 region，实际连接源是 loopback，故稳定进入 fallback。客户端伪造的
+        // source_ip 字段不属于 RegisterReq，不会传给调度器。
+        let fallback_result = auth_krpc
+            .call(
+                "auth.register",
+                json!({
+                    "name": "relayfallbackuser",
+                    "email": "relay-fallback@example.com",
+                    "pwd_hash": "12345678",
+                    "active_code": "bnsProxyCode2",
+                    "asset_owner": PROXY_USER_OWNER,
+                    "source_ip": "8.8.8.8"
+                }),
+            )
+            .await
+            .unwrap();
+        let fallback_token = fallback_result["access_token"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let fallback_zone = kRPC::new(auth_url.as_str(), Some(fallback_token))
+            .call("zone.get_info", json!({}))
+            .await
+            .unwrap();
+        assert_eq!(fallback_zone["relay_sn"], "relay-eu.example");
+        let fallback_assignment = sn
+            .relay_manager()
+            .get_zone_relay("relayfallbackuser")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(fallback_assignment.relay_sn, "relay-eu.example");
+        assert_eq!(
+            fallback_assignment.reason.as_deref(),
+            Some("register;rule=fallback")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sn_bns_proxy_rpc_paths() {
+        init_logging("sn", false);
+        const PROXY_USER: &str = "bnsproxyuser";
+
+        let db = tempfile::NamedTempFile::with_suffix(".db").unwrap();
+        let auth_dir = tempfile::tempdir().unwrap();
+        let (sn, registry) =
+            build_sn_with_bns_proxy(db.path().to_str().unwrap(), auth_dir.path(), true, false)
+                .await;
+
+        let http_server: Arc<dyn HttpServer> = sn.clone();
+        let http_addr = spawn_test_http_server(http_server).await;
+        let base_url = format!("http://{}", http_addr);
+        let auth_url = format!("{}/kapi/sn/auth", base_url);
+        let bns_proxy_url = format!("{}/kapi/sn/bns-proxy", base_url);
+        let internal_url = format!("{}/", base_url);
+
+        // --- 生产模式：缺 asset_owner 注册失败，且不创建本地用户 ---
+        let auth_krpc = kRPC::new(auth_url.as_str(), None);
+        let missing_owner_err = auth_krpc
+            .call(
+                "auth.register",
+                json!({
+                    "name": PROXY_USER,
+                    "email": "proxy-user@example.com",
+                    "pwd_hash": "12345678",
+                    "active_code": CLEAR_STATE_ACTIVE_CODE
+                }),
+            )
+            .await
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(missing_owner_err.contains("[SN:1000:invalid_params]"));
+        assert!(missing_owner_err.contains("asset_owner is required"));
+
+        let result = auth_krpc
+            .call("auth.check_username", json!({ "name": PROXY_USER }))
+            .await
+            .unwrap();
+        assert!(
+            result["valid"].as_bool().unwrap(),
+            "user must not be created when bns bootstrap is rejected"
+        );
+
+        // --- 带用户 asset_owner 注册成功，响应携带 BNS TX 信息 ---
+        let result = auth_krpc
+            .call(
+                "auth.register",
+                json!({
+                    "name": PROXY_USER,
+                    "email": "proxy-user@example.com",
+                    "pwd_hash": "12345678",
+                    "active_code": CLEAR_STATE_ACTIVE_CODE,
+                    "asset_owner": PROXY_USER_OWNER,
+                    "initial_documents": {
+                        "dns_txt": [ { "ttl": 600, "value": "pkx=bootstrap" } ]
+                    }
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["code"].as_i64().unwrap(), 0);
+        assert!(!result["need_bind_owner_key"].as_bool().unwrap());
+        let access_token = result["access_token"].as_str().unwrap().to_string();
+        let bns = result["bns"].as_object().unwrap();
+        assert_eq!(bns["status"].as_str().unwrap(), "confirmed");
+        assert_eq!(
+            bns["operation"].as_str().unwrap(),
+            "register_name_bootstrap"
+        );
+        assert_eq!(bns["asset_owner"].as_str().unwrap(), PROXY_USER_OWNER);
+        assert!(bns["tx_hash"].as_str().unwrap().starts_with("0x"));
+        assert!(bns["raw_tx"].as_str().unwrap().starts_with("0x"));
+        assert!(bns["nonce"].is_u64());
+        assert_eq!(bns["chain_id"].as_u64().unwrap(), 31_337);
+        let bound_controller = bns["controller_address"].as_str().unwrap().to_string();
+        assert!(
+            bound_controller == PROXY_CONTROLLER_A || bound_controller == PROXY_CONTROLLER_B,
+            "controller_address must come from SN-side binding"
+        );
+
+        // 链上（状态机）验证：assetOwner 是用户地址，绑定 controller 可写 dns_txt。
+        let owner = sn
+            .bns_proxy()
+            .controller_for_user(PROXY_USER)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(owner.controller_address, bound_controller);
+
+        // --- publish_dns_txt：token + 本人 name → submitted ---
+        let bns_krpc = kRPC::new(bns_proxy_url.as_str(), Some(access_token.clone()));
+        let result = bns_krpc
+            .call(
+                "bns.publish_dns_txt",
+                json!({
+                    "name": PROXY_USER,
+                    "mode": "add",
+                    "ttl": 300,
+                    "value": "pkx=updated"
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["code"].as_i64().unwrap(), 0);
+        assert_eq!(result["status"].as_str().unwrap(), "submitted");
+        assert_eq!(result["doc_type"].as_str().unwrap(), "dns_txt");
+        assert_eq!(
+            result["controller_address"].as_str().unwrap(),
+            bound_controller
+        );
+        assert!(result["tx_hash"].as_str().unwrap().starts_with("0x"));
+        // 响应不等待 receipt：没有 receipt 字段，document_version 是预期版本。
+        assert_eq!(result["document_version"].as_u64().unwrap(), 2);
+
+        // --- publish_document：注册后可独立补发任意内容型 document ---
+        let result = bns_krpc
+            .call(
+                "bns.publish_document",
+                json!({
+                    "request_id": "publish-zone-1",
+                    "name": PROXY_USER,
+                    "doc_type": "zone",
+                    "document": { "oods": ["ood1"] }
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["code"].as_i64().unwrap(), 0);
+        assert_eq!(result["operation"].as_str().unwrap(), "publish_document");
+        assert_eq!(result["doc_type"].as_str().unwrap(), "zone");
+        assert_eq!(result["document_version"].as_u64().unwrap(), 1);
+        let projected_zone = registry.resolve_document(PROXY_USER, "zone").unwrap();
+        let projected_zone: serde_json::Value =
+            serde_json::from_slice(&projected_zone.document_state.document.inline_document)
+                .unwrap();
+        assert_eq!(projected_zone["oods"], json!(["ood1"]));
+
+        let zone_jwt = "eyJhbGciOiJFZERTQSJ9.eyJpZCI6ImRpZDpibnM6cHJveHl1c2VyIn0.signature";
+        let jwt_result = bns_krpc
+            .call(
+                "bns.publish_document",
+                json!({
+                    "request_id": "publish-zone-jwt-2",
+                    "name": PROXY_USER,
+                    "doc_type": "zone",
+                    "document": zone_jwt
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(jwt_result["document_version"].as_u64().unwrap(), 2);
+        let projected_zone_jwt = registry.resolve_document(PROXY_USER, "zone").unwrap();
+        assert_eq!(
+            projected_zone_jwt.document_state.document.inline_document,
+            zone_jwt.as_bytes()
+        );
+
+        let reused = bns_krpc
+            .call(
+                "bns.publish_document",
+                json!({
+                    "request_id": "publish-zone-jwt-2",
+                    "name": PROXY_USER,
+                    "doc_type": "zone",
+                    "document": zone_jwt
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(reused["reused"].as_bool().unwrap());
+
+        let idempotency_error = bns_krpc
+            .call(
+                "bns.publish_document",
+                json!({
+                    "request_id": "publish-zone-jwt-2",
+                    "name": PROXY_USER,
+                    "doc_type": "zone",
+                    "document": "eyJhbGciOiJFZERTQSJ9.eyJpZCI6ImRpZDp3ZWI6ZXhhbXBsZS5jb20ifQ.signature"
+                }),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(idempotency_error.contains("idempotency"));
+
+        for invalid_document in [json!(["not", "allowed"]), json!(42), json!(true)] {
+            let error = bns_krpc
+                .call(
+                    "bns.publish_document",
+                    json!({
+                        "name": PROXY_USER,
+                        "doc_type": "zone",
+                        "document": invalid_document
+                    }),
+                )
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("[SN:1000:invalid_params]"));
+        }
+
+        let owner_jwt_error = bns_krpc
+            .call(
+                "bns.publish_document",
+                json!({
+                    "name": PROXY_USER,
+                    "doc_type": "owner",
+                    "document": zone_jwt
+                }),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(owner_jwt_error.contains("owner document must be a JSON object"));
+
+        let oversized_jwt = format!("header.{}.signature", "x".repeat(4096));
+        let oversized_error = bns_krpc
+            .call(
+                "bns.publish_document",
+                json!({
+                    "name": PROXY_USER,
+                    "doc_type": "zone",
+                    "document": oversized_jwt
+                }),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(oversized_error.contains("max 4096"));
+
+        // owner 首次补身份字段允许；保持身份字段时其它内容可改；换 key 拒绝且不落 TX。
+        let owner_key = json!({"kty":"OKP","crv":"Ed25519","x":"proxy-user-key"});
+        let first_owner = bns_krpc
+            .call(
+                "bns.publish_document",
+                json!({
+                    "request_id": "publish-owner-key-1",
+                    "name": PROXY_USER,
+                    "doc_type": "owner",
+                    "document": { "name": PROXY_USER, "public_key": owner_key.clone() }
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(first_owner["document_version"].as_u64().unwrap(), 2);
+        let owner_content = bns_krpc
+            .call(
+                "bns.publish_document",
+                json!({
+                    "request_id": "publish-owner-content-2",
+                    "name": PROXY_USER,
+                    "doc_type": "owner",
+                    "document": {
+                        "name": PROXY_USER,
+                        "public_key": owner_key,
+                        "display_name": "Proxy User"
+                    }
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(owner_content["document_version"].as_u64().unwrap(), 3);
+
+        let changed_owner_err = bns_krpc
+            .call(
+                "bns.publish_document",
+                json!({
+                    "request_id": "publish-owner-change-3",
+                    "name": PROXY_USER,
+                    "doc_type": "owner",
+                    "document": {
+                        "name": PROXY_USER,
+                        "public_key": {"kty":"OKP","crv":"Ed25519","x":"evil-key"}
+                    }
+                }),
+            )
+            .await
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(changed_owner_err.contains("[SN:1000:invalid_params]"));
+        assert!(changed_owner_err.contains("cannot be changed"));
+        let projected_owner = registry.resolve_document(PROXY_USER, "owner").unwrap();
+        assert_eq!(projected_owner.document_state.version, 3);
+
+        // relay_assignment 仍不能借通用入口绕过 internal/admin 边界。
+        let reserved_doc_err = bns_krpc
+            .call(
+                "bns.publish_document",
+                json!({
+                    "name": PROXY_USER,
+                    "doc_type": "relay_assignment",
+                    "document": { "relays": ["relay1.buckyos.ai"] }
+                }),
+            )
+            .await
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(reserved_doc_err.contains("[SN:1000:invalid_params]"));
+        assert!(reserved_doc_err.contains("internal-only"));
+
+        // --- 跨用户 name 拒绝 ---
+        let cross_user_err = bns_krpc
+            .call(
+                "bns.publish_dns_txt",
+                json!({
+                    "name": "otheruser",
+                    "mode": "add",
+                    "value": "pkx=evil"
+                }),
+            )
+            .await
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(cross_user_err.contains("[SN:1018:cross_user_access_denied]"));
+
+        let cross_user_document_err = bns_krpc
+            .call(
+                "bns.publish_document",
+                json!({
+                    "name": "otheruser",
+                    "doc_type": "zone",
+                    "document": { "oods": ["evil"] }
+                }),
+            )
+            .await
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(cross_user_document_err.contains("[SN:1018:cross_user_access_denied]"));
+
+        // --- 客户端不能指定 controller_address（未知字段直接拒绝）---
+        let unknown_field_err = bns_krpc
+            .call(
+                "bns.publish_dns_txt",
+                json!({
+                    "name": PROXY_USER,
+                    "mode": "add",
+                    "value": "pkx=x",
+                    "controller_address": PROXY_CONTROLLER_A
+                }),
+            )
+            .await
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(unknown_field_err.contains("[SN:1000:invalid_params]"));
+        assert!(unknown_field_err.contains("controller_address"));
+
+        let unknown_document_field_err = bns_krpc
+            .call(
+                "bns.publish_document",
+                json!({
+                    "name": PROXY_USER,
+                    "doc_type": "zone",
+                    "document": { "oods": ["ood1"] },
+                    "authority": {}
+                }),
+            )
+            .await
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(unknown_document_field_err.contains("[SN:1000:invalid_params]"));
+        assert!(unknown_document_field_err.contains("authority"));
+
+        // --- 无 token 拒绝 ---
+        let no_token_err = kRPC::new(bns_proxy_url.as_str(), None)
+            .call(
+                "bns.publish_dns_txt",
+                json!({ "name": PROXY_USER, "mode": "add", "value": "pkx=x" }),
+            )
+            .await
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(no_token_err.contains("[SN:1006:auth_required]"));
+
+        let no_token_document_err = kRPC::new(bns_proxy_url.as_str(), None)
+            .call(
+                "bns.publish_document",
+                json!({
+                    "name": PROXY_USER,
+                    "doc_type": "zone",
+                    "document": { "oods": ["ood1"] }
+                }),
+            )
+            .await
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(no_token_document_err.contains("[SN:1006:auth_required]"));
+
+        // --- internal-only 方法不暴露在外部 HTTP 路径 ---
+        for method in [
+            "bns.publish_relay_assignment",
+            "bns.register_name_bootstrap",
+        ] {
+            let err = bns_krpc
+                .call(method, json!({ "name": PROXY_USER }))
+                .await
+                .err()
+                .unwrap()
+                .to_string();
+            assert!(
+                err.contains("not available on /kapi/sn/bns-proxy"),
+                "{method} must be internal-only, got: {err}"
+            );
+        }
+
+        // --- internal 路径（"/"）：relay assignment / bootstrap 恢复可用 ---
+        let internal_krpc = kRPC::new(internal_url.as_str(), None);
+        let result = internal_krpc
+            .call(
+                "bns.publish_relay_assignment",
+                json!({
+                    "name": PROXY_USER,
+                    "relay_assignment": { "relays": ["relay1.buckyos.ai"] }
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["code"].as_i64().unwrap(), 0);
+        assert_eq!(result["status"].as_str().unwrap(), "submitted");
+        assert_eq!(result["doc_type"].as_str().unwrap(), "relay_assignment");
+
+        const RECOVER_USER: &str = "bnsrecoveruser";
+        let result = internal_krpc
+            .call(
+                "bns.register_name_bootstrap",
+                json!({
+                    "request_id": "sn:register:bnsrecoveruser",
+                    "name": RECOVER_USER,
+                    "asset_owner": PROXY_USER_OWNER
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["code"].as_i64().unwrap(), 0);
+        assert_eq!(result["status"].as_str().unwrap(), "submitted");
+        assert_eq!(result["reused"].as_bool().unwrap(), false);
+        let first_tx_hash = result["tx_hash"].as_str().unwrap().to_string();
+
+        // Cross the old second-based created_at boundary before replaying.
+        tokio::time::sleep(tokio::time::Duration::from_millis(1_100)).await;
+
+        // 同 request_id 幂等重放：返回同一笔 TX，reused=true。
+        let replay = internal_krpc
+            .call(
+                "bns.register_name_bootstrap",
+                json!({
+                    "request_id": "sn:register:bnsrecoveruser",
+                    "name": RECOVER_USER,
+                    "asset_owner": PROXY_USER_OWNER
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(replay["tx_hash"].as_str().unwrap(), first_tx_hash);
+        assert!(replay["reused"].as_bool().unwrap());
+
+        // --- 登录路径回归：proxy 存在时 need_bind_owner_key = false ---
+        let result = auth_krpc
+            .call(
+                "auth.login",
+                json!({ "name": PROXY_USER, "pwd_hash": "12345678" }),
+            )
+            .await
+            .unwrap();
+        assert!(!result["need_bind_owner_key"].as_bool().unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_auth_register_does_not_create_user_before_chain_receipt() {
+        init_logging("sn", false);
+        const USERNAME: &str = "receiptwaituser";
+
+        let db = tempfile::NamedTempFile::with_suffix(".db").unwrap();
+        let auth_dir = tempfile::tempdir().unwrap();
+        let (sn, _) =
+            build_sn_with_bns_proxy(db.path().to_str().unwrap(), auth_dir.path(), true, true).await;
+        let http_server: Arc<dyn HttpServer> = sn.clone();
+        let http_addr = spawn_test_http_server(http_server).await;
+        let auth_krpc = kRPC::new(format!("http://{http_addr}/kapi/sn/auth").as_str(), None);
+
+        let error = auth_krpc
+            .call(
+                "auth.register",
+                json!({
+                    "name": USERNAME,
+                    "email": "receipt-wait@example.com",
+                    "pwd_hash": "12345678",
+                    "active_code": CLEAR_STATE_ACTIVE_CODE,
+                    "asset_owner": PROXY_USER_OWNER
+                }),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("timed out waiting for BNS EVM tx receipt"));
+        assert!(!sn.auth_db().is_user_exist(USERNAME).await.unwrap());
+        assert!(sn
+            .auth_db()
+            .check_active_code(CLEAR_STATE_ACTIVE_CODE)
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_sn_bns_proxy_dns_txt_projection_visible_after_submit() {
+        init_logging("sn", false);
+        const PROXY_USER: &str = "bnsprojuser";
+
+        let db = tempfile::NamedTempFile::with_suffix(".db").unwrap();
+        let auth_dir = tempfile::tempdir().unwrap();
+        let (sn, registry) =
+            build_sn_with_bns_proxy(db.path().to_str().unwrap(), auth_dir.path(), false, false)
+                .await;
+
+        let http_server: Arc<dyn HttpServer> = sn.clone();
+        let http_addr = spawn_test_http_server(http_server).await;
+        let base_url = format!("http://{}", http_addr);
+        let auth_url = format!("{}/kapi/sn/auth", base_url);
+        let bns_proxy_url = format!("{}/kapi/sn/bns-proxy", base_url);
+
+        // devtest 模式：asset_owner 缺省回落为绑定 controller 地址。
+        let auth_krpc = kRPC::new(auth_url.as_str(), None);
+        let result = auth_krpc
+            .call(
+                "auth.register",
+                json!({
+                    "name": PROXY_USER,
+                    "email": "proxy-user@example.com",
+                    "pwd_hash": "12345678",
+                    "active_code": CLEAR_STATE_ACTIVE_CODE
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["code"].as_i64().unwrap(), 0);
+        let access_token = result["access_token"].as_str().unwrap().to_string();
+        let bns = result["bns"].as_object().unwrap();
+        let bound_controller = bns["controller_address"].as_str().unwrap().to_string();
+        assert_eq!(bns["asset_owner"].as_str().unwrap(), bound_controller);
+
+        let bns_krpc = kRPC::new(bns_proxy_url.as_str(), Some(access_token));
+        let result = bns_krpc
+            .call(
+                "bns.publish_dns_txt",
+                json!({
+                    "name": PROXY_USER,
+                    "mode": "add",
+                    "value": "pkx=projection"
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["status"].as_str().unwrap(), "submitted");
+
+        // 权威状态经「链→indexer 投影」可见（测试里状态机即投影源）。
+        let handler: Arc<dyn BnsRpcApi> =
+            Arc::new(bns_indexer::CentralizedBnsIndexerHandler::new(registry));
+        let reader = BnsRpcClient::new_in_process(handler);
+        let resolved = reader
+            .resolve_document(PROXY_USER, "dns_txt")
+            .await
+            .unwrap();
+        let inline = String::from_utf8(resolved.document_state.document.inline_document).unwrap();
+        assert!(inline.contains("pkx=projection"), "{inline}");
     }
 
     #[test]
@@ -3190,6 +4994,10 @@ mod tests {
             DeviceDocument::new_by_jwk("ood1", serde_json::from_value(jwk).unwrap());
         let device_info = DeviceInfo::from_device_doc(&device_config);
 
+        const TAKEOVER_USER: &str = "takeoveruser";
+        const TAKEOVER_ACTIVE_CODE: &str = "kO3pQ4rS5tU6vW7xY8zA";
+        const EMAIL_CONFLICT_ACTIVE_CODE: &str = "email-conflict-active-code";
+
         let sn_factory = SnServerFactory::new();
         let db = tempfile::NamedTempFile::with_suffix(".db").unwrap();
         let auth_dir = tempfile::tempdir().unwrap();
@@ -3202,7 +5010,21 @@ mod tests {
             db.insert_activation_code(CLEAR_STATE_ACTIVE_CODE)
                 .await
                 .unwrap();
+            db.insert_activation_code(TAKEOVER_ACTIVE_CODE)
+                .await
+                .unwrap();
+            db.insert_activation_code(EMAIL_CONFLICT_ACTIVE_CODE)
+                .await
+                .unwrap();
         }
+
+        // domain.bind 的外部 DNS proof path 指向本地 mock DoH（RFC 8484）。
+        let mock_doh = Arc::new(MockDohServer::new());
+        let doh_addr = spawn_test_http_server(mock_doh.clone()).await;
+        let bns_addr = spawn_test_http_server(Arc::new(ReadinessTestServer::new(
+            ReadinessServerMode::Ready,
+        )))
+        .await;
 
         let config = json!({
             "id": "test-refactor",
@@ -3214,6 +5036,9 @@ mod tests {
             "db_type": "sqlite",
             "db_path": db.path().to_str().unwrap(),
             "auth_data_dir": auth_dir.path().to_str().unwrap(),
+            "pkx_doh_url": format!("http://{}/dns-query", doh_addr),
+            "bns_rpc_url": format!("http://{}", bns_addr),
+            "bns_evm": { "controller_private_key": ANVIL_PRIVATE_KEY },
         });
         let config: SNServerConfig = serde_json::from_value(config).unwrap();
         let servers = sn_factory.create(Arc::new(config), None).await.unwrap();
@@ -3246,7 +5071,7 @@ mod tests {
             .unwrap();
         assert!(result["valid"].as_bool().unwrap());
 
-        let result = auth_krpc
+        let missing_email_err = auth_krpc
             .call(
                 "auth.register",
                 json!({
@@ -3256,8 +5081,53 @@ mod tests {
                 }),
             )
             .await
+            .unwrap_err()
+            .to_string();
+        assert!(missing_email_err.contains("[SN:1028:invalid_email]"));
+
+        let invalid_email_err = auth_krpc
+            .call(
+                "auth.register",
+                json!({
+                    "name": REFACTOR_USER,
+                    "email": "not-an-email",
+                    "pwd_hash": "12345678",
+                    "active_code": CLEAR_STATE_ACTIVE_CODE
+                }),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(invalid_email_err.contains("[SN:1028:invalid_email]"));
+
+        let result = auth_krpc
+            .call(
+                "auth.register",
+                json!({
+                    "name": REFACTOR_USER,
+                    "email": "refactor-user@example.com",
+                    "pwd_hash": "12345678",
+                    "active_code": CLEAR_STATE_ACTIVE_CODE
+                }),
+            )
+            .await
             .unwrap();
         let access_token = result["access_token"].as_str().unwrap().to_string();
+
+        let duplicate_email_err = auth_krpc
+            .call(
+                "auth.register",
+                json!({
+                    "name": "emaildupeuser",
+                    "email": "  REFACTOR-USER@EXAMPLE.COM  ",
+                    "pwd_hash": "different-password",
+                    "active_code": EMAIL_CONFLICT_ACTIVE_CODE
+                }),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(duplicate_email_err.contains("[SN:1029:email_already_bound]"));
 
         let auth_user_krpc = kRPC::new(auth_url.as_str(), Some(access_token.clone()));
         let removed_owner_key = auth_user_krpc
@@ -3313,6 +5183,74 @@ mod tests {
         let result = device_krpc.call("device.list", json!({})).await.unwrap();
         assert_eq!(result["items"].as_array().unwrap().len(), 1);
 
+        // `user.add_dns_record` keeps the SN-provided web3 bridge namespace in
+        // the local compatibility store even before a traditional user_domain
+        // is bound. ACME can therefore create and remove its short-lived TXT
+        // challenge without publishing a BNS document on chain.
+        let bridge_challenge = format!("_acme-challenge.{}.web3.buckyos.ai", REFACTOR_USER);
+        let result = auth_user_krpc
+            .call(
+                "user.add_dns_record",
+                json!({
+                    "device_did": device_config.id.to_string(),
+                    "domain": bridge_challenge,
+                    "record_type": "TXT",
+                    "record": "temporary-acme-proof",
+                    "ttl": 60
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["device_name"].as_str().unwrap(), "ood1");
+
+        let result = auth_user_krpc
+            .call("user.list_dns_records", json!({}))
+            .await
+            .unwrap();
+        let bridge_record = result["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["domain"].as_str() == Some(bridge_challenge.as_str()))
+            .unwrap();
+        assert_eq!(
+            bridge_record["record"].as_str().unwrap(),
+            "temporary-acme-proof"
+        );
+
+        let other_bridge_err = auth_user_krpc
+            .call(
+                "user.add_dns_record",
+                json!({
+                    "device_did": device_config.id.to_string(),
+                    "domain": "_acme-challenge.other.web3.buckyos.ai",
+                    "record_type": "TXT",
+                    "record": "not-owned"
+                }),
+            )
+            .await
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(other_bridge_err.contains("[SN:1015:invalid_domain]"));
+
+        auth_user_krpc
+            .call(
+                "user.remove_dns_record",
+                json!({
+                    "device_did": device_config.id.to_string(),
+                    "domain": bridge_challenge,
+                    "record_type": "TXT"
+                }),
+            )
+            .await
+            .unwrap();
+        let result = auth_user_krpc
+            .call("user.list_dns_records", json!({}))
+            .await
+            .unwrap();
+        assert!(result["items"].as_array().unwrap().is_empty());
+
         let did_resp = reqwest::Client::new()
             .get(format!(
                 "{}/1.0/identifiers/{}?type=info",
@@ -3343,7 +5281,7 @@ mod tests {
         let ood_info = serde_json::from_value::<OODInfo>(result).unwrap();
         assert_eq!(ood_info.did_hostname, registered_did_hostname);
         assert_eq!(ood_info.owner_id, REFACTOR_USER);
-        assert_eq!(ood_info.state, "active");
+        assert_eq!(ood_info.state, SnOodState::Active);
         assert!(!ood_info.self_cert);
 
         let bns_device_did = format!("did:bns:ood1.{}", REFACTOR_USER);
@@ -3359,11 +5297,15 @@ mod tests {
         let ood_info = serde_json::from_value::<OODInfo>(result).unwrap();
         assert_eq!(ood_info.did_hostname, registered_did_hostname);
         assert_eq!(ood_info.owner_id, REFACTOR_USER);
-        assert_eq!(ood_info.state, "active");
+        assert_eq!(ood_info.state, SnOodState::Active);
         assert!(!ood_info.self_cert);
 
+        // BNS 兼容域名（SN-Resolver.md）：嵌套 `public.<user>.web3.<host>` 同样
+        // 映射到该用户 zone——main_http/tls_raw_forward 链对 `*.*.web3.<host>`
+        // 的 self_cert 门控依赖这里能解析出 ANSWER（旧行为是 hostname_not_found，
+        // 导致嵌套主机永远走不到 self_cert 判定）。
         let nested_web3_host = format!("public.{}.web3.buckyos.ai", REFACTOR_USER);
-        let err = device_krpc
+        let result = device_krpc
             .call(
                 "deviceinfo.resolve_ood_by_hostname",
                 json!({
@@ -3371,9 +5313,11 @@ mod tests {
                 }),
             )
             .await
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("hostname_not_found"));
+            .unwrap();
+        let nested_info = serde_json::from_value::<OODInfo>(result).unwrap();
+        assert_eq!(nested_info.did_hostname, registered_did_hostname);
+        assert_eq!(nested_info.owner_id, REFACTOR_USER);
+        assert!(!nested_info.self_cert);
 
         let result = auth_user_krpc
             .call(
@@ -3393,21 +5337,74 @@ mod tests {
         assert!(profile["self_cert"].as_bool().unwrap());
 
         let user_domain = format!("{}.buckyos.ai", REFACTOR_USER);
-        let challenge = auth_user_krpc
-            .call("domain.begin_verify", json!({ "domain": user_domain }))
+        let pkx_record = format!("_pkx.{}", user_domain);
+
+        // §user_domain：外部 DNS 尚未配置 TXT 时，一站式 domain.bind 返回可
+        // 重试错误；错误 payload 即「挑战」——携带待配置的 pkx_record_name
+        // 与期望 pkx，不写入任何 binding。
+        let bind_err = auth_user_krpc
+            .call("domain.bind", json!({ "domain": user_domain }))
             .await
-            .unwrap();
-        let pkx = challenge["pkx"].as_str().unwrap();
-        auth_user_krpc
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(bind_err.contains("[SN:1016:domain_proof_failed]"));
+        assert!(bind_err.contains(pkx_record.as_str()));
+        let expected_pkx = extract_pkx_from_proof_error(bind_err.as_str());
+
+        // 客户端传入 txt_records 不再是信任边界：伪造 proof 无法激活绑定，
+        // 服务端只认自己的 DNS 查询。
+        let forged_err = auth_user_krpc
             .call(
-                "domain.verify",
+                "domain.bind",
                 json!({
                     "domain": user_domain,
-                    "txt_records": [pkx]
+                    "txt_records": [expected_pkx]
                 }),
             )
             .await
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(forged_err.contains("[SN:1016:domain_proof_failed]"));
+        let profile = auth_user_krpc
+            .call("user.get_profile", json!({}))
+            .await
             .unwrap();
+        assert!(profile["user_domain"].is_null());
+
+        // Beta2.2 不再保留两阶段验证 API 的兼容 alias。
+        for removed_method in ["domain.begin_verify", "domain.verify"] {
+            let removed_err = auth_user_krpc
+                .call(removed_method, json!({ "domain": user_domain }))
+                .await
+                .err()
+                .unwrap()
+                .to_string();
+            assert!(removed_err.contains("not available on /kapi/sn/auth"));
+        }
+
+        // 在「外部 DNS」（mock DoH）发布 PKX TXT 后，一站式 bind 成功激活。
+        mock_doh.set_txt(pkx_record.as_str(), vec![format!("\"{}\"", expected_pkx)]);
+        let bound = auth_user_krpc
+            .call("domain.bind", json!({ "domain": user_domain }))
+            .await
+            .unwrap();
+        assert_eq!(bound["code"].as_i64().unwrap(), 0);
+        assert_eq!(bound["domain"].as_str().unwrap(), user_domain);
+        assert_eq!(bound["pkx"].as_str().unwrap(), expected_pkx);
+        assert_eq!(bound["pkx_record_name"].as_str().unwrap(), pkx_record);
+
+        // 绑定生效后 SN-DNS 侧可解析 user_domain 下的设备主机名。
+        let result = device_krpc
+            .call(
+                "deviceinfo.resolve_ood_by_hostname",
+                json!({ "dest_host": format!("ood1.{}", user_domain) }),
+            )
+            .await
+            .unwrap();
+        let ood_info = serde_json::from_value::<OODInfo>(result).unwrap();
+        assert_eq!(ood_info.owner_id, REFACTOR_USER);
 
         let result = auth_user_krpc
             .call(
@@ -3430,6 +5427,73 @@ mod tests {
             .unwrap();
         assert_eq!(result["items"].as_array().unwrap().len(), 1);
 
+        // §域名转让：新 DNS owner 完成自己的 PKX proof 即可接管同一 canonical
+        // domain（历史绑定只作审计，不阻止），无需旧 owner 先 unbind。
+        let result = auth_krpc
+            .call(
+                "auth.register",
+                json!({
+                    "name": TAKEOVER_USER,
+                    "email": "takeover-user@example.com",
+                    "pwd_hash": "87654321",
+                    "active_code": TAKEOVER_ACTIVE_CODE
+                }),
+            )
+            .await
+            .unwrap();
+        let takeover_token = result["access_token"].as_str().unwrap().to_string();
+        let takeover_krpc = kRPC::new(auth_url.as_str(), Some(takeover_token));
+
+        let takeover_err = takeover_krpc
+            .call("domain.bind", json!({ "domain": user_domain }))
+            .await
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(takeover_err.contains("[SN:1016:domain_proof_failed]"));
+        let takeover_pkx = extract_pkx_from_proof_error(takeover_err.as_str());
+        assert_ne!(takeover_pkx, expected_pkx);
+
+        // 新 owner 控制传统 DNS：替换 TXT 为自己的 PKX。
+        mock_doh.set_txt(pkx_record.as_str(), vec![takeover_pkx.clone()]);
+        let takeover_bound = takeover_krpc
+            .call("domain.bind", json!({ "domain": user_domain }))
+            .await
+            .unwrap();
+        assert_eq!(takeover_bound["code"].as_i64().unwrap(), 0);
+        assert_eq!(takeover_bound["pkx"].as_str().unwrap(), takeover_pkx);
+
+        // 旧 owner 的 user_domain 兼容缓存已被清理。
+        let profile = auth_user_krpc
+            .call("user.get_profile", json!({}))
+            .await
+            .unwrap();
+        assert!(profile["user_domain"].is_null());
+        let profile = takeover_krpc
+            .call("user.get_profile", json!({}))
+            .await
+            .unwrap();
+        assert_eq!(profile["user_domain"].as_str().unwrap(), user_domain);
+
+        // §unbind：解绑后 SN-DNS 不再响应该 user_domain 及其子域名。
+        takeover_krpc
+            .call("domain.unbind", json!({ "domain": user_domain }))
+            .await
+            .unwrap();
+        let profile = takeover_krpc
+            .call("user.get_profile", json!({}))
+            .await
+            .unwrap();
+        assert!(profile["user_domain"].is_null());
+        assert!(device_krpc
+            .call(
+                "deviceinfo.resolve_ood_by_hostname",
+                json!({ "dest_host": format!("ood1.{}", user_domain) }),
+            )
+            .await
+            .is_err());
+        mock_doh.remove_txt(pkx_record.as_str());
+
         let admin_on_auth = auth_user_krpc
             .call("admin.clear_state_by_active_code", json!({}))
             .await
@@ -3444,6 +5508,350 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result["code"].as_i64().unwrap(), 0);
+    }
+
+    /// 设备级凭证（device token）驱动 device.register / device.update 的
+    /// 端到端路径：node_daemon 侧按 `cyfs_gateway_api::generate_sn_device_token`
+    /// 签发，SN 侧 `sn_authority::require_sn_device` 校验并锚定 zone 登记的
+    /// 设备公钥。覆盖 SN-Auth.md 的 `Device(zone, device, did)` 上下文。
+    #[tokio::test]
+    async fn test_sn_device_token_report_paths() {
+        init_logging("sn", false);
+        const DEVTOKEN_USER: &str = "devtokenuser";
+
+        let (device_signing_key, device_pkcs8_bytes) = generate_ed25519_key();
+        let device_jwk = encode_ed25519_sk_to_pk_jwk(&device_signing_key);
+        let device_config =
+            DeviceDocument::new_by_jwk("ood1", serde_json::from_value(device_jwk).unwrap());
+        let device_info = DeviceInfo::from_device_doc(&device_config);
+        let device_encoding_key =
+            jsonwebtoken::EncodingKey::from_ed_der(device_pkcs8_bytes.as_slice());
+        let device_key_did = device_config.id.to_string();
+        let device_scoped_did = format!("did:bns:ood1.{}", DEVTOKEN_USER);
+
+        let sn_factory = SnServerFactory::new();
+        let db = tempfile::NamedTempFile::with_suffix(".db").unwrap();
+        let auth_dir = tempfile::tempdir().unwrap();
+        {
+            let db = SqliteSnAuthDB::new_by_path(db.path().to_str().unwrap())
+                .await
+                .unwrap();
+            db.initialize_database().await.unwrap();
+            db.insert_activation_code(CLEAR_STATE_ACTIVE_CODE)
+                .await
+                .unwrap();
+        }
+        let bns_addr = spawn_test_http_server(Arc::new(ReadinessTestServer::new(
+            ReadinessServerMode::Ready,
+        )))
+        .await;
+        let config = json!({
+            "id": "test-device-token",
+            "host": "buckyos.ai",
+            "ip": "127.0.0.1",
+            "boot_jwt": "",
+            "owner_pkx": "",
+            "device_jwt": [],
+            "db_type": "sqlite",
+            "db_path": db.path().to_str().unwrap(),
+            "auth_data_dir": auth_dir.path().to_str().unwrap(),
+            "bns_rpc_url": format!("http://{}", bns_addr),
+            "bns_evm": { "controller_private_key": ANVIL_PRIVATE_KEY },
+        });
+        let config: SNServerConfig = serde_json::from_value(config).unwrap();
+        let servers = sn_factory.create(Arc::new(config), None).await.unwrap();
+        let http_server = servers
+            .iter()
+            .find_map(|server| match server {
+                Server::Http(server) => Some(server.clone()),
+                _ => None,
+            })
+            .unwrap();
+        let http_addr = spawn_test_http_server(http_server).await;
+        let base_url = format!("http://{}", http_addr);
+        let auth_url = format!("{}/kapi/sn/auth", base_url);
+        let deviceinfo_url = format!("{}/kapi/sn/deviceinfo", base_url);
+
+        let device_token = cyfs_gateway_api::generate_sn_device_token(
+            device_key_did.as_str(),
+            device_scoped_did.as_str(),
+            None,
+            &device_encoding_key,
+        )
+        .unwrap();
+        let device_token_krpc = kRPC::new(deviceinfo_url.as_str(), Some(device_token.clone()));
+        let update_params = json!({
+            "device_name": "ood1",
+            "device_ip": "127.0.0.1",
+            "device_info": serde_json::to_string(&device_info).unwrap(),
+            "ttl": 600
+        });
+
+        // zone 用户还不存在：设备 token 被拒（zone 归属无从谈起）。
+        let err = device_token_krpc
+            .call("device.update", update_params.clone())
+            .await
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(err.contains("device_permission_denied"), "{}", err);
+
+        let auth_krpc = kRPC::new(auth_url.as_str(), None);
+        let result = auth_krpc
+            .call(
+                "auth.register",
+                json!({
+                    "name": DEVTOKEN_USER,
+                    "email": "device-token-user@example.com",
+                    "pwd_hash": "12345678",
+                    "active_code": CLEAR_STATE_ACTIVE_CODE
+                }),
+            )
+            .await
+            .unwrap();
+        let access_token = result["access_token"].as_str().unwrap().to_string();
+
+        // zone 权威侧尚无该设备的登记（无 BNS 文档、无历史登记）：拒绝，
+        // 不允许"第一个来报的 key 自动成为锚"。
+        let err = device_token_krpc
+            .call("device.update", update_params.clone())
+            .await
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(err.contains("device_permission_denied"), "{}", err);
+        assert!(err.contains("is not registered"), "{}", err);
+
+        // 激活流程用账号 token 完成设备首次登记（现状协议，保持不变）。
+        let account_krpc = kRPC::new(deviceinfo_url.as_str(), Some(access_token.clone()));
+        let result = account_krpc
+            .call(
+                "device.register",
+                json!({
+                    "device_name": "ood1",
+                    "device_did": device_key_did,
+                    "device_ip": "127.0.0.1",
+                    "device_info": serde_json::to_string(&device_info).unwrap(),
+                    "ttl": 600
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["code"].as_i64().unwrap(), 0);
+        assert_eq!(result["zone"].as_str().unwrap(), DEVTOKEN_USER);
+
+        // 设备 token 驱动周期上报（node_daemon 主循环路径）：device_did 缺省
+        // 由凭证强制补齐。
+        let result = device_token_krpc
+            .call("device.update", update_params.clone())
+            .await
+            .unwrap();
+        assert_eq!(result["code"].as_i64().unwrap(), 0);
+        assert_eq!(result["zone"].as_str().unwrap(), DEVTOKEN_USER);
+        assert_eq!(result["did"].as_str().unwrap(), device_key_did);
+
+        // The same verified device identity may manage only exact ACME TXT
+        // values in its own zone. The payload's device_did is deliberately
+        // forged to prove authorization comes from the token context.
+        let device_auth_krpc = kRPC::new(auth_url.as_str(), Some(device_token.clone()));
+        let challenge = format!(
+            "_acme-challenge.{}.web3.buckyos.ai",
+            DEVTOKEN_USER
+        );
+        for value in ["root-order", "wildcard-order", "root-order"] {
+            device_auth_krpc
+                .call(
+                    "user.add_dns_record",
+                    json!({
+                        "device_did": "did:dev:forged-request-value",
+                        "domain": challenge,
+                        "record_type": "TXT",
+                        "record": value,
+                        "ttl": 600
+                    }),
+                )
+                .await
+                .unwrap();
+        }
+        device_auth_krpc
+            .call(
+                "user.remove_dns_record",
+                json!({
+                    "device_did": "did:dev:forged-request-value",
+                    "domain": challenge,
+                    "record_type": "TXT",
+                    "record": "root-order"
+                }),
+            )
+            .await
+            .unwrap();
+        let account_auth_krpc = kRPC::new(auth_url.as_str(), Some(access_token.clone()));
+        let records = account_auth_krpc
+            .call("user.list_dns_records", json!({}))
+            .await
+            .unwrap();
+        assert_eq!(records["items"].as_array().unwrap().len(), 1);
+        assert_eq!(records["items"][0]["record"], "wildcard-order");
+
+        let err = device_auth_krpc
+            .call(
+                "user.add_dns_record",
+                json!({
+                    "device_did": device_key_did,
+                    "domain": format!("www.{}.web3.buckyos.ai", DEVTOKEN_USER),
+                    "record_type": "A",
+                    "record": "127.0.0.1"
+                }),
+            )
+            .await
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(err.contains("device_permission_denied"), "{}", err);
+
+        let result = device_token_krpc
+            .call(
+                "deviceinfo.resolve_ood_by_did",
+                json!({ "source_device_id": device_key_did }),
+            )
+            .await
+            .unwrap();
+        let ood_info = serde_json::from_value::<OODInfo>(result).unwrap();
+        assert_eq!(ood_info.owner_id, DEVTOKEN_USER);
+        assert_eq!(ood_info.state, SnOodState::Active);
+
+        // 越权：ood1 的设备 token 不能冒名上报 ood2。
+        let err = device_token_krpc
+            .call(
+                "device.update",
+                json!({
+                    "device_name": "ood2",
+                    "device_ip": "127.0.0.1",
+                    "device_info": serde_json::to_string(&device_info).unwrap(),
+                }),
+            )
+            .await
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(err.contains("device_permission_denied"), "{}", err);
+        assert!(err.contains("cannot report device ood2"), "{}", err);
+
+        // 冒名：另一把 key 自签 sub，与 zone 登记的设备公钥锚定不上。
+        let (rogue_signing_key, rogue_pkcs8_bytes) = generate_ed25519_key();
+        let rogue_jwk = encode_ed25519_sk_to_pk_jwk(&rogue_signing_key);
+        let rogue_x = rogue_jwk["x"].as_str().unwrap().to_string();
+        let rogue_encoding_key =
+            jsonwebtoken::EncodingKey::from_ed_der(rogue_pkcs8_bytes.as_slice());
+        let rogue_token = cyfs_gateway_api::generate_sn_device_token(
+            format!("did:dev:{}", rogue_x).as_str(),
+            device_scoped_did.as_str(),
+            None,
+            &rogue_encoding_key,
+        )
+        .unwrap();
+        let rogue_krpc = kRPC::new(deviceinfo_url.as_str(), Some(rogue_token));
+        let err = rogue_krpc
+            .call("device.update", update_params.clone())
+            .await
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(err.contains("device_permission_denied"), "{}", err);
+        assert!(err.contains("does not match the registered key"), "{}", err);
+
+        // 签名与 sub 不符（拿别人的 sub、用自己的 key 签）：验签直接失败。
+        let forged_token = cyfs_gateway_api::generate_sn_device_token(
+            device_key_did.as_str(),
+            device_scoped_did.as_str(),
+            None,
+            &rogue_encoding_key,
+        )
+        .unwrap();
+        let forged_krpc = kRPC::new(deviceinfo_url.as_str(), Some(forged_token));
+        let err = forged_krpc
+            .call("device.update", update_params.clone())
+            .await
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(err.contains("invalid_token"), "{}", err);
+
+        // 设备 token 只代表设备，不是账号：账号侧接口拒绝。
+        let err = device_token_krpc
+            .call("device.list", json!({}))
+            .await
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(err.contains("invalid_token"), "{}", err);
+
+        // 账号 token 的 device.update 路径不受影响（激活/管理面继续可用）。
+        let result = account_krpc
+            .call("device.update", update_params.clone())
+            .await
+            .unwrap();
+        assert_eq!(result["code"].as_i64().unwrap(), 0);
+        assert_eq!(result["zone"].as_str().unwrap(), DEVTOKEN_USER);
+
+        // zone.get_info：账号 token 查询本 zone 运行态，zone 由服务端从
+        // token 推导；尚未分配 relay 时 relay_sn 为 null。
+        let result = account_auth_krpc
+            .call("zone.get_info", json!({}))
+            .await
+            .unwrap();
+        assert_eq!(result["code"].as_i64().unwrap(), 0);
+        assert_eq!(result["zone"].as_str().unwrap(), DEVTOKEN_USER);
+        assert_eq!(result["bns_name"].as_str().unwrap(), DEVTOKEN_USER);
+        assert!(result["relay_sn"].is_null());
+        assert!(!result["self_cert"].as_bool().unwrap());
+
+        // relay manager 分配后回写 relay_sn（经 auth 库，同一 sqlite 文件）；
+        // 设备 token 也能读到稳定 relay 名称，供 node_daemon 检测切换。
+        {
+            let relay_db = SqliteSnAuthDB::new_by_path(db.path().to_str().unwrap())
+                .await
+                .unwrap();
+            assert!(relay_db
+                .update_zone_relay_sn(DEVTOKEN_USER, "us-sn.buckyos.ai", Some("v2"))
+                .await
+                .unwrap());
+        }
+        let result = device_auth_krpc
+            .call("zone.get_info", json!({}))
+            .await
+            .unwrap();
+        assert_eq!(result["code"].as_i64().unwrap(), 0);
+        assert_eq!(result["zone"].as_str().unwrap(), DEVTOKEN_USER);
+        assert_eq!(result["relay_sn"].as_str().unwrap(), "us-sn.buckyos.ai");
+        assert_eq!(result["source_version"].as_str().unwrap(), "v2");
+
+        // 身份字段一律拒绝：不允许"看起来在查别的 zone"。
+        let err = account_auth_krpc
+            .call("zone.get_info", json!({ "zone": "otherzone" }))
+            .await
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(err.contains("invalid_params"), "{}", err);
+
+        // 匿名不可查询。
+        let err = kRPC::new(auth_url.as_str(), None)
+            .call("zone.get_info", json!({}))
+            .await
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(err.contains("auth_required"), "{}", err);
+
+        // 路径强约束：zone.* 只在 /kapi/sn/auth。
+        let err = device_token_krpc
+            .call("zone.get_info", json!({}))
+            .await
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(err.contains("not available on /kapi/sn/deviceinfo"), "{}", err);
     }
 
     #[tokio::test]
@@ -3622,6 +6030,7 @@ mod tests {
                 "auth.register",
                 json!({
                     "name": "sub.domain",
+                    "email": "sub-domain@example.com",
                     "pwd_hash": "12345678",
                     "active_code": CLEAR_STATE_ACTIVE_CODE
                 }),
@@ -3636,6 +6045,7 @@ mod tests {
                 "auth.register",
                 json!({
                     "name": TEST_USER,
+                    "email": "test-user@example.com",
                     "pwd_hash": "12345678",
                     "active_code": CLEAR_STATE_ACTIVE_CODE
                 }),
@@ -3712,6 +6122,7 @@ mod tests {
                 "auth.register",
                 json!({
                     "name": "short",
+                    "email": "short@example.com",
                     "pwd_hash": "12345678",
                     "active_code": CLEAR_STATE_ACTIVE_CODE
                 }),
@@ -3794,32 +6205,6 @@ mod tests {
         assert_eq!(result["name"].as_str().unwrap(), TEST_USER);
 
         let user_domain = format!("{}.buckyos.ai", TEST_USER);
-        let result = user_krpc
-            .call(
-                "domain.begin_verify",
-                json!({
-                    "domain": user_domain
-                }),
-            )
-            .await
-            .unwrap();
-        let pkx = result["pkx"].as_str().unwrap().to_string();
-        assert_eq!(
-            result["pkx_record_name"].as_str().unwrap(),
-            format!("_pkx.{}", user_domain)
-        );
-        let result = user_krpc
-            .call(
-                "domain.verify",
-                json!({
-                    "domain": user_domain,
-                    "txt_records": [pkx]
-                }),
-            )
-            .await
-            .unwrap();
-        assert_eq!(result["code"].as_i64().unwrap(), 0);
-
         let zone_krpc = kRPC::new(bns_url.as_str(), Some(login_access_token.clone()));
         let result = zone_krpc
             .call(
@@ -4060,6 +6445,7 @@ mod tests {
                 "auth.register",
                 json!({
                     "name": REG_USER,
+                    "email": "registration-user@example.com",
                     "pwd_hash": "12345678",
                     "active_code": CLEAR_STATE_ACTIVE_CODE
                 }),

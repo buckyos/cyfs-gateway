@@ -24,8 +24,9 @@ use tokio::time::{sleep, Duration, Instant};
 
 use crate::{
     BnsApplyMutationsReq, BnsBootstrapNameReq, BnsClientError, BnsClientResult, BnsIndexerApi,
-    BnsPublishDocumentReq, BnsRegisterNameReq, BnsRevokeDocumentReq, BnsSetControllerPolicyReq,
-    BnsSetMinDocumentIatReq, BnsSubmitRawTxReq, BnsUpdateAuthorityKeysReq,
+    BnsPrepareTxReq, BnsPublishDocumentReq, BnsRegisterNameReq, BnsRevokeDocumentReq,
+    BnsSetControllerPolicyReq, BnsSetMinDocumentIatReq, BnsSubmitRawTxReq, BnsSystemInfo,
+    BnsTxExecutionState, BnsUpdateAuthorityKeysReq,
 };
 
 impl From<BnsEvmError> for BnsClientError {
@@ -63,6 +64,19 @@ impl BnsEvmClientConfig {
             gas_limit: 3_000_000,
             max_fee_per_gas: 2_000_000_000,
             max_priority_fee_per_gas: 1_000_000_000,
+        }
+    }
+
+    pub fn from_system_info(info: &BnsSystemInfo) -> Self {
+        Self {
+            // Unified BNS RPC mode never dereferences this endpoint. Keeping it
+            // empty makes accidental direct-chain use fail closed.
+            rpc_endpoint: String::new(),
+            chain_id: info.chain_id,
+            contract_address: info.contract_address.clone(),
+            gas_limit: u64::MAX,
+            max_fee_per_gas: u128::MAX,
+            max_priority_fee_per_gas: u128::MAX,
         }
     }
 
@@ -104,6 +118,14 @@ pub struct BnsEvmTxReceipt {
     pub status: Option<u64>,
     pub block_number: u64,
     pub confirmations: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BnsEvmTxSuggestion {
+    pub estimated_gas: u64,
+    pub gas_limit: u64,
+    pub max_fee_per_gas: u128,
+    pub max_priority_fee_per_gas: u128,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -315,6 +337,49 @@ impl BnsEvmStandardClient {
             self.config.tx_params(nonce)?,
         ))
     }
+
+    /// Build a transaction from live node estimates. A 20% buffer is added to
+    /// `eth_estimateGas`; fee caps come from the node's EIP-1559 suggestion.
+    pub async fn build_unsigned_tx_with_suggestion<C: SolCall>(
+        &self,
+        call: &C,
+        from: Address,
+        nonce: u64,
+    ) -> BnsClientResult<(TxEip1559, BnsEvmTxSuggestion)> {
+        let to = self.config.contract()?;
+        let calldata = self.build_calldata(call);
+        let estimated_gas = self
+            .rpc
+            .estimate_gas(from, to, &calldata)
+            .await
+            .map_err(BnsClientError::from)?;
+        let gas_buffer = estimated_gas / 5 + u64::from(estimated_gas % 5 != 0);
+        let gas_limit = estimated_gas.saturating_add(gas_buffer);
+        let fees = self
+            .rpc
+            .suggest_eip1559_fees()
+            .await
+            .map_err(BnsClientError::from)?;
+        let suggestion = BnsEvmTxSuggestion {
+            estimated_gas,
+            gas_limit,
+            max_fee_per_gas: fees.max_fee_per_gas,
+            max_priority_fee_per_gas: fees.max_priority_fee_per_gas,
+        };
+        let tx = build_eip1559_contract_tx(
+            call,
+            Eip1559TxParams {
+                chain_id: self.config.chain_id,
+                nonce,
+                to,
+                gas_limit: suggestion.gas_limit,
+                max_fee_per_gas: suggestion.max_fee_per_gas,
+                max_priority_fee_per_gas: suggestion.max_priority_fee_per_gas,
+                value: U256::ZERO,
+            },
+        );
+        Ok((tx, suggestion))
+    }
 }
 
 pub struct BnsEvmControllerClient {
@@ -325,6 +390,7 @@ pub struct BnsEvmControllerClient {
     next_nonces: Mutex<HashMap<Address, u64>>,
     submission_lock: tokio::sync::Mutex<()>,
     receipt_wait: Option<BnsEvmReceiptWaitConfig>,
+    dynamic_tx_params: bool,
 }
 
 impl BnsEvmControllerClient {
@@ -378,6 +444,7 @@ impl BnsEvmControllerClient {
             next_nonces: Mutex::new(HashMap::new()),
             submission_lock: tokio::sync::Mutex::new(()),
             receipt_wait: None,
+            dynamic_tx_params: false,
         }
     }
 
@@ -411,6 +478,14 @@ impl BnsEvmControllerClient {
         self
     }
 
+    /// Opt into live `eth_estimateGas` and fee suggestions for each signed
+    /// transaction. Static config values remain useful for deterministic Anvil
+    /// tests and callers that manage fee policy themselves.
+    pub fn with_dynamic_tx_params(mut self, enabled: bool) -> Self {
+        self.dynamic_tx_params = enabled;
+        self
+    }
+
     pub fn signer_address(&self) -> Option<Address> {
         self.default_signer_address
     }
@@ -435,8 +510,48 @@ impl BnsEvmControllerClient {
     ) -> BnsClientResult<BnsEvmTxSubmission> {
         let signer_address = self.key_manager.signer_address(request).await?;
         let _submission_guard = self.submission_lock.lock().await;
-        let nonce = self.next_nonce(signer_address).await?;
-        let tx = self.standard.build_unsigned_tx(call, nonce)?;
+        let tx = match &self.raw_tx_submitter {
+            BnsEvmRawTxSubmitter::BnsServer(server) => {
+                let calldata = self.standard.build_calldata(call);
+                let prepared = server
+                    .prepare_tx(BnsPrepareTxReq::new(
+                        format!("{signer_address:#x}"),
+                        calldata.as_ref(),
+                    ))
+                    .await?;
+                let to = parse_address(&prepared.contract_address, "contract_address")?;
+                Ok(build_eip1559_contract_tx(
+                    call,
+                    Eip1559TxParams {
+                        chain_id: prepared.chain_id,
+                        nonce: prepared.nonce,
+                        to,
+                        gas_limit: prepared.gas_limit,
+                        max_fee_per_gas: prepared.max_fee_per_gas,
+                        max_priority_fee_per_gas: prepared.max_priority_fee_per_gas,
+                        value: U256::ZERO,
+                    },
+                ))
+            }
+            BnsEvmRawTxSubmitter::ChainRpc => {
+                let nonce = self.next_nonce(signer_address).await?;
+                if self.dynamic_tx_params {
+                    self.standard
+                        .build_unsigned_tx_with_suggestion(call, signer_address, nonce)
+                        .await
+                        .map(|(tx, _)| tx)
+                } else {
+                    self.standard.build_unsigned_tx(call, nonce)
+                }
+            }
+        };
+        let tx = match tx {
+            Ok(tx) => tx,
+            Err(error) => {
+                self.reset_nonce(signer_address);
+                return Err(error);
+            }
+        };
         let signed = match self.key_manager.sign_transaction(request, tx).await {
             Ok(signed) => signed,
             Err(error) => {
@@ -481,10 +596,42 @@ impl BnsEvmControllerClient {
         tx_hash: &str,
         config: BnsEvmReceiptWaitConfig,
     ) -> BnsClientResult<BnsEvmTxReceipt> {
-        let tx_hash_value = parse_b256(tx_hash, "tx_hash")?;
         let required_confirmations = config.confirmations.max(1);
         let poll_interval = Duration::from_millis(config.poll_interval_ms.max(1));
         let deadline = Instant::now() + Duration::from_millis(config.timeout_ms.max(1));
+
+        if let BnsEvmRawTxSubmitter::BnsServer(server) = &self.raw_tx_submitter {
+            loop {
+                let state = server.query_tx_state(tx_hash).await?;
+                match state.state {
+                    BnsTxExecutionState::Succeeded
+                        if state.confirmations >= required_confirmations =>
+                    {
+                        return Ok(BnsEvmTxReceipt {
+                            tx_hash: state.tx_hash,
+                            status: Some(1),
+                            block_number: state.block_number.unwrap_or_default(),
+                            confirmations: state.confirmations,
+                        });
+                    }
+                    BnsTxExecutionState::Reverted => {
+                        return Err(BnsClientError::registry(
+                            "EVM_TX_REVERTED",
+                            format!("BNS EVM tx {tx_hash} reverted"),
+                        ));
+                    }
+                    _ => {}
+                }
+                if Instant::now() >= deadline {
+                    return Err(BnsClientError::Transport(format!(
+                        "timed out waiting for BNS EVM tx receipt {tx_hash}"
+                    )));
+                }
+                sleep(poll_interval).await;
+            }
+        }
+
+        let tx_hash_value = parse_b256(tx_hash, "tx_hash")?;
 
         loop {
             if let Some(receipt) = self

@@ -1,4 +1,4 @@
-use crate::{into_sn_err, SnErrorCode, SnResult};
+use crate::{SnErrorCode, SnResult, into_sn_err};
 use serde::{Deserialize, Serialize};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteRow};
 use sqlx::{Row, SqlitePool};
@@ -19,6 +19,56 @@ pub struct SNDeviceInfo {
     pub description: String,
     pub created_at: u64,
     pub updated_at: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{SnCompatibilityStore, SqliteSnCompatibilityStore};
+
+    #[tokio::test]
+    async fn txt_rrset_is_multivalue_idempotent_and_exactly_removed() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let store = SqliteSnCompatibilityStore::new_by_path(file.path().to_str().unwrap())
+            .await
+            .unwrap();
+        store.initialize_database().await.unwrap();
+        let name = "_acme-challenge.alice.example";
+
+        store
+            .add_user_domain("alice", name, "TXT", "root-order", 600)
+            .await
+            .unwrap();
+        store
+            .add_user_domain("alice", name, "TXT", "wildcard-order", 300)
+            .await
+            .unwrap();
+        store
+            .add_user_domain("alice", name, "TXT", "root-order", 120)
+            .await
+            .unwrap();
+
+        let (records, ttl) = store
+            .query_domain_record(name, "TXT")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            records.split(',').collect::<Vec<_>>(),
+            vec!["root-order", "wildcard-order"]
+        );
+        assert_eq!(ttl, 120);
+
+        store
+            .remove_user_domain("alice", name, "TXT", Some("root-order"))
+            .await
+            .unwrap();
+        let (records, _) = store
+            .query_domain_record(name, "TXT")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(records, "wildcard-order");
+    }
 }
 
 #[async_trait::async_trait]
@@ -42,6 +92,7 @@ pub trait SnCompatibilityStore: Send + Sync + 'static {
         username: &str,
         domain: &str,
         record_type: &str,
+        record: Option<&str>,
     ) -> SnResult<()>;
     async fn query_domain_record(
         &self,
@@ -139,9 +190,18 @@ impl SqliteSnCompatibilityStore {
             SnErrorCode::DBError,
             "create user_dns_records table failed"
         ))?;
+        // Beta2.2 changes the legacy single-value row into an RRset. Drop the
+        // old index explicitly so existing databases migrate in place.
+        sqlx::query("DROP INDEX IF EXISTS idx_user_domain_record_type")
+            .execute(&self.pool)
+            .await
+            .map_err(into_sn_err!(
+                SnErrorCode::DBError,
+                "drop legacy dns index failed"
+            ))?;
         sqlx::query(
-            "CREATE UNIQUE INDEX IF NOT EXISTS idx_user_domain_record_type
-             ON user_dns_records (owner, domain, record_type)",
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_user_domain_record_value
+             ON user_dns_records (owner, domain, record_type, record)",
         )
         .execute(&self.pool)
         .await
@@ -262,9 +322,8 @@ impl SnCompatibilityStore for SqliteSnCompatibilityStore {
             "INSERT INTO user_dns_records
                 (owner, domain, record_type, record, ttl, created_at, updated_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)
-             ON CONFLICT(owner, domain, record_type)
-             DO UPDATE SET record = excluded.record,
-                           ttl = excluded.ttl,
+             ON CONFLICT(owner, domain, record_type, record)
+             DO UPDATE SET ttl = excluded.ttl,
                            updated_at = excluded.updated_at",
         )
         .bind(username)
@@ -287,16 +346,22 @@ impl SnCompatibilityStore for SqliteSnCompatibilityStore {
         username: &str,
         domain: &str,
         record_type: &str,
+        record: Option<&str>,
     ) -> SnResult<()> {
-        sqlx::query(
-            "DELETE FROM user_dns_records WHERE owner = ?1 AND domain = ?2 AND record_type = ?3",
-        )
-        .bind(username)
-        .bind(domain)
-        .bind(record_type)
-        .execute(&self.pool)
-        .await
-        .map_err(into_sn_err!(
+        let mut query = if record.is_some() {
+            sqlx::query(
+                "DELETE FROM user_dns_records WHERE owner = ?1 AND domain = ?2 AND record_type = ?3 AND record = ?4",
+            )
+        } else {
+            sqlx::query(
+                "DELETE FROM user_dns_records WHERE owner = ?1 AND domain = ?2 AND record_type = ?3",
+            )
+        };
+        query = query.bind(username).bind(domain).bind(record_type);
+        if let Some(record) = record {
+            query = query.bind(record);
+        }
+        query.execute(&self.pool).await.map_err(into_sn_err!(
             SnErrorCode::DBError,
             "delete user dns record failed"
         ))?;
@@ -308,19 +373,31 @@ impl SnCompatibilityStore for SqliteSnCompatibilityStore {
         domain: &str,
         record_type: &str,
     ) -> SnResult<Option<(String, u32)>> {
-        let row = sqlx::query(
-            "SELECT record, ttl FROM user_dns_records WHERE domain = ?1 AND record_type = ?2",
+        let rows = sqlx::query(
+            "SELECT record, ttl FROM user_dns_records WHERE domain = ?1 AND record_type = ?2 ORDER BY id",
         )
         .bind(domain)
         .bind(record_type)
-        .fetch_optional(&self.pool)
+        .fetch_all(&self.pool)
         .await
         .map_err(into_sn_err!(
             SnErrorCode::DBError,
             "query user dns record failed"
         ))?;
-        row.map(|row| Ok((row.get(0), row.get::<i64, _>(1).max(0) as u32)))
-            .transpose()
+        if rows.is_empty() {
+            return Ok(None);
+        }
+        let ttl = rows
+            .iter()
+            .map(|row| row.get::<i64, _>(1).max(0) as u32)
+            .min()
+            .unwrap_or(0);
+        let records = rows
+            .into_iter()
+            .map(|row| row.get::<String, _>(0))
+            .collect::<Vec<_>>()
+            .join(",");
+        Ok(Some((records, ttl)))
     }
 
     async fn query_user_domain_records(

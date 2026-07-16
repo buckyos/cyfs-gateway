@@ -3,29 +3,31 @@
 
 mod acme_sn_provider;
 mod config_loader;
-mod config_merger;
-mod debug;
 mod gateway;
-mod gateway_control_server;
-mod process_chain_doc;
 
-use crate::debug::run_debug_command;
 use acme_sn_provider::*;
 pub use config_loader::*;
-pub use config_merger::*;
+pub use cyfs_gateway_app_lib::{
+    merge, run_debug_command, AcmeConfig, AcmeHostConfig, AcmeHttpChallengeServerConfigParser,
+    ConfigMerger, CyfsDirServerConfigParser, DirServerConfigParser, DnsServerConfigParser,
+    GatewayControlServer, GatewayControlServerConfig, GatewayControlServerConfigParser,
+    GatewayControlServerContext, GatewayControlServerFactory, GatewayProcessChainDoc,
+    HttpServerConfigParser, LocalDnsConfigParser, QuicStackConfigParser, RtcpStackConfigParser,
+    SocksServerConfigParser, TcpStackConfigParser, TlsCA, TlsStackConfigParser,
+    TunStackConfigParser, UdpStackConfigParser, GATEWAY_CONTROL_SERVER_CONFIG,
+    GATEWAY_CONTROL_SERVER_KEY,
+};
 pub use cyfs_gateway_lib::{
     cmd_err, into_cmd_err, ControlError, ControlErrorCode, ControlResult, CyfsTokenFactory,
     CyfsTokenVerifier, ExternalCmd, GatewayControlClient, GatewayControlCmdHandler, LoginReq,
     CONTROL_SERVER,
 };
 pub use gateway::*;
-pub use gateway_control_server::*;
 
 use clap::{Arg, ArgAction, ArgMatches, Command};
 use console_subscriber::{self, Server};
 use cyfs_dns::{InnerDnsRecordManager, LocalDnsFactory, ProcessChainDnsServerFactory};
 use cyfs_gateway_lib::*;
-use process_chain_doc::GatewayProcessChainDoc;
 use std::collections::HashSet;
 
 use anyhow::anyhow;

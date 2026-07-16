@@ -514,6 +514,17 @@ CREATE TABLE IF NOT EXISTS relay_admission_events (
 
 CREATE INDEX IF NOT EXISTS idx_relay_admission_events_zone_time
     ON relay_admission_events(zone, created_at);
+
+CREATE TABLE IF NOT EXISTS relay_allocation_pending (
+    zone TEXT PRIMARY KEY,
+    preferred_region TEXT NULL,
+    reason TEXT NOT NULL,
+    source_version TEXT NULL,
+    attempts INTEGER NOT NULL DEFAULT 1,
+    last_error TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+);
 ```
 
 ## 关键流程
@@ -570,7 +581,7 @@ CREATE INDEX IF NOT EXISTS idx_relay_admission_events_zone_time
 
 ## 迁移建议
 
-1. ✅ 已完成：在 `cyfs-sn` 内新增 `sn_relay_manager` trait 和 SQLite 实现，支持节点表、assignment 表、admission 事件表和 `get/check` 能力（`relay_mgr.rs`）。
+1. ✅ 已完成：在 `cyfs-sn` 内新增 `sn_relay_manager` trait 和 SQLite 实现，支持节点表、assignment 表、admission 事件表、allocation pending 表和 `get/check` 能力（`relay_mgr.rs`）。
 2. 🟡 部分完成：relay 表达已迁移到 `relay_assignments` + `zone_info.relay_sn`，新写入不再用 `sn_ips` 表达 relay；旧 `sn_ips` 兼容输入回填尚未实现。
 3. ✅ 已完成：`sn_auth.zone_info` 已有 `relay_sn` 字段，并由 `sn_relay_manager.sync_zone_relay_cache` 回写（`relay_mgr.rs:666-678`）。
 4. 🟡 部分完成：`query_device_by_hostname` 已优先走 `sn_resolver.resolve_gateway_by_hostname`，`ood1` 降级为兜底默认（`sn_server.rs:2586-2603`，兜底分支 `:2620`）；尚未彻底移除硬编码兜底（`sn_server.rs:1862` 仍有 TODO）。
@@ -584,9 +595,11 @@ CREATE INDEX IF NOT EXISTS idx_relay_admission_events_zone_time
 ### 第一阶段已完成（控制面）
 
 - 独立的 `sn_relay_manager` 控制面模块 `relay_mgr.rs`：`SnRelayManager` trait（`:290-302`）+ `SqliteSnRelayManager` 实现。
-- `relay_nodes` / `relay_assignments` / `relay_admission_events` 三张表与 doc 目标 schema 对齐（建表 `:366-446`）。
+- `relay_nodes` / `relay_assignments` / `relay_admission_events` / `relay_allocation_pending` 四张表与 doc 目标 schema 对齐。
 - 节点注册与心跳：`register_relay_node`（`:1050-1122`）、`heartbeat_relay_node`（`:1124-1190`）。
 - zone -> relay 分配：`assign_zone_relay`（`:1192-1250`）+ `choose_relay_node` 评分（region 命中 → 负载/容量比 → capacity，`:548-557`）与 sticky 复用（`:532-546`）；首次 keep_tunnel 自动建分配（`:713-740`）。
+- 注册自动分配：`allocate_zone_relay` 以 zone 为幂等键，消费非可信 `preferred_region` 与服务端观察到的强类型 `source_ip`，按配置的有序规则和 fallback 选择健康节点；注册 handler 在本地建号后调用，失败写 `relay_allocation_pending` 且不回滚账号。成功结果统一回写 `zone_info.relay_sn`。
+- GeoIP：`GeoIpResolver` 可注入测试实现，生产 `XdbGeoIpResolver` 直接封装 `sfo-ip`/ip2region XDB，不依赖 process-chain collection；私网/loopback/保留地址和查询失败均降级。
 - `keep_tunnel` 准入决策 `check_relay_admission`（`:1263-1396`）：allow / reject / redirect，错误 relay 返回 `expected_relay_sn` 和 `generation`，draining / suspended / stale-generation / device-binding 等分支齐全，并写 admission 审计事件。
 - 迁移窗口：`start_relay_migration`（`:1398-1450`）+ `complete_relay_migration`（`:1452-1455`），含 generation 单调递增、`migrated_from`、默认 300s 迁移窗口。
 - `sync_zone_relay_cache` 回写 `zone_info.relay_sn`（`:666-678`）。
@@ -600,9 +613,32 @@ CREATE INDEX IF NOT EXISTS idx_relay_admission_events_zone_time
 - **没有数据面 `sn_relay` 节点模块**；没有咨询 manager 的 HTTP/HTTPS / RTCP 转发，无跨 zone 准入执行，无 80/443 端口选择落地。
 - admission 内**无 token / `sn_authority` 校验**（`auth_context` 被接收但未验证，`TokenInvalid` 永不返回）；设备绑定校验仅查 DB。
 - **无心跳超时检测与故障切换自动化**：`Unhealthy` 仅靠下一次心跳翻回 `Active`，无后台扫描，`RelayAssignmentSource::Recovery` 从不产生。
-- register / bind zone / `update_ood_info` 流程**不触发**自动分配；`lease_expires_at` 被存储但从不评估与重分配。
-- `from_ip` 地理分配**被接收但未使用**，`choose_relay_node` 仅用显式 `region`，未用 ISP / tags 评分。
+- register 已触发自动分配；bind zone / `update_ood_info` 尚未触发补偿分配，`lease_expires_at` 被存储但从不评估与重分配。
 - 迁移 / admin 操作**无审计事件**（`operator` 被接收但丢弃），且手工调整缺独立 admin 鉴权。
 - **无 `relay.*` API gateway 入口**，控制面目前只能进程内调用。
 - `query_device_by_hostname` 的 `ood1` 兜底尚未彻底移除（`sn_server.rs:1862` TODO）。
 - 设备在线态仍并存于旧 `devices` 表与简化 `sn_device_info` 表，尚未形成 relay 所需的完整 reachability view。
+
+### 自动分配配置
+
+SN server 可选配置：
+
+```yaml
+relay_allocation:
+  # 按顺序执行；首个产生健康候选集的规则获胜。
+  match_rules:
+    - preferred_region
+    - geo_country_code
+    - geo_province
+    - geo_city
+    - geo_isp
+  # relay_id 或 relay_sn；`*` 表示全部健康节点。显式空数组禁用 fallback。
+  fallback_relays: [relay-us-a, relay-eu-a]
+  geoip:
+    # 相对路径按网关主配置目录解析。
+    ipv4_xdb_path: geoip/ip2region_v4.xdb
+    ipv6_xdb_path: geoip/ip2region_v6.xdb
+    cache_policy: vector_index # no_cache | vector_index | full_memory
+```
+
+节点的 `region` 与 `isp` 字段参与匹配，也可使用 `region:<label>`、`country:<code>`、`province:<label>`、`city:<label>`、`isp:<label>` tags。候选集内部按 `current_load / capacity_score`、capacity、relay_id 稳定排序。未配置 `relay_allocation` 时默认使用上述规则并以 `fallback_relays: ["*"]` 保持兼容行为。

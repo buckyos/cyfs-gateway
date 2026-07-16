@@ -340,7 +340,7 @@ map my_coll $(echo ${key}) reduce $(echo ${sum})
 | 命令 | 规范语法 | 说明 |
 | --- | --- | --- |
 | `call-server` | `call-server <server_id>` | 返回 `server <id>` 动作，把处理交给另一个 server 配置对象 |
-| `forward` | `forward [round_robin\|ip_hash] <upstream...>` / `forward [round_robin\|ip_hash] --map <map>` | 返回 `forward "..."` 动作；支持多上游与权重 |
+| `forward` | `forward [algorithm] <upstream...> [group-options]` / `forward [algorithm] --map <map> [group-options]` | 单目标或多候选 upstream 转发；group 形态支持执行阶段重试 |
 | `redirect` | `redirect <location> [301\|302\|303\|307\|308]` | 返回 HTTP 重定向响应 |
 | `error` | `error <status 400..599> [message]` | 返回 HTTP 错误响应；这是网关 HTTP 响应命令，不是 core control `error --from ...` |
 
@@ -365,16 +365,42 @@ forward "http://127.0.0.1:8080"
 forward tcp:///127.0.0.1:80 tcp:///127.0.0.1:81
 forward ip_hash tcp:///127.0.0.1:80,weight=3 tcp:///127.0.0.1:81,weight=1
 forward round_robin --map $UPSTREAMS
+forward round_robin --map $PRIMARY --backup-map $BACKUP --next-upstream error,timeout --tries 3 --next-upstream-timeout 5s
+forward consistent_hash --hash-key "$session_id" --map $UPSTREAMS --next-upstream error,timeout --tries 2
+forward least_time --map $UPSTREAMS --next-upstream error,timeout --tries 3
 ```
 
 说明：
 
 - `forward` 缺省算法是 `round_robin`
-- 支持 `ip_hash`
+- 算法支持 `round_robin` / `rr`、`ip_hash`、`hash`、`consistent_hash`、`least_time`
+- `hash` / `consistent_hash` 必须同时传入 `--hash-key <resolved-value>`
 - inline upstream 可写 `url,weight=N`
 - `--map` 需要一个 map，key 是 upstream URL，value 是权重
+- `--backup-map` 需要同样结构的 map，并把其中 URL 标记为 backup 候选
 - upstream 的基础语法是 URL，而不是裸的 `host:port`
 - 命令本身只校验“URL 能否解析”，具体 scheme 是否可运行，要看消费这个 `forward` 动作的入口
+
+兼容模式与 group 模式必须分开理解：
+
+- 单 URL，或未使用 group 选项的旧多 URL 语法：命令只选出一个 URL，返回 `forward "<selected_url>"`；该目标执行失败时不会在同一次请求内换目标
+- 使用 `--backup-map`、`--next-upstream`、`--tries`、`--next-upstream-timeout`、`--max-fails`、`--fail-timeout`、`--group` 等 group 选项，或使用 `hash` / `consistent_hash` / `least_time`：命令构造候选计划；有效的多候选 plan 返回内部 `forward-group` 动作，由执行层按策略尝试候选。单 URL 且未启用重试时默认仍会退化成普通 `forward`，除非使用 `--force-group`
+
+group 常用参数：
+
+| 参数 | 说明 |
+| --- | --- |
+| `--next-upstream error,timeout` | 建链错误或超时时允许尝试下一候选；传 `off` 关闭 |
+| `--tries N` | 单次请求最多尝试 N 个候选；有重试条件但省略时最多尝试全部候选 |
+| `--next-upstream-timeout 5s` | 全部候选共享的总墙钟时间预算 |
+| `--max-fails N` | 候选进入临时失败窗口前的失败次数，默认 1 |
+| `--fail-timeout 10s` | 临时失败窗口，默认 10 秒 |
+| `--group name` | 失败状态分组名，不是预定义 upstream 的引用名 |
+| `--max-body-buffer 64KB` | HTTP 状态码重试的请求体缓冲上限 |
+
+HTTP 入口还接受 `http_5xx`、`http_502`、`http_503`、`http_504` 条件。状态码重试默认仅用于幂等方法；加入 `non_idempotent` 才允许 POST/PATCH 等非幂等方法，并会带来重复提交风险。stream/datagram 只在建链或 client 创建阶段重试，开始传输后不会静默切换。
+
+`--server-map` / `--provider-retry-scope` 属于 provider-first 高级模型。当前只保证同一 provider 的 routes 相邻排序，执行层尚未按 retry scope 强制截断跨 provider 重试；命令预检目前也仍要求同时存在 inline upstream、`--map` 或 `--backup-map`。因此不能把 `--server-map` 单独作为稳定入口，也不能把 retry scope 当成有状态业务的隔离保证。
 
 常见 upstream URL 形态：
 
@@ -397,7 +423,7 @@ socks://user:pass@127.0.0.1:1080
 - `rtcp://...` / `rudp://...` 常用于远端 tunnel 目标
 - 如果省略 scheme，例如 `127.0.0.1:8080`，不应当视为规范写法
 
-如果用户追问不同 scheme 的运行时语义、path 如何解释、HTTP `forward` 会不会拼接原请求 URI，转到 [data-forwarding.md](data-forwarding.md)。
+如果用户追问 group 重试边界、不同 scheme 的运行时语义、path 如何解释、HTTP `forward` 会不会拼接原请求 URI，转到 [data-forwarding.md](data-forwarding.md)。
 
 ### 8.2 Probe / 协议探测命令
 
