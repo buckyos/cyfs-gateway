@@ -5720,6 +5720,26 @@ mod tests {
         assert_eq!(ood_info.owner_id, DEVTOKEN_USER);
         assert_eq!(ood_info.state, SnOodState::Active);
 
+        // ACME completion is reported by the registered device itself. The
+        // payload DID is not trusted; zone ownership comes from the verified
+        // device token and its registered key anchor.
+        let result = device_auth_krpc
+            .call(
+                "user.set_self_cert",
+                json!({
+                    "self_cert": true,
+                    "device_did": "did:dev:forged-request-value"
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["code"].as_i64().unwrap(), 0);
+        let profile = account_auth_krpc
+            .call("user.get_profile", json!({}))
+            .await
+            .unwrap();
+        assert!(profile["self_cert"].as_bool().unwrap());
+
         // 越权：ood1 的设备 token 不能冒名上报 ood2。
         let err = device_token_krpc
             .call(
@@ -5804,7 +5824,7 @@ mod tests {
         assert_eq!(result["zone"].as_str().unwrap(), DEVTOKEN_USER);
         assert_eq!(result["bns_name"].as_str().unwrap(), DEVTOKEN_USER);
         assert!(result["relay_sn"].is_null());
-        assert!(!result["self_cert"].as_bool().unwrap());
+        assert!(result["self_cert"].as_bool().unwrap());
 
         // relay manager 分配后回写 relay_sn（经 auth 库，同一 sqlite 文件）；
         // 设备 token 也能读到稳定 relay 名称，供 node_daemon 检测切换。
