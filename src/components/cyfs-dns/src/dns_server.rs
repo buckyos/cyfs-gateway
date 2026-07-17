@@ -212,6 +212,16 @@ fn is_authoritative_loopback_suppressed_error(err: &ServerError) -> bool {
         && err.to_string().contains(DNS_AUTH_LOOPBACK_SUPPRESSED_MSG)
 }
 
+fn is_authoritative_unsupported_record_error(err: &ServerError) -> bool {
+    matches!(
+        err.code(),
+        ServerErrorCode::InvalidParam | ServerErrorCode::ProcessChainError
+    ) && err
+        .to_string()
+        .to_ascii_lowercase()
+        .contains("unsupported record type")
+}
+
 /// Trait for handling incoming requests, and providing a message response.
 #[async_trait::async_trait]
 trait DnsRequestHandler<'q, 'a, Answers, NameServers, Soa, Additionals>:
@@ -805,7 +815,8 @@ impl ProcessChainDnsServer {
                                 let is_core_zone_type =
                                     is_core_authoritative_record_type(query_type);
 
-                                if is_authoritative_loopback_suppressed_error(&e)
+                                if (is_authoritative_loopback_suppressed_error(&e)
+                                    || is_authoritative_unsupported_record_error(&e))
                                     && !is_core_zone_type
                                 {
                                     return self.authoritative_zone_response_to_buffer(
@@ -1029,6 +1040,10 @@ mod tests {
                     IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)),
                 )),
                 name_client::RecordType::AAAA => Ok(NameInfo::from_address_vec(name, vec![])),
+                name_client::RecordType::CAA => Err(cyfs_gateway_lib::server_err!(
+                    ServerErrorCode::InvalidParam,
+                    "unsupported record type CAA"
+                )),
                 _ => Err(cyfs_gateway_lib::server_err!(
                     ServerErrorCode::NotFound,
                     "record type not found"
@@ -1104,7 +1119,8 @@ hook_point:
         .unwrap()
     }
 
-    async fn create_authoritative_notfound_test_server() -> ProcessChainDnsServer {
+    async fn create_authoritative_notfound_test_server(
+    ) -> (ProcessChainDnsServer, Arc<ServerManager>) {
         let server_mgr = Arc::new(ServerManager::new());
         server_mgr
             .add_server(Server::NameServer(Arc::new(EmptyAaaaNameServer)))
@@ -1122,7 +1138,7 @@ hook_point:
           call resolve ${REQ.name} ${REQ.record_type} empty_aaaa && return;
         "#;
         let config: DnsServerConfig = serde_yaml_ng::from_str(config).unwrap();
-        ProcessChainDnsServer::create_server(
+        let server = ProcessChainDnsServer::create_server(
             config.id,
             Arc::downgrade(&server_mgr),
             Some(Arc::new(GlobalProcessChains::new())),
@@ -1132,7 +1148,8 @@ hook_point:
             Some(Arc::new(JsExternalsManager::new())),
         )
         .await
-        .unwrap()
+        .unwrap();
+        (server, server_mgr)
     }
 
     async fn create_authoritative_loopback_fallback_test_server() -> ProcessChainDnsServer {
@@ -1246,7 +1263,7 @@ hook_point:
 
     #[tokio::test]
     async fn test_authoritative_web3_zone_apex_missing_record_returns_nodata_with_soa() {
-        let server = create_authoritative_notfound_test_server().await;
+        let (server, _server_mgr) = create_authoritative_notfound_test_server().await;
 
         let mut message = Message::new();
         let name = Name::from_str("web3.buckyos.ai.").unwrap();
@@ -1271,6 +1288,30 @@ hook_point:
     #[tokio::test]
     async fn test_authoritative_web3_zone_subdomain_caa_loopback_fallback_returns_nodata() {
         let server = create_authoritative_loopback_fallback_test_server().await;
+
+        let mut message = Message::new();
+        let name = Name::from_str("wugren2026.web3.buckyos.ai.").unwrap();
+        let query = Query::query(name, RecordType::CAA);
+        message.add_query(query);
+
+        let data = server
+            .serve_datagram(
+                message.to_vec().unwrap().as_slice(),
+                DatagramInfo::new(None),
+            )
+            .await
+            .unwrap();
+        let resp = Message::from_vec(data.as_slice()).unwrap();
+        assert_eq!(resp.response_code(), ResponseCode::NoError);
+        assert!(resp.header().authoritative());
+        assert_eq!(resp.answers().len(), 0);
+        assert_eq!(resp.name_servers().len(), 1);
+        assert_eq!(resp.name_servers()[0].record_type(), RecordType::SOA);
+    }
+
+    #[tokio::test]
+    async fn test_authoritative_web3_zone_subdomain_unsupported_caa_returns_nodata() {
+        let (server, _server_mgr) = create_authoritative_notfound_test_server().await;
 
         let mut message = Message::new();
         let name = Name::from_str("wugren2026.web3.buckyos.ai.").unwrap();
