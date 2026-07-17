@@ -216,9 +216,11 @@ impl AcmeAccount {
 
 #[derive(Debug, Deserialize)]
 struct AcmeError {
+    #[serde(rename = "type")]
     type_: String,
     detail: String,
-    status: u16,
+    #[serde(default)]
+    status: Option<u16>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -317,6 +319,10 @@ impl AcmeOrderSession {
                 );
                 // 准备挑战响应
                 let resp_challenge = self.responder.respond_challenge(&challenges).await?;
+                // Track the prepared response before asking the ACME server to
+                // validate it. This guarantees Drop cleans it up when
+                // verification or authorization polling fails.
+                self.respond_logs.push(resp_challenge.clone());
 
                 // 通知服务器验证挑战
                 self.client
@@ -327,8 +333,6 @@ impl AcmeOrderSession {
                 self.client
                     .poll_authorization(auth_url, directory.clone())
                     .await?;
-
-                self.respond_logs.push(resp_challenge.clone());
             }
         }
 
@@ -803,11 +807,22 @@ impl AcmeClient {
                     continue;
                 }
                 "invalid" => {
+                    let challenge_errors = authz
+                        .challenges
+                        .iter()
+                        .filter_map(|challenge| challenge.error.as_ref())
+                        .map(|error| format!("{}: {}", error.type_, error.detail))
+                        .collect::<Vec<_>>();
+                    let detail = if challenge_errors.is_empty() {
+                        "no challenge error detail returned".to_string()
+                    } else {
+                        challenge_errors.join("; ")
+                    };
                     error!(
-                        "poll acme authorization failed, client: {}, auth_url: {}, status: {}",
-                        self, auth_url, authz.status
+                        "poll acme authorization failed, client: {}, auth_url: {}, status: {}, detail: {}",
+                        self, auth_url, authz.status, detail
                     );
-                    return Err(anyhow::anyhow!("Authorization failed"));
+                    return Err(anyhow::anyhow!("Authorization failed: {}", detail));
                 }
                 _ => {
                     error!(
@@ -1276,6 +1291,8 @@ struct ChallengeResponse {
     url: String,
     status: String,
     token: String,
+    #[serde(default)]
+    error: Option<AcmeError>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1297,6 +1314,32 @@ struct AccountResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn authz_response_parses_challenge_error() {
+        let authz: AuthzResponse = serde_json::from_value(serde_json::json!({
+            "identifier": {"type": "dns", "value": "example.com"},
+            "status": "invalid",
+            "expires": "2026-07-24T00:00:00Z",
+            "challenges": [{
+                "type": "dns-01",
+                "url": "https://acme.example/challenge/1",
+                "status": "invalid",
+                "token": "challenge-token",
+                "error": {
+                    "type": "urn:ietf:params:acme:error:dns",
+                    "detail": "TXT record was not found",
+                    "status": 400
+                }
+            }]
+        }))
+        .unwrap();
+
+        let error = authz.challenges[0].error.as_ref().unwrap();
+        assert_eq!(error.type_, "urn:ietf:params:acme:error:dns");
+        assert_eq!(error.detail, "TXT record was not found");
+        assert_eq!(error.status, Some(400));
+    }
 
     #[test]
     fn post_as_get_uses_empty_payload() {

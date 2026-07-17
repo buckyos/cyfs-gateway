@@ -15,6 +15,10 @@ use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, Weak};
 
+const SN_DNS_CHALLENGE_TTL_SECS: u32 = 60;
+const SN_DNS_PROPAGATION_DELAY: std::time::Duration =
+    std::time::Duration::from_secs(SN_DNS_CHALLENGE_TTL_SECS as u64 + 5);
+
 pub struct AcmeSnProviderFactory {
     data_path: PathBuf,
 }
@@ -324,11 +328,15 @@ impl DnsProvider for AcmeSnProvider {
                     "domain": domain,
                     "record_type": "TXT",
                     "record": key_hash,
-                    "ttl": 600
+                    "ttl": SN_DNS_CHALLENGE_TTL_SECS
                 }),
             )
             .await
             .map_err(|e| anyhow!("add_dns_record failed.{:?}", e))?;
+            // The SN zone advertises a 60-second negative cache TTL. Wait for
+            // cached NXDOMAIN responses to expire before ACME starts DNS-01
+            // validation.
+            tokio::time::sleep(SN_DNS_PROPAGATION_DELAY).await;
         } else if op == "del_challenge" {
             let mut has_cert = false;
             if let Some(acme_mgr) = self.weak_acme_mgr.upgrade() {
