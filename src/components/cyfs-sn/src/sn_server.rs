@@ -1396,17 +1396,45 @@ impl SNServer {
     fn device_did_from_document(value: &Value) -> Option<String> {
         for key in ["did", "id"] {
             if let Some(did) = value.get(key).and_then(|v| v.as_str()) {
+                if DID::from_str(did.trim()).is_ok_and(|parsed| parsed.method == "dev") {
+                    return Some(did.trim().to_string());
+                }
+            }
+        }
+
+        let public_key_x = value
+            .get("x")
+            .and_then(|v| v.as_str())
+            .filter(|x| !x.trim().is_empty())
+            .or_else(|| {
+                value
+                    .get("verificationMethod")
+                    .or_else(|| value.get("verification_method"))
+                    .and_then(|methods| methods.as_array())
+                    .and_then(|methods| {
+                        methods.iter().find_map(|method| {
+                            method
+                                .get("publicKeyJwk")
+                                .or_else(|| method.get("public_key_jwk"))
+                                .and_then(|jwk| jwk.get("x"))
+                                .and_then(|x| x.as_str())
+                                .filter(|x| !x.trim().is_empty())
+                        })
+                    })
+            });
+        if let Some(public_key_x) = public_key_x {
+            return Some(format!("did:dev:{}", public_key_x.trim()));
+        }
+
+        for key in ["did", "id"] {
+            if let Some(did) = value.get(key).and_then(|v| v.as_str()) {
                 if !did.trim().is_empty() {
                     return Some(did.trim().to_string());
                 }
             }
         }
 
-        value
-            .get("x")
-            .and_then(|v| v.as_str())
-            .filter(|x| !x.trim().is_empty())
-            .map(|x| format!("did:dev:{}", x.trim()))
+        None
     }
 
     fn registered_device_not_found(did: &str) -> String {
@@ -2726,6 +2754,43 @@ mod tests {
     const ANVIL_PRIVATE_KEY: &str =
         "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
     const ANVIL_ADDRESS: &str = "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266";
+
+    #[test]
+    fn device_did_from_scoped_document_uses_verification_key() {
+        let document = json!({
+            "id": "did:bns:ood1.alice",
+            "verificationMethod": [{
+                "id": "#main_key",
+                "controller": "did:bns:ood1.alice",
+                "publicKeyJwk": {
+                    "kty": "OKP",
+                    "crv": "Ed25519",
+                    "x": "canonical-device-key"
+                }
+            }]
+        });
+
+        assert_eq!(
+            SNServer::device_did_from_document(&document).as_deref(),
+            Some("did:dev:canonical-device-key")
+        );
+    }
+
+    #[test]
+    fn device_did_from_document_keeps_explicit_dev_did() {
+        let document = json!({
+            "did": "did:dev:explicit-device-key",
+            "id": "did:bns:ood1.alice",
+            "verificationMethod": [{
+                "publicKeyJwk": { "x": "other-device-key" }
+            }]
+        });
+
+        assert_eq!(
+            SNServer::device_did_from_document(&document).as_deref(),
+            Some("did:dev:explicit-device-key")
+        );
+    }
 
     fn test_bns_system_info() -> BnsSystemInfo {
         BnsSystemInfo {
