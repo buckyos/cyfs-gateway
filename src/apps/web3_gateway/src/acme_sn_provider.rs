@@ -117,6 +117,10 @@ impl DnsProviderFactory for AcmeSnProviderFactory {
             config.access_token,
         ))
     }
+
+    fn propagation_delay(&self) -> std::time::Duration {
+        SN_DNS_PROPAGATION_DELAY
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Eq, PartialEq)]
@@ -333,10 +337,6 @@ impl DnsProvider for AcmeSnProvider {
             )
             .await
             .map_err(|e| anyhow!("add_dns_record failed.{:?}", e))?;
-            // The SN zone advertises a 60-second negative cache TTL. Wait for
-            // cached NXDOMAIN responses to expire before ACME starts DNS-01
-            // validation.
-            tokio::time::sleep(SN_DNS_PROPAGATION_DELAY).await;
         } else if op == "del_challenge" {
             let mut has_cert = false;
             if let Some(acme_mgr) = self.weak_acme_mgr.upgrade() {

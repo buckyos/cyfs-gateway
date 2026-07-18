@@ -5,7 +5,7 @@ use base64::Engine;
 use openssl::{
     pkey::{PKey, Private},
     rsa::Rsa,
-    x509::{X509NameBuilder, X509ReqBuilder, extension::SubjectAlternativeName},
+    x509::{extension::SubjectAlternativeName, X509NameBuilder, X509ReqBuilder},
 };
 use rcgen::{KeyPair, PKCS_ECDSA_P256_SHA256};
 use reqwest;
@@ -216,11 +216,16 @@ impl AcmeAccount {
 
 #[derive(Debug, Deserialize)]
 struct AcmeError {
-    #[serde(rename = "type")]
+    #[serde(rename = "type", default = "default_acme_problem_type")]
     type_: String,
-    detail: String,
+    #[serde(default)]
+    detail: Option<String>,
     #[serde(default)]
     status: Option<u16>,
+}
+
+fn default_acme_problem_type() -> String {
+    "about:blank".to_string()
 }
 
 #[derive(Debug, Deserialize)]
@@ -249,6 +254,9 @@ struct AcmeClientInner {
 #[async_trait::async_trait]
 pub trait AcmeChallengeResponder: Send + Sync {
     async fn respond_challenge<'a>(&self, challenges: &'a [Challenge]) -> Result<&'a Challenge>;
+    fn propagation_delay(&self, _challenge: &Challenge) -> Duration {
+        Duration::ZERO
+    }
     fn revert_challenge(&self, challenge: &Challenge);
 }
 
@@ -323,6 +331,15 @@ impl AcmeOrderSession {
                 // validate it. This guarantees Drop cleans it up when
                 // verification or authorization polling fails.
                 self.respond_logs.push(resp_challenge.clone());
+
+                let propagation_delay = self.responder.propagation_delay(resp_challenge);
+                if !propagation_delay.is_zero() {
+                    info!(
+                        "wait {:?} for ACME challenge propagation: {}",
+                        propagation_delay, resp_challenge.domain
+                    );
+                    tokio::time::sleep(propagation_delay).await;
+                }
 
                 // 通知服务器验证挑战
                 self.client
@@ -811,7 +828,12 @@ impl AcmeClient {
                         .challenges
                         .iter()
                         .filter_map(|challenge| challenge.error.as_ref())
-                        .map(|error| format!("{}: {}", error.type_, error.detail))
+                        .map(|error| match error.detail.as_deref() {
+                            Some(detail) if !detail.is_empty() => {
+                                format!("{}: {}", error.type_, detail)
+                            }
+                            _ => error.type_.clone(),
+                        })
                         .collect::<Vec<_>>();
                     let detail = if challenge_errors.is_empty() {
                         "no challenge error detail returned".to_string()
@@ -1337,8 +1359,30 @@ mod tests {
 
         let error = authz.challenges[0].error.as_ref().unwrap();
         assert_eq!(error.type_, "urn:ietf:params:acme:error:dns");
-        assert_eq!(error.detail, "TXT record was not found");
+        assert_eq!(error.detail.as_deref(), Some("TXT record was not found"));
         assert_eq!(error.status, Some(400));
+    }
+
+    #[test]
+    fn authz_response_accepts_challenge_error_without_optional_problem_members() {
+        let authz: AuthzResponse = serde_json::from_value(serde_json::json!({
+            "identifier": {"type": "dns", "value": "example.com"},
+            "status": "invalid",
+            "expires": "2026-07-24T00:00:00Z",
+            "challenges": [{
+                "type": "dns-01",
+                "url": "https://acme.example/challenge/1",
+                "status": "invalid",
+                "token": "challenge-token",
+                "error": {}
+            }]
+        }))
+        .unwrap();
+
+        let error = authz.challenges[0].error.as_ref().unwrap();
+        assert_eq!(error.type_, "about:blank");
+        assert_eq!(error.detail, None);
+        assert_eq!(error.status, None);
     }
 
     #[test]
