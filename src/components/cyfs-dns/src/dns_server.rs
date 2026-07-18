@@ -587,6 +587,39 @@ impl ProcessChainDnsServer {
         }
     }
 
+    async fn authoritative_name_exists(
+        &self,
+        request: &Request,
+        dst_addr: Option<String>,
+    ) -> ServerResult<bool> {
+        let request_info = request
+            .request_info()
+            .map_err(into_server_err!(ServerErrorCode::BadRequest))?;
+        let mut probe = Message::new();
+        probe
+            .set_id(request.id())
+            .set_message_type(MessageType::Query)
+            .set_op_code(OpCode::Query)
+            .set_recursion_desired(request.recursion_desired())
+            .add_query(Query::query(
+                request_info.query.name().into(),
+                hickory_server::proto::rr::RecordType::A,
+            ));
+        let probe_bytes = probe
+            .to_vec()
+            .map_err(into_server_err!(ServerErrorCode::EncodeError))?;
+        let mut decoder = BinDecoder::new(probe_bytes.as_slice());
+        let probe_message = MessageRequest::read(&mut decoder)
+            .map_err(into_server_err!(ServerErrorCode::BadRequest))?;
+        let probe_request = Request::new(probe_message, request.src(), Protocol::Udp);
+
+        match self.handle_request(&probe_request, dst_addr).await {
+            Ok(_) => Ok(true),
+            Err(err) if err.code() == ServerErrorCode::NotFound => Ok(false),
+            Err(err) => Err(err),
+        }
+    }
+
     async fn handle_request<'a>(
         &self,
         request: &Request,
@@ -802,7 +835,7 @@ impl ProcessChainDnsServer {
                     .map_err(into_server_err!(ServerErrorCode::BadRequest))?;
                 let query_name = request_info.query.name().to_string();
                 let query_type = request_info.query.query_type().to_string();
-                match self.handle_request(&request, dst_addr).await {
+                match self.handle_request(&request, dst_addr.clone()).await {
                     Ok(response) => Ok(response),
                     Err(e) => {
                         if let Ok(request_info) = request.request_info() {
@@ -815,8 +848,7 @@ impl ProcessChainDnsServer {
                                 let is_core_zone_type =
                                     is_core_authoritative_record_type(query_type);
 
-                                if (is_authoritative_loopback_suppressed_error(&e)
-                                    || is_authoritative_unsupported_record_error(&e))
+                                if is_authoritative_loopback_suppressed_error(&e)
                                     && !is_core_zone_type
                                 {
                                     return self.authoritative_zone_response_to_buffer(
@@ -825,6 +857,38 @@ impl ProcessChainDnsServer {
                                         vec![],
                                         vec![zone_soa_record(&zone)],
                                     );
+                                }
+
+                                if is_authoritative_unsupported_record_error(&e)
+                                    && !is_core_zone_type
+                                {
+                                    match self
+                                        .authoritative_name_exists(&request, dst_addr.clone())
+                                        .await
+                                    {
+                                        Ok(true) => {
+                                            return self.authoritative_zone_response_to_buffer(
+                                                &request,
+                                                ResponseCode::NoError,
+                                                vec![],
+                                                vec![zone_soa_record(&zone)],
+                                            );
+                                        }
+                                        Ok(false) => {
+                                            return self.authoritative_zone_response_to_buffer(
+                                                &request,
+                                                ResponseCode::NXDomain,
+                                                vec![],
+                                                vec![zone_soa_record(&zone)],
+                                            );
+                                        }
+                                        Err(probe_err) => {
+                                            warn!(
+                                                "failed to confirm authoritative name existence for {}: {}",
+                                                query_name, probe_err
+                                            );
+                                        }
+                                    }
                                 }
 
                                 if is_zone_apex && !is_core_zone_type {
@@ -1020,6 +1084,8 @@ mod tests {
     use std::str::FromStr;
     use std::sync::Arc;
 
+    const EXISTING_WEB3_NAME: &str = "wugren2026.web3.buckyos.ai";
+
     struct EmptyAaaaNameServer;
 
     #[async_trait]
@@ -1035,9 +1101,19 @@ mod tests {
             _from_ip: Option<IpAddr>,
         ) -> ServerResult<NameInfo> {
             match record_type.unwrap_or_default() {
-                name_client::RecordType::A => Ok(NameInfo::from_address(
-                    name,
-                    IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)),
+                name_client::RecordType::A
+                    if name
+                        .trim_end_matches('.')
+                        .eq_ignore_ascii_case(EXISTING_WEB3_NAME) =>
+                {
+                    Ok(NameInfo::from_address(
+                        name,
+                        IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)),
+                    ))
+                }
+                name_client::RecordType::A => Err(cyfs_gateway_lib::server_err!(
+                    ServerErrorCode::NotFound,
+                    "name not found"
                 )),
                 name_client::RecordType::AAAA => Ok(NameInfo::from_address_vec(name, vec![])),
                 name_client::RecordType::CAA => Err(cyfs_gateway_lib::server_err!(
@@ -1327,6 +1403,30 @@ hook_point:
             .unwrap();
         let resp = Message::from_vec(data.as_slice()).unwrap();
         assert_eq!(resp.response_code(), ResponseCode::NoError);
+        assert!(resp.header().authoritative());
+        assert_eq!(resp.answers().len(), 0);
+        assert_eq!(resp.name_servers().len(), 1);
+        assert_eq!(resp.name_servers()[0].record_type(), RecordType::SOA);
+    }
+
+    #[tokio::test]
+    async fn test_authoritative_web3_zone_nonexistent_subdomain_caa_returns_nxdomain() {
+        let (server, _server_mgr) = create_authoritative_notfound_test_server().await;
+
+        let mut message = Message::new();
+        let name = Name::from_str("missing.web3.buckyos.ai.").unwrap();
+        let query = Query::query(name, RecordType::CAA);
+        message.add_query(query);
+
+        let data = server
+            .serve_datagram(
+                message.to_vec().unwrap().as_slice(),
+                DatagramInfo::new(None),
+            )
+            .await
+            .unwrap();
+        let resp = Message::from_vec(data.as_slice()).unwrap();
+        assert_eq!(resp.response_code(), ResponseCode::NXDomain);
         assert!(resp.header().authoritative());
         assert_eq!(resp.answers().len(), 0);
         assert_eq!(resp.name_servers().len(), 1);
