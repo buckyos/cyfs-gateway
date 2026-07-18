@@ -137,6 +137,9 @@ stacks:
   main_tls:
     bind: "{{tls_bind}}"
     protocol: tls
+    trusted_upstreams:
+      - "127.0.0.1/32"
+      - "::1/128"
     hosts:
       - host: "sn.{{sn_host}}"
         cert_path: "{{sn_cer}}"

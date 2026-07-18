@@ -365,6 +365,13 @@ SN 代付 gas 的受限 BNS 写代理：用户不需要持有 gas，就能通过
 
 `/` 同时还承载 bns-proxy 的内部/恢复方法 `bns.publish_relay_assignment`、`bns.register_name_bootstrap`（参数与返回见 6.1、6.2）：同一机制，只允许 loopback 来源，不出现在任何公网路径。非 loopback 请求在解析 RPC body 前返回 HTTP 404。
 
+公网 relay 到 SN API 的来源恢复必须满足以下边界：
+
+- TCP/TLS 栈默认不解析 PROXY v1/v2；只有 direct peer 匹配 stack 的 `trusted_upstreams` IP/CIDR 时才解析，公网客户端直连时携带的伪造 PROXY 头不会被解析或剥离。
+- split `web3_relay` 的 `sn.`、`bns.`、`web3.`、apex、`www.` TLS 路由统一发送 PROXY v2。
+- split relay 的明文 HTTP 通过 `X-Forwarded-For` 传递来源，HTTPS 通过 PROXY v2 传递；`web3_sn_api` 两层都只信任 `sn_relay_trusted_upstream`。
+- `sn_relay_trusted_upstream` 默认是同机 `127.0.0.1/32`。跨机部署必须覆盖为 relay 的私网 IP 或尽可能小的私网 CIDR，不能配置公网全网段。
+
 ## 8. 非 RPC 解析接口
 
 SN 仍然提供两个标准解析面，但它们不是 SN RPC：

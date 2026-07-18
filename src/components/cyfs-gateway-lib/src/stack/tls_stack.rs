@@ -8,7 +8,8 @@ use crate::stack::tls_cert_resolver::{
     IdentityCertResolver, ResolvesServerCertUsingSni, TlsIdentityCertConfig, TlsIdentityHost,
 };
 use crate::stack::{
-    TlsCertResolver, get_limit_info, get_source_addr_from_req_env, probe_proxy_protocol_stream,
+    TlsCertResolver, get_limit_info, get_source_addr_from_req_env,
+    parse_proxy_protocol_trusted_upstreams, probe_proxy_protocol_stream_from_trusted_upstream,
     stream_forward, stream_forward_group,
 };
 use crate::{
@@ -16,8 +17,8 @@ use crate::{
     HandleConnectionController, IoDumpStackConfig, JsExternalsManagerRef, LimiterManagerRef,
     MutComposedSpeedStat, MutComposedSpeedStatRef, ProcessChainConfigs, Server, ServerManagerRef,
     Stack, StackConfig, StackContext, StackErrorCode, StackProtocol, StackResult, StatManagerRef,
-    StreamInfo, TunnelManager, create_io_dump_stack_config, get_external_commands, get_stat_info,
-    hyper_serve_http, into_stack_err, stack_err,
+    StreamInfo, TrustedUpstreamMatcher, TunnelManager, create_io_dump_stack_config,
+    get_external_commands, get_stat_info, hyper_serve_http, into_stack_err, stack_err,
 };
 use cyfs_process_chain::{CollectionValue, CommandControl, ProcessChainLibExecutor, StreamRequest};
 use name_client::IdentityRoots;
@@ -125,6 +126,7 @@ struct TlsConnectionHandler {
     alpn_protocols: Vec<Vec<u8>>,
     server_config: Arc<ServerConfig>,
     io_dump: Option<IoDumpStackConfig>,
+    trusted_upstreams: Vec<TrustedUpstreamMatcher>,
 }
 
 impl TlsConnectionHandler {
@@ -136,6 +138,7 @@ impl TlsConnectionHandler {
         env: Arc<TlsStackContext>,
         connection_manager: Option<ConnectionManagerRef>,
         io_dump: Option<IoDumpStackConfig>,
+        trusted_upstreams: Vec<String>,
     ) -> StackResult<Self> {
         let (executor, _) = create_process_chain_executor(
             &hook_point,
@@ -156,6 +159,7 @@ impl TlsConnectionHandler {
             alpn_protocols,
             server_config,
             io_dump,
+            trusted_upstreams: parse_proxy_protocol_trusted_upstreams(&trusted_upstreams)?,
         })
     }
 
@@ -177,6 +181,7 @@ impl TlsConnectionHandler {
             alpn_protocols: self.alpn_protocols.clone(),
             server_config: self.server_config.clone(),
             io_dump: self.io_dump.clone(),
+            trusted_upstreams: self.trusted_upstreams.clone(),
         })
     }
 
@@ -263,7 +268,12 @@ impl TlsConnectionHandler {
             StackErrorCode::ServerError,
             "read remote addr failed"
         ))?;
-        let (stream, proxy_source_addr) = probe_proxy_protocol_stream(Box::new(stream)).await?;
+        let (stream, proxy_source_addr) = probe_proxy_protocol_stream_from_trusted_upstream(
+            Box::new(stream),
+            remote_addr,
+            &self.trusted_upstreams,
+        )
+        .await?;
         let request_source_addr = proxy_source_addr.unwrap_or(remote_addr);
 
         let tls_acceptor = TlsAcceptor::from(self.server_config.clone());
@@ -570,6 +580,7 @@ impl TlsStack {
             env,
             config.connection_manager.clone(),
             config.io_dump,
+            config.trusted_upstreams,
         )
         .await?;
 
@@ -778,6 +789,7 @@ impl Stack for TlsStack {
             )
             .await
             .map_err(|e| stack_err!(StackErrorCode::InvalidConfig, "{e}"))?,
+            config.trusted_upstreams.clone(),
         )
         .await?;
 
@@ -888,6 +900,8 @@ pub struct TlsStackConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub io_dump_max_download_bytes_per_conn: Option<String>,
     pub reuse_address: Option<bool>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub trusted_upstreams: Vec<String>,
 }
 
 async fn build_tls_domain_configs(config: &TlsStackConfig) -> StackResult<Vec<TlsDomainConfig>> {
@@ -1070,6 +1084,7 @@ impl crate::StackFactory for TlsStackFactory {
                     .collect(),
             )
             .reuse_address(config.reuse_address.unwrap_or(false))
+            .trusted_upstreams(config.trusted_upstreams.clone())
             .stack_context(stack_context)
             .io_dump(io_dump)
             .build()
@@ -1090,6 +1105,7 @@ pub struct TlsStackBuilder {
     stack_context: Option<Arc<TlsStackContext>>,
     io_dump: Option<IoDumpStackConfig>,
     reuse_address: bool,
+    trusted_upstreams: Vec<String>,
 }
 
 impl TlsStackBuilder {
@@ -1106,6 +1122,7 @@ impl TlsStackBuilder {
             stack_context: None,
             io_dump: None,
             reuse_address: false,
+            trusted_upstreams: Vec::new(),
         }
     }
 
@@ -1165,6 +1182,11 @@ impl TlsStackBuilder {
 
     pub fn reuse_address(mut self, reuse_address: bool) -> Self {
         self.reuse_address = reuse_address;
+        self
+    }
+
+    pub fn trusted_upstreams(mut self, trusted_upstreams: Vec<String>) -> Self {
+        self.trusted_upstreams = trusted_upstreams;
         self
     }
 
@@ -1908,6 +1930,7 @@ mod tests {
             stack_context,
             None,
             None,
+            Vec::new(),
         )
         .await
         .unwrap();
@@ -2692,6 +2715,7 @@ mod tests {
             io_dump_max_upload_bytes_per_conn: None,
             io_dump_max_download_bytes_per_conn: None,
             reuse_address: None,
+            trusted_upstreams: Vec::new(),
         };
         let stack_context: Arc<dyn StackContext> = Arc::new(TlsStackContext::new(
             server_manager,
