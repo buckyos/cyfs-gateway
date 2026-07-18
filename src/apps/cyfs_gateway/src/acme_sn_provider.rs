@@ -15,6 +15,10 @@ use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, Weak};
 
+const SN_DNS_CHALLENGE_TTL_SECS: u32 = 60;
+const SN_DNS_PROPAGATION_DELAY: std::time::Duration =
+    std::time::Duration::from_secs(SN_DNS_CHALLENGE_TTL_SECS as u64 + 5);
+
 pub struct AcmeSnProviderFactory {
     data_path: PathBuf,
 }
@@ -136,6 +140,10 @@ impl DnsProviderFactory for AcmeSnProviderFactory {
             device_scoped_did,
             config.access_token,
         ))
+    }
+
+    fn propagation_delay(&self) -> std::time::Duration {
+        SN_DNS_PROPAGATION_DELAY
     }
 }
 
@@ -347,7 +355,7 @@ impl DnsProvider for AcmeSnProvider {
                     "domain": domain,
                     "record_type": "TXT",
                     "record": key_hash,
-                    "ttl": 600
+                    "ttl": SN_DNS_CHALLENGE_TTL_SECS
                 }),
             )
             .await
