@@ -2,7 +2,9 @@ use crate::api::{
     handle_auth, handle_bns_proxy, handle_device, handle_dns, handle_domain, handle_user,
     handle_zone,
 };
-use crate::name_info_cache::{NameInfoCache, NameInfoCacheQueryResult, NameInfoCacheRef};
+use crate::name_info_cache::{
+    NameInfoCache, NameInfoCacheQueryResult, NameInfoCacheRef, MIN_NAME_INFO_CACHE_TTL_SECS,
+};
 use crate::sn_auth_manager::SnAuthManager;
 use crate::sn_bns_proxy::{
     SNBnsProxyConfig, SnBnsControllerBindingStoreRef, SnBnsProxy, SnBnsProxyController,
@@ -57,12 +59,13 @@ use name_client::*;
 use name_lib::*;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
+use std::time::{Duration, Instant};
 use std::{
     net::{IpAddr, Ipv4Addr},
     result::Result,
@@ -475,6 +478,19 @@ pub(crate) struct RegisteredDeviceKey {
     pub(crate) device_name: String,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct BnsDnsCacheState {
+    generation: u64,
+    bypass_until: Instant,
+}
+
+#[derive(Clone, Debug)]
+struct BnsDnsCacheQueryState {
+    username: String,
+    generation: u64,
+    bypassed: bool,
+}
+
 #[derive(Clone)]
 pub struct SNServer {
     id: String,
@@ -484,6 +500,7 @@ pub struct SNServer {
     relay_manager: SnRelayManagerRef,
     auth: Arc<SnAuthManager>,
     name_info_cache: NameInfoCacheRef,
+    bns_dns_cache_state: Arc<RwLock<HashMap<String, BnsDnsCacheState>>>,
     resolver: SnResolverRef,
     did_resolver: SnDidResolverRef,
     bns_proxy: Arc<SnBnsProxy>,
@@ -669,6 +686,7 @@ impl SNServer {
             relay_manager,
             auth,
             name_info_cache: NameInfoCache::new_ref(),
+            bns_dns_cache_state: Arc::new(RwLock::new(HashMap::new())),
             resolver,
             did_resolver,
             bns_proxy,
@@ -799,15 +817,107 @@ impl SNServer {
         self.name_info_cache.remove(name, record_type);
     }
 
-    /// BNS proxy 写投递成功后的本地 DNS 缓存失效（含 tombstone）。
-    /// 只失效缓存，不伪造 BNS 权威状态；下一次查询会经 resolver 重新读
-    /// bns-rpc 投影（投影未同步期间读到旧值属正常窗口）。
-    pub(crate) fn invalidate_bns_name_dns_cache(&self, username: &str) {
+    fn bns_username_for_dns_query(&self, name: &str) -> Option<String> {
+        let normalized = Self::normalize_query_name(name);
+        if !normalized.contains('.') {
+            return canonical_bns_name(normalized.as_str()).ok();
+        }
+
         let resolver_config = self.resolver.config();
-        let mut names = vec![username.to_string()];
         for host in std::iter::once(resolver_config.server_host.as_str())
             .chain(resolver_config.aliases.iter().map(String::as_str))
         {
+            let suffix = format!(".web3.{}", host);
+            if let Some(prefix) = normalized.strip_suffix(suffix.as_str()) {
+                return canonical_bns_name(prefix.rsplit('.').next()?).ok();
+            }
+        }
+        None
+    }
+
+    fn bns_dns_cache_query_state(&self, name: &str) -> Option<BnsDnsCacheQueryState> {
+        let username = self.bns_username_for_dns_query(name)?;
+        let now = Instant::now();
+        let states = self
+            .bns_dns_cache_state
+            .read()
+            .unwrap_or_else(|err| err.into_inner());
+        let state = states
+            .get(username.as_str())
+            .copied()
+            .unwrap_or(BnsDnsCacheState {
+                generation: 0,
+                bypass_until: now,
+            });
+        Some(BnsDnsCacheQueryState {
+            username,
+            generation: state.generation,
+            bypassed: state.bypass_until > now,
+        })
+    }
+
+    fn update_bns_dns_cache_if_current(
+        &self,
+        query_state: Option<&BnsDnsCacheQueryState>,
+        update: impl FnOnce(),
+    ) -> bool {
+        let Some(query_state) = query_state else {
+            update();
+            return true;
+        };
+        if query_state.bypassed {
+            return false;
+        }
+
+        let now = Instant::now();
+        let states = self
+            .bns_dns_cache_state
+            .read()
+            .unwrap_or_else(|err| err.into_inner());
+        let current = states.get(query_state.username.as_str()).copied();
+        let current_generation = current.map(|state| state.generation).unwrap_or(0);
+        let bypassed = current
+            .map(|state| state.bypass_until > now)
+            .unwrap_or(false);
+        if current_generation != query_state.generation || bypassed {
+            return false;
+        }
+
+        // Keep the generation read lock while writing the cache. Invalidation
+        // takes the write lock before incrementing the generation and removing
+        // entries, so an old in-flight resolver can never write after removal.
+        update();
+        true
+    }
+
+    /// BNS proxy 写投递成功后的本地 DNS 缓存失效（含 tombstone）。
+    /// BNS receipt/submission 会早于 indexer 投影可见；失效后若立即重新缓存
+    /// 旧投影，会把正常的秒级追赶窗口放大为 60 秒。因此对应 BNS name 在
+    /// 一个最小缓存 TTL 内绕过缓存，只读取权威投影。
+    pub(crate) fn invalidate_bns_name_dns_cache(&self, username: &str) {
+        let username = Self::normalize_query_name(username);
+        let now = Instant::now();
+        let mut states = self
+            .bns_dns_cache_state
+            .write()
+            .unwrap_or_else(|err| err.into_inner());
+        let state = states.entry(username.clone()).or_insert(BnsDnsCacheState {
+            generation: 0,
+            bypass_until: now,
+        });
+        state.generation = state.generation.wrapping_add(1);
+        state.bypass_until = now + Duration::from_secs(MIN_NAME_INFO_CACHE_TTL_SECS as u64);
+
+        self.name_info_cache.remove_matching_names(|name| {
+            self.bns_username_for_dns_query(name).as_deref() == Some(username.as_str())
+        });
+
+        let resolver_config = self.resolver.config();
+        let mut names = vec![username.clone()];
+        for host in std::iter::once(resolver_config.server_host.as_str())
+            .chain(resolver_config.aliases.iter().map(String::as_str))
+        {
+            names.push(format!("{}.web3.{}", username, host));
             names.push(format!("{}.{}", username, host));
         }
         for name in names {
@@ -817,6 +927,7 @@ impl SNServer {
                     .remove(normalized.as_str(), record_type);
             }
         }
+        drop(states);
     }
 
     pub(crate) fn parse_name_record_type(record_type: &str) -> Option<RecordType> {
@@ -905,11 +1016,7 @@ impl SNServer {
     }
 
     fn normalize_query_name(name: &str) -> String {
-        if name.ends_with(".") {
-            name.trim_end_matches('.').to_string()
-        } else {
-            name.to_string()
-        }
+        name.trim().trim_end_matches('.').to_ascii_lowercase()
     }
 
     // 辅助函数：检测字符串是否包含特殊字符
@@ -1571,30 +1678,42 @@ impl NameServer for SNServer {
         );
         let record_type = record_type.unwrap_or_default();
         let req_real_name = Self::normalize_query_name(name);
+        let bns_cache_state = self.bns_dns_cache_query_state(req_real_name.as_str());
+        let bypass_bns_cache = bns_cache_state
+            .as_ref()
+            .map(|state| state.bypassed)
+            .unwrap_or(false);
 
-        match self
-            .name_info_cache
-            .query(req_real_name.as_str(), record_type)
-        {
-            Some(NameInfoCacheQueryResult::Hit(name_info)) => {
-                info!(
-                    "sn server name cache hit: {} record_type: {:?}",
-                    req_real_name, record_type
-                );
-                return Ok(name_info);
+        if !bypass_bns_cache {
+            match self
+                .name_info_cache
+                .query(req_real_name.as_str(), record_type)
+            {
+                Some(NameInfoCacheQueryResult::Hit(name_info)) => {
+                    info!(
+                        "sn server name cache hit: {} record_type: {:?}",
+                        req_real_name, record_type
+                    );
+                    return Ok(name_info);
+                }
+                Some(NameInfoCacheQueryResult::Tombstone) => {
+                    info!(
+                        "sn server name cache tombstone hit: {} record_type: {:?}",
+                        req_real_name, record_type
+                    );
+                    return Err(server_err!(
+                        ServerErrorCode::NotFound,
+                        "no address found for {}",
+                        name.to_string()
+                    ));
+                }
+                None => {}
             }
-            Some(NameInfoCacheQueryResult::Tombstone) => {
-                info!(
-                    "sn server name cache tombstone hit: {} record_type: {:?}",
-                    req_real_name, record_type
-                );
-                return Err(server_err!(
-                    ServerErrorCode::NotFound,
-                    "no address found for {}",
-                    name.to_string()
-                ));
-            }
-            None => {}
+        } else {
+            debug!(
+                "sn server bypass BNS DNS cache while projection catches up: {} record_type: {:?}",
+                req_real_name, record_type
+            );
         }
 
         info!(
@@ -1609,12 +1728,14 @@ impl NameServer for SNServer {
             Ok(resolution) => {
                 let name_info = resolution.into_name_info(name);
                 let cache_ttl_secs = name_info.ttl;
-                self.name_info_cache.add(
-                    req_real_name.as_str(),
-                    record_type,
-                    name_info.clone(),
-                    cache_ttl_secs,
-                );
+                self.update_bns_dns_cache_if_current(bns_cache_state.as_ref(), || {
+                    self.name_info_cache.add(
+                        req_real_name.as_str(),
+                        record_type,
+                        name_info.clone(),
+                        cache_ttl_secs,
+                    );
+                });
                 Ok(name_info)
             }
             Err(e)
@@ -1626,8 +1747,10 @@ impl NameServer for SNServer {
                         | SnResolverErrorKind::DeviceNotFound
                 ) =>
             {
-                self.name_info_cache
-                    .add_tombstone(req_real_name.as_str(), record_type, None);
+                self.update_bns_dns_cache_if_current(bns_cache_state.as_ref(), || {
+                    self.name_info_cache
+                        .add_tombstone(req_real_name.as_str(), record_type, None);
+                });
                 Err(server_err!(
                     ServerErrorCode::NotFound,
                     "no address found for {}",
@@ -4153,6 +4276,14 @@ mod tests {
         let bound_controller = bns["controller_address"].as_str().unwrap().to_string();
         assert_eq!(bns["asset_owner"].as_str().unwrap(), bound_controller);
 
+        let dns_name = format!("{}.web3.buckyos.ai", PROXY_USER);
+        let stale_dns =
+            NameServer::query(sn.as_ref(), dns_name.as_str(), Some(RecordType::TXT), None)
+                .await
+                .unwrap();
+        assert!(!stale_dns.txt.iter().any(|txt| txt == "pkx=projection"));
+        let stale_cache_state = sn.bns_dns_cache_query_state(dns_name.as_str()).unwrap();
+
         let bns_krpc = kRPC::new(bns_proxy_url.as_str(), Some(access_token));
         let result = bns_krpc
             .call(
@@ -4177,6 +4308,70 @@ mod tests {
             .unwrap();
         let inline = String::from_utf8(resolved.document_state.document.inline_document).unwrap();
         assert!(inline.contains("pkx=projection"), "{inline}");
+        assert!(sn
+            .name_info_cache
+            .query(dns_name.as_str(), RecordType::TXT)
+            .is_none());
+
+        // Simulate a DNS query that started before invalidation and completed
+        // afterward. Its old generation must not be allowed to repopulate the
+        // cache with a long-lived stale value.
+        let inserted = sn.update_bns_dns_cache_if_current(Some(&stale_cache_state), || {
+            sn.name_info_cache.add(
+                dns_name.as_str(),
+                RecordType::TXT,
+                stale_dns.clone(),
+                Some(600),
+            );
+        });
+        assert!(!inserted);
+        let projected_dns = NameServer::query(
+            sn.as_ref(),
+            dns_name.to_ascii_uppercase().as_str(),
+            Some(RecordType::TXT),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(
+            projected_dns.txt.iter().any(|txt| txt == "pkx=projection"),
+            "{:?}",
+            projected_dns.txt
+        );
+
+        // Expire the projection bypass without waiting a minute. The raced
+        // old generation must still be rejected, and a mixed-case query must
+        // continue to resolve and cache the projected value.
+        {
+            let mut states = sn
+                .bns_dns_cache_state
+                .write()
+                .unwrap_or_else(|err| err.into_inner());
+            states.get_mut(PROXY_USER).unwrap().bypass_until = Instant::now();
+        }
+        let inserted_after_bypass =
+            sn.update_bns_dns_cache_if_current(Some(&stale_cache_state), || {
+                sn.name_info_cache
+                    .add(dns_name.as_str(), RecordType::TXT, stale_dns, Some(600));
+            });
+        assert!(!inserted_after_bypass);
+
+        let projected_after_bypass = NameServer::query(
+            sn.as_ref(),
+            dns_name.to_ascii_uppercase().as_str(),
+            Some(RecordType::TXT),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(
+            projected_after_bypass
+                .txt
+                .iter()
+                .any(|txt| txt == "pkx=projection"),
+            "{:?}",
+            projected_after_bypass.txt
+        );
     }
 
     #[test]
