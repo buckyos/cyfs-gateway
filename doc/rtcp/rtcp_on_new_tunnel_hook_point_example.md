@@ -18,9 +18,9 @@
 
 注意：
 
-- `REQ.source_device_id` 来自 RTCP 握手包里的 `hello.body.from_id`
-- 它是对端设备的 `device_config.id` 字符串
-- `REQ.source_device_owner` / `REQ.source_zone_did` / `REQ.source_device_name` 只有在对端 `Hello` 里携带并通过校验 `device_doc_jwt` 时才存在
+- `REQ.source_device_id` 是 RTCP Phase 1 已验证的设备文档身份，不是直接信任的 `hello.body.from_id` 原文；名字设备可以保持 `did:bns` / `did:web` 逻辑 DID
+- `REQ.source_device_owner` / `REQ.source_zone_did` / `REQ.source_device_name` 只有在对端 `Hello` 携带且 RTCP 成功验证 `device_doc_jwt` 时才存在
+- Phase 2 的业务策略应使用这些已验证字段检查注册状态和权限，不要重新解析 `device_doc_jwt` 的公钥来推导另一套设备身份
 - 如果你希望 `on_new_tunnel_hook_point` 使用这些语义字段，发起方的 `device_config_path` 应该指向 owner 已签名的 `device.doc.jwt`
 - 示例里的 `<真实device_id>` 需要替换成你实际设备配置里的 `id`
 
@@ -136,6 +136,7 @@ stacks:
 
 - 如果你要做强身份控制，优先使用 `REQ.source_device_id`
 - 如果你要按 owner / zone 做准入，确保对端实际发送的是 `device.doc.jwt`
+- SN 这类有设备注册表的业务可按已验证的 zone/device name 查询注册状态；canonical key DID 的派生属于 RTCP Phase 1，不属于业务 hook
 - 如果你要做临时封禁或局域网限制，再叠加 `REQ.source_addr`
 - `on_new_tunnel_hook_point` 里只做准入控制，不要把 stream 转发逻辑写进来
 - 真正的 `forward` / `server` 分发逻辑仍然放在普通 `hook_point`

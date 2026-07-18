@@ -382,6 +382,11 @@ RTCP v2 的认证锚点是双方设备的长期 Ed25519 身份；会话密钥则
 
 无论 `from_id` 使用名字还是 `did:dev`，认证成功后 RTCP 内部都会得到一个 canonical source DEV DID。这个 DEV DID 用于 nonce cache、tunnel key 和会话身份锚定；原始名字身份仍保留其逻辑语义，供日志、策略和上层业务理解。
 
+这里分成两个阶段：
+
+1. **Phase 1，RTCP 身份验证**：验证 Hello、设备文档和 tunnel token，得到 canonical `did:dev`，同时保留已经验证的逻辑文档身份、owner、zone 和 device name。
+2. **Phase 2，业务授权 hook**：`on_new_tunnel_hook_point` 的 `REQ.source_device_id` / `REQ.real_source_did` 表示 Phase 1 已验证的文档身份；名字设备可以保持 `did:bns` / `did:web` 逻辑 DID。`REQ.source_device_owner`、`REQ.source_zone_did`、`REQ.source_device_name` 承载经过验证的业务元数据。业务层可以按这些字段检查注册状态和权限，但不应重新解析文档公钥来重建另一套身份。
+
 #### 5.3.1 关于匿名访问：为什么 `did:dev:xxx` 直接放行不是漏洞
 
 第 2 条路径里，接收侧只用 `from_id` 自带的公钥验了一下 `tunnel_token` 就放行进入握手——很多人第一眼会把它当成安全漏洞。这里澄清设计意图：
@@ -501,7 +506,7 @@ IV/nonce 选择规则：
 5. 从 `Hello.my_port` 提取对端后续回连所需的 RTCP 监听端口。
 6. 现场生成一次性 X25519 密钥对 `(resp_secret, resp_public)` 和随机 `challenge`，签发 `ack_token`（`aud == "buckyos-rtcp-v2-ack"`，`peer_xpub == Hello.xpub`），并以**明文**形式把 `HelloAck { ack_token, challenge, responder_id }` 发到承载流上。
 7. 用 `(resp_secret, Hello.xpub)` 做 ECDH，走 §5.4.1 的 HKDF 派生 `(aes_key, iv)`；把承载流包成 `EncryptedStream`（responder 方向），等待 AEAD 形式的 `HelloAckConfirm` 并校验 `challenge_echo`。
-8. 只有 key-confirmation 成功后，才调用 `listener.on_new_tunnel(...)` 做准入控制。
+8. 只有 key-confirmation 成功后，才调用 `listener.on_new_tunnel(...)` 做准入控制；传给 hook 的是 Phase 1 已验证的设备文档身份及其 owner/zone/name 元数据，不是未经验证的 Hello 字符串。
 9. 准入通过后，才把这条连接包装成 tunnel，标记 `can_direct = false`，并按 canonical DEV DID 注册到 `tunnel_map`。
 10. 启动 tunnel 读循环。
 
@@ -510,7 +515,7 @@ IV/nonce 选择规则：
 - `Hello` 之后还有一次 `HelloAck`（明文）/ `HelloAckConfirm`（AEAD）的往返，必须成功才算 tunnel 建立；详见 §14.2。
 - **TCP 三次握手成功不等于 tunnel 建立成功**。当前实现的建链完成点是“协议层 key-confirmation 成功”，不是 `TcpStream::connect()` 返回。
 - `can_direct` 的设置时机也在 key-confirmation 之后，而不是刚拿到一条 TCP 连接时。
-- `Hello.from_id` / `Hello.to_id` 承载逻辑来源和逻辑目标语义；真正的身份校验会把它们解析到 canonical `did:dev` 后再比较。名字到 DEV 的转换是内部动作，不应要求调用方在协议语义上放弃 `did:web` / `did:bns`。
+- `Hello.from_id` / `Hello.to_id` 承载逻辑来源和逻辑目标语义；真正的身份校验会把它们解析到 canonical `did:dev` 后再比较。名字到 DEV 的转换是内部认证动作，不应要求调用方在协议语义上放弃 `did:web` / `did:bns`；Phase 2 可继续按已经验证的逻辑身份实施业务权限。
 - 对端后续回连端口来自 `Hello.my_port`，不是当前 TCP 连接的源端口。
 - v2 的 AES key/IV 完全派生自双方临时 X25519 密钥对，与设备长期密钥无关——即便长期 Ed25519 私钥之后被泄露，也无法解密任何已经结束的会话。
 

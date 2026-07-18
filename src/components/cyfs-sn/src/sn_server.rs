@@ -1159,24 +1159,16 @@ impl SNServer {
         }
 
         if let Some(key) = self.registered_device_key_from_did(did).await? {
-            let canonical_did = self.canonical_device_did_from_scoped_did(did).await?;
+            // RTCP Phase 1 has already authenticated the logical device
+            // document. Phase 2 only applies the SN business registration and
+            // state policy to that verified identity; it must not re-resolve
+            // the document and derive another identity from its key material.
             if let Some(view) = self
                 .device_info_db
                 .get_device_state_by_name(key.zone.as_str(), key.device_name.as_str())
                 .await
                 .map_err(|e| RPCErrors::ReasonError(e.to_string()))?
             {
-                if let Some(canonical_did) = canonical_did.as_deref() {
-                    if canonical_did != view.did.as_str() {
-                        return Err(RPCErrors::ParseRequestError(
-                            Self::registered_device_did_mismatch(
-                                did,
-                                canonical_did,
-                                view.did.as_str(),
-                            ),
-                        ));
-                    }
-                }
                 let registered_did = view.did.clone();
                 return self
                     .ood_info_from_device_state(registered_did.as_str(), view)
@@ -1189,17 +1181,6 @@ impl SNServer {
                 .await
                 .map_err(|e| RPCErrors::ReasonError(e.to_string()))?
             {
-                if let Some(canonical_did) = canonical_did.as_deref() {
-                    if canonical_did != device_info.did.as_str() {
-                        return Err(RPCErrors::ParseRequestError(
-                            Self::registered_device_did_mismatch(
-                                did,
-                                canonical_did,
-                                device_info.did.as_str(),
-                            ),
-                        ));
-                    }
-                }
                 let registered_did = device_info.did.clone();
                 return self
                     .ood_info_from_legacy_device(registered_did.as_str(), device_info)
@@ -1346,119 +1327,15 @@ impl SNServer {
         value.trim().trim_end_matches('.').to_ascii_lowercase()
     }
 
-    async fn canonical_device_did_from_scoped_did(
-        &self,
-        did: &str,
-    ) -> Result<Option<String>, RPCErrors> {
-        let did = match DID::from_str(did) {
-            Ok(did) => did,
-            Err(_) => return Ok(None),
-        };
-        if did.method != "bns" && did.method != "web" {
-            return Ok(None);
-        }
-        let did_string = did.to_string();
-
-        let resolution = match self
-            .did_resolver
-            .resolve(SnDidResolveRequest::new(
-                did,
-                Some("doc".to_string()),
-                None,
-                SnDidResolverProfile::InternalZoneResolver,
-            ))
-            .await
-        {
-            Ok(resolution) => resolution,
-            Err(e) => {
-                debug!(
-                    "skip canonical device DID check for {}: resolver failed: {}",
-                    did_string, e
-                );
-                return Ok(None);
-            }
-        };
-
-        let value = match resolution.document.to_json_value() {
-            Ok(value) => value,
-            Err(e) => {
-                debug!(
-                    "skip canonical device DID check for {}: document decode failed: {}",
-                    did_string, e
-                );
-                return Ok(None);
-            }
-        };
-
-        Ok(Self::device_did_from_document(&value))
-    }
-
-    fn device_did_from_document(value: &Value) -> Option<String> {
-        for key in ["did", "id"] {
-            if let Some(did) = value.get(key).and_then(|v| v.as_str()) {
-                if DID::from_str(did.trim()).is_ok_and(|parsed| parsed.method == "dev") {
-                    return Some(did.trim().to_string());
-                }
-            }
-        }
-
-        let public_key_x = value
-            .get("x")
-            .and_then(|v| v.as_str())
-            .filter(|x| !x.trim().is_empty())
-            .or_else(|| {
-                value
-                    .get("verificationMethod")
-                    .or_else(|| value.get("verification_method"))
-                    .and_then(|methods| methods.as_array())
-                    .and_then(|methods| {
-                        methods.iter().find_map(|method| {
-                            method
-                                .get("publicKeyJwk")
-                                .or_else(|| method.get("public_key_jwk"))
-                                .and_then(|jwk| jwk.get("x"))
-                                .and_then(|x| x.as_str())
-                                .filter(|x| !x.trim().is_empty())
-                        })
-                    })
-            });
-        if let Some(public_key_x) = public_key_x {
-            return Some(format!("did:dev:{}", public_key_x.trim()));
-        }
-
-        for key in ["did", "id"] {
-            if let Some(did) = value.get(key).and_then(|v| v.as_str()) {
-                if !did.trim().is_empty() {
-                    return Some(did.trim().to_string());
-                }
-            }
-        }
-
-        None
-    }
-
     fn registered_device_not_found(did: &str) -> String {
         format!(
             "registered device not found for source_device_id={did}; \
              deviceinfo.resolve_ood_by_did checks the exact DID first, then for \
              did:bns:<device>.<zone> or did:web:<device>.<domain> checks the \
-             registered device binding by zone and device_name. Prefer passing the \
-             canonical did:dev device DID after registration; scoped BNS/Web device \
-             DIDs are accepted as compatibility aliases. Verify the SN sqlite \
-             devices/device_indexes tables contain a device registered for the same \
-             public key, device name, and zone."
-        )
-    }
-
-    fn registered_device_did_mismatch(
-        query_did: &str,
-        resolved_did: &str,
-        registered_did: &str,
-    ) -> String {
-        format!(
-            "registered device DID mismatch for source_device_id={query_did}; \
-             scoped DID resolves to canonical device DID {resolved_did}, but the \
-             registered device binding points to {registered_did}."
+             registered device binding by zone and device_name. RTCP Phase 1 \
+             authenticates the presented device document; this Phase 2 lookup only \
+             applies the stored registration/state policy. Verify the SN sqlite \
+             devices/device_indexes tables contain that zone and device name."
         )
     }
 
@@ -2754,43 +2631,6 @@ mod tests {
     const ANVIL_PRIVATE_KEY: &str =
         "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
     const ANVIL_ADDRESS: &str = "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266";
-
-    #[test]
-    fn device_did_from_scoped_document_uses_verification_key() {
-        let document = json!({
-            "id": "did:bns:ood1.alice",
-            "verificationMethod": [{
-                "id": "#main_key",
-                "controller": "did:bns:ood1.alice",
-                "publicKeyJwk": {
-                    "kty": "OKP",
-                    "crv": "Ed25519",
-                    "x": "canonical-device-key"
-                }
-            }]
-        });
-
-        assert_eq!(
-            SNServer::device_did_from_document(&document).as_deref(),
-            Some("did:dev:canonical-device-key")
-        );
-    }
-
-    #[test]
-    fn device_did_from_document_keeps_explicit_dev_did() {
-        let document = json!({
-            "did": "did:dev:explicit-device-key",
-            "id": "did:bns:ood1.alice",
-            "verificationMethod": [{
-                "publicKeyJwk": { "x": "other-device-key" }
-            }]
-        });
-
-        assert_eq!(
-            SNServer::device_did_from_document(&document).as_deref(),
-            Some("did:dev:explicit-device-key")
-        );
-    }
 
     fn test_bns_system_info() -> BnsSystemInfo {
         BnsSystemInfo {
