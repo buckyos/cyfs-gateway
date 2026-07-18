@@ -38,6 +38,10 @@ servers:
 
   main_http:
     type: http
+    # The split relay appends X-Forwarded-For on cleartext HTTP. Override the
+    # parameter with the relay host's private IP/CIDR for a cross-host split.
+    trusted_upstreams:
+      - "{{sn_relay_trusted_upstream}}"
     hook_point:
       main:
         id: main
@@ -73,6 +77,10 @@ stacks:
   main_tls:
     bind: "{{api_tls_bind}}"
     protocol: tls
+    # PROXY v2 is parsed only for this direct peer. Keep the default for a
+    # same-host split; cross-host deployments must set the relay private CIDR.
+    trusted_upstreams:
+      - "{{sn_relay_trusted_upstream}}"
     hosts:
       - host: "sn.{{sn_host}}"
         cert_path: "{{sn_cer}}"
