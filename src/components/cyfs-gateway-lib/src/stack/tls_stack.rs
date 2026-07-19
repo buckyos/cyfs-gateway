@@ -8,15 +8,16 @@ use crate::stack::tls_cert_resolver::{
     IdentityCertResolver, ResolvesServerCertUsingSni, TlsIdentityCertConfig, TlsIdentityHost,
 };
 use crate::stack::{
-    TlsCertResolver, get_limit_info, get_source_addr_from_req_env, probe_proxy_protocol_stream,
-    stream_forward, stream_forward_group,
+    StackManagerWeakRef, StackStreamContext, StreamStack, TlsCertResolver, get_limit_info,
+    get_source_addr_from_req_env, probe_proxy_protocol_stream, stream_forward,
+    stream_forward_group,
 };
 use crate::{
     ConnectionInfo, ConnectionManagerRef, DumpStream, GlobalCollectionManagerRef,
     HandleConnectionController, IoDumpStackConfig, JsExternalsManagerRef, LimiterManagerRef,
     MutComposedSpeedStat, MutComposedSpeedStatRef, ProcessChainConfigs, Server, ServerManagerRef,
     Stack, StackConfig, StackContext, StackErrorCode, StackProtocol, StackResult, StatManagerRef,
-    StreamInfo, TunnelManager, create_io_dump_stack_config, get_external_commands, get_stat_info,
+    TunnelManager, create_io_dump_stack_config, get_external_commands, get_stat_info,
     hyper_serve_http, into_stack_err, stack_err,
 };
 use cyfs_process_chain::{CollectionValue, CommandControl, ProcessChainLibExecutor, StreamRequest};
@@ -85,6 +86,7 @@ pub struct TlsStackContext {
     pub global_process_chains: Option<GlobalProcessChainsRef>,
     pub global_collection_manager: Option<GlobalCollectionManagerRef>,
     pub js_externals: Option<JsExternalsManagerRef>,
+    pub stack_manager: StackManagerWeakRef,
 }
 
 impl TlsStackContext {
@@ -107,7 +109,13 @@ impl TlsStackContext {
             global_process_chains,
             global_collection_manager,
             js_externals,
+            stack_manager: StackManagerWeakRef::new(),
         }
+    }
+
+    pub fn with_stack_manager(mut self, stack_manager: StackManagerWeakRef) -> Self {
+        self.stack_manager = stack_manager;
+        self
     }
 }
 
@@ -118,6 +126,7 @@ impl StackContext for TlsStackContext {
 }
 
 struct TlsConnectionHandler {
+    stack_id: String,
     env: Arc<TlsStackContext>,
     executor: ProcessChainLibExecutor,
     connection_manager: Option<ConnectionManagerRef>,
@@ -129,6 +138,7 @@ struct TlsConnectionHandler {
 
 impl TlsConnectionHandler {
     async fn create(
+        stack_id: String,
         hook_point: ProcessChainConfigs,
         certs: Vec<TlsDomainConfig>,
         identity_certs: Option<TlsIdentityCertConfig>,
@@ -149,6 +159,7 @@ impl TlsConnectionHandler {
         let certs = Self::build_cert_resolver(certs, identity_certs, env.as_ref())?;
         let server_config = Self::build_server_config(certs.clone(), &alpn_protocols)?;
         Ok(Self {
+            stack_id,
             env,
             executor,
             connection_manager,
@@ -170,6 +181,7 @@ impl TlsConnectionHandler {
         .await
         .map_err(into_stack_err!(StackErrorCode::ProcessChainError))?;
         Ok(Self {
+            stack_id: self.stack_id.clone(),
             env: self.env.clone(),
             executor,
             connection_manager: self.connection_manager.clone(),
@@ -257,60 +269,17 @@ impl TlsConnectionHandler {
         local_addr: SocketAddr,
         compose_stat: MutComposedSpeedStatRef,
     ) -> StackResult<()> {
-        let servers = self.env.servers.clone();
-        let executor = self.executor.fork();
         let remote_addr = stream.raw_stream().peer_addr().map_err(into_stack_err!(
             StackErrorCode::ServerError,
             "read remote addr failed"
         ))?;
         let (stream, proxy_source_addr) = probe_proxy_protocol_stream(Box::new(stream)).await?;
         let request_source_addr = proxy_source_addr.unwrap_or(remote_addr);
-
-        let tls_acceptor = TlsAcceptor::from(self.server_config.clone());
-        let tls_stream = tls_acceptor
-            .accept(stream)
-            .await
-            .map_err(into_stack_err!(StackErrorCode::StreamError))?;
-        let server_name = {
-            let (_, conn) = tls_stream.get_ref();
-            conn.server_name().map(|s| s.to_string())
-        };
-        if server_name.is_none() {
-            return Ok(());
-        }
-        if let Some(proxy_addr) = proxy_source_addr {
-            log::debug!(
-                "accept tls stream from {} (proxy via {}) to {} name {}",
-                proxy_addr,
-                remote_addr,
-                local_addr,
-                server_name.as_ref().unwrap_or(&"".to_string())
-            );
-        } else {
-            log::debug!(
-                "accept tls stream from {} to {} name {}",
-                remote_addr,
-                local_addr,
-                server_name.as_ref().unwrap_or(&"".to_string())
-            );
-        }
-        let request_stream: Box<dyn buckyos_kit::AsyncStream> =
-            if let Some(io_dump) = self.io_dump.clone() {
-                Box::new(DumpStream::new(
-                    tls_stream,
-                    io_dump,
-                    remote_addr.to_string(),
-                    local_addr.to_string(),
-                ))
-            } else {
-                Box::new(tls_stream)
-            };
-        let mut request = StreamRequest::new(request_stream, local_addr);
+        let mut request = StreamRequest::new(stream, local_addr);
         request.source_addr = Some(request_source_addr);
         request.conn_source_addr = Some(remote_addr);
         request.real_source_addr = proxy_source_addr;
         request.dest_port = local_addr.port();
-        request.dest_host = server_name;
         if let Some(device_info) = self
             .connection_manager
             .as_ref()
@@ -320,30 +289,100 @@ impl TlsConnectionHandler {
             request.source_hostname = device_info.hostname().map(|v| v.to_string());
             request.source_online_secs = Some(device_info.today_online_seconds().to_string());
         }
+        let source_online_secs = request.source_online_secs.clone();
+        let context = StackStreamContext::from_request(self.stack_id.clone(), &request);
+        let stream = request
+            .incoming_stream
+            .lock()
+            .unwrap()
+            .take()
+            .ok_or_else(|| {
+                stack_err!(
+                    StackErrorCode::StreamError,
+                    "listener stream is unavailable"
+                )
+            })?;
+        self.handle_tls_stream(stream, context, compose_stat, source_online_secs)
+            .await
+    }
+
+    async fn handle_tls_stream(
+        &self,
+        stream: Box<dyn buckyos_kit::AsyncStream>,
+        mut context: StackStreamContext,
+        compose_stat: MutComposedSpeedStatRef,
+        source_online_secs: Option<String>,
+    ) -> StackResult<()> {
+        let tls_acceptor = TlsAcceptor::from(self.server_config.clone());
+        let tls_stream = tls_acceptor
+            .accept(stream)
+            .await
+            .map_err(into_stack_err!(StackErrorCode::StreamError))?;
+        let server_name = {
+            let (_, conn) = tls_stream.get_ref();
+            conn.server_name().map(|s| s.to_string())
+        };
+        let Some(server_name) = server_name else {
+            return Ok(());
+        };
+        log::debug!(
+            "accept tls stream from {} to {} name {}",
+            context
+                .source_addr
+                .or(context.conn_source_addr)
+                .map(|addr| addr.to_string())
+                .unwrap_or_else(|| "unknown".to_string()),
+            context
+                .dest_addr
+                .map(|addr| addr.to_string())
+                .unwrap_or_else(|| "unknown".to_string()),
+            server_name
+        );
+        let request_stream: Box<dyn buckyos_kit::AsyncStream> =
+            if let Some(io_dump) = self.io_dump.clone() {
+                Box::new(DumpStream::new(
+                    tls_stream,
+                    io_dump,
+                    context
+                        .conn_source_addr
+                        .or(context.source_addr)
+                        .map(|addr| addr.to_string())
+                        .unwrap_or_else(|| "unknown".to_string()),
+                    context
+                        .dest_addr
+                        .map(|addr| addr.to_string())
+                        .unwrap_or_else(|| "unknown".to_string()),
+                ))
+            } else {
+                Box::new(tls_stream)
+            };
+        context.dest_host = Some(server_name);
+        let request = context.create_request(request_stream);
+        self.handle_stream(request, context, compose_stat, source_online_secs)
+            .await
+    }
+
+    async fn handle_stream(
+        &self,
+        request: StreamRequest,
+        mut context: StackStreamContext,
+        compose_stat: MutComposedSpeedStatRef,
+        source_online_secs: Option<String>,
+    ) -> StackResult<()> {
+        let servers = self.env.servers.clone();
+        let executor = self.executor.fork();
         let global_env = executor.global_env().clone();
         let (ret, stream) = execute_stream_chain(executor, request)
             .await
             .map_err(into_stack_err!(StackErrorCode::ProcessChainError))?;
-        let conn_src_addr = Some(remote_addr.to_string());
-        let mut real_src_addr = get_source_addr_from_req_env(&global_env)
+        context.refresh_from_env(&global_env).await?;
+        if let Some(real_source_addr) = get_source_addr_from_req_env(&global_env)
             .await
-            .and_then(|addr| addr.parse::<SocketAddr>().ok().map(|_| addr));
-        if real_src_addr.is_none() {
-            real_src_addr = proxy_source_addr.map(|addr| addr.to_string());
-        }
-        let mut stream_info = StreamInfo::with_addrs(conn_src_addr, real_src_addr)
-            .with_dst_addr(Some(local_addr.to_string()));
-        if let Some(device_info) = self
-            .connection_manager
-            .as_ref()
-            .and_then(|manager| manager.get_device_info_by_source(request_source_addr.ip()))
+            .and_then(|addr| addr.parse::<SocketAddr>().ok())
         {
-            stream_info = stream_info.with_device_info(
-                device_info.mac().map(|v| v.to_string()),
-                device_info.hostname().map(|v| v.to_string()),
-                Some(device_info.today_online_seconds().to_string()),
-            );
+            context.real_source_addr = Some(real_source_addr);
         }
+        let stream_info = context.stream_info(source_online_secs);
         if ret.is_control() {
             if ret.is_drop() {
                 return Ok(());
@@ -502,6 +541,32 @@ impl TlsConnectionHandler {
                                 }
                             }
                         }
+                        "stack" => {
+                            if list.len() != 2 {
+                                return Err(stack_err!(
+                                    StackErrorCode::InvalidConfig,
+                                    "invalid stack command"
+                                ));
+                            }
+                            let stream = if limiter.is_some() {
+                                let (read_limit, write_limit) =
+                                    limiter.as_ref().unwrap().new_limit_session();
+                                Box::new(LimitStream::new(stream, read_limit, write_limit))
+                            } else {
+                                stream
+                            };
+                            let stack_manager =
+                                self.env.stack_manager.upgrade().ok_or_else(|| {
+                                    stack_err!(
+                                        StackErrorCode::StackNotFound,
+                                        "stack manager is unavailable for handoff from {}",
+                                        self.stack_id
+                                    )
+                                })?;
+                            stack_manager
+                                .serve_stream(list[1].as_str(), stream, context)
+                                .await?;
+                        }
                         v => {
                             log::error!("unknown command: {}", v);
                         }
@@ -563,6 +628,7 @@ impl TlsStack {
         let bind_addr = config.bind.unwrap();
         let env = config.stack_context.unwrap();
         let handler = TlsConnectionHandler::create(
+            id.clone(),
             config.hook_point.unwrap(),
             config.certs,
             config.identity_certs,
@@ -762,6 +828,7 @@ impl Stack for TlsStack {
         let cert_list = build_tls_domain_configs(config).await?;
 
         let new_handler = TlsConnectionHandler::create(
+            self.id.clone(),
             config.hook_point.clone(),
             cert_list,
             build_tls_identity_cert_config(&config.hosts, config.identity_manager.as_ref())?,
@@ -793,6 +860,26 @@ impl Stack for TlsStack {
 
     async fn rollback_update(&self) {
         self.prepare_handler.write().unwrap().take();
+    }
+
+    fn as_stream_stack(&self) -> Option<&dyn StreamStack> {
+        Some(self)
+    }
+}
+
+#[async_trait::async_trait]
+impl StreamStack for TlsStack {
+    async fn serve_stream(
+        &self,
+        stream: Box<dyn buckyos_kit::AsyncStream>,
+        context: StackStreamContext,
+    ) -> StackResult<()> {
+        let handler = self.handler.read().unwrap().clone();
+        let compose_stat = MutComposedSpeedStat::new();
+        let stream = StatStream::new_with_tracker(stream, compose_stat.clone());
+        handler
+            .handle_tls_stream(Box::new(stream), context, compose_stat, None)
+            .await
     }
 }
 
@@ -1186,14 +1273,16 @@ mod tests {
     use crate::{
         ConnectionManager, DefaultLimiterManager, GlobalCollectionManager, MutComposedSpeedStat,
         ProcessChainConfigs, ProcessChainHttpServer, Server, ServerManager, ServerResult, Stack,
-        StackFactory, StackProtocol, StatManager, StreamInfo, StreamServer, TlsStackConfig,
-        TlsStackFactory, TunnelManager, create_io_dump_stack_config, decode_io_dump_frames,
+        StackFactory, StackManager, StackProtocol, StackStreamContext, StatManager, StreamInfo,
+        StreamServer, StreamStack, TcpStack, TcpStackContext, TlsStackConfig, TlsStackFactory,
+        TunnelManager, create_io_dump_stack_config, decode_io_dump_frames,
     };
     use crate::{
         LimiterManagerRef, ServerManagerRef, StackContext, StatManagerRef, TlsDomainConfig,
         TlsStack, TlsStackContext,
     };
     use buckyos_kit::{AsyncStream, init_logging};
+    use cyfs_process_chain::StreamRequest;
     use http_body_util::Full;
     use hyper::body::Bytes;
     use hyper_util::rt::{TokioExecutor, TokioIo};
@@ -1895,6 +1984,7 @@ mod tests {
             Some(Arc::new(GlobalProcessChains::new())),
         );
         let mut handler = TlsConnectionHandler::create(
+            "test-tls".to_string(),
             chains,
             vec![TlsDomainConfig {
                 domain: "www.buckyos.com".to_string(),
@@ -2042,6 +2132,207 @@ mod tests {
         let ret = stream.read_exact(&mut buf).await;
         assert!(ret.is_ok());
         assert_eq!(&buf, b"recv");
+    }
+
+    #[tokio::test]
+    async fn test_stack_handoff_dv_tls_accepts_existing_stream() {
+        let cert_key = generate_simple_self_signed(vec!["www.buckyos.com".to_string()]).unwrap();
+        let chains: ProcessChainConfigs = serde_yaml_ng::from_str(
+            r#"
+- id: main
+  priority: 1
+  blocks:
+    - id: main
+      block: |
+        return "server handoff-tls";
+"#,
+        )
+        .unwrap();
+        let server_manager = Arc::new(ServerManager::new());
+        server_manager
+            .add_server(Server::Stream(Arc::new(MockServer::new(
+                "handoff-tls".to_string(),
+            ))))
+            .unwrap();
+        let stack = TlsStack::builder()
+            .id("target-tls")
+            .bind("127.0.0.1:0")
+            .hook_point(chains)
+            .add_certs(vec![TlsDomainConfig {
+                domain: "www.buckyos.com".to_string(),
+                certs: Some(vec![cert_key.cert.der().clone()]),
+                key: Some(PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
+                    cert_key.signing_key.serialize_der(),
+                ))),
+            }])
+            .alpn_protocols(vec![b"http/1.1".to_vec()])
+            .stack_context(build_stack_context(
+                server_manager,
+                TunnelManager::new(),
+                Arc::new(DefaultLimiterManager::new()),
+                StatManager::new(),
+                SelfCertMgr::create(SelfCertConfig::default())
+                    .await
+                    .unwrap(),
+                Some(Arc::new(GlobalProcessChains::new())),
+            ))
+            .build()
+            .await
+            .unwrap();
+
+        let (client_io, server_io) = tokio::io::duplex(4096);
+        let (context_stream, _) = tokio::io::duplex(1);
+        let mut request =
+            StreamRequest::new(Box::new(context_stream), "192.0.2.10:443".parse().unwrap());
+        request.source_addr = Some("198.51.100.20:50000".parse().unwrap());
+        request.conn_source_addr = Some("198.51.100.20:50000".parse().unwrap());
+        let context = StackStreamContext::from_request("source-tcp", &request);
+        let serve = stack.serve_stream(Box::new(server_io), context);
+        let client = async move {
+            let config = ClientConfig::builder_with_provider(Arc::new(
+                rustls::crypto::ring::default_provider(),
+            ))
+            .with_protocol_versions(rustls::DEFAULT_VERSIONS)
+            .unwrap()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(NoVerifier))
+            .with_no_client_auth();
+            let connector = TlsConnector::from(Arc::new(config));
+            let mut stream = connector
+                .connect(ServerName::try_from("www.buckyos.com").unwrap(), client_io)
+                .await
+                .unwrap();
+            stream.write_all(b"test").await.unwrap();
+            let mut response = [0u8; 4];
+            stream.read_exact(&mut response).await.unwrap();
+            assert_eq!(&response, b"recv");
+        };
+        let (serve_result, ()) = tokio::join!(serve, client);
+        serve_result.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_stack_handoff_dv_tcp_sni_probe_to_tls() {
+        let cert_key = generate_simple_self_signed(vec!["www.buckyos.com".to_string()]).unwrap();
+        let source_chains: ProcessChainConfigs = serde_yaml_ng::from_str(
+            r#"
+- id: main
+  priority: 1
+  blocks:
+    - id: main
+      block: |
+        call https-sni-probe || reject;
+        eq ${REQ.dest_host} "www.buckyos.com" && call-stack target-tls;
+        reject;
+"#,
+        )
+        .unwrap();
+        let target_chains: ProcessChainConfigs = serde_yaml_ng::from_str(
+            r#"
+- id: main
+  priority: 1
+  blocks:
+    - id: main
+      block: |
+        return "server handoff-tls";
+"#,
+        )
+        .unwrap();
+        let manager = StackManager::new();
+        let servers = Arc::new(ServerManager::new());
+        servers
+            .add_server(Server::Stream(Arc::new(MockServer::new(
+                "handoff-tls".to_string(),
+            ))))
+            .unwrap();
+        let source_context = Arc::new(
+            TcpStackContext::new(
+                servers.clone(),
+                TunnelManager::new(),
+                Arc::new(DefaultLimiterManager::new()),
+                StatManager::new(),
+                Some(Arc::new(GlobalProcessChains::new())),
+                None,
+                None,
+            )
+            .with_stack_manager(Arc::downgrade(&manager)),
+        );
+        let tls_context = build_stack_context(
+            servers,
+            TunnelManager::new(),
+            Arc::new(DefaultLimiterManager::new()),
+            StatManager::new(),
+            SelfCertMgr::create(SelfCertConfig::default())
+                .await
+                .unwrap(),
+            Some(Arc::new(GlobalProcessChains::new())),
+        );
+        let tls_context = Arc::new(
+            tls_context
+                .as_ref()
+                .clone()
+                .with_stack_manager(Arc::downgrade(&manager)),
+        );
+        let source = Arc::new(
+            TcpStack::builder()
+                .id("source-tcp")
+                .bind("127.0.0.1:0")
+                .hook_point(source_chains)
+                .stack_context(source_context)
+                .build()
+                .await
+                .unwrap(),
+        );
+        let target = Arc::new(
+            TlsStack::builder()
+                .id("target-tls")
+                .bind("127.0.0.1:0")
+                .hook_point(target_chains)
+                .add_certs(vec![TlsDomainConfig {
+                    domain: "www.buckyos.com".to_string(),
+                    certs: Some(vec![cert_key.cert.der().clone()]),
+                    key: Some(PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
+                        cert_key.signing_key.serialize_der(),
+                    ))),
+                }])
+                .alpn_protocols(vec![b"http/1.1".to_vec()])
+                .stack_context(tls_context)
+                .build()
+                .await
+                .unwrap(),
+        );
+        manager.add_stack(source.clone()).unwrap();
+        manager.add_stack(target).unwrap();
+
+        let (client_io, source_io) = tokio::io::duplex(4096);
+        let (context_stream, _) = tokio::io::duplex(1);
+        let mut request =
+            StreamRequest::new(Box::new(context_stream), "192.0.2.10:443".parse().unwrap());
+        request.source_addr = Some("198.51.100.20:50000".parse().unwrap());
+        request.conn_source_addr = Some("198.51.100.20:50000".parse().unwrap());
+        let context = StackStreamContext::from_request("source-tcp", &request);
+        let serve = source.serve_stream(Box::new(source_io), context);
+        let client = async move {
+            let config = ClientConfig::builder_with_provider(Arc::new(
+                rustls::crypto::ring::default_provider(),
+            ))
+            .with_protocol_versions(rustls::DEFAULT_VERSIONS)
+            .unwrap()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(NoVerifier))
+            .with_no_client_auth();
+            let connector = TlsConnector::from(Arc::new(config));
+            let mut stream = connector
+                .connect(ServerName::try_from("www.buckyos.com").unwrap(), client_io)
+                .await
+                .unwrap();
+            stream.write_all(b"test").await.unwrap();
+            let mut response = [0u8; 4];
+            stream.read_exact(&mut response).await.unwrap();
+            assert_eq!(&response, b"recv");
+        };
+        let (serve_result, ()) = tokio::join!(serve, client);
+        serve_result.unwrap();
     }
 
     #[tokio::test]

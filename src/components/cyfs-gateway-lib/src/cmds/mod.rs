@@ -8,6 +8,7 @@ mod redirect;
 mod server;
 mod set_limit;
 mod set_stat;
+mod stack;
 mod verify_jwt;
 
 use crate::{CmdQa, ServerManagerWeakRef};
@@ -24,6 +25,7 @@ pub use redirect::*;
 pub use server::*;
 pub use set_limit::*;
 pub use set_stat::*;
+pub use stack::*;
 use std::sync::Arc;
 pub use verify_jwt::*;
 
@@ -123,6 +125,13 @@ pub fn get_external_commands(
         Arc::new(Box::new(server_command) as Box<dyn ExternalCommand>),
     ));
 
+    let stack_command = CallStack::new();
+    let name = stack_command.name().to_owned();
+    cmds.push((
+        name,
+        Arc::new(Box::new(stack_command) as Box<dyn ExternalCommand>),
+    ));
+
     let qa_command = CmdQa::new(server_manager);
     let name = qa_command.name().to_owned();
     cmds.push((
@@ -148,5 +157,6 @@ mod tests {
 
         assert!(names.iter().any(|name| name == "verify-jwt"));
         assert!(names.iter().any(|name| name == "parse-cookie"));
+        assert!(names.iter().any(|name| name == "call-stack"));
     }
 }

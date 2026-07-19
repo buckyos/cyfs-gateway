@@ -39,7 +39,7 @@ stacks:
     bind: 127.0.0.1:{{control_server_port}}
 
   test1:
-    bind: 0.0.0.0:18080
+    bind: 0.0.0.0:{{test1_port}}
     protocol: tcp
     io_dump_file: {{test_io_dump}}
     hook_point:
@@ -60,7 +60,7 @@ stacks:
               reject;
 
   test2:
-    bind: 0.0.0.0:18081
+    bind: 0.0.0.0:{{test2_port}}
     protocol: tcp
     hook_point:
       main:
@@ -71,6 +71,84 @@ stacks:
             block: |
               exec --lib global_test1;
               http-probe && call-server ${REQ.dest_host};
+              reject;
+
+  call_stack_tcp_target:
+    bind: 127.0.0.1:{{call_stack_tcp_target_port}}
+    protocol: tcp
+    hook_point:
+      main:
+        priority: 1
+        blocks:
+          default:
+            priority: 1
+            block: |
+              eq ${REQ.dest_host} "tcp-call-tcp.buckyos.com" && call-server www.buckyos.com;
+              eq ${REQ.dest_host} "tls-call-tcp.buckyos.com" && call-server www.buckyos.com;
+              reject;
+
+  call_stack_tls_target:
+    bind: 127.0.0.1:{{call_stack_tls_target_port}}
+    protocol: tls
+    hosts:
+      - host: tcp-call-tls.buckyos.com
+        cert_path: {{call_stack_tls_cert_path}}
+        key_path: {{call_stack_tls_key_path}}
+    alpn_protocols:
+      - http/1.1
+    hook_point:
+      main:
+        priority: 1
+        blocks:
+          default:
+            priority: 1
+            block: |
+              eq ${REQ.dest_host} "tcp-call-tls.buckyos.com" && call-server www.buckyos.com;
+              reject;
+
+  call_stack_tcp_to_tcp:
+    bind: 127.0.0.1:{{call_stack_tcp_to_tcp_port}}
+    protocol: tcp
+    hook_point:
+      main:
+        priority: 1
+        blocks:
+          default:
+            priority: 1
+            block: |
+              http-probe && eq ${REQ.dest_host} "tcp-call-tcp.buckyos.com" && call-stack call_stack_tcp_target;
+              reject;
+
+  call_stack_tcp_to_tls:
+    bind: 127.0.0.1:{{call_stack_tcp_to_tls_port}}
+    protocol: tcp
+    hook_point:
+      main:
+        priority: 1
+        blocks:
+          default:
+            priority: 1
+            block: |
+              https-sni-probe && eq ${REQ.dest_host} "tcp-call-tls.buckyos.com" && call-stack call_stack_tls_target;
+              reject;
+
+  call_stack_tls_to_tcp:
+    bind: 127.0.0.1:{{call_stack_tls_to_tcp_port}}
+    protocol: tls
+    hosts:
+      - host: tls-call-tcp.buckyos.com
+        cert_path: {{call_stack_tls_cert_path}}
+        key_path: {{call_stack_tls_key_path}}
+    alpn_protocols:
+      - http/1.1
+    hook_point:
+      main:
+        priority: 1
+        blocks:
+          default:
+            priority: 1
+            block: |
+              eq ${REQ.dest_host} "tls-call-tcp.buckyos.com" && call-stack call_stack_tcp_target;
               reject;
 
   socks_stack:
@@ -98,7 +176,7 @@ stacks:
               call-server upstream_socks;
 
   test3:
-    bind: 0.0.0.0:9545
+    bind: 0.0.0.0:{{dns_port}}
     protocol: udp
     transparent: false
     hook_point:
@@ -111,7 +189,7 @@ stacks:
               call-server main_dns;
 
   test_ptcp_entry:
-    bind: 0.0.0.0:18082
+    bind: 0.0.0.0:{{ptcp_entry_port}}
     protocol: tcp
     hook_point:
       main:
@@ -120,11 +198,11 @@ stacks:
           default:
             priority: 1
             block: |
-              http-probe && forward "ptcp://${REQ.source_addr}/127.0.0.1:18084";
+              http-probe && forward "ptcp://${REQ.source_addr}/127.0.0.1:{{ptcp_mix_port}}";
               reject;
 
   test_ptcp_mix:
-    bind: 0.0.0.0:18084
+    bind: 0.0.0.0:{{ptcp_mix_port}}
     protocol: tcp
     hook_point:
       main:
@@ -147,14 +225,14 @@ servers:
           default:
             priority: 1
             block: |
-              starts-with ${REQ.path} "/api" && rewrite ${REQ.path} "/api*" "*" && map-add REQ host www.buckyos.com && forward http://127.0.0.1:18081;
+              starts-with ${REQ.path} "/api" && rewrite ${REQ.path} "/api*" "*" && map-add REQ host www.buckyos.com && forward http://127.0.0.1:{{test2_port}};
       main1:
         priority: 1
         blocks:
           default:
             priority: 1
             block: |
-              starts-with ${REQ.path} "/test_return" && rewrite ${REQ.path} "/test_return*" "*" && map-add REQ host www.buckyos.com && return "forward http://127.0.0.1:18081";
+              starts-with ${REQ.path} "/test_return" && rewrite ${REQ.path} "/test_return*" "*" && map-add REQ host www.buckyos.com && return "forward http://127.0.0.1:{{test2_port}}";
               starts-with ${REQ.path} "/sn" && rewrite ${REQ.path} "/sn*" "/*" && call-server sn.http;
 
           default1:
@@ -250,6 +328,9 @@ servers:
     boot_jwt: "eyJhbGciOiJFZERTQSJ9.eyJvb2RzIjpbInNuIl0sImV4cCI6MjA1ODgzODkzOX0.SGem2FBRB0H2TcRWBRJCsCg5PYXzHW9X9853UChV_qzWHHhKxunZ-emotSnr9HufjL7avGEos1ifRjl9KTrzBg"
     owner_pkx: "qJdNEtscIYwTo-I0K7iPEt_UZdBDRd4r16jdBfNR0tM"
     device_jwt: ["eyJhbGciOiJFZERTQSJ9.eyJuIjoic24iLCJ4IjoiRlB2WTNXWFB4dVdQWUZ1d09ZMFFiaDBPNy1oaEtyNnRhMWpUY1g5T1JQSSIsImV4cCI6MjA1ODgzODkzOX0._YKR0y6E4JQJXDEG12WWFfY1pXyxtdSuigERZQXphnQAarDM02JIoXLNtad80U7T7lO_A4z_HbNDRJ9hMGKhCA"]
+    bns_rpc_url: http://127.0.0.1:{{bns_rpc_port}}
+    bns_evm:
+      controller_private_key: "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
     db_type: sqlite
     db_path: {{sn_db}}
 

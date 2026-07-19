@@ -1,6 +1,7 @@
 use super::{
-    Stack, get_limit_info, get_source_addr_from_req_env, probe_proxy_protocol_stream,
-    stream_forward, stream_forward_group,
+    Stack, StackManagerWeakRef, StackStreamContext, StreamStack, get_limit_info,
+    get_source_addr_from_req_env, probe_proxy_protocol_stream, stream_forward,
+    stream_forward_group,
 };
 use crate::forward::ForwardPlan;
 
@@ -17,8 +18,8 @@ use crate::{
     HandleConnectionController, IoDumpStackConfig, JsExternalsManagerRef, LimiterManagerRef,
     MutComposedSpeedStat, MutComposedSpeedStatRef, ProcessChainConfig, ProcessChainConfigs, Server,
     ServerManagerRef, StackConfig, StackContext, StackErrorCode, StackFactory, StackProtocol,
-    StackRef, StatManagerRef, StreamInfo, TunnelManager, create_io_dump_stack_config,
-    get_external_commands, get_stat_info, hyper_serve_http, into_stack_err, stack_err,
+    StackRef, StatManagerRef, TunnelManager, create_io_dump_stack_config, get_external_commands,
+    get_stat_info, hyper_serve_http, into_stack_err, stack_err,
 };
 use cyfs_process_chain::{CollectionValue, CommandControl, ProcessChainLibExecutor, StreamRequest};
 use serde::{Deserialize, Serialize};
@@ -41,6 +42,7 @@ pub struct TcpStackContext {
     pub global_process_chains: Option<GlobalProcessChainsRef>,
     pub global_collection_manager: Option<GlobalCollectionManagerRef>,
     pub js_externals: Option<JsExternalsManagerRef>,
+    pub stack_manager: StackManagerWeakRef,
 }
 
 impl TcpStackContext {
@@ -61,7 +63,13 @@ impl TcpStackContext {
             global_process_chains,
             global_collection_manager,
             js_externals,
+            stack_manager: StackManagerWeakRef::new(),
         }
+    }
+
+    pub fn with_stack_manager(mut self, stack_manager: StackManagerWeakRef) -> Self {
+        self.stack_manager = stack_manager;
+        self
     }
 }
 
@@ -72,6 +80,7 @@ impl StackContext for TcpStackContext {
 }
 
 struct TcpConnectionHandler {
+    stack_id: String,
     env: Arc<TcpStackContext>,
     executor: ProcessChainLibExecutor,
     connection_manager: Option<ConnectionManagerRef>,
@@ -80,6 +89,7 @@ struct TcpConnectionHandler {
 
 impl TcpConnectionHandler {
     async fn create(
+        stack_id: String,
         hook_point: ProcessChainConfigs,
         env: Arc<TcpStackContext>,
         connection_manager: Option<ConnectionManagerRef>,
@@ -95,6 +105,7 @@ impl TcpConnectionHandler {
         .await
         .map_err(into_stack_err!(StackErrorCode::ProcessChainError))?;
         Ok(Self {
+            stack_id,
             env,
             executor,
             connection_manager,
@@ -117,6 +128,7 @@ impl TcpConnectionHandler {
         .await
         .map_err(into_stack_err!(StackErrorCode::ProcessChainError))?;
         Ok(Self {
+            stack_id: self.stack_id.clone(),
             env: self.env.clone(),
             executor,
             connection_manager: self.connection_manager.clone(),
@@ -130,8 +142,6 @@ impl TcpConnectionHandler {
         dest_addr: SocketAddr,
         compose_stat: MutComposedSpeedStatRef,
     ) -> StackResult<()> {
-        let executor = self.executor.fork();
-        let servers = self.env.servers.clone();
         let remote_addr = stream.raw_stream().peer_addr().map_err(into_stack_err!(
             StackErrorCode::ServerError,
             "read remote addr failed"
@@ -164,30 +174,63 @@ impl TcpConnectionHandler {
             request.source_hostname = device_info.hostname().map(|v| v.to_string());
             request.source_online_secs = Some(device_info.today_online_seconds().to_string());
         }
+        let source_online_secs = request.source_online_secs.clone();
+        let context = StackStreamContext::from_request(self.stack_id.clone(), &request);
+        self.handle_stream(request, context, compose_stat, source_online_secs)
+            .await
+    }
+
+    async fn handle_handoff_stream(
+        &self,
+        stream: Box<dyn buckyos_kit::AsyncStream>,
+        context: StackStreamContext,
+    ) -> StackResult<()> {
+        let compose_stat = MutComposedSpeedStat::new();
+        let stream = StatStream::new_with_tracker(stream, compose_stat.clone());
+        let stream: Box<dyn buckyos_kit::AsyncStream> = if let Some(io_dump) = self.io_dump.clone()
+        {
+            Box::new(DumpStream::new(
+                stream,
+                io_dump,
+                context
+                    .conn_source_addr
+                    .or(context.source_addr)
+                    .map(|addr| addr.to_string())
+                    .unwrap_or_else(|| "unknown".to_string()),
+                context
+                    .dest_addr
+                    .map(|addr| addr.to_string())
+                    .unwrap_or_else(|| "unknown".to_string()),
+            ))
+        } else {
+            Box::new(stream)
+        };
+        let request = context.create_request(stream);
+        self.handle_stream(request, context, compose_stat, None)
+            .await
+    }
+
+    async fn handle_stream(
+        &self,
+        request: StreamRequest,
+        mut context: StackStreamContext,
+        compose_stat: MutComposedSpeedStatRef,
+        source_online_secs: Option<String>,
+    ) -> StackResult<()> {
+        let executor = self.executor.fork();
+        let servers = self.env.servers.clone();
         let global_env = executor.global_env().clone();
         let (ret, stream) = execute_stream_chain(executor, request)
             .await
             .map_err(into_stack_err!(StackErrorCode::ProcessChainError))?;
-        let conn_src_addr = Some(remote_addr.to_string());
-        let mut real_src_addr = get_source_addr_from_req_env(&global_env)
+        context.refresh_from_env(&global_env).await?;
+        if let Some(real_source_addr) = get_source_addr_from_req_env(&global_env)
             .await
-            .and_then(|addr| addr.parse::<SocketAddr>().ok().map(|_| addr));
-        if real_src_addr.is_none() {
-            real_src_addr = proxy_source_addr.map(|addr| addr.to_string());
-        }
-        let mut stream_info = StreamInfo::with_addrs(conn_src_addr, real_src_addr)
-            .with_dst_addr(Some(dest_addr.to_string()));
-        if let Some(device_info) = self
-            .connection_manager
-            .as_ref()
-            .and_then(|manager| manager.get_device_info_by_source(device_lookup_ip))
+            .and_then(|addr| addr.parse::<SocketAddr>().ok())
         {
-            stream_info = stream_info.with_device_info(
-                device_info.mac().map(|v| v.to_string()),
-                device_info.hostname().map(|v| v.to_string()),
-                Some(device_info.today_online_seconds().to_string()),
-            );
+            context.real_source_addr = Some(real_source_addr);
         }
+        let stream_info = context.stream_info(source_online_secs);
         if ret.is_control() {
             if ret.is_drop() {
                 return Ok(());
@@ -344,6 +387,32 @@ impl TcpConnectionHandler {
                                 }
                             }
                         }
+                        "stack" => {
+                            if list.len() != 2 {
+                                return Err(stack_err!(
+                                    StackErrorCode::InvalidConfig,
+                                    "invalid stack command"
+                                ));
+                            }
+                            let stream = if limiter.is_some() {
+                                let (read_limit, write_limit) =
+                                    limiter.as_ref().unwrap().new_limit_session();
+                                Box::new(LimitStream::new(stream, read_limit, write_limit))
+                            } else {
+                                stream
+                            };
+                            let stack_manager =
+                                self.env.stack_manager.upgrade().ok_or_else(|| {
+                                    stack_err!(
+                                        StackErrorCode::StackNotFound,
+                                        "stack manager is unavailable for handoff from {}",
+                                        self.stack_id
+                                    )
+                                })?;
+                            stack_manager
+                                .serve_stream(list[1].as_str(), stream, context)
+                                .await?;
+                        }
                         v => {
                             log::error!("unknown command: {}", v);
                         }
@@ -440,6 +509,7 @@ impl TcpStack {
         let bind_addr = config.bind.unwrap();
         let env = config.stack_context.unwrap();
         let handler = TcpConnectionHandler::create(
+            id.clone(),
             config.hook_point.unwrap(),
             env,
             config.connection_manager.clone(),
@@ -682,6 +752,7 @@ impl Stack for TcpStack {
         .await
         .map_err(|e| stack_err!(StackErrorCode::InvalidConfig, "{e}"))?;
         let new_handler = TcpConnectionHandler::create(
+            self.id.clone(),
             config.hook_point.clone(),
             env,
             self.connection_manager.clone(),
@@ -701,6 +772,22 @@ impl Stack for TcpStack {
 
     async fn rollback_update(&self) {
         self.prepare_handler.write().unwrap().take();
+    }
+
+    fn as_stream_stack(&self) -> Option<&dyn StreamStack> {
+        Some(self)
+    }
+}
+
+#[async_trait::async_trait]
+impl StreamStack for TcpStack {
+    async fn serve_stream(
+        &self,
+        stream: Box<dyn buckyos_kit::AsyncStream>,
+        context: StackStreamContext,
+    ) -> StackResult<()> {
+        let handler = self.handler.read().unwrap().clone();
+        handler.handle_handoff_stream(stream, context).await
     }
 }
 
@@ -863,11 +950,12 @@ mod tests {
     use crate::{
         ConnectionManager, DefaultLimiterManager, GlobalCollectionManager, LimiterManagerRef,
         ProcessChainConfigs, Server, ServerManager, ServerManagerRef, ServerResult, Stack,
-        StackFactory, StackProtocol, StatManager, StatManagerRef, StreamInfo, StreamServer,
-        TcpStack, TcpStackConfig, TcpStackContext, TcpStackFactory, TunnelManager,
-        create_io_dump_stack_config, decode_io_dump_frames,
+        StackFactory, StackManager, StackProtocol, StackStreamContext, StatManager, StatManagerRef,
+        StreamInfo, StreamServer, StreamStack, TcpStack, TcpStackConfig, TcpStackContext,
+        TcpStackFactory, TunnelManager, create_io_dump_stack_config, decode_io_dump_frames,
     };
     use buckyos_kit::AsyncStream;
+    use cyfs_process_chain::StreamRequest;
     use std::path::Path;
     use std::sync::Arc;
     use std::time::Instant;
@@ -1245,6 +1333,105 @@ mod tests {
 
     pub struct MockServer {
         id: String,
+    }
+
+    #[tokio::test]
+    async fn test_stack_handoff_dv_tcp_to_tcp_without_listener() {
+        let target_chains: ProcessChainConfigs = serde_yaml_ng::from_str(
+            r#"
+- id: main
+  priority: 1
+  blocks:
+    - id: main
+      block: |
+        set-stat target-stat;
+        return "server handoff-target";
+"#,
+        )
+        .unwrap();
+        let source_chains: ProcessChainConfigs = serde_yaml_ng::from_str(
+            r#"
+- id: main
+  priority: 1
+  blocks:
+    - id: main
+      block: |
+        set-stat source-stat;
+        call-stack target;
+"#,
+        )
+        .unwrap();
+
+        let manager = StackManager::new();
+        let servers = Arc::new(ServerManager::new());
+        servers
+            .add_server(Server::Stream(Arc::new(MockServer::new(
+                "handoff-target".to_string(),
+            ))))
+            .unwrap();
+        let source_stat_manager = StatManager::new();
+        let target_stat_manager = StatManager::new();
+        let build_context = |stat_manager| {
+            Arc::new(
+                TcpStackContext::new(
+                    servers.clone(),
+                    TunnelManager::new(),
+                    Arc::new(DefaultLimiterManager::new()),
+                    stat_manager,
+                    Some(Arc::new(GlobalProcessChains::new())),
+                    None,
+                    None,
+                )
+                .with_stack_manager(Arc::downgrade(&manager)),
+            )
+        };
+        let source = Arc::new(
+            TcpStack::builder()
+                .id("source")
+                .bind("127.0.0.1:0")
+                .hook_point(source_chains)
+                .stack_context(build_context(source_stat_manager.clone()))
+                .build()
+                .await
+                .unwrap(),
+        );
+        let target = Arc::new(
+            TcpStack::builder()
+                .id("target")
+                .bind("127.0.0.1:0")
+                .hook_point(target_chains)
+                .stack_context(build_context(target_stat_manager.clone()))
+                .build()
+                .await
+                .unwrap(),
+        );
+        manager.add_stack(source.clone()).unwrap();
+        manager.add_stack(target).unwrap();
+
+        let (mut client, handed_off) = tokio::io::duplex(64);
+        let (context_stream, _) = tokio::io::duplex(1);
+        let mut request =
+            StreamRequest::new(Box::new(context_stream), "192.0.2.10:443".parse().unwrap());
+        request.source_addr = Some("198.51.100.20:50000".parse().unwrap());
+        request.conn_source_addr = Some("198.51.100.20:50000".parse().unwrap());
+        let context = StackStreamContext::from_request("source", &request);
+
+        let serve = source.serve_stream(Box::new(handed_off), context);
+        let client_io = async move {
+            client.write_all(b"test").await.unwrap();
+            let mut response = [0u8; 4];
+            client.read_exact(&mut response).await.unwrap();
+            assert_eq!(&response, b"recv");
+        };
+        let (serve_result, ()) = tokio::join!(serve, client_io);
+        serve_result.unwrap();
+
+        let source_stat = source_stat_manager.get_speed_stat("source-stat").unwrap();
+        let target_stat = target_stat_manager.get_speed_stat("target-stat").unwrap();
+        assert_eq!(source_stat.get_read_sum_size(), 4);
+        assert_eq!(source_stat.get_write_sum_size(), 4);
+        assert_eq!(target_stat.get_read_sum_size(), 4);
+        assert_eq!(target_stat.get_write_sum_size(), 4);
     }
 
     impl MockServer {

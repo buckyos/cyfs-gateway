@@ -144,6 +144,11 @@ mod tests {
         listener.local_addr().unwrap().port()
     }
 
+    async fn allocate_free_udp_port() -> u16 {
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        socket.local_addr().unwrap().port()
+    }
+
     async fn start_echo_server() -> u16 {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -173,6 +178,79 @@ mod tests {
         });
 
         port
+    }
+
+    async fn start_bns_readiness_server() -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        tokio::spawn(async move {
+            loop {
+                let (stream, _) = match listener.accept().await {
+                    Ok(value) => value,
+                    Err(_) => break,
+                };
+                tokio::spawn(async move {
+                    let service = hyper::service::service_fn(
+                        |request: hyper::Request<hyper::body::Incoming>| async move {
+                            let request = request.into_body().collect().await.unwrap().to_bytes();
+                            let request: serde_json::Value =
+                                serde_json::from_slice(request.as_ref()).unwrap();
+                            let seq = request
+                                .get("sys")
+                                .and_then(|value| value.get(0))
+                                .and_then(serde_json::Value::as_u64)
+                                .unwrap_or(0);
+                            let body = serde_json::to_vec(&json!({
+                                "result": {
+                                    "ok": true,
+                                    "result": {
+                                        "ready": true,
+                                        "chain_id": 31337,
+                                        "contract_address": "0x2222222222222222222222222222222222222222"
+                                    },
+                                    "error": null
+                                },
+                                "sys": [seq]
+                            }))
+                            .unwrap();
+                            Ok::<_, std::convert::Infallible>(hyper::Response::new(Full::new(
+                                Bytes::from(body),
+                            )))
+                        },
+                    );
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(TokioIo::new(stream), service)
+                        .await;
+                });
+            }
+        });
+
+        port
+    }
+
+    async fn assert_call_stack_response(scheme: &str, host: &str, port: u16) {
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .danger_accept_invalid_certs(true)
+            .resolve(host, SocketAddr::from(([127, 0, 0, 1], port)))
+            .build()
+            .unwrap();
+        let url = format!("{scheme}://{host}/");
+        let response = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                match client.get(url.as_str()).send().await {
+                    Ok(response) => break response,
+                    Err(_) => {
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    }
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(response.status().as_u16(), 200);
+        assert_eq!(response.text().await.unwrap(), "www.buckyos.com");
     }
 
     async fn read_socks_addr(stream: &mut TcpStream, atyp: u8) -> Result<(), std::io::Error> {
@@ -294,10 +372,26 @@ mod tests {
 
         let echo_direct_port = start_echo_server().await;
         let echo_proxy_port = start_echo_server().await;
+        let bns_rpc_port = start_bns_readiness_server().await;
+        let test1_port = allocate_free_port().await;
+        let test2_port = allocate_free_port().await;
+        let dns_port = allocate_free_udp_port().await;
+        let ptcp_entry_port = allocate_free_port().await;
+        let ptcp_mix_port = allocate_free_port().await;
+        let dispatch_port = allocate_free_port().await;
         let reject_port = allocate_free_port().await;
         let socks_stack_port = allocate_free_port().await;
         let upstream_socks_stack_port = allocate_free_port().await;
+        let call_stack_tcp_target_port = allocate_free_port().await;
+        let call_stack_tls_target_port = allocate_free_port().await;
+        let call_stack_tcp_to_tcp_port = allocate_free_port().await;
+        let call_stack_tcp_to_tls_port = allocate_free_port().await;
+        let call_stack_tls_to_tcp_port = allocate_free_port().await;
         let control_server_port = allocate_free_port().await;
+        let test1_addr = SocketAddr::from(([127, 0, 0, 1], test1_port));
+        let test2_url = format!("http://127.0.0.1:{test2_port}/");
+        let dispatch_port_string = dispatch_port.to_string();
+        let dispatch_addr = SocketAddr::from(([127, 0, 0, 1], dispatch_port));
         let control_server = format!("http://127.0.0.1:{control_server_port}");
 
         let config = include_str!("test_cyfs_gateway.yaml");
@@ -369,6 +463,54 @@ function test_js_hook(context, host) {
             "{{upstream_socks_stack_port}}",
             upstream_socks_stack_port.to_string().as_str(),
         );
+        let config = config.replace("{{test1_port}}", test1_port.to_string().as_str());
+        let config = config.replace("{{test2_port}}", test2_port.to_string().as_str());
+        let config = config.replace("{{dns_port}}", dns_port.to_string().as_str());
+        let config = config.replace("{{ptcp_entry_port}}", ptcp_entry_port.to_string().as_str());
+        let config = config.replace("{{ptcp_mix_port}}", ptcp_mix_port.to_string().as_str());
+        let config = config.replace(
+            "{{call_stack_tcp_target_port}}",
+            call_stack_tcp_target_port.to_string().as_str(),
+        );
+        let config = config.replace(
+            "{{call_stack_tls_target_port}}",
+            call_stack_tls_target_port.to_string().as_str(),
+        );
+        let config = config.replace(
+            "{{call_stack_tcp_to_tcp_port}}",
+            call_stack_tcp_to_tcp_port.to_string().as_str(),
+        );
+        let config = config.replace(
+            "{{call_stack_tcp_to_tls_port}}",
+            call_stack_tcp_to_tls_port.to_string().as_str(),
+        );
+        let config = config.replace(
+            "{{call_stack_tls_to_tcp_port}}",
+            call_stack_tls_to_tcp_port.to_string().as_str(),
+        );
+        let call_stack_cert_dir = tempfile::TempDir::new().unwrap();
+        let call_stack_cert_path = call_stack_cert_dir.path().join("cert.pem");
+        let call_stack_key_path = call_stack_cert_dir.path().join("key.pem");
+        let call_stack_cert = rcgen::generate_simple_self_signed(vec![
+            "tcp-call-tls.buckyos.com".to_string(),
+            "tls-call-tcp.buckyos.com".to_string(),
+        ])
+        .unwrap();
+        std::fs::write(&call_stack_cert_path, call_stack_cert.cert.pem()).unwrap();
+        std::fs::write(
+            &call_stack_key_path,
+            call_stack_cert.signing_key.serialize_pem(),
+        )
+        .unwrap();
+        let config = config.replace(
+            "{{call_stack_tls_cert_path}}",
+            call_stack_cert_path.to_str().unwrap(),
+        );
+        let config = config.replace(
+            "{{call_stack_tls_key_path}}",
+            call_stack_key_path.to_str().unwrap(),
+        );
+        let config = config.replace("{{bns_rpc_port}}", bns_rpc_port.to_string().as_str());
         let config = config.replace(
             "{{control_server_port}}",
             control_server_port.to_string().as_str(),
@@ -394,11 +536,28 @@ function test_js_hook(context, host) {
 
         tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
 
+        assert_call_stack_response(
+            "http",
+            "tcp-call-tcp.buckyos.com",
+            call_stack_tcp_to_tcp_port,
+        )
+        .await;
+        assert_call_stack_response(
+            "https",
+            "tcp-call-tls.buckyos.com",
+            call_stack_tcp_to_tls_port,
+        )
+        .await;
+        assert_call_stack_response(
+            "https",
+            "tls-call-tcp.buckyos.com",
+            call_stack_tls_to_tcp_port,
+        )
+        .await;
+
         {
             //用tokio库创建一个tcpstream
-            let stream = tokio::net::TcpStream::connect("127.0.0.1:18080")
-                .await
-                .unwrap();
+            let stream = tokio::net::TcpStream::connect(test1_addr).await.unwrap();
 
             // 用hyper构造一个http请求
             let (mut sender, conn) = hyper::client::conn::http1::Builder::new()
@@ -451,9 +610,7 @@ function test_js_hook(context, host) {
 
         {
             //用tokio库创建一个tcpstream
-            let stream = tokio::net::TcpStream::connect("127.0.0.1:18080")
-                .await
-                .unwrap();
+            let stream = tokio::net::TcpStream::connect(test1_addr).await.unwrap();
 
             // 用hyper构造一个http请求
             let (mut sender, conn) = hyper::client::conn::http1::Builder::new()
@@ -484,9 +641,7 @@ function test_js_hook(context, host) {
 
         {
             //用tokio库创建一个tcpstream
-            let stream = tokio::net::TcpStream::connect("127.0.0.1:18080")
-                .await
-                .unwrap();
+            let stream = tokio::net::TcpStream::connect(test1_addr).await.unwrap();
 
             // 用hyper构造一个http请求
             let (mut sender, conn) = hyper::client::conn::http1::Builder::new()
@@ -523,9 +678,7 @@ function test_js_hook(context, host) {
 
         {
             //用tokio库创建一个tcpstream
-            let stream = tokio::net::TcpStream::connect("127.0.0.1:18080")
-                .await
-                .unwrap();
+            let stream = tokio::net::TcpStream::connect(test1_addr).await.unwrap();
 
             // 用hyper构造一个http请求
             let (mut sender, conn) = hyper::client::conn::http1::Builder::new()
@@ -552,9 +705,7 @@ function test_js_hook(context, host) {
         }
 
         {
-            let stream = tokio::net::TcpStream::connect("127.0.0.1:18080")
-                .await
-                .unwrap();
+            let stream = tokio::net::TcpStream::connect(test1_addr).await.unwrap();
 
             // 用hyper构造一个http请求
             let (mut sender, conn) = hyper::client::conn::http1::Builder::new()
@@ -584,9 +735,7 @@ function test_js_hook(context, host) {
         }
 
         {
-            let stream = tokio::net::TcpStream::connect("127.0.0.1:18080")
-                .await
-                .unwrap();
+            let stream = tokio::net::TcpStream::connect(test1_addr).await.unwrap();
 
             // 用hyper构造一个http请求
             let (mut sender, conn) = hyper::client::conn::http1::Builder::new()
@@ -618,9 +767,7 @@ function test_js_hook(context, host) {
         }
 
         {
-            let stream = tokio::net::TcpStream::connect("127.0.0.1:18080")
-                .await
-                .unwrap();
+            let stream = tokio::net::TcpStream::connect(test1_addr).await.unwrap();
 
             let body = json!({
                 "method": "admin.clear_state_by_active_code",
@@ -651,7 +798,7 @@ function test_js_hook(context, host) {
         }
 
         {
-            let stream = tokio::net::TcpStream::connect("127.0.0.1:18084")
+            let stream = tokio::net::TcpStream::connect(("127.0.0.1", ptcp_mix_port))
                 .await
                 .unwrap();
 
@@ -678,14 +825,12 @@ function test_js_hook(context, host) {
 
         {
             let socket = tokio::net::TcpSocket::new_v4().unwrap();
-            socket
-                .bind(SocketAddr::from_str("127.0.0.1:18123").unwrap())
-                .unwrap();
+            socket.bind(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
             let stream = socket
-                .connect(SocketAddr::from_str("127.0.0.1:18082").unwrap())
+                .connect(SocketAddr::from(([127, 0, 0, 1], ptcp_entry_port)))
                 .await
                 .unwrap();
-            let expected_port = 18123;
+            let expected_port = stream.local_addr().unwrap().port();
 
             let (mut sender, conn) = hyper::client::conn::http1::Builder::new()
                 .handshake(TokioIo::new(stream))
@@ -734,7 +879,7 @@ function test_js_hook(context, host) {
 
         {
             let name_server_configs = vec![NameServerConfig::new(
-                SocketAddr::from_str("127.0.0.1:9545").unwrap(),
+                SocketAddr::from(([127, 0, 0, 1], dns_port)),
                 Protocol::Udp,
             )];
             let server_config = ResolverConfig::from_parts(None, vec![], name_server_configs);
@@ -773,9 +918,7 @@ function test_js_hook(context, host) {
             let ret = cyfs_cmd_client.add_rule("stack:test1", r#"http-probe && eq ${REQ.dest_host} "test.buckyos.com" && call-server www.buckyos.com;"#).await;
             assert!(ret.is_ok());
 
-            let stream = tokio::net::TcpStream::connect("127.0.0.1:18080")
-                .await
-                .unwrap();
+            let stream = tokio::net::TcpStream::connect(test1_addr).await.unwrap();
 
             // 用hyper构造一个http请求
             let (mut sender, conn) = hyper::client::conn::http1::Builder::new()
@@ -812,9 +955,7 @@ function test_js_hook(context, host) {
             let ret = cyfs_cmd_client.add_rule("stack:test1", r#"http-probe && eq ${REQ.dest_host} "test2.buckyos.com" && call-server www.buckyos.com;"#).await;
             assert!(ret.is_ok());
 
-            let stream = tokio::net::TcpStream::connect("127.0.0.1:18080")
-                .await
-                .unwrap();
+            let stream = tokio::net::TcpStream::connect(test1_addr).await.unwrap();
 
             // 用hyper构造一个http请求
             let (mut sender, conn) = hyper::client::conn::http1::Builder::new()
@@ -854,9 +995,7 @@ function test_js_hook(context, host) {
             let ret = cyfs_cmd_client.add_rule("server:www_dir:main:test2", r#"starts-with ${REQ.path} "/sn" && rewrite ${REQ.path} "/sn*" "/*" && call-server sn.http;"#).await;
             assert!(ret.is_err());
 
-            let stream = tokio::net::TcpStream::connect("127.0.0.1:18080")
-                .await
-                .unwrap();
+            let stream = tokio::net::TcpStream::connect(test1_addr).await.unwrap();
 
             let body = json!({
                 "method": "admin.clear_state_by_active_code",
@@ -901,9 +1040,7 @@ function test_js_hook(context, host) {
                 .await;
             assert!(ret.is_err());
 
-            let stream = tokio::net::TcpStream::connect("127.0.0.1:18080")
-                .await
-                .unwrap();
+            let stream = tokio::net::TcpStream::connect(test1_addr).await.unwrap();
 
             let body = json!({
                 "method": "admin.clear_state_by_active_code",
@@ -944,9 +1081,7 @@ function test_js_hook(context, host) {
             let ret = cyfs_cmd_client.append_rule("server:www_dir:main:test2", r#"starts-with ${REQ.path} "/sn" && rewrite ${REQ.path} "/sn*" "/*" && call-server sn.http;"#).await;
             assert!(ret.is_err());
 
-            let stream = tokio::net::TcpStream::connect("127.0.0.1:18080")
-                .await
-                .unwrap();
+            let stream = tokio::net::TcpStream::connect(test1_addr).await.unwrap();
 
             let body = json!({
                 "method": "admin.clear_state_by_active_code",
@@ -986,9 +1121,7 @@ function test_js_hook(context, host) {
                 .await;
             assert!(ret.is_ok());
 
-            let stream = tokio::net::TcpStream::connect("127.0.0.1:18080")
-                .await
-                .unwrap();
+            let stream = tokio::net::TcpStream::connect(test1_addr).await.unwrap();
 
             let body = json!({
                 "method": "admin.clear_state_by_active_code",
@@ -1026,9 +1159,7 @@ function test_js_hook(context, host) {
             let ret = cyfs_cmd_client.set_rule("server:www.buckyos.com:main:test2", r#"starts-with ${REQ.path} "/snsn" && rewrite ${REQ.path} "/snsn*" "/*" && call-server sn.http;"#).await;
             assert!(ret.is_ok());
 
-            let stream = tokio::net::TcpStream::connect("127.0.0.1:18080")
-                .await
-                .unwrap();
+            let stream = tokio::net::TcpStream::connect(test1_addr).await.unwrap();
 
             let body = json!({
                 "method": "admin.clear_state_by_active_code",
@@ -1076,9 +1207,7 @@ function test_js_hook(context, host) {
                 .await;
             assert!(ret.is_ok());
 
-            let stream = tokio::net::TcpStream::connect("127.0.0.1:18080")
-                .await
-                .unwrap();
+            let stream = tokio::net::TcpStream::connect(test1_addr).await.unwrap();
 
             let (mut sender, conn) = hyper::client::conn::http1::Builder::new()
                 .handshake(TokioIo::new(stream))
@@ -1125,9 +1254,7 @@ function test_js_hook(context, host) {
                 .await;
             assert!(ret.is_err());
 
-            let stream = tokio::net::TcpStream::connect("127.0.0.1:18080")
-                .await
-                .unwrap();
+            let stream = tokio::net::TcpStream::connect(test1_addr).await.unwrap();
 
             let (mut sender, conn) = hyper::client::conn::http1::Builder::new()
                 .handshake(TokioIo::new(stream))
@@ -1156,15 +1283,13 @@ function test_js_hook(context, host) {
                 .add_router(
                     Some("server:www.buckyos.com"),
                     "/reverse/",
-                    "http://127.0.0.1:18081/",
+                    test2_url.as_str(),
                 )
                 .await;
             ret.as_ref().unwrap();
             assert!(ret.is_ok());
 
-            let stream = tokio::net::TcpStream::connect("127.0.0.1:18080")
-                .await
-                .unwrap();
+            let stream = tokio::net::TcpStream::connect(test1_addr).await.unwrap();
 
             let (mut sender, conn) = hyper::client::conn::http1::Builder::new()
                 .handshake(TokioIo::new(stream))
@@ -1198,14 +1323,12 @@ function test_js_hook(context, host) {
                 .remove_router(
                     Some("server:www.buckyos.com"),
                     "/reverse/",
-                    "http://127.0.0.1:18081/",
+                    test2_url.as_str(),
                 )
                 .await;
             assert!(ret.is_ok());
 
-            let stream = tokio::net::TcpStream::connect("127.0.0.1:18080")
-                .await
-                .unwrap();
+            let stream = tokio::net::TcpStream::connect(test1_addr).await.unwrap();
 
             let (mut sender, conn) = hyper::client::conn::http1::Builder::new()
                 .handshake(TokioIo::new(stream))
@@ -1231,13 +1354,15 @@ function test_js_hook(context, host) {
                 read_login_token(CONTROL_SERVER),
             );
             let ret = cyfs_cmd_client
-                .add_dispatch("19080", "127.0.0.1:18080", None)
+                .add_dispatch(
+                    dispatch_port_string.as_str(),
+                    test1_addr.to_string().as_str(),
+                    None,
+                )
                 .await;
             assert!(ret.is_ok());
 
-            let stream = tokio::net::TcpStream::connect("127.0.0.1:19080")
-                .await
-                .unwrap();
+            let stream = tokio::net::TcpStream::connect(dispatch_addr).await.unwrap();
 
             let body = json!({
                 "method": "admin.clear_state_by_active_code",
@@ -1272,10 +1397,12 @@ function test_js_hook(context, host) {
                 control_server.as_str(),
                 read_login_token(CONTROL_SERVER),
             );
-            let ret = cyfs_cmd_client.remove_dispatch("19080", None).await;
+            let ret = cyfs_cmd_client
+                .remove_dispatch(dispatch_port_string.as_str(), None)
+                .await;
             assert!(ret.is_ok());
 
-            let ret = tokio::net::TcpStream::connect("127.0.0.1:19080").await;
+            let ret = tokio::net::TcpStream::connect(dispatch_addr).await;
             assert!(ret.is_err());
         }
 

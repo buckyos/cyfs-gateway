@@ -303,17 +303,21 @@ fn build_stack_context(
     global_collection_manager: Option<GlobalCollectionManagerRef>,
     js_externals: Option<JsExternalsManagerRef>,
     self_cert_mgr: SelfCertMgrRef,
+    stack_manager: StackManagerWeakRef,
 ) -> StackResult<Arc<dyn StackContext>> {
     match protocol {
-        StackProtocol::Tcp => Ok(Arc::new(TcpStackContext::new(
-            servers.clone(),
-            tunnel_manager.clone(),
-            limiter_manager.clone(),
-            stat_manager.clone(),
-            global_process_chains.clone(),
-            global_collection_manager.clone(),
-            js_externals.clone(),
-        ))),
+        StackProtocol::Tcp => Ok(Arc::new(
+            TcpStackContext::new(
+                servers.clone(),
+                tunnel_manager.clone(),
+                limiter_manager.clone(),
+                stat_manager.clone(),
+                global_process_chains.clone(),
+                global_collection_manager.clone(),
+                js_externals.clone(),
+            )
+            .with_stack_manager(stack_manager.clone()),
+        )),
         StackProtocol::Udp => Ok(Arc::new(UdpStackContext::new(
             servers.clone(),
             tunnel_manager.clone(),
@@ -332,16 +336,19 @@ fn build_stack_context(
             global_collection_manager.clone(),
             js_externals.clone(),
         ))),
-        StackProtocol::Tls => Ok(Arc::new(TlsStackContext::new(
-            servers.clone(),
-            tunnel_manager.clone(),
-            limiter_manager.clone(),
-            stat_manager.clone(),
-            self_cert_mgr.clone(),
-            global_process_chains.clone(),
-            global_collection_manager.clone(),
-            js_externals.clone(),
-        ))),
+        StackProtocol::Tls => Ok(Arc::new(
+            TlsStackContext::new(
+                servers.clone(),
+                tunnel_manager.clone(),
+                limiter_manager.clone(),
+                stat_manager.clone(),
+                self_cert_mgr.clone(),
+                global_process_chains.clone(),
+                global_collection_manager.clone(),
+                js_externals.clone(),
+            )
+            .with_stack_manager(stack_manager.clone()),
+        )),
         StackProtocol::Quic => Ok(Arc::new(QuicStackContext::new(
             servers.clone(),
             tunnel_manager.clone(),
@@ -945,6 +952,7 @@ impl GatewayFactory {
                 Some(global_collections.clone()),
                 Some(js_externals.clone()),
                 self_cert_manager.clone(),
+                Arc::downgrade(&stack_manager),
             )?;
             let stack = self
                 .stack_factory
@@ -3007,6 +3015,7 @@ impl Gateway {
                 Some(global_collections.clone()),
                 Some(js_externals.clone()),
                 self_cert_manager.clone(),
+                Arc::downgrade(&self.stack_manager),
             )?;
             exist_stacks.insert(stack_config.id().clone());
             if let Some(stack) = self.stack_manager.get_stack(stack_config.id().as_str()) {
