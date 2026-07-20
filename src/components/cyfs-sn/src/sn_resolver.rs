@@ -2867,22 +2867,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn absent_underscore_txt_record_does_not_fall_through_to_bns() {
-        let resolver = test_resolver_with_bns(StaticBnsReader::default());
-
-        for hostname in [
-            "_acme-challenge.alice.web3.buckyos.test",
-            "_pkx.alice.web3.buckyos.test",
-        ] {
-            let error = resolver
-                .resolve_dns(hostname, RecordType::TXT)
-                .await
-                .unwrap_err();
-            assert_eq!(error.kind(), SnResolverErrorKind::DocumentNotFound);
-        }
-    }
-
     #[test]
     fn dns_address_filter_removes_loopback_and_docker_bridge() {
         let mut addresses = Vec::new();

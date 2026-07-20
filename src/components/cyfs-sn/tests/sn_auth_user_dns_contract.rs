@@ -2,10 +2,12 @@ use std::sync::Arc;
 
 use cyfs_sn::{
     AuthDbRoutedSnCompatibilityStore, SnAuthDbAddUserDnsRecordReq, SnAuthDbQueryUserDnsRecordReq,
-    SnAuthDbRemoveUserDnsRecordReq, SnCompatibilityStore, SnErrorCode, SqliteSnAuthDB,
-    SqliteSnCompatibilityStore, METHOD_ADD_USER_DNS_RECORD, METHOD_LIST_USER_DNS_RECORDS,
-    METHOD_QUERY_USER_DNS_RECORD, METHOD_REMOVE_USER_DNS_RECORD,
+    SnAuthDbRemoveUserDnsRecordReq, SnCompatibilityStore, SnErrorCode, SnResolver,
+    SnResolverConfig, SnResolverErrorKind, SqliteSnAuthDB, SqliteSnCompatibilityStore,
+    METHOD_ADD_USER_DNS_RECORD, METHOD_LIST_USER_DNS_RECORDS, METHOD_QUERY_USER_DNS_RECORD,
+    METHOD_REMOVE_USER_DNS_RECORD,
 };
+use name_client::RecordType;
 
 #[test]
 fn user_dns_wire_contract_has_stable_methods_and_fields() {
@@ -156,4 +158,29 @@ async fn sqlite_baseline_keeps_multivalue_order_min_ttl_and_delete_modes() {
         .await
         .unwrap();
     assert_eq!(store.query_domain_record(name, "TXT").await.unwrap(), None);
+}
+
+#[tokio::test]
+async fn absent_underscore_txt_record_does_not_fall_through_to_bns() {
+    let resolver = SnResolver::new(
+        SnResolverConfig::new(
+            "buckyos.test",
+            "192.0.2.10".parse().unwrap(),
+            "",
+            "",
+            Vec::new(),
+        ),
+        Arc::new(cyfs_sn::EmptySnAuthReader),
+    );
+
+    for hostname in [
+        "_acme-challenge.alice.web3.buckyos.test",
+        "_pkx.alice.web3.buckyos.test",
+    ] {
+        let error = resolver
+            .resolve_dns(hostname, RecordType::TXT)
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), SnResolverErrorKind::DocumentNotFound);
+    }
 }
