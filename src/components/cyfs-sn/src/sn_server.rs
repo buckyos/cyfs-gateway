@@ -14,7 +14,10 @@ use crate::sn_bns_reader::BnsRpcDocumentReader;
 use crate::sn_bns_signer::{
     BoundControllerKeyManager, SnBnsControllerKeySpec, SnBnsProxyOperation, SnBnsTxSigner,
 };
-use crate::sn_compat_store::{SNDeviceInfo, SnCompatibilityStoreRef, SqliteSnCompatibilityStore};
+use crate::sn_compat_store::{
+    AuthDbRoutedSnCompatibilityStore, SNDeviceInfo, SnCompatibilityStoreRef,
+    SqliteSnCompatibilityStore,
+};
 use crate::sn_did_resolver::{
     key_like_string_to_jwk, normalize_sn_did_doc_type, owner_key_from_config, SnDidResolveRequest,
     SnDidResolverProfile, SnDidResolverRef, SnResolverBackedDidResolver,
@@ -2786,7 +2789,14 @@ impl ServerFactory for SnServerFactory {
                 e
             )
         })?;
-        let compat_store: SnCompatibilityStoreRef = Arc::new(compat_store);
+        let local_compat_store: SnCompatibilityStoreRef = Arc::new(compat_store);
+        let compat_store: SnCompatibilityStoreRef = match db_type.as_str() {
+            "postgres" | "postgresql" => Arc::new(AuthDbRoutedSnCompatibilityStore::new(
+                auth_db.clone(),
+                local_compat_store,
+            )),
+            _ => local_compat_store,
+        };
 
         let mut allocation_config = config.relay_allocation.clone().unwrap_or_default();
         allocation_config.geoip = allocation_config

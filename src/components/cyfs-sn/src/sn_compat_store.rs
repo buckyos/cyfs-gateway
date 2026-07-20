@@ -1,4 +1,4 @@
-use crate::{SnErrorCode, SnResult, into_sn_err};
+use crate::{into_sn_err, SnAuthDBRef, SnErrorCode, SnResult};
 use serde::{Deserialize, Serialize};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteRow};
 use sqlx::{Row, SqlitePool};
@@ -109,6 +109,88 @@ pub trait SnCompatibilityStore: Send + Sync + 'static {
         obj_name: &str,
         doc_type: Option<&str>,
     ) -> SnResult<Option<(String, String, Option<String>)>>;
+}
+
+/// Keeps legacy device/DID compatibility reads local while routing mutable DNS
+/// RRsets through the shared auth provider. This is used only for remote
+/// database modes; SQLite keeps using `SqliteSnCompatibilityStore` directly.
+pub struct AuthDbRoutedSnCompatibilityStore {
+    auth_db: SnAuthDBRef,
+    local: SnCompatibilityStoreRef,
+}
+
+impl AuthDbRoutedSnCompatibilityStore {
+    pub fn new(auth_db: SnAuthDBRef, local: SnCompatibilityStoreRef) -> Self {
+        Self { auth_db, local }
+    }
+}
+
+#[async_trait::async_trait]
+impl SnCompatibilityStore for AuthDbRoutedSnCompatibilityStore {
+    async fn query_device_by_name(
+        &self,
+        username: &str,
+        device_name: &str,
+    ) -> SnResult<Option<SNDeviceInfo>> {
+        self.local.query_device_by_name(username, device_name).await
+    }
+
+    async fn query_device_by_did(&self, did: &str) -> SnResult<Option<SNDeviceInfo>> {
+        self.local.query_device_by_did(did).await
+    }
+
+    async fn add_user_domain(
+        &self,
+        username: &str,
+        domain: &str,
+        record_type: &str,
+        record: &str,
+        ttl: u32,
+    ) -> SnResult<()> {
+        self.auth_db
+            .add_user_dns_record(username, domain, record_type, record, ttl)
+            .await
+    }
+
+    async fn remove_user_domain(
+        &self,
+        username: &str,
+        domain: &str,
+        record_type: &str,
+        record: Option<&str>,
+    ) -> SnResult<()> {
+        self.auth_db
+            .remove_user_dns_record(username, domain, record_type, record)
+            .await
+    }
+
+    async fn query_domain_record(
+        &self,
+        domain: &str,
+        record_type: &str,
+    ) -> SnResult<Option<(String, u32)>> {
+        self.auth_db
+            .query_user_dns_record(domain, record_type)
+            .await
+    }
+
+    async fn query_user_domain_records(
+        &self,
+        username: &str,
+    ) -> SnResult<Vec<(String, String, String, u32)>> {
+        self.auth_db.list_user_dns_records(username).await
+    }
+
+    async fn query_user_did_document(
+        &self,
+        owner_user: &str,
+        obj_name: &str,
+        doc_type: Option<&str>,
+    ) -> SnResult<Option<(String, String, Option<String>)>> {
+        self.local
+            .query_user_did_document(owner_user, obj_name, doc_type)
+            .await
+    }
 }
 
 pub struct SqliteSnCompatibilityStore {

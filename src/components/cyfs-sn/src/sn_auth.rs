@@ -400,6 +400,58 @@ pub trait SnAuthDB: Send + Sync + 'static {
     ) -> SnResult<DomainBinding>;
     async fn unbind_user_domain(&self, username: &str, domain: &str) -> SnResult<()>;
 
+    /// Compatibility DNS RRsets are part of the shared auth/provider state in
+    /// postgres mode. SQLite deployments continue to use the local
+    /// `SnCompatibilityStore` implementation.
+    async fn add_user_dns_record(
+        &self,
+        username: &str,
+        domain: &str,
+        record_type: &str,
+        record: &str,
+        ttl: u32,
+    ) -> SnResult<()> {
+        let _ = (username, domain, record_type, record, ttl);
+        Err(sn_err!(
+            SnErrorCode::Failed,
+            "user DNS records are not supported by this auth DB"
+        ))
+    }
+    async fn remove_user_dns_record(
+        &self,
+        username: &str,
+        domain: &str,
+        record_type: &str,
+        record: Option<&str>,
+    ) -> SnResult<()> {
+        let _ = (username, domain, record_type, record);
+        Err(sn_err!(
+            SnErrorCode::Failed,
+            "user DNS records are not supported by this auth DB"
+        ))
+    }
+    async fn query_user_dns_record(
+        &self,
+        domain: &str,
+        record_type: &str,
+    ) -> SnResult<Option<(String, u32)>> {
+        let _ = (domain, record_type);
+        Err(sn_err!(
+            SnErrorCode::Failed,
+            "user DNS records are not supported by this auth DB"
+        ))
+    }
+    async fn list_user_dns_records(
+        &self,
+        username: &str,
+    ) -> SnResult<Vec<(String, String, String, u32)>> {
+        let _ = username;
+        Err(sn_err!(
+            SnErrorCode::Failed,
+            "user DNS records are not supported by this auth DB"
+        ))
+    }
+
     async fn get_zone_info(&self, username: &str) -> SnResult<Option<ZoneInfo>>;
     async fn update_zone_info(&self, username: &str, patch: ZoneInfoPatch) -> SnResult<()>;
     async fn update_zone_relay_sn(
@@ -606,6 +658,46 @@ impl SnAuthDB for RemoteSnAuthDB {
 
     async fn unbind_user_domain(&self, username: &str, domain: &str) -> SnResult<()> {
         self.client.unbind_user_domain(username, domain).await
+    }
+
+    async fn add_user_dns_record(
+        &self,
+        username: &str,
+        domain: &str,
+        record_type: &str,
+        record: &str,
+        ttl: u32,
+    ) -> SnResult<()> {
+        self.client
+            .add_user_dns_record(username, domain, record_type, record, ttl)
+            .await
+    }
+
+    async fn remove_user_dns_record(
+        &self,
+        username: &str,
+        domain: &str,
+        record_type: &str,
+        record: Option<&str>,
+    ) -> SnResult<()> {
+        self.client
+            .remove_user_dns_record(username, domain, record_type, record)
+            .await
+    }
+
+    async fn query_user_dns_record(
+        &self,
+        domain: &str,
+        record_type: &str,
+    ) -> SnResult<Option<(String, u32)>> {
+        self.client.query_user_dns_record(domain, record_type).await
+    }
+
+    async fn list_user_dns_records(
+        &self,
+        username: &str,
+    ) -> SnResult<Vec<(String, String, String, u32)>> {
+        self.client.list_user_dns_records(username).await
     }
 
     async fn get_zone_info(&self, username: &str) -> SnResult<Option<ZoneInfo>> {
