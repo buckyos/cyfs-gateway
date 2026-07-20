@@ -961,6 +961,16 @@ impl SnResolver {
             return explicit_dns_record(hostname.as_str(), record_type, record.as_str(), ttl);
         }
 
+        // Underscore-prefixed TXT names are control records such as ACME and
+        // PKX. They only exist when explicitly stored; falling through would
+        // either expose the zone's root TXT data or send an invalid BNS name.
+        if is_explicit_only_dns_name(hostname.as_str(), record_type) {
+            return Err(SnResolverError::new(
+                SnResolverErrorKind::DocumentNotFound,
+                format!("explicit TXT record not found for {}", hostname),
+            ));
+        }
+
         let zone = self.resolve_zone_by_hostname(hostname.as_str()).await?;
 
         if record_type == RecordType::TXT {
@@ -1993,6 +2003,11 @@ fn is_supported_record_type(record_type: RecordType) -> bool {
         record_type,
         RecordType::A | RecordType::AAAA | RecordType::TXT
     )
+}
+
+fn is_explicit_only_dns_name(hostname: &str, record_type: RecordType) -> bool {
+    record_type == RecordType::TXT
+        && matches!(hostname.split('.').next(), Some(label) if label.starts_with('_'))
 }
 
 fn normalize_host_lossy(hostname: &str) -> String {
