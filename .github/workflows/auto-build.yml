@@ -4,29 +4,7 @@ on:
     workflow_dispatch:  # 测试用，临时允许手动触发
 
 jobs:
-  check-new-commit:
-    runs-on: ubuntu-latest
-    outputs:
-      have_new_commit: ${{ steps.compare-commits.outputs.have_new_commit }}
-    steps:
-      - name: Compare Current Commit with url from https://buckyos.ai/version/latest/commit?product=gateway
-        id: compare-commits
-        run: |
-          latest_commit_url="https://buckyos.ai/version/latest/commit"
-          latest_commit_sha=$(curl -s $latest_commit_url)
-          echo "Latest commit SHA from server: $latest_commit_sha"
-          echo "Current commit SHA: ${{ github.sha }}"
-          
-          if [ "$latest_commit_sha" != "${{ github.sha }}" ]; then
-            echo "New commit detected."
-            echo "have_new_commit=true" >> $GITHUB_OUTPUT
-          else
-            echo "No new commit."
-            echo "have_new_commit=false" >> $GITHUB_OUTPUT
-          fi
   auto-build:
-    needs: check-new-commit
-    if: needs.check-new-commit.outputs.have_new_commit == 'true'
     uses: ./.github/workflows/build-all.yml
     with:
       enable_tests: false
