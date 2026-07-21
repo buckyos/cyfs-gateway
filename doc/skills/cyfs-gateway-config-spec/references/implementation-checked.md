@@ -6,14 +6,15 @@
 ## 校验范围
 
 - 源码仓库：`cyfs-gateway`
-- 校验日期：2026-07-15
-- 校验时 HEAD：`f74ed4ed`
+- 校验日期：2026-07-20
+- 校验基线：Gateway 统一 Server registry 改造后的工作区
 
 ## 已校验的当前实现事实
 
 ### 1. 当前注册的 stack 协议
 
-在 `src/apps/cyfs_gateway/src/lib.rs` 中，`GatewayConfigParser` 和 `GatewayFactory` 显式注册了：
+在 `src/apps/cyfs_gateway/src/lib.rs` 和 `src/apps/web3_gateway/src/lib.rs` 中，
+`GatewayConfigParser` 与 `GatewayFactory` 仍显式注册了：
 
 - `tcp`
 - `udp`
@@ -26,18 +27,24 @@
 
 ### 2. 当前注册的 server 类型
 
-在 `src/apps/cyfs_gateway/src/lib.rs` 中，当前显式注册了：
+在 `src/components/cyfs-gateway-app-lib/src/server_registry.rs` 中，
+`register_default_gateway_servers(...)` 通过完整 registration 集中注册：
 
 - `http`
 - `socks`
 - `dns`
 - `dir`
+- `cyfs-dir`
 - `control_server`
 - `local_dns`
 - `sn`
 - `acme_response`
 
-结论：skill 可以把这 8 个 server 类型列为“当前应用层正式支持”。
+每个 registration 同时包含 config parser、runtime factory 和 context builder；`dir` 与
+`sn` 显式标记为 contextless。`cyfs_gateway` 和 `web3_gateway` 都调用
+`build_default_gateway_server_registry()`，因此共享同一份 9 项能力清单。
+
+结论：skill 可以把这 9 个 server 类型列为“当前应用层正式支持”。
 
 ### 3. `tun` 的当前配置语义
 
@@ -108,7 +115,7 @@
 
 ### 6. `hook_point` / `post_hook_point` / `on_new_tunnel_hook_point` / `blocks` 的 map-to-vector 转换
 
-在 `src/apps/cyfs_gateway/src/config_loader.rs` 中，当前存在：
+在 `src/components/cyfs-gateway-app-lib/src/config_parser.rs` 中，当前存在：
 
 - `blocks_map_to_vector(...)`
 - `hook_point_value_map_to_vector(...)`
@@ -163,7 +170,8 @@
 ### 10. `ndn` 的当前状态
 
 在 `src/components/cyfs-gateway-lib/src/server/ndn_server.rs` 中，库里存在 `NdnServerConfig`。
-但在 `src/apps/cyfs_gateway/src/lib.rs` 中，没有注册 `ndn` 对应 parser/factory。
+但在 `src/components/cyfs-gateway-app-lib/src/server_registry.rs` 的默认 registry 中，没有
+`ndn` 对应的完整 registration。
 
 结论：skill 必须把 `ndn` 表述为“库里有实现，但当前应用没有注册支持”。
 

@@ -1,10 +1,15 @@
+use async_trait::async_trait;
+use bns_client::{
+    AuthorityKey, AuthoritySetState, BnsClientResult, BnsIndexerApi, BnsSystemInfo, DocumentState,
+    EventLogRecord, LogCheckpoint, NameState, OwnerResolution, ResolveResult,
+};
+use bns_indexer::CentralizedBnsIndexerHandler;
 use bns_indexer::{
     default_document_update, CallAuthority, CentralizedBnsRegistry, DocumentRef, MutationGuard,
     RegisterOptions, SqliteBnsRegistryStore,
 };
-use bns_server::{open_sqlite_registry, spawn_listener, BnsIndexerHttpServer};
+use bns_server::{open_sqlite_registry, spawn_listener, BnsContractHttpServer};
 use buckyos_kit::init_logging;
-use web3_gateway::{gateway_service_main, GatewayParams};
 use cyfs_sn::SqliteSnAuthDB;
 use hickory_resolver::config::{NameServerConfig, Protocol, ResolverConfig, ResolverOpts};
 use hickory_resolver::TokioAsyncResolver;
@@ -15,6 +20,7 @@ use std::path::Path;
 use std::str::FromStr;
 use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
+use web3_gateway::{gateway_service_main, GatewayParams};
 
 const BNS_NAME: &str = "bnsalice";
 const BNS_ASSET_OWNER: &str = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -22,6 +28,69 @@ const BNS_GATEWAY_DEVICE: &str = "gateway1";
 const BNS_GATEWAY_DID: &str = "did:dev:bnsdevice1";
 const BNS_GATEWAY_IP: &str = "203.0.113.11";
 const BNS_TXT_RECORD: &str = "bns-txt=ok";
+
+struct TestBnsRpc {
+    projection: CentralizedBnsIndexerHandler<SqliteBnsRegistryStore>,
+}
+
+#[async_trait]
+impl BnsIndexerApi for TestBnsRpc {
+    async fn system_info(&self) -> BnsClientResult<BnsSystemInfo> {
+        self.projection.latest_checkpoint().await?;
+        Ok(BnsSystemInfo {
+            ready: true,
+            chain_id: 31_337,
+            contract_address: "0x2222222222222222222222222222222222222222".to_string(),
+        })
+    }
+
+    async fn query_name_state(&self, name: &str) -> BnsClientResult<Option<NameState>> {
+        self.projection.query_name_state(name).await
+    }
+
+    async fn resolve_owner(&self, name: &str) -> BnsClientResult<OwnerResolution> {
+        self.projection.resolve_owner(name).await
+    }
+
+    async fn get_authority_set(&self, name: &str) -> BnsClientResult<AuthoritySetState> {
+        self.projection.get_authority_set(name).await
+    }
+
+    async fn get_authority_key(
+        &self,
+        name: &str,
+        kid: &str,
+    ) -> BnsClientResult<Option<AuthorityKey>> {
+        self.projection.get_authority_key(name, kid).await
+    }
+
+    async fn resolve_document(&self, name: &str, doc_type: &str) -> BnsClientResult<ResolveResult> {
+        self.projection.resolve_document(name, doc_type).await
+    }
+
+    async fn get_document_version(
+        &self,
+        name: &str,
+        doc_type: &str,
+        version: u64,
+    ) -> BnsClientResult<Option<DocumentState>> {
+        self.projection
+            .get_document_version(name, doc_type, version)
+            .await
+    }
+
+    async fn list_events(
+        &self,
+        from_seq: u64,
+        limit: usize,
+    ) -> BnsClientResult<Vec<EventLogRecord>> {
+        self.projection.list_events(from_seq, limit).await
+    }
+
+    async fn latest_checkpoint(&self) -> BnsClientResult<Option<LogCheckpoint>> {
+        self.projection.latest_checkpoint().await
+    }
+}
 
 fn inline_json_doc(doc_type: &str, value: Value) -> bns_indexer::DocumentUpdate {
     default_document_update(
@@ -122,7 +191,9 @@ async fn gateway_sn_resolves_bns_documents_through_sn_only() {
     let bns_db = tempfile::NamedTempFile::with_suffix(".bns.sqlite").unwrap();
     seed_bns_registry(bns_db.path());
     let registry = open_sqlite_registry(bns_db.path()).unwrap();
-    let bns_http = BnsIndexerHttpServer::from_registry(registry.clone());
+    let bns_http = BnsContractHttpServer::new(TestBnsRpc {
+        projection: CentralizedBnsIndexerHandler::new(registry.clone()),
+    });
     let bns_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let bns_addr = bns_listener.local_addr().unwrap();
     let bns_server = spawn_listener(bns_listener, Arc::new(bns_http)).unwrap();
@@ -202,8 +273,9 @@ servers:
     db_type: sqlite
     db_path: {}
     auth_data_dir: {}
-    bns_indexer_url: http://{}
-    bns_write_enabled: false
+    bns_rpc_url: http://{}
+    bns_evm:
+      controller_private_key: "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
 "#,
         sn_db.path().to_string_lossy(),
         auth_dir.path().to_string_lossy(),

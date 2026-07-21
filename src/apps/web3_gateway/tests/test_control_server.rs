@@ -1,11 +1,11 @@
 #[cfg(test)]
 mod tests {
     use buckyos_kit::init_logging;
-    use web3_gateway::*;
     use cyfs_gateway_lib::*;
     use log::error;
     use serde_json::{json, Value};
     use std::sync::Arc;
+    use web3_gateway::*;
 
     #[tokio::test]
     async fn test_cmd_server() {
@@ -25,23 +25,14 @@ mod tests {
             json!(format!("127.0.0.1:{control_port}"));
 
         // Load config from json
-        let parser = Arc::new(GatewayConfigParser::new());
+        let parser = Arc::new(GatewayConfigParser::new(
+            build_default_gateway_server_registry().unwrap(),
+        ));
         parser.register_stack_config_parser("tcp", Arc::new(TcpStackConfigParser::new()));
         parser.register_stack_config_parser("udp", Arc::new(UdpStackConfigParser::new()));
         parser.register_stack_config_parser("rtcp", Arc::new(RtcpStackConfigParser::new()));
         parser.register_stack_config_parser("tls", Arc::new(TlsStackConfigParser::new()));
         parser.register_stack_config_parser("quic", Arc::new(QuicStackConfigParser::new()));
-
-        parser.register_server_config_parser("http", Arc::new(HttpServerConfigParser::new()));
-
-        parser.register_server_config_parser(
-            "control_server",
-            Arc::new(GatewayControlServerConfigParser::new()),
-        );
-        parser.register_server_config_parser(
-            "acme_response",
-            Arc::new(AcmeHttpChallengeServerConfigParser::new()),
-        );
 
         let load_result = parser.parse(cmd_config);
         if load_result.is_err() {
@@ -74,17 +65,6 @@ mod tests {
             Arc::new(RtcpStackFactory::new(connect_manager.clone())),
         );
 
-        factory.register_server_factory("http", Arc::new(ProcessChainHttpServerFactory::new()));
-
-        factory.register_server_factory(
-            "control_server",
-            Arc::new(GatewayControlServerFactory::new()),
-        );
-        factory.register_server_factory(
-            "acme_response",
-            Arc::new(AcmeHttpChallengeServerFactory::new()),
-        );
-
         let login = json!({
             "user_name": "test",
             "password": "123456"
@@ -113,6 +93,24 @@ mod tests {
             .get("uptime_sec")
             .and_then(Value::as_u64)
             .is_some());
+
+        // The replacement manager is built entirely through the registry before any
+        // stack is updated. Force a late manager-build failure by colliding with the
+        // built-in `welcome` HTTP server, then verify the old control plane survives.
+        let old_config = gateway.get_all_config().unwrap();
+        let mut failing_raw = old_config.clone();
+        failing_raw
+            .as_object_mut()
+            .unwrap()
+            .entry("servers")
+            .or_insert_with(|| json!({}))["welcome"] = json!({
+            "type": "dir",
+            "root_path": temp_dir.path().to_string_lossy()
+        });
+        let failing_config = parser.parse(failing_raw).unwrap();
+        assert!(gateway.reload(failing_config).await.is_err());
+        assert_eq!(gateway.get_all_config().unwrap(), old_config);
+        assert!(cmd_client.get_system_info().await.is_ok());
 
         let ret = cmd_client.get_config_by_id(None).await;
         assert!(ret.is_err());

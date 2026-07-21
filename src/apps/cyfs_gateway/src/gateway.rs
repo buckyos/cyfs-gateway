@@ -13,15 +13,12 @@ use anyhow::{anyhow, Result};
 use buckyos_kit::*;
 use chrono::Utc;
 use cyfs_acme::{AcmeCertManager, AcmeCertManagerRef, AcmeItem, CertManagerConfig, ChallengeType};
-use cyfs_dns::{
-    DnsServerContext, InnerDnsRecordManager, InnerDnsRecordManagerRef, LocalDnsServerContext,
-};
+use cyfs_dns::{InnerDnsRecordManager, InnerDnsRecordManagerRef};
 use cyfs_gateway_app_lib::{
-    GatewayControlServerConfigParser, GatewayControlServerContext, GATEWAY_CONTROL_SERVER_CONFIG,
+    GatewayServerRegistry, GatewayServerRuntime, GATEWAY_CONTROL_SERVER_CONFIG,
     GATEWAY_CONTROL_SERVER_KEY,
 };
 use cyfs_process_chain::CollectionValue;
-use cyfs_socks::{SocksServerContext, SocksTunnelBuilder};
 use cyfs_traffic::{
     TrafficQuotaService, TrafficServiceHandle, TrafficStatFactory, TrafficStatFactoryRef,
     TrafficUserLimiterFactory,
@@ -240,57 +237,6 @@ fn apply_saved_config_patch(mut user_config: Value, patch: &SavedConfigPatch) ->
         }
     }
     user_config
-}
-
-fn build_server_context(
-    server_type: &str,
-    server_manager: ServerManagerWeakRef,
-    global_process_chains: GlobalProcessChainsRef,
-    js_externals: JsExternalsManagerRef,
-    tunnel_manager: TunnelManager,
-    global_collection_manager: GlobalCollectionManagerRef,
-    acme_mgr: AcmeCertManagerRef,
-    inner_dns_record_manager: InnerDnsRecordManagerRef,
-    control_handler: Weak<dyn GatewayControlCmdHandler>,
-    control_token_verifier: Arc<dyn CyfsTokenVerifier>,
-    control_token_factory: Arc<dyn CyfsTokenFactory>,
-) -> Option<ServerContextRef> {
-    match server_type {
-        "http" => Some(Arc::new(HttpServerContext::new(
-            server_manager,
-            global_process_chains,
-            js_externals,
-            tunnel_manager,
-            global_collection_manager,
-        ))),
-        "dns" => Some(Arc::new(DnsServerContext::new(
-            server_manager,
-            global_process_chains,
-            js_externals,
-            global_collection_manager,
-            inner_dns_record_manager,
-        ))),
-        "socks" => Some(Arc::new(SocksServerContext::new(
-            global_process_chains,
-            js_externals,
-            global_collection_manager,
-            SocksTunnelBuilder::new_ref(tunnel_manager),
-        ))),
-        "cyfs-dir" => Some(Arc::new(CyfsDirServerContext::new(
-            server_manager,
-            global_process_chains,
-            js_externals,
-            global_collection_manager,
-        ))),
-        "acme_response" => Some(Arc::new(AcmeHttpChallengeServerContext::new(acme_mgr))),
-        "local_dns" => Some(Arc::new(LocalDnsServerContext::new(None))),
-        "control_server" => Some(Arc::new(GatewayControlServerContext::new(
-            control_handler,
-            control_token_verifier,
-            control_token_factory,
-        ))),
-        _ => None,
-    }
 }
 
 fn build_stack_context(
@@ -744,13 +690,65 @@ async fn build_global_process_chains_from_config(
     Ok(global_process_chains)
 }
 
+struct GatewayServerRuntimeInputs {
+    global_process_chains: GlobalProcessChainsRef,
+    js_externals: JsExternalsManagerRef,
+    tunnel_manager: TunnelManager,
+    global_collection_manager: GlobalCollectionManagerRef,
+    acme_manager: AcmeCertManagerRef,
+    inner_dns_record_manager: InnerDnsRecordManagerRef,
+    control_handler: Weak<dyn GatewayControlCmdHandler>,
+    control_token_verifier: Arc<dyn CyfsTokenVerifier>,
+    control_token_factory: Arc<dyn CyfsTokenFactory>,
+}
+
+async fn build_server_manager(
+    registry: &GatewayServerRegistry,
+    configs: &[Arc<dyn ServerConfig>],
+    inputs: GatewayServerRuntimeInputs,
+) -> Result<ServerManagerRef> {
+    let server_manager = Arc::new(ServerManager::new());
+    let runtime = GatewayServerRuntime {
+        server_manager: Arc::downgrade(&server_manager),
+        global_process_chains: inputs.global_process_chains,
+        js_externals: inputs.js_externals,
+        tunnel_manager: inputs.tunnel_manager,
+        global_collection_manager: inputs.global_collection_manager,
+        acme_manager: inputs.acme_manager,
+        inner_dns_record_manager: inputs.inner_dns_record_manager,
+        control_handler: inputs.control_handler,
+        control_token_verifier: inputs.control_token_verifier,
+        control_token_factory: inputs.control_token_factory,
+    };
+
+    for config in configs {
+        let servers = registry
+            .create_servers(config.clone(), &runtime)
+            .await
+            .map_err(|e| {
+                anyhow!(
+                    "create server '{}' (type '{}') failed: {}",
+                    config.id(),
+                    config.server_type(),
+                    e
+                )
+            })?;
+        for server in servers {
+            server_manager.add_server(server)?;
+        }
+    }
+
+    server_manager.add_server(Server::Http(Arc::new(WelcomeServer::new())))?;
+    Ok(server_manager)
+}
+
 //use buckyos_api::{*};
 pub struct GatewayParams {
     pub keep_tunnel: Vec<String>,
 }
 
 pub struct GatewayFactory {
-    server_factory: CyfsServerFactoryRef,
+    server_registry: Arc<GatewayServerRegistry>,
 
     stack_factory: CyfsStackFactoryRef,
     parser: GatewayConfigParserRef,
@@ -760,24 +758,17 @@ pub struct GatewayFactory {
 
 impl GatewayFactory {
     pub fn new(connection_manager: ConnectionManagerRef, parser: GatewayConfigParserRef) -> Self {
+        let server_registry = parser.server_registry().clone();
         Self {
             connection_manager,
             stack_factory: Arc::new(CyfsStackFactory::new()),
-            server_factory: Arc::new(CyfsServerFactory::new()),
+            server_registry,
             parser,
         }
     }
 
     pub fn register_stack_factory(&self, protocol: StackProtocol, factory: Arc<dyn StackFactory>) {
         self.stack_factory.register(protocol, factory);
-    }
-
-    pub fn register_server_factory<T: Into<String>>(
-        &self,
-        server_type: T,
-        factory: Arc<dyn ServerFactory>,
-    ) {
-        self.server_factory.register(server_type.into(), factory);
     }
 
     pub async fn create_gateway(
@@ -906,32 +897,23 @@ impl GatewayFactory {
             build_global_process_chains_from_config(&config.global_process_chains).await?;
 
         let tunnel_manager = TunnelManager::new();
-        let server_manager = Arc::new(ServerManager::new());
         let control_handler: Arc<dyn GatewayControlCmdHandler> = handler.clone();
-        for server_config in config.servers.iter() {
-            let context = build_server_context(
-                server_config.server_type().as_str(),
-                Arc::downgrade(&server_manager),
-                global_process_chains.clone(),
-                js_externals.clone(),
-                tunnel_manager.clone(),
-                global_collections.clone(),
-                cert_manager.clone(),
-                inner_dns_record_manager.clone(),
-                Arc::downgrade(&control_handler),
-                token_manager.clone(),
-                token_manager.clone(),
-            );
-            let servers = self
-                .server_factory
-                .create(server_config.clone(), context)
-                .await?;
-            for server in servers.into_iter() {
-                server_manager.add_server(server)?;
-            }
-        }
-
-        server_manager.add_server(Server::Http(Arc::new(WelcomeServer::new())))?;
+        let server_manager = build_server_manager(
+            self.server_registry.as_ref(),
+            &config.servers,
+            GatewayServerRuntimeInputs {
+                global_process_chains: global_process_chains.clone(),
+                js_externals: js_externals.clone(),
+                tunnel_manager: tunnel_manager.clone(),
+                global_collection_manager: global_collections.clone(),
+                acme_manager: cert_manager.clone(),
+                inner_dns_record_manager: inner_dns_record_manager.clone(),
+                control_handler: Arc::downgrade(&control_handler),
+                control_token_verifier: token_manager.clone(),
+                control_token_factory: token_manager.clone(),
+            },
+        )
+        .await?;
 
         let stack_manager = StackManager::new();
         for stack_config in config.stacks.iter() {
@@ -975,7 +957,7 @@ impl GatewayFactory {
             parser: self.parser.clone(),
             connection_manager: self.connection_manager.clone(),
             stack_factory: self.stack_factory.clone(),
-            server_factory: self.server_factory.clone(),
+            server_registry: self.server_registry.clone(),
             limiter_manager: Mutex::new(limiter_manager),
             stat_manager,
             traffic_stat_factory,
@@ -1022,7 +1004,7 @@ pub struct Gateway {
     parser: GatewayConfigParserRef,
     connection_manager: ConnectionManagerRef,
     stack_factory: CyfsStackFactoryRef,
-    server_factory: CyfsServerFactoryRef,
+    server_registry: Arc<GatewayServerRegistry>,
     limiter_manager: Mutex<LimiterManagerRef>,
     stat_manager: StatManagerRef,
     traffic_stat_factory: TrafficStatFactoryRef,
@@ -2968,30 +2950,23 @@ impl Gateway {
         let global_process_chains =
             build_global_process_chains_from_config(&config.global_process_chains).await?;
 
-        let server_manager = Arc::new(ServerManager::new());
         let control_handler: Arc<dyn GatewayControlCmdHandler> = self.control_handler.clone();
-        for server_config in config.servers.iter() {
-            let context = build_server_context(
-                server_config.server_type().as_str(),
-                Arc::downgrade(&server_manager),
-                global_process_chains.clone(),
-                js_externals.clone(),
-                self.tunnel_manager.clone(),
-                global_collections.clone(),
-                cert_manager.clone(),
-                inner_dns_record_manager.clone(),
-                Arc::downgrade(&control_handler),
-                self.control_token_manager.clone(),
-                self.control_token_manager.clone(),
-            );
-            let servers = self
-                .server_factory
-                .create(server_config.clone(), context)
-                .await?;
-            for server in servers.into_iter() {
-                server_manager.add_server(server)?;
-            }
-        }
+        let server_manager = build_server_manager(
+            self.server_registry.as_ref(),
+            &config.servers,
+            GatewayServerRuntimeInputs {
+                global_process_chains: global_process_chains.clone(),
+                js_externals: js_externals.clone(),
+                tunnel_manager: self.tunnel_manager.clone(),
+                global_collection_manager: global_collections.clone(),
+                acme_manager: cert_manager.clone(),
+                inner_dns_record_manager: inner_dns_record_manager.clone(),
+                control_handler: Arc::downgrade(&control_handler),
+                control_token_verifier: self.control_token_manager.clone(),
+                control_token_factory: self.control_token_manager.clone(),
+            },
+        )
+        .await?;
 
         let mut exist_stacks = HashSet::new();
         let mut new_stacks = Vec::new();
@@ -4469,7 +4444,9 @@ mod tests {
     fn external_cmd_registry_rejects_builtin_method() {
         let handler = GatewayCmdHandler::new(
             None,
-            Arc::new(crate::config_loader::GatewayConfigParser::new()),
+            Arc::new(crate::config_loader::GatewayConfigParser::new(
+                cyfs_gateway_app_lib::build_default_gateway_server_registry().unwrap(),
+            )),
         );
 
         let err = handler
@@ -4483,7 +4460,9 @@ mod tests {
     fn external_cmd_registry_rejects_duplicate_method() {
         let handler = GatewayCmdHandler::new(
             None,
-            Arc::new(crate::config_loader::GatewayConfigParser::new()),
+            Arc::new(crate::config_loader::GatewayConfigParser::new(
+                cyfs_gateway_app_lib::build_default_gateway_server_registry().unwrap(),
+            )),
         );
 
         handler
@@ -4500,7 +4479,9 @@ mod tests {
     fn external_cmd_registry_unregisters_method() {
         let handler = GatewayCmdHandler::new(
             None,
-            Arc::new(crate::config_loader::GatewayConfigParser::new()),
+            Arc::new(crate::config_loader::GatewayConfigParser::new(
+                cyfs_gateway_app_lib::build_default_gateway_server_registry().unwrap(),
+            )),
         );
 
         handler

@@ -208,32 +208,40 @@ pub struct CyfsDirServerContext {
 }
 ```
 
-cyfs-gateway 在 [gateway.rs:274](../src/apps/cyfs_gateway/src/gateway.rs#L274)
-已经为 `cyfs-dir` 类型注册了 context 构造器,正常通过 yaml/json 加载配置
-时不需要手动构造。
+cyfs-gateway 在
+[`server_registry.rs`](../src/components/cyfs-gateway-app-lib/src/server_registry.rs)
+的统一 registration 中为 `cyfs-dir` 绑定了 parser、factory 和 context builder，正常通过
+yaml/json 加载配置时不需要手动构造。
 
 ## 注册到 ServerManager
 
-应用初始化时按下面的方式同时注册 parser 和 factory(参考
-[lib.rs:91](../src/apps/cyfs_gateway/src/lib.rs#L91) /
-[lib.rs:182](../src/apps/cyfs_gateway/src/lib.rs#L182)):
+应用初始化时通过一个完整 descriptor 一次性注册 parser、factory 和 context builder：
 
 ```rust
+use cyfs_gateway_app_lib::{
+    GatewayServerContextMode, GatewayServerRegistration, GatewayServerRegistryBuilder,
+};
 use cyfs_gateway_lib::CyfsDirServerFactory;
-use crate::config_loader::CyfsDirServerConfigParser;
+use cyfs_gateway_app_lib::CyfsDirServerConfigParser;
 
-config_loader.register_parser(
+registry_builder.register(GatewayServerRegistration::new(
     "cyfs-dir",
+    "my-module::cyfs-dir",
     Arc::new(CyfsDirServerConfigParser::new()),
-);
-
-server_factory.register_server_factory(
-    "cyfs-dir",
     Arc::new(CyfsDirServerFactory::new()),
-);
+    GatewayServerContextMode::Required,
+    |runtime| Ok(Some(Arc::new(CyfsDirServerContext::new(
+        runtime.server_manager.clone(),
+        runtime.global_process_chains.clone(),
+        runtime.js_externals.clone(),
+        runtime.global_collection_manager.clone(),
+    )))),
+))?;
 ```
 
-cyfs-gateway 主程序已经默认注册,自定义嵌入时才需要手动调用。
+默认的 9 种 Server 由 `register_default_gateway_servers(...)` 集中安装；两个 Gateway
+二进制共享这份清单。自定义 profile 可以在 build 阶段向 builder 显式安装自己的完整
+registration，registry build 后不可再修改。
 
 ## 错误处理
 

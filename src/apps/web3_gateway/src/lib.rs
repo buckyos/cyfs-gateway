@@ -76,29 +76,19 @@ async fn run_gateway_with_config(
     params: GatewayParams,
 ) -> Result<()> {
     let config_json = merge_keep_tunnel_into_rtcp_stack_config(config_json, &params.keep_tunnel);
-    let parser = Arc::new(GatewayConfigParser::new());
+    let server_registry = build_default_gateway_server_registry()
+        .map_err(|e| anyhow::anyhow!("build gateway server registry failed: {}", e))?;
+    info!(
+        "Registered gateway server types: [{}]",
+        server_registry.registered_server_types().join(", ")
+    );
+    let parser = Arc::new(GatewayConfigParser::new(server_registry));
     parser.register_stack_config_parser("tcp", Arc::new(TcpStackConfigParser::new()));
     parser.register_stack_config_parser("udp", Arc::new(UdpStackConfigParser::new()));
     parser.register_stack_config_parser("rtcp", Arc::new(RtcpStackConfigParser::new()));
     parser.register_stack_config_parser("tls", Arc::new(TlsStackConfigParser::new()));
     parser.register_stack_config_parser("quic", Arc::new(QuicStackConfigParser::new()));
     parser.register_stack_config_parser("tun", Arc::new(TunStackConfigParser::new()));
-
-    parser.register_server_config_parser("http", Arc::new(HttpServerConfigParser::new()));
-    parser.register_server_config_parser("socks", Arc::new(SocksServerConfigParser::new()));
-    parser.register_server_config_parser("dns", Arc::new(DnsServerConfigParser::new()));
-    parser.register_server_config_parser("dir", Arc::new(DirServerConfigParser::new()));
-    parser.register_server_config_parser("cyfs-dir", Arc::new(CyfsDirServerConfigParser::new()));
-    parser.register_server_config_parser(
-        "control_server",
-        Arc::new(GatewayControlServerConfigParser::new()),
-    );
-    parser.register_server_config_parser("local_dns", Arc::new(LocalDnsConfigParser::new()));
-    parser.register_server_config_parser("sn", Arc::new(SNServerConfigParser::new()));
-    parser.register_server_config_parser(
-        "acme_response",
-        Arc::new(AcmeHttpChallengeServerConfigParser::new()),
-    );
 
     debug!("Parse cyfs-gatway config...");
     let gateway_config = parser.parse(config_json.clone()).map_err(|e| {
@@ -174,29 +164,6 @@ async fn run_gateway_with_config(
         Arc::new(TunStackFactory::new(connect_manager.clone())),
     );
     debug!("Register tun stack context factory");
-    factory.register_server_factory("http", Arc::new(ProcessChainHttpServerFactory::new()));
-    debug!("Register http server factory");
-    factory.register_server_factory("dir", Arc::new(DirServerFactory::new()));
-    factory.register_server_factory("cyfs-dir", Arc::new(CyfsDirServerFactory::new()));
-    debug!("Register cyfs-dir server factory");
-    factory.register_server_factory("socks", Arc::new(SocksServerFactory::new()));
-    debug!("Register dir server factory");
-    factory.register_server_factory("dns", Arc::new(ProcessChainDnsServerFactory::new()));
-    debug!("Register dns server factory");
-    factory.register_server_factory(
-        "acme_response",
-        Arc::new(AcmeHttpChallengeServerFactory::new()),
-    );
-    debug!("Register acme response server factory");
-    factory.register_server_factory(
-        "control_server",
-        Arc::new(GatewayControlServerFactory::new()),
-    );
-    debug!("Register control server factory");
-    factory.register_server_factory("local_dns", Arc::new(LocalDnsFactory::new()));
-    debug!("Register local dns server factory");
-    factory.register_server_factory("sn", Arc::new(SnServerFactory::new()));
-    debug!("Register sn server factory");
     let gateway = factory
         .create_gateway(config_file, gateway_config, init_gateway_config)
         .await
@@ -2407,30 +2374,18 @@ mod tests {
     async fn test_web3_gateway_configs_parse() {
         use super::*;
 
-        let parser = GatewayConfigParser::new();
+        let registry = build_default_gateway_server_registry().unwrap();
+        assert_eq!(
+            registry.registered_server_types(),
+            DEFAULT_GATEWAY_SERVER_TYPES.map(str::to_string)
+        );
+        let parser = GatewayConfigParser::new(registry);
         parser.register_stack_config_parser("tcp", Arc::new(TcpStackConfigParser::new()));
         parser.register_stack_config_parser("udp", Arc::new(UdpStackConfigParser::new()));
         parser.register_stack_config_parser("rtcp", Arc::new(RtcpStackConfigParser::new()));
         parser.register_stack_config_parser("tls", Arc::new(TlsStackConfigParser::new()));
         parser.register_stack_config_parser("quic", Arc::new(QuicStackConfigParser::new()));
         parser.register_stack_config_parser("tun", Arc::new(TunStackConfigParser::new()));
-        parser.register_server_config_parser("http", Arc::new(HttpServerConfigParser::new()));
-        parser.register_server_config_parser("socks", Arc::new(SocksServerConfigParser::new()));
-        parser.register_server_config_parser("dns", Arc::new(DnsServerConfigParser::new()));
-        parser.register_server_config_parser("dir", Arc::new(DirServerConfigParser::new()));
-        parser
-            .register_server_config_parser("cyfs-dir", Arc::new(CyfsDirServerConfigParser::new()));
-        parser.register_server_config_parser("local_dns", Arc::new(LocalDnsConfigParser::new()));
-        parser.register_server_config_parser("sn", Arc::new(SNServerConfigParser::new()));
-        parser.register_server_config_parser(
-            "control_server",
-            Arc::new(GatewayControlServerConfigParser::new()),
-        );
-        parser.register_server_config_parser(
-            "acme_response",
-            Arc::new(AcmeHttpChallengeServerConfigParser::new()),
-        );
-
         let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../web3-gateway");
         for name in [
             "web3_gateway.yaml",

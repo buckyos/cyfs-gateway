@@ -6,47 +6,27 @@ use cyfs_gateway_lib::{
     config_err, CollectionConfig, ConfigErrorCode, ConfigResult, ProcessChainConfig,
     ProcessChainConfigs, ServerConfig, StackConfig,
 };
-use cyfs_sn::SNServerConfig;
 use cyfs_traffic::TrafficConfig;
 use log::*;
-use serde::{Deserialize, Deserializer};
-
-pub struct SNServerConfigParser {}
-
-impl SNServerConfigParser {
-    pub fn new() -> Self {
-        Self {}
-    }
-}
-
-impl<D: for<'de> Deserializer<'de> + Clone> ServerConfigParser<D> for SNServerConfigParser {
-    fn parse(&self, de: D) -> ConfigResult<Arc<dyn ServerConfig>> {
-        let config = SNServerConfig::deserialize(de.clone()).map_err(|e| {
-            config_err!(
-                ConfigErrorCode::InvalidConfig,
-                "invalid sn server config.{:?}\n{}",
-                e,
-                serde_json::to_string_pretty(&serde_json::Value::deserialize(de.clone()).unwrap())
-                    .unwrap()
-            )
-        })?;
-        Ok(Arc::new(config))
-    }
-}
+use serde::Deserialize;
 
 pub struct GatewayConfigParser {
     stack_config_parser: CyfsStackConfigParser<serde_json::Value>,
-    server_config_parser: CyfsServerConfigParser<serde_json::Value>,
+    server_registry: Arc<GatewayServerRegistry>,
 }
 
 pub type GatewayConfigParserRef = Arc<GatewayConfigParser>;
 
 impl GatewayConfigParser {
-    pub fn new() -> Self {
+    pub fn new(server_registry: Arc<GatewayServerRegistry>) -> Self {
         Self {
             stack_config_parser: CyfsStackConfigParser::new(),
-            server_config_parser: CyfsServerConfigParser::new(),
+            server_registry,
         }
+    }
+
+    pub fn server_registry(&self) -> &Arc<GatewayServerRegistry> {
+        &self.server_registry
     }
 
     pub fn register_stack_config_parser(
@@ -55,14 +35,6 @@ impl GatewayConfigParser {
         parser: Arc<dyn StackConfigParser<serde_json::Value>>,
     ) {
         self.stack_config_parser.register(protocol, parser);
-    }
-
-    pub fn register_server_config_parser(
-        &self,
-        server_type: &str,
-        parser: Arc<dyn ServerConfigParser<serde_json::Value>>,
-    ) {
-        self.server_config_parser.register(server_type, parser);
     }
 
     pub fn parse(&self, json_value: serde_json::Value) -> ConfigResult<GatewayConfig> {
@@ -124,7 +96,7 @@ impl GatewayConfigParser {
             for (id, server_value) in servers_value_list.unwrap() {
                 let mut server_value = server_value.clone();
                 server_value["id"] = serde_json::Value::String(id.clone());
-                servers.push(self.server_config_parser.parse(server_value)?);
+                servers.push(self.server_registry.parse_server_config(server_value)?);
             }
         }
 
