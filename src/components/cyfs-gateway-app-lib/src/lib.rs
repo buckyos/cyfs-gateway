@@ -1,13 +1,27 @@
+mod app;
+mod composition;
+mod config_loader;
 mod config_merger;
 mod config_parser;
 mod debug;
+mod gateway;
 mod gateway_control_server;
 mod process_chain_doc;
+mod profile;
 mod server_registry;
+mod stack_registry;
+mod traffic;
 
+pub use app::*;
+pub use composition::*;
+pub use config_loader::*;
 pub use config_merger::*;
 pub use config_parser::*;
 pub use debug::*;
+pub use gateway::*;
 pub use gateway_control_server::*;
 pub use process_chain_doc::*;
+pub use profile::*;
 pub use server_registry::*;
+pub use stack_registry::*;
+pub use traffic::*;

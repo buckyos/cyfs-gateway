@@ -2,28 +2,21 @@ use std::collections::HashMap;
 use std::sync::{Arc, Weak};
 
 use cyfs_acme::AcmeCertManagerRef;
-use cyfs_dns::{
-    DnsServerContext, InnerDnsRecordManagerRef, LocalDnsFactory, LocalDnsServerContext,
-    ProcessChainDnsServerFactory,
-};
 use cyfs_gateway_lib::{
-    AcmeHttpChallengeServerContext, AcmeHttpChallengeServerFactory, CyfsDirServerContext,
-    CyfsDirServerFactory, CyfsTokenFactory, CyfsTokenVerifier, DirServerFactory,
-    GatewayControlCmdHandler, GlobalCollectionManagerRef, GlobalProcessChainsRef,
+    config_err, server_err, AcmeHttpChallengeServerContext, AcmeHttpChallengeServerFactory,
+    CyfsDirServerContext, CyfsDirServerFactory, CyfsTokenFactory, CyfsTokenVerifier,
+    DirServerFactory, GatewayControlCmdHandler, GlobalCollectionManagerRef, GlobalProcessChainsRef,
     HttpServerContext, JsExternalsManagerRef, ProcessChainHttpServerFactory, Server, ServerConfig,
     ServerContextRef, ServerErrorCode, ServerFactory, ServerManagerWeakRef, ServerResult,
-    TunnelManager, config_err, server_err,
+    TunnelManager,
 };
 use cyfs_gateway_lib::{ConfigErrorCode, ConfigResult};
-use cyfs_sn::{SNServerConfig, SnServerFactory};
-use cyfs_socks::{SocksServerContext, SocksServerFactory, SocksTunnelBuilder};
 use serde::Deserialize;
 
 use crate::{
     AcmeHttpChallengeServerConfigParser, CyfsDirServerConfigParser, DirServerConfigParser,
-    DnsServerConfigParser, GatewayControlServerConfigParser, GatewayControlServerContext,
-    GatewayControlServerFactory, HttpServerConfigParser, LocalDnsConfigParser, ServerConfigParser,
-    SocksServerConfigParser,
+    GatewayControlServerConfigParser, GatewayControlServerContext, GatewayControlServerFactory,
+    HttpServerConfigParser, ServerConfigParser,
 };
 
 pub type JsonServerConfigParser = dyn ServerConfigParser<serde_json::Value>;
@@ -41,7 +34,7 @@ pub struct GatewayServerRuntime {
     pub tunnel_manager: TunnelManager,
     pub global_collection_manager: GlobalCollectionManagerRef,
     pub acme_manager: AcmeCertManagerRef,
-    pub inner_dns_record_manager: InnerDnsRecordManagerRef,
+    pub capabilities: Arc<crate::GatewayRuntimeCapabilities>,
     pub control_handler: Weak<dyn GatewayControlCmdHandler>,
     pub control_token_verifier: Arc<dyn CyfsTokenVerifier>,
     pub control_token_factory: Arc<dyn CyfsTokenFactory>,
@@ -250,19 +243,7 @@ impl GatewayServerRegistry {
     }
 }
 
-pub const DEFAULT_GATEWAY_SERVER_TYPES: [&str; 9] = [
-    "acme_response",
-    "control_server",
-    "cyfs-dir",
-    "dir",
-    "dns",
-    "http",
-    "local_dns",
-    "sn",
-    "socks",
-];
-
-pub fn register_default_gateway_servers(
+pub(crate) fn register_core_gateway_servers(
     builder: &mut GatewayServerRegistryBuilder,
 ) -> Result<(), GatewayServerRegistryError> {
     use GatewayServerContextMode::{Contextless, Required};
@@ -280,37 +261,6 @@ pub fn register_default_gateway_servers(
                 runtime.js_externals.clone(),
                 runtime.tunnel_manager.clone(),
                 runtime.global_collection_manager.clone(),
-            )) as ServerContextRef))
-        },
-    ))?;
-    builder.register(GatewayServerRegistration::new(
-        "socks",
-        "cyfs-gateway-app-lib::socks",
-        Arc::new(SocksServerConfigParser::new()),
-        Arc::new(SocksServerFactory::new()),
-        Required,
-        |runtime: &GatewayServerRuntime| {
-            Ok(Some(Arc::new(SocksServerContext::new(
-                runtime.global_process_chains.clone(),
-                runtime.js_externals.clone(),
-                runtime.global_collection_manager.clone(),
-                SocksTunnelBuilder::new_ref(runtime.tunnel_manager.clone()),
-            )) as ServerContextRef))
-        },
-    ))?;
-    builder.register(GatewayServerRegistration::new(
-        "dns",
-        "cyfs-gateway-app-lib::dns",
-        Arc::new(DnsServerConfigParser::new()),
-        Arc::new(ProcessChainDnsServerFactory::new()),
-        Required,
-        |runtime: &GatewayServerRuntime| {
-            Ok(Some(Arc::new(DnsServerContext::new(
-                runtime.server_manager.clone(),
-                runtime.global_process_chains.clone(),
-                runtime.js_externals.clone(),
-                runtime.global_collection_manager.clone(),
-                runtime.inner_dns_record_manager.clone(),
             )) as ServerContextRef))
         },
     ))?;
@@ -352,26 +302,6 @@ pub fn register_default_gateway_servers(
         },
     ))?;
     builder.register(GatewayServerRegistration::new(
-        "local_dns",
-        "cyfs-gateway-app-lib::local_dns",
-        Arc::new(LocalDnsConfigParser::new()),
-        Arc::new(LocalDnsFactory::new()),
-        Required,
-        |_runtime: &GatewayServerRuntime| {
-            Ok(Some(
-                Arc::new(LocalDnsServerContext::new(None)) as ServerContextRef
-            ))
-        },
-    ))?;
-    builder.register(GatewayServerRegistration::new(
-        "sn",
-        "cyfs-gateway-app-lib::sn",
-        Arc::new(SNServerConfigParser::new()),
-        Arc::new(SnServerFactory::new()),
-        Contextless,
-        |_runtime: &GatewayServerRuntime| Ok(None),
-    ))?;
-    builder.register(GatewayServerRegistration::new(
         "acme_response",
         "cyfs-gateway-app-lib::acme_response",
         Arc::new(AcmeHttpChallengeServerConfigParser::new()),
@@ -387,53 +317,16 @@ pub fn register_default_gateway_servers(
     Ok(())
 }
 
-pub fn build_default_gateway_server_registry()
--> Result<Arc<GatewayServerRegistry>, GatewayServerRegistryError> {
-    let mut builder = GatewayServerRegistryBuilder::new();
-    register_default_gateway_servers(&mut builder)?;
-    Ok(Arc::new(builder.build()?))
-}
-
-pub struct SNServerConfigParser;
-
-impl SNServerConfigParser {
-    pub fn new() -> Self {
-        Self
-    }
-}
-
-impl Default for SNServerConfigParser {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl ServerConfigParser<serde_json::Value> for SNServerConfigParser {
-    fn parse(&self, value: serde_json::Value) -> ConfigResult<Arc<dyn ServerConfig>> {
-        let config = SNServerConfig::deserialize(value.clone()).map_err(|e| {
-            config_err!(
-                ConfigErrorCode::InvalidConfig,
-                "invalid sn server config.{:?}\n{}",
-                e,
-                serde_json::to_string_pretty(&value)
-                    .unwrap_or_else(|_| "<invalid json>".to_string())
-            )
-        })?;
-        Ok(Arc::new(config))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     use cyfs_acme::CertManagerConfig;
-    use cyfs_dns::InnerDnsRecordManager;
     use cyfs_gateway_lib::{
         ControlResult, GlobalCollectionManager, GlobalProcessChains, JsExternalsManager,
         ServerContext, ServerManager,
     };
-    use serde_json::{Value, json};
+    use serde_json::{json, Value};
 
     use super::*;
 
@@ -707,7 +600,7 @@ mod tests {
             tunnel_manager: TunnelManager::new(),
             global_collection_manager: GlobalCollectionManager::new(),
             acme_manager,
-            inner_dns_record_manager: InnerDnsRecordManager::new(),
+            capabilities: Arc::new(crate::GatewayRuntimeCapabilities::default()),
             control_handler: Arc::downgrade(&control_handler),
             control_token_verifier: control.clone(),
             control_token_factory: control,
@@ -725,11 +618,13 @@ mod tests {
     }
 
     #[test]
-    fn default_capability_snapshot_is_complete() {
-        let registry = build_default_gateway_server_registry().unwrap();
+    fn core_capability_snapshot_is_complete() {
+        let mut builder = GatewayServerRegistryBuilder::new();
+        register_core_gateway_servers(&mut builder).unwrap();
+        let registry = builder.build().unwrap();
         assert_eq!(
             registry.registered_server_types(),
-            DEFAULT_GATEWAY_SERVER_TYPES.map(str::to_string)
+            ["acme_response", "control_server", "cyfs-dir", "dir", "http"].map(str::to_string)
         );
 
         let expected_modes = [
@@ -737,11 +632,7 @@ mod tests {
             ("control_server", GatewayServerContextMode::Required),
             ("cyfs-dir", GatewayServerContextMode::Required),
             ("dir", GatewayServerContextMode::Contextless),
-            ("dns", GatewayServerContextMode::Required),
             ("http", GatewayServerContextMode::Required),
-            ("local_dns", GatewayServerContextMode::Required),
-            ("sn", GatewayServerContextMode::Contextless),
-            ("socks", GatewayServerContextMode::Required),
         ];
         for (server_type, expected_mode) in expected_modes {
             let registration = registry.registration(server_type).unwrap();

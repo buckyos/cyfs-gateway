@@ -7,14 +7,15 @@
 
 - 源码仓库：`cyfs-gateway`
 - 校验日期：2026-07-20
-- 校验基线：Gateway 统一 Server registry 改造后的工作区
+- 校验基线：Gateway 公共宿主与静态模块化改造后的工作区
 
 ## 已校验的当前实现事实
 
 ### 1. 当前注册的 stack 协议
 
-在 `src/apps/cyfs_gateway/src/lib.rs` 和 `src/apps/web3_gateway/src/lib.rs` 中，
-`GatewayConfigParser` 与 `GatewayFactory` 仍显式注册了：
+`src/components/cyfs-gateway-app-lib/src/stack_registry.rs` 的 `CoreGatewayModule`
+注册前 5 种协议，`src/components/cyfs-gateway-modules/src/lib.rs` 的
+`TunGatewayModule` 注册 `tun`：
 
 - `tcp`
 - `udp`
@@ -23,12 +24,13 @@
 - `quic`
 - `tun`
 
-结论：skill 可以把这 6 个协议列为“当前应用层正式支持”。
+两个二进制在各自的薄 `lib.rs` 中显式安装相同模块清单。结论：skill 可以把这 6 个
+协议列为两个当前应用编译安装的能力。配置只会创建其中实际声明的 Stack 实例。
 
 ### 2. 当前注册的 server 类型
 
-在 `src/components/cyfs-gateway-app-lib/src/server_registry.rs` 中，
-`register_default_gateway_servers(...)` 通过完整 registration 集中注册：
+`src/components/cyfs-gateway-app-lib/src/server_registry.rs` 的 core registration 与
+`src/components/cyfs-gateway-modules/src/lib.rs` 的 DNS、SOCKS、SN adapter 共同注册：
 
 - `http`
 - `socks`
@@ -41,10 +43,20 @@
 - `acme_response`
 
 每个 registration 同时包含 config parser、runtime factory 和 context builder；`dir` 与
-`sn` 显式标记为 contextless。`cyfs_gateway` 和 `web3_gateway` 都调用
-`build_default_gateway_server_registry()`，因此共享同一份 9 项能力清单。
+`sn` 显式标记为 contextless。`cyfs_gateway` 和 `web3_gateway` 当前都显式安装
+`CoreGatewayModule`、`DnsGatewayModule`、`SocksGatewayModule`、`TunGatewayModule`、
+`SnGatewayModule`、`TrafficGatewayModule`，因此 manifest 具有相同的 9 项 Server 能力。
 
-结论：skill 可以把这 9 个 server 类型列为“当前应用层正式支持”。
+结论：skill 可以把这 9 个 server 类型列为两个当前应用编译安装的能力；没有安装相应
+模块的其它应用会在 parse 阶段拒绝该类型，并列出已安装能力。
+
+### 2.1 编译能力与配置实例
+
+- Cargo dependency 与二进制的显式 `.install(...)` 清单决定可用能力；
+- YAML/JSON 只决定从这些能力中创建哪些 Server/Stack 实例及其顺序；
+- 配置不能动态装载 Rust 模块，也不会因为组件 crate 出现在依赖图中而自动注册能力；
+- Server/Stack registry 在 composition build 后不可变，解析、首次创建和 reload 共用
+  同一份 registry。
 
 ### 3. `tun` 的当前配置语义
 
@@ -97,7 +109,8 @@
 - `hook_point`
 
 在 `src/components/cyfs-socks/src/server/server.rs` 中，`target`、`enable_tunnel`、`rule_config` 会进入 `SocksProxyConfig`。
-在 `src/apps/cyfs_gateway/src/socks.rs` 中，`SocksTunnelBuilder` 会：
+在 `src/components/cyfs-gateway-modules/src/lib.rs` 的 `SocksGatewayModule` 中，
+`SocksTunnelBuilder` 会：
 
 - 基于 `proxy_target` 与 `enable_tunnel` 调用 `TunnelManager::get_tunnel(...)`
 - 再按请求目标地址 `open_stream_by_dest(...)`
@@ -133,7 +146,8 @@
 
 ### 7. 顶层 map key 注入为 `id` / `name`
 
-在 `src/apps/cyfs_gateway/src/config_loader.rs` 的 `GatewayConfigParser::parse(...)` 中：
+在 `src/components/cyfs-gateway-app-lib/src/config_loader.rs` 的
+`GatewayConfigParser::parse(...)` 中：
 
 - `stacks.<key>` 会注入 `id`
 - `servers.<key>` 会注入 `id`
@@ -152,13 +166,14 @@
 - `normalize_all_path_value_config(...)` 会归一化 `path` 与 `*_path`
 - 相对路径按传入的 `base_dir` 归一化
 
-在 `src/apps/cyfs_gateway/src/lib.rs` 中，加载主配置文件后会先设置主配置目录，再调用 `normalize_all_path_value_config(...)`。
+在 `src/components/cyfs-gateway-app-lib/src/app.rs` 中，加载主配置文件后会先设置主配置
+目录，再调用 `normalize_all_path_value_config(...)`。
 
 结论：skill 可以稳定宣称“配置值里的 `path` / `*_path` 按主配置文件目录解释”。
 
 ### 9. includes 解析规则
 
-在 `src/apps/cyfs_gateway/src/config_merger.rs` 中：
+在 `src/components/cyfs-gateway-app-lib/src/config_merger.rs` 中：
 
 - 本地 include 相对当前 include 文件所在目录解析
 - 远程 include 相对当前 URL 的父路径解析
@@ -169,11 +184,11 @@
 
 ### 10. `ndn` 的当前状态
 
-在 `src/components/cyfs-gateway-lib/src/server/ndn_server.rs` 中，库里存在 `NdnServerConfig`。
-但在 `src/components/cyfs-gateway-app-lib/src/server_registry.rs` 的默认 registry 中，没有
-`ndn` 对应的完整 registration。
+旧版 `NdnServer` / `NdnServerConfig` 已移除。当前 `cyfs://` 语义服务由
+`CyfsDirServer` 提供，配置类型是 `cyfs-dir`；composition 中没有 `ndn` registration。
 
-结论：skill 必须把 `ndn` 表述为“库里有实现，但当前应用没有注册支持”。
+结论：skill 必须把 `ndn` 表述为“旧类型已经移除，当前应用不支持”；需要该语义时使用
+已经注册的 `cyfs-dir`。
 
 ### 11. `forward` 的当前语义
 

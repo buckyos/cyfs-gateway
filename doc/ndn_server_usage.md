@@ -7,7 +7,8 @@
 
 实现位置:[src/components/cyfs-gateway-lib/src/server/cyfs_dir_server.rs](../src/components/cyfs-gateway-lib/src/server/cyfs_dir_server.rs)
 
-注册位置:[src/apps/cyfs_gateway/src/lib.rs:91](../src/apps/cyfs_gateway/src/lib.rs#L91) / [:182](../src/apps/cyfs_gateway/src/lib.rs#L182)
+注册位置：[server_registry.rs](../src/components/cyfs-gateway-app-lib/src/server_registry.rs)，
+由 `CoreGatewayModule` 在 composition 构建阶段显式安装。
 
 ## 概述
 
@@ -239,9 +240,10 @@ registry_builder.register(GatewayServerRegistration::new(
 ))?;
 ```
 
-默认的 9 种 Server 由 `register_default_gateway_servers(...)` 集中安装；两个 Gateway
-二进制共享这份清单。自定义 profile 可以在 build 阶段向 builder 显式安装自己的完整
-registration，registry build 后不可再修改。
+`cyfs-dir` 属于 `CoreGatewayModule`。完整的 9 种 Server 能力来自二进制显式安装的
+core、DNS、SOCKS 和 SN 模块；YAML/JSON 只能创建这些已编译且已安装的能力实例。
+两个 Gateway 二进制当前声明相同的模块清单，但不会由 app-lib 隐式安装所有可选模块。
+自定义应用可以在 build 阶段安装自己的完整 registration，registry build 后不可再修改。
 
 ## 错误处理
 

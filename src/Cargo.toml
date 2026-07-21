@@ -8,6 +8,7 @@ members = [
     "components/cyfs-lookup",
     "components/cyfs-gateway-api",
     "components/cyfs-gateway-app-lib",
+    "components/cyfs-gateway-modules",
     "components/cyfs-gateway-lib",
     "components/cyfs-traffic",
     "components/bns-evm",

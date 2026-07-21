@@ -25,15 +25,9 @@ mod tests {
             json!(format!("127.0.0.1:{control_port}"));
 
         // Load config from json
-        let parser = Arc::new(GatewayConfigParser::new(
-            build_default_gateway_server_registry().unwrap(),
-        ));
-        parser.register_stack_config_parser("tcp", Arc::new(TcpStackConfigParser::new()));
-        parser.register_stack_config_parser("udp", Arc::new(UdpStackConfigParser::new()));
-        parser.register_stack_config_parser("rtcp", Arc::new(RtcpStackConfigParser::new()));
-        parser.register_stack_config_parser("tls", Arc::new(TlsStackConfigParser::new()));
-        parser.register_stack_config_parser("quic", Arc::new(QuicStackConfigParser::new()));
-
+        let parser = Arc::new(GatewayConfigParser::new(Arc::new(
+            build_gateway_composition().unwrap(),
+        )));
         let load_result = parser.parse(cmd_config);
         if load_result.is_err() {
             let msg = format!("Error loading config: {}", load_result.err().unwrap().msg());
@@ -44,27 +38,6 @@ mod tests {
 
         let connect_manager = ConnectionManager::new();
         let factory = GatewayFactory::new(connect_manager.clone(), parser.clone());
-        factory.register_stack_factory(
-            StackProtocol::Tcp,
-            Arc::new(TcpStackFactory::new(connect_manager.clone())),
-        );
-        factory.register_stack_factory(
-            StackProtocol::Udp,
-            Arc::new(UdpStackFactory::new(connect_manager.clone())),
-        );
-        factory.register_stack_factory(
-            StackProtocol::Tls,
-            Arc::new(TlsStackFactory::new(connect_manager.clone())),
-        );
-        factory.register_stack_factory(
-            StackProtocol::Quic,
-            Arc::new(QuicStackFactory::new(connect_manager.clone())),
-        );
-        factory.register_stack_factory(
-            StackProtocol::Rtcp,
-            Arc::new(RtcpStackFactory::new(connect_manager.clone())),
-        );
-
         let login = json!({
             "user_name": "test",
             "password": "123456"

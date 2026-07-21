@@ -1,4 +1,4 @@
-use super::config_loader::GatewayConfig;
+use crate::config_loader::GatewayConfig;
 use cyfs_gateway_lib::*;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::marker::PhantomData;
@@ -6,24 +6,19 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::Instant;
 
-use crate::acme_sn_provider::AcmeSnProviderFactory;
 use crate::config_loader::GatewayConfigParserRef;
 use crate::{merge, AcmeConfig, AcmeHostConfig, TlsCA};
+use crate::{
+    GatewayAppProfile, GatewayComposition, GatewayRuntimeCapabilities, GatewayServerRegistry,
+    GatewayServerRuntime, GatewayStackRegistry, GatewayStackRuntime, GatewayTrafficConfigRef,
+    GatewayTrafficService, GatewayTrafficStatFactoryRef, GATEWAY_CONTROL_SERVER_CONFIG,
+    GATEWAY_CONTROL_SERVER_KEY,
+};
 use anyhow::{anyhow, Result};
 use buckyos_kit::*;
 use chrono::Utc;
 use cyfs_acme::{AcmeCertManager, AcmeCertManagerRef, AcmeItem, CertManagerConfig, ChallengeType};
-use cyfs_dns::{InnerDnsRecordManager, InnerDnsRecordManagerRef};
-use cyfs_gateway_app_lib::{
-    GatewayServerRegistry, GatewayServerRuntime, GATEWAY_CONTROL_SERVER_CONFIG,
-    GATEWAY_CONTROL_SERVER_KEY,
-};
 use cyfs_process_chain::CollectionValue;
-use cyfs_traffic::{
-    TrafficQuotaService, TrafficServiceHandle, TrafficStatFactory, TrafficStatFactoryRef,
-    TrafficUserLimiterFactory,
-};
-use cyfs_tun::TunStackContext;
 use jsonwebtoken::jwk::Jwk;
 use jsonwebtoken::{DecodingKey, EncodingKey};
 use kRPC::RPCSessionToken;
@@ -35,29 +30,32 @@ use rand::rng;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
-use sfo_js::object::builtins::JsArray;
-use sfo_js::{JsEngine, JsPkg, JsPkgManager, JsPkgManagerRef, JsString, JsValue, NativeFunction};
+use sfo_js::{JsPkg, JsPkgManager, JsPkgManagerRef, JsString, JsValue, NativeFunction};
 use sha2::Digest;
 use std::future::Future;
 use tokio::fs::create_dir_all;
 use url::Url;
 
-fn get_default_saved_gateway_config_path() -> PathBuf {
-    get_buckyos_service_data_dir("cyfs_gateway").join("cyfs_gateway_saved.json")
+fn get_default_saved_gateway_config_path(profile: &GatewayAppProfile) -> PathBuf {
+    get_buckyos_service_data_dir(profile.service_data_namespace)
+        .join(format!("{}_saved.json", profile.config_basename))
 }
 
-async fn get_gateway_remote_config_cache_path() -> PathBuf {
-    let cache_dir = get_buckyos_service_data_dir("cyfs_gateway").join("config_cache");
+async fn get_gateway_remote_config_cache_path(profile: &GatewayAppProfile) -> PathBuf {
+    let cache_dir =
+        get_buckyos_service_data_dir(profile.service_data_namespace).join("config_cache");
     if !cache_dir.exists() {
         let _ = create_dir_all(cache_dir.clone()).await;
     }
     cache_dir
 }
 
-pub fn get_default_config_path() -> PathBuf {
-    let mut default_config = get_buckyos_system_etc_dir().join("cyfs_gateway.yaml");
+pub fn get_default_config_path(profile: &GatewayAppProfile) -> PathBuf {
+    let mut default_config =
+        get_buckyos_system_etc_dir().join(format!("{}.yaml", profile.config_basename));
     if !default_config.exists() {
-        default_config = get_buckyos_system_etc_dir().join("cyfs_gateway.json");
+        default_config =
+            get_buckyos_system_etc_dir().join(format!("{}.json", profile.config_basename));
     }
     default_config.canonicalize().unwrap_or(default_config)
 }
@@ -239,84 +237,6 @@ fn apply_saved_config_patch(mut user_config: Value, patch: &SavedConfigPatch) ->
     user_config
 }
 
-fn build_stack_context(
-    protocol: StackProtocol,
-    servers: ServerManagerRef,
-    tunnel_manager: TunnelManager,
-    limiter_manager: LimiterManagerRef,
-    stat_manager: StatManagerRef,
-    global_process_chains: Option<GlobalProcessChainsRef>,
-    global_collection_manager: Option<GlobalCollectionManagerRef>,
-    js_externals: Option<JsExternalsManagerRef>,
-    self_cert_mgr: SelfCertMgrRef,
-) -> StackResult<Arc<dyn StackContext>> {
-    match protocol {
-        StackProtocol::Tcp => Ok(Arc::new(TcpStackContext::new(
-            servers.clone(),
-            tunnel_manager.clone(),
-            limiter_manager.clone(),
-            stat_manager.clone(),
-            global_process_chains.clone(),
-            global_collection_manager.clone(),
-            js_externals.clone(),
-        ))),
-        StackProtocol::Udp => Ok(Arc::new(UdpStackContext::new(
-            servers.clone(),
-            tunnel_manager.clone(),
-            limiter_manager.clone(),
-            stat_manager.clone(),
-            global_process_chains.clone(),
-            global_collection_manager.clone(),
-            js_externals.clone(),
-        ))),
-        StackProtocol::Rtcp => Ok(Arc::new(RtcpStackContext::new(
-            servers.clone(),
-            tunnel_manager.clone(),
-            limiter_manager.clone(),
-            stat_manager.clone(),
-            global_process_chains.clone(),
-            global_collection_manager.clone(),
-            js_externals.clone(),
-        ))),
-        StackProtocol::Tls => Ok(Arc::new(TlsStackContext::new(
-            servers.clone(),
-            tunnel_manager.clone(),
-            limiter_manager.clone(),
-            stat_manager.clone(),
-            self_cert_mgr.clone(),
-            global_process_chains.clone(),
-            global_collection_manager.clone(),
-            js_externals.clone(),
-        ))),
-        StackProtocol::Quic => Ok(Arc::new(QuicStackContext::new(
-            servers.clone(),
-            tunnel_manager.clone(),
-            limiter_manager.clone(),
-            stat_manager.clone(),
-            self_cert_mgr,
-            global_process_chains.clone(),
-            global_collection_manager.clone(),
-            js_externals.clone(),
-        ))),
-        StackProtocol::Extension(name) => match name.as_str() {
-            "tun" => Ok(Arc::new(TunStackContext::new(
-                servers.clone(),
-                tunnel_manager.clone(),
-                limiter_manager.clone(),
-                stat_manager.clone(),
-                global_process_chains.clone(),
-                global_collection_manager.clone(),
-                js_externals.clone(),
-            ))),
-            _ => Err(server_err!(
-                StackErrorCode::InvalidConfig,
-                "invalid protocol: {}",
-                name
-            )),
-        },
-    }
-}
-
 fn build_acme_host_data(host_config: &AcmeHostConfig) -> Result<Option<Value>> {
     let mut data = match host_config.data.clone() {
         Some(Value::Object(data)) => data,
@@ -408,59 +328,13 @@ fn read_config_value(path: &Path) -> Result<Value> {
     Ok(value)
 }
 
-fn load_include_paths(config: &Value, config_dir: &Path) -> Vec<PathBuf> {
-    let mut includes = Vec::new();
-    let include_value = match config.get("include") {
-        Some(value) => value,
-        None => return includes,
-    };
-    let include_list = match include_value.as_array() {
-        Some(list) => list,
-        None => return includes,
-    };
-    for entry in include_list {
-        let path_value = match entry {
-            Value::String(path) => Some(path.as_str()),
-            Value::Object(map) => map.get("path").and_then(|v| v.as_str()),
-            _ => None,
-        };
-        if let Some(path) = path_value {
-            includes.push(config_dir.join(path));
-        }
-    }
-    includes
-}
-
-fn saved_config_newer_than_others(
-    saved_path: &Path,
-    config_file: &Path,
-    config_dir: &Path,
-) -> bool {
-    let saved_mtime = match std::fs::metadata(saved_path).and_then(|meta| meta.modified()) {
-        Ok(time) => time,
-        Err(_) => return false,
-    };
-    let mut other_paths = vec![config_file.to_path_buf()];
-    if let Ok(root_config) = read_config_value(config_file) {
-        other_paths.extend(load_include_paths(&root_config, config_dir));
-    }
-    for path in other_paths {
-        if let Ok(other_time) = std::fs::metadata(path).and_then(|meta| meta.modified()) {
-            if saved_mtime <= other_time {
-                return false;
-            }
-        }
-    }
-    true
-}
-
-fn is_default_gateway_config(config_file: &Path) -> bool {
-    let default_config = get_default_config_path();
+fn is_default_gateway_config(profile: &GatewayAppProfile, config_file: &Path) -> bool {
+    let default_config = get_default_config_path(profile);
     config_file == default_config
 }
 
-fn resolve_save_path(requested: Option<&str>) -> PathBuf {
-    let default_path = get_default_saved_gateway_config_path();
+fn resolve_save_path(profile: &GatewayAppProfile, requested: Option<&str>) -> PathBuf {
+    let default_path = get_default_saved_gateway_config_path(profile);
     let requested = match requested {
         Some(path) if !path.is_empty() => path,
         _ => return default_path,
@@ -485,12 +359,15 @@ pub struct LoadedGatewayConfig {
     pub effective_config: Value,
 }
 
-pub async fn load_config_from_file(config_file: &Path) -> Result<LoadedGatewayConfig> {
-    let user_config = load_user_config_from_file(config_file).await?;
+pub async fn load_config_from_file(
+    profile: &GatewayAppProfile,
+    config_file: &Path,
+) -> Result<LoadedGatewayConfig> {
+    let user_config = load_user_config_from_file(profile, config_file).await?;
     let mut effective_config = user_config.clone();
 
-    let saved_path = get_default_saved_gateway_config_path();
-    if is_default_gateway_config(config_file) && saved_path.exists() {
+    let saved_path = get_default_saved_gateway_config_path(profile);
+    if is_default_gateway_config(profile, config_file) && saved_path.exists() {
         match read_config_value(saved_path.as_path()) {
             Ok(saved_value) => match serde_json::from_value::<SavedConfigPatch>(saved_value) {
                 Ok(saved_patch) => {
@@ -524,14 +401,17 @@ pub async fn load_config_from_file(config_file: &Path) -> Result<LoadedGatewayCo
     })
 }
 
-async fn load_user_config_from_file(config_file: &Path) -> Result<serde_json::Value> {
+async fn load_user_config_from_file(
+    profile: &GatewayAppProfile,
+    config_file: &Path,
+) -> Result<serde_json::Value> {
     let config_dir = config_file.parent().ok_or_else(|| {
         let msg = format!("cannot get config dir: {:?}", config_file);
         error!("{}", msg);
         anyhow::anyhow!(msg)
     })?;
 
-    let cache_dir = get_gateway_remote_config_cache_path().await;
+    let cache_dir = get_gateway_remote_config_cache_path(profile).await;
     let config_json =
         crate::ConfigMerger::load_dir_with_root(&config_dir, &config_file, None, &cache_dir)
             .await
@@ -592,12 +472,13 @@ pub(crate) async fn run_server_tempalte_pkg(
 }
 
 async fn build_acme_mgr_from_config(
+    profile: &GatewayAppProfile,
     acme_config: &Option<AcmeConfig>,
 ) -> Result<AcmeCertManagerRef> {
     let mut cert_config = CertManagerConfig::default();
-    let data_dir = get_buckyos_service_data_dir("cyfs_gateway").join("certs");
+    let data_dir = get_buckyos_service_data_dir(profile.service_data_namespace).join("certs");
     let dns_provider_dir = get_buckyos_system_etc_dir()
-        .join("cyfs_gateway")
+        .join(profile.template_namespace)
         .join("acme_dns_provider");
     cert_config.keystore_path = data_dir.to_string_lossy().to_string();
     if let Some(acme_config) = acme_config.clone() {
@@ -629,8 +510,11 @@ async fn build_acme_mgr_from_config(
     Ok(cert_manager)
 }
 
-async fn build_self_cert_mgr_from_config(tls_ca: &Option<TlsCA>) -> Result<SelfCertMgrRef> {
-    let data_dir = get_buckyos_service_data_dir("cyfs_gateway").join("self_certs");
+async fn build_self_cert_mgr_from_config(
+    profile: &GatewayAppProfile,
+    tls_ca: &Option<TlsCA>,
+) -> Result<SelfCertMgrRef> {
+    let data_dir = get_buckyos_service_data_dir(profile.service_data_namespace).join("self_certs");
     let mut self_cert_config = SelfCertConfig::default();
     if let Some(config) = tls_ca.clone() {
         self_cert_config.ca_path = Some(config.cert_path);
@@ -696,7 +580,7 @@ struct GatewayServerRuntimeInputs {
     tunnel_manager: TunnelManager,
     global_collection_manager: GlobalCollectionManagerRef,
     acme_manager: AcmeCertManagerRef,
-    inner_dns_record_manager: InnerDnsRecordManagerRef,
+    capabilities: Arc<GatewayRuntimeCapabilities>,
     control_handler: Weak<dyn GatewayControlCmdHandler>,
     control_token_verifier: Arc<dyn CyfsTokenVerifier>,
     control_token_factory: Arc<dyn CyfsTokenFactory>,
@@ -715,7 +599,7 @@ async fn build_server_manager(
         tunnel_manager: inputs.tunnel_manager,
         global_collection_manager: inputs.global_collection_manager,
         acme_manager: inputs.acme_manager,
-        inner_dns_record_manager: inputs.inner_dns_record_manager,
+        capabilities: inputs.capabilities,
         control_handler: inputs.control_handler,
         control_token_verifier: inputs.control_token_verifier,
         control_token_factory: inputs.control_token_factory,
@@ -748,9 +632,10 @@ pub struct GatewayParams {
 }
 
 pub struct GatewayFactory {
+    composition: Arc<GatewayComposition>,
     server_registry: Arc<GatewayServerRegistry>,
 
-    stack_factory: CyfsStackFactoryRef,
+    stack_registry: Arc<GatewayStackRegistry>,
     parser: GatewayConfigParserRef,
 
     connection_manager: ConnectionManagerRef,
@@ -759,16 +644,15 @@ pub struct GatewayFactory {
 impl GatewayFactory {
     pub fn new(connection_manager: ConnectionManagerRef, parser: GatewayConfigParserRef) -> Self {
         let server_registry = parser.server_registry().clone();
+        let stack_registry = parser.stack_registry().clone();
+        let composition = parser.composition().clone();
         Self {
+            composition,
             connection_manager,
-            stack_factory: Arc::new(CyfsStackFactory::new()),
             server_registry,
+            stack_registry,
             parser,
         }
-    }
-
-    pub fn register_stack_factory(&self, protocol: StackProtocol, factory: Arc<dyn StackFactory>) {
-        self.stack_factory.register(protocol, factory);
     }
 
     pub async fn create_gateway(
@@ -787,8 +671,15 @@ impl GatewayFactory {
         };
 
         let mut limiter_manager = DefaultLimiterManager::new();
-        let traffic_stat_factory = TrafficStatFactory::new(config.traffic.stat_prefix.clone());
-        let stat_manager = StatManager::with_stat_factory(traffic_stat_factory.clone());
+        let traffic_adapter = self.composition.traffic_adapter();
+        let traffic_stat_factory = match (traffic_adapter, config.traffic.as_ref()) {
+            (Some(adapter), Some(config)) => Some(adapter.create_stat_factory(config)?),
+            _ => None,
+        };
+        let stat_manager = traffic_stat_factory
+            .as_ref()
+            .map(|factory| StatManager::with_stat_factory(factory.as_stat_factory()))
+            .unwrap_or_else(StatManager::new);
         if let Some(limiters_config) = config.limiters_config.clone() {
             for limiter_config in limiters_config.iter() {
                 if limiter_manager
@@ -819,48 +710,23 @@ impl GatewayFactory {
                 );
             }
         }
-        if config.traffic.enabled {
-            limiter_manager.set_limiter_factory(Some(Arc::new(
-                TrafficUserLimiterFactory::new_http(
-                    config.traffic.clone(),
-                    traffic_stat_factory.clone(),
-                )?,
-            )));
+        if let (Some(adapter), Some(config), Some(stat_factory)) = (
+            traffic_adapter,
+            config.traffic.as_ref(),
+            traffic_stat_factory.as_ref(),
+        ) {
+            adapter.configure_limiter_factory(config, stat_factory, limiter_manager.as_mut())?;
         }
         let limiter_manager: LimiterManagerRef = Arc::new(limiter_manager);
-        let sn_acme_data = get_buckyos_service_data_dir("cyfs_gateway").join("sn_dns");
-        if !sn_acme_data.exists() {
-            std::fs::create_dir_all(&sn_acme_data).unwrap();
-        }
-        AcmeCertManager::register_dns_provider_factory(
-            "sn-dns",
-            AcmeSnProviderFactory::new(sn_acme_data),
-        );
-
-        let cert_manager = build_acme_mgr_from_config(&config.acme_config).await?;
-        let inner_dns_record_manager = InnerDnsRecordManager::new();
-        let record_manager = inner_dns_record_manager.clone();
-        cert_manager.register_dns_provider(
-            "local",
-            move |op: String, domain: String, key_hash: String| {
-                let record_manager = record_manager.clone();
-                async move {
-                    if op == "add_challenge" {
-                        record_manager
-                            .add_record(domain, "TXT", key_hash)
-                            .map_err(|e| anyhow!(e.to_string()))
-                    } else if op == "del_challenge" {
-                        record_manager.remove_record(domain, "TXT");
-                        Ok(())
-                    } else {
-                        Err(anyhow!("Unsupported op: {}", op))
-                    }
-                }
-            },
-        );
+        self.composition.apply_acme_dns_provider_factories();
+        let profile = self.composition.profile();
+        let cert_manager = build_acme_mgr_from_config(profile, &config.acme_config).await?;
+        let runtime_capabilities = Arc::new(self.composition.build_runtime_capabilities()?);
+        self.composition
+            .apply_runtime_hooks(&runtime_capabilities, &cert_manager)?;
         register_acme_hosts(&cert_manager, &config.acme_config)?;
 
-        let self_cert_manager = build_self_cert_mgr_from_config(&config.tls_ca).await?;
+        let self_cert_manager = build_self_cert_mgr_from_config(profile, &config.tls_ca).await?;
 
         let global_collections =
             GlobalCollectionManager::create(config.collections.clone()).await?;
@@ -880,16 +746,18 @@ impl GatewayFactory {
             build_js_externals_from_raw_config(base_dir.as_path(), &config.raw_config).await?;
 
         let chain_cmds = get_buckyos_system_etc_dir()
-            .join("cyfs_gateway")
+            .join(profile.template_namespace)
             .join("server_templates");
         let external_cmds = JsPkgManager::new(chain_cmds);
-        let data_dir = get_buckyos_service_data_dir("cyfs_gateway").join("token_key");
+        let data_dir =
+            get_buckyos_service_data_dir(profile.service_data_namespace).join("token_key");
         if !data_dir.exists() {
             create_dir_all(data_dir.clone()).await?;
         }
 
         let store = LocalTokenKeyStore::new(data_dir);
-        let token_manager = LocalTokenManager::new(user_name, password, store).await?;
+        let token_manager =
+            LocalTokenManager::new(user_name, password, profile.token_audience, store).await?;
         let handler =
             GatewayCmdHandler::new(config_file.map(|v| v.to_path_buf()), self.parser.clone());
 
@@ -907,7 +775,7 @@ impl GatewayFactory {
                 tunnel_manager: tunnel_manager.clone(),
                 global_collection_manager: global_collections.clone(),
                 acme_manager: cert_manager.clone(),
-                inner_dns_record_manager: inner_dns_record_manager.clone(),
+                capabilities: runtime_capabilities,
                 control_handler: Arc::downgrade(&control_handler),
                 control_token_verifier: token_manager.clone(),
                 control_token_factory: token_manager.clone(),
@@ -916,37 +784,43 @@ impl GatewayFactory {
         .await?;
 
         let stack_manager = StackManager::new();
+        let stack_runtime = GatewayStackRuntime {
+            connection_manager: self.connection_manager.clone(),
+            server_manager: server_manager.clone(),
+            tunnel_manager: tunnel_manager.clone(),
+            limiter_manager: limiter_manager.clone(),
+            stat_manager: stat_manager.clone(),
+            global_process_chains: Some(global_process_chains.clone()),
+            global_collection_manager: Some(global_collections.clone()),
+            js_externals: Some(js_externals.clone()),
+            self_cert_manager: self_cert_manager.clone(),
+        };
         for stack_config in config.stacks.iter() {
-            let stack_context = build_stack_context(
-                stack_config.stack_protocol(),
-                server_manager.clone(),
-                tunnel_manager.clone(),
-                limiter_manager.clone(),
-                stat_manager.clone(),
-                Some(global_process_chains.clone()),
-                Some(global_collections.clone()),
-                Some(js_externals.clone()),
-                self_cert_manager.clone(),
-            )?;
             let stack = self
-                .stack_factory
-                .create(stack_config.clone(), stack_context)
+                .stack_registry
+                .create_stack(stack_config.clone(), &stack_runtime)
                 .await?;
             stack_manager.add_stack(stack)?;
         }
 
         let control_handler: Arc<dyn GatewayControlCmdHandler> = handler.clone();
         let timer_manager = TimerManager::new();
-        let traffic_service = if config.traffic.enabled {
-            TrafficQuotaService::start_http(
-                config.traffic.clone(),
-                stat_manager.clone(),
-                traffic_stat_factory.clone(),
-                limiter_manager.clone(),
-            )
-            .await?
-        } else {
-            None
+        let traffic_service = match (
+            traffic_adapter,
+            config.traffic.as_ref(),
+            traffic_stat_factory.as_ref(),
+        ) {
+            (Some(adapter), Some(config), Some(stat_factory)) => {
+                adapter
+                    .start_service(
+                        config,
+                        stat_manager.clone(),
+                        stat_factory,
+                        limiter_manager.clone(),
+                    )
+                    .await?
+            }
+            _ => None,
         };
         let gateway = Arc::new(Gateway {
             config_file: config_file.map(|v| v.to_path_buf()),
@@ -955,8 +829,9 @@ impl GatewayFactory {
             stack_manager,
             tunnel_manager,
             parser: self.parser.clone(),
+            composition: self.composition.clone(),
             connection_manager: self.connection_manager.clone(),
-            stack_factory: self.stack_factory.clone(),
+            stack_registry: self.stack_registry.clone(),
             server_registry: self.server_registry.clone(),
             limiter_manager: Mutex::new(limiter_manager),
             stat_manager,
@@ -1002,18 +877,19 @@ pub struct Gateway {
     stack_manager: StackManagerRef,
     tunnel_manager: TunnelManager,
     parser: GatewayConfigParserRef,
+    composition: Arc<GatewayComposition>,
     connection_manager: ConnectionManagerRef,
-    stack_factory: CyfsStackFactoryRef,
+    stack_registry: Arc<GatewayStackRegistry>,
     server_registry: Arc<GatewayServerRegistry>,
     limiter_manager: Mutex<LimiterManagerRef>,
     stat_manager: StatManagerRef,
-    traffic_stat_factory: TrafficStatFactoryRef,
+    traffic_stat_factory: Option<GatewayTrafficStatFactoryRef>,
     external_cmds: JsPkgManagerRef,
     control_handler: Arc<dyn GatewayControlCmdHandler>,
     control_token_manager: Arc<LocalTokenManager<LocalTokenKeyStore>>,
     timer_manager: TimerManager,
     global_collection_manager: RwLock<GlobalCollectionManagerRef>,
-    traffic_service: Mutex<Option<TrafficServiceHandle>>,
+    traffic_service: Mutex<Option<Box<dyn GatewayTrafficService>>>,
 }
 
 impl Drop for Gateway {
@@ -2831,7 +2707,8 @@ impl Gateway {
                     config.device_manager.cleanup_interval_seconds.max(1),
                 );
                 let device_online_db_path =
-                    get_buckyos_service_data_dir("cyfs_gateway").join("device_online.db");
+                    get_buckyos_service_data_dir(self.composition.profile().service_data_namespace)
+                        .join("device_online.db");
                 let store = SqliteDeviceOnlineStore::new(device_online_db_path)
                     .await
                     .map_err(|e| anyhow!("create sqlite device online store failed: {}", e))?;
@@ -2893,42 +2770,25 @@ impl Gateway {
             }
         }
         limiter_manager.retain(Box::new(move |id, _| exist_limters.contains(id)));
-        if traffic_config.enabled {
-            limiter_manager.set_limiter_factory(Some(Arc::new(
-                TrafficUserLimiterFactory::new_http(
-                    traffic_config.clone(),
-                    self.traffic_stat_factory.clone(),
-                )?,
-            )));
+        if let (Some(adapter), Some(config), Some(stat_factory)) = (
+            self.composition.traffic_adapter(),
+            traffic_config.as_ref(),
+            self.traffic_stat_factory.as_ref(),
+        ) {
+            adapter.configure_limiter_factory(config, stat_factory, limiter_manager.as_mut())?;
         } else {
             limiter_manager.set_limiter_factory(None);
         }
         let limiter_manager: LimiterManagerRef = Arc::new(limiter_manager);
 
-        let cert_manager = build_acme_mgr_from_config(&config.acme_config).await?;
-        let inner_dns_record_manager = InnerDnsRecordManager::new();
-        let record_manager = inner_dns_record_manager.clone();
-        cert_manager.register_dns_provider(
-            "local",
-            move |op: String, domain: String, key_hash: String| {
-                let record_manager = record_manager.clone();
-                async move {
-                    if op == "add_challenge" {
-                        record_manager
-                            .add_record(domain, "TXT", key_hash)
-                            .map_err(|e| anyhow!(e.to_string()))
-                    } else if op == "del_challenge" {
-                        record_manager.remove_record(domain, "TXT");
-                        Ok(())
-                    } else {
-                        Err(anyhow!("Unsupported op: {}", op))
-                    }
-                }
-            },
-        );
+        let profile = self.composition.profile();
+        let cert_manager = build_acme_mgr_from_config(profile, &config.acme_config).await?;
+        let runtime_capabilities = Arc::new(self.composition.build_runtime_capabilities()?);
+        self.composition
+            .apply_runtime_hooks(&runtime_capabilities, &cert_manager)?;
         register_acme_hosts(&cert_manager, &config.acme_config)?;
 
-        let self_cert_manager = build_self_cert_mgr_from_config(&config.tls_ca).await?;
+        let self_cert_manager = build_self_cert_mgr_from_config(profile, &config.tls_ca).await?;
 
         let global_collections =
             GlobalCollectionManager::create(config.collections.clone()).await?;
@@ -2960,7 +2820,7 @@ impl Gateway {
                 tunnel_manager: self.tunnel_manager.clone(),
                 global_collection_manager: global_collections.clone(),
                 acme_manager: cert_manager.clone(),
-                inner_dns_record_manager: inner_dns_record_manager.clone(),
+                capabilities: runtime_capabilities,
                 control_handler: Arc::downgrade(&control_handler),
                 control_token_verifier: self.control_token_manager.clone(),
                 control_token_factory: self.control_token_manager.clone(),
@@ -2968,54 +2828,72 @@ impl Gateway {
         )
         .await?;
 
+        let stack_runtime = GatewayStackRuntime {
+            connection_manager: self.connection_manager.clone(),
+            server_manager: server_manager.clone(),
+            tunnel_manager: self.tunnel_manager.clone(),
+            limiter_manager: limiter_manager.clone(),
+            stat_manager: self.stat_manager.clone(),
+            global_process_chains: Some(global_process_chains.clone()),
+            global_collection_manager: Some(global_collections.clone()),
+            js_externals: Some(js_externals.clone()),
+            self_cert_manager: self_cert_manager.clone(),
+        };
         let mut exist_stacks = HashSet::new();
-        let mut new_stacks = Vec::new();
-        let mut changed_stacks = Vec::new();
+        let mut new_stacks: Vec<StackRef> = Vec::new();
+        let mut changed_stacks: Vec<StackRef> = Vec::new();
         for stack_config in config.stacks.iter() {
-            let stack_context = build_stack_context(
-                stack_config.stack_protocol(),
-                server_manager.clone(),
-                self.tunnel_manager.clone(),
-                limiter_manager.clone(),
-                self.stat_manager.clone(),
-                Some(global_process_chains.clone()),
-                Some(global_collections.clone()),
-                Some(js_externals.clone()),
-                self_cert_manager.clone(),
-            )?;
             exist_stacks.insert(stack_config.id().clone());
             if let Some(stack) = self.stack_manager.get_stack(stack_config.id().as_str()) {
-                stack
-                    .prepare_update(stack_config.clone(), Some(stack_context))
+                if let Err(error) = self
+                    .stack_registry
+                    .prepare_stack_update(&stack, stack_config.clone(), &stack_runtime)
                     .await
-                    .map_err(|e| {
-                        let msg = format!(
-                            "Failed to prepare update stack {}: {}",
-                            stack_config.id(),
-                            e
-                        );
-                        log::error!("{}", msg);
-                        anyhow!(msg)
-                    })?;
+                {
+                    stack.rollback_update().await;
+                    for prepared in &changed_stacks {
+                        prepared.rollback_update().await;
+                    }
+                    let msg = format!(
+                        "Failed to prepare update stack {}: {}",
+                        stack_config.id(),
+                        error
+                    );
+                    log::error!("{}", msg);
+                    return Err(anyhow!(msg));
+                }
                 changed_stacks.push(stack);
             } else {
                 let new_stack = match self
-                    .stack_factory
-                    .create(stack_config.clone(), stack_context)
+                    .stack_registry
+                    .create_stack(stack_config.clone(), &stack_runtime)
                     .await
                 {
                     Ok(stack) => stack,
                     Err(e) => {
+                        for prepared in &changed_stacks {
+                            prepared.rollback_update().await;
+                        }
                         log::error!("Failed to create stack {}: {}", stack_config.id(), e);
-                        continue;
+                        return Err(anyhow!(
+                            "Failed to create stack {}: {}",
+                            stack_config.id(),
+                            e
+                        ));
                     }
                 };
-                new_stack.start().await.map_err(|e| {
-                    let msg = format!("Failed to start stack {}: {}", stack_config.id(), e);
-                    log::error!("{}", msg);
-                    anyhow!(msg)
-                })?;
                 new_stacks.push(new_stack);
+            }
+        }
+
+        for new_stack in &new_stacks {
+            if let Err(error) = new_stack.start().await {
+                for prepared in &changed_stacks {
+                    prepared.rollback_update().await;
+                }
+                let msg = format!("Failed to start stack {}: {}", new_stack.id(), error);
+                log::error!("{}", msg);
+                return Err(anyhow!(msg));
             }
         }
 
@@ -3075,7 +2953,7 @@ impl Gateway {
 
     async fn restart_traffic_service(
         &self,
-        traffic_config: cyfs_traffic::TrafficConfig,
+        traffic_config: Option<GatewayTrafficConfigRef>,
         limiter_manager: LimiterManagerRef,
     ) -> Result<()> {
         let old_service = { self.traffic_service.lock().unwrap().take() };
@@ -3083,18 +2961,23 @@ impl Gateway {
             service.stop().await;
         }
 
-        if !traffic_config.enabled {
+        let (Some(adapter), Some(config), Some(stat_factory)) = (
+            self.composition.traffic_adapter(),
+            traffic_config.as_ref(),
+            self.traffic_stat_factory.as_ref(),
+        ) else {
             *self.traffic_service.lock().unwrap() = None;
             return Ok(());
-        }
+        };
 
-        let new_service = TrafficQuotaService::start_http(
-            traffic_config,
-            self.stat_manager.clone(),
-            self.traffic_stat_factory.clone(),
-            limiter_manager,
-        )
-        .await?;
+        let new_service = adapter
+            .start_service(
+                config,
+                self.stat_manager.clone(),
+                stat_factory,
+                limiter_manager,
+            )
+            .await?;
         *self.traffic_service.lock().unwrap() = new_service;
         Ok(())
     }
@@ -3331,7 +3214,8 @@ impl GatewayCmdHandler {
         let gateway = self
             .get_gateway()
             .ok_or_else(|| cmd_err!(ControlErrorCode::NoGateway, "gateway not init"))?;
-        let save_path = resolve_save_path(requested_path);
+        let profile = gateway.composition.profile();
+        let save_path = resolve_save_path(profile, requested_path);
         if let Some(parent) = save_path.parent() {
             tokio::fs::create_dir_all(parent)
                 .await
@@ -3341,7 +3225,7 @@ impl GatewayCmdHandler {
                 ))?;
         }
 
-        let default_saved_path = get_default_saved_gateway_config_path();
+        let default_saved_path = get_default_saved_gateway_config_path(profile);
         let content = if save_path == default_saved_path {
             let current_raw = {
                 let config = gateway.config.lock().unwrap();
@@ -4109,10 +3993,12 @@ impl GatewayControlCmdHandler for GatewayCmdHandler {
                     ))?;
                 }
                 debug!("*** reload gateway config ...");
-                let loaded_config =
-                    load_config_from_file(self.config_file.as_ref().unwrap().as_path())
-                        .await
-                        .map_err(|e| cmd_err!(ControlErrorCode::Failed, "{}", e))?;
+                let loaded_config = load_config_from_file(
+                    self.parser.composition().profile(),
+                    self.config_file.as_ref().unwrap().as_path(),
+                )
+                .await
+                .map_err(|e| cmd_err!(ControlErrorCode::Failed, "{}", e))?;
                 let gateway_config = self
                     .parser
                     .parse(loaded_config.effective_config)
@@ -4225,6 +4111,7 @@ struct LocalTokenCredentials {
 
 pub struct LocalTokenManager<S: TokenKeyStore> {
     credentials: RwLock<LocalTokenCredentials>,
+    token_audience: String,
     pub token_encode_key: EncodingKey,
     pub token_decode_key: DecodingKey,
     _p: PhantomData<S>,
@@ -4234,6 +4121,7 @@ impl<S: TokenKeyStore> LocalTokenManager<S> {
     pub async fn new(
         user_name: Option<String>,
         password: Option<String>,
+        token_audience: impl Into<String>,
         store: S,
     ) -> ControlResult<Arc<Self>> {
         let (encode_key, decode_key) = match store.load_key().await {
@@ -4252,6 +4140,7 @@ impl<S: TokenKeyStore> LocalTokenManager<S> {
                 user_name,
                 password,
             }),
+            token_audience: token_audience.into(),
             token_encode_key: encode_key,
             token_decode_key: decode_key,
             _p: Default::default(),
@@ -4262,23 +4151,6 @@ impl<S: TokenKeyStore> LocalTokenManager<S> {
         let mut credentials = self.credentials.write().unwrap();
         credentials.user_name = user_name;
         credentials.password = password;
-    }
-
-    fn load(private_key: &Path, public_key: &Path) -> ControlResult<(EncodingKey, DecodingKey)> {
-        if !private_key.exists() || !public_key.exists() {
-            return Err(cmd_err!(ControlErrorCode::Failed));
-        }
-
-        let encode_key =
-            load_private_key(private_key).map_err(into_cmd_err!(ControlErrorCode::Failed))?;
-
-        let public_key =
-            std::fs::read_to_string(public_key).map_err(into_cmd_err!(ControlErrorCode::Failed))?;
-        let public_key: Jwk = serde_json::from_str(public_key.as_str())
-            .map_err(into_cmd_err!(ControlErrorCode::Failed))?;
-        let decode_key =
-            DecodingKey::from_jwk(&public_key).map_err(into_cmd_err!(ControlErrorCode::Failed))?;
-        Ok((encode_key, decode_key))
     }
 }
 #[async_trait::async_trait]
@@ -4323,7 +4195,7 @@ impl<S: TokenKeyStore> CyfsTokenFactory for LocalTokenManager<S> {
 
         let (token, _) = RPCSessionToken::generate_jwt_token(
             user_name,
-            "cyfs-gateway",
+            self.token_audience.as_str(),
             None,
             &self.token_encode_key,
         )
@@ -4359,7 +4231,7 @@ impl<S: TokenKeyStore> CyfsTokenVerifier for LocalTokenManager<S> {
             let user_name = credentials.user_name.as_deref().unwrap_or("root");
             match RPCSessionToken::generate_jwt_token(
                 user_name,
-                "cyfs-gateway",
+                self.token_audience.as_str(),
                 None,
                 &self.token_encode_key,
             ) {
@@ -4374,14 +4246,18 @@ impl<S: TokenKeyStore> CyfsTokenVerifier for LocalTokenManager<S> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::gateway::*;
+    use super::*;
     use chrono::Utc;
-    use kRPC::RPCSessionToken;
     use serde_json::json;
     use std::io::{Read, Write};
-    use std::path::PathBuf;
     use std::sync::Arc;
-    use tempfile::TempDir;
+
+    fn test_composition() -> Arc<GatewayComposition> {
+        let mut builder =
+            crate::GatewayCompositionBuilder::new(crate::GatewayAppProfile::cyfs_gateway());
+        builder.install(crate::CoreGatewayModule::new()).unwrap();
+        Arc::new(builder.build().unwrap())
+    }
 
     pub struct TempKeyStore {
         private_key: tokio::sync::Mutex<tempfile::NamedTempFile>,
@@ -4394,11 +4270,6 @@ mod tests {
                 private_key: tokio::sync::Mutex::new(tempfile::NamedTempFile::new().unwrap()),
                 public_key: tokio::sync::Mutex::new(tempfile::NamedTempFile::new().unwrap()),
             }
-        }
-
-        pub async fn new_key(&self) {
-            let (sign_key, public_key_value) = generate_ed25519_key_pair();
-            self.save_key(sign_key, public_key_value).await.unwrap();
         }
     }
 
@@ -4445,7 +4316,7 @@ mod tests {
         let handler = GatewayCmdHandler::new(
             None,
             Arc::new(crate::config_loader::GatewayConfigParser::new(
-                cyfs_gateway_app_lib::build_default_gateway_server_registry().unwrap(),
+                test_composition(),
             )),
         );
 
@@ -4461,7 +4332,7 @@ mod tests {
         let handler = GatewayCmdHandler::new(
             None,
             Arc::new(crate::config_loader::GatewayConfigParser::new(
-                cyfs_gateway_app_lib::build_default_gateway_server_registry().unwrap(),
+                test_composition(),
             )),
         );
 
@@ -4480,7 +4351,7 @@ mod tests {
         let handler = GatewayCmdHandler::new(
             None,
             Arc::new(crate::config_loader::GatewayConfigParser::new(
-                cyfs_gateway_app_lib::build_default_gateway_server_registry().unwrap(),
+                test_composition(),
             )),
         );
 
@@ -5728,8 +5599,13 @@ mod tests {
         let user_name = "test_user".to_string();
         let password = "test_password".to_string();
         let store = TempKeyStore::new();
-        let manager =
-            LocalTokenManager::new(Some(user_name.clone()), Some(password.clone()), store).await;
+        let manager = LocalTokenManager::new(
+            Some(user_name.clone()),
+            Some(password.clone()),
+            "cyfs-gateway",
+            store,
+        )
+        .await;
         assert!(manager.is_ok());
         let manager = manager.unwrap();
 
@@ -5748,8 +5624,13 @@ mod tests {
         let user_name = "test_user".to_string();
         let password = "test_password".to_string();
         let store = TempKeyStore::new();
-        let manager =
-            LocalTokenManager::new(Some(user_name.clone()), Some(password.clone()), store).await;
+        let manager = LocalTokenManager::new(
+            Some(user_name.clone()),
+            Some(password.clone()),
+            "cyfs-gateway",
+            store,
+        )
+        .await;
         assert!(manager.is_ok());
         let manager = manager.unwrap();
 
@@ -5769,8 +5650,13 @@ mod tests {
         let user_name = "test_user".to_string();
         let password = "test_password".to_string();
         let store = TempKeyStore::new();
-        let manager =
-            LocalTokenManager::new(Some(user_name.clone()), Some(password.clone()), store).await;
+        let manager = LocalTokenManager::new(
+            Some(user_name.clone()),
+            Some(password.clone()),
+            "cyfs-gateway",
+            store,
+        )
+        .await;
         assert!(manager.is_ok());
         let manager = manager.unwrap();
 
@@ -5792,8 +5678,13 @@ mod tests {
         let user_name = "test_user".to_string();
         let password = "test_password".to_string();
         let store = TempKeyStore::new();
-        let manager =
-            LocalTokenManager::new(Some(user_name.clone()), Some(password.clone()), store).await;
+        let manager = LocalTokenManager::new(
+            Some(user_name.clone()),
+            Some(password.clone()),
+            "cyfs-gateway",
+            store,
+        )
+        .await;
         assert!(manager.is_ok());
         let manager = manager.unwrap();
 
@@ -5813,8 +5704,13 @@ mod tests {
         let user_name = "test_user".to_string();
         let password = "test_password".to_string();
         let store = TempKeyStore::new();
-        let manager =
-            LocalTokenManager::new(Some(user_name.clone()), Some(password.clone()), store).await;
+        let manager = LocalTokenManager::new(
+            Some(user_name.clone()),
+            Some(password.clone()),
+            "cyfs-gateway",
+            store,
+        )
+        .await;
         assert!(manager.is_ok());
         let manager = manager.unwrap();
 
@@ -5839,8 +5735,13 @@ mod tests {
         let user_name = "test_user".to_string();
         let password = "test_password".to_string();
         let store = TempKeyStore::new();
-        let manager =
-            LocalTokenManager::new(Some(user_name.clone()), Some(password.clone()), store).await;
+        let manager = LocalTokenManager::new(
+            Some(user_name.clone()),
+            Some(password.clone()),
+            "cyfs-gateway",
+            store,
+        )
+        .await;
         assert!(manager.is_ok());
         let manager = manager.unwrap();
 
