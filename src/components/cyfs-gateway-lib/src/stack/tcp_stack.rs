@@ -15,7 +15,7 @@ use crate::stack::limiter::Limiter;
 use crate::{
     ConnectionInfo, ConnectionManagerRef, DumpStream, GlobalCollectionManagerRef,
     HandleConnectionController, IoDumpStackConfig, JsExternalsManagerRef, LimiterManagerRef,
-    MutComposedSpeedStat, MutComposedSpeedStatRef, ProcessChainConfig, ProcessChainConfigs, Server,
+    MutComposedSpeedStat, MutComposedSpeedStatRef, ProcessChainConfig, ProcessChainConfigs,
     ServerManagerRef, StackConfig, StackContext, StackErrorCode, StackFactory, StackProtocol,
     StackRef, StatManagerRef, StreamInfo, TrustedUpstreamMatcher, TunnelManager,
     create_io_dump_stack_config, get_external_commands, get_stat_info, hyper_serve_http,
@@ -326,32 +326,29 @@ impl TcpConnectionHandler {
                             };
 
                             let server_name = list[1].as_str();
-                            if let Some(server) = servers.get_server(server_name) {
-                                match server {
-                                    Server::Http(server) => {
-                                        hyper_serve_http(stream, server, stream_info.clone())
-                                            .await
-                                            .map_err(into_stack_err!(
-                                                StackErrorCode::ServerError,
-                                                "server {server_name}"
-                                            ))?;
-                                    }
-                                    Server::Stream(server) => {
-                                        server
-                                            .serve_connection(stream, stream_info.clone())
-                                            .await
-                                            .map_err(into_stack_err!(
-                                                StackErrorCode::ServerError,
-                                                "server {server_name}"
-                                            ))?;
-                                    }
-                                    _ => {
-                                        return Err(stack_err!(
-                                            StackErrorCode::InvalidConfig,
-                                            "unsupported server type {server_name}"
-                                        ));
-                                    }
-                                }
+                            // Resolve by compatible trait instead of relying on
+                            // HashMap iteration order when one logical server
+                            // exposes more than one interface.
+                            if let Some(server) = servers.get_http_server(server_name) {
+                                hyper_serve_http(stream, server, stream_info.clone())
+                                    .await
+                                    .map_err(into_stack_err!(
+                                        StackErrorCode::ServerError,
+                                        "server {server_name}"
+                                    ))?;
+                            } else if let Some(server) = servers.get_stream_server(server_name) {
+                                server
+                                    .serve_connection(stream, stream_info.clone())
+                                    .await
+                                    .map_err(into_stack_err!(
+                                        StackErrorCode::ServerError,
+                                        "server {server_name}"
+                                    ))?;
+                            } else if !servers.get_all_servers_by_id(server_name).is_empty() {
+                                return Err(stack_err!(
+                                    StackErrorCode::InvalidConfig,
+                                    "unsupported server type {server_name}"
+                                ));
                             }
                         }
                         v => {

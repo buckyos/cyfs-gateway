@@ -4,6 +4,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::str::FromStr;
 
 use async_trait::async_trait;
+use buckyos_kit::AsyncStream;
 
 use hickory_proto::serialize::binary::{BinDecodable, BinDecoder, BinEncodable, BinEncoder};
 use hickory_server::authority::{
@@ -16,6 +17,7 @@ use hickory_server::ServerFuture;
 use log::trace;
 use log::{debug, error, info, warn};
 use rdata::{A, AAAA, CNAME, NS, PTR, SOA, TXT};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UdpSocket;
 
 use crate::cmd_resolve::{CmdResolve, DNS_AUTH_LOOPBACK_SUPPRESSED_MSG};
@@ -36,6 +38,9 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::time::timeout;
 use url::Url;
+
+const DNS_TCP_MAX_MESSAGE_SIZE: usize = u16::MAX as usize;
+const DNS_TCP_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 //TODO: dns_provider is realy a demo implementation, must refactor before  used in a offical server.
 fn nameinfo_to_rdata(record_type: &str, name_info: &NameInfo) -> Result<Vec<RData>> {
@@ -384,6 +389,14 @@ pub struct ProcessChainDnsServer {
 }
 
 impl ProcessChainDnsServer {
+    fn response_max_size(request: &Request) -> u16 {
+        if request.protocol() == Protocol::Udp {
+            request.max_payload()
+        } else {
+            u16::MAX
+        }
+    }
+
     async fn command_error_to_server_error(&self, value: &CollectionValue) -> Option<ServerError> {
         let CollectionValue::Map(map) = value else {
             return None;
@@ -469,20 +482,14 @@ impl ProcessChainDnsServer {
         let mut message = builder.build(header, records.iter(), &[], &[], &[]);
 
         let mut buffer = Vec::with_capacity(512);
-        let encode_result = {
+        {
             let mut encoder = BinEncoder::new(&mut buffer);
 
-            let max_size = if let Some(edns) = message.get_edns() {
-                edns.max_payload()
-            } else {
-                // No EDNS, use the recommended max from RFC6891.
-                hickory_proto::udp::MAX_RECEIVE_BUFFER_SIZE as u16
-            };
-            encoder.set_max_size(max_size);
+            encoder.set_max_size(Self::response_max_size(request));
 
             message.destructive_emit(&mut encoder)
         }
-        .map_err(into_server_err!(ServerErrorCode::EncodeError));
+        .map_err(into_server_err!(ServerErrorCode::EncodeError))?;
         Ok(buffer)
     }
 
@@ -506,12 +513,7 @@ impl ProcessChainDnsServer {
         {
             let mut encoder = BinEncoder::new(&mut buffer);
 
-            let max_size = if let Some(edns) = message.get_edns() {
-                edns.max_payload()
-            } else {
-                hickory_proto::udp::MAX_RECEIVE_BUFFER_SIZE as u16
-            };
-            encoder.set_max_size(max_size);
+            encoder.set_max_size(Self::response_max_size(request));
 
             message
                 .destructive_emit(&mut encoder)
@@ -611,7 +613,7 @@ impl ProcessChainDnsServer {
         let mut decoder = BinDecoder::new(probe_bytes.as_slice());
         let probe_message = MessageRequest::read(&mut decoder)
             .map_err(into_server_err!(ServerErrorCode::BadRequest))?;
-        let probe_request = Request::new(probe_message, request.src(), Protocol::Udp);
+        let probe_request = Request::new(probe_message, request.src(), request.protocol());
 
         match self.handle_request(&probe_request, dst_addr).await {
             Ok(_) => Ok(true),
@@ -679,8 +681,11 @@ impl ProcessChainDnsServer {
         )
         .await
         .map_err(|e| server_err!(ServerErrorCode::ProcessChainError, "{e}"))?;
+        map.insert("source_addr", CollectionValue::String(from_ip.to_string()))
+            .await
+            .map_err(|e| server_err!(ServerErrorCode::ProcessChainError, "{e}"))?;
         map.insert(
-            "source_addr",
+            "source_ip",
             CollectionValue::String(from_ip.ip().to_string()),
         )
         .await
@@ -814,6 +819,7 @@ impl ProcessChainDnsServer {
         message_bytes: &[u8],
         src_addr: Option<String>,
         dst_addr: Option<String>,
+        protocol: Protocol,
     ) -> ServerResult<Vec<u8>> {
         let mut decoder = BinDecoder::new(message_bytes);
 
@@ -829,7 +835,7 @@ impl ProcessChainDnsServer {
                     SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
                 };
 
-                let request = Request::new(message, addr, Protocol::Udp);
+                let request = Request::new(message, addr, protocol);
                 let request_info = request
                     .request_info()
                     .map_err(into_server_err!(ServerErrorCode::BadRequest))?;
@@ -922,6 +928,11 @@ impl ProcessChainDnsServer {
 
                 let mut buffer = Vec::with_capacity(512);
                 let mut encoder = BinEncoder::new(&mut buffer);
+                encoder.set_max_size(if protocol == Protocol::Udp {
+                    512
+                } else {
+                    u16::MAX
+                });
                 message::emit_message_parts(
                     &header,
                     &mut CyfsQueriesEmitAndCount::new(),
@@ -944,9 +955,172 @@ impl ProcessChainDnsServer {
 #[async_trait::async_trait]
 impl cyfs_gateway_lib::server::DatagramServer for ProcessChainDnsServer {
     async fn serve_datagram(&self, buf: &[u8], info: DatagramInfo) -> ServerResult<Vec<u8>> {
-        let response = self.handle(buf, info.src_addr, info.dst_addr).await?;
+        let response = self
+            .handle(buf, info.src_addr, info.dst_addr, Protocol::Udp)
+            .await?;
 
         Ok(response)
+    }
+
+    fn id(&self) -> String {
+        self.id.clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl cyfs_gateway_lib::server::StreamServer for ProcessChainDnsServer {
+    async fn serve_connection(
+        &self,
+        mut stream: Box<dyn AsyncStream>,
+        info: StreamInfo,
+    ) -> ServerResult<()> {
+        let src_addr = info.src_addr.or(info.conn_src_addr);
+        let dst_addr = info.dst_addr;
+        let connection = format!(
+            "{} -> {}",
+            src_addr.as_deref().unwrap_or("unknown"),
+            dst_addr.as_deref().unwrap_or("unknown")
+        );
+
+        loop {
+            let mut length_bytes = [0u8; 2];
+            match timeout(DNS_TCP_IDLE_TIMEOUT, stream.read(&mut length_bytes[..1])).await {
+                Ok(Ok(0)) => {
+                    debug!("dns tcp connection closed cleanly: {}", connection);
+                    return Ok(());
+                }
+                Ok(Ok(_)) => {}
+                Ok(Err(err)) => {
+                    return Err(server_err!(
+                        ServerErrorCode::IOError,
+                        "read dns tcp frame length from {} failed: {}",
+                        connection,
+                        err
+                    ));
+                }
+                Err(_) => {
+                    debug!(
+                        "dns tcp connection idle for {:?}, closing: {}",
+                        DNS_TCP_IDLE_TIMEOUT, connection
+                    );
+                    return Ok(());
+                }
+            }
+
+            match timeout(
+                DNS_TCP_IDLE_TIMEOUT,
+                stream.read_exact(&mut length_bytes[1..]),
+            )
+            .await
+            {
+                Ok(Ok(_)) => {}
+                Ok(Err(err)) if err.kind() == std::io::ErrorKind::UnexpectedEof => {
+                    warn!("incomplete dns tcp frame length from {}", connection);
+                    return Ok(());
+                }
+                Ok(Err(err)) => {
+                    return Err(server_err!(
+                        ServerErrorCode::IOError,
+                        "read dns tcp frame length from {} failed: {}",
+                        connection,
+                        err
+                    ));
+                }
+                Err(_) => {
+                    warn!("dns tcp frame length timed out from {}", connection);
+                    return Ok(());
+                }
+            }
+
+            let message_len = u16::from_be_bytes(length_bytes) as usize;
+            if message_len == 0 {
+                warn!("rejecting zero-length dns tcp frame from {}", connection);
+                return Ok(());
+            }
+            if message_len > DNS_TCP_MAX_MESSAGE_SIZE {
+                warn!(
+                    "rejecting oversized dns tcp frame from {}: {} bytes",
+                    connection, message_len
+                );
+                return Ok(());
+            }
+
+            let mut message = vec![0u8; message_len];
+            match timeout(DNS_TCP_IDLE_TIMEOUT, stream.read_exact(&mut message)).await {
+                Ok(Ok(_)) => {}
+                Ok(Err(err)) if err.kind() == std::io::ErrorKind::UnexpectedEof => {
+                    warn!(
+                        "incomplete dns tcp frame from {}: expected {} bytes",
+                        connection, message_len
+                    );
+                    return Ok(());
+                }
+                Ok(Err(err)) => {
+                    return Err(server_err!(
+                        ServerErrorCode::IOError,
+                        "read dns tcp frame from {} failed: {}",
+                        connection,
+                        err
+                    ));
+                }
+                Err(_) => {
+                    warn!(
+                        "dns tcp frame body timed out from {}: expected {} bytes",
+                        connection, message_len
+                    );
+                    return Ok(());
+                }
+            }
+
+            let response = match self
+                .handle(
+                    message.as_slice(),
+                    src_addr.clone(),
+                    dst_addr.clone(),
+                    Protocol::Tcp,
+                )
+                .await
+            {
+                Ok(response) => response,
+                Err(err) => {
+                    warn!(
+                        "dns tcp request handling failed for {}: {}",
+                        connection, err
+                    );
+                    return Err(err);
+                }
+            };
+            let response_len = u16::try_from(response.len()).map_err(|_| {
+                server_err!(
+                    ServerErrorCode::EncodeError,
+                    "dns tcp response for {} exceeds {} bytes",
+                    connection,
+                    DNS_TCP_MAX_MESSAGE_SIZE
+                )
+            })?;
+
+            let write_result = timeout(DNS_TCP_IDLE_TIMEOUT, async {
+                stream.write_all(&response_len.to_be_bytes()).await?;
+                stream.write_all(response.as_slice()).await?;
+                stream.flush().await
+            })
+            .await;
+            match write_result {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => {
+                    return Err(server_err!(
+                        ServerErrorCode::IOError,
+                        "write dns tcp response to {} failed: {}",
+                        connection,
+                        err
+                    ));
+                }
+                Err(_) => {
+                    warn!("dns tcp response write timed out for {}", connection);
+                    return Ok(());
+                }
+            }
+        }
     }
 
     fn id(&self) -> String {
@@ -1023,17 +1197,22 @@ impl ServerFactory for ProcessChainDnsServerFactory {
                 "invalid dns server context"
             ))?;
 
-        let server = ProcessChainDnsServer::create_server(
-            config.id.clone(),
-            context.server_mgr.clone(),
-            Some(context.global_process_chains.clone()),
-            Some(context.global_collection_manager.clone()),
-            config.hook_point.clone(),
-            context.inner_record_manager.clone(),
-            Some(context.js_externals.clone()),
-        )
-        .await?;
-        Ok(vec![Server::Datagram(Arc::new(server))])
+        let server = Arc::new(
+            ProcessChainDnsServer::create_server(
+                config.id.clone(),
+                context.server_mgr.clone(),
+                Some(context.global_process_chains.clone()),
+                Some(context.global_collection_manager.clone()),
+                config.hook_point.clone(),
+                context.inner_record_manager.clone(),
+                Some(context.js_externals.clone()),
+            )
+            .await?,
+        );
+        Ok(vec![
+            Server::Datagram(server.clone()),
+            Server::Stream(server),
+        ])
     }
 }
 
@@ -1166,6 +1345,14 @@ hook_point:
         let factory = ProcessChainDnsServerFactory::new();
         let ret = factory.create(config, Some(Arc::new(context))).await;
         assert!(ret.is_ok());
+        let servers = ret.unwrap();
+        assert_eq!(servers.len(), 2);
+        assert!(servers
+            .iter()
+            .any(|server| matches!(server, Server::Datagram(_))));
+        assert!(servers
+            .iter()
+            .any(|server| matches!(server, Server::Stream(_))));
     }
 
     async fn create_authoritative_test_server() -> ProcessChainDnsServer {
