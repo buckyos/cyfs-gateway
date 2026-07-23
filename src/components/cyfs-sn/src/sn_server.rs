@@ -26,9 +26,9 @@ use crate::sn_did_resolver::{
 use crate::sn_dns_proof::{DnsTxtResolverRef, DohDnsTxtResolver, DEFAULT_PKX_DOH_URL};
 use crate::sn_resolver::{
     device_config_from_mini_jwt, BnsDocumentReader, ResolverCompatibilityReader,
-    ResolverDeviceDocument, ResolverDidDocument, SnAuthResolverReader, SnDeviceInfoResolverReader,
-    SnRelayManagerResolverReader, SnResolver, SnResolverConfig, SnResolverError,
-    SnResolverErrorKind, SnResolverRef, SnResolverResult,
+    ResolverDeviceDocument, ResolverDidDocument, SnAuthResolverReader, SnAuthoritativeDnsResult,
+    SnDeviceInfoResolverReader, SnRelayManagerResolverReader, SnResolver, SnResolverConfig,
+    SnResolverError, SnResolverErrorKind, SnResolverRef, SnResolverResult,
 };
 use crate::{
     GeoIpResolverConfig, RelayAllocationConfig, SnAuthDBRef, SnAuthDbClient,
@@ -45,14 +45,14 @@ use bns_client::{
     SqliteSnBnsWriteRequestStore,
 };
 use buckyos_kit::{get_buckyos_service_data_dir, is_valid_name, NameType};
+pub use cyfs_gateway_api::SnOodInfo as OODInfo;
+use cyfs_gateway_api::{SnCheckActiveCodeResp, SnOodState};
 use cyfs_gateway_lib::server_err;
 use cyfs_gateway_lib::{
-    get_gateway_main_config_dir, qa_json_to_rpc_request, HttpRequestProcessChainVars, HttpServer,
-    NameServer, QAServer, Server, ServerConfig, ServerContextRef, ServerError, ServerErrorCode,
-    ServerFactory, ServerResult, StreamInfo,
+    get_gateway_main_config_dir, qa_json_to_rpc_request, DnsQueryResult,
+    HttpRequestProcessChainVars, HttpServer, NameServer, QAServer, Server, ServerConfig,
+    ServerContextRef, ServerError, ServerErrorCode, ServerFactory, ServerResult, StreamInfo,
 };
-use cyfs_gateway_api::{SnCheckActiveCodeResp, SnOodState};
-pub use cyfs_gateway_api::SnOodInfo as OODInfo;
 use http::{Method, Response, StatusCode};
 use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full};
@@ -818,6 +818,11 @@ impl SNServer {
 
     pub fn remove_name_info_cache(&self, name: &str, record_type: RecordType) {
         self.name_info_cache.remove(name, record_type);
+        self.resolver.cache().remove_authoritative_name(name);
+    }
+
+    pub(crate) fn clear_authoritative_dns_cache(&self) {
+        self.resolver.cache().clear();
     }
 
     fn bns_username_for_dns_query(&self, name: &str) -> Option<String> {
@@ -898,6 +903,7 @@ impl SNServer {
     /// 旧投影，会把正常的秒级追赶窗口放大为 60 秒。因此对应 BNS name 在
     /// 一个最小缓存 TTL 内绕过缓存，只读取权威投影。
     pub(crate) fn invalidate_bns_name_dns_cache(&self, username: &str) {
+        self.resolver.cache().clear();
         let username = Self::normalize_query_name(username);
         let now = Instant::now();
         let mut states = self
@@ -1667,6 +1673,42 @@ impl QAServer for SNServer {
 impl NameServer for SNServer {
     fn id(&self) -> String {
         self.id.clone()
+    }
+
+    async fn query_dns(
+        &self,
+        name: &str,
+        record_type: &str,
+        _from_ip: Option<IpAddr>,
+    ) -> ServerResult<DnsQueryResult> {
+        match self
+            .resolver
+            .resolve_authoritative_dns_cached(name, record_type)
+            .await
+            .map_err(|error| error.to_server_error())?
+        {
+            SnAuthoritativeDnsResult::NotManaged => Err(server_err!(
+                ServerErrorCode::NotFound,
+                "{} is not in an authoritative SN zone",
+                name
+            )),
+            SnAuthoritativeDnsResult::AuthoritativeAnswer {
+                authority,
+                resolution,
+            } => Ok(DnsQueryResult::Answer {
+                name_info: resolution.into_name_info(name),
+                authority: Some(authority),
+            }),
+            SnAuthoritativeDnsResult::AuthoritativeNoData { authority } => {
+                Ok(DnsQueryResult::AuthoritativeNoData { authority })
+            }
+            SnAuthoritativeDnsResult::AuthoritativeNxDomain { authority } => {
+                Ok(DnsQueryResult::AuthoritativeNxDomain { authority })
+            }
+            SnAuthoritativeDnsResult::TemporaryFailure { cause } => {
+                Ok(DnsQueryResult::TemporaryFailure { cause })
+            }
+        }
     }
 
     async fn query(
