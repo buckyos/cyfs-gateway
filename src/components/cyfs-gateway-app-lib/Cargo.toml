@@ -9,24 +9,31 @@ async-recursion = "*"
 async-trait.workspace = true
 buckyos-kit.workspace = true
 bytes.workspace = true
+chrono.workspace = true
+clap.workspace = true
+console-subscriber = "*"
 cyfs-acme = { path = "../cyfs-acme" }
-cyfs-dns = { path = "../cyfs-dns" }
 cyfs-gateway-lib = { path = "../cyfs-gateway-lib" }
 cyfs-process-chain = { path = "../cyfs-process-chain" }
-cyfs-socks = { path = "../cyfs-socks" }
-cyfs-tun = { path = "../cyfs-tun" }
 hex.workspace = true
 http.workspace = true
 http-body-util.workspace = true
 httpdate = "1.0"
+jsonwebtoken.workspace = true
+kRPC.workspace = true
 log.workspace = true
+name-client.workspace = true
+name-lib.workspace = true
+rand.workspace = true
 reqwest = { version = "0.12.28", default-features = false, features = ["json", "rustls-tls-native-roots"] }
 serde.workspace = true
 serde_json.workspace = true
 serde_yaml_ng.workspace = true
 sha2.workspace = true
+sfo-js = { version = "0.1.8" }
 tokio.workspace = true
 toml.workspace = true
+thiserror.workspace = true
 url.workspace = true
 
 [dev-dependencies]

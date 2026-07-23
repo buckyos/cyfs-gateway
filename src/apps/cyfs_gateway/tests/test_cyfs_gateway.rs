@@ -1,13 +1,19 @@
 #[cfg(test)]
 mod tests {
     use async_compression::tokio::bufread::GzipDecoder;
+    use bns_client::{BnsClientError, BnsRpcEnvelope, BnsSystemInfo, METHOD_SYSTEM_INFO};
     use buckyos_kit::init_logging;
     use bytes::Bytes;
     use cyfs_gateway::{
         gateway_service_main, read_login_token, GatewayControlClient, GatewayParams, CONTROL_SERVER,
     };
+    use cyfs_gateway_lib::{
+        hyper_serve_http, serve_http_by_rpc_handler, HttpServer, ServerError, ServerResult,
+        StreamInfo,
+    };
     use hickory_resolver::config::{NameServerConfig, Protocol, ResolverConfig, ResolverOpts};
     use hickory_resolver::TokioAsyncResolver;
+    use http_body_util::combinators::BoxBody;
     use http_body_util::BodyExt;
     use http_body_util::Full;
     use hyper_util::rt::TokioIo;
@@ -17,6 +23,7 @@ mod tests {
     use std::net::{IpAddr, SocketAddr};
     use std::path::Path;
     use std::str::FromStr;
+    use std::sync::Arc;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
 
@@ -175,6 +182,79 @@ mod tests {
         port
     }
 
+    struct MockBnsReadinessServer;
+
+    #[async_trait::async_trait]
+    impl kRPC::RPCHandler for MockBnsReadinessServer {
+        async fn handle_rpc_call(
+            &self,
+            req: kRPC::RPCRequest,
+            _ip_from: IpAddr,
+        ) -> std::result::Result<kRPC::RPCResponse, kRPC::RPCErrors> {
+            let value = if req.method == METHOD_SYSTEM_INFO {
+                serde_json::to_value(BnsRpcEnvelope::success(BnsSystemInfo {
+                    ready: true,
+                    chain_id: 31_337,
+                    contract_address: "0x2222222222222222222222222222222222222222".to_string(),
+                }))
+                .unwrap()
+            } else {
+                serde_json::to_value(BnsRpcEnvelope::<serde_json::Value>::failure(
+                    BnsClientError::unsupported("mock only supports system.info"),
+                ))
+                .unwrap()
+            };
+            Ok(kRPC::RPCResponse::create_by_req(
+                kRPC::RPCResult::Success(value),
+                &req,
+            ))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl HttpServer for MockBnsReadinessServer {
+        async fn serve_request(
+            &self,
+            req: http::Request<BoxBody<Bytes, ServerError>>,
+            info: StreamInfo,
+        ) -> ServerResult<http::Response<BoxBody<Bytes, ServerError>>> {
+            serve_http_by_rpc_handler(req, info, self).await
+        }
+
+        fn id(&self) -> String {
+            "mock-bns-readiness".to_string()
+        }
+
+        fn http_version(&self) -> http::Version {
+            http::Version::HTTP_11
+        }
+
+        fn http3_port(&self) -> Option<u16> {
+            None
+        }
+    }
+
+    async fn start_mock_bns_server() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server: Arc<dyn HttpServer> = Arc::new(MockBnsReadinessServer);
+        tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                let server = server.clone();
+                tokio::spawn(async move {
+                    let _ = hyper_serve_http(
+                        Box::new(stream),
+                        server,
+                        StreamInfo::new(addr.to_string()),
+                    )
+                    .await;
+                });
+            }
+        });
+        format!("http://{}", addr)
+    }
+
     async fn read_socks_addr(stream: &mut TcpStream, atyp: u8) -> Result<(), std::io::Error> {
         match atyp {
             SOCKS_ADDR_IPV4 => {
@@ -299,6 +379,7 @@ mod tests {
         let upstream_socks_stack_port = allocate_free_port().await;
         let control_server_port = allocate_free_port().await;
         let control_server = format!("http://127.0.0.1:{control_server_port}");
+        let bns_server_url = start_mock_bns_server().await;
 
         let config = include_str!("test_cyfs_gateway.yaml");
         let local_dns = include_str!("local_dns.toml");
@@ -338,6 +419,7 @@ function test_js_hook(context, host) {
 
         let db = tempfile::NamedTempFile::with_suffix(".db").unwrap();
         let config = config.replace("{{sn_db}}", db.path().to_str().unwrap());
+        let config = config.replace("{{bns_server_url}}", bns_server_url.as_str());
 
         let io_dump = tempfile::NamedTempFile::with_suffix(".dump").unwrap();
         let config = config.replace("{{test_io_dump}}", io_dump.path().to_str().unwrap());

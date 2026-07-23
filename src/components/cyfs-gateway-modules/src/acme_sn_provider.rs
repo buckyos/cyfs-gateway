@@ -1,19 +1,19 @@
 use anyhow::anyhow;
-use cyfs_acme::{
-    AcmeCertManager, AcmeCertManagerRef, DnsProvider, DnsProviderFactory, DnsProviderRef,
-};
-use cyfs_gateway_lib::{RtcpStackConfig, StackProtocol};
+use cyfs_acme::{AcmeCertManager, DnsProvider, DnsProviderFactory, DnsProviderRef};
+use cyfs_gateway_api::generate_sn_device_token;
 use cyfs_sn::OODInfo;
-use kRPC::RPCSessionToken;
 use name_lib::{
     encode_ed25519_pkcs8_sk_to_pk, get_x_from_jwk, load_raw_private_key, DeviceDocument, DID,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::collections::HashMap;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, Weak};
+
+const SN_DNS_CHALLENGE_TTL_SECS: u32 = 60;
+const SN_DNS_PROPAGATION_DELAY: std::time::Duration =
+    std::time::Duration::from_secs(SN_DNS_CHALLENGE_TTL_SECS as u64 + 5);
 
 pub struct AcmeSnProviderFactory {
     data_path: PathBuf,
@@ -99,7 +99,34 @@ impl DnsProviderFactory for AcmeSnProviderFactory {
             }
             device_config
         } else {
-            DeviceDocument::new("cyfs_gateway", public_key)
+            return Err(anyhow!(
+                "device_config_path is required for unattended SN authentication"
+            ));
+        };
+        tokio::fs::create_dir_all(&self.data_path)
+            .await
+            .map_err(|e| anyhow!("create SN ACME state directory failed: {}", e))?;
+        let device_key_did = DID::new("dev", public_key.as_str());
+        let device_scoped_did = match device_config.id.method.as_str() {
+            "web" | "bns" => device_config.id.clone(),
+            "dev" => {
+                let zone = device_config
+                    .zone_did
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("device config with did:dev id is missing zone_did"))?;
+                if !matches!(zone.method.as_str(), "web" | "bns") || device_config.name.is_empty() {
+                    return Err(anyhow!(
+                        "cannot derive zone-scoped device DID from zone_did {:?} and name {:?}",
+                        zone,
+                        device_config.name
+                    ));
+                }
+                DID::new(
+                    zone.method.as_str(),
+                    format!("{}.{}", device_config.name, zone.id).as_str(),
+                )
+            }
+            method => return Err(anyhow!("unsupported device DID method {}", method)),
         };
         let private_key = jsonwebtoken::EncodingKey::from_ed_der(private_key.as_slice());
 
@@ -108,10 +135,14 @@ impl DnsProviderFactory for AcmeSnProviderFactory {
             acme_mgr,
             normalize_sn_rpc_url(config.sn.as_str()),
             private_key,
-            device_config.id,
-            device_config.name,
+            device_key_did,
+            device_scoped_did,
             config.access_token,
         ))
+    }
+
+    fn propagation_delay(&self) -> std::time::Duration {
+        SN_DNS_PROPAGATION_DELAY
     }
 }
 
@@ -128,7 +159,7 @@ struct AcmeSnProvider {
     sn: String,
     private_key: jsonwebtoken::EncodingKey,
     did: DID,
-    user_name: String,
+    device_scoped_did: DID,
     access_token: Option<String>,
     cert_state_cache: Mutex<Vec<CertStateItem>>,
     handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -149,7 +180,7 @@ impl AcmeSnProvider {
         sn: String,
         private_key: jsonwebtoken::EncodingKey,
         did: DID,
-        user_name: String,
+        device_scoped_did: DID,
         access_token: Option<String>,
     ) -> Arc<AcmeSnProvider> {
         let this = Arc::new(AcmeSnProvider {
@@ -158,7 +189,7 @@ impl AcmeSnProvider {
             sn,
             private_key,
             did,
-            user_name,
+            device_scoped_did,
             access_token,
             cert_state_cache: Mutex::new(Default::default()),
             handle: Mutex::new(None),
@@ -245,14 +276,13 @@ impl AcmeSnProvider {
         let token = if let Some(access_token) = self.access_token.clone() {
             access_token
         } else {
-            let (token, _) = RPCSessionToken::generate_jwt_token(
-                self.user_name.as_str(),
-                "cyfs_gateway",
+            generate_sn_device_token(
+                self.did.to_string().as_str(),
+                self.device_scoped_did.to_string().as_str(),
                 None,
                 &self.private_key,
             )
-            .map_err(|_| anyhow!("generate jwt token failed"))?;
-            token
+            .map_err(|e| anyhow!("generate SN device token failed: {}", e))?
         };
         let url = format!(
             "{}/{}",
@@ -324,7 +354,7 @@ impl DnsProvider for AcmeSnProvider {
                     "domain": domain,
                     "record_type": "TXT",
                     "record": key_hash,
-                    "ttl": 600
+                    "ttl": SN_DNS_CHALLENGE_TTL_SECS
                 }),
             )
             .await
@@ -353,11 +383,12 @@ impl DnsProvider for AcmeSnProvider {
                     "device_did": self.did.to_string(),
                     "domain": domain,
                     "record_type": "TXT",
+                    "record": key_hash,
                     "has_cert": has_cert,
                 }),
             )
             .await
-            .map_err(|e| anyhow!("add_dns_record failed.{:?}", e))?;
+            .map_err(|e| anyhow!("remove_dns_record failed.{:?}", e))?;
 
             let deviceinfo_krpc = self.get_krpc_for_route("/kapi/sn/deviceinfo")?;
             let result = deviceinfo_krpc
@@ -377,5 +408,51 @@ impl DnsProvider for AcmeSnProvider {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cyfs_acme::CertManagerConfig;
+    use name_lib::generate_ed25519_key_pair;
+
+    #[tokio::test]
+    async fn web3_flat_device_files_create_real_provider() {
+        let temp = tempfile::tempdir().unwrap();
+        let key_path = temp.path().join("sn_private_key.pem");
+        let device_path = temp.path().join("sn_device_config.json");
+        let (private_key, public_jwk) = generate_ed25519_key_pair();
+        tokio::fs::write(&key_path, private_key).await.unwrap();
+
+        let mut device =
+            DeviceDocument::new_by_jwk("ood1", serde_json::from_value(public_jwk).unwrap());
+        device.id = DID::new("web", "ood1.example.com");
+        tokio::fs::write(&device_path, serde_json::to_vec_pretty(&device).unwrap())
+            .await
+            .unwrap();
+
+        let mut manager_config = CertManagerConfig::default();
+        manager_config.keystore_path = temp.path().join("certs").to_string_lossy().to_string();
+        let manager = AcmeCertManager::create(manager_config).await.unwrap();
+        let factory = AcmeSnProviderFactory::new(temp.path().join("sn_dns"));
+        tokio::fs::create_dir_all(temp.path().join("sn_dns"))
+            .await
+            .unwrap();
+        let provider = factory
+            .create(
+                Arc::downgrade(&manager),
+                json!({
+                    "sn": "http://127.0.0.1:18090/kapi/sn",
+                    "key_path": key_path,
+                    "device_config_path": device_path
+                }),
+            )
+            .await;
+        assert!(
+            provider.is_ok(),
+            "provider create failed: {:?}",
+            provider.err()
+        );
     }
 }

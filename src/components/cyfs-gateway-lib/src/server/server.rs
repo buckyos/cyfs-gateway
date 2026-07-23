@@ -1054,22 +1054,15 @@ impl ServerManager {
 
     /// 通过 id 和 trait_type 获取 server
     pub fn get_server_by_type(&self, id: &str, trait_type: &str) -> Option<Server> {
-        let key = if id.contains(".") {
-            id.to_string()
-        } else {
-            Server::build_key(id, trait_type)
-        };
-
-        let result = self.get_server_by_key(&key);
-        if result.is_none() {
-            return None;
-        }
-        let result = result.unwrap();
-        if result.trait_type() == trait_type {
-            return Some(result);
+        // Accept an explicitly typed full key, but do not treat every dotted
+        // server id (for example, a DNS name) as a full key.
+        if let Some(server) = self.get_server_by_key(id) {
+            if server.trait_type() == trait_type {
+                return Some(server);
+            }
         }
 
-        None
+        self.get_server_by_key(&Server::build_key(id, trait_type))
     }
 
     pub fn get_http_server(&self, id: &str) -> Option<Arc<dyn HttpServer>> {

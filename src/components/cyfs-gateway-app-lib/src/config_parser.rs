@@ -1,14 +1,11 @@
 use buckyos_kit::get_buckyos_service_data_dir;
 use cyfs_acme::{AcmeIdentityConfig, ChallengeType};
-use cyfs_dns::{DnsServerConfig, LocalDnsConfig};
 use cyfs_gateway_lib::{
-    AcmeHttpChallengeServerConfig, BlockConfig, CollectionConfig, ConfigErrorCode, ConfigResult,
-    CyfsDirServerConfig, DirServerConfig, ProcessChainConfig, ProcessChainConfigs,
+    config_err, AcmeHttpChallengeServerConfig, BlockConfig, CollectionConfig, ConfigErrorCode,
+    ConfigResult, CyfsDirServerConfig, DirServerConfig, ProcessChainConfig, ProcessChainConfigs,
     ProcessChainHttpServerConfig, QuicStackConfig, RtcpStackConfig, ServerConfig, StackConfig,
-    TcpStackConfig, TlsStackConfig, UdpStackConfig, config_err,
+    TcpStackConfig, TlsStackConfig, UdpStackConfig,
 };
-use cyfs_socks::SocksServerConfig;
-use cyfs_tun::TunStackConfig;
 use log::*;
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::HashMap;
@@ -131,7 +128,7 @@ fn hook_point_map_to_vector(hook_point: &serde_json::Value) -> ConfigResult<serd
     }
 }
 
-fn hook_point_value_map_to_vector_in_value(
+pub fn hook_point_value_map_to_vector_in_value(
     mut stack_config: serde_json::Value,
     key_name: &str,
 ) -> ConfigResult<serde_json::Value> {
@@ -143,7 +140,7 @@ fn hook_point_value_map_to_vector_in_value(
     Ok(stack_config)
 }
 
-fn hook_point_value_map_to_vector<D: for<'de> Deserializer<'de> + Clone>(
+pub fn hook_point_value_map_to_vector<D: for<'de> Deserializer<'de> + Clone>(
     de: D,
     key_name: &str,
 ) -> ConfigResult<serde_json::Value> {
@@ -162,6 +159,7 @@ fn hook_point_value_map_to_vector<D: for<'de> Deserializer<'de> + Clone>(
 
 pub fn parse_collections_from_raw_config(
     raw_config: &serde_json::Value,
+    service_data_namespace: &str,
 ) -> ConfigResult<Vec<CollectionConfig>> {
     let mut collections = Vec::new();
     let Some(collections_value) = raw_config.get("collections") else {
@@ -172,7 +170,7 @@ pub fn parse_collections_from_raw_config(
         return Ok(collections);
     };
 
-    let geo_ip_cache_path = get_buckyos_service_data_dir("cyfs_gateway")
+    let geo_ip_cache_path = get_buckyos_service_data_dir(service_data_namespace)
         .join("geo_ip")
         .to_string_lossy()
         .to_string();
@@ -371,33 +369,6 @@ impl<D: for<'de> Deserializer<'de> + Clone> StackConfigParser<D> for RtcpStackCo
     }
 }
 
-pub struct TunStackConfigParser {}
-
-impl TunStackConfigParser {
-    pub fn new() -> Self {
-        Self {}
-    }
-}
-
-impl<D: for<'de> Deserializer<'de> + Clone> StackConfigParser<D> for TunStackConfigParser {
-    fn parse(&self, de: D) -> ConfigResult<Arc<dyn StackConfig>> {
-        let tun_config =
-            TunStackConfig::deserialize(hook_point_value_map_to_vector(de.clone(), "hook_point")?)
-                .map_err(|e| {
-                    config_err!(
-                        ConfigErrorCode::InvalidConfig,
-                        "invalid tun stack config: {}\n{}",
-                        e,
-                        serde_json::to_string_pretty(
-                            &serde_json::Value::deserialize(de.clone()).unwrap()
-                        )
-                        .unwrap()
-                    )
-                })?;
-        Ok(Arc::new(tun_config))
-    }
-}
-
 pub trait ServerConfigParser<D: for<'de> Deserializer<'de>>: Send + Sync {
     fn parse(&self, de: D) -> ConfigResult<Arc<dyn ServerConfig>>;
 }
@@ -476,61 +447,6 @@ impl<D: for<'de> Deserializer<'de> + Clone> ServerConfigParser<D> for HttpServer
     }
 }
 
-pub struct DnsServerConfigParser {}
-
-impl DnsServerConfigParser {
-    pub fn new() -> Self {
-        Self {}
-    }
-}
-
-impl<D: for<'de> Deserializer<'de> + Clone> ServerConfigParser<D> for DnsServerConfigParser {
-    fn parse(&self, de: D) -> ConfigResult<Arc<dyn ServerConfig>> {
-        let config =
-            DnsServerConfig::deserialize(hook_point_value_map_to_vector(de.clone(), "hook_point")?)
-                .map_err(|e| {
-                    config_err!(
-                        ConfigErrorCode::InvalidConfig,
-                        "invalid dns server config.{:?}\n{}",
-                        e,
-                        serde_json::to_string_pretty(
-                            &serde_json::Value::deserialize(de.clone()).unwrap()
-                        )
-                        .unwrap()
-                    )
-                })?;
-        Ok(Arc::new(config))
-    }
-}
-
-pub struct SocksServerConfigParser {}
-
-impl SocksServerConfigParser {
-    pub fn new() -> Self {
-        Self {}
-    }
-}
-
-impl<D: for<'de> Deserializer<'de> + Clone> ServerConfigParser<D> for SocksServerConfigParser {
-    fn parse(&self, de: D) -> ConfigResult<Arc<dyn ServerConfig>> {
-        let config = SocksServerConfig::deserialize(hook_point_value_map_to_vector(
-            de.clone(),
-            "hook_point",
-        )?)
-        .map_err(|e| {
-            config_err!(
-                ConfigErrorCode::InvalidConfig,
-                "invalid socks server config.{}\n{}",
-                e,
-                serde_json::to_string_pretty(&serde_json::Value::deserialize(de.clone()).unwrap())
-                    .unwrap()
-            )
-        })?;
-
-        Ok(Arc::new(config))
-    }
-}
-
 pub struct CyfsDirServerConfigParser {}
 
 impl CyfsDirServerConfigParser {
@@ -571,29 +487,6 @@ impl<D: for<'de> Deserializer<'de> + Clone> ServerConfigParser<D> for DirServerC
             config_err!(
                 ConfigErrorCode::InvalidConfig,
                 "invalid dir server config.{}\n{}",
-                e,
-                serde_json::to_string_pretty(&serde_json::Value::deserialize(de.clone()).unwrap())
-                    .unwrap()
-            )
-        })?;
-        Ok(Arc::new(config))
-    }
-}
-
-pub struct LocalDnsConfigParser {}
-
-impl LocalDnsConfigParser {
-    pub fn new() -> Self {
-        Self {}
-    }
-}
-
-impl<D: for<'de> Deserializer<'de> + Clone> ServerConfigParser<D> for LocalDnsConfigParser {
-    fn parse(&self, de: D) -> ConfigResult<Arc<dyn ServerConfig>> {
-        let config = LocalDnsConfig::deserialize(de.clone()).map_err(|e| {
-            config_err!(
-                ConfigErrorCode::InvalidConfig,
-                "invalid local dns config.{:?}\n{}",
                 e,
                 serde_json::to_string_pretty(&serde_json::Value::deserialize(de.clone()).unwrap())
                     .unwrap()
@@ -958,17 +851,15 @@ mod tests {
 
     #[test]
     fn test_timer_config_timeout_zero() {
-        assert!(
-            parse_timers_from_raw_config(&json!({
-                "timers": {
-                    "t1": {
-                        "timeout": 0,
-                        "process-chain": "echo \"test\";"
-                    }
+        assert!(parse_timers_from_raw_config(&json!({
+            "timers": {
+                "t1": {
+                    "timeout": 0,
+                    "process-chain": "echo \"test\";"
                 }
-            }))
-            .is_err()
-        );
+            }
+        }))
+        .is_err());
     }
 
     #[test]

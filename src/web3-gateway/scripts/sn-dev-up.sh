@@ -181,7 +181,7 @@ if [ "$MODE" = "fresh" ]; then
     cp "$APP_DIR/$f" "$ROOTFS/$f"
   done
 
-  # alignBnsRuntimeParams 以 rootfs 里的 dv-env.json 为准写 bns_rpc_url 等。
+  # alignBnsRuntimeParams 以 rootfs 里的 dv-env.json 为准写 bns_server_url。
   cat > "$ROOTFS/dv-env.json" <<EOF
 {
   "rpc_endpoint": "$RPC",
@@ -208,9 +208,9 @@ echo "[sn-dev-up] building bns_dv + web3_gateway (cargo)"
 BNS_DV_BIN="$(cd "$SRC_DIR" && cargo build -p bns-server --bin bns_dv --message-format=json 2>/dev/null \
   | grep -o '"executable":"[^"]*bns_dv"' | tail -1 | sed 's/.*:"//;s/"$//')"
 [ -n "$BNS_DV_BIN" ] && [ -x "$BNS_DV_BIN" ] || { echo "failed to build bns_dv binary" >&2; exit 1; }
-GW_BIN="$(cd "$SRC_DIR" && cargo build -p cyfs_gateway --bin cyfs_gateway --message-format=json 2>/dev/null \
-  | grep -o '"executable":"[^"]*cyfs_gateway"' | tail -1 | sed 's/.*:"//;s/"$//')"
-[ -n "$GW_BIN" ] && [ -x "$GW_BIN" ] || { echo "failed to build cyfs_gateway (web3_gateway) binary" >&2; exit 1; }
+GW_BIN="$(cd "$SRC_DIR" && cargo build -p web3_gateway --bin web3_gateway --message-format=json 2>/dev/null \
+  | grep -o '"executable":"[^"]*web3_gateway"' | tail -1 | sed 's/.*:"//;s/"$//')"
+[ -n "$GW_BIN" ] && [ -x "$GW_BIN" ] || { echo "failed to build web3_gateway binary" >&2; exit 1; }
 
 # --- 7) bns_dv serve --seed-config（种子上链完成后才开 HTTP，健康门控即种子门控）---
 echo "[sn-dev-up] starting bns_dv serve on $BNS_SERVER_URL (with seed config)"

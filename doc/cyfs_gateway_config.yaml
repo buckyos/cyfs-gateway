@@ -211,15 +211,21 @@ servers:
   # sn_example:
   #   type: sn
   #   host: example.com
-  #   ip: 1.2.3.4
-  #   boot_jwt: "<jwt>"
-  #   owner_pkx: "<pkx>"
-  #   device_jwt:
-  #     - "<jwt>"
+  #   ip: 1.2.3.4              # 可选；自身解析/relay fallback 使用
+  #   boot_jwt: "<jwt>"        # 可选；仅用于 host/sn.<host>/aliases 的 BOOT TXT
+  #   owner_pkx: "<pkx>"       # 可选；仅用于 host/sn.<host>/aliases 的 PKX TXT
+  #   device_jwt:              # 可选；仅用于 host/sn.<host>/aliases 的 DEV TXT
+  #     - "<jwt>"              # 不需要自身 bootstrap 时三项全部省略
   #   aliases: []                 # 可选
-  #   db_type: sqlite             # 可选
-  #   db_params:
-  #     db_path: ./sn.db
+  #   bns_server_url: http://127.0.0.1:18080  # 必填；不带 /kapi/bns
+  #   bns_proxy:                  # 可选；存在即启用写能力
+  #     require_user_asset_owner: true
+  #     controllers:
+  #       - id: default
+  #         private_key_env: BNS_PRIVATE_KEY
+  #   auth_db: http://auth-provider:8080        # 可选；缺省使用本地 SQLite
+  #   device_info_db: http://device-provider:8080 # 可选；缺省使用本地 SQLite
+  #   db_path: ./sn.db
 
   # socks_example:
   #   type: socks

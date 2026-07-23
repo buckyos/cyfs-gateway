@@ -1051,6 +1051,10 @@ pub trait DnsProviderFactory: Send + Sync + 'static {
         acme_mgr: Weak<AcmeCertManager>,
         params: serde_json::Value,
     ) -> Result<DnsProviderRef>;
+
+    fn propagation_delay(&self) -> Duration {
+        Duration::ZERO
+    }
 }
 pub type DnsProviderFactoryRef = Arc<dyn DnsProviderFactory>;
 
@@ -1104,6 +1108,7 @@ pub struct AcmeCertManager {
     challenge_certs: Mutex<HashMap<String, Arc<sign::CertifiedKey>>>,
     http_challenges: Mutex<HashMap<String, String>>,
     dns_providers: RwLock<HashMap<String, DnsProviderRef>>,
+    dns_provider_propagation_delays: RwLock<HashMap<String, Duration>>,
 }
 
 pub type AcmeCertManagerRef = Arc<AcmeCertManager>;
@@ -1227,6 +1232,7 @@ impl AcmeCertManager {
         let acme_client = AcmeClient::new(account, config.acme_server.clone()).await?;
 
         let mut dns_providers = HashMap::<String, DnsProviderRef>::new();
+        let mut dns_provider_propagation_delays = HashMap::<String, Duration>::new();
         let manager = AcmeCertManagerRef::new(Self {
             config: config.clone(),
             acme_client,
@@ -1236,6 +1242,7 @@ impl AcmeCertManager {
             challenge_certs: Mutex::new(Default::default()),
             http_challenges: Mutex::new(Default::default()),
             dns_providers: RwLock::new(dns_providers.clone()),
+            dns_provider_propagation_delays: RwLock::new(dns_provider_propagation_delays.clone()),
         });
 
         if let Some(dns_providers_config) = &config.dns_providers {
@@ -1250,10 +1257,14 @@ impl AcmeCertManager {
             for (name, provider_config) in dns_providers_config.iter() {
                 let factory = { DNS_PROVIDER_FACTORYS.read().unwrap().get(name).cloned() };
                 if let Some(factory) = factory {
+                    let propagation_delay = factory.propagation_delay();
                     let provider = factory
                         .create(Arc::downgrade(&manager), provider_config.clone())
                         .await?;
                     dns_providers.insert(name.clone(), provider);
+                    if !propagation_delay.is_zero() {
+                        dns_provider_propagation_delays.insert(name.clone(), propagation_delay);
+                    }
                 } else {
                     if provider_manager.is_some() {
                         let provider = ExternalDnsProvider::new(
@@ -1268,6 +1279,11 @@ impl AcmeCertManager {
         }
         {
             manager.dns_providers.write().unwrap().extend(dns_providers);
+            manager
+                .dns_provider_propagation_delays
+                .write()
+                .unwrap()
+                .extend(dns_provider_propagation_delays);
         }
 
         {
@@ -1481,34 +1497,61 @@ impl AcmeCertManager {
         providers.get(provider_name).cloned()
     }
 
+    fn get_dns_provider_for_cert(&self, cert_stub: &CertStub) -> Result<DnsProviderRef> {
+        let provider_data = cert_stub
+            .inner
+            .acme_item
+            .data
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("dns challenge provider params is empty"))?;
+        let provider_info: DnsProviderInfo = serde_json::from_value(provider_data.clone())
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "parse plugin data {} failed: {}",
+                    serde_json::to_string(&provider_data).unwrap_or_default(),
+                    e
+                )
+            })?;
+
+        self.get_provider(provider_info.dns_provider.as_str())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "dns challenge provider {} not exists",
+                    provider_info.dns_provider
+                )
+            })
+    }
+
+    pub(crate) fn challenge_propagation_delay(&self, challenge: &Challenge) -> Duration {
+        if !matches!(&challenge.data, ChallengeData::Dns01 { .. }) {
+            return Duration::ZERO;
+        }
+
+        let cert_stub = {
+            let certs = self.certs.read().unwrap();
+            certs.get(challenge.domain.as_str()).cloned()
+        };
+        cert_stub
+            .as_ref()
+            .and_then(|stub| stub.inner.acme_item.data.clone())
+            .and_then(|data| serde_json::from_value::<DnsProviderInfo>(data).ok())
+            .and_then(|info| {
+                self.dns_provider_propagation_delays
+                    .read()
+                    .unwrap()
+                    .get(info.dns_provider.as_str())
+                    .copied()
+            })
+            .unwrap_or(Duration::ZERO)
+    }
+
     async fn call_dns_provider(
         &self,
         cert_stub: &CertStub,
         key_hash: &str,
         op: &str,
     ) -> Result<()> {
-        if cert_stub.inner.acme_item.data.is_none() {
-            return Err(anyhow::anyhow!("dns challenge provider params is empty"));
-        }
-
-        let provider_data = cert_stub.inner.acme_item.data.clone().unwrap();
-        let provider_info: DnsProviderInfo = serde_json::from_value(provider_data.clone())
-            .map_err(|e| {
-                anyhow::anyhow!(
-                    "parse plugin data {} failed: {}",
-                    serde_json::to_string(&provider_data).unwrap_or("".to_string()),
-                    e
-                )
-            })?;
-
-        let provider = self.get_provider(provider_info.dns_provider.as_str());
-        if provider.is_none() {
-            return Err(anyhow::anyhow!(
-                "dns challenge provider {} not exists",
-                provider_info.dns_provider
-            ));
-        }
-        let provider = provider.unwrap().clone();
+        let provider = self.get_dns_provider_for_cert(cert_stub)?;
 
         let domain = if cert_stub.inner.acme_item.domain.starts_with("*.") {
             format!("_acme-challenge{}", &cert_stub.inner.acme_item.domain[1..])

@@ -1,68 +1,34 @@
-pub use cyfs_gateway_app_lib::*;
-
 use std::sync::Arc;
+
+use crate::*;
 
 use cyfs_gateway_lib::{
     config_err, CollectionConfig, ConfigErrorCode, ConfigResult, ProcessChainConfig,
     ProcessChainConfigs, ServerConfig, StackConfig,
 };
-use cyfs_sn::SNServerConfig;
-use cyfs_traffic::TrafficConfig;
 use log::*;
-use serde::{Deserialize, Deserializer};
-
-pub struct SNServerConfigParser {}
-
-impl SNServerConfigParser {
-    pub fn new() -> Self {
-        Self {}
-    }
-}
-
-impl<D: for<'de> Deserializer<'de> + Clone> ServerConfigParser<D> for SNServerConfigParser {
-    fn parse(&self, de: D) -> ConfigResult<Arc<dyn ServerConfig>> {
-        let config = SNServerConfig::deserialize(de.clone()).map_err(|e| {
-            config_err!(
-                ConfigErrorCode::InvalidConfig,
-                "invalid sn server config.{:?}\n{}",
-                e,
-                serde_json::to_string_pretty(&serde_json::Value::deserialize(de.clone()).unwrap())
-                    .unwrap()
-            )
-        })?;
-        Ok(Arc::new(config))
-    }
-}
 
 pub struct GatewayConfigParser {
-    stack_config_parser: CyfsStackConfigParser<serde_json::Value>,
-    server_config_parser: CyfsServerConfigParser<serde_json::Value>,
+    composition: Arc<GatewayComposition>,
 }
 
 pub type GatewayConfigParserRef = Arc<GatewayConfigParser>;
 
 impl GatewayConfigParser {
-    pub fn new() -> Self {
-        Self {
-            stack_config_parser: CyfsStackConfigParser::new(),
-            server_config_parser: CyfsServerConfigParser::new(),
-        }
+    pub fn new(composition: Arc<GatewayComposition>) -> Self {
+        Self { composition }
     }
 
-    pub fn register_stack_config_parser(
-        &self,
-        protocol: &str,
-        parser: Arc<dyn StackConfigParser<serde_json::Value>>,
-    ) {
-        self.stack_config_parser.register(protocol, parser);
+    pub fn server_registry(&self) -> &Arc<GatewayServerRegistry> {
+        self.composition.server_registry()
     }
 
-    pub fn register_server_config_parser(
-        &self,
-        server_type: &str,
-        parser: Arc<dyn ServerConfigParser<serde_json::Value>>,
-    ) {
-        self.server_config_parser.register(server_type, parser);
+    pub fn stack_registry(&self) -> &Arc<GatewayStackRegistry> {
+        self.composition.stack_registry()
+    }
+
+    pub fn composition(&self) -> &Arc<GatewayComposition> {
+        &self.composition
     }
 
     pub fn parse(&self, json_value: serde_json::Value) -> ConfigResult<GatewayConfig> {
@@ -102,7 +68,11 @@ impl GatewayConfigParser {
                 stack_value["id"] = serde_json::Value::String(id.clone());
                 stack_value =
                     apply_gateway_identity_manager_to_stack(stack_value, identity_manager.as_ref());
-                stacks.push(self.stack_config_parser.parse(stack_value)?);
+                stacks.push(
+                    self.composition
+                        .stack_registry()
+                        .parse_stack_config(stack_value)?,
+                );
             }
         }
 
@@ -124,7 +94,11 @@ impl GatewayConfigParser {
             for (id, server_value) in servers_value_list.unwrap() {
                 let mut server_value = server_value.clone();
                 server_value["id"] = serde_json::Value::String(id.clone());
-                servers.push(self.server_config_parser.parse(server_value)?);
+                servers.push(
+                    self.composition
+                        .server_registry()
+                        .parse_server_config(server_value)?,
+                );
             }
         }
 
@@ -164,7 +138,10 @@ impl GatewayConfigParser {
         };
 
         let limiters_config = parse_limiters_from_raw_config(&json_value)?;
-        let collections = parse_collections_from_raw_config(&json_value)?;
+        let collections = parse_collections_from_raw_config(
+            &json_value,
+            self.composition.profile().service_data_namespace,
+        )?;
         let timers = parse_timers_from_raw_config(&json_value)?;
         let device_manager = json_value
             .get("device_manager")
@@ -181,21 +158,20 @@ impl GatewayConfigParser {
             })
             .transpose()?
             .unwrap_or_default();
-        let traffic = json_value
-            .get("traffic")
-            .map(|value| {
-                serde_json::from_value::<TrafficConfig>(value.clone()).map_err(|e| {
-                    config_err!(
-                        ConfigErrorCode::InvalidConfig,
-                        "invalid traffic config: {:?}\n{}",
-                        e,
-                        serde_json::to_string_pretty(value)
-                            .unwrap_or_else(|_| "<invalid json>".to_string())
-                    )
-                })
-            })
-            .transpose()?
-            .unwrap_or_default();
+        let traffic = match (
+            json_value.get("traffic"),
+            self.composition.traffic_adapter(),
+        ) {
+            (value, Some(adapter)) => Some(adapter.parse_config(value)?),
+            (Some(_), None) => {
+                return Err(config_err!(
+                    ConfigErrorCode::InvalidConfig,
+                    "config section 'traffic' requires an installed traffic module; installed modules: [{}]",
+                    self.composition.manifest().modules.join(", ")
+                ));
+            }
+            (None, None) => None,
+        };
 
         Ok(GatewayConfig {
             raw_config,
@@ -301,5 +277,5 @@ pub struct GatewayConfig {
     pub collections: Vec<CollectionConfig>,
     pub timers: Vec<TimerConfig>,
     pub device_manager: DeviceManagerConfig,
-    pub traffic: TrafficConfig,
+    pub traffic: Option<GatewayTrafficConfigRef>,
 }

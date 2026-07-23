@@ -117,7 +117,8 @@ description: 用于独立讲解、审查、设计和排查 cyfs-gateway 配置�
 - 如果用户要求“完整支持列表”，必须指出：
   当前 `cyfs_gateway` 注册的 stack 协议是 `tcp`、`udp`、`tls`、`quic`、`rtcp`、`tun`
   当前注册的 server 类型是 `http`、`socks`、`dns`、`dir`、`control_server`、`local_dns`、`sn`、`acme_response`
-- 如果提到 `ndn`，必须注明：库里存在 `NdnServerConfig`，但当前 `src/apps/cyfs_gateway/src/lib.rs` 没有注册对应 parser/factory，不能当成当前应用支持项。
+- 如果提到 `ndn`，必须注明：旧版 `NdnServerConfig` 已移除，当前应用不支持该类型；
+  `cyfs://` 语义由已注册的 `cyfs-dir` 提供。
 - 如果用户要“独立规范文档”或“可复制的 skill”，只使用本 skill 自带 references 中的内容组织答案，不再要求回到仓库核对。
 - 如果用户要求“配置规范 + process chain 规则”，需要同时覆盖配置承载结构和 DSL 执行规则，而不是只给 YAML 结构。
 - 如果用户要求“完整命令列表”“某条命令怎么写”“某个 collection 命令的精确行为”，优先按 `process-chain-command-manual.md` 回答，并使用文档中的 canonical 命令名。

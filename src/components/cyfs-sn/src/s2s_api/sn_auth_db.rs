@@ -4,7 +4,8 @@ use crate::{
 };
 use ::kRPC::{kRPC, RPCErrors, RPCHandler, RPCRequest, RPCResponse, RPCResult};
 use async_trait::async_trait;
-use serde::{Deserialize, Serialize};
+use serde::de::{DeserializeOwned, Error as DeError};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -34,6 +35,10 @@ pub const METHOD_GET_AUTH: &str = "sn_auth_db.get_auth";
 pub const METHOD_UPDATE_LAST_LOGIN: &str = "sn_auth_db.update_last_login";
 pub const METHOD_ACTIVATE_USER_DOMAIN_BINDING: &str = "sn_auth_db.activate_user_domain_binding";
 pub const METHOD_UNBIND_USER_DOMAIN: &str = "sn_auth_db.unbind_user_domain";
+pub const METHOD_ADD_USER_DNS_RECORD: &str = "sn_auth_db.add_user_dns_record";
+pub const METHOD_REMOVE_USER_DNS_RECORD: &str = "sn_auth_db.remove_user_dns_record";
+pub const METHOD_QUERY_USER_DNS_RECORD: &str = "sn_auth_db.query_user_dns_record";
+pub const METHOD_LIST_USER_DNS_RECORDS: &str = "sn_auth_db.list_user_dns_records";
 pub const METHOD_GET_ZONE_INFO: &str = "sn_auth_db.get_zone_info";
 pub const METHOD_UPDATE_ZONE_INFO: &str = "sn_auth_db.update_zone_info";
 pub const METHOD_UPDATE_ZONE_RELAY_SN: &str = "sn_auth_db.update_zone_relay_sn";
@@ -61,11 +66,52 @@ impl SnAuthDbRpcErrorInfo {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct SnAuthDbRpcEnvelope<T> {
     pub ok: bool,
     pub result: Option<T>,
     pub error: Option<SnAuthDbRpcErrorInfo>,
+}
+
+#[derive(Deserialize)]
+struct SnAuthDbRpcEnvelopeWire {
+    ok: bool,
+    #[serde(default, deserialize_with = "deserialize_present_json_value")]
+    result: Option<Value>,
+    error: Option<SnAuthDbRpcErrorInfo>,
+}
+
+fn deserialize_present_json_value<'de, D>(deserializer: D) -> Result<Option<Value>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Value::deserialize(deserializer).map(Some)
+}
+
+impl<'de, T> Deserialize<'de> for SnAuthDbRpcEnvelope<T>
+where
+    T: DeserializeOwned,
+{
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = SnAuthDbRpcEnvelopeWire::deserialize(deserializer)?;
+        let result = if wire.ok {
+            wire.result
+                .map(serde_json::from_value)
+                .transpose()
+                .map_err(DeError::custom)?
+        } else {
+            None
+        };
+
+        Ok(Self {
+            ok: wire.ok,
+            result,
+            error: wire.error,
+        })
+    }
 }
 
 impl<T> SnAuthDbRpcEnvelope<T> {
@@ -475,6 +521,67 @@ impl SnAuthDbUnbindUserDomainReq {
     }
 
     impl_req_from_json!(SnAuthDbUnbindUserDomainReq);
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SnAuthDbAddUserDnsRecordReq {
+    pub username: String,
+    pub domain: String,
+    pub record_type: String,
+    pub record: String,
+    pub ttl: u32,
+}
+
+impl SnAuthDbAddUserDnsRecordReq {
+    pub fn new(username: &str, domain: &str, record_type: &str, record: &str, ttl: u32) -> Self {
+        Self {
+            username: username.to_string(),
+            domain: domain.to_string(),
+            record_type: record_type.to_string(),
+            record: record.to_string(),
+            ttl,
+        }
+    }
+
+    impl_req_from_json!(SnAuthDbAddUserDnsRecordReq);
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SnAuthDbRemoveUserDnsRecordReq {
+    pub username: String,
+    pub domain: String,
+    pub record_type: String,
+    pub record: Option<String>,
+}
+
+impl SnAuthDbRemoveUserDnsRecordReq {
+    pub fn new(username: &str, domain: &str, record_type: &str, record: Option<&str>) -> Self {
+        Self {
+            username: username.to_string(),
+            domain: domain.to_string(),
+            record_type: record_type.to_string(),
+            record: record.map(ToString::to_string),
+        }
+    }
+
+    impl_req_from_json!(SnAuthDbRemoveUserDnsRecordReq);
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SnAuthDbQueryUserDnsRecordReq {
+    pub domain: String,
+    pub record_type: String,
+}
+
+impl SnAuthDbQueryUserDnsRecordReq {
+    pub fn new(domain: &str, record_type: &str) -> Self {
+        Self {
+            domain: domain.to_string(),
+            record_type: record_type.to_string(),
+        }
+    }
+
+    impl_req_from_json!(SnAuthDbQueryUserDnsRecordReq);
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1024,6 +1131,86 @@ impl SnAuthDB for SnAuthDbClient {
         }
     }
 
+    async fn add_user_dns_record(
+        &self,
+        username: &str,
+        domain: &str,
+        record_type: &str,
+        record: &str,
+        ttl: u32,
+    ) -> SnResult<()> {
+        match self {
+            Self::InProcess(handler) => {
+                handler
+                    .add_user_dns_record(username, domain, record_type, record, ttl)
+                    .await
+            }
+            Self::KRPC(_) => {
+                self.call(
+                    METHOD_ADD_USER_DNS_RECORD,
+                    &SnAuthDbAddUserDnsRecordReq::new(username, domain, record_type, record, ttl),
+                )
+                .await
+            }
+        }
+    }
+
+    async fn remove_user_dns_record(
+        &self,
+        username: &str,
+        domain: &str,
+        record_type: &str,
+        record: Option<&str>,
+    ) -> SnResult<()> {
+        match self {
+            Self::InProcess(handler) => {
+                handler
+                    .remove_user_dns_record(username, domain, record_type, record)
+                    .await
+            }
+            Self::KRPC(_) => {
+                self.call(
+                    METHOD_REMOVE_USER_DNS_RECORD,
+                    &SnAuthDbRemoveUserDnsRecordReq::new(username, domain, record_type, record),
+                )
+                .await
+            }
+        }
+    }
+
+    async fn query_user_dns_record(
+        &self,
+        domain: &str,
+        record_type: &str,
+    ) -> SnResult<Option<(String, u32)>> {
+        match self {
+            Self::InProcess(handler) => handler.query_user_dns_record(domain, record_type).await,
+            Self::KRPC(_) => {
+                self.call(
+                    METHOD_QUERY_USER_DNS_RECORD,
+                    &SnAuthDbQueryUserDnsRecordReq::new(domain, record_type),
+                )
+                .await
+            }
+        }
+    }
+
+    async fn list_user_dns_records(
+        &self,
+        username: &str,
+    ) -> SnResult<Vec<(String, String, String, u32)>> {
+        match self {
+            Self::InProcess(handler) => handler.list_user_dns_records(username).await,
+            Self::KRPC(_) => {
+                self.call(
+                    METHOD_LIST_USER_DNS_RECORDS,
+                    &SnAuthDbUsernameReq::new(username),
+                )
+                .await
+            }
+        }
+    }
+
     async fn get_zone_info(&self, username: &str) -> SnResult<Option<ZoneInfo>> {
         match self {
             Self::InProcess(handler) => handler.get_zone_info(username).await,
@@ -1331,6 +1518,48 @@ where
                     &req,
                 )
             }
+            METHOD_ADD_USER_DNS_RECORD | "add_user_dns_record" => {
+                let parsed = SnAuthDbAddUserDnsRecordReq::from_json(req.params.clone())?;
+                rpc_envelope_response(
+                    self.0
+                        .add_user_dns_record(
+                            &parsed.username,
+                            &parsed.domain,
+                            &parsed.record_type,
+                            &parsed.record,
+                            parsed.ttl,
+                        )
+                        .await,
+                    &req,
+                )
+            }
+            METHOD_REMOVE_USER_DNS_RECORD | "remove_user_dns_record" => {
+                let parsed = SnAuthDbRemoveUserDnsRecordReq::from_json(req.params.clone())?;
+                rpc_envelope_response(
+                    self.0
+                        .remove_user_dns_record(
+                            &parsed.username,
+                            &parsed.domain,
+                            &parsed.record_type,
+                            parsed.record.as_deref(),
+                        )
+                        .await,
+                    &req,
+                )
+            }
+            METHOD_QUERY_USER_DNS_RECORD | "query_user_dns_record" => {
+                let parsed = SnAuthDbQueryUserDnsRecordReq::from_json(req.params.clone())?;
+                rpc_envelope_response(
+                    self.0
+                        .query_user_dns_record(&parsed.domain, &parsed.record_type)
+                        .await,
+                    &req,
+                )
+            }
+            METHOD_LIST_USER_DNS_RECORDS | "list_user_dns_records" => {
+                let parsed = SnAuthDbUsernameReq::from_json(req.params.clone())?;
+                rpc_envelope_response(self.0.list_user_dns_records(&parsed.username).await, &req)
+            }
             METHOD_GET_ZONE_INFO | "get_zone_info" => {
                 let parsed = SnAuthDbUsernameReq::from_json(req.params.clone())?;
                 rpc_envelope_response(self.0.get_zone_info(&parsed.username).await, &req)
@@ -1419,4 +1648,54 @@ fn rpc_envelope_response<T: Serialize>(
         RPCErrors::ParserResponseError(format!("Failed to serialize SnAuthDB RPC envelope: {}", e))
     })?;
     Ok(RPCResponse::create_by_req(RPCResult::Success(value), req))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_normalize_sn_auth_db_url() {
+        assert_eq!(
+            normalize_sn_auth_db_url("http://127.0.0.1:8080"),
+            "http://127.0.0.1:8080/kapi/sn/s2s/auth-db"
+        );
+        assert_eq!(
+            normalize_sn_auth_db_url("http://127.0.0.1:8080/kapi/sn/s2s/auth-db/"),
+            "http://127.0.0.1:8080/kapi/sn/s2s/auth-db"
+        );
+    }
+
+    #[test]
+    fn test_unit_envelope_roundtrip_allows_null_result() {
+        let value = serde_json::to_value(SnAuthDbRpcEnvelope::success(())).unwrap();
+        let envelope: SnAuthDbRpcEnvelope<Value> = serde_json::from_value(value).unwrap();
+
+        assert!(envelope.into_result().is_ok());
+    }
+
+    #[test]
+    fn test_optional_envelope_roundtrip_preserves_null_success() {
+        let value = serde_json::to_value(SnAuthDbRpcEnvelope::success(None::<String>)).unwrap();
+        assert_eq!(value["result"], Value::Null);
+
+        let envelope: SnAuthDbRpcEnvelope<Option<String>> = serde_json::from_value(value).unwrap();
+
+        assert_eq!(envelope.into_result().unwrap(), None);
+    }
+
+    #[test]
+    fn test_error_envelope_null_result_does_not_parse_response_type() {
+        let value = serde_json::to_value(SnAuthDbRpcEnvelope::<String>::failure(sn_err!(
+            SnErrorCode::NotFound,
+            "missing"
+        )))
+        .unwrap();
+        assert_eq!(value["result"], Value::Null);
+
+        let envelope: SnAuthDbRpcEnvelope<String> = serde_json::from_value(value).unwrap();
+        let error = envelope.into_result().unwrap_err();
+
+        assert_eq!(error.code(), SnErrorCode::NotFound);
+    }
 }

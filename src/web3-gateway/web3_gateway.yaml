@@ -7,18 +7,16 @@ servers:
     id: web3_sn
     type: sn
     host: "{{sn_host}}"
-    boot_jwt: "{{sn_boot_jwt}}"
-    owner_pkx: "{{sn_owner_pk}}"
-    device_jwt: ["{{sn_device_jwt}}"]
     ip: "{{sn_ip}}"
     # SN 强依赖统一 BNS RPC；裸 host 会规范化为 /kapi/bns。
-    bns_rpc_url: "{{bns_rpc_url}}"
+    bns_server_url: "{{bns_server_url}}"
     # 生产环境通过 secret 注入 controller key；缺失时 SN 初始化失败。
     # dev-local/dev-vm profile 会替换为各自的受限 controller 列表。
-    bns_evm:
-      controller_private_key_env: BNS_SN_CONTROLLER_PRIVATE_KEY
     bns_proxy:
       require_user_asset_owner: true
+      controllers:
+        - id: default
+          private_key_env: BNS_SN_CONTROLLER_PRIVATE_KEY
     # C 类种子(激活码/sn_user 账号/user_domain 绑定)幂等导入;相对路径按
     # 配置目录解析,文件不存在时自动跳过(部署目录没有种子也能正常启动)。
     seed_path: "sn_seed.yaml"
@@ -137,6 +135,9 @@ stacks:
   main_tls:
     bind: "{{tls_bind}}"
     protocol: tls
+    trusted_upstreams:
+      - "127.0.0.1/32"
+      - "::1/128"
     hosts:
       - host: "sn.{{sn_host}}"
         cert_path: "{{sn_cer}}"
@@ -176,15 +177,15 @@ stacks:
               call https-sni-probe || reject; 
               map-create "REQ.ext";
               map-add "REQ.ext" "proxy_source_addr" "${REQ.source_addr}";
-              eq ${REQ.dest_host} "bns.{{sn_host}}" && return "forward tcp:///:{{tls_port}}";
-              eq ${REQ.dest_host} "sn.{{sn_host}}" && return "forward tcp:///:{{tls_port}}";
-              eq ${REQ.dest_host} "www.{{sn_host}}" && return "forward tcp:///:{{tls_port}}";
-              eq ${REQ.dest_host} "{{sn_host}}" && return "forward tcp:///:{{tls_port}}";
-              eq ${REQ.dest_host} "web3.{{sn_host}}" && return "forward tcp:///:{{tls_port}}";
+              eq ${REQ.dest_host} "bns.{{sn_host}}" && return "forward tcp:///:{{tls_port}}?proxy_protocol=v2";
+              eq ${REQ.dest_host} "sn.{{sn_host}}" && return "forward tcp:///:{{tls_port}}?proxy_protocol=v2";
+              eq ${REQ.dest_host} "www.{{sn_host}}" && return "forward tcp:///:{{tls_port}}?proxy_protocol=v2";
+              eq ${REQ.dest_host} "{{sn_host}}" && return "forward tcp:///:{{tls_port}}?proxy_protocol=v2";
+              eq ${REQ.dest_host} "web3.{{sn_host}}" && return "forward tcp:///:{{tls_port}}?proxy_protocol=v2";
               map-create "QUESTION" && map-add "QUESTION" "dest_host" "${REQ.dest_host}" && map-add "QUESTION" "method" "deviceinfo.resolve_ood_by_hostname";
               call qa "web3_sn" "QUESTION";
               eq ${ANSWER.self_cert} "true" && return "forward rtcp://${ANSWER.did_hostname}/:443";
               match ${REQ.dest_host} "*.*.web3.{{sn_host}}" && eq ${ANSWER.self_cert} "false" && error --from chain "self_cert=false for ${REQ.dest_host}; enable self_cert to use nested web3 host over HTTPS";
-              match ${REQ.dest_host} "*.web3.{{sn_host}}" && return "forward tcp:///:{{tls_port}}";
+              match ${REQ.dest_host} "*.web3.{{sn_host}}" && return "forward tcp:///:{{tls_port}}?proxy_protocol=v2";
               reject;
   

@@ -626,7 +626,10 @@ impl UdpDatagramHandler {
                                 ));
                             }
                             let server_name = list[1].to_string();
-                            if let Some(server) = self.env.servers.get_server(server_name.as_str())
+                            if let Some(server) = self
+                                .env
+                                .servers
+                                .get_server_by_type(server_name.as_str(), "datagram")
                             {
                                 if let Server::Datagram(datagram_server) = &server {
                                     let notify = Arc::new(Notify::new());

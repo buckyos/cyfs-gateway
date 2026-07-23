@@ -1,11 +1,11 @@
 use crate::sn_did_resolver::{SnDidDocumentSource, SnDidResolveResponse, SnDidResolverProfile};
 use crate::{
     RelayAssignment, RelayAssignmentState, SNUserInfo, SnAuthDBRef, SnDeviceInfoDBRef,
-    SnDeviceStateView, SnRelayManagerRef, ZoneInfo,
+    SnDeviceStateView, SnRelayManagerRef, UserState, ZoneInfo,
 };
 use async_trait::async_trait;
 use bns_client::canonical_bns_name;
-use cyfs_gateway_lib::{server_err, ServerError, ServerErrorCode};
+use cyfs_gateway_lib::{server_err, DnsAuthority, ServerError, ServerErrorCode};
 use jsonwebtoken::DecodingKey;
 use log::{debug, warn};
 use name_client::{NameInfo, RecordType};
@@ -28,6 +28,12 @@ pub const BNS_DOC_BOOT: &str = "boot";
 pub const BNS_DOC_DEVICE_MINI: &str = "device_mini_doc";
 pub const BNS_DOC_DNS_TXT: &str = "dns_txt";
 pub const UNASSIGNED_RELAY_SN: &str = "unassigned";
+pub const DEFAULT_AUTH_SOA_SERIAL: u32 = 1;
+pub const DEFAULT_AUTH_SOA_REFRESH: i32 = 300;
+pub const DEFAULT_AUTH_SOA_RETRY: i32 = 60;
+pub const DEFAULT_AUTH_SOA_EXPIRE: i32 = 86_400;
+pub const DEFAULT_AUTH_SOA_MINIMUM: u32 = 60;
+pub const SN_SERVER_IP_NOT_CONFIGURED: &str = "SN server ip is not configured";
 
 pub type SnResolverRef = Arc<SnResolver>;
 pub type SnResolverResult<T> = std::result::Result<T, SnResolverError>;
@@ -108,32 +114,45 @@ impl std::error::Error for SnResolverError {}
 #[derive(Debug, Clone)]
 pub struct SnResolverConfig {
     pub server_host: String,
-    pub server_ip: IpAddr,
+    pub server_ip: Option<IpAddr>,
     pub aliases: Vec<String>,
-    pub boot_jwt: String,
-    pub owner_pkx: String,
+    pub boot_jwt: Option<String>,
+    pub owner_pkx: Option<String>,
     pub device_jwts: Vec<String>,
     pub default_ttl: u32,
     pub legacy_gateway_device_name: String,
+    pub soa_serial: u32,
+    pub soa_refresh: i32,
+    pub soa_retry: i32,
+    pub soa_expire: i32,
+    pub soa_minimum: u32,
 }
 
 impl SnResolverConfig {
     pub fn new(
         server_host: impl Into<String>,
-        server_ip: IpAddr,
-        boot_jwt: impl Into<String>,
-        owner_pkx: impl Into<String>,
+        server_ip: Option<IpAddr>,
+        boot_jwt: Option<String>,
+        owner_pkx: Option<String>,
         device_jwts: Vec<String>,
     ) -> Self {
         Self {
             server_host: normalize_host_lossy(server_host.into().as_str()),
             server_ip,
             aliases: Vec::new(),
-            boot_jwt: boot_jwt.into(),
-            owner_pkx: owner_pkx.into(),
-            device_jwts,
+            boot_jwt: boot_jwt.filter(|value| !value.trim().is_empty()),
+            owner_pkx: owner_pkx.filter(|value| !value.trim().is_empty()),
+            device_jwts: device_jwts
+                .into_iter()
+                .filter(|value| !value.trim().is_empty())
+                .collect(),
             default_ttl: DEFAULT_SN_RESOLVER_TTL_SECS,
             legacy_gateway_device_name: DEFAULT_LEGACY_GATEWAY_DEVICE.to_string(),
+            soa_serial: DEFAULT_AUTH_SOA_SERIAL,
+            soa_refresh: DEFAULT_AUTH_SOA_REFRESH,
+            soa_retry: DEFAULT_AUTH_SOA_RETRY,
+            soa_expire: DEFAULT_AUTH_SOA_EXPIRE,
+            soa_minimum: DEFAULT_AUTH_SOA_MINIMUM,
         }
     }
 
@@ -399,6 +418,27 @@ pub struct DnsResolution {
     pub source: DnsResolutionSource,
 }
 
+/// Resolver-level authoritative DNS outcome.  Zone ownership, owner-name
+/// existence, RRset existence, and temporary failure remain distinct until
+/// the DNS wire response is built.
+#[derive(Debug, Clone)]
+pub enum SnAuthoritativeDnsResult {
+    NotManaged,
+    AuthoritativeAnswer {
+        authority: DnsAuthority,
+        resolution: DnsResolution,
+    },
+    AuthoritativeNoData {
+        authority: DnsAuthority,
+    },
+    AuthoritativeNxDomain {
+        authority: DnsAuthority,
+    },
+    TemporaryFailure {
+        cause: String,
+    },
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
 pub struct RelayResolution {
     pub zone_name: String,
@@ -536,6 +576,19 @@ pub trait ResolverCompatibilityReader: Send + Sync + 'static {
         Ok(None)
     }
 
+    async fn domain_name_exists(&self, domain: &str) -> SnResolverResult<bool> {
+        for record_type in [RecordType::A, RecordType::AAAA, RecordType::TXT] {
+            if self
+                .query_domain_record(domain, record_type)
+                .await?
+                .is_some()
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     async fn get_device_by_name(
         &self,
         _zone_name: &str,
@@ -655,6 +708,7 @@ impl RelayAssignmentReader for SnRelayManagerResolverReader {
 #[derive(Debug)]
 pub struct SnResolverCache {
     dns: RwLock<HashMap<DnsCacheKey, DnsCacheEntry>>,
+    authoritative_dns: RwLock<HashMap<AuthoritativeDnsCacheKey, AuthoritativeDnsCacheEntry>>,
     min_ttl: Duration,
 }
 
@@ -668,6 +722,7 @@ impl SnResolverCache {
     pub fn new() -> Self {
         Self {
             dns: RwLock::new(HashMap::new()),
+            authoritative_dns: RwLock::new(HashMap::new()),
             min_ttl: Duration::from_secs(DEFAULT_SN_RESOLVER_TTL_SECS as u64),
         }
     }
@@ -721,8 +776,77 @@ impl SnResolverCache {
             .is_some()
     }
 
+    pub fn query_authoritative_dns(
+        &self,
+        hostname: &str,
+        record_type: &str,
+    ) -> Option<SnAuthoritativeDnsResult> {
+        let key = AuthoritativeDnsCacheKey::new(hostname, record_type);
+        let now = Instant::now();
+        {
+            let items = self
+                .authoritative_dns
+                .read()
+                .unwrap_or_else(|e| e.into_inner());
+            if let Some(entry) = items.get(&key) {
+                if entry.expires_at > now {
+                    return Some(entry.value.clone());
+                }
+            }
+        }
+
+        let mut items = self
+            .authoritative_dns
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        if items
+            .get(&key)
+            .map(|entry| entry.expires_at <= now)
+            .unwrap_or(false)
+        {
+            items.remove(&key);
+        }
+        None
+    }
+
+    pub fn insert_authoritative_dns(
+        &self,
+        hostname: &str,
+        record_type: &str,
+        value: SnAuthoritativeDnsResult,
+        ttl: u32,
+    ) {
+        let requested = Duration::from_secs(ttl as u64).max(self.min_ttl);
+        let entry = AuthoritativeDnsCacheEntry {
+            value,
+            expires_at: Instant::now() + requested,
+        };
+        self.authoritative_dns
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(AuthoritativeDnsCacheKey::new(hostname, record_type), entry);
+    }
+
+    /// Invalidate every RR type for an owner name. Name existence is shared
+    /// across RRsets, so adding/removing TXT can change an MX response between
+    /// NXDOMAIN and NODATA as well.
+    pub fn remove_authoritative_name(&self, hostname: &str) -> usize {
+        let hostname = normalize_host_lossy(hostname);
+        let mut items = self
+            .authoritative_dns
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        let before = items.len();
+        items.retain(|key, _| key.hostname != hostname);
+        before - items.len()
+    }
+
     pub fn clear(&self) {
         self.dns.write().unwrap_or_else(|e| e.into_inner()).clear();
+        self.authoritative_dns
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
     }
 }
 
@@ -751,6 +875,39 @@ impl DnsCacheKey {
 struct DnsCacheEntry {
     value: DnsCacheValue,
     expires_at: Instant,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct AuthoritativeDnsCacheKey {
+    hostname: String,
+    record_type: String,
+}
+
+impl AuthoritativeDnsCacheKey {
+    fn new(hostname: &str, record_type: &str) -> Self {
+        Self {
+            hostname: normalize_host_lossy(hostname),
+            record_type: record_type.trim().to_ascii_uppercase(),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct AuthoritativeDnsCacheEntry {
+    value: SnAuthoritativeDnsResult,
+    expires_at: Instant,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum ManagedDnsZoneKind {
+    Web3,
+    UserDomain,
+}
+
+#[derive(Debug, Clone)]
+struct ManagedDnsZone {
+    kind: ManagedDnsZoneKind,
+    authority: DnsAuthority,
 }
 
 pub struct SnResolver {
@@ -859,6 +1016,218 @@ impl SnResolver {
             || self.config.aliases.iter().any(|alias| alias == &hostname)
     }
 
+    pub async fn resolve_authoritative_dns_cached(
+        &self,
+        hostname: &str,
+        record_type: &str,
+    ) -> SnResolverResult<SnAuthoritativeDnsResult> {
+        let hostname = Self::normalize_hostname(hostname)?;
+        let record_type = record_type.trim().to_ascii_uppercase();
+        if record_type.is_empty() {
+            return Err(SnResolverError::new(
+                SnResolverErrorKind::UnsupportedRecordType,
+                "record type is empty",
+            ));
+        }
+
+        if let Some(result) = self
+            .cache
+            .query_authoritative_dns(hostname.as_str(), record_type.as_str())
+        {
+            debug!(
+                "sn_resolver authoritative dns cache hit: {} {}",
+                hostname, record_type
+            );
+            return Ok(result);
+        }
+
+        let result = match self
+            .resolve_authoritative_dns_uncached(hostname.as_str(), record_type.as_str())
+            .await
+        {
+            Ok(result) => result,
+            Err(error) if error.kind() == SnResolverErrorKind::BackendUnavailable => {
+                SnAuthoritativeDnsResult::TemporaryFailure {
+                    cause: error.to_string(),
+                }
+            }
+            Err(error) => return Err(error),
+        };
+
+        let ttl = match &result {
+            SnAuthoritativeDnsResult::AuthoritativeAnswer { resolution, .. } => {
+                Some(resolution.ttl)
+            }
+            SnAuthoritativeDnsResult::AuthoritativeNoData { authority }
+            | SnAuthoritativeDnsResult::AuthoritativeNxDomain { authority } => {
+                Some(authority.soa_minimum)
+            }
+            SnAuthoritativeDnsResult::NotManaged
+            | SnAuthoritativeDnsResult::TemporaryFailure { .. } => None,
+        };
+        if let Some(ttl) = ttl {
+            self.cache.insert_authoritative_dns(
+                hostname.as_str(),
+                record_type.as_str(),
+                result.clone(),
+                ttl,
+            );
+        }
+        Ok(result)
+    }
+
+    async fn resolve_authoritative_dns_uncached(
+        &self,
+        hostname: &str,
+        record_type: &str,
+    ) -> SnResolverResult<SnAuthoritativeDnsResult> {
+        let Some(zone) = self.managed_dns_zone(hostname).await? else {
+            return Ok(SnAuthoritativeDnsResult::NotManaged);
+        };
+
+        let name_exists = self.authoritative_name_exists(hostname, &zone).await?;
+        if !name_exists {
+            return Ok(SnAuthoritativeDnsResult::AuthoritativeNxDomain {
+                authority: zone.authority,
+            });
+        }
+
+        let Some(record_type) = RecordType::from_str(record_type) else {
+            return Ok(SnAuthoritativeDnsResult::AuthoritativeNoData {
+                authority: zone.authority,
+            });
+        };
+        if !is_supported_record_type(record_type) {
+            return Ok(SnAuthoritativeDnsResult::AuthoritativeNoData {
+                authority: zone.authority,
+            });
+        }
+
+        match self.resolve_dns(hostname, record_type).await {
+            Ok(resolution) if dns_resolution_has_rrset(&resolution) => {
+                Ok(SnAuthoritativeDnsResult::AuthoritativeAnswer {
+                    authority: zone.authority,
+                    resolution,
+                })
+            }
+            Ok(_) => Ok(SnAuthoritativeDnsResult::AuthoritativeNoData {
+                authority: zone.authority,
+            }),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    SnResolverErrorKind::NotManaged
+                        | SnResolverErrorKind::NameNotFound
+                        | SnResolverErrorKind::DocumentNotFound
+                        | SnResolverErrorKind::DeviceNotFound
+                        | SnResolverErrorKind::UnsupportedRecordType
+                ) =>
+            {
+                Ok(SnAuthoritativeDnsResult::AuthoritativeNoData {
+                    authority: zone.authority,
+                })
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn managed_dns_zone(&self, hostname: &str) -> SnResolverResult<Option<ManagedDnsZone>> {
+        let web3_zone = format!("web3.{}", self.config.server_host);
+        let mut candidates = Vec::new();
+        if dns_name_in_zone(hostname, web3_zone.as_str()) {
+            candidates.push((web3_zone, ManagedDnsZoneKind::Web3));
+        }
+
+        if let Some(user) = self.auth.get_user_by_domain(hostname).await? {
+            if matches!(user.state, UserState::Active) {
+                if let Some(user_domain) = user.user_domain.as_deref() {
+                    let user_domain = normalize_host_lossy(user_domain);
+                    if dns_name_in_zone(hostname, user_domain.as_str()) {
+                        candidates.push((user_domain, ManagedDnsZoneKind::UserDomain));
+                    }
+                }
+            }
+        }
+
+        let Some((zone_apex, kind)) = candidates
+            .into_iter()
+            .max_by_key(|(zone_apex, _)| zone_apex.split('.').count())
+        else {
+            return Ok(None);
+        };
+        Ok(Some(ManagedDnsZone {
+            kind,
+            authority: self.dns_authority(zone_apex),
+        }))
+    }
+
+    fn dns_authority(&self, zone_apex: String) -> DnsAuthority {
+        DnsAuthority {
+            zone_apex,
+            primary_ns: format!("dns.{}", self.config.server_host),
+            responsible_mailbox: format!("hostmaster.{}", self.config.server_host),
+            soa_serial: self.config.soa_serial,
+            soa_refresh: self.config.soa_refresh,
+            soa_retry: self.config.soa_retry,
+            soa_expire: self.config.soa_expire,
+            soa_minimum: self.config.soa_minimum,
+            positive_ttl: self.config.default_ttl,
+        }
+    }
+
+    async fn authoritative_name_exists(
+        &self,
+        hostname: &str,
+        zone: &ManagedDnsZone,
+    ) -> SnResolverResult<bool> {
+        if hostname == zone.authority.zone_apex {
+            return Ok(true);
+        }
+
+        // Explicit DNS records are owner-name data. Check the compatibility
+        // store as a set, not by probing one particular RR type.
+        let has_explicit_rrset = self.compatibility.domain_name_exists(hostname).await?;
+        if has_explicit_rrset {
+            return Ok(true);
+        }
+
+        // Control owners such as _acme-challenge exist only while at least one
+        // explicit RRset exists. Removing the last TXT therefore restores
+        // NXDOMAIN instead of leaving a permanent empty node.
+        if hostname
+            .split('.')
+            .next()
+            .map(|label| label.starts_with('_'))
+            .unwrap_or(false)
+        {
+            return Ok(false);
+        }
+
+        match zone.kind {
+            // Active user_domain bindings retain the existing wildcard gateway
+            // model for ordinary descendants.
+            ManagedDnsZoneKind::UserDomain => Ok(true),
+            ManagedDnsZoneKind::Web3 => {
+                let prefix = hostname
+                    .strip_suffix(format!(".{}", zone.authority.zone_apex).as_str())
+                    .unwrap_or_default();
+                let Some(bns_name) = prefix.rsplit('.').next().filter(|name| !name.is_empty())
+                else {
+                    return Ok(false);
+                };
+                if self.bns.resolve_owner(bns_name).await?.is_some() {
+                    return Ok(true);
+                }
+                Ok(self
+                    .auth
+                    .get_user_info(bns_name)
+                    .await?
+                    .map(|user| matches!(user.state, UserState::Active))
+                    .unwrap_or(false))
+            }
+        }
+    }
+
     pub async fn resolve_dns_cached(
         &self,
         hostname: &str,
@@ -950,7 +1319,7 @@ impl SnResolver {
         }
 
         if self.is_self_hostname(hostname.as_str()) {
-            return Ok(self.resolve_self_dns(hostname.as_str(), record_type));
+            return self.resolve_self_dns(hostname.as_str(), record_type);
         }
 
         if let Some((record, ttl)) = self
@@ -959,6 +1328,16 @@ impl SnResolver {
             .await?
         {
             return explicit_dns_record(hostname.as_str(), record_type, record.as_str(), ttl);
+        }
+
+        // Underscore-prefixed TXT names are control records such as ACME and
+        // PKX. They only exist when explicitly stored; falling through would
+        // either expose the zone's root TXT data or send an invalid BNS name.
+        if is_explicit_only_dns_name(hostname.as_str(), record_type) {
+            return Err(SnResolverError::new(
+                SnResolverErrorKind::DocumentNotFound,
+                format!("explicit TXT record not found for {}", hostname),
+            ));
         }
 
         let zone = self.resolve_zone_by_hostname(hostname.as_str()).await?;
@@ -1295,7 +1674,7 @@ impl SnResolver {
                 compatibility_device.as_ref(),
                 online.as_ref(),
             )
-            .await;
+            .await?;
 
         Ok(GatewayResolution {
             zone_name: zone.zone_name.clone(),
@@ -1400,7 +1779,7 @@ impl SnResolver {
         device_doc: &DeviceMiniDocument,
         compatibility_device: Option<&ResolverDeviceDocument>,
         online: Option<&SnDeviceStateView>,
-    ) -> Vec<IpAddr> {
+    ) -> SnResolverResult<Vec<IpAddr>> {
         let mut addresses = Vec::new();
 
         for ip in zone.zone_doc.gateway_ips.iter().copied() {
@@ -1424,7 +1803,7 @@ impl SnResolver {
                 .await
                 .unwrap_or_default();
             if sn_ips.is_empty() {
-                push_exportable_ip(&mut addresses, self.config.server_ip);
+                push_exportable_ip(&mut addresses, self.server_ip()?);
             } else {
                 for ip in sn_ips {
                     push_exportable_ip(&mut addresses, ip);
@@ -1477,7 +1856,7 @@ impl SnResolver {
                 .await
                 .unwrap_or_default();
             let relay_ips = if sn_ips.is_empty() {
-                vec![self.config.server_ip]
+                vec![self.server_ip()?]
             } else {
                 sn_ips
             };
@@ -1488,7 +1867,7 @@ impl SnResolver {
             }
         }
 
-        addresses
+        Ok(addresses)
     }
 
     async fn resolve_zone_txt(&self, zone: &ZoneResolution) -> SnResolverResult<Vec<String>> {
@@ -1558,11 +1937,15 @@ impl SnResolver {
         Ok(txt)
     }
 
-    fn resolve_self_dns(&self, hostname: &str, record_type: RecordType) -> DnsResolution {
-        match record_type {
+    fn resolve_self_dns(
+        &self,
+        hostname: &str,
+        record_type: RecordType,
+    ) -> SnResolverResult<DnsResolution> {
+        Ok(match record_type {
             RecordType::A | RecordType::AAAA => {
                 let mut addresses = Vec::new();
-                push_dns_address(&mut addresses, self.config.server_ip, record_type);
+                push_dns_address(&mut addresses, self.server_ip()?, record_type);
                 DnsResolution {
                     hostname: hostname.to_string(),
                     record_type,
@@ -1574,18 +1957,18 @@ impl SnResolver {
             }
             RecordType::TXT => {
                 let mut txt = Vec::new();
-                if let Some(x) = pkx_from_public_key(self.config.owner_pkx.as_str()) {
-                    txt.push(format!("PKX={};", x));
-                } else if !self.config.owner_pkx.trim().is_empty() {
-                    txt.push(format!("PKX={};", self.config.owner_pkx));
+                if let Some(owner_pkx) = self.config.owner_pkx.as_deref() {
+                    if let Some(x) = pkx_from_public_key(owner_pkx) {
+                        txt.push(format!("PKX={};", x));
+                    } else {
+                        txt.push(format!("PKX={};", owner_pkx));
+                    }
                 }
-                if !self.config.boot_jwt.trim().is_empty() {
-                    txt.push(format!("BOOT={};", self.config.boot_jwt));
+                if let Some(boot_jwt) = self.config.boot_jwt.as_deref() {
+                    txt.push(format!("BOOT={};", boot_jwt));
                 }
                 for jwt in &self.config.device_jwts {
-                    if !jwt.trim().is_empty() {
-                        txt.push(format!("DEV={};", jwt));
-                    }
+                    txt.push(format!("DEV={};", jwt));
                 }
                 DnsResolution {
                     hostname: hostname.to_string(),
@@ -1604,7 +1987,13 @@ impl SnResolver {
                 txt: Vec::new(),
                 source: DnsResolutionSource::SnSelf,
             },
-        }
+        })
+    }
+
+    fn server_ip(&self) -> SnResolverResult<IpAddr> {
+        self.config
+            .server_ip
+            .ok_or_else(|| SnResolverError::backend(SN_SERVER_IP_NOT_CONFIGURED))
     }
 
     async fn resolve_web_did(
@@ -1993,6 +2382,27 @@ fn is_supported_record_type(record_type: RecordType) -> bool {
         record_type,
         RecordType::A | RecordType::AAAA | RecordType::TXT
     )
+}
+
+fn dns_resolution_has_rrset(resolution: &DnsResolution) -> bool {
+    match resolution.record_type {
+        RecordType::A | RecordType::AAAA => !resolution.addresses.is_empty(),
+        RecordType::TXT => !resolution.txt.is_empty(),
+        _ => false,
+    }
+}
+
+fn dns_name_in_zone(hostname: &str, zone_apex: &str) -> bool {
+    hostname == zone_apex
+        || hostname
+            .strip_suffix(zone_apex)
+            .map(|prefix| prefix.ends_with('.') && prefix.len() > 1)
+            .unwrap_or(false)
+}
+
+fn is_explicit_only_dns_name(hostname: &str, record_type: RecordType) -> bool {
+    record_type == RecordType::TXT
+        && matches!(hostname.split('.').next(), Some(label) if label.starts_with('_'))
 }
 
 fn normalize_host_lossy(hostname: &str) -> String {
@@ -2791,11 +3201,15 @@ mod tests {
     struct StaticBnsReader {
         owners: HashMap<String, BnsOwner>,
         documents: HashMap<(String, String), BnsDocument>,
+        unavailable: bool,
     }
 
     #[async_trait]
     impl BnsDocumentReader for StaticBnsReader {
         async fn resolve_owner(&self, name: &str) -> SnResolverResult<Option<BnsOwner>> {
+            if self.unavailable {
+                return Err(SnResolverError::backend("static BNS backend unavailable"));
+            }
             Ok(self.owners.get(name).cloned())
         }
 
@@ -2811,18 +3225,308 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct StaticAuthReader {
+        users: HashMap<String, SNUserInfo>,
+        bindings: Vec<(String, String)>,
+    }
+
+    #[async_trait]
+    impl SnAuthReader for StaticAuthReader {
+        async fn get_user_info(&self, username: &str) -> SnResolverResult<Option<SNUserInfo>> {
+            Ok(self.users.get(username).cloned())
+        }
+
+        async fn get_user_by_domain(&self, domain: &str) -> SnResolverResult<Option<SNUserInfo>> {
+            let domain = normalize_host_lossy(domain);
+            let binding = self
+                .bindings
+                .iter()
+                .filter(|(zone, _)| dns_name_in_zone(domain.as_str(), zone.as_str()))
+                .max_by_key(|(zone, _)| zone.split('.').count());
+            let Some((zone, username)) = binding else {
+                return Ok(None);
+            };
+            let mut user = self.users.get(username).cloned();
+            if let Some(user) = user.as_mut() {
+                user.user_domain = Some(zone.clone());
+            }
+            Ok(user)
+        }
+
+        async fn get_zone_info(&self, username: &str) -> SnResolverResult<Option<ZoneInfo>> {
+            Ok(Some(ZoneInfo::default_for(username)))
+        }
+    }
+
+    #[derive(Default)]
+    struct StaticCompatibilityReader {
+        records: HashMap<(String, String), (String, u32)>,
+    }
+
+    #[async_trait]
+    impl ResolverCompatibilityReader for StaticCompatibilityReader {
+        async fn query_domain_record(
+            &self,
+            domain: &str,
+            record_type: RecordType,
+        ) -> SnResolverResult<Option<(String, u32)>> {
+            Ok(self
+                .records
+                .get(&(normalize_host_lossy(domain), record_type.to_string()))
+                .cloned())
+        }
+    }
+
+    fn test_user(username: &str, state: UserState, user_domain: Option<&str>) -> SNUserInfo {
+        SNUserInfo {
+            username: Some(username.to_string()),
+            email: None,
+            state,
+            public_key: "test-key".to_string(),
+            activation_code: None,
+            zone_config: String::new(),
+            self_cert: false,
+            user_domain: user_domain.map(ToOwned::to_owned),
+            sn_ips: None,
+        }
+    }
+
     fn test_resolver_with_bns(bns: StaticBnsReader) -> SnResolver {
         SnResolver::new(
             SnResolverConfig::new(
                 "buckyos.test",
-                "192.0.2.10".parse::<IpAddr>().unwrap(),
-                "",
-                "",
+                Some("192.0.2.10".parse::<IpAddr>().unwrap()),
+                None,
+                None,
                 Vec::new(),
             ),
             Arc::new(EmptySnAuthReader),
         )
         .with_bns_reader(Arc::new(bns))
+    }
+
+    fn authoritative_test_resolver(
+        bns: StaticBnsReader,
+        auth: StaticAuthReader,
+        compatibility: StaticCompatibilityReader,
+    ) -> SnResolver {
+        SnResolver::new_with_bns(
+            SnResolverConfig::new(
+                "BuckyOS.Test.",
+                Some("192.0.2.10".parse::<IpAddr>().unwrap()),
+                None,
+                None,
+                Vec::new(),
+            ),
+            Arc::new(auth),
+            Arc::new(bns),
+        )
+        .with_compatibility_reader(Arc::new(compatibility))
+    }
+
+    fn resolver_without_server_ip() -> SnResolver {
+        SnResolver::new(
+            SnResolverConfig::new(
+                "buckyos.test",
+                None,
+                Some("boot".to_string()),
+                Some("owner".to_string()),
+                Vec::new(),
+            )
+            .with_aliases(vec!["alias.buckyos.test".to_string()]),
+            Arc::new(EmptySnAuthReader),
+        )
+    }
+
+    #[tokio::test]
+    async fn self_dns_bootstrap_fields_are_independent_and_empty_values_are_omitted() {
+        let cases = [
+            (None, None, Vec::new(), Vec::<String>::new()),
+            (
+                Some(String::new()),
+                Some("  ".to_string()),
+                vec![String::new(), "  ".to_string()],
+                Vec::new(),
+            ),
+            (
+                Some("boot".to_string()),
+                None,
+                Vec::new(),
+                vec!["BOOT=boot;".to_string()],
+            ),
+            (
+                None,
+                Some("owner".to_string()),
+                Vec::new(),
+                vec!["PKX=owner;".to_string()],
+            ),
+            (
+                None,
+                None,
+                vec!["device".to_string()],
+                vec!["DEV=device;".to_string()],
+            ),
+        ];
+
+        for (boot_jwt, owner_pkx, device_jwts, expected) in cases {
+            let resolver = SnResolver::new(
+                SnResolverConfig::new(
+                    "buckyos.test",
+                    Some("192.0.2.10".parse().unwrap()),
+                    boot_jwt,
+                    owner_pkx,
+                    device_jwts,
+                ),
+                Arc::new(EmptySnAuthReader),
+            );
+            let resolution = resolver
+                .resolve_dns("sn.buckyos.test", RecordType::TXT)
+                .await
+                .unwrap();
+            assert_eq!(resolution.txt, expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn bootstrap_absence_preserves_bns_and_user_domain_dns_sources() {
+        let mut bns = StaticBnsReader::default();
+        bns.owners.insert(
+            "alice".to_string(),
+            BnsOwner {
+                name: "alice".to_string(),
+                effective_owner: Some("alice-owner".to_string()),
+                owner_config: None,
+            },
+        );
+        bns.documents.insert(
+            ("alice".to_string(), BNS_DOC_BOOT.to_string()),
+            BnsDocument::jwt("alice", BNS_DOC_BOOT, "alice-boot"),
+        );
+        bns.documents.insert(
+            ("alice".to_string(), BNS_DOC_DEVICE_MINI.to_string()),
+            BnsDocument::json(
+                "alice",
+                BNS_DOC_DEVICE_MINI,
+                json!({
+                    "devices": {
+                        "ood1": {
+                            "did": "did:dev:alice-device",
+                            "mini_config_jwt": "alice-device-jwt"
+                        }
+                    }
+                }),
+            ),
+        );
+
+        let mut auth = StaticAuthReader::default();
+        auth.users.insert(
+            "bob".to_string(),
+            test_user("bob", UserState::Active, Some("bob.example")),
+        );
+        auth.bindings
+            .push(("bob.example".to_string(), "bob".to_string()));
+
+        let mut compatibility = StaticCompatibilityReader::default();
+        compatibility.records.insert(
+            ("www.bob.example".to_string(), "A".to_string()),
+            ("198.51.100.20".to_string(), 90),
+        );
+        compatibility.records.insert(
+            ("www.bob.example".to_string(), "TXT".to_string()),
+            ("user-domain-record".to_string(), 90),
+        );
+
+        let resolver = authoritative_test_resolver(bns, auth, compatibility);
+        assert!(resolver.config().boot_jwt.is_none());
+        assert!(resolver.config().owner_pkx.is_none());
+        assert!(resolver.config().device_jwts.is_empty());
+
+        let web3_txt = resolver
+            .resolve_dns("alice.web3.buckyos.test", RecordType::TXT)
+            .await
+            .unwrap();
+        assert!(web3_txt.txt.iter().any(|value| value == "PKX=alice-owner;"));
+        assert!(web3_txt.txt.iter().any(|value| value == "BOOT=alice-boot;"));
+        assert!(web3_txt
+            .txt
+            .iter()
+            .any(|value| value == "DEV=alice-device-jwt;"));
+
+        let user_domain_a = resolver
+            .resolve_dns("www.bob.example", RecordType::A)
+            .await
+            .unwrap();
+        assert_eq!(
+            user_domain_a.addresses,
+            vec!["198.51.100.20".parse::<IpAddr>().unwrap()]
+        );
+        let user_domain_txt = resolver
+            .resolve_dns("www.bob.example", RecordType::TXT)
+            .await
+            .unwrap();
+        assert_eq!(user_domain_txt.txt, vec!["user-domain-record".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn missing_server_ip_only_fails_ip_dependent_resolution() {
+        let resolver = resolver_without_server_ip();
+
+        let txt = resolver
+            .resolve_dns("buckyos.test", RecordType::TXT)
+            .await
+            .unwrap();
+        assert!(txt.txt.iter().any(|value| value == "BOOT=boot;"));
+
+        for hostname in ["buckyos.test", "sn.buckyos.test", "alias.buckyos.test"] {
+            for record_type in [RecordType::A, RecordType::AAAA] {
+                let error = resolver
+                    .resolve_dns(hostname, record_type)
+                    .await
+                    .unwrap_err();
+                assert_eq!(error.kind(), SnResolverErrorKind::BackendUnavailable);
+                assert_eq!(error.message(), SN_SERVER_IP_NOT_CONFIGURED);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_server_ip_fails_relay_fallbacks() {
+        let resolver = resolver_without_server_ip();
+        let zone = ZoneResolution {
+            input: "testuser".to_string(),
+            canonical_name: "testuser".to_string(),
+            zone_name: "testuser".to_string(),
+            owner: BnsOwner {
+                name: "testuser".to_string(),
+                effective_owner: None,
+                owner_config: None,
+            },
+            zone_doc: ZoneDocument::empty(),
+            boot_doc: BootDocument::empty(),
+            user_domain: None,
+            self_cert: false,
+            relay_sn: None,
+            source: ZoneResolutionSource::BnsName,
+        };
+
+        for net_id in ["nat", "wan"] {
+            let device_doc = DeviceMiniDocument {
+                zone_name: "testuser".to_string(),
+                device_name: "ood1".to_string(),
+                did: "did:dev:test-device".to_string(),
+                mini_config_jwt: None,
+                document: Some(json!({ "net_id": net_id })),
+                ttl: None,
+                version: None,
+            };
+            let error = resolver
+                .resolve_gateway_addresses(&zone, &device_doc, None, None)
+                .await
+                .unwrap_err();
+            assert_eq!(error.kind(), SnResolverErrorKind::BackendUnavailable);
+            assert_eq!(error.message(), SN_SERVER_IP_NOT_CONFIGURED);
+        }
     }
 
     #[test]
@@ -2850,6 +3554,211 @@ mod tests {
             bns_compat_name_for("devtests.org", "alice.web3.other.org"),
             None
         );
+    }
+
+    #[tokio::test]
+    async fn authoritative_dns_distinguishes_answer_nodata_nxdomain_and_not_managed() {
+        let mut bns = StaticBnsReader::default();
+        bns.owners.insert(
+            "alice".to_string(),
+            BnsOwner {
+                name: "alice".to_string(),
+                effective_owner: None,
+                owner_config: None,
+            },
+        );
+        let mut compatibility = StaticCompatibilityReader::default();
+        for (record_type, record) in [
+            ("A", "192.0.2.11"),
+            ("AAAA", "2001:db8::11"),
+            ("TXT", "alice-txt"),
+        ] {
+            compatibility.records.insert(
+                (
+                    "alice.web3.buckyos.test".to_string(),
+                    record_type.to_string(),
+                ),
+                (record.to_string(), 120),
+            );
+        }
+        compatibility.records.insert(
+            ("txt-only.web3.buckyos.test".to_string(), "TXT".to_string()),
+            ("only-txt".to_string(), 120),
+        );
+        let resolver = authoritative_test_resolver(bns, StaticAuthReader::default(), compatibility);
+
+        for record_type in ["A", "AAAA", "TXT"] {
+            match resolver
+                .resolve_authoritative_dns_cached("Alice.Web3.BuckyOS.Test.", record_type)
+                .await
+                .unwrap()
+            {
+                SnAuthoritativeDnsResult::AuthoritativeAnswer {
+                    authority,
+                    resolution,
+                } => {
+                    assert_eq!(authority.zone_apex, "web3.buckyos.test");
+                    assert_eq!(authority.soa_serial, DEFAULT_AUTH_SOA_SERIAL);
+                    assert!(dns_resolution_has_rrset(&resolution));
+                }
+                other => panic!("expected answer for {record_type}, got {other:?}"),
+            }
+        }
+
+        for record_type in ["HTTPS", "SVCB", "CAA", "MX", "NS", "SOA"] {
+            assert!(matches!(
+                resolver
+                    .resolve_authoritative_dns_cached("txt-only.web3.buckyos.test", record_type,)
+                    .await
+                    .unwrap(),
+                SnAuthoritativeDnsResult::AuthoritativeNoData { .. }
+            ));
+        }
+        assert!(matches!(
+            resolver
+                .resolve_authoritative_dns_cached("web3.buckyos.test", "A")
+                .await
+                .unwrap(),
+            SnAuthoritativeDnsResult::AuthoritativeNoData { .. }
+        ));
+
+        assert!(matches!(
+            resolver
+                .resolve_authoritative_dns_cached("missing.web3.buckyos.test", "MX")
+                .await
+                .unwrap(),
+            SnAuthoritativeDnsResult::AuthoritativeNxDomain { .. }
+        ));
+        assert!(matches!(
+            resolver
+                .resolve_authoritative_dns_cached("alice.web3.other.test", "A")
+                .await
+                .unwrap(),
+            SnAuthoritativeDnsResult::NotManaged
+        ));
+    }
+
+    #[tokio::test]
+    async fn authoritative_control_owner_exists_only_while_an_explicit_rrset_exists() {
+        let mut bns = StaticBnsReader::default();
+        bns.owners.insert(
+            "alice".to_string(),
+            BnsOwner {
+                name: "alice".to_string(),
+                effective_owner: None,
+                owner_config: None,
+            },
+        );
+        let resolver_without_record = authoritative_test_resolver(
+            bns,
+            StaticAuthReader::default(),
+            StaticCompatibilityReader::default(),
+        );
+        assert!(matches!(
+            resolver_without_record
+                .resolve_authoritative_dns_cached("_acme-challenge.alice.web3.buckyos.test", "MX",)
+                .await
+                .unwrap(),
+            SnAuthoritativeDnsResult::AuthoritativeNxDomain { .. }
+        ));
+
+        let mut bns = StaticBnsReader::default();
+        bns.owners.insert(
+            "alice".to_string(),
+            BnsOwner {
+                name: "alice".to_string(),
+                effective_owner: None,
+                owner_config: None,
+            },
+        );
+        let mut compatibility = StaticCompatibilityReader::default();
+        compatibility.records.insert(
+            (
+                "_acme-challenge.alice.web3.buckyos.test".to_string(),
+                "TXT".to_string(),
+            ),
+            ("challenge".to_string(), 60),
+        );
+        let resolver_with_record =
+            authoritative_test_resolver(bns, StaticAuthReader::default(), compatibility);
+        assert!(matches!(
+            resolver_with_record
+                .resolve_authoritative_dns_cached("_acme-challenge.alice.web3.buckyos.test", "MX",)
+                .await
+                .unwrap(),
+            SnAuthoritativeDnsResult::AuthoritativeNoData { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn authoritative_user_domain_uses_active_longest_suffix_binding() {
+        let mut auth = StaticAuthReader::default();
+        auth.users.insert(
+            "alice".to_string(),
+            test_user("alice", UserState::Active, Some("example.com")),
+        );
+        auth.users.insert(
+            "bob".to_string(),
+            test_user("bob", UserState::Active, Some("sub.example.com")),
+        );
+        auth.users.insert(
+            "mallory".to_string(),
+            test_user("mallory", UserState::Suspended, Some("suspended.test")),
+        );
+        auth.bindings = vec![
+            ("example.com".to_string(), "alice".to_string()),
+            ("sub.example.com".to_string(), "bob".to_string()),
+            ("suspended.test".to_string(), "mallory".to_string()),
+        ];
+        let resolver = authoritative_test_resolver(
+            StaticBnsReader::default(),
+            auth,
+            StaticCompatibilityReader::default(),
+        );
+
+        match resolver
+            .resolve_authoritative_dns_cached("host.sub.example.com", "MX")
+            .await
+            .unwrap()
+        {
+            SnAuthoritativeDnsResult::AuthoritativeNoData { authority } => {
+                assert_eq!(authority.zone_apex, "sub.example.com");
+            }
+            other => panic!("expected user-domain NODATA, got {other:?}"),
+        }
+        assert!(matches!(
+            resolver
+                .resolve_authoritative_dns_cached("host.suspended.test", "MX")
+                .await
+                .unwrap(),
+            SnAuthoritativeDnsResult::NotManaged
+        ));
+        assert!(matches!(
+            resolver
+                .resolve_authoritative_dns_cached("notexample.com", "MX")
+                .await
+                .unwrap(),
+            SnAuthoritativeDnsResult::NotManaged
+        ));
+    }
+
+    #[tokio::test]
+    async fn authoritative_backend_unavailable_is_not_negative_dns_data() {
+        let resolver = authoritative_test_resolver(
+            StaticBnsReader {
+                unavailable: true,
+                ..Default::default()
+            },
+            StaticAuthReader::default(),
+            StaticCompatibilityReader::default(),
+        );
+        assert!(matches!(
+            resolver
+                .resolve_authoritative_dns_cached("alice.web3.buckyos.test", "A")
+                .await
+                .unwrap(),
+            SnAuthoritativeDnsResult::TemporaryFailure { .. }
+        ));
     }
 
     #[test]
@@ -2974,7 +3883,8 @@ mod tests {
 
         let addresses = resolver
             .resolve_gateway_addresses(&zone, &device_doc, None, Some(&online))
-            .await;
+            .await
+            .unwrap();
 
         assert!(addresses.contains(&"192.0.2.10".parse::<IpAddr>().unwrap()));
         assert!(addresses.contains(&"2600:1700:1150:9440::49".parse::<IpAddr>().unwrap()));

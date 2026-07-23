@@ -134,6 +134,7 @@ async fn handle_bind(server: &SNServer, req: RPCRequest) -> RpcCallResult<RPCRes
         )
         .await
         .map_err(map_domain_error)?;
+    server.clear_authoritative_dns_cache();
     log::info!(
         "domain.bind {} activated for {} (pkx source: {})",
         binding.domain,
@@ -167,6 +168,7 @@ pub(crate) async fn handle_domain(
                 .unbind_user_domain(username.as_str(), params.domain.as_str())
                 .await
                 .into_rpc()?;
+            server.clear_authoritative_dns_cache();
             ok_response(&req, SnSuccessResp { code: 0 })
         }
         _ => Err(RPCErrors::UnknownMethod(req.method)),

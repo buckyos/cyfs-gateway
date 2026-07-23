@@ -57,8 +57,7 @@ pub fn canonical_email(email: &str) -> SnResult<String> {
             byte.is_ascii_alphanumeric()
                 || matches!(
                     byte,
-                    b'!'
-                        | b'#'
+                    b'!' | b'#'
                         | b'$'
                         | b'%'
                         | b'&'
@@ -400,6 +399,58 @@ pub trait SnAuthDB: Send + Sync + 'static {
     ) -> SnResult<DomainBinding>;
     async fn unbind_user_domain(&self, username: &str, domain: &str) -> SnResult<()>;
 
+    /// Compatibility DNS RRsets are part of the shared auth/provider state when
+    /// `auth_db` is remote. Local auth deployments continue to use the local
+    /// `SnCompatibilityStore` implementation.
+    async fn add_user_dns_record(
+        &self,
+        username: &str,
+        domain: &str,
+        record_type: &str,
+        record: &str,
+        ttl: u32,
+    ) -> SnResult<()> {
+        let _ = (username, domain, record_type, record, ttl);
+        Err(sn_err!(
+            SnErrorCode::Failed,
+            "user DNS records are not supported by this auth DB"
+        ))
+    }
+    async fn remove_user_dns_record(
+        &self,
+        username: &str,
+        domain: &str,
+        record_type: &str,
+        record: Option<&str>,
+    ) -> SnResult<()> {
+        let _ = (username, domain, record_type, record);
+        Err(sn_err!(
+            SnErrorCode::Failed,
+            "user DNS records are not supported by this auth DB"
+        ))
+    }
+    async fn query_user_dns_record(
+        &self,
+        domain: &str,
+        record_type: &str,
+    ) -> SnResult<Option<(String, u32)>> {
+        let _ = (domain, record_type);
+        Err(sn_err!(
+            SnErrorCode::Failed,
+            "user DNS records are not supported by this auth DB"
+        ))
+    }
+    async fn list_user_dns_records(
+        &self,
+        username: &str,
+    ) -> SnResult<Vec<(String, String, String, u32)>> {
+        let _ = username;
+        Err(sn_err!(
+            SnErrorCode::Failed,
+            "user DNS records are not supported by this auth DB"
+        ))
+    }
+
     async fn get_zone_info(&self, username: &str) -> SnResult<Option<ZoneInfo>>;
     async fn update_zone_info(&self, username: &str, patch: ZoneInfoPatch) -> SnResult<()>;
     async fn update_zone_relay_sn(
@@ -606,6 +657,46 @@ impl SnAuthDB for RemoteSnAuthDB {
 
     async fn unbind_user_domain(&self, username: &str, domain: &str) -> SnResult<()> {
         self.client.unbind_user_domain(username, domain).await
+    }
+
+    async fn add_user_dns_record(
+        &self,
+        username: &str,
+        domain: &str,
+        record_type: &str,
+        record: &str,
+        ttl: u32,
+    ) -> SnResult<()> {
+        self.client
+            .add_user_dns_record(username, domain, record_type, record, ttl)
+            .await
+    }
+
+    async fn remove_user_dns_record(
+        &self,
+        username: &str,
+        domain: &str,
+        record_type: &str,
+        record: Option<&str>,
+    ) -> SnResult<()> {
+        self.client
+            .remove_user_dns_record(username, domain, record_type, record)
+            .await
+    }
+
+    async fn query_user_dns_record(
+        &self,
+        domain: &str,
+        record_type: &str,
+    ) -> SnResult<Option<(String, u32)>> {
+        self.client.query_user_dns_record(domain, record_type).await
+    }
+
+    async fn list_user_dns_records(
+        &self,
+        username: &str,
+    ) -> SnResult<Vec<(String, String, String, u32)>> {
+        self.client.list_user_dns_records(username).await
     }
 
     async fn get_zone_info(&self, username: &str) -> SnResult<Option<ZoneInfo>> {
@@ -873,13 +964,12 @@ impl SqliteSnAuthDB {
     /// seed 导入用：激活码是否存在（含已使用的码；`get_activation_codes`
     /// 只返回未使用的）。
     pub async fn has_activation_code(&self, code: &str) -> SnResult<bool> {
-        let count = sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*) FROM activation_codes WHERE code = ?1",
-        )
-        .bind(code)
-        .fetch_one(&self.pool)
-        .await
-        .map_err(|e| Self::db_err("query activation code failed", e))?;
+        let count =
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM activation_codes WHERE code = ?1")
+                .bind(code)
+                .fetch_one(&self.pool)
+                .await
+                .map_err(|e| Self::db_err("query activation code failed", e))?;
         Ok(count > 0)
     }
 
@@ -909,20 +999,17 @@ impl SqliteSnAuthDB {
     }
 
     fn email_already_bound(email: &str) -> SnError {
-        sn_err!(
-            SnErrorCode::Conflict,
-            "email already bound: {}",
-            email
-        )
+        sn_err!(SnErrorCode::Conflict, "email already bound: {}", email)
     }
 
     fn insert_user_err(email: &str, error: sqlx::Error) -> SnError {
-        let is_email_unique_violation = error
-            .as_database_error()
-            .is_some_and(|db_error| {
-                db_error.is_unique_violation()
-                    && db_error.message().to_ascii_lowercase().contains("users.email")
-            });
+        let is_email_unique_violation = error.as_database_error().is_some_and(|db_error| {
+            db_error.is_unique_violation()
+                && db_error
+                    .message()
+                    .to_ascii_lowercase()
+                    .contains("users.email")
+        });
         if is_email_unique_violation {
             Self::email_already_bound(email)
         } else {
@@ -1825,10 +1912,11 @@ impl SnAuthDB for SqliteSnAuthDB {
         };
         let row = sqlx::query(
             "SELECT u.username, u.email, u.state, u.public_key, u.activation_code, u.zone_config,
-                    u.self_cert, u.user_domain, u.sn_ips
+                    u.self_cert, b.domain AS user_domain, u.sn_ips
              FROM user_domain_bindings b
              JOIN users u ON u.username = b.owner
              WHERE b.state = 'active'
+               AND u.state = 'active'
                AND (?1 = b.domain OR ?1 LIKE '%.' || b.domain)
              ORDER BY length(b.domain) DESC
              LIMIT 1",
@@ -2061,8 +2149,8 @@ impl SnAuthDB for SqliteSnAuthDB {
         domain: &str,
         pkx: &str,
     ) -> SnResult<DomainBinding> {
-        let canonical_domain = canonical_user_domain(domain)
-            .ok_or_else(|| Self::invalid_input("domain is empty"))?;
+        let canonical_domain =
+            canonical_user_domain(domain).ok_or_else(|| Self::invalid_input("domain is empty"))?;
         let pkx = pkx.trim();
         Self::check_non_empty(pkx, "pkx")?;
         let _locker =
@@ -2108,8 +2196,8 @@ impl SnAuthDB for SqliteSnAuthDB {
     }
 
     async fn unbind_user_domain(&self, username: &str, domain: &str) -> SnResult<()> {
-        let canonical_domain = canonical_user_domain(domain)
-            .ok_or_else(|| Self::invalid_input("domain is empty"))?;
+        let canonical_domain =
+            canonical_user_domain(domain).ok_or_else(|| Self::invalid_input("domain is empty"))?;
         let _locker =
             async_named_locker::Locker::get_locker(Self::USER_DOMAIN_BINDING_LOCK.to_string())
                 .await;
@@ -2475,14 +2563,13 @@ mod tests {
         assert!(!db.is_user_exist("bob").await?);
 
         // 应用层预查之外，SQLite 唯一索引也必须独立拒绝重复绑定。
-        let raw_duplicate = sqlx::query(
-            "INSERT INTO users (username, email, state) VALUES (?1, ?2, 'active')",
-        )
-        .bind("raw-duplicate")
-        .bind("alice.recovery@example.com")
-        .execute(&db.pool)
-        .await
-        .unwrap_err();
+        let raw_duplicate =
+            sqlx::query("INSERT INTO users (username, email, state) VALUES (?1, ?2, 'active')")
+                .bind("raw-duplicate")
+                .bind("alice.recovery@example.com")
+                .execute(&db.pool)
+                .await
+                .unwrap_err();
         assert!(raw_duplicate
             .as_database_error()
             .is_some_and(|error| error.is_unique_violation()));
@@ -2612,7 +2699,7 @@ mod tests {
                 "salt",
                 "pbkdf2",
             )
-                .await?
+            .await?
         );
         assert!(!db.check_active_code(active_code).await?);
         assert!(
@@ -2624,7 +2711,7 @@ mod tests {
                 "salt2",
                 "pbkdf2",
             )
-                .await?
+            .await?
         );
         assert!(db.is_user_exist("alice").await?);
 
@@ -2669,7 +2756,7 @@ mod tests {
                 "salt",
                 "pbkdf2",
             )
-                .await?
+            .await?
         );
         assert!(
             db.register_user(
@@ -2680,7 +2767,7 @@ mod tests {
                 "salt",
                 "pbkdf2",
             )
-                .await?
+            .await?
         );
 
         let binding = db
@@ -2698,7 +2785,11 @@ mod tests {
             Some("alice")
         );
         assert_eq!(
-            db.get_user_info("alice").await?.unwrap().user_domain.as_deref(),
+            db.get_user_info("alice")
+                .await?
+                .unwrap()
+                .user_domain
+                .as_deref(),
             Some("example.com")
         );
 
@@ -2751,7 +2842,7 @@ mod tests {
                 "salt",
                 "pbkdf2",
             )
-                .await?
+            .await?
         );
 
         db.update_zone_info(
@@ -2806,7 +2897,7 @@ mod tests {
                 "salt",
                 "pbkdf2",
             )
-                .await?
+            .await?
         );
 
         sqlx::query("CREATE TABLE devices (owner TEXT, device_name TEXT, did TEXT PRIMARY KEY, ip TEXT, description TEXT, mini_config_jwt TEXT, created_at INTEGER, updated_at INTEGER)")
@@ -2912,7 +3003,7 @@ mod tests {
                 "salt",
                 "pbkdf2",
             )
-                .await?
+            .await?
         );
 
         // users 行。
@@ -2944,7 +3035,7 @@ mod tests {
                 "s2",
                 "pbkdf2",
             )
-                .await?
+            .await?
         );
         // code-2 未被消费。
         assert!(db.check_active_code("code-2").await?);
@@ -3064,7 +3155,7 @@ mod tests {
                 "s",
                 "pbkdf2",
             )
-                .await?
+            .await?
         );
 
         // active → active：session 保留。
@@ -3180,7 +3271,10 @@ mod tests {
 
         // 派生 helper 同输入恒等（无 nonce / exp）。
         assert_eq!(pkx_record_name("example.com"), "_pkx.example.com");
-        assert_eq!(pkx_value("owner-key").unwrap(), pkx_value("owner-key").unwrap());
+        assert_eq!(
+            pkx_value("owner-key").unwrap(),
+            pkx_value("owner-key").unwrap()
+        );
         assert_eq!(pkx_value("  owner-key  ").unwrap(), "PKX(owner-key)");
         assert!(pkx_value("   ").is_err());
 
@@ -3216,7 +3310,7 @@ mod tests {
                 "s",
                 "pbkdf2",
             )
-                .await?
+            .await?
         );
 
         let binding = db
@@ -3380,7 +3474,7 @@ mod tests {
                 "s",
                 "pbkdf2",
             )
-                .await?
+            .await?
         );
 
         // alice 同时激活 example.com 与更具体的 sub.example.com。
@@ -3390,27 +3484,24 @@ mod tests {
             .await?;
 
         // host.sub.example.com → 命中最长的 sub.example.com binding（同样属 alice）。
-        assert_eq!(
-            db.get_user_by_domain("host.sub.example.com")
-                .await?
-                .unwrap()
-                .username
-                .as_deref(),
-            Some("alice")
-        );
+        let matched = db
+            .get_user_by_domain("host.sub.example.com")
+            .await?
+            .unwrap();
+        assert_eq!(matched.username.as_deref(), Some("alice"));
+        assert_eq!(matched.user_domain.as_deref(), Some("sub.example.com"));
+        db.set_user_state("alice", UserState::Suspended).await?;
+        assert!(db
+            .get_user_by_domain("host.sub.example.com")
+            .await?
+            .is_none());
+        db.set_user_state("alice", UserState::Active).await?;
         assert!(db.get_user_by_domain("unrelated.org").await?.is_none());
 
         // breaking change：bob 仅在 users.user_domain 留有遗留域名、无 binding 行，不再命中。
         db.insert_activation_code("bob-code").await?;
         assert!(
-            db.register_user(
-                "bob-code",
-                "bob",
-                "bob@example.com",
-                "h",
-                "s",
-                "pbkdf2",
-            )
+            db.register_user("bob-code", "bob", "bob@example.com", "h", "s", "pbkdf2",)
                 .await?
         );
         sqlx::query("UPDATE users SET user_domain = 'legacy.test' WHERE username = 'bob'")
@@ -3479,18 +3570,11 @@ mod tests {
                 "s",
                 "pbkdf2",
             )
-                .await?
+            .await?
         );
         db.insert_activation_code("bob-code").await?;
         assert!(
-            db.register_user(
-                "bob-code",
-                "bob",
-                "bob@example.com",
-                "h",
-                "s",
-                "pbkdf2",
-            )
+            db.register_user("bob-code", "bob", "bob@example.com", "h", "s", "pbkdf2",)
                 .await?
         );
 
@@ -3546,7 +3630,7 @@ mod tests {
                 "s",
                 "pbkdf2",
             )
-                .await?
+            .await?
         );
 
         // 初始整体写入。
@@ -3595,7 +3679,7 @@ mod tests {
                 "s",
                 "pbkdf2",
             )
-                .await?
+            .await?
         );
 
         // 删 zone_info 行，并在 users 上留下旧 zone_config / self_cert。
@@ -3639,7 +3723,7 @@ mod tests {
                 "s",
                 "pbkdf2",
             )
-                .await?
+            .await?
         );
 
         // 按 username/bns_name 命中既有行。

@@ -191,7 +191,12 @@ pub(crate) async fn handle_auth(
             // BNS bootstrap 在本地建号之前执行：失败则不创建本地用户，避免
             // 本地账号与 BNS name 不一致（同 request_id 重试幂等）。
             let bns_info = {
-                let proxy = server.bns_proxy();
+                let proxy = server.bns_proxy().ok_or_else(|| {
+                    reason_error(
+                        SnApiErrorCode::BnsProxyUnavailable,
+                        "BNS proxy is not configured",
+                    )
+                })?;
                 let asset_owner = match params.asset_owner.as_deref() {
                     Some(value) => normalize_evm_address(value, "asset_owner")?,
                     None if proxy.require_user_asset_owner() => {

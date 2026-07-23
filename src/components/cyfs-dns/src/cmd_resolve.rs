@@ -1,10 +1,9 @@
 use crate::nameinfo_to_map_collection;
 use clap::{Arg, Command};
-use cyfs_gateway_lib::ServerErrorCode;
-use cyfs_gateway_lib::ServerManagerWeakRef;
+use cyfs_gateway_lib::{DnsAuthority, DnsQueryResult, ServerErrorCode, ServerManagerWeakRef};
 use cyfs_process_chain::{
     command_help, CollectionValue, CommandArgs, CommandHelpType, CommandResult, Context, EnvLevel,
-    ExternalCommand, MemoryMapCollection,
+    ExternalCommand, MapCollection, MemoryMapCollection,
 };
 use hickory_proto::xfer::Protocol;
 use log::error;
@@ -12,9 +11,7 @@ use name_client::{DnsProvider, NameInfo, NsProvider, RecordType};
 use name_lib::{EncodedDocument, DID};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::str::FromStr;
-
-pub(crate) const DNS_AUTH_LOOPBACK_SUPPRESSED_MSG: &str =
-    "authoritative_loopback_recursion_suppressed";
+use std::sync::Arc;
 
 //todo:implement the cmd_resolve_did
 
@@ -148,36 +145,6 @@ fn normalize_ptr_query_name(domain: &str, record_type: RecordType) -> String {
     domain.to_string()
 }
 
-fn is_loopback_dns_server(server_address: &str) -> bool {
-    if let Ok(ip) = server_address.parse::<IpAddr>() {
-        return ip.is_loopback();
-    }
-
-    if let Ok(addr) = server_address.parse::<SocketAddr>() {
-        return addr.ip().is_loopback();
-    }
-
-    false
-}
-
-async fn should_suppress_loopback_recursion(
-    context: &Context,
-    server_address: &str,
-) -> Result<bool, String> {
-    if !is_loopback_dns_server(server_address) {
-        return Ok(false);
-    }
-
-    let authoritative = context
-        .env()
-        .get("REQ_dns_authoritative", None)
-        .await?
-        .and_then(|value| value.as_str().map(|s| s.eq_ignore_ascii_case("true")))
-        .unwrap_or(false);
-
-    Ok(authoritative)
-}
-
 async fn server_error_result(
     code: ServerErrorCode,
     message: impl Into<String>,
@@ -192,6 +159,63 @@ async fn server_error_result(
         .await
         .map_err(|e| e.to_string())?;
     Ok(CommandResult::error_with_value(CollectionValue::Map(map)))
+}
+
+async fn authority_to_collection(authority: &DnsAuthority) -> Result<MemoryMapCollection, String> {
+    let map = MemoryMapCollection::new();
+    for (key, value) in [
+        ("zone_apex", authority.zone_apex.clone()),
+        ("primary_ns", authority.primary_ns.clone()),
+        ("responsible_mailbox", authority.responsible_mailbox.clone()),
+        ("soa_serial", authority.soa_serial.to_string()),
+        ("soa_refresh", authority.soa_refresh.to_string()),
+        ("soa_retry", authority.soa_retry.to_string()),
+        ("soa_expire", authority.soa_expire.to_string()),
+        ("soa_minimum", authority.soa_minimum.to_string()),
+        ("positive_ttl", authority.positive_ttl.to_string()),
+    ] {
+        map.insert(key, CollectionValue::String(value)).await?;
+    }
+    Ok(map)
+}
+
+async fn store_structured_dns_result(
+    context: &Context,
+    status: &str,
+    authority: Option<&DnsAuthority>,
+    cause: Option<&str>,
+) -> Result<(), String> {
+    context
+        .env()
+        .create(
+            "RESOLVE_DNS_STATUS",
+            CollectionValue::String(status.to_string()),
+            EnvLevel::Global,
+        )
+        .await?;
+    if let Some(authority) = authority {
+        context
+            .env()
+            .create(
+                "RESOLVE_DNS_AUTHORITY",
+                CollectionValue::Map(Arc::new(Box::new(
+                    authority_to_collection(authority).await?,
+                ))),
+                EnvLevel::Global,
+            )
+            .await?;
+    }
+    if let Some(cause) = cause {
+        context
+            .env()
+            .create(
+                "RESOLVE_DNS_FAILURE_CAUSE",
+                CollectionValue::String(cause.to_string()),
+                EnvLevel::Global,
+            )
+            .await?;
+    }
+    Ok(())
 }
 
 #[async_trait::async_trait]
@@ -251,15 +275,18 @@ impl ExternalCommand for CmdResolve {
             msg
         })?;
 
-        let record_type = RecordType::from_str(record_type_str.as_str()).ok_or_else(|| {
-            let msg = format!("Invalid record type: {}", record_type_str);
-            error!("{}", msg);
-            msg
-        })?;
-
-        let query_name = normalize_ptr_query_name(domain, record_type);
+        let parsed_record_type = RecordType::from_str(record_type_str.as_str());
+        let query_name = parsed_record_type
+            .map(|record_type| normalize_ptr_query_name(domain, record_type))
+            .unwrap_or_else(|| domain.to_string());
         let server_address = matches.get_one::<String>("server_address");
         let (provider_name, name_info) = if server_address.is_none() {
+            let Some(record_type) = parsed_record_type else {
+                return Ok(CommandResult::error_with_string(format!(
+                    "Invalid record type: {}",
+                    record_type_str
+                )));
+            };
             let provider_name = "default_dns".to_string();
             let provider = DnsProvider::new(None);
             let name_info = match provider
@@ -278,16 +305,12 @@ impl ExternalCommand for CmdResolve {
         } else {
             let server_address = server_address.unwrap();
             if let Ok(address) = server_address.parse::<IpAddr>() {
-                if should_suppress_loopback_recursion(context, server_address).await? {
-                    let msg = format!(
-                        "{}: skip resolve {} {} via loopback {}",
-                        DNS_AUTH_LOOPBACK_SUPPRESSED_MSG,
-                        query_name,
-                        record_type_str,
-                        server_address
-                    );
-                    return server_error_result(ServerErrorCode::NotFound, msg).await;
-                }
+                let Some(record_type) = parsed_record_type else {
+                    return Ok(CommandResult::error_with_string(format!(
+                        "Invalid record type: {}",
+                        record_type_str
+                    )));
+                };
                 let provider_name = address.to_string();
                 let provider = DnsProvider::new(Some(provider_name.clone()));
                 let name_info = match provider
@@ -304,16 +327,12 @@ impl ExternalCommand for CmdResolve {
                 };
                 (provider_name, name_info)
             } else if let Ok(address) = server_address.parse::<SocketAddr>() {
-                if should_suppress_loopback_recursion(context, server_address).await? {
-                    let msg = format!(
-                        "{}: skip resolve {} {} via loopback {}",
-                        DNS_AUTH_LOOPBACK_SUPPRESSED_MSG,
-                        query_name,
-                        record_type_str,
-                        server_address
-                    );
-                    return server_error_result(ServerErrorCode::NotFound, msg).await;
-                }
+                let Some(record_type) = parsed_record_type else {
+                    return Ok(CommandResult::error_with_string(format!(
+                        "Invalid record type: {}",
+                        record_type_str
+                    )));
+                };
                 let provider_name = address.to_string();
                 let provider = DnsProvider::new(Some(provider_name.clone()));
                 let name_info = match provider
@@ -341,11 +360,11 @@ impl ExternalCommand for CmdResolve {
                 };
                 if let Some(dns_service) = server_mgr.get_name_server(server_address) {
                     let provider_name = dns_service.id();
-                    let name_info = match dns_service
-                        .query(query_name.as_str(), Some(record_type), None)
+                    let dns_result = match dns_service
+                        .query_dns(query_name.as_str(), record_type_str.as_str(), None)
                         .await
                     {
-                        Ok(name_info) => name_info,
+                        Ok(result) => result,
                         Err(e) => {
                             let msg = format!(
                                 "Resolve failed via {} for domain {} record_type {}: {:?}",
@@ -354,7 +373,53 @@ impl ExternalCommand for CmdResolve {
                             return server_error_result(e.code(), msg).await;
                         }
                     };
-                    (provider_name, name_info)
+                    match dns_result {
+                        DnsQueryResult::Answer {
+                            name_info,
+                            authority,
+                        } => {
+                            if let Some(authority) = authority.as_ref() {
+                                store_structured_dns_result(
+                                    context,
+                                    "authoritative_answer",
+                                    Some(authority),
+                                    None,
+                                )
+                                .await?;
+                            }
+                            (provider_name, name_info)
+                        }
+                        DnsQueryResult::AuthoritativeNoData { authority } => {
+                            store_structured_dns_result(
+                                context,
+                                "authoritative_nodata",
+                                Some(&authority),
+                                None,
+                            )
+                            .await?;
+                            return Ok(CommandResult::success_with_string("RESOLVE_DNS_STATUS"));
+                        }
+                        DnsQueryResult::AuthoritativeNxDomain { authority } => {
+                            store_structured_dns_result(
+                                context,
+                                "authoritative_nxdomain",
+                                Some(&authority),
+                                None,
+                            )
+                            .await?;
+                            return Ok(CommandResult::success_with_string("RESOLVE_DNS_STATUS"));
+                        }
+                        DnsQueryResult::TemporaryFailure { cause } => {
+                            store_structured_dns_result(
+                                context,
+                                "temporary_failure",
+                                None,
+                                Some(cause.as_str()),
+                            )
+                            .await?;
+                            return Ok(CommandResult::success_with_string("RESOLVE_DNS_STATUS"));
+                        }
+                    }
                 } else {
                     let msg = format!(
                         "Invalid resolve command: inner service {} not found",
@@ -392,10 +457,6 @@ impl ExternalCommand for CmdResolve {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cyfs_process_chain::{
-        CommandPipe, Context as ChainContext, Env, EnvLevel, GotoCounter, ProcessChainLinkedManager,
-    };
-    use std::sync::Arc;
 
     #[test]
     fn test_normalize_ptr_query_name_ipv4_arpa() {
@@ -416,45 +477,5 @@ mod tests {
     fn test_normalize_ptr_query_name_plain_ip() {
         let name = normalize_ptr_query_name("192.168.1.1", RecordType::PTR);
         assert_eq!(name, "192.168.1.1");
-    }
-
-    #[test]
-    fn test_is_loopback_dns_server() {
-        assert!(is_loopback_dns_server("127.0.0.1"));
-        assert!(is_loopback_dns_server("127.0.0.1:53"));
-        assert!(is_loopback_dns_server("::1"));
-        assert!(is_loopback_dns_server("[::1]:53"));
-        assert!(!is_loopback_dns_server("8.8.8.8"));
-        assert!(!is_loopback_dns_server("8.8.8.8:53"));
-        assert!(!is_loopback_dns_server("local_dns"));
-    }
-
-    #[tokio::test]
-    async fn test_should_suppress_loopback_recursion_only_for_authoritative_queries() {
-        let env = Arc::new(Env::new(EnvLevel::Global, None));
-        let context = ChainContext::new(
-            Arc::new(ProcessChainLinkedManager::new()),
-            env.clone(),
-            Arc::new(GotoCounter::new()),
-            CommandPipe::default(),
-        );
-
-        assert!(!should_suppress_loopback_recursion(&context, "127.0.0.1")
-            .await
-            .unwrap());
-
-        env.create(
-            "REQ_dns_authoritative",
-            CollectionValue::String("true".to_string()),
-        )
-        .await
-        .unwrap();
-
-        assert!(should_suppress_loopback_recursion(&context, "127.0.0.1")
-            .await
-            .unwrap());
-        assert!(!should_suppress_loopback_recursion(&context, "8.8.8.8")
-            .await
-            .unwrap());
     }
 }
