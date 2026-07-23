@@ -7,9 +7,6 @@ servers:
     id: web3_sn
     type: sn
     host: "{{sn_host}}"
-    boot_jwt: "{{sn_boot_jwt}}"
-    owner_pkx: "{{sn_owner_pk}}"
-    device_jwt: ["{{sn_device_jwt}}"]
     ip: "{{sn_ip}}"
     # SN 强依赖统一 BNS RPC；裸 host 会规范化为 /kapi/bns。
     bns_server_url: "{{bns_server_url}}"

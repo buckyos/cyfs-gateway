@@ -267,10 +267,10 @@ stacks:
   #   type: sn
   #   host: example.com
   #   ip: 1.2.3.4                 # optional; self DNS/relay fallback
-  #   boot_jwt: "<jwt>"
-  #   owner_pkx: "<pkx>"
-  #   device_jwt:
-  #     - "<jwt>"
+  #   boot_jwt: "<jwt>"           # optional; BOOT for host/sn.<host>/aliases TXT only
+  #   owner_pkx: "<pkx>"          # optional; PKX for host/sn.<host>/aliases TXT only
+  #   device_jwt:                 # optional; DEV for host/sn.<host>/aliases TXT only
+  #     - "<jwt>"                 # omit all three when self bootstrap is not required
   #   aliases: []                 # optional
   #   bns_server_url: http://127.0.0.1:13450  # required base URL; no /kapi/bns
   #   bns_proxy:                  # optional; presence enables write capability

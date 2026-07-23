@@ -116,8 +116,8 @@ pub struct SnResolverConfig {
     pub server_host: String,
     pub server_ip: Option<IpAddr>,
     pub aliases: Vec<String>,
-    pub boot_jwt: String,
-    pub owner_pkx: String,
+    pub boot_jwt: Option<String>,
+    pub owner_pkx: Option<String>,
     pub device_jwts: Vec<String>,
     pub default_ttl: u32,
     pub legacy_gateway_device_name: String,
@@ -132,17 +132,20 @@ impl SnResolverConfig {
     pub fn new(
         server_host: impl Into<String>,
         server_ip: Option<IpAddr>,
-        boot_jwt: impl Into<String>,
-        owner_pkx: impl Into<String>,
+        boot_jwt: Option<String>,
+        owner_pkx: Option<String>,
         device_jwts: Vec<String>,
     ) -> Self {
         Self {
             server_host: normalize_host_lossy(server_host.into().as_str()),
             server_ip,
             aliases: Vec::new(),
-            boot_jwt: boot_jwt.into(),
-            owner_pkx: owner_pkx.into(),
-            device_jwts,
+            boot_jwt: boot_jwt.filter(|value| !value.trim().is_empty()),
+            owner_pkx: owner_pkx.filter(|value| !value.trim().is_empty()),
+            device_jwts: device_jwts
+                .into_iter()
+                .filter(|value| !value.trim().is_empty())
+                .collect(),
             default_ttl: DEFAULT_SN_RESOLVER_TTL_SECS,
             legacy_gateway_device_name: DEFAULT_LEGACY_GATEWAY_DEVICE.to_string(),
             soa_serial: DEFAULT_AUTH_SOA_SERIAL,
@@ -1954,18 +1957,18 @@ impl SnResolver {
             }
             RecordType::TXT => {
                 let mut txt = Vec::new();
-                if let Some(x) = pkx_from_public_key(self.config.owner_pkx.as_str()) {
-                    txt.push(format!("PKX={};", x));
-                } else if !self.config.owner_pkx.trim().is_empty() {
-                    txt.push(format!("PKX={};", self.config.owner_pkx));
+                if let Some(owner_pkx) = self.config.owner_pkx.as_deref() {
+                    if let Some(x) = pkx_from_public_key(owner_pkx) {
+                        txt.push(format!("PKX={};", x));
+                    } else {
+                        txt.push(format!("PKX={};", owner_pkx));
+                    }
                 }
-                if !self.config.boot_jwt.trim().is_empty() {
-                    txt.push(format!("BOOT={};", self.config.boot_jwt));
+                if let Some(boot_jwt) = self.config.boot_jwt.as_deref() {
+                    txt.push(format!("BOOT={};", boot_jwt));
                 }
                 for jwt in &self.config.device_jwts {
-                    if !jwt.trim().is_empty() {
-                        txt.push(format!("DEV={};", jwt));
-                    }
+                    txt.push(format!("DEV={};", jwt));
                 }
                 DnsResolution {
                     hostname: hostname.to_string(),
@@ -3294,8 +3297,8 @@ mod tests {
             SnResolverConfig::new(
                 "buckyos.test",
                 Some("192.0.2.10".parse::<IpAddr>().unwrap()),
-                "",
-                "",
+                None,
+                None,
                 Vec::new(),
             ),
             Arc::new(EmptySnAuthReader),
@@ -3312,8 +3315,8 @@ mod tests {
             SnResolverConfig::new(
                 "BuckyOS.Test.",
                 Some("192.0.2.10".parse::<IpAddr>().unwrap()),
-                "",
-                "",
+                None,
+                None,
                 Vec::new(),
             ),
             Arc::new(auth),
@@ -3324,10 +3327,145 @@ mod tests {
 
     fn resolver_without_server_ip() -> SnResolver {
         SnResolver::new(
-            SnResolverConfig::new("buckyos.test", None, "boot", "owner", Vec::new())
-                .with_aliases(vec!["alias.buckyos.test".to_string()]),
+            SnResolverConfig::new(
+                "buckyos.test",
+                None,
+                Some("boot".to_string()),
+                Some("owner".to_string()),
+                Vec::new(),
+            )
+            .with_aliases(vec!["alias.buckyos.test".to_string()]),
             Arc::new(EmptySnAuthReader),
         )
+    }
+
+    #[tokio::test]
+    async fn self_dns_bootstrap_fields_are_independent_and_empty_values_are_omitted() {
+        let cases = [
+            (None, None, Vec::new(), Vec::<String>::new()),
+            (
+                Some(String::new()),
+                Some("  ".to_string()),
+                vec![String::new(), "  ".to_string()],
+                Vec::new(),
+            ),
+            (
+                Some("boot".to_string()),
+                None,
+                Vec::new(),
+                vec!["BOOT=boot;".to_string()],
+            ),
+            (
+                None,
+                Some("owner".to_string()),
+                Vec::new(),
+                vec!["PKX=owner;".to_string()],
+            ),
+            (
+                None,
+                None,
+                vec!["device".to_string()],
+                vec!["DEV=device;".to_string()],
+            ),
+        ];
+
+        for (boot_jwt, owner_pkx, device_jwts, expected) in cases {
+            let resolver = SnResolver::new(
+                SnResolverConfig::new(
+                    "buckyos.test",
+                    Some("192.0.2.10".parse().unwrap()),
+                    boot_jwt,
+                    owner_pkx,
+                    device_jwts,
+                ),
+                Arc::new(EmptySnAuthReader),
+            );
+            let resolution = resolver
+                .resolve_dns("sn.buckyos.test", RecordType::TXT)
+                .await
+                .unwrap();
+            assert_eq!(resolution.txt, expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn bootstrap_absence_preserves_bns_and_user_domain_dns_sources() {
+        let mut bns = StaticBnsReader::default();
+        bns.owners.insert(
+            "alice".to_string(),
+            BnsOwner {
+                name: "alice".to_string(),
+                effective_owner: Some("alice-owner".to_string()),
+                owner_config: None,
+            },
+        );
+        bns.documents.insert(
+            ("alice".to_string(), BNS_DOC_BOOT.to_string()),
+            BnsDocument::jwt("alice", BNS_DOC_BOOT, "alice-boot"),
+        );
+        bns.documents.insert(
+            ("alice".to_string(), BNS_DOC_DEVICE_MINI.to_string()),
+            BnsDocument::json(
+                "alice",
+                BNS_DOC_DEVICE_MINI,
+                json!({
+                    "devices": {
+                        "ood1": {
+                            "did": "did:dev:alice-device",
+                            "mini_config_jwt": "alice-device-jwt"
+                        }
+                    }
+                }),
+            ),
+        );
+
+        let mut auth = StaticAuthReader::default();
+        auth.users.insert(
+            "bob".to_string(),
+            test_user("bob", UserState::Active, Some("bob.example")),
+        );
+        auth.bindings
+            .push(("bob.example".to_string(), "bob".to_string()));
+
+        let mut compatibility = StaticCompatibilityReader::default();
+        compatibility.records.insert(
+            ("www.bob.example".to_string(), "A".to_string()),
+            ("198.51.100.20".to_string(), 90),
+        );
+        compatibility.records.insert(
+            ("www.bob.example".to_string(), "TXT".to_string()),
+            ("user-domain-record".to_string(), 90),
+        );
+
+        let resolver = authoritative_test_resolver(bns, auth, compatibility);
+        assert!(resolver.config().boot_jwt.is_none());
+        assert!(resolver.config().owner_pkx.is_none());
+        assert!(resolver.config().device_jwts.is_empty());
+
+        let web3_txt = resolver
+            .resolve_dns("alice.web3.buckyos.test", RecordType::TXT)
+            .await
+            .unwrap();
+        assert!(web3_txt.txt.iter().any(|value| value == "PKX=alice-owner;"));
+        assert!(web3_txt.txt.iter().any(|value| value == "BOOT=alice-boot;"));
+        assert!(web3_txt
+            .txt
+            .iter()
+            .any(|value| value == "DEV=alice-device-jwt;"));
+
+        let user_domain_a = resolver
+            .resolve_dns("www.bob.example", RecordType::A)
+            .await
+            .unwrap();
+        assert_eq!(
+            user_domain_a.addresses,
+            vec!["198.51.100.20".parse::<IpAddr>().unwrap()]
+        );
+        let user_domain_txt = resolver
+            .resolve_dns("www.bob.example", RecordType::TXT)
+            .await
+            .unwrap();
+        assert_eq!(user_domain_txt.txt, vec!["user-domain-record".to_string()]);
     }
 
     #[tokio::test]

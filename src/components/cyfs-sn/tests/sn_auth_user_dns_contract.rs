@@ -166,8 +166,8 @@ async fn absent_underscore_txt_record_does_not_fall_through_to_bns() {
         SnResolverConfig::new(
             "buckyos.test",
             Some("192.0.2.10".parse().unwrap()),
-            "",
-            "",
+            None,
+            None,
             Vec::new(),
         ),
         Arc::new(cyfs_sn::EmptySnAuthReader),

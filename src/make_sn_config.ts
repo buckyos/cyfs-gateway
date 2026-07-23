@@ -34,7 +34,8 @@
 // Output layout:
 //   <rootfs>/sn_device_config.json    SN server device config
 //   <rootfs>/sn_private_key.pem       device private key (rtcp stack)
-//   <rootfs>/params.json              SN service parameters (incl. sn_ip)
+//   <rootfs>/params.json              SN service parameters (incl. sn_ip; no
+//                                    SN self-DNS bootstrap material)
 //   <rootfs>/sn.sqlite3               SN sqlite database runtime path (created by cyfs-sn)
 //   <rootfs>/sn_token_key/            server JWT signing key directory
 //   <rootfs>/fullchain.cert/.pem      TLS cert+key for sn.$base, bns.$base,
@@ -182,6 +183,11 @@ const WEB3_GATEWAY_ALL_CONFIG_FILES = [
 const LOCAL_DNS_CONFIG_FILE = "local_dns.toml";
 const BNS_LOCAL_DNS_BEGIN = "# BEGIN make_sn_config:bns";
 const BNS_LOCAL_DNS_END = "# END make_sn_config:bns";
+const SN_SELF_BOOTSTRAP_PARAM_KEYS = [
+  "sn_boot_jwt",
+  "sn_owner_pk",
+  "sn_device_jwt",
+] as const;
 
 function printUsage(log: (message?: unknown) => void = console.error): void {
   log(
@@ -272,6 +278,14 @@ function readStagedParams(targetDir: string): Record<string, unknown> {
   }
 }
 
+export function omitSnSelfBootstrapParams(
+  params: Record<string, unknown>,
+): void {
+  for (const key of SN_SELF_BOOTSTRAP_PARAM_KEYS) {
+    delete params[key];
+  }
+}
+
 function updateParamsJson(
   targetDir: string,
   snDbPath: string,
@@ -292,6 +306,10 @@ function updateParamsJson(
       params[key] = value;
     }
   }
+  // provision still creates the RTCP identity and may expose legacy parameters
+  // derived from it. They are unrelated to the stack identity and are no longer
+  // consumed by the SN server template.
+  omitSnSelfBootstrapParams(params);
   params.sn_db_path = snDbPath;
   delete params.sn_v2_auth_data_dir;
   params.sn_auth_data_dir = authDataDir;
@@ -1237,7 +1255,8 @@ export function makeDevtestLocalDns(targetDir: string): void {
 }
 
 /**
- * seed-v2 目标编排。SN 自身身份/TLS/params 闭环仍由 makeSnConfigs 负责，
+ * seed-v2 目标编排。RTCP stack 身份、TLS 和通用 params 仍由 makeSnConfigs
+ * 负责；SN 自身 TXT bootstrap 参数不再生成到最终 params.json。
  * 此处只补各组件的种子配置产物。
  */
 export async function makeSnSeedV2(

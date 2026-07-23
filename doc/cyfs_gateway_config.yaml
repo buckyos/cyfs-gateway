@@ -212,10 +212,10 @@ servers:
   #   type: sn
   #   host: example.com
   #   ip: 1.2.3.4              # 可选；自身解析/relay fallback 使用
-  #   boot_jwt: "<jwt>"
-  #   owner_pkx: "<pkx>"
-  #   device_jwt:
-  #     - "<jwt>"
+  #   boot_jwt: "<jwt>"        # 可选；仅用于 host/sn.<host>/aliases 的 BOOT TXT
+  #   owner_pkx: "<pkx>"       # 可选；仅用于 host/sn.<host>/aliases 的 PKX TXT
+  #   device_jwt:              # 可选；仅用于 host/sn.<host>/aliases 的 DEV TXT
+  #     - "<jwt>"              # 不需要自身 bootstrap 时三项全部省略
   #   aliases: []                 # 可选
   #   bns_server_url: http://127.0.0.1:18080  # 必填；不带 /kapi/bns
   #   bns_proxy:                  # 可选；存在即启用写能力

@@ -1,8 +1,9 @@
 # CYFS-SN 配置收敛 TODO
 
-状态：DONE（2026-07-22）
+状态：DONE（2026-07-22；原收敛项与新增 §6 均已实施）
 
-Beta2.2 配置收敛已完成。本文保留为破坏性迁移和验收记录；下文描述的
+Beta2.2 原配置收敛已完成。本文同时保留为破坏性迁移和验收记录，并追加
+SN 自身 DNS bootstrap 字段可选化。除 §6 明确标记的追加项外，下文描述的
 目标配置即当前配置，不再兼容被删除的旧字段。
 
 本文档固化 Beta2.2 已完成的 SN 配置破坏性调整。Beta2.2 允许删除旧字段；
@@ -16,6 +17,13 @@ servers:
     id: web3_sn
     type: sn
     host: example.com
+
+    # 三项均可选，只用于 host / sn.<host> / aliases 的兼容 TXT bootstrap。
+    # 不属于 RTCP stack identity；只解析 *.web3.<host> 和 user-domain 的部署可省略。
+    boot_jwt: eyJ...
+    owner_pkx: ...
+    device_jwt:
+      - eyJ...
 
     # 可选。只有解析 SN 自身地址或需要 SN relay fallback 时才使用。
     ip: 203.0.113.10
@@ -42,6 +50,9 @@ servers:
 
 最终字段语义：
 
+- `boot_jwt: Option<String>`；
+- `owner_pkx: Option<String>`；
+- `device_jwt: Vec<String>`，字段缺省时使用空数组；
 - `ip: Option<String>`；
 - `bns_server_url: String`；
 - `bns_proxy: Option<SNBnsProxyConfig>`，controller key 只在此块配置；
@@ -49,7 +60,9 @@ servers:
 - `device_info_db: Option<String>`。
 
 在本 TODO 讨论的运行时集成字段中，只有 `bns_server_url` 必须配置；
-`ip`、`bns_proxy`、`auth_db` 和 `device_info_db` 均为可选。
+`boot_jwt`、`owner_pkx`、`device_jwt`、`ip`、`bns_proxy`、`auth_db` 和
+`device_info_db` 均为可选。`host` 仍然必须配置，用于确定 SN hostname 和
+唯一权威 zone `web3.<host>`。
 
 `auth_db` / `device_info_db` 不包含 token、token file 或数据库 DSN。remote
 provider 的访问控制采用部署环境的源 IP 认证；SN client 一律以
@@ -259,7 +272,67 @@ SnDeviceInfoDbClient::new_krpc_url(device_info_db_url, None)
   `InvalidConfig`；seed 必须在 auth provider 侧导入。
 - `device_info_db` 是否 remote 不影响 seed 判定。
 
-## 6. 实施顺序
+## 6. SN 自身 DNS bootstrap 字段改为可选
+
+### 6.1 字段用途和边界
+
+当前 `boot_jwt`、`owner_pkx`、`device_jwt` 只由 `SnResolver::resolve_self_dns`
+消费，用于查询 `host`、`sn.<host>` 或 `aliases` 的 TXT 时分别生成：
+
+- `BOOT=<boot_jwt>;`
+- `PKX=<owner_pkx>;`
+- `DEV=<device_jwt>;`
+
+这三个字段不是 RTCP stack 的本机身份配置，不得用来替代 Gateway identity
+manager。RTCP 本机身份继续由 stack 的 `identity`（兼容别名 `did` /
+`device_did`）和 `identity_manager` 加载；legacy 部署仍可使用 `key_path` 与
+`device_config_path`。
+
+`*.web3.<host>` 和 active `user_domain` 的解析不读取这三个顶层字段：
+
+- PKX 来自对应 BNS owner 或用户公钥；
+- BOOT 来自对应 BNS `boot` document、`zone.boot_jwt` 或明确的 legacy zone 数据；
+- DEV 来自对应 BNS `device_mini`、zone devices 或兼容设备记录；
+- 其它 TXT 来自显式 DNS record 或 BNS `dns_txt`。
+
+因此，只提供 `web3.<host>` 和 `user_domain` 权威 DNS 的部署可以完全省略这三个
+字段，不得被迫生成一套与 RTCP identity manager 重复的 bootstrap 材料。
+
+### 6.2 目标配置模型
+
+将 `SNServerConfig` 改为：
+
+```rust
+pub boot_jwt: Option<String>,
+pub owner_pkx: Option<String>,
+#[serde(default)]
+pub device_jwt: Vec<String>,
+```
+
+`SnResolverConfig` 同步使用可选的 `boot_jwt` / `owner_pkx` 和缺省为空的
+`device_jwts`。配置缺失或值为空时，SN 自身 TXT 不生成对应记录；不得生成
+`PKX=;`、`BOOT=;` 或 `DEV=;`。为兼容现有生成物，显式空字符串按未配置处理，
+后续模板应直接省略字段。
+
+三个字段必须可以独立配置，不能要求同时出现。未配置全部三个字段时：
+
+- `*.web3.<host>` 和 `user_domain` 的 A/AAAA/TXT 解析保持不变；
+- SN 自身 hostname 的 A/AAAA 行为仍只由可选 `ip` 决定；
+- SN 自身 hostname 不再合成 PKX/BOOT/DEV TXT；
+- RTCP stack 的启动和身份加载完全不受影响。
+
+### 6.3 模板和文档迁移
+
+- 生产模板默认删除 `boot_jwt`、`owner_pkx`、`device_jwt`。
+- 仍需兼容 SN 自身 TXT bootstrap 的 dev/test profile 可以继续生成并配置。
+- `make_sn_config.ts` 不得再把生成这三个值作为启动 `cyfs-sn` 的必要条件。
+- SN 完整部署文档应把 RTCP `identity` / `device_did` 放在 `stacks` 配置下，
+  不得放进 `servers.web3_sn`；`SNServerConfig` 使用 `deny_unknown_fields`，
+  在 server block 中配置 `device_did` 应继续报错。
+- 保留 per-zone BNS `boot` / `device_mini` 数据模型；本项只处理 SN 自身 hostname
+  的全局兼容值，不删除用户 zone 的 BOOT/DEV 能力。
+
+## 7. 实施顺序
 
 1. 先改 `SNServerConfig` 和配置解析单元测试，锁定目标 YAML 结构。
 2. 改 `ip` 可选语义及 resolver 错误传递。
@@ -267,16 +340,24 @@ SnDeviceInfoDbClient::new_krpc_url(device_info_db_url, None)
 4. 删除 `bns_evm` legacy 路径，将所有模板改为 `bns_proxy.controllers`。
 5. 将 auth/device backend 分别改为可选 URL 驱动，删除 `db_type=postgres`
    和 token 配置。
-6. 更新配置生成器、开发环境脚本、样例、文档和旧 TODO 中的过时说明。
-7. 执行格式化和分层测试，最后做全局旧字段残留扫描。
+6. 将 SN 自身 TXT bootstrap 三字段改为可选，解除其与启动配置的强制绑定。
+7. 更新配置生成器、开发环境脚本、样例、文档和旧 TODO 中的过时说明。
+8. 执行格式化和分层测试，最后做全局旧字段残留扫描。
 
-## 7. 测试和验收
+## 8. 测试和验收
 
-### 7.1 必须增加的测试
+### 8.1 必须增加的测试
 
 - 配置不带 `ip` 可成功构造 SN；不依赖 `server_ip` 的查询正常。
 - 缺少 `ip` 时，SN 自身 A/AAAA 和 relay fallback 返回明确解析失败。
 - 显式非法 `ip` 启动失败。
+- 配置同时缺少 `boot_jwt`、`owner_pkx` 和 `device_jwt` 时可成功解析和启动。
+- 三个自身 TXT bootstrap 字段均可独立配置；缺省或空值不生成空的
+  PKX/BOOT/DEV TXT。
+- 不配置三个字段时，`*.web3.<host>` 和 `user_domain` 的 A/AAAA/TXT 解析
+  仍从 BNS、auth、device-info 和显式 DNS record 获取数据。
+- RTCP identity manager 配置只依赖 stack `identity`，不依赖三个 SN server
+  bootstrap 字段。
 - IPv4/IPv6 记录类型匹配逻辑保持不变。
 - `bns_server_url` 被用于 readiness probe、BNS 读写和 HTTP forward
   生成物；不再需要 `bns_rpc_url`。
@@ -292,7 +373,7 @@ SnDeviceInfoDbClient::new_krpc_url(device_info_db_url, None)
 - 空 `auth_db` / `device_info_db` URL 失败，不回退本地。
 - remote `auth_db` 与 `seed_path` 同时出现时启动失败。
 
-### 7.2 建议执行命令
+### 8.2 建议执行命令
 
 ```bash
 cd src
@@ -311,7 +392,7 @@ npm run build
 
 Web 代码未变时无需强制安装前端依赖。
 
-### 7.3 最终残留扫描
+### 8.3 最终残留扫描
 
 ```bash
 rg -n "bns_rpc_url|bns_evm|SnPostgresDbConfig|provider_session_token|provider_token|db_type.*postgres" src doc/SN
@@ -321,7 +402,7 @@ rg -n "bns_rpc_url|bns_evm|SnPostgresDbConfig|provider_session_token|provider_to
 当前配置文档不应再出现旧字段。对 `[DONE]` 文档应加注“历史配置已被
 Beta2.2 取代”，避免被误当成现行文档。
 
-## 8. 非目标和边界
+## 9. 非目标和边界
 
 - 本 TODO 不实现 remote provider 服务本身，只改 SN 的 client/backend 选择。
 - 本 TODO 不将 compatibility store、relay manager、BNS write request store 或
@@ -332,7 +413,9 @@ Beta2.2 取代”，避免被误当成现行文档。
 - 本 TODO 不引入 session-token 备用认证路径；安全边界是部署环境的源 IP
   认证。
 
-## 9. 完成记录
+## 10. 完成记录
+
+### 10.1 原收敛项（DONE，2026-07-22）
 
 - `ip` 已改为可选；缺少 IP 时仅依赖 SN 地址的解析分支返回
   `BackendUnavailable`，显式非法 IP 仍阻止启动。
@@ -348,4 +431,17 @@ Beta2.2 取代”，避免被误当成现行文档。
 验收结果：`cyfs-sn` lib/tests、`cyfs_gateway` lib/集成测试、Deno 配置生成测试、
 Python staging 测试以及 `git diff --check` 均通过。workspace 的全量
 `cargo fmt --check` 仍会报告本次修改范围之外的既有格式差异，因此未对无关文件做
+批量格式化。
+
+### 10.2 SN 自身 DNS bootstrap 可选化（DONE，2026-07-22）
+
+- [x] `boot_jwt`、`owner_pkx` 改为 `Option<String>`。
+- [x] `device_jwt` 缺省为空数组。
+- [x] resolver 不再要求三个字段存在，也不生成空 TXT。
+- [x] 生产模板和生成器默认省略三个字段。
+- [x] 增加无 bootstrap 配置下的 web3/user-domain DNS 与 RTCP identity 回归测试。
+
+验收结果：`cyfs-sn` lib/tests、`cyfs_gateway` 集成测试、RTCP identity parser
+回归测试、Deno 配置生成测试和 `git diff --check` 均通过。workspace 全量
+`cargo fmt --check` 仍报告本次修改范围之外的既有格式差异，未对无关文件做
 批量格式化。

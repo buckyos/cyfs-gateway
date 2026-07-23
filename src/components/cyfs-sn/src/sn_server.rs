@@ -2138,8 +2138,11 @@ pub struct SNServerConfig {
     pub host: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ip: Option<String>,
-    pub boot_jwt: String,
-    pub owner_pkx: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub boot_jwt: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_pkx: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub device_jwt: Vec<String>,
     #[serde(default)]
     pub aliases: Vec<String>,
@@ -3070,9 +3073,6 @@ mod tests {
         let base = json!({
             "id": "read-only",
             "host": "sn.test",
-            "boot_jwt": "",
-            "owner_pkx": "",
-            "device_jwt": [],
             "bns_server_url": format!("http://{}", bns_addr),
             "db_path": db.path().to_str().unwrap(),
             "auth_data_dir": auth_dir.path().to_str().unwrap()
@@ -3164,9 +3164,6 @@ mod tests {
             "id": "test",
             "type": "sn",
             "host": "buckyos.ai",
-            "boot_jwt": "",
-            "owner_pkx": "",
-            "device_jwt": [],
             "bns_server_url": "http://127.0.0.1:18080",
             "auth_db": "http://auth-provider:8080",
             "device_info_db": "http://device-provider:8080",
@@ -3174,6 +3171,9 @@ mod tests {
         });
         let config: SNServerConfig = serde_json::from_value(config).unwrap();
         assert!(config.ip.is_none());
+        assert!(config.boot_jwt.is_none());
+        assert!(config.owner_pkx.is_none());
+        assert!(config.device_jwt.is_empty());
         assert_eq!(config.bns_server_url, "http://127.0.0.1:18080");
         assert_eq!(config.auth_db.as_deref(), Some("http://auth-provider:8080"));
         assert!(SNServer::parse_server_ip(None).unwrap().is_none());
@@ -3182,6 +3182,47 @@ mod tests {
             .unwrap()
             .to_string();
         assert!(invalid_ip.contains("invalid SN server ip not-an-ip"));
+    }
+
+    #[test]
+    fn sn_config_bootstrap_fields_are_independent_and_not_stack_identity() {
+        let base = json!({
+            "id": "test",
+            "host": "buckyos.ai",
+            "bns_server_url": "http://127.0.0.1:18080"
+        });
+        for (field, value) in [
+            ("boot_jwt", json!("boot")),
+            ("owner_pkx", json!("owner")),
+            ("device_jwt", json!(["device"])),
+        ] {
+            let mut value_with_field = base.clone();
+            value_with_field[field] = value;
+            let config: SNServerConfig = serde_json::from_value(value_with_field).unwrap();
+            assert_eq!(
+                config.boot_jwt.as_deref(),
+                (field == "boot_jwt").then_some("boot")
+            );
+            assert_eq!(
+                config.owner_pkx.as_deref(),
+                (field == "owner_pkx").then_some("owner")
+            );
+            assert_eq!(
+                config.device_jwt,
+                if field == "device_jwt" {
+                    vec!["device".to_string()]
+                } else {
+                    Vec::new()
+                }
+            );
+        }
+
+        let mut misplaced_identity = base;
+        misplaced_identity["device_did"] = json!("did:web:sn.example");
+        let error = serde_json::from_value::<SNServerConfig>(misplaced_identity)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("unknown field `device_did`"), "{error}");
     }
 
     #[test]
