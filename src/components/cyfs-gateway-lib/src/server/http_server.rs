@@ -10,9 +10,9 @@ use crate::forward::{
 use crate::global_process_chains::{GlobalProcessChainsRef, create_process_chain_executor};
 use crate::tunnel_url_status::TunnelFailureReason;
 use crate::{
-    GlobalCollectionManagerRef, HttpRequestHeaderMap, HttpRequestHostOverride,
-    HttpRequestProcessChainVars, HttpResponseHeaderMap, HttpServer, JsExternalsManagerRef,
-    ProcessChainConfigs,RequestSourceInfo, Server, ServerConfig, ServerContext, ServerContextRef, ServerError,
+    GlobalCollectionManagerRef, HttpRequestHeaderMap, HttpRequestProcessChainVars,
+    HttpResponseHeaderMap, HttpServer, JsExternalsManagerRef, ProcessChainConfigs,
+    RequestSourceInfo, Server, ServerConfig, ServerContext, ServerContextRef, ServerError,
     ServerErrorCode, ServerFactory, ServerManagerWeakRef, ServerResult, StreamInfo, TunnelManager,
     get_external_commands,
 };
@@ -814,48 +814,6 @@ impl ProcessChainHttpServer {
             })
     }
 
-    fn upstream_host_header(request_url: &Url) -> ServerResult<http::HeaderValue> {
-        let host = request_url.host().ok_or_else(|| {
-            server_err!(
-                ServerErrorCode::InvalidConfig,
-                "Missing upstream host in url: {}",
-                request_url
-            )
-        })?;
-        let mut authority = match host {
-            url::Host::Domain(host) => host.to_string(),
-            url::Host::Ipv4(host) => host.to_string(),
-            url::Host::Ipv6(host) => format!("[{}]", host),
-        };
-        if let Some(port) = request_url.port() {
-            authority.push(':');
-            authority.push_str(&port.to_string());
-        }
-        http::HeaderValue::from_str(&authority).map_err(|e| {
-            server_err!(
-                ServerErrorCode::InvalidConfig,
-                "Invalid upstream Host header '{}': {}",
-                authority,
-                e
-            )
-        })
-    }
-
-    fn process_chain_overrode_host(req: &http::Request<BoxBody<Bytes, ServerError>>) -> bool {
-        req.extensions().get::<HttpRequestHostOverride>().is_some()
-    }
-
-    fn apply_default_proxy_host(
-        header: &mut http::HeaderMap,
-        request_url: &Url,
-        process_chain_overrode_host: bool,
-    ) -> ServerResult<()> {
-        if matches!(request_url.scheme(), "http" | "https") && !process_chain_overrode_host {
-            header.insert(http::header::HOST, Self::upstream_host_header(request_url)?);
-        }
-        Ok(())
-    }
-
     /// Match the wire-version behavior of the existing direct branches.
     /// HTTPS preserves an inbound HTTP/1.x version; direct HTTP and
     /// tunnel-backed forwarding use HTTP/1.1.
@@ -981,62 +939,6 @@ impl ProcessChainHttpServer {
         }
 
         raw_uri.to_string()
-    }
-
-    fn proxy_pass_has_uri(target_url: &str) -> bool {
-        let Some((_, authority_and_uri)) = target_url.split_once("://") else {
-            return false;
-        };
-        authority_and_uri
-            .find(|ch| matches!(ch, '/' | '?' | '#'))
-            .and_then(|index| authority_and_uri.as_bytes().get(index).copied())
-            .is_some_and(|byte| matches!(byte, b'/' | b'?'))
-    }
-
-    /// Apply nginx `proxy_pass` URI replacement rules for an implicit
-    /// `location /`. A target without a URI preserves the inbound URI;
-    /// a target with a URI replaces the leading `/` and appends the
-    /// remainder exactly, so the configured trailing slash is significant.
-    fn proxy_pass_origin_uri(
-        target_url: &str,
-        parsed_target: &Url,
-        client_origin_uri: &str,
-    ) -> ServerResult<String> {
-        if parsed_target.fragment().is_some() {
-            return Err(server_err!(
-                ServerErrorCode::InvalidConfig,
-                "http upstream URL must not contain a fragment: {}",
-                target_url
-            ));
-        }
-
-        if !Self::proxy_pass_has_uri(target_url) {
-            return Ok(client_origin_uri.to_string());
-        }
-
-        let client_uri = client_origin_uri.parse::<http::Uri>().map_err(|e| {
-            server_err!(
-                ServerErrorCode::BadRequest,
-                "invalid inbound request URI '{}': {}",
-                client_origin_uri,
-                e
-            )
-        })?;
-        let suffix = client_uri
-            .path()
-            .strip_prefix('/')
-            .unwrap_or(client_uri.path());
-        let mut upstream_uri = format!("{}{}", parsed_target.path(), suffix);
-        if upstream_uri.is_empty() {
-            upstream_uri.push('/');
-        }
-
-        let query = parsed_target.query().or_else(|| client_uri.query());
-        if let Some(query) = query {
-            upstream_uri.push('?');
-            upstream_uri.push_str(query);
-        }
-        Ok(upstream_uri)
     }
 
     pub fn builder() -> ProcessChainHttpServerBuilder {
@@ -1542,7 +1444,7 @@ impl ProcessChainHttpServer {
         info: &StreamInfo,
         pooled_http_client: Option<&PooledHttpClient>,
     ) -> ServerResult<http::Response<BoxBody<Bytes, ServerError>>> {
-        let (org_url, mut header, method, version, process_chain_overrode_host) = {
+        let (org_url, mut header, method, version) = {
             let req_ref = req_slot
                 .as_ref()
                 .expect("forward_to_candidate: req_slot must be Some on entry");
@@ -1554,7 +1456,6 @@ impl ProcessChainHttpServer {
                 h,
                 req_ref.method().clone(),
                 req_ref.version(),
-                Self::process_chain_overrode_host(req_ref),
             )
         };
         let client_origin_uri = Self::origin_form_uri(org_url.as_str());
@@ -1567,15 +1468,9 @@ impl ProcessChainHttpServer {
             )
         })?;
         let scheme = parsed_target.scheme();
-        Self::apply_default_proxy_host(&mut header, &parsed_target, process_chain_overrode_host)?;
-        let upstream_origin_uri = if matches!(scheme, "http" | "https") {
-            Self::proxy_pass_origin_uri(target_url, &parsed_target, &client_origin_uri)?
-        } else {
-            client_origin_uri.clone()
-        };
         debug!(
             "handle_upstream target: {}, request uri: {}",
-            parsed_target, upstream_origin_uri
+            parsed_target, client_origin_uri
         );
         // Per §6.7 we report the outcome of every business attempt to
         // tunnel_mgr against the candidate URL, not a request URL carrying
@@ -1583,16 +1478,11 @@ impl ProcessChainHttpServer {
         // history entry.
         let history_key = Some(parsed_target.clone());
         if let Some(pooled) = pooled_http_client {
-            let pooled_request_uri = if matches!(scheme, "http" | "https") {
-                upstream_origin_uri.as_str()
-            } else {
-                client_origin_uri.as_str()
-            };
             return self
                 .forward_to_pooled_http_candidate(
                     req_slot,
                     pooled,
-                    pooled_request_uri,
+                    client_origin_uri.as_str(),
                     history_key.as_ref(),
                     header,
                     method,
@@ -1685,7 +1575,7 @@ impl ProcessChainHttpServer {
                     .boxed();
                 let mut upstream_req = Request::builder()
                     .method(method)
-                    .uri(upstream_origin_uri.as_str())
+                    .uri(client_origin_uri.as_str())
                     .version(Self::upstream_http_version(scheme, version))
                     .body(body)
                     .map_err(|e| {
@@ -1838,7 +1728,7 @@ impl ProcessChainHttpServer {
                     .boxed();
                 let mut upstream_req = Request::builder()
                     .method(method)
-                    .uri(upstream_origin_uri.as_str())
+                    .uri(client_origin_uri.as_str())
                     .version(upstream_http_version)
                     .body(body)
                     .map_err(|e| {
@@ -3706,71 +3596,6 @@ hook_point: []
         assert_eq!(config.proxy_ssl_verify_depth, 1);
     }
 
-    #[test]
-    fn test_proxy_pass_without_uri_preserves_inbound_uri() {
-        let target = Url::parse("http://backend.example").unwrap();
-        assert_eq!(
-            ProcessChainHttpServer::proxy_pass_origin_uri(
-                "http://backend.example",
-                &target,
-                "/users?id=7",
-            )
-            .unwrap(),
-            "/users?id=7"
-        );
-    }
-
-    #[test]
-    fn test_proxy_pass_uri_replaces_implicit_location_prefix() {
-        let trailing_slash = Url::parse("http://backend.example/api/").unwrap();
-        assert_eq!(
-            ProcessChainHttpServer::proxy_pass_origin_uri(
-                "http://backend.example/api/",
-                &trailing_slash,
-                "/users?id=7",
-            )
-            .unwrap(),
-            "/api/users?id=7"
-        );
-
-        let no_trailing_slash = Url::parse("http://backend.example/api").unwrap();
-        assert_eq!(
-            ProcessChainHttpServer::proxy_pass_origin_uri(
-                "http://backend.example/api",
-                &no_trailing_slash,
-                "/users?id=7",
-            )
-            .unwrap(),
-            "/apiusers?id=7"
-        );
-    }
-
-    #[test]
-    fn test_proxy_pass_configured_query_replaces_inbound_query() {
-        let target = Url::parse("http://backend.example/api/?token=fixed").unwrap();
-        assert_eq!(
-            ProcessChainHttpServer::proxy_pass_origin_uri(
-                "http://backend.example/api/?token=fixed",
-                &target,
-                "/users?id=7",
-            )
-            .unwrap(),
-            "/api/users?token=fixed"
-        );
-    }
-
-    #[test]
-    fn test_proxy_pass_rejects_http_url_fragment() {
-        let target = Url::parse("http://backend.example/api/#section").unwrap();
-        let error = ProcessChainHttpServer::proxy_pass_origin_uri(
-            "http://backend.example/api/#section",
-            &target,
-            "/users",
-        )
-        .unwrap_err();
-        assert_eq!(error.code(), ServerErrorCode::InvalidConfig);
-    }
-
     #[tokio::test]
     async fn test_buffer_body_accepts_multiple_frames_at_exact_cap() {
         let body = framed_body(vec![
@@ -4836,6 +4661,7 @@ hook_point: []
                 let service = hyper::service::service_fn(
                     |req: http::Request<hyper::body::Incoming>| async move {
                         println!("{:?}", req.headers());
+                        assert_eq!(req.uri().to_string(), "/test");
                         assert!(req.headers().get("X-Real-IP").is_some());
                         assert_eq!(
                             req.headers().get("X-Real-IP").map(|v| v.to_str().unwrap()),
@@ -4880,7 +4706,7 @@ hook_point: []
   blocks:
     - id: main
       block: |
-        map-add REQ X-Real-IP $REQ_remote_ip && map-add REQ X-Real-Port $REQ_remote_port && forward http://127.0.0.1:18090;
+        map-add REQ X-Real-IP $REQ_remote_ip && map-add REQ X-Real-Port $REQ_remote_port && forward http://127.0.0.1:18090/;
         "#;
 
         let chains: ProcessChainConfigs = serde_yaml_ng::from_str(chains).unwrap();
@@ -4937,94 +4763,6 @@ hook_point: []
 
         let body = resp.collect().await.unwrap().to_bytes();
         assert_eq!(body, Bytes::from("forward success"));
-    }
-
-    #[tokio::test]
-    async fn test_process_chain_http_server_forward_http_base_path_keeps_origin_form_uri() {
-        use http_body_util::BodyExt;
-        use tokio::net::TcpListener;
-
-        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let upstream_addr = upstream_listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            let (stream, _) = upstream_listener.accept().await.unwrap();
-            let service = hyper::service::service_fn(
-                |req: http::Request<hyper::body::Incoming>| async move {
-                    assert_eq!(req.uri().scheme_str(), None);
-                    assert_eq!(req.uri().authority(), None);
-                    assert_eq!(req.uri().to_string(), "/base/v1/chat?x=1");
-                    let _ = req.collect().await;
-                    Ok::<_, ServerError>(
-                        http::Response::builder()
-                            .status(StatusCode::OK)
-                            .body(
-                                Full::new(Bytes::from("base path success"))
-                                    .map_err(|e| match e {})
-                                    .boxed(),
-                            )
-                            .unwrap(),
-                    )
-                },
-            );
-
-            let _ = hyper::server::conn::http1::Builder::new()
-                .serve_connection(TokioIo::new(stream), service)
-                .await;
-        });
-
-        let mock_server_mgr = Arc::new(ServerManager::new());
-        let chains = format!(
-            r#"
-- id: main
-  priority: 1
-  blocks:
-    - id: main
-      block: |
-        forward http://{}/base/;
-        "#,
-            upstream_addr
-        );
-
-        let chains: ProcessChainConfigs = serde_yaml_ng::from_str(&chains).unwrap();
-        let http_server = Arc::new(
-            ProcessChainHttpServer::builder()
-                .id("test_forward_http_base_path")
-                .version("HTTP/1.1".to_string())
-                .hook_point(chains)
-                .server_mgr(Arc::downgrade(&mock_server_mgr))
-                .tunnel_manager(TunnelManager::new())
-                .build()
-                .await
-                .unwrap(),
-        );
-
-        let (client, server) = tokio::io::duplex(1024);
-        tokio::spawn(async move {
-            hyper_serve_http(Box::new(server), http_server, StreamInfo::default())
-                .await
-                .unwrap();
-        });
-
-        let request = http::Request::builder()
-            .method("GET")
-            .uri("/v1/chat?x=1")
-            .body(Full::new(Bytes::new()).map_err(|e| match e {}).boxed())
-            .unwrap();
-
-        let (mut sender, conn) = hyper::client::conn::http1::Builder::new()
-            .handshake(TokioIo::new(client))
-            .await
-            .unwrap();
-
-        tokio::spawn(async move {
-            conn.await.unwrap();
-        });
-
-        let resp = sender.send_request(request).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-
-        let body = resp.collect().await.unwrap().to_bytes();
-        assert_eq!(body, Bytes::from("base path success"));
     }
 
     #[tokio::test]
@@ -6194,23 +5932,8 @@ hook_point: []
         send_process_chain_request_with_headers(&mut sender, path, headers).await;
     }
 
-    #[test]
-    fn test_proxy_host_formats_upstream_authority() {
-        let cases = [
-            ("http://example.com/path", "example.com"),
-            ("https://example.com:8443/path", "example.com:8443"),
-            ("http://[2001:db8::1]:8080/path", "[2001:db8::1]:8080"),
-        ];
-
-        for (url, expected) in cases {
-            let value =
-                ProcessChainHttpServer::upstream_host_header(&Url::parse(url).unwrap()).unwrap();
-            assert_eq!(value, expected);
-        }
-    }
-
     #[tokio::test]
-    async fn test_proxy_host_defaults_to_upstream_authority_for_direct_and_pooled() {
+    async fn test_proxy_host_preserves_inbound_host_for_direct_and_pooled() {
         for keepalive in [None, Some(HttpKeepaliveConfig::Count(1))] {
             let (addr, seen_hosts) = spawn_host_recording_http_upstream().await;
             let upstream_config = HttpNamedUpstreamConfig {
@@ -6229,49 +5952,11 @@ hook_point: []
 
             send_one_process_chain_request(http_server, "/proxy-host", headers).await;
 
-            assert_eq!(seen_hosts.lock().unwrap().as_slice(), &[addr.to_string()]);
+            assert_eq!(
+                seen_hosts.lock().unwrap().as_slice(),
+                &["client.example".to_string()]
+            );
         }
-    }
-
-    #[tokio::test]
-    async fn test_proxy_host_process_chain_override_wins() {
-        let (addr, seen_hosts) = spawn_host_recording_http_upstream().await;
-        let upstream_config = HttpNamedUpstreamConfig {
-            url: format!("http://{addr}"),
-            keepalive: Some(HttpKeepaliveConfig::Count(1)),
-            keepalive_timeout: None,
-            keepalive_requests: None,
-        };
-        let chains = r#"
-- id: main
-  priority: 1
-  blocks:
-    - id: main
-      block: |
-        ${REQ.host} = chain.example;
-        forward api_a;
-        "#;
-        let chains: ProcessChainConfigs = serde_yaml_ng::from_str(chains).unwrap();
-        let (http_server, _server_mgr) =
-            test_process_chain_server_with_named_http_upstream_config_and_chains(
-                upstream_config,
-                chains,
-            )
-            .await;
-        let mut headers = http::HeaderMap::new();
-        headers.insert(
-            http::header::HOST,
-            // Setting Host to the same value as the inbound header is still
-            // an explicit process-chain override and must beat the default.
-            http::HeaderValue::from_static("chain.example"),
-        );
-
-        send_one_process_chain_request(http_server, "/proxy-host-override", headers).await;
-
-        assert_eq!(
-            seen_hosts.lock().unwrap().as_slice(),
-            &["chain.example".to_string()]
-        );
     }
 
     #[test]
