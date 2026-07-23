@@ -379,7 +379,7 @@ mod tests {
         let upstream_socks_stack_port = allocate_free_port().await;
         let control_server_port = allocate_free_port().await;
         let control_server = format!("http://127.0.0.1:{control_server_port}");
-        let bns_rpc_url = start_mock_bns_server().await;
+        let bns_server_url = start_mock_bns_server().await;
 
         let config = include_str!("test_cyfs_gateway.yaml");
         let local_dns = include_str!("local_dns.toml");
@@ -419,7 +419,7 @@ function test_js_hook(context, host) {
 
         let db = tempfile::NamedTempFile::with_suffix(".db").unwrap();
         let config = config.replace("{{sn_db}}", db.path().to_str().unwrap());
-        let config = config.replace("{{bns_rpc_url}}", bns_rpc_url.as_str());
+        let config = config.replace("{{bns_server_url}}", bns_server_url.as_str());
 
         let io_dump = tempfile::NamedTempFile::with_suffix(".dump").unwrap();
         let config = config.replace("{{test_io_dump}}", io_dump.path().to_str().unwrap());

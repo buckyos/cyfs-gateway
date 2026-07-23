@@ -326,7 +326,6 @@ function patchWeb3GatewayConfigText(text: string): string | null {
   }
 
   const childIndent = indent + 2;
-  const nestedIndent = childIndent + 2;
   const block = lines.slice(start + 1, end);
   const filtered: string[] = [];
   for (let i = 0; i < block.length; i++) {
@@ -337,17 +336,8 @@ function patchWeb3GatewayConfigText(text: string): string | null {
       lineIndent === childIndent &&
       (trim.startsWith("v2_auth_data_dir:") ||
         trim.startsWith("auth_data_dir:") ||
-        trim.startsWith("db_type:") ||
         trim.startsWith("db_path:"))
     ) {
-      continue;
-    }
-    if (lineIndent === childIndent && trim === "db_params:") {
-      i++;
-      while (i < block.length && leadingSpaces(block[i]) > childIndent) {
-        i++;
-      }
-      i--;
       continue;
     }
     filtered.push(line);
@@ -355,9 +345,7 @@ function patchWeb3GatewayConfigText(text: string): string | null {
 
   const insertLines = [
     `${" ".repeat(childIndent)}auth_data_dir: "{{sn_auth_data_dir}}"`,
-    `${" ".repeat(childIndent)}db_type: sqlite`,
-    `${" ".repeat(childIndent)}db_params:`,
-    `${" ".repeat(nestedIndent)}db_path: "{{sn_db_path}}"`,
+    `${" ".repeat(childIndent)}db_path: "{{sn_db_path}}"`,
   ];
   const ipLine = filtered.findIndex((line) =>
     leadingSpaces(line) === childIndent && line.trim().startsWith("ip:")
@@ -580,7 +568,7 @@ async function makeSnConfigs(
 // 3. cyfs-sn web3_sn server【已实现】启动时从 sn_seed.yaml 幂等导入 C 类
 //    种子（激活码、sn_user 账号、user_domain 绑定），格式真值
 //    cyfs-sn/src/sn_seed.rs；schema 完全归 SN 所有。
-// 4. web3_gateway.yaml【已实现】bns_rpc_url 参数化为 {{bns_rpc_url}}，
+// 4. web3_gateway.yaml【已实现】bns_server_url 参数化为 {{bns_server_url}}，
 //    由 params.json 提供（alignBnsRuntimeParams 与 dv-env.json 对齐）。
 //
 // 验证入口：scripts/sn-dev-up.sh + sn-dev-smoke.sh（本机三件套）与
@@ -1109,11 +1097,11 @@ export function applyBindParams(targetDir: string, devLocal: boolean): void {
 
 /**
  * 把 BNS 运行参数收敛进 params.json，消除三处各自写死：start.py 的 RPC/合约
- * 常量、web3_gateway.yaml 写死的 bns_rpc_url、dv 环境实际产出的
+ * 常量、web3_gateway.yaml 写死的 bns_server_url、dv 环境实际产出的
  * dv-env.json（rpc_endpoint/chain_id/contract_address/server_url/
- * server_rpc_path）。存在 dv-env.json 时以其为准写入 bns_rpc_url /
- * bns_server_url 等 key；无 dv-env.json 时写 start.py 内置拓扑的缺省值
- * （web3_gateway.yaml 的 {{bns_rpc_url}} 必须始终有值）。
+ * server_rpc_path）。存在 dv-env.json 时以其为准写入 bns_server_url；
+ * 无 dv-env.json 时写 start.py 内置拓扑的缺省值
+ * （web3_gateway.yaml 的 {{bns_server_url}} 必须始终有值）。
  */
 export function alignBnsRuntimeParams(targetDir: string): void {
   const paramsPath = path.join(targetDir, "params.json");
@@ -1145,7 +1133,6 @@ export function alignBnsRuntimeParams(targetDir: string): void {
     console.log(`# params.json: BNS runtime params taken from ${dvEnvPath}`);
   }
 
-  params.bns_rpc_url = serverUrl;
   params.bns_server_url = serverUrl;
   json.params = params;
   writeJson(paramsPath, json);
@@ -1173,10 +1160,11 @@ function injectDevBnsProxy(
     ]),
   ].join("\n");
   const baseProxyBlock = [
-    "    bns_evm:",
-    "      controller_private_key_env: BNS_SN_CONTROLLER_PRIVATE_KEY",
     "    bns_proxy:",
     "      require_user_asset_owner: true",
+    "      controllers:",
+    "        - id: default",
+    "          private_key_env: BNS_SN_CONTROLLER_PRIVATE_KEY",
   ].join("\n");
 
   let injected = false;
@@ -1230,8 +1218,7 @@ const SEED_V2_P1_TODO = "TODO(seed-v2 P1): not implemented";
 
 /**
  * P1：Web2 托管代发路径的 SN controller 身份种子。
- * 生成/复用托管 EVM key，写 params.json 的 sn_controller_principal /
- * sn_controller_kid / allowed_controller_doc_types / bns_evm，并在种子 tx 里
+ * 生成/复用托管 EVM key，写入 bns_proxy.controllers，并在种子 tx 里
  * 为相关 name 设置受限 controller policy（依赖组件侧需求 1 的 tx type 扩展）。
  * 对应 devenv 注释 add_dns_txt_record "代发 tx" 能力与 SN-测试计划 §7 的
  * controller policy 端到端缺口。

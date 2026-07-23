@@ -1,9 +1,12 @@
 # CYFS-SN 配置收敛 TODO
 
-状态：TODO
+状态：DONE（2026-07-22）
 
-本文档固化下一轮 CodeAgent 需要完成的 SN 配置破坏性调整。当前版本为
-Beta2.2，允许删除旧字段；不保留多套字段的长期兼容分支。
+Beta2.2 配置收敛已完成。本文保留为破坏性迁移和验收记录；下文描述的
+目标配置即当前配置，不再兼容被删除的旧字段。
+
+本文档固化 Beta2.2 已完成的 SN 配置破坏性调整。Beta2.2 允许删除旧字段；
+不保留多套字段的长期兼容分支。
 
 ## 1. 已确认的目标配置
 
@@ -328,3 +331,21 @@ Beta2.2 取代”，避免被误当成现行文档。
 - 本 TODO 不改变 provider RPC method 集合和 response envelope。
 - 本 TODO 不引入 session-token 备用认证路径；安全边界是部署环境的源 IP
   认证。
+
+## 9. 完成记录
+
+- `ip` 已改为可选；缺少 IP 时仅依赖 SN 地址的解析分支返回
+  `BackendUnavailable`，显式非法 IP 仍阻止启动。
+- BNS 地址已统一为 `bns_server_url`；写能力只由可选的
+  `bns_proxy.controllers` 开启，缺省时以只读模式运行。
+- `auth_db` 与 `device_info_db` 已改为相互独立的可选 provider base URL；remote
+  client 固定不携带 session token，本地分支继续使用 `db_path`。
+- 旧的 `bns_rpc_url`、`bns_evm`、BNS 写开关、DB selector/DSN/token 解析和
+  legacy controller fallback 已从生产代码、模板、生成器及现行配置文档删除。
+- 已增加可选 IP、只读 BNS、controller 配置、四种 backend 组合、空 URL、
+  remote auth seed 冲突以及模板生成相关回归测试。
+
+验收结果：`cyfs-sn` lib/tests、`cyfs_gateway` lib/集成测试、Deno 配置生成测试、
+Python staging 测试以及 `git diff --check` 均通过。workspace 的全量
+`cargo fmt --check` 仍会报告本次修改范围之外的既有格式差异，因此未对无关文件做
+批量格式化。

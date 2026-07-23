@@ -77,7 +77,7 @@ fn user_dns_wire_contract_has_stable_methods_and_fields() {
 }
 
 #[tokio::test]
-async fn postgres_route_fails_closed_instead_of_reading_local_sqlite() {
+async fn remote_auth_route_fails_closed_instead_of_reading_local_sqlite() {
     let temp = tempfile::tempdir().unwrap();
     let auth_path = temp.path().join("auth.sqlite3");
     let compat_path = temp.path().join("compat.sqlite3");
@@ -165,7 +165,7 @@ async fn absent_underscore_txt_record_does_not_fall_through_to_bns() {
     let resolver = SnResolver::new(
         SnResolverConfig::new(
             "buckyos.test",
-            "192.0.2.10".parse().unwrap(),
+            Some("192.0.2.10".parse().unwrap()),
             "",
             "",
             Vec::new(),

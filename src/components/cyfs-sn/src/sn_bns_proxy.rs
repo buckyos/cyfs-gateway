@@ -45,10 +45,8 @@ use crate::{sn_err, SnErrorCode, SnResult};
 
 /// `SNServerConfig.bns_proxy` 配置块。
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SNBnsProxyConfig {
-    /// 显式关闭 proxy（保留 bns 读路径）。缺省 = true。
-    #[serde(default = "default_enabled")]
-    pub enabled: bool,
     /// 生产模式要求注册必须携带用户 `asset_owner`。缺省 = true；仅 devtest
     /// 场景可显式设为 false（此时回落为该用户绑定 controller 的地址）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -60,10 +58,6 @@ pub struct SNBnsProxyConfig {
     /// publish_document）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allowed_operations: Option<Vec<String>>,
-}
-
-fn default_enabled() -> bool {
-    true
 }
 
 impl SNBnsProxyConfig {
@@ -98,6 +92,7 @@ impl SNBnsProxyConfig {
 
 /// 一把 controller key 的配置。私钥来源三选一：env / file / inline。
 #[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SNBnsProxyControllerKeyConfig {
     pub id: String,
     /// 可选的地址声明；与私钥推导地址不一致时启动失败（防错配）。
@@ -131,7 +126,7 @@ impl fmt::Debug for SNBnsProxyControllerKeyConfig {
 }
 
 impl SNBnsProxyControllerKeyConfig {
-    /// 解析私钥明文（env > file > inline，与旧 `bns_evm.controller_private_key*` 同序）。
+    /// 解析私钥明文（env > file > inline）。
     pub fn load_private_key(&self) -> SnResult<String> {
         if let Some(env_name) = self.private_key_env.as_deref() {
             let value = std::env::var(env_name).map_err(|e| {

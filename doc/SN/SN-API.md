@@ -84,12 +84,12 @@ RPC method 必须使用 `namespace.method` 形式。当前实现不再做 legacy
 - source IP 只取 HTTP/连接上下文中的可信 real remote IP。RPC params 没有 `source_ip` 或 relay node 字段；即使客户端发送同名未知字段也不会进入调度请求。
 - relay 分配在本地账号创建后执行。成功时 `relay_assignments` 与 `zone_info.relay_sn` 同步完成，注册返回后可立即调用 `zone.get_info`；失败时记录 `relay_allocation_pending`，`relay_sn` 保持 `null`，注册仍正常返回。
 
-`auth.register` 的 BNS 行为取决于 SN 是否启用了 bns-proxy（`bns_write_enabled`/`bns_indexer_url` + `bns_evm`，可选 `bns_proxy` 多 controller 配置块；完整配置见 `doc/SN/sn-bns-proxy-todo.md`）：
+`auth.register` 依赖可选的 `bns_proxy` 写能力：
 
-- 未启用：只创建 SN 本地账号，`need_bind_owner_key = true`，响应没有 `bns` 字段。
+- 未配置：返回稳定的 `bns_proxy_unavailable`（`BNS proxy is not configured`），不创建本地账号。
 - 已启用：注册前先原子性执行 BNS `registerName`（`assetOwner` = 用户地址、`controllerPolicy.actor` = 该用户分配到的 SN controller、`initialDocuments` = 固定的 `owner` document + 请求携带的 `zone`/`boot`/`dns_txt`）；BNS 写入失败则不创建本地账号（用户名可重试注册），成功后才建本地账号，`need_bind_owner_key = false`。
-  - 生产多 controller 配置（`bns_proxy.controllers` 非空）下 `require_user_asset_owner` 缺省 `true`：`asset_owner` 必填，缺失返回 `invalid_params`。
-  - 仅旧版单 controller 配置（`bns_evm.controller_private_key*`，未配置 `bns_proxy.controllers`）下缺省 `false`：`asset_owner` 缺省回落为该用户绑定 controller 的地址（devtest 语义）。
+  - `bns_proxy.controllers` 必须非空；单 controller 与多 controller 使用同一模型。
+  - `require_user_asset_owner` 缺省 `true`：`asset_owner` 必填，缺失返回 `invalid_params`；仅 dev/test 可显式设为 `false`，此时缺省回落为该用户绑定 controller 的地址。
   - `request_id` 缺省为 `sn:register:<username>`；同 `request_id` 重放幂等，返回同一笔已提交的 TX。
 
 响应里的 `bns` 字段结构与 bns-proxy 写操作的返回结构一致（见 6.2），例如：
@@ -276,7 +276,7 @@ SN 代付 gas 的受限 BNS 写代理：用户不需要持有 gas，就能通过
 
 不要与已下线的 `/kapi/sn/bns` 混淆（见第 10 节）：旧路径曾承载通用文档读写代理，已完全移除；bns-proxy 只覆盖下面四个受控操作。`publish_document` 虽允许内容型 doc_type 通用化，但 authority、controller 和 TX 都由服务端构造，不能提交任意 calldata。
 
-只有 SN 配置了 BNS 写链路（`bns_write_enabled`/`bns_indexer_url` + `bns_evm`）时才启用；配置了 `bns_proxy` 块时还可以显式 `bns_proxy.enabled: false` 关闭。未启用时所有 `bns.*` 调用返回 `bns_proxy_unavailable`（1026），`auth.register` 回落为纯本地注册（不带 `bns` 字段）。
+只有 SN 配置了 `bns_proxy` 块时才启用写能力；块缺失即为 BNS 只读模式。未配置时所有 `bns.*` 写调用和 `auth.register` 都返回 `bns_proxy_unavailable`（1026），message 为 `BNS proxy is not configured`。
 
 ### 6.1 方法
 
@@ -350,10 +350,10 @@ SN 代付 gas 的受限 BNS 写代理：用户不需要持有 gas，就能通过
 ### 6.4 权限与白名单
 
 - 私钥只存在于 SN 内部签名组件（`SnBnsTxSigner`）；RPC handler、日志、DB、错误信息都不会出现明文私钥或原始 calldata。
-- 每个部署可配置多把 controller key（`bns_proxy.controllers`，带 `weight`；`weight: 0` 表示排水，不接新用户但已绑定用户不受影响）；不配置 `bns_proxy.controllers` 时回落旧版单 controller（`bns_evm.controller_private_key*`，id 固定为 `default`）。
+- 每个启用写能力的部署必须在 `bns_proxy.controllers` 配置至少一把 controller key（带 `weight`；`weight: 0` 表示排水，不接新用户但已绑定用户不受影响）。
 - `bns_proxy.allowed_operations` 是服务端白名单（缺省 = 全部四个操作）；命中白名单外操作同样返回 `bns_proxy_unavailable`。`dns_txt` 和 `relay_assignment` 仍映射到各自专属 operation，其余 doc_type 映射到 `publish_document`。签名组件另有一层独立白名单（chain id / contract / method selector / operation×doc_type / gas 上限），未知一律拒签，双重防护。
 - 新注册用户的 controller policy 使用空 doc_type 通配规则，以承载注册后新增的内容型 document；SN 应用层继续硬隔离 relay 专用入口，并通过受保护的 owner 路径锁定已经存在的身份字段。存量用户的链上 policy 不会自动升级。
-- `bns_proxy.require_user_asset_owner`：配置了 `bns_proxy.controllers`（生产多 controller 模式）缺省 `true`；仅旧版单 controller 配置缺省 `false`（devtest，`asset_owner` 缺省回落为该用户绑定 controller 的地址）。
+- `bns_proxy.require_user_asset_owner` 缺省 `true`；仅 dev/test 可显式设为 `false`（`asset_owner` 缺省回落为该用户绑定 controller 的地址）。
 
 ## 7. 本机管理 RPC
 

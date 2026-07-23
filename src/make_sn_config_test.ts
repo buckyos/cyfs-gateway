@@ -6,11 +6,12 @@ Deno.test("dev-vm replaces the production BNS key source with controller list", 
   const baseConfig = `servers:
   web3_sn:
     id: web3_sn
-    bns_rpc_url: "{{bns_rpc_url}}"
-    bns_evm:
-      controller_private_key_env: BNS_SN_CONTROLLER_PRIVATE_KEY
+    bns_server_url: "{{bns_server_url}}"
     bns_proxy:
       require_user_asset_owner: true
+      controllers:
+        - id: default
+          private_key_env: BNS_SN_CONTROLLER_PRIVATE_KEY
 `;
 
   try {
@@ -48,11 +49,12 @@ Deno.test("dev-vm BNS proxy injection also covers the split config files", async
   const baseConfig = `servers:
   web3_sn:
     id: web3_sn
-    bns_rpc_url: "{{bns_rpc_url}}"
-    bns_evm:
-      controller_private_key_env: BNS_SN_CONTROLLER_PRIVATE_KEY
+    bns_server_url: "{{bns_server_url}}"
     bns_proxy:
       require_user_asset_owner: true
+      controllers:
+        - id: default
+          private_key_env: BNS_SN_CONTROLLER_PRIVATE_KEY
 `;
   // web3_sn_api.yaml 缺失：拆分文件是可选的，注入必须跳过而不是报错。
   const files = ["web3_gateway.yaml", "web3_dns.yaml", "web3_relay.yaml"];

@@ -20,9 +20,10 @@ Web3 Gateway 已把主要部署角色拆分为：
 - `web3_relay`：HTTP/TLS/RTCP 流量入口和设备中继；
 - `web3_sn_api`：SN RPC、DID Resolver 和 Web2 兼容 BNS Gateway。
 
-账号与设备主数据已具备 remote S2S 接口：`db_type=postgres`
-时，`cyfs-sn` 使用 `SnAuthDbClient` 和 `SnDeviceInfoDbClient` 访问远程
-provider。这解决了账号、session 记录和设备在线态的主要共享存储问题。
+账号与设备主数据已具备 remote S2S 接口：分别配置 `auth_db` 和
+`device_info_db` 时，`cyfs-sn` 使用 `SnAuthDbClient` 和
+`SnDeviceInfoDbClient` 访问远程 provider。这解决了账号、session 记录和设备
+在线态的主要共享存储问题；两个 backend 可以独立选择。
 
 但 `type: sn` 当前仍会无条件初始化本地 token key、compatibility store、
 relay manager 和 BNS 写入运行态。所以“部署角色已拆分”并不等于
@@ -50,7 +51,7 @@ relay manager 和 BNS 写入运行态。所以“部署角色已拆分”并不�
 - `bns-indexer` 仍是合约事件的只读投影，可重建，不成为 SN 本地真相源。
 - 不把 DNS 入口或流量转发重新合并回 `web3_sn_api`。
 - 不要求多副本共享进程内 DNS/BNS 读缓存；缓存只需有正确的 TTL 和失效语义。
-- 可以保留 `db_type=sqlite` 的单机开发/all-in-one 模式，但必须与生产
+- 可以保留两个 remote URL 均缺省的本地 SQLite 单机开发/all-in-one 模式，但必须与生产
   cluster 模式明确隔离。
 - 本改造不保留本地 compatibility 数据兼容，不设计新的 compatibility
   迁移层。
@@ -69,7 +70,7 @@ relay manager 和 BNS 写入运行态。所以“部署角色已拆分”并不�
 | DNS/name cache | 进程内 `HashMap` | 是 | 可丢弃缓存 | 保留本地 |
 | EVM next nonce cache | 进程内 `HashMap` | 是 | 并发协调状态 | BNS/controller 服务 |
 
-当前 `db_type=postgres` 只替换 `auth_db` 和 `device_info_db`。随后
+当前 `auth_db` / `device_info_db` 只替换对应的两个 backend。随后
 `SnServerFactory` 仍使用同一个 `db_path` 无条件打开 compatibility、relay 和 BNS
 相关 SQLite store。
 
@@ -238,13 +239,12 @@ nonce 恢复和 controller 选择，不能作为每个 `cyfs-sn` 副本的私有
   查询所需的只读依赖。
 - [ ] resolver-only/authority-only 角色不得初始化 token issuer、BNS writer 或
   relay allocation writer。
-- [ ] 允许在生产只读角色中禁用 BNS proxy；当前
-  `bns_proxy.enabled=false` 的启动限制需按角色放开。
+- [x] 允许在生产只读角色中不配置 BNS proxy；配置块缺失即只读。
 
 ### G. 生产 cluster 配置和文件系统不变量
 
-- [ ] 增加明确的 cluster/remote 生产模式，不再仅通过名为
-  `db_type=postgres` 的开关隐式表达“所有状态已远程化”。
+- [ ] 增加明确的 cluster/remote 生产模式，不再仅通过配置两个 remote backend
+  隐式表达“所有状态已远程化”。
 - [ ] cluster 模式启动时禁止 fallback 到本地 SQLite。
 - [ ] cluster 模式启动时校验 `sn_auth`、`sn_device_info`、
   `sn_relay_manager` 等必需 remote endpoint 的 readiness。

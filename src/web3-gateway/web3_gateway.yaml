@@ -12,13 +12,14 @@ servers:
     device_jwt: ["{{sn_device_jwt}}"]
     ip: "{{sn_ip}}"
     # SN 强依赖统一 BNS RPC；裸 host 会规范化为 /kapi/bns。
-    bns_rpc_url: "{{bns_rpc_url}}"
+    bns_server_url: "{{bns_server_url}}"
     # 生产环境通过 secret 注入 controller key；缺失时 SN 初始化失败。
     # dev-local/dev-vm profile 会替换为各自的受限 controller 列表。
-    bns_evm:
-      controller_private_key_env: BNS_SN_CONTROLLER_PRIVATE_KEY
     bns_proxy:
       require_user_asset_owner: true
+      controllers:
+        - id: default
+          private_key_env: BNS_SN_CONTROLLER_PRIVATE_KEY
     # C 类种子(激活码/sn_user 账号/user_domain 绑定)幂等导入;相对路径按
     # 配置目录解析,文件不存在时自动跳过(部署目录没有种子也能正常启动)。
     seed_path: "sn_seed.yaml"

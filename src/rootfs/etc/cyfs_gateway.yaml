@@ -266,20 +266,21 @@ stacks:
   # sn_example:
   #   type: sn
   #   host: example.com
-  #   ip: 1.2.3.4
+  #   ip: 1.2.3.4                 # optional; self DNS/relay fallback
   #   boot_jwt: "<jwt>"
   #   owner_pkx: "<pkx>"
   #   device_jwt:
   #     - "<jwt>"
   #   aliases: []                 # optional
-  #   bns_rpc_url: http://127.0.0.1:13450  # required unified /kapi/bns RPC
-  #   bns_evm:                    # legacy single-controller key source
-  #     controller_private_key_env: BNS_PRIVATE_KEY
-  #   bns_proxy:                  # required registration/write capability
+  #   bns_server_url: http://127.0.0.1:13450  # required base URL; no /kapi/bns
+  #   bns_proxy:                  # optional; presence enables write capability
   #     require_user_asset_owner: true
-  #   db_type: sqlite             # optional
-  #   db_params:
-  #     db_path: ./sn.db
+  #     controllers:
+  #       - id: default
+  #         private_key_env: BNS_PRIVATE_KEY
+  #   auth_db: http://auth-provider:8080          # optional; local SQLite if absent
+  #   device_info_db: http://device-provider:8080 # optional; local SQLite if absent
+  #   db_path: ./sn.db
 
   # socks_example:
   #   type: socks

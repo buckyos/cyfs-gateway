@@ -96,7 +96,7 @@ class Web3GatewayStagingTests(unittest.TestCase):
             gateway_path.write_text(
                 "servers:\n"
                 "  web3_sn:\n"
-                '    bns_rpc_url: "{{bns_rpc_url}}"\n'
+                '    bns_server_url: "{{bns_server_url}}"\n'
             )
             with (
                 mock.patch.object(module, "BNS_RPC_ENDPOINT", "http://127.0.0.1:8545"),
@@ -111,9 +111,9 @@ class Web3GatewayStagingTests(unittest.TestCase):
             self.assertEqual(params["bns_rpc_endpoint"], "http://127.0.0.1:8545")
             self.assertEqual(params["bns_chain_id"], "31337")
             self.assertEqual(params["bns_contract_address"], "0x1234")
-            self.assertEqual(params["bns_rpc_url"], "http://127.0.0.1:18080")
+            self.assertEqual(params["bns_server_url"], "http://127.0.0.1:18080")
             gateway = gateway_path.read_text()
-            self.assertIn('bns_rpc_url: "{{bns_rpc_url}}"', gateway)
+            self.assertIn('bns_server_url: "{{bns_server_url}}"', gateway)
 
     def test_init_anvil_deploys_bns_through_hardhat(self) -> None:
         module_path = staging.SRC_ROOT / "web3-gateway" / "init_anvil.py"

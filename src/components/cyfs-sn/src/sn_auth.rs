@@ -399,8 +399,8 @@ pub trait SnAuthDB: Send + Sync + 'static {
     ) -> SnResult<DomainBinding>;
     async fn unbind_user_domain(&self, username: &str, domain: &str) -> SnResult<()>;
 
-    /// Compatibility DNS RRsets are part of the shared auth/provider state in
-    /// postgres mode. SQLite deployments continue to use the local
+    /// Compatibility DNS RRsets are part of the shared auth/provider state when
+    /// `auth_db` is remote. Local auth deployments continue to use the local
     /// `SnCompatibilityStore` implementation.
     async fn add_user_dns_record(
         &self,

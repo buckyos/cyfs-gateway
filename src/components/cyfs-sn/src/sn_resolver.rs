@@ -33,6 +33,7 @@ pub const DEFAULT_AUTH_SOA_REFRESH: i32 = 300;
 pub const DEFAULT_AUTH_SOA_RETRY: i32 = 60;
 pub const DEFAULT_AUTH_SOA_EXPIRE: i32 = 86_400;
 pub const DEFAULT_AUTH_SOA_MINIMUM: u32 = 60;
+pub const SN_SERVER_IP_NOT_CONFIGURED: &str = "SN server ip is not configured";
 
 pub type SnResolverRef = Arc<SnResolver>;
 pub type SnResolverResult<T> = std::result::Result<T, SnResolverError>;
@@ -113,7 +114,7 @@ impl std::error::Error for SnResolverError {}
 #[derive(Debug, Clone)]
 pub struct SnResolverConfig {
     pub server_host: String,
-    pub server_ip: IpAddr,
+    pub server_ip: Option<IpAddr>,
     pub aliases: Vec<String>,
     pub boot_jwt: String,
     pub owner_pkx: String,
@@ -130,7 +131,7 @@ pub struct SnResolverConfig {
 impl SnResolverConfig {
     pub fn new(
         server_host: impl Into<String>,
-        server_ip: IpAddr,
+        server_ip: Option<IpAddr>,
         boot_jwt: impl Into<String>,
         owner_pkx: impl Into<String>,
         device_jwts: Vec<String>,
@@ -1315,7 +1316,7 @@ impl SnResolver {
         }
 
         if self.is_self_hostname(hostname.as_str()) {
-            return Ok(self.resolve_self_dns(hostname.as_str(), record_type));
+            return self.resolve_self_dns(hostname.as_str(), record_type);
         }
 
         if let Some((record, ttl)) = self
@@ -1670,7 +1671,7 @@ impl SnResolver {
                 compatibility_device.as_ref(),
                 online.as_ref(),
             )
-            .await;
+            .await?;
 
         Ok(GatewayResolution {
             zone_name: zone.zone_name.clone(),
@@ -1775,7 +1776,7 @@ impl SnResolver {
         device_doc: &DeviceMiniDocument,
         compatibility_device: Option<&ResolverDeviceDocument>,
         online: Option<&SnDeviceStateView>,
-    ) -> Vec<IpAddr> {
+    ) -> SnResolverResult<Vec<IpAddr>> {
         let mut addresses = Vec::new();
 
         for ip in zone.zone_doc.gateway_ips.iter().copied() {
@@ -1799,7 +1800,7 @@ impl SnResolver {
                 .await
                 .unwrap_or_default();
             if sn_ips.is_empty() {
-                push_exportable_ip(&mut addresses, self.config.server_ip);
+                push_exportable_ip(&mut addresses, self.server_ip()?);
             } else {
                 for ip in sn_ips {
                     push_exportable_ip(&mut addresses, ip);
@@ -1852,7 +1853,7 @@ impl SnResolver {
                 .await
                 .unwrap_or_default();
             let relay_ips = if sn_ips.is_empty() {
-                vec![self.config.server_ip]
+                vec![self.server_ip()?]
             } else {
                 sn_ips
             };
@@ -1863,7 +1864,7 @@ impl SnResolver {
             }
         }
 
-        addresses
+        Ok(addresses)
     }
 
     async fn resolve_zone_txt(&self, zone: &ZoneResolution) -> SnResolverResult<Vec<String>> {
@@ -1933,11 +1934,15 @@ impl SnResolver {
         Ok(txt)
     }
 
-    fn resolve_self_dns(&self, hostname: &str, record_type: RecordType) -> DnsResolution {
-        match record_type {
+    fn resolve_self_dns(
+        &self,
+        hostname: &str,
+        record_type: RecordType,
+    ) -> SnResolverResult<DnsResolution> {
+        Ok(match record_type {
             RecordType::A | RecordType::AAAA => {
                 let mut addresses = Vec::new();
-                push_dns_address(&mut addresses, self.config.server_ip, record_type);
+                push_dns_address(&mut addresses, self.server_ip()?, record_type);
                 DnsResolution {
                     hostname: hostname.to_string(),
                     record_type,
@@ -1979,7 +1984,13 @@ impl SnResolver {
                 txt: Vec::new(),
                 source: DnsResolutionSource::SnSelf,
             },
-        }
+        })
+    }
+
+    fn server_ip(&self) -> SnResolverResult<IpAddr> {
+        self.config
+            .server_ip
+            .ok_or_else(|| SnResolverError::backend(SN_SERVER_IP_NOT_CONFIGURED))
     }
 
     async fn resolve_web_did(
@@ -3282,7 +3293,7 @@ mod tests {
         SnResolver::new(
             SnResolverConfig::new(
                 "buckyos.test",
-                "192.0.2.10".parse::<IpAddr>().unwrap(),
+                Some("192.0.2.10".parse::<IpAddr>().unwrap()),
                 "",
                 "",
                 Vec::new(),
@@ -3300,7 +3311,7 @@ mod tests {
         SnResolver::new_with_bns(
             SnResolverConfig::new(
                 "BuckyOS.Test.",
-                "192.0.2.10".parse::<IpAddr>().unwrap(),
+                Some("192.0.2.10".parse::<IpAddr>().unwrap()),
                 "",
                 "",
                 Vec::new(),
@@ -3309,6 +3320,75 @@ mod tests {
             Arc::new(bns),
         )
         .with_compatibility_reader(Arc::new(compatibility))
+    }
+
+    fn resolver_without_server_ip() -> SnResolver {
+        SnResolver::new(
+            SnResolverConfig::new("buckyos.test", None, "boot", "owner", Vec::new())
+                .with_aliases(vec!["alias.buckyos.test".to_string()]),
+            Arc::new(EmptySnAuthReader),
+        )
+    }
+
+    #[tokio::test]
+    async fn missing_server_ip_only_fails_ip_dependent_resolution() {
+        let resolver = resolver_without_server_ip();
+
+        let txt = resolver
+            .resolve_dns("buckyos.test", RecordType::TXT)
+            .await
+            .unwrap();
+        assert!(txt.txt.iter().any(|value| value == "BOOT=boot;"));
+
+        for hostname in ["buckyos.test", "sn.buckyos.test", "alias.buckyos.test"] {
+            for record_type in [RecordType::A, RecordType::AAAA] {
+                let error = resolver
+                    .resolve_dns(hostname, record_type)
+                    .await
+                    .unwrap_err();
+                assert_eq!(error.kind(), SnResolverErrorKind::BackendUnavailable);
+                assert_eq!(error.message(), SN_SERVER_IP_NOT_CONFIGURED);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_server_ip_fails_relay_fallbacks() {
+        let resolver = resolver_without_server_ip();
+        let zone = ZoneResolution {
+            input: "testuser".to_string(),
+            canonical_name: "testuser".to_string(),
+            zone_name: "testuser".to_string(),
+            owner: BnsOwner {
+                name: "testuser".to_string(),
+                effective_owner: None,
+                owner_config: None,
+            },
+            zone_doc: ZoneDocument::empty(),
+            boot_doc: BootDocument::empty(),
+            user_domain: None,
+            self_cert: false,
+            relay_sn: None,
+            source: ZoneResolutionSource::BnsName,
+        };
+
+        for net_id in ["nat", "wan"] {
+            let device_doc = DeviceMiniDocument {
+                zone_name: "testuser".to_string(),
+                device_name: "ood1".to_string(),
+                did: "did:dev:test-device".to_string(),
+                mini_config_jwt: None,
+                document: Some(json!({ "net_id": net_id })),
+                ttl: None,
+                version: None,
+            };
+            let error = resolver
+                .resolve_gateway_addresses(&zone, &device_doc, None, None)
+                .await
+                .unwrap_err();
+            assert_eq!(error.kind(), SnResolverErrorKind::BackendUnavailable);
+            assert_eq!(error.message(), SN_SERVER_IP_NOT_CONFIGURED);
+        }
     }
 
     #[test]
@@ -3665,7 +3745,8 @@ mod tests {
 
         let addresses = resolver
             .resolve_gateway_addresses(&zone, &device_doc, None, Some(&online))
-            .await;
+            .await
+            .unwrap();
 
         assert!(addresses.contains(&"192.0.2.10".parse::<IpAddr>().unwrap()));
         assert!(addresses.contains(&"2600:1700:1150:9440::49".parse::<IpAddr>().unwrap()));
