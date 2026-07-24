@@ -6,7 +6,7 @@ use super::common::{
 use super::errors::{bns_proxy_error, parse_error, reason_error, SnApiErrorCode};
 use crate::sn_auth_manager::{hash_password, verify_password, PASSWORD_ALGO};
 use crate::sn_bns_proxy::SnBnsProxyRegisterParams;
-use crate::{AllocateZoneRelayReq, SNServer};
+use crate::{RegisterUserWithRelayAllocationReq, RegistrationRelayAllocation, SNServer};
 use ::kRPC::{RPCErrors, RPCRequest, RPCResponse};
 use cyfs_gateway_api::{
     SnAuthRefreshResp, SnAuthSessionResp, SnBnsProxyTxOutcome, SnCheckUsernameReason,
@@ -238,16 +238,19 @@ pub(crate) async fn handle_auth(
                 );
                 Some(outcome)
             };
-            let ok = server
+            let registration = server
                 .auth_db()
-                .register_user(
-                    params.active_code.as_str(),
-                    username.as_str(),
-                    email.as_str(),
-                    password_hash.as_str(),
-                    password_salt.as_str(),
-                    PASSWORD_ALGO,
-                )
+                .register_user_with_relay_allocation(RegisterUserWithRelayAllocationReq {
+                    active_code: params.active_code,
+                    username: username.clone(),
+                    email,
+                    password_hash,
+                    password_salt,
+                    password_algo: PASSWORD_ALGO.to_string(),
+                    preferred_region: params.region,
+                    source_ip,
+                    source_version: None,
+                })
                 .await
                 .map_err(|error| {
                     if error.code() == crate::SnErrorCode::Conflict
@@ -261,7 +264,7 @@ pub(crate) async fn handle_auth(
                         reason_error(SnApiErrorCode::InternalError, error.to_string())
                     }
                 })?;
-            if !ok {
+            if !registration.registered {
                 return Err(parse_error(
                     SnApiErrorCode::InvalidActiveCode,
                     "register failed, invalid activation code",
@@ -271,30 +274,22 @@ pub(crate) async fn handle_auth(
                 "sn auth register local account created: username={} request_id={}",
                 username, request_id
             );
-            // BNS 和本地账号创建都可能已产生不可回滚状态。Relay 暂不可用、
-            // GeoIP 失败或调度存储失败时只记录 pending，不让注册失败。
-            match server
-                .relay_manager()
-                .allocate_zone_relay(AllocateZoneRelayReq {
-                    zone: username.clone(),
-                    preferred_region: params.region,
-                    source_ip,
-                    reason: "register".to_string(),
-                    source_version: None,
-                })
-                .await
-            {
-                Ok(assignment) => info!(
+            match registration.relay {
+                Some(RegistrationRelayAllocation::Assigned { assignment }) => info!(
                     "sn auth register relay assigned: username={} request_id={} relay_id={} generation={}",
                     username, request_id, assignment.relay_id, assignment.generation
                 ),
-                Err(error) => warn!(
+                Some(RegistrationRelayAllocation::Pending {
+                    error_code,
+                    message,
+                }) => warn!(
                     "sn auth register relay assignment pending: username={} request_id={} error_code={:?} error={}",
                     username,
                     request_id,
-                    error.code(),
-                    error.msg()
+                    error_code,
+                    message
                 ),
+                None => {}
             }
             let response = build_auth_success_response(
                 server,

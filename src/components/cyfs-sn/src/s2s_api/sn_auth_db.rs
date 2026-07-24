@@ -1,6 +1,10 @@
 use crate::{
-    sn_err, AccountSession, DomainBinding, SNUserInfo, SnAuthDB, SnAuthInfo, SnClearStateResult,
-    SnError, SnErrorCode, SnResult, UserState, ZoneInfo, ZoneInfoPatch,
+    sn_err, AccountSession, AllocateZoneRelayReq, AssignZoneRelayReq, DomainBinding,
+    RegisterUserWithRelayAllocationReq, RegisterUserWithRelayAllocationResult,
+    RelayAdmissionDecision, RelayAdmissionReq, RelayAssignment, RelayHeartbeat, RelayMigrationReq,
+    RelayNode, RelayNodeAddressUpdate, RelayNodeHealth, RelayNodeIpMapReq, RelayNodeIpMapSnapshot,
+    RelayNodeRegistration, SNUserInfo, SnAuthDB, SnAuthInfo, SnClearStateResult, SnError,
+    SnErrorCode, SnResult, UserState, ZoneInfo, ZoneInfoPatch,
 };
 use ::kRPC::{kRPC, RPCErrors, RPCHandler, RPCRequest, RPCResponse, RPCResult};
 use async_trait::async_trait;
@@ -18,6 +22,8 @@ pub const METHOD_GENERATE_ACTIVATION_CODES: &str = "sn_auth_db.generate_activati
 pub const METHOD_CHECK_ACTIVE_CODE: &str = "sn_auth_db.check_active_code";
 pub const METHOD_CLEAR_STATE_BY_ACTIVE_CODE: &str = "sn_auth_db.clear_state_by_active_code";
 pub const METHOD_REGISTER_USER: &str = "sn_auth_db.register_user";
+pub const METHOD_REGISTER_USER_WITH_RELAY_ALLOCATION: &str =
+    "sn_auth_db.register_user_with_relay_allocation";
 pub const METHOD_CREATE_AUTH: &str = "sn_auth_db.create_auth";
 pub const METHOD_IS_USER_EXIST: &str = "sn_auth_db.is_user_exist";
 pub const METHOD_GET_USER_BY_EMAIL: &str = "sn_auth_db.get_user_by_email";
@@ -42,6 +48,18 @@ pub const METHOD_LIST_USER_DNS_RECORDS: &str = "sn_auth_db.list_user_dns_records
 pub const METHOD_GET_ZONE_INFO: &str = "sn_auth_db.get_zone_info";
 pub const METHOD_UPDATE_ZONE_INFO: &str = "sn_auth_db.update_zone_info";
 pub const METHOD_UPDATE_ZONE_RELAY_SN: &str = "sn_auth_db.update_zone_relay_sn";
+pub const METHOD_REGISTER_RELAY_NODE: &str = "sn_auth_db.register_relay_node";
+pub const METHOD_HEARTBEAT_RELAY_NODE: &str = "sn_auth_db.heartbeat_relay_node";
+pub const METHOD_UPDATE_RELAY_NODE_ADDRESSES: &str = "sn_auth_db.update_relay_node_addresses";
+pub const METHOD_GET_RELAY_NODE: &str = "sn_auth_db.get_relay_node";
+pub const METHOD_LIST_RELAY_NODES: &str = "sn_auth_db.list_relay_nodes";
+pub const METHOD_GET_RELAY_NODES_IP_MAP: &str = "sn_auth_db.get_relay_nodes_ip_map";
+pub const METHOD_ASSIGN_ZONE_RELAY: &str = "sn_auth_db.assign_zone_relay";
+pub const METHOD_ALLOCATE_ZONE_RELAY: &str = "sn_auth_db.allocate_zone_relay";
+pub const METHOD_GET_ZONE_RELAY: &str = "sn_auth_db.get_zone_relay";
+pub const METHOD_START_RELAY_MIGRATION: &str = "sn_auth_db.start_relay_migration";
+pub const METHOD_COMPLETE_RELAY_MIGRATION: &str = "sn_auth_db.complete_relay_migration";
+pub const METHOD_CHECK_RELAY_ADMISSION: &str = "sn_auth_db.check_relay_admission";
 pub const METHOD_CREATE_ACCOUNT_SESSION: &str = "sn_auth_db.create_account_session";
 pub const METHOD_REVOKE_ACCOUNT_SESSION: &str = "sn_auth_db.revoke_account_session";
 pub const METHOD_REVOKE_USER_SESSIONS: &str = "sn_auth_db.revoke_user_sessions";
@@ -161,6 +179,16 @@ macro_rules! impl_req_from_json {
             })
         }
     };
+}
+
+fn parse_request<T: DeserializeOwned>(value: Value) -> Result<T, RPCErrors> {
+    serde_json::from_value(value).map_err(|e| {
+        RPCErrors::ParseRequestError(format!(
+            "Failed to parse {}: {}",
+            std::any::type_name::<T>(),
+            e
+        ))
+    })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -608,6 +636,53 @@ pub struct SnAuthDbUpdateZoneRelaySnReq {
     pub source_version: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SnAuthDbRelayIdReq {
+    pub relay_id: String,
+}
+
+impl SnAuthDbRelayIdReq {
+    pub fn new(relay_id: &str) -> Self {
+        Self {
+            relay_id: relay_id.to_string(),
+        }
+    }
+
+    impl_req_from_json!(SnAuthDbRelayIdReq);
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SnAuthDbZoneReq {
+    pub zone: String,
+}
+
+impl SnAuthDbZoneReq {
+    pub fn new(zone: &str) -> Self {
+        Self {
+            zone: zone.to_string(),
+        }
+    }
+
+    impl_req_from_json!(SnAuthDbZoneReq);
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SnAuthDbCompleteRelayMigrationReq {
+    pub zone: String,
+    pub generation: u64,
+}
+
+impl SnAuthDbCompleteRelayMigrationReq {
+    pub fn new(zone: &str, generation: u64) -> Self {
+        Self {
+            zone: zone.to_string(),
+            generation,
+        }
+    }
+
+    impl_req_from_json!(SnAuthDbCompleteRelayMigrationReq);
+}
+
 impl SnAuthDbUpdateZoneRelaySnReq {
     pub fn new(zone: &str, relay_sn: &str, source_version: Option<&str>) -> Self {
         Self {
@@ -862,6 +937,19 @@ impl SnAuthDB for SnAuthDbClient {
                     ),
                 )
                 .await
+            }
+        }
+    }
+
+    async fn register_user_with_relay_allocation(
+        &self,
+        req: RegisterUserWithRelayAllocationReq,
+    ) -> SnResult<RegisterUserWithRelayAllocationResult> {
+        match self {
+            Self::InProcess(handler) => handler.register_user_with_relay_allocation(req).await,
+            Self::KRPC(_) => {
+                self.call(METHOD_REGISTER_USER_WITH_RELAY_ALLOCATION, &req)
+                    .await
             }
         }
     }
@@ -1256,6 +1344,117 @@ impl SnAuthDB for SnAuthDbClient {
         }
     }
 
+    async fn register_relay_node(&self, node: RelayNodeRegistration) -> SnResult<RelayNode> {
+        match self {
+            Self::InProcess(handler) => handler.register_relay_node(node).await,
+            Self::KRPC(_) => self.call(METHOD_REGISTER_RELAY_NODE, &node).await,
+        }
+    }
+
+    async fn heartbeat_relay_node(&self, heartbeat: RelayHeartbeat) -> SnResult<RelayNodeHealth> {
+        match self {
+            Self::InProcess(handler) => handler.heartbeat_relay_node(heartbeat).await,
+            Self::KRPC(_) => self.call(METHOD_HEARTBEAT_RELAY_NODE, &heartbeat).await,
+        }
+    }
+
+    async fn update_relay_node_addresses(
+        &self,
+        update: RelayNodeAddressUpdate,
+    ) -> SnResult<RelayNode> {
+        match self {
+            Self::InProcess(handler) => handler.update_relay_node_addresses(update).await,
+            Self::KRPC(_) => self.call(METHOD_UPDATE_RELAY_NODE_ADDRESSES, &update).await,
+        }
+    }
+
+    async fn get_relay_node(&self, relay_id: &str) -> SnResult<Option<RelayNode>> {
+        match self {
+            Self::InProcess(handler) => handler.get_relay_node(relay_id).await,
+            Self::KRPC(_) => {
+                self.call(METHOD_GET_RELAY_NODE, &SnAuthDbRelayIdReq::new(relay_id))
+                    .await
+            }
+        }
+    }
+
+    async fn list_relay_nodes(&self) -> SnResult<Vec<RelayNode>> {
+        match self {
+            Self::InProcess(handler) => handler.list_relay_nodes().await,
+            Self::KRPC(_) => {
+                self.call(
+                    METHOD_LIST_RELAY_NODES,
+                    &SnAuthDbGetActivationCodesReq::new(),
+                )
+                .await
+            }
+        }
+    }
+
+    async fn get_relay_nodes_ip_map(
+        &self,
+        req: RelayNodeIpMapReq,
+    ) -> SnResult<Option<RelayNodeIpMapSnapshot>> {
+        match self {
+            Self::InProcess(handler) => handler.get_relay_nodes_ip_map(req).await,
+            Self::KRPC(_) => self.call(METHOD_GET_RELAY_NODES_IP_MAP, &req).await,
+        }
+    }
+
+    async fn assign_zone_relay(&self, req: AssignZoneRelayReq) -> SnResult<RelayAssignment> {
+        match self {
+            Self::InProcess(handler) => handler.assign_zone_relay(req).await,
+            Self::KRPC(_) => self.call(METHOD_ASSIGN_ZONE_RELAY, &req).await,
+        }
+    }
+
+    async fn allocate_zone_relay(&self, req: AllocateZoneRelayReq) -> SnResult<RelayAssignment> {
+        match self {
+            Self::InProcess(handler) => handler.allocate_zone_relay(req).await,
+            Self::KRPC(_) => self.call(METHOD_ALLOCATE_ZONE_RELAY, &req).await,
+        }
+    }
+
+    async fn get_zone_relay(&self, zone: &str) -> SnResult<Option<RelayAssignment>> {
+        match self {
+            Self::InProcess(handler) => handler.get_zone_relay(zone).await,
+            Self::KRPC(_) => {
+                self.call(METHOD_GET_ZONE_RELAY, &SnAuthDbZoneReq::new(zone))
+                    .await
+            }
+        }
+    }
+
+    async fn start_relay_migration(&self, req: RelayMigrationReq) -> SnResult<RelayAssignment> {
+        match self {
+            Self::InProcess(handler) => handler.start_relay_migration(req).await,
+            Self::KRPC(_) => self.call(METHOD_START_RELAY_MIGRATION, &req).await,
+        }
+    }
+
+    async fn complete_relay_migration(&self, zone: &str, generation: u64) -> SnResult<()> {
+        match self {
+            Self::InProcess(handler) => handler.complete_relay_migration(zone, generation).await,
+            Self::KRPC(_) => {
+                self.call(
+                    METHOD_COMPLETE_RELAY_MIGRATION,
+                    &SnAuthDbCompleteRelayMigrationReq::new(zone, generation),
+                )
+                .await
+            }
+        }
+    }
+
+    async fn check_relay_admission(
+        &self,
+        req: RelayAdmissionReq,
+    ) -> SnResult<RelayAdmissionDecision> {
+        match self {
+            Self::InProcess(handler) => handler.check_relay_admission(req).await,
+            Self::KRPC(_) => self.call(METHOD_CHECK_RELAY_ADMISSION, &req).await,
+        }
+    }
+
     async fn create_account_session(
         &self,
         session_id: &str,
@@ -1382,6 +1581,14 @@ where
                     &req,
                 )
             }
+            METHOD_REGISTER_USER_WITH_RELAY_ALLOCATION | "register_user_with_relay_allocation" => {
+                let parsed =
+                    parse_request::<RegisterUserWithRelayAllocationReq>(req.params.clone())?;
+                rpc_envelope_response(
+                    self.0.register_user_with_relay_allocation(parsed).await,
+                    &req,
+                )
+            }
             METHOD_CREATE_AUTH | "create_auth" => {
                 let parsed = SnAuthDbCreateAuthReq::from_json(req.params.clone())?;
                 rpc_envelope_response(
@@ -1500,11 +1707,7 @@ where
                 let parsed = SnAuthDbActivateUserDomainBindingReq::from_json(req.params.clone())?;
                 rpc_envelope_response(
                     self.0
-                        .activate_user_domain_binding(
-                            &parsed.username,
-                            &parsed.domain,
-                            &parsed.pkx,
-                        )
+                        .activate_user_domain_binding(&parsed.username, &parsed.domain, &parsed.pkx)
                         .await,
                     &req,
                 )
@@ -1585,6 +1788,59 @@ where
                         .await,
                     &req,
                 )
+            }
+            METHOD_REGISTER_RELAY_NODE | "register_relay_node" => {
+                let parsed = parse_request::<RelayNodeRegistration>(req.params.clone())?;
+                rpc_envelope_response(self.0.register_relay_node(parsed).await, &req)
+            }
+            METHOD_HEARTBEAT_RELAY_NODE | "heartbeat_relay_node" => {
+                let parsed = parse_request::<RelayHeartbeat>(req.params.clone())?;
+                rpc_envelope_response(self.0.heartbeat_relay_node(parsed).await, &req)
+            }
+            METHOD_UPDATE_RELAY_NODE_ADDRESSES | "update_relay_node_addresses" => {
+                let parsed = parse_request::<RelayNodeAddressUpdate>(req.params.clone())?;
+                rpc_envelope_response(self.0.update_relay_node_addresses(parsed).await, &req)
+            }
+            METHOD_GET_RELAY_NODE | "get_relay_node" => {
+                let parsed = SnAuthDbRelayIdReq::from_json(req.params.clone())?;
+                rpc_envelope_response(self.0.get_relay_node(&parsed.relay_id).await, &req)
+            }
+            METHOD_LIST_RELAY_NODES | "list_relay_nodes" => {
+                let _parsed = SnAuthDbGetActivationCodesReq::from_json(req.params.clone())?;
+                rpc_envelope_response(self.0.list_relay_nodes().await, &req)
+            }
+            METHOD_GET_RELAY_NODES_IP_MAP | "get_relay_nodes_ip_map" => {
+                let parsed = parse_request::<RelayNodeIpMapReq>(req.params.clone())?;
+                rpc_envelope_response(self.0.get_relay_nodes_ip_map(parsed).await, &req)
+            }
+            METHOD_ASSIGN_ZONE_RELAY | "assign_zone_relay" => {
+                let parsed = parse_request::<AssignZoneRelayReq>(req.params.clone())?;
+                rpc_envelope_response(self.0.assign_zone_relay(parsed).await, &req)
+            }
+            METHOD_ALLOCATE_ZONE_RELAY | "allocate_zone_relay" => {
+                let parsed = parse_request::<AllocateZoneRelayReq>(req.params.clone())?;
+                rpc_envelope_response(self.0.allocate_zone_relay(parsed).await, &req)
+            }
+            METHOD_GET_ZONE_RELAY | "get_zone_relay" => {
+                let parsed = SnAuthDbZoneReq::from_json(req.params.clone())?;
+                rpc_envelope_response(self.0.get_zone_relay(&parsed.zone).await, &req)
+            }
+            METHOD_START_RELAY_MIGRATION | "start_relay_migration" => {
+                let parsed = parse_request::<RelayMigrationReq>(req.params.clone())?;
+                rpc_envelope_response(self.0.start_relay_migration(parsed).await, &req)
+            }
+            METHOD_COMPLETE_RELAY_MIGRATION | "complete_relay_migration" => {
+                let parsed = SnAuthDbCompleteRelayMigrationReq::from_json(req.params.clone())?;
+                rpc_envelope_response(
+                    self.0
+                        .complete_relay_migration(&parsed.zone, parsed.generation)
+                        .await,
+                    &req,
+                )
+            }
+            METHOD_CHECK_RELAY_ADMISSION | "check_relay_admission" => {
+                let parsed = parse_request::<RelayAdmissionReq>(req.params.clone())?;
+                rpc_envelope_response(self.0.check_relay_admission(parsed).await, &req)
             }
             METHOD_CREATE_ACCOUNT_SESSION | "create_account_session" => {
                 let parsed = SnAuthDbCreateAccountSessionReq::from_json(req.params.clone())?;
@@ -1697,5 +1953,150 @@ mod tests {
         let error = envelope.into_result().unwrap_err();
 
         assert_eq!(error.code(), SnErrorCode::NotFound);
+    }
+
+    #[test]
+    fn test_relay_registration_wire_requires_two_canonical_typed_ips() {
+        let base = serde_json::json!({
+            "relay_id": "relay-a",
+            "relay_sn": "relay-a.example",
+            "ips": ["192.0.2.10", "2001:db8::10"],
+            "public_host": "relay-a.example",
+            "http_endpoint": null,
+            "rtcp_endpoint": null,
+            "region": "test",
+            "isp": null,
+            "tags": [],
+            "capabilities": ["rtcp_relay"],
+            "status": "active",
+            "capacity_score": 100
+        });
+        let registration: RelayNodeRegistration =
+            serde_json::from_value(base.clone()).expect("valid typed IP pair");
+        assert_eq!(
+            serde_json::to_value(registration).unwrap()["ips"],
+            serde_json::json!(["192.0.2.10", "2001:db8::10"])
+        );
+
+        for ips in [
+            serde_json::json!(["192.0.2.10"]),
+            serde_json::json!(["192.0.2.10", "2001:db8::10", "198.51.100.10"]),
+            serde_json::json!(["192.0.2.10:443", "2001:db8::10"]),
+            serde_json::json!(["192.0.2.10", "fe80::1%eth0"]),
+            serde_json::json!(["192.0.2.10", "2001:0db8::10"]),
+        ] {
+            let mut invalid = base.clone();
+            invalid["ips"] = ips;
+            assert!(
+                serde_json::from_value::<RelayNodeRegistration>(invalid).is_err(),
+                "invalid relay IP pair must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn test_relay_s2s_method_names_are_stable() {
+        assert_eq!(
+            METHOD_GET_RELAY_NODES_IP_MAP,
+            "sn_auth_db.get_relay_nodes_ip_map"
+        );
+        assert_eq!(METHOD_ALLOCATE_ZONE_RELAY, "sn_auth_db.allocate_zone_relay");
+        assert_eq!(
+            METHOD_CHECK_RELAY_ADMISSION,
+            "sn_auth_db.check_relay_admission"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_relay_rpc_handler_roundtrips_node_map_and_not_modified() {
+        use crate::SqliteSnAuthDB;
+        use std::net::{IpAddr, Ipv4Addr};
+
+        async fn dispatch<T: DeserializeOwned>(
+            handler: &SnAuthDbRpcHandler<SqliteSnAuthDB>,
+            method: &str,
+            params: Value,
+        ) -> SnResult<T> {
+            let request = RPCRequest::new(method, params);
+            let response = handler
+                .handle_rpc_call(request, IpAddr::V4(Ipv4Addr::LOCALHOST))
+                .await
+                .map_err(|e| {
+                    sn_err!(
+                        SnErrorCode::RemoteError,
+                        "loopback relay RPC transport failed: {}",
+                        e
+                    )
+                })?;
+            let value = match response.result {
+                RPCResult::Success(value) => value,
+                RPCResult::Failed(error) => {
+                    return Err(sn_err!(SnErrorCode::RemoteError, "{}", error));
+                }
+            };
+            serde_json::from_value::<SnAuthDbRpcEnvelope<T>>(value)
+                .map_err(|e| sn_err!(SnErrorCode::RemoteError, "decode envelope failed: {}", e))?
+                .into_result()
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("auth.sqlite3");
+        let db = SqliteSnAuthDB::new_by_path(path.to_string_lossy().as_ref())
+            .await
+            .unwrap();
+        db.initialize_database().await.unwrap();
+        let handler = SnAuthDbRpcHandler::new(db);
+        let registration = RelayNodeRegistration {
+            relay_id: "relay-a".to_string(),
+            relay_sn: "relay-a.example".to_string(),
+            ips: [
+                "192.0.2.60".parse().unwrap(),
+                "2001:db8::60".parse().unwrap(),
+            ],
+            public_host: "relay-a.example".to_string(),
+            http_endpoint: None,
+            rtcp_endpoint: None,
+            region: None,
+            isp: None,
+            tags: Vec::new(),
+            capabilities: Vec::new(),
+            status: None,
+            capacity_score: Some(100),
+        };
+        let node: RelayNode = dispatch(
+            &handler,
+            METHOD_REGISTER_RELAY_NODE,
+            serde_json::to_value(registration).unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            node.ips,
+            [
+                "192.0.2.60".parse::<IpAddr>().unwrap(),
+                "2001:db8::60".parse::<IpAddr>().unwrap()
+            ]
+        );
+
+        let snapshot: Option<RelayNodeIpMapSnapshot> = dispatch(
+            &handler,
+            METHOD_GET_RELAY_NODES_IP_MAP,
+            serde_json::to_value(RelayNodeIpMapReq::default()).unwrap(),
+        )
+        .await
+        .unwrap();
+        let snapshot = snapshot.unwrap();
+        assert_eq!(snapshot.nodes.len(), 1);
+        let not_modified: Option<RelayNodeIpMapSnapshot> = dispatch(
+            &handler,
+            METHOD_GET_RELAY_NODES_IP_MAP,
+            serde_json::to_value(RelayNodeIpMapReq {
+                if_revision: Some(snapshot.revision),
+            })
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert!(not_modified.is_none());
     }
 }

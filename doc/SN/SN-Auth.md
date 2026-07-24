@@ -429,10 +429,12 @@ TODO（阶段二，2026-07-06 完成）：
 
 ## zone_info 更新
 
-`zone_info` 是运行态缓存，典型更新来源：
+`zone_info` 是运行态查询视图，典型更新来源：
 
 - bind zone 成功后，从 BNS `zone`/`boot` 文档同步基础缓存。
-- `sn_relay_manager` 调整 zone -> relay 分配后写入 `relay_sn`。
+- AuthDB provider 内部的 `sn_relay_manager` 调整 zone -> relay 分配；userinfo /
+  zone info 通过同库 assignment join 返回 `relay_id`、`relay_sn`、state 和
+  generation，不再异步双写一份 `relay_sn` 真相。
 - `sn_acme_client` 完成证书签发后写入 `self_cert=true` 和证书时间。
 - 证书校验失败或证书过期巡检时写入 `self_cert=false`。
 
@@ -440,11 +442,16 @@ TODO（阶段二，2026-07-06 完成）：
 
 - `self_cert` 不能仅因客户端声明就永久置 true；应由 ACME 成功结果、证书有效性校验或受信任 device 上报驱动。
 - device 上报 `self_cert` 时，必须由 `sn_authority` 校验 device token，得到 `Device(zone, device_name, did)`。
-- `relay_sn` 应由 `sn_relay_manager` 写入，用户 session token 不能直接设置。
+- relay assignment 只能由 AuthDB provider 内部的 `sn_relay_manager` 修改，用户
+  session token 不能直接设置 `relay_id` 或 `relay_sn`。
 
 当前实现：
 
 - 阶段一已完成：`update_zone_info` 提供 patch 写入，`update_user_self_cert` 走该统一入口（sn_auth.rs:1407-1416、1916-2014）。
+- 当前 `SqliteSnRelayManager` 仍异步调用 `update_zone_relay_sn`；目标上将 relay
+  控制面表和双 IP 映射收敛到 AuthDB provider，并把 assignment 作为 userinfo 的
+  一致投影。详见
+  [SN-AuthDB内置RelayManager与DNS双栈解析-TODO.md](./SN-AuthDB内置RelayManager与DNS双栈解析-TODO.md)。
 - 待实现（阶段二，绕过风险）：`user.set_self_cert` V2 用裸 access token 即可把 `self_cert` 置 true（user.rs:59-67）；DNS mutation 已停止消费客户端 `has_cert`，不会再修改 `self_cert`。
 - 旧 `set_user_self_cert` 的 device-signed token 分支已随旧代码移除；`Device(zone,device,did)` 上下文现由 `sn_authority::require_sn_device` 提供（见「设备级凭证」小节），但 `user.set_self_cert` 尚未接入该上下文。
 - 目标实现应把这些入口收敛到 `sn_authority + update_zone_info`，并记录审计事件。

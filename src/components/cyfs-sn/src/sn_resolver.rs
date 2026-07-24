@@ -1,7 +1,7 @@
 use crate::sn_did_resolver::{SnDidDocumentSource, SnDidResolveResponse, SnDidResolverProfile};
 use crate::{
-    RelayAssignment, RelayAssignmentState, SNUserInfo, SnAuthDBRef, SnDeviceInfoDBRef,
-    SnDeviceStateView, SnRelayManagerRef, UserState, ZoneInfo,
+    RelayAssignment, RelayAssignmentState, RelayNodeIpMapReq, RelayNodeIpMapSnapshot, SNUserInfo,
+    SnAuthDBRef, SnDeviceInfoDBRef, SnDeviceStateView, UserState, ZoneInfo,
 };
 use async_trait::async_trait;
 use bns_client::canonical_bns_name;
@@ -679,6 +679,10 @@ pub trait RelayAssignmentReader: Send + Sync + 'static {
     async fn get_zone_relay(&self, _zone: &str) -> SnResolverResult<Option<RelayAssignment>> {
         Ok(None)
     }
+
+    async fn get_relay_node_ips(&self, _relay_id: &str) -> SnResolverResult<Option<[IpAddr; 2]>> {
+        Ok(None)
+    }
 }
 
 pub struct EmptyRelayAssignmentReader;
@@ -686,22 +690,104 @@ pub struct EmptyRelayAssignmentReader;
 #[async_trait]
 impl RelayAssignmentReader for EmptyRelayAssignmentReader {}
 
-pub struct SnRelayManagerResolverReader {
-    manager: SnRelayManagerRef,
+#[derive(Debug)]
+struct RelayNodeMapCache {
+    snapshot: Option<RelayNodeIpMapSnapshot>,
+    expires_at: Instant,
 }
 
-impl SnRelayManagerResolverReader {
-    pub fn new(manager: SnRelayManagerRef) -> Self {
-        Self { manager }
+pub struct SnAuthDbRelayResolverReader {
+    db: SnAuthDBRef,
+    cache: RwLock<RelayNodeMapCache>,
+    cache_ttl: Duration,
+}
+
+impl SnAuthDbRelayResolverReader {
+    pub fn new(db: SnAuthDBRef) -> Self {
+        Self {
+            db,
+            cache: RwLock::new(RelayNodeMapCache {
+                snapshot: None,
+                expires_at: Instant::now(),
+            }),
+            cache_ttl: Duration::from_secs(DEFAULT_SN_RESOLVER_TTL_SECS as u64),
+        }
+    }
+
+    pub fn with_cache_ttl(mut self, cache_ttl: Duration) -> Self {
+        self.cache_ttl = cache_ttl;
+        self
+    }
+
+    fn cached_ip_pair(&self, relay_id: &str) -> (Option<[IpAddr; 2]>, bool) {
+        let cache = self.cache.read().unwrap_or_else(|e| e.into_inner());
+        let value = cache.snapshot.as_ref().and_then(|snapshot| {
+            snapshot
+                .nodes
+                .iter()
+                .find(|node| node.relay_id == relay_id)
+                .map(|node| node.ips)
+        });
+        (value, cache.expires_at > Instant::now())
+    }
+
+    async fn refresh(&self, force_full: bool) -> SnResolverResult<()> {
+        let if_revision = if force_full {
+            None
+        } else {
+            self.cache
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.revision)
+        };
+        let snapshot = self
+            .db
+            .get_relay_nodes_ip_map(RelayNodeIpMapReq { if_revision })
+            .await
+            .map_err(|e| {
+                SnResolverError::backend(format!("refresh relay node IP map failed: {}", e))
+            })?;
+        let mut cache = self.cache.write().unwrap_or_else(|e| e.into_inner());
+        if let Some(snapshot) = snapshot {
+            cache.snapshot = Some(snapshot);
+        } else if cache.snapshot.is_none() {
+            return Err(SnResolverError::backend(
+                "AuthDB returned not-modified without a cached relay node map",
+            ));
+        }
+        cache.expires_at = Instant::now() + self.cache_ttl;
+        Ok(())
     }
 }
 
 #[async_trait]
-impl RelayAssignmentReader for SnRelayManagerResolverReader {
+impl RelayAssignmentReader for SnAuthDbRelayResolverReader {
     async fn get_zone_relay(&self, zone: &str) -> SnResolverResult<Option<RelayAssignment>> {
-        self.manager.get_zone_relay(zone).await.map_err(|e| {
+        self.db.get_zone_relay(zone).await.map_err(|e| {
             SnResolverError::backend(format!("query relay assignment {} failed: {}", zone, e))
         })
+    }
+
+    async fn get_relay_node_ips(&self, relay_id: &str) -> SnResolverResult<Option<[IpAddr; 2]>> {
+        let (cached, fresh) = self.cached_ip_pair(relay_id);
+        if cached.is_some() {
+            if fresh {
+                return Ok(cached);
+            }
+        } else if fresh {
+            self.refresh(true).await?;
+            return Ok(self.cached_ip_pair(relay_id).0);
+        }
+
+        self.refresh(false).await?;
+        let refreshed = self.cached_ip_pair(relay_id).0;
+        if refreshed.is_some() {
+            return Ok(refreshed);
+        }
+        self.refresh(true).await?;
+        Ok(self.cached_ip_pair(relay_id).0)
     }
 }
 
@@ -1786,31 +1872,6 @@ impl SnResolver {
             push_exportable_ip(&mut addresses, ip);
         }
 
-        // net_id comes from the owner-signed device document and describes the
-        // intended ingress topology. Prefer it over IP-shape inference: a NAT
-        // device can legitimately report a global IPv6 address that is not an
-        // externally reachable gateway endpoint (for example, a host address
-        // observed while activating a VM). In that case the online-state
-        // heuristic marks the device as WAN, but DNS must still include the SN
-        // relay selected by the signed topology.
-        let requires_sn_relay = device_document_requires_sn_relay(device_doc)
-            .or_else(|| online.map(|online| !online.is_wan_device))
-            .unwrap_or(false);
-        if requires_sn_relay {
-            let sn_ips = self
-                .auth
-                .get_user_sn_ips(zone.zone_name.as_str())
-                .await
-                .unwrap_or_default();
-            if sn_ips.is_empty() {
-                push_exportable_ip(&mut addresses, self.server_ip()?);
-            } else {
-                for ip in sn_ips {
-                    push_exportable_ip(&mut addresses, ip);
-                }
-            }
-        }
-
         if let Some(online) = online {
             for value in online
                 .public_ips
@@ -1843,23 +1904,32 @@ impl SnResolver {
         }
 
         if addresses.is_empty() {
-            // 没有任何直接可达地址（设备离线的 LAN/relay 型 zone，或文档
-            // 未带 IP）：回退 SN 中继地址（用户 sn_ips 优先，否则本 SN
-            // server_ip），与上面"在线但非 WAN 设备"分支同语义——流量落到
-            // SN 后经 rtcp 隧道转发。空答案（NXDOMAIN）会让 *.web3 域名在
-            // 设备未上线时完全不可达。SN 自身地址与 resolve_self_dns 同
-            // 信任级，不做 zonegate 回环过滤（dev-local 的 sn_ip 就是
-            // 127.0.0.1）。
-            let sn_ips = self
-                .auth
-                .get_user_sn_ips(zone.zone_name.as_str())
-                .await
-                .unwrap_or_default();
-            let relay_ips = if sn_ips.is_empty() {
-                vec![self.server_ip()?]
-            } else {
-                sn_ips
-            };
+            let assignment = self
+                .relay_reader
+                .get_zone_relay(zone.zone_name.as_str())
+                .await?
+                .ok_or_else(|| {
+                    SnResolverError::backend(format!(
+                        "relay assignment is missing for {}",
+                        zone.zone_name
+                    ))
+                })?;
+            if assignment.state == RelayAssignmentState::Suspended {
+                return Err(SnResolverError::backend(format!(
+                    "relay assignment for {} is suspended",
+                    zone.zone_name
+                )));
+            }
+            let relay_ips = self
+                .relay_reader
+                .get_relay_node_ips(assignment.relay_id.as_str())
+                .await?
+                .ok_or_else(|| {
+                    SnResolverError::backend(format!(
+                        "relay assignment for {} points to unknown node {}",
+                        zone.zone_name, assignment.relay_id
+                    ))
+                })?;
             for ip in relay_ips {
                 if !addresses.contains(&ip) {
                     addresses.push(ip);
@@ -2954,6 +3024,7 @@ fn device_doc_from_value(
     })
 }
 
+#[cfg(test)]
 fn device_document_requires_sn_relay(device_doc: &DeviceMiniDocument) -> Option<bool> {
     let net_id = device_doc
         .document
@@ -3259,6 +3330,83 @@ mod tests {
         }
     }
 
+    struct StaticRelayReader {
+        assignment: RelayAssignment,
+        ips: Option<[IpAddr; 2]>,
+    }
+
+    #[async_trait]
+    impl RelayAssignmentReader for StaticRelayReader {
+        async fn get_zone_relay(&self, zone: &str) -> SnResolverResult<Option<RelayAssignment>> {
+            Ok((zone == self.assignment.zone).then(|| self.assignment.clone()))
+        }
+
+        async fn get_relay_node_ips(
+            &self,
+            relay_id: &str,
+        ) -> SnResolverResult<Option<[IpAddr; 2]>> {
+            Ok((relay_id == self.assignment.relay_id)
+                .then_some(self.ips)
+                .flatten())
+        }
+    }
+
+    fn test_relay_assignment(zone: &str) -> RelayAssignment {
+        RelayAssignment {
+            zone: zone.to_string(),
+            relay_id: "relay-test".to_string(),
+            relay_sn: "relay-test.example".to_string(),
+            state: RelayAssignmentState::Active,
+            source: crate::RelayAssignmentSource::Auto,
+            reason: Some("test".to_string()),
+            generation: 1,
+            backup_relay_id: None,
+            sticky_until: None,
+            lease_expires_at: None,
+            migrated_from: None,
+            migration_deadline: None,
+            source_version: None,
+            created_at: 1,
+            updated_at: 1,
+        }
+    }
+
+    fn relay_dns_test_resolver(ips: Option<[IpAddr; 2]>) -> SnResolver {
+        let mut bns = StaticBnsReader::default();
+        bns.owners.insert(
+            "alice".to_string(),
+            BnsOwner {
+                name: "alice".to_string(),
+                effective_owner: None,
+                owner_config: None,
+            },
+        );
+        bns.documents.insert(
+            ("alice".to_string(), BNS_DOC_DEVICE_MINI.to_string()),
+            BnsDocument::json(
+                "alice",
+                BNS_DOC_DEVICE_MINI,
+                json!({
+                    "devices": {
+                        "ood1": {
+                            "did": "did:dev:alice-ood",
+                            "net_id": "nat"
+                        }
+                    }
+                }),
+            ),
+        );
+        SnResolver::new_with_bns(
+            SnResolverConfig::new("buckyos.test", None, None, None, Vec::new()),
+            Arc::new(StaticAuthReader::default()),
+            Arc::new(bns),
+        )
+        .with_relay_reader(Arc::new(StaticRelayReader {
+            assignment: test_relay_assignment("alice"),
+            ips,
+        }))
+    }
+
     #[derive(Default)]
     struct StaticCompatibilityReader {
         records: HashMap<(String, String), (String, u32)>,
@@ -3289,6 +3437,7 @@ mod tests {
             self_cert: false,
             user_domain: user_domain.map(ToOwned::to_owned),
             sn_ips: None,
+            relay: None,
         }
     }
 
@@ -3491,7 +3640,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn missing_server_ip_fails_relay_fallbacks() {
+    async fn missing_assignment_fails_without_server_ip_fallback() {
         let resolver = resolver_without_server_ip();
         let zone = ZoneResolution {
             input: "testuser".to_string(),
@@ -3525,7 +3674,7 @@ mod tests {
                 .await
                 .unwrap_err();
             assert_eq!(error.kind(), SnResolverErrorKind::BackendUnavailable);
-            assert_eq!(error.message(), SN_SERVER_IP_NOT_CONFIGURED);
+            assert_eq!(error.message(), "relay assignment is missing for testuser");
         }
     }
 
@@ -3835,7 +3984,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn nat_device_includes_sn_even_when_online_state_looks_wan() {
+    async fn direct_device_address_does_not_inject_relay_address() {
         let resolver = test_resolver_with_bns(StaticBnsReader::default());
         let zone = ZoneResolution {
             input: "testuser.web3.buckyos.test".to_string(),
@@ -3886,8 +4035,169 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(addresses.contains(&"192.0.2.10".parse::<IpAddr>().unwrap()));
+        assert!(!addresses.contains(&"192.0.2.10".parse::<IpAddr>().unwrap()));
         assert!(addresses.contains(&"2600:1700:1150:9440::49".parse::<IpAddr>().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn relay_dns_filters_two_typed_addresses_by_query_family() {
+        let cases = [
+            (
+                [
+                    "192.0.2.10".parse().unwrap(),
+                    "198.51.100.20".parse().unwrap(),
+                ],
+                vec!["192.0.2.10", "198.51.100.20"],
+                Vec::<&str>::new(),
+            ),
+            (
+                [
+                    "192.0.2.11".parse().unwrap(),
+                    "2001:db8::11".parse().unwrap(),
+                ],
+                vec!["192.0.2.11"],
+                vec!["2001:db8::11"],
+            ),
+            (
+                [
+                    "2001:db8::12".parse().unwrap(),
+                    "2001:db8::13".parse().unwrap(),
+                ],
+                Vec::<&str>::new(),
+                vec!["2001:db8::12", "2001:db8::13"],
+            ),
+        ];
+
+        for (ips, expected_a, expected_aaaa) in cases {
+            let resolver = relay_dns_test_resolver(Some(ips));
+            let a = resolver
+                .resolve_dns("alice.web3.buckyos.test", RecordType::A)
+                .await
+                .unwrap();
+            let aaaa = resolver
+                .resolve_dns("alice.web3.buckyos.test", RecordType::AAAA)
+                .await
+                .unwrap();
+            assert_eq!(
+                a.addresses,
+                expected_a
+                    .into_iter()
+                    .map(|ip| ip.parse::<IpAddr>().unwrap())
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(
+                aaaa.addresses,
+                expected_aaaa
+                    .into_iter()
+                    .map(|ip| ip.parse::<IpAddr>().unwrap())
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn relay_dns_unknown_node_is_backend_failure_without_fallback() {
+        let resolver = relay_dns_test_resolver(None);
+        let error = resolver
+            .resolve_dns("alice.web3.buckyos.test", RecordType::A)
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), SnResolverErrorKind::BackendUnavailable);
+        assert!(error.message().contains("unknown node relay-test"));
+        assert!(!error.message().contains(SN_SERVER_IP_NOT_CONFIGURED));
+    }
+
+    #[tokio::test]
+    async fn relay_dns_missing_family_is_authoritative_nodata() {
+        let resolver = relay_dns_test_resolver(Some([
+            "2001:db8::20".parse().unwrap(),
+            "2001:db8::21".parse().unwrap(),
+        ]));
+        assert!(matches!(
+            resolver
+                .resolve_authoritative_dns_cached("alice.web3.buckyos.test", "A")
+                .await
+                .unwrap(),
+            SnAuthoritativeDnsResult::AuthoritativeNoData { .. }
+        ));
+        assert!(matches!(
+            resolver
+                .resolve_authoritative_dns_cached("alice.web3.buckyos.test", "AAAA")
+                .await
+                .unwrap(),
+            SnAuthoritativeDnsResult::AuthoritativeAnswer { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn relay_dns_keeps_ipv4_mapped_ipv6_in_aaaa_and_deduplicates() {
+        let mapped: IpAddr = "::ffff:192.0.2.44".parse().unwrap();
+        let resolver = relay_dns_test_resolver(Some([mapped, mapped]));
+        let a = resolver
+            .resolve_dns("alice.web3.buckyos.test", RecordType::A)
+            .await
+            .unwrap();
+        let aaaa = resolver
+            .resolve_dns("alice.web3.buckyos.test", RecordType::AAAA)
+            .await
+            .unwrap();
+        assert!(a.addresses.is_empty());
+        assert_eq!(aaaa.addresses, vec![mapped]);
+    }
+
+    #[tokio::test]
+    async fn auth_db_relay_map_cache_refreshes_after_revision_change() {
+        use crate::{RelayNodeAddressUpdate, RelayNodeRegistration, SnAuthDB, SqliteSnAuthDB};
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("auth.sqlite3");
+        let db = SqliteSnAuthDB::new_by_path(path.to_string_lossy().as_ref())
+            .await
+            .unwrap();
+        db.initialize_database().await.unwrap();
+        db.register_relay_node(RelayNodeRegistration {
+            relay_id: "relay-a".to_string(),
+            relay_sn: "relay-a.example".to_string(),
+            ips: [
+                "192.0.2.30".parse().unwrap(),
+                "2001:db8::30".parse().unwrap(),
+            ],
+            public_host: "relay-a.example".to_string(),
+            http_endpoint: None,
+            rtcp_endpoint: None,
+            region: None,
+            isp: None,
+            tags: Vec::new(),
+            capabilities: Vec::new(),
+            status: None,
+            capacity_score: Some(100),
+        })
+        .await
+        .unwrap();
+        let db: SnAuthDBRef = Arc::new(db);
+        let reader = SnAuthDbRelayResolverReader::new(db.clone()).with_cache_ttl(Duration::ZERO);
+        assert_eq!(
+            reader.get_relay_node_ips("relay-a").await.unwrap(),
+            Some([
+                "192.0.2.30".parse().unwrap(),
+                "2001:db8::30".parse().unwrap()
+            ])
+        );
+
+        let updated = [
+            "198.51.100.31".parse().unwrap(),
+            "2001:db8::31".parse().unwrap(),
+        ];
+        db.update_relay_node_addresses(RelayNodeAddressUpdate {
+            relay_id: "relay-a".to_string(),
+            ips: updated,
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            reader.get_relay_node_ips("relay-a").await.unwrap(),
+            Some(updated)
+        );
     }
 
     #[test]

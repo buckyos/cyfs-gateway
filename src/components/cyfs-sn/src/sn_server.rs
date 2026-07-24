@@ -26,16 +26,15 @@ use crate::sn_did_resolver::{
 use crate::sn_dns_proof::{DnsTxtResolverRef, DohDnsTxtResolver, DEFAULT_PKX_DOH_URL};
 use crate::sn_resolver::{
     device_config_from_mini_jwt, BnsDocumentReader, ResolverCompatibilityReader,
-    ResolverDeviceDocument, ResolverDidDocument, SnAuthResolverReader, SnAuthoritativeDnsResult,
-    SnDeviceInfoResolverReader, SnRelayManagerResolverReader, SnResolver, SnResolverConfig,
+    ResolverDeviceDocument, ResolverDidDocument, SnAuthDbRelayResolverReader, SnAuthResolverReader,
+    SnAuthoritativeDnsResult, SnDeviceInfoResolverReader, SnResolver, SnResolverConfig,
     SnResolverError, SnResolverErrorKind, SnResolverRef, SnResolverResult,
 };
 use crate::{
     GeoIpResolverConfig, RelayAllocationConfig, SnAuthDBRef, SnAuthDbClient,
     SnDeviceEndpointUpdate, SnDeviceInfoDBRef, SnDeviceInfoDbClient, SnDeviceRole, SnDeviceState,
     SnDeviceStateUpdate, SnEndpointProtocol, SnEndpointScope, SnEndpointSource, SnNatType,
-    SnRelayManagerRef, SnResult, SqliteSnAuthDB, SqliteSnDeviceInfoDB, SqliteSnRelayManager,
-    XdbGeoIpResolver,
+    SnResult, SqliteSnAuthDB, SqliteSnDeviceInfoDB, XdbGeoIpResolver,
 };
 use ::kRPC::*;
 use async_trait::async_trait;
@@ -499,7 +498,6 @@ pub struct SNServer {
     auth_db: SnAuthDBRef,
     device_info_db: SnDeviceInfoDBRef,
     compat_store: SnCompatibilityStoreRef,
-    relay_manager: SnRelayManagerRef,
     auth: Arc<SnAuthManager>,
     name_info_cache: NameInfoCacheRef,
     bns_dns_cache_state: Arc<RwLock<HashMap<String, BnsDnsCacheState>>>,
@@ -631,7 +629,6 @@ impl SNServer {
         auth_db: SnAuthDBRef,
         device_info_db: SnDeviceInfoDBRef,
         compat_store: SnCompatibilityStoreRef,
-        relay_manager: SnRelayManagerRef,
         bns_client: BnsRpcClient,
         bns_proxy: Option<Arc<SnBnsProxy>>,
     ) -> ServerResult<Self> {
@@ -670,9 +667,7 @@ impl SNServer {
         .with_device_online_reader(Arc::new(SnDeviceInfoResolverReader::new(
             device_info_db.clone(),
         )))
-        .with_relay_reader(Arc::new(SnRelayManagerResolverReader::new(
-            relay_manager.clone(),
-        )))
+        .with_relay_reader(Arc::new(SnAuthDbRelayResolverReader::new(auth_db.clone())))
         .with_compatibility_reader(Arc::new(LegacyResolverCompatibilityReader::new(
             auth_db.clone(),
             device_info_db.clone(),
@@ -692,7 +687,6 @@ impl SNServer {
             auth_db,
             device_info_db,
             compat_store,
-            relay_manager,
             auth,
             name_info_cache: NameInfoCache::new_ref(),
             bns_dns_cache_state: Arc::new(RwLock::new(HashMap::new())),
@@ -714,10 +708,6 @@ impl SNServer {
 
     pub fn did_resolver(&self) -> SnDidResolverRef {
         self.did_resolver.clone()
-    }
-
-    pub(crate) fn relay_manager(&self) -> &SnRelayManagerRef {
-        &self.relay_manager
     }
 
     pub(crate) fn bns_proxy(&self) -> Option<Arc<SnBnsProxy>> {
@@ -2487,12 +2477,17 @@ impl ServerFactory for SnServerFactory {
                 "seed_path cannot be used with remote auth_db; import seed data through the provider side"
             ));
         }
+        let mut allocation_config = config.relay_allocation.clone().unwrap_or_default();
+        allocation_config.geoip = allocation_config
+            .geoip
+            .take()
+            .map(Self::resolve_geoip_config);
 
         let auth_db: SnAuthDBRef = if let Some(url) = auth_db_url.as_deref() {
             info!("sn server uses remote auth_db provider: {}", url);
             Arc::new(SnAuthDbClient::new_krpc_url(url, None))
         } else {
-            let auth_db = SqliteSnAuthDB::new_by_path(db_path.as_str())
+            let mut auth_db = SqliteSnAuthDB::new_by_path(db_path.as_str())
                 .await
                 .map_err(|e| {
                     server_err!(
@@ -2500,7 +2495,23 @@ impl ServerFactory for SnServerFactory {
                         "open sn auth db failed: {}",
                         e
                     )
-                })?;
+                })?
+                .with_relay_allocation_config(allocation_config.clone());
+            if let Some(geoip_config) = allocation_config.geoip.as_ref() {
+                match XdbGeoIpResolver::new(geoip_config) {
+                    Ok(resolver) => {
+                        auth_db = auth_db.with_relay_geo_ip_resolver(Arc::new(resolver));
+                        info!("sn AuthDB relay GeoIP resolver enabled");
+                    }
+                    Err(error) => {
+                        warn!(
+                            "sn AuthDB relay GeoIP resolver disabled after load failure: error_code={:?} error={}",
+                            error.code(),
+                            error.msg()
+                        );
+                    }
+                }
+            }
             auth_db.initialize_database().await.map_err(|e| {
                 server_err!(
                     ServerErrorCode::InvalidConfig,
@@ -2586,47 +2597,6 @@ impl ServerFactory for SnServerFactory {
             local_compat_store
         };
 
-        let mut allocation_config = config.relay_allocation.clone().unwrap_or_default();
-        allocation_config.geoip = allocation_config
-            .geoip
-            .take()
-            .map(Self::resolve_geoip_config);
-        let mut relay_manager = SqliteSnRelayManager::new_by_path(db_path.as_str())
-            .await
-            .map_err(|e| {
-                server_err!(
-                    ServerErrorCode::InvalidConfig,
-                    "open sn relay manager failed: {}",
-                    e
-                )
-            })?
-            .with_auth_db(auth_db.clone())
-            .with_device_info_db(device_info_db.clone())
-            .with_allocation_config(allocation_config.clone());
-        if let Some(geoip_config) = allocation_config.geoip.as_ref() {
-            match XdbGeoIpResolver::new(geoip_config) {
-                Ok(resolver) => {
-                    relay_manager = relay_manager.with_geo_ip_resolver(Arc::new(resolver));
-                    info!("sn relay GeoIP resolver enabled");
-                }
-                Err(error) => {
-                    // GeoIP 是调度提示；数据库暂不可用时保留 preferred region/fallback。
-                    warn!(
-                        "sn relay GeoIP resolver disabled after load failure: error_code={:?} error={}",
-                        error.code(),
-                        error.msg()
-                    );
-                }
-            }
-        }
-        relay_manager.initialize_database().await.map_err(|e| {
-            server_err!(
-                ServerErrorCode::InvalidConfig,
-                "initialize sn relay manager failed: {}",
-                e
-            )
-        })?;
-        let relay_manager: SnRelayManagerRef = Arc::new(relay_manager);
         let bns_proxy =
             Self::build_bns_proxy(config, db_path.as_str(), bns_client.clone(), &system_info)
                 .await?;
@@ -2637,7 +2607,6 @@ impl ServerFactory for SnServerFactory {
                 auth_db,
                 device_info_db,
                 compat_store,
-                relay_manager,
                 bns_client,
                 bns_proxy,
             )
@@ -2654,7 +2623,7 @@ impl ServerFactory for SnServerFactory {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::SnAuthDB;
+    use crate::{RelayNodeRegistration, SnAuthDB};
     use buckyos_kit::init_logging;
     use cyfs_gateway_lib::hyper_serve_http;
     use std::time::SystemTime;
@@ -2666,6 +2635,26 @@ mod tests {
     const ANVIL_PRIVATE_KEY: &str =
         "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
     const ANVIL_ADDRESS: &str = "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266";
+
+    fn test_relay_registration(relay_id: &str, relay_sn: &str) -> RelayNodeRegistration {
+        RelayNodeRegistration {
+            relay_id: relay_id.to_string(),
+            relay_sn: relay_sn.to_string(),
+            ips: [
+                "192.0.2.80".parse().unwrap(),
+                "2001:db8::80".parse().unwrap(),
+            ],
+            public_host: relay_sn.to_string(),
+            http_endpoint: None,
+            rtcp_endpoint: None,
+            region: None,
+            isp: None,
+            tags: Vec::new(),
+            capabilities: Vec::new(),
+            status: None,
+            capacity_score: Some(100),
+        }
+    }
 
     #[test]
     fn internal_rpc_root_only_allows_loopback_clients() {
@@ -3553,14 +3542,6 @@ mod tests {
         compat_store.initialize_database().await.unwrap();
         let compat_store: SnCompatibilityStoreRef = Arc::new(compat_store);
 
-        let relay_manager = SqliteSnRelayManager::new_by_path(db_path)
-            .await
-            .unwrap()
-            .with_auth_db(auth_db.clone())
-            .with_device_info_db(device_info_db.clone());
-        relay_manager.initialize_database().await.unwrap();
-        let relay_manager: SnRelayManagerRef = Arc::new(relay_manager);
-
         let registry = Arc::new(
             bns_indexer::CentralizedBnsRegistry::new_legacy_state_machine(
                 bns_indexer::SqliteBnsRegistryStore::open_memory().unwrap(),
@@ -3620,7 +3601,6 @@ mod tests {
                 auth_db,
                 device_info_db,
                 compat_store,
-                relay_manager,
                 bns_client,
                 Some(Arc::new(proxy)),
             )
@@ -3642,10 +3622,14 @@ mod tests {
             ("relay-eu", "relay-eu.example", "eu"),
             ("relay-us", "relay-us.example", "us-west"),
         ] {
-            sn.relay_manager()
+            sn.auth_db()
                 .register_relay_node(crate::RelayNodeRegistration {
                     relay_id: relay_id.to_string(),
                     relay_sn: relay_sn.to_string(),
+                    ips: [
+                        "192.0.2.10".parse().unwrap(),
+                        "2001:db8::10".parse().unwrap(),
+                    ],
                     public_host: relay_sn.to_string(),
                     http_endpoint: Some(format!("https://{relay_sn}")),
                     rtcp_endpoint: Some(format!("rtcp://{relay_sn}:443")),
@@ -3686,7 +3670,7 @@ mod tests {
             .unwrap();
         assert_eq!(region_zone["relay_sn"], "relay-us.example");
         let region_assignment = sn
-            .relay_manager()
+            .auth_db()
             .get_zone_relay("relayregionuser")
             .await
             .unwrap()
@@ -3720,7 +3704,7 @@ mod tests {
             .unwrap();
         assert_eq!(fallback_zone["relay_sn"], "relay-eu.example");
         let fallback_assignment = sn
-            .relay_manager()
+            .auth_db()
             .get_zone_relay("relayfallbackuser")
             .await
             .unwrap()
@@ -5539,6 +5523,27 @@ mod tests {
         assert_eq!(ood_info.state, SnOodState::Active);
         assert!(!ood_info.self_cert);
 
+        // 注册时没有可用 relay，AuthDB 已持久化 pending。node 注册后 provider
+        // 内部补偿 assignment，resolver 随后只使用该 assignment 的双 IP。
+        {
+            let relay_db = SqliteSnAuthDB::new_by_path(db.path().to_str().unwrap())
+                .await
+                .unwrap();
+            relay_db
+                .register_relay_node(test_relay_registration(
+                    "relay-refactor",
+                    "relay-refactor.example",
+                ))
+                .await
+                .unwrap();
+            let assignment = relay_db
+                .get_zone_relay(REFACTOR_USER)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(assignment.relay_id, "relay-refactor");
+        }
+
         // BNS 兼容域名（SN-Resolver.md）：嵌套 `public.<user>.web3.<host>` 同样
         // 映射到该用户 zone——main_http/tls_raw_forward 链对 `*.*.web3.<host>`
         // 的 self_cert 门控依赖这里能解析出 ANSWER（旧行为是 hostname_not_found，
@@ -6070,16 +6075,25 @@ mod tests {
         assert!(result["relay_sn"].is_null());
         assert!(result["self_cert"].as_bool().unwrap());
 
-        // relay manager 分配后回写 relay_sn（经 auth 库，同一 sqlite 文件）；
-        // 设备 token 也能读到稳定 relay 名称，供 node_daemon 检测切换。
+        // node 注册后 AuthDB provider 补偿 pending assignment；relay_sn 是
+        // assignment join 的只读投影，设备 token 也能读到稳定 relay 名称。
         {
             let relay_db = SqliteSnAuthDB::new_by_path(db.path().to_str().unwrap())
                 .await
                 .unwrap();
-            assert!(relay_db
-                .update_zone_relay_sn(DEVTOKEN_USER, "us-sn.buckyos.ai", Some("v2"))
+            relay_db
+                .register_relay_node(test_relay_registration(
+                    "relay-device-token",
+                    "us-sn.buckyos.ai",
+                ))
                 .await
-                .unwrap());
+                .unwrap();
+            let assignment = relay_db
+                .get_zone_relay(DEVTOKEN_USER)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(assignment.relay_id, "relay-device-token");
         }
         let result = device_auth_krpc
             .call("zone.get_info", json!({}))
@@ -6088,7 +6102,6 @@ mod tests {
         assert_eq!(result["code"].as_i64().unwrap(), 0);
         assert_eq!(result["zone"].as_str().unwrap(), DEVTOKEN_USER);
         assert_eq!(result["relay_sn"].as_str().unwrap(), "us-sn.buckyos.ai");
-        assert_eq!(result["source_version"].as_str().unwrap(), "v2");
 
         // 身份字段一律拒绝：不允许"看起来在查别的 zone"。
         let err = account_auth_krpc

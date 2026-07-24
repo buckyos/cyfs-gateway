@@ -1,22 +1,19 @@
-use crate::{
-    sn_err, SnAuthDBRef, SnDeviceInfoDBRef, SnDeviceState, SnError, SnErrorCode, SnResult,
-};
+use crate::{sn_err, SnDeviceInfoDBRef, SnDeviceState, SnError, SnErrorCode, SnResult};
 use log::{debug, info, warn};
 use serde::{Deserialize, Serialize};
 use sfo_ip::{CachePolicy, Searcher};
-use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteRow};
-use sqlx::{Row, SqlitePool};
+use sqlx::sqlite::SqliteRow;
+#[cfg(test)]
+use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
+use sqlx::{Row, Sqlite, SqlitePool, Transaction};
 use std::cmp::Ordering;
 use std::collections::HashSet;
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
-
-pub type SnRelayManagerRef = Arc<dyn SnRelayManager>;
 
 const DEFAULT_CAPACITY_SCORE: i64 = 100;
 const DEFAULT_ADMISSION_TTL_SECS: u64 = 60;
@@ -147,6 +144,8 @@ relay_string_enum!(RelayAdmissionReason {
 pub struct RelayNode {
     pub relay_id: String,
     pub relay_sn: String,
+    #[serde(with = "canonical_ip_pair")]
+    pub ips: [IpAddr; 2],
     pub public_host: String,
     pub http_endpoint: Option<String>,
     pub rtcp_endpoint: Option<String>,
@@ -167,6 +166,8 @@ pub struct RelayNode {
 pub struct RelayNodeRegistration {
     pub relay_id: String,
     pub relay_sn: String,
+    #[serde(with = "canonical_ip_pair")]
+    pub ips: [IpAddr; 2],
     pub public_host: String,
     pub http_endpoint: Option<String>,
     pub rtcp_endpoint: Option<String>,
@@ -198,6 +199,73 @@ pub struct RelayNodeHealth {
     pub last_heartbeat_at: u64,
     pub drain_until: Option<u64>,
     pub updated_at: u64,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RelayNodeAddressUpdate {
+    pub relay_id: String,
+    #[serde(with = "canonical_ip_pair")]
+    pub ips: [IpAddr; 2],
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize, Default)]
+pub struct RelayNodeIpMapReq {
+    pub if_revision: Option<u64>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RelayNodeIpEntry {
+    pub relay_id: String,
+    pub relay_sn: String,
+    #[serde(with = "canonical_ip_pair")]
+    pub ips: [IpAddr; 2],
+    pub status: RelayNodeStatus,
+    pub updated_at: u64,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RelayNodeIpMapSnapshot {
+    pub revision: u64,
+    pub generated_at: u64,
+    pub nodes: Vec<RelayNodeIpEntry>,
+}
+
+mod canonical_ip_pair {
+    use serde::{de::Error as _, Deserialize, Deserializer, Serialize, Serializer};
+    use std::net::IpAddr;
+
+    pub fn serialize<S>(ips: &[IpAddr; 2], serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        [ips[0].to_string(), ips[1].to_string()].serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<[IpAddr; 2], D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let values = Vec::<String>::deserialize(deserializer)?;
+        if values.len() != 2 {
+            return Err(D::Error::custom(format!(
+                "relay node must contain exactly two IP addresses, got {}",
+                values.len()
+            )));
+        }
+        let mut ips = [IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED); 2];
+        for (slot, value) in values.into_iter().enumerate() {
+            let ip = value.parse::<IpAddr>().map_err(|e| {
+                D::Error::custom(format!("invalid relay IP address in slot {slot}: {e}"))
+            })?;
+            if ip.to_string() != value {
+                return Err(D::Error::custom(format!(
+                    "relay IP address in slot {slot} is not canonical: {value}"
+                )));
+            }
+            ips[slot] = ip;
+        }
+        Ok(ips)
+    }
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
@@ -483,10 +551,10 @@ struct RelayAllocationMetrics {
     geoip_failures: AtomicU64,
 }
 
-struct RelaySelection {
-    node: RelayNode,
-    rule: &'static str,
-    fallback: bool,
+pub(crate) struct RelaySelection {
+    pub(crate) node: RelayNode,
+    pub(crate) rule: &'static str,
+    pub(crate) fallback: bool,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
@@ -534,6 +602,16 @@ pub trait SnRelayManager: Send + Sync + 'static {
     fn allocation_metrics(&self) -> RelayAllocationMetricsSnapshot;
     async fn register_relay_node(&self, node: RelayNodeRegistration) -> SnResult<RelayNode>;
     async fn heartbeat_relay_node(&self, heartbeat: RelayHeartbeat) -> SnResult<RelayNodeHealth>;
+    async fn update_relay_node_addresses(
+        &self,
+        update: RelayNodeAddressUpdate,
+    ) -> SnResult<RelayNode>;
+    async fn get_relay_node(&self, relay_id: &str) -> SnResult<Option<RelayNode>>;
+    async fn list_relay_nodes(&self) -> SnResult<Vec<RelayNode>>;
+    async fn get_relay_nodes_ip_map(
+        &self,
+        req: RelayNodeIpMapReq,
+    ) -> SnResult<Option<RelayNodeIpMapSnapshot>>;
     async fn assign_zone_relay(&self, req: AssignZoneRelayReq) -> SnResult<RelayAssignment>;
     async fn allocate_zone_relay(&self, req: AllocateZoneRelayReq) -> SnResult<RelayAssignment>;
     async fn get_zone_relay(&self, zone: &str) -> SnResult<Option<RelayAssignment>>;
@@ -545,9 +623,8 @@ pub trait SnRelayManager: Send + Sync + 'static {
     async fn complete_relay_migration(&self, zone: &str, generation: u64) -> SnResult<()>;
 }
 
-pub struct SqliteSnRelayManager {
+pub(crate) struct SqliteSnRelayManager {
     pool: SqlitePool,
-    auth_db: Option<SnAuthDBRef>,
     device_info_db: Option<SnDeviceInfoDBRef>,
     admission_ttl_secs: u64,
     allocation_config: RelayAllocationConfig,
@@ -556,13 +633,7 @@ pub struct SqliteSnRelayManager {
 }
 
 impl SqliteSnRelayManager {
-    pub async fn new() -> SnResult<Self> {
-        let base_dir = PathBuf::from(std::env::current_exe().unwrap().parent().unwrap());
-        let db_path = base_dir.join("sn_relay_mgr.sqlite3");
-
-        Self::new_by_path(db_path.to_string_lossy().as_ref()).await
-    }
-
+    #[cfg(test)]
     pub async fn new_by_path(path: &str) -> SnResult<Self> {
         let db_url = if path.starts_with("sqlite:") {
             path.to_string()
@@ -579,33 +650,27 @@ impl SqliteSnRelayManager {
             .await
             .map_err(|e| Self::db_err(format!("open file: {:?}", path), e))?;
 
-        Ok(Self {
+        Ok(Self::from_pool(pool))
+    }
+
+    pub(crate) fn from_pool(pool: SqlitePool) -> Self {
+        Self {
             pool,
-            auth_db: None,
             device_info_db: None,
             admission_ttl_secs: DEFAULT_ADMISSION_TTL_SECS,
             allocation_config: RelayAllocationConfig::default(),
             geo_ip_resolver: None,
             allocation_metrics: RelayAllocationMetrics::default(),
-        })
+        }
     }
 
-    pub async fn open_local(path: &str) -> SnResult<SnRelayManagerRef> {
-        let db = Self::new_by_path(path).await?;
-        db.initialize_database().await?;
-        Ok(Arc::new(db))
-    }
-
-    pub fn with_auth_db(mut self, auth_db: SnAuthDBRef) -> Self {
-        self.auth_db = Some(auth_db);
-        self
-    }
-
+    #[allow(dead_code)]
     pub fn with_device_info_db(mut self, device_info_db: SnDeviceInfoDBRef) -> Self {
         self.device_info_db = Some(device_info_db);
         self
     }
 
+    #[allow(dead_code)]
     pub fn with_admission_ttl_secs(mut self, admission_ttl_secs: u64) -> Self {
         self.admission_ttl_secs = admission_ttl_secs;
         self
@@ -672,10 +737,41 @@ impl SqliteSnRelayManager {
         .map_err(|e| Self::db_err("create relay_nodes table failed", e))?;
 
         sqlx::query(
+            "CREATE TABLE IF NOT EXISTS relay_node_addresses (
+                relay_id TEXT NOT NULL,
+                slot INTEGER NOT NULL CHECK(slot IN (0, 1)),
+                ip TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                PRIMARY KEY (relay_id, slot),
+                FOREIGN KEY (relay_id) REFERENCES relay_nodes(relay_id) ON DELETE CASCADE
+            )",
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| Self::db_err("create relay_node_addresses table failed", e))?;
+
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS relay_metadata (
+                key TEXT PRIMARY KEY,
+                value INTEGER NOT NULL
+            )",
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| Self::db_err("create relay_metadata table failed", e))?;
+        sqlx::query(
+            "INSERT OR IGNORE INTO relay_metadata (key, value)
+             VALUES ('node_map_revision', 0)",
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| Self::db_err("initialize relay node-map revision failed", e))?;
+
+        sqlx::query(
             "CREATE TABLE IF NOT EXISTS relay_assignments (
                 zone TEXT PRIMARY KEY,
                 relay_id TEXT NOT NULL,
-                relay_sn TEXT NOT NULL,
                 state TEXT NOT NULL,
                 source TEXT NOT NULL,
                 reason TEXT NULL,
@@ -693,6 +789,7 @@ impl SqliteSnRelayManager {
         .execute(&self.pool)
         .await
         .map_err(|e| Self::db_err("create relay_assignments table failed", e))?;
+        self.migrate_relay_assignments_schema().await?;
 
         sqlx::query(
             "CREATE INDEX IF NOT EXISTS idx_relay_assignments_relay
@@ -749,9 +846,76 @@ impl SqliteSnRelayManager {
         Ok(())
     }
 
+    async fn migrate_relay_assignments_schema(&self) -> SnResult<()> {
+        let columns = sqlx::query("PRAGMA table_info(relay_assignments)")
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| Self::db_err("inspect relay_assignments schema failed", e))?;
+        if !columns.iter().any(|row| {
+            row.try_get::<String, _>("name")
+                .map(|name| name == "relay_sn")
+                .unwrap_or(false)
+        }) {
+            return Ok(());
+        }
+
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| Self::db_err("begin relay assignment migration failed", e))?;
+        sqlx::query("ALTER TABLE relay_assignments RENAME TO relay_assignments_legacy")
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| Self::db_err("rename legacy relay_assignments failed", e))?;
+        sqlx::query(
+            "CREATE TABLE relay_assignments (
+                zone TEXT PRIMARY KEY,
+                relay_id TEXT NOT NULL,
+                state TEXT NOT NULL,
+                source TEXT NOT NULL,
+                reason TEXT NULL,
+                generation INTEGER NOT NULL,
+                backup_relay_id TEXT NULL,
+                sticky_until INTEGER NULL,
+                lease_expires_at INTEGER NULL,
+                migrated_from TEXT NULL,
+                migration_deadline INTEGER NULL,
+                source_version TEXT NULL,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                FOREIGN KEY (relay_id) REFERENCES relay_nodes(relay_id)
+            )",
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| Self::db_err("create normalized relay_assignments failed", e))?;
+        sqlx::query(
+            "INSERT INTO relay_assignments
+                (zone, relay_id, state, source, reason, generation, backup_relay_id,
+                 sticky_until, lease_expires_at, migrated_from, migration_deadline,
+                 source_version, created_at, updated_at)
+             SELECT zone, relay_id, state, source, reason, generation, backup_relay_id,
+                    sticky_until, lease_expires_at, migrated_from, migration_deadline,
+                    source_version, created_at, updated_at
+             FROM relay_assignments_legacy",
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| Self::db_err("copy legacy relay assignments failed", e))?;
+        sqlx::query("DROP TABLE relay_assignments_legacy")
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| Self::db_err("drop legacy relay_assignments failed", e))?;
+        tx.commit()
+            .await
+            .map_err(|e| Self::db_err("commit relay assignment migration failed", e))?;
+        Ok(())
+    }
+
     pub async fn get_relay_node(&self, relay_id: &str) -> SnResult<Option<RelayNode>> {
         Self::check_non_empty(relay_id, "relay_id")?;
-        let row = sqlx::query(Self::relay_node_select_sql("WHERE relay_id = ?1").as_str())
+        let row = sqlx::query(Self::relay_node_select_sql("WHERE n.relay_id = ?1").as_str())
             .bind(relay_id)
             .fetch_optional(&self.pool)
             .await
@@ -761,7 +925,7 @@ impl SqliteSnRelayManager {
     }
 
     pub async fn list_relay_nodes(&self) -> SnResult<Vec<RelayNode>> {
-        let rows = sqlx::query(Self::relay_node_select_sql("ORDER BY relay_id ASC").as_str())
+        let rows = sqlx::query(Self::relay_node_select_sql("ORDER BY n.relay_id ASC").as_str())
             .fetch_all(&self.pool)
             .await
             .map_err(|e| Self::db_err("list relay nodes failed", e))?;
@@ -771,12 +935,118 @@ impl SqliteSnRelayManager {
             .collect::<SnResult<Vec<_>>>()
     }
 
+    pub async fn get_relay_nodes_ip_map_snapshot(
+        &self,
+        if_revision: Option<u64>,
+    ) -> SnResult<Option<RelayNodeIpMapSnapshot>> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| Self::db_err("begin relay node-map snapshot failed", e))?;
+        let revision: i64 =
+            sqlx::query_scalar("SELECT value FROM relay_metadata WHERE key = 'node_map_revision'")
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(|e| Self::db_err("read relay node-map revision failed", e))?;
+        let revision = Self::i64_to_u64(revision);
+        if if_revision == Some(revision) {
+            tx.commit()
+                .await
+                .map_err(|e| Self::db_err("commit relay node-map revision read failed", e))?;
+            return Ok(None);
+        }
+
+        let rows = sqlx::query(
+            "SELECT relay_id, relay_sn, status, updated_at
+             FROM relay_nodes
+             WHERE status <> 'deleted'
+             ORDER BY relay_id ASC",
+        )
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|e| Self::db_err("list relay node-map nodes failed", e))?;
+        let mut nodes = Vec::with_capacity(rows.len());
+        for row in rows {
+            let relay_id: String = row
+                .try_get(0)
+                .map_err(|e| Self::db_err("read relay node-map relay_id failed", e))?;
+            let address_rows = sqlx::query(
+                "SELECT slot, ip FROM relay_node_addresses
+                 WHERE relay_id = ?1 ORDER BY slot ASC",
+            )
+            .bind(relay_id.as_str())
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(|e| Self::db_err("read relay node-map addresses failed", e))?;
+            if address_rows.len() != 2 {
+                return Err(sn_err!(
+                    SnErrorCode::DBError,
+                    "relay node {} has {} addresses; expected exactly 2",
+                    relay_id,
+                    address_rows.len()
+                ));
+            }
+            let mut ips = [IpAddr::V4(Ipv4Addr::UNSPECIFIED); 2];
+            for (expected_slot, address_row) in address_rows.into_iter().enumerate() {
+                let slot: i64 = address_row
+                    .try_get(0)
+                    .map_err(|e| Self::db_err("read relay address slot failed", e))?;
+                if slot != expected_slot as i64 {
+                    return Err(sn_err!(
+                        SnErrorCode::DBError,
+                        "relay node {} is missing address slot {}",
+                        relay_id,
+                        expected_slot
+                    ));
+                }
+                let value: Option<String> = address_row
+                    .try_get(1)
+                    .map_err(|e| Self::db_err("read relay address failed", e))?;
+                ips[expected_slot] = Self::parse_stored_ip(value, expected_slot)?;
+            }
+            nodes.push(RelayNodeIpEntry {
+                relay_id,
+                relay_sn: row
+                    .try_get(1)
+                    .map_err(|e| Self::db_err("read relay node-map relay_sn failed", e))?,
+                ips,
+                status: Self::parse_db_enum(
+                    row.try_get(2)
+                        .map_err(|e| Self::db_err("read relay node-map status failed", e))?,
+                    "relay status",
+                )?,
+                updated_at: Self::i64_to_u64(
+                    row.try_get(3)
+                        .map_err(|e| Self::db_err("read relay node-map updated_at failed", e))?,
+                ),
+            });
+        }
+        tx.commit()
+            .await
+            .map_err(|e| Self::db_err("commit relay node-map snapshot failed", e))?;
+        Ok(Some(RelayNodeIpMapSnapshot {
+            revision,
+            generated_at: Self::now_secs(),
+            nodes,
+        }))
+    }
+
+    async fn bump_node_map_revision(tx: &mut Transaction<'_, Sqlite>) -> SnResult<()> {
+        sqlx::query("UPDATE relay_metadata SET value = value + 1 WHERE key = 'node_map_revision'")
+            .execute(&mut **tx)
+            .await
+            .map_err(|e| Self::db_err("advance relay node-map revision failed", e))?;
+        Ok(())
+    }
+
+    #[allow(dead_code)]
     pub async fn list_zone_relays_by_node(&self, relay_id: &str) -> SnResult<Vec<RelayAssignment>> {
         Self::check_non_empty(relay_id, "relay_id")?;
         let rows = sqlx::query(
             Self::relay_assignment_select_sql(
-                "WHERE relay_id = ?1 AND state IN ('active', 'migrating', 'draining')
-                 ORDER BY zone ASC",
+                "WHERE a.relay_id = ?1 AND a.state IN ('active', 'migrating', 'draining')
+                 ORDER BY a.zone ASC",
             )
             .as_str(),
         )
@@ -790,6 +1060,7 @@ impl SqliteSnRelayManager {
             .collect::<SnResult<Vec<_>>>()
     }
 
+    #[allow(dead_code)]
     pub async fn zone_belongs_to_relay(&self, zone: &str, relay_id: &str) -> SnResult<bool> {
         let Some(assignment) = self.get_zone_relay(zone).await? else {
             return Ok(false);
@@ -801,6 +1072,7 @@ impl SqliteSnRelayManager {
             ))
     }
 
+    #[allow(dead_code)]
     pub async fn get_pending_allocation(
         &self,
         zone: &str,
@@ -874,12 +1146,12 @@ impl SqliteSnRelayManager {
 
         let row = sqlx::query(
             Self::relay_node_select_sql(
-                "WHERE status = 'active'
+                "WHERE n.status = 'active'
                  ORDER BY
-                    CASE WHEN ?1 IS NOT NULL AND region = ?1 THEN 0 ELSE 1 END,
-                    (current_load * 1000 / CASE WHEN capacity_score > 0 THEN capacity_score ELSE 1 END) ASC,
-                    capacity_score DESC,
-                    relay_id ASC
+                    CASE WHEN ?1 IS NOT NULL AND n.region = ?1 THEN 0 ELSE 1 END,
+                    (n.current_load * 1000 / CASE WHEN n.capacity_score > 0 THEN n.capacity_score ELSE 1 END) ASC,
+                    n.capacity_score DESC,
+                    n.relay_id ASC
                  LIMIT 1",
             )
             .as_str(),
@@ -1138,6 +1410,189 @@ impl SqliteSnRelayManager {
             })
     }
 
+    pub(crate) async fn plan_registration_allocation(
+        &self,
+        req: &AllocateZoneRelayReq,
+    ) -> SnResult<RelaySelection> {
+        Self::check_non_empty(req.zone.as_str(), "zone")?;
+        Self::check_non_empty(req.reason.as_str(), "reason")?;
+        self.allocation_metrics
+            .attempts
+            .fetch_add(1, AtomicOrdering::Relaxed);
+
+        let preferred_region = req
+            .preferred_region
+            .as_deref()
+            .and_then(Self::normalize_match_label);
+        if req.preferred_region.is_some() && preferred_region.is_none() {
+            debug!(
+                "relay allocation ignored invalid preferred region: zone={}",
+                req.zone
+            );
+        }
+        let geo = self.lookup_geo_for_allocation(req.source_ip).await;
+        self.choose_automatic_relay(preferred_region.as_ref(), geo.as_ref())
+            .await
+    }
+
+    pub(crate) async fn commit_registration_allocation(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+        req: &AllocateZoneRelayReq,
+        plan: SnResult<RelaySelection>,
+    ) -> SnResult<Result<RelayAssignment, SnError>> {
+        let allocation = match plan {
+            Ok(plan) => {
+                let row =
+                    sqlx::query(Self::relay_node_select_sql("WHERE n.relay_id = ?1").as_str())
+                        .bind(plan.node.relay_id.as_str())
+                        .fetch_optional(&mut **tx)
+                        .await
+                        .map_err(|e| {
+                            Self::db_err("revalidate registration relay node failed", e)
+                        })?;
+                match row.map(Self::relay_node_from_row).transpose()? {
+                    Some(node) if Self::is_assignable_node(&node) => {
+                        let now = Self::now_secs();
+                        let assignment = RelayAssignment {
+                            zone: req.zone.trim().to_string(),
+                            relay_id: node.relay_id,
+                            relay_sn: node.relay_sn,
+                            state: RelayAssignmentState::Active,
+                            source: RelayAssignmentSource::Auto,
+                            reason: Some(format!("{};rule={}", req.reason.trim(), plan.rule)),
+                            generation: 1,
+                            backup_relay_id: None,
+                            sticky_until: None,
+                            lease_expires_at: None,
+                            migrated_from: None,
+                            migration_deadline: None,
+                            source_version: req.source_version.clone(),
+                            created_at: now,
+                            updated_at: now,
+                        };
+                        Self::insert_registration_assignment_tx(tx, &assignment).await?;
+                        sqlx::query("DELETE FROM relay_allocation_pending WHERE zone = ?1")
+                            .bind(assignment.zone.as_str())
+                            .execute(&mut **tx)
+                            .await
+                            .map_err(|e| {
+                                Self::db_err("clear registration relay pending failed", e)
+                            })?;
+                        self.allocation_metrics
+                            .successes
+                            .fetch_add(1, AtomicOrdering::Relaxed);
+                        if plan.fallback {
+                            self.allocation_metrics
+                                .fallbacks
+                                .fetch_add(1, AtomicOrdering::Relaxed);
+                        }
+                        info!(
+                            "relay allocation selected: zone={} relay_id={} generation={} rule={} fallback={}",
+                            assignment.zone,
+                            assignment.relay_id,
+                            assignment.generation,
+                            plan.rule,
+                            plan.fallback
+                        );
+                        Ok(assignment)
+                    }
+                    Some(node) => Err(sn_err!(
+                        SnErrorCode::Conflict,
+                        "planned relay node {} became unavailable: {}",
+                        node.relay_id,
+                        node.status
+                    )),
+                    None => Err(sn_err!(
+                        SnErrorCode::NotFound,
+                        "planned relay node {} no longer exists",
+                        plan.node.relay_id
+                    )),
+                }
+            }
+            Err(error) => Err(error),
+        };
+
+        match allocation {
+            Ok(assignment) => Ok(Ok(assignment)),
+            Err(error) => {
+                Self::record_registration_pending_tx(tx, req, &error).await?;
+                self.allocation_metrics
+                    .failures
+                    .fetch_add(1, AtomicOrdering::Relaxed);
+                warn!(
+                    "relay allocation pending: zone={} error_code={:?} error={}",
+                    req.zone,
+                    error.code(),
+                    error.msg()
+                );
+                Ok(Err(error))
+            }
+        }
+    }
+
+    async fn insert_registration_assignment_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        assignment: &RelayAssignment,
+    ) -> SnResult<()> {
+        sqlx::query(
+            "INSERT INTO relay_assignments
+                (zone, relay_id, state, source, reason, generation,
+                 backup_relay_id, sticky_until, lease_expires_at, migrated_from,
+                 migration_deadline, source_version, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, NULL, NULL, NULL, NULL, ?7, ?8, ?9)",
+        )
+        .bind(assignment.zone.as_str())
+        .bind(assignment.relay_id.as_str())
+        .bind(assignment.state.as_str())
+        .bind(assignment.source.as_str())
+        .bind(assignment.reason.as_deref())
+        .bind(Self::to_db_time(assignment.generation, "generation")?)
+        .bind(assignment.source_version.as_deref())
+        .bind(Self::to_db_time(assignment.created_at, "created_at")?)
+        .bind(Self::to_db_time(assignment.updated_at, "updated_at")?)
+        .execute(&mut **tx)
+        .await
+        .map_err(|e| Self::db_err("insert registration relay assignment failed", e))?;
+        Ok(())
+    }
+
+    async fn record_registration_pending_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        req: &AllocateZoneRelayReq,
+        error: &SnError,
+    ) -> SnResult<()> {
+        let now = Self::now_secs();
+        let preferred_region = req
+            .preferred_region
+            .as_deref()
+            .and_then(Self::normalize_match_label);
+        sqlx::query(
+            "INSERT INTO relay_allocation_pending
+                (zone, preferred_region, reason, source_version, attempts, last_error,
+                 created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, 1, ?5, ?6, ?7)
+             ON CONFLICT(zone) DO UPDATE SET
+                preferred_region = excluded.preferred_region,
+                reason = excluded.reason,
+                source_version = excluded.source_version,
+                attempts = relay_allocation_pending.attempts + 1,
+                last_error = excluded.last_error,
+                updated_at = excluded.updated_at",
+        )
+        .bind(req.zone.trim())
+        .bind(preferred_region.as_deref())
+        .bind(req.reason.trim())
+        .bind(req.source_version.as_deref())
+        .bind(format!("{:?}: {}", error.code(), error.msg()))
+        .bind(Self::to_db_time(now, "created_at")?)
+        .bind(Self::to_db_time(now, "updated_at")?)
+        .execute(&mut **tx)
+        .await
+        .map_err(|e| Self::db_err("record registration relay pending failed", e))?;
+        Ok(())
+    }
+
     async fn record_pending_allocation(
         &self,
         req: &AllocateZoneRelayReq,
@@ -1183,6 +1638,42 @@ impl SqliteSnRelayManager {
         Ok(())
     }
 
+    async fn retry_pending_allocations(&self) -> SnResult<()> {
+        let rows = sqlx::query(
+            "SELECT zone, preferred_region, reason, source_version
+             FROM relay_allocation_pending ORDER BY created_at ASC, zone ASC",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| Self::db_err("list pending relay allocations failed", error))?;
+        for row in rows {
+            let req = AllocateZoneRelayReq {
+                zone: row
+                    .try_get(0)
+                    .map_err(|e| Self::db_err("read pending relay zone failed", e))?,
+                preferred_region: row
+                    .try_get(1)
+                    .map_err(|e| Self::db_err("read pending relay region failed", e))?,
+                source_ip: None,
+                reason: row
+                    .try_get(2)
+                    .map_err(|e| Self::db_err("read pending relay reason failed", e))?,
+                source_version: row
+                    .try_get(3)
+                    .map_err(|e| Self::db_err("read pending relay source_version failed", e))?,
+            };
+            if let Err(error) = self.allocate_zone_relay(req.clone()).await {
+                warn!(
+                    "retry pending relay allocation failed: zone={} error_code={:?} error={}",
+                    req.zone,
+                    error.code(),
+                    error.msg()
+                );
+            }
+        }
+        Ok(())
+    }
+
     async fn allocate_zone_relay_inner(
         &self,
         req: &AllocateZoneRelayReq,
@@ -1196,7 +1687,6 @@ impl SqliteSnRelayManager {
             if existing.state == RelayAssignmentState::Active {
                 if let Some(node) = self.get_relay_node(existing.relay_id.as_str()).await? {
                     if Self::is_assignable_node(&node) {
-                        self.sync_zone_relay_cache(&existing).await?;
                         info!(
                             "relay allocation reused sticky assignment: zone={} relay_id={} generation={} rule=sticky",
                             req.zone, existing.relay_id, existing.generation
@@ -1250,7 +1740,7 @@ impl SqliteSnRelayManager {
 
     async fn get_relay_node_by_sn(&self, relay_sn: &str) -> SnResult<Option<RelayNode>> {
         Self::check_non_empty(relay_sn, "relay_sn")?;
-        let row = sqlx::query(Self::relay_node_select_sql("WHERE relay_sn = ?1").as_str())
+        let row = sqlx::query(Self::relay_node_select_sql("WHERE n.relay_sn = ?1").as_str())
             .bind(relay_sn)
             .fetch_optional(&self.pool)
             .await
@@ -1282,7 +1772,7 @@ impl SqliteSnRelayManager {
     }
 
     async fn fetch_assignment_for_update(&self, zone: &str) -> SnResult<Option<RelayAssignment>> {
-        let row = sqlx::query(Self::relay_assignment_select_sql("WHERE zone = ?1").as_str())
+        let row = sqlx::query(Self::relay_assignment_select_sql("WHERE a.zone = ?1").as_str())
             .bind(zone)
             .fetch_optional(&self.pool)
             .await
@@ -1294,13 +1784,12 @@ impl SqliteSnRelayManager {
     async fn upsert_assignment(&self, assignment: &RelayAssignment) -> SnResult<()> {
         sqlx::query(
             "INSERT INTO relay_assignments
-                (zone, relay_id, relay_sn, state, source, reason, generation,
+                (zone, relay_id, state, source, reason, generation,
                  backup_relay_id, sticky_until, lease_expires_at, migrated_from,
                  migration_deadline, source_version, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
              ON CONFLICT(zone) DO UPDATE SET
                 relay_id = excluded.relay_id,
-                relay_sn = excluded.relay_sn,
                 state = excluded.state,
                 source = excluded.source,
                 reason = excluded.reason,
@@ -1315,7 +1804,6 @@ impl SqliteSnRelayManager {
         )
         .bind(assignment.zone.as_str())
         .bind(assignment.relay_id.as_str())
-        .bind(assignment.relay_sn.as_str())
         .bind(assignment.state.as_str())
         .bind(assignment.source.as_str())
         .bind(assignment.reason.as_deref())
@@ -1340,20 +1828,6 @@ impl SqliteSnRelayManager {
         .execute(&self.pool)
         .await
         .map_err(|e| Self::db_err("upsert relay assignment failed", e))?;
-
-        Ok(())
-    }
-
-    async fn sync_zone_relay_cache(&self, assignment: &RelayAssignment) -> SnResult<()> {
-        if let Some(auth_db) = self.auth_db.as_ref() {
-            auth_db
-                .update_zone_relay_sn(
-                    assignment.zone.as_str(),
-                    assignment.relay_sn.as_str(),
-                    assignment.source_version.as_deref(),
-                )
-                .await?;
-        }
 
         Ok(())
     }
@@ -1509,42 +1983,59 @@ impl SqliteSnRelayManager {
 
     fn relay_node_select_sql(tail: &str) -> String {
         format!(
-            "SELECT relay_id, relay_sn, public_host, http_endpoint, rtcp_endpoint,
-                    region, isp, tags, capabilities, status, capacity_score,
-                    current_load, last_heartbeat_at, drain_until, created_at, updated_at
-             FROM relay_nodes {}",
+            "SELECT n.relay_id, n.relay_sn,
+                    (SELECT a0.ip FROM relay_node_addresses a0
+                     WHERE a0.relay_id = n.relay_id AND a0.slot = 0),
+                    (SELECT a1.ip FROM relay_node_addresses a1
+                     WHERE a1.relay_id = n.relay_id AND a1.slot = 1),
+                    n.public_host, n.http_endpoint, n.rtcp_endpoint,
+                    n.region, n.isp, n.tags, n.capabilities, n.status, n.capacity_score,
+                    n.current_load, n.last_heartbeat_at, n.drain_until, n.created_at, n.updated_at
+             FROM relay_nodes n {}",
             tail
         )
     }
 
     fn relay_assignment_select_sql(tail: &str) -> String {
         format!(
-            "SELECT zone, relay_id, relay_sn, state, source, reason, generation,
-                    backup_relay_id, sticky_until, lease_expires_at, migrated_from,
-                    migration_deadline, source_version, created_at, updated_at
-             FROM relay_assignments {}",
+            "SELECT a.zone, a.relay_id, n.relay_sn, a.state, a.source, a.reason, a.generation,
+                    a.backup_relay_id, a.sticky_until, a.lease_expires_at, a.migrated_from,
+                    a.migration_deadline, a.source_version, a.created_at, a.updated_at
+             FROM relay_assignments a
+             JOIN relay_nodes n ON n.relay_id = a.relay_id {}",
             tail
         )
     }
 
     fn relay_node_from_row(row: SqliteRow) -> SnResult<RelayNode> {
+        let ip0 = Self::parse_stored_ip(
+            row.try_get::<Option<String>, _>(2)
+                .map_err(|e| Self::db_err("read relay address slot 0 failed", e))?,
+            0,
+        )?;
+        let ip1 = Self::parse_stored_ip(
+            row.try_get::<Option<String>, _>(3)
+                .map_err(|e| Self::db_err("read relay address slot 1 failed", e))?,
+            1,
+        )?;
         Ok(RelayNode {
             relay_id: row.get(0),
             relay_sn: row.get(1),
-            public_host: row.get(2),
-            http_endpoint: row.get(3),
-            rtcp_endpoint: row.get(4),
-            region: row.get(5),
-            isp: row.get(6),
-            tags: Self::parse_json_string_vec(row.get(7), "relay tags")?,
-            capabilities: Self::parse_json_string_vec(row.get(8), "relay capabilities")?,
-            status: Self::parse_db_enum(row.get(9), "relay status")?,
-            capacity_score: row.get(10),
-            current_load: row.get(11),
-            last_heartbeat_at: Self::opt_to_u64(row.get(12)),
-            drain_until: Self::opt_to_u64(row.get(13)),
-            created_at: Self::i64_to_u64(row.get(14)),
-            updated_at: Self::i64_to_u64(row.get(15)),
+            ips: [ip0, ip1],
+            public_host: row.get(4),
+            http_endpoint: row.get(5),
+            rtcp_endpoint: row.get(6),
+            region: row.get(7),
+            isp: row.get(8),
+            tags: Self::parse_json_string_vec(row.get(9), "relay tags")?,
+            capabilities: Self::parse_json_string_vec(row.get(10), "relay capabilities")?,
+            status: Self::parse_db_enum(row.get(11), "relay status")?,
+            capacity_score: row.get(12),
+            current_load: row.get(13),
+            last_heartbeat_at: Self::opt_to_u64(row.get(14)),
+            drain_until: Self::opt_to_u64(row.get(15)),
+            created_at: Self::i64_to_u64(row.get(16)),
+            updated_at: Self::i64_to_u64(row.get(17)),
         })
     }
 
@@ -1693,6 +2184,33 @@ impl SqliteSnRelayManager {
         }
     }
 
+    fn parse_stored_ip(value: Option<String>, slot: usize) -> SnResult<IpAddr> {
+        let value = value.ok_or_else(|| {
+            sn_err!(
+                SnErrorCode::DBError,
+                "relay node address slot {} is missing",
+                slot
+            )
+        })?;
+        let ip = value.parse::<IpAddr>().map_err(|e| {
+            sn_err!(
+                SnErrorCode::DBError,
+                "relay node address slot {} is corrupt: {}",
+                slot,
+                e
+            )
+        })?;
+        if ip.to_string() != value {
+            return Err(sn_err!(
+                SnErrorCode::DBError,
+                "relay node address slot {} is not canonical: {}",
+                slot,
+                value
+            ));
+        }
+        Ok(ip)
+    }
+
     fn to_json_string(values: &[String], field: &str) -> SnResult<String> {
         serde_json::to_string(values)
             .map_err(|e| sn_err!(SnErrorCode::InvalidInput, "invalid {} json: {}", field, e))
@@ -1735,12 +2253,15 @@ impl SnRelayManager for SqliteSnRelayManager {
             .await?;
 
         let now = Self::now_secs();
-        let existing = self.get_relay_node(node.relay_id.as_str()).await?;
-        if existing
-            .as_ref()
-            .map(|node| node.status == RelayNodeStatus::Deleted)
-            .unwrap_or(false)
-        {
+        let existing_status =
+            sqlx::query_scalar::<_, String>("SELECT status FROM relay_nodes WHERE relay_id = ?1")
+                .bind(node.relay_id.as_str())
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| Self::db_err("query existing relay node status failed", e))?
+                .map(|status| Self::parse_db_enum(status, "relay status"))
+                .transpose()?;
+        if existing_status == Some(RelayNodeStatus::Deleted) {
             return Err(sn_err!(
                 SnErrorCode::Conflict,
                 "deleted relay node cannot be registered"
@@ -1749,9 +2270,7 @@ impl SnRelayManager for SqliteSnRelayManager {
         let tags = Self::normalize_label_vec(node.tags);
         let capabilities = Self::normalize_capability_vec(node.capabilities);
         let status = node.status.unwrap_or_else(|| {
-            existing
-                .as_ref()
-                .map(|node| node.status)
+            existing_status
                 .filter(|status| {
                     matches!(
                         status,
@@ -1761,6 +2280,12 @@ impl SnRelayManager for SqliteSnRelayManager {
                 .unwrap_or(RelayNodeStatus::Active)
         });
         let capacity_score = node.capacity_score.unwrap_or(DEFAULT_CAPACITY_SCORE);
+        let ips = node.ips;
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| Self::db_err("begin relay node registration failed", e))?;
 
         sqlx::query(
             "INSERT INTO relay_nodes
@@ -1794,13 +2319,40 @@ impl SnRelayManager for SqliteSnRelayManager {
         .bind(capacity_score)
         .bind(Self::to_db_time(now, "created_at")?)
         .bind(Self::to_db_time(now, "updated_at")?)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
         .map_err(|e| Self::db_err("upsert relay node failed", e))?;
+        for (slot, ip) in ips.into_iter().enumerate() {
+            sqlx::query(
+                "INSERT INTO relay_node_addresses
+                    (relay_id, slot, ip, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(relay_id, slot) DO UPDATE SET
+                    ip = excluded.ip,
+                    updated_at = excluded.updated_at",
+            )
+            .bind(node.relay_id.as_str())
+            .bind(slot as i64)
+            .bind(ip.to_string())
+            .bind(Self::to_db_time(now, "created_at")?)
+            .bind(Self::to_db_time(now, "updated_at")?)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| Self::db_err("upsert relay node address failed", e))?;
+        }
+        Self::bump_node_map_revision(&mut tx).await?;
+        tx.commit()
+            .await
+            .map_err(|e| Self::db_err("commit relay node registration failed", e))?;
 
-        self.get_relay_node(node.relay_id.as_str())
+        let stored = self
+            .get_relay_node(node.relay_id.as_str())
             .await?
-            .ok_or_else(|| sn_err!(SnErrorCode::NotFound, "relay node not found after upsert"))
+            .ok_or_else(|| sn_err!(SnErrorCode::NotFound, "relay node not found after upsert"))?;
+        if status == RelayNodeStatus::Active {
+            self.retry_pending_allocations().await?;
+        }
+        Ok(stored)
     }
 
     async fn heartbeat_relay_node(&self, heartbeat: RelayHeartbeat) -> SnResult<RelayNodeHealth> {
@@ -1834,6 +2386,12 @@ impl SnRelayManager for SqliteSnRelayManager {
         } else {
             heartbeat.drain_until
         };
+        let status_changed = status != existing.status;
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| Self::db_err("begin relay heartbeat update failed", e))?;
 
         sqlx::query(
             "UPDATE relay_nodes
@@ -1856,9 +2414,18 @@ impl SnRelayManager for SqliteSnRelayManager {
         .bind(Self::to_db_time_opt(drain_until, "drain_until")?)
         .bind(Self::to_db_time(now, "updated_at")?)
         .bind(heartbeat.relay_id.as_str())
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
         .map_err(|e| Self::db_err("update relay heartbeat failed", e))?;
+        if status_changed {
+            Self::bump_node_map_revision(&mut tx).await?;
+        }
+        tx.commit()
+            .await
+            .map_err(|e| Self::db_err("commit relay heartbeat update failed", e))?;
+        if status == RelayNodeStatus::Active && existing.status != RelayNodeStatus::Active {
+            self.retry_pending_allocations().await?;
+        }
 
         Ok(RelayNodeHealth {
             relay_id: heartbeat.relay_id,
@@ -1869,6 +2436,75 @@ impl SnRelayManager for SqliteSnRelayManager {
             drain_until,
             updated_at: now,
         })
+    }
+
+    async fn update_relay_node_addresses(
+        &self,
+        update: RelayNodeAddressUpdate,
+    ) -> SnResult<RelayNode> {
+        Self::check_non_empty(update.relay_id.as_str(), "relay_id")?;
+        let existing = self
+            .get_relay_node(update.relay_id.as_str())
+            .await?
+            .ok_or_else(|| sn_err!(SnErrorCode::NotFound, "relay node not found"))?;
+        if existing.status == RelayNodeStatus::Deleted {
+            return Err(sn_err!(
+                SnErrorCode::Conflict,
+                "deleted relay node addresses cannot be updated"
+            ));
+        }
+        if existing.ips == update.ips {
+            return Ok(existing);
+        }
+
+        let now = Self::now_secs();
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| Self::db_err("begin relay address update failed", e))?;
+        for (slot, ip) in update.ips.into_iter().enumerate() {
+            sqlx::query(
+                "UPDATE relay_node_addresses
+                 SET ip = ?1, updated_at = ?2
+                 WHERE relay_id = ?3 AND slot = ?4",
+            )
+            .bind(ip.to_string())
+            .bind(Self::to_db_time(now, "updated_at")?)
+            .bind(update.relay_id.as_str())
+            .bind(slot as i64)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| Self::db_err("update relay node address failed", e))?;
+        }
+        sqlx::query("UPDATE relay_nodes SET updated_at = ?1 WHERE relay_id = ?2")
+            .bind(Self::to_db_time(now, "updated_at")?)
+            .bind(update.relay_id.as_str())
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| Self::db_err("touch relay node after address update failed", e))?;
+        Self::bump_node_map_revision(&mut tx).await?;
+        tx.commit()
+            .await
+            .map_err(|e| Self::db_err("commit relay address update failed", e))?;
+        self.get_relay_node(update.relay_id.as_str())
+            .await?
+            .ok_or_else(|| sn_err!(SnErrorCode::NotFound, "relay node not found after update"))
+    }
+
+    async fn get_relay_node(&self, relay_id: &str) -> SnResult<Option<RelayNode>> {
+        SqliteSnRelayManager::get_relay_node(self, relay_id).await
+    }
+
+    async fn list_relay_nodes(&self) -> SnResult<Vec<RelayNode>> {
+        SqliteSnRelayManager::list_relay_nodes(self).await
+    }
+
+    async fn get_relay_nodes_ip_map(
+        &self,
+        req: RelayNodeIpMapReq,
+    ) -> SnResult<Option<RelayNodeIpMapSnapshot>> {
+        self.get_relay_nodes_ip_map_snapshot(req.if_revision).await
     }
 
     async fn assign_zone_relay(&self, req: AssignZoneRelayReq) -> SnResult<RelayAssignment> {
@@ -1927,7 +2563,6 @@ impl SnRelayManager for SqliteSnRelayManager {
         };
 
         self.upsert_assignment(&assignment).await?;
-        self.sync_zone_relay_cache(&assignment).await?;
         Ok(assignment)
     }
 
@@ -1991,7 +2626,7 @@ impl SnRelayManager for SqliteSnRelayManager {
 
     async fn get_zone_relay(&self, zone: &str) -> SnResult<Option<RelayAssignment>> {
         Self::check_non_empty(zone, "zone")?;
-        let row = sqlx::query(Self::relay_assignment_select_sql("WHERE zone = ?1").as_str())
+        let row = sqlx::query(Self::relay_assignment_select_sql("WHERE a.zone = ?1").as_str())
             .bind(zone)
             .fetch_optional(&self.pool)
             .await
@@ -2185,7 +2820,6 @@ impl SnRelayManager for SqliteSnRelayManager {
         };
 
         self.upsert_assignment(&assignment).await?;
-        self.sync_zone_relay_cache(&assignment).await?;
         Ok(assignment)
     }
 
@@ -2250,6 +2884,10 @@ mod tests {
         RelayNodeRegistration {
             relay_id: relay_id.to_string(),
             relay_sn: relay_sn.to_string(),
+            ips: [
+                "192.0.2.10".parse().unwrap(),
+                "2001:db8::10".parse().unwrap(),
+            ],
             public_host: relay_sn.to_string(),
             http_endpoint: Some(format!("https://{}", relay_sn)),
             rtcp_endpoint: Some(format!("rtcp://{}:443", relay_sn)),
@@ -2284,6 +2922,161 @@ mod tests {
             city: Some(city.to_string()),
             isp: Some(isp.to_string()),
         }
+    }
+
+    #[tokio::test]
+    async fn test_node_ip_map_roundtrips_all_address_families_and_revision() -> SnResult<()> {
+        let (_tmp_dir, mgr) = temp_mgr().await?;
+        let cases = [
+            (
+                "relay-v4",
+                [
+                    "192.0.2.10".parse::<IpAddr>().unwrap(),
+                    "198.51.100.10".parse::<IpAddr>().unwrap(),
+                ],
+            ),
+            (
+                "relay-dual",
+                [
+                    "192.0.2.11".parse::<IpAddr>().unwrap(),
+                    "2001:db8::11".parse::<IpAddr>().unwrap(),
+                ],
+            ),
+            (
+                "relay-v6",
+                [
+                    "2001:db8::12".parse::<IpAddr>().unwrap(),
+                    "2001:db8::13".parse::<IpAddr>().unwrap(),
+                ],
+            ),
+        ];
+        for (relay_id, ips) in cases {
+            let mut registration = node(relay_id, &format!("{relay_id}.example"), "test");
+            registration.ips = ips;
+            let stored = mgr.register_relay_node(registration).await?;
+            assert_eq!(stored.ips, ips);
+        }
+
+        let snapshot = mgr
+            .get_relay_nodes_ip_map(RelayNodeIpMapReq::default())
+            .await?
+            .unwrap();
+        assert_eq!(snapshot.revision, 3);
+        assert_eq!(
+            snapshot
+                .nodes
+                .iter()
+                .map(|node| node.relay_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["relay-dual", "relay-v4", "relay-v6"]
+        );
+        assert!(mgr
+            .get_relay_nodes_ip_map(RelayNodeIpMapReq {
+                if_revision: Some(snapshot.revision),
+            })
+            .await?
+            .is_none());
+
+        let updated_ips = [
+            "203.0.113.20".parse().unwrap(),
+            "2001:db8::20".parse().unwrap(),
+        ];
+        mgr.update_relay_node_addresses(RelayNodeAddressUpdate {
+            relay_id: "relay-dual".to_string(),
+            ips: updated_ips,
+        })
+        .await?;
+        let updated = mgr
+            .get_relay_nodes_ip_map(RelayNodeIpMapReq {
+                if_revision: Some(snapshot.revision),
+            })
+            .await?
+            .unwrap();
+        assert_eq!(updated.revision, 4);
+        assert_eq!(updated.nodes.len(), 3);
+        assert_eq!(
+            updated
+                .nodes
+                .iter()
+                .find(|node| node.relay_id == "relay-dual")
+                .unwrap()
+                .ips,
+            updated_ips
+        );
+
+        mgr.heartbeat_relay_node(RelayHeartbeat {
+            relay_id: "relay-dual".to_string(),
+            status: None,
+            current_load: Some(5),
+            capacity_score: None,
+            drain_until: None,
+            http_endpoint: None,
+            rtcp_endpoint: None,
+        })
+        .await?;
+        assert!(mgr
+            .get_relay_nodes_ip_map(RelayNodeIpMapReq {
+                if_revision: Some(updated.revision),
+            })
+            .await?
+            .is_none());
+        mgr.heartbeat_relay_node(RelayHeartbeat {
+            relay_id: "relay-dual".to_string(),
+            status: Some(RelayNodeStatus::Draining),
+            current_load: None,
+            capacity_score: None,
+            drain_until: Some(100),
+            http_endpoint: None,
+            rtcp_endpoint: None,
+        })
+        .await?;
+        assert_eq!(
+            mgr.get_relay_nodes_ip_map(RelayNodeIpMapReq {
+                if_revision: Some(updated.revision),
+            })
+            .await?
+            .unwrap()
+            .revision,
+            5
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_node_ip_map_rejects_incomplete_or_noncanonical_storage() -> SnResult<()> {
+        let (_tmp_dir, mgr) = temp_mgr().await?;
+        mgr.register_relay_node(node("relay-a", "relay-a.example", "test"))
+            .await?;
+        sqlx::query(
+            "UPDATE relay_node_addresses SET ip = '2001:0db8::10'
+             WHERE relay_id = 'relay-a' AND slot = 1",
+        )
+        .execute(&mgr.pool)
+        .await
+        .map_err(|e| SqliteSnRelayManager::db_err("corrupt test relay address failed", e))?;
+        assert_eq!(
+            mgr.get_relay_nodes_ip_map(RelayNodeIpMapReq::default())
+                .await
+                .unwrap_err()
+                .code(),
+            SnErrorCode::DBError
+        );
+
+        sqlx::query(
+            "DELETE FROM relay_node_addresses
+             WHERE relay_id = 'relay-a' AND slot = 1",
+        )
+        .execute(&mgr.pool)
+        .await
+        .map_err(|e| SqliteSnRelayManager::db_err("delete test relay address failed", e))?;
+        assert_eq!(
+            mgr.get_relay_nodes_ip_map(RelayNodeIpMapReq::default())
+                .await
+                .unwrap_err()
+                .code(),
+            SnErrorCode::DBError
+        );
+        Ok(())
     }
 
     #[tokio::test]
@@ -2441,6 +3234,21 @@ mod tests {
         assert_eq!(pending.preferred_region.as_deref(), Some("unknown"));
         assert!(pending.last_error.contains("no_relay_available"));
         assert_eq!(mgr.allocation_metrics().failures, 1);
+        mgr.heartbeat_relay_node(RelayHeartbeat {
+            relay_id: "relay-b".to_string(),
+            status: Some(RelayNodeStatus::Active),
+            current_load: None,
+            capacity_score: None,
+            drain_until: None,
+            http_endpoint: None,
+            rtcp_endpoint: None,
+        })
+        .await?;
+        assert!(mgr.get_pending_allocation("alice").await?.is_none());
+        assert_eq!(
+            mgr.get_zone_relay("alice").await?.unwrap().relay_id,
+            "relay-b"
+        );
         Ok(())
     }
 
@@ -2681,10 +3489,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_assignment_syncs_zone_info_relay_sn() -> SnResult<()> {
+    async fn test_auth_db_projects_assignment_into_zone_info() -> SnResult<()> {
         let tmp_dir = tempfile::tempdir()
             .map_err(|e| sn_err!(SnErrorCode::DBError, "create temp dir failed: {}", e))?;
-        let relay_path = tmp_dir.path().join("sn_relay_mgr.sqlite3");
         let auth_path = tmp_dir.path().join("sn_auth.sqlite3");
         let auth_db = SqliteSnAuthDB::new_by_path(auth_path.to_string_lossy().as_ref()).await?;
         auth_db.initialize_database().await?;
@@ -2711,36 +3518,34 @@ mod tests {
             )
             .await?;
 
-        let mgr = SqliteSnRelayManager::new_by_path(relay_path.to_string_lossy().as_ref())
-            .await?
-            .with_auth_db(Arc::new(auth_db));
-        mgr.initialize_database().await?;
-        mgr.register_relay_node(node("relay-a", "relay-a.example", "us"))
+        auth_db
+            .register_relay_node(node("relay-a", "relay-a.example", "us"))
             .await?;
-        mgr.assign_zone_relay(AssignZoneRelayReq {
-            zone: "alice.zone".to_string(),
-            relay_id: Some("relay-a".to_string()),
-            relay_sn: None,
-            from_ip: None,
-            region: None,
-            source: RelayAssignmentSource::Admin,
-            reason: Some("test".to_string()),
-            sticky_until: None,
-            lease_expires_at: None,
-            backup_relay_id: None,
-            source_version: Some("relay-v1".to_string()),
-        })
-        .await?;
+        auth_db
+            .assign_zone_relay(AssignZoneRelayReq {
+                zone: "alice".to_string(),
+                relay_id: Some("relay-a".to_string()),
+                relay_sn: None,
+                from_ip: None,
+                region: None,
+                source: RelayAssignmentSource::Admin,
+                reason: Some("test".to_string()),
+                sticky_until: None,
+                lease_expires_at: None,
+                backup_relay_id: None,
+                source_version: Some("relay-v1".to_string()),
+            })
+            .await?;
 
-        let zone_info = mgr
-            .auth_db
-            .as_ref()
-            .unwrap()
-            .get_zone_info("alice")
-            .await?
-            .unwrap();
+        let zone_info = auth_db.get_zone_info("alice").await?.unwrap();
         assert_eq!(zone_info.relay_sn.as_deref(), Some("relay-a.example"));
-        assert_eq!(zone_info.source_version.as_deref(), Some("relay-v1"));
+        assert_eq!(
+            zone_info
+                .relay
+                .as_ref()
+                .map(|relay| relay.relay_id.as_str()),
+            Some("relay-a")
+        );
 
         Ok(())
     }

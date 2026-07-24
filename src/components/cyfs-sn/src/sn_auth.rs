@@ -1,4 +1,10 @@
-use crate::{sn_err, SnError, SnErrorCode, SnResult};
+use crate::{
+    sn_err, AllocateZoneRelayReq, AssignZoneRelayReq, GeoIpResolverRef, RelayAdmissionDecision,
+    RelayAdmissionReq, RelayAllocationConfig, RelayAssignment, RelayAssignmentState,
+    RelayHeartbeat, RelayMigrationReq, RelayNode, RelayNodeAddressUpdate, RelayNodeHealth,
+    RelayNodeIpMapReq, RelayNodeIpMapSnapshot, RelayNodeRegistration, SnError, SnErrorCode,
+    SnRelayManager, SnResult, SqliteSnRelayManager,
+};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
@@ -225,6 +231,8 @@ pub struct SNUserInfo {
     pub self_cert: bool,
     pub user_domain: Option<String>,
     pub sn_ips: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay: Option<UserRelayInfo>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -268,6 +276,58 @@ pub struct ZoneInfo {
     pub sn_ips: Option<String>,
     pub source_version: Option<String>,
     pub updated_at: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay: Option<UserRelayInfo>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct UserRelayInfo {
+    pub relay_id: String,
+    pub relay_sn: String,
+    pub state: RelayAssignmentState,
+    pub generation: u64,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RegisterUserWithRelayAllocationReq {
+    pub active_code: String,
+    pub username: String,
+    pub email: String,
+    pub password_hash: String,
+    pub password_salt: String,
+    pub password_algo: String,
+    pub preferred_region: Option<String>,
+    pub source_ip: Option<std::net::IpAddr>,
+    pub source_version: Option<String>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum RegistrationRelayAllocation {
+    Assigned {
+        assignment: RelayAssignment,
+    },
+    Pending {
+        error_code: SnErrorCode,
+        message: String,
+    },
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RegisterUserWithRelayAllocationResult {
+    pub registered: bool,
+    pub relay: Option<RegistrationRelayAllocation>,
+}
+
+impl From<&RelayAssignment> for UserRelayInfo {
+    fn from(assignment: &RelayAssignment) -> Self {
+        Self {
+            relay_id: assignment.relay_id.clone(),
+            relay_sn: assignment.relay_sn.clone(),
+            state: assignment.state,
+            generation: assignment.generation,
+        }
+    }
 }
 
 impl ZoneInfo {
@@ -283,6 +343,7 @@ impl ZoneInfo {
             sn_ips: None,
             source_version: None,
             updated_at: 0,
+            relay: None,
         }
     }
 }
@@ -326,6 +387,47 @@ pub trait SnAuthDB: Send + Sync + 'static {
         password_salt: &str,
         password_algo: &str,
     ) -> SnResult<bool>;
+    async fn register_user_with_relay_allocation(
+        &self,
+        req: RegisterUserWithRelayAllocationReq,
+    ) -> SnResult<RegisterUserWithRelayAllocationResult> {
+        let registered = self
+            .register_user(
+                req.active_code.as_str(),
+                req.username.as_str(),
+                req.email.as_str(),
+                req.password_hash.as_str(),
+                req.password_salt.as_str(),
+                req.password_algo.as_str(),
+            )
+            .await?;
+        if !registered {
+            return Ok(RegisterUserWithRelayAllocationResult {
+                registered: false,
+                relay: None,
+            });
+        }
+        let relay = match self
+            .allocate_zone_relay(AllocateZoneRelayReq {
+                zone: req.username,
+                preferred_region: req.preferred_region,
+                source_ip: req.source_ip,
+                reason: "register".to_string(),
+                source_version: req.source_version,
+            })
+            .await
+        {
+            Ok(assignment) => RegistrationRelayAllocation::Assigned { assignment },
+            Err(error) => RegistrationRelayAllocation::Pending {
+                error_code: error.code(),
+                message: error.msg().to_string(),
+            },
+        };
+        Ok(RegisterUserWithRelayAllocationResult {
+            registered: true,
+            relay: Some(relay),
+        })
+    }
     async fn create_auth(
         &self,
         username: &str,
@@ -463,6 +565,28 @@ pub trait SnAuthDB: Send + Sync + 'static {
         Ok(false)
     }
 
+    async fn register_relay_node(&self, node: RelayNodeRegistration) -> SnResult<RelayNode>;
+    async fn heartbeat_relay_node(&self, heartbeat: RelayHeartbeat) -> SnResult<RelayNodeHealth>;
+    async fn update_relay_node_addresses(
+        &self,
+        update: RelayNodeAddressUpdate,
+    ) -> SnResult<RelayNode>;
+    async fn get_relay_node(&self, relay_id: &str) -> SnResult<Option<RelayNode>>;
+    async fn list_relay_nodes(&self) -> SnResult<Vec<RelayNode>>;
+    async fn get_relay_nodes_ip_map(
+        &self,
+        req: RelayNodeIpMapReq,
+    ) -> SnResult<Option<RelayNodeIpMapSnapshot>>;
+    async fn assign_zone_relay(&self, req: AssignZoneRelayReq) -> SnResult<RelayAssignment>;
+    async fn allocate_zone_relay(&self, req: AllocateZoneRelayReq) -> SnResult<RelayAssignment>;
+    async fn get_zone_relay(&self, zone: &str) -> SnResult<Option<RelayAssignment>>;
+    async fn start_relay_migration(&self, req: RelayMigrationReq) -> SnResult<RelayAssignment>;
+    async fn complete_relay_migration(&self, zone: &str, generation: u64) -> SnResult<()>;
+    async fn check_relay_admission(
+        &self,
+        req: RelayAdmissionReq,
+    ) -> SnResult<RelayAdmissionDecision>;
+
     async fn create_account_session(
         &self,
         session_id: &str,
@@ -544,6 +668,13 @@ impl SnAuthDB for RemoteSnAuthDB {
                 password_algo,
             )
             .await
+    }
+
+    async fn register_user_with_relay_allocation(
+        &self,
+        req: RegisterUserWithRelayAllocationReq,
+    ) -> SnResult<RegisterUserWithRelayAllocationResult> {
+        self.client.register_user_with_relay_allocation(req).await
     }
 
     async fn create_auth(
@@ -718,6 +849,63 @@ impl SnAuthDB for RemoteSnAuthDB {
             .await
     }
 
+    async fn register_relay_node(&self, node: RelayNodeRegistration) -> SnResult<RelayNode> {
+        self.client.register_relay_node(node).await
+    }
+
+    async fn heartbeat_relay_node(&self, heartbeat: RelayHeartbeat) -> SnResult<RelayNodeHealth> {
+        self.client.heartbeat_relay_node(heartbeat).await
+    }
+
+    async fn update_relay_node_addresses(
+        &self,
+        update: RelayNodeAddressUpdate,
+    ) -> SnResult<RelayNode> {
+        self.client.update_relay_node_addresses(update).await
+    }
+
+    async fn get_relay_node(&self, relay_id: &str) -> SnResult<Option<RelayNode>> {
+        self.client.get_relay_node(relay_id).await
+    }
+
+    async fn list_relay_nodes(&self) -> SnResult<Vec<RelayNode>> {
+        self.client.list_relay_nodes().await
+    }
+
+    async fn get_relay_nodes_ip_map(
+        &self,
+        req: RelayNodeIpMapReq,
+    ) -> SnResult<Option<RelayNodeIpMapSnapshot>> {
+        self.client.get_relay_nodes_ip_map(req).await
+    }
+
+    async fn assign_zone_relay(&self, req: AssignZoneRelayReq) -> SnResult<RelayAssignment> {
+        self.client.assign_zone_relay(req).await
+    }
+
+    async fn allocate_zone_relay(&self, req: AllocateZoneRelayReq) -> SnResult<RelayAssignment> {
+        self.client.allocate_zone_relay(req).await
+    }
+
+    async fn get_zone_relay(&self, zone: &str) -> SnResult<Option<RelayAssignment>> {
+        self.client.get_zone_relay(zone).await
+    }
+
+    async fn start_relay_migration(&self, req: RelayMigrationReq) -> SnResult<RelayAssignment> {
+        self.client.start_relay_migration(req).await
+    }
+
+    async fn complete_relay_migration(&self, zone: &str, generation: u64) -> SnResult<()> {
+        self.client.complete_relay_migration(zone, generation).await
+    }
+
+    async fn check_relay_admission(
+        &self,
+        req: RelayAdmissionReq,
+    ) -> SnResult<RelayAdmissionDecision> {
+        self.client.check_relay_admission(req).await
+    }
+
     async fn create_account_session(
         &self,
         session_id: &str,
@@ -748,6 +936,7 @@ impl SnAuthDB for RemoteSnAuthDB {
 
 pub struct SqliteSnAuthDB {
     pool: SqlitePool,
+    relay_manager: SqliteSnRelayManager,
 }
 
 impl SqliteSnAuthDB {
@@ -776,10 +965,25 @@ impl SqliteSnAuthDB {
             .await
             .map_err(|e| Self::db_err(format!("open file: {:?}", path), e))?;
 
-        Ok(Self { pool })
+        Ok(Self {
+            relay_manager: SqliteSnRelayManager::from_pool(pool.clone()),
+            pool,
+        })
+    }
+
+    pub fn with_relay_allocation_config(mut self, config: RelayAllocationConfig) -> Self {
+        self.relay_manager = self.relay_manager.with_allocation_config(config);
+        self
+    }
+
+    pub fn with_relay_geo_ip_resolver(mut self, resolver: GeoIpResolverRef) -> Self {
+        self.relay_manager = self.relay_manager.with_geo_ip_resolver(resolver);
+        self
     }
 
     pub async fn initialize_database(&self) -> SnResult<()> {
+        self.relay_manager.initialize_database().await?;
+
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS activation_codes (
                 code TEXT PRIMARY KEY,
@@ -958,6 +1162,64 @@ impl SqliteSnAuthDB {
         .await
         .map_err(|e| Self::db_err("create account_sessions index failed", e))?;
 
+        self.migrate_legacy_zone_relay_projection().await?;
+        Ok(())
+    }
+
+    async fn migrate_legacy_zone_relay_projection(&self) -> SnResult<()> {
+        let now = Self::now_secs() as i64;
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| Self::db_err("begin legacy relay projection migration failed", e))?;
+        sqlx::query(
+            "INSERT OR IGNORE INTO relay_assignments
+                (zone, relay_id, state, source, reason, generation, backup_relay_id,
+                 sticky_until, lease_expires_at, migrated_from, migration_deadline,
+                 source_version, created_at, updated_at)
+             SELECT z.username, n.relay_id, 'active', 'recovery',
+                    'legacy_zone_info_relay_sn', 1, NULL, NULL, NULL, NULL, NULL,
+                    z.source_version,
+                    CASE WHEN z.updated_at > 0 THEN z.updated_at ELSE ?1 END,
+                    CASE WHEN z.updated_at > 0 THEN z.updated_at ELSE ?1 END
+             FROM zone_info z
+             JOIN relay_nodes n ON n.relay_sn = z.relay_sn
+             WHERE z.relay_sn IS NOT NULL AND trim(z.relay_sn) <> ''",
+        )
+        .bind(now)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| Self::db_err("migrate matched legacy relay assignments failed", e))?;
+        sqlx::query(
+            "INSERT OR IGNORE INTO relay_allocation_pending
+                (zone, preferred_region, reason, source_version, attempts, last_error,
+                 created_at, updated_at)
+             SELECT z.username, NULL, 'legacy_relay_unmatched', z.source_version, 1,
+                    'legacy zone_info.relay_sn has no matching relay node: ' || z.relay_sn,
+                    ?1, ?1
+             FROM zone_info z
+             LEFT JOIN relay_nodes n ON n.relay_sn = z.relay_sn
+             LEFT JOIN relay_assignments a ON a.zone = z.username
+             WHERE z.relay_sn IS NOT NULL
+               AND trim(z.relay_sn) <> ''
+               AND n.relay_id IS NULL
+               AND a.zone IS NULL",
+        )
+        .bind(now)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| Self::db_err("record unmatched legacy relay assignments failed", e))?;
+        sqlx::query(
+            "UPDATE zone_info SET relay_sn = NULL
+             WHERE relay_sn IS NOT NULL AND trim(relay_sn) <> ''",
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| Self::db_err("clear legacy zone relay cache failed", e))?;
+        tx.commit()
+            .await
+            .map_err(|e| Self::db_err("commit legacy relay projection migration failed", e))?;
         Ok(())
     }
 
@@ -1368,6 +1630,7 @@ impl SqliteSnAuthDB {
             sn_ips: row
                 .try_get("sn_ips")
                 .map_err(|e| Self::db_err("read sn_ips failed", e))?,
+            relay: None,
         })
     }
 
@@ -1407,7 +1670,115 @@ impl SqliteSnAuthDB {
                 .try_get("source_version")
                 .map_err(|e| Self::db_err("read source_version failed", e))?,
             updated_at: Self::i64_to_u64(updated_at),
+            relay: None,
         })
+    }
+
+    async fn relay_projection(&self, zone: &str) -> SnResult<Option<UserRelayInfo>> {
+        Ok(self
+            .relay_manager
+            .get_zone_relay(zone)
+            .await?
+            .as_ref()
+            .map(UserRelayInfo::from))
+    }
+
+    async fn project_user_relay(&self, mut user: SNUserInfo) -> SnResult<SNUserInfo> {
+        if let Some(username) = user.username.as_deref() {
+            user.relay = self.relay_projection(username).await?;
+        }
+        Ok(user)
+    }
+
+    async fn register_user_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        active_code: &str,
+        username: &str,
+        email: &str,
+        password_hash: &str,
+        password_salt: &str,
+        password_algo: &str,
+    ) -> SnResult<bool> {
+        let code_unused =
+            sqlx::query_scalar::<_, i64>("SELECT used FROM activation_codes WHERE code = ?1")
+                .bind(active_code)
+                .fetch_optional(&mut **tx)
+                .await
+                .map_err(|e| Self::db_err("query activation code failed", e))?
+                == Some(0);
+        if !code_unused {
+            return Ok(false);
+        }
+
+        let user_count =
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM users WHERE username = ?1")
+                .bind(username)
+                .fetch_one(&mut **tx)
+                .await
+                .map_err(|e| Self::db_err("query user count failed", e))?;
+        if user_count > 0 {
+            return Ok(false);
+        }
+
+        let auth_count =
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM user_auth WHERE username = ?1")
+                .bind(username)
+                .fetch_one(&mut **tx)
+                .await
+                .map_err(|e| Self::db_err("query user auth count failed", e))?;
+        if auth_count > 0 {
+            return Ok(false);
+        }
+
+        let email_count =
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM users WHERE email = ?1")
+                .bind(email)
+                .fetch_one(&mut **tx)
+                .await
+                .map_err(|e| Self::db_err("query email count failed", e))?;
+        if email_count > 0 {
+            return Err(Self::email_already_bound(email));
+        }
+
+        let now = Self::now_secs() as i64;
+        sqlx::query(
+            "INSERT INTO users
+                (username, email, state, bns_name, public_key, activation_code, owner_key_ref,
+                 zone_config, user_domain, self_cert, sn_ips, created_at, updated_at, last_login_at)
+             VALUES (?1, ?2, ?3, ?4, '', ?5, NULL, '', NULL, 0, NULL, ?6, ?6, NULL)",
+        )
+        .bind(username)
+        .bind(email)
+        .bind(UserState::Active.to_string())
+        .bind(username)
+        .bind(active_code)
+        .bind(now)
+        .execute(&mut **tx)
+        .await
+        .map_err(|e| Self::insert_user_err(email, e))?;
+
+        sqlx::query(
+            "INSERT INTO user_auth
+                (username, password_hash, password_salt, password_algo,
+                 created_at, updated_at, last_login_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?5, NULL)",
+        )
+        .bind(username)
+        .bind(password_hash)
+        .bind(password_salt)
+        .bind(password_algo)
+        .bind(now)
+        .execute(&mut **tx)
+        .await
+        .map_err(|e| Self::db_err("insert auth failed", e))?;
+
+        sqlx::query("UPDATE activation_codes SET used = 1 WHERE code = ?1")
+            .bind(active_code)
+            .execute(&mut **tx)
+            .await
+            .map_err(|e| Self::db_err("update activation code failed", e))?;
+
+        Ok(true)
     }
 }
 
@@ -1494,6 +1865,24 @@ impl SnAuthDB for SqliteSnAuthDB {
             Self::count_optional_related_rows(&mut tx, "did_documents", active_code).await?;
 
         Self::delete_optional_related_rows(&mut tx, active_code).await?;
+
+        for (table, field) in [
+            ("relay_admission_events", "zone"),
+            ("relay_assignments", "zone"),
+            ("relay_allocation_pending", "zone"),
+        ] {
+            let sql = format!(
+                "DELETE FROM {table}
+                 WHERE {field} IN (
+                    SELECT username FROM users WHERE activation_code = ?1
+                 )"
+            );
+            sqlx::query(sql.as_str())
+                .bind(active_code)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| Self::db_err(format!("delete {table} rows failed"), e))?;
+        }
 
         sqlx::query(
             "DELETE FROM account_sessions
@@ -1587,91 +1976,97 @@ impl SnAuthDB for SqliteSnAuthDB {
             .begin()
             .await
             .map_err(|e| Self::db_err("begin transaction failed", e))?;
-
-        let code_unused =
-            sqlx::query_scalar::<_, i64>("SELECT used FROM activation_codes WHERE code = ?1")
-                .bind(active_code)
-                .fetch_optional(&mut *tx)
-                .await
-                .map_err(|e| Self::db_err("query activation code failed", e))?
-                == Some(0);
-        if !code_unused {
-            return Ok(false);
-        }
-
-        let user_count =
-            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM users WHERE username = ?1")
-                .bind(username)
-                .fetch_one(&mut *tx)
-                .await
-                .map_err(|e| Self::db_err("query user count failed", e))?;
-        if user_count > 0 {
-            return Ok(false);
-        }
-
-        let auth_count =
-            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM user_auth WHERE username = ?1")
-                .bind(username)
-                .fetch_one(&mut *tx)
-                .await
-                .map_err(|e| Self::db_err("query user auth count failed", e))?;
-        if auth_count > 0 {
-            return Ok(false);
-        }
-
-        let email_count =
-            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM users WHERE email = ?1")
-                .bind(email.as_str())
-                .fetch_one(&mut *tx)
-                .await
-                .map_err(|e| Self::db_err("query email count failed", e))?;
-        if email_count > 0 {
-            return Err(Self::email_already_bound(email.as_str()));
-        }
-
-        let now = Self::now_secs() as i64;
-        sqlx::query(
-            "INSERT INTO users
-                (username, email, state, bns_name, public_key, activation_code, owner_key_ref,
-                 zone_config, user_domain, self_cert, sn_ips, created_at, updated_at, last_login_at)
-             VALUES (?1, ?2, ?3, ?4, '', ?5, NULL, '', NULL, 0, NULL, ?6, ?6, NULL)",
+        let registered = Self::register_user_tx(
+            &mut tx,
+            active_code,
+            username,
+            email.as_str(),
+            password_hash,
+            password_salt,
+            password_algo,
         )
-        .bind(username)
-        .bind(email.as_str())
-        .bind(UserState::Active.to_string())
-        .bind(username)
-        .bind(active_code)
-        .bind(now)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| Self::insert_user_err(email.as_str(), e))?;
-
-        sqlx::query(
-            "INSERT INTO user_auth
-                (username, password_hash, password_salt, password_algo,
-                 created_at, updated_at, last_login_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?5, NULL)",
-        )
-        .bind(username)
-        .bind(password_hash)
-        .bind(password_salt)
-        .bind(password_algo)
-        .bind(now)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| Self::db_err("insert auth failed", e))?;
-
-        sqlx::query("UPDATE activation_codes SET used = 1 WHERE code = ?1")
-            .bind(active_code)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| Self::db_err("update activation code failed", e))?;
+        .await?;
+        if !registered {
+            return Ok(false);
+        }
 
         tx.commit()
             .await
             .map_err(|e| Self::db_err("commit transaction failed", e))?;
 
         Ok(true)
+    }
+
+    async fn register_user_with_relay_allocation(
+        &self,
+        req: RegisterUserWithRelayAllocationReq,
+    ) -> SnResult<RegisterUserWithRelayAllocationResult> {
+        let email = canonical_email(req.email.as_str())?;
+        let _active_code_locker =
+            async_named_locker::Locker::get_locker(format!("active_code_{}", req.active_code))
+                .await;
+        let _email_locker =
+            async_named_locker::Locker::get_locker(format!("sn_email_{}", email)).await;
+        let _zone_locker = async_named_locker::Locker::get_locker(format!(
+            "sn_relay_allocate_zone_{}",
+            req.username.trim()
+        ))
+        .await;
+
+        let allocation_req = AllocateZoneRelayReq {
+            zone: req.username.clone(),
+            preferred_region: req.preferred_region,
+            source_ip: req.source_ip,
+            reason: "register".to_string(),
+            source_version: req.source_version,
+        };
+        // GeoIP/selection reads happen before the write transaction. The chosen node is
+        // revalidated inside the transaction before the assignment is inserted.
+        let allocation_plan = self
+            .relay_manager
+            .plan_registration_allocation(&allocation_req)
+            .await;
+
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| Self::db_err("begin registration transaction failed", e))?;
+        let registered = Self::register_user_tx(
+            &mut tx,
+            req.active_code.as_str(),
+            req.username.as_str(),
+            email.as_str(),
+            req.password_hash.as_str(),
+            req.password_salt.as_str(),
+            req.password_algo.as_str(),
+        )
+        .await?;
+        if !registered {
+            return Ok(RegisterUserWithRelayAllocationResult {
+                registered: false,
+                relay: None,
+            });
+        }
+
+        let relay = self
+            .relay_manager
+            .commit_registration_allocation(&mut tx, &allocation_req, allocation_plan)
+            .await?;
+        tx.commit()
+            .await
+            .map_err(|e| Self::db_err("commit registration transaction failed", e))?;
+
+        Ok(RegisterUserWithRelayAllocationResult {
+            registered: true,
+            relay: Some(match relay {
+                Ok(assignment) => RegistrationRelayAllocation::Assigned { assignment },
+                Err(error) => RegistrationRelayAllocation::Pending {
+                    error_code: error.code(),
+                    message: error.msg().to_string(),
+                },
+            }),
+        })
     }
 
     async fn create_auth(
@@ -1743,7 +2138,10 @@ impl SnAuthDB for SqliteSnAuthDB {
         .await
         .map_err(|e| Self::db_err("query user by email failed", e))?;
 
-        row.as_ref().map(Self::user_from_row).transpose()
+        match row.as_ref().map(Self::user_from_row).transpose()? {
+            Some(user) => Ok(Some(self.project_user_relay(user).await?)),
+            None => Ok(None),
+        }
     }
 
     async fn register_user_with_owner_key(
@@ -1902,7 +2300,10 @@ impl SnAuthDB for SqliteSnAuthDB {
         .await
         .map_err(|e| Self::db_err("query user failed", e))?;
 
-        row.as_ref().map(Self::user_from_row).transpose()
+        match row.as_ref().map(Self::user_from_row).transpose()? {
+            Some(user) => Ok(Some(self.project_user_relay(user).await?)),
+            None => Ok(None),
+        }
     }
 
     async fn get_user_by_domain(&self, domain: &str) -> SnResult<Option<SNUserInfo>> {
@@ -1926,7 +2327,10 @@ impl SnAuthDB for SqliteSnAuthDB {
         .await
         .map_err(|e| Self::db_err("query user by domain failed", e))?;
 
-        row.as_ref().map(Self::user_from_row).transpose()
+        match row.as_ref().map(Self::user_from_row).transpose()? {
+            Some(user) => Ok(Some(self.project_user_relay(user).await?)),
+            None => Ok(None),
+        }
     }
 
     async fn set_user_state(&self, username: &str, state: UserState) -> SnResult<()> {
@@ -2247,26 +2651,33 @@ impl SnAuthDB for SqliteSnAuthDB {
         .fetch_optional(&self.pool)
         .await
         .map_err(|e| Self::db_err("query zone_info failed", e))?;
-        if let Some(row) = row.as_ref() {
-            return Self::zone_info_from_row(row).map(Some);
-        }
-
-        Ok(Some(ZoneInfo::default_for(username)))
+        let mut info = match row.as_ref() {
+            Some(row) => Self::zone_info_from_row(row)?,
+            None => ZoneInfo::default_for(username),
+        };
+        info.relay = self.relay_projection(username).await?;
+        info.relay_sn = info.relay.as_ref().map(|relay| relay.relay_sn.clone());
+        Ok(Some(info))
     }
 
     async fn update_zone_info(&self, username: &str, patch: ZoneInfoPatch) -> SnResult<()> {
+        if patch.relay_sn.is_some() {
+            return Err(sn_err!(
+                SnErrorCode::InvalidInput,
+                "relay_sn is read-only; use relay allocation or migration APIs"
+            ));
+        }
         let mut current = self
             .get_zone_info(username)
             .await?
             .unwrap_or_else(|| ZoneInfo::default_for(username));
+        current.relay_sn = None;
+        current.relay = None;
         if let Some(value) = patch.bns_name {
             current.bns_name = value;
         }
         if let Some(value) = patch.zone {
             current.zone = Some(value);
-        }
-        if let Some(value) = patch.relay_sn {
-            current.relay_sn = Some(value);
         }
         if let Some(value) = patch.self_cert {
             current.self_cert = value;
@@ -2345,51 +2756,73 @@ impl SnAuthDB for SqliteSnAuthDB {
 
     async fn update_zone_relay_sn(
         &self,
-        zone: &str,
-        relay_sn: &str,
-        source_version: Option<&str>,
+        _zone: &str,
+        _relay_sn: &str,
+        _source_version: Option<&str>,
     ) -> SnResult<bool> {
-        Self::check_non_empty(zone, "zone")?;
-        Self::check_non_empty(relay_sn, "relay_sn")?;
-        let now = Self::now_secs();
-        let result = sqlx::query(
-            "UPDATE zone_info
-             SET relay_sn = ?1,
-                 source_version = COALESCE(?2, source_version),
-                 updated_at = ?3
-             WHERE zone = ?4 OR bns_name = ?4 OR username = ?4",
-        )
-        .bind(relay_sn)
-        .bind(source_version)
-        .bind(now as i64)
-        .bind(zone)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| Self::db_err("update zone relay_sn failed", e))?;
+        Err(sn_err!(
+            SnErrorCode::InvalidInput,
+            "relay_sn is read-only; use relay allocation or migration APIs"
+        ))
+    }
 
-        if result.rows_affected() > 0 {
-            return Ok(true);
-        }
+    async fn register_relay_node(&self, node: RelayNodeRegistration) -> SnResult<RelayNode> {
+        self.relay_manager.register_relay_node(node).await
+    }
 
-        let result = sqlx::query(
-            "INSERT INTO zone_info
-                (username, bns_name, zone, relay_sn, self_cert, cert_checked_at,
-                 cert_expires_at, sn_ips, source_version, updated_at)
-             VALUES (?1, ?1, NULL, ?2, 0, NULL, NULL, NULL, ?3, ?4)
-             ON CONFLICT(username) DO UPDATE SET
-                relay_sn = excluded.relay_sn,
-                source_version = COALESCE(excluded.source_version, zone_info.source_version),
-                updated_at = excluded.updated_at",
-        )
-        .bind(zone)
-        .bind(relay_sn)
-        .bind(source_version)
-        .bind(now as i64)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| Self::db_err("insert zone relay_sn cache failed", e))?;
+    async fn heartbeat_relay_node(&self, heartbeat: RelayHeartbeat) -> SnResult<RelayNodeHealth> {
+        self.relay_manager.heartbeat_relay_node(heartbeat).await
+    }
 
-        Ok(result.rows_affected() > 0)
+    async fn update_relay_node_addresses(
+        &self,
+        update: RelayNodeAddressUpdate,
+    ) -> SnResult<RelayNode> {
+        self.relay_manager.update_relay_node_addresses(update).await
+    }
+
+    async fn get_relay_node(&self, relay_id: &str) -> SnResult<Option<RelayNode>> {
+        self.relay_manager.get_relay_node(relay_id).await
+    }
+
+    async fn list_relay_nodes(&self) -> SnResult<Vec<RelayNode>> {
+        self.relay_manager.list_relay_nodes().await
+    }
+
+    async fn get_relay_nodes_ip_map(
+        &self,
+        req: RelayNodeIpMapReq,
+    ) -> SnResult<Option<RelayNodeIpMapSnapshot>> {
+        self.relay_manager.get_relay_nodes_ip_map(req).await
+    }
+
+    async fn assign_zone_relay(&self, req: AssignZoneRelayReq) -> SnResult<RelayAssignment> {
+        self.relay_manager.assign_zone_relay(req).await
+    }
+
+    async fn allocate_zone_relay(&self, req: AllocateZoneRelayReq) -> SnResult<RelayAssignment> {
+        self.relay_manager.allocate_zone_relay(req).await
+    }
+
+    async fn get_zone_relay(&self, zone: &str) -> SnResult<Option<RelayAssignment>> {
+        self.relay_manager.get_zone_relay(zone).await
+    }
+
+    async fn start_relay_migration(&self, req: RelayMigrationReq) -> SnResult<RelayAssignment> {
+        self.relay_manager.start_relay_migration(req).await
+    }
+
+    async fn complete_relay_migration(&self, zone: &str, generation: u64) -> SnResult<()> {
+        self.relay_manager
+            .complete_relay_migration(zone, generation)
+            .await
+    }
+
+    async fn check_relay_admission(
+        &self,
+        req: RelayAdmissionReq,
+    ) -> SnResult<RelayAdmissionDecision> {
+        self.relay_manager.check_relay_admission(req).await
     }
 
     async fn create_account_session(
@@ -2499,6 +2932,43 @@ mod tests {
         let db = SqliteSnAuthDB::new_by_path(db_path.to_string_lossy().as_ref()).await?;
         db.initialize_database().await?;
         Ok((tmp_dir, db))
+    }
+
+    async fn assign_test_relay(db: &SqliteSnAuthDB, zone: &str) -> SnResult<RelayAssignment> {
+        if db.get_relay_node("relay-a").await?.is_none() {
+            db.register_relay_node(RelayNodeRegistration {
+                relay_id: "relay-a".to_string(),
+                relay_sn: "relay-a.example".to_string(),
+                ips: [
+                    "192.0.2.10".parse().unwrap(),
+                    "2001:db8::10".parse().unwrap(),
+                ],
+                public_host: "relay-a.example".to_string(),
+                http_endpoint: None,
+                rtcp_endpoint: None,
+                region: Some("test".to_string()),
+                isp: None,
+                tags: Vec::new(),
+                capabilities: vec!["rtcp_relay".to_string()],
+                status: None,
+                capacity_score: Some(100),
+            })
+            .await?;
+        }
+        db.assign_zone_relay(AssignZoneRelayReq {
+            zone: zone.to_string(),
+            relay_id: Some("relay-a".to_string()),
+            relay_sn: None,
+            from_ip: None,
+            region: None,
+            source: crate::RelayAssignmentSource::Admin,
+            reason: Some("test".to_string()),
+            sticky_until: None,
+            lease_expires_at: None,
+            backup_relay_id: None,
+            source_version: Some("v2".to_string()),
+        })
+        .await
     }
 
     #[test]
@@ -2743,6 +3213,92 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_register_with_relay_reports_pending_then_provider_compensates() -> SnResult<()> {
+        let (_tmp_dir, db) = new_test_db().await?;
+        db.insert_activation_code("relay-register-code").await?;
+        let result = db
+            .register_user_with_relay_allocation(RegisterUserWithRelayAllocationReq {
+                active_code: "relay-register-code".to_string(),
+                username: "alice".to_string(),
+                email: "alice@example.com".to_string(),
+                password_hash: "hash".to_string(),
+                password_salt: "salt".to_string(),
+                password_algo: "pbkdf2".to_string(),
+                preferred_region: Some("test".to_string()),
+                source_ip: Some("192.0.2.1".parse().unwrap()),
+                source_version: Some("v1".to_string()),
+            })
+            .await?;
+        assert!(result.registered);
+        assert!(matches!(
+            result.relay,
+            Some(RegistrationRelayAllocation::Pending {
+                error_code: SnErrorCode::NotFound,
+                ..
+            })
+        ));
+        assert!(db.get_user_info("alice").await?.unwrap().relay.is_none());
+
+        db.register_relay_node(RelayNodeRegistration {
+            relay_id: "relay-a".to_string(),
+            relay_sn: "relay-a.example".to_string(),
+            ips: [
+                "192.0.2.50".parse().unwrap(),
+                "2001:db8::50".parse().unwrap(),
+            ],
+            public_host: "relay-a.example".to_string(),
+            http_endpoint: None,
+            rtcp_endpoint: None,
+            region: Some("test".to_string()),
+            isp: None,
+            tags: Vec::new(),
+            capabilities: Vec::new(),
+            status: None,
+            capacity_score: Some(100),
+        })
+        .await?;
+        let user = db.get_user_info("alice").await?.unwrap();
+        assert_eq!(
+            user.relay.as_ref().map(|relay| relay.relay_id.as_str()),
+            Some("relay-a")
+        );
+        assert_eq!(
+            db.get_zone_info("alice").await?.unwrap().relay.unwrap(),
+            user.relay.unwrap()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_register_with_relay_rolls_back_user_when_pending_cannot_commit() -> SnResult<()> {
+        let (_tmp_dir, db) = new_test_db().await?;
+        db.insert_activation_code("relay-atomic-code").await?;
+        sqlx::query("DROP TABLE relay_allocation_pending")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        let error = db
+            .register_user_with_relay_allocation(RegisterUserWithRelayAllocationReq {
+                active_code: "relay-atomic-code".to_string(),
+                username: "alice".to_string(),
+                email: "alice@example.com".to_string(),
+                password_hash: "hash".to_string(),
+                password_salt: "salt".to_string(),
+                password_algo: "pbkdf2".to_string(),
+                preferred_region: None,
+                source_ip: None,
+                source_version: None,
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), SnErrorCode::DBError);
+        assert!(!db.is_user_exist("alice").await?);
+        assert!(db.check_active_code("relay-atomic-code").await?);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_activate_binding_flow_and_supersede() -> SnResult<()> {
         let (_tmp_dir, db) = new_test_db().await?;
         db.insert_activation_code("alice-code").await?;
@@ -2849,7 +3405,6 @@ mod tests {
             "alice",
             ZoneInfoPatch {
                 zone: Some("did:zone:alice".to_string()),
-                relay_sn: Some("relay-a".to_string()),
                 self_cert: Some(true),
                 cert_checked_at: Some(10),
                 cert_expires_at: Some(20),
@@ -2859,9 +3414,10 @@ mod tests {
             },
         )
         .await?;
+        assign_test_relay(&db, "alice").await?;
         let zone = db.get_zone_info("alice").await?.unwrap();
         assert_eq!(zone.zone.as_deref(), Some("did:zone:alice"));
-        assert_eq!(zone.relay_sn.as_deref(), Some("relay-a"));
+        assert_eq!(zone.relay_sn.as_deref(), Some("relay-a.example"));
         assert!(zone.self_cert);
         assert_eq!(zone.sn_ips.as_deref(), Some("[\"1.2.3.4\"]"));
         assert_eq!(db.get_user_info("alice").await?.unwrap().self_cert, true);
@@ -3645,17 +4201,23 @@ mod tests {
         )
         .await?;
 
-        // 仅 patch relay_sn，其余字段保留。
-        db.update_zone_info(
-            "alice",
-            ZoneInfoPatch {
-                relay_sn: Some("relay-a".to_string()),
-                ..Default::default()
-            },
-        )
-        .await?;
+        // relay_sn 已变为只读 assignment 投影。
+        assert_eq!(
+            db.update_zone_info(
+                "alice",
+                ZoneInfoPatch {
+                    relay_sn: Some("relay-a".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err()
+            .code(),
+            SnErrorCode::InvalidInput
+        );
+        assign_test_relay(&db, "alice").await?;
         let zone = db.get_zone_info("alice").await?.unwrap();
-        assert_eq!(zone.relay_sn.as_deref(), Some("relay-a"));
+        assert_eq!(zone.relay_sn.as_deref(), Some("relay-a.example"));
         assert_eq!(zone.zone.as_deref(), Some("did:zone:alice"));
         assert!(zone.self_cert);
         assert_eq!(zone.sn_ips.as_deref(), Some("[\"1.2.3.4\"]"));
@@ -3709,9 +4271,9 @@ mod tests {
         Ok(())
     }
 
-    /// `update_zone_relay_sn`：按 zone/bns_name/username 命中写 relay_sn；缺行则插入；空参数被拒。
+    /// `update_zone_relay_sn` 不再允许维护第二份真相；assignment 通过 join 投影。
     #[tokio::test]
-    async fn test_update_zone_relay_sn_paths() -> SnResult<()> {
+    async fn test_zone_relay_is_read_only_assignment_projection() -> SnResult<()> {
         let (_tmp_dir, db) = new_test_db().await?;
         db.insert_activation_code("zone-code").await?;
         assert!(
@@ -3726,16 +4288,18 @@ mod tests {
             .await?
         );
 
-        // 按 username/bns_name 命中既有行。
-        assert!(
+        assert_eq!(
             db.update_zone_relay_sn("alice", "relay-a", Some("v2"))
-                .await?
+                .await
+                .unwrap_err()
+                .code(),
+            SnErrorCode::InvalidInput
         );
+        assign_test_relay(&db, "alice").await?;
         let zone = db.get_zone_info("alice").await?.unwrap();
-        assert_eq!(zone.relay_sn.as_deref(), Some("relay-a"));
-        assert_eq!(zone.source_version.as_deref(), Some("v2"));
+        assert_eq!(zone.relay_sn.as_deref(), Some("relay-a.example"));
+        assert_eq!(zone.relay.unwrap().generation, 1);
 
-        // 空 zone / 空 relay_sn → InvalidInput。
         assert_eq!(
             db.update_zone_relay_sn("", "relay-a", None)
                 .await
@@ -3751,13 +4315,15 @@ mod tests {
             SnErrorCode::InvalidInput
         );
 
-        // 缺行 → 插入新 zone_info 行。
-        assert!(
+        assert_eq!(
             db.update_zone_relay_sn("ghost-zone", "relay-b", None)
-                .await?
+                .await
+                .unwrap_err()
+                .code(),
+            SnErrorCode::InvalidInput
         );
         let zone = db.get_zone_info("ghost-zone").await?.unwrap();
-        assert_eq!(zone.relay_sn.as_deref(), Some("relay-b"));
+        assert!(zone.relay_sn.is_none());
 
         Ok(())
     }

@@ -7,6 +7,12 @@
 
 当本文和当前实现冲突时，以 `doc/SN/新SN核心流程整理.md` 中的设计意图为准；当前 `cyfs-sn` 实现只作为字段、兼容接口和迁移状态参考。
 
+> 架构决策更新（2026-07-23）：生产环境的 `sn_relay_manager` 不再作为独立
+> remote provider，而是由 AuthDB provider 内部实现；relay 控制面表、用户
+> assignment 和每个 node 的两个类型化 IP 共用 AuthDB。Web3 SN DNS 通过 AuthDB
+> S2S 查询 user assignment 与完整 node IP map。实施计划见
+> [SN-AuthDB内置RelayManager与DNS双栈解析-TODO.md](./SN-AuthDB内置RelayManager与DNS双栈解析-TODO.md)。
+
 重构第一阶段已完成：`sn_relay_manager` 控制面已抽成独立模块 `src/components/cyfs-sn/src/relay_mgr.rs`（`SnRelayManager` trait + `SqliteSnRelayManager` 实现），不再散落在 `SNServer` 内。控制面的节点注册、心跳、zone -> relay 分配、准入决策、迁移窗口和 `zone_info.relay_sn` 回写都已实现并有单元测试。仍缺的是数据面 `sn_relay` 节点模块，以及把控制面接入实时准入和转发路径；HTTP/HTTPS、`self_cert`、`sn_ips`、旧 `zone_config` 等兼容逻辑仍部分留在 `SNServer` 内。详见末尾 `## 当前实现状态`。
 
 ## 设计定位

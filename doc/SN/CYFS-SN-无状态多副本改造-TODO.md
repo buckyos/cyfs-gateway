@@ -7,6 +7,7 @@
 - [新SN核心流程整理.md](./新SN核心流程整理.md)
 - [SN-Auth.md](./SN-Auth.md)
 - [SN-Relay.md](./SN-Relay.md)
+- [SN-AuthDB内置RelayManager与DNS双栈解析-TODO.md](./SN-AuthDB内置RelayManager与DNS双栈解析-TODO.md)
 - [SN部署Node整理.md](./SN部署Node整理.md)
 - [CYFS-SN-配置收敛-TODO.md](./CYFS-SN-配置收敛-TODO.md)
 - [SN-API.md](./SN-API.md)
@@ -45,6 +46,8 @@
 尚未实现的关键部分：
 
 - `SnServerFactory` 仍总是解析 `db_path` 并打开 compatibility 和 relay SQLite；
+- AuthDB provider 尚未内置 relay manager、relay 控制面表和 node 双 IP
+  查询 contract；
 - `SNServer::new` 仍总是创建本地 token key 目录和密钥；
 - `type: sn` 仍一次性注册 NameServer、HttpServer、QAServer 三种能力，没有
   resolver-only/authority-only/API role；
@@ -113,7 +116,7 @@ relay manager；配置 `bns_proxy` 时还会初始化 BNS 写入运行态。所�
 | 账号、session、user DNS | `SnAuthDB`；可由 `SnAuthDbClient` 访问 remote provider | 否，已可 remote | 业务状态 | `sn_auth` |
 | 设备在线态 | `SnDeviceInfoDB`；可由 `SnDeviceInfoDbClient` 访问 remote provider | 否，已可 remote | 运行态 | `sn_device_info` |
 | legacy device/DID/DNS | `SqliteSnCompatibilityStore`；remote auth 时仅 user DNS 路由到 `SnAuthDB` | 是，仍总是打开 | 历史兼容状态 | 删除 |
-| relay node/assignment/pending/admission | `SqliteSnRelayManager` | 是，仍总是打开 | 共享运行态 | `sn_relay_manager` |
+| relay node/双 IP/assignment/pending/admission | `SqliteSnRelayManager` | 是，仍总是打开 | user/zone 关联的共享运行态 | AuthDB provider 内部 relay manager |
 | BNS 写请求幂等记录 | `sn_bns_write_requests` | 仅配置 `bns_proxy` 时 | 非权威操作状态 | BNS/controller 服务 |
 | username -> controller 绑定 | `sn_bns_controller_bindings` | 仅配置 `bns_proxy` 时 | Web2 兼容路由状态 | BNS/controller 服务或可重建映射 |
 | DNS/name cache | 进程内 `HashMap` | 是 | 可丢弃缓存 | 保留本地 |
@@ -147,12 +150,13 @@ SQLite；只有 BNS 相关 SQLite 已按 `bns_proxy` 是否存在改为条件初
                          | routing + validation + orchestration     |
                          | no SQLite, no writable business files    |
                          +----+----------------+----------------+---+
-                              |                |                |
-                         +----v-----+    +-----v------+   +-----v----------+
-                         | sn_auth  |    | device-info|   | relay manager  |
-                         | token +  |    | shared DB  |   | shared state   |
-                         | account  |    +------------+   +----------------+
-                         +----------+
+                              |                |
+                         +----v----------------v---+    +--------v---+
+                         | AuthDB provider         |    | device-info|
+                         | token/account/user DNS  |    | shared DB  |
+                         | internal relay manager  |    +-----------+
+                         | node 双 IP + assignment |
+                         +-------------------------+
 ```
 
 ### 5.0 跨仓职责
@@ -160,7 +164,7 @@ SQLite；只有 BNS 相关 SQLite 已按 `bns_proxy` 是否存在改为条件初
 | 工作 | `cyfs-gateway` | `sn-business` |
 |---|---|---|
 | `type: sn` 配置 schema、factory 和 role/capability 初始化 | 负责 | 消费固定版本 |
-| remote auth/device/relay/BNS client contract | 负责通用 contract/client | 负责生产 provider/server 与共享存储 |
+| remote AuthDB（含 relay）/device/BNS client contract | 负责通用 contract/client | 负责生产 provider/server 与共享存储 |
 | `sn_gateway` 可执行程序、三角色 YAML 和渲染器 | 不再维护商用副本 | 负责 |
 | cluster placement、Secret、只读文件系统和多副本部署 | 提供可验证的不变量 | 负责实施与验收 |
 | 通用单元/contract 测试 | 负责 | 复用并补充 provider 测试 |
@@ -192,18 +196,24 @@ SN 用户 token 验证建议使用：
 3. 需要立即撤销语义时，继续查询共享 session 状态，或调用 introspection；
 4. 验证成功后只向业务模块传递 `AuthContext`。
 
-### 5.3 `sn_relay_manager`
+### 5.3 AuthDB 内部 `sn_relay_manager`
 
 DNS 和 relay 数据面虽然已拆分，relay 控制状态目前仍在 `cyfs-sn` crate
-本地 SQLite 中。`sn_relay_manager` 应使用共享存储并提供 remote API，统一负责：
+本地 SQLite 中。目标上不再部署独立 remote relay manager；AuthDB provider
+在同一个共享数据库和 S2S contract 内部实现 `sn_relay_manager`，统一负责：
 
 - relay node 注册、心跳、容量和健康状态；
+- 每个 relay node 的两个类型化 IPv4/IPv6 地址；
 - zone -> relay assignment；
 - sticky assignment、迁移、pending 和失败补偿；
-- relay admission 判定所需的共享状态。
+- relay admission 判定所需的共享状态；
+- user/zone info 的 assignment 投影；
+- 供 Web3 SN DNS 使用的完整 `relay_nodes -> [IpAddr; 2]` 快照。
 
-`type: sn` 注册流程只调用 remote relay manager，不再打开
-`SqliteSnRelayManager`。
+`type: sn` 注册、DNS 和 relay 准入流程统一调用 AuthDB S2S；不再打开
+`SqliteSnRelayManager`，也不再通过异步 `update_zone_relay_sn` 维护第二份真相。
+详细 contract、schema、DNS A/AAAA 语义和迁移计划见
+[SN-AuthDB内置RelayManager与DNS双栈解析-TODO.md](./SN-AuthDB内置RelayManager与DNS双栈解析-TODO.md)。
 
 ### 5.4 BNS Web2 兼容写路径
 
@@ -276,15 +286,17 @@ nonce 恢复和 controller 选择，不能作为每个 `type: sn` 副本的私�
 - [ ] token 改为 remote `sn_auth` 后，清理 `auth.refresh` / `auth.logout` 之外残留的
   JWT/session 直连逻辑，保持业务 API 只消费 `AuthContext`。
 
-### D. 远程化 relay manager 控制状态 `[跨仓]`
+### D. 将 relay manager 收敛到 AuthDB provider `[跨仓]`
 
-- [ ] 为 `SnRelayManager` 提供生产 remote client/server 实现。
-- [ ] relay manager provider 使用共享数据库，为 zone assignment 和 relay node
-  心跳提供跨副本一致的并发约束。
-- [ ] `auth.register` 中的 relay allocation 改为调用 remote manager。
+- [ ] 扩展 AuthDB S2S contract，由 provider 内部实现 `SnRelayManager` 领域逻辑；
+  不增加独立 relay manager endpoint。
+- [ ] AuthDB 共享数据库保存 relay node 双 IP、zone assignment、pending、
+  admission 和 migration，为注册与 heartbeat 提供跨副本一致的并发约束。
+- [ ] `auth.register` 中的 relay allocation 改为调用 AuthDB provider。
+- [ ] user/zone info 返回 assignment 投影；删除 `zone_info.relay_sn` 异步双写真相。
+- [ ] 增加完整 `relay_nodes -> [IpAddr; 2]` S2S 快照，Web3 SN DNS 按 assignment
+  生成 A/AAAA。
 - [ ] 从生产 `cyfs-sn` 初始化路径移除 `SqliteSnRelayManager`。
-- [ ] 明确 assignment 的权威状态和 BNS `relay_assignment` 文档、
-  `sn_auth.zone_info.relay_sn` 缓存之间的投影/恢复规则。
 - [ ] 多个 `sn-api` 副本并发为同一 zone 分配 relay 时必须返回同一有效
   assignment，不得分裂。
 
@@ -324,8 +336,8 @@ nonce 恢复和 controller 选择，不能作为每个 `type: sn` 副本的私�
 - [ ] 增加明确的 cluster/remote 生产模式，不再仅通过配置两个 remote backend
   隐式表达“所有状态已远程化”。
 - [ ] cluster 模式启动时禁止 fallback 到本地 SQLite。
-- [ ] cluster 模式启动时校验 `sn_auth`、`sn_device_info`、
-  `sn_relay_manager` 等必需 remote endpoint 的 readiness。
+- [ ] cluster 模式启动时校验 AuthDB（含 relay capabilities）和
+  `sn_device_info` 等必需 remote endpoint 的 readiness。
 - [ ] 对齐 `cyfs-sn` remote client 与商用 `sn_db_provider_app` 的服务身份认证；
   当前 client 固定不发送 session token，而 provider 的非 loopback 模式要求 token，
   不能把两端分别完成误判为生产链路已经可用。
@@ -372,7 +384,8 @@ nonce 恢复和 controller 选择，不能作为每个 `type: sn` 副本的私�
 3. 在 `sn-business` 提供完整 `sn_auth` service；在 `cyfs-gateway` 把 token
    签发、refresh、revoke 和私钥管理切换到该服务。
 4. 改造 `sn_authority`，使其消费 JWKS/introspection 并输出统一 `AuthContext`。
-5. 远程化 relay manager，移除 `type: sn` 本地 relay SQLite。
+5. 将 relay manager、控制面表和 node 双 IP 映射收敛到 AuthDB provider，
+   移除 `type: sn` 本地 relay SQLite。
 6. 将 BNS Web2 兼容写入的幂等、binding 和 nonce 协调收敛到 BNS/controller
    服务。
 7. 增加角色化初始化，让 DNS/relay 的进程内 adapter 不构造无关的有状态
