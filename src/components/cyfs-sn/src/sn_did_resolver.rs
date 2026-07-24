@@ -37,7 +37,7 @@ pub enum SnDidDocumentSource {
     BnsDocument,
     DeviceMiniDocument,
     DeviceOnlineInfo,
-    LegacyCompatibilityStore,
+    AuthDbProjection,
     SynthesizedOwnerDocument,
     InternalCache,
 }

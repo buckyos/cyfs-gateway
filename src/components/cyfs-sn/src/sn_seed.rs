@@ -339,6 +339,23 @@ pub async fn import_sn_seed(
                 }
             }
             if mismatches.is_empty() {
+                if auth_db.get_auth(username).await?.is_none() {
+                    let (password_hash, password_salt) = hash_password(user.password.as_str())
+                        .map_err(|e| {
+                            sn_err!(SnErrorCode::Failed, "hash seed password failed: {}", e)
+                        })?;
+                    if auth_db
+                        .create_auth(
+                            username,
+                            password_hash.as_str(),
+                            password_salt.as_str(),
+                            PASSWORD_ALGO,
+                        )
+                        .await?
+                    {
+                        report.users_updated += 1;
+                    }
+                }
                 if let Some(self_cert) = user.self_cert {
                     if existing.self_cert != self_cert {
                         auth_db.update_user_self_cert(username, self_cert).await?;
@@ -368,25 +385,10 @@ pub async fn import_sn_seed(
             continue;
         }
 
-        // 先建 auth（user_auth 与 users 都要求"用户不存在"，且 create_auth
-        // 的守卫更严；若上次导入中途失败留下孤儿 auth 行，这里返回 false，
-        // 继续走注册即可自愈）。
+        // 先计算凭证，再创建 users 主行，最后插入受外键约束的 user_auth。
+        // 中途失败后重放 seed 会从已存在用户分支继续，且不会制造孤儿 auth 行。
         let (password_hash, password_salt) = hash_password(user.password.as_str())
             .map_err(|e| sn_err!(SnErrorCode::Failed, "hash seed password failed: {}", e))?;
-        let auth_created = auth_db
-            .create_auth(
-                username,
-                password_hash.as_str(),
-                password_salt.as_str(),
-                PASSWORD_ALGO,
-            )
-            .await?;
-        if !auth_created {
-            warn!(
-                "sn seed user {}: auth row already exists (previous partial import?); keep it",
-                username
-            );
-        }
 
         let code = seed_user_activation_code(username);
         if !auth_db.has_activation_code(code.as_str()).await? {
@@ -413,6 +415,20 @@ pub async fn import_sn_seed(
             );
             report.conflicts_skipped += 1;
             continue;
+        }
+        let auth_created = auth_db
+            .create_auth(
+                username,
+                password_hash.as_str(),
+                password_salt.as_str(),
+                PASSWORD_ALGO,
+            )
+            .await?;
+        if !auth_created {
+            warn!(
+                "sn seed user {}: auth row already exists; keep it",
+                username
+            );
         }
         // bns_name 缺省即 username（register 已写入）；显式给出且不同时补投影。
         if let Some(bns_name) = user.bns_name.as_deref() {
@@ -712,10 +728,6 @@ user_domains:
         db.insert_activation_code("pre-code").await.unwrap();
         let (hash, salt) = hash_password("real-user-pwd").unwrap();
         assert!(db
-            .create_auth("alice", hash.as_str(), salt.as_str(), PASSWORD_ALGO)
-            .await
-            .unwrap());
-        assert!(db
             .register_user_with_owner_key(
                 "pre-code",
                 "alice",
@@ -725,6 +737,10 @@ user_domains:
                 None,
                 None,
             )
+            .await
+            .unwrap());
+        assert!(db
+            .create_auth("alice", hash.as_str(), salt.as_str(), PASSWORD_ALGO)
             .await
             .unwrap());
 

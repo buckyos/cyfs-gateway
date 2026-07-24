@@ -61,10 +61,7 @@ impl ReportIdentity {
             if params_did.trim() != did.as_str() {
                 return Err(parse_error(
                     SnApiErrorCode::DevicePermissionDenied,
-                    format!(
-                        "device token of {} cannot report did {}",
-                        did, params_did
-                    ),
+                    format!("device token of {} cannot report did {}", did, params_did),
                 ));
             }
         }
@@ -311,15 +308,6 @@ async fn resolve_report_did(
         .into_rpc()?
     {
         return Ok(view.did);
-    }
-
-    if let Some(device) = server
-        .compat_store()
-        .query_device_by_name(username, device_name)
-        .await
-        .into_rpc()?
-    {
-        return Ok(device.did);
     }
 
     Err(parse_error(

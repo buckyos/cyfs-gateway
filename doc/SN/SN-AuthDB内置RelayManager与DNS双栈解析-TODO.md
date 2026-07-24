@@ -1,7 +1,8 @@
 # SN AuthDB 内置 Relay Manager 与 DNS 双栈解析 TODO
 
-状态：`cyfs-gateway` 实现完成（2026-07-23）；`sn-business` provider、服务角色鉴权和
-商用集群部署项待跨仓完成。
+状态：`cyfs-gateway` 实现完成（2026-07-23）；`sn-business` PostgreSQL provider、
+服务角色鉴权与部署配置完成（2026-07-23）。剩余：商用集群端到端（跨副本
+`auth.register` 可见性、只读 rootfs cluster 模式）验证。
 
 相关文档：
 
@@ -460,8 +461,10 @@ relay 地址的 DNS 规则：
   `relay_admission_events` 定义一次性迁移工具或 provider seed/import 格式。
 - [x] 通过 `relay_sn` 把旧 `zone_info.relay_sn` 解析为稳定 `relay_id`；无法匹配的用户
   写入 pending/修复清单，禁止静默绑定到 fallback node。
-- [ ] 旧 relay node 没有显式双 IP 时必须由部署配置补齐两个 IP；不得通过运行时 DNS
-  解析 `public_host` 自动生成权威映射。（代码已禁止 fallback；部署数据待补齐。）
+- [x] 旧 relay node 没有显式双 IP 时必须由部署配置补齐两个 IP；不得通过运行时 DNS
+  解析 `public_host` 自动生成权威映射。（代码已禁止 fallback；nightly 已在
+  `apps.sn-relay.settings.relay_node_ips` 显式声明每台 relay 的两个地址，
+  单地址机器暂以同 IP 填满两个 slot，DNS 端去重。）
 - [x] 导入前验证每个可服务 node 恰好两个 IP，并覆盖 IPv4-only、IPv6-only 和双栈。
 - [x] 切换读路径到 AuthDB 后停止写本地 relay 表和 `zone_info.relay_sn` 缓存。
 - [x] 删除 `SNServer` 本地 relay manager 初始化路径；商用切换前仍需确认无旧版本
@@ -492,10 +495,16 @@ relay 地址的 DNS 规则：
 - [x] 将 `SqliteSnRelayManager` 收为 AuthDB provider 内部模块并复用同一连接池和事务
   逻辑，未复制第二套选择算法。
 - [x] 在本地 SQLite AuthDB 实现内部 relay manager。
-- [ ] 在 `sn-business` PostgreSQL AuthDB provider 实现相同 contract。
-- [ ] 在 PostgreSQL provider 落地跨进程 assignment 锁和常驻 pending/heartbeat
-  worker。（SQLite 已实现唯一约束、并发幂等、node 恢复触发 pending 补偿和迁移。）
-- [ ] 对 node 注册、heartbeat、admin mutation 和只读 map API 实施服务角色鉴权。
+- [x] 在 `sn-business` PostgreSQL AuthDB provider 实现相同 contract
+  （`sn_db_provider::relay_manager::PgSnRelayManager` + RRset 用户 DNS +
+  capabilities，与 `PostgresSnAuthDB` 共用连接池）。
+- [x] 在 PostgreSQL provider 落地跨进程 assignment 锁和常驻 pending/heartbeat
+  worker。（`pg_advisory_xact_lock` 按 zone 串行化 + zone 主键幂等；
+  sn-db-provider-app 内置 pending 补偿定时 worker，node 注册/恢复也同步触发。）
+- [x] 对 node 注册、heartbeat、admin mutation 和只读 map API 实施服务角色鉴权。
+  （provider 侧 admin/api/dns/relay 角色 token；relay token 绑定 relay_id，
+  只能注册/heartbeat/admission 自己；address update/migration/assign 仅 admin。
+  cyfs-sn 客户端带 token 的通路待上游接线。）
 
 ### D. SN server 清理 `[cyfs-gateway]`
 
@@ -516,11 +525,17 @@ relay 地址的 DNS 规则：
 
 ### F. 商用部署 `[sn-business]`
 
-- [ ] AuthDB provider schema 和 migration 增加所有 relay 表及两个 IP。
-- [ ] 更新 `sn_api.yaml`、`sn_dns.yaml`、`sn_relay.yaml` 的 provider 权限和配置。
-- [ ] relay node 启动注册必须提交两个 IP。
-- [ ] DNS 角色获得 map/userinfo 只读权限，不获得 node mutation/admin 权限。
-- [ ] 移除独立 relay manager URL/PVC/部署计划。
+- [x] AuthDB provider schema 和 migration 增加所有 relay 表及两个 IP
+  （`sn_relay_*` 表族，地址列 INET、slot 0/1、node-map revision 单行）。
+- [x] 更新 `sn_api.yaml`、`sn_dns.yaml`、`sn_relay.yaml` 的 provider 权限和配置
+  （relay 控制面归 AuthDB provider 的部署说明 + 角色 token 的 security_config
+  键名约定；nightly 客户端未带 token 前保持不启用）。
+- [x] relay node 启动注册必须提交两个 IP（`start_relay.ts` pre_exec 用
+  `apps.sn-relay.settings.relay_node_ips` 显式双 IP 调
+  `sn_auth_db.register_relay_node`，缺失即拒绝启动，不做 DNS 解析回退）。
+- [x] DNS 角色获得 map/userinfo 只读权限，不获得 node mutation/admin 权限。
+- [x] 移除独立 relay manager URL/PVC/部署计划（sn-business 侧确认从未落地，
+  无残留需要清理）。
 
 ## 12. 测试要求
 

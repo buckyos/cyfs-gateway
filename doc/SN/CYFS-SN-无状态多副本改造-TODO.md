@@ -115,16 +115,17 @@ relay manager；配置 `bns_proxy` 时还会初始化 BNS 写入运行态。所�
 | SN JWT 私钥/公钥 | `SnAuthManager` 在 `auth_data_dir` 创建 `private_key.pem`、`public_key.json` | 是，所有角色 | 认证关键状态 | `sn_auth` |
 | 账号、session、user DNS | `SnAuthDB`；可由 `SnAuthDbClient` 访问 remote provider | 否，已可 remote | 业务状态 | `sn_auth` |
 | 设备在线态 | `SnDeviceInfoDB`；可由 `SnDeviceInfoDbClient` 访问 remote provider | 否，已可 remote | 运行态 | `sn_device_info` |
-| legacy device/DID/DNS | `SqliteSnCompatibilityStore`；remote auth 时仅 user DNS 路由到 `SnAuthDB` | 是，仍总是打开 | 历史兼容状态 | 删除 |
+| legacy device/DID/DNS | 已删除；user DNS 改由 `SnAuthDB` 结构化 RRset 提供 | 否 | compatibility store 已退役 | 已完成 |
 | relay node/双 IP/assignment/pending/admission | `SqliteSnRelayManager` | 是，仍总是打开 | user/zone 关联的共享运行态 | AuthDB provider 内部 relay manager |
 | BNS 写请求幂等记录 | `sn_bns_write_requests` | 仅配置 `bns_proxy` 时 | 非权威操作状态 | BNS/controller 服务 |
 | username -> controller 绑定 | `sn_bns_controller_bindings` | 仅配置 `bns_proxy` 时 | Web2 兼容路由状态 | BNS/controller 服务或可重建映射 |
 | DNS/name cache | 进程内 `HashMap` | 是 | 可丢弃缓存 | 保留本地 |
 | EVM next nonce cache | 进程内 `HashMap` | 仅配置 `bns_proxy` 时 | 并发协调状态 | BNS/controller 服务 |
 
-当前 `auth_db` / `device_info_db` 只替换对应的两个 backend。随后
-`SnServerFactory` 仍使用同一个 `db_path` 无条件打开 compatibility 和 relay
-SQLite；只有 BNS 相关 SQLite 已按 `bns_proxy` 是否存在改为条件初始化。
+Beta2.2 起 `SnServerFactory` 不再打开 compatibility SQLite；远端 `auth_db`
+启动时通过 capability handshake 校验 contract/schema 版本与 user DNS 能力。
+relay SQLite 仍由后续任务按本文件计划迁移；BNS 相关 SQLite 已按
+`bns_proxy` 是否存在改为条件初始化。
 
 此外，`SnServerFactory` 目前只对 `bns_server_url` 执行启动 readiness probe，
 不会在启动阶段探测 remote `auth_db` / `device_info_db`；remote provider 故障会在
@@ -232,21 +233,21 @@ nonce 恢复和 controller 选择，不能作为每个 `type: sn` 副本的私�
 
 ### A. 删除 compatibility store `[cyfs-gateway]`
 
-- [ ] 删除 `SqliteSnCompatibilityStore` 和
+- [x] 删除 `SqliteSnCompatibilityStore` 和
   `AuthDbRoutedSnCompatibilityStore`。
-- [ ] 删除 `LegacyResolverCompatibilityReader`。
-- [ ] 删除 `SNServer.compat_store` 字段及其 accessor。
-- [ ] 删除 `devices`、`user_dns_records`、`did_documents` compatibility schema
+- [x] 删除 `LegacyResolverCompatibilityReader`。
+- [x] 删除 `SNServer.compat_store` 字段及其 accessor。
+- [x] 删除 `devices`、`user_dns_records`、`did_documents` compatibility schema
   初始化代码。
-- [ ] device 查询只读 `SnDeviceInfoDB` 和 BNS `device_mini_doc`。
-- [ ] DID document 查询只读 BNS/indexer，不再回退到本地 SQLite。
-- [x] remote `auth_db` 模式下，user DNS RRset 已通过
-  `AuthDbRoutedSnCompatibilityStore` 读写 `SnAuthDB` S2S provider。
-- [ ] 删除 compatibility store 后，user DNS RRset 直接读写 `SnAuthDB`，不再经
+- [x] device 查询只读 `SnDeviceInfoDB` 和 BNS `device_mini_doc`。
+- [x] DID document 查询只读 BNS/indexer，不再回退到本地 SQLite。
+- [x] remote `auth_db` 模式下，user DNS RRset 直接通过新的 `SnAuthDB` S2S
+  DNS API 读写。
+- [x] 删除 compatibility store 后，user DNS RRset 直接读写 `SnAuthDB`，不再经
   compatibility 抽象；本地单机模式仍由本地 `SnAuthDB` 实现同一 contract。
-- [ ] 删除 compatibility 专用测试和旧数据迁移分支；需要的业务用例改为
+- [x] 删除 compatibility 专用测试和旧数据迁移分支；需要的业务用例改为
   BNS/remote provider fixture。
-- [ ] 更新 API 文档，明确不再支持仅存在于旧 SN SQLite 的 device/DID
+- [x] 更新 API 文档，明确不再支持仅存在于旧 SN SQLite 的 device/DID
   数据。
 
 ### B. 把 token 生命周期收回 `sn_auth` `[跨仓]`

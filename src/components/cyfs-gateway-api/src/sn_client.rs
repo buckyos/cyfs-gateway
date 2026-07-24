@@ -480,20 +480,40 @@ pub struct SnUserProfileResp {
 pub struct SnAddDnsRecordResp {
     pub code: u16,
     pub device_name: String,
+    pub revision: u64,
+    pub changed: bool,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+pub enum SnDnsRecordType {
+    #[serde(rename = "A")]
+    A,
+    #[serde(rename = "AAAA")]
+    Aaaa,
+    #[serde(rename = "TXT")]
+    Txt,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SnDnsRecord {
-    pub domain: String,
-    pub record_type: String,
-    pub record: String,
+pub struct SnDnsRrset {
+    pub name: String,
+    pub record_type: SnDnsRecordType,
     pub ttl: u32,
+    pub values: Vec<String>,
+    pub revision: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SnRemoveDnsRecordResp {
+    pub code: u16,
+    pub revision: u64,
+    pub changed: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SnDnsRecordListResp {
     pub code: u16,
-    pub items: Vec<SnDnsRecord>,
+    pub items: Vec<SnDnsRrset>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -751,7 +771,10 @@ impl SnClient {
             .await
     }
 
-    pub async fn remove_dns_record(&self, req: SnDnsRecordReq) -> Result<SnSuccessResp, RPCErrors> {
+    pub async fn remove_dns_record(
+        &self,
+        req: SnDnsRecordReq,
+    ) -> Result<SnRemoveDnsRecordResp, RPCErrors> {
         self.call_auth("user.remove_dns_record", to_value(req, "SnDnsRecordReq")?)
             .await
     }

@@ -391,7 +391,7 @@ TODO（阶段二，2026-07-06 完成）：
 - [x] 移除 `pending_pkx` 目标语义与 `domain.begin_verify` / `domain.verify` / `create_pkx_binding` / `verify_pkx_binding` RPC。→ 对应 S2S/DB 方法和兼容 alias 均已删除；旧库中的 `pending_pkx` 行随 schema 迁移丢弃。
 - [x] 移除外部客户端传入 `txt_records` 作为 proof 的信任边界。→ `DomainReq` 只接受 `domain`，携带 `txt_records` 的旧请求被忽略；e2e 断言伪造 `txt_records` 不能激活绑定。
 - [x] 修改冲突规则：`user_domain_history` 仅审计；同一 canonical domain 的旧 active binding 可被当前 DNS proof 成功的新 owner supersede；父子域名按最长 active binding 匹配，不因历史记录互斥。→ `check_domain_conflicts_tx` 已删除，`activate_binding_tx` 实现 supersede（sn_auth.rs:1013-1119）。
-- [x] DNS 查询必须走外部 DNS proof path，不能复用 SN 自己的权威/合成解析路径，不能读取 `user_dns_records`、BNS fallback 或本地 name cache。→ 独立 `sn_dns_proof.rs` 模块，仅出站 DoH。
+- [x] DNS 查询必须走外部 DNS proof path，不能复用 SN 自己的权威/合成解析路径，不能读取 AuthDB user DNS、BNS fallback 或本地 name cache。→ 独立 `sn_dns_proof.rs` 模块，仅出站 DoH。
 - [x] 默认可配置使用 Google Public DNS DoH：优先 RFC 8484 `https://dns.google/dns-query`，只做 TXT 查询时也可用 JSON API `https://dns.google/resolve?name=<pkx_record_name>&type=TXT`；实现上必须允许配置替换 resolver。→ `SNServerConfig.pkx_doh_url`（默认 RFC 8484；`/resolve` 结尾自动走 JSON API）。
 - [x] DNS 查询应读取 `_pkx.<canonical-domain>` 的 TXT，支持多条 TXT、多段 TXT 拼接、引号/首尾空白归一化。→ wire 路径按 rdata 段无分隔拼接、JSON 路径 `unquote_txt_data`，比对经 `txt_matches_pkx` 归一。
 - [x] 验证成功后在同一事务内 supersede 同一 canonical domain 的旧 active binding、写入当前 active binding、更新 `users.user_domain`、写入 `user_domain_history` 审计记录。→ `activate_user_domain_binding`（sn_auth.rs:1876-1927 → activate_binding_tx）。
@@ -401,21 +401,27 @@ TODO（阶段二，2026-07-06 完成）：
 - [x] 收窄 `update_user_domain` / `register_user_with_owner_key` 的直接 active 写入语义，只允许 seed/import 等明确 trusted 路径使用。→ trait 上标注 trusted-only（sn_auth.rs:252-282），两者均不在对外 RPC 路由暴露（仅 seed 导入与 SN 内部 S2S auth-db API 使用）。
 - [x] 增加测试：DNS TXT 命中后一站式 bind 成功、TXT 不匹配失败且不写 binding、同一 canonical domain 可被新 DNS owner supersede、history 不阻止接管、父子域名最长 active binding 匹配、客户端伪造 `txt_records` 不能激活绑定、unbind 后 SN-DNS 不再响应相关域名。→ DB 层 sn_auth.rs:2281-3050（supersede/audit-only/最长匹配/迁移），e2e sn_server.rs `test_sn_refactored_api_paths`（mock DoH 上的完整一站式流程），DoH 单测 sn_dns_proof.rs。
 
-## user DNS records
+## AuthDB user DNS RRsets
 
-当前实现有 `user_dns_records`，用于保存用户域名下的 DNS 记录：
+Beta2.2 已删除 compat store。user DNS 直接由 `SnAuthDB` 保存为
+`user_dns_names -> user_dns_rrsets -> user_dns_rdata`：
 
-- `(owner, domain, record_type, record)` 唯一，同名 TXT 可组成多值 RRset。
-- `add_user_domain` 对同一个 value 幂等，不覆盖同名的其他 value。
-- `remove_user_domain` 支持精确删除 value；整组删除仅保留给账号管理路径。
-- `dns.add_record` / `dns.remove_record` 会检查 domain 是否属于当前用户可管理范围。
+- 一个 canonical name 只能由一个 owner claim，数据库外键和唯一约束负责兜底；
+- TTL、revision 属于 RRset，A/AAAA/TXT value 是独立有序数组；
+- put 同一 value 幂等，并发加入不同 value 不丢失；普通 put 只能缩短 TTL，主动增大 TTL
+  使用 owner-only `set_user_dns_rrset_ttl`；
+- 精确删除最后一个 value 会清理空 RRset/name；账号可显式删除 RRset，device 只能精确删除；
+- 每次实际 mutation 在同一事务分配全局 revision，并写
+  `upsert_rrset` / `delete_rrset` / `delete_name` change event；
+- local、in-process、remote provider 共用结构化 S2S contract，provider capability 不匹配时
+  SN readiness 失败，不回退本地数据。
 
 目标边界：
 
 - `user_domain` 绑定关系仍属于 `sn_auth`。
 - DNS 查询合成属于 `sn_resolver`。
 - 对 BNS 域名的 `dns_txt` 发布应由 `sn_bns_controller` 使用 SN controller key 写 BNS 文档。
-- 对传统 `user_domain` 的本地辅助记录可以继续放在 SN 本地 DB，但必须基于 active PKX 绑定授权。
+- 对传统 `user_domain` 的辅助记录继续放在 AuthDB，但必须基于 active PKX 绑定授权。
 
 域名授权规则：
 
@@ -425,7 +431,10 @@ TODO（阶段二，2026-07-06 完成）：
 - ACME challenge 记录应只允许写入符合该用户域名边界的 `_acme-challenge.*`，不能借设备 token 写入任意域名。
 - 已通过 `sn-device` 信任链验证的设备只能增删所属 zone 边界内的 `_acme-challenge.*` TXT；请求中的 `device_did` 不参与授权，删除必须携带精确 `record` value。
 
-`<username>.web3.<server_host>` 允许写入 SN 本地 `user_dns_records` 是过渡设计，主要避免 ACME 短期 TXT 记录触发链上发布并产生额外 gas。该调用不写 BNS 文档。未来用户不再依赖 web3 bridge 解析 `did:bns:xxx`，或传统 DNS 解析服务已广泛原生支持 `did:bns:xxx` 后，应删除这项兼容例外，使 BNS 名称的 `add_dns_record` 回归链上发布；传统 `user_domain` 记录仍保持本地授权语义。
+`<username>.web3.<server_host>` 的 AuthDB 写入主要避免 ACME 短期 TXT 记录触发链上发布并
+产生额外 gas；该调用不写 BNS 文档。控制记录 `_acme-challenge` / `_pkx` 绕过本地正负缓存，
+普通记录由各 SN 副本消费 revision change feed 失效缓存；consumer 发生 retention gap 时清空
+全部 user DNS cache 后从当前 revision 恢复。
 
 ## zone_info 更新
 
@@ -565,7 +574,8 @@ RPC 层可以使用 breaking API，不要求保留旧 method alias。内部不�
 - user_domain 绑定 DB 层（阶段二重写）：`activate_user_domain_binding`/`unbind_user_domain` + supersede 事务（`activate_binding_tx`，sn_auth.rs:1013-1119、1876-1960）；history 仅审计，无冲突检查。
 - 独立 `zone_info`：`get_zone_info`/`update_zone_info`/`update_zone_relay_sn` + backfill（sn_auth.rs:1883-2041、548-600）。
 - `account_sessions` 撤销表方法：`create_account_session`/`revoke_account_session`/`revoke_user_sessions`/`get_account_session`（sn_auth.rs:2125-2218），签发/校验/登出路径已接线（见 account_session 小节）。
-- `clear_state_by_active_code`，包含可选清理旧 `devices`、`user_dns_records`、`did_documents`（sn_auth.rs:895-987）。
+- `clear_state_by_active_code` 在事务中清理账号关联业务状态并为 DNS name 写完整删除事件；
+  返回值只包含 `deleted_users` 和 `activation_code_reset`。
 
 相关实现分散在：
 
@@ -576,7 +586,14 @@ RPC 层可以使用 breaking API，不要求保留旧 method alias。内部不�
 - `src/components/cyfs-sn/src/api/user.rs`: owner key、profile、self_cert。
 - `src/components/cyfs-sn/src/api/dns.rs`: user DNS records。
 - `src/components/cyfs-sn/src/sn_server.rs`: RPC 路由、旧 alias 兼容、device-signed token 校验。
-- `src/components/cyfs-sn/src/sqlite_db.rs`: 兼容期 `SnDB` SQLite 实现，包含 devices、DNS records、DID documents。
+- `src/components/cyfs-sn/src/sn_device_info.rs`: 独立的设备索引与在线状态数据库。
+
+### Beta2.2 数据库升级
+
+AuthDB schema version 为 2。旧版、无版本或含旧 compat 表的数据库启动会返回
+`incompatible schema, recreate database`，不执行 ALTER/copy migration。部署必须同时升级
+SN、AuthDB provider 和客户端，并在停服后删除旧测试数据库、由新版本创建 fresh schema；
+不支持新旧 provider 混跑。
 
 ### 阶段二待实现（主要差距）
 

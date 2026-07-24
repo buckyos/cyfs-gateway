@@ -2,7 +2,7 @@
 //!
 //! 信任边界：绑定证明必须来自「外部 DNS」视角——本模块只通过配置的公共 DoH
 //! resolver 查询 TXT，绝不复用 SN 自己的权威/合成解析路径，也不读取
-//! `user_dns_records`、BNS fallback 或本地 name cache（否则调用方能用 SN
+//! AuthDB user DNS、BNS fallback 或本地 name cache（否则调用方能用 SN
 //! 自身状态伪造 proof）。
 //!
 //! 默认 resolver 为 Google Public DNS 的 RFC 8484 端点

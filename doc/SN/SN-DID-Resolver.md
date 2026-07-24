@@ -31,8 +31,8 @@ SN-DID-Resolver 同时有两个 profile：
   document 解析问题。
 - 为 RTCP `keep_tunnel` 验证 `hello.device_doc_jwt` 提供稳定的 owner document 和设备
   document 查询路径。
-- 支持从 BNS indexer、SN user_domain、SN device_info 和 legacy compatibility store 合成
-  现有 SN 用户和设备的 DID 查询结果。
+- 支持从 BNS indexer、SN user_domain、AuthDB projection 和 SN DeviceInfo 组合
+  SN 管理范围内的 DID 查询结果。
 - 明确区分“SN 知道的内部事实”和“DID method 权威发布状态”，避免补充源冒充权威源。
 
 ## 非目标
@@ -145,14 +145,13 @@ SN-DID-Resolver 只读以下数据源：
 
 | 数据源 | 当前实现 | 用途 |
 | --- | --- | --- |
-| BNS indexer | `BnsIndexerDocumentReader` | 读取 BNS owner、owner_config、`zone`、`boot`、`device_mini_doc`、`dns_txt` 和任意 doc_type |
-| SN Auth DB | `SnAuthResolverReader` | 读取 `user_domain -> username`、legacy `zone_config`、legacy public key、`self_cert`、`zone_info` |
+| BNS indexer | `BnsRpcDocumentReader` | 读取 BNS owner、owner_config、`zone`、`boot`、`device_mini_doc`、`dns_txt` 和任意 doc_type |
+| SN Auth DB | `SnAuthResolverReader` | 读取 `user_domain -> username`、zone/boot projection、`self_cert`、`zone_info` |
 | SN DeviceInfo DB | `SnDeviceInfoResolverReader` | 读取 device DID、`zone + device_name`、在线状态、endpoint、NAT/公网状态 |
 | Relay manager | `SnRelayManagerResolverReader` | 读取 zone 当前 relay 分配；可作为 `info` 类结果的辅助 metadata |
-| Compatibility store | `LegacyResolverCompatibilityReader` | 兼容旧 `devices`、`user_dns_records`、`did_documents` 数据 |
 
-查询优先级应保持 BNS-first：BNS document / owner 有结果时优先使用，legacy 本地数据只作为迁移
-fallback。
+查询按真实来源分离：静态 device/DID document 只读 BNS；`info` 只读 DeviceInfo；
+AuthDB 只生成明确标记为 `AuthDbProjection` 的 zone/boot 结果。缺失不再回退旧本地表。
 
 ## 支持的 DID 与 doc_type
 
@@ -162,11 +161,11 @@ fallback。
 
 | doc_type | 目标行为 |
 | --- | --- |
-| `owner` | 返回该 BNS name 的 owner document。优先使用 BNS `owner` document / owner_config；legacy fallback 可由 SN 用户 public key 合成最小 owner document |
-| `zone` | 返回 BNS `zone` document；缺失时可回退到 legacy `SNUserInfo.zone_config` 合成结果 |
-| `boot` | 返回 BNS `boot` document；缺失时可使用 `zone.boot_jwt` 或 legacy `zone_config` |
+| `owner` | 返回该 BNS name 的 BNS owner document / owner_config；明确的 AuthDB 用户 key projection 会标注来源 |
+| `zone` | 返回 BNS `zone` document；注册用户的 AuthDB cache projection 标为 `AuthDbProjection` |
+| `boot` | 返回 BNS `boot` document或 AuthDB boot projection |
 | `device_mini_doc` | 返回 BNS 聚合设备 mini document |
-| 其它 | 优先直接读取 BNS 同名 doc_type；缺失时才查 legacy did document |
+| 其它 | 直接读取 BNS 同名 doc_type；缺失返回 not-found |
 
 如果 BNS name 不存在且 SN 本地也没有该用户，Public profile 返回 NotApplicable；Internal profile
 可以在明确属于本 SN 管理范围时返回 Missing。
@@ -177,12 +176,12 @@ fallback。
 
 | doc_type | 目标行为 |
 | --- | --- |
-| `doc` | 返回设备/对象 document。设备场景优先读取 `{object}.{zone}` 的 `device_mini_doc` 或 `doc`，再读 `{zone}` 聚合 `device_mini_doc`，再读 `zone.devices`，最后 legacy fallback |
-| `info` | 返回运行态信息。优先读取 `sn_device_info` 在线态；没有在线态但能找到设备身份时返回 offline info；`info` 是免验证运行态 doc_type，不代表已发布文档 |
-| 其它 | 优先读取 BNS child document `{object}.{zone}/{doc_type}`；缺失时查 legacy did document |
+| `doc` | 返回设备/对象静态文档。依次读取 `{object}.{zone}` 的 `device_mini_doc` / `doc`、`{zone}` 聚合 `device_mini_doc`、`zone.devices` |
+| `info` | 只返回 `SnDeviceInfoDB` 运行态；没有在线态即 device-not-found，静态文档不能冒充 offline info |
+| 其它 | 读取 BNS child document `{object}.{zone}/{doc_type}`；缺失返回 not-found |
 
 owner 约束必须是 `did:bns:{zone}`。返回的 `doc` 若是 JWT，JWT 内 `id` 必须等于请求 DID，
-`owner` 必须等于 `did:bns:{zone}`；否则只能作为兼容裸 JSON 返回，不能被标成已验证/已发布。
+`owner` 必须等于 `did:bns:{zone}`；否则不能被标成已验证/已发布。
 
 ### `did:web:{domain}`
 
@@ -191,8 +190,8 @@ owner 约束必须是 `did:bns:{zone}`。返回的 `doc` 若是 JWT，JWT 内 `i
 目标行为：
 
 - 找到绑定用户 `{username}`，canonical zone 为 `did:bns:{username}`。
-- `type=owner` 必须返回 `id = did:web:{domain}` 的 owner document，key 来源优先为 BNS
-  owner/owner_config，其次 legacy SN 用户 public key。
+- `type=owner` 必须返回 `id = did:web:{domain}` 的 owner document，key 来源为 BNS
+  owner/owner_config 或明确标记的 AuthDB projection。
 - `type=zone` / `type=boot` 可从 canonical zone 的 BNS document 合成，但 document 中的
   `id`/`owner` 不能伪装成 `did:bns:{username}` 后直接返回给 `did:web:{domain}` 调用方。
 - 如果无法构造与请求 DID 自述一致的 document，Public profile 应返回 NotApplicable 或只返回
@@ -211,7 +210,7 @@ device_info 掌握了足够的内部事实。
 - owner 结构约束是 `did:web:{domain}`。
 - `type=doc` 映射到 canonical BNS zone 的设备 document 来源，但返回 document 的 `id` 必须
   保持请求 DID：`did:web:{device}.{domain}`。
-- `type=info` 返回 `sn_device_info` 运行态；没有在线态但设备存在时返回 offline info。
+- `type=info` 返回 `sn_device_info` 运行态；没有在线态返回 device-not-found。
 - `type=owner` 一般不用于设备 DID；需要 owner document 时应解析 `did:web:{domain}` 的
   `type=owner`。
 
@@ -221,8 +220,8 @@ device_info 掌握了足够的内部事实。
 
 ### `did:dev:*`
 
-当前 `cyfs-sn` 已实现 `did:dev` 的 `doc` / `info` 兼容查询：按 device DID 查
-`sn_device_info` 或 compatibility store，返回设备 document / info。
+`did:dev` 先通过 DeviceInfo 找到 zone/device name；`info` 直接返回在线态，
+`doc` 再读取对应 BNS static document。不存在本地 document fallback。
 
 目标上它应被标记为私有兼容接口：
 
@@ -232,11 +231,11 @@ device_info 掌握了足够的内部事实。
 
 ## owner document 合成要求
 
-当 SN 需要为 `did:web:{domain}` 或 legacy BNS 用户合成 owner document 时，必须满足：
+当 SN 需要为 `did:web:{domain}` 或 AuthDB 管理的 BNS 用户生成 owner projection 时，必须满足：
 
 - `id` 等于请求的 owner DID，例如 `did:web:example.com`。
-- public key 来自请求 DID 之外的可信来源：BNS owner_config、BNS effective owner key、SN
-  账号 legacy public key。
+- public key 来自请求 DID 之外的可信来源：BNS owner_config、BNS effective owner key或
+  AuthDB 用户 key projection。
 - document 中应记录 provenance，例如 `canonicalZone: "did:bns:alice"`、`source:
   "bns-owner-config"`，但这些字段不能替代 `id` 和 `owner` 语义。
 - 如果返回 JWT，签名 key 必须与 owner document 声明的 key 关系一致；如果无法签名，Internal
@@ -248,8 +247,8 @@ device_info 掌握了足够的内部事实。
 SN-DID-Resolver 只在“SN 自己能用内部可信数据完成查询”的范围内兜底：
 
 - `did:bns:alice`：如果 `alice` 是 BNS name 或 SN 注册用户，则返回根 DID 相关文档。
-- `did:bns:ood1.alice`：如果能从 BNS `device_mini_doc`、`zone.devices`、`sn_device_info` 或
-  legacy store 找到设备，则返回 `doc` / `info`。
+- `did:bns:ood1.alice`：`doc` 由 BNS `device_mini_doc` / `zone.devices` 提供；
+  `info` 由 `SnDeviceInfoDB` 提供。
 - `did:web:example.com`：如果 `example.com` 已绑定到 SN 用户 `user_domain`，则返回 owner /
   zone / boot 候选或内部 cache 结果。
 - `did:web:ood1.example.com`：如果 `example.com` 是 SN `user_domain`，则按对应 BNS zone 的
@@ -290,15 +289,15 @@ SN-DID-Resolver 只在“SN 自己能用内部可信数据完成查询”的范�
 - `did:web` 当前通过 `sn_auth.get_user_by_domain` 映射到 BNS username，再复用
   `resolve_bns_did`。这解决了部分 booting 查询，但还没有完整的 owner document 合成和
   DID 自述一致性处理。
-- `did:bns` 当前 BNS-first：优先读 BNS document，缺失时回退 legacy `SNUserInfo` /
-  compatibility store。
-- 设备 `doc` / `info` 已接入 BNS `device_mini_doc`、`zone.devices`、`sn_device_info` 和
-  legacy devices。
+- `did:bns` 优先读取 BNS document；AuthDB zone/boot projection 使用
+  `source=auth_db_projection`，普通 doc_type 缺失不回退。
+- 设备 `doc` 只接入 BNS `device_mini_doc` / `zone.devices`，`info` 只接入
+  `SnDeviceInfoDB`。
 - BNS indexer reader 已能读取 owner、owner_config 和 BNS document。
 - HTTP response 当前直接返回 bare JSON/JWT，尚未实现 DID Resolution Result 信封、
   `documentStatus`、`effectiveOwner`、`source` 等 metadata。
 - `from_ip` 参数当前传入 `resolve_did` 但未使用。
-- `did:dev` 当前仍对公网 resolver 路径可用，应在目标语义中降级为兼容/私有能力。
+- `did:dev` 当前仍对公网 resolver 路径可用，其 static doc 与 online info 来源已严格分离。
 
 ## 验收测试
 
@@ -309,10 +308,8 @@ SN-DID-Resolver 只在“SN 自己能用内部可信数据完成查询”的范�
   `device_mini_doc` / `zone.devices` 合成设备 document，owner 约束为 `did:web:example.com`。
 - RTCP `keep_tunnel`：客户端提交 `did:web:ood1.example.com + hello.device_doc_jwt` 时，
   relay 能解析 `did:web:example.com?type=owner` 并完成设备 JWT 验证。
-- `did:bns:alice` 和 `did:bns:ood1.alice`：BNS document 优先，legacy store 只在缺失时 fallback。
+- `did:bns:alice` 和 `did:bns:ood1.alice`：BNS document 优先且不存在旧表 fallback。
 - 不管理的 `did:web:not-bound.example`：Public profile 返回 NotApplicable，不访问该域名。
 - BNS indexer 故障：返回 5xx/unknown，不能返回 Missing。
 - 内部 zone-resolver upstream 配置到 SN-DID-Resolver 时，不发生 resolver 自递归。
 - Public profile 不把补充源候选结果标成 `documentStatus: "active"`。
-
-

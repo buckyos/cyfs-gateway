@@ -1,18 +1,15 @@
 use crate::sn_did_resolver::{SnDidDocumentSource, SnDidResolveResponse, SnDidResolverProfile};
 use crate::{
     RelayAssignment, RelayAssignmentState, RelayNodeIpMapReq, RelayNodeIpMapSnapshot, SNUserInfo,
-    SnAuthDBRef, SnDeviceInfoDBRef, SnDeviceStateView, UserState, ZoneInfo,
+    SnAuthDBRef, SnDeviceInfoDBRef, SnDeviceStateView, UserDnsChangePage, UserDnsLookup,
+    UserDnsRecordType, UserDnsRrset, UserState, ZoneInfo,
 };
 use async_trait::async_trait;
 use bns_client::canonical_bns_name;
 use cyfs_gateway_lib::{server_err, DnsAuthority, ServerError, ServerErrorCode};
-use jsonwebtoken::DecodingKey;
 use log::{debug, warn};
 use name_client::{NameInfo, RecordType};
-use name_lib::{
-    decode_json_from_jwt_with_pk, DeviceDocument, DeviceMiniDocument as NameDeviceMiniDocument,
-    EncodedDocument, DID,
-};
+use name_lib::{EncodedDocument, DID};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
@@ -41,7 +38,6 @@ pub type SnAuthReaderRef = Arc<dyn SnAuthReader>;
 pub type BnsDocumentReaderRef = Arc<dyn BnsDocumentReader>;
 pub type DeviceOnlineReaderRef = Arc<dyn DeviceOnlineReader>;
 pub type RelayAssignmentReaderRef = Arc<dyn RelayAssignmentReader>;
-pub type ResolverCompatibilityReaderRef = Arc<dyn ResolverCompatibilityReader>;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum SnResolverErrorKind {
@@ -472,6 +468,29 @@ pub trait SnAuthReader: Send + Sync + 'static {
     async fn get_user_info(&self, username: &str) -> SnResolverResult<Option<SNUserInfo>>;
     async fn get_user_by_domain(&self, domain: &str) -> SnResolverResult<Option<SNUserInfo>>;
     async fn get_zone_info(&self, username: &str) -> SnResolverResult<Option<ZoneInfo>>;
+    async fn get_user_dns_rrset(
+        &self,
+        name: &str,
+        record_type: UserDnsRecordType,
+    ) -> SnResolverResult<UserDnsLookup> {
+        let _ = (name, record_type);
+        Ok(UserDnsLookup {
+            rrset: None,
+            observed_revision: 0,
+        })
+    }
+    async fn list_user_dns_changes(
+        &self,
+        after_revision: u64,
+        limit: usize,
+    ) -> SnResolverResult<UserDnsChangePage> {
+        let _ = (after_revision, limit);
+        Ok(UserDnsChangePage {
+            changes: Vec::new(),
+            current_revision: 0,
+            earliest_available_revision: 1,
+        })
+    }
 
     async fn get_user_sn_ips(&self, username: &str) -> SnResolverResult<Vec<IpAddr>> {
         let Some(zone_info) = self.get_zone_info(username).await? else {
@@ -530,94 +549,39 @@ impl SnAuthReader for SnAuthResolverReader {
             SnResolverError::backend(format!("query zone_info {} failed: {}", username, e))
         })
     }
-}
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct ResolverDeviceDocument {
-    pub zone_name: String,
-    pub device_name: String,
-    pub did: String,
-    pub mini_config_jwt: Option<String>,
-    pub document: Option<Value>,
-    pub info_document: Option<Value>,
-    pub addresses: Vec<IpAddr>,
-    pub ttl: Option<u32>,
-    pub version: Option<u64>,
-}
-
-impl ResolverDeviceDocument {
-    fn to_device_mini_document(&self) -> DeviceMiniDocument {
-        DeviceMiniDocument {
-            zone_name: self.zone_name.clone(),
-            device_name: self.device_name.clone(),
-            did: self.did.clone(),
-            mini_config_jwt: self.mini_config_jwt.clone(),
-            document: self.document.clone(),
-            ttl: self.ttl,
-            version: self.version,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct ResolverDidDocument {
-    pub obj_id: String,
-    pub document_json: String,
-    pub doc_type: Option<String>,
-}
-
-#[async_trait]
-pub trait ResolverCompatibilityReader: Send + Sync + 'static {
-    async fn query_domain_record(
+    async fn get_user_dns_rrset(
         &self,
-        _domain: &str,
-        _record_type: RecordType,
-    ) -> SnResolverResult<Option<(String, u32)>> {
-        Ok(None)
+        name: &str,
+        record_type: UserDnsRecordType,
+    ) -> SnResolverResult<UserDnsLookup> {
+        self.db
+            .get_user_dns_rrset(name, record_type)
+            .await
+            .map_err(|e| {
+                SnResolverError::backend(format!(
+                    "query user DNS RRset {} {} failed: {}",
+                    name, record_type, e
+                ))
+            })
     }
 
-    async fn domain_name_exists(&self, domain: &str) -> SnResolverResult<bool> {
-        for record_type in [RecordType::A, RecordType::AAAA, RecordType::TXT] {
-            if self
-                .query_domain_record(domain, record_type)
-                .await?
-                .is_some()
-            {
-                return Ok(true);
-            }
-        }
-        Ok(false)
-    }
-
-    async fn get_device_by_name(
+    async fn list_user_dns_changes(
         &self,
-        _zone_name: &str,
-        _device_name: &str,
-    ) -> SnResolverResult<Option<ResolverDeviceDocument>> {
-        Ok(None)
-    }
-
-    async fn get_device_by_did(
-        &self,
-        _did: &str,
-    ) -> SnResolverResult<Option<ResolverDeviceDocument>> {
-        Ok(None)
-    }
-
-    async fn query_user_did_document(
-        &self,
-        _owner_user: &str,
-        _obj_name: &str,
-        _doc_type: Option<&str>,
-    ) -> SnResolverResult<Option<ResolverDidDocument>> {
-        Ok(None)
+        after_revision: u64,
+        limit: usize,
+    ) -> SnResolverResult<UserDnsChangePage> {
+        self.db
+            .list_user_dns_changes(after_revision, limit)
+            .await
+            .map_err(|e| {
+                SnResolverError::backend(format!(
+                    "list user DNS changes after {} failed: {}",
+                    after_revision, e
+                ))
+            })
     }
 }
-
-pub struct EmptyResolverCompatibilityReader;
-
-#[async_trait]
-impl ResolverCompatibilityReader for EmptyResolverCompatibilityReader {}
 
 #[async_trait]
 pub trait DeviceOnlineReader: Send + Sync + 'static {
@@ -862,6 +826,18 @@ impl SnResolverCache {
             .is_some()
     }
 
+    pub fn remove_dns_name(&self, hostname: &str) -> usize {
+        let hostname = normalize_host_lossy(hostname);
+        let mut removed = 0;
+        {
+            let mut items = self.dns.write().unwrap_or_else(|e| e.into_inner());
+            let before = items.len();
+            items.retain(|key, _| key.hostname != hostname);
+            removed += before - items.len();
+        }
+        removed + self.remove_authoritative_name(hostname.as_str())
+    }
+
     pub fn query_authoritative_dns(
         &self,
         hostname: &str,
@@ -1002,8 +978,8 @@ pub struct SnResolver {
     bns: BnsDocumentReaderRef,
     device_online: DeviceOnlineReaderRef,
     relay_reader: RelayAssignmentReaderRef,
-    compatibility: ResolverCompatibilityReaderRef,
     cache: Arc<SnResolverCache>,
+    user_dns_revision: tokio::sync::Mutex<u64>,
 }
 
 impl SnResolver {
@@ -1022,8 +998,8 @@ impl SnResolver {
             bns,
             device_online: Arc::new(EmptyDeviceOnlineReader),
             relay_reader: Arc::new(EmptyRelayAssignmentReader),
-            compatibility: Arc::new(EmptyResolverCompatibilityReader),
             cache: Arc::new(SnResolverCache::new()),
+            user_dns_revision: tokio::sync::Mutex::new(0),
         }
     }
 
@@ -1043,11 +1019,6 @@ impl SnResolver {
 
     pub fn with_relay_reader(mut self, reader: RelayAssignmentReaderRef) -> Self {
         self.relay_reader = reader;
-        self
-    }
-
-    pub fn with_compatibility_reader(mut self, reader: ResolverCompatibilityReaderRef) -> Self {
-        self.compatibility = reader;
         self
     }
 
@@ -1102,6 +1073,39 @@ impl SnResolver {
             || self.config.aliases.iter().any(|alias| alias == &hostname)
     }
 
+    pub async fn synchronize_user_dns_changes(&self) -> SnResolverResult<u64> {
+        let mut cursor = self.user_dns_revision.lock().await;
+        loop {
+            let page = self.auth.list_user_dns_changes(*cursor, 256).await?;
+            if *cursor < page.current_revision
+                && cursor.saturating_add(1) < page.earliest_available_revision
+            {
+                self.cache.clear();
+                *cursor = page.current_revision;
+                return Ok(*cursor);
+            }
+            if let Some(first) = page.changes.first() {
+                if first.revision > cursor.saturating_add(1) {
+                    self.cache.clear();
+                    *cursor = page.current_revision;
+                    return Ok(*cursor);
+                }
+            }
+            for change in &page.changes {
+                self.cache.remove_dns_name(change.name.as_str());
+                *cursor = change.revision;
+            }
+            if *cursor >= page.current_revision || page.changes.is_empty() {
+                *cursor = page.current_revision;
+                return Ok(*cursor);
+            }
+        }
+    }
+
+    pub fn invalidate_user_dns_name(&self, name: &str) {
+        self.cache.remove_dns_name(name);
+    }
+
     pub async fn resolve_authoritative_dns_cached(
         &self,
         hostname: &str,
@@ -1116,15 +1120,19 @@ impl SnResolver {
             ));
         }
 
-        if let Some(result) = self
-            .cache
-            .query_authoritative_dns(hostname.as_str(), record_type.as_str())
-        {
-            debug!(
-                "sn_resolver authoritative dns cache hit: {} {}",
-                hostname, record_type
-            );
-            return Ok(result);
+        self.synchronize_user_dns_changes().await?;
+        let bypass_cache = is_user_dns_control_name(hostname.as_str());
+        if !bypass_cache {
+            if let Some(result) = self
+                .cache
+                .query_authoritative_dns(hostname.as_str(), record_type.as_str())
+            {
+                debug!(
+                    "sn_resolver authoritative dns cache hit: {} {}",
+                    hostname, record_type
+                );
+                return Ok(result);
+            }
         }
 
         let result = match self
@@ -1151,7 +1159,7 @@ impl SnResolver {
             SnAuthoritativeDnsResult::NotManaged
             | SnAuthoritativeDnsResult::TemporaryFailure { .. } => None,
         };
-        if let Some(ttl) = ttl {
+        if let Some(ttl) = ttl.filter(|_| !bypass_cache) {
             self.cache.insert_authoritative_dns(
                 hostname.as_str(),
                 record_type.as_str(),
@@ -1270,11 +1278,20 @@ impl SnResolver {
             return Ok(true);
         }
 
-        // Explicit DNS records are owner-name data. Check the compatibility
-        // store as a set, not by probing one particular RR type.
-        let has_explicit_rrset = self.compatibility.domain_name_exists(hostname).await?;
-        if has_explicit_rrset {
-            return Ok(true);
+        for record_type in [
+            UserDnsRecordType::A,
+            UserDnsRecordType::Aaaa,
+            UserDnsRecordType::Txt,
+        ] {
+            if self
+                .auth
+                .get_user_dns_rrset(hostname, record_type)
+                .await?
+                .rrset
+                .is_some()
+            {
+                return Ok(true);
+            }
         }
 
         // Control owners such as _acme-challenge exist only while at least one
@@ -1327,7 +1344,12 @@ impl SnResolver {
             ));
         }
 
-        match self.cache.query_dns(normalized.as_str(), record_type) {
+        self.synchronize_user_dns_changes().await?;
+        let bypass_cache = is_user_dns_control_name(normalized.as_str());
+        match (!bypass_cache)
+            .then(|| self.cache.query_dns(normalized.as_str(), record_type))
+            .flatten()
+        {
             Some(DnsCacheValue::Hit(result)) => {
                 debug!(
                     "sn_resolver dns cache hit: {} {}",
@@ -1352,12 +1374,14 @@ impl SnResolver {
 
         match self.resolve_dns(normalized.as_str(), record_type).await {
             Ok(result) => {
-                self.cache.insert_dns(
-                    normalized.as_str(),
-                    record_type,
-                    DnsCacheValue::Hit(result.clone()),
-                    Some(result.ttl),
-                );
+                if !bypass_cache {
+                    self.cache.insert_dns(
+                        normalized.as_str(),
+                        record_type,
+                        DnsCacheValue::Hit(result.clone()),
+                        Some(result.ttl),
+                    );
+                }
                 Ok(result)
             }
             Err(e)
@@ -1369,12 +1393,14 @@ impl SnResolver {
                         | SnResolverErrorKind::DeviceNotFound
                 ) =>
             {
-                self.cache.insert_dns(
-                    normalized.as_str(),
-                    record_type,
-                    DnsCacheValue::Tombstone(e.kind()),
-                    Some(DEFAULT_SN_RESOLVER_TTL_SECS),
-                );
+                if !bypass_cache {
+                    self.cache.insert_dns(
+                        normalized.as_str(),
+                        record_type,
+                        DnsCacheValue::Tombstone(e.kind()),
+                        Some(DEFAULT_SN_RESOLVER_TTL_SECS),
+                    );
+                }
                 Err(e)
             }
             Err(e) => Err(e),
@@ -1408,12 +1434,19 @@ impl SnResolver {
             return self.resolve_self_dns(hostname.as_str(), record_type);
         }
 
-        if let Some((record, ttl)) = self
-            .compatibility
-            .query_domain_record(hostname.as_str(), record_type)
+        let user_record_type = match record_type {
+            RecordType::A => UserDnsRecordType::A,
+            RecordType::AAAA => UserDnsRecordType::Aaaa,
+            RecordType::TXT => UserDnsRecordType::Txt,
+            _ => unreachable!("supported record type checked above"),
+        };
+        if let Some(rrset) = self
+            .auth
+            .get_user_dns_rrset(hostname.as_str(), user_record_type)
             .await?
+            .rrset
         {
-            return explicit_dns_record(hostname.as_str(), record_type, record.as_str(), ttl);
+            return explicit_dns_rrset(hostname.as_str(), record_type, &rrset);
         }
 
         // Underscore-prefixed TXT names are control records such as ACME and
@@ -1740,7 +1773,7 @@ impl SnResolver {
             .unwrap_or(self.config.legacy_gateway_device_name.as_str())
             .to_string();
 
-        let (device_doc, compatibility_device) = self
+        let device_doc = self
             .resolve_device_mini_doc(
                 zone.zone_name.as_str(),
                 gateway_device_name.as_str(),
@@ -1754,12 +1787,7 @@ impl SnResolver {
             .await?;
 
         let addresses = self
-            .resolve_gateway_addresses(
-                zone,
-                &device_doc,
-                compatibility_device.as_ref(),
-                online.as_ref(),
-            )
+            .resolve_gateway_addresses(zone, &device_doc, online.as_ref())
             .await?;
 
         Ok(GatewayResolution {
@@ -1778,14 +1806,14 @@ impl SnResolver {
     /// 按 (zone, device_name) 解析 zone 权威侧登记的设备身份文档，返回其中的
     /// 设备 DID（通常是 `did:dev:<x>`，公钥内嵌）。来源优先级与内部设备解析
     /// 一致：BNS `<device>.<zone>` 单文档 → zone 级 `device_mini_doc` 聚合 →
-    /// zone doc devices → 兼容期 devices 表。`sn_authority` 用它锚定设备
+    /// zone doc devices。`sn_authority` 用它锚定设备
     /// token 的公钥，不存在时返回 `DeviceNotFound`。
     pub async fn resolve_zone_device_did(
         &self,
         zone_name: &str,
         device_name: &str,
     ) -> SnResolverResult<String> {
-        let (device_doc, _) = self
+        let device_doc = self
             .resolve_device_mini_doc(zone_name, device_name, None)
             .await?;
         Ok(device_doc.did)
@@ -1796,7 +1824,7 @@ impl SnResolver {
         zone_name: &str,
         device_name: &str,
         zone_doc: Option<&ZoneDocument>,
-    ) -> SnResolverResult<(DeviceMiniDocument, Option<ResolverDeviceDocument>)> {
+    ) -> SnResolverResult<DeviceMiniDocument> {
         let child_name = format!("{}.{}", device_name, zone_name);
         for doc_type in [BNS_DOC_DEVICE_MINI, "doc"] {
             if let Some(document) = self.bns.get_document(child_name.as_str(), doc_type).await? {
@@ -1806,7 +1834,7 @@ impl SnResolver {
                     &document,
                     Some(child_name.as_str()),
                 ) {
-                    return Ok((device_doc, None));
+                    return Ok(device_doc);
                 }
             }
         }
@@ -1817,7 +1845,7 @@ impl SnResolver {
             .await?
         {
             if let Some(device_doc) = device_doc_from_aggregate(zone_name, device_name, &document) {
-                return Ok((device_doc, None));
+                return Ok(device_doc);
             }
         }
 
@@ -1829,7 +1857,7 @@ impl SnResolver {
                 zone_doc.ttl,
                 zone_doc.version,
             ) {
-                return Ok((device_doc, None));
+                return Ok(device_doc);
             }
         } else if let Some(document) = self.bns.get_document(zone_name, BNS_DOC_ZONE).await? {
             let zone_doc = ZoneDocument::from_bns_document(&document);
@@ -1840,30 +1868,23 @@ impl SnResolver {
                 zone_doc.ttl,
                 zone_doc.version,
             ) {
-                return Ok((device_doc, None));
+                return Ok(device_doc);
             }
         }
 
-        let compatibility_device = self
-            .compatibility
-            .get_device_by_name(zone_name, device_name)
-            .await?
-            .ok_or_else(|| {
-                SnResolverError::new(
-                    SnResolverErrorKind::DeviceNotFound,
-                    format!("device {}.{} not found", device_name, zone_name),
-                )
-            })?;
-
-        let device_doc = compatibility_device.to_device_mini_document();
-        Ok((device_doc, Some(compatibility_device)))
+        Err(SnResolverError::new(
+            SnResolverErrorKind::DeviceNotFound,
+            format!(
+                "BNS device document {}.{} not found",
+                device_name, zone_name
+            ),
+        ))
     }
 
     async fn resolve_gateway_addresses(
         &self,
         zone: &ZoneResolution,
         device_doc: &DeviceMiniDocument,
-        compatibility_device: Option<&ResolverDeviceDocument>,
         online: Option<&SnDeviceStateView>,
     ) -> SnResolverResult<Vec<IpAddr>> {
         let mut addresses = Vec::new();
@@ -1888,12 +1909,6 @@ impl SnResolver {
                 if let Some(ip) = parse_ip_or_socket_addr(endpoint.host.as_str()) {
                     push_exportable_ip(&mut addresses, ip);
                 }
-            }
-        }
-
-        if let Some(compatibility_device) = compatibility_device {
-            for ip in compatibility_device.addresses.iter().copied() {
-                push_exportable_ip(&mut addresses, ip);
             }
         }
 
@@ -1975,26 +1990,7 @@ impl SnResolver {
             }
         }
 
-        if !device_jwt_source_found {
-            if let Some(device) = self
-                .compatibility
-                .get_device_by_name(
-                    zone.zone_name.as_str(),
-                    zone.zone_doc
-                        .gateway_device_name
-                        .as_deref()
-                        .or(zone.boot_doc.gateway_device_name.as_deref())
-                        .unwrap_or(self.config.legacy_gateway_device_name.as_str()),
-                )
-                .await?
-            {
-                if let Some(mini_config_jwt) = device.mini_config_jwt {
-                    if !mini_config_jwt.trim().is_empty() {
-                        txt.push(format!("DEV={};", mini_config_jwt));
-                    }
-                }
-            }
-        }
+        let _ = device_jwt_source_found;
 
         if let Some(dns_txt_doc) = self
             .bns
@@ -2155,7 +2151,7 @@ impl SnResolver {
                 let user = self.auth.get_user_info(zone_name.as_str()).await?;
                 if let Some(user) = user {
                     let document = if doc_type == BNS_DOC_ZONE {
-                        build_legacy_zone_config_json(zone_name.as_str(), &user)
+                        build_auth_db_zone_projection(zone_name.as_str(), &user)
                     } else {
                         json!({ "boot": user.zone_config })
                     };
@@ -2163,7 +2159,7 @@ impl SnResolver {
                         did,
                         doc_type,
                         EncodedDocument::JsonLd(document),
-                        SnDidDocumentSource::LegacyCompatibilityStore,
+                        SnDidDocumentSource::AuthDbProjection,
                     ));
                 }
 
@@ -2178,12 +2174,11 @@ impl SnResolver {
                 ))
             }
             device_name => {
-                if let Ok((device_doc, compatibility_device)) = self
+                if let Ok(device_doc) = self
                     .resolve_device_mini_doc(zone_name.as_str(), device_name, None)
                     .await
                 {
-                    let document =
-                        device_document_or_fallback(device_doc, compatibility_device.as_ref());
+                    let document = device_document(device_doc);
                     return Ok(did_response(
                         did,
                         device_name,
@@ -2191,14 +2186,13 @@ impl SnResolver {
                         SnDidDocumentSource::DeviceMiniDocument,
                     ));
                 }
-
-                self.resolve_legacy_local_did_doc(
-                    did,
-                    zone_name.as_str(),
-                    device_name,
-                    Some(device_name),
-                )
-                .await
+                Err(SnResolverError::new(
+                    SnResolverErrorKind::DocumentNotFound,
+                    format!(
+                        "BNS device document {}/{} not found",
+                        zone_name, device_name
+                    ),
+                ))
             }
         }
     }
@@ -2212,11 +2206,10 @@ impl SnResolver {
     ) -> SnResolverResult<SnDidResolveResponse> {
         match doc_type {
             "doc" => {
-                let (device_doc, compatibility_device) = self
+                let device_doc = self
                     .resolve_device_mini_doc(zone_name, obj_name, None)
                     .await?;
-                let document =
-                    device_document_or_fallback(device_doc, compatibility_device.as_ref());
+                let document = device_document(device_doc);
                 Ok(did_response(
                     did,
                     doc_type,
@@ -2238,38 +2231,9 @@ impl SnResolver {
                     ));
                 }
 
-                if let Ok((device_doc, compatibility_device)) = self
-                    .resolve_device_mini_doc(zone_name, obj_name, None)
-                    .await
-                {
-                    return Ok(did_response(
-                        did,
-                        doc_type,
-                        EncodedDocument::JsonLd(device_offline_info_document(
-                            &device_doc,
-                            compatibility_device.as_ref(),
-                        )),
-                        SnDidDocumentSource::DeviceMiniDocument,
-                    ));
-                }
-
-                let compatibility_device = self
-                    .compatibility
-                    .get_device_by_name(zone_name, obj_name)
-                    .await?
-                    .ok_or_else(|| {
-                        SnResolverError::new(
-                            SnResolverErrorKind::DeviceNotFound,
-                            format!("device {}.{} not found", obj_name, zone_name),
-                        )
-                    })?;
-                Ok(did_response(
-                    did,
-                    doc_type,
-                    EncodedDocument::JsonLd(device_info_document_or_fallback(
-                        &compatibility_device,
-                    )),
-                    SnDidDocumentSource::LegacyCompatibilityStore,
+                Err(SnResolverError::new(
+                    SnResolverErrorKind::DeviceNotFound,
+                    format!("online device {}.{} not found", obj_name, zone_name),
                 ))
             }
             other => {
@@ -2282,8 +2246,10 @@ impl SnResolver {
                         SnDidDocumentSource::BnsDocument,
                     ));
                 }
-                self.resolve_legacy_local_did_doc(did, zone_name, obj_name, Some(other))
-                    .await
+                Err(SnResolverError::new(
+                    SnResolverErrorKind::DocumentNotFound,
+                    format!("BNS document {}/{} not found", child_name, other),
+                ))
             }
         }
     }
@@ -2299,115 +2265,37 @@ impl SnResolver {
             .device_online
             .get_device_state(did_str.as_str())
             .await?;
-        if doc_type == "info" {
-            if let Some(online) = online {
-                return Ok(did_response_str(
-                    did_str,
-                    doc_type,
-                    EncodedDocument::JsonLd(device_online_info_document(&online)),
-                    SnDidDocumentSource::DeviceOnlineInfo,
-                ));
-            }
-        }
-
-        let compatibility_device = self
-            .compatibility
-            .get_device_by_did(did_str.as_str())
-            .await?;
-        if let Some(compatibility_device) = compatibility_device {
-            return match doc_type {
-                "doc" => Ok(did_response_str(
-                    did_str,
-                    doc_type,
-                    EncodedDocument::JsonLd(device_document_or_fallback(
-                        compatibility_device.to_device_mini_document(),
-                        Some(&compatibility_device),
-                    )),
-                    SnDidDocumentSource::DeviceMiniDocument,
-                )),
-                "info" => Ok(did_response_str(
-                    did_str,
-                    doc_type,
-                    EncodedDocument::JsonLd(device_info_document_or_fallback(
-                        &compatibility_device,
-                    )),
-                    SnDidDocumentSource::LegacyCompatibilityStore,
-                )),
-                other => Err(SnResolverError::new(
-                    SnResolverErrorKind::DocumentNotFound,
-                    format!("unsupported doc_type {} for {}", other, did_str),
-                )),
-            };
-        }
-
-        if let Some(online) = online {
-            if doc_type == "doc" {
-                let (device_doc, _) = self
+        match (doc_type, online) {
+            ("info", Some(online)) => Ok(did_response_str(
+                did_str,
+                doc_type,
+                EncodedDocument::JsonLd(device_online_info_document(&online)),
+                SnDidDocumentSource::DeviceOnlineInfo,
+            )),
+            ("doc", Some(online)) => {
+                let device_doc = self
                     .resolve_device_mini_doc(
                         online.zone.as_str(),
                         online.device_name.as_str(),
                         None,
                     )
                     .await?;
-                return Ok(did_response_str(
+                Ok(did_response_str(
                     did_str,
                     doc_type,
-                    EncodedDocument::JsonLd(device_doc.document.unwrap_or_else(|| {
-                        json!({
-                            "id": device_doc.did,
-                            "name": device_doc.device_name,
-                            "zone": device_doc.zone_name,
-                            "mini_config_jwt": device_doc.mini_config_jwt,
-                        })
-                    })),
+                    EncodedDocument::JsonLd(device_document(device_doc)),
                     SnDidDocumentSource::DeviceMiniDocument,
-                ));
+                ))
             }
-        }
-
-        Err(SnResolverError::new(
-            SnResolverErrorKind::DeviceNotFound,
-            format!("device {} not found", did_str),
-        ))
-    }
-
-    async fn resolve_legacy_local_did_doc(
-        &self,
-        did: &DID,
-        owner_user: &str,
-        obj_name: &str,
-        doc_type: Option<&str>,
-    ) -> SnResolverResult<SnDidResolveResponse> {
-        let Some(did_document) = self
-            .compatibility
-            .query_user_did_document(owner_user, obj_name, doc_type)
-            .await?
-        else {
-            return Err(SnResolverError::new(
+            ("doc" | "info", None) => Err(SnResolverError::new(
+                SnResolverErrorKind::DeviceNotFound,
+                format!("online device {} not found", did_str),
+            )),
+            (other, _) => Err(SnResolverError::new(
                 SnResolverErrorKind::DocumentNotFound,
-                format!("did document not found for {}/{}", owner_user, obj_name),
-            ));
-        };
-
-        let value = if did_document.document_json.trim().is_empty() {
-            Value::Null
-        } else {
-            serde_json::from_str::<Value>(did_document.document_json.as_str()).map_err(|e| {
-                SnResolverError::new(
-                    SnResolverErrorKind::BackendUnavailable,
-                    format!("invalid stored did document json: {}", e),
-                )
-            })?
-        };
-
-        Ok(did_response(
-            did,
-            did_document
-                .doc_type
-                .unwrap_or_else(|| doc_type.unwrap_or("doc").to_string()),
-            EncodedDocument::JsonLd(value),
-            SnDidDocumentSource::LegacyCompatibilityStore,
-        ))
+                format!("unsupported doc_type {} for {}", other, did_str),
+            )),
+        }
     }
 }
 
@@ -2564,24 +2452,23 @@ fn effective_ttl(values: &[Option<u32>], default_ttl: u32) -> u32 {
         .unwrap_or(default_ttl)
 }
 
-fn explicit_dns_record(
+fn explicit_dns_rrset(
     hostname: &str,
     record_type: RecordType,
-    record: &str,
-    ttl: u32,
+    rrset: &UserDnsRrset,
 ) -> SnResolverResult<DnsResolution> {
     match record_type {
         RecordType::TXT => Ok(DnsResolution {
             hostname: hostname.to_string(),
             record_type,
-            ttl,
+            ttl: rrset.ttl,
             addresses: Vec::new(),
-            txt: split_record_values(record),
+            txt: rrset.values.clone(),
             source: DnsResolutionSource::ExplicitRecord,
         }),
         RecordType::A | RecordType::AAAA => {
             let mut addresses = Vec::new();
-            for value in split_record_values(record) {
+            for value in &rrset.values {
                 if let Some(ip) = parse_ip_or_socket_addr(value.as_str()) {
                     push_dns_address_unfiltered(&mut addresses, ip, record_type);
                 }
@@ -2589,7 +2476,7 @@ fn explicit_dns_record(
             Ok(DnsResolution {
                 hostname: hostname.to_string(),
                 record_type,
-                ttl,
+                ttl: rrset.ttl,
                 addresses,
                 txt: Vec::new(),
                 source: DnsResolutionSource::ExplicitRecord,
@@ -2602,13 +2489,11 @@ fn explicit_dns_record(
     }
 }
 
-fn split_record_values(record: &str) -> Vec<String> {
-    record
-        .split(',')
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned)
-        .collect()
+pub fn is_user_dns_control_name(name: &str) -> bool {
+    matches!(
+        normalize_host_lossy(name).split('.').next(),
+        Some("_acme-challenge" | "_pkx")
+    )
 }
 
 fn owner_pkx_from_owner_config(owner: &BnsOwner) -> Option<String> {
@@ -2629,62 +2514,14 @@ fn pkx_from_public_key(public_key: &str) -> Option<String> {
     find_string_path(&value, &["x"])
 }
 
-fn device_document_or_fallback(
-    device_doc: DeviceMiniDocument,
-    compatibility_device: Option<&ResolverDeviceDocument>,
-) -> Value {
-    compatibility_device
-        .and_then(|device| device.document.clone())
-        .or(device_doc.document)
-        .unwrap_or_else(|| {
-            json!({
-                "id": device_doc.did,
-                "name": device_doc.device_name,
-                "zone": device_doc.zone_name,
-                "mini_config_jwt": device_doc.mini_config_jwt,
-            })
+fn device_document(device_doc: DeviceMiniDocument) -> Value {
+    device_doc.document.unwrap_or_else(|| {
+        json!({
+            "id": device_doc.did,
+            "name": device_doc.device_name,
+            "zone": device_doc.zone_name,
+            "mini_config_jwt": device_doc.mini_config_jwt,
         })
-}
-
-fn device_info_document_or_fallback(device: &ResolverDeviceDocument) -> Value {
-    device
-        .info_document
-        .clone()
-        .or_else(|| device.document.clone())
-        .unwrap_or_else(|| {
-            json!({
-                "did": device.did,
-                "device_name": device.device_name,
-                "owner": device.zone_name,
-                "mini_config_jwt": device.mini_config_jwt,
-                "addresses": device.addresses,
-            })
-        })
-}
-
-fn device_offline_info_document(
-    device_doc: &DeviceMiniDocument,
-    compatibility_device: Option<&ResolverDeviceDocument>,
-) -> Value {
-    if let Some(compatibility_device) = compatibility_device {
-        return device_info_document_or_fallback(compatibility_device);
-    }
-
-    json!({
-        "did": device_doc.did.clone(),
-        "device_name": device_doc.device_name.clone(),
-        "owner": device_doc.zone_name.clone(),
-        "zone_name": device_doc.zone_name.clone(),
-        "mini_config_jwt": device_doc.mini_config_jwt.clone(),
-        "state": "offline",
-        "public_ips": [],
-        "private_ips": [],
-        "active_endpoints": [],
-        "preferred_endpoint": null,
-        "nat_type": "unknown",
-        "is_wan_device": false,
-        "last_seen_at": null,
-        "expires_at": null,
     })
 }
 
@@ -3052,7 +2889,7 @@ fn device_public_key_x(value: &Value) -> Option<String> {
         .or_else(|| find_string_path(value, &["public_key", "x"]))
 }
 
-fn build_legacy_zone_config_json(username: &str, user: &SNUserInfo) -> Value {
+fn build_auth_db_zone_projection(username: &str, user: &SNUserInfo) -> Value {
     json!({
         "user_name": username,
         "public_key": user.public_key.clone(),
@@ -3062,130 +2899,6 @@ fn build_legacy_zone_config_json(username: &str, user: &SNUserInfo) -> Value {
         "sn_ips": user.sn_ips.clone(),
         "state": user.state.to_string(),
     })
-}
-
-pub(crate) fn device_config_from_mini_jwt(
-    mini_config_jwt: &str,
-    owner_public_key_jwk_str: &str,
-    owner_username: &str,
-) -> SnResolverResult<Value> {
-    let owner_public_key_jwk: jsonwebtoken::jwk::Jwk =
-        serde_json::from_str(owner_public_key_jwk_str).map_err(|e| {
-            SnResolverError::new(
-                SnResolverErrorKind::BackendUnavailable,
-                format!("failed to parse owner public key jwk: {}", e),
-            )
-        })?;
-
-    let decoding_key = DecodingKey::from_jwk(&owner_public_key_jwk).map_err(|e| {
-        SnResolverError::new(
-            SnResolverErrorKind::BackendUnavailable,
-            format!("failed to build decoding key from jwk: {}", e),
-        )
-    })?;
-
-    let mini =
-        decode_mini_config_with_schema_compat(mini_config_jwt, &decoding_key).map_err(|e| {
-            SnResolverError::new(
-                SnResolverErrorKind::BackendUnavailable,
-                format!("failed to parse mini_config_jwt: {}", e),
-            )
-        })?;
-
-    let owner_did_str = format!("did:bns:{}", owner_username);
-    let zone_did = DID::from_str(owner_did_str.as_str()).map_err(|e| {
-        SnResolverError::new(
-            SnResolverErrorKind::InvalidDid,
-            format!("failed to build zone did: {}", e),
-        )
-    })?;
-    let owner_did = DID::from_str(owner_did_str.as_str()).map_err(|e| {
-        SnResolverError::new(
-            SnResolverErrorKind::InvalidDid,
-            format!("failed to build owner did: {}", e),
-        )
-    })?;
-
-    let device_config = DeviceDocument::new_by_mini_document(
-        &mini_config_jwt.to_string(),
-        &mini,
-        zone_did,
-        owner_did,
-    );
-
-    serde_json::to_value(device_config).map_err(|e| {
-        SnResolverError::new(
-            SnResolverErrorKind::BackendUnavailable,
-            format!("failed to encode device_config: {}", e),
-        )
-    })
-}
-
-fn decode_mini_config_with_schema_compat(
-    mini_config_jwt: &str,
-    user_public_key: &DecodingKey,
-) -> Result<NameDeviceMiniDocument, String> {
-    match NameDeviceMiniDocument::from_jwt(mini_config_jwt, user_public_key) {
-        Ok(config) => Ok(config),
-        Err(primary_err) => {
-            let primary_err = primary_err.to_string();
-            if extract_missing_field_name(primary_err.as_str()).is_none() {
-                return Err(primary_err);
-            }
-
-            let mut claims = decode_json_from_jwt_with_pk(mini_config_jwt, user_public_key)
-                .map_err(|e| format!("jwt-claims compatibility fallback failed: {}", e))?;
-
-            let Some(obj) = claims.as_object_mut() else {
-                return Err("jwt-claims compatibility fallback expected object".to_string());
-            };
-
-            if !obj.contains_key("n") {
-                if let Some(v) = obj.get("name").cloned() {
-                    obj.insert("n".to_string(), v);
-                }
-            }
-            if !obj.contains_key("name") {
-                if let Some(v) = obj.get("n").cloned() {
-                    obj.insert("name".to_string(), v);
-                }
-            }
-            if !obj.contains_key("p") {
-                if let Some(v) = obj.get("rtcp_port").cloned() {
-                    obj.insert("p".to_string(), v);
-                }
-            }
-            if !obj.contains_key("rtcp_port") {
-                if let Some(v) = obj.get("p").cloned() {
-                    obj.insert("rtcp_port".to_string(), v);
-                }
-            }
-            if !obj.contains_key("hostname") {
-                if let Some(v) = obj.get("name").cloned().or_else(|| obj.get("n").cloned()) {
-                    obj.insert("hostname".to_string(), v);
-                }
-            }
-
-            serde_json::from_value::<NameDeviceMiniDocument>(claims)
-                .map_err(|e| format!("fallback mini_config parse failed: {}", e))
-        }
-    }
-}
-
-fn extract_missing_field_name(err: &str) -> Option<String> {
-    for marker in ["missing field `", "missing field '"] {
-        if let Some(start) = err.find(marker) {
-            let value_start = start + marker.len();
-            let tail = &err[value_start..];
-            if let Some(end) = tail.find(['`', '\'']) {
-                let field = tail[..end].trim();
-                if !field.is_empty() {
-                    return Some(field.to_string());
-                }
-            }
-        }
-    }
-    None
 }
 
 fn parse_ip_or_socket_addr(value: &str) -> Option<IpAddr> {
@@ -3300,6 +3013,7 @@ mod tests {
     struct StaticAuthReader {
         users: HashMap<String, SNUserInfo>,
         bindings: Vec<(String, String)>,
+        records: HashMap<(String, String), (String, u32)>,
     }
 
     #[async_trait]
@@ -3327,6 +3041,40 @@ mod tests {
 
         async fn get_zone_info(&self, username: &str) -> SnResolverResult<Option<ZoneInfo>> {
             Ok(Some(ZoneInfo::default_for(username)))
+        }
+
+        async fn get_user_dns_rrset(
+            &self,
+            name: &str,
+            record_type: UserDnsRecordType,
+        ) -> SnResolverResult<UserDnsLookup> {
+            let rrset = self
+                .records
+                .get(&(normalize_host_lossy(name), record_type.to_string()))
+                .map(|(value, ttl)| UserDnsRrset {
+                    name: normalize_host_lossy(name),
+                    record_type,
+                    ttl: *ttl,
+                    values: vec![value.clone()],
+                    revision: 1,
+                });
+            Ok(UserDnsLookup {
+                rrset,
+                observed_revision: u64::from(!self.records.is_empty()),
+            })
+        }
+
+        async fn list_user_dns_changes(
+            &self,
+            _after_revision: u64,
+            _limit: usize,
+        ) -> SnResolverResult<UserDnsChangePage> {
+            let current_revision = u64::from(!self.records.is_empty());
+            Ok(UserDnsChangePage {
+                changes: Vec::new(),
+                current_revision,
+                earliest_available_revision: current_revision.saturating_add(1),
+            })
         }
     }
 
@@ -3407,25 +3155,6 @@ mod tests {
         }))
     }
 
-    #[derive(Default)]
-    struct StaticCompatibilityReader {
-        records: HashMap<(String, String), (String, u32)>,
-    }
-
-    #[async_trait]
-    impl ResolverCompatibilityReader for StaticCompatibilityReader {
-        async fn query_domain_record(
-            &self,
-            domain: &str,
-            record_type: RecordType,
-        ) -> SnResolverResult<Option<(String, u32)>> {
-            Ok(self
-                .records
-                .get(&(normalize_host_lossy(domain), record_type.to_string()))
-                .cloned())
-        }
-    }
-
     fn test_user(username: &str, state: UserState, user_domain: Option<&str>) -> SNUserInfo {
         SNUserInfo {
             username: Some(username.to_string()),
@@ -3455,11 +3184,7 @@ mod tests {
         .with_bns_reader(Arc::new(bns))
     }
 
-    fn authoritative_test_resolver(
-        bns: StaticBnsReader,
-        auth: StaticAuthReader,
-        compatibility: StaticCompatibilityReader,
-    ) -> SnResolver {
+    fn authoritative_test_resolver(bns: StaticBnsReader, auth: StaticAuthReader) -> SnResolver {
         SnResolver::new_with_bns(
             SnResolverConfig::new(
                 "BuckyOS.Test.",
@@ -3471,7 +3196,6 @@ mod tests {
             Arc::new(auth),
             Arc::new(bns),
         )
-        .with_compatibility_reader(Arc::new(compatibility))
     }
 
     fn resolver_without_server_ip() -> SnResolver {
@@ -3576,17 +3300,16 @@ mod tests {
         auth.bindings
             .push(("bob.example".to_string(), "bob".to_string()));
 
-        let mut compatibility = StaticCompatibilityReader::default();
-        compatibility.records.insert(
+        auth.records.insert(
             ("www.bob.example".to_string(), "A".to_string()),
             ("198.51.100.20".to_string(), 90),
         );
-        compatibility.records.insert(
+        auth.records.insert(
             ("www.bob.example".to_string(), "TXT".to_string()),
             ("user-domain-record".to_string(), 90),
         );
 
-        let resolver = authoritative_test_resolver(bns, auth, compatibility);
+        let resolver = authoritative_test_resolver(bns, auth);
         assert!(resolver.config().boot_jwt.is_none());
         assert!(resolver.config().owner_pkx.is_none());
         assert!(resolver.config().device_jwts.is_empty());
@@ -3670,7 +3393,7 @@ mod tests {
                 version: None,
             };
             let error = resolver
-                .resolve_gateway_addresses(&zone, &device_doc, None, None)
+                .resolve_gateway_addresses(&zone, &device_doc, None)
                 .await
                 .unwrap_err();
             assert_eq!(error.kind(), SnResolverErrorKind::BackendUnavailable);
@@ -3716,13 +3439,13 @@ mod tests {
                 owner_config: None,
             },
         );
-        let mut compatibility = StaticCompatibilityReader::default();
+        let mut auth = StaticAuthReader::default();
         for (record_type, record) in [
             ("A", "192.0.2.11"),
             ("AAAA", "2001:db8::11"),
             ("TXT", "alice-txt"),
         ] {
-            compatibility.records.insert(
+            auth.records.insert(
                 (
                     "alice.web3.buckyos.test".to_string(),
                     record_type.to_string(),
@@ -3730,11 +3453,11 @@ mod tests {
                 (record.to_string(), 120),
             );
         }
-        compatibility.records.insert(
+        auth.records.insert(
             ("txt-only.web3.buckyos.test".to_string(), "TXT".to_string()),
             ("only-txt".to_string(), 120),
         );
-        let resolver = authoritative_test_resolver(bns, StaticAuthReader::default(), compatibility);
+        let resolver = authoritative_test_resolver(bns, auth);
 
         for record_type in ["A", "AAAA", "TXT"] {
             match resolver
@@ -3798,11 +3521,7 @@ mod tests {
                 owner_config: None,
             },
         );
-        let resolver_without_record = authoritative_test_resolver(
-            bns,
-            StaticAuthReader::default(),
-            StaticCompatibilityReader::default(),
-        );
+        let resolver_without_record = authoritative_test_resolver(bns, StaticAuthReader::default());
         assert!(matches!(
             resolver_without_record
                 .resolve_authoritative_dns_cached("_acme-challenge.alice.web3.buckyos.test", "MX",)
@@ -3820,16 +3539,15 @@ mod tests {
                 owner_config: None,
             },
         );
-        let mut compatibility = StaticCompatibilityReader::default();
-        compatibility.records.insert(
+        let mut auth = StaticAuthReader::default();
+        auth.records.insert(
             (
                 "_acme-challenge.alice.web3.buckyos.test".to_string(),
                 "TXT".to_string(),
             ),
             ("challenge".to_string(), 60),
         );
-        let resolver_with_record =
-            authoritative_test_resolver(bns, StaticAuthReader::default(), compatibility);
+        let resolver_with_record = authoritative_test_resolver(bns, auth);
         assert!(matches!(
             resolver_with_record
                 .resolve_authoritative_dns_cached("_acme-challenge.alice.web3.buckyos.test", "MX",)
@@ -3859,11 +3577,7 @@ mod tests {
             ("sub.example.com".to_string(), "bob".to_string()),
             ("suspended.test".to_string(), "mallory".to_string()),
         ];
-        let resolver = authoritative_test_resolver(
-            StaticBnsReader::default(),
-            auth,
-            StaticCompatibilityReader::default(),
-        );
+        let resolver = authoritative_test_resolver(StaticBnsReader::default(), auth);
 
         match resolver
             .resolve_authoritative_dns_cached("host.sub.example.com", "MX")
@@ -3899,7 +3613,6 @@ mod tests {
                 ..Default::default()
             },
             StaticAuthReader::default(),
-            StaticCompatibilityReader::default(),
         );
         assert!(matches!(
             resolver
@@ -4031,7 +3744,7 @@ mod tests {
         };
 
         let addresses = resolver
-            .resolve_gateway_addresses(&zone, &device_doc, None, Some(&online))
+            .resolve_gateway_addresses(&zone, &device_doc, Some(&online))
             .await
             .unwrap();
 
@@ -4369,12 +4082,11 @@ mod tests {
         );
         let resolver = test_resolver_with_bns(bns);
 
-        let (device, compatibility) = resolver
+        let device = resolver
             .resolve_device_mini_doc("testuser", "ood1", None)
             .await
             .unwrap();
 
-        assert!(compatibility.is_none());
         assert_eq!(device.device_name, "ood1");
         assert_eq!(device.did, "did:dev:embedded");
         assert_eq!(device.mini_config_jwt.as_deref(), Some("embedded-jwt"));
@@ -4406,11 +4118,11 @@ mod tests {
         );
         let standalone_resolver = test_resolver_with_bns(standalone_bns);
 
-        let (embedded, _) = embedded_resolver
+        let embedded = embedded_resolver
             .resolve_device_mini_doc("testuser", "ood1", None)
             .await
             .unwrap();
-        let (standalone, _) = standalone_resolver
+        let standalone = standalone_resolver
             .resolve_device_mini_doc("testuser", "ood1", None)
             .await
             .unwrap();
@@ -4449,7 +4161,7 @@ mod tests {
         );
         let resolver = test_resolver_with_bns(bns);
 
-        let (device, _) = resolver
+        let device = resolver
             .resolve_device_mini_doc("testuser", "ood1", None)
             .await
             .unwrap();
@@ -4620,7 +4332,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolves_bns_device_info_as_offline_without_runtime_state() {
+    async fn bns_static_device_document_does_not_impersonate_online_state() {
         let mut bns = StaticBnsReader::default();
         bns.documents.insert(
             ("testuser".to_string(), BNS_DOC_DEVICE_MINI.to_string()),
@@ -4640,17 +4352,11 @@ mod tests {
         let resolver = test_resolver_with_bns(bns);
         let did = DID::from_str("did:bns:ood1.testuser").unwrap();
 
-        let resolved = resolver
+        let error = resolver
             .resolve_did(&did, Some("info"), None)
             .await
-            .unwrap();
-        let value = match resolved.document {
-            EncodedDocument::JsonLd(value) => value,
-            EncodedDocument::Jwt(_) => panic!("expected json document"),
-        };
-
-        assert_eq!(resolved.source, SnDidDocumentSource::DeviceMiniDocument);
-        assert_eq!(value["state"], "offline");
-        assert_eq!(value["did"], "did:dev:abc");
+            .unwrap_err();
+        assert_eq!(error.kind(), SnResolverErrorKind::DeviceNotFound);
+        assert!(error.to_string().contains("online device"));
     }
 }

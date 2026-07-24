@@ -14,10 +14,6 @@ use crate::sn_bns_reader::BnsRpcDocumentReader;
 use crate::sn_bns_signer::{
     BoundControllerKeyManager, SnBnsControllerKeySpec, SnBnsProxyOperation, SnBnsTxSigner,
 };
-use crate::sn_compat_store::{
-    AuthDbRoutedSnCompatibilityStore, SNDeviceInfo, SnCompatibilityStoreRef,
-    SqliteSnCompatibilityStore,
-};
 use crate::sn_did_resolver::{
     key_like_string_to_jwk, normalize_sn_did_doc_type, owner_key_from_config, SnDidResolveRequest,
     SnDidResolverProfile, SnDidResolverRef, SnResolverBackedDidResolver,
@@ -25,10 +21,8 @@ use crate::sn_did_resolver::{
 };
 use crate::sn_dns_proof::{DnsTxtResolverRef, DohDnsTxtResolver, DEFAULT_PKX_DOH_URL};
 use crate::sn_resolver::{
-    device_config_from_mini_jwt, BnsDocumentReader, ResolverCompatibilityReader,
-    ResolverDeviceDocument, ResolverDidDocument, SnAuthDbRelayResolverReader, SnAuthResolverReader,
-    SnAuthoritativeDnsResult, SnDeviceInfoResolverReader, SnResolver, SnResolverConfig,
-    SnResolverError, SnResolverErrorKind, SnResolverRef, SnResolverResult,
+    BnsDocumentReader, SnAuthDbRelayResolverReader, SnAuthResolverReader, SnAuthoritativeDnsResult,
+    SnDeviceInfoResolverReader, SnResolver, SnResolverConfig, SnResolverErrorKind, SnResolverRef,
 };
 use crate::{
     GeoIpResolverConfig, RelayAllocationConfig, SnAuthDBRef, SnAuthDbClient,
@@ -40,8 +34,7 @@ use ::kRPC::*;
 use async_trait::async_trait;
 use bns_client::{
     canonical_bns_name, BnsEvmClientConfig, BnsEvmControllerClient, BnsRpcApi, BnsRpcClient,
-    BnsSystemInfo, Principal, SnBnsController, SnBnsControllerConfig,
-    SqliteSnBnsWriteRequestStore,
+    BnsSystemInfo, Principal, SnBnsController, SnBnsControllerConfig, SqliteSnBnsWriteRequestStore,
 };
 use buckyos_kit::{get_buckyos_service_data_dir, is_valid_name, NameType};
 pub use cyfs_gateway_api::SnOodInfo as OODInfo;
@@ -65,6 +58,7 @@ use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::str::FromStr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 use std::{
@@ -100,232 +94,7 @@ fn push_exportable_device_ip(address_vec: &mut Vec<IpAddr>, ip: IpAddr) {
     }
 }
 
-struct LegacyResolverCompatibilityReader {
-    auth_db: SnAuthDBRef,
-    device_info_db: SnDeviceInfoDBRef,
-    compat_store: SnCompatibilityStoreRef,
-}
-
-impl LegacyResolverCompatibilityReader {
-    fn new(
-        auth_db: SnAuthDBRef,
-        device_info_db: SnDeviceInfoDBRef,
-        compat_store: SnCompatibilityStoreRef,
-    ) -> Self {
-        Self {
-            auth_db,
-            device_info_db,
-            compat_store,
-        }
-    }
-
-    fn convert_device_state(view: crate::SnDeviceStateView) -> ResolverDeviceDocument {
-        let mut addresses = Vec::new();
-        for value in view
-            .public_ips
-            .iter()
-            .chain(view.private_ips.iter())
-            .map(|s| s.as_str())
-        {
-            if let Some(ip) = parse_ip_or_socket_addr(value) {
-                push_exportable_device_ip(&mut addresses, ip);
-            }
-        }
-        for endpoint in &view.active_endpoints {
-            if let Some(ip) = parse_ip_or_socket_addr(endpoint.host.as_str()) {
-                push_exportable_device_ip(&mut addresses, ip);
-            }
-        }
-
-        let document = serde_json::to_value(&view).ok();
-
-        ResolverDeviceDocument {
-            zone_name: view.zone,
-            device_name: view.device_name,
-            did: view.did,
-            mini_config_jwt: None,
-            document: document.clone(),
-            info_document: document,
-            addresses,
-            ttl: None,
-            version: None,
-        }
-    }
-
-    async fn convert_device(
-        &self,
-        device: SNDeviceInfo,
-    ) -> SnResolverResult<ResolverDeviceDocument> {
-        let raw_document = serde_json::from_str::<Value>(device.description.as_str()).ok();
-        let user_public_key = self
-            .auth_db
-            .get_user_info(device.owner.as_str())
-            .await
-            .map_err(|e| {
-                SnResolverError::backend(format!(
-                    "query owner {} for device {} failed: {}",
-                    device.owner, device.device_name, e
-                ))
-            })?
-            .map(|user| user.public_key);
-
-        let document = if !device.mini_config_jwt.trim().is_empty() {
-            if let Some(public_key) = user_public_key.as_deref() {
-                match device_config_from_mini_jwt(
-                    device.mini_config_jwt.as_str(),
-                    public_key,
-                    device.owner.as_str(),
-                ) {
-                    Ok(value) => Some(value),
-                    Err(e) => {
-                        warn!(
-                            "failed to build legacy device document for {}.{} from mini jwt: {}",
-                            device.device_name, device.owner, e
-                        );
-                        raw_document.clone()
-                    }
-                }
-            } else {
-                raw_document.clone()
-            }
-        } else {
-            raw_document.clone()
-        };
-
-        let mut addresses = Vec::new();
-        if let Some(ip) = parse_ip_or_socket_addr(device.ip.as_str()) {
-            push_exportable_device_ip(&mut addresses, ip);
-        }
-        collect_device_ips_from_legacy_document(raw_document.as_ref(), &mut addresses);
-
-        Ok(ResolverDeviceDocument {
-            zone_name: device.owner.clone(),
-            device_name: device.device_name.clone(),
-            did: device.did.clone(),
-            mini_config_jwt: if device.mini_config_jwt.trim().is_empty() {
-                None
-            } else {
-                Some(device.mini_config_jwt.clone())
-            },
-            document,
-            info_document: Some(build_legacy_device_info_json(&device)),
-            addresses,
-            ttl: None,
-            version: None,
-        })
-    }
-}
-
-#[async_trait]
-impl ResolverCompatibilityReader for LegacyResolverCompatibilityReader {
-    async fn query_domain_record(
-        &self,
-        domain: &str,
-        record_type: RecordType,
-    ) -> SnResolverResult<Option<(String, u32)>> {
-        self.compat_store
-            .query_domain_record(domain, record_type.to_string().as_str())
-            .await
-            .map_err(|e| {
-                SnResolverError::backend(format!(
-                    "query domain record {} {} failed: {}",
-                    domain,
-                    record_type.to_string(),
-                    e
-                ))
-            })
-    }
-
-    async fn get_device_by_name(
-        &self,
-        zone_name: &str,
-        device_name: &str,
-    ) -> SnResolverResult<Option<ResolverDeviceDocument>> {
-        let registered_device = self
-            .device_info_db
-            .get_device_state_by_name(zone_name, device_name)
-            .await
-            .map_err(|e| {
-                SnResolverError::backend(format!(
-                    "query registered device {}.{} failed: {}",
-                    device_name, zone_name, e
-                ))
-            })?
-            .map(Self::convert_device_state);
-
-        let Some(device) = self
-            .compat_store
-            .query_device_by_name(zone_name, device_name)
-            .await
-            .map_err(|e| {
-                SnResolverError::backend(format!(
-                    "query device {}.{} failed: {}",
-                    device_name, zone_name, e
-                ))
-            })?
-        else {
-            return Ok(registered_device);
-        };
-
-        self.convert_device(device).await.map(Some)
-    }
-
-    async fn get_device_by_did(
-        &self,
-        did: &str,
-    ) -> SnResolverResult<Option<ResolverDeviceDocument>> {
-        if let Some(view) = self
-            .device_info_db
-            .get_device_state(did)
-            .await
-            .map_err(|e| {
-                SnResolverError::backend(format!("query registered device {} failed: {}", did, e))
-            })?
-        {
-            return Ok(Some(Self::convert_device_state(view)));
-        }
-
-        let Some(device) = self
-            .compat_store
-            .query_device_by_did(did)
-            .await
-            .map_err(|e| SnResolverError::backend(format!("query device {} failed: {}", did, e)))?
-        else {
-            return Ok(None);
-        };
-
-        self.convert_device(device).await.map(Some)
-    }
-
-    async fn query_user_did_document(
-        &self,
-        owner_user: &str,
-        obj_name: &str,
-        doc_type: Option<&str>,
-    ) -> SnResolverResult<Option<ResolverDidDocument>> {
-        let Some((obj_id, document_json, stored_type)) = self
-            .compat_store
-            .query_user_did_document(owner_user, obj_name, doc_type)
-            .await
-            .map_err(|e| {
-                SnResolverError::backend(format!(
-                    "query did document {}/{} failed: {}",
-                    owner_user, obj_name, e
-                ))
-            })?
-        else {
-            return Ok(None);
-        };
-
-        Ok(Some(ResolverDidDocument {
-            obj_id,
-            document_json,
-            doc_type: stored_type,
-        }))
-    }
-}
-
-fn collect_device_ips_from_legacy_document(value: Option<&Value>, result: &mut Vec<IpAddr>) {
+fn collect_device_report_ips_from_json(value: Option<&Value>, result: &mut Vec<IpAddr>) {
     let Some(value) = value else {
         return;
     };
@@ -348,68 +117,6 @@ fn collect_device_ips_from_legacy_document(value: Option<&Value>, result: &mut V
                     push_exportable_device_ip(result, ip);
                 }
             }
-        }
-    }
-}
-
-fn build_legacy_device_info_json(device: &SNDeviceInfo) -> Value {
-    let mut value = serde_json::from_str::<Value>(device.description.as_str())
-        .unwrap_or_else(|_| json!({ "description": device.description }));
-
-    if let Some(obj) = value.as_object_mut() {
-        obj.insert("did".to_string(), Value::String(device.did.clone()));
-        obj.insert("ip".to_string(), Value::String(device.ip.clone()));
-        obj.insert("owner".to_string(), Value::String(device.owner.clone()));
-        obj.insert(
-            "device_name".to_string(),
-            Value::String(device.device_name.clone()),
-        );
-        obj.insert(
-            "created_at".to_string(),
-            Value::Number(serde_json::Number::from(device.created_at)),
-        );
-        obj.insert(
-            "updated_at".to_string(),
-            Value::Number(serde_json::Number::from(device.updated_at)),
-        );
-        sanitize_device_info_json_for_export(obj);
-    }
-
-    value
-}
-
-fn sanitize_device_info_json_for_export(obj: &mut serde_json::Map<String, Value>) {
-    let mut exportable_ips = Vec::new();
-
-    if let Some(ip_str) = obj.get("ip").and_then(|v| v.as_str()) {
-        if let Some(ip) = parse_ip_or_socket_addr(ip_str) {
-            push_exportable_device_ip(&mut exportable_ips, ip);
-        }
-    }
-
-    for key in ["ips", "all_ip"] {
-        if let Some(ip_values) = obj.get(key).and_then(|v| v.as_array()) {
-            for ip_str in ip_values.iter().filter_map(|v| v.as_str()) {
-                if let Some(ip) = parse_ip_or_socket_addr(ip_str) {
-                    push_exportable_device_ip(&mut exportable_ips, ip);
-                }
-            }
-        }
-    }
-
-    if let Some(first_ip) = exportable_ips.first() {
-        obj.insert("ip".to_string(), Value::String(first_ip.to_string()));
-    } else {
-        obj.remove("ip");
-    }
-
-    let exportable_ip_values: Vec<Value> = exportable_ips
-        .iter()
-        .map(|ip| Value::String(ip.to_string()))
-        .collect();
-    for key in ["ips", "all_ip"] {
-        if obj.contains_key(key) {
-            obj.insert(key.to_string(), Value::Array(exportable_ip_values.clone()));
         }
     }
 }
@@ -497,9 +204,9 @@ pub struct SNServer {
     id: String,
     auth_db: SnAuthDBRef,
     device_info_db: SnDeviceInfoDBRef,
-    compat_store: SnCompatibilityStoreRef,
     auth: Arc<SnAuthManager>,
     name_info_cache: NameInfoCacheRef,
+    user_dns_cache_revision: Arc<AtomicU64>,
     bns_dns_cache_state: Arc<RwLock<HashMap<String, BnsDnsCacheState>>>,
     resolver: SnResolverRef,
     did_resolver: SnDidResolverRef,
@@ -628,7 +335,6 @@ impl SNServer {
         server_config: SNServerConfig,
         auth_db: SnAuthDBRef,
         device_info_db: SnDeviceInfoDBRef,
-        compat_store: SnCompatibilityStoreRef,
         bns_client: BnsRpcClient,
         bns_proxy: Option<Arc<SnBnsProxy>>,
     ) -> ServerResult<Self> {
@@ -667,12 +373,7 @@ impl SNServer {
         .with_device_online_reader(Arc::new(SnDeviceInfoResolverReader::new(
             device_info_db.clone(),
         )))
-        .with_relay_reader(Arc::new(SnAuthDbRelayResolverReader::new(auth_db.clone())))
-        .with_compatibility_reader(Arc::new(LegacyResolverCompatibilityReader::new(
-            auth_db.clone(),
-            device_info_db.clone(),
-            compat_store.clone(),
-        )));
+        .with_relay_reader(Arc::new(SnAuthDbRelayResolverReader::new(auth_db.clone())));
         let resolver = Arc::new(resolver);
         let did_resolver = SnResolverBackedDidResolver::new_ref(resolver.clone(), auth_reader);
         let pkx_txt_resolver = DohDnsTxtResolver::new_ref(
@@ -686,9 +387,9 @@ impl SNServer {
             id: server_config.id,
             auth_db,
             device_info_db,
-            compat_store,
             auth,
             name_info_cache: NameInfoCache::new_ref(),
+            user_dns_cache_revision: Arc::new(AtomicU64::new(0)),
             bns_dns_cache_state: Arc::new(RwLock::new(HashMap::new())),
             resolver,
             did_resolver,
@@ -952,7 +653,7 @@ impl SNServer {
 
         let value = serde_json::from_str::<Value>(description).ok();
         let mut candidates = Vec::new();
-        collect_device_ips_from_legacy_document(value.as_ref(), &mut candidates);
+        collect_device_report_ips_from_json(value.as_ref(), &mut candidates);
         for ip in candidates {
             let value = ip.to_string();
             if !result.contains(&value) {
@@ -1082,9 +783,6 @@ impl SNServer {
             RPCResult::Success(json!({
                 "code": 0,
                 "deleted_users": result.deleted_users,
-                "deleted_devices": result.deleted_devices,
-                "deleted_domain_records": result.deleted_domain_records,
-                "deleted_did_documents": result.deleted_did_documents,
                 "activation_code_reset": result.activation_code_reset
             })),
             &req,
@@ -1262,18 +960,6 @@ impl SNServer {
                 .await;
         }
 
-        if let Some(device_info) = self
-            .compat_store
-            .query_device_by_did(did)
-            .await
-            .map_err(|e| RPCErrors::ReasonError(e.to_string()))?
-        {
-            let registered_did = device_info.did.clone();
-            return self
-                .ood_info_from_legacy_device(registered_did.as_str(), device_info)
-                .await;
-        }
-
         if let Some(key) = self.registered_device_key_from_did(did).await? {
             let canonical_did = self.canonical_device_did_from_scoped_did(did).await?;
             if let Some(view) = self
@@ -1298,29 +984,6 @@ impl SNServer {
                     .ood_info_from_device_state(registered_did.as_str(), view)
                     .await;
             }
-
-            if let Some(device_info) = self
-                .compat_store
-                .query_device_by_name(key.zone.as_str(), key.device_name.as_str())
-                .await
-                .map_err(|e| RPCErrors::ReasonError(e.to_string()))?
-            {
-                if let Some(canonical_did) = canonical_did.as_deref() {
-                    if canonical_did != device_info.did.as_str() {
-                        return Err(RPCErrors::ParseRequestError(
-                            Self::registered_device_did_mismatch(
-                                did,
-                                canonical_did,
-                                device_info.did.as_str(),
-                            ),
-                        ));
-                    }
-                }
-                let registered_did = device_info.did.clone();
-                return self
-                    .ood_info_from_legacy_device(registered_did.as_str(), device_info)
-                    .await;
-            }
         }
 
         Err(RPCErrors::ParseRequestError(
@@ -1343,24 +1006,6 @@ impl SNServer {
             owner_id: view.zone,
             self_cert: user.map(|u| u.self_cert).unwrap_or(false),
             state: Self::device_state_to_ood_state(view.state),
-        })
-    }
-
-    async fn ood_info_from_legacy_device(
-        &self,
-        did_for_hostname: &str,
-        device_info: SNDeviceInfo,
-    ) -> Result<OODInfo, RPCErrors> {
-        let user = self
-            .auth_db
-            .get_user_info(device_info.owner.as_str())
-            .await
-            .map_err(|e| RPCErrors::ReasonError(e.to_string()))?;
-        Ok(OODInfo {
-            did_hostname: Self::did_hostname(did_for_hostname),
-            owner_id: device_info.owner,
-            self_cert: user.map(|u| u.self_cert).unwrap_or(false),
-            state: SnOodState::Active,
         })
     }
 
@@ -1532,9 +1177,8 @@ impl SNServer {
              did:bns:<device>.<zone> or did:web:<device>.<domain> checks the \
              registered device binding by zone and device_name. Prefer passing the \
              canonical did:dev device DID after registration; scoped BNS/Web device \
-             DIDs are accepted as compatibility aliases. Verify the SN sqlite \
-             devices/device_indexes tables contain a device registered for the same \
-             public key, device name, and zone."
+             DIDs are accepted as aliases. Verify SnDeviceInfoDB contains a registered \
+             device index with the same public key, device name, and zone."
         )
     }
 
@@ -1607,10 +1251,6 @@ impl SNServer {
 
     pub(crate) fn auth_db(&self) -> &SnAuthDBRef {
         &self.auth_db
-    }
-
-    pub(crate) fn compat_store(&self) -> &SnCompatibilityStoreRef {
-        &self.compat_store
     }
 
     pub(crate) fn device_info_db(&self) -> &SnDeviceInfoDBRef {
@@ -1719,11 +1359,23 @@ impl NameServer for SNServer {
         );
         let record_type = record_type.unwrap_or_default();
         let req_real_name = Self::normalize_query_name(name);
+        let user_dns_revision = self
+            .resolver
+            .synchronize_user_dns_changes()
+            .await
+            .map_err(|error| error.to_server_error())?;
+        let previous_revision = self
+            .user_dns_cache_revision
+            .swap(user_dns_revision, Ordering::AcqRel);
+        if previous_revision != user_dns_revision {
+            self.name_info_cache.remove_matching_names(|_| true);
+        }
         let bns_cache_state = self.bns_dns_cache_query_state(req_real_name.as_str());
-        let bypass_bns_cache = bns_cache_state
-            .as_ref()
-            .map(|state| state.bypassed)
-            .unwrap_or(false);
+        let bypass_bns_cache = crate::sn_resolver::is_user_dns_control_name(req_real_name.as_str())
+            || bns_cache_state
+                .as_ref()
+                .map(|state| state.bypassed)
+                .unwrap_or(false);
 
         if !bypass_bns_cache {
             match self
@@ -1769,14 +1421,16 @@ impl NameServer for SNServer {
             Ok(resolution) => {
                 let name_info = resolution.into_name_info(name);
                 let cache_ttl_secs = name_info.ttl;
-                self.update_bns_dns_cache_if_current(bns_cache_state.as_ref(), || {
-                    self.name_info_cache.add(
-                        req_real_name.as_str(),
-                        record_type,
-                        name_info.clone(),
-                        cache_ttl_secs,
-                    );
-                });
+                if !bypass_bns_cache {
+                    self.update_bns_dns_cache_if_current(bns_cache_state.as_ref(), || {
+                        self.name_info_cache.add(
+                            req_real_name.as_str(),
+                            record_type,
+                            name_info.clone(),
+                            cache_ttl_secs,
+                        );
+                    });
+                }
                 Ok(name_info)
             }
             Err(e)
@@ -1788,10 +1442,15 @@ impl NameServer for SNServer {
                         | SnResolverErrorKind::DeviceNotFound
                 ) =>
             {
-                self.update_bns_dns_cache_if_current(bns_cache_state.as_ref(), || {
-                    self.name_info_cache
-                        .add_tombstone(req_real_name.as_str(), record_type, None);
-                });
+                if !bypass_bns_cache {
+                    self.update_bns_dns_cache_if_current(bns_cache_state.as_ref(), || {
+                        self.name_info_cache.add_tombstone(
+                            req_real_name.as_str(),
+                            record_type,
+                            None,
+                        );
+                    });
+                }
                 Err(server_err!(
                     ServerErrorCode::NotFound,
                     "no address found for {}",
@@ -2546,55 +2205,48 @@ impl ServerFactory for SnServerFactory {
             }
             Arc::new(auth_db)
         };
-
-        let device_info_db: SnDeviceInfoDBRef =
-            if let Some(url) = device_info_db_url.as_deref() {
-                info!("sn server uses remote device_info_db provider: {}", url);
-                Arc::new(SnDeviceInfoDbClient::new_krpc_url(url, None))
-            } else {
-                let device_info_db = SqliteSnDeviceInfoDB::new_by_path(db_path.as_str())
-                    .await
-                    .map_err(|e| {
-                        server_err!(
-                            ServerErrorCode::InvalidConfig,
-                            "open sn device info db failed: {}",
-                            e
-                        )
-                    })?;
-                device_info_db.initialize_database().await.map_err(|e| {
-                    server_err!(
-                        ServerErrorCode::InvalidConfig,
-                        "initialize sn device info db failed: {}",
-                        e
-                    )
-                })?;
-                Arc::new(device_info_db)
-            };
-
-        let compat_store = SqliteSnCompatibilityStore::new_by_path(db_path.as_str())
-            .await
-            .map_err(|e| {
-                server_err!(
-                    ServerErrorCode::InvalidConfig,
-                    "open sn compatibility store failed: {}",
-                    e
-                )
-            })?;
-        compat_store.initialize_database().await.map_err(|e| {
+        let capabilities = auth_db.capabilities().await.map_err(|e| {
             server_err!(
                 ServerErrorCode::InvalidConfig,
-                "initialize sn compatibility store failed: {}",
+                "AuthDB capability check failed: {}",
                 e
             )
         })?;
-        let local_compat_store: SnCompatibilityStoreRef = Arc::new(compat_store);
-        let compat_store: SnCompatibilityStoreRef = if auth_db_url.is_some() {
-            Arc::new(AuthDbRoutedSnCompatibilityStore::new(
-                auth_db.clone(),
-                local_compat_store,
-            ))
+        if capabilities.contract_version != crate::SN_AUTH_DB_CONTRACT_VERSION
+            || capabilities.schema_version != crate::SN_AUTH_DB_SCHEMA_VERSION
+            || !capabilities.user_dns_rrsets
+            || !capabilities.user_dns_change_feed
+        {
+            return Err(server_err!(
+                ServerErrorCode::InvalidConfig,
+                "incompatible AuthDB capability: expected contract {} / schema {} with user DNS RRsets/change feed, got {:?}",
+                crate::SN_AUTH_DB_CONTRACT_VERSION,
+                crate::SN_AUTH_DB_SCHEMA_VERSION,
+                capabilities
+            ));
+        }
+
+        let device_info_db: SnDeviceInfoDBRef = if let Some(url) = device_info_db_url.as_deref() {
+            info!("sn server uses remote device_info_db provider: {}", url);
+            Arc::new(SnDeviceInfoDbClient::new_krpc_url(url, None))
         } else {
-            local_compat_store
+            let device_info_db = SqliteSnDeviceInfoDB::new_by_path(db_path.as_str())
+                .await
+                .map_err(|e| {
+                    server_err!(
+                        ServerErrorCode::InvalidConfig,
+                        "open sn device info db failed: {}",
+                        e
+                    )
+                })?;
+            device_info_db.initialize_database().await.map_err(|e| {
+                server_err!(
+                    ServerErrorCode::InvalidConfig,
+                    "initialize sn device info db failed: {}",
+                    e
+                )
+            })?;
+            Arc::new(device_info_db)
         };
 
         let bns_proxy =
@@ -2606,7 +2258,6 @@ impl ServerFactory for SnServerFactory {
                 config.clone(),
                 auth_db,
                 device_info_db,
-                compat_store,
                 bns_client,
                 bns_proxy,
             )
@@ -3376,7 +3027,9 @@ mod tests {
         .await
         .err()
         .unwrap();
-        assert!(error.to_string().contains("bns_proxy.controllers cannot be empty"));
+        assert!(error
+            .to_string()
+            .contains("bns_proxy.controllers cannot be empty"));
     }
 
     /// 模拟「链 + indexer 同步完成」的 EVM 提交器：直接把 TX 应用到
@@ -3536,12 +3189,6 @@ mod tests {
         device_info_db.initialize_database().await.unwrap();
         let device_info_db: SnDeviceInfoDBRef = Arc::new(device_info_db);
 
-        let compat_store = SqliteSnCompatibilityStore::new_by_path(db_path)
-            .await
-            .unwrap();
-        compat_store.initialize_database().await.unwrap();
-        let compat_store: SnCompatibilityStoreRef = Arc::new(compat_store);
-
         let registry = Arc::new(
             bns_indexer::CentralizedBnsRegistry::new_legacy_state_machine(
                 bns_indexer::SqliteBnsRegistryStore::open_memory().unwrap(),
@@ -3600,7 +3247,6 @@ mod tests {
                 config,
                 auth_db,
                 device_info_db,
-                compat_store,
                 bns_client,
                 Some(Arc::new(proxy)),
             )
@@ -4421,75 +4067,6 @@ mod tests {
         assert!(!is_filtered_zonegate_ip(
             "240e:3b3:30c0:930::47f".parse().unwrap()
         ));
-    }
-
-    #[test]
-    fn test_build_device_info_json_filters_172_from_exported_ip_fields() {
-        let device = SNDeviceInfo {
-            owner: "meteormeta".to_string(),
-            device_name: "ood1".to_string(),
-            mini_config_jwt: "mini-jwt".to_string(),
-            did: "did:dev:test".to_string(),
-            ip: "172.26.48.1".to_string(),
-            description: json!({
-                "ip": "172.17.0.1",
-                "ips": ["172.20.1.2", "192.168.100.182", "240e:3b3:30c1:5380::997"],
-                "all_ip": ["172.26.48.1", "192.168.100.182", "240e:3b3:30c1:5380::997"]
-            })
-            .to_string(),
-            created_at: 1,
-            updated_at: 2,
-        };
-
-        let exported = build_legacy_device_info_json(&device);
-        assert_eq!(
-            exported.get("ip").and_then(|v| v.as_str()),
-            Some("192.168.100.182")
-        );
-        assert_eq!(
-            exported.get("ips").and_then(|v| v.as_array()).cloned(),
-            Some(vec![
-                Value::String("192.168.100.182".to_string()),
-                Value::String("240e:3b3:30c1:5380::997".to_string()),
-            ])
-        );
-        assert_eq!(
-            exported.get("all_ip").and_then(|v| v.as_array()).cloned(),
-            Some(vec![
-                Value::String("192.168.100.182".to_string()),
-                Value::String("240e:3b3:30c1:5380::997".to_string()),
-            ])
-        );
-    }
-
-    #[test]
-    fn test_build_device_info_json_removes_ip_when_only_filtered_values_exist() {
-        let device = SNDeviceInfo {
-            owner: "meteormeta".to_string(),
-            device_name: "ood1".to_string(),
-            mini_config_jwt: "mini-jwt".to_string(),
-            did: "did:dev:test".to_string(),
-            ip: "172.26.48.1".to_string(),
-            description: json!({
-                "ip": "172.17.0.1",
-                "ips": ["172.20.1.2"],
-                "all_ip": ["172.26.48.1"]
-            })
-            .to_string(),
-            created_at: 1,
-            updated_at: 2,
-        };
-
-        let exported = build_legacy_device_info_json(&device);
-        assert!(exported.get("ip").is_none());
-        assert_eq!(
-            exported.get("ips").and_then(|v| v.as_array()).cloned(),
-            Some(vec![])
-        );
-        assert_eq!(
-            exported.get("all_ip").and_then(|v| v.as_array()).cloned(),
-            Some(vec![])
-        );
     }
 
     #[tokio::test]
@@ -5407,9 +4984,9 @@ mod tests {
         assert_eq!(result["items"].as_array().unwrap().len(), 1);
 
         // `user.add_dns_record` keeps the SN-provided web3 bridge namespace in
-        // the local compatibility store even before a traditional user_domain
-        // is bound. ACME can therefore create and remove its short-lived TXT
-        // challenge without publishing a BNS document on chain.
+        // AuthDB even before a traditional user_domain is bound. ACME can
+        // therefore create and remove its short-lived TXT challenge without
+        // publishing a BNS document on chain.
         let bridge_challenge = format!("_acme-challenge.{}.web3.buckyos.ai", REFACTOR_USER);
         let result = auth_user_krpc
             .call(
@@ -5434,12 +5011,10 @@ mod tests {
             .as_array()
             .unwrap()
             .iter()
-            .find(|item| item["domain"].as_str() == Some(bridge_challenge.as_str()))
+            .find(|item| item["name"].as_str() == Some(bridge_challenge.as_str()))
             .unwrap();
-        assert_eq!(
-            bridge_record["record"].as_str().unwrap(),
-            "temporary-acme-proof"
-        );
+        assert_eq!(bridge_record["record_type"], "TXT");
+        assert_eq!(bridge_record["values"], json!(["temporary-acme-proof"]));
 
         let other_bridge_err = auth_user_krpc
             .call(
@@ -5544,12 +5119,10 @@ mod tests {
             assert_eq!(assignment.relay_id, "relay-refactor");
         }
 
-        // BNS 兼容域名（SN-Resolver.md）：嵌套 `public.<user>.web3.<host>` 同样
-        // 映射到该用户 zone——main_http/tls_raw_forward 链对 `*.*.web3.<host>`
-        // 的 self_cert 门控依赖这里能解析出 ANSWER（旧行为是 hostname_not_found，
-        // 导致嵌套主机永远走不到 self_cert 判定）。
+        // 仅有在线上报不能生成静态 device_mini_doc；按 hostname 解析必须等待
+        // BNS 静态文档发布，不能从 DeviceInfo 反向伪造身份文档。
         let nested_web3_host = format!("public.{}.web3.buckyos.ai", REFACTOR_USER);
-        let result = device_krpc
+        let nested_error = device_krpc
             .call(
                 "deviceinfo.resolve_ood_by_hostname",
                 json!({
@@ -5557,11 +5130,9 @@ mod tests {
                 }),
             )
             .await
-            .unwrap();
-        let nested_info = serde_json::from_value::<OODInfo>(result).unwrap();
-        assert_eq!(nested_info.did_hostname, registered_did_hostname);
-        assert_eq!(nested_info.owner_id, REFACTOR_USER);
-        assert!(!nested_info.self_cert);
+            .unwrap_err()
+            .to_string();
+        assert!(nested_error.contains("[SN:1017:hostname_not_found]"));
 
         let result = auth_user_krpc
             .call(
@@ -5639,16 +5210,16 @@ mod tests {
         assert_eq!(bound["pkx"].as_str().unwrap(), expected_pkx);
         assert_eq!(bound["pkx_record_name"].as_str().unwrap(), pkx_record);
 
-        // 绑定生效后 SN-DNS 侧可解析 user_domain 下的设备主机名。
-        let result = device_krpc
+        // user_domain 绑定不会改变静态设备文档来源；仍不得用在线态补文档。
+        let user_domain_device_error = device_krpc
             .call(
                 "deviceinfo.resolve_ood_by_hostname",
                 json!({ "dest_host": format!("ood1.{}", user_domain) }),
             )
             .await
-            .unwrap();
-        let ood_info = serde_json::from_value::<OODInfo>(result).unwrap();
-        assert_eq!(ood_info.owner_id, REFACTOR_USER);
+            .unwrap_err()
+            .to_string();
+        assert!(user_domain_device_error.contains("[SN:1017:hostname_not_found]"));
 
         let result = auth_user_krpc
             .call(
@@ -5773,53 +5344,17 @@ mod tests {
         let device_key_did = device_config.id.to_string();
         let device_scoped_did = format!("did:bns:ood1.{}", DEVTOKEN_USER);
 
-        let sn_factory = SnServerFactory::new();
         let db = tempfile::NamedTempFile::with_suffix(".db").unwrap();
         let auth_dir = tempfile::tempdir().unwrap();
-        {
-            let db = SqliteSnAuthDB::new_by_path(db.path().to_str().unwrap())
-                .await
-                .unwrap();
-            db.initialize_database().await.unwrap();
-            db.insert_activation_code(CLEAR_STATE_ACTIVE_CODE)
-                .await
-                .unwrap();
-        }
-        let bns_addr = spawn_test_http_server(Arc::new(ReadinessTestServer::new(
-            ReadinessServerMode::Ready,
-        )))
-        .await;
-        let config = json!({
-            "id": "test-device-token",
-            "host": "buckyos.ai",
-            "ip": "127.0.0.1",
-            "boot_jwt": "",
-            "owner_pkx": "",
-            "device_jwt": [],
-            "db_path": db.path().to_str().unwrap(),
-            "auth_data_dir": auth_dir.path().to_str().unwrap(),
-            "bns_server_url": format!("http://{}", bns_addr),
-            "bns_proxy": {
-                "require_user_asset_owner": false,
-                "controllers": [{
-                    "id": "default",
-                    "private_key": ANVIL_PRIVATE_KEY
-                }]
-            },
-        });
-        let config: SNServerConfig = serde_json::from_value(config).unwrap();
-        let servers = sn_factory.create(Arc::new(config), None).await.unwrap();
-        let http_server = servers
-            .iter()
-            .find_map(|server| match server {
-                Server::Http(server) => Some(server.clone()),
-                _ => None,
-            })
-            .unwrap();
+        let (sn, _) =
+            build_sn_with_bns_proxy(db.path().to_str().unwrap(), auth_dir.path(), false, false)
+                .await;
+        let http_server: Arc<dyn HttpServer> = sn;
         let http_addr = spawn_test_http_server(http_server).await;
         let base_url = format!("http://{}", http_addr);
         let auth_url = format!("{}/kapi/sn/auth", base_url);
         let deviceinfo_url = format!("{}/kapi/sn/deviceinfo", base_url);
+        let bns_proxy_url = format!("{}/kapi/sn/bns-proxy", base_url);
 
         let device_token = cyfs_gateway_api::generate_sn_device_token(
             device_key_did.as_str(),
@@ -5871,7 +5406,29 @@ mod tests {
         assert!(err.contains("device_permission_denied"), "{}", err);
         assert!(err.contains("is not registered"), "{}", err);
 
-        // 激活流程用账号 token 完成设备首次登记（现状协议，保持不变）。
+        // 在线登记不能充当静态身份锚。先由账号在 BNS 发布 device_mini_doc，
+        // 之后设备 token 才能通过公钥锚定。
+        let bns_krpc = kRPC::new(bns_proxy_url.as_str(), Some(access_token.clone()));
+        bns_krpc
+            .call(
+                "bns.publish_document",
+                json!({
+                    "name": DEVTOKEN_USER,
+                    "doc_type": crate::sn_resolver::BNS_DOC_DEVICE_MINI,
+                    "document": {
+                        "devices": {
+                            "ood1": {
+                                "did": device_key_did,
+                                "mini_config_jwt": "test-device-mini-jwt"
+                            }
+                        }
+                    }
+                }),
+            )
+            .await
+            .unwrap();
+
+        // 激活流程用账号 token完成设备首次在线登记。
         let account_krpc = kRPC::new(deviceinfo_url.as_str(), Some(access_token.clone()));
         let result = account_krpc
             .call(
@@ -5903,10 +5460,7 @@ mod tests {
         // values in its own zone. The payload's device_did is deliberately
         // forged to prove authorization comes from the token context.
         let device_auth_krpc = kRPC::new(auth_url.as_str(), Some(device_token.clone()));
-        let challenge = format!(
-            "_acme-challenge.{}.web3.buckyos.ai",
-            DEVTOKEN_USER
-        );
+        let challenge = format!("_acme-challenge.{}.web3.buckyos.ai", DEVTOKEN_USER);
         for value in ["root-order", "wildcard-order", "root-order"] {
             device_auth_krpc
                 .call(
@@ -5940,7 +5494,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(records["items"].as_array().unwrap().len(), 1);
-        assert_eq!(records["items"][0]["record"], "wildcard-order");
+        assert_eq!(records["items"][0]["values"], json!(["wildcard-order"]));
 
         let err = device_auth_krpc
             .call(
@@ -6128,7 +5682,11 @@ mod tests {
             .err()
             .unwrap()
             .to_string();
-        assert!(err.contains("not available on /kapi/sn/deviceinfo"), "{}", err);
+        assert!(
+            err.contains("not available on /kapi/sn/deviceinfo"),
+            "{}",
+            err
+        );
     }
 
     #[tokio::test]

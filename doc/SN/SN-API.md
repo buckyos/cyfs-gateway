@@ -117,20 +117,38 @@ RPC method 必须使用 `namespace.method` 形式。当前实现不再做 legacy
 |--------|--------|--------|------|
 | `user.get_profile` | `{}` | `code`, `name`, `owner_key_bound`, `user_domain`, `self_cert`, `sn_ips`, `zone_config` | 返回当前用户 profile。 |
 | `user.set_self_cert` | `self_cert: bool`, `device_did?` | `code` | 开启 `self_cert` 时必须提供属于当前用户的在线设备 DID。关闭时不需要 DID。 |
-| `user.add_dns_record` | `device_did`, `domain`, `record_type`, `record`, `ttl?`, `has_cert?` | `code`, `device_name` | 管理当前用户 `user_domain` 或 SN 提供的 `<username>.web3.<server_host>` 范围内的本地 DNS 记录。 |
-| `user.remove_dns_record` | `device_did`, `domain`, `record_type`, `record?`, `has_cert?` | `code` | 删除上述范围内的本地 DNS 记录；device token 调用时 `record` 必填并精确删除。 |
-| `user.list_dns_records` | `{}` | `code`, `items[]` | 列出当前用户本地 DNS 记录。 |
+| `user.add_dns_record` | `device_did`, `domain`, `record_type`, `record`, `ttl?`, `has_cert?` | `code`, `device_name`, `revision`, `changed` | 向当前用户的 AuthDB RRset 加入一个 value。 |
+| `user.remove_dns_record` | `device_did`, `domain`, `record_type`, `record?`, `has_cert?` | `code`, `revision`, `changed` | 精确删除 value；账号省略 `record` 时删除整个 RRset，device token 必须精确删除。 |
+| `user.list_dns_records` | `{}` | `code`, `items[]` | 按 name/type/value 稳定排序列出结构化 RRset。 |
 
 `user.add_dns_record` / `user.remove_dns_record` 要求 `device_did` 属于当前用户，并允许管理以下两个范围：
 
 - 已完成 active PKX 绑定的传统 `user_domain` 及其子域；
 - 当前账号自己的 `<username>.web3.<server_host>` 及其子域，例如 `_acme-challenge.alice.web3.<server_host>`。不能写入其他账号的 web3 bridge 域名。
 
-`record_type` 主要面向 `A`、`AAAA`、`TXT`。这两个范围的记录都保存在 SN compatibility store，由 SN DNS NameServer 优先解析；调用不会发布 BNS `dns_txt`、不会发起链上交易，也不会产生 gas 成本。因此 ACME 可以通过同一 API 创建和删除短期 challenge TXT 记录，而不必为临时状态上链。
+`record_type` 只允许 `A`、`AAAA`、`TXT`。name、A/AAAA rdata 会在授权前规范化；TTL
+范围是 `30..=86400`，缺省 600。记录存入 AuthDB 的 name/RRset/rdata 模型，由 SN DNS
+NameServer 优先解析；调用不会发布 BNS `dns_txt`、不会发起链上交易，也不会产生 gas 成本。
+
+`items[]` 的结构为：
+
+```json
+{
+  "name": "_acme-challenge.alice.web3.example.com",
+  "record_type": "TXT",
+  "ttl": 600,
+  "values": ["root-order", "wildcard-order"],
+  "revision": 42
+}
+```
+
+TXT value 始终是独立字符串，逗号属于值本身，不是多值分隔符。重复写入是 no-op，
+`changed=false` 且不分配新 revision。
 
 账号 access token 保持上述管理能力。`aud=sn-device` 的短期设备 token 只允许所属 zone 范围内的 `_acme-challenge.*` TXT；SN 使用已验证 token 得到的 zone/device/DID，忽略请求中的身份声明。TXT 使用多值 RRset 语义，重复添加同一 value 幂等，删除必须指定本次 challenge value，因此并发的根域和 wildcard order 不会互相覆盖或误删。`has_cert` 仅作为兼容字段解析，DNS mutation 不据此更新证书状态。
 
-> **过渡设计：** `<username>.web3.<server_host>` 的本地写入是 web3 bridge 仍承担 `did:bns:<username>` 到传统 DNS 名称转换期间的兼容措施。未来如果用户不再通过 web3 bridge 解析 `did:bns:xxx`，或者已有足够多 DNS 解析服务原生支持 `did:bns:xxx`，应移除这个本地例外，让 BNS 名称的 `add_dns_record` 重新回归 BNS 链上发布。传统 `user_domain` 的本地记录不受这一迁移方向影响。
+> `<username>.web3.<server_host>` 仍是 AuthDB 管理的 bridge namespace，用于避免 ACME
+> 短期状态上链；它不是旧 compat store fallback。
 
 `items[]` 结构：
 
@@ -361,7 +379,7 @@ SN 代付 gas 的受限 BNS 写代理：用户不需要持有 gas，就能通过
 
 | Method | Params | Result | 说明 |
 |--------|--------|--------|------|
-| `admin.clear_state_by_active_code` | `{}` | `code`, `deleted_users`, `deleted_devices`, `deleted_domain_records`, `deleted_did_documents`, `activation_code_reset` | 清理内置激活码关联的测试/运维状态。请求参数中不允许带 `active_code`。 |
+| `admin.clear_state_by_active_code` | `{}` | `code`, `deleted_users`, `activation_code_reset` | 清理内置激活码关联的测试/运维业务状态。请求参数中不允许带 `active_code`，响应不暴露表级删除计数。 |
 
 `/` 同时还承载 bns-proxy 的内部/恢复方法 `bns.publish_relay_assignment`、`bns.register_name_bootstrap`（参数与返回见 6.1、6.2）：同一机制，只允许 loopback 来源，不出现在任何公网路径。非 loopback 请求在解析 RPC body 前返回 HTTP 404。
 
@@ -379,7 +397,7 @@ SN 仍然提供两个标准解析面，但它们不是 SN RPC：
 | 接口 | 形式 | 说明 |
 |------|------|------|
 | W3C DID Resolver | `GET /1.0/identifiers/{did}?type={doc_type}` | 支持 `did:bns`、`did:dev`、`did:web`，返回 `application/json` 或 `application/jwt`。 |
-| DNS NameServer | DNS `A` / `AAAA` / `TXT` 查询 | 解析 SN 自身、user_domain、本地 DNS 记录、BNS 文档和设备在线态。 |
+| DNS NameServer | DNS `A` / `AAAA` / `TXT` 查询 | 解析 SN 自身、AuthDB user DNS、user_domain、BNS 静态文档和 DeviceInfo 在线态。 |
 
 需要解析 DID 或域名时优先使用这两个标准接口，不再通过 kRPC `query.resolve_*`。
 

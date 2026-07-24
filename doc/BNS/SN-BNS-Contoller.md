@@ -690,20 +690,22 @@ SN API 响应中建议包含：
 - version guard：`expected_name_seq` 来自 `NameState`，`expected_version` 来自当前文档状态（`:660-715`）。
 - 幂等逻辑 `run_idempotent`（`:902-1012`）：request_id 必填、payload_hash 冲突拒绝、pending/failed/succeeded 状态机、重放 `mark_reused`。
 
-### `cyfs-sn`（写 API 全部仍是 compat-shim，未迁移，阶段二）
+### `cyfs-sn`（Beta2.2 当前边界）
 
-下列写入点目标是迁移到 `SnBnsController`，但目前**全部仍只写本地 SQLite**，未接入写入层：
+- `auth.register` 通过 `SnBnsProxy` 提交 BNS name bootstrap，再创建 AuthDB 账号；receipt
+  未确认时不提前创建本地用户。
+- `bns.publish_document` / `bns.publish_dns_txt` 是受 controller policy、operation
+  allowlist 和幂等 request_id 约束的代付写入口。
+- `device.register/update` 只写 `SnDeviceInfoDB` 在线态；设备静态身份必须发布为 BNS
+  `device_mini_doc`，在线 JSON 不得作为静态文档 fallback。
+- `user.add_dns_record/remove_dns_record` 管理 AuthDB user-domain / web3 bridge RRset，
+  不发布 BNS `dns_txt`。它使用 name/RRset/rdata 与 revision change feed，不是 BNS
+  document 的本地缓存。
+- 普通 DID document 只从 BNS/indexer 读取；本地 DID 写表与 fallback 已删除。
 
-- `api/auth.rs::register`: 仍只 `register_user` 写本地 `users` / `user_auth`，返回 `need_bind_owner_key=true`；尚未调用 `bootstrap_name`。
-- `api/zone.rs::bind_config`: 仍只写 `users.zone_config`（按需 `update_user_domain`）；尚未发布 BNS `zone` / `boot`。
-- `api/device.rs::register`: 仍校验 `mini_config_jwt` 后写本地 `devices` 表；尚未发布 BNS `device_mini_doc`，本地也无 `pending_bns_publish` 状态。
-- `api/dns.rs::add_record/remove_record`: 仍只写本地 `user_dns_records`（compat store）；尚未发布 BNS `dns_txt`。传统 `user_domain` 记录本就继续走 `sn_auth`。
-- `api/did.rs::set_document`: 仍只写本地 `did_documents` 表，是纯 compat 缓存；尚未对标准 doc type 改为 BNS `publish_document`。
-
-`cyfs-sn` 侧其它已知缺口：
-
-- 没有 `sn_authority` → `CallAuthority` 的桥接；写入库把 `CallAuthority` 当作已构造好的入参。
-- 文档错误映射表（`CONTROLLER_SCOPE_DENIED` / `NOT_EFFECTIVE_OWNER` 等 → SN API code，见上文"错误映射"）在 `cyfs-sn` 中**不存在**，因为根本没有调用 controller。
+`sn_authority` 已把账号和设备 token 收敛为明确上下文；BNS proxy 再将账号授权映射到绑定
+controller。`CONTROLLER_SCOPE_DENIED` / `NOT_EFFECTIVE_OWNER` 等错误会映射成稳定 SN API
+错误，不会静默改用本地 SQLite。
 
 ### `bns-indexer`
 

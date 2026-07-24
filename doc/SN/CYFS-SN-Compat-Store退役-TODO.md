@@ -1,8 +1,20 @@
 # CYFS-SN Compat Store 退役 TODO
 
-> 状态：待实施。2026-07-23 按 Beta2.2 breaking change 重新设计。  
+> 状态：已完成。2026-07-23 按 Beta2.2 breaking change 实施并验收。
 > 前提：真实数据尚未上线，测试环境允许清库重建；本轮不提供旧 schema
 > migration、旧数据导入或 runtime fallback。
+
+## 0. 实施结果
+
+Beta2.2 已删除 compat store 模块、trait、adapter、旧表和所有 resolver/API fallback。
+user DNS 已迁入 AuthDB v2 的 name/RRset/rdata 模型，并通过结构化 S2S contract、全局
+revision/change feed 和控制记录 cache bypass 支持多副本一致性。静态 device/DID document
+只读 BNS，在线态只读 `SnDeviceInfoDB`，AuthDB zone/boot 投影标记为
+`AuthDbProjection`。
+
+升级是明确的 breaking change：SN、AuthDB provider 和客户端必须同步升级；旧数据库启动会
+返回 `incompatible schema, recreate database`。部署步骤是停服、备份后删除旧测试数据库，
+再由 Beta2.2 创建 fresh schema，不提供原地 migration 或混跑窗口。
 
 ## 1. 设计基线
 
@@ -309,28 +321,28 @@ document。
 - `src/components/cyfs-gateway-api/`
 - 生产 AuthDB provider
 
-- [ ] 提升 AuthDB schema version；旧 version 启动时返回明确的
+- [x] 提升 AuthDB schema version；旧 version 启动时返回明确的
   `incompatible schema, recreate database`，不执行兼容 migration。
-- [ ] 删除 `devices`、`did_documents`、旧 `user_dns_records` DDL。
-- [ ] 实现 `user_dns_names`、`user_dns_rrsets`、`user_dns_rdata`、
+- [x] 删除 `devices`、`did_documents`、旧 `user_dns_records` DDL。
+- [x] 实现 `user_dns_names`、`user_dns_rrsets`、`user_dns_rdata`、
   `user_dns_state` 和 `user_dns_changes`。
-- [ ] 固定 canonical domain、record type、rdata、TTL 和 TXT size validation。
-- [ ] 定义结构化 RRset、lookup、mutation result 和 change event 类型。
-- [ ] 删除旧 add/remove/query/list user DNS S2S method，统一切换到新 method；
+- [x] 固定 canonical domain、record type、rdata、TTL 和 TXT size validation。
+- [x] 定义结构化 RRset、lookup、mutation result 和 change event 类型。
+- [x] 删除旧 add/remove/query/list user DNS S2S method，统一切换到新 method；
   不保留双 contract。
-- [ ] production provider 与本地 `SqliteSnAuthDB` 同步实现，启动时校验 capability。
+- [x] production provider 与本地 `SqliteSnAuthDB` 同步实现，启动时校验 capability。
 
 ### B. 实现 AuthDB user DNS 事务
 
-- [ ] 实现 name owner claim；数据库保证同一 name 不能跨 owner。
-- [ ] 实现幂等 put、并发多值 add、RRset TTL 规则和稳定排序。
-- [ ] 实现精确 value 删除、显式 RRset 删除及空 rrset/name 清理。
-- [ ] 每次实际 mutation 在同一事务生成一个全局 revision/change event。
-- [ ] revision 只能由事务内的 `user_dns_state` 分配；禁止 `MAX + 1` 和进程内计数器。
-- [ ] domain unbind、account delete、`clear_state_by_active_code` 产生完整删除事件。
-- [ ] 并发测试覆盖两个事务同时 claim name、同时 add value、add/remove 交错和重复
+- [x] 实现 name owner claim；数据库保证同一 name 不能跨 owner。
+- [x] 实现幂等 put、并发多值 add、RRset TTL 规则和稳定排序。
+- [x] 实现精确 value 删除、显式 RRset 删除及空 rrset/name 清理。
+- [x] 每次实际 mutation 在同一事务生成一个全局 revision/change event。
+- [x] revision 只能由事务内的 `user_dns_state` 分配；禁止 `MAX + 1` 和进程内计数器。
+- [x] domain unbind、account delete、`clear_state_by_active_code` 产生完整删除事件。
+- [x] 并发测试覆盖两个事务同时 claim name、同时 add value、add/remove 交错和重复
   request。
-- [ ] remote provider failure 必须 fail-closed，不得创建或读取本地替代数据。
+- [x] remote provider failure 必须 fail-closed，不得创建或读取本地替代数据。
 
 ### C. API 直接调用 AuthDB
 
@@ -340,13 +352,13 @@ document。
 - `src/components/cyfs-sn/src/api/common.rs`
 - `src/components/cyfs-sn/src/sn_server.rs`
 
-- [ ] `dns.add_record` 改为 `put_user_dns_value`。
-- [ ] `dns.remove_record` 拆分精确 value 删除与 owner-only RRset 删除。
-- [ ] `dns.list_records` 返回结构化 RRset；同步修改 gateway API 和客户端。
-- [ ] 保留 SnUser/Device identity、domain scope、Device 仅限 ACME TXT 等授权边界。
-- [ ] 所有 name/type/value 在授权前后使用同一 canonical representation，避免校验值和
+- [x] `dns.add_record` 改为 `put_user_dns_value`。
+- [x] `dns.remove_record` 拆分精确 value 删除与 owner-only RRset 删除。
+- [x] `dns.list_records` 返回结构化 RRset；同步修改 gateway API 和客户端。
+- [x] 保留 SnUser/Device identity、domain scope、Device 仅限 ACME TXT 等授权边界。
+- [x] 所有 name/type/value 在授权前后使用同一 canonical representation，避免校验值和
   落库值不同。
-- [ ] mutation 成功后按 committed revision 更新当前副本 cache cursor。
+- [x] mutation 成功后按 committed revision 更新当前副本 cache cursor。
 
 ### D. Resolver 直接使用 AuthDB 与 device-info
 
@@ -356,20 +368,20 @@ document。
 - `src/components/cyfs-sn/src/sn_server.rs`
 - `src/components/cyfs-sn/src/sn_did_resolver.rs`
 
-- [ ] 为 `SnAuthReader` 增加结构化 user DNS lookup/change-feed 能力，或增加命名准确的
+- [x] 为 `SnAuthReader` 增加结构化 user DNS lookup/change-feed 能力，或增加命名准确的
   `UserDnsReader`；禁止出现新的 compatibility reader。
-- [ ] 显式 DNS 查询直接消费 `Vec<String>`，删除逗号 split/join。
-- [ ] name existence 使用 AuthDB name/RRset 查询，保持权威 NXDOMAIN/NODATA 语义。
-- [ ] 保持 explicit RRset 高于 BNS/合成记录的现有优先级。
-- [ ] `_acme-challenge` / `_pkx` 缺失时不得回退到 BNS。
-- [ ] 每个 SN 副本消费 `user_dns_changes` 并同时失效正缓存和负缓存。
-- [ ] change consumer 断档时清空全部 user DNS cache；恢复前控制记录绕过缓存。
-- [ ] `_acme-challenge`、`_pkx` 等控制 name 的正负查询默认绕过本地 TTL cache，保证
+- [x] 显式 DNS 查询直接消费 `Vec<String>`，删除逗号 split/join。
+- [x] name existence 使用 AuthDB name/RRset 查询，保持权威 NXDOMAIN/NODATA 语义。
+- [x] 保持 explicit RRset 高于 BNS/合成记录的现有优先级。
+- [x] `_acme-challenge` / `_pkx` 缺失时不得回退到 BNS。
+- [x] 每个 SN 副本消费 `user_dns_changes` 并同时失效正缓存和负缓存。
+- [x] change consumer 断档时清空全部 user DNS cache；恢复前控制记录绕过缓存。
+- [x] `_acme-challenge`、`_pkx` 等控制 name 的正负查询默认绕过本地 TTL cache，保证
   commit 后任一 SN 副本的下一次查询直接观察 AuthDB；普通 RRset 的跨副本陈旧窗口不得
   超过声明的 change-feed poll SLA。
-- [ ] static device document 只读 BNS；online info 只读 `SnDeviceInfoDB`。
-- [ ] 重构 `resolve_device_mini_doc` 及其调用者，不再使用 online state 冒充 static doc。
-- [ ] 删除 local DID document fallback，统一返回结构化 not-found。
+- [x] static device document 只读 BNS；online info 只读 `SnDeviceInfoDB`。
+- [x] 重构 `resolve_device_mini_doc` 及其调用者，不再使用 online state 冒充 static doc。
+- [x] 删除 local DID document fallback，统一返回结构化 not-found。
 
 ### E. 删除 compat store 与 legacy 分支
 
@@ -383,28 +395,28 @@ document。
 - `src/components/cyfs-sn/src/api/dns.rs`
 - `src/components/cyfs-sn/src/api/device.rs`
 
-- [ ] 删除 `sn_compat_store.rs`。
-- [ ] 删除 module 声明和 public re-export。
-- [ ] 删除 `SnCompatibilityStore`、ref alias、两个实现和 `SNDeviceInfo`。
-- [ ] 删除 `LegacyResolverCompatibilityReader`。
-- [ ] 删除 `ResolverCompatibilityReader`、empty implementation、
+- [x] 删除 `sn_compat_store.rs`。
+- [x] 删除 module 声明和 public re-export。
+- [x] 删除 `SnCompatibilityStore`、ref alias、两个实现和 `SNDeviceInfo`。
+- [x] 删除 `LegacyResolverCompatibilityReader`。
+- [x] 删除 `ResolverCompatibilityReader`、empty implementation、
   `SnResolver.compatibility` 和 `with_compatibility_reader`。
-- [ ] 删除 `SNServer.compat_store` 字段、constructor 参数和 accessor。
-- [ ] `SnServerFactory` 不再打开或初始化 compatibility SQLite。
-- [ ] 删除 `resolve_ood_by_did`、device ownership 和 report DID inference 中的
+- [x] 删除 `SNServer.compat_store` 字段、constructor 参数和 accessor。
+- [x] `SnServerFactory` 不再打开或初始化 compatibility SQLite。
+- [x] 删除 `resolve_ood_by_did`、device ownership 和 report DID inference 中的
   legacy device fallback。
-- [ ] 删除 `resolve_legacy_local_did_doc`、`ood_info_from_legacy_device`、
+- [x] 删除 `resolve_legacy_local_did_doc`、`ood_info_from_legacy_device`、
   `build_legacy_device_info_json` 和其他 legacy conversion helper。
-- [ ] 删除 `SnDidDocumentSource::LegacyCompatibilityStore`；需要保留的 AuthDB
+- [x] 删除 `SnDidDocumentSource::LegacyCompatibilityStore`；需要保留的 AuthDB
   projection 改用新 source。
 
 ### F. 重做 clear-state 与 schema 初始化
 
-- [ ] `SnClearStateResult` 只表达业务结果，不返回各存储表删除行数。
-- [ ] 删除 `sqlite_master` probe、optional legacy table count/delete。
-- [ ] 使用 foreign key cascade 清理关联数据，同时由业务事务写 change event。
-- [ ] fresh AuthDB 初始化后只包含新 schema；不存在任何 compatibility table/index。
-- [ ] 删除所有 old-index drop、ALTER、copy-table 等 migration 分支。
+- [x] `SnClearStateResult` 只表达业务结果，不返回各存储表删除行数。
+- [x] 删除 `sqlite_master` probe、optional legacy table count/delete。
+- [x] 使用 foreign key cascade 清理关联数据，同时由业务事务写 change event。
+- [x] fresh AuthDB 初始化后只包含新 schema；不存在任何 compatibility table/index。
+- [x] 删除所有 old-index drop、ALTER、copy-table 等 migration 分支。
 
 ### G. 测试和文档
 
@@ -417,21 +429,21 @@ document。
 - `doc/SN/SN-DID-Resolver.md`
 - `doc/BNS/SN-BNS-Contoller.md`
 
-- [ ] 删除 compat-store unit/integration fixture。
-- [ ] 用 AuthDB RRset fixture 替换 `StaticCompatibilityReader`。
-- [ ] 更新所有 `SNServer::new` 测试构造。
-- [ ] schema test 校验 table、PK、FK、CHECK、index 和 foreign-key enforcement。
-- [ ] contract test 覆盖 local/in-process/remote 三种实现。
-- [ ] DNS test 覆盖 A/AAAA canonicalization、TXT 逗号、TXT 多值、TTL、
+- [x] 删除 compat-store unit/integration fixture。
+- [x] 用 AuthDB RRset fixture 替换 `StaticCompatibilityReader`。
+- [x] 更新所有 `SNServer::new` 测试构造。
+- [x] schema test 校验 table、PK、FK、CHECK、index 和 foreign-key enforcement。
+- [x] contract test 覆盖 local/in-process/remote 三种实现。
+- [x] DNS test 覆盖 A/AAAA canonicalization、TXT 逗号、TXT 多值、TTL、
   幂等和稳定排序。
-- [ ] authorization test 覆盖跨 owner name claim、Device 精确删除和 SnUser
+- [x] authorization test 覆盖跨 owner name claim、Device 精确删除和 SnUser
   RRset 删除。
-- [ ] 两个 SN resolver 实例共享 provider：控制记录在 commit 后的下一次查询直接可见；
+- [x] 两个 SN resolver 实例共享 provider：控制记录在 commit 后的下一次查询直接可见；
   普通记录在声明的 poll SLA 内完成正/负 cache 失效。
-- [ ] 模拟 change-log retention gap，验证 consumer 清空 cache 后恢复。
-- [ ] 覆盖 BNS static doc、device-info online state 分离后的所有 DID/DNS 组合。
-- [ ] 旧 schema 文件启动必须返回明确 incompatibility error；测试不要求 migration。
-- [ ] 文档和 release note 明确必须清库重建，以及所有删除/重命名的 API。
+- [x] 模拟 change-log retention gap，验证 consumer 清空 cache 后恢复。
+- [x] 覆盖 BNS static doc、device-info online state 分离后的所有 DID/DNS 组合。
+- [x] 旧 schema 文件启动必须返回明确 incompatibility error；测试不要求 migration。
+- [x] 文档和 release note 明确必须清库重建，以及所有删除/重命名的 API。
 
 建议验证命令：
 
@@ -457,14 +469,14 @@ cargo check --workspace
 
 ## 7. 完成标准
 
-- [ ] 源码和测试中不存在 `SnCompatibilityStore`、
+- [x] 源码和测试中不存在 `SnCompatibilityStore`、
   `SqliteSnCompatibilityStore`、`AuthDbRoutedSnCompatibilityStore`、
   `LegacyResolverCompatibilityReader`。
-- [ ] 数据库中不存在 `devices`、`did_documents`、旧 `user_dns_records`。
-- [ ] user DNS 使用 name/RRset/rdata 三层模型和强 owner 约束。
-- [ ] S2S contract 不再使用逗号拼接 value 或 `Option<record>` 重载删除语义。
-- [ ] local、remote、多副本查询具有一致结果，正负 cache 均能按 revision 失效。
-- [ ] static device document、online state、DID document 的来源完全分离。
-- [ ] 管理 API 不暴露数据库表级删除计数。
-- [ ] 旧 schema 被明确拒绝；fresh schema 初始化和全量测试通过。
-- [ ] `cargo test -p cyfs-sn -- --test-threads=1` 与 workspace check 通过。
+- [x] 数据库中不存在 `devices`、`did_documents`、旧 `user_dns_records`。
+- [x] user DNS 使用 name/RRset/rdata 三层模型和强 owner 约束。
+- [x] S2S contract 不再使用逗号拼接 value 或 `Option<record>` 重载删除语义。
+- [x] local、remote、多副本查询具有一致结果，正负 cache 均能按 revision 失效。
+- [x] static device document、online state、DID document 的来源完全分离。
+- [x] 管理 API 不暴露数据库表级删除计数。
+- [x] 旧 schema 被明确拒绝；fresh schema 初始化和全量测试通过。
+- [x] `cargo test -p cyfs-sn -- --test-threads=1` 与 workspace check 通过。

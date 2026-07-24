@@ -3,8 +3,9 @@ use crate::{
     RegisterUserWithRelayAllocationReq, RegisterUserWithRelayAllocationResult,
     RelayAdmissionDecision, RelayAdmissionReq, RelayAssignment, RelayHeartbeat, RelayMigrationReq,
     RelayNode, RelayNodeAddressUpdate, RelayNodeHealth, RelayNodeIpMapReq, RelayNodeIpMapSnapshot,
-    RelayNodeRegistration, SNUserInfo, SnAuthDB, SnAuthInfo, SnClearStateResult, SnError,
-    SnErrorCode, SnResult, UserState, ZoneInfo, ZoneInfoPatch,
+    RelayNodeRegistration, SNUserInfo, SnAuthDB, SnAuthDbCapabilities, SnAuthInfo,
+    SnClearStateResult, SnError, SnErrorCode, SnResult, UserDnsChangePage, UserDnsLookup,
+    UserDnsMutationResult, UserDnsRecordType, UserDnsRrset, UserState, ZoneInfo, ZoneInfoPatch,
 };
 use ::kRPC::{kRPC, RPCErrors, RPCHandler, RPCRequest, RPCResponse, RPCResult};
 use async_trait::async_trait;
@@ -16,6 +17,7 @@ use std::sync::Arc;
 
 pub const SN_AUTH_DB_RPC_PATH: &str = "/kapi/sn/s2s/auth-db";
 
+pub const METHOD_CAPABILITIES: &str = "sn_auth_db.capabilities";
 pub const METHOD_GET_ACTIVATION_CODES: &str = "sn_auth_db.get_activation_codes";
 pub const METHOD_INSERT_ACTIVATION_CODE: &str = "sn_auth_db.insert_activation_code";
 pub const METHOD_GENERATE_ACTIVATION_CODES: &str = "sn_auth_db.generate_activation_codes";
@@ -41,10 +43,13 @@ pub const METHOD_GET_AUTH: &str = "sn_auth_db.get_auth";
 pub const METHOD_UPDATE_LAST_LOGIN: &str = "sn_auth_db.update_last_login";
 pub const METHOD_ACTIVATE_USER_DOMAIN_BINDING: &str = "sn_auth_db.activate_user_domain_binding";
 pub const METHOD_UNBIND_USER_DOMAIN: &str = "sn_auth_db.unbind_user_domain";
-pub const METHOD_ADD_USER_DNS_RECORD: &str = "sn_auth_db.add_user_dns_record";
-pub const METHOD_REMOVE_USER_DNS_RECORD: &str = "sn_auth_db.remove_user_dns_record";
-pub const METHOD_QUERY_USER_DNS_RECORD: &str = "sn_auth_db.query_user_dns_record";
-pub const METHOD_LIST_USER_DNS_RECORDS: &str = "sn_auth_db.list_user_dns_records";
+pub const METHOD_PUT_USER_DNS_VALUE: &str = "sn_auth_db.put_user_dns_value";
+pub const METHOD_REMOVE_USER_DNS_VALUE: &str = "sn_auth_db.remove_user_dns_value";
+pub const METHOD_DELETE_USER_DNS_RRSET: &str = "sn_auth_db.delete_user_dns_rrset";
+pub const METHOD_SET_USER_DNS_RRSET_TTL: &str = "sn_auth_db.set_user_dns_rrset_ttl";
+pub const METHOD_GET_USER_DNS_RRSET: &str = "sn_auth_db.get_user_dns_rrset";
+pub const METHOD_LIST_USER_DNS_RRSETS: &str = "sn_auth_db.list_user_dns_rrsets";
+pub const METHOD_LIST_USER_DNS_CHANGES: &str = "sn_auth_db.list_user_dns_changes";
 pub const METHOD_GET_ZONE_INFO: &str = "sn_auth_db.get_zone_info";
 pub const METHOD_UPDATE_ZONE_INFO: &str = "sn_auth_db.update_zone_info";
 pub const METHOD_UPDATE_ZONE_RELAY_SN: &str = "sn_auth_db.update_zone_relay_sn";
@@ -552,64 +557,127 @@ impl SnAuthDbUnbindUserDomainReq {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SnAuthDbAddUserDnsRecordReq {
-    pub username: String,
-    pub domain: String,
-    pub record_type: String,
-    pub record: String,
+pub struct SnAuthDbPutUserDnsValueReq {
+    pub owner: String,
+    pub name: String,
+    pub record_type: UserDnsRecordType,
+    pub value: String,
     pub ttl: u32,
 }
 
-impl SnAuthDbAddUserDnsRecordReq {
-    pub fn new(username: &str, domain: &str, record_type: &str, record: &str, ttl: u32) -> Self {
+impl SnAuthDbPutUserDnsValueReq {
+    pub fn new(
+        owner: &str,
+        name: &str,
+        record_type: UserDnsRecordType,
+        value: &str,
+        ttl: u32,
+    ) -> Self {
         Self {
-            username: username.to_string(),
-            domain: domain.to_string(),
-            record_type: record_type.to_string(),
-            record: record.to_string(),
+            owner: owner.to_string(),
+            name: name.to_string(),
+            record_type,
+            value: value.to_string(),
             ttl,
         }
     }
 
-    impl_req_from_json!(SnAuthDbAddUserDnsRecordReq);
+    impl_req_from_json!(SnAuthDbPutUserDnsValueReq);
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SnAuthDbRemoveUserDnsRecordReq {
-    pub username: String,
-    pub domain: String,
-    pub record_type: String,
-    pub record: Option<String>,
+pub struct SnAuthDbRemoveUserDnsValueReq {
+    pub owner: String,
+    pub name: String,
+    pub record_type: UserDnsRecordType,
+    pub value: String,
 }
 
-impl SnAuthDbRemoveUserDnsRecordReq {
-    pub fn new(username: &str, domain: &str, record_type: &str, record: Option<&str>) -> Self {
+impl SnAuthDbRemoveUserDnsValueReq {
+    pub fn new(owner: &str, name: &str, record_type: UserDnsRecordType, value: &str) -> Self {
         Self {
-            username: username.to_string(),
-            domain: domain.to_string(),
-            record_type: record_type.to_string(),
-            record: record.map(ToString::to_string),
+            owner: owner.to_string(),
+            name: name.to_string(),
+            record_type,
+            value: value.to_string(),
         }
     }
 
-    impl_req_from_json!(SnAuthDbRemoveUserDnsRecordReq);
+    impl_req_from_json!(SnAuthDbRemoveUserDnsValueReq);
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SnAuthDbQueryUserDnsRecordReq {
-    pub domain: String,
-    pub record_type: String,
+pub struct SnAuthDbUserDnsRrsetReq {
+    pub owner: String,
+    pub name: String,
+    pub record_type: UserDnsRecordType,
 }
 
-impl SnAuthDbQueryUserDnsRecordReq {
-    pub fn new(domain: &str, record_type: &str) -> Self {
+impl SnAuthDbUserDnsRrsetReq {
+    pub fn new(owner: &str, name: &str, record_type: UserDnsRecordType) -> Self {
         Self {
-            domain: domain.to_string(),
-            record_type: record_type.to_string(),
+            owner: owner.to_string(),
+            name: name.to_string(),
+            record_type,
         }
     }
 
-    impl_req_from_json!(SnAuthDbQueryUserDnsRecordReq);
+    impl_req_from_json!(SnAuthDbUserDnsRrsetReq);
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SnAuthDbSetUserDnsRrsetTtlReq {
+    pub owner: String,
+    pub name: String,
+    pub record_type: UserDnsRecordType,
+    pub ttl: u32,
+}
+
+impl SnAuthDbSetUserDnsRrsetTtlReq {
+    pub fn new(owner: &str, name: &str, record_type: UserDnsRecordType, ttl: u32) -> Self {
+        Self {
+            owner: owner.to_string(),
+            name: name.to_string(),
+            record_type,
+            ttl,
+        }
+    }
+
+    impl_req_from_json!(SnAuthDbSetUserDnsRrsetTtlReq);
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SnAuthDbGetUserDnsRrsetReq {
+    pub name: String,
+    pub record_type: UserDnsRecordType,
+}
+
+impl SnAuthDbGetUserDnsRrsetReq {
+    pub fn new(name: &str, record_type: UserDnsRecordType) -> Self {
+        Self {
+            name: name.to_string(),
+            record_type,
+        }
+    }
+
+    impl_req_from_json!(SnAuthDbGetUserDnsRrsetReq);
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SnAuthDbListUserDnsChangesReq {
+    pub after_revision: u64,
+    pub limit: usize,
+}
+
+impl SnAuthDbListUserDnsChangesReq {
+    pub fn new(after_revision: u64, limit: usize) -> Self {
+        Self {
+            after_revision,
+            limit,
+        }
+    }
+
+    impl_req_from_json!(SnAuthDbListUserDnsChangesReq);
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -837,6 +905,16 @@ impl SnAuthDbClient {
 
 #[async_trait]
 impl SnAuthDB for SnAuthDbClient {
+    async fn capabilities(&self) -> SnResult<SnAuthDbCapabilities> {
+        match self {
+            Self::InProcess(handler) => handler.capabilities().await,
+            Self::KRPC(_) => {
+                self.call(METHOD_CAPABILITIES, &SnAuthDbGetActivationCodesReq::new())
+                    .await
+            }
+        }
+    }
+
     async fn get_activation_codes(&self) -> SnResult<Vec<String>> {
         match self {
             Self::InProcess(handler) => handler.get_activation_codes().await,
@@ -1219,80 +1297,139 @@ impl SnAuthDB for SnAuthDbClient {
         }
     }
 
-    async fn add_user_dns_record(
+    async fn put_user_dns_value(
         &self,
-        username: &str,
-        domain: &str,
-        record_type: &str,
-        record: &str,
+        owner: &str,
+        name: &str,
+        record_type: UserDnsRecordType,
+        value: &str,
         ttl: u32,
-    ) -> SnResult<()> {
+    ) -> SnResult<UserDnsMutationResult> {
         match self {
             Self::InProcess(handler) => {
                 handler
-                    .add_user_dns_record(username, domain, record_type, record, ttl)
+                    .put_user_dns_value(owner, name, record_type, value, ttl)
                     .await
             }
             Self::KRPC(_) => {
                 self.call(
-                    METHOD_ADD_USER_DNS_RECORD,
-                    &SnAuthDbAddUserDnsRecordReq::new(username, domain, record_type, record, ttl),
+                    METHOD_PUT_USER_DNS_VALUE,
+                    &SnAuthDbPutUserDnsValueReq::new(owner, name, record_type, value, ttl),
                 )
                 .await
             }
         }
     }
 
-    async fn remove_user_dns_record(
+    async fn remove_user_dns_value(
         &self,
-        username: &str,
-        domain: &str,
-        record_type: &str,
-        record: Option<&str>,
-    ) -> SnResult<()> {
+        owner: &str,
+        name: &str,
+        record_type: UserDnsRecordType,
+        value: &str,
+    ) -> SnResult<UserDnsMutationResult> {
         match self {
             Self::InProcess(handler) => {
                 handler
-                    .remove_user_dns_record(username, domain, record_type, record)
+                    .remove_user_dns_value(owner, name, record_type, value)
                     .await
             }
             Self::KRPC(_) => {
                 self.call(
-                    METHOD_REMOVE_USER_DNS_RECORD,
-                    &SnAuthDbRemoveUserDnsRecordReq::new(username, domain, record_type, record),
+                    METHOD_REMOVE_USER_DNS_VALUE,
+                    &SnAuthDbRemoveUserDnsValueReq::new(owner, name, record_type, value),
                 )
                 .await
             }
         }
     }
 
-    async fn query_user_dns_record(
+    async fn delete_user_dns_rrset(
         &self,
-        domain: &str,
-        record_type: &str,
-    ) -> SnResult<Option<(String, u32)>> {
+        owner: &str,
+        name: &str,
+        record_type: UserDnsRecordType,
+    ) -> SnResult<UserDnsMutationResult> {
         match self {
-            Self::InProcess(handler) => handler.query_user_dns_record(domain, record_type).await,
+            Self::InProcess(handler) => {
+                handler
+                    .delete_user_dns_rrset(owner, name, record_type)
+                    .await
+            }
             Self::KRPC(_) => {
                 self.call(
-                    METHOD_QUERY_USER_DNS_RECORD,
-                    &SnAuthDbQueryUserDnsRecordReq::new(domain, record_type),
+                    METHOD_DELETE_USER_DNS_RRSET,
+                    &SnAuthDbUserDnsRrsetReq::new(owner, name, record_type),
                 )
                 .await
             }
         }
     }
 
-    async fn list_user_dns_records(
+    async fn set_user_dns_rrset_ttl(
         &self,
-        username: &str,
-    ) -> SnResult<Vec<(String, String, String, u32)>> {
+        owner: &str,
+        name: &str,
+        record_type: UserDnsRecordType,
+        ttl: u32,
+    ) -> SnResult<UserDnsMutationResult> {
         match self {
-            Self::InProcess(handler) => handler.list_user_dns_records(username).await,
+            Self::InProcess(handler) => {
+                handler
+                    .set_user_dns_rrset_ttl(owner, name, record_type, ttl)
+                    .await
+            }
             Self::KRPC(_) => {
                 self.call(
-                    METHOD_LIST_USER_DNS_RECORDS,
-                    &SnAuthDbUsernameReq::new(username),
+                    METHOD_SET_USER_DNS_RRSET_TTL,
+                    &SnAuthDbSetUserDnsRrsetTtlReq::new(owner, name, record_type, ttl),
+                )
+                .await
+            }
+        }
+    }
+
+    async fn get_user_dns_rrset(
+        &self,
+        name: &str,
+        record_type: UserDnsRecordType,
+    ) -> SnResult<UserDnsLookup> {
+        match self {
+            Self::InProcess(handler) => handler.get_user_dns_rrset(name, record_type).await,
+            Self::KRPC(_) => {
+                self.call(
+                    METHOD_GET_USER_DNS_RRSET,
+                    &SnAuthDbGetUserDnsRrsetReq::new(name, record_type),
+                )
+                .await
+            }
+        }
+    }
+
+    async fn list_user_dns_rrsets(&self, owner: &str) -> SnResult<Vec<UserDnsRrset>> {
+        match self {
+            Self::InProcess(handler) => handler.list_user_dns_rrsets(owner).await,
+            Self::KRPC(_) => {
+                self.call(
+                    METHOD_LIST_USER_DNS_RRSETS,
+                    &SnAuthDbUsernameReq::new(owner),
+                )
+                .await
+            }
+        }
+    }
+
+    async fn list_user_dns_changes(
+        &self,
+        after_revision: u64,
+        limit: usize,
+    ) -> SnResult<UserDnsChangePage> {
+        match self {
+            Self::InProcess(handler) => handler.list_user_dns_changes(after_revision, limit).await,
+            Self::KRPC(_) => {
+                self.call(
+                    METHOD_LIST_USER_DNS_CHANGES,
+                    &SnAuthDbListUserDnsChangesReq::new(after_revision, limit),
                 )
                 .await
             }
@@ -1542,6 +1679,10 @@ where
         _ip_from: IpAddr,
     ) -> Result<RPCResponse, RPCErrors> {
         match req.method.as_str() {
+            METHOD_CAPABILITIES => {
+                let _parsed = SnAuthDbGetActivationCodesReq::from_json(req.params.clone())?;
+                rpc_envelope_response(self.0.capabilities().await, &req)
+            }
             METHOD_GET_ACTIVATION_CODES | "get_activation_codes" => {
                 let _parsed = SnAuthDbGetActivationCodesReq::from_json(req.params.clone())?;
                 rpc_envelope_response(self.0.get_activation_codes().await, &req)
@@ -1721,47 +1862,79 @@ where
                     &req,
                 )
             }
-            METHOD_ADD_USER_DNS_RECORD | "add_user_dns_record" => {
-                let parsed = SnAuthDbAddUserDnsRecordReq::from_json(req.params.clone())?;
+            METHOD_PUT_USER_DNS_VALUE => {
+                let parsed = SnAuthDbPutUserDnsValueReq::from_json(req.params.clone())?;
                 rpc_envelope_response(
                     self.0
-                        .add_user_dns_record(
-                            &parsed.username,
-                            &parsed.domain,
-                            &parsed.record_type,
-                            &parsed.record,
+                        .put_user_dns_value(
+                            &parsed.owner,
+                            &parsed.name,
+                            parsed.record_type,
+                            &parsed.value,
                             parsed.ttl,
                         )
                         .await,
                     &req,
                 )
             }
-            METHOD_REMOVE_USER_DNS_RECORD | "remove_user_dns_record" => {
-                let parsed = SnAuthDbRemoveUserDnsRecordReq::from_json(req.params.clone())?;
+            METHOD_REMOVE_USER_DNS_VALUE => {
+                let parsed = SnAuthDbRemoveUserDnsValueReq::from_json(req.params.clone())?;
                 rpc_envelope_response(
                     self.0
-                        .remove_user_dns_record(
-                            &parsed.username,
-                            &parsed.domain,
-                            &parsed.record_type,
-                            parsed.record.as_deref(),
+                        .remove_user_dns_value(
+                            &parsed.owner,
+                            &parsed.name,
+                            parsed.record_type,
+                            &parsed.value,
                         )
                         .await,
                     &req,
                 )
             }
-            METHOD_QUERY_USER_DNS_RECORD | "query_user_dns_record" => {
-                let parsed = SnAuthDbQueryUserDnsRecordReq::from_json(req.params.clone())?;
+            METHOD_DELETE_USER_DNS_RRSET => {
+                let parsed = SnAuthDbUserDnsRrsetReq::from_json(req.params.clone())?;
                 rpc_envelope_response(
                     self.0
-                        .query_user_dns_record(&parsed.domain, &parsed.record_type)
+                        .delete_user_dns_rrset(&parsed.owner, &parsed.name, parsed.record_type)
                         .await,
                     &req,
                 )
             }
-            METHOD_LIST_USER_DNS_RECORDS | "list_user_dns_records" => {
+            METHOD_SET_USER_DNS_RRSET_TTL => {
+                let parsed = SnAuthDbSetUserDnsRrsetTtlReq::from_json(req.params.clone())?;
+                rpc_envelope_response(
+                    self.0
+                        .set_user_dns_rrset_ttl(
+                            &parsed.owner,
+                            &parsed.name,
+                            parsed.record_type,
+                            parsed.ttl,
+                        )
+                        .await,
+                    &req,
+                )
+            }
+            METHOD_GET_USER_DNS_RRSET => {
+                let parsed = SnAuthDbGetUserDnsRrsetReq::from_json(req.params.clone())?;
+                rpc_envelope_response(
+                    self.0
+                        .get_user_dns_rrset(&parsed.name, parsed.record_type)
+                        .await,
+                    &req,
+                )
+            }
+            METHOD_LIST_USER_DNS_RRSETS => {
                 let parsed = SnAuthDbUsernameReq::from_json(req.params.clone())?;
-                rpc_envelope_response(self.0.list_user_dns_records(&parsed.username).await, &req)
+                rpc_envelope_response(self.0.list_user_dns_rrsets(&parsed.username).await, &req)
+            }
+            METHOD_LIST_USER_DNS_CHANGES => {
+                let parsed = SnAuthDbListUserDnsChangesReq::from_json(req.params.clone())?;
+                rpc_envelope_response(
+                    self.0
+                        .list_user_dns_changes(parsed.after_revision, parsed.limit)
+                        .await,
+                    &req,
+                )
             }
             METHOD_GET_ZONE_INFO | "get_zone_info" => {
                 let parsed = SnAuthDbUsernameReq::from_json(req.params.clone())?;

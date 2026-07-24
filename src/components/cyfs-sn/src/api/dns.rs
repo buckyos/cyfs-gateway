@@ -1,12 +1,15 @@
 use super::common::{
-    AddDnsRecordReq, IntoRpcResult, RemoveDnsRecordReq, RpcCallResult, ok_response, parse_params,
-    resolve_self_scoped_username,
+    ok_response, parse_params, resolve_self_scoped_username, AddDnsRecordReq, IntoRpcResult,
+    RemoveDnsRecordReq, RpcCallResult,
 };
-use super::errors::{SnApiErrorCode, parse_error};
-use crate::SNServer;
-use crate::sn_authority::{AuthContext, require_sn_user_or_device};
+use super::errors::{parse_error, SnApiErrorCode};
+use crate::sn_authority::{require_sn_user_or_device, AuthContext};
+use crate::{canonical_user_dns_name, canonical_user_dns_rdata, SNServer, UserDnsRecordType};
 use ::kRPC::{RPCErrors, RPCRequest, RPCResponse};
-use cyfs_gateway_api::{SnAddDnsRecordResp, SnDnsRecord, SnDnsRecordListResp, SnSuccessResp};
+use cyfs_gateway_api::{
+    SnAddDnsRecordResp, SnDnsRecordListResp, SnDnsRecordType, SnDnsRrset, SnRemoveDnsRecordResp,
+};
+use std::str::FromStr;
 
 fn normalize_domain(domain: &str) -> String {
     domain.trim().trim_end_matches('.').to_ascii_lowercase()
@@ -30,10 +33,9 @@ fn ensure_user_dns_domain(
         }
     }
 
-    // Transitional web3 bridge compatibility: records under the SN-provided
-    // `<username>.web3.<server_host>` namespace stay in the local compatibility
-    // store. In particular, ACME challenges must not require a temporary BNS
-    // document update and its associated on-chain gas cost.
+    // Records under the SN-provided `<username>.web3.<server_host>` namespace
+    // remain AuthDB-managed. In particular, ACME challenges must not require a
+    // temporary BNS document update and its associated on-chain gas cost.
     let bridge_domain = format!(
         "{}.web3.{}",
         normalize_domain(username),
@@ -80,8 +82,8 @@ async fn resolve_dns_mutation_identity(
     }
 }
 
-fn ensure_device_acme_record(domain: &str, record_type: &str) -> RpcCallResult<()> {
-    if !record_type.eq_ignore_ascii_case("TXT") {
+fn ensure_device_acme_record(domain: &str, record_type: UserDnsRecordType) -> RpcCallResult<()> {
+    if record_type != UserDnsRecordType::Txt {
         return Err(parse_error(
             SnApiErrorCode::DevicePermissionDenied,
             "device DNS mutation only allows TXT",
@@ -101,6 +103,10 @@ pub(crate) async fn handle_dns(server: &SNServer, req: RPCRequest) -> RpcCallRes
     match req.method.as_str() {
         "add_record" => {
             let params: AddDnsRecordReq = parse_params(&req)?;
+            let name = canonical_user_dns_name(params.domain.as_str()).into_rpc()?;
+            let record_type =
+                UserDnsRecordType::from_str(params.record_type.as_str()).into_rpc()?;
+            let value = canonical_user_dns_rdata(record_type, params.record.as_str()).into_rpc()?;
             let identity =
                 resolve_dns_mutation_identity(server, &req, params.device_did.as_str()).await?;
             let username = identity.username;
@@ -111,45 +117,58 @@ pub(crate) async fn handle_dns(server: &SNServer, req: RPCRequest) -> RpcCallRes
                 .into_rpc()?
                 .ok_or_else(|| parse_error(SnApiErrorCode::UserNotFound, "user not found"))?;
             if identity.is_device {
-                ensure_device_acme_record(&params.domain, &params.record_type)?;
+                ensure_device_acme_record(name.as_str(), record_type)?;
             }
             ensure_user_dns_domain(
                 username.as_str(),
                 user.user_domain.as_deref(),
                 server.resolver().config().server_host.as_str(),
-                params.domain.as_str(),
+                name.as_str(),
             )?;
-            server
-                .compat_store()
-                .add_user_domain(
+            let mutation = server
+                .auth_db()
+                .put_user_dns_value(
                     username.as_str(),
-                    params.domain.as_str(),
-                    params.record_type.as_str(),
-                    params.record.as_str(),
+                    name.as_str(),
+                    record_type,
+                    value.as_str(),
                     params.ttl.unwrap_or(600),
                 )
                 .await
                 .into_rpc()?;
-            if let Some(record_type) =
-                crate::SNServer::parse_name_record_type(params.record_type.as_str())
+            server.resolver().invalidate_user_dns_name(name.as_str());
+            if let Some(cache_type) = crate::SNServer::parse_name_record_type(record_type.as_str())
             {
-                server.remove_name_info_cache(params.domain.as_str(), record_type);
-            } else {
-                server
-                    .resolver()
-                    .cache()
-                    .remove_authoritative_name(params.domain.as_str());
+                server.remove_name_info_cache(name.as_str(), cache_type);
+            }
+            if let Err(error) = server.resolver().synchronize_user_dns_changes().await {
+                log::warn!(
+                    "refresh user DNS change cursor after {} failed: {}",
+                    mutation.revision,
+                    error
+                );
             }
             ok_response(
                 &req,
                 SnAddDnsRecordResp {
                     code: 0,
                     device_name: identity.device_name,
+                    revision: mutation.revision,
+                    changed: mutation.changed,
                 },
             )
         }
         "remove_record" => {
             let params: RemoveDnsRecordReq = parse_params(&req)?;
+            let name = canonical_user_dns_name(params.domain.as_str()).into_rpc()?;
+            let record_type =
+                UserDnsRecordType::from_str(params.record_type.as_str()).into_rpc()?;
+            let value = params
+                .record
+                .as_deref()
+                .map(|value| canonical_user_dns_rdata(record_type, value))
+                .transpose()
+                .into_rpc()?;
             let identity =
                 resolve_dns_mutation_identity(server, &req, params.device_did.as_str()).await?;
             let username = identity.username;
@@ -160,8 +179,8 @@ pub(crate) async fn handle_dns(server: &SNServer, req: RPCRequest) -> RpcCallRes
                 .into_rpc()?
                 .ok_or_else(|| parse_error(SnApiErrorCode::UserNotFound, "user not found"))?;
             if identity.is_device {
-                ensure_device_acme_record(&params.domain, &params.record_type)?;
-                if params.record.as_deref().map(str::is_empty).unwrap_or(true) {
+                ensure_device_acme_record(name.as_str(), record_type)?;
+                if value.is_none() {
                     return Err(parse_error(
                         SnApiErrorCode::InvalidParams,
                         "device DNS removal requires an exact record value",
@@ -172,35 +191,47 @@ pub(crate) async fn handle_dns(server: &SNServer, req: RPCRequest) -> RpcCallRes
                 username.as_str(),
                 user.user_domain.as_deref(),
                 server.resolver().config().server_host.as_str(),
-                params.domain.as_str(),
+                name.as_str(),
             )?;
-            server
-                .compat_store()
-                .remove_user_domain(
-                    username.as_str(),
-                    params.domain.as_str(),
-                    params.record_type.as_str(),
-                    params.record.as_deref(),
-                )
-                .await
-                .into_rpc()?;
-            if let Some(record_type) =
-                crate::SNServer::parse_name_record_type(params.record_type.as_str())
-            {
-                server.remove_name_info_cache(params.domain.as_str(), record_type);
+            let mutation = if let Some(value) = value.as_deref() {
+                server
+                    .auth_db()
+                    .remove_user_dns_value(username.as_str(), name.as_str(), record_type, value)
+                    .await
+                    .into_rpc()?
             } else {
                 server
-                    .resolver()
-                    .cache()
-                    .remove_authoritative_name(params.domain.as_str());
+                    .auth_db()
+                    .delete_user_dns_rrset(username.as_str(), name.as_str(), record_type)
+                    .await
+                    .into_rpc()?
+            };
+            server.resolver().invalidate_user_dns_name(name.as_str());
+            if let Some(cache_type) = crate::SNServer::parse_name_record_type(record_type.as_str())
+            {
+                server.remove_name_info_cache(name.as_str(), cache_type);
             }
-            ok_response(&req, SnSuccessResp { code: 0 })
+            if let Err(error) = server.resolver().synchronize_user_dns_changes().await {
+                log::warn!(
+                    "refresh user DNS change cursor after {} failed: {}",
+                    mutation.revision,
+                    error
+                );
+            }
+            ok_response(
+                &req,
+                SnRemoveDnsRecordResp {
+                    code: 0,
+                    revision: mutation.revision,
+                    changed: mutation.changed,
+                },
+            )
         }
         "list_records" => {
             let username = resolve_self_scoped_username(server, &req, false).await?;
             let items = server
-                .compat_store()
-                .query_user_domain_records(username.as_str())
+                .auth_db()
+                .list_user_dns_rrsets(username.as_str())
                 .await
                 .into_rpc()?;
             ok_response(
@@ -209,11 +240,16 @@ pub(crate) async fn handle_dns(server: &SNServer, req: RPCRequest) -> RpcCallRes
                     code: 0,
                     items: items
                         .into_iter()
-                        .map(|(domain, record_type, record, ttl)| SnDnsRecord {
-                            domain,
-                            record_type,
-                            record,
-                            ttl,
+                        .map(|rrset| SnDnsRrset {
+                            name: rrset.name,
+                            record_type: match rrset.record_type {
+                                UserDnsRecordType::A => SnDnsRecordType::A,
+                                UserDnsRecordType::Aaaa => SnDnsRecordType::Aaaa,
+                                UserDnsRecordType::Txt => SnDnsRecordType::Txt,
+                            },
+                            ttl: rrset.ttl,
+                            values: rrset.values,
+                            revision: rrset.revision,
                         })
                         .collect(),
                 },
@@ -243,17 +279,6 @@ async fn ensure_owned_runtime_device(
         ));
     }
 
-    if let Some(device) = server
-        .compat_store()
-        .query_device_by_did(device_did)
-        .await
-        .into_rpc()?
-    {
-        if device.owner == username {
-            return Ok(device.device_name);
-        }
-    }
-
     Err(parse_error(
         SnApiErrorCode::DevicePermissionDenied,
         "device has no permission",
@@ -269,15 +294,13 @@ mod tests {
         assert!(
             ensure_user_dns_domain("alice", None, "buckyos.ai", "alice.web3.buckyos.ai").is_ok()
         );
-        assert!(
-            ensure_user_dns_domain(
-                "alice",
-                None,
-                "buckyos.ai",
-                "_acme-challenge.alice.web3.buckyos.ai"
-            )
-            .is_ok()
-        );
+        assert!(ensure_user_dns_domain(
+            "alice",
+            None,
+            "buckyos.ai",
+            "_acme-challenge.alice.web3.buckyos.ai"
+        )
+        .is_ok());
 
         let err = ensure_user_dns_domain("alice", None, "buckyos.ai", "home.bob.web3.buckyos.ai")
             .unwrap_err()
@@ -287,24 +310,20 @@ mod tests {
 
     #[test]
     fn test_ensure_user_dns_domain_for_custom_user_domain() {
-        assert!(
-            ensure_user_dns_domain(
-                "alice",
-                Some("alice.example.com"),
-                "buckyos.ai",
-                "home.alice.example.com",
-            )
-            .is_ok()
-        );
-        assert!(
-            ensure_user_dns_domain(
-                "alice",
-                Some("alice.example.com"),
-                "buckyos.ai",
-                "alice.example.com",
-            )
-            .is_ok()
-        );
+        assert!(ensure_user_dns_domain(
+            "alice",
+            Some("alice.example.com"),
+            "buckyos.ai",
+            "home.alice.example.com",
+        )
+        .is_ok());
+        assert!(ensure_user_dns_domain(
+            "alice",
+            Some("alice.example.com"),
+            "buckyos.ai",
+            "alice.example.com",
+        )
+        .is_ok());
 
         let err = ensure_user_dns_domain(
             "alice",

@@ -9,9 +9,11 @@ use rand::Rng;
 use serde::{Deserialize, Serialize};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use sqlx::{Row, Sqlite, SqlitePool, Transaction};
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const ACTIVATION_CODE_LEN: usize = 32;
@@ -22,6 +24,13 @@ const DOMAIN_BINDING_REVOKED: &str = "revoked";
 const DOMAIN_BINDING_SUPERSEDED: &str = "superseded";
 const SESSION_ACTIVE: &str = "active";
 const SESSION_REVOKED: &str = "revoked";
+pub const SN_AUTH_DB_SCHEMA_VERSION: u32 = 2;
+pub const SN_AUTH_DB_CONTRACT_VERSION: u32 = 2;
+pub const USER_DNS_DEFAULT_TTL: u32 = 600;
+pub const USER_DNS_MIN_TTL: u32 = 30;
+pub const USER_DNS_MAX_TTL: u32 = 86_400;
+pub const USER_DNS_MAX_TXT_BYTES: usize = 4_096;
+const USER_DNS_CHANGE_RETENTION: u64 = 10_000;
 
 pub type SnAuthDBRef = Arc<dyn SnAuthDB>;
 
@@ -125,6 +134,204 @@ pub fn canonical_user_domain(domain: &str) -> Option<String> {
     } else {
         Some(canonical)
     }
+}
+
+/// Canonical DNS owner name used by the AuthDB user-DNS contract.
+///
+/// User DNS names are ASCII, lower-case and stored without a trailing dot.
+/// Underscores are accepted because control owners such as
+/// `_acme-challenge` and `_pkx` are first-class product features.
+pub fn canonical_user_dns_name(name: &str) -> SnResult<String> {
+    let name = name.trim().trim_end_matches('.');
+    if name.is_empty() || name.len() > 253 || !name.is_ascii() {
+        return Err(sn_err!(
+            SnErrorCode::InvalidInput,
+            "DNS name must be a non-empty ASCII name no longer than 253 bytes"
+        ));
+    }
+
+    let canonical = name.to_ascii_lowercase();
+    if canonical.split('.').any(|label| {
+        label.is_empty()
+            || label.len() > 63
+            || label.starts_with('-')
+            || label.ends_with('-')
+            || !label.bytes().all(|byte| {
+                byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-' || byte == b'_'
+            })
+    }) {
+        return Err(sn_err!(
+            SnErrorCode::InvalidInput,
+            "DNS name contains an invalid label: {}",
+            name
+        ));
+    }
+    Ok(canonical)
+}
+
+#[derive(Debug, Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+pub enum UserDnsRecordType {
+    #[serde(rename = "A")]
+    A,
+    #[serde(rename = "AAAA")]
+    Aaaa,
+    #[serde(rename = "TXT")]
+    Txt,
+}
+
+impl UserDnsRecordType {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::A => "A",
+            Self::Aaaa => "AAAA",
+            Self::Txt => "TXT",
+        }
+    }
+}
+
+impl std::fmt::Display for UserDnsRecordType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for UserDnsRecordType {
+    type Err = SnError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_uppercase().as_str() {
+            "A" => Ok(Self::A),
+            "AAAA" => Ok(Self::Aaaa),
+            "TXT" => Ok(Self::Txt),
+            _ => Err(sn_err!(
+                SnErrorCode::InvalidInput,
+                "unsupported user DNS record type: {}",
+                value
+            )),
+        }
+    }
+}
+
+pub fn canonical_user_dns_rdata(record_type: UserDnsRecordType, value: &str) -> SnResult<String> {
+    match record_type {
+        UserDnsRecordType::A => value
+            .trim()
+            .parse::<Ipv4Addr>()
+            .map(|value| value.to_string())
+            .map_err(|_| sn_err!(SnErrorCode::InvalidInput, "invalid IPv4 rdata: {}", value)),
+        UserDnsRecordType::Aaaa => value
+            .trim()
+            .parse::<Ipv6Addr>()
+            .map(|value| value.to_string())
+            .map_err(|_| sn_err!(SnErrorCode::InvalidInput, "invalid IPv6 rdata: {}", value)),
+        UserDnsRecordType::Txt => {
+            if value.is_empty() {
+                return Err(sn_err!(
+                    SnErrorCode::InvalidInput,
+                    "TXT rdata must not be empty"
+                ));
+            }
+            if value.as_bytes().len() > USER_DNS_MAX_TXT_BYTES {
+                return Err(sn_err!(
+                    SnErrorCode::InvalidInput,
+                    "TXT rdata exceeds {} bytes",
+                    USER_DNS_MAX_TXT_BYTES
+                ));
+            }
+            // DNS wire encoders may split this logical value into <=255-byte
+            // character-strings. Keeping it as one value here preserves commas
+            // and other user data without introducing a storage delimiter.
+            Ok(value.to_string())
+        }
+    }
+}
+
+pub fn validate_user_dns_ttl(ttl: u32) -> SnResult<u32> {
+    if !(USER_DNS_MIN_TTL..=USER_DNS_MAX_TTL).contains(&ttl) {
+        return Err(sn_err!(
+            SnErrorCode::InvalidInput,
+            "user DNS TTL must be in {}..={}",
+            USER_DNS_MIN_TTL,
+            USER_DNS_MAX_TTL
+        ));
+    }
+    Ok(ttl)
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct UserDnsRrset {
+    pub name: String,
+    pub record_type: UserDnsRecordType,
+    pub ttl: u32,
+    pub values: Vec<String>,
+    pub revision: u64,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct UserDnsLookup {
+    pub rrset: Option<UserDnsRrset>,
+    pub observed_revision: u64,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct UserDnsMutationResult {
+    pub revision: u64,
+    pub changed: bool,
+    pub rrset: Option<UserDnsRrset>,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UserDnsChangeOperation {
+    UpsertRrset,
+    DeleteRrset,
+    DeleteName,
+}
+
+impl UserDnsChangeOperation {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::UpsertRrset => "upsert_rrset",
+            Self::DeleteRrset => "delete_rrset",
+            Self::DeleteName => "delete_name",
+        }
+    }
+
+    fn from_db(value: &str) -> SnResult<Self> {
+        match value {
+            "upsert_rrset" => Ok(Self::UpsertRrset),
+            "delete_rrset" => Ok(Self::DeleteRrset),
+            "delete_name" => Ok(Self::DeleteName),
+            _ => Err(sn_err!(
+                SnErrorCode::DBError,
+                "invalid user DNS change operation: {}",
+                value
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct UserDnsChange {
+    pub revision: u64,
+    pub name: String,
+    pub record_type: Option<UserDnsRecordType>,
+    pub operation: UserDnsChangeOperation,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct UserDnsChangePage {
+    pub changes: Vec<UserDnsChange>,
+    pub current_revision: u64,
+    pub earliest_available_revision: u64,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SnAuthDbCapabilities {
+    pub contract_version: u32,
+    pub schema_version: u32,
+    pub user_dns_rrsets: bool,
+    pub user_dns_change_feed: bool,
 }
 
 /// PKX proof TXT 的固定 DNS name：`_pkx.<canonical-domain>`。
@@ -238,9 +445,6 @@ pub struct SNUserInfo {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SnClearStateResult {
     pub deleted_users: u64,
-    pub deleted_devices: u64,
-    pub deleted_domain_records: u64,
-    pub deleted_did_documents: u64,
     pub activation_code_reset: bool,
 }
 
@@ -373,6 +577,7 @@ pub struct AccountSession {
 
 #[async_trait::async_trait]
 pub trait SnAuthDB: Send + Sync + 'static {
+    async fn capabilities(&self) -> SnResult<SnAuthDbCapabilities>;
     async fn get_activation_codes(&self) -> SnResult<Vec<String>>;
     async fn insert_activation_code(&self, code: &str) -> SnResult<()>;
     async fn generate_activation_codes(&self, count: usize) -> SnResult<Vec<String>>;
@@ -501,57 +706,45 @@ pub trait SnAuthDB: Send + Sync + 'static {
     ) -> SnResult<DomainBinding>;
     async fn unbind_user_domain(&self, username: &str, domain: &str) -> SnResult<()>;
 
-    /// Compatibility DNS RRsets are part of the shared auth/provider state when
-    /// `auth_db` is remote. Local auth deployments continue to use the local
-    /// `SnCompatibilityStore` implementation.
-    async fn add_user_dns_record(
+    async fn put_user_dns_value(
         &self,
-        username: &str,
-        domain: &str,
-        record_type: &str,
-        record: &str,
+        owner: &str,
+        name: &str,
+        record_type: UserDnsRecordType,
+        value: &str,
         ttl: u32,
-    ) -> SnResult<()> {
-        let _ = (username, domain, record_type, record, ttl);
-        Err(sn_err!(
-            SnErrorCode::Failed,
-            "user DNS records are not supported by this auth DB"
-        ))
-    }
-    async fn remove_user_dns_record(
+    ) -> SnResult<UserDnsMutationResult>;
+    async fn remove_user_dns_value(
         &self,
-        username: &str,
-        domain: &str,
-        record_type: &str,
-        record: Option<&str>,
-    ) -> SnResult<()> {
-        let _ = (username, domain, record_type, record);
-        Err(sn_err!(
-            SnErrorCode::Failed,
-            "user DNS records are not supported by this auth DB"
-        ))
-    }
-    async fn query_user_dns_record(
+        owner: &str,
+        name: &str,
+        record_type: UserDnsRecordType,
+        value: &str,
+    ) -> SnResult<UserDnsMutationResult>;
+    async fn delete_user_dns_rrset(
         &self,
-        domain: &str,
-        record_type: &str,
-    ) -> SnResult<Option<(String, u32)>> {
-        let _ = (domain, record_type);
-        Err(sn_err!(
-            SnErrorCode::Failed,
-            "user DNS records are not supported by this auth DB"
-        ))
-    }
-    async fn list_user_dns_records(
+        owner: &str,
+        name: &str,
+        record_type: UserDnsRecordType,
+    ) -> SnResult<UserDnsMutationResult>;
+    async fn set_user_dns_rrset_ttl(
         &self,
-        username: &str,
-    ) -> SnResult<Vec<(String, String, String, u32)>> {
-        let _ = username;
-        Err(sn_err!(
-            SnErrorCode::Failed,
-            "user DNS records are not supported by this auth DB"
-        ))
-    }
+        owner: &str,
+        name: &str,
+        record_type: UserDnsRecordType,
+        ttl: u32,
+    ) -> SnResult<UserDnsMutationResult>;
+    async fn get_user_dns_rrset(
+        &self,
+        name: &str,
+        record_type: UserDnsRecordType,
+    ) -> SnResult<UserDnsLookup>;
+    async fn list_user_dns_rrsets(&self, owner: &str) -> SnResult<Vec<UserDnsRrset>>;
+    async fn list_user_dns_changes(
+        &self,
+        after_revision: u64,
+        limit: usize,
+    ) -> SnResult<UserDnsChangePage>;
 
     async fn get_zone_info(&self, username: &str) -> SnResult<Option<ZoneInfo>>;
     async fn update_zone_info(&self, username: &str, patch: ZoneInfoPatch) -> SnResult<()>;
@@ -629,6 +822,10 @@ impl RemoteSnAuthDB {
 
 #[async_trait::async_trait]
 impl SnAuthDB for RemoteSnAuthDB {
+    async fn capabilities(&self) -> SnResult<SnAuthDbCapabilities> {
+        self.client.capabilities().await
+    }
+
     async fn get_activation_codes(&self) -> SnResult<Vec<String>> {
         self.client.get_activation_codes().await
     }
@@ -790,44 +987,74 @@ impl SnAuthDB for RemoteSnAuthDB {
         self.client.unbind_user_domain(username, domain).await
     }
 
-    async fn add_user_dns_record(
+    async fn put_user_dns_value(
         &self,
-        username: &str,
-        domain: &str,
-        record_type: &str,
-        record: &str,
+        owner: &str,
+        name: &str,
+        record_type: UserDnsRecordType,
+        value: &str,
         ttl: u32,
-    ) -> SnResult<()> {
+    ) -> SnResult<UserDnsMutationResult> {
         self.client
-            .add_user_dns_record(username, domain, record_type, record, ttl)
+            .put_user_dns_value(owner, name, record_type, value, ttl)
             .await
     }
 
-    async fn remove_user_dns_record(
+    async fn remove_user_dns_value(
         &self,
-        username: &str,
-        domain: &str,
-        record_type: &str,
-        record: Option<&str>,
-    ) -> SnResult<()> {
+        owner: &str,
+        name: &str,
+        record_type: UserDnsRecordType,
+        value: &str,
+    ) -> SnResult<UserDnsMutationResult> {
         self.client
-            .remove_user_dns_record(username, domain, record_type, record)
+            .remove_user_dns_value(owner, name, record_type, value)
             .await
     }
 
-    async fn query_user_dns_record(
+    async fn delete_user_dns_rrset(
         &self,
-        domain: &str,
-        record_type: &str,
-    ) -> SnResult<Option<(String, u32)>> {
-        self.client.query_user_dns_record(domain, record_type).await
+        owner: &str,
+        name: &str,
+        record_type: UserDnsRecordType,
+    ) -> SnResult<UserDnsMutationResult> {
+        self.client
+            .delete_user_dns_rrset(owner, name, record_type)
+            .await
     }
 
-    async fn list_user_dns_records(
+    async fn set_user_dns_rrset_ttl(
         &self,
-        username: &str,
-    ) -> SnResult<Vec<(String, String, String, u32)>> {
-        self.client.list_user_dns_records(username).await
+        owner: &str,
+        name: &str,
+        record_type: UserDnsRecordType,
+        ttl: u32,
+    ) -> SnResult<UserDnsMutationResult> {
+        self.client
+            .set_user_dns_rrset_ttl(owner, name, record_type, ttl)
+            .await
+    }
+
+    async fn get_user_dns_rrset(
+        &self,
+        name: &str,
+        record_type: UserDnsRecordType,
+    ) -> SnResult<UserDnsLookup> {
+        self.client.get_user_dns_rrset(name, record_type).await
+    }
+
+    async fn list_user_dns_rrsets(&self, owner: &str) -> SnResult<Vec<UserDnsRrset>> {
+        self.client.list_user_dns_rrsets(owner).await
+    }
+
+    async fn list_user_dns_changes(
+        &self,
+        after_revision: u64,
+        limit: usize,
+    ) -> SnResult<UserDnsChangePage> {
+        self.client
+            .list_user_dns_changes(after_revision, limit)
+            .await
     }
 
     async fn get_zone_info(&self, username: &str) -> SnResult<Option<ZoneInfo>> {
@@ -958,7 +1185,9 @@ impl SqliteSnAuthDB {
         let options = SqliteConnectOptions::from_str(db_url.as_str())
             .map_err(|e| Self::db_err("parse sqlite url failed", e))?
             .create_if_missing(true)
-            .journal_mode(SqliteJournalMode::Wal);
+            .journal_mode(SqliteJournalMode::Wal)
+            .foreign_keys(true)
+            .busy_timeout(Duration::from_secs(5));
         let pool = SqlitePoolOptions::new()
             .max_connections(300)
             .connect_with(options)
@@ -982,19 +1211,78 @@ impl SqliteSnAuthDB {
     }
 
     pub async fn initialize_database(&self) -> SnResult<()> {
-        self.relay_manager.initialize_database().await?;
+        let schema_version = sqlx::query_scalar::<_, i64>(
+            "SELECT version FROM sn_auth_schema WHERE singleton_id = 1",
+        )
+        .fetch_optional(&self.pool)
+        .await;
+        match schema_version {
+            Ok(Some(version)) if version == SN_AUTH_DB_SCHEMA_VERSION as i64 => {}
+            Ok(Some(version)) => {
+                return Err(Self::db_err(
+                    "incompatible schema, recreate database",
+                    format!(
+                        "expected auth schema {}, found {}",
+                        SN_AUTH_DB_SCHEMA_VERSION, version
+                    ),
+                ));
+            }
+            Ok(None) => {
+                return Err(Self::db_err(
+                    "incompatible schema, recreate database",
+                    "sn_auth_schema has no singleton row",
+                ));
+            }
+            Err(sqlx::Error::Database(error))
+                if error.message().contains("no such table: sn_auth_schema") =>
+            {
+                let existing_tables = sqlx::query("PRAGMA table_list")
+                    .fetch_all(&self.pool)
+                    .await
+                    .map_err(|e| Self::db_err("inspect auth schema failed", e))?;
+                let incompatible_tables = [
+                    "activation_codes",
+                    "users",
+                    "user_auth",
+                    "user_domain_history",
+                    "user_domain_bindings",
+                    "zone_info",
+                    "account_sessions",
+                    "devices",
+                    "did_documents",
+                    "user_dns_records",
+                ];
+                if existing_tables.iter().any(|row| {
+                    row.try_get::<String, _>("name")
+                        .ok()
+                        .is_some_and(|name| incompatible_tables.contains(&name.as_str()))
+                }) {
+                    return Err(Self::db_err(
+                        "incompatible schema, recreate database",
+                        "unversioned AuthDB or compatibility tables found",
+                    ));
+                }
+            }
+            Err(error) => return Err(Self::db_err("read auth schema version failed", error)),
+        }
 
-        sqlx::query(
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| Self::db_err("begin auth schema transaction failed", e))?;
+        for statement in [
+            "CREATE TABLE IF NOT EXISTS sn_auth_schema (
+                singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
+                version INTEGER NOT NULL
+            )",
+            "INSERT INTO sn_auth_schema (singleton_id, version)
+             VALUES (1, 2)
+             ON CONFLICT(singleton_id) DO NOTHING",
             "CREATE TABLE IF NOT EXISTS activation_codes (
                 code TEXT PRIMARY KEY,
                 used INTEGER NOT NULL DEFAULT 0
             )",
-        )
-        .execute(&self.pool)
-        .await
-        .map_err(|e| Self::db_err("create activation_codes table failed", e))?;
-
-        sqlx::query(
             "CREATE TABLE IF NOT EXISTS users (
                 username TEXT PRIMARY KEY,
                 email TEXT NULL,
@@ -1011,24 +1299,10 @@ impl SqliteSnAuthDB {
                 updated_at INTEGER NOT NULL DEFAULT 0,
                 last_login_at INTEGER NULL
             )",
-        )
-        .execute(&self.pool)
-        .await
-        .map_err(|e| Self::db_err("create users table failed", e))?;
-        self.ensure_user_columns().await?;
-        // SQLite 允许 UNIQUE 索引中存在多行 NULL：存量/seed 账号可以先不补录，
-        // 但所有带邮箱的新注册都由数据库保证全局一对一。
-        sqlx::query(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email_unique
              ON users (email) WHERE email IS NOT NULL",
-        )
-        .execute(&self.pool)
-        .await
-        .map_err(|e| Self::db_err("create users email unique index failed", e))?;
-
-        sqlx::query(
             "CREATE TABLE IF NOT EXISTS user_auth (
-                username TEXT PRIMARY KEY,
+                username TEXT PRIMARY KEY REFERENCES users(username) ON DELETE CASCADE,
                 password_hash TEXT NOT NULL,
                 password_salt TEXT NOT NULL,
                 password_algo TEXT NOT NULL,
@@ -1036,95 +1310,31 @@ impl SqliteSnAuthDB {
                 updated_at INTEGER NOT NULL,
                 last_login_at INTEGER NULL
             )",
-        )
-        .execute(&self.pool)
-        .await
-        .map_err(|e| Self::db_err("create user_auth table failed", e))?;
-
-        // 审计事件表：每次绑定获得（新建/接管）追加一行；历史仅审计，
-        // 不参与冲突判定。旧 schema（domain 主键）会被迁移重建。
-        sqlx::query(
             "CREATE TABLE IF NOT EXISTS user_domain_history (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 domain TEXT NOT NULL,
-                owner TEXT NOT NULL,
+                owner TEXT NOT NULL REFERENCES users(username) ON DELETE CASCADE,
                 created_at INTEGER NOT NULL
             )",
-        )
-        .execute(&self.pool)
-        .await
-        .map_err(|e| Self::db_err("create user_domain_history table failed", e))?;
-        self.migrate_legacy_user_domain_table(
-            "user_domain_history",
-            "id INTEGER PRIMARY KEY AUTOINCREMENT,
-             domain TEXT NOT NULL,
-             owner TEXT NOT NULL,
-             created_at INTEGER NOT NULL",
-            "domain, owner, created_at",
-            None,
-        )
-        .await?;
-        sqlx::query(
             "CREATE INDEX IF NOT EXISTS idx_user_domain_history_domain
              ON user_domain_history (domain)",
-        )
-        .execute(&self.pool)
-        .await
-        .map_err(|e| Self::db_err("create user_domain_history index failed", e))?;
-
-        // 绑定状态表：state ∈ active|revoked|superseded；同一 canonical domain
-        // 至多一行 active（部分唯一索引），revoked/superseded 行保留作状态审计。
-        sqlx::query(
             "CREATE TABLE IF NOT EXISTS user_domain_bindings (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 domain TEXT NOT NULL,
-                owner TEXT NOT NULL,
-                state TEXT NOT NULL,
+                owner TEXT NOT NULL REFERENCES users(username) ON DELETE CASCADE,
+                state TEXT NOT NULL CHECK (state IN ('active', 'revoked', 'superseded')),
                 pkx TEXT NOT NULL,
                 pkx_record_name TEXT NOT NULL,
                 verified_at INTEGER NULL,
                 created_at INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL
             )",
-        )
-        .execute(&self.pool)
-        .await
-        .map_err(|e| Self::db_err("create user_domain_bindings table failed", e))?;
-        // 旧 schema（domain 主键、含 pending_pkx 挑战态）迁移重建；
-        // pending_pkx 是已移除的中间态，直接丢弃。
-        self.migrate_legacy_user_domain_table(
-            "user_domain_bindings",
-            "id INTEGER PRIMARY KEY AUTOINCREMENT,
-             domain TEXT NOT NULL,
-             owner TEXT NOT NULL,
-             state TEXT NOT NULL,
-             pkx TEXT NOT NULL,
-             pkx_record_name TEXT NOT NULL,
-             verified_at INTEGER NULL,
-             created_at INTEGER NOT NULL,
-             updated_at INTEGER NOT NULL",
-            "domain, owner, state, pkx, pkx_record_name, verified_at, created_at, updated_at",
-            Some("state != 'pending_pkx'"),
-        )
-        .await?;
-        sqlx::query(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_user_domain_bindings_domain_active
              ON user_domain_bindings (domain) WHERE state = 'active'",
-        )
-        .execute(&self.pool)
-        .await
-        .map_err(|e| Self::db_err("create user_domain_bindings active index failed", e))?;
-        sqlx::query(
             "CREATE INDEX IF NOT EXISTS idx_user_domain_bindings_owner_state
              ON user_domain_bindings (owner, state)",
-        )
-        .execute(&self.pool)
-        .await
-        .map_err(|e| Self::db_err("create user_domain_bindings index failed", e))?;
-
-        sqlx::query(
             "CREATE TABLE IF NOT EXISTS zone_info (
-                username TEXT PRIMARY KEY,
+                username TEXT PRIMARY KEY REFERENCES users(username) ON DELETE CASCADE,
                 bns_name TEXT NOT NULL,
                 zone TEXT NULL,
                 relay_sn TEXT NULL,
@@ -1135,91 +1345,77 @@ impl SqliteSnAuthDB {
                 source_version TEXT NULL,
                 updated_at INTEGER NOT NULL
             )",
-        )
-        .execute(&self.pool)
-        .await
-        .map_err(|e| Self::db_err("create zone_info table failed", e))?;
-
-        sqlx::query(
             "CREATE TABLE IF NOT EXISTS account_sessions (
                 session_id TEXT PRIMARY KEY,
-                username TEXT NOT NULL,
+                username TEXT NOT NULL REFERENCES users(username) ON DELETE CASCADE,
                 token_aud TEXT NOT NULL,
                 state TEXT NOT NULL,
                 issued_at INTEGER NOT NULL,
                 expires_at INTEGER NOT NULL,
                 revoked_at INTEGER NULL
             )",
-        )
-        .execute(&self.pool)
-        .await
-        .map_err(|e| Self::db_err("create account_sessions table failed", e))?;
-        sqlx::query(
             "CREATE INDEX IF NOT EXISTS idx_account_sessions_username_state
              ON account_sessions (username, state)",
-        )
-        .execute(&self.pool)
-        .await
-        .map_err(|e| Self::db_err("create account_sessions index failed", e))?;
-
-        self.migrate_legacy_zone_relay_projection().await?;
-        Ok(())
-    }
-
-    async fn migrate_legacy_zone_relay_projection(&self) -> SnResult<()> {
-        let now = Self::now_secs() as i64;
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|e| Self::db_err("begin legacy relay projection migration failed", e))?;
-        sqlx::query(
-            "INSERT OR IGNORE INTO relay_assignments
-                (zone, relay_id, state, source, reason, generation, backup_relay_id,
-                 sticky_until, lease_expires_at, migrated_from, migration_deadline,
-                 source_version, created_at, updated_at)
-             SELECT z.username, n.relay_id, 'active', 'recovery',
-                    'legacy_zone_info_relay_sn', 1, NULL, NULL, NULL, NULL, NULL,
-                    z.source_version,
-                    CASE WHEN z.updated_at > 0 THEN z.updated_at ELSE ?1 END,
-                    CASE WHEN z.updated_at > 0 THEN z.updated_at ELSE ?1 END
-             FROM zone_info z
-             JOIN relay_nodes n ON n.relay_sn = z.relay_sn
-             WHERE z.relay_sn IS NOT NULL AND trim(z.relay_sn) <> ''",
-        )
-        .bind(now)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| Self::db_err("migrate matched legacy relay assignments failed", e))?;
-        sqlx::query(
-            "INSERT OR IGNORE INTO relay_allocation_pending
-                (zone, preferred_region, reason, source_version, attempts, last_error,
-                 created_at, updated_at)
-             SELECT z.username, NULL, 'legacy_relay_unmatched', z.source_version, 1,
-                    'legacy zone_info.relay_sn has no matching relay node: ' || z.relay_sn,
-                    ?1, ?1
-             FROM zone_info z
-             LEFT JOIN relay_nodes n ON n.relay_sn = z.relay_sn
-             LEFT JOIN relay_assignments a ON a.zone = z.username
-             WHERE z.relay_sn IS NOT NULL
-               AND trim(z.relay_sn) <> ''
-               AND n.relay_id IS NULL
-               AND a.zone IS NULL",
-        )
-        .bind(now)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| Self::db_err("record unmatched legacy relay assignments failed", e))?;
-        sqlx::query(
-            "UPDATE zone_info SET relay_sn = NULL
-             WHERE relay_sn IS NOT NULL AND trim(relay_sn) <> ''",
-        )
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| Self::db_err("clear legacy zone relay cache failed", e))?;
+            "CREATE TABLE IF NOT EXISTS user_dns_names (
+                name TEXT PRIMARY KEY
+                    CHECK (name = lower(name) AND name NOT LIKE '%.'
+                           AND length(name) BETWEEN 1 AND 253),
+                owner TEXT NOT NULL REFERENCES users(username) ON DELETE CASCADE,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            )",
+            "CREATE INDEX IF NOT EXISTS idx_user_dns_names_owner_name
+             ON user_dns_names (owner, name)",
+            "CREATE TABLE IF NOT EXISTS user_dns_rrsets (
+                name TEXT NOT NULL REFERENCES user_dns_names(name) ON DELETE CASCADE,
+                record_type TEXT NOT NULL CHECK (record_type IN ('A', 'AAAA', 'TXT')),
+                ttl INTEGER NOT NULL CHECK (ttl BETWEEN 30 AND 86400),
+                revision INTEGER NOT NULL CHECK (revision > 0),
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                PRIMARY KEY (name, record_type)
+            )",
+            "CREATE TABLE IF NOT EXISTS user_dns_rdata (
+                name TEXT NOT NULL,
+                record_type TEXT NOT NULL,
+                rdata TEXT NOT NULL CHECK (
+                    length(rdata) > 0
+                    AND length(CAST(rdata AS BLOB)) <= 4096
+                ),
+                created_at INTEGER NOT NULL,
+                PRIMARY KEY (name, record_type, rdata),
+                FOREIGN KEY (name, record_type)
+                    REFERENCES user_dns_rrsets(name, record_type) ON DELETE CASCADE
+            )",
+            "CREATE TABLE IF NOT EXISTS user_dns_state (
+                singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
+                revision INTEGER NOT NULL CHECK (revision >= 0)
+            )",
+            "INSERT INTO user_dns_state (singleton_id, revision)
+             VALUES (1, 0)
+             ON CONFLICT(singleton_id) DO NOTHING",
+            "CREATE TABLE IF NOT EXISTS user_dns_changes (
+                revision INTEGER PRIMARY KEY,
+                name TEXT NOT NULL,
+                record_type TEXT NULL CHECK (
+                    record_type IS NULL OR record_type IN ('A', 'AAAA', 'TXT')
+                ),
+                operation TEXT NOT NULL CHECK (
+                    operation IN ('upsert_rrset', 'delete_rrset', 'delete_name')
+                ),
+                committed_at INTEGER NOT NULL
+            )",
+        ] {
+            sqlx::query(statement)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| Self::db_err("initialize fresh AuthDB schema failed", e))?;
+        }
         tx.commit()
             .await
-            .map_err(|e| Self::db_err("commit legacy relay projection migration failed", e))?;
+            .map_err(|e| Self::db_err("commit AuthDB schema failed", e))?;
+
+        self.relay_manager.initialize_database().await?;
         Ok(())
     }
 
@@ -1295,195 +1491,191 @@ impl SqliteSnAuthDB {
         value.map(Self::i64_to_u64)
     }
 
-    async fn ensure_user_columns(&self) -> SnResult<()> {
-        // Breaking-change migration policy: legacy rows keep NULL until a separate,
-        // authenticated backfill flow is introduced. Public auth.register never writes NULL.
-        self.ensure_column("users", "email", "TEXT NULL").await?;
-        self.ensure_column("users", "bns_name", "TEXT").await?;
-        self.ensure_column("users", "owner_key_ref", "TEXT").await?;
-        self.ensure_column("users", "created_at", "INTEGER NOT NULL DEFAULT 0")
-            .await?;
-        self.ensure_column("users", "updated_at", "INTEGER NOT NULL DEFAULT 0")
-            .await?;
-        self.ensure_column("users", "last_login_at", "INTEGER NULL")
-            .await?;
-        Ok(())
-    }
-
-    async fn ensure_column(&self, table: &str, column: &str, definition: &str) -> SnResult<()> {
-        let pragma = format!("PRAGMA table_info({})", table);
-        let rows = sqlx::query(pragma.as_str())
-            .fetch_all(&self.pool)
-            .await
-            .map_err(|e| Self::db_err(format!("query {} columns failed", table), e))?;
-        let exists = rows.iter().any(|row| {
-            row.try_get::<String, _>("name")
-                .map(|name| name == column)
-                .unwrap_or(false)
-        });
-        if !exists {
-            let alter = format!("ALTER TABLE {} ADD COLUMN {} {}", table, column, definition);
-            sqlx::query(alter.as_str())
-                .execute(&self.pool)
-                .await
-                .map_err(|e| Self::db_err(format!("add {}.{} failed", table, column), e))?;
-        }
-        Ok(())
-    }
-
-    /// 旧 user_domain 表（domain 主键、无 `id` 列）→ 新 id 主键 schema 的重建
-    /// 迁移。以 `id` 列缺失作为旧 schema 判据；`copy_filter` 用于丢弃已移除的
-    /// 状态（如 `pending_pkx`）。
-    async fn migrate_legacy_user_domain_table(
-        &self,
-        table: &str,
-        columns_def: &str,
-        copy_columns: &str,
-        copy_filter: Option<&str>,
-    ) -> SnResult<()> {
-        let pragma = format!("PRAGMA table_info({})", table);
-        let rows = sqlx::query(pragma.as_str())
-            .fetch_all(&self.pool)
-            .await
-            .map_err(|e| Self::db_err(format!("query {} columns failed", table), e))?;
-        let has_id = rows.iter().any(|row| {
-            row.try_get::<String, _>("name")
-                .map(|name| name == "id")
-                .unwrap_or(false)
-        });
-        if has_id {
-            return Ok(());
-        }
-
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|e| Self::db_err("begin transaction failed", e))?;
-        let legacy = format!("{}_legacy", table);
-        sqlx::query(format!("ALTER TABLE {} RENAME TO {}", table, legacy).as_str())
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| Self::db_err(format!("rename legacy {} failed", table), e))?;
-        sqlx::query(format!("CREATE TABLE {} ({})", table, columns_def).as_str())
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| Self::db_err(format!("recreate {} failed", table), e))?;
-        let filter = copy_filter
-            .map(|clause| format!(" WHERE {}", clause))
-            .unwrap_or_default();
-        sqlx::query(
-            format!(
-                "INSERT INTO {} ({}) SELECT {} FROM {}{}",
-                table, copy_columns, copy_columns, legacy, filter
-            )
-            .as_str(),
+    async fn current_user_dns_revision_tx(tx: &mut Transaction<'_, Sqlite>) -> SnResult<u64> {
+        let revision = sqlx::query_scalar::<_, i64>(
+            "SELECT revision FROM user_dns_state WHERE singleton_id = 1",
         )
-        .execute(&mut *tx)
+        .fetch_one(&mut **tx)
         .await
-        .map_err(|e| Self::db_err(format!("copy legacy {} rows failed", table), e))?;
-        sqlx::query(format!("DROP TABLE {}", legacy).as_str())
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| Self::db_err(format!("drop legacy {} failed", table), e))?;
-        tx.commit()
-            .await
-            .map_err(|e| Self::db_err("commit transaction failed", e))?;
-        log::info!("migrated legacy {} table to id-keyed schema", table);
+        .map_err(|e| Self::db_err("read user DNS revision failed", e))?;
+        Ok(Self::i64_to_u64(revision))
+    }
+
+    /// SQLite transactions start deferred. Acquire the single DNS-state writer
+    /// lock before any read so two replicas cannot both read an unclaimed name
+    /// and then fail while upgrading their transactions to writers.
+    async fn lock_user_dns_state_tx(tx: &mut Transaction<'_, Sqlite>) -> SnResult<()> {
+        sqlx::query(
+            "UPDATE user_dns_state
+             SET revision = revision
+             WHERE singleton_id = 1",
+        )
+        .execute(&mut **tx)
+        .await
+        .map_err(|e| Self::db_err("lock user DNS state failed", e))?;
         Ok(())
     }
 
-    async fn table_exists_tx(tx: &mut Transaction<'_, Sqlite>, table_name: &str) -> SnResult<bool> {
-        let row = sqlx::query("SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?1")
-            .bind(table_name)
+    async fn allocate_user_dns_revision_tx(tx: &mut Transaction<'_, Sqlite>) -> SnResult<u64> {
+        let revision = sqlx::query_scalar::<_, i64>(
+            "UPDATE user_dns_state
+             SET revision = revision + 1
+             WHERE singleton_id = 1
+             RETURNING revision",
+        )
+        .fetch_one(&mut **tx)
+        .await
+        .map_err(|e| Self::db_err("allocate user DNS revision failed", e))?;
+        Ok(Self::i64_to_u64(revision))
+    }
+
+    async fn append_user_dns_change_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        revision: u64,
+        name: &str,
+        record_type: Option<UserDnsRecordType>,
+        operation: UserDnsChangeOperation,
+        now: i64,
+    ) -> SnResult<()> {
+        sqlx::query(
+            "INSERT INTO user_dns_changes
+                (revision, name, record_type, operation, committed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+        )
+        .bind(revision as i64)
+        .bind(name)
+        .bind(record_type.map(UserDnsRecordType::as_str))
+        .bind(operation.as_str())
+        .bind(now)
+        .execute(&mut **tx)
+        .await
+        .map_err(|e| Self::db_err("append user DNS change failed", e))?;
+
+        let cutoff = revision.saturating_sub(USER_DNS_CHANGE_RETENTION);
+        if cutoff > 0 {
+            sqlx::query("DELETE FROM user_dns_changes WHERE revision <= ?1")
+                .bind(cutoff as i64)
+                .execute(&mut **tx)
+                .await
+                .map_err(|e| Self::db_err("prune user DNS changes failed", e))?;
+        }
+        Ok(())
+    }
+
+    async fn user_dns_rrset_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        name: &str,
+        record_type: UserDnsRecordType,
+    ) -> SnResult<Option<UserDnsRrset>> {
+        let row = sqlx::query(
+            "SELECT ttl, revision
+             FROM user_dns_rrsets
+             WHERE name = ?1 AND record_type = ?2",
+        )
+        .bind(name)
+        .bind(record_type.as_str())
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(|e| Self::db_err("query user DNS RRset failed", e))?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let ttl = row
+            .try_get::<i64, _>("ttl")
+            .map_err(|e| Self::db_err("read user DNS TTL failed", e))?;
+        let revision = row
+            .try_get::<i64, _>("revision")
+            .map_err(|e| Self::db_err("read user DNS RRset revision failed", e))?;
+        let values = sqlx::query_scalar::<_, String>(
+            "SELECT rdata
+             FROM user_dns_rdata
+             WHERE name = ?1 AND record_type = ?2
+             ORDER BY rdata",
+        )
+        .bind(name)
+        .bind(record_type.as_str())
+        .fetch_all(&mut **tx)
+        .await
+        .map_err(|e| Self::db_err("query user DNS rdata failed", e))?;
+        Ok(Some(UserDnsRrset {
+            name: name.to_string(),
+            record_type,
+            ttl: ttl.max(0) as u32,
+            values,
+            revision: Self::i64_to_u64(revision),
+        }))
+    }
+
+    async fn user_dns_owner_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        name: &str,
+    ) -> SnResult<Option<String>> {
+        sqlx::query_scalar::<_, String>("SELECT owner FROM user_dns_names WHERE name = ?1")
+            .bind(name)
             .fetch_optional(&mut **tx)
             .await
-            .map_err(|e| Self::db_err("query sqlite_master failed", e))?;
-        Ok(row.is_some())
+            .map_err(|e| Self::db_err("query user DNS name owner failed", e))
     }
 
-    async fn count_optional_related_rows(
-        tx: &mut Transaction<'_, Sqlite>,
-        table_name: &str,
-        active_code: &str,
-    ) -> SnResult<i64> {
-        if !Self::table_exists_tx(tx, table_name).await? {
-            return Ok(0);
+    fn ensure_user_dns_owner(actual: &str, requested: &str, name: &str) -> SnResult<()> {
+        if actual != requested {
+            return Err(sn_err!(
+                SnErrorCode::Conflict,
+                "user DNS name {} is owned by {}, not {}",
+                name,
+                actual,
+                requested
+            ));
         }
-
-        let sql = match table_name {
-            "devices" => {
-                "SELECT COUNT(*) FROM devices
-                 WHERE owner IN (
-                    SELECT username FROM users WHERE activation_code = ?1
-                 )"
-            }
-            "user_dns_records" => {
-                "SELECT COUNT(*) FROM user_dns_records
-                 WHERE owner IN (
-                    SELECT username FROM users WHERE activation_code = ?1
-                 )"
-            }
-            "did_documents" => {
-                "SELECT COUNT(*) FROM did_documents
-                 WHERE owner_user IN (
-                    SELECT username FROM users WHERE activation_code = ?1
-                 )"
-            }
-            _ => return Ok(0),
-        };
-
-        sqlx::query_scalar::<_, i64>(sql)
-            .bind(active_code)
-            .fetch_one(&mut **tx)
-            .await
-            .map_err(|e| Self::db_err(format!("count {} failed", table_name), e))
-    }
-
-    async fn delete_optional_related_rows(
-        tx: &mut Transaction<'_, Sqlite>,
-        active_code: &str,
-    ) -> SnResult<()> {
-        if Self::table_exists_tx(tx, "devices").await? {
-            sqlx::query(
-                "DELETE FROM devices
-                 WHERE owner IN (
-                    SELECT username FROM users WHERE activation_code = ?1
-                 )",
-            )
-            .bind(active_code)
-            .execute(&mut **tx)
-            .await
-            .map_err(|e| Self::db_err("delete devices failed", e))?;
-        }
-
-        if Self::table_exists_tx(tx, "user_dns_records").await? {
-            sqlx::query(
-                "DELETE FROM user_dns_records
-                 WHERE owner IN (
-                    SELECT username FROM users WHERE activation_code = ?1
-                 )",
-            )
-            .bind(active_code)
-            .execute(&mut **tx)
-            .await
-            .map_err(|e| Self::db_err("delete user dns records failed", e))?;
-        }
-
-        if Self::table_exists_tx(tx, "did_documents").await? {
-            sqlx::query(
-                "DELETE FROM did_documents
-                 WHERE owner_user IN (
-                    SELECT username FROM users WHERE activation_code = ?1
-                 )",
-            )
-            .bind(active_code)
-            .execute(&mut **tx)
-            .await
-            .map_err(|e| Self::db_err("delete did documents failed", e))?;
-        }
-
         Ok(())
+    }
+
+    async fn delete_user_dns_names_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        owner: &str,
+        domain: Option<&str>,
+        now: i64,
+    ) -> SnResult<u64> {
+        let names = if let Some(domain) = domain {
+            sqlx::query_scalar::<_, String>(
+                "SELECT name FROM user_dns_names
+                 WHERE owner = ?1 AND (name = ?2 OR name LIKE '%.' || ?2)
+                 ORDER BY name",
+            )
+            .bind(owner)
+            .bind(domain)
+            .fetch_all(&mut **tx)
+            .await
+        } else {
+            sqlx::query_scalar::<_, String>(
+                "SELECT name FROM user_dns_names WHERE owner = ?1 ORDER BY name",
+            )
+            .bind(owner)
+            .fetch_all(&mut **tx)
+            .await
+        }
+        .map_err(|e| Self::db_err("list user DNS names for deletion failed", e))?;
+
+        let mut latest = Self::current_user_dns_revision_tx(tx).await?;
+        for name in names {
+            latest = Self::allocate_user_dns_revision_tx(tx).await?;
+            sqlx::query("DELETE FROM user_dns_names WHERE name = ?1 AND owner = ?2")
+                .bind(name.as_str())
+                .bind(owner)
+                .execute(&mut **tx)
+                .await
+                .map_err(|e| Self::db_err("delete user DNS name failed", e))?;
+            Self::append_user_dns_change_tx(
+                tx,
+                latest,
+                name.as_str(),
+                None,
+                UserDnsChangeOperation::DeleteName,
+                now,
+            )
+            .await?;
+        }
+        Ok(latest)
     }
 
     /// 激活绑定的共享事务逻辑（调用方保证已完成 proof 或走 trusted 路径）。
@@ -1499,6 +1691,26 @@ impl SqliteSnAuthDB {
         pkx: &str,
         now: i64,
     ) -> SnResult<()> {
+        let previous_dns_owners = sqlx::query_scalar::<_, String>(
+            "SELECT DISTINCT owner FROM user_dns_names
+             WHERE owner != ?1 AND (name = ?2 OR name LIKE '%.' || ?2)
+             ORDER BY owner",
+        )
+        .bind(username)
+        .bind(canonical_domain)
+        .fetch_all(&mut **tx)
+        .await
+        .map_err(|e| Self::db_err("query previous DNS owners failed", e))?;
+        for previous_owner in previous_dns_owners {
+            Self::delete_user_dns_names_tx(
+                tx,
+                previous_owner.as_str(),
+                Some(canonical_domain),
+                now,
+            )
+            .await?;
+        }
+
         let record_name = pkx_record_name(canonical_domain);
         let existing = sqlx::query(
             "SELECT id, owner FROM user_domain_bindings
@@ -1784,6 +1996,21 @@ impl SqliteSnAuthDB {
 
 #[async_trait::async_trait]
 impl SnAuthDB for SqliteSnAuthDB {
+    async fn capabilities(&self) -> SnResult<SnAuthDbCapabilities> {
+        let version = sqlx::query_scalar::<_, i64>(
+            "SELECT version FROM sn_auth_schema WHERE singleton_id = 1",
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| Self::db_err("read auth schema capability failed", e))?;
+        Ok(SnAuthDbCapabilities {
+            contract_version: SN_AUTH_DB_CONTRACT_VERSION,
+            schema_version: Self::i64_to_u64(version) as u32,
+            user_dns_rrsets: true,
+            user_dns_change_feed: true,
+        })
+    }
+
     async fn get_activation_codes(&self) -> SnResult<Vec<String>> {
         let rows = sqlx::query("SELECT code FROM activation_codes WHERE used = 0")
             .fetch_all(&self.pool)
@@ -1857,14 +2084,17 @@ impl SnAuthDB for SqliteSnAuthDB {
                 .fetch_one(&mut *tx)
                 .await
                 .map_err(|e| Self::db_err("count users failed", e))?;
-        let device_count =
-            Self::count_optional_related_rows(&mut tx, "devices", active_code).await?;
-        let domain_record_count =
-            Self::count_optional_related_rows(&mut tx, "user_dns_records", active_code).await?;
-        let did_doc_count =
-            Self::count_optional_related_rows(&mut tx, "did_documents", active_code).await?;
-
-        Self::delete_optional_related_rows(&mut tx, active_code).await?;
+        let owners = sqlx::query_scalar::<_, String>(
+            "SELECT username FROM users WHERE activation_code = ?1 ORDER BY username",
+        )
+        .bind(active_code)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|e| Self::db_err("list users for state clear failed", e))?;
+        let now = Self::now_secs() as i64;
+        for owner in &owners {
+            Self::delete_user_dns_names_tx(&mut tx, owner, None, now).await?;
+        }
 
         for (table, field) in [
             ("relay_admission_events", "zone"),
@@ -1883,50 +2113,6 @@ impl SnAuthDB for SqliteSnAuthDB {
                 .await
                 .map_err(|e| Self::db_err(format!("delete {table} rows failed"), e))?;
         }
-
-        sqlx::query(
-            "DELETE FROM account_sessions
-             WHERE username IN (
-                SELECT username FROM users WHERE activation_code = ?1
-             )",
-        )
-        .bind(active_code)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| Self::db_err("delete account sessions failed", e))?;
-
-        sqlx::query(
-            "DELETE FROM user_domain_bindings
-             WHERE owner IN (
-                SELECT username FROM users WHERE activation_code = ?1
-             )",
-        )
-        .bind(active_code)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| Self::db_err("delete user domain bindings failed", e))?;
-
-        sqlx::query(
-            "DELETE FROM zone_info
-             WHERE username IN (
-                SELECT username FROM users WHERE activation_code = ?1
-             )",
-        )
-        .bind(active_code)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| Self::db_err("delete zone info failed", e))?;
-
-        sqlx::query(
-            "DELETE FROM user_auth
-             WHERE username IN (
-                SELECT username FROM users WHERE activation_code = ?1
-             )",
-        )
-        .bind(active_code)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| Self::db_err("delete user auth failed", e))?;
 
         sqlx::query("DELETE FROM users WHERE activation_code = ?1")
             .bind(active_code)
@@ -1949,9 +2135,6 @@ impl SnAuthDB for SqliteSnAuthDB {
 
         Ok(SnClearStateResult {
             deleted_users: user_count.max(0) as u64,
-            deleted_devices: device_count.max(0) as u64,
-            deleted_domain_records: domain_record_count.max(0) as u64,
-            deleted_did_documents: did_doc_count.max(0) as u64,
             activation_code_reset: true,
         })
     }
@@ -2084,8 +2267,12 @@ impl SnAuthDB for SqliteSnAuthDB {
                 .fetch_one(&self.pool)
                 .await
                 .map_err(|e| Self::db_err("query user count failed", e))?;
-        if user_count > 0 {
-            return Ok(false);
+        if user_count == 0 {
+            return Err(sn_err!(
+                SnErrorCode::NotFound,
+                "cannot create auth for missing user: {}",
+                username
+            ));
         }
 
         let auth_count =
@@ -2335,13 +2522,24 @@ impl SnAuthDB for SqliteSnAuthDB {
 
     async fn set_user_state(&self, username: &str, state: UserState) -> SnResult<()> {
         let now = Self::now_secs() as i64;
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| Self::db_err("begin user state update failed", e))?;
         sqlx::query("UPDATE users SET state = ?1, updated_at = ?2 WHERE username = ?3")
             .bind(state.to_string())
             .bind(now)
             .bind(username)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await
             .map_err(|e| Self::db_err("update user state failed", e))?;
+        if matches!(state, UserState::Deleted) {
+            Self::delete_user_dns_names_tx(&mut tx, username, None, now).await?;
+        }
+        tx.commit()
+            .await
+            .map_err(|e| Self::db_err("commit user state update failed", e))?;
         if !state.is_active() {
             self.revoke_user_sessions(username, now as u64).await?;
         }
@@ -2635,10 +2833,570 @@ impl SnAuthDB for SqliteSnAuthDB {
         .execute(&mut *tx)
         .await
         .map_err(|e| Self::db_err("clear user_domain failed", e))?;
+        Self::delete_user_dns_names_tx(&mut tx, username, Some(canonical_domain.as_str()), now)
+            .await?;
         tx.commit()
             .await
             .map_err(|e| Self::db_err("commit transaction failed", e))?;
         Ok(())
+    }
+
+    async fn put_user_dns_value(
+        &self,
+        owner: &str,
+        name: &str,
+        record_type: UserDnsRecordType,
+        value: &str,
+        ttl: u32,
+    ) -> SnResult<UserDnsMutationResult> {
+        let owner = owner.trim();
+        Self::check_non_empty(owner, "owner")?;
+        let name = canonical_user_dns_name(name)?;
+        let value = canonical_user_dns_rdata(record_type, value)?;
+        let ttl = validate_user_dns_ttl(ttl)?;
+        let now = Self::now_secs() as i64;
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| Self::db_err("begin user DNS put failed", e))?;
+        Self::lock_user_dns_state_tx(&mut tx).await?;
+
+        let state = sqlx::query_scalar::<_, String>("SELECT state FROM users WHERE username = ?1")
+            .bind(owner)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| Self::db_err("query user for DNS put failed", e))?
+            .ok_or_else(|| sn_err!(SnErrorCode::NotFound, "user not found: {}", owner))?;
+        if !UserState::from_str(Some(state.as_str())).is_active() {
+            return Err(sn_err!(
+                SnErrorCode::Blocked,
+                "user is not active: {}",
+                owner
+            ));
+        }
+
+        // This write acquires SQLite's writer lock before ownership is read,
+        // making simultaneous first claims deterministic across processes.
+        sqlx::query(
+            "INSERT OR IGNORE INTO user_dns_names
+                (name, owner, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?3)",
+        )
+        .bind(name.as_str())
+        .bind(owner)
+        .bind(now)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| Self::db_err("claim user DNS name failed", e))?;
+        let actual_owner = Self::user_dns_owner_tx(&mut tx, name.as_str())
+            .await?
+            .ok_or_else(|| Self::db_err("claim user DNS name failed", "owner row missing"))?;
+        Self::ensure_user_dns_owner(actual_owner.as_str(), owner, name.as_str())?;
+
+        let current = Self::user_dns_rrset_tx(&mut tx, name.as_str(), record_type).await?;
+        let value_exists = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM user_dns_rdata
+             WHERE name = ?1 AND record_type = ?2 AND rdata = ?3",
+        )
+        .bind(name.as_str())
+        .bind(record_type.as_str())
+        .bind(value.as_str())
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| Self::db_err("query existing user DNS value failed", e))?
+            > 0;
+        let effective_ttl = current
+            .as_ref()
+            .map(|rrset| rrset.ttl.min(ttl))
+            .unwrap_or(ttl);
+        if value_exists
+            && current
+                .as_ref()
+                .is_some_and(|rrset| rrset.ttl == effective_ttl)
+        {
+            let revision = Self::current_user_dns_revision_tx(&mut tx).await?;
+            tx.commit()
+                .await
+                .map_err(|e| Self::db_err("commit no-op user DNS put failed", e))?;
+            return Ok(UserDnsMutationResult {
+                revision,
+                changed: false,
+                rrset: current,
+            });
+        }
+
+        let revision = Self::allocate_user_dns_revision_tx(&mut tx).await?;
+        sqlx::query(
+            "INSERT INTO user_dns_rrsets
+                (name, record_type, ttl, revision, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?5)
+             ON CONFLICT(name, record_type) DO UPDATE SET
+                ttl = excluded.ttl,
+                revision = excluded.revision,
+                updated_at = excluded.updated_at",
+        )
+        .bind(name.as_str())
+        .bind(record_type.as_str())
+        .bind(effective_ttl as i64)
+        .bind(revision as i64)
+        .bind(now)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| Self::db_err("upsert user DNS RRset failed", e))?;
+        sqlx::query(
+            "INSERT OR IGNORE INTO user_dns_rdata
+                (name, record_type, rdata, created_at)
+             VALUES (?1, ?2, ?3, ?4)",
+        )
+        .bind(name.as_str())
+        .bind(record_type.as_str())
+        .bind(value.as_str())
+        .bind(now)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| Self::db_err("insert user DNS rdata failed", e))?;
+        sqlx::query("UPDATE user_dns_names SET updated_at = ?1 WHERE name = ?2")
+            .bind(now)
+            .bind(name.as_str())
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| Self::db_err("touch user DNS name failed", e))?;
+        Self::append_user_dns_change_tx(
+            &mut tx,
+            revision,
+            name.as_str(),
+            Some(record_type),
+            UserDnsChangeOperation::UpsertRrset,
+            now,
+        )
+        .await?;
+        let rrset = Self::user_dns_rrset_tx(&mut tx, name.as_str(), record_type).await?;
+        tx.commit()
+            .await
+            .map_err(|e| Self::db_err("commit user DNS put failed", e))?;
+        Ok(UserDnsMutationResult {
+            revision,
+            changed: true,
+            rrset,
+        })
+    }
+
+    async fn remove_user_dns_value(
+        &self,
+        owner: &str,
+        name: &str,
+        record_type: UserDnsRecordType,
+        value: &str,
+    ) -> SnResult<UserDnsMutationResult> {
+        let owner = owner.trim();
+        Self::check_non_empty(owner, "owner")?;
+        let name = canonical_user_dns_name(name)?;
+        let value = canonical_user_dns_rdata(record_type, value)?;
+        let now = Self::now_secs() as i64;
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| Self::db_err("begin user DNS value delete failed", e))?;
+        Self::lock_user_dns_state_tx(&mut tx).await?;
+        let Some(actual_owner) = Self::user_dns_owner_tx(&mut tx, name.as_str()).await? else {
+            let revision = Self::current_user_dns_revision_tx(&mut tx).await?;
+            tx.commit()
+                .await
+                .map_err(|e| Self::db_err("commit absent user DNS value delete failed", e))?;
+            return Ok(UserDnsMutationResult {
+                revision,
+                changed: false,
+                rrset: None,
+            });
+        };
+        Self::ensure_user_dns_owner(actual_owner.as_str(), owner, name.as_str())?;
+        let deleted = sqlx::query(
+            "DELETE FROM user_dns_rdata
+             WHERE name = ?1 AND record_type = ?2 AND rdata = ?3",
+        )
+        .bind(name.as_str())
+        .bind(record_type.as_str())
+        .bind(value.as_str())
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| Self::db_err("delete user DNS value failed", e))?;
+        if deleted.rows_affected() == 0 {
+            let revision = Self::current_user_dns_revision_tx(&mut tx).await?;
+            let rrset = Self::user_dns_rrset_tx(&mut tx, name.as_str(), record_type).await?;
+            tx.commit()
+                .await
+                .map_err(|e| Self::db_err("commit no-op user DNS value delete failed", e))?;
+            return Ok(UserDnsMutationResult {
+                revision,
+                changed: false,
+                rrset,
+            });
+        }
+
+        let revision = Self::allocate_user_dns_revision_tx(&mut tx).await?;
+        let remaining = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM user_dns_rdata
+             WHERE name = ?1 AND record_type = ?2",
+        )
+        .bind(name.as_str())
+        .bind(record_type.as_str())
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| Self::db_err("count remaining user DNS values failed", e))?;
+        let (operation, change_type) = if remaining == 0 {
+            sqlx::query("DELETE FROM user_dns_rrsets WHERE name = ?1 AND record_type = ?2")
+                .bind(name.as_str())
+                .bind(record_type.as_str())
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| Self::db_err("delete empty user DNS RRset failed", e))?;
+            let rrset_count = sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM user_dns_rrsets WHERE name = ?1",
+            )
+            .bind(name.as_str())
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|e| Self::db_err("count remaining user DNS RRsets failed", e))?;
+            if rrset_count == 0 {
+                sqlx::query("DELETE FROM user_dns_names WHERE name = ?1")
+                    .bind(name.as_str())
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| Self::db_err("delete empty user DNS name failed", e))?;
+                (UserDnsChangeOperation::DeleteName, None)
+            } else {
+                (UserDnsChangeOperation::DeleteRrset, Some(record_type))
+            }
+        } else {
+            sqlx::query(
+                "UPDATE user_dns_rrsets
+                 SET revision = ?1, updated_at = ?2
+                 WHERE name = ?3 AND record_type = ?4",
+            )
+            .bind(revision as i64)
+            .bind(now)
+            .bind(name.as_str())
+            .bind(record_type.as_str())
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| Self::db_err("update user DNS RRset revision failed", e))?;
+            (UserDnsChangeOperation::UpsertRrset, Some(record_type))
+        };
+        Self::append_user_dns_change_tx(
+            &mut tx,
+            revision,
+            name.as_str(),
+            change_type,
+            operation,
+            now,
+        )
+        .await?;
+        let rrset = Self::user_dns_rrset_tx(&mut tx, name.as_str(), record_type).await?;
+        tx.commit()
+            .await
+            .map_err(|e| Self::db_err("commit user DNS value delete failed", e))?;
+        Ok(UserDnsMutationResult {
+            revision,
+            changed: true,
+            rrset,
+        })
+    }
+
+    async fn delete_user_dns_rrset(
+        &self,
+        owner: &str,
+        name: &str,
+        record_type: UserDnsRecordType,
+    ) -> SnResult<UserDnsMutationResult> {
+        let owner = owner.trim();
+        Self::check_non_empty(owner, "owner")?;
+        let name = canonical_user_dns_name(name)?;
+        let now = Self::now_secs() as i64;
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| Self::db_err("begin user DNS RRset delete failed", e))?;
+        Self::lock_user_dns_state_tx(&mut tx).await?;
+        let Some(actual_owner) = Self::user_dns_owner_tx(&mut tx, name.as_str()).await? else {
+            let revision = Self::current_user_dns_revision_tx(&mut tx).await?;
+            tx.commit()
+                .await
+                .map_err(|e| Self::db_err("commit absent user DNS RRset delete failed", e))?;
+            return Ok(UserDnsMutationResult {
+                revision,
+                changed: false,
+                rrset: None,
+            });
+        };
+        Self::ensure_user_dns_owner(actual_owner.as_str(), owner, name.as_str())?;
+        let deleted =
+            sqlx::query("DELETE FROM user_dns_rrsets WHERE name = ?1 AND record_type = ?2")
+                .bind(name.as_str())
+                .bind(record_type.as_str())
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| Self::db_err("delete user DNS RRset failed", e))?;
+        if deleted.rows_affected() == 0 {
+            let revision = Self::current_user_dns_revision_tx(&mut tx).await?;
+            tx.commit()
+                .await
+                .map_err(|e| Self::db_err("commit no-op user DNS RRset delete failed", e))?;
+            return Ok(UserDnsMutationResult {
+                revision,
+                changed: false,
+                rrset: None,
+            });
+        }
+        let revision = Self::allocate_user_dns_revision_tx(&mut tx).await?;
+        let remaining =
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM user_dns_rrsets WHERE name = ?1")
+                .bind(name.as_str())
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(|e| Self::db_err("count user DNS RRsets after delete failed", e))?;
+        let (operation, change_type) = if remaining == 0 {
+            sqlx::query("DELETE FROM user_dns_names WHERE name = ?1")
+                .bind(name.as_str())
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| Self::db_err("delete empty user DNS name failed", e))?;
+            (UserDnsChangeOperation::DeleteName, None)
+        } else {
+            (UserDnsChangeOperation::DeleteRrset, Some(record_type))
+        };
+        Self::append_user_dns_change_tx(
+            &mut tx,
+            revision,
+            name.as_str(),
+            change_type,
+            operation,
+            now,
+        )
+        .await?;
+        tx.commit()
+            .await
+            .map_err(|e| Self::db_err("commit user DNS RRset delete failed", e))?;
+        Ok(UserDnsMutationResult {
+            revision,
+            changed: true,
+            rrset: None,
+        })
+    }
+
+    async fn set_user_dns_rrset_ttl(
+        &self,
+        owner: &str,
+        name: &str,
+        record_type: UserDnsRecordType,
+        ttl: u32,
+    ) -> SnResult<UserDnsMutationResult> {
+        let owner = owner.trim();
+        Self::check_non_empty(owner, "owner")?;
+        let name = canonical_user_dns_name(name)?;
+        let ttl = validate_user_dns_ttl(ttl)?;
+        let now = Self::now_secs() as i64;
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| Self::db_err("begin user DNS TTL update failed", e))?;
+        Self::lock_user_dns_state_tx(&mut tx).await?;
+        let actual_owner = Self::user_dns_owner_tx(&mut tx, name.as_str())
+            .await?
+            .ok_or_else(|| sn_err!(SnErrorCode::NotFound, "user DNS name not found: {}", name))?;
+        Self::ensure_user_dns_owner(actual_owner.as_str(), owner, name.as_str())?;
+        let current = Self::user_dns_rrset_tx(&mut tx, name.as_str(), record_type)
+            .await?
+            .ok_or_else(|| {
+                sn_err!(
+                    SnErrorCode::NotFound,
+                    "user DNS RRset not found: {} {}",
+                    name,
+                    record_type
+                )
+            })?;
+        if current.ttl == ttl {
+            let revision = Self::current_user_dns_revision_tx(&mut tx).await?;
+            tx.commit()
+                .await
+                .map_err(|e| Self::db_err("commit no-op user DNS TTL update failed", e))?;
+            return Ok(UserDnsMutationResult {
+                revision,
+                changed: false,
+                rrset: Some(current),
+            });
+        }
+        let revision = Self::allocate_user_dns_revision_tx(&mut tx).await?;
+        sqlx::query(
+            "UPDATE user_dns_rrsets
+             SET ttl = ?1, revision = ?2, updated_at = ?3
+             WHERE name = ?4 AND record_type = ?5",
+        )
+        .bind(ttl as i64)
+        .bind(revision as i64)
+        .bind(now)
+        .bind(name.as_str())
+        .bind(record_type.as_str())
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| Self::db_err("update user DNS TTL failed", e))?;
+        Self::append_user_dns_change_tx(
+            &mut tx,
+            revision,
+            name.as_str(),
+            Some(record_type),
+            UserDnsChangeOperation::UpsertRrset,
+            now,
+        )
+        .await?;
+        let rrset = Self::user_dns_rrset_tx(&mut tx, name.as_str(), record_type).await?;
+        tx.commit()
+            .await
+            .map_err(|e| Self::db_err("commit user DNS TTL update failed", e))?;
+        Ok(UserDnsMutationResult {
+            revision,
+            changed: true,
+            rrset,
+        })
+    }
+
+    async fn get_user_dns_rrset(
+        &self,
+        name: &str,
+        record_type: UserDnsRecordType,
+    ) -> SnResult<UserDnsLookup> {
+        let name = canonical_user_dns_name(name)?;
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| Self::db_err("begin user DNS lookup failed", e))?;
+        let observed_revision = Self::current_user_dns_revision_tx(&mut tx).await?;
+        let rrset = Self::user_dns_rrset_tx(&mut tx, name.as_str(), record_type).await?;
+        tx.commit()
+            .await
+            .map_err(|e| Self::db_err("commit user DNS lookup failed", e))?;
+        Ok(UserDnsLookup {
+            rrset,
+            observed_revision,
+        })
+    }
+
+    async fn list_user_dns_rrsets(&self, owner: &str) -> SnResult<Vec<UserDnsRrset>> {
+        let rows = sqlx::query(
+            "SELECT s.name, s.record_type, s.ttl, s.revision, d.rdata
+             FROM user_dns_rrsets s
+             JOIN user_dns_names n ON n.name = s.name
+             JOIN user_dns_rdata d
+               ON d.name = s.name AND d.record_type = s.record_type
+             WHERE n.owner = ?1
+             ORDER BY s.name, s.record_type, d.rdata",
+        )
+        .bind(owner.trim())
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| Self::db_err("list user DNS RRsets failed", e))?;
+        let mut rrsets = Vec::<UserDnsRrset>::new();
+        for row in rows {
+            let name: String = row
+                .try_get("name")
+                .map_err(|e| Self::db_err("read user DNS name failed", e))?;
+            let record_type_raw: String = row
+                .try_get("record_type")
+                .map_err(|e| Self::db_err("read user DNS record type failed", e))?;
+            let record_type = UserDnsRecordType::from_str(record_type_raw.as_str())?;
+            let ttl: i64 = row
+                .try_get("ttl")
+                .map_err(|e| Self::db_err("read user DNS TTL failed", e))?;
+            let revision: i64 = row
+                .try_get("revision")
+                .map_err(|e| Self::db_err("read user DNS revision failed", e))?;
+            let value: String = row
+                .try_get("rdata")
+                .map_err(|e| Self::db_err("read user DNS rdata failed", e))?;
+            if let Some(last) = rrsets.last_mut() {
+                if last.name == name && last.record_type == record_type {
+                    last.values.push(value);
+                    continue;
+                }
+            }
+            rrsets.push(UserDnsRrset {
+                name,
+                record_type,
+                ttl: ttl.max(0) as u32,
+                values: vec![value],
+                revision: Self::i64_to_u64(revision),
+            });
+        }
+        Ok(rrsets)
+    }
+
+    async fn list_user_dns_changes(
+        &self,
+        after_revision: u64,
+        limit: usize,
+    ) -> SnResult<UserDnsChangePage> {
+        if !(1..=1_000).contains(&limit) {
+            return Err(Self::invalid_input(
+                "user DNS change page limit must be in 1..=1000",
+            ));
+        }
+        let current_revision = sqlx::query_scalar::<_, i64>(
+            "SELECT revision FROM user_dns_state WHERE singleton_id = 1",
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| Self::db_err("read user DNS current revision failed", e))?;
+        let earliest =
+            sqlx::query_scalar::<_, Option<i64>>("SELECT MIN(revision) FROM user_dns_changes")
+                .fetch_one(&self.pool)
+                .await
+                .map_err(|e| Self::db_err("read earliest user DNS revision failed", e))?;
+        let rows = sqlx::query(
+            "SELECT revision, name, record_type, operation
+             FROM user_dns_changes
+             WHERE revision > ?1
+             ORDER BY revision
+             LIMIT ?2",
+        )
+        .bind(after_revision as i64)
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| Self::db_err("list user DNS changes failed", e))?;
+        let mut changes = Vec::with_capacity(rows.len());
+        for row in rows {
+            let revision: i64 = row
+                .try_get("revision")
+                .map_err(|e| Self::db_err("read user DNS change revision failed", e))?;
+            let record_type = row
+                .try_get::<Option<String>, _>("record_type")
+                .map_err(|e| Self::db_err("read user DNS change record type failed", e))?
+                .map(|value| UserDnsRecordType::from_str(value.as_str()))
+                .transpose()?;
+            let operation: String = row
+                .try_get("operation")
+                .map_err(|e| Self::db_err("read user DNS change operation failed", e))?;
+            changes.push(UserDnsChange {
+                revision: Self::i64_to_u64(revision),
+                name: row
+                    .try_get("name")
+                    .map_err(|e| Self::db_err("read user DNS change name failed", e))?,
+                record_type,
+                operation: UserDnsChangeOperation::from_db(operation.as_str())?,
+            });
+        }
+        let current_revision = Self::i64_to_u64(current_revision);
+        Ok(UserDnsChangePage {
+            changes,
+            current_revision,
+            earliest_available_revision: earliest
+                .map(Self::i64_to_u64)
+                .unwrap_or_else(|| current_revision.saturating_add(1)),
+        })
     }
 
     async fn get_zone_info(&self, username: &str) -> SnResult<Option<ZoneInfo>> {
@@ -3111,7 +3869,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_legacy_users_migration_keeps_account_without_email() -> SnResult<()> {
+    async fn test_unversioned_legacy_schema_is_rejected() -> SnResult<()> {
         let tmp_dir = tempfile::tempdir()
             .map_err(|e| sn_err!(SnErrorCode::DBError, "create temp dir failed: {}", e))?;
         let db_path = tmp_dir.path().join("legacy-sn-auth.sqlite3");
@@ -3131,22 +3889,10 @@ mod tests {
         .execute(&db.pool)
         .await
         .map_err(|e| SqliteSnAuthDB::db_err("create legacy users table failed", e))?;
-        sqlx::query("INSERT INTO users (username) VALUES ('legacy-user')")
-            .execute(&db.pool)
-            .await
-            .map_err(|e| SqliteSnAuthDB::db_err("insert legacy user failed", e))?;
-
-        db.initialize_database().await?;
-
-        let legacy = db.get_user_info("legacy-user").await?.unwrap();
-        assert!(legacy.email.is_none());
-        let email_column_count = sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*) FROM pragma_table_info('users') WHERE name = 'email'",
-        )
-        .fetch_one(&db.pool)
-        .await
-        .map_err(|e| SqliteSnAuthDB::db_err("query migrated email column failed", e))?;
-        assert_eq!(email_column_count, 1);
+        let error = db.initialize_database().await.unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("incompatible schema, recreate database"));
 
         Ok(())
     }
@@ -3441,7 +4187,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_clear_state_by_active_code_resets_auth_and_legacy_related_rows() -> SnResult<()> {
+    async fn test_clear_state_by_active_code_resets_account_and_emits_dns_changes() -> SnResult<()>
+    {
         let (_tmp_dir, db) = new_test_db().await?;
         db.insert_activation_code("clear-me").await?;
         assert!(
@@ -3456,36 +4203,17 @@ mod tests {
             .await?
         );
 
-        sqlx::query("CREATE TABLE devices (owner TEXT, device_name TEXT, did TEXT PRIMARY KEY, ip TEXT, description TEXT, mini_config_jwt TEXT, created_at INTEGER, updated_at INTEGER)")
-            .execute(&db.pool)
-            .await
-            .map_err(|e| SqliteSnAuthDB::db_err("create devices failed", e))?;
-        sqlx::query("CREATE TABLE user_dns_records (id INTEGER PRIMARY KEY AUTOINCREMENT, owner TEXT, domain TEXT, record_type TEXT, record TEXT, ttl INTEGER, created_at INTEGER, updated_at INTEGER)")
-            .execute(&db.pool)
-            .await
-            .map_err(|e| SqliteSnAuthDB::db_err("create user_dns_records failed", e))?;
-        sqlx::query("CREATE TABLE did_documents (id INTEGER PRIMARY KEY AUTOINCREMENT, obj_id TEXT, owner_user TEXT, obj_name TEXT, did_document TEXT, doc_type TEXT, update_time INTEGER)")
-            .execute(&db.pool)
-            .await
-            .map_err(|e| SqliteSnAuthDB::db_err("create did_documents failed", e))?;
-        sqlx::query("INSERT INTO devices (owner, device_name, did, ip, description, mini_config_jwt, created_at, updated_at) VALUES ('alice', 'ood1', 'did:dev:1', '', '', '', 1, 1)")
-            .execute(&db.pool)
-            .await
-            .map_err(|e| SqliteSnAuthDB::db_err("insert device failed", e))?;
-        sqlx::query("INSERT INTO user_dns_records (owner, domain, record_type, record, ttl, created_at, updated_at) VALUES ('alice', 'alice.example.com', 'A', '127.0.0.1', 60, 1, 1)")
-            .execute(&db.pool)
-            .await
-            .map_err(|e| SqliteSnAuthDB::db_err("insert dns record failed", e))?;
-        sqlx::query("INSERT INTO did_documents (obj_id, owner_user, obj_name, did_document, doc_type, update_time) VALUES ('obj1', 'alice', 'zone', '{}', 'zone', 1)")
-            .execute(&db.pool)
-            .await
-            .map_err(|e| SqliteSnAuthDB::db_err("insert did document failed", e))?;
+        db.put_user_dns_value(
+            "alice",
+            "alice.example.com",
+            UserDnsRecordType::A,
+            "127.0.0.1",
+            60,
+        )
+        .await?;
 
         let result = db.clear_state_by_active_code("clear-me").await?;
         assert_eq!(result.deleted_users, 1);
-        assert_eq!(result.deleted_devices, 1);
-        assert_eq!(result.deleted_domain_records, 1);
-        assert_eq!(result.deleted_did_documents, 1);
         assert!(result.activation_code_reset);
         assert!(db.check_active_code("clear-me").await?);
         assert!(!db.is_user_exist("alice").await?);
@@ -3495,7 +4223,387 @@ mod tests {
         assert_eq!(zone.bns_name, "alice");
         assert!(!zone.self_cert);
         assert!(zone.zone.is_none());
+        let changes = db.list_user_dns_changes(0, 10).await?;
+        assert_eq!(changes.changes.len(), 2);
+        assert_eq!(
+            changes.changes.last().unwrap().operation,
+            UserDnsChangeOperation::DeleteName
+        );
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_fresh_user_dns_schema_has_constraints_and_no_compatibility_tables() -> SnResult<()>
+    {
+        let (_tmp_dir, db) = new_test_db().await?;
+        let foreign_keys = sqlx::query_scalar::<_, i64>("PRAGMA foreign_keys")
+            .fetch_one(&db.pool)
+            .await
+            .map_err(|e| SqliteSnAuthDB::db_err("read foreign_keys pragma failed", e))?;
+        assert_eq!(foreign_keys, 1);
+
+        let tables = sqlx::query_scalar::<_, String>(
+            "SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name",
+        )
+        .fetch_all(&db.pool)
+        .await
+        .map_err(|e| SqliteSnAuthDB::db_err("list schema tables failed", e))?;
+        for expected in [
+            "user_dns_names",
+            "user_dns_rrsets",
+            "user_dns_rdata",
+            "user_dns_state",
+            "user_dns_changes",
+        ] {
+            assert!(tables.iter().any(|table| table == expected));
+        }
+        for removed in ["devices", "did_documents", "user_dns_records"] {
+            assert!(!tables.iter().any(|table| table == removed));
+        }
+
+        let rrset_columns = sqlx::query("PRAGMA table_info(user_dns_rrsets)")
+            .fetch_all(&db.pool)
+            .await
+            .map_err(|e| SqliteSnAuthDB::db_err("read RRset columns failed", e))?;
+        assert_eq!(
+            rrset_columns
+                .iter()
+                .find(|row| row.get::<String, _>("name") == "name")
+                .unwrap()
+                .get::<i64, _>("pk"),
+            1
+        );
+        assert_eq!(
+            rrset_columns
+                .iter()
+                .find(|row| row.get::<String, _>("name") == "record_type")
+                .unwrap()
+                .get::<i64, _>("pk"),
+            2
+        );
+        let rdata_foreign_keys = sqlx::query("PRAGMA foreign_key_list(user_dns_rdata)")
+            .fetch_all(&db.pool)
+            .await
+            .map_err(|e| SqliteSnAuthDB::db_err("read rdata foreign keys failed", e))?;
+        assert_eq!(rdata_foreign_keys.len(), 2);
+        assert!(rdata_foreign_keys
+            .iter()
+            .all(|row| row.get::<String, _>("on_delete") == "CASCADE"));
+        let name_indexes = sqlx::query("PRAGMA index_list(user_dns_names)")
+            .fetch_all(&db.pool)
+            .await
+            .map_err(|e| SqliteSnAuthDB::db_err("read user DNS indexes failed", e))?;
+        assert!(name_indexes.iter().any(|row| {
+            row.get::<String, _>("name") == "idx_user_dns_names_owner_name"
+        }));
+        let rrset_sql = sqlx::query_scalar::<_, String>(
+            "SELECT sql FROM sqlite_master
+             WHERE type = 'table' AND name = 'user_dns_rrsets'",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .map_err(|e| SqliteSnAuthDB::db_err("read RRset DDL failed", e))?;
+        assert!(rrset_sql.contains("record_type IN ('A', 'AAAA', 'TXT')"));
+        assert!(rrset_sql.contains("ttl BETWEEN 30 AND 86400"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_user_dns_canonicalization_owner_claim_and_stable_values() -> SnResult<()> {
+        let (_tmp_dir, db) = new_test_db().await?;
+        for (code, username) in [("dns-alice", "alice"), ("dns-bob", "bob")] {
+            db.insert_activation_code(code).await?;
+            assert!(
+                db.register_user(
+                    code,
+                    username,
+                    format!("{}@example.com", username).as_str(),
+                    "h",
+                    "s",
+                    "pbkdf2",
+                )
+                .await?
+            );
+        }
+        let a = db
+            .put_user_dns_value(
+                "alice",
+                "Host.Example.COM.",
+                UserDnsRecordType::A,
+                "192.000.002.001",
+                600,
+            )
+            .await;
+        assert!(a.is_err(), "non-canonical IPv4 syntax must be rejected");
+        db.put_user_dns_value(
+            "alice",
+            "Host.Example.COM.",
+            UserDnsRecordType::A,
+            "192.0.2.1",
+            600,
+        )
+        .await?;
+        db.put_user_dns_value(
+            "alice",
+            "host.example.com",
+            UserDnsRecordType::Aaaa,
+            "2001:0db8:0:0:0:0:0:1",
+            300,
+        )
+        .await?;
+        for value in ["z,value", "a,value"] {
+            db.put_user_dns_value(
+                "alice",
+                "host.example.com",
+                UserDnsRecordType::Txt,
+                value,
+                120,
+            )
+            .await?;
+        }
+        let rrsets = db.list_user_dns_rrsets("alice").await?;
+        assert_eq!(
+            rrsets
+                .iter()
+                .find(|rrset| rrset.record_type == UserDnsRecordType::Aaaa)
+                .unwrap()
+                .values,
+            vec!["2001:db8::1"]
+        );
+        assert_eq!(
+            rrsets
+                .iter()
+                .find(|rrset| rrset.record_type == UserDnsRecordType::Txt)
+                .unwrap()
+                .values,
+            vec!["a,value", "z,value"]
+        );
+        let conflict = db
+            .put_user_dns_value(
+                "bob",
+                "host.example.com",
+                UserDnsRecordType::Txt,
+                "mine",
+                600,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(conflict.code(), SnErrorCode::Conflict);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_user_dns_claim_and_multivalue_add() -> SnResult<()> {
+        let (tmp_dir, db) = new_test_db().await?;
+        db.insert_activation_code("claim-a").await?;
+        db.insert_activation_code("claim-b").await?;
+        assert!(
+            db.register_user("claim-a", "alice", "alice@example.com", "h", "s", "pbkdf2",)
+                .await?
+        );
+        assert!(
+            db.register_user("claim-b", "bob", "bob@example.com", "h", "s", "pbkdf2",)
+                .await?
+        );
+        let db = Arc::new(db);
+        let barrier = Arc::new(tokio::sync::Barrier::new(3));
+        let mut claims = Vec::new();
+        for owner in ["alice", "bob"] {
+            let db = db.clone();
+            let barrier = barrier.clone();
+            claims.push(tokio::spawn(async move {
+                barrier.wait().await;
+                db.put_user_dns_value(
+                    owner,
+                    "claimed.example.com",
+                    UserDnsRecordType::Txt,
+                    owner,
+                    600,
+                )
+                .await
+            }));
+        }
+        barrier.wait().await;
+        let outcomes = [
+            claims.remove(0).await.unwrap(),
+            claims.remove(0).await.unwrap(),
+        ];
+        assert_eq!(outcomes.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|result| result
+                    .as_ref()
+                    .err()
+                    .is_some_and(|error| error.code() == SnErrorCode::Conflict))
+                .count(),
+            1
+        );
+
+        let barrier = Arc::new(tokio::sync::Barrier::new(3));
+        let mut adds = Vec::new();
+        for value in ["one", "two"] {
+            let db = db.clone();
+            let barrier = barrier.clone();
+            adds.push(tokio::spawn(async move {
+                barrier.wait().await;
+                db.put_user_dns_value(
+                    "alice",
+                    "multi.example.com",
+                    UserDnsRecordType::Txt,
+                    value,
+                    600,
+                )
+                .await
+            }));
+        }
+        barrier.wait().await;
+        for add in adds {
+            add.await.unwrap()?;
+        }
+        assert_eq!(
+            db.get_user_dns_rrset("multi.example.com", UserDnsRecordType::Txt)
+                .await?
+                .rrset
+                .unwrap()
+                .values,
+            vec!["one", "two"]
+        );
+
+        db.put_user_dns_value(
+            "alice",
+            "interleave.example.com",
+            UserDnsRecordType::Txt,
+            "remove-me",
+            600,
+        )
+        .await?;
+        let barrier = Arc::new(tokio::sync::Barrier::new(3));
+        let add = {
+            let db = db.clone();
+            let barrier = barrier.clone();
+            tokio::spawn(async move {
+                barrier.wait().await;
+                db.put_user_dns_value(
+                    "alice",
+                    "interleave.example.com",
+                    UserDnsRecordType::Txt,
+                    "keep-me",
+                    600,
+                )
+                .await
+            })
+        };
+        let remove = {
+            let db = db.clone();
+            let barrier = barrier.clone();
+            tokio::spawn(async move {
+                barrier.wait().await;
+                db.remove_user_dns_value(
+                    "alice",
+                    "interleave.example.com",
+                    UserDnsRecordType::Txt,
+                    "remove-me",
+                )
+                .await
+            })
+        };
+        barrier.wait().await;
+        assert!(add.await.unwrap()?.changed);
+        assert!(remove.await.unwrap()?.changed);
+        assert_eq!(
+            db.get_user_dns_rrset("interleave.example.com", UserDnsRecordType::Txt)
+                .await?
+                .rrset
+                .unwrap()
+                .values,
+            vec!["keep-me"]
+        );
+
+        let barrier = Arc::new(tokio::sync::Barrier::new(3));
+        let mut duplicates = Vec::new();
+        for _ in 0..2 {
+            let db = db.clone();
+            let barrier = barrier.clone();
+            duplicates.push(tokio::spawn(async move {
+                barrier.wait().await;
+                db.put_user_dns_value(
+                    "alice",
+                    "duplicate.example.com",
+                    UserDnsRecordType::Txt,
+                    "same-request",
+                    600,
+                )
+                .await
+            }));
+        }
+        barrier.wait().await;
+        let duplicate_results = [
+            duplicates.remove(0).await.unwrap()?,
+            duplicates.remove(0).await.unwrap()?,
+        ];
+        assert_eq!(
+            duplicate_results
+                .iter()
+                .filter(|result| result.changed)
+                .count(),
+            1
+        );
+        drop(tmp_dir);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_resolver_recovers_from_user_dns_change_retention_gap() -> SnResult<()> {
+        use crate::{SnAuthResolverReader, SnResolver, SnResolverConfig};
+        use name_client::RecordType;
+
+        let (_tmp_dir, db) = new_test_db().await?;
+        db.insert_activation_code("gap-code").await?;
+        assert!(
+            db.register_user("gap-code", "alice", "alice@example.com", "h", "s", "pbkdf2",)
+                .await?
+        );
+        let name = "host.alice.web3.example";
+        db.put_user_dns_value("alice", name, UserDnsRecordType::A, "192.0.2.1", 600)
+            .await?;
+        let db = Arc::new(db);
+        let auth: SnAuthDBRef = db.clone();
+        let resolver = SnResolver::new(
+            SnResolverConfig::new(
+                "example",
+                Some("192.0.2.10".parse().unwrap()),
+                None,
+                None,
+                Vec::new(),
+            ),
+            Arc::new(SnAuthResolverReader::new(auth.clone())),
+        );
+        assert_eq!(
+            resolver
+                .resolve_dns_cached(name, RecordType::A)
+                .await
+                .unwrap()
+                .addresses,
+            vec!["192.0.2.1".parse::<std::net::IpAddr>().unwrap()]
+        );
+        auth.put_user_dns_value("alice", name, UserDnsRecordType::A, "192.0.2.2", 600)
+            .await?;
+        auth.remove_user_dns_value("alice", name, UserDnsRecordType::A, "192.0.2.1")
+            .await?;
+        sqlx::query("DELETE FROM user_dns_changes WHERE revision <= 2")
+            .execute(&db.pool)
+            .await
+            .map_err(|e| SqliteSnAuthDB::db_err("simulate DNS retention gap failed", e))?;
+        assert_eq!(
+            resolver
+                .resolve_dns_cached(name, RecordType::A)
+                .await
+                .unwrap()
+                .addresses,
+            vec!["192.0.2.2".parse::<std::net::IpAddr>().unwrap()]
+        );
         Ok(())
     }
 
@@ -3762,6 +4870,13 @@ mod tests {
 
         // 未知 session → None。
         assert!(db.get_account_session("missing").await?.is_none());
+        for username in ["alice", "bob"] {
+            sqlx::query("INSERT INTO users (username) VALUES (?1)")
+                .bind(username)
+                .execute(&db.pool)
+                .await
+                .map_err(|e| SqliteSnAuthDB::db_err("insert session test user failed", e))?;
+        }
 
         db.create_account_session("a1", "alice", "sn-refresh", 1, 100)
             .await?;
@@ -4069,104 +5184,30 @@ mod tests {
         Ok(())
     }
 
-    /// 旧 schema（domain 主键 + pending_pkx 行）迁移：active/revoked 行保留，
-    /// pending_pkx 行丢弃，迁移后 supersede/多行审计可用。
     #[tokio::test]
-    async fn test_legacy_user_domain_schema_migration() -> SnResult<()> {
+    async fn test_wrong_schema_version_is_rejected() -> SnResult<()> {
         let tmp_dir = tempfile::tempdir()
             .map_err(|e| sn_err!(SnErrorCode::DBError, "create temp dir failed: {}", e))?;
         let db_path = tmp_dir.path().join("sn_auth.sqlite3");
         let db_path_str = db_path.to_string_lossy().to_string();
-
-        {
-            // 手工构造旧 schema。
-            let db = SqliteSnAuthDB::new_by_path(db_path_str.as_str()).await?;
-            for sql in [
-                "CREATE TABLE user_domain_history (
-                    domain TEXT PRIMARY KEY,
-                    owner TEXT NOT NULL,
-                    created_at INTEGER NOT NULL
-                )",
-                "CREATE TABLE user_domain_bindings (
-                    domain TEXT PRIMARY KEY,
-                    owner TEXT NOT NULL,
-                    state TEXT NOT NULL,
-                    pkx TEXT NOT NULL,
-                    pkx_record_name TEXT NOT NULL,
-                    verified_at INTEGER NULL,
-                    created_at INTEGER NOT NULL,
-                    updated_at INTEGER NOT NULL
-                )",
-                "INSERT INTO user_domain_history (domain, owner, created_at)
-                 VALUES ('active.test', 'alice', 1)",
-                "INSERT INTO user_domain_bindings
-                    (domain, owner, state, pkx, pkx_record_name, verified_at, created_at, updated_at)
-                 VALUES ('active.test', 'alice', 'active', 'PKX(alice-key)', '_pkx.active.test', 1, 1, 1)",
-                "INSERT INTO user_domain_bindings
-                    (domain, owner, state, pkx, pkx_record_name, verified_at, created_at, updated_at)
-                 VALUES ('pending.test', 'alice', 'pending_pkx', 'PKX(alice-key)', '_pkx.pending.test', NULL, 1, 1)",
-            ] {
-                sqlx::query(sql)
-                    .execute(&db.pool)
-                    .await
-                    .map_err(|e| SqliteSnAuthDB::db_err("seed legacy schema failed", e))?;
-            }
-        }
-
         let db = SqliteSnAuthDB::new_by_path(db_path_str.as_str()).await?;
-        db.initialize_database().await?;
-
-        db.insert_activation_code("alice-code").await?;
-        assert!(
-            db.register_user(
-                "alice-code",
-                "alice",
-                "alice@example.com",
-                "h",
-                "s",
-                "pbkdf2",
-            )
-            .await?
-        );
-        db.insert_activation_code("bob-code").await?;
-        assert!(
-            db.register_user("bob-code", "bob", "bob@example.com", "h", "s", "pbkdf2",)
-                .await?
-        );
-
-        // 旧 active 行仍可解析；pending_pkx 行被丢弃。
-        assert_eq!(
-            db.get_user_by_domain("active.test")
-                .await?
-                .unwrap()
-                .username
-                .as_deref(),
-            Some("alice")
-        );
-        let pending_rows: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM user_domain_bindings WHERE domain = 'pending.test'",
+        sqlx::query(
+            "CREATE TABLE sn_auth_schema (
+                singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
+                version INTEGER NOT NULL
+             )",
         )
-        .fetch_one(&db.pool)
+        .execute(&db.pool)
         .await
-        .map_err(|e| SqliteSnAuthDB::db_err("count pending rows failed", e))?;
-        assert_eq!(pending_rows, 0);
-
-        // 迁移后的表支持 supersede（多行同域名）。
-        db.activate_user_domain_binding("bob", "active.test", "PKX(bob-key)")
-            .await?;
-        assert_eq!(
-            binding_state(&db, "active.test", "alice").await?,
-            DOMAIN_BINDING_SUPERSEDED
-        );
-        assert_eq!(
-            db.get_user_by_domain("active.test")
-                .await?
-                .unwrap()
-                .username
-                .as_deref(),
-            Some("bob")
-        );
-
+        .map_err(|e| SqliteSnAuthDB::db_err("create old schema marker failed", e))?;
+        sqlx::query("INSERT INTO sn_auth_schema VALUES (1, 1)")
+            .execute(&db.pool)
+            .await
+            .map_err(|e| SqliteSnAuthDB::db_err("insert old schema marker failed", e))?;
+        let error = db.initialize_database().await.unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("incompatible schema, recreate database"));
         Ok(())
     }
 
