@@ -1,3 +1,4 @@
+use super::read_cache::RemoteReadCache;
 use crate::{
     sn_err, AccountSession, AllocateZoneRelayReq, AssignZoneRelayReq, DomainBinding,
     RegisterUserWithRelayAllocationReq, RegisterUserWithRelayAllocationResult,
@@ -14,8 +15,13 @@ use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use std::net::IpAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 pub const SN_AUTH_DB_RPC_PATH: &str = "/kapi/sn/s2s/auth-db";
+// Auth metadata changes relatively infrequently; bound staleness without caching
+// the in-process SQLite path used by all-in-one deployments.
+const SN_AUTH_DB_READ_CACHE_TTL: Duration = Duration::from_secs(5);
+const SN_AUTH_DB_READ_CACHE_CAPACITY: usize = 4096;
 
 pub const METHOD_CAPABILITIES: &str = "sn_auth_db.capabilities";
 pub const METHOD_GET_ACTIVATION_CODES: &str = "sn_auth_db.get_activation_codes";
@@ -844,7 +850,24 @@ impl SnAuthDbSessionIdReq {
 #[derive(Clone)]
 pub enum SnAuthDbClient {
     InProcess(Arc<dyn SnAuthDB>),
-    KRPC(Arc<kRPC>),
+    KRPC(Arc<SnAuthDbKrpcClient>),
+}
+
+pub struct SnAuthDbKrpcClient {
+    client: Arc<kRPC>,
+    read_cache: RemoteReadCache,
+}
+
+impl SnAuthDbKrpcClient {
+    fn new(client: Arc<kRPC>) -> Self {
+        Self {
+            client,
+            read_cache: RemoteReadCache::new(
+                SN_AUTH_DB_READ_CACHE_TTL,
+                SN_AUTH_DB_READ_CACHE_CAPACITY,
+            ),
+        }
+    }
 }
 
 impl SnAuthDbClient {
@@ -853,12 +876,12 @@ impl SnAuthDbClient {
     }
 
     pub fn new_krpc(client: Arc<kRPC>) -> Self {
-        Self::KRPC(client)
+        Self::KRPC(Arc::new(SnAuthDbKrpcClient::new(client)))
     }
 
     pub fn new_krpc_url(auth_db_url: &str, session_token: Option<String>) -> Self {
         let endpoint = normalize_sn_auth_db_url(auth_db_url);
-        Self::KRPC(Arc::new(kRPC::new(endpoint.as_str(), session_token)))
+        Self::new_krpc(Arc::new(kRPC::new(endpoint.as_str(), session_token)))
     }
 
     async fn call<Req, Resp>(&self, method: &str, req: &Req) -> SnResult<Resp>
@@ -872,6 +895,34 @@ impl SnAuthDbClient {
                 "generic call is only available for KRPC clients"
             )),
             Self::KRPC(client) => {
+                let cache_key = if is_cached_auth_db_read(method) {
+                    Some(RemoteReadCache::key(method, req).map_err(|e| {
+                        sn_err!(
+                            SnErrorCode::RemoteError,
+                            "failed to build SnAuthDB RPC {} cache key: {}",
+                            method,
+                            e
+                        )
+                    })?)
+                } else {
+                    None
+                };
+                if let Some(cached) = cache_key
+                    .as_deref()
+                    .and_then(|key| client.read_cache.get(key))
+                {
+                    let envelope: SnAuthDbRpcEnvelope<Resp> = serde_json::from_value(cached)
+                        .map_err(|e| {
+                            sn_err!(
+                                SnErrorCode::RemoteError,
+                                "failed to parse cached SnAuthDB RPC {} response: {}",
+                                method,
+                                e
+                            )
+                        })?;
+                    return envelope.into_result();
+                }
+
                 let req_json = serde_json::to_value(req).map_err(|e| {
                     sn_err!(
                         SnErrorCode::RemoteError,
@@ -880,7 +931,7 @@ impl SnAuthDbClient {
                         e
                     )
                 })?;
-                let result = client.call(method, req_json).await.map_err(|e| {
+                let result = client.client.call(method, req_json).await.map_err(|e| {
                     sn_err!(
                         SnErrorCode::RemoteError,
                         "SnAuthDB RPC {} transport failed: {}",
@@ -888,8 +939,8 @@ impl SnAuthDbClient {
                         e
                     )
                 })?;
-                let envelope: SnAuthDbRpcEnvelope<Resp> =
-                    serde_json::from_value(result).map_err(|e| {
+                let envelope: SnAuthDbRpcEnvelope<Resp> = serde_json::from_value(result.clone())
+                    .map_err(|e| {
                         sn_err!(
                             SnErrorCode::RemoteError,
                             "failed to parse SnAuthDB RPC {} response: {}",
@@ -897,10 +948,49 @@ impl SnAuthDbClient {
                             e
                         )
                     })?;
-                envelope.into_result()
+                let response = envelope.into_result()?;
+                if let Some(cache_key) = cache_key {
+                    client.read_cache.insert(cache_key, result);
+                } else if auth_db_method_invalidates_read_cache(method) {
+                    client.read_cache.clear();
+                }
+                Ok(response)
             }
         }
     }
+}
+
+fn is_cached_auth_db_read(method: &str) -> bool {
+    matches!(
+        method,
+        METHOD_GET_USER_INFO
+            | METHOD_GET_USER_BY_DOMAIN
+            | METHOD_GET_ZONE_INFO
+            | METHOD_GET_ZONE_RELAY
+    )
+}
+
+fn auth_db_method_invalidates_read_cache(method: &str) -> bool {
+    matches!(
+        method,
+        METHOD_CLEAR_STATE_BY_ACTIVE_CODE
+            | METHOD_REGISTER_USER
+            | METHOD_REGISTER_USER_WITH_RELAY_ALLOCATION
+            | METHOD_REGISTER_USER_WITH_OWNER_KEY
+            | METHOD_SET_USER_STATE
+            | METHOD_UPDATE_USER_PUBLIC_KEY
+            | METHOD_UPDATE_USER_ZONE_CONFIG
+            | METHOD_UPDATE_USER_SELF_CERT
+            | METHOD_UPDATE_USER_DOMAIN
+            | METHOD_ACTIVATE_USER_DOMAIN_BINDING
+            | METHOD_UNBIND_USER_DOMAIN
+            | METHOD_UPDATE_ZONE_INFO
+            | METHOD_UPDATE_ZONE_RELAY_SN
+            | METHOD_ASSIGN_ZONE_RELAY
+            | METHOD_ALLOCATE_ZONE_RELAY
+            | METHOD_START_RELAY_MIGRATION
+            | METHOD_COMPLETE_RELAY_MIGRATION
+    )
 }
 
 #[async_trait]
@@ -2093,6 +2183,71 @@ mod tests {
             normalize_sn_auth_db_url("http://127.0.0.1:8080/kapi/sn/s2s/auth-db/"),
             "http://127.0.0.1:8080/kapi/sn/s2s/auth-db"
         );
+    }
+
+    #[test]
+    fn test_hot_path_reads_are_cached_and_mutations_invalidate() {
+        for method in [
+            METHOD_GET_USER_INFO,
+            METHOD_GET_USER_BY_DOMAIN,
+            METHOD_GET_ZONE_INFO,
+            METHOD_GET_ZONE_RELAY,
+        ] {
+            assert!(is_cached_auth_db_read(method), "{method}");
+            assert!(!auth_db_method_invalidates_read_cache(method), "{method}");
+        }
+
+        for method in [
+            METHOD_UPDATE_USER_SELF_CERT,
+            METHOD_ACTIVATE_USER_DOMAIN_BINDING,
+            METHOD_UNBIND_USER_DOMAIN,
+            METHOD_UPDATE_ZONE_INFO,
+            METHOD_UPDATE_ZONE_RELAY_SN,
+        ] {
+            assert!(!is_cached_auth_db_read(method), "{method}");
+            assert!(auth_db_method_invalidates_read_cache(method), "{method}");
+        }
+
+        assert!(!is_cached_auth_db_read(METHOD_GET_AUTH));
+        assert!(!auth_db_method_invalidates_read_cache(METHOD_GET_AUTH));
+    }
+
+    #[test]
+    fn test_krpc_client_clones_share_read_cache() {
+        let client = SnAuthDbClient::new_krpc(Arc::new(kRPC::new(
+            "http://127.0.0.1:1/kapi/sn/s2s/auth-db",
+            None,
+        )));
+        let cloned = client.clone();
+
+        let (SnAuthDbClient::KRPC(client), SnAuthDbClient::KRPC(cloned)) = (&client, &cloned)
+        else {
+            panic!("new_krpc must create the cached remote variant");
+        };
+        assert!(Arc::ptr_eq(client, cloned));
+    }
+
+    #[tokio::test]
+    async fn test_krpc_client_serves_cached_negative_read_without_transport() {
+        let client = SnAuthDbClient::new_krpc(Arc::new(kRPC::new(
+            "http://127.0.0.1:1/kapi/sn/s2s/auth-db",
+            None,
+        )));
+        let SnAuthDbClient::KRPC(remote) = &client else {
+            panic!("new_krpc must create the cached remote variant");
+        };
+        let request = SnAuthDbUsernameReq::new("missing-user");
+        let key = RemoteReadCache::key(METHOD_GET_USER_INFO, &request).unwrap();
+        remote.read_cache.insert(
+            key,
+            serde_json::to_value(SnAuthDbRpcEnvelope::success(None::<SNUserInfo>)).unwrap(),
+        );
+
+        assert!(client
+            .get_user_info("missing-user")
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[test]

@@ -1,3 +1,4 @@
+use crate::read_cache::RemoteReadCache;
 use crate::{
     AuthorityKey, AuthorityKeyUpdate, AuthoritySetState, BnsRegistryError, BnsRegistryResult,
     CallAuthority, ControllerRule, DocumentState, DocumentUpdate, EventLogRecord, LogCheckpoint,
@@ -11,11 +12,15 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::net::IpAddr;
 use std::sync::Arc;
+use std::time::Duration;
 use thiserror::Error;
 
 pub const BNS_INDEXER_RPC_PATH: &str = "/kapi/bns-indexer";
 pub const BNS_SERVER_RPC_PATH: &str = "/kapi/bns";
 pub const MAX_BNS_NAMES_PAGE_SIZE: usize = 1_000;
+// Only the remote KRPC variant uses this cache; in-process indexers stay direct.
+const BNS_READ_CACHE_TTL: Duration = Duration::from_secs(5);
+const BNS_READ_CACHE_CAPACITY: usize = 8192;
 
 pub const METHOD_QUERY_NAME_STATE: &str = "name.query_state";
 pub const METHOD_RESOLVE_OWNER: &str = "name.resolve_owner";
@@ -542,7 +547,21 @@ pub trait BnsIndexerApi: Send + Sync {
 #[derive(Clone)]
 pub enum BnsRpcClient {
     InProcess(Arc<dyn BnsIndexerApi>),
-    KRPC(Arc<kRPC>),
+    KRPC(Arc<BnsKrpcClient>),
+}
+
+pub struct BnsKrpcClient {
+    client: Arc<kRPC>,
+    read_cache: RemoteReadCache,
+}
+
+impl BnsKrpcClient {
+    fn new(client: Arc<kRPC>) -> Self {
+        Self {
+            client,
+            read_cache: RemoteReadCache::new(BNS_READ_CACHE_TTL, BNS_READ_CACHE_CAPACITY),
+        }
+    }
 }
 
 impl BnsRpcClient {
@@ -551,17 +570,17 @@ impl BnsRpcClient {
     }
 
     pub fn new_krpc(client: Arc<kRPC>) -> Self {
-        Self::KRPC(client)
+        Self::KRPC(Arc::new(BnsKrpcClient::new(client)))
     }
 
     pub fn new_krpc_url(indexer_url: &str, session_token: Option<String>) -> Self {
         let endpoint = normalize_bns_indexer_url(indexer_url);
-        Self::KRPC(Arc::new(kRPC::new(endpoint.as_str(), session_token)))
+        Self::new_krpc(Arc::new(kRPC::new(endpoint.as_str(), session_token)))
     }
 
     pub fn new_bns_server_url(server_url: &str, session_token: Option<String>) -> Self {
         let endpoint = normalize_bns_server_url(server_url);
-        Self::KRPC(Arc::new(kRPC::new(endpoint.as_str(), session_token)))
+        Self::new_krpc(Arc::new(kRPC::new(endpoint.as_str(), session_token)))
     }
 
     async fn call_envelope<Req>(&self, method: &str, req: &Req) -> BnsClientResult<Value>
@@ -573,12 +592,37 @@ impl BnsRpcClient {
                 "generic call is only available for KRPC clients",
             ));
         };
+        let cache_key = if is_cached_bns_read(method) {
+            Some(
+                RemoteReadCache::key(method, req)
+                    .map_err(|e| BnsClientError::Serialization(e.to_string()))?,
+            )
+        } else {
+            None
+        };
+        if let Some(cached) = cache_key
+            .as_deref()
+            .and_then(|key| client.read_cache.get(key))
+        {
+            return Ok(cached);
+        }
+
         let req_json =
             serde_json::to_value(req).map_err(|e| BnsClientError::Serialization(e.to_string()))?;
-        client
+        let result = client
+            .client
             .call(method, req_json)
             .await
-            .map_err(|e| BnsClientError::Transport(e.to_string()))
+            .map_err(|e| BnsClientError::Transport(e.to_string()))?;
+
+        if let Some(cache_key) = cache_key {
+            if is_cacheable_bns_envelope(&result) {
+                client.read_cache.insert(cache_key, result.clone());
+            }
+        } else if method == METHOD_SUBMIT_RAW_TX && is_successful_bns_envelope(&result) {
+            client.read_cache.clear();
+        }
+        Ok(result)
     }
 
     async fn call<Req, Resp>(&self, method: &str, req: &Req) -> BnsClientResult<Resp>
@@ -603,6 +647,27 @@ impl BnsRpcClient {
     {
         decode_optional_envelope(self.call_envelope(method, req).await?)
     }
+}
+
+fn is_cached_bns_read(method: &str) -> bool {
+    matches!(method, METHOD_RESOLVE_OWNER | METHOD_RESOLVE_DOCUMENT)
+}
+
+fn is_successful_bns_envelope(value: &Value) -> bool {
+    value.get("ok").and_then(Value::as_bool) == Some(true)
+}
+
+fn is_cacheable_bns_envelope(value: &Value) -> bool {
+    if is_successful_bns_envelope(value) {
+        return true;
+    }
+    matches!(
+        value
+            .get("error")
+            .and_then(|error| error.get("code"))
+            .and_then(Value::as_str),
+        Some("NAME_NOT_FOUND" | "DOCUMENT_NOT_FOUND" | "DOCUMENT_INCONSISTENT")
+    )
 }
 
 fn decode_optional_envelope<T: DeserializeOwned>(value: Value) -> BnsClientResult<Option<T>> {
@@ -1024,6 +1089,53 @@ mod url_tests {
         }))
         .unwrap_err();
 
+        assert_eq!(error.code(), "NAME_NOT_FOUND");
+    }
+
+    #[test]
+    fn hot_path_bns_reads_and_negative_envelopes_are_cacheable() {
+        assert!(is_cached_bns_read(METHOD_RESOLVE_OWNER));
+        assert!(is_cached_bns_read(METHOD_RESOLVE_DOCUMENT));
+        assert!(!is_cached_bns_read(METHOD_QUERY_TX_STATE));
+
+        assert!(is_cacheable_bns_envelope(&json!({
+            "ok": true,
+            "result": {}
+        })));
+        for code in [
+            "NAME_NOT_FOUND",
+            "DOCUMENT_NOT_FOUND",
+            "DOCUMENT_INCONSISTENT",
+        ] {
+            assert!(is_cacheable_bns_envelope(&json!({
+                "ok": false,
+                "error": {"code": code}
+            })));
+        }
+        assert!(!is_cacheable_bns_envelope(&json!({
+            "ok": false,
+            "error": {"code": "BACKEND_UNAVAILABLE"}
+        })));
+    }
+
+    #[tokio::test]
+    async fn krpc_client_serves_cached_not_found_without_transport() {
+        let client =
+            BnsRpcClient::new_krpc(Arc::new(kRPC::new("http://127.0.0.1:1/kapi/bns", None)));
+        let BnsRpcClient::KRPC(remote) = &client else {
+            panic!("new_krpc must create the cached remote variant");
+        };
+        let request = BnsNameReq::new("missing");
+        let key = RemoteReadCache::key(METHOD_RESOLVE_OWNER, &request).unwrap();
+        remote.read_cache.insert(
+            key,
+            serde_json::to_value(BnsRpcEnvelope::<OwnerResolution>::failure(
+                BnsClientError::registry("NAME_NOT_FOUND", "name was not found"),
+            ))
+            .unwrap(),
+        );
+
+        let error = client.resolve_owner("missing").await.unwrap_err();
         assert_eq!(error.code(), "NAME_NOT_FOUND");
     }
 }

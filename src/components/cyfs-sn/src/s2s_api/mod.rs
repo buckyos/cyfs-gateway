@@ -1,3 +1,4 @@
+mod read_cache;
 pub mod sn_auth_db;
 pub mod sn_device_info_db;
 

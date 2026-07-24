@@ -1,3 +1,4 @@
+use super::read_cache::RemoteReadCache;
 use crate::{
     sn_err, SnDeviceInfoDB, SnDeviceListOptions, SnDeviceRole, SnDeviceStateUpdate,
     SnDeviceStateView, SnError, SnErrorCode, SnResult,
@@ -9,8 +10,12 @@ use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use std::net::IpAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 pub const SN_DEVICE_INFO_DB_RPC_PATH: &str = "/kapi/sn/s2s/device-info-db";
+// Device online/block state is more time-sensitive than AuthDB metadata.
+const SN_DEVICE_INFO_DB_READ_CACHE_TTL: Duration = Duration::from_secs(1);
+const SN_DEVICE_INFO_DB_READ_CACHE_CAPACITY: usize = 4096;
 
 pub const METHOD_UPSERT_DEVICE_INDEX: &str = "sn_device_info_db.upsert_device_index";
 pub const METHOD_REBIND_DEVICE_INDEX: &str = "sn_device_info_db.rebind_device_index";
@@ -302,7 +307,24 @@ impl SnDeviceInfoDbExpireDevicesReq {
 #[derive(Clone)]
 pub enum SnDeviceInfoDbClient {
     InProcess(Arc<dyn SnDeviceInfoDB>),
-    KRPC(Arc<kRPC>),
+    KRPC(Arc<SnDeviceInfoDbKrpcClient>),
+}
+
+pub struct SnDeviceInfoDbKrpcClient {
+    client: Arc<kRPC>,
+    read_cache: RemoteReadCache,
+}
+
+impl SnDeviceInfoDbKrpcClient {
+    fn new(client: Arc<kRPC>) -> Self {
+        Self {
+            client,
+            read_cache: RemoteReadCache::new(
+                SN_DEVICE_INFO_DB_READ_CACHE_TTL,
+                SN_DEVICE_INFO_DB_READ_CACHE_CAPACITY,
+            ),
+        }
+    }
 }
 
 impl SnDeviceInfoDbClient {
@@ -311,12 +333,12 @@ impl SnDeviceInfoDbClient {
     }
 
     pub fn new_krpc(client: Arc<kRPC>) -> Self {
-        Self::KRPC(client)
+        Self::KRPC(Arc::new(SnDeviceInfoDbKrpcClient::new(client)))
     }
 
     pub fn new_krpc_url(device_info_db_url: &str, session_token: Option<String>) -> Self {
         let endpoint = normalize_sn_device_info_db_url(device_info_db_url);
-        Self::KRPC(Arc::new(kRPC::new(endpoint.as_str(), session_token)))
+        Self::new_krpc(Arc::new(kRPC::new(endpoint.as_str(), session_token)))
     }
 
     async fn call_rpc<Req>(&self, method: &str, req: &Req) -> SnResult<Value>
@@ -337,7 +359,7 @@ impl SnDeviceInfoDbClient {
                         e
                     )
                 })?;
-                client.call(method, req_json).await.map_err(|e| {
+                client.client.call(method, req_json).await.map_err(|e| {
                     sn_err!(
                         SnErrorCode::RemoteError,
                         "SnDeviceInfoDB RPC {} transport failed: {}",
@@ -354,9 +376,39 @@ impl SnDeviceInfoDbClient {
         Req: Serialize + Sync,
         Resp: DeserializeOwned,
     {
+        let cache_key = match self {
+            Self::KRPC(client) if is_cached_device_info_db_read(method) => Some((
+                client,
+                RemoteReadCache::key(method, req).map_err(|e| {
+                    sn_err!(
+                        SnErrorCode::RemoteError,
+                        "failed to build SnDeviceInfoDB RPC {} cache key: {}",
+                        method,
+                        e
+                    )
+                })?,
+            )),
+            _ => None,
+        };
+        if let Some(cached) = cache_key
+            .as_ref()
+            .and_then(|(client, key)| client.read_cache.get(key.as_str()))
+        {
+            let envelope: SnDeviceInfoDbRpcEnvelope<Resp> = serde_json::from_value(cached)
+                .map_err(|e| {
+                    sn_err!(
+                        SnErrorCode::RemoteError,
+                        "failed to parse cached SnDeviceInfoDB RPC {} response: {}",
+                        method,
+                        e
+                    )
+                })?;
+            return envelope.into_result();
+        }
+
         let result = self.call_rpc(method, req).await?;
-        let envelope: SnDeviceInfoDbRpcEnvelope<Resp> =
-            serde_json::from_value(result).map_err(|e| {
+        let envelope: SnDeviceInfoDbRpcEnvelope<Resp> = serde_json::from_value(result.clone())
+            .map_err(|e| {
                 sn_err!(
                     SnErrorCode::RemoteError,
                     "failed to parse SnDeviceInfoDB RPC {} response: {}",
@@ -364,7 +416,15 @@ impl SnDeviceInfoDbClient {
                     e
                 )
             })?;
-        envelope.into_result()
+        let response = envelope.into_result()?;
+        if let Some((client, key)) = cache_key {
+            client.read_cache.insert(key, result);
+        } else if device_info_db_method_invalidates_read_cache(method) {
+            if let Self::KRPC(client) = self {
+                client.read_cache.clear();
+            }
+        }
+        Ok(response)
     }
 
     async fn call_unit<Req>(&self, method: &str, req: &Req) -> SnResult<()>
@@ -381,8 +441,35 @@ impl SnDeviceInfoDbClient {
                     e
                 )
             })?;
-        envelope.into_unit_result()
+        let response = envelope.into_unit_result()?;
+        if device_info_db_method_invalidates_read_cache(method) {
+            if let Self::KRPC(client) = self {
+                client.read_cache.clear();
+            }
+        }
+        Ok(response)
     }
+}
+
+fn is_cached_device_info_db_read(method: &str) -> bool {
+    matches!(
+        method,
+        METHOD_GET_DEVICE_STATE | METHOD_GET_DEVICE_STATE_BY_NAME
+    )
+}
+
+fn device_info_db_method_invalidates_read_cache(method: &str) -> bool {
+    matches!(
+        method,
+        METHOD_UPSERT_DEVICE_INDEX
+            | METHOD_REBIND_DEVICE_INDEX
+            | METHOD_REMOVE_DEVICE_INDEX
+            | METHOD_UPDATE_DEVICE_STATE
+            | METHOD_MARK_DEVICE_OFFLINE
+            | METHOD_BLOCK_DEVICE
+            | METHOD_UNBLOCK_DEVICE
+            | METHOD_EXPIRE_DEVICES
+    )
 }
 
 #[async_trait]
@@ -707,6 +794,81 @@ mod tests {
             normalize_sn_device_info_db_url("http://127.0.0.1:8080/kapi/sn/s2s/device-info-db/"),
             "http://127.0.0.1:8080/kapi/sn/s2s/device-info-db"
         );
+    }
+
+    #[test]
+    fn test_hot_path_reads_are_cached_and_mutations_invalidate() {
+        for method in [METHOD_GET_DEVICE_STATE, METHOD_GET_DEVICE_STATE_BY_NAME] {
+            assert!(is_cached_device_info_db_read(method), "{method}");
+            assert!(
+                !device_info_db_method_invalidates_read_cache(method),
+                "{method}"
+            );
+        }
+
+        for method in [
+            METHOD_UPSERT_DEVICE_INDEX,
+            METHOD_REBIND_DEVICE_INDEX,
+            METHOD_REMOVE_DEVICE_INDEX,
+            METHOD_UPDATE_DEVICE_STATE,
+            METHOD_MARK_DEVICE_OFFLINE,
+            METHOD_BLOCK_DEVICE,
+            METHOD_UNBLOCK_DEVICE,
+            METHOD_EXPIRE_DEVICES,
+        ] {
+            assert!(!is_cached_device_info_db_read(method), "{method}");
+            assert!(
+                device_info_db_method_invalidates_read_cache(method),
+                "{method}"
+            );
+        }
+
+        assert!(!is_cached_device_info_db_read(METHOD_LIST_ZONE_DEVICES));
+        assert!(!device_info_db_method_invalidates_read_cache(
+            METHOD_LIST_ZONE_DEVICES
+        ));
+    }
+
+    #[test]
+    fn test_krpc_client_clones_share_read_cache() {
+        let client = SnDeviceInfoDbClient::new_krpc(Arc::new(kRPC::new(
+            "http://127.0.0.1:1/kapi/sn/s2s/device-info-db",
+            None,
+        )));
+        let cloned = client.clone();
+
+        let (SnDeviceInfoDbClient::KRPC(client), SnDeviceInfoDbClient::KRPC(cloned)) =
+            (&client, &cloned)
+        else {
+            panic!("new_krpc must create the cached remote variant");
+        };
+        assert!(Arc::ptr_eq(client, cloned));
+    }
+
+    #[tokio::test]
+    async fn test_krpc_client_serves_cached_negative_read_without_transport() {
+        let client = SnDeviceInfoDbClient::new_krpc(Arc::new(kRPC::new(
+            "http://127.0.0.1:1/kapi/sn/s2s/device-info-db",
+            None,
+        )));
+        let SnDeviceInfoDbClient::KRPC(remote) = &client else {
+            panic!("new_krpc must create the cached remote variant");
+        };
+        let request = SnDeviceInfoDbDidReq::new("did:dev:missing");
+        let key = RemoteReadCache::key(METHOD_GET_DEVICE_STATE, &request).unwrap();
+        remote.read_cache.insert(
+            key,
+            serde_json::to_value(SnDeviceInfoDbRpcEnvelope::success(
+                None::<SnDeviceStateView>,
+            ))
+            .unwrap(),
+        );
+
+        assert!(client
+            .get_device_state("did:dev:missing")
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[test]
