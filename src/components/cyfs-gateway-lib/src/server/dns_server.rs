@@ -1,5 +1,5 @@
 use name_client::{NameInfo, RecordType};
-use name_lib::{EncodedDocument, DID};
+use name_lib::{DID, EncodedDocument};
 use std::net::IpAddr;
 
 use crate::ServerResult;

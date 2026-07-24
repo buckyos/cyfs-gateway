@@ -5,9 +5,10 @@
 //! `TunnelManager`. This helper bridges the gap: at executor entry the
 //! caller invokes [`apply_least_time_via_tunnel_mgr`] before iterating
 //! the candidate list. It calls `query_tunnel_url_statuses` once with
-//! `RttAscending` sort and applies the result through
-//! [`apply_least_time_order`]. URLs we can't parse are skipped so a
-//! single bad candidate never poisons the whole sort.
+//! `RttAscending` sort. Callers whose candidates are logical upstream
+//! names can use [`apply_least_time_via_tunnel_mgr_with_resolved_urls`]
+//! so history lookup uses concrete URLs while the logical names remain
+//! available for connection-pool selection.
 //!
 //! The helper is intentionally a no-op for non-`LeastTime` plans so
 //! callers can drop it on the front of their forward path without
@@ -18,7 +19,6 @@ use std::time::Duration;
 use url::Url;
 
 use super::plan::{BalanceMethod, ForwardPlan};
-use super::selector::apply_least_time_order;
 use crate::tunnel_mgr::TunnelManager;
 use crate::tunnel_url_status::{TunnelProbeOptions, TunnelUrlSortPolicy, normalize_tunnel_url};
 
@@ -54,6 +54,35 @@ pub async fn apply_least_time_via_tunnel_mgr(
         }
     }
 
+    apply_least_time_via_tunnel_mgr_with_resolved_urls(plan, &urls, tunnel_manager).await;
+}
+
+/// Reorder `plan.candidates` using concrete URLs that correspond by index
+/// to the candidates, without replacing the candidate strings themselves.
+///
+/// This is used by HTTP named upstreams: `resolved_urls` supplies the URL
+/// history key, while `plan.candidates[*].url` remains the logical upstream
+/// name needed to acquire its configured connection pool.
+pub async fn apply_least_time_via_tunnel_mgr_with_resolved_urls(
+    plan: &mut ForwardPlan,
+    resolved_urls: &[Url],
+    tunnel_manager: &TunnelManager,
+) {
+    if !matches!(plan.balance, BalanceMethod::LeastTime) {
+        return;
+    }
+    if plan.candidates.len() <= 1 {
+        return;
+    }
+    if resolved_urls.len() != plan.candidates.len() {
+        log::debug!(
+            "least_time: resolved URL count {} does not match candidate count {}, keeping order",
+            resolved_urls.len(),
+            plan.candidates.len()
+        );
+        return;
+    }
+
     // Per §6.7.5: business path must not block on tunnel_mgr work. Cap
     // the lookup to a small budget so a slow probe never adds latency
     // to the request itself; on timeout we keep the existing order.
@@ -69,7 +98,7 @@ pub async fn apply_least_time_via_tunnel_mgr(
         caller_priorities: None,
     };
 
-    let lookup = tunnel_manager.query_tunnel_url_statuses(&urls, opts);
+    let lookup = tunnel_manager.query_tunnel_url_statuses(resolved_urls, opts);
     let result = match tokio::time::timeout(LEAST_TIME_LOOKUP_BUDGET, lookup).await {
         Ok(Ok(r)) => r,
         Ok(Err(e)) => {
@@ -91,25 +120,26 @@ pub async fn apply_least_time_via_tunnel_mgr(
         return;
     }
 
-    // The selector helper compares against raw candidate strings, so
-    // build a parallel list of "normalized form of each raw candidate"
-    // and resolve the sorted order back to raw forms.
-    let raw_by_norm: std::collections::HashMap<String, String> = plan
-        .candidates
-        .iter()
-        .filter_map(|c| {
-            Url::parse(&c.url)
-                .ok()
-                .map(|u| (normalize_tunnel_url(&u), c.url.clone()))
-        })
-        .collect();
-    let raw_sorted: Vec<String> = result
-        .sorted_urls
+    let unknown_rank = result.sorted_urls.len();
+    let mut rank = std::collections::HashMap::with_capacity(unknown_rank);
+    for (index, normalized) in result.sorted_urls.into_iter().enumerate() {
+        // Multiple logical upstreams may intentionally resolve to the same
+        // concrete URL. Give them the same rank and preserve their input order.
+        rank.entry(normalized).or_insert(index);
+    }
+    let candidates = std::mem::take(&mut plan.candidates);
+    let mut indexed_candidates: Vec<_> = candidates.into_iter().enumerate().collect();
+    indexed_candidates.sort_by_key(|(original_index, _)| {
+        let normalized = normalize_tunnel_url(&resolved_urls[*original_index]);
+        (
+            rank.get(&normalized).copied().unwrap_or(unknown_rank),
+            *original_index,
+        )
+    });
+    plan.candidates = indexed_candidates
         .into_iter()
-        .filter_map(|n| raw_by_norm.get(&n).cloned())
+        .map(|(_, candidate)| candidate)
         .collect();
-
-    apply_least_time_order(plan, &raw_sorted);
 }
 
 #[cfg(test)]
@@ -173,5 +203,47 @@ mod tests {
 
         assert_eq!(plan.candidates[0].url, "rtcp://b/");
         assert_eq!(plan.candidates[1].url, "rtcp://a/");
+    }
+
+    #[tokio::test]
+    async fn applies_rtt_sort_to_logical_names_using_resolved_urls() {
+        let mgr = TunnelManager::new();
+        let slow_url = Url::parse("http://slow.example/").unwrap();
+        let fast_url = Url::parse("http://fast.example/").unwrap();
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+
+        for (url, rtt) in [(&slow_url, 100u64), (&fast_url, 10u64)] {
+            let normalized = normalize_tunnel_url(url);
+            let status = reachable_status(
+                url,
+                &normalized,
+                now_ms,
+                TunnelUrlStatusSource::BusinessConnect,
+                Some(rtt),
+            );
+            mgr.record_status_observation(status).await;
+        }
+
+        let mut plan = ForwardPlan {
+            group: Some("named-http".to_string()),
+            balance: BalanceMethod::LeastTime,
+            next_upstream: Default::default(),
+            candidates: vec![
+                ForwardTarget::new("api_slow"),
+                ForwardTarget::new("api_fast"),
+            ],
+            hash_key_value: None,
+            servers: Vec::new(),
+            provider_policy: Default::default(),
+        };
+
+        apply_least_time_via_tunnel_mgr_with_resolved_urls(&mut plan, &[slow_url, fast_url], &mgr)
+            .await;
+
+        assert_eq!(plan.candidates[0].url, "api_fast");
+        assert_eq!(plan.candidates[1].url, "api_slow");
     }
 }
