@@ -1,7 +1,7 @@
 use super::package::*;
 use super::protocol::*;
 use super::stream_helper::RTcpStreamBuildHelper;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::rtcp::datagram::RTcpTunnelDatagramClient;
 use crate::tunnel::TunnelBox;
@@ -36,11 +36,11 @@ use std::os::fd::{FromRawFd, IntoRawFd};
 use std::os::windows::io::{FromRawSocket, IntoRawSocket};
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::io::{ReadHalf, WriteHalf};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Mutex, Semaphore, TryAcquireError, oneshot};
+use tokio::sync::{Mutex, Notify, Semaphore, TryAcquireError, oneshot};
 use tokio::task;
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
@@ -156,6 +156,12 @@ const HELLO_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 // next one until it fully fails.
 const DIRECT_CONNECT_ATTEMPT_DELAY: Duration = Duration::from_millis(250);
 const DIRECT_TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+// Stable process-local identity for compare-and-remove in RTcpTunnelMap.
+// Tunnel keys identify a peer/path and are intentionally reused across
+// reconnects; they cannot distinguish a superseded instance from its
+// replacement.
+static NEXT_RTCP_TUNNEL_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 
 // Upper bound on NonceCache size. Each entry is ~100 bytes, so 16k entries
 // caps memory at roughly 1.6 MiB. A healthy peer hits nowhere near this;
@@ -1727,35 +1733,34 @@ impl RTcpInner {
         );
 
         let tunnel_key = self.format_tunnel_key(&source_dev_did, None);
+        if let Some(old_tunnel) = self
+            .tunnel_map
+            .replace_authenticated_inbound(&tunnel_key, tunnel.clone())
+            .await
         {
-            //info!("accept tunnel from {} try get lock",hello_package.body.from_id.as_str());
-            if self
-                .tunnel_map
-                .on_new_tunnel(&tunnel_key, tunnel.clone())
-                .await
-                .is_err()
-            {
-                // Duplicate tunnel key: a live tunnel already holds this
-                // (aes_key, iv) space. Drop the just-built tunnel rather
-                // than racing it against the live one. Shutting it down
-                // here also sends a FIN to the replayer/peer so they see
-                // the rejection promptly.
-                tunnel.close().await;
-                return;
-            }
-            // info!("Accept tunnel from {}", hello_package.body.from_id.as_str());
+            // replace_authenticated_inbound marks the old instance closed in
+            // the map critical section. Finish waiter cleanup and transport
+            // shutdown only after releasing the map lock.
+            old_tunnel.close().await;
         }
 
         info!(
-            "Tunnel {} accept from {} OK,start running",
+            "Tunnel {} accept from {} OK, instance {}, start running",
             source_device_id.as_str(),
-            tunnel_key.as_str()
+            tunnel_key.as_str(),
+            tunnel.instance_id()
         );
         tunnel.run().await;
 
-        info!("Tunnel {} end", tunnel_key.as_str());
+        info!(
+            "Tunnel {} instance {} end",
+            tunnel_key.as_str(),
+            tunnel.instance_id()
+        );
 
-        self.tunnel_map.remove_tunnel(&tunnel_key).await;
+        self.tunnel_map
+            .remove_if_current(&tunnel_key, &tunnel)
+            .await;
     }
 
     pub async fn create_tunnel(
@@ -1791,15 +1796,16 @@ impl RTcpInner {
             tunnel_key.as_str()
         );
 
-        // First check if the tunnel already exists, then we can reuse it
-        let tunnels = self.tunnel_map.tunnel_map().clone();
-        let all_tunnel = tunnels.lock().await;
-        let tunnel = all_tunnel.get(tunnel_key.as_str());
-        if tunnel.is_some() {
-            debug!("Reuse tunnel {}", tunnel_key.as_str());
-            return Ok(Box::new(tunnel.unwrap().clone()));
+        // First check if the tunnel already exists, then we can reuse it.
+        if let Some(tunnel) = self.tunnel_map.get_tunnel(tunnel_key.as_str()).await {
+            if !tunnel.is_closed() {
+                debug!("Reuse tunnel {}", tunnel_key.as_str());
+                return Ok(Box::new(tunnel));
+            }
+            self.tunnel_map
+                .remove_if_current(&tunnel_key, &tunnel)
+                .await;
         }
-        drop(all_tunnel);
 
         // `params@remote` bootstrap: build the tunnel's bearing stream through
         // the tunnel framework instead of opening a direct TCP connection.
@@ -1897,23 +1903,24 @@ impl RTcpInner {
                 aes_key,
                 self.listener.clone(),
             );
-            let mut all_tunnel = tunnels.lock().await;
-            if let Some(existing) = all_tunnel.get(tunnel_key.as_str()).cloned() {
+            if let Err(existing) = self
+                .tunnel_map
+                .register_outbound_if_absent(&tunnel_key, tunnel.clone())
+                .await
+            {
                 debug!(
                     "Reuse tunnel {} after bootstrap build raced with another creator",
                     tunnel_key.as_str()
                 );
-                drop(all_tunnel);
                 tunnel.close().await;
                 return Ok(Box::new(existing));
             }
-            all_tunnel.insert(tunnel_key.clone(), tunnel.clone());
             info!(
-                "create tunnel {} ok via bootstrap url {}",
+                "create tunnel {} instance {} ok via bootstrap url {}",
                 tunnel_key.as_str(),
+                tunnel.instance_id(),
                 bootstrap_url
             );
-            drop(all_tunnel);
 
             let result: TunnelResult<Box<dyn TunnelBox>> = Ok(Box::new(tunnel.clone()));
             let tunnel_map = self.tunnel_map.clone();
@@ -1923,7 +1930,7 @@ impl RTcpInner {
                     tunnel_key.as_str()
                 );
                 tunnel.run().await;
-                tunnel_map.remove_tunnel(&tunnel_key).await;
+                tunnel_map.remove_if_current(&tunnel_key, &tunnel).await;
                 info!("RTcp tunnel {} end", tunnel_key.as_str());
             });
 
@@ -1998,23 +2005,24 @@ impl RTcpInner {
             match attempt_result {
                 Some(Ok(attempt)) => {
                     let tunnel = attempt.tunnel;
-                    let mut all_tunnel = tunnels.lock().await;
-                    if let Some(existing) = all_tunnel.get(tunnel_key.as_str()).cloned() {
+                    if let Err(existing) = self
+                        .tunnel_map
+                        .register_outbound_if_absent(&tunnel_key, tunnel.clone())
+                        .await
+                    {
                         debug!(
                             "Reuse tunnel {} after direct build raced with another creator",
                             tunnel_key.as_str()
                         );
-                        drop(all_tunnel);
                         tunnel.close().await;
                         return Ok(Box::new(existing));
                     }
-                    all_tunnel.insert(tunnel_key.clone(), tunnel.clone());
                     info!(
-                        "create tunnel {} ok, remote addr is {}",
+                        "create tunnel {} instance {} ok, remote addr is {}",
                         tunnel_key.as_str(),
+                        tunnel.instance_id(),
                         attempt.remote_addr
                     );
-                    drop(all_tunnel);
 
                     let result: TunnelResult<Box<dyn TunnelBox>> = Ok(Box::new(tunnel.clone()));
                     let tunnel_map = self.tunnel_map.clone();
@@ -2026,7 +2034,7 @@ impl RTcpInner {
                         tunnel.run().await;
 
                         // remove tunnel from manager
-                        tunnel_map.remove_tunnel(&tunnel_key).await;
+                        tunnel_map.remove_if_current(&tunnel_key, &tunnel).await;
 
                         info!("RTcp tunnel {} end", tunnel_key.as_str());
                     });
@@ -2396,6 +2404,7 @@ struct RTcpBootstrapCtx {
 
 #[derive(Clone)]
 struct RTcpTunnel {
+    instance_id: u64,
     build_helper: RTcpStreamBuildHelper,
     remote_stack: RTcpTargetStackEP,
     can_direct: bool,
@@ -2422,11 +2431,11 @@ struct RTcpTunnel {
     write_stream: Arc<Mutex<WriteHalf<EncryptedStream<RTcpBearingStream>>>>,
     read_stream: Arc<Mutex<ReadHalf<EncryptedStream<RTcpBearingStream>>>>,
 
-    // Set by close() to force the run() loop to exit at the next read boundary
-    // and to make any subsequent send_package fail quickly. This is what makes
-    // a replaced / superseded tunnel actually stop using its (aes_key, nonce)
-    // space, so a replayed Hello cannot run concurrently with the original.
+    // Set before an authenticated inbound replacement is published. Every
+    // operation checks it before allocating waiters, reconnecting, or sending
+    // another control record.
     closed: Arc<AtomicBool>,
+    close_notify: Arc<Notify>,
 
     next_seq: Arc<AtomicU32>,
     listener: RTcpListenerRef,
@@ -2442,6 +2451,11 @@ struct RTcpTunnel {
     // wait-HelloStream slot immediately instead of stalling for the full
     // 30s STREAM_WAIT_TIMEOUT.
     ropen_resp_waiters: Arc<Mutex<HashMap<u32, oneshot::Sender<u32>>>>,
+
+    // Keys registered in the stack-wide RTcpStreamBuildHelper by this tunnel.
+    // Closing the tunnel removes them so waiters wake promptly instead of
+    // waiting for STREAM_WAIT_TIMEOUT.
+    pending_wait_stream_keys: Arc<Mutex<HashSet<String>>>,
 
     // Per-tunnel concurrency quota for inbound Open requests.
     inbound_open_slots: Arc<Semaphore>,
@@ -2479,6 +2493,7 @@ impl RTcpTunnel {
         let peer_addr = peer_addr.map(|addr| Arc::new(std::sync::Mutex::new(addr)));
 
         Self {
+            instance_id: NEXT_RTCP_TUNNEL_INSTANCE_ID.fetch_add(1, Ordering::Relaxed),
             build_helper,
             remote_stack: this_remote_stack,
             can_direct, //Considering the limit of port mapping, the default configuration is configured as "NoDirect" mode
@@ -2490,33 +2505,74 @@ impl RTcpTunnel {
             write_stream: Arc::new(Mutex::new(write_stream)),
 
             closed: Arc::new(AtomicBool::new(false)),
+            close_notify: Arc::new(Notify::new()),
             next_seq: Arc::new(AtomicU32::new(0)),
             listener,
             open_resp_waiters: Arc::new(Mutex::new(HashMap::new())),
             ropen_resp_waiters: Arc::new(Mutex::new(HashMap::new())),
+            pending_wait_stream_keys: Arc::new(Mutex::new(HashSet::new())),
             inbound_open_slots: Arc::new(Semaphore::new(MAX_PENDING_INBOUND_OPENS)),
             pong_waiters: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
+    fn instance_id(&self) -> u64 {
+        self.instance_id
+    }
+
+    fn is_same_instance(&self, other: &RTcpTunnel) -> bool {
+        self.instance_id == other.instance_id
+    }
+
+    // Synchronous first half of close. RTcpTunnelMap invokes this while
+    // replacing the map entry so no caller can observe the new current tunnel
+    // while the old instance still accepts new operations.
+    fn mark_closed(&self) {
+        if !self.closed.swap(true, Ordering::SeqCst) {
+            self.inbound_open_slots.close();
+            // notify_one stores a permit when run() has not entered notified()
+            // yet, avoiding a lost wake-up between its closed check and select.
+            self.close_notify.notify_one();
+        }
+    }
+
     pub async fn close(&self) {
-        // Flag first so any in-flight send_package / process_package
-        // observes the closed state. Then shut down the write half: this
-        // prevents the superseded tunnel from ever producing another
-        // authenticated record under the shared (aes_key, nonce_base) pair.
-        //
-        // Shutting down the write side also sends FIN to the peer; in
-        // practice the read loop will then wake with UnexpectedEof and
-        // exit via run()'s error branch. The `closed` flag is a belt-
-        // and-suspenders check in case the read side is still readable.
-        self.closed.store(true, std::sync::atomic::Ordering::SeqCst);
+        // Flag and wake the read loop before awaiting any locks or network I/O.
+        self.mark_closed();
+
+        // Dropping the senders makes in-flight Open/ROpen/Ping callers fail
+        // immediately. Removing this tunnel's HelloStream slots also wakes the
+        // ROpen path after a successful ROpenResp has already consumed its
+        // response waiter.
+        self.open_resp_waiters.lock().await.clear();
+        self.ropen_resp_waiters.lock().await.clear();
+        self.pong_waiters.lock().await.clear();
+        let wait_keys: Vec<String> = self.pending_wait_stream_keys.lock().await.drain().collect();
+        for key in wait_keys {
+            self.build_helper.remove_wait_stream(&key).await;
+        }
+
+        // Shutting down the write side sends FIN to the peer. The local run
+        // loop exits independently through close_notify, even if the peer
+        // keeps its write half open.
         let mut ws = self.write_stream.lock().await;
         use tokio::io::AsyncWriteExt;
         let _ = Pin::new(&mut *ws).shutdown().await;
     }
 
     fn is_closed(&self) -> bool {
-        self.closed.load(std::sync::atomic::Ordering::SeqCst)
+        self.closed.load(Ordering::SeqCst)
+    }
+
+    fn ensure_active(&self) -> std::io::Result<()> {
+        if self.is_closed() {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "rtcp tunnel closed",
+            ))
+        } else {
+            Ok(())
+        }
     }
 
     pub fn get_key(&self) -> &[u8; 32] {
@@ -2524,16 +2580,17 @@ impl RTcpTunnel {
     }
 
     fn next_seq(&self) -> u32 {
-        self.next_seq
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+        self.next_seq.fetch_add(1, Ordering::SeqCst)
     }
 
     async fn process_package(&self, package: RTcpTunnelPackage) -> Result<(), anyhow::Error> {
+        self.ensure_active()?;
         match package {
             RTcpTunnelPackage::Ping(ping_package) => {
                 //send pong
                 let pong_package = RTcpPongPackage::new(ping_package.seq, 0);
                 let mut write_stream = self.write_stream.lock().await;
+                self.ensure_active()?;
                 let write_stream = Pin::new(&mut *write_stream);
                 let _ = RTcpTunnelPackage::send_package(write_stream, pong_package).await?;
                 return Ok(());
@@ -2613,6 +2670,7 @@ impl RTcpTunnel {
     async fn build_reconnect_stream(
         &self,
     ) -> Result<(Box<dyn AsyncStream>, SocketAddr, SocketAddr), std::io::Error> {
+        self.ensure_active()?;
         if let Some(bootstrap) = self.bootstrap.as_ref() {
             let stream = bootstrap
                 .tunnel_manager
@@ -2627,6 +2685,7 @@ impl RTcpTunnel {
                         ),
                     )
                 })?;
+            self.ensure_active()?;
             // No meaningful TCP peer/local addrs exist for a nested-transport
             // stream; upstream uses these only for logging and endpoint tags.
             let placeholder = SocketAddr::from(([0, 0, 0, 0], 0));
@@ -2651,8 +2710,11 @@ impl RTcpTunnel {
         let last_addr = *peer_addr_handle.lock().unwrap();
         let candidates = self.collect_reconnect_candidates(last_addr).await;
 
-        self.race_reconnect_candidates(peer_addr_handle, candidates)
-            .await
+        let stream = self
+            .race_reconnect_candidates(peer_addr_handle, candidates)
+            .await?;
+        self.ensure_active()?;
+        Ok(stream)
     }
 
     // Build the ordered candidate list used by build_reconnect_stream.
@@ -2836,6 +2898,7 @@ impl RTcpTunnel {
     }
 
     async fn on_ropen(&self, ropen_package: RTcpROpenPackage) -> Result<(), anyhow::Error> {
+        self.ensure_active()?;
         debug!(
             "RTcp tunnel ropen request: {:?}:{}, {:?}",
             ropen_package.body.dest_host, ropen_package.body.dest_port, ropen_package.body.purpose
@@ -2849,6 +2912,7 @@ impl RTcpTunnel {
         let (mut rtcp_stream, remote_addr, local_addr) = match self.build_reconnect_stream().await {
             Ok(triple) => triple,
             Err(e) => {
+                self.ensure_active()?;
                 warn!(
                     "ropen reject: build reconnect stream to {} failed: {}",
                     self.remote_stack.did.to_string(),
@@ -2856,6 +2920,7 @@ impl RTcpTunnel {
                 );
                 let ropen_resp_package = RTcpROpenRespPackage::new(ropen_package.seq, 2);
                 let mut write_stream = self.write_stream.lock().await;
+                self.ensure_active()?;
                 let write_stream = Pin::new(&mut *write_stream);
                 RTcpTunnelPackage::send_package(write_stream, ropen_resp_package).await?;
                 return Ok(());
@@ -2865,12 +2930,14 @@ impl RTcpTunnel {
         // 2. send ropen_resp
         {
             let mut write_stream = self.write_stream.lock().await;
+            self.ensure_active()?;
             let write_stream = Pin::new(&mut *write_stream);
             let ropen_resp_package = RTcpROpenRespPackage::new(ropen_package.seq, 0);
             RTcpTunnelPackage::send_package(write_stream, ropen_resp_package).await?;
         }
 
         // 3. send hello stream
+        self.ensure_active()?;
         RTcpTunnelPackage::send_hello_stream(
             rtcp_stream.as_mut(),
             ropen_package.body.stream_id.as_str(),
@@ -2898,6 +2965,7 @@ impl RTcpTunnel {
         );
 
         let purpose = ropen_package.body.purpose.clone().unwrap_or_default();
+        self.ensure_active()?;
         match purpose {
             StreamPurpose::Stream => {
                 self.on_stream_ropen(
@@ -2930,6 +2998,7 @@ impl RTcpTunnel {
         local_addr: SocketAddr,
         stream: Box<dyn AsyncStream>,
     ) -> Result<(), anyhow::Error> {
+        self.ensure_active()?;
         //TODO: bug?
         let end_point = TunnelEndpoint {
             device_id: self.remote_stack.did.to_string(),
@@ -2956,6 +3025,7 @@ impl RTcpTunnel {
         local_addr: SocketAddr,
         stream: Box<dyn AsyncStream>,
     ) -> Result<(), anyhow::Error> {
+        self.ensure_active()?;
         let end_point = TunnelEndpoint {
             device_id: self.remote_stack.did.to_string(),
             port: self.remote_stack.stack_port,
@@ -2974,6 +3044,7 @@ impl RTcpTunnel {
     }
 
     async fn on_open(&self, open_package: RTcpOpenPackage) -> Result<(), anyhow::Error> {
+        self.ensure_active()?;
         debug!(
             "RTcp tunnel open request: {:?}:{}, {:?}",
             open_package.body.dest_host, open_package.body.dest_port, open_package.body.purpose
@@ -2992,6 +3063,7 @@ impl RTcpTunnel {
                     MAX_PENDING_INBOUND_OPENS, open_package.body.stream_id
                 );
                 let mut write_stream = self.write_stream.lock().await;
+                self.ensure_active()?;
                 let write_stream = Pin::new(&mut *write_stream);
                 let open_resp_package = RTcpOpenRespPackage::new(open_package.seq, 1);
                 RTcpTunnelPackage::send_package(write_stream, open_resp_package).await?;
@@ -3008,12 +3080,16 @@ impl RTcpTunnel {
             self.this_device.to_string(),
             open_package.body.stream_id
         );
-        self.build_helper.new_wait_stream(&real_key).await;
+        self.register_wait_stream(&real_key).await?;
 
         // 3. send open_resp with success (synchronous: keeps seq/response
         // ordering intact on the read loop).
         {
             let mut write_stream = self.write_stream.lock().await;
+            if let Err(e) = self.ensure_active() {
+                self.remove_wait_stream(&real_key).await;
+                return Err(e.into());
+            }
             let write_stream = Pin::new(&mut *write_stream);
             let open_resp_package = RTcpOpenRespPackage::new(open_package.seq, 0);
             RTcpTunnelPackage::send_package(write_stream, open_resp_package).await?;
@@ -3050,6 +3126,7 @@ impl RTcpTunnel {
                 ));
             }
         };
+        self.ensure_active()?;
 
         let remote_addr = stream
             .peer_addr()
@@ -3098,7 +3175,7 @@ impl RTcpTunnel {
         }
     }
 
-    pub async fn run(self) {
+    pub async fn run(&self) {
         let source_info = self.remote_stack.did.to_string();
         let mut read_stream = self.read_stream.lock().await;
         //let read_stream = self.read_stream.clone();
@@ -3116,8 +3193,13 @@ impl RTcpTunnel {
             let read_stream = Pin::new(&mut *read_stream);
             //info!("rtcp tunnel try read package from {}",self.peer_addr.to_string());
 
-            let ret =
-                RTcpTunnelPackage::read_package(read_stream, false, source_info.as_str()).await;
+            let ret = tokio::select! {
+                _ = self.close_notify.notified() => {
+                    info!("RTcp tunnel {} instance {} closed, exit run loop", source_info, self.instance_id);
+                    break;
+                }
+                ret = RTcpTunnelPackage::read_package(read_stream, false, source_info.as_str()) => ret,
+            };
             //info!("rtcp tunnel read package from {} ok",source_info.as_str());
             if ret.is_err() {
                 error!(
@@ -3139,6 +3221,8 @@ impl RTcpTunnel {
                 break;
             }
         }
+        drop(read_stream);
+        self.close().await;
     }
 
     async fn post_ropen(
@@ -3149,9 +3233,11 @@ impl RTcpTunnel {
         dest_host: Option<String>,
         session_key: &str,
     ) -> Result<(), std::io::Error> {
+        self.ensure_active()?;
         let ropen_package =
             RTcpROpenPackage::new(seq, session_key.to_string(), purpose, dest_port, dest_host);
         let mut write_stream = self.write_stream.lock().await;
+        self.ensure_active()?;
         let write_stream = Pin::new(&mut *write_stream);
         RTcpTunnelPackage::send_package(write_stream, ropen_package)
             .await
@@ -3170,9 +3256,11 @@ impl RTcpTunnel {
         dest_host: Option<String>,
         session_key: &str,
     ) -> Result<(), std::io::Error> {
+        self.ensure_active()?;
         let ropen_package =
             RTcpOpenPackage::new(seq, session_key.to_string(), purpose, dest_port, dest_host);
         let mut write_stream = self.write_stream.lock().await;
+        self.ensure_active()?;
         let write_stream = Pin::new(&mut *write_stream);
         RTcpTunnelPackage::send_package(write_stream, ropen_package)
             .await
@@ -3185,7 +3273,28 @@ impl RTcpTunnel {
 
     async fn wait_ropen_stream(&self, session_key: &str) -> Result<TcpStream, std::io::Error> {
         let real_key = format!("{}_{}", self.this_device.to_string(), session_key);
-        self.build_helper.wait_ropen_stream(&real_key).await
+        let result = self.build_helper.wait_ropen_stream(&real_key).await;
+        self.pending_wait_stream_keys.lock().await.remove(&real_key);
+        result
+    }
+
+    async fn register_wait_stream(&self, real_key: &str) -> Result<(), std::io::Error> {
+        self.ensure_active()?;
+        self.build_helper.new_wait_stream(real_key).await;
+        self.pending_wait_stream_keys
+            .lock()
+            .await
+            .insert(real_key.to_string());
+        if let Err(e) = self.ensure_active() {
+            self.remove_wait_stream(real_key).await;
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    async fn remove_wait_stream(&self, real_key: &str) {
+        self.pending_wait_stream_keys.lock().await.remove(real_key);
+        self.build_helper.remove_wait_stream(real_key).await;
     }
 
     async fn request_open_stream(
@@ -3194,6 +3303,7 @@ impl RTcpTunnel {
         dest_port: u16,
         dest_host: Option<String>,
     ) -> Result<Box<dyn AsyncStream>, std::io::Error> {
+        self.ensure_active()?;
         // Tunnels carried neither by a direct TCP socket nor by a bootstrap
         // transport cannot fulfil either the Open or ROpen path (both need a
         // way to produce a fresh stream leg to the remote RTCP listener).
@@ -3222,6 +3332,10 @@ impl RTcpTunnel {
         if self.can_direct {
             let (tx, rx) = oneshot::channel::<u32>();
             self.open_resp_waiters.lock().await.insert(seq, tx);
+            if let Err(e) = self.ensure_active() {
+                self.open_resp_waiters.lock().await.remove(&seq);
+                return Err(e);
+            }
 
             // Send open to remote stack to build a direct stream
             if let Err(e) = self
@@ -3283,6 +3397,7 @@ impl RTcpTunnel {
                 })?;
 
             // Send hello stream
+            self.ensure_active()?;
             RTcpTunnelPackage::send_hello_stream(stream.as_mut(), session_key.as_str())
                 .await
                 .map_err(|e| {
@@ -3321,7 +3436,10 @@ impl RTcpTunnel {
             let (resp_tx, resp_rx) = oneshot::channel::<u32>();
             self.ropen_resp_waiters.lock().await.insert(seq, resp_tx);
 
-            self.build_helper.new_wait_stream(&real_key).await;
+            if let Err(e) = self.register_wait_stream(&real_key).await {
+                self.ropen_resp_waiters.lock().await.remove(&seq);
+                return Err(e);
+            }
 
             //info!("insert session_key {} to wait ropen stream map",real_key.as_str());
             if let Err(e) = self
@@ -3332,7 +3450,7 @@ impl RTcpTunnel {
                 // so the waiting slot must be reclaimed now rather than
                 // relying on the 30s timeout path.
                 self.ropen_resp_waiters.lock().await.remove(&seq);
-                self.build_helper.remove_wait_stream(&real_key).await;
+                self.remove_wait_stream(&real_key).await;
                 return Err(e);
             }
 
@@ -3359,7 +3477,7 @@ impl RTcpTunnel {
                                 real_key.as_str(),
                                 code
                             );
-                            self.build_helper.remove_wait_stream(&real_key).await;
+                            self.remove_wait_stream(&real_key).await;
                             return Err(std::io::Error::new(
                                 std::io::ErrorKind::ConnectionRefused,
                                 format!("peer rejected ropen, result={}", code),
@@ -3367,7 +3485,7 @@ impl RTcpTunnel {
                         }
                         Err(_) => {
                             // Tunnel dropped the waiter (likely tunnel closed).
-                            self.build_helper.remove_wait_stream(&real_key).await;
+                            self.remove_wait_stream(&real_key).await;
                             return Err(std::io::Error::new(
                                 std::io::ErrorKind::BrokenPipe,
                                 "tunnel dropped ropen resp waiter",
@@ -3376,6 +3494,7 @@ impl RTcpTunnel {
                     }
                 }
             };
+            self.ensure_active()?;
             // ROpen path: this side sent ROpen and the peer connected back
             // with HelloStream, so it is the stream-layer responder.
             let aes_stream: EncryptedStream<TcpStream> = EncryptedStream::new(
@@ -3393,12 +3512,20 @@ impl RTcpTunnel {
 #[async_trait]
 impl Tunnel for RTcpTunnel {
     async fn ping(&self) -> Result<(), std::io::Error> {
+        self.ensure_active()?;
         let timestamp = buckyos_get_unix_timestamp();
         let ping_package = RTcpPingPackage::new(0, timestamp);
         let mut write_stream = self.write_stream.lock().await;
+        self.ensure_active()?;
         let write_stream = Pin::new(&mut *write_stream);
-        let _ = RTcpTunnelPackage::send_package(write_stream, ping_package).await;
-        Ok(())
+        RTcpTunnelPackage::send_package(write_stream, ping_package)
+            .await
+            .map_err(|e| {
+                std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    format!("send rtcp ping failed: {}", e),
+                )
+            })
     }
 
     async fn open_stream_by_dest(
@@ -3486,11 +3613,19 @@ impl RTcpTunnel {
 
         let (tx, rx) = oneshot::channel::<()>();
         self.pong_waiters.lock().await.insert(seq, tx);
+        if let Err(e) = self.ensure_active() {
+            self.pong_waiters.lock().await.remove(&seq);
+            return Err(e);
+        }
 
         let timestamp = buckyos_get_unix_timestamp();
         let ping_package = RTcpPingPackage::new(seq, timestamp);
         let send_result = {
             let mut write_stream = self.write_stream.lock().await;
+            if let Err(e) = self.ensure_active() {
+                self.pong_waiters.lock().await.remove(&seq);
+                return Err(e);
+            }
             let write_stream = Pin::new(&mut *write_stream);
             RTcpTunnelPackage::send_package(write_stream, ping_package).await
         };
@@ -3567,50 +3702,93 @@ impl RTcpTunnelMap {
         }
     }
 
-    pub fn tunnel_map(&self) -> Arc<Mutex<HashMap<String, RTcpTunnel>>> {
-        self.tunnel_map.clone()
-    }
-
     pub async fn get_tunnel(&self, tunnel_key: &str) -> Option<RTcpTunnel> {
         let all_tunnel = self.tunnel_map.lock().await;
-        if let Some(tunnel) = all_tunnel.get(tunnel_key) {
-            Some(tunnel.clone())
-        } else {
-            None
-        }
+        all_tunnel.get(tunnel_key).cloned()
     }
 
-    // Returns Err(()) if a tunnel for `tunnel_key` is already present.
-    //
-    // A silent replace here would let a replayed Hello stand up a second
-    // tunnel under the same (aes_key, iv) as the live one. The AEAD record
-    // layer starts its per-direction sequence counter at 0 for every new
-    // tunnel, so two concurrent tunnels with the same key would reuse the
-    // same (key, nonce) pairs — catastrophic for AES-GCM. Rejecting the
-    // replay keeps the (key, nonce) space owned by a single tunnel at a
-    // time. The existing tunnel will be cleaned up by `remove_tunnel` once
-    // its read loop exits (e.g. on TCP close); a genuine reconnect will
-    // succeed on retry after that.
-    //
-    // Across-time nonce reuse (attacker replays Hello after the original
-    // tunnel has ended) is a separate concern addressed by §14.2 of
-    // doc/rtcp.md.
-    pub async fn on_new_tunnel(&self, tunnel_key: &str, tunnel: RTcpTunnel) -> Result<(), ()> {
+    // Outbound creators retain first-wins semantics: concurrent local dials
+    // reuse whichever tunnel registered first and close their extra tunnel.
+    pub async fn register_outbound_if_absent(
+        &self,
+        tunnel_key: &str,
+        tunnel: RTcpTunnel,
+    ) -> Result<(), RTcpTunnel> {
         let mut all_tunnel = self.tunnel_map.lock().await;
-        if all_tunnel.contains_key(tunnel_key) {
-            warn!(
-                "tunnel {} already exists, rejecting duplicate Hello to avoid (key, nonce) reuse",
-                tunnel_key
+        if let Some(existing) = all_tunnel.get(tunnel_key) {
+            if !existing.is_closed() {
+                return Err(existing.clone());
+            }
+            debug!(
+                "replace closed outbound RTcp tunnel {} instance {} with instance {}",
+                tunnel_key,
+                existing.instance_id(),
+                tunnel.instance_id()
             );
-            return Err(());
         }
+        info!(
+            "register outbound RTcp tunnel {} instance {}",
+            tunnel_key,
+            tunnel.instance_id()
+        );
         all_tunnel.insert(tunnel_key.to_owned(), tunnel);
         Ok(())
     }
 
-    pub async fn remove_tunnel(&self, tunnel_key: &str) {
+    // Authenticated inbound tunnels use last-accepted-wins. Each v2 handshake
+    // has fresh ephemeral keys, nonces, and challenge, so a newly admitted
+    // connection owns an independent AEAD key/nonce space. The old instance is
+    // marked closed in the same critical section as the replacement, then
+    // returned so its async shutdown can run after releasing the map lock.
+    pub async fn replace_authenticated_inbound(
+        &self,
+        tunnel_key: &str,
+        tunnel: RTcpTunnel,
+    ) -> Option<RTcpTunnel> {
         let mut all_tunnel = self.tunnel_map.lock().await;
-        all_tunnel.remove(tunnel_key);
+        let old_tunnel = all_tunnel.insert(tunnel_key.to_owned(), tunnel.clone());
+        if let Some(old_tunnel) = old_tunnel.as_ref() {
+            old_tunnel.mark_closed();
+            info!(
+                "replace authenticated inbound RTcp tunnel {}: instance {} -> {}",
+                tunnel_key,
+                old_tunnel.instance_id(),
+                tunnel.instance_id()
+            );
+        } else {
+            info!(
+                "register authenticated inbound RTcp tunnel {} instance {}",
+                tunnel_key,
+                tunnel.instance_id()
+            );
+        }
+        old_tunnel
+    }
+
+    // Remove only when the map still points at the exact instance whose run
+    // loop is exiting. A superseded tunnel must never delete its replacement.
+    pub async fn remove_if_current(&self, tunnel_key: &str, tunnel: &RTcpTunnel) -> bool {
+        let mut all_tunnel = self.tunnel_map.lock().await;
+        let is_current = all_tunnel
+            .get(tunnel_key)
+            .map(|current| current.is_same_instance(tunnel))
+            .unwrap_or(false);
+        if is_current {
+            all_tunnel.remove(tunnel_key);
+            debug!(
+                "remove current RTcp tunnel {} instance {}",
+                tunnel_key,
+                tunnel.instance_id()
+            );
+            true
+        } else {
+            debug!(
+                "skip removing stale RTcp tunnel {} instance {}",
+                tunnel_key,
+                tunnel.instance_id()
+            );
+            false
+        }
     }
 }
 #[cfg(test)]
@@ -3628,6 +3806,154 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::io::{AsyncReadExt, AsyncWriteExt, copy_bidirectional};
+
+    fn test_tunnel(seed: u8) -> (RTcpTunnel, tokio::io::DuplexStream) {
+        let (bearing, peer) = tokio::io::duplex(64 * 1024);
+        let bearing: RTcpBearingStream = Box::new(bearing);
+        let encrypted_stream = EncryptedStream::new(
+            bearing,
+            &[seed; 32],
+            &[seed.wrapping_add(1); 16],
+            EncryptionRole::Initiator,
+        );
+        let remote_stack = RTcpTargetStackEP {
+            did: DID::new("dev", "rtcp-map-test-peer"),
+            stack_port: DEFAULT_RTCP_STACK_PORT,
+            bootstrap_stream_url: None,
+        };
+        (
+            RTcpTunnel::new(
+                RTcpStreamBuildHelper::new(),
+                DID::new("dev", "rtcp-map-test-local"),
+                &remote_stack,
+                false,
+                encrypted_stream,
+                None,
+                None,
+                [seed; 32],
+                Arc::new(MockRTcpListener::new()),
+            ),
+            peer,
+        )
+    }
+
+    #[tokio::test]
+    async fn inbound_tunnel_replace_is_atomic_and_cleanup_is_instance_safe() {
+        let map = RTcpTunnelMap::new();
+        let key = "local_remote";
+        let (old_tunnel, _old_peer) = test_tunnel(1);
+        let (new_tunnel, _new_peer) = test_tunnel(2);
+
+        assert!(
+            map.replace_authenticated_inbound(key, old_tunnel.clone())
+                .await
+                .is_none()
+        );
+        assert!(
+            map.get_tunnel(key)
+                .await
+                .unwrap()
+                .is_same_instance(&old_tunnel)
+        );
+
+        let replaced = map
+            .replace_authenticated_inbound(key, new_tunnel.clone())
+            .await
+            .expect("second authenticated inbound tunnel must replace the first");
+        assert!(replaced.is_same_instance(&old_tunnel));
+        assert!(old_tunnel.is_closed());
+        assert!(
+            map.get_tunnel(key)
+                .await
+                .unwrap()
+                .is_same_instance(&new_tunnel)
+        );
+
+        assert!(
+            !map.remove_if_current(key, &old_tunnel).await,
+            "superseded tunnel cleanup must not remove its replacement"
+        );
+        assert!(
+            map.get_tunnel(key)
+                .await
+                .unwrap()
+                .is_same_instance(&new_tunnel)
+        );
+        assert!(map.remove_if_current(key, &new_tunnel).await);
+        assert!(map.get_tunnel(key).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn concurrent_authenticated_inbound_replacements_leave_one_current_instance() {
+        const TUNNEL_COUNT: usize = 8;
+
+        let map = RTcpTunnelMap::new();
+        let key = "local_concurrent-remote";
+        let barrier = Arc::new(tokio::sync::Barrier::new(TUNNEL_COUNT));
+        let mut tunnels = Vec::new();
+        let mut peers = Vec::new();
+        let mut tasks = Vec::new();
+
+        for index in 0..TUNNEL_COUNT {
+            let (tunnel, peer) = test_tunnel(index as u8 + 10);
+            tunnels.push(tunnel.clone());
+            peers.push(peer);
+            let map = map.clone();
+            let barrier = barrier.clone();
+            tasks.push(tokio::spawn(async move {
+                barrier.wait().await;
+                tokio::time::sleep(Duration::from_millis(index as u64 * 5)).await;
+                map.replace_authenticated_inbound(key, tunnel).await;
+            }));
+        }
+
+        for task in tasks {
+            task.await.unwrap();
+        }
+
+        let current = map.get_tunnel(key).await.unwrap();
+        assert!(current.is_same_instance(tunnels.last().unwrap()));
+        assert_eq!(map.tunnel_map.lock().await.len(), 1);
+        for tunnel in &tunnels[..TUNNEL_COUNT - 1] {
+            assert!(tunnel.is_closed());
+        }
+        assert!(!tunnels.last().unwrap().is_closed());
+    }
+
+    #[tokio::test]
+    async fn outbound_registration_keeps_first_tunnel_and_closed_tunnel_fails_fast() {
+        let map = RTcpTunnelMap::new();
+        let key = "local_outbound-remote";
+        let (first, _first_peer) = test_tunnel(30);
+        let (extra, _extra_peer) = test_tunnel(31);
+
+        assert!(
+            map.register_outbound_if_absent(key, first.clone())
+                .await
+                .is_ok()
+        );
+        let existing = map
+            .register_outbound_if_absent(key, extra)
+            .await
+            .expect_err("outbound race must preserve the first registered tunnel");
+        assert!(existing.is_same_instance(&first));
+
+        first.close().await;
+        let ping_err = first.ping().await.unwrap_err();
+        assert_eq!(ping_err.kind(), std::io::ErrorKind::BrokenPipe);
+        let open_err = first
+            .open_stream("closed-tunnel.test:80")
+            .await
+            .err()
+            .expect("open on a closed tunnel must fail");
+        assert_eq!(open_err.kind(), std::io::ErrorKind::BrokenPipe);
+        let datagram_err = first
+            .create_datagram_client("closed-tunnel.test:80")
+            .await
+            .err()
+            .expect("datagram creation on a closed tunnel must fail");
+        assert_eq!(datagram_err.kind(), std::io::ErrorKind::BrokenPipe);
+    }
 
     // §14.2 regression: the nonce cache retention window must cover the
     // full signature-acceptance window (`exp + JWT_LEEWAY_SECS`), not just
@@ -3959,6 +4285,82 @@ mod tests {
         )
     }
 
+    fn test_named_device_identity(name: &str) -> (DID, DID, [u8; 48], String) {
+        let (owner_signing_key, owner_pkcs8_bytes) = generate_ed25519_key();
+        let owner_jwk = encode_ed25519_sk_to_pk_jwk(&owner_signing_key);
+        let owner_config =
+            DeviceDocument::new_by_jwk("owner", serde_json::from_value(owner_jwk).unwrap());
+        let owner_private_key = EncodingKey::from_ed_der(&owner_pkcs8_bytes);
+
+        let (device_signing_key, device_pkcs8_bytes) = generate_ed25519_key();
+        let device_jwk = encode_ed25519_sk_to_pk_jwk(&device_signing_key);
+        let mut device_config =
+            DeviceDocument::new_by_jwk(name, serde_json::from_value(device_jwk).unwrap());
+        let device_dev_did = device_config.id.clone();
+        let logical_did = DID::new("test", name);
+        device_config.id = logical_did.clone();
+        device_config.owner = owner_config.id;
+        let device_doc_jwt = match device_config
+            .encode(Some(&owner_private_key))
+            .expect("test device document signing failed")
+        {
+            EncodedDocument::Jwt(jwt) => jwt,
+            _ => panic!("signed test device document must be JWT"),
+        };
+
+        (
+            logical_did,
+            device_dev_did,
+            device_pkcs8_bytes,
+            device_doc_jwt,
+        )
+    }
+
+    async fn cache_test_device(device_config: &DeviceDocument) {
+        let did_doc_value = serde_json::to_value(device_config).unwrap();
+        let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
+        add_observed_cache(device_config.id.clone(), None, encoded_doc, None).unwrap();
+        add_nameinfo_cache(
+            device_config.id.to_string().as_str(),
+            NameInfo::from_address(
+                device_config.id.to_string().as_str(),
+                "127.0.0.1".parse().unwrap(),
+            ),
+        )
+        .await
+        .unwrap();
+    }
+
+    fn unused_tcp_port() -> u16 {
+        std::net::TcpListener::bind(("127.0.0.1", 0))
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
+    }
+
+    async fn wait_for_current_tunnel(
+        tunnel_map: &RTcpTunnelMap,
+        tunnel_key: &str,
+        different_from: Option<u64>,
+    ) -> RTcpTunnel {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(tunnel) = tunnel_map.get_tunnel(tunnel_key).await {
+                    if different_from
+                        .map(|instance_id| tunnel.instance_id() != instance_id)
+                        .unwrap_or(true)
+                    {
+                        break tunnel;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("timed out waiting for current RTcp tunnel")
+    }
+
     async fn add_rtcp_alias(name: &str, dev_did: &DID) {
         let mut name_info = NameInfo::from_address(name, "127.0.0.1".parse().unwrap());
         name_info.txt.push(format!("PKX={};", dev_did.id));
@@ -4262,6 +4664,263 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn outbound_name_then_dev_creation_reuses_existing_tunnel() {
+        let _ = init_name_lib_for_test(&HashMap::new()).await;
+        let (server_config, server_key) = test_device_config("reuse-server");
+        let (client_config, client_key) = test_device_config("reuse-client");
+        cache_test_device(&server_config).await;
+        cache_test_device(&client_config).await;
+        let alias = "rtcp-reuse-target.devtests.org";
+        add_rtcp_alias(alias, &server_config.id).await;
+
+        let server_port = unused_tcp_port();
+        let mut server = RTcp::new(
+            server_config.id.clone(),
+            format!("127.0.0.1:{}", server_port),
+            Some(server_key),
+            None,
+            Arc::new(MockRTcpListener::new()),
+        );
+        server.start().await.unwrap();
+        let mut client = RTcp::new(
+            client_config.id.clone(),
+            format!("127.0.0.1:{}", unused_tcp_port()),
+            Some(client_key),
+            None,
+            Arc::new(MockRTcpListener::new()),
+        );
+        client.start().await.unwrap();
+
+        let by_name = format!("{}:{}", alias, server_port);
+        let first_handle = client.create_tunnel(Some(&by_name)).await.unwrap();
+        first_handle.ping().await.unwrap();
+
+        let client_tunnel_key = format!(
+            "{}_{}",
+            client_config.id.to_string(),
+            server_config.id.to_string()
+        );
+        let server_tunnel_key = format!(
+            "{}_{}",
+            server_config.id.to_string(),
+            client_config.id.to_string()
+        );
+        let client_instance =
+            wait_for_current_tunnel(&client.inner.tunnel_map, &client_tunnel_key, None)
+                .await
+                .instance_id();
+        let server_instance =
+            wait_for_current_tunnel(&server.inner.tunnel_map, &server_tunnel_key, None)
+                .await
+                .instance_id();
+
+        let by_dev = format!("{}:{}", server_config.id.to_host_name(), server_port);
+        let second_handle = client.create_tunnel(Some(&by_dev)).await.unwrap();
+        second_handle.ping().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        assert_eq!(
+            client
+                .inner
+                .tunnel_map
+                .get_tunnel(&client_tunnel_key)
+                .await
+                .unwrap()
+                .instance_id(),
+            client_instance
+        );
+        assert_eq!(
+            server
+                .inner
+                .tunnel_map
+                .get_tunnel(&server_tunnel_key)
+                .await
+                .unwrap()
+                .instance_id(),
+            server_instance,
+            "name/dev reuse must not create a second inbound connection"
+        );
+    }
+
+    #[tokio::test]
+    async fn authenticated_second_connection_replaces_old_inbound_tunnel() {
+        let _ = init_name_lib_for_test(&HashMap::new()).await;
+        let (server_config, server_key) = test_device_config("replace-server");
+        let (client_logical_did, client_dev_did, client_key, client_device_doc_jwt) =
+            test_named_device_identity("replace-client");
+        cache_test_device(&server_config).await;
+
+        let server_port = unused_tcp_port();
+        let client_one_port = unused_tcp_port();
+        let client_two_port = unused_tcp_port();
+
+        let mut server = RTcp::new(
+            server_config.id.clone(),
+            format!("127.0.0.1:{}", server_port),
+            Some(server_key),
+            None,
+            Arc::new(MockRTcpListener::new()),
+        );
+        server.start().await.unwrap();
+        let mut client_one = RTcp::new(
+            client_logical_did,
+            format!("127.0.0.1:{}", client_one_port),
+            Some(client_key),
+            Some(client_device_doc_jwt),
+            Arc::new(MockRTcpListener::new()),
+        );
+        client_one.start().await.unwrap();
+        let mut client_two = RTcp::new(
+            client_dev_did.clone(),
+            format!("127.0.0.1:{}", client_two_port),
+            Some(client_key),
+            None,
+            Arc::new(MockRTcpListener::new()),
+        );
+        client_two.start().await.unwrap();
+
+        let server_stack_id = format!("{}:{}", server_config.id.to_host_name(), server_port);
+        let _client_one_tunnel = client_one
+            .create_tunnel(Some(&server_stack_id))
+            .await
+            .unwrap();
+        let server_tunnel_key = format!(
+            "{}_{}",
+            server_config.id.to_string(),
+            client_dev_did.to_string()
+        );
+        let old_server_tunnel =
+            wait_for_current_tunnel(&server.inner.tunnel_map, &server_tunnel_key, None).await;
+
+        let client_two_tunnel = client_two
+            .create_tunnel(Some(&server_stack_id))
+            .await
+            .unwrap();
+        let new_server_tunnel = wait_for_current_tunnel(
+            &server.inner.tunnel_map,
+            &server_tunnel_key,
+            Some(old_server_tunnel.instance_id()),
+        )
+        .await;
+
+        assert!(old_server_tunnel.is_closed());
+        assert!(!new_server_tunnel.is_closed());
+        let old_open_error = old_server_tunnel
+            .open_stream("superseded.test:80")
+            .await
+            .err()
+            .expect("superseded inbound tunnel must reject new streams");
+        assert_eq!(old_open_error.kind(), std::io::ErrorKind::BrokenPipe);
+
+        new_server_tunnel
+            .ping_rtt(Duration::from_secs(2))
+            .await
+            .expect("replacement tunnel must answer ping");
+        let mut stream = tokio::time::timeout(
+            Duration::from_secs(5),
+            client_two_tunnel.open_stream("replacement-echo.test:80"),
+        )
+        .await
+        .expect("replacement tunnel open timed out")
+        .expect("replacement tunnel open failed");
+        stream.write_all(b"replacement-ok").await.unwrap();
+        let mut response = [0u8; 14];
+        stream.read_exact(&mut response).await.unwrap();
+        assert_eq!(&response, b"replacement-ok");
+
+        // Give the old run loop time to execute its delayed cleanup. The map
+        // must still point at the replacement (compare-and-remove).
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            server
+                .inner
+                .tunnel_map
+                .get_tunnel(&server_tunnel_key)
+                .await
+                .unwrap()
+                .is_same_instance(&new_server_tunnel)
+        );
+    }
+
+    #[tokio::test]
+    async fn listener_rejection_does_not_replace_current_inbound_tunnel() {
+        let _ = init_name_lib_for_test(&HashMap::new()).await;
+        let (server_config, server_key) = test_device_config("reject-replace-server");
+        let (client_logical_did, client_dev_did, client_key, client_device_doc_jwt) =
+            test_named_device_identity("reject-replace-client");
+        cache_test_device(&server_config).await;
+
+        let admissions = Arc::new(AtomicUsize::new(0));
+        let server_port = unused_tcp_port();
+        let mut server = RTcp::new(
+            server_config.id.clone(),
+            format!("127.0.0.1:{}", server_port),
+            Some(server_key),
+            None,
+            Arc::new(RejectAfterFirstTunnelListener {
+                admissions: admissions.clone(),
+            }),
+        );
+        server.start().await.unwrap();
+
+        let mut client_one = RTcp::new(
+            client_logical_did,
+            format!("127.0.0.1:{}", unused_tcp_port()),
+            Some(client_key),
+            Some(client_device_doc_jwt),
+            Arc::new(MockRTcpListener::new()),
+        );
+        client_one.start().await.unwrap();
+        let mut client_two = RTcp::new(
+            client_dev_did.clone(),
+            format!("127.0.0.1:{}", unused_tcp_port()),
+            Some(client_key),
+            None,
+            Arc::new(MockRTcpListener::new()),
+        );
+        client_two.start().await.unwrap();
+
+        let server_stack_id = format!("{}:{}", server_config.id.to_host_name(), server_port);
+        let _first_client_tunnel = client_one
+            .create_tunnel(Some(&server_stack_id))
+            .await
+            .unwrap();
+        let server_tunnel_key = format!(
+            "{}_{}",
+            server_config.id.to_string(),
+            client_dev_did.to_string()
+        );
+        let original =
+            wait_for_current_tunnel(&server.inner.tunnel_map, &server_tunnel_key, None).await;
+
+        // The initiator can finish key confirmation before the responder's
+        // application admission result is known. Regardless of that local
+        // return value, the responder must keep its previously admitted map
+        // entry when the listener rejects the second connection.
+        let _ = client_two.create_tunnel(Some(&server_stack_id)).await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while admissions.load(Ordering::SeqCst) < 2 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("second listener admission was not observed");
+
+        let current = server
+            .inner
+            .tunnel_map
+            .get_tunnel(&server_tunnel_key)
+            .await
+            .unwrap();
+        assert!(current.is_same_instance(&original));
+        assert!(!original.is_closed());
+        original
+            .ping_rtt(Duration::from_secs(2))
+            .await
+            .expect("listener rejection must leave the old tunnel usable");
+    }
+
     // Mock实现用于测试
     struct MockRTcpListener;
 
@@ -4269,6 +4928,10 @@ mod tests {
         fn new() -> Self {
             MockRTcpListener {}
         }
+    }
+
+    struct RejectAfterFirstTunnelListener {
+        admissions: Arc<AtomicUsize>,
     }
 
     struct RelayRTcpListener {
@@ -4422,6 +5085,53 @@ mod tests {
                 let len = datagram_stream.recv_datagram(&mut buf).await.unwrap();
                 datagram_stream.send_datagram(&buf[..len]).await.unwrap();
             }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl RTcpListener for RejectAfterFirstTunnelListener {
+        async fn on_new_tunnel(
+            &self,
+            _endpoint: TunnelEndpoint,
+            _source_addr: SocketAddr,
+            _source_device_info: Option<RTcpSourceDeviceInfo>,
+        ) -> TunnelResult<()> {
+            let admission = self.admissions.fetch_add(1, Ordering::SeqCst);
+            if admission == 0 {
+                Ok(())
+            } else {
+                Err(TunnelError::ReasonError(
+                    "test listener rejects replacement".to_string(),
+                ))
+            }
+        }
+
+        async fn on_new_stream(
+            &self,
+            _stream: Box<dyn AsyncStream>,
+            _dest_host: Option<String>,
+            _dest_port: u16,
+            _endpoint: TunnelEndpoint,
+            _remote_addr: SocketAddr,
+            _local_addr: SocketAddr,
+        ) -> TunnelResult<()> {
+            Err(TunnelError::ReasonError(
+                "test listener does not accept streams".to_string(),
+            ))
+        }
+
+        async fn on_new_datagram(
+            &self,
+            _stream: Box<dyn AsyncStream>,
+            _dest_host: Option<String>,
+            _dest_port: u16,
+            _endpoint: TunnelEndpoint,
+            _remote_addr: SocketAddr,
+            _local_addr: SocketAddr,
+        ) -> TunnelResult<()> {
+            Err(TunnelError::ReasonError(
+                "test listener does not accept datagrams".to_string(),
+            ))
         }
     }
 
@@ -5176,6 +5886,8 @@ mod tests {
     #[tokio::test]
     async fn test_rtcp_stream() {
         let _ = init_name_lib_for_test(&HashMap::new()).await;
+        let port1 = unused_tcp_port();
+        let port2 = unused_tcp_port();
         let (signing_key, pkcs8_bytes) = generate_ed25519_key();
         let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
         let device_config =
@@ -5196,7 +5908,7 @@ mod tests {
 
         let mut rtcp1 = RTcp::new(
             device_config.id,
-            "127.0.0.1:19053".to_string(),
+            format!("127.0.0.1:{port1}"),
             Some(pkcs8_bytes),
             None,
             Arc::new(MockRTcpListener::new()),
@@ -5223,7 +5935,7 @@ mod tests {
 
         let mut rtcp2 = RTcp::new(
             device_config.id,
-            "127.0.0.1:19054".to_string(),
+            format!("127.0.0.1:{port2}"),
             Some(pkcs8_bytes),
             None,
             Arc::new(MockRTcpListener::new()),
@@ -5233,7 +5945,7 @@ mod tests {
 
         {
             let tunnel = rtcp1
-                .create_tunnel(Some(format!("{}:19054", id2.to_host_name()).as_str()))
+                .create_tunnel(Some(format!("{}:{port2}", id2.to_host_name()).as_str()))
                 .await
                 .unwrap();
             let mut stream = tunnel.open_stream("www.baidu.com:80").await.unwrap();
@@ -5248,7 +5960,7 @@ mod tests {
         tokio::time::sleep(Duration::from_secs(2)).await;
         {
             let tunnel = rtcp2
-                .create_tunnel(Some(format!("{}:19053", id1.to_host_name()).as_str()))
+                .create_tunnel(Some(format!("{}:{port1}", id1.to_host_name()).as_str()))
                 .await
                 .unwrap();
             let mut stream = tunnel.open_stream("www.baidu.com:80").await.unwrap();
@@ -5680,6 +6392,8 @@ mod tests {
     #[tokio::test]
     async fn test_rtcp_datagram() {
         let _ = init_name_lib_for_test(&HashMap::new()).await;
+        let port1 = unused_tcp_port();
+        let port2 = unused_tcp_port();
         let (signing_key, pkcs8_bytes) = generate_ed25519_key();
         let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
         let device_config =
@@ -5700,7 +6414,7 @@ mod tests {
 
         let mut rtcp1 = RTcp::new(
             device_config.id,
-            "127.0.0.1:19043".to_string(),
+            format!("127.0.0.1:{port1}"),
             Some(pkcs8_bytes),
             None,
             Arc::new(MockRTcpListener::new()),
@@ -5727,7 +6441,7 @@ mod tests {
 
         let mut rtcp2 = RTcp::new(
             device_config.id,
-            "127.0.0.1:19044".to_string(),
+            format!("127.0.0.1:{port2}"),
             Some(pkcs8_bytes),
             None,
             Arc::new(MockRTcpListener::new()),
@@ -5737,7 +6451,7 @@ mod tests {
 
         {
             let tunnel = rtcp1
-                .create_tunnel(Some(format!("{}:19044", id2.to_host_name()).as_str()))
+                .create_tunnel(Some(format!("{}:{port2}", id2.to_host_name()).as_str()))
                 .await
                 .unwrap();
             let stream = tunnel
@@ -5757,7 +6471,7 @@ mod tests {
 
         {
             let tunnel = rtcp2
-                .create_tunnel(Some(format!("{}:19043", id1.to_host_name()).as_str()))
+                .create_tunnel(Some(format!("{}:{port1}", id1.to_host_name()).as_str()))
                 .await
                 .unwrap();
             let stream = tunnel

@@ -502,8 +502,10 @@ IV/nonce 选择规则：
 6. 现场生成一次性 X25519 密钥对 `(resp_secret, resp_public)` 和随机 `challenge`，签发 `ack_token`（`aud == "buckyos-rtcp-v2-ack"`，`peer_xpub == Hello.xpub`），并以**明文**形式把 `HelloAck { ack_token, challenge, responder_id }` 发到承载流上。
 7. 用 `(resp_secret, Hello.xpub)` 做 ECDH，走 §5.4.1 的 HKDF 派生 `(aes_key, iv)`；把承载流包成 `EncryptedStream`（responder 方向），等待 AEAD 形式的 `HelloAckConfirm` 并校验 `challenge_echo`。
 8. 只有 key-confirmation 成功后，才调用 `listener.on_new_tunnel(...)` 做准入控制。
-9. 准入通过后，才把这条连接包装成 tunnel，标记 `can_direct = false`，并按 canonical DEV DID 注册到 `tunnel_map`。
-10. 启动 tunnel 读循环。
+9. 准入通过后提交本次握手携带且已经验证的设备文档（如有）；只有 freshness/CAS 提交成功，才把这条连接包装成 tunnel，并标记 `can_direct = false`。
+10. 按 canonical DEV DID 计算 tunnel key，在一次 map mutex 临界区内把新 tunnel 原子替换为 current。接收端采用 **last accepted connection wins**：“新”按完成全部认证、key-confirmation、listener 准入、设备文档提交并执行原子替换的顺序定义，不按 TCP accept 顺序、握手开始时间或源 IP 定义。
+11. 如果同 key 已有旧 tunnel，旧实例在 map 临界区内先被同步标记为 closed；释放 map 锁后再清理 waiter、关闭写半边并唤醒旧实例的读循环。未通过前述任一步骤的连接不得替换或关闭旧 tunnel。
+12. 启动新 tunnel 读循环；读循环退出时只在 map 仍指向自身 `instance_id` 的情况下删除 entry。旧实例延迟退出不得删除替换后的新实例。
 
 ### 6.3 当前实现上的重要事实
 
@@ -513,6 +515,7 @@ IV/nonce 选择规则：
 - `Hello.from_id` / `Hello.to_id` 承载逻辑来源和逻辑目标语义；真正的身份校验会把它们解析到 canonical `did:dev` 后再比较。名字到 DEV 的转换是内部动作，不应要求调用方在协议语义上放弃 `did:web` / `did:bns`。
 - 对端后续回连端口来自 `Hello.my_port`，不是当前 TCP 连接的源端口。
 - v2 的 AES key/IV 完全派生自双方临时 X25519 密钥对，与设备长期密钥无关——即便长期 Ed25519 私钥之后被泄露，也无法解密任何已经结束的会话。
+- 每次 v2 握手都会生成新的双方 ephemeral X25519 密钥、nonce 和 challenge，因此两条分别完成握手的 tunnel 拥有独立的 AEAD key/nonce 空间；这正是认证成功的新入站 tunnel 可以安全替换旧 tunnel 的密码学前提。
 
 ### 6.4 Tunnel Key 与设备唯一性
 
@@ -521,9 +524,15 @@ RTCP 的 tunnel key 只用于协议栈内部复用和去重，不是对外 URL �
 - direct tunnel key: `<local_dev_did>_<remote_dev_did>`
 - bootstrap-backed tunnel key: `<local_dev_did>_<remote_dev_did>|bootstrap=<bootstrap_url>`
 
-这个规则保证“从当前 stack 到另一个真实设备 stack 有且仅有一条 tunnel”。名字 DID 的公钥发生变化时，解析出的 remote DEV DID 也会变化，旧 tunnel 不应继续被复用；协议栈应建立新 tunnel，并让旧 tunnel 自然断开或被清理。
+这个规则保证每个 `<设备对, 承载路径>` 任意时刻只有一个 current tunnel。direct 与不同 bootstrap URL 属于不同承载路径，不互相替换。名字 DID 的公钥发生变化时，解析出的 remote DEV DID 也会变化，旧 tunnel 不应继续被复用；协议栈应建立新 tunnel，并让旧 tunnel 自然断开或被清理。
 
 反过来，如果用户把同一个设备公钥绑定到多个名字，这些名字会解析到同一个 canonical DEV DID，并共享同一条 tunnel。对 RTCP 来说这是同一个设备，不是多个逻辑设备。用同一把设备公钥表达多个逻辑设备会导致 tunnel 复用、keep_tunnel 状态、准入策略和日志语义混淆；这违反“每个逻辑设备必须有不同设备公钥”的原则，不应通过 name-based tunnel key 兼容。
+
+同一 key 下的仲裁按方向区分：
+
+- 客户端主动创建 tunnel 时采用 first-wins：拨号前复用已有 current tunnel；并发拨号竞速只注册第一个成功实例，多建出的实例关闭并返回 current。
+- 服务端接收已完整认证和准入的 tunnel 时采用 last-accepted-wins：新实例原子替换旧实例，旧实例立即进入 closed 状态。
+- 每个 `RTcpTunnel` 有稳定的进程内 `instance_id`。读循环清理使用 compare-and-remove；只有 map 仍指向自己的实例时才能删除 entry。
 
 ## 7. Open 流程
 
@@ -772,7 +781,9 @@ stacks:
 - 每条记录的 96-bit nonce 由 `SHA-256(iv || direction)` 派生的 `nonce_base` 与 64-bit 记录序号 XOR 得到；initiator / responder 使用不同方向的 `nonce_base`，两端写方向的 `(key, nonce)` 空间不会碰撞。
 - 任何一次解密失败都会立即把读端返回 `InvalidData`，不再向上层回吐可疑明文。
 - 读端在收到第一条被认证的 AEAD 记录之前遇到 FIN / `Ok(0)`，一律按 `UnexpectedEof` 上报；避免在没有任何认证证据的情况下把“对端悄悄断开”当作正常结束。
-- `RTcpTunnel::close()` 现在真正会关闭写半边并设置关闭标记，`run()` 循环会在下一个读边界退出；`on_new_tunnel` 不再静默替换已存在的 tunnel，而是直接拒绝重复的 `Hello`——否则新旧两条 tunnel 在同一把 `(aes_key, iv)` 上各自从序号 0 开始递增，会把 `(key, nonce)` 空间重新打开。
+- `RTcpTunnel::close()` 会先同步设置 closed 状态并唤醒 `run()`，再清理 Open/ROpen/Pong waiter 和 pending HelloStream 槽位，最后关闭写半边；关闭后的 `ping`、open 和 datagram 创建会以 `BrokenPipe` 快速失败。
+- v2 中每次完整握手都使用全新的双方 ephemeral X25519 密钥、nonce 和 challenge，经 HKDF 得到独立的 `(aes_key, iv)`。因此认证成功的新入站 tunnel 不会与旧 tunnel 重用 `(key, nonce)`；接收端可以安全执行 last-accepted-wins 替换。相同 Hello/nonce 的重放仍会在 map 仲裁前被 nonce cache 和 key-confirmation 拒绝。
+- map 替换与 transport shutdown 分离：旧实例在 map 临界区内先标记 closed 并被新实例替换，异步 waiter 清理和 shutdown 在锁外执行；旧读循环随后通过 `instance_id` compare-and-remove 清理，不能误删新实例。
 
 这是一次 **不兼容的协议升级**：新实现不能与旧的 `AES-256-CTR` 实现互通。部署升级时两端必须一起换到 AEAD 版本。
 
@@ -813,7 +824,7 @@ v2 3-message handshake 语义：
    - 任意一项不通过即终止握手，`peer_xpub` 不匹配是 v2 防 ack-splicing 的关键护栏。
    - 通过后用 `(my_secret, ack_token.xpub)` 完成 ECDH，与 responder 派生出**同一把** `(aes_key, iv)`；把承载流包成 `EncryptedStream`（initiator 方向）。
    - 在加密流上发出 `HelloAckConfirm { challenge_echo = ack.challenge }`。
-   - 接收端只有在该 AEAD 记录解密成功，且 `challenge_echo` 与本端发出的 `challenge` 完全一致时，才把 tunnel 注册进 `tunnel_map` 并触发 `on_new_tunnel` 回调；否则直接丢弃。
+   - 接收端只有在该 AEAD 记录解密成功，且 `challenge_echo` 与本端发出的 `challenge` 完全一致时，才触发 `listener.on_new_tunnel` 准入并提交已验证的设备文档；全部成功后才把 tunnel 注册/替换进 `tunnel_map`，否则直接丢弃且保留已有 current tunnel。
 
 落地后的性质：
 
