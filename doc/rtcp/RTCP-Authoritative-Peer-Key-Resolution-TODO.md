@@ -1,6 +1,7 @@
 # RTCP Peer Identity、Tunnel 与 Stream 安全收口 TODO
 
-状态：TODO（合并权威 Peer Key 解析与 RTCP v2 review）
+状态：TODO（合并权威 Peer Key 解析与 RTCP v2 review；§G 的入站原子替换部分已于
+2026-07-24 完成，见下）
 
 适用基线：
 
@@ -13,6 +14,9 @@
 
 - [`doc/rtcp/rtcp.md`](rtcp.md)
 - [`doc/rtcp/rtcp_v2_review.md`](rtcp_v2_review.md)
+- [`doc/rtcp/RTCP-New-Tunnel-Replaces-Old-TODO.md`](RTCP-New-Tunnel-Replaces-Old-TODO.md)
+  （已完成：§G 依赖的入站 tunnel 原子替换、`instance_id`、compare-and-remove 与
+  close fail-fast）
 - [`doc/SN/RTCP-SN-Registered-Device-Authorization-TODO.md`](../SN/RTCP-SN-Registered-Device-Authorization-TODO.md)
 
 本文档是上述 review 的统一实施入口。`rtcp_v2_review.md` 保留 review 原文和历史上下文，
@@ -81,16 +85,21 @@ OwnerDocument、DeviceDocument 等类型时，才需要同目录的 `owner.json`
 
 ### 1.3 合并 RTCP v2 review 后的当前结论
 
-以下问题已按当前 HEAD 复核，仍然成立，必须纳入同一次收口：
+以下问题已按当前 HEAD 复核。除第 1 条已在 2026-07-24 修复外，其余仍然成立，必须纳入
+同一次收口：
 
-1. **重复 tunnel 的拒绝理由已经失效。** v2 的双方每次握手都生成新的 ephemeral
-   X25519 key 和 nonce，完成 key-confirmation 的新 tunnel 不会与旧 tunnel 复用同一组
-   `(aes_key, iv)`。当前 `RTcpTunnelMap::on_new_tunnel()` 仍沿用 v1 的 key/nonce-reuse
-   理由拒绝相同 tunnel key，可能让僵尸 tunnel 阻塞合法重连。
-2. **liveness 不能可靠清理僵尸 tunnel。** `RTcpTunnel::run()` 没有协议级 idle/liveness
-   判定；TCP socket 未配置 keepalive；`Tunnel::ping()` 丢弃 `send_package()` 错误并始终
-   返回 `Ok(())`，而 keep-tunnel 路径也不等待 `Pong`。因此 keep-tunnel 不能作为可靠的
-   活性证明。
+1. **已修复（2026-07-24，commit 736a7178）：重复 tunnel 拒绝已改为原子替换。** 入站
+   连接在完整认证、anti-replay、key-confirmation、listener 准入和设备文档提交全部成功
+   后，按 canonical key 以 last-accepted-wins 原子替换旧 tunnel；`instance_id` +
+   `remove_if_current` 保证旧实例延迟退出不能删除新实例。实施与测试记录见
+   [RTCP-New-Tunnel-Replaces-Old-TODO.md](RTCP-New-Tunnel-Replaces-Old-TODO.md)。
+   本条不再是待办；§G 只剩 liveness 部分。
+2. **liveness 仍不能可靠清理僵尸 tunnel。** `RTcpTunnel::run()` 没有协议级 idle/liveness
+   判定；TCP socket 未配置 keepalive。`Tunnel::ping()` 已改为传播 `send_package()`
+   错误，带 seq 并等待匹配 `Pong` 的 `ping_rtt()` 也已存在并被 prober 使用，但
+   keep-tunnel 路径（`rtcp_stack.rs` 的 `start_keep_tunnel`）仍调用不等 `Pong` 的
+   `ping()`——写入本地 TCP buffer 成功即记为 reachable。替换修复后 NAT 半开不再阻塞
+   合法重连（新连接会踢掉僵尸），但僵尸 tunnel 的主动检测和清理仍缺失。
 3. **inbound `ROpen` 无配额且不校验方向。** `Open` 有 64 槽 semaphore，`ROpen`
    则在读循环中直接 spawn，每条请求都能触发地址解析、并发拨号和 `HelloStream`。
 4. **未认证入口缺少完整的资源和边界保护。** `read_package()` 在检查最小包长和
@@ -113,7 +122,12 @@ OwnerDocument、DeviceDocument 等类型时，才需要同目录的 `owner.json`
 - 本地 older/conflict 和 authority `DifferentDocument` / `Superseded` 会被 freshness
   policy 拒绝；
 - DEV-based tunnel key 已落地，bootstrap-backed key 带 transport URL 后缀；
-- v2 tunnel 建立以 HelloAck/HelloAckConfirm key-confirmation 完成为成功边界。
+- v2 tunnel 建立以 HelloAck/HelloAckConfirm key-confirmation 完成为成功边界；
+- 入站 tunnel 已实现 last-accepted-wins 原子替换：`replace_authenticated_inbound`
+  在 map 临界区内同步标记旧实例 closed，锁外完成 waiter 清理和 shutdown；清理一律走
+  `remove_if_current`（按 `instance_id` compare-and-remove）；closed tunnel 的
+  ping/open/datagram 以 `BrokenPipe` 快速失败；出站保持 first-wins 的
+  `register_outbound_if_absent`。
 
 review 中“明确吊销仍会进入 self-declared fallback”的描述已经过时。后续修改必须保留
 上述 typed rejection 和 anti-rollback 行为；本 TODO 要关闭的是 **Unavailable 类默认
@@ -170,13 +184,20 @@ logical DID
 
 ### 2.1 Tunnel 生命周期契约
 
+已落地（2026-07-24，不得回退；实现与测试见
+[RTCP-New-Tunnel-Replaces-Old-TODO.md](RTCP-New-Tunnel-Replaces-Old-TODO.md)）：
+
 - 相同 tunnel key 的新连接只有在身份验证、key-confirmation、listener 授权和需要的
   freshness/cache commit 全部成功后，才有资格替换旧 tunnel。
-- 替换必须在 map 内原子完成：插入新 tunnel 时返回旧 tunnel，锁外关闭旧 tunnel。
-- 每个 tunnel 必须有不可复用的 generation/id；`run()` 退出时只能执行
-  `remove_if_current(tunnel_key, generation)`，旧 tunnel 绝不能删除后来替换进去的新值。
-- `close()` 必须唤醒或终止阻塞中的读循环，并使所有后续写、Open/ROpen waiter 和
+- 替换在 map 内原子完成：插入新 tunnel 时返回旧 tunnel，旧实例在临界区内同步标记
+  closed，锁外完成 waiter 清理和 transport shutdown。
+- 每个 tunnel 有进程内唯一 `instance_id`；`run()` 退出时只执行
+  `remove_if_current(tunnel_key, instance)`，旧 tunnel 绝不能删除后来替换进去的新值。
+- `close()` 幂等，唤醒或终止阻塞中的读循环，并使所有后续写、Open/ROpen waiter 和
   Pong waiter 快速失败。
+
+待完成：
+
 - keep-tunnel 的健康判断必须等待匹配的 `Pong`；仅仅成功写入本地 TCP buffer 不算远端
   存活。
 - 连续 liveness 失败后应 close + conditional remove，让下一轮重建；TCP keepalive 只能
@@ -377,21 +398,31 @@ struct ResolvedRtcpPeerKey {
 
 ### G. 实现 tunnel 原子替换和可靠 liveness
 
-- [ ] 给 `RTcpTunnel` 增加 generation/id；map value 必须能比较具体实例。
-- [ ] 将 `on_new_tunnel()` 改为 key-confirmation 和授权成功后的原子 replace，并返回旧
-  tunnel；锁外调用旧 tunnel `close()`。
-- [ ] 增加 `remove_if_current(key, generation)`，替换所有无条件 `remove_tunnel(key)`。
-- [ ] `close()` 主动：
+原子替换部分已于 2026-07-24（commit 736a7178）完成，实现与测试记录见
+[RTCP-New-Tunnel-Replaces-Old-TODO.md](RTCP-New-Tunnel-Replaces-Old-TODO.md)：
+
+- [x] 给 `RTcpTunnel` 增加 generation/id；map value 必须能比较具体实例。
+      （落地为进程内唯一 `instance_id` + `is_same_instance`。）
+- [x] 将 `on_new_tunnel()` 改为 key-confirmation 和授权成功后的原子 replace，并返回旧
+  tunnel；锁外调用旧 tunnel `close()`。（落地为 `replace_authenticated_inbound`，旧实例
+  在临界区内先 `mark_closed`；出站保持 first-wins 的 `register_outbound_if_absent`。）
+- [x] 增加 `remove_if_current(key, generation)`，替换所有无条件 `remove_tunnel(key)`。
+- [x] `close()` 主动：
   - 设置 closed/cancel 状态；
   - shutdown bearing stream；
   - 失败所有 Open/ROpen/Pong waiter；
   - 终止或唤醒 pending stream-build task；
-  - 保证 `run()` 在有界时间内退出。
-- [ ] 修复 `Tunnel::ping()`：传播 `send_package()` 错误，不得无条件 `Ok(())`。
+  - 保证 `run()` 在有界时间内退出（`close_notify` 唤醒读循环）。
+- [x] 修复 `Tunnel::ping()`：传播 `send_package()` 错误，不得无条件 `Ok(())`。
+
+剩余 liveness 工作：
+
 - [ ] keep-tunnel 改用带 seq 的 `ping_rtt()` 或等价 Ping/Pong，按配置 timeout 和连续失败
-  次数 close + conditional remove。
+  次数 close + conditional remove。（`ping_rtt()` 及 Pong waiter 机制已存在并被 prober
+  使用；`start_keep_tunnel` 仍用不等 Pong 的 `ping()`。）
 - [ ] direct TCP socket 配置平台允许的 keepalive，作为 NAT/内核级补充。
-- [ ] 新旧 tunnel 的替换日志记录 key、generation、原因和存活时长，不记录密钥材料。
+- [ ] 替换/清理日志补充原因和旧实例存活时长（tunnel key 与新旧 `instance_id` 已记录），
+  不记录密钥材料。
 
 ### H. 统一 Open/ROpen 配额、方向和失败语义
 
@@ -499,17 +530,23 @@ struct ResolvedRtcpPeerKey {
 
 ### 5.3 Tunnel 替换和 liveness
 
-- [ ] 已有 tunnel A 时，完成全新 v2 握手的 tunnel B 原子替换 A；B 使用不同 session
+已由替换修复覆盖（`rtcp::rtcp::tests`，2026-07-24 全量通过）：
+
+- [x] 已有 tunnel A 时，完成全新 v2 握手的 tunnel B 原子替换 A；B 使用不同 session
   key/IV，A 被 close。
-- [ ] A 的 `run()` 在 B 注册后退出，不得把 B 从 map 删除。
-- [ ] 未完成 key-confirmation、listener 拒绝或 freshness commit 失败的新 tunnel 不得替换
-  A。
-- [ ] `ping()` 写失败必须向调用者返回错误。
+- [x] A 的 `run()` 在 B 注册后退出，不得把 B 从 map 删除。
+- [x] listener 拒绝或 Hello/nonce 重放的新连接不得替换 A。（freshness commit 失败在
+  代码路径上位于 tunnel 构造之前，结构上到不了替换点，无独立测试。）
+- [x] `ping()` 写失败必须向调用者返回错误。（closed tunnel 的 fail-fast 已测；真实
+  socket 写失败路径随 liveness 工作一并覆盖。）
+- [x] 并发两个新 tunnel 抢同一 key：最终 map 中恰好一个 current generation，所有 loser
+  都关闭且不能删除 winner。
+
+待补（随剩余 liveness 工作）：
+
 - [ ] 只写成功但收不到匹配 Pong：达到连续失败阈值后 close/remove 并允许重建。
 - [ ] 模拟 NAT black-hole/半开连接：在配置的 liveness 上界内恢复，不依赖操作系统默认
   TCP 超时。
-- [ ] 并发两个新 tunnel 抢同一 key：最终 map 中恰好一个 current generation，所有 loser
-  都关闭且不能删除 winner。
 
 ### 5.4 Open/ROpen、reconnect 与授权
 
@@ -552,7 +589,9 @@ struct ResolvedRtcpPeerKey {
 ### Phase 1：先落地不依赖 resolver API 的资源/生命周期修复
 
 1. 完成 §F parser、首包 deadline 和 pending-handshake 上限。
-2. 完成 §G tunnel generation、conditional remove、ping 错误传播和 Pong liveness。
+2. §G 的 tunnel generation、conditional remove、原子替换和 ping 错误传播已完成
+   （2026-07-24，commit 736a7178）；本阶段剩余 keep-tunnel Pong liveness 与 TCP
+   keepalive。
 3. 完成 §H Open/ROpen 配额、方向、重复 stream id 和取消清理。
 4. 完成 §I reconnect 完整 winner 与 RTT 口径。
 

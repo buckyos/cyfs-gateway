@@ -19,7 +19,7 @@
 - 入站替换在 map 临界区内同步标记旧实例 closed 并原子切换 current，锁外完成 waiter 清理和 transport shutdown。
 - `run()` 可被 close 主动唤醒；自然退出同样进入幂等 close，Open/ROpen/Pong 和 pending HelloStream waiter 会快速释放。
 - `ping`、`ping_rtt`、stream/datagram 创建、reconnect 和入站 Open/ROpen 处理均检查 closed 状态。
-- 出站路径仍为 first-wins；入站完整认证和准入后的路径为 last-accepted-wins。
+- 出站路径仍为 first-wins，但只在存活实例间生效：map 中的 closed 实例不参与复用，`create_tunnel` 会先 `remove_if_current` 再重新拨号，`register_outbound_if_absent` 也会替换已 closed 的旧值；入站完整认证和准入后的路径为 last-accepted-wins。
 
 ## 目标
 
