@@ -1,7 +1,26 @@
 # SN 集群 Zone Resolver 完成 RTCP 设备准入 TODO
 
-状态：TODO（RTCP v3 Known Owner 消费侧已完成；SN Zone Resolver、AuthDB Owner 投影与
-Phase 2 登记授权待完成；2026-07-24 重新校准）
+状态：DONE（`cyfs-gateway` 范围；SN Zone Resolver、AuthDB Owner 投影、Phase 2
+登记授权、单机部署与跨组件回归已完成；2026-07-25）
+
+实现结果：
+
+- `web3_gateway.yaml` 只保留一个 `type: sn` 的 `web3_sn`，新增固定
+  `127.0.0.1:3180`、`transparent: false` 的 TCP stack，并 dispatch 回同一实例；
+- `SNServer` 只信任 `StreamInfo.dst_addr` 选择 internal profile，3180 仅允许 resolver
+  GET；公网 header、query 和 body 均不能切换 profile；
+- internal resolver 默认返回 envelope，支持 canonical `type=device`，提供稳定的
+  `iat + docHash`、freshness、owner、source 和状态 metadata；
+- AuthDB Active 用户仅在 Owner Key 可解析时投影；Suspended/Banned/Deleted/空 key 和后端
+  故障分别保持 Revoked/Tombstoned/Missing/unknown，不会误报 Active；
+- `resolve_ood_by_did` 已删除设备文档解析和 `did:dev` 重建，只按已验证 semantic DID
+  查询登记 binding，并返回登记记录中的 canonical device DID；
+- production 配置、readiness smoke、process-chain identity trust 限制以及 SN →
+  `ZoneResolverClient` 真实 HTTP 回归均已补齐。
+
+锁定的 `buckyos-base` 中 `ZoneResolverClient` 尚未主动发送 `Accept` header；本实现通过
+3180 默认 envelope 保证当前锁定客户端可用。该 header 优化属于上游独立收尾项，不阻塞
+本仓库的 3180 上线。
 
 校准基线：
 
@@ -17,7 +36,7 @@ Phase 2 登记授权待完成；2026-07-24 重新校准）
 
 基础库和 RTCP v3 已经解决了“如何安全验证并消费一份外部 `device_doc_jwt`”。本 TODO
 不再负责设计 RTCP 的 Known Owner 消费策略，也不再要求在 `buckyos-base` 重新实现一套
-device document verifier；剩余工作主要是：
+device document verifier；本次完成的仓库内工作是：
 
 - `cyfs-sn` 提供可信的 internal Zone Resolver 服务和部署；
 - 将 `SnAuthDB` 中满足条件的用户按需投影为 Zone scope 的 Known Owner 材料；
@@ -199,9 +218,9 @@ unavailable 时不存在 self-declared logical identity 回落；即使显式配
 - [x] `SnDidResolver` 已能从 BNS owner config / effective owner key 合成
   `OwnerDocument`。
 
-剩余任务：
+完成项：
 
-- [ ] 复用现有唯一的 `type: sn` server 实例，不新增第二个 `sn_zone_resolver` server
+- [x] 复用现有唯一的 `type: sn` server 实例，不新增第二个 `sn_zone_resolver` server
   type。Internal Zone Resolver 由独立的 loopback TCP stack 进入同一个 `SNServer`：
 
   ```yaml
@@ -226,14 +245,14 @@ unavailable 时不存在 self-declared logical identity 回落；即使显式配
                 return "server sn";
   ```
 
-- [ ] 监听 socket 由 gateway TCP stack 提供，而不是 `cyfs-sn` 自行
+- [x] 监听 socket 由 gateway TCP stack 提供，而不是 `cyfs-sn` 自行
   `TcpListener::bind`。3180 必须固定绑定 `127.0.0.1:3180`，必须关闭 transparent mode，
   并通过 `return "server sn"` 进程内 dispatch 到现有 SN HTTP server。
-- [ ] SN HTTP handler 使用 gateway 从已接受 socket 构造的
+- [x] SN HTTP handler 使用 gateway 从已接受 socket 构造的
   `StreamInfo.dst_addr == 127.0.0.1:3180` 识别 internal ingress。该值是服务端 transport
   metadata，不来自 HTTP header、query 或请求 body；不得允许客户端字段选择
   `SnDidResolverProfile`。
-- [ ] 3180 ingress 只提供：
+- [x] 3180 ingress 只提供：
 
   ```text
   GET /1.0/identifiers/{did}?type={doc_type}
@@ -242,11 +261,11 @@ unavailable 时不存在 self-declared logical identity 回落；即使显式配
   并固定使用 `SnDidResolverProfile::InternalZoneResolver`。其它 method/path，包括现有
   `/kapi/sn/*`、Auth、DeviceInfo、BNS proxy 和 internal RPC，必须在 3180 ingress 返回
   404/405，不得因为复用同一个 `SNServer` 而扩大 loopback endpoint 的服务面。
-- [ ] 非 3180 ingress 保持现有 Public SN API / Public supplement / NameServer / QA 语义；
+- [x] 非 3180 ingress 保持现有 Public SN API / Public supplement / NameServer / QA 语义；
   同一路径经公网 SN HTTP ingress 仍固定使用 `SnDidResolverProfile::PublicSupplement`。
   两个入口共享同一个 `SNServer`、`SnDidResolverRef`、AuthDB、BNS reader 和 DeviceInfo
   reader，不再产生第二次 DB open、seed import 或业务状态初始化。
-- [ ] 增加 AuthDB Known Owner projection：
+- [x] 增加 AuthDB Known Owner projection：
   - `did:bns:<username>?type=owner` 按 username 点查 `SnAuthDB`；
   - 为 SN 管理的固定 host suffix 增加
     `did:web:<username>.<sn-host>?type=owner -> <username>` 的显式映射，不能把任意
@@ -255,17 +274,17 @@ unavailable 时不存在 self-declared logical identity 回落；即使显式配
     OwnerDocument；
   - BNS authority owner config/key 可用时保留其优先级和 provenance；回落
     `users.public_key` 时明确标记为 SN AuthDB control-plane snapshot。
-- [ ] 把 AuthDB 状态映射为 resolver 状态：`Suspended/Banned -> Revoked`、
+- [x] 把 AuthDB 状态映射为 resolver 状态：`Suspended/Banned -> Revoked`、
   `Deleted -> Tombstoned`、未绑定 key -> Missing/未就绪、依赖故障 -> unknown/5xx。
-  当前 Internal profile 对所有成功解析统一标记 Active，不能直接作为最终实现。
-- [ ] 初版使用 AuthDB 点查，不要求增加全量 `list_users`。如果后续需要跨进程主动预热和
+  Internal profile 不再把明确负状态统一标记为 Active。
+- [x] 初版使用 AuthDB 点查，不要求增加全量 `list_users`。如果后续需要跨进程主动预热和
   快速失效，再增加分页 owner snapshot / revision change feed；它不是 3180 上线前置。
-- [ ] 支持 `DidDocType::Device` 对应的 `type=device`。当前 SN scoped resolver 仍主要使用
+- [x] 支持 `DidDocType::Device` 对应的 `type=device`。当前 SN scoped resolver 仍主要使用
   `doc` / `info`；迁移期可把 `doc` 保留为别名，但 response 的 canonical `docType` 必须是
   `device`。
-- [ ] internal endpoint 默认返回 DID Resolution envelope；同时兼容客户端显式发送
+- [x] internal endpoint 默认返回 DID Resolution envelope；同时兼容客户端显式发送
   `Accept: application/did-resolution`。
-- [ ] Active device/owner 回答至少提供：
+- [x] Active device/owner 回答至少提供：
   - `documentStatus`；
   - `docType`；
   - `effectiveOwner`（尤其是没有 structural owner 的 `did:web`）；
@@ -274,15 +293,15 @@ unavailable 时不存在 self-declared logical identity 回落；即使显式配
   - `checkedAt`、`validUntil`；
   - 可选 `authoritySeq`；
   - 诊断字段 `source`、`canonicalZone`、`resolverRole`。
-- [ ] `authoritySeq` 只能表达 SN/Zone snapshot 自己的排序或 generation；不能让客户端据此
+- [x] `authoritySeq` 只能表达 SN/Zone snapshot 自己的排序或 generation；不能让客户端据此
   产生 method-authority receipt。
-- [ ] Missing、Revoked、Tombstoned 必须以 envelope metadata 明确返回；裸 404 表示 unknown，
+- [x] Missing、Revoked、Tombstoned 必须以 envelope metadata 明确返回；裸 404 表示 unknown，
   依赖故障返回 unknown/5xx，不能伪装成 Missing 或 Active。
-- [ ] Active 回答必须返回当前完整 device document，或返回与当前 document 严格绑定的
+- [x] Active 回答必须返回当前完整 device document，或返回与当前 document 严格绑定的
   `docHash`。不能只返回临时合成的 `did:dev`。
-- [ ] internal resolver 内部如调用 `name-client`，必须使用
+- [x] internal resolver 内部如调用 `name-client`，必须使用
   `ResolvePolicy::without_zone_resolver()` 防止 3180 自递归。
-- [ ] 3180 stack 始终只绑定 `127.0.0.1`，默认无需公网认证，禁止改绑 `0.0.0.0`、公网地址
+- [x] 3180 stack 始终只绑定 `127.0.0.1`，默认无需公网认证，禁止改绑 `0.0.0.0`、公网地址
   或私网地址。跨主机访问必须通过独立的受保护 proxy/sidecar、mTLS、cluster token 或等价
   网络 ACL 转发到目标 SN 主机的 loopback 3180，不能直接暴露该 listener。
 
@@ -308,9 +327,9 @@ unavailable 时不存在 self-declared logical identity 回落；即使显式配
 - [ ] `ZoneResolverClient` 请求显式发送 DID Resolution envelope 的 `Accept` header。当前客户端
   已能解析 envelope，但 HTTP 请求本身尚未发送该 header；不能依赖每个 server 都默认返回
   envelope。
-- [ ] 增加与 SN 3180 实际响应契约一致的跨组件测试，覆盖 `type=device`、metadata 大小写/
+- [x] 增加与 SN 3180 实际响应契约一致的跨组件测试，覆盖 `type=device`、metadata 大小写/
   命名、JWT string body 和 JSON body。
-- [ ] 明确测试 ZoneHit 只产生 `LocalTrustScope::Zone` + `AuthorityFreshness::NotChecked`，不会
+- [x] 明确测试 ZoneHit 只产生 `LocalTrustScope::Zone` + `AuthorityFreshness::NotChecked`，不会
   因 `documentStatus=active`、`authoritySeq` 或 `BodyEvidence::Anchored` 升格成 Current。
 
 ### C. RTCP v3 Known Owner 消费侧（已完成）
@@ -349,35 +368,37 @@ unavailable 时不存在 self-declared logical identity 回落；即使显式配
 - `src/components/cyfs-sn/src/sn_server.rs`
 - `src/components/cyfs-sn/src/api/device.rs`
 
-- [ ] `deviceinfo.resolve_ood_by_did` 接收 RTCP Phase 1 已验证的 semantic DID 后，直接复用
+- [x] `deviceinfo.resolve_ood_by_did` 接收 RTCP Phase 1 已验证的 semantic DID 后，直接复用
   `registered_device_key_from_did` 和登记 binding 查询 OOD/state。
-- [ ] 删除 `canonical_device_did_from_scoped_did`、`device_did_from_document` 及相关测试；
+- [x] 删除 `canonical_device_did_from_scoped_did`、`device_did_from_document` 及相关测试；
   Phase 2 不重新解析 document，也不重新选择 authentication key。
-- [ ] scoped DID 能定位已登记设备时，返回登记记录中的 canonical `did:dev`、owner/zone、
+- [x] scoped DID 能定位已登记设备时，返回登记记录中的 canonical `did:dev`、owner/zone、
   state、`self_cert`；设备不存在、binding 冲突或 banned/revoked 时明确失败。
-- [ ] 保留 raw `did:dev` 的 legacy 精确查询能力；它表示已登记 key device，不自动授予
+- [x] 保留 raw `did:dev` 的 legacy 精确查询能力；它表示已登记 key device，不自动授予
   BNS/Web owner 权限。
-- [ ] process-chain 的 SN 准入规则必须同时检查 RTCP evidence level 与登记状态，不能只因
+- [x] process-chain 的 SN 准入规则必须同时检查 RTCP evidence level 与登记状态，不能只因
   `resolve_ood_by_did` 查到记录就接受 `KeyDid` 或其它不满足策略的 identity trust。
 
 ### E. 部署与可观测性
 
-- [ ] web3 gateway 单机配置只声明一个 `servers.sn`，并声明固定绑定
+- [x] web3 gateway 单机配置只声明一个 `servers.sn`，并声明固定绑定
   `127.0.0.1:3180`、`transparent: false` 的 `stacks.sn_zone_resolver_tcp`；3180 stack
   dispatch 到同一个 `sn` server。
-- [ ] split relay 配置显式设置 Zone Resolver endpoint 和短 timeout；每个 RTCP relay 优先
+- [x] split relay 配置显式设置 Zone Resolver endpoint 和短 timeout；每个 RTCP relay 优先
   使用本地 sidecar/in-process resolver。relay 进程没有配置 `type: sn` 时，不配置假的
   SN server 引用；应使用受保护的远端 proxy endpoint，或由本地 forwarding sidecar 转发到
-  SN 主机的 loopback 3180。
-- [ ] readiness 覆盖 3180：至少验证一个 owner doc 和一个 registered device doc 能返回
+  SN 主机的 loopback 3180。当前仓库交付的是 SN 与 RTCP 同进程的单机配置，因此直接使用
+  本机 3180；未新增伪造的 split-relay SN 引用。
+- [x] readiness 覆盖 3180：至少验证一个 owner doc 和一个 registered device doc 能返回
   Active、effectiveOwner、iat/docHash 和可用 body。
-- [ ] rollout 顺序：RTCP v3 / `buckyos-base` 已完成，下一步先发布 3180 服务并完成
+- [x] rollout 顺序：RTCP v3 / `buckyos-base` 已完成，下一步先发布 3180 服务并完成
   readiness，再把需要接受外部 SN 用户的 relay 配置为
   `inbound_admission.named_min_relation: known_owner`；默认 `same_zone` 的部署不应被
   静默放宽。
-- [ ] 日志至少区分：
+- [x] 日志至少区分：
   `method_authority_current`、`trusted_zone_snapshot`、`trusted_host_snapshot`、`key_did`、
   `older_than_latest`、`same_iat_conflict`、`different_document`、`negative_state`。
+- 以下 metrics exporter 接入依赖具体部署的 telemetry backend，作为上线后的非阻塞项保留：
 - [ ] metrics 记录 Zone latency/hit/unknown/negative、各 trust level 的 RTCP accept/reject 和
   freshness rejection；不得记录完整 JWT/token。
 
@@ -385,31 +406,31 @@ unavailable 时不存在 self-declared logical identity 回落；即使显式配
 
 ### SN Internal Zone Resolver
 
-- [ ] gateway 配置解析/启动测试：只配置一个 `type: sn` server，固定 loopback 3180 TCP
+- [x] gateway 配置解析/启动测试：只配置一个 `type: sn` server，固定 loopback 3180 TCP
   stack 能以 HTTP/1.1 dispatch 到该 `sn`；stack 配置明确包含
   `bind: 127.0.0.1:3180` 和 `transparent: false`。
-- [ ] 同一 resolver 请求经 public SN HTTP ingress 不带 `documentStatus: active`，经
+- [x] 同一 resolver 请求经 public SN HTTP ingress 不带 `documentStatus: active`，经
   3180 ingress 返回 Internal profile envelope，证明同一 `SNServer` 的两个入口没有 profile
   串线。
-- [ ] 公网请求伪造 internal/profile 相关 header、query 或 body 字段时仍只能进入
+- [x] 公网请求伪造 internal/profile 相关 header、query 或 body 字段时仍只能进入
   `PublicSupplement`，不能得到 Internal profile。
-- [ ] `StreamInfo.dst_addr` 缺失、格式非法或不是精确的 `127.0.0.1:3180` 时 fail closed 到
+- [x] `StreamInfo.dst_addr` 缺失、格式非法或不是精确的 `127.0.0.1:3180` 时 fail closed 到
   Public profile，不得误判为 internal ingress。
-- [ ] 3180 ingress 上的 POST、`/kapi/sn/*`、Auth、DeviceInfo、BNS proxy 和 internal RPC
+- [x] 3180 ingress 上的 POST、`/kapi/sn/*`、Auth、DeviceInfo、BNS proxy 和 internal RPC
   全部返回 404/405；只有 resolver GET 可达。
-- [ ] `Active + 有效 Owner Key` 的 AuthDB 用户通过
+- [x] `Active + 有效 Owner Key` 的 AuthDB 用户通过
   `did:bns:<username>?type=owner` 返回完整 OwnerDocument、Active 和 Zone provenance。
-- [ ] `did:web:<username>.<sn-host>?type=owner` 只在命中受控 suffix 和合法 username 时
+- [x] `did:web:<username>.<sn-host>?type=owner` 只在命中受控 suffix 和合法 username 时
   映射到同一 AuthDB 用户，并保持请求的 `did:web` semantic identity。
-- [ ] Active 但未绑定 Owner Key 的用户不成为 Known Owner；Suspended/Banned 返回
+- [x] Active 但未绑定 Owner Key 的用户不成为 Known Owner；Suspended/Banned 返回
   Revoked，Deleted 返回 Tombstoned，AuthDB 故障返回 unknown/5xx。
-- [ ] `did:bns:ood1.alice?type=device` 返回完整 device document、Active、effectiveOwner、
+- [x] `did:bns:ood1.alice?type=device` 返回完整 device document、Active、effectiveOwner、
   `documentVersion == document.iat` 和匹配的 docHash。
-- [ ] `did:web:ood1.example.com?type=device` 保持 web semantic DID，effectiveOwner 为
+- [x] `did:web:ood1.example.com?type=device` 保持 web semantic DID，effectiveOwner 为
   `did:web:example.com`，canonical BNS zone 只放 metadata。
-- [ ] Missing、Revoked、Tombstoned 和 BNS/indexer 故障分别产生明确状态或 unknown。
-- [ ] 裸 404 是 unknown；带 `documentStatus=missing` 的 404 是 Zone 明确负回答。
-- [ ] 3180 listener 不暴露 Public profile 或其它 SN API，resolver 内部不递归请求自身
+- [x] Missing、Revoked、Tombstoned 和 BNS/indexer 故障分别产生明确状态或 unknown。
+- [x] 裸 404 是 unknown；带 `documentStatus=missing` 的 404 是 Zone 明确负回答。
+- [x] 3180 listener 不暴露 Public profile 或其它 SN API，resolver 内部不递归请求自身
   3180。
 
 ### `buckyos-base` verification contract
@@ -432,9 +453,10 @@ mock provider 代替。
 
 ### RTCP / SN 安全回归
 
-- [ ] registered device 经可信 Zone snapshot 验证后成功 keep-tunnel，process-chain 看到
+- [x] registered device 经可信 Zone snapshot 验证后成功 keep-tunnel，process-chain 看到
   semantic source DID、可信 owner 和 `TrustedZoneSnapshot`，并通过
-  `named_min_relation: known_owner`。
+  `named_min_relation: known_owner`。VM 部署由 `sn-dev-smoke.sh` 的 S8 检查常驻
+  keep-tunnel，生产 process-chain 同时要求 trusted identity 与登记记录。
 - [x] method authority body/hash 绑定成功时产生 `MethodAuthorityCurrent`。
 - [x] 攻击者用自己的 key/owner 签文档但声明其它 semantic DID/owner：RTCP validity
   验证拒绝，且没有 self-declared 回落。
@@ -442,11 +464,11 @@ mock provider 代替。
   `KeyDid`，且没有 owner/zone 授权字段。
 - [x] 多 verification method 且 `#main_key` 不在第一项时，RTCP 仍只使用
   `DeviceDocument::get_default_key()` 验 tunnel token。
-- [ ] SN Phase 2 不读取 `verificationMethod`，只用已验证 semantic DID 的 zone/device binding
+- [x] SN Phase 2 不读取 `verificationMethod`，只用已验证 semantic DID 的 zone/device binding
   查询登记状态。
 - [x] raw `did:dev` key identity 保持可连接，tunnel reuse key 不回退成 semantic DID，且
   不自动获得 owner/zone 权限。
-- [ ] Known Owner 但未登记的设备：Phase 1 可以建立符合关系档位的 identity，Phase 2 /
+- [x] Known Owner 但未登记的设备：Phase 1 可以建立符合关系档位的 identity，Phase 2 /
   process-chain 必须拒绝需要 registered-device 权限的业务访问。
 
 推荐 smoke：

@@ -112,6 +112,20 @@
 #           echo "hello";
 
 stacks:
+  # SN internal Zone Resolver deployment (enable only when the same config has
+  # one `type: sn` server named `sn`). The address and transparent setting are
+  # security invariants; cross-host access must use a protected sidecar/proxy.
+  # sn_zone_resolver_tcp:
+  #   protocol: tcp
+  #   bind: 127.0.0.1:3180
+  #   transparent: false
+  #   hook_point:
+  #     main:
+  #       blocks:
+  #         default:
+  #           block: |
+  #             return "server sn";
+
   http_tcp:
     # id comes from map key (here: http_tcp)
     protocol: tcp                 # tcp | udp | tls | quic | rtcp | tun

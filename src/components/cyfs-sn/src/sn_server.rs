@@ -69,6 +69,19 @@ use std::{
 const CLEAR_STATE_ACTIVE_CODE: &str = "zX6cV7bN8mK9lJ0hG1fD";
 const RESERVED_USER_NAMES_FILE_ENV: &str = "BUCKYOS_SN_RESERVED_NAMES_FILE";
 const RESERVED_USER_NAMES_FILE: &str = "reserved_user_names.txt";
+const INTERNAL_ZONE_RESOLVER_ADDR: &str = "127.0.0.1:3180";
+
+fn is_internal_zone_resolver_ingress(info: &StreamInfo) -> bool {
+    info.dst_addr
+        .as_deref()
+        .and_then(|addr| addr.parse::<SocketAddr>().ok())
+        .map(|addr| {
+            addr == INTERNAL_ZONE_RESOLVER_ADDR
+                .parse::<SocketAddr>()
+                .expect("internal Zone Resolver address is a constant")
+        })
+        .unwrap_or(false)
+}
 
 fn is_filtered_zonegate_ip(ip: IpAddr) -> bool {
     match ip {
@@ -375,7 +388,8 @@ impl SNServer {
         )))
         .with_relay_reader(Arc::new(SnAuthDbRelayResolverReader::new(auth_db.clone())));
         let resolver = Arc::new(resolver);
-        let did_resolver = SnResolverBackedDidResolver::new_ref(resolver.clone(), auth_reader);
+        let did_resolver =
+            SnResolverBackedDidResolver::new_ref(resolver.clone(), auth_reader, server_host);
         let pkx_txt_resolver = DohDnsTxtResolver::new_ref(
             server_config
                 .pkx_doh_url
@@ -961,24 +975,12 @@ impl SNServer {
         }
 
         if let Some(key) = self.registered_device_key_from_did(did).await? {
-            let canonical_did = self.canonical_device_did_from_scoped_did(did).await?;
             if let Some(view) = self
                 .device_info_db
                 .get_device_state_by_name(key.zone.as_str(), key.device_name.as_str())
                 .await
                 .map_err(|e| RPCErrors::ReasonError(e.to_string()))?
             {
-                if let Some(canonical_did) = canonical_did.as_deref() {
-                    if canonical_did != view.did.as_str() {
-                        return Err(RPCErrors::ParseRequestError(
-                            Self::registered_device_did_mismatch(
-                                did,
-                                canonical_did,
-                                view.did.as_str(),
-                            ),
-                        ));
-                    }
-                }
                 let registered_did = view.did.clone();
                 return self
                     .ood_info_from_device_state(registered_did.as_str(), view)
@@ -1003,6 +1005,7 @@ impl SNServer {
             .map_err(|e| RPCErrors::ReasonError(e.to_string()))?;
         Ok(OODInfo {
             did_hostname: Self::did_hostname(did_for_hostname),
+            canonical_device_id: Some(view.did.clone()),
             owner_id: view.zone,
             self_cert: user.map(|u| u.self_cert).unwrap_or(false),
             state: Self::device_state_to_ood_state(view.state),
@@ -1107,69 +1110,6 @@ impl SNServer {
         value.trim().trim_end_matches('.').to_ascii_lowercase()
     }
 
-    async fn canonical_device_did_from_scoped_did(
-        &self,
-        did: &str,
-    ) -> Result<Option<String>, RPCErrors> {
-        let did = match DID::from_str(did) {
-            Ok(did) => did,
-            Err(_) => return Ok(None),
-        };
-        if did.method != "bns" && did.method != "web" {
-            return Ok(None);
-        }
-        let did_string = did.to_string();
-
-        let resolution = match self
-            .did_resolver
-            .resolve(SnDidResolveRequest::new(
-                did,
-                Some("doc".to_string()),
-                None,
-                SnDidResolverProfile::InternalZoneResolver,
-            ))
-            .await
-        {
-            Ok(resolution) => resolution,
-            Err(e) => {
-                debug!(
-                    "skip canonical device DID check for {}: resolver failed: {}",
-                    did_string, e
-                );
-                return Ok(None);
-            }
-        };
-
-        let value = match resolution.document.to_json_value() {
-            Ok(value) => value,
-            Err(e) => {
-                debug!(
-                    "skip canonical device DID check for {}: document decode failed: {}",
-                    did_string, e
-                );
-                return Ok(None);
-            }
-        };
-
-        Ok(Self::device_did_from_document(&value))
-    }
-
-    fn device_did_from_document(value: &Value) -> Option<String> {
-        for key in ["did", "id"] {
-            if let Some(did) = value.get(key).and_then(|v| v.as_str()) {
-                if !did.trim().is_empty() {
-                    return Some(did.trim().to_string());
-                }
-            }
-        }
-
-        value
-            .get("x")
-            .and_then(|v| v.as_str())
-            .filter(|x| !x.trim().is_empty())
-            .map(|x| format!("did:dev:{}", x.trim()))
-    }
-
     fn registered_device_not_found(did: &str) -> String {
         format!(
             "registered device not found for source_device_id={did}; \
@@ -1179,18 +1119,6 @@ impl SNServer {
              canonical did:dev device DID after registration; scoped BNS/Web device \
              DIDs are accepted as aliases. Verify SnDeviceInfoDB contains a registered \
              device index with the same public key, device name, and zone."
-        )
-    }
-
-    fn registered_device_did_mismatch(
-        query_did: &str,
-        resolved_did: &str,
-        registered_did: &str,
-    ) -> String {
-        format!(
-            "registered device DID mismatch for source_device_id={query_did}; \
-             scoped DID resolves to canonical device DID {resolved_did}, but the \
-             registered device binding points to {registered_did}."
         )
     }
 
@@ -1221,6 +1149,7 @@ impl SNServer {
                     .unwrap_or(SnOodState::Active);
                 return Some(OODInfo {
                     did_hostname,
+                    canonical_device_id: Some(gateway.gateway_did),
                     owner_id: gateway.zone_name,
                     self_cert: gateway.self_cert,
                     state,
@@ -1499,6 +1428,30 @@ impl HttpServer for SNServer {
         request: http::Request<BoxBody<Bytes, ServerError>>,
         info: StreamInfo,
     ) -> ServerResult<http::Response<BoxBody<Bytes, ServerError>>> {
+        let path = request.uri().path().to_string();
+        let internal_zone_resolver = is_internal_zone_resolver_ingress(&info);
+        if internal_zone_resolver
+            && (!path.starts_with(SN_DID_RESOLVER_ROUTE_PREFIX) || request.method() != Method::GET)
+        {
+            let status = if path.starts_with(SN_DID_RESOLVER_ROUTE_PREFIX) {
+                StatusCode::METHOD_NOT_ALLOWED
+            } else {
+                StatusCode::NOT_FOUND
+            };
+            return Ok(Response::builder()
+                .status(status)
+                .body(BoxBody::new(
+                    Full::new(Bytes::from_static(if status == StatusCode::NOT_FOUND {
+                        b"Not Found"
+                    } else {
+                        b"Method Not Allowed"
+                    }))
+                    .map_err(|never| match never {})
+                    .boxed(),
+                ))
+                .unwrap());
+        }
+
         // Handle OPTIONS preflight request for CORS
         if request.method() == Method::OPTIONS {
             return Ok(Response::builder()
@@ -1516,7 +1469,6 @@ impl HttpServer for SNServer {
                 .unwrap());
         }
 
-        let path = request.uri().path().to_string();
         if path.starts_with(SN_DID_RESOLVER_ROUTE_PREFIX) && request.method() == Method::GET {
             let did_str = path
                 .trim_start_matches(SN_DID_RESOLVER_ROUTE_PREFIX)
@@ -1567,16 +1519,34 @@ impl HttpServer for SNServer {
                 did,
                 doc_type,
                 from_ip,
-                SnDidResolverProfile::PublicSupplement,
+                if internal_zone_resolver {
+                    SnDidResolverProfile::InternalZoneResolver
+                } else {
+                    SnDidResolverProfile::PublicSupplement
+                },
             );
             resolve_request.accept = accept;
             resolve_request.iat = iat;
             let response_accept = resolve_request.accept.clone();
+            let started_at = Instant::now();
 
             match self.did_resolver.resolve(resolve_request).await {
                 Ok(resolution) => {
+                    let status = resolution.status_code();
+                    info!(
+                        "SN DID resolver profile={:?} did={} doc_type={} status={} source={:?} latency_ms={}",
+                        resolution.profile,
+                        resolution.did,
+                        resolution.doc_type,
+                        resolution
+                            .document_status
+                            .map(|status| format!("{:?}", status).to_ascii_lowercase())
+                            .unwrap_or_else(|| status.as_u16().to_string()),
+                        resolution.source,
+                        started_at.elapsed().as_millis(),
+                    );
                     return Ok(Response::builder()
-                        .status(StatusCode::OK)
+                        .status(status)
                         .header("Access-Control-Allow-Origin", "*")
                         .header(
                             "Content-Type",
@@ -1605,6 +1575,17 @@ impl HttpServer for SNServer {
                             StatusCode::INTERNAL_SERVER_ERROR
                         }
                     };
+                    warn!(
+                        "SN DID resolver profile={} status=unknown error_kind={:?} latency_ms={} error={}",
+                        if internal_zone_resolver {
+                            "internal_zone_resolver"
+                        } else {
+                            "public_supplement"
+                        },
+                        e.kind(),
+                        started_at.elapsed().as_millis(),
+                        e,
+                    );
                     return Self::builder_error_http_response(status, e.to_string());
                 }
             }
@@ -2467,6 +2448,13 @@ mod tests {
     }
 
     async fn spawn_test_http_server(http_server: Arc<dyn HttpServer>) -> SocketAddr {
+        spawn_test_http_server_with_dst(http_server, None).await
+    }
+
+    async fn spawn_test_http_server_with_dst(
+        http_server: Arc<dyn HttpServer>,
+        dst_addr: Option<String>,
+    ) -> SocketAddr {
         let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
             .await
             .unwrap();
@@ -2476,7 +2464,7 @@ mod tests {
             loop {
                 let (stream, _) = listener.accept().await.unwrap();
                 let http_server = http_server.clone();
-                let stream_info = StreamInfo::new(addr.to_string());
+                let stream_info = StreamInfo::new(addr.to_string()).with_dst_addr(dst_addr.clone());
                 tokio::spawn(async move {
                     let ret = hyper_serve_http(Box::new(stream), http_server, stream_info).await;
                     if let Err(e) = ret {
@@ -2488,6 +2476,23 @@ mod tests {
 
         wait_for_tcp(addr).await;
         addr
+    }
+
+    #[test]
+    fn internal_zone_resolver_ingress_requires_exact_transport_destination() {
+        for dst_addr in [
+            None,
+            Some("invalid"),
+            Some("127.0.0.1:3181"),
+            Some("[::1]:3180"),
+        ] {
+            let info = StreamInfo::new("127.0.0.1:12345".to_string())
+                .with_dst_addr(dst_addr.map(ToString::to_string));
+            assert!(!is_internal_zone_resolver_ingress(&info));
+        }
+        let info = StreamInfo::new("198.51.100.10:12345".to_string())
+            .with_dst_addr(Some(INTERNAL_ZONE_RESOLVER_ADDR.to_string()));
+        assert!(is_internal_zone_resolver_ingress(&info));
     }
 
     async fn wait_for_tcp(addr: SocketAddr) {
@@ -4850,8 +4855,14 @@ mod tests {
             })
             .unwrap();
 
+        let internal_http_addr = spawn_test_http_server_with_dst(
+            http_server.clone(),
+            Some(INTERNAL_ZONE_RESOLVER_ADDR.to_string()),
+        )
+        .await;
         let http_addr = spawn_test_http_server(http_server).await;
         let base_url = format!("http://{}", http_addr);
+        let internal_base_url = format!("http://{}", internal_http_addr);
         let root_url = format!("{}/kapi/sn", base_url);
         let auth_url = format!("{}/kapi/sn/auth", base_url);
         let deviceinfo_url = format!("{}/kapi/sn/deviceinfo", base_url);
@@ -4914,6 +4925,109 @@ mod tests {
             .unwrap();
         let access_token = result["access_token"].as_str().unwrap().to_string();
 
+        // The public and loopback Zone Resolver ingress share one SNServer but
+        // select profiles only from transport metadata. Client-controlled
+        // headers/query parameters cannot opt into the Internal profile.
+        let client = reqwest::Client::new();
+        let public_response = client
+            .get(format!(
+                "{}/1.0/identifiers/did:bns:{}?profile=internal_zone_resolver",
+                base_url, REFACTOR_USER
+            ))
+            .header("x-sn-resolver-profile", "internal_zone_resolver")
+            .send()
+            .await
+            .unwrap();
+        assert!(public_response.status().is_success());
+        let public_body: Value = public_response.json().await.unwrap();
+        assert!(public_body.get("didDocumentMetadata").is_none());
+
+        let internal_response = client
+            .get(format!(
+                "{}/1.0/identifiers/did:bns:{}",
+                internal_base_url, REFACTOR_USER
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert!(internal_response.status().is_success());
+        assert_eq!(
+            internal_response
+                .headers()
+                .get(http::header::CONTENT_TYPE)
+                .unwrap(),
+            crate::sn_did_resolver::DID_RESOLUTION_CONTENT_TYPE
+        );
+        let internal_body: Value = internal_response.json().await.unwrap();
+        assert_eq!(
+            internal_body["didDocumentMetadata"]["buckyos"]["documentStatus"],
+            "active"
+        );
+        assert_eq!(
+            internal_body["didDocumentMetadata"]["buckyos"]["resolverRole"],
+            "zone_resolver"
+        );
+        let zone_client = ZoneResolverClient::new(ZoneResolverConfig {
+            endpoint: internal_base_url.clone(),
+            connect_timeout: Duration::from_millis(100),
+            request_timeout: Duration::from_secs(1),
+        });
+        let zone_did = DID::from_str(format!("did:bns:{}", REFACTOR_USER).as_str()).unwrap();
+        match zone_client
+            .lookup(&zone_did, &DidDocType::Zone, false)
+            .await
+        {
+            ZoneLookup::Answered(answer) => {
+                let resolved = answer.result.unwrap();
+                assert_eq!(
+                    resolved.resolution_metadata.cache_status,
+                    Some(CacheStatus::ZoneHit)
+                );
+                let state = answer.state.unwrap();
+                assert_eq!(state.document_status, DocumentStatus::Active);
+                assert!(state.document_ref.is_some());
+                assert!(state.checked_at.is_some());
+                assert!(state.valid_until.is_some());
+            }
+            ZoneLookup::Unknown(error) => {
+                panic!("SN internal response must be a Zone answer: {}", error)
+            }
+        }
+
+        let forbidden_rpc = client
+            .post(format!("{}/kapi/sn/auth", internal_base_url))
+            .body("{}")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(forbidden_rpc.status(), StatusCode::NOT_FOUND);
+        let forbidden_method = client
+            .post(format!(
+                "{}/1.0/identifiers/did:bns:{}",
+                internal_base_url, REFACTOR_USER
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(forbidden_method.status(), StatusCode::METHOD_NOT_ALLOWED);
+        let unknown_response = client
+            .get(format!(
+                "{}/1.0/identifiers/did:web:unmanaged.example?type=device",
+                internal_base_url
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(unknown_response.status(), StatusCode::NOT_FOUND);
+        assert!(
+            !unknown_response
+                .text()
+                .await
+                .unwrap()
+                .contains("documentStatus"),
+            "an unmanaged DID must remain unknown rather than becoming a Zone negative"
+        );
+
         let duplicate_email_err = auth_krpc
             .call(
                 "auth.register",
@@ -4970,6 +5084,31 @@ mod tests {
             .unwrap();
         assert_eq!(result["code"].as_i64().unwrap(), 0);
         assert_eq!(result["zone"].as_str().unwrap(), REFACTOR_USER);
+
+        // Phase 2 authorization consumes only the already-verified semantic
+        // DID's registration binding. The mock BNS has no device document, so
+        // this succeeds only if resolve_ood_by_did does not inspect
+        // verificationMethod or reconstruct a did:dev from resolver content.
+        let scoped_ood = device_krpc
+            .call(
+                "deviceinfo.resolve_ood_by_did",
+                json!({
+                    "source_device_id": format!("did:bns:ood1.{}", REFACTOR_USER)
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(scoped_ood["owner_id"], REFACTOR_USER);
+        assert_eq!(
+            scoped_ood["canonical_device_id"],
+            device_config.id.to_string()
+        );
+        assert_eq!(
+            scoped_ood["did_hostname"],
+            DID::from_str(device_config.id.to_string().as_str())
+                .unwrap()
+                .to_host_name()
+        );
 
         let result = device_krpc
             .call("device.get", json!({ "device_name": "ood1" }))

@@ -438,6 +438,10 @@ pub struct SNUserInfo {
     pub self_cert: bool,
     pub user_domain: Option<String>,
     pub sn_ips: Option<String>,
+    /// AuthDB control-plane revision used when projecting a stable Zone-scope
+    /// OwnerDocument. Older remote providers may omit it.
+    #[serde(default)]
+    pub updated_at: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relay: Option<UserRelayInfo>,
 }
@@ -1842,6 +1846,11 @@ impl SqliteSnAuthDB {
             sn_ips: row
                 .try_get("sn_ips")
                 .map_err(|e| Self::db_err("read sn_ips failed", e))?,
+            updated_at: row
+                .try_get::<Option<i64>, _>("updated_at")
+                .map_err(|e| Self::db_err("read updated_at failed", e))?
+                .unwrap_or_default()
+                .max(0) as u64,
             relay: None,
         })
     }
@@ -2317,7 +2326,7 @@ impl SnAuthDB for SqliteSnAuthDB {
         let email = canonical_email(email)?;
         let row = sqlx::query(
             "SELECT username, email, state, public_key, activation_code, zone_config,
-                    self_cert, user_domain, sn_ips
+                    self_cert, user_domain, sn_ips, updated_at
              FROM users WHERE email = ?1",
         )
         .bind(email.as_str())
@@ -2479,7 +2488,7 @@ impl SnAuthDB for SqliteSnAuthDB {
     async fn get_user_info(&self, username: &str) -> SnResult<Option<SNUserInfo>> {
         let row = sqlx::query(
             "SELECT username, email, state, public_key, activation_code, zone_config,
-                    self_cert, user_domain, sn_ips
+                    self_cert, user_domain, sn_ips, updated_at
              FROM users WHERE username = ?1",
         )
         .bind(username)
@@ -2500,7 +2509,7 @@ impl SnAuthDB for SqliteSnAuthDB {
         };
         let row = sqlx::query(
             "SELECT u.username, u.email, u.state, u.public_key, u.activation_code, u.zone_config,
-                    u.self_cert, b.domain AS user_domain, u.sn_ips
+                    u.self_cert, b.domain AS user_domain, u.sn_ips, u.updated_at
              FROM user_domain_bindings b
              JOIN users u ON u.username = b.owner
              WHERE b.state = 'active'

@@ -383,6 +383,8 @@ pub struct ZoneResolution {
     pub canonical_name: String,
     pub zone_name: String,
     pub owner: BnsOwner,
+    #[serde(skip)]
+    pub owner_from_auth_db: bool,
     pub zone_doc: ZoneDocument,
     pub boot_doc: BootDocument,
     pub user_domain: Option<String>,
@@ -1540,6 +1542,7 @@ impl SnResolver {
                     hostname.as_str(),
                     hostname.as_str(),
                     owner,
+                    false,
                     ZoneResolutionSource::BnsName,
                     None,
                     None,
@@ -1609,6 +1612,7 @@ impl SnResolver {
     ) -> SnResolverResult<ZoneResolution> {
         let canonical_name = normalize_bns_name(bns_name)?;
         let bns_owner = self.bns.resolve_owner(canonical_name.as_str()).await?;
+        let owner_from_auth_db = bns_owner.is_none();
         let user = self.auth.get_user_info(canonical_name.as_str()).await?;
 
         if bns_owner.is_none() && user.is_none() {
@@ -1624,6 +1628,7 @@ impl SnResolver {
             input,
             canonical_name.as_str(),
             owner,
+            owner_from_auth_db,
             source,
             user,
             user_domain,
@@ -1689,15 +1694,21 @@ impl SnResolver {
         user: SNUserInfo,
         source: ZoneResolutionSource,
     ) -> SnResolverResult<ZoneResolution> {
-        let owner = self
-            .bns
-            .resolve_owner(username)
-            .await?
-            .unwrap_or_else(|| legacy_owner(username, Some(&user)));
+        let bns_owner = self.bns.resolve_owner(username).await?;
+        let owner_from_auth_db = bns_owner.is_none();
+        let owner = bns_owner.unwrap_or_else(|| legacy_owner(username, Some(&user)));
         let user_domain = user.user_domain.clone();
 
-        self.resolve_zone_by_bns_owner(input, username, owner, source, Some(user), user_domain)
-            .await
+        self.resolve_zone_by_bns_owner(
+            input,
+            username,
+            owner,
+            owner_from_auth_db,
+            source,
+            Some(user),
+            user_domain,
+        )
+        .await
     }
 
     async fn resolve_zone_by_bns_owner(
@@ -1705,6 +1716,7 @@ impl SnResolver {
         input: &str,
         zone_name: &str,
         owner: BnsOwner,
+        owner_from_auth_db: bool,
         source: ZoneResolutionSource,
         user: Option<SNUserInfo>,
         user_domain: Option<String>,
@@ -1751,6 +1763,7 @@ impl SnResolver {
             canonical_name: zone_name.to_string(),
             zone_name: zone_name.to_string(),
             owner,
+            owner_from_auth_db,
             zone_doc,
             boot_doc,
             user_domain,
@@ -3168,6 +3181,7 @@ mod tests {
             self_cert: false,
             user_domain: user_domain.map(ToOwned::to_owned),
             sn_ips: None,
+            updated_at: 1,
             relay: None,
         }
     }
@@ -3376,6 +3390,7 @@ mod tests {
                 effective_owner: None,
                 owner_config: None,
             },
+            owner_from_auth_db: false,
             zone_doc: ZoneDocument::empty(),
             boot_doc: BootDocument::empty(),
             user_domain: None,
@@ -3710,6 +3725,7 @@ mod tests {
                 effective_owner: None,
                 owner_config: None,
             },
+            owner_from_auth_db: false,
             zone_doc: ZoneDocument::empty(),
             boot_doc: BootDocument::empty(),
             user_domain: None,
@@ -4244,6 +4260,7 @@ mod tests {
                     effective_owner: Some("owner-key".to_string()),
                     owner_config: None,
                 },
+                false,
                 ZoneResolutionSource::BnsName,
                 None,
                 None,
@@ -4281,6 +4298,7 @@ mod tests {
                     effective_owner: Some("owner-key".to_string()),
                     owner_config: None,
                 },
+                false,
                 ZoneResolutionSource::BnsName,
                 None,
                 None,

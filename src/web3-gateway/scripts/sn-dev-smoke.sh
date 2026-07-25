@@ -15,10 +15,12 @@
 #   S3 链上种子  GET /1.0/identifiers/did:bns:alice 经 indexer 投影解析成功
 #   S4 user_domain 种子  GET /1.0/identifiers/did:web:charlie.me 解析成功
 #   S5 纯 Web3 位  did:bns:dave（无 sn_user 行）仍可经 BNS 路径解析
-#   S6 BNS proxy   auth.register 用户只给 asset_owner，SN 代付 gas 注册 BNS；
+#   S6 Zone Resolver  loopback :3180 的 owner/device 回答包含 Active、
+#                  effectiveOwner、documentVersion、docHash 和完整 body
+#   S7 BNS proxy   auth.register 用户只给 asset_owner，SN 代付 gas 注册 BNS；
 #                  再用 access token 经 bns.publish_dns_txt 代理写 dns_txt，
 #                  最后从 DNS TXT 读回 indexer 投影。
-#   S7 keep-tunnel  OOD peer 到 SN 的 RTCP keep-tunnel 处于 ESTABLISHED
+#   S8 keep-tunnel  OOD peer 到 SN 的 RTCP keep-tunnel 处于 ESTABLISHED
 #      （仅 --vm；经 buckyos-devtest <group> run sn 检查 rtcp 端口的入站长
 #      连接。tunnel 断开时该 case 必须失败；单节点 group 用 --no-keep-tunnel
 #      显式关闭。）
@@ -46,12 +48,12 @@ Options:
   --dns-server <addr>  DNS server address; defaults to 127.0.0.1 locally and the VM IP in VM mode.
   --http-origin <url>  HTTP origin; defaults to local high port or http://sn.<domain> in VM mode.
   --config-dir <path>  VM devtest config dir; default $DEFAULT_VM_CONFIG_DIR.
-  --devtest-group <g>  buckyos-devtest group for the S6 keep-tunnel check; default sntest.
+  --devtest-group <g>  buckyos-devtest group for the S8 keep-tunnel check; default sntest.
   --devtest-dir <dir>  Directory to run buckyos-devtest from (must contain dev_configs/<group>.json);
                        auto-detected from this repo and the sibling buckyos checkout.
   --rtcp-port <port>   SN RTCP listen port for the keep-tunnel check; default 2980.
-  --no-bns-proxy       Skip S6 (older dev environments without bns_proxy enabled).
-  --no-keep-tunnel     Skip S7 (single-node groups without an OOD peer).
+  --no-bns-proxy       Skip S7 (older dev environments without bns_proxy enabled).
+  --no-keep-tunnel     Skip S8 (single-node groups without an OOD peer).
 EOF
 }
 
@@ -182,7 +184,7 @@ esac
 SN_HTTP_HOST="sn.$SN_HOST"
 ALICE_HOST="alice.web3.$SN_HOST"
 
-# S6 keep-tunnel 依赖 buckyos-devtest（VM 后端保持透明，不直接调 multipass）。
+# S8 keep-tunnel 依赖 buckyos-devtest（VM 后端保持透明，不直接调 multipass）。
 # devtest 要求 cwd 含 dev_configs/<group>.json：优先显式 --devtest-dir，
 # 其次本仓库，再次同级 buckyos checkout（sntest 组即在那里）。
 detect_devtest_dir() {
@@ -237,6 +239,17 @@ identifiers_ok() { # identifiers_ok <did>
   # 当前兼容 API 顶层返回 boot/user_name；旧 DID 文档形态可能返回 id/oods。
   # 任一形态都说明 resolver 成功返回了可用文档。
   curl -fsS --connect-timeout 3 --max-time 10 -H "Host: $SN_HTTP_HOST" "$HTTP_ORIGIN/1.0/identifiers/$1" | grep -Eq '"(boot|user_name|id|oods)"'
+}
+zone_resolver_ready() { # zone_resolver_ready <did> <doc-type>
+  local body
+  body="$(curl -fsS --connect-timeout 3 --max-time 10 \
+    -H "Accept: application/did-resolution" \
+    "http://127.0.0.1:3180/1.0/identifiers/$1?type=$2")" || return 1
+  printf '%s' "$body" | grep -q '"didDocument":{' &&
+    printf '%s' "$body" | grep -q '"documentStatus":"active"' &&
+    printf '%s' "$body" | grep -q '"effectiveOwner":"did:' &&
+    printf '%s' "$body" | grep -Eq '"documentVersion":[0-9]+' &&
+    printf '%s' "$body" | grep -Eq '"docHash":"[0-9a-f]{64}"'
 }
 bns_proxy_real_path_ok() {
   SN_HOST="$SN_HOST" \
@@ -413,7 +426,7 @@ PY
 keep_tunnel_established() {
   # OOD -> SN 的 RTCP keep-tunnel 是一条常驻 TCP 长连接；SN 侧 rtcp 端口
   # 存在非本机来源的 ESTABLISHED 即视为 keep-tunnel 在线。tunnel 断开时
-  # 连接消失，本检查失败——这正是 S6 的验收语义。
+  # 连接消失，本检查失败——这正是 S8 的验收语义。
   local out
   out="$(cd "$DEVTEST_DIR" && uv run buckyos-devtest "$DEVTEST_GROUP" run sn \
     "ss -tnH state established '( sport = :$RTCP_PORT )' | grep -v 127.0.0.1 | wc -l" 2>/dev/null)" || return 1
@@ -433,12 +446,16 @@ check "S2 DNS TXT contains DEV=" dns_txt_has "DEV="
 check "S3 resolve did:bns:alice via indexer projection" identifiers_ok "did:bns:alice"
 check "S4 resolve did:web:charlie.me via user_domain seed" identifiers_ok "did:web:charlie.me"
 check "S5 resolve did:bns:dave (pure Web3, no sn_user row)" identifiers_ok "did:bns:dave"
+if [ "$MODE" = "local" ]; then
+  check "S6 Zone Resolver owner snapshot is ready" zone_resolver_ready "did:bns:alice" "owner"
+  check "S6 Zone Resolver device snapshot is ready" zone_resolver_ready "did:bns:ood1.alice" "device"
+fi
 if [ "$BNS_PROXY_CHECK" = "1" ]; then
-  check "S6 auth.register + bns.publish_dns_txt via SN-paid BNS proxy" bns_proxy_real_path_ok
+  check "S7 auth.register + bns.publish_dns_txt via SN-paid BNS proxy" bns_proxy_real_path_ok
 fi
 if [ "$MODE" = "vm" ] && [ "$KEEP_TUNNEL_CHECK" = "1" ]; then
   echo "[sn-dev-smoke] keep-tunnel via: buckyos-devtest $DEVTEST_GROUP (cwd $DEVTEST_DIR)"
-  check "S7 OOD keep-tunnel to SN rtcp :$RTCP_PORT is ESTABLISHED" keep_tunnel_established
+  check "S8 OOD keep-tunnel to SN rtcp :$RTCP_PORT is ESTABLISHED" keep_tunnel_established
 fi
 
 echo "[sn-dev-smoke] $PASS passed, $FAIL failed"

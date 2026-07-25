@@ -2,13 +2,17 @@ use crate::sn_resolver::{
     SnAuthReaderRef, SnResolverError, SnResolverErrorKind, SnResolverRef, SnResolverResult,
     ZoneResolution, ZoneResolutionSource, BNS_DOC_ZONE, DEFAULT_SN_RESOLVER_TTL_SECS,
 };
+use crate::{SNUserInfo, UserState};
 use async_trait::async_trait;
-use jsonwebtoken::jwk::Jwk;
+use http::StatusCode;
+use jsonwebtoken::{jwk::Jwk, DecodingKey};
+use name_client::{document_content_hash, document_iat};
 use name_lib::{create_jwt_by_x, EncodedDocument, OwnerDocument, DID};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::net::IpAddr;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const SN_DID_RESOLVER_ROUTE_PREFIX: &str = "/1.0/identifiers/";
 pub const DID_RESOLUTION_CONTENT_TYPE: &str = "application/did-resolution+json";
@@ -59,9 +63,16 @@ impl SnDidResolveRequest {
         from_ip: Option<IpAddr>,
         profile: SnDidResolverProfile,
     ) -> Self {
+        let doc_type = normalize_sn_did_doc_type(doc_type.as_deref()).map(|doc_type| {
+            if profile == SnDidResolverProfile::InternalZoneResolver && doc_type == "doc" {
+                "device".to_string()
+            } else {
+                doc_type
+            }
+        });
         Self {
             did,
-            doc_type: normalize_sn_did_doc_type(doc_type.as_deref()),
+            doc_type,
             from_ip,
             profile,
             accept: None,
@@ -86,10 +97,24 @@ pub struct SnDidResolveResponse {
 }
 
 impl SnDidResolveResponse {
+    fn uses_resolution_envelope(&self, accept: Option<&str>) -> bool {
+        self.profile == SnDidResolverProfile::InternalZoneResolver || accepts_did_resolution(accept)
+    }
+
     pub fn content_type(&self) -> &'static str {
         match self.document {
             EncodedDocument::JsonLd(_) => "application/json",
             EncodedDocument::Jwt(_) => "application/jwt",
+        }
+    }
+
+    pub fn status_code(&self) -> StatusCode {
+        match self.document_status {
+            Some(SnDidDocumentStatus::Missing) => StatusCode::NOT_FOUND,
+            Some(SnDidDocumentStatus::Revoked | SnDidDocumentStatus::Tombstoned) => {
+                StatusCode::GONE
+            }
+            _ => StatusCode::OK,
         }
     }
 
@@ -98,7 +123,7 @@ impl SnDidResolveResponse {
     }
 
     pub fn content_type_for_accept(&self, accept: Option<&str>) -> &'static str {
-        if accepts_did_resolution(accept) {
+        if self.uses_resolution_envelope(accept) {
             DID_RESOLUTION_CONTENT_TYPE
         } else {
             self.content_type()
@@ -106,7 +131,7 @@ impl SnDidResolveResponse {
     }
 
     pub fn body_for_accept(&self, accept: Option<&str>) -> String {
-        if accepts_did_resolution(accept) {
+        if self.uses_resolution_envelope(accept) {
             self.did_resolution_body()
         } else {
             self.body()
@@ -114,11 +139,13 @@ impl SnDidResolveResponse {
     }
 
     fn did_resolution_body(&self) -> String {
-        let did_document = self
-            .document
-            .clone()
-            .to_json_value()
-            .unwrap_or_else(|_| Value::String(self.document.to_string()));
+        // Preserve compact JWT artifacts verbatim. Decoding a JWT payload into
+        // JSON here would discard its signature and make docHash describe a
+        // different body than the one consumed by name-client.
+        let did_document = match &self.document {
+            EncodedDocument::JsonLd(value) => value.clone(),
+            EncodedDocument::Jwt(jwt) => Value::String(jwt.clone()),
+        };
         let mut buckyos = self
             .metadata
             .get("buckyos")
@@ -152,15 +179,28 @@ pub trait SnDidResolver: Send + Sync + 'static {
 pub struct SnResolverBackedDidResolver {
     resolver: SnResolverRef,
     auth: SnAuthReaderRef,
+    server_host: String,
 }
 
 impl SnResolverBackedDidResolver {
-    pub fn new(resolver: SnResolverRef, auth: SnAuthReaderRef) -> Self {
-        Self { resolver, auth }
+    pub fn new(
+        resolver: SnResolverRef,
+        auth: SnAuthReaderRef,
+        server_host: impl Into<String>,
+    ) -> Self {
+        Self {
+            resolver,
+            auth,
+            server_host: normalize_host_lossy(server_host.into().as_str()),
+        }
     }
 
-    pub fn new_ref(resolver: SnResolverRef, auth: SnAuthReaderRef) -> SnDidResolverRef {
-        Arc::new(Self::new(resolver, auth))
+    pub fn new_ref(
+        resolver: SnResolverRef,
+        auth: SnAuthReaderRef,
+        server_host: impl Into<String>,
+    ) -> SnDidResolverRef {
+        Arc::new(Self::new(resolver, auth, server_host))
     }
 
     async fn resolve_request(
@@ -202,7 +242,64 @@ impl SnResolverBackedDidResolver {
         request: &SnDidResolveRequest,
     ) -> SnResolverResult<SnDidResolveResponse> {
         let doc_type = effective_bns_doc_type(&request.did, request.doc_type());
+        if request.profile == SnDidResolverProfile::InternalZoneResolver
+            && is_root_bns_did(&request.did)
+        {
+            if let Some(user) = self.auth.get_user_info(request.did.id.as_str()).await? {
+                if let Some(status) = owner_status_for_user_state(&user.state) {
+                    return Ok(self.negative_response(
+                        request,
+                        doc_type.as_str(),
+                        status,
+                        SnDidDocumentSource::AuthDbProjection,
+                        format!(
+                            "AuthDB user {} is {}",
+                            request.did.id,
+                            user.state.to_string()
+                        ),
+                    ));
+                }
+            }
+        }
+        if request.profile == SnDidResolverProfile::InternalZoneResolver
+            && doc_type == "device"
+            && !is_root_bns_did(&request.did)
+        {
+            if let Some((_, zone_name)) = request.did.id.split_once('.') {
+                if !zone_name.contains('.') {
+                    if let Some(user) = self.auth.get_user_info(zone_name).await? {
+                        if let Some(status) = owner_status_for_user_state(&user.state) {
+                            return Ok(self.negative_response(
+                                request,
+                                "device",
+                                status,
+                                SnDidDocumentSource::AuthDbProjection,
+                                format!("AuthDB owner {} is {}", zone_name, user.state.to_string()),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
         if is_root_bns_did(&request.did) && doc_type == "owner" {
+            let user = if request.profile == SnDidResolverProfile::InternalZoneResolver {
+                self.auth.get_user_info(request.did.id.as_str()).await?
+            } else {
+                None
+            };
+            if let Some((status, state)) = user.as_ref().and_then(|user| {
+                owner_status_for_user_state(&user.state)
+                    .map(|status| (status, user.state.to_string()))
+            }) {
+                return Ok(self.negative_response(
+                    request,
+                    "owner",
+                    status,
+                    SnDidDocumentSource::AuthDbProjection,
+                    format!("AuthDB user {} is {}", request.did.id, state),
+                ));
+            }
+
             match self.resolve_passthrough(request).await {
                 Ok(response) => return Ok(response),
                 Err(error)
@@ -215,7 +312,7 @@ impl SnResolverBackedDidResolver {
                 Err(error) => return Err(error),
             }
 
-            let zone = self
+            let zone = match self
                 .resolver
                 .resolve_zone_by_bns_name(
                     request.did.id.as_str(),
@@ -223,14 +320,60 @@ impl SnResolverBackedDidResolver {
                     ZoneResolutionSource::BnsName,
                     None,
                 )
-                .await?;
+                .await
+            {
+                Ok(zone) => zone,
+                Err(error)
+                    if request.profile == SnDidResolverProfile::InternalZoneResolver
+                        && matches!(
+                            error.kind(),
+                            SnResolverErrorKind::DocumentNotFound
+                                | SnResolverErrorKind::NameNotFound
+                        ) =>
+                {
+                    return Ok(self.negative_response(
+                        request,
+                        "owner",
+                        SnDidDocumentStatus::Missing,
+                        SnDidDocumentSource::BnsDocument,
+                        error.to_string(),
+                    ));
+                }
+                Err(error) => return Err(error),
+            };
             let owner_did = request.did.to_string();
-            let mut response = self.synthesize_owner_response(&owner_did, &zone, "owner")?;
+            let mut response = match self.synthesize_owner_response(&owner_did, &zone, "owner") {
+                Ok(response) => response,
+                Err(error)
+                    if request.profile == SnDidResolverProfile::InternalZoneResolver
+                        && error.kind() == SnResolverErrorKind::DocumentNotFound =>
+                {
+                    return Ok(self.negative_response(
+                        request,
+                        "owner",
+                        SnDidDocumentStatus::Missing,
+                        if zone.owner_from_auth_db {
+                            SnDidDocumentSource::AuthDbProjection
+                        } else {
+                            SnDidDocumentSource::BnsDocument
+                        },
+                        "owner has no valid key material",
+                    ));
+                }
+                Err(error) => return Err(error),
+            };
+            if let Some(user) = user
+                .as_ref()
+                .filter(|user| owner_uses_auth_db_key(&zone, user))
+            {
+                mark_auth_db_projection(&mut response, user);
+            }
             self.apply_profile(
                 request,
                 &mut response,
                 Some(json!({
                     "canonicalZone": format!("did:bns:{}", zone.canonical_name),
+                    "effectiveOwner": owner_did,
                 })),
             );
             return Ok(response);
@@ -251,6 +394,16 @@ impl SnResolverBackedDidResolver {
             ));
         }
 
+        if request.profile == SnDidResolverProfile::InternalZoneResolver
+            && request.doc_type().unwrap_or(BNS_DOC_ZONE) == "owner"
+        {
+            if let Some(username) = self.managed_owner_username(id.as_str()) {
+                return self
+                    .resolve_managed_web_owner(request, username.as_str())
+                    .await;
+            }
+        }
+
         let Some(binding) = self.find_user_domain_binding(id.as_str()).await? else {
             return Err(SnResolverError::new(
                 SnResolverErrorKind::NotManaged,
@@ -268,6 +421,7 @@ impl SnResolverBackedDidResolver {
                 Some(json!({
                     "canonicalZone": binding.canonical_zone_did(),
                     "userDomain": binding.user_domain,
+                    "effectiveOwner": owner_did,
                 })),
             );
             return Ok(response);
@@ -296,15 +450,106 @@ impl SnResolverBackedDidResolver {
         );
 
         response.did = request.did.to_string();
-        let mut metadata = json!({
+        let metadata = json!({
             "canonicalZone": binding.canonical_zone_did(),
             "userDomain": binding.user_domain,
             "mappedDid": mapped.to_string(),
+            "effectiveOwner": owner_did,
         });
-        if let Some(effective_owner) = document_declared_owner(&response.document) {
-            metadata["effectiveOwner"] = Value::String(effective_owner);
-        }
         self.apply_profile(request, &mut response, Some(metadata));
+        Ok(response)
+    }
+
+    fn managed_owner_username(&self, host: &str) -> Option<String> {
+        let suffix = format!(".{}", self.server_host);
+        let username = host.strip_suffix(suffix.as_str())?;
+        if username.is_empty() || username.contains('.') {
+            return None;
+        }
+        Some(username.to_string())
+    }
+
+    async fn resolve_managed_web_owner(
+        &self,
+        request: &SnDidResolveRequest,
+        username: &str,
+    ) -> SnResolverResult<SnDidResolveResponse> {
+        let Some(user) = self.auth.get_user_info(username).await? else {
+            return Ok(self.negative_response(
+                request,
+                "owner",
+                SnDidDocumentStatus::Missing,
+                SnDidDocumentSource::AuthDbProjection,
+                format!("AuthDB user {} is not registered", username),
+            ));
+        };
+        if let Some(status) = owner_status_for_user_state(&user.state) {
+            return Ok(self.negative_response(
+                request,
+                "owner",
+                status,
+                SnDidDocumentSource::AuthDbProjection,
+                format!("AuthDB user {} is {}", username, user.state.to_string()),
+            ));
+        }
+
+        let zone = match self
+            .resolver
+            .resolve_zone_by_bns_name(
+                username,
+                request.did.id.as_str(),
+                ZoneResolutionSource::UserDomain,
+                Some(request.did.id.clone()),
+            )
+            .await
+        {
+            Ok(zone) => zone,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    SnResolverErrorKind::DocumentNotFound | SnResolverErrorKind::NameNotFound
+                ) =>
+            {
+                return Ok(self.negative_response(
+                    request,
+                    "owner",
+                    SnDidDocumentStatus::Missing,
+                    SnDidDocumentSource::BnsDocument,
+                    error.to_string(),
+                ));
+            }
+            Err(error) => return Err(error),
+        };
+        let owner_did = request.did.to_string();
+        let mut response = match self.synthesize_owner_response(&owner_did, &zone, "owner") {
+            Ok(response) => response,
+            Err(error) if error.kind() == SnResolverErrorKind::DocumentNotFound => {
+                return Ok(self.negative_response(
+                    request,
+                    "owner",
+                    SnDidDocumentStatus::Missing,
+                    if zone.owner_from_auth_db {
+                        SnDidDocumentSource::AuthDbProjection
+                    } else {
+                        SnDidDocumentSource::BnsDocument
+                    },
+                    "owner has no valid key material",
+                ));
+            }
+            Err(error) => return Err(error),
+        };
+        if owner_uses_auth_db_key(&zone, &user) {
+            mark_auth_db_projection(&mut response, &user);
+        }
+        self.apply_profile(
+            request,
+            &mut response,
+            Some(json!({
+                "canonicalZone": format!("did:bns:{}", zone.canonical_name),
+                "managedHostSuffix": self.server_host,
+                "effectiveOwner": owner_did,
+            })),
+        );
         Ok(response)
     }
 
@@ -386,6 +631,35 @@ impl SnResolverBackedDidResolver {
         })
     }
 
+    fn negative_response(
+        &self,
+        request: &SnDidResolveRequest,
+        doc_type: &str,
+        status: SnDidDocumentStatus,
+        source: SnDidDocumentSource,
+        reason: impl Into<String>,
+    ) -> SnDidResolveResponse {
+        let mut response = SnDidResolveResponse {
+            did: request.did.to_string(),
+            doc_type: doc_type.to_string(),
+            document: EncodedDocument::JsonLd(Value::Null),
+            source,
+            profile: request.profile,
+            document_status: Some(status),
+            metadata: json!({
+                "buckyos": {
+                    "docType": doc_type,
+                    "source": source,
+                    "resolverRole": "zone_resolver",
+                    "profile": request.profile,
+                    "reason": reason.into(),
+                }
+            }),
+        };
+        self.apply_profile(request, &mut response, None);
+        response
+    }
+
     fn apply_profile(
         &self,
         request: &SnDidResolveRequest,
@@ -395,7 +669,9 @@ impl SnResolverBackedDidResolver {
         response.profile = request.profile;
         response.document_status = match request.profile {
             SnDidResolverProfile::PublicSupplement => None,
-            SnDidResolverProfile::InternalZoneResolver => Some(SnDidDocumentStatus::Active),
+            SnDidResolverProfile::InternalZoneResolver => response
+                .document_status
+                .or(Some(SnDidDocumentStatus::Active)),
         };
 
         let mut buckyos = response
@@ -428,6 +704,37 @@ impl SnResolverBackedDidResolver {
             }
         }
 
+        if request.profile == SnDidResolverProfile::InternalZoneResolver {
+            let now = unix_timestamp();
+            buckyos.insert("checkedAt".to_string(), Value::from(now));
+            buckyos.insert(
+                "validUntil".to_string(),
+                Value::from(now.saturating_add(DEFAULT_SN_RESOLVER_TTL_SECS as u64)),
+            );
+        }
+
+        if response.document_status == Some(SnDidDocumentStatus::Active) {
+            buckyos.insert(
+                "documentVersion".to_string(),
+                document_iat(&response.document)
+                    .map(Value::from)
+                    .unwrap_or(Value::Null),
+            );
+            buckyos.insert(
+                "docHash".to_string(),
+                Value::String(document_content_hash(&response.document)),
+            );
+            if !buckyos.contains_key("effectiveOwner") {
+                if let Some(owner) = expected_owner_for_request(request, &response.document) {
+                    buckyos.insert("effectiveOwner".to_string(), Value::String(owner));
+                }
+            }
+        } else {
+            for key in ["documentVersion", "docHash", "effectiveOwner"] {
+                buckyos.remove(key);
+            }
+        }
+
         if let Some(status) = response.document_status {
             buckyos.insert("documentStatus".to_string(), json!(status));
         } else {
@@ -438,13 +745,112 @@ impl SnResolverBackedDidResolver {
     }
 }
 
+fn unix_timestamp() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn owner_status_for_user_state(state: &UserState) -> Option<SnDidDocumentStatus> {
+    match state {
+        UserState::Active => None,
+        UserState::Suspended | UserState::Banned => Some(SnDidDocumentStatus::Revoked),
+        UserState::Deleted => Some(SnDidDocumentStatus::Tombstoned),
+    }
+}
+
+fn owner_uses_auth_db_key(zone: &ZoneResolution, user: &SNUserInfo) -> bool {
+    zone.owner_from_auth_db && key_like_string_to_jwk(user.public_key.as_str()).is_some()
+}
+
+fn mark_auth_db_projection(response: &mut SnDidResolveResponse, user: &SNUserInfo) {
+    response.source = SnDidDocumentSource::AuthDbProjection;
+    if let EncodedDocument::JsonLd(Value::Object(document)) = &mut response.document {
+        let revision = user.updated_at.max(1);
+        document.insert("iat".to_string(), Value::from(revision));
+        // The Zone snapshot's checkedAt/validUntil controls freshness. Keep the
+        // synthesized document stable between reads of the same AuthDB
+        // revision instead of regenerating exp/hash on every request.
+        document.insert("exp".to_string(), Value::from(253_402_300_799_u64));
+        merge_buckyos_object(
+            document,
+            json!({
+                "source": "sn-auth-db-control-plane",
+                "ownerKeySource": "sn-auth-db",
+                "authDbRevision": revision,
+            }),
+        );
+    }
+    if let Some(buckyos) = response
+        .metadata
+        .get_mut("buckyos")
+        .and_then(Value::as_object_mut)
+    {
+        buckyos.insert(
+            "source".to_string(),
+            json!(SnDidDocumentSource::AuthDbProjection),
+        );
+        buckyos.insert(
+            "ownerKeySource".to_string(),
+            Value::String("sn-auth-db".to_string()),
+        );
+        buckyos.insert(
+            "authoritySeq".to_string(),
+            Value::from(user.updated_at.max(1)),
+        );
+    }
+}
+
+fn expected_owner_for_request(
+    request: &SnDidResolveRequest,
+    document: &EncodedDocument,
+) -> Option<String> {
+    if request.doc_type() == Some("owner") {
+        return Some(request.did.to_string());
+    }
+    if let Some(owner) = document_declared_owner(document) {
+        return Some(owner);
+    }
+    if request.did.method == "bns" {
+        let (_, owner) = request.did.id.split_once('.')?;
+        if owner.contains('.') {
+            return None;
+        }
+        return Some(format!("did:bns:{}", owner));
+    }
+    None
+}
+
 #[async_trait]
 impl SnDidResolver for SnResolverBackedDidResolver {
     async fn resolve(
         &self,
         request: SnDidResolveRequest,
     ) -> SnResolverResult<SnDidResolveResponse> {
-        self.resolve_request(&request).await
+        match self.resolve_request(&request).await {
+            Ok(response) => Ok(response),
+            Err(error)
+                if request.profile == SnDidResolverProfile::InternalZoneResolver
+                    && request.did.method == "bns"
+                    && matches!(
+                        error.kind(),
+                        SnResolverErrorKind::NameNotFound
+                            | SnResolverErrorKind::DocumentNotFound
+                            | SnResolverErrorKind::DeviceNotFound
+                    ) =>
+            {
+                let doc_type = effective_bns_doc_type(&request.did, request.doc_type());
+                Ok(self.negative_response(
+                    &request,
+                    doc_type.as_str(),
+                    SnDidDocumentStatus::Missing,
+                    SnDidDocumentSource::BnsDocument,
+                    error.to_string(),
+                ))
+            }
+            Err(error) => Err(error),
+        }
     }
 }
 
@@ -539,6 +945,7 @@ fn synthesize_owner_document(
                 "bns-owner-config",
                 DEFAULT_SN_RESOLVER_TTL_SECS,
             );
+            stabilize_bns_owner_document(&mut document, owner_config);
             return Ok((document, "bns-owner-config"));
         }
 
@@ -551,6 +958,7 @@ fn synthesize_owner_document(
                 "bns-owner-config",
                 DEFAULT_SN_RESOLVER_TTL_SECS,
             );
+            stabilize_bns_owner_document(&mut document, owner_config);
             return Ok((document, "bns-owner-config"));
         }
     }
@@ -573,6 +981,31 @@ fn synthesize_owner_document(
         SnResolverErrorKind::DocumentNotFound,
         format!("owner key not found for {}", canonical_zone),
     ))
+}
+
+fn stabilize_bns_owner_document(document: &mut Value, owner_config: &Value) {
+    let Some(document) = document.as_object_mut() else {
+        return;
+    };
+    document.remove("_snBnsUpdatedAt");
+    document.remove("_snBnsDocumentVersion");
+    let revision = owner_config
+        .get("iat")
+        .and_then(Value::as_u64)
+        .or_else(|| owner_config.get("_snBnsUpdatedAt").and_then(Value::as_u64))
+        .or_else(|| {
+            owner_config
+                .get("_snBnsDocumentVersion")
+                .and_then(Value::as_u64)
+        })
+        .unwrap_or(1)
+        .max(1);
+    document
+        .entry("iat".to_string())
+        .or_insert_with(|| Value::from(revision));
+    document
+        .entry("exp".to_string())
+        .or_insert_with(|| Value::from(253_402_300_799_u64));
 }
 
 fn build_owner_document_from_jwk(
@@ -750,12 +1183,13 @@ pub(crate) fn key_like_string_to_jwk(value: &str) -> Option<Jwk> {
     }
 
     if let Ok(jwk) = serde_json::from_str::<Jwk>(value) {
-        return Some(jwk);
+        return DecodingKey::from_jwk(&jwk).ok().map(|_| jwk);
     }
 
     let value = value.strip_prefix("PKX=").unwrap_or(value);
     let x = value.split(':').next().unwrap_or(value);
-    create_jwt_by_x(x).ok()
+    let jwk = create_jwt_by_x(x).ok()?;
+    DecodingKey::from_jwk(&jwk).ok().map(|_| jwk)
 }
 
 fn rewrite_web_document_identity(
@@ -836,8 +1270,131 @@ fn document_declared_owner(document: &EncodedDocument) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sn_resolver::{BnsOwner, BootDocument, ZoneDocument};
+    use crate::sn_resolver::{
+        BnsDocument, BnsDocumentReader, BnsOwner, BootDocument, SnAuthReader, SnResolver,
+        SnResolverConfig, ZoneDocument, BNS_DOC_DEVICE_MINI,
+    };
+    use crate::ZoneInfo;
     use std::collections::HashMap;
+
+    const OWNER_X: &str = "T4Quc1L6Ogu4N2tTKOvneV1yYnBcmhP89B_RsuFsJZ8";
+
+    #[derive(Default)]
+    struct StaticAuthReader {
+        users: HashMap<String, SNUserInfo>,
+        fail: bool,
+    }
+
+    #[async_trait]
+    impl SnAuthReader for StaticAuthReader {
+        async fn get_user_info(&self, username: &str) -> SnResolverResult<Option<SNUserInfo>> {
+            if self.fail {
+                return Err(SnResolverError::backend("AuthDB unavailable (test)"));
+            }
+            Ok(self.users.get(username).cloned())
+        }
+
+        async fn get_user_by_domain(&self, domain: &str) -> SnResolverResult<Option<SNUserInfo>> {
+            if self.fail {
+                return Err(SnResolverError::backend("AuthDB unavailable (test)"));
+            }
+            Ok(self
+                .users
+                .values()
+                .filter(|user| {
+                    user.user_domain.as_deref().is_some_and(|user_domain| {
+                        domain == user_domain
+                            || domain.ends_with(format!(".{}", user_domain).as_str())
+                    })
+                })
+                .max_by_key(|user| {
+                    user.user_domain
+                        .as_deref()
+                        .map(str::len)
+                        .unwrap_or_default()
+                })
+                .cloned())
+        }
+
+        async fn get_zone_info(&self, username: &str) -> SnResolverResult<Option<ZoneInfo>> {
+            if self.fail {
+                return Err(SnResolverError::backend("AuthDB unavailable (test)"));
+            }
+            Ok(Some(ZoneInfo::default_for(username)))
+        }
+    }
+
+    #[derive(Default)]
+    struct StaticBnsReader {
+        owners: HashMap<String, BnsOwner>,
+        documents: HashMap<(String, String), BnsDocument>,
+    }
+
+    #[async_trait]
+    impl BnsDocumentReader for StaticBnsReader {
+        async fn resolve_owner(&self, name: &str) -> SnResolverResult<Option<BnsOwner>> {
+            Ok(self.owners.get(name).cloned())
+        }
+
+        async fn get_document(
+            &self,
+            name: &str,
+            doc_type: &str,
+        ) -> SnResolverResult<Option<BnsDocument>> {
+            Ok(self
+                .documents
+                .get(&(name.to_string(), doc_type.to_string()))
+                .cloned())
+        }
+    }
+
+    fn auth_user(username: &str, state: UserState, public_key: &str) -> SNUserInfo {
+        SNUserInfo {
+            username: Some(username.to_string()),
+            email: None,
+            state,
+            public_key: public_key.to_string(),
+            activation_code: None,
+            zone_config: String::new(),
+            self_cert: false,
+            user_domain: None,
+            sn_ips: None,
+            updated_at: 7,
+            relay: None,
+        }
+    }
+
+    fn auth_db_owner_key() -> String {
+        json!({
+            "kty": "OKP",
+            "crv": "Ed25519",
+            "x": OWNER_X,
+        })
+        .to_string()
+    }
+
+    fn resolver_with_users(users: Vec<SNUserInfo>) -> SnResolverBackedDidResolver {
+        resolver_with_users_and_bns(users, StaticBnsReader::default())
+    }
+
+    fn resolver_with_users_and_bns(
+        users: Vec<SNUserInfo>,
+        bns: StaticBnsReader,
+    ) -> SnResolverBackedDidResolver {
+        let auth = Arc::new(StaticAuthReader {
+            users: users
+                .into_iter()
+                .map(|user| (user.username.clone().unwrap(), user))
+                .collect(),
+            fail: false,
+        });
+        let resolver = Arc::new(SnResolver::new_with_bns(
+            SnResolverConfig::new("sn.test", None, None, None, Vec::new()),
+            auth.clone(),
+            Arc::new(bns),
+        ));
+        SnResolverBackedDidResolver::new(resolver, auth, "sn.test")
+    }
 
     fn empty_zone_document() -> ZoneDocument {
         ZoneDocument {
@@ -933,6 +1490,7 @@ mod tests {
                 effective_owner: Some("T4Quc1L6Ogu4N2tTKOvneV1yYnBcmhP89B_RsuFsJZ8".to_string()),
                 owner_config: None,
             },
+            owner_from_auth_db: false,
             zone_doc: empty_zone_document(),
             boot_doc: empty_boot_document(),
             user_domain: Some("example.com".to_string()),
@@ -1000,6 +1558,368 @@ mod tests {
         assert_eq!(
             body["didDocumentMetadata"]["buckyos"]["canonicalZone"],
             "did:bns:alice"
+        );
+    }
+
+    #[tokio::test]
+    async fn internal_zone_resolver_projects_active_auth_db_owner_with_revision_metadata() {
+        let resolver = resolver_with_users(vec![auth_user(
+            "alice",
+            UserState::Active,
+            auth_db_owner_key().as_str(),
+        )]);
+        let response = resolver
+            .resolve(SnDidResolveRequest::new(
+                DID::from_str("did:bns:alice").unwrap(),
+                Some("owner".to_string()),
+                None,
+                SnDidResolverProfile::InternalZoneResolver,
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.document_status, Some(SnDidDocumentStatus::Active));
+        assert_eq!(response.source, SnDidDocumentSource::AuthDbProjection);
+        assert_eq!(response.status_code(), StatusCode::OK);
+        assert_eq!(response.doc_type, "owner");
+        let body: Value = serde_json::from_str(response.body_for_accept(None).as_str()).unwrap();
+        let metadata = &body["didDocumentMetadata"]["buckyos"];
+        assert_eq!(body["didDocument"]["id"], "did:bns:alice");
+        assert_eq!(metadata["documentStatus"], "active");
+        assert_eq!(metadata["effectiveOwner"], "did:bns:alice");
+        assert_eq!(metadata["ownerKeySource"], "sn-auth-db");
+        assert!(metadata["documentVersion"].as_u64().is_some());
+        assert_eq!(metadata["docHash"].as_str().unwrap().len(), 64);
+        assert!(
+            metadata["validUntil"].as_u64().unwrap() >= metadata["checkedAt"].as_u64().unwrap()
+        );
+        let first_hash = metadata["docHash"].clone();
+
+        let repeated = resolver
+            .resolve(SnDidResolveRequest::new(
+                DID::from_str("did:bns:alice").unwrap(),
+                Some("owner".to_string()),
+                None,
+                SnDidResolverProfile::InternalZoneResolver,
+            ))
+            .await
+            .unwrap();
+        let repeated_body: Value =
+            serde_json::from_str(repeated.body_for_accept(None).as_str()).unwrap();
+        assert_eq!(
+            repeated_body["didDocumentMetadata"]["buckyos"]["docHash"], first_hash,
+            "the same AuthDB revision must not regenerate a different OwnerDocument"
+        );
+    }
+
+    #[tokio::test]
+    async fn internal_zone_resolver_maps_auth_db_negative_owner_states() {
+        for (state, expected_status, expected_http) in [
+            (
+                UserState::Suspended,
+                SnDidDocumentStatus::Revoked,
+                StatusCode::GONE,
+            ),
+            (
+                UserState::Banned,
+                SnDidDocumentStatus::Revoked,
+                StatusCode::GONE,
+            ),
+            (
+                UserState::Deleted,
+                SnDidDocumentStatus::Tombstoned,
+                StatusCode::GONE,
+            ),
+        ] {
+            let resolver = resolver_with_users(vec![auth_user(
+                "alice",
+                state,
+                auth_db_owner_key().as_str(),
+            )]);
+            let response = resolver
+                .resolve(SnDidResolveRequest::new(
+                    DID::from_str("did:bns:alice").unwrap(),
+                    Some("owner".to_string()),
+                    None,
+                    SnDidResolverProfile::InternalZoneResolver,
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.document_status, Some(expected_status));
+            assert_eq!(response.status_code(), expected_http);
+            let body: Value =
+                serde_json::from_str(response.body_for_accept(None).as_str()).unwrap();
+            assert!(body["didDocument"].is_null());
+            assert_eq!(
+                body["didDocumentMetadata"]["buckyos"]["documentStatus"],
+                json!(expected_status)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn internal_zone_resolver_does_not_promote_active_user_without_owner_key() {
+        let resolver = resolver_with_users(vec![auth_user("alice", UserState::Active, "")]);
+        let response = resolver
+            .resolve(SnDidResolveRequest::new(
+                DID::from_str("did:bns:alice").unwrap(),
+                Some("owner".to_string()),
+                None,
+                SnDidResolverProfile::InternalZoneResolver,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.document_status, Some(SnDidDocumentStatus::Missing));
+        assert_eq!(response.status_code(), StatusCode::NOT_FOUND);
+        assert!(response
+            .body_for_accept(None)
+            .contains("\"documentStatus\":\"missing\""));
+    }
+
+    #[tokio::test]
+    async fn internal_zone_resolver_maps_only_the_managed_web_owner_suffix() {
+        let resolver = resolver_with_users(vec![auth_user(
+            "alice",
+            UserState::Active,
+            auth_db_owner_key().as_str(),
+        )]);
+        let response = resolver
+            .resolve(SnDidResolveRequest::new(
+                DID::from_str("did:web:alice.sn.test").unwrap(),
+                Some("owner".to_string()),
+                None,
+                SnDidResolverProfile::InternalZoneResolver,
+            ))
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_str(response.body_for_accept(None).as_str()).unwrap();
+        assert_eq!(body["didDocument"]["id"], "did:web:alice.sn.test");
+        assert_eq!(
+            body["didDocumentMetadata"]["buckyos"]["effectiveOwner"],
+            "did:web:alice.sn.test"
+        );
+
+        let error = resolver
+            .resolve(SnDidResolveRequest::new(
+                DID::from_str("did:web:alice.unmanaged.test").unwrap(),
+                Some("owner".to_string()),
+                None,
+                SnDidResolverProfile::InternalZoneResolver,
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), SnResolverErrorKind::NotManaged);
+    }
+
+    #[tokio::test]
+    async fn internal_zone_resolver_returns_complete_device_with_stable_revision_metadata() {
+        let document = json!({
+            "id": "did:bns:ood1.alice",
+            "owner": "did:bns:alice",
+            "iat": 42,
+            "exp": 253_402_300_799_u64,
+            "verificationMethod": [{
+                "id": "did:bns:ood1.alice#main_key",
+                "type": "JsonWebKey2020",
+                "controller": "did:bns:ood1.alice",
+                "publicKeyJwk": {
+                    "kty": "OKP",
+                    "crv": "Ed25519",
+                    "x": OWNER_X,
+                }
+            }],
+            "authentication": ["did:bns:ood1.alice#main_key"],
+        });
+        let mut bns = StaticBnsReader::default();
+        bns.documents.insert(
+            ("ood1.alice".to_string(), BNS_DOC_DEVICE_MINI.to_string()),
+            BnsDocument::json("ood1.alice", BNS_DOC_DEVICE_MINI, document.clone()),
+        );
+        let resolver = resolver_with_users_and_bns(
+            vec![auth_user(
+                "alice",
+                UserState::Active,
+                auth_db_owner_key().as_str(),
+            )],
+            bns,
+        );
+        let response = resolver
+            .resolve(SnDidResolveRequest::new(
+                DID::from_str("did:bns:ood1.alice").unwrap(),
+                Some("device".to_string()),
+                None,
+                SnDidResolverProfile::InternalZoneResolver,
+            ))
+            .await
+            .unwrap();
+        let encoded = EncodedDocument::JsonLd(document);
+        let body: Value = serde_json::from_str(response.body_for_accept(None).as_str()).unwrap();
+        let metadata = &body["didDocumentMetadata"]["buckyos"];
+
+        assert_eq!(body["didDocument"]["id"], "did:bns:ood1.alice");
+        assert_eq!(metadata["docType"], "device");
+        assert_eq!(metadata["documentStatus"], "active");
+        assert_eq!(metadata["effectiveOwner"], "did:bns:alice");
+        assert_eq!(metadata["documentVersion"], 42);
+        assert_eq!(
+            metadata["docHash"],
+            Value::String(document_content_hash(&encoded))
+        );
+    }
+
+    #[tokio::test]
+    async fn internal_zone_resolver_preserves_bns_owner_key_provenance_over_auth_db() {
+        let mut bns = StaticBnsReader::default();
+        bns.owners.insert(
+            "alice".to_string(),
+            BnsOwner {
+                name: "alice".to_string(),
+                effective_owner: Some(OWNER_X.to_string()),
+                owner_config: None,
+            },
+        );
+        let resolver = resolver_with_users_and_bns(
+            vec![auth_user(
+                "alice",
+                UserState::Active,
+                auth_db_owner_key().as_str(),
+            )],
+            bns,
+        );
+        let response = resolver
+            .resolve(SnDidResolveRequest::new(
+                DID::from_str("did:bns:alice").unwrap(),
+                Some("owner".to_string()),
+                None,
+                SnDidResolverProfile::InternalZoneResolver,
+            ))
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_str(response.body_for_accept(None).as_str()).unwrap();
+        let metadata = &body["didDocumentMetadata"]["buckyos"];
+
+        assert_eq!(
+            response.source,
+            SnDidDocumentSource::SynthesizedOwnerDocument
+        );
+        assert_eq!(metadata["ownerKeySource"], "effective-owner");
+        assert!(metadata.get("authDbRevision").is_none());
+    }
+
+    #[tokio::test]
+    async fn internal_zone_resolver_keeps_web_device_identity_and_owner_metadata() {
+        let document = json!({
+            "id": "did:bns:ood1.alice",
+            "owner": "did:bns:alice",
+            "iat": 42,
+            "exp": 253_402_300_799_u64,
+            "verificationMethod": [{
+                "id": "did:bns:ood1.alice#main_key",
+                "type": "JsonWebKey2020",
+                "controller": "did:bns:ood1.alice",
+                "publicKeyJwk": {
+                    "kty": "OKP",
+                    "crv": "Ed25519",
+                    "x": OWNER_X,
+                }
+            }],
+            "authentication": ["did:bns:ood1.alice#main_key"],
+        });
+        let mut bns = StaticBnsReader::default();
+        bns.documents.insert(
+            ("ood1.alice".to_string(), BNS_DOC_DEVICE_MINI.to_string()),
+            BnsDocument::json("ood1.alice", BNS_DOC_DEVICE_MINI, document),
+        );
+        let mut user = auth_user("alice", UserState::Active, auth_db_owner_key().as_str());
+        user.user_domain = Some("example.com".to_string());
+        let resolver = resolver_with_users_and_bns(vec![user], bns);
+        let response = resolver
+            .resolve(SnDidResolveRequest::new(
+                DID::from_str("did:web:ood1.example.com").unwrap(),
+                Some("device".to_string()),
+                None,
+                SnDidResolverProfile::InternalZoneResolver,
+            ))
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_str(response.body_for_accept(None).as_str()).unwrap();
+        let metadata = &body["didDocumentMetadata"]["buckyos"];
+
+        assert_eq!(body["didDocument"]["id"], "did:web:ood1.example.com");
+        assert_eq!(
+            body["didDocument"]["owner"], "did:web:example.com",
+            "the rewritten document must keep the Web authority boundary"
+        );
+        assert_eq!(metadata["effectiveOwner"], "did:web:example.com");
+        assert_eq!(metadata["canonicalZone"], "did:bns:alice");
+    }
+
+    #[tokio::test]
+    async fn internal_zone_resolver_does_not_turn_auth_db_failure_into_missing() {
+        let auth = Arc::new(StaticAuthReader {
+            users: HashMap::new(),
+            fail: true,
+        });
+        let resolver = Arc::new(SnResolver::new(
+            SnResolverConfig::new("sn.test", None, None, None, Vec::new()),
+            auth.clone(),
+        ));
+        let resolver = SnResolverBackedDidResolver::new(resolver, auth, "sn.test");
+        let error = resolver
+            .resolve(SnDidResolveRequest::new(
+                DID::from_str("did:bns:alice").unwrap(),
+                Some("owner".to_string()),
+                None,
+                SnDidResolverProfile::InternalZoneResolver,
+            ))
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.kind(), SnResolverErrorKind::BackendUnavailable);
+    }
+
+    #[test]
+    fn internal_zone_resolver_canonicalizes_legacy_doc_type_and_defaults_to_envelope() {
+        let request = SnDidResolveRequest::new(
+            DID::from_str("did:bns:ood1.alice").unwrap(),
+            Some("doc".to_string()),
+            None,
+            SnDidResolverProfile::InternalZoneResolver,
+        );
+        assert_eq!(request.doc_type(), Some("device"));
+
+        let response = SnDidResolveResponse {
+            did: request.did.to_string(),
+            doc_type: "device".to_string(),
+            document: EncodedDocument::JsonLd(json!({
+                "id": "did:bns:ood1.alice",
+                "iat": 7,
+            })),
+            source: SnDidDocumentSource::DeviceMiniDocument,
+            profile: SnDidResolverProfile::InternalZoneResolver,
+            document_status: Some(SnDidDocumentStatus::Active),
+            metadata: json!({"buckyos": {"docType": "device"}}),
+        };
+        assert_eq!(
+            response.content_type_for_accept(None),
+            DID_RESOLUTION_CONTENT_TYPE
+        );
+        assert!(
+            serde_json::from_str::<Value>(response.body_for_accept(None).as_str())
+                .unwrap()
+                .get("didDocument")
+                .is_some()
+        );
+
+        let jwt_response = SnDidResolveResponse {
+            document: EncodedDocument::Jwt("header.payload.signature".to_string()),
+            ..response
+        };
+        let jwt_body: Value =
+            serde_json::from_str(jwt_response.body_for_accept(None).as_str()).unwrap();
+        assert_eq!(
+            jwt_body["didDocument"],
+            Value::String("header.payload.signature".to_string())
         );
     }
 }

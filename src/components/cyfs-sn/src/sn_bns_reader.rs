@@ -35,11 +35,22 @@ impl BnsRpcDocumentReader {
                 if result.status != DocumentStatus::Active {
                     return Ok(None);
                 }
-                Ok(Self::decode_inline_document_value(
+                let mut owner_config = Self::decode_inline_document_value(
                     result.document_state.document.inline_document.as_slice(),
                     name,
                     "owner",
-                )?)
+                )?;
+                if let Some(Value::Object(owner_config)) = owner_config.as_mut() {
+                    owner_config.insert(
+                        "_snBnsUpdatedAt".to_string(),
+                        Value::from(result.name_state.updated_at),
+                    );
+                    owner_config.insert(
+                        "_snBnsDocumentVersion".to_string(),
+                        Value::from(result.document_state.version),
+                    );
+                }
+                Ok(owner_config)
             }
             Err(error) if Self::is_document_not_found(&error) => Ok(None),
             Err(error) => Err(Self::backend_error(

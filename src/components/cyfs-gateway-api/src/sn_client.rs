@@ -555,6 +555,9 @@ pub struct SnDeviceListResp {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SnOodInfo {
     pub did_hostname: String,
+    /// Canonical registered key DID. Older SN responses may omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub canonical_device_id: Option<String>,
     pub owner_id: String,
     pub self_cert: bool,
     pub state: SnOodState,

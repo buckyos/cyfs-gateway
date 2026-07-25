@@ -71,6 +71,24 @@ servers:
               match ${REQ.host} "*.*.web3.{{sn_host}}" && eq ${ANSWER.self_cert} "false" && return "error 503 self_cert_is_false_for_${REQ.host};_enable_self_cert_on_your_gateway";
               return "forward rtcp://${ANSWER.did_hostname}/:80";
 stacks:
+  # name-client's Zone cache endpoint. Keep this listener loopback-only: SN
+  # selects the InternalZoneResolver profile from transport dst_addr, and this
+  # stack dispatches to the same web3_sn instance used by the public API.
+  sn_zone_resolver_tcp:
+    bind: 127.0.0.1:3180
+    protocol: tcp
+    transparent: false
+    hook_point:
+      main:
+        id: main
+        priority: 1
+        blocks:
+          default:
+            id: default
+            priority: 1
+            block: |
+              return "server web3_sn";
+
   dns_udp:
     bind: "{{dns_bind}}"
     protocol: udp
@@ -118,7 +136,9 @@ stacks:
             # 上报驱动，把它作为前置会造成设备重启后首连必拒的鸡生蛋问题。
             block: |
               map-add "REQ" "method" "deviceinfo.resolve_ood_by_did"
-              call qa "web3_sn" "REQ" && !eq ${ANSWER.state} "banned" && accept;
+              eq ${REQ.source_identity_trust} "trusted_host_snapshot" && call qa "web3_sn" "REQ" && !eq ${ANSWER.state} "banned" && accept;
+              eq ${REQ.source_identity_trust} "trusted_zone_snapshot" && call qa "web3_sn" "REQ" && !eq ${ANSWER.state} "banned" && accept;
+              eq ${REQ.source_identity_trust} "method_authority_current" && call qa "web3_sn" "REQ" && !eq ${ANSWER.state} "banned" && accept;
               reject;
 
     on_new_tunnel_hook_point:
@@ -136,7 +156,9 @@ stacks:
             # 本身就是设备上线的前提，不能反过来依赖在线状态）。
             block: |
               map-add "REQ" "method" "deviceinfo.resolve_ood_by_did"
-              call qa "web3_sn" "REQ" && !eq ${ANSWER.state} "banned" && accept;
+              eq ${REQ.source_identity_trust} "trusted_host_snapshot" && call qa "web3_sn" "REQ" && !eq ${ANSWER.state} "banned" && accept;
+              eq ${REQ.source_identity_trust} "trusted_zone_snapshot" && call qa "web3_sn" "REQ" && !eq ${ANSWER.state} "banned" && accept;
+              eq ${REQ.source_identity_trust} "method_authority_current" && call qa "web3_sn" "REQ" && !eq ${ANSWER.state} "banned" && accept;
               reject;
 
   main_http_tcp:
