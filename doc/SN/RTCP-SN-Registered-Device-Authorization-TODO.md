@@ -201,14 +201,51 @@ unavailable 时不存在 self-declared logical identity 回落；即使显式配
 
 剩余任务：
 
-- [ ] 增加独立 internal listener，默认 endpoint 为 `http://127.0.0.1:3180`：
+- [ ] 复用现有唯一的 `type: sn` server 实例，不新增第二个 `sn_zone_resolver` server
+  type。Internal Zone Resolver 由独立的 loopback TCP stack 进入同一个 `SNServer`：
+
+  ```yaml
+  servers:
+    sn:
+      type: sn
+      host: sn.example.com
+      bns_server_url: http://127.0.0.1:13450
+      auth_db: http://auth-provider:8080
+      device_info_db: http://device-provider:8080
+
+  stacks:
+    sn_zone_resolver_tcp:
+      protocol: tcp
+      bind: 127.0.0.1:3180
+      transparent: false
+      hook_point:
+        main:
+          blocks:
+            default:
+              block: |
+                return "server sn";
+  ```
+
+- [ ] 监听 socket 由 gateway TCP stack 提供，而不是 `cyfs-sn` 自行
+  `TcpListener::bind`。3180 必须固定绑定 `127.0.0.1:3180`，必须关闭 transparent mode，
+  并通过 `return "server sn"` 进程内 dispatch 到现有 SN HTTP server。
+- [ ] SN HTTP handler 使用 gateway 从已接受 socket 构造的
+  `StreamInfo.dst_addr == 127.0.0.1:3180` 识别 internal ingress。该值是服务端 transport
+  metadata，不来自 HTTP header、query 或请求 body；不得允许客户端字段选择
+  `SnDidResolverProfile`。
+- [ ] 3180 ingress 只提供：
 
   ```text
   GET /1.0/identifiers/{did}?type={doc_type}
   ```
 
-- [ ] listener 必须固定使用 `SnDidResolverProfile::InternalZoneResolver`；当前公开 HTTP route
-  仍固定为 `PublicSupplement`，不能直接当成 3180 服务复用。
+  并固定使用 `SnDidResolverProfile::InternalZoneResolver`。其它 method/path，包括现有
+  `/kapi/sn/*`、Auth、DeviceInfo、BNS proxy 和 internal RPC，必须在 3180 ingress 返回
+  404/405，不得因为复用同一个 `SNServer` 而扩大 loopback endpoint 的服务面。
+- [ ] 非 3180 ingress 保持现有 Public SN API / Public supplement / NameServer / QA 语义；
+  同一路径经公网 SN HTTP ingress 仍固定使用 `SnDidResolverProfile::PublicSupplement`。
+  两个入口共享同一个 `SNServer`、`SnDidResolverRef`、AuthDB、BNS reader 和 DeviceInfo
+  reader，不再产生第二次 DB open、seed import 或业务状态初始化。
 - [ ] 增加 AuthDB Known Owner projection：
   - `did:bns:<username>?type=owner` 按 username 点查 `SnAuthDB`；
   - 为 SN 管理的固定 host suffix 增加
@@ -245,8 +282,9 @@ unavailable 时不存在 self-declared logical identity 回落；即使显式配
   `docHash`。不能只返回临时合成的 `did:dev`。
 - [ ] internal resolver 内部如调用 `name-client`，必须使用
   `ResolvePolicy::without_zone_resolver()` 防止 3180 自递归。
-- [ ] loopback 部署默认无需公网认证；跨主机集群必须绑定内网地址并使用 mTLS、cluster token
-  或等价网络 ACL，禁止直接暴露公网。
+- [ ] 3180 stack 始终只绑定 `127.0.0.1`，默认无需公网认证，禁止改绑 `0.0.0.0`、公网地址
+  或私网地址。跨主机访问必须通过独立的受保护 proxy/sidecar、mTLS、cluster token 或等价
+  网络 ACL 转发到目标 SN 主机的 loopback 3180，不能直接暴露该 listener。
 
 ### B. 收口 `buckyos-base` Zone/verification 契约
 
@@ -324,9 +362,13 @@ unavailable 时不存在 self-declared logical identity 回落；即使显式配
 
 ### E. 部署与可观测性
 
-- [ ] web3 gateway 单机配置启动本地 3180 internal listener。
+- [ ] web3 gateway 单机配置只声明一个 `servers.sn`，并声明固定绑定
+  `127.0.0.1:3180`、`transparent: false` 的 `stacks.sn_zone_resolver_tcp`；3180 stack
+  dispatch 到同一个 `sn` server。
 - [ ] split relay 配置显式设置 Zone Resolver endpoint 和短 timeout；每个 RTCP relay 优先
-  使用本地 sidecar/in-process resolver。
+  使用本地 sidecar/in-process resolver。relay 进程没有配置 `type: sn` 时，不配置假的
+  SN server 引用；应使用受保护的远端 proxy endpoint，或由本地 forwarding sidecar 转发到
+  SN 主机的 loopback 3180。
 - [ ] readiness 覆盖 3180：至少验证一个 owner doc 和一个 registered device doc 能返回
   Active、effectiveOwner、iat/docHash 和可用 body。
 - [ ] rollout 顺序：RTCP v3 / `buckyos-base` 已完成，下一步先发布 3180 服务并完成
@@ -343,6 +385,18 @@ unavailable 时不存在 self-declared logical identity 回落；即使显式配
 
 ### SN Internal Zone Resolver
 
+- [ ] gateway 配置解析/启动测试：只配置一个 `type: sn` server，固定 loopback 3180 TCP
+  stack 能以 HTTP/1.1 dispatch 到该 `sn`；stack 配置明确包含
+  `bind: 127.0.0.1:3180` 和 `transparent: false`。
+- [ ] 同一 resolver 请求经 public SN HTTP ingress 不带 `documentStatus: active`，经
+  3180 ingress 返回 Internal profile envelope，证明同一 `SNServer` 的两个入口没有 profile
+  串线。
+- [ ] 公网请求伪造 internal/profile 相关 header、query 或 body 字段时仍只能进入
+  `PublicSupplement`，不能得到 Internal profile。
+- [ ] `StreamInfo.dst_addr` 缺失、格式非法或不是精确的 `127.0.0.1:3180` 时 fail closed 到
+  Public profile，不得误判为 internal ingress。
+- [ ] 3180 ingress 上的 POST、`/kapi/sn/*`、Auth、DeviceInfo、BNS proxy 和 internal RPC
+  全部返回 404/405；只有 resolver GET 可达。
 - [ ] `Active + 有效 Owner Key` 的 AuthDB 用户通过
   `did:bns:<username>?type=owner` 返回完整 OwnerDocument、Active 和 Zone provenance。
 - [ ] `did:web:<username>.<sn-host>?type=owner` 只在命中受控 suffix 和合法 username 时
@@ -355,7 +409,8 @@ unavailable 时不存在 self-declared logical identity 回落；即使显式配
   `did:web:example.com`，canonical BNS zone 只放 metadata。
 - [ ] Missing、Revoked、Tombstoned 和 BNS/indexer 故障分别产生明确状态或 unknown。
 - [ ] 裸 404 是 unknown；带 `documentStatus=missing` 的 404 是 Zone 明确负回答。
-- [ ] internal listener 不暴露 Public profile，resolver 内部不递归请求自身 3180。
+- [ ] 3180 listener 不暴露 Public profile 或其它 SN API，resolver 内部不递归请求自身
+  3180。
 
 ### `buckyos-base` verification contract
 
@@ -407,8 +462,11 @@ cargo test -p cyfs-gateway-lib rtcp_zone_verified -- --nocapture --test-threads=
 
 ## 6. 验收标准
 
-- SN 集群内部存在可用且受保护的 Zone Resolver endpoint，默认本地地址为
+- SN 集群内部存在可用且受保护的 Zone Resolver endpoint，固定本地地址为
   `127.0.0.1:3180`，不依赖设备自己的公网 HTTPS 服务已启动。
+- `cyfs-sn` 模块只注册一个 `type: sn` server；固定 loopback 3180 TCP stack dispatch 到
+  同一个实例，SN 根据可信的 `StreamInfo.dst_addr` 区分
+  `InternalZoneResolver` 与 `PublicSupplement`，且 3180 只暴露 resolver GET。
 - AuthDB 中 `Active + 有效 Owner Key` 的用户可按需成为 Zone scope Known Owner；空 key、
   Suspended/Banned/Deleted 和依赖故障不会被错误标记为 Active。
 - RTCP Hello 中的完整 DeviceDocument 能通过基础库统一入口完成 expected owner、owner
