@@ -1,24 +1,28 @@
 # SN 集群 Zone Resolver 完成 RTCP 设备准入 TODO
 
-状态：TODO（已按 2026-07 `name-lib` / `name-client` 验证基础库重构重新校准）
+状态：TODO（RTCP v3 Known Owner 消费侧已完成；SN Zone Resolver、AuthDB Owner 投影与
+Phase 2 登记授权待完成；2026-07-24 重新校准）
 
 校准基线：
 
 - `cyfs-gateway` 当前锁定 `buckyos-base` commit
   `c5b7f8dc7861dd7cbb5f3e238e1d235209098da8`；
-- gateway commit `06c33570` 已把 RTCP 迁移到新的 resolve / verify API；
+- [`doc/rtcp/RTCP-Authoritative-Peer-Key-Resolution-TODO.md`](../rtcp/RTCP-Authoritative-Peer-Key-Resolution-TODO.md)
+  的 RTCP v3 安全收口已经完成：入站具名身份固定使用 `LocalAndZone`，`known_owner`
+  关系档位、identity trust 传递、后台 authority 确认和否定踢除均已落地；
+- `gateway` 已把 RTCP 迁移到新的 resolve / verify API；
 - GitHub PR [#166](https://github.com/buckyos/cyfs-gateway/pull/166) 尝试在
   `deviceinfo.resolve_ood_by_did` 中从 scoped device document 的任意 key 字段重建
   `did:dev`。该方向仍不应合并。
 
-这次基础库重构已经解决了“如何验证一份外部 `device_doc_jwt`”的通用能力。本 TODO
-不再要求在 `buckyos-base` 重新实现一套 device document verifier；剩余工作主要是：
+基础库和 RTCP v3 已经解决了“如何安全验证并消费一份外部 `device_doc_jwt`”。本 TODO
+不再负责设计 RTCP 的 Known Owner 消费策略，也不再要求在 `buckyos-base` 重新实现一套
+device document verifier；剩余工作主要是：
 
-- `cyfs-gateway` 为 SN/relay 提供可信的 internal Zone Resolver 服务和部署；
-- RTCP 对新验证结果应用明确的 freshness / admission policy，并把 evidence level 传给
-  process-chain；
+- `cyfs-sn` 提供可信的 internal Zone Resolver 服务和部署；
+- 将 `SnAuthDB` 中满足条件的用户按需投影为 Zone scope 的 Known Owner 材料；
 - SN 业务授权只检查已验证 semantic DID 对应的登记关系，不再解析文档 key 重建身份；
-- 补齐跨仓库契约测试和可观测性。
+- 补齐 SN → `name-client` → RTCP 的跨组件契约测试和可观测性。
 
 ## 1. 新基础库已经确定的语义
 
@@ -83,6 +87,51 @@ Internal Zone Resolver 是 Zone/集群级共享 cache 或 control-plane snapshot
 且 receipt 能绑定候选 body/hash 时，才是 authority-current。后续配置和日志不得继续把
 “Zone 已知最新”与“method authority 全局当前”混为一个 `anchored` 布尔值。
 
+### 1.4 RTCP v3 已完成的 `known_owner` 契约
+
+RTCP 入站具名身份固定使用 `VerifyPurpose::AuthSubject` 和 `LocalAndZone`。当前
+`named_min_relation: known_owner` 的通过条件是：
+
+```text
+verified.usable_as_authz_subject
+&& verified.authz_owner.is_some()
+&& verified.validity.owner_document_source.is_some()
+```
+
+RTCP 只消费 `name-client` 验证后的 `authz_owner` 和 OwnerDocument evidence，不信任
+candidate/claim 自声明的 owner。同步握手不访问 method authority；可信 Host/Zone snapshot
+可在握手后触发有预算的后台 authority 确认，并把 trust 单向升级为
+`MethodAuthorityCurrent`。
+
+`known_owner` 是关系准入条件，`TrustedZoneSnapshot` 是证据来源等级，二者是正交维度。
+SN 3180 通常会让一次成功验证同时满足二者，但文档和代码不得把它们合并为同一个状态。
+
+### 1.5 `SnAuthDB` 用户投影为 Known Owner 的边界
+
+Internal Zone Resolver 可以把 SN 控制面认可的 AuthDB 用户按需投影为 OwnerDocument。
+无需为了初版增加 `list_users` 或把全表复制到另一份缓存；收到 Owner DID 查询后使用
+`get_user_info` 点查即可。
+
+“AuthDB 中存在用户记录”本身不等于 Known Owner。投影至少要求：
+
+```text
+user.state == Active
+&& Owner DID 能唯一映射到该用户
+&& 存在合法、可解析的 Owner Public Key
+&& 能构造完整 OwnerDocument
+```
+
+- `Active + 有效 Owner Key`：返回 Zone scope `Active` OwnerDocument；
+- `Active + 未绑定 Owner Key`：不是 Known Owner，返回明确 Missing/未就绪语义，不能合成
+  虚假 key；
+- `Suspended` / `Banned`：返回 `Revoked`；
+- `Deleted`：返回 `Tombstoned`；
+- AuthDB、BNS/indexer 或其它依赖不可用：返回 unknown/5xx，不能伪装成 Missing 或 Active。
+
+AuthDB `users.public_key` 可作为 SN internal control-plane snapshot 的本地 Owner Key
+材料，但不会因此成为 `did:web` / `did:bns` method authority receipt；BNS authority
+材料可用时仍应保留其来源和优先级。
+
 ## 2. 目标身份与准入模型
 
 ```text
@@ -109,9 +158,11 @@ Hello.device_doc_jwt
 3. **Possession**：Hello tunnel token 是否由该 DeviceDocument 的 `#main_key` 验证；
 4. **Authorization**：semantic DID 是否有有效的 SN 登记关系，且未被 banned/revoked。
 
-公网 relay 至少必须要求可信 Zone snapshot 或 method authority evidence，绝不能把
-self-declared fallback 的 owner/zone 当作授权主体。部署若要求“全局发布状态当前”，必须显式
-选择 `RemoteAuthority + FreshnessRequirement::RequireAuthorityCurrent`，不能把 ZoneHit 当成
+公网 relay 的具名身份必须通过 RTCP v3 的 `LocalAndZone` 验证和配置的关系档位。验证
+unavailable 时不存在 self-declared logical identity 回落；即使显式配置
+`anonymous: allow`，也只能降级为不携带 owner/zone 的 `KeyDid`。部署若要求“全局发布状态
+当前”，由后台或出站路径显式使用
+`RemoteAuthority + FreshnessRequirement::RequireAuthorityCurrent`，不能把 ZoneHit 当成
 替代品。
 
 ## 3. 非目标和禁止做法
@@ -126,8 +177,11 @@ self-declared fallback 的 owner/zone 当作授权主体。部署若要求“全
 - 不把 `CacheStatus::ZoneHit`、`BodyEvidence::Anchored` 或 `Published` cache 单独解释成
   `AuthorityFreshness::Current`。
 - 不再新增或比较 `version_seq`；anti-rollback 使用 `iat + content_hash`。
-- 不允许公网 relay 在验证证据不可用时静默用 self-declared owner 获得 owner/zone 权限。
-- 离线 LAN 可以显式允许 fallback，但必须与公网默认策略隔离，并向业务层暴露 trust level。
+- 不重新引入 self-declared document fallback 或 observed cache 写入路径。
+- `anonymous: allow` 只允许按已证明持有的 key 降级为 `KeyDid`，不得携带或授权
+  self-declared owner/zone。
+- 不把 Known Owner 等同于 Registered Device；前者只证明 owner-backed identity，后者仍由
+  Phase 2 登记状态和 process-chain 业务策略决定。
 
 ## 4. 实施任务
 
@@ -140,6 +194,10 @@ self-declared fallback 的 owner/zone 当作授权主体。部署若要求“全
 - [x] Internal profile 已能标记 `documentStatus: active`，并保留 `did:web` semantic identity
   与 `canonicalZone` metadata。
 - [x] 已有 `did:web` owner document 合成及 BNS/DeviceInfo/compatibility reader。
+- [x] `SnAuthDB` 已有 `get_user_info` / `get_user_by_domain` 点查能力，`SnResolver` 已能在
+  BNS owner 缺失时从 `users.public_key` 生成 legacy owner key 材料。
+- [x] `SnDidResolver` 已能从 BNS owner config / effective owner key 合成
+  `OwnerDocument`。
 
 剩余任务：
 
@@ -151,6 +209,20 @@ self-declared fallback 的 owner/zone 当作授权主体。部署若要求“全
 
 - [ ] listener 必须固定使用 `SnDidResolverProfile::InternalZoneResolver`；当前公开 HTTP route
   仍固定为 `PublicSupplement`，不能直接当成 3180 服务复用。
+- [ ] 增加 AuthDB Known Owner projection：
+  - `did:bns:<username>?type=owner` 按 username 点查 `SnAuthDB`；
+  - 为 SN 管理的固定 host suffix 增加
+    `did:web:<username>.<sn-host>?type=owner -> <username>` 的显式映射，不能把任意
+    `did:web` hostname 当成 AuthDB username；
+  - 只允许 `UserState::Active` 且具有合法 Owner Key 的用户返回 Active
+    OwnerDocument；
+  - BNS authority owner config/key 可用时保留其优先级和 provenance；回落
+    `users.public_key` 时明确标记为 SN AuthDB control-plane snapshot。
+- [ ] 把 AuthDB 状态映射为 resolver 状态：`Suspended/Banned -> Revoked`、
+  `Deleted -> Tombstoned`、未绑定 key -> Missing/未就绪、依赖故障 -> unknown/5xx。
+  当前 Internal profile 对所有成功解析统一标记 Active，不能直接作为最终实现。
+- [ ] 初版使用 AuthDB 点查，不要求增加全量 `list_users`。如果后续需要跨进程主动预热和
+  快速失效，再增加分页 owner snapshot / revision change feed；它不是 3180 上线前置。
 - [ ] 支持 `DidDocType::Device` 对应的 `type=device`。当前 SN scoped resolver 仍主要使用
   `doc` / `info`；迁移期可把 `doc` 保留为别名，但 response 的 canonical `docType` 必须是
   `device`。
@@ -203,51 +275,34 @@ self-declared fallback 的 owner/zone 当作授权主体。部署若要求“全
 - [ ] 明确测试 ZoneHit 只产生 `LocalTrustScope::Zone` + `AuthorityFreshness::NotChecked`，不会
   因 `documentStatus=active`、`authoritySeq` 或 `BodyEvidence::Anchored` 升格成 Current。
 
-### C. RTCP 应用明确的 evidence / freshness policy
+### C. RTCP v3 Known Owner 消费侧（已完成）
 
-当前已完成：
+本节已由
+[`RTCP-Authoritative-Peer-Key-Resolution-TODO.md`](../rtcp/RTCP-Authoritative-Peer-Key-Resolution-TODO.md)
+完成，后续以该文档和 [`doc/rtcp/rtcp.md`](../rtcp/rtcp.md) 为当前实现真值：
 
-- [x] RTCP 已调用 `resolve_and_verify_device_document_jwt`，不再在主路径自行拼
-  `payload.owner -> resolve_auth_key`。
-- [x] 主路径使用 `verified.subject_did` 作为 semantic `source_device_id`，使用
-  `verified.authz_owner` 作为可信 owner。
-- [x] tunnel token 使用返回 `DeviceDocument::get_default_key()` 验证，canonical `did:dev`
-  只用于持钥和 tunnel 内部标识。
-- [x] RTCP 已对 terminal typed rejection、local older/conflict、authority
-  DifferentDocument/Superseded 做硬拒绝。
-- [x] verified cache 写入已推迟到 tunnel-token 持钥证明和 listener 授权通过之后。
+- [x] 入站具名身份固定使用
+  `resolve_and_verify_device_document_jwt(VerifyPurpose::AuthSubject)` 和
+  `LocalAndZone`，握手同步路径不访问 method authority。
+- [x] `named_min_relation` 已支持 `same_zone | known_owner | any`；`known_owner` 只检查
+  `usable_as_authz_subject`、`authz_owner` 和可信 OwnerDocument evidence。
+- [x] RTCP 不信任 claim/payload 自声明 owner，使用 `verified.subject_did` 和
+  `verified.authz_owner`。
+- [x] tunnel token 使用 `DeviceDocument::get_default_key()` 做持钥证明，canonical
+  `did:dev` 只用于 key identity、tunnel key/reuse 和确定性通信。
+- [x] trust 已随 tunnel endpoint 和 per-stream process-chain 传递，当前枚举为
+  `DnsTxtBootstrap | KeyDid | TrustedHostSnapshot | TrustedZoneSnapshot |
+  MethodAuthorityCurrent`。
+- [x] terminal typed rejection、local older/conflict、authority
+  DifferentDocument/Superseded 均硬拒绝；verified cache 只在持钥证明、key confirmation
+  和 listener 授权后提交。
+- [x] self-declared/observed fallback 已删除。验证 unavailable 时，
+  `anonymous: allow` 最多降级为不携带 owner/zone 的 `KeyDid`。
+- [x] 后台 authority 确认已有 singleflight、限速、负缓存、并发和超时预算；确认成功
+  单向升级 `MethodAuthorityCurrent`，确定性否定会踢除 tunnel。
 
-剩余任务：
-
-- [ ] 为 `VerifiedSourceDevice` 增加可传递到 process-chain 的 evidence level，至少区分：
-
-  ```rust
-  enum RtcpIdentityTrust {
-      MethodAuthorityCurrent,
-      ZoneVerified,
-      HostVerified,
-      SelfDeclaredFallback,
-      KeyDid,
-  }
-  ```
-
-  具体值必须由 `VerifiedDidDocument.validity` 和 `freshness` 推导，不能只根据“组合 API
-  返回 Ok”判断。
-- [ ] 用基础库 `evaluate_freshness` + `FreshnessRequirement` 代替 RTCP 当前手写的部分枚举
-  匹配，避免遗漏新增 freshness 状态或 scope 不匹配。
-- [ ] 增加清晰配置，避免继续使用含义模糊的 `authoritative` 单布尔值。建议至少提供：
-  - `authority_current`：`RemoteAuthority` + `RequireAuthorityCurrent`；
-  - `zone_or_authority`：接受可信 Zone baseline 或 Authority Current，不接受 fallback；
-  - `allow_fallback`：只用于显式离线/首次组网场景。
-- [ ] web3 gateway / 公网 SN relay 默认至少使用 `zone_or_authority`；需要全局当前保证的部署
-  显式使用 `authority_current`。
-- [ ] self-declared fallback 不得填充可授权的 `source_device_owner` / `source_zone_did`，或必须
-  保证所有授权策略先检查 `RtcpIdentityTrust`。仅记录 JWT 自声明字段时要使用单独的
-  untrusted/observed 命名。
-- [ ] `AuthorityFreshness::Unavailable`、`NotChecked`、`ActiveUnanchored` 和非 terminal
-  `NotCurrent::NegativeStatus` 的接受方式必须由配置决定，不能隐式落入同一成功档位。
-- [ ] 保留 `allow_fallback` 时，只允许 `ResolveVerifyError` 中真正的 unavailable/missing
-  dependency 进入 fallback；`VerifyError` 的 definite rejection 永远不得回落。
+因此，RTCP 不再是本 TODO 的实现阻塞项。SN 3180 只需严格提供符合契约的 Zone snapshot；
+跨组件联调仍在本 TODO 的测试范围内。
 
 ### D. SN 登记状态查询只做 Phase 2 业务授权
 
@@ -265,7 +320,7 @@ self-declared fallback 的 owner/zone 当作授权主体。部署若要求“全
 - [ ] 保留 raw `did:dev` 的 legacy 精确查询能力；它表示已登记 key device，不自动授予
   BNS/Web owner 权限。
 - [ ] process-chain 的 SN 准入规则必须同时检查 RTCP evidence level 与登记状态，不能只因
-  `resolve_ood_by_did` 查到记录就接受 self-declared logical identity。
+  `resolve_ood_by_did` 查到记录就接受 `KeyDid` 或其它不满足策略的 identity trust。
 
 ### E. 部署与可观测性
 
@@ -274,10 +329,12 @@ self-declared fallback 的 owner/zone 当作授权主体。部署若要求“全
   使用本地 sidecar/in-process resolver。
 - [ ] readiness 覆盖 3180：至少验证一个 owner doc 和一个 registered device doc 能返回
   Active、effectiveOwner、iat/docHash 和可用 body。
-- [ ] rollout 顺序：先升级 `buckyos-base` 和 3180 服务，再开启
-  `zone_or_authority`，最后按部署能力选择 `authority_current`。
+- [ ] rollout 顺序：RTCP v3 / `buckyos-base` 已完成，下一步先发布 3180 服务并完成
+  readiness，再把需要接受外部 SN 用户的 relay 配置为
+  `inbound_admission.named_min_relation: known_owner`；默认 `same_zone` 的部署不应被
+  静默放宽。
 - [ ] 日志至少区分：
-  `authority_current`、`zone_verified`、`host_verified`、`self_declared_fallback`、
+  `method_authority_current`、`trusted_zone_snapshot`、`trusted_host_snapshot`、`key_did`、
   `older_than_latest`、`same_iat_conflict`、`different_document`、`negative_state`。
 - [ ] metrics 记录 Zone latency/hit/unknown/negative、各 trust level 的 RTCP accept/reject 和
   freshness rejection；不得记录完整 JWT/token。
@@ -286,6 +343,12 @@ self-declared fallback 的 owner/zone 当作授权主体。部署若要求“全
 
 ### SN Internal Zone Resolver
 
+- [ ] `Active + 有效 Owner Key` 的 AuthDB 用户通过
+  `did:bns:<username>?type=owner` 返回完整 OwnerDocument、Active 和 Zone provenance。
+- [ ] `did:web:<username>.<sn-host>?type=owner` 只在命中受控 suffix 和合法 username 时
+  映射到同一 AuthDB 用户，并保持请求的 `did:web` semantic identity。
+- [ ] Active 但未绑定 Owner Key 的用户不成为 Known Owner；Suspended/Banned 返回
+  Revoked，Deleted 返回 Tombstoned，AuthDB 故障返回 unknown/5xx。
 - [ ] `did:bns:ood1.alice?type=device` 返回完整 device document、Active、effectiveOwner、
   `documentVersion == document.iat` 和匹配的 docHash。
 - [ ] `did:web:ood1.example.com?type=device` 保持 web semantic DID，effectiveOwner 为
@@ -296,33 +359,40 @@ self-declared fallback 的 owner/zone 当作授权主体。部署若要求“全
 
 ### `buckyos-base` verification contract
 
-- [ ] `LocalAndZone` 命中完整 Active evidence：validity 成功，local freshness 为 Zone scope，
+- [x] `LocalAndZone` 命中完整 Active evidence：validity 成功，local freshness 为 Zone scope，
   authority freshness 仍是 NotChecked。
-- [ ] candidate 比 Zone baseline 旧：`OlderThanLatestKnown`；同 iat 不同 hash：
+- [x] candidate 比 Zone baseline 旧：`OlderThanLatestKnown`；同 iat 不同 hash：
   `ConflictAtSameRevision`。
-- [ ] `RemoteAuthority` 的 body/hash 与 candidate 相同：`AuthorityFreshness::Current`；不同：
+- [x] `RemoteAuthority` 的 body/hash 与 candidate 相同：`AuthorityFreshness::Current`；不同：
   `DifferentDocument` 或 `Superseded`。
-- [ ] effectiveOwner 与 declared owner 不同：`OwnerMismatch`；detached owner 用于 AuthSubject
+- [x] effectiveOwner 与 declared owner 不同：`OwnerMismatch`；detached owner 用于 AuthSubject
   时：`DetachedOwnerRejected`。
-- [ ] Zone Revoked/Tombstoned：`RejectedByNegativeState`；Zone unknown 可继续其他来源。
-- [ ] `resolve_and_verify_*` 验证成功不写 cache；显式 cache API 才写入。
-- [ ] 只有 `iat`、没有 `version_seq` 的合法 DeviceDocument JWT 可验证；缺少可推导 iat 的
+- [x] Zone Revoked/Tombstoned：`RejectedByNegativeState`；Zone unknown 可继续其它允许来源。
+- [x] `resolve_and_verify_*` 验证成功不写 cache；显式 cache API 才写入。
+- [x] 只有 `iat`、没有 `version_seq` 的合法 DeviceDocument JWT 可验证；缺少可推导 iat 的
   JWT 被拒绝。
+
+上述基础库契约已完成；本 TODO 仍需补 SN 3180 真实 HTTP response 的跨组件测试，不能只用
+mock provider 代替。
 
 ### RTCP / SN 安全回归
 
 - [ ] registered device 经可信 Zone snapshot 验证后成功 keep-tunnel，process-chain 看到
-  semantic source DID、可信 owner 和 `ZoneVerified`。
-- [ ] method authority body/hash 绑定成功时产生 `MethodAuthorityCurrent`。
-- [ ] 攻击者用自己的 key/owner 签文档，但声明已登记 semantic DID：validity 或登记授权必须
-  拒绝。
-- [ ] Zone unavailable：`zone_or_authority` 拒绝；显式 `allow_fallback` 只产生
-  `SelfDeclaredFallback`，且没有 owner/zone 授权字段。
-- [ ] 多 verification method 且 `#main_key` 不在第一项时，RTCP 仍只使用
+  semantic source DID、可信 owner 和 `TrustedZoneSnapshot`，并通过
+  `named_min_relation: known_owner`。
+- [x] method authority body/hash 绑定成功时产生 `MethodAuthorityCurrent`。
+- [x] 攻击者用自己的 key/owner 签文档但声明其它 semantic DID/owner：RTCP validity
+  验证拒绝，且没有 self-declared 回落。
+- [x] Zone unavailable：`anonymous: reject` 拒绝；显式 `anonymous: allow` 最多产生
+  `KeyDid`，且没有 owner/zone 授权字段。
+- [x] 多 verification method 且 `#main_key` 不在第一项时，RTCP 仍只使用
   `DeviceDocument::get_default_key()` 验 tunnel token。
 - [ ] SN Phase 2 不读取 `verificationMethod`，只用已验证 semantic DID 的 zone/device binding
   查询登记状态。
-- [ ] raw `did:dev` legacy device 保持可连接，tunnel reuse key 不回退成 semantic DID。
+- [x] raw `did:dev` key identity 保持可连接，tunnel reuse key 不回退成 semantic DID，且
+  不自动获得 owner/zone 权限。
+- [ ] Known Owner 但未登记的设备：Phase 1 可以建立符合关系档位的 identity，Phase 2 /
+  process-chain 必须拒绝需要 registered-device 权限的业务访问。
 
 推荐 smoke：
 
@@ -339,12 +409,15 @@ cargo test -p cyfs-gateway-lib rtcp_zone_verified -- --nocapture --test-threads=
 
 - SN 集群内部存在可用且受保护的 Zone Resolver endpoint，默认本地地址为
   `127.0.0.1:3180`，不依赖设备自己的公网 HTTPS 服务已启动。
+- AuthDB 中 `Active + 有效 Owner Key` 的用户可按需成为 Zone scope Known Owner；空 key、
+  Suspended/Banned/Deleted 和依赖故障不会被错误标记为 Active。
 - RTCP Hello 中的完整 DeviceDocument 能通过基础库统一入口完成 expected owner、owner
   signature、negative state、local/authority freshness 分层验证。
 - Zone snapshot 与 method authority receipt 在结果、配置、日志和 metrics 中始终可区分。
 - 权威/Zone 验证成功后，权限系统使用 semantic DID；canonical `did:dev` 只用于持钥证明和
   tunnel 确定性标识。
-- Public SN relay 不接受 self-declared fallback 的 owner/zone 权限。
+- Public SN relay 不存在 self-declared logical identity fallback；`KeyDid` 不携带或自动获得
+  owner/zone 权限。
 - SN OOD/登记状态查询不再手工解析 document key；PR #166 所修场景通过“RTCP Phase 1
   验证 + SN Phase 2 registration lookup”自然完成。
 - 合法 `did:bns`、`did:web` registered device 可正常 keep-tunnel；伪造同一 semantic DID
