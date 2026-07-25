@@ -27,6 +27,16 @@ RTCP 使用两类承载：
 主动建立 tunnel 的一端 `can_direct = true`，接收 `ROpen`；被动接收 tunnel 的一端
 `can_direct = false`，接收 `Open`。错误方向会返回明确错误码，且不做解析或拨号。
 
+Tunnel 建立与业务 stream 建立是两个独立成功边界：
+
+- initiator 验证 `HelloAck` 并成功写出 AEAD `HelloAckConfirm` 后，将控制 tunnel 视为
+  本地可用；
+- responder 验证 `HelloAckConfirm` 并通过 listener 准入后，将控制 tunnel 视为本地可用；
+- 协议没有第四条 “tunnel accepted” 回复，initiator 不等待 responder 完成本地发布；
+- tunnel 可用只表示 RTCP 控制通道已经完成 Hello/密钥确认，不承诺后续任意一次
+  `Open` / `ROpen` 成功。每次业务流仍要独立经过方向、配额、授权、解析、拨号和
+  HelloStream 交接。
+
 Tunnel URL：
 
 ```text
@@ -123,6 +133,41 @@ RTCP 同时保留：
 canonical DID 用于 tunnel key 和持钥证明；semantic DID 与 canonical DID 一起进入
 session HKDF。trust 不会在 canonical 化后丢失，并暴露给 process-chain。
 
+当前 tunnel 复用键只使用 canonical device identity 和承载路径：
+
+```text
+direct:    <local-canonical-dev-did>_<remote-canonical-dev-did>
+bootstrap: <local-canonical-dev-did>_<remote-canonical-dev-did>|bootstrap=<url>
+```
+
+因此同一逻辑名字和它的裸 `did:dev` 寻址会复用同一设备 tunnel。
+
+在 tunnel key 之上，tunnel map 维护“逻辑名字 `<->` canonical DEV DID”的一一绑定
+仲裁（当前实现）：
+
+- 任一时刻一个 canonical DEV DID 至多属于一个已验证逻辑名字。反向唯一性索引
+  （canonical DEV DID -> logical DID）与既有 logical DID 二级索引一起维护；绑定检查、
+  verified-cache commit、主 tunnel map 与两个方向的索引更新在同一提交序列
+  （commit lock + map 临界区）内完成。
+- 出站：具名目标在复用或新建 canonical tunnel 前检查已验证名字绑定；不同逻辑名字
+  命中同一 canonical DEV DID 时明确拒绝（`one-to-one name binding` 错误），不静默
+  复用先建立的 tunnel。参与绑定的是设备名（DeviceDocument 解析）与 DNS TXT
+  bootstrap 名字；zone 目标（ZoneDocument 委托默认 gateway）是 zone 寻址不是第二个
+  设备名，不参与设备名绑定；裸 `did:dev` 寻址不算逻辑名字。
+- 入站：具名 from 在文档验证后、HelloAck/listener 授权前有 rejection-only 预检查，
+  发布时在提交序列内做权威仲裁；冲突连接被拒绝，不得替换已存在的合法 tunnel（同
+  canonical key 的 last-accepted-wins 替换只对同名或匿名 key 身份成立）。
+- 同一逻辑名字提交更高 `DocumentRevision` 时，已验证二级索引会关闭严格更旧
+  revision / 旧 canonical key 下的 tunnel，并在同一临界区释放旧 canonical DEV DID
+  的反向绑定；版本仲裁使用 name-client 的 verified-cache CAS 结果，不由 RTCP 自行
+  比较文档内容。same-iat 不同 content 属于 same-version 冲突：CAS 以
+  `RejectedConflict` 拒绝，map 内还有 fail-closed 的同版本门兜底，不允许两个绑定
+  同时保持 current。
+- 绑定随实例生命周期清理：实例退出（`remove_if_current`）、被替换、被 supersede 或
+  权威否定（`close_verified_identity`，含出站具名绑定实例）都会同时清理两个方向的
+  索引；全部实例已关闭的 stale 绑定不再守住名字，会在下一次仲裁时被剪除。
+- 裸 `did:dev` 的 key identity 不因共享设备 tunnel 获得具名身份的 owner/zone 权限。
+
 ### 3.2 出站 peer key 解析
 
 默认配置：
@@ -191,7 +236,10 @@ nonce cache 以 `(canonical source did:dev, nonce)` 为键，最多 16K **条目
 
 HelloAck token 使用 `buckyos-rtcp-v3-ack`，带同样的 `iat`/`exp`/`nonce`，并用
 `peer_xpub` 绑定本次 Hello。`HelloAckConfirm` 是第一条 AEAD 记录，echo responder
-challenge；完整 key confirmation 结束前 tunnel 不会注册或替换旧 tunnel。
+challenge。initiator 在成功写出 Confirm 后可以发布本地 tunnel；responder 必须成功
+解密并校验 Confirm、通过 listener 授权后才能注册或替换旧 tunnel。listener 拒绝发生在
+responder 发布前，不会替换已有 tunnel；initiator 通过后续控制读写/liveness 感知对端
+拒绝或断开。
 
 ### 3.4 入站具名准入
 
@@ -212,9 +260,12 @@ challenge；完整 key confirmation 结束前 tunnel 不会注册或替换旧 tu
    - `known_owner` 要求结果可作为 `AuthSubject` 授权、`authz_owner` 非空，并带可信
      OwnerDocument evidence；
    - `any` 不增加关系约束，但仍必须先完成上述 name-client 文档验证；
-8. 将 trust、canonical DID、owner/zone（只有验证成功时）交给 listener；
-9. 持钥证明、key confirmation、listener 授权都成功后才提交 verified cache 并注册
-   tunnel。
+8. 文档验证成功后、HelloAck 之前做一一绑定预检查（rejection-only）：candidate
+   canonical DEV DID 已绑定到其它已验证逻辑名字时直接拒绝；
+9. 将 trust、canonical DID、owner/zone（只有验证成功时）交给 listener；
+10. 持钥证明、key confirmation、listener 授权都成功后才提交 verified cache 并注册
+    tunnel；注册前在同一提交序列内做权威的一一绑定仲裁与 same-version 冲突门
+    （§3.1），冲突连接被拒绝，不得替换已存在的合法 tunnel。
 
 同步路径不访问 method authority。self-declared 验证和 observed cache 写入路径不存在。
 验证 unavailable 时，默认 `anonymous: reject`；显式 `anonymous: allow` 只按已证明持有的
@@ -236,26 +287,46 @@ candidate key 降级为 `KeyDid`，不携带 owner/zone，不写授权缓存。
 
 ### 4.1 Tunnel session key
 
-双方各生成一次性 X25519 key，ECDH 后用 HKDF-SHA256 独立扩展 AES key 和 IV salt。
-v3 HKDF context 绑定：
+双方各生成一次性 X25519 key。以下 `||` 表示原始字节串拼接，字符串使用签名 claim 中
+双方实际校验过的 UTF-8 字节；canonical DID 使用 `DID::to_string()` 的结果，xpub 和
+nonce 使用 token 中双方共同看到的十六进制字符串：
 
-- `buckyos-rtcp-v3` domain label；
-- initiator/responder semantic DID；
-- initiator/responder canonical `did:dev`；
-- 双方临时 X25519 公钥；
-- 双方 nonce。
+```text
+shared = X25519(my_ephemeral_secret, peer_ephemeral_public)
+PRK = HKDF-Extract-SHA256(salt = None, IKM = shared)
 
-因此逻辑身份、实际 key、角色或握手实例任何一项不同都会得到不同 session secret。
+ctx = "|" || initiator_semantic_did
+          || "|" || responder_semantic_did
+          || "|" || initiator_canonical_dev_did
+          || "|" || responder_canonical_dev_did
+          || "|" || initiator_xpub_hex
+          || "|" || responder_xpub_hex
+          || "|" || initiator_nonce_hex
+          || "|" || responder_nonce_hex
+
+control_key = HKDF-Expand-SHA256(
+  PRK, "buckyos-rtcp-v3 aes256-key" || ctx, 32)
+control_iv = HKDF-Expand-SHA256(
+  PRK, "buckyos-rtcp-v3 iv-salt" || ctx, 16)
+```
+
+`control_key` / `control_iv` 用于 tunnel 控制通道。当前实现不会把 ECDH `PRK` 作为独立
+exporter secret 保留；后续 per-stream KDF 以 `control_key` 作为输入。因此逻辑身份、
+实际 key、角色或握手实例任何一项不同都会得到不同控制通道和业务流密钥。
 
 ### 4.2 Per-stream key
 
-业务 stream 不复用控制通道 key：
+业务 stream 不直接使用控制通道 AES key。stream id 必须先解码为 16 字节；version 和
+purpose 都是单字节，其中 `version = 3`、`Stream = 0`、`Datagram = 1`：
 
 ```text
-stream_key = HKDF-Expand(tunnel_secret,
-  "buckyos-rtcp stream key|" || version || stream_id || purpose)
-stream_iv = HKDF-Expand(tunnel_secret,
-  "buckyos-rtcp stream iv|"  || version || stream_id || purpose)
+stream_PRK = HKDF-Extract-SHA256(salt = None, IKM = control_key)
+stream_ctx = 0x03 || stream_id_raw_16_bytes || purpose_u8
+
+stream_key = HKDF-Expand-SHA256(
+  stream_PRK, "buckyos-rtcp stream key|" || stream_ctx, 32)
+stream_iv = HKDF-Expand-SHA256(
+  stream_PRK, "buckyos-rtcp stream iv|" || stream_ctx, 16)
 ```
 
 非法或重复 stream id 在 KDF 前拒绝。不同 id、purpose 或版本派生不同 key/IV。
@@ -270,9 +341,20 @@ stream_iv = HKDF-Expand(tunnel_secret,
 +-------------+------------------------+
 ```
 
-单记录明文最大 16 KiB。两个方向的 nonce base 分别为
-`SHA-256("rtcp-aead-nonce/A" || base_iv)` 和
-`SHA-256("rtcp-aead-nonce/B" || base_iv)` 的前 12 字节；低 8 字节 XOR 单调 u64 seq。
+- `len` 等于 `ciphertext length + 16-byte tag`，不包含自身的 2 字节；合法范围是
+  `16..=16400`；
+- 单记录明文最大 16 KiB，较大的上层写入拆成多条记录；
+- GCM 不使用 additional authenticated data，2 字节 `len` 不在 tag 覆盖范围内；篡改
+  framing 会导致认证失败、截断或连接关闭，不能产生通过认证的伪造明文；
+- 每个方向的 `seq` 从 `0` 开始，成功消费一条记录后加一，以 8 字节大端序 XOR 到
+  nonce base 的低 8 字节；
+- `nonce_A = first12(SHA-256("rtcp-aead-nonce/A" || base_iv))`，
+  `nonce_B = first12(SHA-256("rtcp-aead-nonce/B" || base_iv))`；
+- underlying transport initiator（发送明文 Hello/HelloStream 的一端）写方向使用 A、
+  读方向使用 B；responder 写方向使用 B、读方向使用 A。
+
+控制 tunnel 的 `base_iv` 是 `control_iv`；业务 stream 的 `base_iv` 是对应
+`stream_iv`。年龄预算从本端创建该 `EncryptedStream` 时开始计时，不依赖双方墙上时钟。
 
 key-use 预算：
 
@@ -290,10 +372,14 @@ key-use 预算：
 
 - 每个实例有进程内唯一 `instance_id`；
 - 旧实例在 map 临界区内先标记 closed，锁外清 waiter 和 shutdown；
-- run loop 退出只执行 `remove_if_current(key, instance)`；
-- 同逻辑 DID 的更新 revision 通过二级索引关闭旧 revision。
+- run loop 退出只执行 `remove_if_current(key, instance)`，并同时清理该实例的
+  一一绑定索引；
+- 同逻辑 DID 的更新 revision 通过二级索引关闭旧 revision；
+- 替换资格受 §3.1 一一绑定约束：不同逻辑名字命中同一 canonical key 的连接在注册前
+  被拒绝，last-accepted-wins 只对同名或匿名 key 身份成立。
 
-出站并发建链保持 first-wins，loser 关闭并复用 winner。
+出站并发建链保持 first-wins，loser 关闭并复用 winner；具名目标复用前先过一一绑定
+仲裁。
 
 `keep_tunnel` 使用带 seq 的 `ping_rtt()`，只有匹配 Pong 才算成功。配置的连续失败次数达到
 阈值后 close + conditional remove，下一轮重新建链。direct accept、初始 connect 和
@@ -384,7 +470,15 @@ stacks:
       stream_request_burst: 64
 ```
 
-安全默认值是 authority-current、TXT bootstrap 关闭、anonymous 拒绝、same-zone。
+默认安全策略按方向区分：
+
+- 出站具名 peer key 解析要求 `authority_current`，DNS TXT bootstrap 关闭；
+- 入站具名 tunnel 使用已验证的 same-zone Host/Zone snapshot 同步准入，随后按配置做
+  后台 authority confirmation；它不声称握手时已经取得 method-authority current receipt；
+- 入站 anonymous 默认拒绝；
+- 每条业务 stream 仍应由 process-chain 根据 `source_identity_trust` 决定是否需要
+  `method_authority_current`，不能仅凭 tunnel 已建立授予敏感服务权限。
+
 `named_min_relation` 支持 `same_zone`、`known_owner`、`any`。`same_owner` 等未实现枚举值、
 已删除的 `inbound_self_declared_fallback` 和其它未知字段会导致配置反序列化失败，不会
 静默忽略。
@@ -408,6 +502,10 @@ Identity manager 实际探测：
 - Hello/HelloAck 和可选 DeviceDocument JWT 是明文，会暴露 identity metadata；当前
   版本优先保证可认证建链，未提供身份隐私。
 - Hello 与 DeviceDocument JWT 受 u16 控制包长度限制。
+- 逻辑名字与 canonical DEV DID 的一一绑定按活跃实例仲裁（§3.1）：出站对同一名字先后
+  解析到不同 canonical DEV DID（如 TXT bootstrap 名字迁移）时，旧 canonical tunnel
+  不会被出站路径主动关闭，依赖 liveness/轮换或入站 revision 仲裁收敛；这是“不另造
+  版本判断规则”的既定取舍。
 - 按既定 D1 不做后台定时吊销轮询：若合法设备在吊销后不再连接本节点，存量 tunnel
   只能由 liveness、自然轮换或一次性/懒式 authority confirmation 清理。
 - 上游提供 `FreshnessRequirement::NotProvenRegressed` 后，可用其替换 RTCP 当前对

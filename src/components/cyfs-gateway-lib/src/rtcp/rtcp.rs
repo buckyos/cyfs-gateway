@@ -472,11 +472,33 @@ struct ResolvedHandshakeIdentity {
     ed25519_pk_der: [u8; 32],
     trust: RtcpIdentityTrust,
     resolver_id: Option<String>,
+    // True when the semantic DID is a logical *device* name whose resolution
+    // must obey the one-to-one binding to its canonical DEV DID: DeviceDocument
+    // resolutions and DNS TXT bootstrap hints. False for direct did:dev
+    // targets and for ZoneDocument targets -- a zone delegating to its default
+    // gateway is zone addressing, not a second device name.
+    binds_logical_name: bool,
+}
+
+impl ResolvedHandshakeIdentity {
+    fn logical_name_binding(&self) -> Option<OutboundNameBinding> {
+        if !self.binds_logical_name {
+            return None;
+        }
+        Some(OutboundNameBinding {
+            logical_did: self.semantic_did.to_string(),
+            canonical_dev_did: self.canonical_dev_did.to_string(),
+        })
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct VerifiedTunnelIdentity {
     logical_did: String,
+    // The canonical did:dev derived from the verified document's default key.
+    // It is the subject of the one-to-one binding arbitration: at any moment
+    // a canonical DEV DID may belong to at most one verified logical name.
+    canonical_dev_did: String,
     document_revision: DocumentRevision,
 }
 
@@ -682,6 +704,7 @@ impl RTcpInner {
                         ed25519_pk_der: exchange_key,
                         trust: RtcpIdentityTrust::DnsTxtBootstrap,
                         resolver_id: Some(format!("dns-txt:{}", web_host)),
+                        binds_logical_name: true,
                     }));
                 }
             }
@@ -705,6 +728,7 @@ impl RTcpInner {
                             ed25519_pk_der: exchange_key,
                             trust: RtcpIdentityTrust::DnsTxtBootstrap,
                             resolver_id: Some(format!("dns-txt:{}", web_host)),
+                            binds_logical_name: true,
                         }));
                     }
                 } else if parse_errors.len() < 6 {
@@ -720,32 +744,42 @@ impl RTcpInner {
         Ok(None)
     }
 
+    // Returns the exchange key together with whether the semantic DID names a
+    // device (DeviceDocument) rather than a zone (ZoneDocument). Only device
+    // names enter the one-to-one logical-name binding.
     fn exchange_key_from_resolved_document(
         resolved: &ResolvedDocument,
-    ) -> Result<[u8; 32], String> {
+    ) -> Result<([u8; 32], bool), String> {
         let document_value = resolved
             .document
             .clone()
             .to_json_value()
             .map_err(|e| format!("decode resolved DID document failed: {}", e))?;
-        let exchange_key = if document_value.get("device_type").is_some() {
-            DeviceDocument::decode(&resolved.document, None)
-                .map_err(|e| format!("decode resolved DeviceDocument failed: {}", e))?
-                .get_exchange_key(None)
+        let (exchange_key, is_device_document) = if document_value.get("device_type").is_some() {
+            (
+                DeviceDocument::decode(&resolved.document, None)
+                    .map_err(|e| format!("decode resolved DeviceDocument failed: {}", e))?
+                    .get_exchange_key(None),
+                true,
+            )
         } else if document_value.get("hostname").is_some() {
             let zone_document = ZoneDocument::decode(&resolved.document, None)
                 .map_err(|e| format!("decode resolved ZoneDocument failed: {}", e))?;
-            zone_document
-                .get_default_zone_gateway()
-                .and_then(|gateway| zone_document.get_device_document(&gateway))
-                .and_then(|device| device.get_exchange_key(None))
+            (
+                zone_document
+                    .get_default_zone_gateway()
+                    .and_then(|gateway| zone_document.get_device_document(&gateway))
+                    .and_then(|device| device.get_exchange_key(None)),
+                false,
+            )
         } else {
             return Err("resolved DID document is neither DeviceDocument nor ZoneDocument".into());
         };
         let (_, jwk) =
             exchange_key.ok_or_else(|| "resolved DID document has no exchange key".to_string())?;
-        jwk_to_ed25519_pk(&jwk)
-            .map_err(|e| format!("decode resolved Ed25519 exchange key failed: {}", e))
+        let key = jwk_to_ed25519_pk(&jwk)
+            .map_err(|e| format!("decode resolved Ed25519 exchange key failed: {}", e))?;
+        Ok((key, is_device_document))
     }
 
     fn authority_error_allows_txt_bootstrap(err: &NSError) -> bool {
@@ -776,6 +810,7 @@ impl RTcpInner {
                 ed25519_pk_der: exchange_key,
                 trust: RtcpIdentityTrust::KeyDid,
                 resolver_id: None,
+                binds_logical_name: false,
             });
         }
 
@@ -836,7 +871,8 @@ impl RTcpInner {
                         }
                     }
                 };
-                let exchange_key = Self::exchange_key_from_resolved_document(&resolved)?;
+                let (exchange_key, is_device_document) =
+                    Self::exchange_key_from_resolved_document(&resolved)?;
                 let canonical_dev_did = canonical_dev_did_from_ed25519_pk(&exchange_key);
                 info!(
                     "resolved RTCP peer {} as {} with trust {} via {:?}",
@@ -851,6 +887,7 @@ impl RTcpInner {
                     ed25519_pk_der: exchange_key,
                     trust,
                     resolver_id: metadata.resolver_id.clone(),
+                    binds_logical_name: is_device_document,
                 })
             }
             Err(primary_err) => {
@@ -1748,6 +1785,7 @@ impl RTcpInner {
                     document: verified.document.clone(),
                     identity: VerifiedTunnelIdentity {
                         logical_did: verified.subject_did.to_string(),
+                        canonical_dev_did: canonical_dev_did.to_string(),
                         document_revision: verified.revision.clone(),
                     },
                 });
@@ -2182,6 +2220,33 @@ impl RTcpInner {
         let source_dev_did = source_device.canonical_dev_did;
         let identity_trust = source_device.identity_trust;
         let verified_cache_entry = source_device.verified_cache_entry;
+
+        // One-to-one binding pre-check before HelloAck, listener authorization
+        // and publication: a named identity whose canonical DEV DID is bound
+        // to a different verified logical name cannot be admitted. This early
+        // read is rejection-only; the authoritative arbitration re-runs inside
+        // the map/verified-cache commit sequence.
+        if let Some(entry) = verified_cache_entry.as_ref() {
+            if let Some(bound_logical) = self
+                .tunnel_map
+                .find_conflicting_binding(
+                    &entry.identity.logical_did,
+                    &entry.identity.canonical_dev_did,
+                )
+                .await
+            {
+                warn!(
+                    "reject rtcp tunnel from {} {}: canonical device {} is already bound to \
+                     verified logical name {}",
+                    source_device_id,
+                    source_addr_log,
+                    entry.identity.canonical_dev_did,
+                    bound_logical
+                );
+                return;
+            }
+        }
+
         let source_did = match DID::from_str(source_device_id.as_str()) {
             Ok(did) => did,
             Err(e) => {
@@ -2623,6 +2688,7 @@ impl RTcpInner {
             &remote_dev_did,
             remote_stack.bootstrap_stream_url.as_deref(),
         );
+        let name_binding = responder_identity.logical_name_binding();
         debug!(
             "will create tunnel to {} (canonical {}), tunnel key is {}, try reuse",
             target_device_id.as_str(),
@@ -2630,15 +2696,29 @@ impl RTcpInner {
             tunnel_key.as_str()
         );
 
-        // First check if the tunnel already exists, then we can reuse it.
-        if let Some(tunnel) = self.tunnel_map.get_tunnel(tunnel_key.as_str()).await {
-            if !tunnel.is_closed() {
+        // Reuse an existing tunnel only after the one-to-one arbitration: a
+        // named target whose canonical DEV DID is bound to a different
+        // verified logical name is rejected instead of silently sharing the
+        // earlier tunnel. Direct did:dev addressing carries no name binding
+        // and keeps sharing the device tunnel by design.
+        match self
+            .tunnel_map
+            .acquire_outbound(tunnel_key.as_str(), name_binding.as_ref())
+            .await
+        {
+            Ok(Some(tunnel)) => {
                 debug!("Reuse tunnel {}", tunnel_key.as_str());
                 return Ok(Box::new(tunnel));
             }
-            self.tunnel_map
-                .remove_if_current(&tunnel_key, &tunnel)
-                .await;
+            Ok(None) => {}
+            Err(conflict) => {
+                let msg = format!(
+                    "rtcp target {} rejected by one-to-one name binding: {}",
+                    target_device_id, conflict
+                );
+                warn!("{}", msg);
+                return Err(TunnelError::DocumentError(msg));
+            }
         }
 
         // `params@remote` bootstrap: build the tunnel's bearing stream through
@@ -2743,17 +2823,29 @@ impl RTcpInner {
                 self.listener.clone(),
             );
             tunnel.set_identity(&responder_canonical_did, responder_trust);
-            if let Err(existing) = self
+            if let Err(err) = self
                 .tunnel_map
-                .register_outbound_if_absent(&tunnel_key, tunnel.clone())
+                .register_outbound_if_absent(&tunnel_key, tunnel.clone(), name_binding.as_ref())
                 .await
             {
-                debug!(
-                    "Reuse tunnel {} after bootstrap build raced with another creator",
-                    tunnel_key.as_str()
-                );
                 tunnel.close().await;
-                return Ok(Box::new(existing));
+                match err {
+                    OutboundRegisterError::Existing(existing) => {
+                        debug!(
+                            "Reuse tunnel {} after bootstrap build raced with another creator",
+                            tunnel_key.as_str()
+                        );
+                        return Ok(Box::new(existing));
+                    }
+                    OutboundRegisterError::BindingConflict(conflict) => {
+                        let msg = format!(
+                            "rtcp target {} rejected by one-to-one name binding: {}",
+                            target_device_id, conflict
+                        );
+                        warn!("{}", msg);
+                        return Err(TunnelError::DocumentError(msg));
+                    }
+                }
             }
             info!(
                 "create tunnel {} instance {} ok via bootstrap url {}",
@@ -2845,17 +2937,29 @@ impl RTcpInner {
             match attempt_result {
                 Some(Ok(attempt)) => {
                     let tunnel = attempt.tunnel;
-                    if let Err(existing) = self
+                    if let Err(err) = self
                         .tunnel_map
-                        .register_outbound_if_absent(&tunnel_key, tunnel.clone())
+                        .register_outbound_if_absent(&tunnel_key, tunnel.clone(), name_binding.as_ref())
                         .await
                     {
-                        debug!(
-                            "Reuse tunnel {} after direct build raced with another creator",
-                            tunnel_key.as_str()
-                        );
                         tunnel.close().await;
-                        return Ok(Box::new(existing));
+                        match err {
+                            OutboundRegisterError::Existing(existing) => {
+                                debug!(
+                                    "Reuse tunnel {} after direct build raced with another creator",
+                                    tunnel_key.as_str()
+                                );
+                                return Ok(Box::new(existing));
+                            }
+                            OutboundRegisterError::BindingConflict(conflict) => {
+                                let msg = format!(
+                                    "rtcp target {} rejected by one-to-one name binding: {}",
+                                    target_device_id, conflict
+                                );
+                                warn!("{}", msg);
+                                return Err(TunnelError::DocumentError(msg));
+                            }
+                        }
                     }
                     info!(
                         "create tunnel {} instance {} ok, remote addr is {}",
@@ -4786,7 +4890,16 @@ struct RTcpTunnelMap {
 struct RTcpTunnelMapState {
     tunnels: HashMap<String, RTcpTunnel>,
     verified_by_logical_did: HashMap<String, HashMap<u64, VerifiedTunnelIndexEntry>>,
-    logical_did_by_instance: HashMap<u64, String>,
+    // Every instance currently holding a logical-name binding. Inbound
+    // instances with a committed verified document and outbound instances
+    // created for a named target both appear here; only the former also carry
+    // a revision entry in verified_by_logical_did.
+    binding_by_instance: HashMap<u64, InstanceNameBinding>,
+    // Reverse uniqueness index for the one-to-one model: at any moment a
+    // canonical DEV DID belongs to at most one verified logical name.
+    // Addressing the same device directly by its did:dev is not a second
+    // logical name and never appears here.
+    binding_by_canonical_dev: HashMap<String, CanonicalDevBinding>,
 }
 
 #[derive(Clone)]
@@ -4797,6 +4910,19 @@ struct VerifiedTunnelIndexEntry {
     tunnel: RTcpTunnel,
 }
 
+#[derive(Clone)]
+struct InstanceNameBinding {
+    logical_did: String,
+    canonical_dev_did: String,
+    canonical_key: String,
+    tunnel: RTcpTunnel,
+}
+
+struct CanonicalDevBinding {
+    logical_did: String,
+    instances: HashSet<u64>,
+}
+
 struct InboundTunnelRegistration {
     accepted: bool,
     replaced: Option<RTcpTunnel>,
@@ -4804,22 +4930,113 @@ struct InboundTunnelRegistration {
     rejected: Option<RTcpTunnel>,
 }
 
+// A named outbound target's verified resolution snapshot, used to arbitrate
+// the one-to-one logical-name binding. Direct did:dev targets and zone
+// (ZoneDocument) targets never produce one: a zone delegating to its gateway
+// device is zone addressing, not a second device name.
+#[derive(Clone, Debug)]
+struct OutboundNameBinding {
+    logical_did: String,
+    canonical_dev_did: String,
+}
+
+enum OutboundRegisterError {
+    // First-wins race: another creator registered this key; reuse its tunnel.
+    Existing(RTcpTunnel),
+    // One-to-one arbitration: the canonical DEV DID is bound to another
+    // verified logical name. The new tunnel must be closed, not registered.
+    BindingConflict(String),
+}
+
 impl RTcpTunnelMapState {
-    fn remove_verified_instance(&mut self, instance_id: u64) -> bool {
-        let Some(logical_did) = self.logical_did_by_instance.remove(&instance_id) else {
+    fn remove_instance_binding(&mut self, instance_id: u64) -> bool {
+        let Some(binding) = self.binding_by_instance.remove(&instance_id) else {
             return false;
         };
         let remove_logical_bucket =
-            if let Some(entries) = self.verified_by_logical_did.get_mut(&logical_did) {
+            if let Some(entries) = self.verified_by_logical_did.get_mut(&binding.logical_did) {
                 entries.remove(&instance_id);
                 entries.is_empty()
             } else {
                 false
             };
         if remove_logical_bucket {
-            self.verified_by_logical_did.remove(&logical_did);
+            self.verified_by_logical_did.remove(&binding.logical_did);
+        }
+        let remove_reverse = if let Some(reverse) = self
+            .binding_by_canonical_dev
+            .get_mut(&binding.canonical_dev_did)
+        {
+            reverse.instances.remove(&instance_id);
+            reverse.instances.is_empty()
+        } else {
+            false
+        };
+        if remove_reverse {
+            self.binding_by_canonical_dev
+                .remove(&binding.canonical_dev_did);
         }
         true
+    }
+
+    // Register both binding directions for an instance. The caller must have
+    // arbitrated with conflicting_logical_binding() in the same critical
+    // section; an existing binding here is therefore for the same name.
+    fn record_instance_binding(
+        &mut self,
+        tunnel: &RTcpTunnel,
+        logical_did: &str,
+        canonical_dev_did: &str,
+        canonical_key: &str,
+    ) {
+        self.binding_by_instance.insert(
+            tunnel.instance_id(),
+            InstanceNameBinding {
+                logical_did: logical_did.to_string(),
+                canonical_dev_did: canonical_dev_did.to_string(),
+                canonical_key: canonical_key.to_string(),
+                tunnel: tunnel.clone(),
+            },
+        );
+        self.binding_by_canonical_dev
+            .entry(canonical_dev_did.to_string())
+            .or_insert_with(|| CanonicalDevBinding {
+                logical_did: logical_did.to_string(),
+                instances: HashSet::new(),
+            })
+            .instances
+            .insert(tunnel.instance_id());
+    }
+
+    // One-to-one arbitration: returns the logical name a live binding already
+    // reserves this canonical DEV DID for, when that name differs from the
+    // candidate. A binding whose instances are all closed no longer defends
+    // its name and is pruned here so delayed run-loop cleanup cannot block a
+    // legitimate new binding.
+    fn conflicting_logical_binding(
+        &mut self,
+        logical_did: &str,
+        canonical_dev_did: &str,
+    ) -> Option<String> {
+        let binding = self.binding_by_canonical_dev.get(canonical_dev_did)?;
+        if binding.logical_did == logical_did {
+            return None;
+        }
+        let bound_logical = binding.logical_did.clone();
+        let has_live_instance = binding.instances.iter().any(|instance_id| {
+            self.binding_by_instance
+                .get(instance_id)
+                .map(|entry| !entry.tunnel.is_closed())
+                .unwrap_or(false)
+        });
+        if has_live_instance {
+            return Some(bound_logical);
+        }
+        let stale: Vec<u64> = binding.instances.iter().copied().collect();
+        for instance_id in stale {
+            self.remove_instance_binding(instance_id);
+        }
+        None
     }
 
     fn remove_primary_if_instance(&mut self, tunnel_key: &str, instance_id: u64) -> bool {
@@ -4859,17 +5076,110 @@ impl RTcpTunnelMap {
         all_tunnel.tunnels.get(tunnel_key).cloned()
     }
 
+    // Outbound reuse with one-to-one arbitration: before reusing (or deciding
+    // to build) a canonical tunnel for a named target, verify the canonical
+    // DEV DID is not already bound to a different verified logical name. A
+    // successful named reuse records the binding on the reused instance so a
+    // later second name cannot silently share the tunnel either.
+    pub async fn acquire_outbound(
+        &self,
+        tunnel_key: &str,
+        binding: Option<&OutboundNameBinding>,
+    ) -> Result<Option<RTcpTunnel>, String> {
+        let mut all_tunnel = self.tunnel_map.lock().await;
+        if let Some(binding) = binding {
+            if let Some(bound_logical) = all_tunnel
+                .conflicting_logical_binding(&binding.logical_did, &binding.canonical_dev_did)
+            {
+                return Err(Self::binding_conflict_message(
+                    &binding.logical_did,
+                    &binding.canonical_dev_did,
+                    &bound_logical,
+                ));
+            }
+        }
+        let Some(existing) = all_tunnel.tunnels.get(tunnel_key).cloned() else {
+            return Ok(None);
+        };
+        if existing.is_closed() {
+            all_tunnel.remove_primary_if_instance(tunnel_key, existing.instance_id());
+            all_tunnel.remove_instance_binding(existing.instance_id());
+            return Ok(None);
+        }
+        if let Some(binding) = binding {
+            all_tunnel.record_instance_binding(
+                &existing,
+                &binding.logical_did,
+                &binding.canonical_dev_did,
+                tunnel_key,
+            );
+        }
+        Ok(Some(existing))
+    }
+
+    // Rejection-only pre-check used before the expensive handshake steps.
+    // The authoritative arbitration runs again inside the commit sequence
+    // (replace_authenticated_inbound); this early answer can only reject a
+    // handshake, never admit one.
+    pub async fn find_conflicting_binding(
+        &self,
+        logical_did: &str,
+        canonical_dev_did: &str,
+    ) -> Option<String> {
+        self.tunnel_map
+            .lock()
+            .await
+            .conflicting_logical_binding(logical_did, canonical_dev_did)
+    }
+
+    fn binding_conflict_message(
+        logical_did: &str,
+        canonical_dev_did: &str,
+        bound_logical: &str,
+    ) -> String {
+        format!(
+            "canonical device {} is already bound to verified logical name {}; \
+             one-to-one binding rejects logical name {}",
+            canonical_dev_did, bound_logical, logical_did
+        )
+    }
+
     // Outbound creators retain first-wins semantics: concurrent local dials
     // reuse whichever tunnel registered first and close their extra tunnel.
+    // A named creator additionally re-arbitrates the one-to-one binding under
+    // the map lock; losing that arbitration rejects the new tunnel outright
+    // instead of reusing a tunnel that belongs to another logical name.
     pub async fn register_outbound_if_absent(
         &self,
         tunnel_key: &str,
         tunnel: RTcpTunnel,
-    ) -> Result<(), RTcpTunnel> {
+        binding: Option<&OutboundNameBinding>,
+    ) -> Result<(), OutboundRegisterError> {
         let mut all_tunnel = self.tunnel_map.lock().await;
+        if let Some(binding) = binding {
+            if let Some(bound_logical) = all_tunnel
+                .conflicting_logical_binding(&binding.logical_did, &binding.canonical_dev_did)
+            {
+                return Err(OutboundRegisterError::BindingConflict(
+                    Self::binding_conflict_message(
+                        &binding.logical_did,
+                        &binding.canonical_dev_did,
+                        &bound_logical,
+                    ),
+                ));
+            }
+        }
         if let Some(existing) = all_tunnel.tunnels.get(tunnel_key).cloned() {
             if !existing.is_closed() {
-                return Err(existing);
+                if let Some(binding) = binding {
+                    all_tunnel.record_instance_binding(
+                        &existing,
+                        &binding.logical_did,
+                        &binding.canonical_dev_did,
+                        tunnel_key,
+                    );
+                }
+                return Err(OutboundRegisterError::Existing(existing));
             }
             debug!(
                 "replace closed outbound RTcp tunnel {} instance {} with instance {}",
@@ -4877,13 +5187,21 @@ impl RTcpTunnelMap {
                 existing.instance_id(),
                 tunnel.instance_id()
             );
-            all_tunnel.remove_verified_instance(existing.instance_id());
+            all_tunnel.remove_instance_binding(existing.instance_id());
         }
         info!(
             "register outbound RTcp tunnel {} instance {}",
             tunnel_key,
             tunnel.instance_id()
         );
+        if let Some(binding) = binding {
+            all_tunnel.record_instance_binding(
+                &tunnel,
+                &binding.logical_did,
+                &binding.canonical_dev_did,
+                tunnel_key,
+            );
+        }
         all_tunnel.tunnels.insert(tunnel_key.to_owned(), tunnel);
         Ok(())
     }
@@ -4905,7 +5223,7 @@ impl RTcpTunnelMap {
             // authority/supersession kick.  It must not republish the closed
             // instance or scan and kick unrelated tunnels.
             all_tunnel.remove_primary_if_instance(tunnel_key, tunnel.instance_id());
-            all_tunnel.remove_verified_instance(tunnel.instance_id());
+            all_tunnel.remove_instance_binding(tunnel.instance_id());
             return InboundTunnelRegistration {
                 accepted: false,
                 replaced: None,
@@ -4914,12 +5232,74 @@ impl RTcpTunnelMap {
             };
         }
 
+        if let Some(identity) = verified_identity.as_ref() {
+            // One-to-one gate 1: the canonical DEV DID must not be bound to a
+            // different live verified logical name. A conflicting connection
+            // is rejected before the primary insert so it can never replace
+            // the legitimate binding's tunnel.
+            if let Some(bound_logical) = all_tunnel
+                .conflicting_logical_binding(&identity.logical_did, &identity.canonical_dev_did)
+            {
+                warn!(
+                    "reject authenticated inbound RTcp tunnel {} instance {}: {}",
+                    tunnel_key,
+                    tunnel.instance_id(),
+                    Self::binding_conflict_message(
+                        &identity.logical_did,
+                        &identity.canonical_dev_did,
+                        &bound_logical,
+                    )
+                );
+                return InboundTunnelRegistration {
+                    accepted: false,
+                    replaced: None,
+                    superseded: Vec::new(),
+                    rejected: Some(tunnel),
+                };
+            }
+            // One-to-one gate 2: a live same-name tunnel whose committed
+            // document shares the candidate's revision iat but not its
+            // content is a same-version conflict. name-client's CAS rejects
+            // this ordering with RejectedConflict before we get here; this
+            // in-map re-check keeps the race window fail-closed instead of
+            // letting two bindings stay current.
+            if let Some(entries) = all_tunnel
+                .verified_by_logical_did
+                .get(&identity.logical_did)
+            {
+                let conflicting = entries.values().find(|entry| {
+                    !entry.tunnel.is_closed()
+                        && entry.document_revision.iat == identity.document_revision.iat
+                        && entry.document_revision != identity.document_revision
+                });
+                if let Some(entry) = conflicting {
+                    error!(
+                        "reject authenticated inbound RTcp tunnel {} instance {}: verified \
+                         document for {} conflicts at the same revision iat {} with active \
+                         instance {} under {}",
+                        tunnel_key,
+                        tunnel.instance_id(),
+                        identity.logical_did,
+                        identity.document_revision.iat,
+                        entry.instance_id,
+                        entry.canonical_key
+                    );
+                    return InboundTunnelRegistration {
+                        accepted: false,
+                        replaced: None,
+                        superseded: Vec::new(),
+                        rejected: Some(tunnel),
+                    };
+                }
+            }
+        }
+
         let old_tunnel = all_tunnel
             .tunnels
             .insert(tunnel_key.to_owned(), tunnel.clone());
         if let Some(old_tunnel) = old_tunnel.as_ref() {
             old_tunnel.mark_closed();
-            all_tunnel.remove_verified_instance(old_tunnel.instance_id());
+            all_tunnel.remove_instance_binding(old_tunnel.instance_id());
             info!(
                 "replace authenticated inbound RTcp tunnel {}: instance {} -> {}",
                 tunnel_key,
@@ -4949,9 +5329,12 @@ impl RTcpTunnelMap {
                 .entry(logical_did.clone())
                 .or_default()
                 .insert(tunnel.instance_id(), new_entry);
-            all_tunnel
-                .logical_did_by_instance
-                .insert(tunnel.instance_id(), logical_did.clone());
+            all_tunnel.record_instance_binding(
+                &tunnel,
+                &logical_did,
+                &identity.canonical_dev_did,
+                tunnel_key,
+            );
 
             let indexed: Vec<VerifiedTunnelIndexEntry> = all_tunnel
                 .verified_by_logical_did
@@ -4975,6 +5358,9 @@ impl RTcpTunnelMap {
                     // Mark under the map lock so no operation can start on the
                     // superseded key after the new revision is published.
                     // Waiter cleanup and transport shutdown remain lock-free.
+                    // Removing the entry below also releases the old canonical
+                    // key's reverse binding, completing the name's move to the
+                    // new canonical DEV DID in the same critical section.
                     entry.tunnel.mark_closed();
                     stale_instance_ids.push(entry.instance_id);
                     all_tunnel.remove_primary_if_instance(&entry.canonical_key, entry.instance_id);
@@ -4991,35 +5377,26 @@ impl RTcpTunnelMap {
                     continue;
                 }
 
-                if entry.document_revision.iat == new_revision.iat {
-                    if entry.document_revision == new_revision {
-                        if entry.canonical_key != tunnel_key {
-                            warn!(
-                                "same verified document revision for {} is active under different \
-                                 canonical keys: {} (instance {}) and {} (instance {}); keep both",
-                                logical_did,
-                                entry.canonical_key,
-                                entry.instance_id,
-                                tunnel_key,
-                                tunnel.instance_id()
-                            );
-                        }
-                    } else {
-                        error!(
-                            "conflicting same-iat verified document revisions for {} remain active: \
-                             {:?} under {} and {:?} under {}; keep both",
-                            logical_did,
-                            entry.document_revision,
-                            entry.canonical_key,
-                            new_revision,
-                            tunnel_key
-                        );
-                    }
+                if entry.document_revision == new_revision && entry.canonical_key != tunnel_key {
+                    // One document implies one default key and thus one
+                    // canonical tunnel key. If this impossible-looking state
+                    // is observed, log it but do not invent an ordering.
+                    // A same-iat *different* revision cannot reach this scan:
+                    // gate 2 rejects it before the primary insert.
+                    warn!(
+                        "same verified document revision for {} is active under different \
+                         canonical keys: {} (instance {}) and {} (instance {}); keep both",
+                        logical_did,
+                        entry.canonical_key,
+                        entry.instance_id,
+                        tunnel_key,
+                        tunnel.instance_id()
+                    );
                 }
             }
 
             for instance_id in stale_instance_ids {
-                all_tunnel.remove_verified_instance(instance_id);
+                all_tunnel.remove_instance_binding(instance_id);
             }
         }
 
@@ -5174,35 +5551,48 @@ impl RTcpTunnelMap {
                 tunnel.instance_id()
             );
         }
-        all_tunnel.remove_verified_instance(tunnel.instance_id());
+        all_tunnel.remove_instance_binding(tunnel.instance_id());
         is_current
     }
 
     // AuthorityNotCurrent/definite-negative handling reuses this entry point:
-    // only authoritatively verified named tunnels are indexed, so an
-    // anonymous or self-declared name can never target this operation.
-    // Instances are marked and detached while locked, then shut down outside
-    // the critical section.  The commit guard prevents an accepted handshake
-    // from sitting between cache CAS and index publication while a negative
-    // authority result scans the bucket.
+    // only verified named identities hold bindings, so an anonymous or
+    // self-declared name can never target this operation. It drains every
+    // instance bound to the logical name -- inbound committed tunnels and
+    // outbound tunnels created for the name alike. Instances are marked and
+    // detached while locked, then shut down outside the critical section.
+    // The commit guard prevents an accepted handshake from sitting between
+    // cache CAS and index publication while a negative authority result
+    // scans the bindings.
     pub async fn close_verified_identity(&self, logical_did: &str, reason: &str) -> usize {
         let _commit_guard = self.authenticated_commit_lock.lock().await;
         let tunnels = {
             let mut all_tunnel = self.tunnel_map.lock().await;
-            let entries = all_tunnel
-                .verified_by_logical_did
-                .remove(logical_did)
-                .unwrap_or_default();
-            let mut tunnels = Vec::with_capacity(entries.len());
-            for (instance_id, entry) in entries {
-                all_tunnel.logical_did_by_instance.remove(&instance_id);
-                entry.tunnel.mark_closed();
-                all_tunnel.remove_primary_if_instance(&entry.canonical_key, instance_id);
+            let bound_instance_ids: Vec<u64> = all_tunnel
+                .binding_by_instance
+                .iter()
+                .filter(|(_, binding)| binding.logical_did == logical_did)
+                .map(|(instance_id, _)| *instance_id)
+                .collect();
+            let mut tunnels = Vec::with_capacity(bound_instance_ids.len());
+            for instance_id in bound_instance_ids {
+                let Some(binding) = all_tunnel.binding_by_instance.get(&instance_id).cloned()
+                else {
+                    continue;
+                };
+                let revision = all_tunnel
+                    .verified_by_logical_did
+                    .get(logical_did)
+                    .and_then(|entries| entries.get(&instance_id))
+                    .map(|entry| entry.document_revision.clone());
+                binding.tunnel.mark_closed();
+                all_tunnel.remove_primary_if_instance(&binding.canonical_key, instance_id);
+                all_tunnel.remove_instance_binding(instance_id);
                 info!(
                     "close verified RTcp tunnel for {} after {}: key {}, instance {}, revision {:?}",
-                    logical_did, reason, entry.canonical_key, instance_id, entry.document_revision
+                    logical_did, reason, binding.canonical_key, instance_id, revision
                 );
-                tunnels.push(entry.tunnel);
+                tunnels.push(binding.tunnel);
             }
             tunnels
         };
@@ -5261,8 +5651,33 @@ impl RTcpTunnelMap {
         self.tunnel_map
             .lock()
             .await
-            .logical_did_by_instance
+            .binding_by_instance
             .contains_key(&tunnel.instance_id())
+    }
+
+    #[cfg(test)]
+    async fn bound_logical_for_dev(&self, canonical_dev_did: &str) -> Option<String> {
+        self.tunnel_map
+            .lock()
+            .await
+            .binding_by_canonical_dev
+            .get(canonical_dev_did)
+            .map(|binding| binding.logical_did.clone())
+    }
+
+    #[cfg(test)]
+    async fn binding_len(&self) -> usize {
+        let state = self.tunnel_map.lock().await;
+        debug_assert_eq!(
+            state.binding_by_instance.len(),
+            state
+                .binding_by_canonical_dev
+                .values()
+                .map(|binding| binding.instances.len())
+                .sum::<usize>(),
+            "binding index directions must stay consistent"
+        );
+        state.binding_by_instance.len()
     }
 }
 #[cfg(test)]
@@ -5312,9 +5727,23 @@ mod tests {
         )
     }
 
+    // The canonical DEV DID follows the content hash: rotating to a new
+    // revision hash models a key rotation, while cloning the same identity
+    // keeps the same canonical device, matching how production derives the
+    // canonical DID from the verified document's default key.
     fn verified_test_identity(logical_did: &str, iat: u64, hash: &str) -> VerifiedTunnelIdentity {
+        verified_test_identity_bound(logical_did, iat, hash, &format!("did:dev:{}", hash))
+    }
+
+    fn verified_test_identity_bound(
+        logical_did: &str,
+        iat: u64,
+        hash: &str,
+        canonical_dev_did: &str,
+    ) -> VerifiedTunnelIdentity {
         VerifiedTunnelIdentity {
             logical_did: logical_did.to_string(),
+            canonical_dev_did: canonical_dev_did.to_string(),
             document_revision: DocumentRevision {
                 iat,
                 content_hash: hash.to_string(),
@@ -5533,6 +5962,13 @@ mod tests {
         assert!(!map.is_verified_instance_indexed(&old_tunnel).await);
         assert!(map.is_verified_instance_indexed(&new_tunnel).await);
         assert_eq!(map.verified_identity_len(logical_did).await, 1);
+        // The higher revision moved the name's binding to the new canonical
+        // dev in the same commit sequence; the old canonical key is released.
+        assert_eq!(map.bound_logical_for_dev("did:dev:rev-1").await, None);
+        assert_eq!(
+            map.bound_logical_for_dev("did:dev:rev-2").await,
+            Some(logical_did.to_string())
+        );
 
         assert!(
             !map.remove_if_current(old_key, &old_tunnel).await,
@@ -5766,7 +6202,433 @@ mod tests {
         assert!(second.is_closed());
         assert!(!key_only.is_closed());
         assert_eq!(map.verified_identity_len(logical_did).await, 0);
+        assert_eq!(map.binding_len().await, 0);
         assert_eq!(map.primary_len().await, 1);
+    }
+
+    #[tokio::test]
+    async fn inbound_second_logical_name_for_same_canonical_dev_is_rejected() {
+        let map = RTcpTunnelMap::new();
+        let shared_dev = "did:dev:shared-binding-key";
+        let tunnel_key = "local_did:dev:shared-binding-key";
+        let (first, _first_peer) = test_tunnel(60);
+        let (second, _second_peer) = test_tunnel(61);
+
+        assert!(
+            map.complete_authenticated_inbound_with_outcome(
+                tunnel_key,
+                first.clone(),
+                Some((
+                    verified_test_identity_bound("did:web:name-a.example", 5, "doc-a", shared_dev),
+                    CacheWriteOutcome::Inserted,
+                )),
+            )
+            .await
+        );
+        assert_eq!(
+            map.bound_logical_for_dev(shared_dev).await,
+            Some("did:web:name-a.example".to_string())
+        );
+
+        // The conflicting name arrives under the SAME canonical tunnel key
+        // (it proves possession of the same device key). It must be rejected
+        // and must not replace the legitimate binding's tunnel.
+        assert!(
+            !map.complete_authenticated_inbound_with_outcome(
+                tunnel_key,
+                second.clone(),
+                Some((
+                    verified_test_identity_bound("did:web:name-b.example", 6, "doc-b", shared_dev),
+                    CacheWriteOutcome::Inserted,
+                )),
+            )
+            .await
+        );
+
+        assert!(second.is_closed());
+        assert!(!first.is_closed());
+        assert!(
+            map.get_tunnel(tunnel_key)
+                .await
+                .unwrap()
+                .is_same_instance(&first)
+        );
+        assert_eq!(
+            map.bound_logical_for_dev(shared_dev).await,
+            Some("did:web:name-a.example".to_string())
+        );
+        assert!(!map.is_verified_instance_indexed(&second).await);
+        assert_eq!(map.verified_identity_len("did:web:name-b.example").await, 0);
+    }
+
+    #[tokio::test]
+    async fn concurrent_conflicting_names_admit_exactly_one_binding() {
+        const RACERS: usize = 8;
+        let map = RTcpTunnelMap::new();
+        let shared_dev = "did:dev:race-binding-key";
+        let tunnel_key = "local_did:dev:race-binding-key";
+        let barrier = Arc::new(tokio::sync::Barrier::new(RACERS));
+        let mut tunnels = Vec::new();
+        let mut peers = Vec::new();
+        for i in 0..RACERS {
+            let (tunnel, peer) = test_tunnel(70 + i as u8);
+            tunnels.push(tunnel);
+            peers.push(peer);
+        }
+
+        let mut handles = Vec::new();
+        for (i, tunnel) in tunnels.iter().cloned().enumerate() {
+            let map = map.clone();
+            let barrier = barrier.clone();
+            handles.push(tokio::spawn(async move {
+                barrier.wait().await;
+                map.complete_authenticated_inbound_with_outcome(
+                    tunnel_key,
+                    tunnel,
+                    Some((
+                        verified_test_identity_bound(
+                            &format!("did:web:racer-{}.example", i),
+                            5,
+                            &format!("doc-{}", i),
+                            shared_dev,
+                        ),
+                        CacheWriteOutcome::Inserted,
+                    )),
+                )
+                .await
+            }));
+        }
+        let mut accepted = 0;
+        for handle in handles {
+            if handle.await.unwrap() {
+                accepted += 1;
+            }
+        }
+
+        assert_eq!(
+            accepted, 1,
+            "exactly one logical name may win the canonical dev binding"
+        );
+        let current = map
+            .get_tunnel(tunnel_key)
+            .await
+            .expect("winner tunnel must stay current");
+        assert!(!current.is_closed());
+        let mut open = 0;
+        for tunnel in &tunnels {
+            if !tunnel.is_closed() {
+                open += 1;
+                assert!(current.is_same_instance(tunnel));
+            }
+        }
+        assert_eq!(open, 1);
+        assert_eq!(map.binding_len().await, 1);
+        assert!(map.bound_logical_for_dev(shared_dev).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn same_revision_conflicting_content_is_rejected_fail_closed() {
+        let map = RTcpTunnelMap::new();
+        let logical_did = "did:web:same-iat-conflict.example";
+        let key_a = "local_did:dev:same-iat-a";
+        let key_b = "local_did:dev:same-iat-b";
+        let (first, _first_peer) = test_tunnel(80);
+        let (second, _second_peer) = test_tunnel(81);
+
+        assert!(
+            map.complete_authenticated_inbound_with_outcome(
+                key_a,
+                first.clone(),
+                Some((
+                    verified_test_identity(logical_did, 7, "content-a"),
+                    CacheWriteOutcome::Inserted,
+                )),
+            )
+            .await
+        );
+
+        // name-client's CAS reports a same-iat different-content write as
+        // RejectedConflict: definite rejection, current binding untouched.
+        assert!(
+            !map.complete_authenticated_inbound_with_outcome(
+                key_b,
+                second.clone(),
+                Some((
+                    verified_test_identity(logical_did, 7, "content-b"),
+                    CacheWriteOutcome::RejectedConflict,
+                )),
+            )
+            .await
+        );
+        assert!(second.is_closed());
+        assert!(!first.is_closed());
+
+        // Defense in depth: even a stored outcome cannot publish a same-iat
+        // different-content revision while the current one is live -- the
+        // in-map same-version gate keeps the race window fail-closed.
+        let (third, _third_peer) = test_tunnel(82);
+        assert!(
+            !map.complete_authenticated_inbound_with_outcome(
+                key_b,
+                third.clone(),
+                Some((
+                    verified_test_identity(logical_did, 7, "content-c"),
+                    CacheWriteOutcome::ReplacedOlder,
+                )),
+            )
+            .await
+        );
+        assert!(third.is_closed());
+        assert!(!first.is_closed());
+        assert_eq!(map.verified_identity_len(logical_did).await, 1);
+        assert!(
+            map.get_tunnel(key_a)
+                .await
+                .unwrap()
+                .is_same_instance(&first)
+        );
+    }
+
+    #[tokio::test]
+    async fn outbound_binding_arbitrates_reuse_and_cleanup() {
+        let map = RTcpTunnelMap::new();
+        let dev = "did:dev:outbound-bound-key";
+        let key = "local_did:dev:outbound-bound-key";
+        let binding_a = OutboundNameBinding {
+            logical_did: "did:web:out-a.example".to_string(),
+            canonical_dev_did: dev.to_string(),
+        };
+        let binding_b = OutboundNameBinding {
+            logical_did: "did:web:out-b.example".to_string(),
+            canonical_dev_did: dev.to_string(),
+        };
+        let (tunnel, _peer) = test_tunnel(84);
+
+        assert!(
+            map.acquire_outbound(key, Some(&binding_a))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            map.register_outbound_if_absent(key, tunnel.clone(), Some(&binding_a))
+                .await
+                .is_ok()
+        );
+        assert_eq!(
+            map.bound_logical_for_dev(dev).await,
+            Some(binding_a.logical_did.clone())
+        );
+
+        // Direct did:dev reuse carries no binding and shares the tunnel.
+        let reused = map
+            .acquire_outbound(key, None)
+            .await
+            .unwrap()
+            .expect("direct dev addressing must reuse the bound tunnel");
+        assert!(reused.is_same_instance(&tunnel));
+
+        // The same name reuses; a second name is rejected explicitly.
+        assert!(
+            map.acquire_outbound(key, Some(&binding_a))
+                .await
+                .unwrap()
+                .unwrap()
+                .is_same_instance(&tunnel)
+        );
+        let err = match map.acquire_outbound(key, Some(&binding_b)).await {
+            Err(err) => err,
+            Ok(_) => panic!("second logical name must not silently reuse the bound tunnel"),
+        };
+        assert!(
+            err.contains("out-a.example"),
+            "conflict must name the bound logical: {err}"
+        );
+        match map
+            .register_outbound_if_absent(key, tunnel.clone(), Some(&binding_b))
+            .await
+        {
+            Err(OutboundRegisterError::BindingConflict(err)) => {
+                assert!(err.contains("out-a.example"))
+            }
+            _ => panic!("second logical name registration must report a binding conflict"),
+        }
+
+        // run-loop exit cleanup releases both index directions.
+        assert!(map.remove_if_current(key, &tunnel).await);
+        assert_eq!(map.binding_len().await, 0);
+        assert_eq!(map.bound_logical_for_dev(dev).await, None);
+    }
+
+    #[tokio::test]
+    async fn named_reuse_of_unbound_tunnel_records_binding() {
+        let map = RTcpTunnelMap::new();
+        let dev = "did:dev:late-bound-key";
+        let key = "local_did:dev:late-bound-key";
+        let (tunnel, _peer) = test_tunnel(85);
+        assert!(
+            map.register_outbound_if_absent(key, tunnel.clone(), None)
+                .await
+                .is_ok()
+        );
+        assert_eq!(map.binding_len().await, 0);
+
+        // The first named reuse claims the binding...
+        let binding_a = OutboundNameBinding {
+            logical_did: "did:web:late-a.example".to_string(),
+            canonical_dev_did: dev.to_string(),
+        };
+        assert!(
+            map.acquire_outbound(key, Some(&binding_a))
+                .await
+                .unwrap()
+                .unwrap()
+                .is_same_instance(&tunnel)
+        );
+        assert_eq!(
+            map.bound_logical_for_dev(dev).await,
+            Some(binding_a.logical_did.clone())
+        );
+        // ...so a second name can no longer share the same device silently.
+        let binding_b = OutboundNameBinding {
+            logical_did: "did:web:late-b.example".to_string(),
+            canonical_dev_did: dev.to_string(),
+        };
+        assert!(map.acquire_outbound(key, Some(&binding_b)).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn closed_instances_do_not_defend_a_binding() {
+        let map = RTcpTunnelMap::new();
+        let shared_dev = "did:dev:stale-binding-key";
+        let tunnel_key = "local_did:dev:stale-binding-key";
+        let (first, _first_peer) = test_tunnel(86);
+        let (second, _second_peer) = test_tunnel(87);
+
+        assert!(
+            map.complete_authenticated_inbound_with_outcome(
+                tunnel_key,
+                first.clone(),
+                Some((
+                    verified_test_identity_bound("did:web:stale-a.example", 3, "doc-a", shared_dev),
+                    CacheWriteOutcome::Inserted,
+                )),
+            )
+            .await
+        );
+        // The bound instance died (marked closed) but its run-loop cleanup
+        // has not run yet. A different name may then claim the canonical
+        // dev: the stale binding is pruned instead of blocking it.
+        first.mark_closed();
+        assert!(
+            map.complete_authenticated_inbound_with_outcome(
+                tunnel_key,
+                second.clone(),
+                Some((
+                    verified_test_identity_bound("did:web:stale-b.example", 4, "doc-b", shared_dev),
+                    CacheWriteOutcome::Inserted,
+                )),
+            )
+            .await
+        );
+        assert_eq!(
+            map.bound_logical_for_dev(shared_dev).await,
+            Some("did:web:stale-b.example".to_string())
+        );
+        assert!(
+            map.get_tunnel(tunnel_key)
+                .await
+                .unwrap()
+                .is_same_instance(&second)
+        );
+        assert_eq!(map.binding_len().await, 1);
+    }
+
+    #[tokio::test]
+    async fn outbound_binding_blocks_conflicting_inbound_name() {
+        let map = RTcpTunnelMap::new();
+        let dev = "did:dev:cross-bound-key";
+        let key = "local_did:dev:cross-bound-key";
+        let (outbound, _outbound_peer) = test_tunnel(88);
+        let binding = OutboundNameBinding {
+            logical_did: "did:web:cross-out.example".to_string(),
+            canonical_dev_did: dev.to_string(),
+        };
+        assert!(
+            map.register_outbound_if_absent(key, outbound.clone(), Some(&binding))
+                .await
+                .is_ok()
+        );
+
+        let (inbound, _inbound_peer) = test_tunnel(89);
+        assert!(
+            !map.complete_authenticated_inbound_with_outcome(
+                key,
+                inbound.clone(),
+                Some((
+                    verified_test_identity_bound("did:web:cross-in.example", 9, "doc-in", dev),
+                    CacheWriteOutcome::Inserted,
+                )),
+            )
+            .await
+        );
+        assert!(inbound.is_closed());
+        assert!(!outbound.is_closed());
+        assert!(map.get_tunnel(key).await.unwrap().is_same_instance(&outbound));
+
+        // The same name arriving inbound replaces the outbound tunnel via the
+        // normal last-accepted-wins path and keeps the binding.
+        let (inbound_same, _inbound_same_peer) = test_tunnel(90);
+        assert!(
+            map.complete_authenticated_inbound_with_outcome(
+                key,
+                inbound_same.clone(),
+                Some((
+                    verified_test_identity_bound("did:web:cross-out.example", 9, "doc-out", dev),
+                    CacheWriteOutcome::Inserted,
+                )),
+            )
+            .await
+        );
+        assert!(outbound.is_closed());
+        assert!(
+            map.get_tunnel(key)
+                .await
+                .unwrap()
+                .is_same_instance(&inbound_same)
+        );
+        assert_eq!(
+            map.bound_logical_for_dev(dev).await,
+            Some("did:web:cross-out.example".to_string())
+        );
+        assert_eq!(map.binding_len().await, 1);
+    }
+
+    #[tokio::test]
+    async fn authority_negative_also_closes_outbound_bound_tunnels() {
+        let map = RTcpTunnelMap::new();
+        let logical = "did:web:authority-outbound.example";
+        let dev = "did:dev:authority-outbound-key";
+        let key = "local_did:dev:authority-outbound-key";
+        let (outbound, _peer) = test_tunnel(93);
+        let binding = OutboundNameBinding {
+            logical_did: logical.to_string(),
+            canonical_dev_did: dev.to_string(),
+        };
+        assert!(
+            map.register_outbound_if_absent(key, outbound.clone(), Some(&binding))
+                .await
+                .is_ok()
+        );
+
+        assert_eq!(
+            map.close_verified_identity(logical, "AuthorityNotCurrent")
+                .await,
+            1
+        );
+        assert!(outbound.is_closed());
+        assert!(map.get_tunnel(key).await.is_none());
+        assert_eq!(map.binding_len().await, 0);
     }
 
     #[tokio::test]
@@ -5777,14 +6639,20 @@ mod tests {
         let (extra, _extra_peer) = test_tunnel(31);
 
         assert!(
-            map.register_outbound_if_absent(key, first.clone())
+            map.register_outbound_if_absent(key, first.clone(), None)
                 .await
                 .is_ok()
         );
-        let existing = map
-            .register_outbound_if_absent(key, extra)
+        let existing = match map
+            .register_outbound_if_absent(key, extra, None)
             .await
-            .expect_err("outbound race must preserve the first registered tunnel");
+            .expect_err("outbound race must preserve the first registered tunnel")
+        {
+            OutboundRegisterError::Existing(existing) => existing,
+            OutboundRegisterError::BindingConflict(conflict) => {
+                panic!("unbound outbound race must not report a binding conflict: {conflict}")
+            }
+        };
         assert!(existing.is_same_instance(&first));
 
         first.close().await;
@@ -6597,32 +7465,108 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_rtcp_multiple_names_to_same_dev_share_key_by_design() {
+    async fn test_rtcp_second_logical_name_to_same_dev_is_rejected() {
         let _ = init_name_lib_for_test(&HashMap::new()).await;
-        let (local_config, local_pkcs8_bytes) = test_device_config("multi-name-key-local");
-        let (remote_config, _) = test_device_config("multi-name-key-remote");
-        let alias_a = "rtcp-alias-a.devtests.org";
-        let alias_b = "rtcp-alias-b.devtests.org";
-        add_rtcp_alias(alias_a, &remote_config.id).await;
-        add_rtcp_alias(alias_b, &remote_config.id).await;
+        let (server_config, server_key) = test_device_config("one-binding-server");
+        let (client_config, client_key) = test_device_config("one-binding-client");
+        cache_test_device(&server_config).await;
+        cache_test_device(&client_config).await;
+        let alias_a = "rtcp-one-binding-a.devtests.org";
+        let alias_b = "rtcp-one-binding-b.devtests.org";
+        add_rtcp_alias(alias_a, &server_config.id).await;
+        add_rtcp_alias(alias_b, &server_config.id).await;
 
-        let mut inner = RTcpInner::new(
-            local_config.id.clone(),
-            "127.0.0.1:0".to_string(),
-            Some(local_pkcs8_bytes),
+        let server_port = unused_tcp_port();
+        let mut server = RTcp::new(
+            server_config.id.clone(),
+            format!("127.0.0.1:{}", server_port),
+            Some(server_key),
             None,
             Arc::new(MockRTcpListener::new()),
         );
-        inner.security.peer_identity.dns_txt_bootstrap = true;
-        let by_alias_a = parse_rtcp_stack_id(&format!("{}:2981", alias_a)).unwrap();
-        let by_alias_b = parse_rtcp_stack_id(&format!("{}:2981", alias_b)).unwrap();
+        allow_named_key_fallback(&mut server);
+        server.start().await.unwrap();
+        let mut client = RTcp::new(
+            client_config.id.clone(),
+            format!("127.0.0.1:{}", unused_tcp_port()),
+            Some(client_key),
+            None,
+            Arc::new(MockRTcpListener::new()),
+        );
+        enable_txt_bootstrap(&mut client);
+        client.start().await.unwrap();
 
-        // This is intentionally not a compatibility fallback: two logical
-        // device names resolving to the same DEV DID are invalid device
-        // modeling, and RTCP treats them as the same device identity.
+        // Two logical names resolving to the same DEV DID share the canonical
+        // tunnel key by construction...
+        let by_alias_a = parse_rtcp_stack_id(&format!("{}:{}", alias_a, server_port)).unwrap();
+        let by_alias_b = parse_rtcp_stack_id(&format!("{}:{}", alias_b, server_port)).unwrap();
         assert_eq!(
-            inner.compute_tunnel_key(&by_alias_a).await.unwrap(),
-            inner.compute_tunnel_key(&by_alias_b).await.unwrap()
+            client.inner.compute_tunnel_key(&by_alias_a).await.unwrap(),
+            client.inner.compute_tunnel_key(&by_alias_b).await.unwrap()
+        );
+
+        let first_handle = client
+            .create_tunnel(Some(&format!("{}:{}", alias_a, server_port)))
+            .await
+            .unwrap();
+        first_handle.ping().await.unwrap();
+
+        let client_tunnel_key = format!(
+            "{}_{}",
+            client_config.id.to_string(),
+            server_config.id.to_string()
+        );
+        let bound_instance =
+            wait_for_current_tunnel(&client.inner.tunnel_map, &client_tunnel_key, None)
+                .await
+                .instance_id();
+
+        // ...but two names for one device is invalid device modeling under
+        // the one-to-one binding: the second name is rejected explicitly
+        // instead of silently reusing the first name's tunnel.
+        let err = match client
+            .create_tunnel(Some(&format!("{}:{}", alias_b, server_port)))
+            .await
+        {
+            Ok(_) => panic!("second logical name to the same canonical dev must be rejected"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("one-to-one name binding")
+                && err.to_string().contains("rtcp-one-binding-a"),
+            "unexpected error: {}",
+            err
+        );
+
+        // The legitimate binding's tunnel stays untouched, and direct did:dev
+        // addressing is not a second logical name: it keeps sharing the
+        // device tunnel.
+        let dev_handle = client
+            .create_tunnel(Some(&format!(
+                "{}:{}",
+                server_config.id.to_host_name(),
+                server_port
+            )))
+            .await
+            .unwrap();
+        dev_handle.ping().await.unwrap();
+        assert_eq!(
+            client
+                .inner
+                .tunnel_map
+                .get_tunnel(&client_tunnel_key)
+                .await
+                .unwrap()
+                .instance_id(),
+            bound_instance
+        );
+        assert_eq!(
+            client
+                .inner
+                .tunnel_map
+                .bound_logical_for_dev(&server_config.id.to_string())
+                .await,
+            Some(by_alias_a.did.to_string())
         );
     }
 
@@ -7862,6 +8806,7 @@ mod tests {
             document: verified.document.clone(),
             identity: VerifiedTunnelIdentity {
                 logical_did: verified.subject_did.to_string(),
+                canonical_dev_did: canonical_dev_did_from_ed25519_pk(&verified_key).to_string(),
                 document_revision: verified.revision.clone(),
             },
         });

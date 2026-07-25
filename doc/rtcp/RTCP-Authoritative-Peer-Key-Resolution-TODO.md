@@ -1,7 +1,7 @@
 # RTCP Peer Identity、Tunnel 与 Stream 安全收口 TODO
 
 状态：**v3 安全收口 DONE（2026-07-24）；逻辑名字与 canonical DEV DID 一一绑定
-follow-up OPEN**
+follow-up DONE（2026-07-24）**
 
 本轮已完成的实现收口：
 
@@ -26,8 +26,7 @@ follow-up OPEN**
 
 清单状态已按当前代码回填：
 
-- `[x]` 表示 RTCP v3 本轮已经落地并验证；
-- `[ ]` 只用于文首“一一绑定” follow-up，表示它仍是独立开放任务；
+- `[x]` 表示已经落地并验证（含 v3 收口与“一一绑定” follow-up）；
 - `Deferred` 表示已完成取舍、但明确不属于本轮发布阻塞项，不能解释成已实现。
 
 原清单中依赖未来上游 API 的 `NotProvenRegressed` 类型收编、仓库当前不存在承载面的
@@ -60,12 +59,20 @@ metrics backend，以及 authenticated close / HelloStream MAC 不作为本次�
 代码任务、测试和验收标准，作为 v3 收口的审计轨迹；当前实现真值以文首完成记录及
 `rtcp.md` 为准。后续维护不得把 review 中已经过时的认证行为重新带回代码。
 
-## Follow-up：逻辑名字与 canonical DEV DID 一一绑定（OPEN）
+## Follow-up：逻辑名字与 canonical DEV DID 一一绑定（DONE 2026-07-24）
 
-本 follow-up 不改变 RTCP v3 的 tunnel 可用性定义，也预计不需要修改线协议。目标是补齐
+本 follow-up 不改变 RTCP v3 的 tunnel 可用性定义，也没有修改线协议。目标是补齐
 身份模型的本地仲裁：对 `did:web` / `did:bns` 等具名设备，只接受一个逻辑名字与一个
 canonical `did:dev` 的一一绑定。直接使用同一 `did:dev` 寻址不算第二个逻辑名字，仍应
 与该设备的具名寻址复用同一设备 tunnel。
+
+实现真值见 [`rtcp.md`](rtcp.md) §3.1/§3.4/§5：`RTcpTunnelMapState` 增加
+`binding_by_canonical_dev` 反向唯一性索引与 `binding_by_instance` 实例绑定表；
+入站在 `replace_authenticated_inbound` 的提交序列内做绑定门与 same-version 冲突门，
+握手路径另有 rejection-only 预检查；出站 `acquire_outbound` /
+`register_outbound_if_absent` 在复用与注册前仲裁具名绑定（DeviceDocument 与 DNS TXT
+bootstrap 名字参与绑定；zone 目标与裸 `did:dev` 不参与）；权威否定
+`close_verified_identity` 连同出站具名绑定实例一并踢除。
 
 目标语义：
 
@@ -78,32 +85,53 @@ canonical `did:dev` 的一一绑定。直接使用同一 `did:dev` 寻址不算�
 - same-version 不同内容属于冲突，必须 fail closed，不能让两个绑定同时保持 current；
 - 裸 `did:dev` 的 key identity 不自动获得具名身份的 owner/zone 权限。
 
-当前实现与上述目标不完全一致：
+任务启动时与上述目标不一致、现已收口的事实：
 
-- `RTcpInner::format_tunnel_key()` 只使用双方 canonical DEV DID（以及可选 bootstrap URL），
-  不包含或校验逻辑名字；
-- `RTcpTunnelMap` 只有 `logical DID -> tunnel instances` 二级索引，没有
-  `canonical DEV DID -> logical DID` 的反向唯一性索引；
-- `test_rtcp_multiple_names_to_same_dev_share_key_by_design` 当前明确断言两个不同逻辑名字
-  解析到同一 DEV DID 时共享 tunnel key，这与一一绑定目标相反；
-- 同一逻辑名字按 `DocumentRevision` 踢除严格旧 revision 的路径已经存在，应复用现有
-  verified-cache CAS、提交锁和逻辑 DID 二级索引，不另造版本判断规则。
+- `RTcpInner::format_tunnel_key()` 只使用双方 canonical DEV DID（以及可选 bootstrap URL）。
+  这一点保持不变：一一绑定不改 tunnel key 形态，仲裁在 tunnel map 的绑定索引层完成；
+- `RTcpTunnelMap` 原来只有 `logical DID -> tunnel instances` 二级索引，现已补上
+  `canonical DEV DID -> logical DID` 反向唯一性索引（`binding_by_canonical_dev`）；
+- 原 `test_rtcp_multiple_names_to_same_dev_share_key_by_design` 断言两个不同逻辑名字
+  共享 tunnel，已改写为 `test_rtcp_second_logical_name_to_same_dev_is_rejected`
+  冲突拒绝测试；
+- 同一逻辑名字按 `DocumentRevision` 踢除严格旧 revision 的路径复用既有
+  verified-cache CAS、提交锁和逻辑 DID 二级索引，未另造版本判断规则；踢除时在同一
+  临界区释放旧 canonical key 的反向绑定。
 
 实施任务：
 
-- [ ] 在 verified identity 仲裁中增加 canonical DEV DID 到逻辑名字的反向绑定；绑定检查、
+- [x] 在 verified identity 仲裁中增加 canonical DEV DID 到逻辑名字的反向绑定；绑定检查、
       verified-cache commit、主 tunnel map 和两个方向的索引更新必须在同一提交序列中完成。
-- [ ] 出站解析在复用已有 canonical tunnel 前检查已验证名字绑定；不同逻辑名字命中同一
+      （`VerifiedTunnelIdentity` 携带 `canonical_dev_did`；仲裁在
+      `authenticated_commit_lock` + map 临界区内完成。）
+- [x] 出站解析在复用已有 canonical tunnel 前检查已验证名字绑定；不同逻辑名字命中同一
       canonical DEV DID 时明确拒绝，不能静默复用先建立的 tunnel。
-- [ ] 入站具名 tunnel 在 listener 授权和发布前执行相同的一一绑定检查；冲突连接不得替换
-      已存在的合法 tunnel。
-- [ ] 同一逻辑名字的更高版本 DeviceDocument 继续使用 name-client 的 revision/CAS 结果
+      （`acquire_outbound` / `register_outbound_if_absent` 双检查；具名复用会把绑定
+      落到被复用实例上；zone 目标与裸 `did:dev` 不构成设备名绑定。）
+- [x] 入站具名 tunnel 在 listener 授权和发布前执行相同的一一绑定检查；冲突连接不得替换
+      已存在的合法 tunnel。（握手路径 rejection-only 预检查 + 发布时在提交序列内的
+      权威绑定门，拒绝发生在 primary insert 之前。）
+- [x] 同一逻辑名字的更高版本 DeviceDocument 继续使用 name-client 的 revision/CAS 结果
       淘汰旧绑定；same-version 内容冲突按 definite rejection 处理。
-- [ ] 保留“逻辑名字与其 canonical `did:dev` 直接寻址共享设备 tunnel”的行为，并增加测试
+      （CAS `RejectedConflict` 拒绝 + map 内 same-version 门兜底；原“keep both”
+      错误分支已删除。）
+- [x] 保留“逻辑名字与其 canonical `did:dev` 直接寻址共享设备 tunnel”的行为，并增加测试
       区分 direct key DID 与第二个逻辑名字。
-- [ ] 将 `test_rtcp_multiple_names_to_same_dev_share_key_by_design` 改为冲突拒绝测试，并补充
+- [x] 将 `test_rtcp_multiple_names_to_same_dev_share_key_by_design` 改为冲突拒绝测试，并补充
       出站复用、入站并发、换钥升级、same-version conflict 和清理索引的覆盖。
-- [ ] 实现完成后把一一绑定不变量及更高版本 DeviceDocument 优先规则写入 `rtcp.md`。
+      （新增/改写：`test_rtcp_second_logical_name_to_same_dev_is_rejected`、
+      `inbound_second_logical_name_for_same_canonical_dev_is_rejected`、
+      `concurrent_conflicting_names_admit_exactly_one_binding`、
+      `same_revision_conflicting_content_is_rejected_fail_closed`、
+      `outbound_binding_arbitrates_reuse_and_cleanup`、
+      `named_reuse_of_unbound_tunnel_records_binding`、
+      `closed_instances_do_not_defend_a_binding`、
+      `outbound_binding_blocks_conflicting_inbound_name`、
+      `authority_negative_also_closes_outbound_bound_tunnels`，并扩展换钥升级与
+      authority-negative 清理测试的绑定断言。）
+- [x] 实现完成后把一一绑定不变量及更高版本 DeviceDocument 优先规则写入 `rtcp.md`。
+      （§3.1 不变量与绑定生命周期、§3.4 入站步骤、§5 替换资格、§10 出站名字迁移的
+      既定取舍。）
 
 ## 1. Review 结论
 
