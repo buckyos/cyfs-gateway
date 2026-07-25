@@ -4087,14 +4087,28 @@ users:
         assert_eq!(bns["asset_owner"].as_str().unwrap(), bound_controller);
 
         let dns_name = format!("{}.web3.buckyos.ai", PROXY_USER);
+        let bns_krpc = kRPC::new(bns_proxy_url.as_str(), Some(access_token));
+        let result = bns_krpc
+            .call(
+                "bns.publish_dns_txt",
+                json!({
+                    "name": PROXY_USER,
+                    "mode": "add",
+                    "value": "pkx=stale"
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["status"].as_str().unwrap(), "submitted");
+
         let stale_dns =
             NameServer::query(sn.as_ref(), dns_name.as_str(), Some(RecordType::TXT), None)
                 .await
                 .unwrap();
+        assert!(stale_dns.txt.iter().any(|txt| txt == "pkx=stale"));
         assert!(!stale_dns.txt.iter().any(|txt| txt == "pkx=projection"));
         let stale_cache_state = sn.bns_dns_cache_query_state(dns_name.as_str()).unwrap();
 
-        let bns_krpc = kRPC::new(bns_proxy_url.as_str(), Some(access_token));
         let result = bns_krpc
             .call(
                 "bns.publish_dns_txt",

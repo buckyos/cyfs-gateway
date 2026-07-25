@@ -1,4 +1,7 @@
-use crate::sn_did_resolver::{SnDidDocumentSource, SnDidResolveResponse, SnDidResolverProfile};
+use crate::sn_did_resolver::{
+    key_like_string_to_jwk, owner_key_from_config, SnDidDocumentSource, SnDidResolveResponse,
+    SnDidResolverProfile,
+};
 use crate::{
     RelayAssignment, RelayAssignmentState, RelayNodeIpMapReq, RelayNodeIpMapSnapshot, SNUserInfo,
     SnAuthDBRef, SnDeviceInfoDBRef, SnDeviceStateView, UserDnsChangePage, UserDnsLookup,
@@ -7,6 +10,10 @@ use crate::{
 use async_trait::async_trait;
 use bns_client::canonical_bns_name;
 use cyfs_gateway_lib::{server_err, DnsAuthority, ServerError, ServerErrorCode};
+use jsonwebtoken::{
+    jwk::{AlgorithmParameters, Jwk},
+    DecodingKey,
+};
 use log::{debug, warn};
 use name_client::{NameInfo, RecordType};
 use name_lib::{EncodedDocument, DID};
@@ -2512,7 +2519,12 @@ pub fn is_user_dns_control_name(name: &str) -> bool {
 }
 
 fn owner_pkx_from_owner_config(owner: &BnsOwner) -> Option<String> {
-    owner
+    let from_complete_document = owner
+        .owner_config
+        .as_ref()
+        .and_then(owner_key_from_config)
+        .and_then(|jwk| ed25519_jwk_x(&jwk));
+    let from_legacy_config = owner
         .owner_config
         .as_ref()
         .and_then(|value| {
@@ -2521,7 +2533,25 @@ fn owner_pkx_from_owner_config(owner: &BnsOwner) -> Option<String> {
                 .or_else(|| find_string_path(value, &["default_key", "x"]))
                 .or_else(|| find_string_path(value, &["x"]))
         })
-        .or_else(|| owner.effective_owner.clone())
+        .and_then(|value| key_like_string_to_jwk(value.as_str()))
+        .and_then(|jwk| ed25519_jwk_x(&jwk));
+    let from_effective_owner = owner
+        .effective_owner
+        .as_deref()
+        .and_then(key_like_string_to_jwk)
+        .and_then(|jwk| ed25519_jwk_x(&jwk));
+
+    from_complete_document
+        .or(from_legacy_config)
+        .or(from_effective_owner)
+}
+
+fn ed25519_jwk_x(jwk: &Jwk) -> Option<String> {
+    DecodingKey::from_jwk(jwk).ok()?;
+    match &jwk.algorithm {
+        AlgorithmParameters::OctetKeyPair(params) => Some(params.x.clone()),
+        _ => None,
+    }
 }
 
 fn pkx_from_public_key(public_key: &str) -> Option<String> {
@@ -3284,8 +3314,21 @@ mod tests {
             "alice".to_string(),
             BnsOwner {
                 name: "alice".to_string(),
-                effective_owner: Some("alice-owner".to_string()),
-                owner_config: None,
+                // The chain-level asset owner is an EVM address. A complete
+                // OwnerDocument must win when constructing the PKX TXT record.
+                effective_owner: Some("0x70997970c51812dc3a010c7d01b50e0d17dc79c8".to_string()),
+                owner_config: Some(json!({
+                    "id": "did:bns:alice",
+                    "verificationMethod": [{
+                        "id": "#main_key",
+                        "controller": "did:bns:alice",
+                        "publicKeyJwk": {
+                            "kty": "OKP",
+                            "crv": "Ed25519",
+                            "x": "T4Quc1L6Ogu4N2tTKOvneV1yYnBcmhP89B_RsuFsJZ8"
+                        }
+                    }]
+                })),
             },
         );
         bns.documents.insert(
@@ -3334,7 +3377,11 @@ mod tests {
             .resolve_dns("alice.web3.buckyos.test", RecordType::TXT)
             .await
             .unwrap();
-        assert!(web3_txt.txt.iter().any(|value| value == "PKX=alice-owner;"));
+        assert!(web3_txt
+            .txt
+            .iter()
+            .any(|value| { value == "PKX=T4Quc1L6Ogu4N2tTKOvneV1yYnBcmhP89B_RsuFsJZ8;" }));
+        assert!(!web3_txt.txt.iter().any(|value| value.starts_with("PKX=0x")));
         assert!(web3_txt.txt.iter().any(|value| value == "BOOT=alice-boot;"));
         assert!(web3_txt
             .txt
