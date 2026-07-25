@@ -46,6 +46,7 @@ REQUIRED_DIRS = (
     "bns/src",
     "bns/hardhat-scripts",
     "ca",
+    "sn_did_web/.well-known",
     "sn_token_key",
 )
 

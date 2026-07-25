@@ -19,16 +19,17 @@
 #       Accepted risk：吊销后，合法设备若不再连接本节点，本节点上
 #       已建立的旧 tunnel 不会被发现。这是显式接受的风险，实现时
 #       不要隐式"顺手修复"。
-#   D2. 关系档位当前只实现 same_zone | any；same_owner / known_owner /
-#       unknown_owner_escalation=budgeted 预留枚举值，配置了未实现值
-#       必须启动报错，不得静默接受。
+#   D2. 关系档位实现 same_zone | known_owner | any；known_owner 只接受
+#       name-client 已验证的可授权 owner 与 OwnerDocument evidence。
+#       same_owner / unknown_owner_escalation=budgeted 仍为预留枚举值，
+#       配置了未实现值必须启动报错，不得静默接受。
 #   D3. 没有自声明（self-declared）回落路径。离线/首次组网的可用性来自
 #       预置信任材料（set_local_authority_override / 预置 verified cache），
 #       不来自验证放松。
 
 配置 SecurityConfig:
     anonymous: allow | reject          # 具名验证不可用时，能否降级为 key 身份准入
-    named_min_relation: same_zone | any
+    named_min_relation: same_zone | known_owner | any
     authority_reconfirm_max_age: 无限   # 权威确认复用期；懒检查，无后台定时器（D1）
 
 本地锚 LocalAnchor（启动时装好，全部是本地事实）:
@@ -117,6 +118,11 @@ admission_policy = ResolvePolicy(
         如果 owner != anchor.my_owner_did: 返回 失败
         如果 device_doc.zone_did != anchor.my_zone_did: 返回 失败
         # zone_did 取自验签通过的文档 ⇒ owner 背书；zone 只随 owner
+    如果 cfg.named_min_relation == known_owner:
+        如果 verified.usable_as_authz_subject != true: 返回 失败
+        如果 owner 为空: 返回 失败
+        如果 verified.validity.owner_document_source 为空: 返回 失败
+        # 只消费 name-client 的验证证据，不使用 claim.owner
 
     # ⑧ 准入。tunnel 槽位/原子替换仍按 canonical_dev（736a7178 行为不变）。
     #    trust 档位必须随 tunnel 记录，供 process-chain / on_new_tunnel 授权用。

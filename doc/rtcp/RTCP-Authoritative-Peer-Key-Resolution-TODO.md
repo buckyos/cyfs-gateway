@@ -1,6 +1,7 @@
 # RTCP Peer Identity、Tunnel 与 Stream 安全收口 TODO
 
-状态：**DONE（2026-07-24，落地为不兼容 RTCP v3）**
+状态：**v3 安全收口 DONE（2026-07-24）；逻辑名字与 canonical DEV DID 一一绑定
+follow-up OPEN**
 
 本轮已完成的实现收口：
 
@@ -19,13 +20,21 @@
   key/IV 和使用预算；
 - identity provenance、canonical DID、purpose 与目标字段已进入 tunnel endpoint 和
   per-stream process-chain；[`rtcp.md`](rtcp.md) 已重写为当前实现真值。
+- 入站 `known_owner` 关系档位已接通：只消费 name-client 验证后的 `authz_owner` 与
+  OwnerDocument evidence，不信任 claim owner，也不在握手路径增加 method-authority
+  外联。
 
-§4/§5 的方框保留为原 review 的审计基线；本次完成状态以上述收口记录、当前代码和文末
-验证命令为准。原清单中依赖未来上游 API 的 `NotProvenRegressed` 类型收编、仓库当前
-不存在承载面的 metrics backend，以及 authenticated close / HelloStream MAC 不作为
-本次发布阻塞项：前两项继续使用本地 typed freshness 匹配与不含密钥材料的结构化日志，
-后两项已在 `rtcp.md` “Accepted risks” 中明确记录。parser 使用有界 property-style
-单测覆盖任意短输入；仓库未新增 `cargo-fuzz` workspace。
+清单状态已按当前代码回填：
+
+- `[x]` 表示 RTCP v3 本轮已经落地并验证；
+- `[ ]` 只用于文首“一一绑定” follow-up，表示它仍是独立开放任务；
+- `Deferred` 表示已完成取舍、但明确不属于本轮发布阻塞项，不能解释成已实现。
+
+原清单中依赖未来上游 API 的 `NotProvenRegressed` 类型收编、仓库当前不存在承载面的
+metrics backend，以及 authenticated close / HelloStream MAC 不作为本次发布阻塞项：
+前两项继续使用本地 typed freshness 匹配与不含密钥材料的结构化日志，后两项已在
+`rtcp.md` “Accepted risks” 中明确记录。parser 使用有界 property-style 单测覆盖任意
+短输入；仓库未新增 `cargo-fuzz` workspace。
 
 本 TODO 启动时的适用基线：
 
@@ -50,6 +59,51 @@
 本文档曾是上述 review 的统一实施入口。以下正文保留任务启动时按 HEAD 复核的决策、
 代码任务、测试和验收标准，作为 v3 收口的审计轨迹；当前实现真值以文首完成记录及
 `rtcp.md` 为准。后续维护不得把 review 中已经过时的认证行为重新带回代码。
+
+## Follow-up：逻辑名字与 canonical DEV DID 一一绑定（OPEN）
+
+本 follow-up 不改变 RTCP v3 的 tunnel 可用性定义，也预计不需要修改线协议。目标是补齐
+身份模型的本地仲裁：对 `did:web` / `did:bns` 等具名设备，只接受一个逻辑名字与一个
+canonical `did:dev` 的一一绑定。直接使用同一 `did:dev` 寻址不算第二个逻辑名字，仍应
+与该设备的具名寻址复用同一设备 tunnel。
+
+目标语义：
+
+- 一个逻辑名字在任一时刻只绑定 authority/name-client 已验证的 current canonical
+  `did:dev`；
+- 一个 canonical `did:dev` 在任一时刻只属于一个已验证逻辑名字，不能被两个不同逻辑
+  名字当作两个授权主体复用；
+- 同一逻辑名字出现更高版本的已验证 DeviceDocument 时，新版本优先，并关闭旧 revision /
+  旧 canonical key 下的 tunnel；
+- same-version 不同内容属于冲突，必须 fail closed，不能让两个绑定同时保持 current；
+- 裸 `did:dev` 的 key identity 不自动获得具名身份的 owner/zone 权限。
+
+当前实现与上述目标不完全一致：
+
+- `RTcpInner::format_tunnel_key()` 只使用双方 canonical DEV DID（以及可选 bootstrap URL），
+  不包含或校验逻辑名字；
+- `RTcpTunnelMap` 只有 `logical DID -> tunnel instances` 二级索引，没有
+  `canonical DEV DID -> logical DID` 的反向唯一性索引；
+- `test_rtcp_multiple_names_to_same_dev_share_key_by_design` 当前明确断言两个不同逻辑名字
+  解析到同一 DEV DID 时共享 tunnel key，这与一一绑定目标相反；
+- 同一逻辑名字按 `DocumentRevision` 踢除严格旧 revision 的路径已经存在，应复用现有
+  verified-cache CAS、提交锁和逻辑 DID 二级索引，不另造版本判断规则。
+
+实施任务：
+
+- [ ] 在 verified identity 仲裁中增加 canonical DEV DID 到逻辑名字的反向绑定；绑定检查、
+      verified-cache commit、主 tunnel map 和两个方向的索引更新必须在同一提交序列中完成。
+- [ ] 出站解析在复用已有 canonical tunnel 前检查已验证名字绑定；不同逻辑名字命中同一
+      canonical DEV DID 时明确拒绝，不能静默复用先建立的 tunnel。
+- [ ] 入站具名 tunnel 在 listener 授权和发布前执行相同的一一绑定检查；冲突连接不得替换
+      已存在的合法 tunnel。
+- [ ] 同一逻辑名字的更高版本 DeviceDocument 继续使用 name-client 的 revision/CAS 结果
+      淘汰旧绑定；same-version 内容冲突按 definite rejection 处理。
+- [ ] 保留“逻辑名字与其 canonical `did:dev` 直接寻址共享设备 tunnel”的行为，并增加测试
+      区分 direct key DID 与第二个逻辑名字。
+- [ ] 将 `test_rtcp_multiple_names_to_same_dev_share_key_by_design` 改为冲突拒绝测试，并补充
+      出站复用、入站并发、换钥升级、same-version conflict 和清理索引的覆盖。
+- [ ] 实现完成后把一一绑定不变量及更高版本 DeviceDocument 优先规则写入 `rtcp.md`。
 
 ## 1. Review 结论
 
@@ -112,17 +166,17 @@ OwnerDocument、DeviceDocument 等类型时，才需要同目录的 `owner.json`
 - DNS A/AAAA 仍可用于可达地址解析；本 TODO 禁止的是把未经认证的 TXT `DEV/PKX`
   当作长期身份 key，而不是禁止 DNS 参与寻址。
 
-### 1.3 合并 RTCP v2 review 后的当前结论
+### 1.3 合并 RTCP v2 review 后的结论（任务启动时快照）
 
-以下问题已按当前 HEAD 复核。除第 1 条已在 2026-07-24 修复外，其余仍然成立，必须纳入
-同一次收口：
+以下文字保留任务启动时的复核结果。第 2–7 条已经在本轮 v3 收口中处理；它们不是当前
+未完成项，完成状态见 §4 的 `[x]` 清单。
 
 1. **已修复（2026-07-24，commit 736a7178）：重复 tunnel 拒绝已改为原子替换。** 入站
    连接在完整认证、anti-replay、key-confirmation、listener 准入和设备文档提交全部成功
    后，按 canonical key 以 last-accepted-wins 原子替换旧 tunnel；`instance_id` +
    `remove_if_current` 保证旧实例延迟退出不能删除新实例。实施与测试记录见
    [RTCP-New-Tunnel-Replaces-Old-TODO.md](RTCP-New-Tunnel-Replaces-Old-TODO.md)。
-   本条不再是待办；§G 只剩 liveness 部分。
+   本条不再是待办；后续 liveness 也已在 §G 完成。
 2. **liveness 仍不能可靠清理僵尸 tunnel。** `RTcpTunnel::run()` 没有协议级 idle/liveness
    判定；TCP socket 未配置 keepalive。`Tunnel::ping()` 已改为传播 `send_package()`
    错误，带 seq 并等待匹配 `Pong` 的 `ping_rtt()` 也已存在并被 prober 使用，但
@@ -177,9 +231,9 @@ review 中“明确吊销仍会进入 self-declared fallback”的描述已经�
 写入），Unavailable 时的唯一降级是 `anonymous` 档位控制的 key 身份准入，不是重新合并
 所有失败类型，也不是加一个开关保留旧路径。
 
-### 1.4 文档与现有线协议的已确认偏差
+### 1.4 文档与当时线协议的已确认偏差（任务启动时快照）
 
-这些偏差需要在代码决策完成后一次修正，不能继续用“目标语义”冒充当前实现：
+以下偏差均已在 v3 代码或 `rtcp.md` 中修正，列表作为变更依据保留：
 
 - `StreamPurpose` 当前通过 Serde 序列化为 `"Stream"` / `"Datagram"`，不是文档中的
   `0` / `1`；
@@ -191,13 +245,13 @@ review 中“明确吊销仍会进入 self-declared fallback”的描述已经�
 - reconnect 使用的是 tunnel 发起侧保存的 remote stack port；文档不能笼统写成
   `Hello.my_port`；
 - nonce cache 上限是 16K **条目**，不是 16 KiB；
-- `did:web` 当前实现是 TXT-first，而不是文档所写 DID Document first；
+- `did:web` 当时实现是 TXT-first，而不是文档所写 DID Document first；
 - identity 文件实际使用 `device.jwt` / `device_doc.jwt` / `did.json`，不是
   `device.doc.jwt`；
 - AEAD nonce base 实际是 `SHA-256(label || base_iv)`；
 - JWT `exp` 只提供过期上界；当前 token 没有 `iat` / `nbf`，文档所写
   `[exp-leeway, exp+leeway]` 不是验证器实际建立的双边窗口；
-- `doc/rtcp/rtcp.md` 尚未说明每条 stream 的 process-chain 授权点和可见字段。
+- 当时的 `doc/rtcp/rtcp.md` 尚未说明每条 stream 的 process-chain 授权点和可见字段。
 
 ## 2. 目标安全契约
 
@@ -242,12 +296,11 @@ logical DID
 - `close()` 幂等，唤醒或终止阻塞中的读循环，并使所有后续写、Open/ROpen waiter 和
   Pong waiter 快速失败。
 
-待完成：
+本轮已完成：
 
-- keep-tunnel 的健康判断必须等待匹配的 `Pong`；仅仅成功写入本地 TCP buffer 不算远端
-  存活。
-- 连续 liveness 失败后应 close + conditional remove，让下一轮重建；TCP keepalive 只能
-  作为补充，不能替代协议级 Ping/Pong。
+- keep-tunnel 的健康判断等待匹配的 `Pong`；仅仅成功写入本地 TCP buffer 不算远端存活。
+- 连续 liveness 失败后 close + conditional remove，让下一轮重建；TCP keepalive 只作为
+  补充，不替代协议级 Ping/Pong。
 
 ### 2.2 未认证入口与资源契约
 
@@ -318,9 +371,10 @@ logical DID
   第⑪步按逻辑 DID 踢旧 revision（已落地）；b) 第⑨步每身份一次的后台权威确认。
   Accepted risk：吊销后，合法设备若不再连接本节点，本节点上已建立的旧 tunnel 不会
   被发现。这是显式接受的风险，实现时不得隐式“顺手修复”。
-- **D2 关系档位只实现 `same_zone | any`。** `same_owner` / `known_owner` /
-  `unknown_owner_escalation=budgeted` 仅预留枚举值；配置了未实现值必须启动报错，
-  不得静默接受。
+- **D2 关系档位实现 `same_zone | known_owner | any`。** `known_owner` 要求
+  `AuthSubject` 验证结果可用于授权、`authz_owner` 非空且带可信 OwnerDocument evidence；
+  `same_owner` / `unknown_owner_escalation=budgeted` 仍只预留枚举值，配置了未实现值必须
+  启动报错，不得静默接受。
 - **D3 没有 self-declared 回落路径。** 离线/首次组网的可用性来自预置信任材料
   （`set_local_authority_override` / 预置 verified cache），不来自验证放松。验证
   Unavailable（MissingDependency / Resolve 不可达，即“本地评估不了 ≠ 假”）时的
@@ -348,7 +402,7 @@ stacks:
     # 入站具名准入（§2.5/§C；字段对应设计文档的 SecurityConfig）
     inbound_admission:
       anonymous: reject              # allow | reject：具名验证 Unavailable 时能否降级为 key 身份
-      named_min_relation: same_zone  # same_zone | any；其余枚举值预留，配置即启动报错（D2）
+      named_min_relation: same_zone  # same_zone | known_owner | any；其余值配置即报错（D2）
       authority_reconfirm_max_age: unlimited # 权威确认复用期；懒检查，无后台定时器（D1）
     liveness:
       ping_interval_secs: 30
@@ -407,7 +461,8 @@ struct ResolvedRtcpPeerKey {
 
 ### 3.1 线协议决策
 
-本轮开始编码前先冻结以下决策并写入 golden wire tests：
+本轮开始编码前先冻结以下决策；已落地的 wire/contract 测试状态见 §5.5，完整 golden
+corpus 的扩充按该节 Deferred 处理：
 
 1. **`purpose` 保留当前实际上线格式。** 默认选择继续发送字符串 `"Stream"` /
    `"Datagram"`，修正文档并拒绝把 Rust enum 判别值误认为 Serde 线值。如果确实要改成
@@ -432,14 +487,14 @@ struct ResolvedRtcpPeerKey {
 
 ### A. 立即消除 TXT-first
 
-- [ ] 删除 `resolve_handshake_identity()` 开头的 `did:web` TXT 预解析。
-- [ ] 默认先走 DID method 解析；解析成功后不得再查询 TXT。
-- [ ] DID 解析失败时默认直接返回错误。
-- [ ] 只有 `dns_txt_bootstrap: true` 时才调用
+- [x] 删除 `resolve_handshake_identity()` 开头的 `did:web` TXT 预解析。
+- [x] 默认先走 DID method 解析；解析成功后不得再查询 TXT。
+- [x] DID 解析失败时默认直接返回错误。
+- [x] 只有 `dns_txt_bootstrap: true` 时才调用
   `resolve_handshake_identity_by_web_name_info()`。
-- [ ] fallback 日志明确输出 `non-authoritative DNS TXT bootstrap`，不得写成普通
+- [x] fallback 日志明确输出 `non-authoritative DNS TXT bootstrap`，不得写成普通
   “resolve success”。
-- [ ] `DEV=` 若保留兼容支持，不得再让 “JWT without verify 后取 `x`” 看起来像完成了
+- [x] `DEV=` 若保留兼容支持，不得再让 “JWT without verify 后取 `x`” 看起来像完成了
   document verification；函数、类型和日志都应标明它只是在解析 bootstrap hint。
 
 ### B. 增加带 provenance 的 exchange-key API
@@ -447,10 +502,10 @@ struct ResolvedRtcpPeerKey {
 现有 `resolve_ed25519_exchange_key()` 丢弃 `ResolvedDocument.resolution_metadata`，无法实现
 严格 policy 和可观测性。二选一：
 
-- [ ] 在 `name-client` 增加
+- **未采用（已由下一项替代）：** 在 `name-client` 增加
   `resolve_ed25519_exchange_key_ex(did, policy) -> ResolvedExchangeKey`，返回 key、文档解析
   metadata、freshness/authority 证据；推荐方案。
-- [ ] 或 RTCP 直接调用 `resolve_did_ex()`，按统一的 ZoneDocument/DeviceDocument key 选择
+- [x] 或 RTCP 直接调用 `resolve_did_ex()`，按统一的 ZoneDocument/DeviceDocument key 选择
   API 提取 exchange key；禁止在 RTCP 内复制一套容易漂移的 key-selection 规则。
 
 严格模式必须使用 `ResolveSourcePolicy::RemoteAuthority`，不能把一次
@@ -475,33 +530,34 @@ struct ResolvedRtcpPeerKey {
 - [x] 第⑪步按逻辑 DID 踢旧 revision：二级索引 + `CacheWriteOutcome` 仲裁（见
       [RTCP-New-Tunnel-Replaces-Old-TODO.md](RTCP-New-Tunnel-Replaces-Old-TODO.md)）。
 
-待办：
+完成记录：
 
-- [ ] **按①–⑤重排握手顺序（I1）。** parse-only 解码取 claim → `claim.id == from_id`
+- [x] **按①–⑤重排握手顺序（I1）。** parse-only 解码取 claim → `claim.id == from_id`
       绑定 → claim 预过滤（`same_zone` 时 `claim.owner != my_owner_did` 直接拒；纯
       字符串比较，只拒不信）→ `verify_tunnel_token`（用 claim 候选 key，
-      `canonical_dev = did_dev(candidate_key)`）→ 第⑤步文档验证。当前实现先做文档
-      验证（`resolve_source_device_info`）后验 token（`verify_hello_token`），任意
-      构造的输入可先触发解析 I/O。
-- [ ] **固定 `admission_policy` 替换 `ResolveVerifyOptions::default()`。**
+      `canonical_dev = did_dev(candidate_key)`）→ 第⑤步文档验证。当前实现已按该顺序
+      执行，文档验证不会先于持钥证明。
+- [x] **固定 `admission_policy` 替换 `ResolveVerifyOptions::default()`。**
       `LocalAndZone` + `allow_stale_cache = true`，其余兜底全关（§2.5 I1）；全流程
       唯一一份，任何地方不得另配解析策略。锁定的 name-client commit 已含
       `ResolveSourcePolicy::{LocalAndZone, RemoteAuthority}`，无需等上游。
-- [ ] **删除 `verify_source_device_doc_self_declared()` 及其 `add_observed_cache`
+- [x] **删除 `verify_source_device_doc_self_declared()` 及其 `add_observed_cache`
       写入（D3）。** 非 Definite 失败（MissingDependency / Resolve 不可达）改为：
       `anonymous: allow` 时按 `KeyDid` 准入（canonical_dev 来自已通过持钥证明的候选
       key；未验证声明仅观测/日志，不填 owner/zone、不进授权判断），
       `anonymous: reject` 时拒绝。
-- [ ] **新增 `inbound_admission`（SecurityConfig）并接入 stack 配置**：`anonymous` /
+- [x] **新增 `inbound_admission`（SecurityConfig）并接入 stack 配置**：`anonymous` /
       `named_min_relation` / `authority_reconfirm_max_age`；D2：未实现枚举值必须
       启动报错。
-- [ ] **实现第⑦步关系档位**：`same_zone` 校验 `verified.authz_owner ==
+- [x] **实现第⑦步关系档位**：`same_zone` 校验 `verified.authz_owner ==
       my_owner_did` 且验签文档 `zone_did == my_zone_did`（zone_did 取自 owner 背书的
-      文档，zone 只随 owner）；信任判断只看第⑤步输出，不看 claim。LocalAnchor
-      （`my_owner_did` / `my_zone_did`）启动时装好，来源是预置信任材料（D3）。
-- [ ] **第⑧步 trust 档位随 tunnel 记录**（按证据映射，如 `TrustedZoneSnapshot`），
-      供 process-chain / on_new_tunnel 授权消费；当前 tunnel 未携带任何 trust 字段。
-- [ ] **实现第⑨步后台 `confirm_authority_binding`（I2 的唯一外联点）**：懒触发
+      文档，zone 只随 owner）；`known_owner` 校验 `usable_as_authz_subject`、
+      `authz_owner` 与 OwnerDocument evidence；信任判断只看第⑤步输出，不看 claim。
+      LocalAnchor（`my_owner_did` / `my_zone_did`）启动时装好，来源是预置信任材料（D3）。
+- [x] **第⑧步 trust 档位随 tunnel 记录**（按证据映射，如 `TrustedZoneSnapshot`），
+      供 process-chain / on_new_tunnel 授权消费；tunnel endpoint 与 per-stream
+      process-chain 均携带 trust/canonical DID。
+- [x] **实现第⑨步后台 `confirm_authority_binding`（I2 的唯一外联点）**：懒触发
       （`IdentityState[did].authority_confirmed_at` 缺失或超过
       `authority_reconfirm_max_age`）；singleflight + 负缓存 + 按 from_did/source_ip
       限速 + 全局并发额度 + 超时预算；用 `admission_policy 改 source =
@@ -512,62 +568,65 @@ struct ResolvedRtcpPeerKey {
       Definite 否定 → 踢除 tunnel、写负缓存，并经第⑪步逻辑 DID 索引批量 close 该
       DID 全部旧实例（索引入口已预留，见 New-Tunnel TODO 第 5 条）；不可达 → 有限
       退避后放弃，档位保持快照级不变（不可达 ≠ 否定）。
-- [ ] **freshness 收编跟踪**：已向上游提议 `FreshnessRequirement::NotProvenRegressed`
+- **Deferred（等待上游类型，不阻塞 v3）：freshness 收编。** 已向上游提议
+      `FreshnessRequirement::NotProvenRegressed`
       （现状只有 NotOlderThanLocalLatest / AnyValid / RequireAuthorityCurrent，前者
       会误杀离线/首见、后者连权威否定都不看）；上游落地后整体换用并删除本地
       `freshness_rejection` 匹配，落地前保持现状。
-- [ ] **与上游确认 `OwnerBindingUnavailable` 归类**：其注释语义是“权威已回答的确定性
+- **Deferred（等待上游归类，不阻塞 v3）：`OwnerBindingUnavailable`。** 其注释语义是
+      “权威已回答的确定性
       缺失”，应属 Definite；确认前按现状归入降级类。
-- [ ] `did:dev` 无文档路径继续支持 `KeyDid`，但上层策略必须明确决定匿名 key identity
+- [x] `did:dev` 无文档路径继续支持 `KeyDid`，但上层策略必须明确决定匿名 key identity
   可以访问哪些服务。
-- [ ] 与
+- **Deferred（跨 TODO 类型收敛）：** 与
   [`RTCP-SN-Registered-Device-Authorization-TODO.md`](../SN/RTCP-SN-Registered-Device-Authorization-TODO.md)
   的 `RtcpIdentityTrust` 收敛为同一类型，避免出站 key provenance 与入站授权 evidence
   各自定义一套不兼容枚举。
 
 ### D. 接通配置
 
-- [ ] 给 `RtcpStackConfig`、`RtcpStackBuilder`、`RTcp` / `RTcpInner` 增加
+- [x] 给 `RtcpStackConfig`、`RtcpStackBuilder`、`RTcp` / `RTcpInner` 增加
   `peer_identity`（出站）与 `inbound_admission`（入站 SecurityConfig）两组 policy。
-- [ ] 配置反序列化默认值必须是 fail-closed（入站默认 `anonymous: reject`、
+- [x] 配置反序列化默认值必须是 fail-closed（入站默认 `anonymous: reject`、
   `named_min_relation: same_zone`）；D2：未实现枚举值启动报错，不得静默接受。
-- [ ] 更新 `src/rootfs/etc/cyfs_gateway.yaml` 示例，明确 TXT bootstrap 默认关闭、
+- [x] 更新 `src/rootfs/etc/cyfs_gateway.yaml` 示例，明确 TXT bootstrap 默认关闭、
   self-declared 路径已不存在。
-- [ ] 对旧配置不做静默兼容；Beta2.2 启动日志应提示 TXT bootstrap 与入站 fallback
+- [x] 对旧配置不做静默兼容；Beta2.2 启动日志应提示 TXT bootstrap 与入站 fallback
   行为已改变；出现已删除的 `inbound_self_declared_fallback` 键时启动报错。
-- [ ] web3 gateway、公网 SN/relay 配置不得开启 `dns_txt_bootstrap`；其
+- [x] web3 gateway、公网 SN/relay 配置不得开启 `dns_txt_bootstrap`；其
   `anonymous` 档位按各自准入需求显式声明，不依赖默认值。
 
 ### E. 文档与可观测性
 
-- [ ] 修正 `doc/rtcp/rtcp.md` §5.2，使“当前实现”与实际代码一致，并描述 authority policy。
-- [ ] 修正 §5.3：按 §2.5 重写入站验证——self-declared fallback 已删除（D3），改为
+- [x] 修正 `doc/rtcp/rtcp.md` §5.2，使“当前实现”与实际代码一致，并描述 authority policy。
+- [x] 修正 §5.3：按 §2.5 重写入站验证——self-declared fallback 已删除（D3），改为
   固定 `admission_policy` + `anonymous` 档位降级 + 第⑨步后台权威确认与档位升级。
-- [ ] 记录 resolver method、trust level、cache/freshness 结果和降级/踢除原因；不得记录
+- [x] 记录 resolver method、trust level、cache/freshness 结果和降级/踢除原因；不得记录
   完整 JWT、`DEV=` 或 token。
-- [ ] metrics 至少区分 authority/Zone/Host/key-DID/TXT 的成功与拒绝次数，以及入站
+- **Deferred（仓库暂无 metrics backend）：** metrics 至少区分
+  authority/Zone/Host/key-DID/TXT 的成功与拒绝次数，以及入站
   `anonymous` 降级次数、后台确认的通过/否定/不可达与档位升级次数（I2 预算可观测：
   外联次数应 ≤ 活跃具名身份数）。
 
 ### F. 加固控制包解析和未认证握手入口
 
-- [ ] 重写 `RTcpTunnelPackage::read_package()` 的长度处理：
+- [x] 重写 `RTcpTunnelPackage::read_package()` 的长度处理：
   - 使用 checked subtraction；
   - `len < 8` 返回 `InvalidData`；
   - 当前版本要求 `json_pos == 8`；
   - `json_pos > len`、不足 cmd/seq、空或无效 JSON 全部返回 `InvalidData`；
   - 删除所有由远端长度控制的直接索引、unchecked range 和 `unwrap()`。
-- [ ] 首包读取加入 deadline；慢连接超时后 shutdown。
-- [ ] 为 accept 后、完成 tunnel 注册前的所有未认证握手增加全局 semaphore。
-- [ ] handshake deadline 覆盖 Hello 解析、§C ①–⑤ 的文档验证（`LocalAndZone` 含
+- [x] 首包读取加入 deadline；慢连接超时后 shutdown。
+- [x] 为 accept 后、完成 tunnel 注册前的所有未认证握手增加全局 semaphore。
+- [x] handshake deadline 覆盖 Hello 解析、§C ①–⑤ 的文档验证（`LocalAndZone` 含
   zone-resolver 调用）、HelloAck 写入和 HelloAckConfirm 等待，而不是只包住最后两步。
   §C 落地后握手路径不再有 method-authority I/O（I1），但 zone 内调用仍须在 deadline
   之内。
-- [ ] 评估按 source IP 的 token bucket 和重复错误日志抑制（本地资源纵深防护）。
+- [x] 评估按 source IP 的 token bucket 和重复错误日志抑制（本地资源纵深防护）。
   authority 查询的 singleflight/负缓存/限速属于第⑨步后台确认的 I2 预算（§C），
   不再是握手入口的职责。
-- [ ] 为 parser 建 fuzz target/property test；任意字节输入只能返回 package/error，不能
-  panic、无限等待或产生超上限分配。
+- [x] 为 parser 增加有界 property-style test；任意短字节输入只能返回 package/error，
+  不能 panic、无限等待或产生超上限分配。独立 `cargo-fuzz` workspace 延期，见 §5.2。
 
 ### G. 实现 tunnel 原子替换和可靠 liveness
 
@@ -588,55 +647,54 @@ struct ResolvedRtcpPeerKey {
   - 保证 `run()` 在有界时间内退出（`close_notify` 唤醒读循环）。
 - [x] 修复 `Tunnel::ping()`：传播 `send_package()` 错误，不得无条件 `Ok(())`。
 
-剩余 liveness 工作：
+已完成的 liveness 工作：
 
-- [ ] keep-tunnel 改用带 seq 的 `ping_rtt()` 或等价 Ping/Pong，按配置 timeout 和连续失败
-  次数 close + conditional remove。（`ping_rtt()` 及 Pong waiter 机制已存在并被 prober
-  使用；`start_keep_tunnel` 仍用不等 Pong 的 `ping()`。）
-- [ ] direct TCP socket 配置平台允许的 keepalive，作为 NAT/内核级补充。
-- [ ] 替换/清理日志补充原因和旧实例存活时长（tunnel key 与新旧 `instance_id` 已记录），
+- [x] keep-tunnel 改用带 seq 的 `ping_rtt()` 或等价 Ping/Pong，按配置 timeout 和连续失败
+  次数 close + conditional remove；`start_keep_tunnel` 已等待匹配 Pong。
+- [x] direct TCP socket 配置平台允许的 keepalive，作为 NAT/内核级补充。
+- [x] 替换/清理日志补充原因和旧实例存活时长（tunnel key 与新旧 `instance_id` 已记录），
   不记录密钥材料。
 
 ### H. 统一 Open/ROpen 配额、方向和失败语义
 
-- [ ] 在 `process_package()` spawn `ROpen` task 之前获取 pending-build permit。
-- [ ] 明确配额是 Open/ROpen 共用还是各自独立；默认建议共用，防止交替请求绕过总上限。
-- [ ] `Open` 只允许在 `can_direct == false` 的 tunnel 端处理；`ROpen` 只允许在
+- [x] 在 `process_package()` spawn `ROpen` task 之前获取 pending-build permit。
+- [x] 明确配额是 Open/ROpen 共用还是各自独立；默认建议共用，防止交替请求绕过总上限。
+- [x] `Open` 只允许在 `can_direct == false` 的 tunnel 端处理；`ROpen` 只允许在
   `can_direct == true` 的 tunnel 端处理。
-- [ ] 增加 per-peer 请求速率限制和突发上限。
-- [ ] permit 覆盖地址解析、拨号、HelloStream 和 listener 交接，在所有 early return /
+- [x] 增加 per-peer 请求速率限制和突发上限。
+- [x] permit 覆盖地址解析、拨号、HelloStream 和 listener 交接，在所有 early return /
   timeout / cancelled 路径释放。
-- [ ] 扩展 `OpenResp` / `ROpenResp` 错误码，至少区分 quota、wrong-direction、
+- [x] 扩展 `OpenResp` / `ROpenResp` 错误码，至少区分 quota、wrong-direction、
   reconnect-failed、timeout、authorization-rejected；未知错误码仍安全失败。
-- [ ] 重复 stream id 必须显式拒绝，`new_wait_stream()` 不得覆盖已有 waiter。
+- [x] 重复 stream id 必须显式拒绝，`new_wait_stream()` 不得覆盖已有 waiter。
 
 ### I. 让 reconnect winner 与 RTT 语义一致
 
-- [ ] 把 direct reconnect 的单个 attempt 扩展为“TCP connect + HelloStream 写入成功”；
+- [x] 把 direct reconnect 的单个 attempt 扩展为“TCP connect + HelloStream 写入成功”；
   只有完整成功的 attempt 才能成为 winner。
-- [ ] 某个 candidate TCP 成功但 HelloStream 失败时，继续等待/启动其他 candidate，不能
+- [x] 某个 candidate TCP 成功但 HelloStream 失败时，继续等待/启动其他 candidate，不能
   提前取消整场竞速。
-- [ ] 成功 RTT 从 attempt 启动计到 HelloStream 写入完成，记录
+- [x] 成功 RTT 从 attempt 启动计到 HelloStream 写入完成，记录
   `MeasurementLayer::Application`。
-- [ ] 失败 attempt 尽可能记录 `Refused` / `Unreachable` / `Timeout`；若拿不到
+- [x] 失败 attempt 尽可能记录 `Refused` / `Unreachable` / `Timeout`；若拿不到
   `local_addr`，扩展 name-client API 或明确记录“无法归档”，不能用 debug 日志冒充回写。
-- [ ] 文档明确 standard Open/ROpen 的 reconnect 都由原 tunnel 发起侧执行，端口来自其
+- [x] 文档明确 standard Open/ROpen 的 reconnect 都由原 tunnel 发起侧执行，端口来自其
   remote stack endpoint；`Hello.my_port` 的实际消费场景单独说明。
 
 ### J. 绑定 Hello 字段并规范 token 时间窗口
 
-- [ ] 按 §3.1 将 `my_port`/`listen_port` 加入签名 claim，验证 claim/body 一致。
-- [ ] 盘点 Hello/HelloAck 中所有明文且影响路由、身份、keying、tunnel reuse 的字段；
+- [x] 按 §3.1 将 `my_port`/`listen_port` 加入签名 claim，验证 claim/body 一致。
+- [x] 盘点 Hello/HelloAck 中所有明文且影响路由、身份、keying、tunnel reuse 的字段；
   要么纳入签名 claim/HKDF context，要么删除冗余副本。
-- [ ] token 增加 `iat`，实施最大寿命和 future-skew 检查。
-- [ ] HKDF context 同时区分 semantic DID 与 canonical DEV DID，双方采用同一规范化规则；
+- [x] token 增加 `iat`，实施最大寿命和 future-skew 检查。
+- [x] HKDF context 同时区分 semantic DID 与 canonical DEV DID，双方采用同一规范化规则；
   不再让文档宣称 canonical、代码却混入未经说明的 host-name 字符串。
-- [ ] 如果 claim/KDF 改动造成不兼容，按 §3.1 升级 audience/protocol version，并增加明确
+- [x] 如果 claim/KDF 改动造成不兼容，按 §3.1 升级 audience/protocol version，并增加明确
   的新旧版本拒绝测试。
 
 ### K. 实现业务 stream key separation 和使用预算
 
-- [ ] 定义 stream KDF：
+- [x] 定义 stream KDF：
 
   ```text
   stream_key = HKDF-Expand(tunnel_secret,
@@ -645,90 +703,94 @@ struct ResolvedRtcpPeerKey {
       "rtcp stream iv"  || protocol_version || stream_id || purpose)
   ```
 
-- [ ] 双方验证 stream id 是规范的 16-byte 值并在 tunnel 内唯一后，才构造加密 stream。
-- [ ] 控制 tunnel 和业务 stream 分别维护 record/byte counters 与预算。
-- [ ] 达到预算或最大 tunnel age 时建立替代 tunnel；复用 §G 的原子替换，不在旧 key 下
-  继续开新 stream。
-- [ ] 明确预算耗尽、seq 溢出和 KDF 输入错误的错误码、metrics 和日志。
-- [ ] 评估 authenticated close record；若延期，记录“至少一条认证记录后 FIN 被当正常
+- [x] 双方验证 stream id 是规范的 16-byte 值并在 tunnel 内唯一后，才构造加密 stream。
+- [x] 控制 tunnel 和业务 stream 分别维护 record/byte counters 与预算。
+- [x] 达到预算或最大 tunnel age 后，旧 tunnel 不再接受新 stream；后续正常建链复用
+  §G 的原子替换。主动、提前建立替代 tunnel 属于后续轮换增强，不阻塞 v3。
+- [x] 明确预算耗尽、seq 溢出和 KDF 输入错误的错误与日志；metrics 随 §E 的 backend
+  工作延期。
+- [x] 评估 authenticated close record；若延期，记录“至少一条认证记录后 FIN 被当正常
   EOF，尾部截断无法与正常关闭区分”的 accepted risk。
 
 ### L. 修正文档真值并补 per-stream 授权章节
 
-- [ ] `doc/rtcp/rtcp.md` 的每个相关段落明确标记“当前实现”或“目标语义”，不得混写。
-- [ ] §4.5 按 golden wire decision 修正 `purpose` 示例和值域。
-- [ ] §5.2/§5.3 按 authority/provenance 实现重写，并保留 typed revocation/freshness 拒绝。
-- [ ] §5.4/§5.5 写清 semantic/canonical DID、stream KDF、实际
+- [x] `doc/rtcp/rtcp.md` 的每个相关段落明确标记“当前实现”或“目标语义”，不得混写。
+- [x] §4.5 按 golden wire decision 修正 `purpose` 示例和值域。
+- [x] §5.2/§5.3 按 authority/provenance 实现重写，并保留 typed revocation/freshness 拒绝。
+- [x] §5.4/§5.5 写清 semantic/canonical DID、stream KDF、实际
   `SHA-256(label || base_iv)` 和 key/record budget。
-- [ ] §6/§8/§10 修正 tunnel key、`my_port`、reconnect winner、端口来源和 RTT layer。
-- [ ] §12.1 使用 identity manager 实际文件名和探测顺序。
-- [ ] 把 nonce cache 单位改为条目，写明淘汰、多实例和“纵深防护”定位。
-- [ ] 将 §14 已落地历史移回对应正文；§14 只保留未完成 TODO 和 accepted risks。
-- [ ] 新增 per-stream 授权章节，列出 process-chain 可见的 identity trust、
+- [x] §6/§8/§10 修正 tunnel key、`my_port`、reconnect winner、端口来源和 RTT layer。
+- [x] §12.1 使用 identity manager 实际文件名和探测顺序。
+- [x] 把 nonce cache 单位改为条目，写明淘汰、多实例和“纵深防护”定位。
+- [x] 将 §14 已落地历史移回对应正文；§14 只保留未完成 TODO 和 accepted risks。
+- [x] 新增 per-stream 授权章节，列出 process-chain 可见的 identity trust、
   `real_source_did`/`source_did`、连接来源、dest host/port、protocol/purpose 和拒绝语义。
-- [ ] 修复文首本机绝对路径链接，并补 `aes_stream.rs`、`stream_helper.rs` 实现入口。
+- [x] 修复文首本机绝对路径链接，并补 `aes_stream.rs`、`stream_helper.rs` 实现入口。
 
-## 5. 必须增加/更新的测试
+## 5. 测试验收状态
 
 ### 5.1 Peer identity 与 provenance
 
-- [ ] `did:web` 同时存在合法 HTTPS ZoneDocument 与冲突 TXT：必须采用 HTTPS 文档 key。
-- [ ] HTTPS authority unavailable 且 fallback 默认关闭：必须失败。
-- [ ] HTTPS 返回 malformed/缺字段文档，同时 TXT 合法：默认仍必须失败。
-- [ ] 显式开启 TXT bootstrap 后，authority unavailable 才可使用 TXT，结果 trust 为
+- [x] `did:web` 同时存在合法 HTTPS ZoneDocument 与冲突 TXT：必须采用 HTTPS 文档 key。
+- [x] HTTPS authority unavailable 且 fallback 默认关闭：必须失败。
+- [x] HTTPS 返回 malformed/缺字段文档，同时 TXT 合法：默认仍必须失败。
+- [x] 显式开启 TXT bootstrap 后，authority unavailable 才可使用 TXT，结果 trust 为
   `DnsTxtBootstrap`。
-- [ ] authority 明确 Missing/Revoked/Tombstoned 时，即使开启 TXT bootstrap 也不得回退；
+- [x] authority 明确 Missing/Revoked/Tombstoned 时，即使开启 TXT bootstrap 也不得回退；
   fallback 只处理真正的 unavailable，不覆盖权威负回答。
-- [ ] `did:bns` 使用 BNS authority 解析；DNS TXT 冲突不能覆盖 BNS 结果。
-- [ ] `did:dev` 从 DID 自身取得 key，不发起 Web/BNS/TXT 查询，trust 为 `KeyDid`。
-- [ ] `authority_current` 不接受 Zone/cache 命中冒充 current receipt。
-- [ ] `trusted_snapshot` 只接受允许的未过期可信 evidence，拒绝 observed/unverified/stale。
+- [x] `did:bns` 使用 BNS authority 解析；DNS TXT 冲突不能覆盖 BNS 结果。
+- [x] `did:dev` 从 DID 自身取得 key，不发起 Web/BNS/TXT 查询，trust 为 `KeyDid`。
+- [x] `authority_current` 不接受 Zone/cache 命中冒充 current receipt。
+- [x] `trusted_snapshot` 只接受允许的未过期可信 evidence，拒绝 observed/unverified/stale。
 
 入站具名准入（对应 §2.5/§C；部分 Definite/freshness 拒绝测试已存在于
 `rtcp::rtcp::tests`，重排后需保持通过）：
 
-- [ ] I1 断言：匿名/任意构造的 Hello（含随机 owner/JWT）在握手同步路径零外网 I/O
+- [x] I1 断言：匿名/任意构造的 Hello（含随机 owner/JWT）在握手同步路径零外网 I/O
   （mock resolver 断言无 method-authority 调用），最多一次本地 ed25519 验签。
-- [ ] 顺序与预过滤：`claim.id != from_id` 在任何解析前拒绝；`same_zone` 下异 owner
+- [x] 顺序与预过滤：`claim.id != from_id` 在任何解析前拒绝；`same_zone` 下异 owner
   claim 被第③步预过滤拒绝且不触发文档验证；`verify_tunnel_token` 失败不触发文档
   验证。
-- [ ] Definite 否定（Revoked / NegativeState / OwnerMismatch / Superseded 等）：拒绝
+- [x] Definite 否定（Revoked / NegativeState / OwnerMismatch / Superseded 等）：拒绝
   握手，不存在任何 self-declared 回落路径（函数已删除）。
-- [ ] 非 Definite（MissingDependency / Resolve 不可达）：`anonymous: reject` 拒绝；
+- [x] 非 Definite（MissingDependency / Resolve 不可达）：`anonymous: reject` 拒绝；
   `anonymous: allow` 降级为 `KeyDid` 准入，未验证声明不填 owner/zone、不进授权
   判断，且降级不触发任何联网。
-- [ ] 第⑦步档位：`authz_owner != my_owner_did` 或文档 `zone_did != my_zone_did`
+- [x] 第⑦步档位：`authz_owner != my_owner_did` 或文档 `zone_did != my_zone_did`
   拒绝；第③步预过滤通过但第⑤步输出不符也必须拒绝（信任判断只看⑤输出）。
-- [ ] D2 配置校验：`named_min_relation` 配置未实现枚举值（如 `same_owner`）启动报错。
-- [ ] 第⑨步后台确认：同身份并发握手只触发一次外联（singleflight + 负缓存）；确认
+- [x] D2 配置校验：`known_owner` 可反序列化并进入关系校验；配置未实现枚举值（如
+  `same_owner`）启动报错。
+- [x] 第⑨步后台确认：同身份并发握手只触发一次外联（singleflight + 负缓存）；确认
   通过后 tunnel 升档 `MethodAuthorityCurrent`，该身份后续握手在第⑤步本地命中最高
   档；AuthorityNotCurrent / Definite 否定踢除 tunnel、写负缓存，并经逻辑 DID 索引
   批量 close 同 DID 旧实例；不可达仅退避放弃，档位不变、不踢除。
-- [ ] 第⑩步：仅提交文档而未完成持钥证明/key-confirmation/listener 授权，不得推进
+- [x] 第⑩步：仅提交文档而未完成持钥证明/key-confirmation/listener 授权，不得推进
   verified-cache high-water（verify 无隐式写入）。
-- [ ] 更新当前依赖 TXT cache 的
+- [x] 更新当前依赖 TXT cache 的
   `web_target_token_uses_resolved_dev_identity`、alias/tunnel-key 测试，改用可控的 method
   authority/ZoneDocument fixture；另保留独立 bootstrap compatibility 测试。
-- [ ] 配置测试覆盖默认值、`dns_txt_bootstrap` 显式开启、`inbound_admission` 三字段、
+- [x] 配置测试覆盖默认值、`dns_txt_bootstrap` 显式开启、`inbound_admission` 三字段、
   非法/未实现枚举（D2）和已删除 `inbound_self_declared_fallback` 键的启动报错提示。
 
 ### 5.2 未认证入口和 parser
 
-- [ ] 表驱动覆盖 `len = 0..=9`、截断 cmd/seq、`json_pos < 8`、`json_pos > len`、超长和
+- [x] 表驱动覆盖 `len = 0..=9`、截断 cmd/seq、`json_pos < 8`、`json_pos > len`、超长和
   非法 JSON；除合法 HelloStream 特例外都应得到确定的 `InvalidData`，不能 panic。
-- [ ] 首包只发送 0/1 字节后停住：在 handshake deadline 内断开并释放 semaphore。
-- [ ] 并发连接超过 pending-handshake 上限：多余连接快速拒绝，accept loop 和既有 tunnel
+- [x] 首包只发送 0/1 字节后停住：在 handshake deadline 内断开并释放 semaphore。
+- [x] 并发连接超过 pending-handshake 上限：多余连接快速拒绝，accept loop 和既有 tunnel
   仍可服务。
-- [ ] 随机 owner / `device_doc_jwt` 在握手路径不触发任何 authority 查询（I1，与 §5.1
+- [x] 随机 owner / `device_doc_jwt` 在握手路径不触发任何 authority 查询（I1，与 §5.1
   的 mock resolver 断言呼应）；zone-resolver 慢或不可达时握手受统一 deadline 约束；
   后台确认的超时/并发/负缓存已在 §5.1 覆盖。
-- [ ] fuzz 至少覆盖 `read_package()`、Hello/HelloAck JSON 和 token claim 边界。
+- **Deferred（测试工具增强）：** 当前以有界 property-style parser 测试覆盖任意短输入，
+  未新增 `cargo-fuzz` workspace；后续 fuzz corpus 应继续覆盖 `read_package()`、
+  Hello/HelloAck JSON 和 token claim 边界。
 
 ### 5.3 Tunnel 替换和 liveness
 
 已由替换修复覆盖（`rtcp::rtcp::tests`，2026-07-24 全量通过）：
 
-- [x] 已有 tunnel A 时，完成全新 v2 握手的 tunnel B 原子替换 A；B 使用不同 session
+- [x] 已有 tunnel A 时，完成全新 v3 握手的 tunnel B 原子替换 A；B 使用不同 session
   key/IV，A 被 close。
 - [x] A 的 `run()` 在 B 注册后退出，不得把 B 从 map 删除。
 - [x] listener 拒绝或 Hello/nonce 重放的新连接不得替换 A。（freshness commit 失败在
@@ -738,56 +800,60 @@ struct ResolvedRtcpPeerKey {
 - [x] 并发两个新 tunnel 抢同一 key：最终 map 中恰好一个 current generation，所有 loser
   都关闭且不能删除 winner。
 
-待补（随剩余 liveness 工作）：
+当前 liveness 验证状态：
 
-- [ ] 只写成功但收不到匹配 Pong：达到连续失败阈值后 close/remove 并允许重建。
-- [ ] 模拟 NAT black-hole/半开连接：在配置的 liveness 上界内恢复，不依赖操作系统默认
-  TCP 超时。
+- [x] 只写成功但收不到匹配 Pong：达到连续失败阈值后 close/remove 并允许重建。
+- **Deferred（环境型集成测试）：** 模拟 NAT black-hole/半开连接并验证在配置的
+  liveness 上界内恢复；当前单测覆盖连续 missed-Pong 判定，代码路径执行
+  close + conditional remove。
 
 ### 5.4 Open/ROpen、reconnect 与授权
 
-- [ ] inbound `Open` 和 `ROpen` 分别/合计达到配额时，下一条请求收到明确 quota 错误，
+- [x] inbound `Open` 和 `ROpen` 分别/合计达到配额时，下一条请求收到明确 quota 错误，
   不启动额外拨号 task。
-- [ ] 在错误 tunnel 角色上发送 Open/ROpen：返回 wrong-direction，不触发 DNS、connect
+- [x] 在错误 tunnel 角色上发送 Open/ROpen：返回 wrong-direction，不触发 DNS、connect
   或 listener。
-- [ ] 高频交替 Open/ROpen 不能绕过总配额或 per-peer rate limit。
-- [ ] 重复 stream id 不能覆盖 waiter；迟到 HelloStream 被关闭。
-- [ ] candidate A TCP connect 成功但 HelloStream 写失败、candidate B 完整成功：B 获胜。
-- [ ] reconnect 成功只记录 Application RTT；失败 candidate 的 outcome 与最终错误一致。
-- [ ] per-stream process-chain 能看到可信 identity/provenance 与目标字段，并能在建立业务
+- [x] 高频交替 Open/ROpen 不能绕过总配额或 per-peer rate limit。
+- [x] 重复 stream id 不能覆盖 waiter；迟到 HelloStream 被关闭。
+- [x] candidate A TCP connect 成功但 HelloStream 写失败、candidate B 完整成功：B 获胜。
+- [x] reconnect 成功只记录 Application RTT；失败 candidate 的 outcome 与最终错误一致。
+- [x] per-stream process-chain 能看到可信 identity/provenance 与目标字段，并能在建立业务
   转发前拒绝无权限 dest host/port。
 
 ### 5.5 线协议、KDF 与 Datagram
 
-- [ ] 保存 Hello、HelloAck、Open、ROpen 的 golden bytes/JSON，锁定 `purpose`、字段名、
-  claim 和 protocol version。
-- [ ] 篡改 Hello body 的 `my_port`/`listen_port`，token/body mismatch 必须在任何回连前
+- **Deferred（golden corpus 扩充）：** 当前 Open wire golden 与 Hello/HelloAck token
+  contract 测试已锁定 `purpose`、关键 claim 和 v3 audience；完整保存
+  Hello、HelloAck、Open、ROpen golden bytes/JSON 留作测试增强。
+- [x] 篡改 Hello body 的 `my_port`/`listen_port`，token/body mismatch 必须在任何回连前
   拒绝。
-- [ ] 缺失/未来 `iat`、`exp < iat`、寿命超限、允许 skew 边界分别有测试。
-- [ ] 相同 tunnel secret 下不同 stream id 或 purpose 派生不同 key/IV；双方对同一 context
+- [x] 缺失/未来 `iat`、`exp < iat`、寿命超限、允许 skew 边界分别有测试。
+- [x] 相同 tunnel secret 下不同 stream id 或 purpose 派生不同 key/IV；双方对同一 context
   派生完全一致。
-- [ ] 重复 stream id、非法长度和非 hex 值在 KDF 前拒绝。
-- [ ] record/byte/tunnel-age 预算触发轮换；旧 tunnel 不再接受新 stream。
-- [ ] Datagram 等于上限成功，上限 + 1 在发送端和接收端都返回专用错误且不破坏后续协议
+- [x] 重复 stream id、非法长度和非 hex 值在 KDF 前拒绝。
+- [x] record/byte/tunnel-age 预算触发安全失败，达到最大 tunnel age 后旧 tunnel 不再接受
+  新 stream；主动预建替代 tunnel 作为后续轮换增强。
+- [x] Datagram 等于上限成功，上限 + 1 在发送端和接收端都返回专用错误且不破坏后续协议
   framing。
-- [ ] 新旧 protocol version/audience 组合在握手阶段明确失败，不出现首条业务 AEAD 才失败。
+- [x] 新旧 protocol version/audience 组合在握手阶段明确失败，不出现首条业务 AEAD 才失败。
 
-## 6. 发布顺序
+## 6. 已执行的发布顺序（历史记录）
 
 ### Phase 0：冻结决策和测试基线
 
 1. 确认 §3.1 的 `purpose`、token claim、`iat`、protocol version、stream KDF 和 Datagram
    上限决策。
-2. 先补当前 v2 golden wire tests 和已知 bug 的失败测试；测试必须能在修复前稳定复现，
+2. 先补当时 v2 的 wire/contract tests 和已知 bug 的失败测试；测试必须能在修复前稳定复现，
    不能只靠人工日志判断。
-3. 建立 parser fuzz target 和 tunnel replacement generation 模型。
+3. 建立 parser property-style test 和 tunnel replacement generation 模型；独立
+   `cargo-fuzz` workspace 按前述 Deferred 处理。
 
 ### Phase 1：先落地不依赖 resolver API 的资源/生命周期修复
 
 1. 完成 §F parser、首包 deadline 和 pending-handshake 上限。
 2. §G 的 tunnel generation、conditional remove、原子替换和 ping 错误传播已完成
-   （2026-07-24，commit 736a7178）；本阶段剩余 keep-tunnel Pong liveness 与 TCP
-   keepalive。
+   （2026-07-24，commit 736a7178）；keep-tunnel Pong liveness 与 TCP keepalive 随后
+   也已完成。
 3. 完成 §H Open/ROpen 配额、方向、重复 stream id 和取消清理。
 4. 完成 §I reconnect 完整 winner 与 RTT 口径。
 

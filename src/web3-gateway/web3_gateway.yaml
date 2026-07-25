@@ -25,6 +25,15 @@ servers:
     type: local_dns
     file_path: local_dns.toml
 
+  # did:web:sn.<sn_host> is the authority identity that RTCP clients resolve
+  # before opening a keep-tunnel. make_sn_config materializes did.json and
+  # device.json from the same SN device key under this deployment-relative root.
+  sn_did_web:
+    type: dir
+    root_path: "./sn_did_web"
+    autoindex: false
+    etag: true
+
   main_dns:
     id: main_dns
     type: dns
@@ -52,6 +61,8 @@ servers:
             priority: 1
             block: |
               eq ${REQ.host} "bns.{{sn_host}}" && return "forward {{bns_server_url}}";
+              eq ${REQ.host} "sn.{{sn_host}}" && eq ${REQ.path} "/.well-known/did.json" && return "server sn_did_web";
+              eq ${REQ.host} "sn.{{sn_host}}" && eq ${REQ.path} "/.well-known/device.json" && return "server sn_did_web";
               eq ${REQ.host} "sn.{{sn_host}}" && match ${REQ.path} "/1.0/identifiers/*" && return "server web3_sn";
               eq ${REQ.host} "sn.{{sn_host}}" && return "server web3_sn";
               eq ${REQ.host} "web3.{{sn_host}}" && return "server web3_sn";
@@ -83,6 +94,16 @@ stacks:
     # hello.to 规范化为 did:dev,SN 无需解析别名即可接受。
     key_path: ./sn_private_key.pem
     device_config_path: ./sn_device_config.json
+    peer_identity:
+      requirement: authority_current
+      dns_txt_bootstrap: false
+    # Web3 Gateway 接受任意可信的已知 owner，而不限制为 SN 自身所在 zone。
+    # known_owner 要求 name-client 给出可授权 owner 与可信 OwnerDocument
+    # 证据；anonymous=reject 保证验证不可用时不会降级为仅持有设备 key 的身份。
+    inbound_admission:
+      anonymous: reject
+      named_min_relation: known_owner
+      authority_reconfirm_max_age: unlimited
     hook_point:
       main:
         id: main

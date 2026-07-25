@@ -296,15 +296,15 @@ impl SnResolverBackedDidResolver {
         );
 
         response.did = request.did.to_string();
-        self.apply_profile(
-            request,
-            &mut response,
-            Some(json!({
-                "canonicalZone": binding.canonical_zone_did(),
-                "userDomain": binding.user_domain,
-                "mappedDid": mapped.to_string(),
-            })),
-        );
+        let mut metadata = json!({
+            "canonicalZone": binding.canonical_zone_did(),
+            "userDomain": binding.user_domain,
+            "mappedDid": mapped.to_string(),
+        });
+        if let Some(effective_owner) = document_declared_owner(&response.document) {
+            metadata["effectiveOwner"] = Value::String(effective_owner);
+        }
+        self.apply_profile(request, &mut response, Some(metadata));
         Ok(response)
     }
 
@@ -773,6 +773,14 @@ fn rewrite_web_document_identity(
         return;
     };
 
+    // New node environments already publish a full DeviceDocument whose
+    // semantic did:web identity matches the request. Keep it byte-for-byte
+    // equivalent to the JWT payload supplied in RTCP Hello so authority
+    // membership can compare the two documents exactly.
+    if obj.get("id").and_then(Value::as_str) == Some(request_did) {
+        return;
+    }
+
     if let Some(existing_id) = obj
         .get("id")
         .and_then(Value::as_str)
@@ -817,6 +825,12 @@ fn rewrite_web_document_identity(
             "ownerConstraint": owner_did,
         }),
     );
+}
+
+fn document_declared_owner(document: &EncodedDocument) -> Option<String> {
+    let value = document.clone().to_json_value().ok()?;
+    let owner = value.get("owner")?.as_str()?;
+    DID::from_str(owner).ok().map(|did| did.to_string())
 }
 
 #[cfg(test)]
@@ -871,6 +885,41 @@ mod tests {
         assert_eq!(value["owner"], "did:web:example.com");
         assert_eq!(value["zone_did"], "did:web:example.com");
         assert_eq!(value["buckyos"]["canonicalZone"], "did:bns:alice");
+    }
+
+    #[test]
+    fn preserves_matching_web_device_document_for_authority_membership() {
+        let expected = json!({
+            "id": "did:web:ood1.example.com",
+            "owner": "did:bns:alice",
+            "device_type": "ood",
+            "name": "ood1",
+            "verificationMethod": [{
+                "id": "#main_key",
+                "controller": "did:web:ood1.example.com",
+                "type": "Ed25519VerificationKey2020",
+                "publicKeyJwk": {
+                    "kty": "OKP",
+                    "crv": "Ed25519",
+                    "x": "abc"
+                }
+            }]
+        });
+        let mut document = EncodedDocument::JsonLd(expected.clone());
+
+        rewrite_web_document_identity(
+            &mut document,
+            "did:web:ood1.example.com",
+            "did:web:example.com",
+            "did:bns:alice",
+            Some("ood1"),
+        );
+
+        assert_eq!(document.clone().to_json_value().unwrap(), expected);
+        assert_eq!(
+            document_declared_owner(&document).as_deref(),
+            Some("did:bns:alice")
+        );
     }
 
     #[test]

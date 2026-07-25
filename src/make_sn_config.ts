@@ -34,6 +34,8 @@
 // Output layout:
 //   <rootfs>/sn_device_config.json    SN server device config
 //   <rootfs>/sn_private_key.pem       device private key (rtcp stack)
+//   <rootfs>/sn_did_web/.well-known/  authoritative did:web documents for
+//                                    RTCP authority-current peer resolution
 //   <rootfs>/params.json              SN service parameters (incl. sn_ip; no
 //                                    SN self-DNS bootstrap material)
 //   <rootfs>/sn.sqlite3               SN sqlite database runtime path (created by cyfs-sn)
@@ -169,6 +171,7 @@ const DEFAULT_CA_NAME = "buckyos_test_ca";
 const PROVISION_SN_DB_FILE = "sn_db.sqlite3";
 const SN_DB_FILE = "sn.sqlite3";
 const SN_AUTH_DATA_DIR = "sn_token_key";
+const SN_DID_WEB_ROOT_DIR = "sn_did_web";
 const WEB3_GATEWAY_CONFIG_FILE = "web3_gateway.yaml";
 // web3_gateway.yaml 的独立部署拆分（DNS / 流量转发 / SN API）。每个文件都有
 // 自己的 web3_sn server 块，provision 阶段的文本补丁（sn.sqlite3 db 路径、
@@ -245,6 +248,141 @@ function writeMachineConfig(targetDir: string, snBaseHost: string): void {
     ],
   });
   console.log(`  machine.json bns bridge -> web3.${snBaseHost}`);
+}
+
+function rewriteDidController(
+  value: unknown,
+  previousDid: string,
+  authoritativeDid: string,
+): unknown {
+  if (typeof value !== "string") {
+    return value;
+  }
+  if (value === previousDid) {
+    return authoritativeDid;
+  }
+  if (value.startsWith(`${previousDid}#`)) {
+    return `${authoritativeDid}${value.slice(previousDid.length)}`;
+  }
+  return value;
+}
+
+function cloneDeviceDocumentWithDid(
+  source: Record<string, unknown>,
+  previousDid: string,
+  targetDid: string,
+  zoneDid: string,
+): Record<string, unknown> {
+  const document: Record<string, unknown> = {
+    ...source,
+    id: targetDid,
+    zone_did: zoneDid,
+  };
+  if (Array.isArray(source.verificationMethod)) {
+    document.verificationMethod = source.verificationMethod.map((entry) => {
+      if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+        return entry;
+      }
+      const method = { ...entry } as Record<string, unknown>;
+      method.id = rewriteDidController(method.id, previousDid, targetDid);
+      method.controller = rewriteDidController(
+        method.controller,
+        previousDid,
+        targetDid,
+      );
+      return method;
+    });
+  }
+  for (
+    const field of [
+      "authentication",
+      "assertionMethod",
+      "assertion_method",
+      "capabilityInvocation",
+      "capabilityDelegation",
+    ]
+  ) {
+    const value = source[field];
+    if (Array.isArray(value)) {
+      document[field] = value.map((entry) =>
+        rewriteDidController(entry, previousDid, targetDid)
+      );
+    }
+  }
+  return document;
+}
+
+/**
+ * RTCP v3 默认按 DID method authority 解析对端 key，普通 DNS TXT 只允许
+ * 显式开启的 non-authoritative bootstrap。客户端用 sn.<base> 建
+ * keep-tunnel 时语义 DID 是 did:web:sn.<base>，因此部署目录必须提供真正的
+ * did:web origin 文档，而不能只依赖 BOOT/DEV TXT。
+ *
+ * 当前 provision 仍可能生成逻辑 did:web 身份、但不生成 owner-signed
+ * device_doc_jwt；新版 RTCP 会拒绝用它启动。因此这里从同一 device key：
+ *   1. 发布 did:web authority 文档；
+ *   2. 将本地 stack 配置规范化为 did:dev key identity。
+ */
+export function materializeSnDidWebDocuments(
+  targetDir: string,
+  snBaseHost: string,
+): string {
+  const deviceConfigPath = path.join(targetDir, "sn_device_config.json");
+  if (!fs.existsSync(deviceConfigPath)) {
+    throw new Error(
+      `cannot publish SN did:web identity: missing ${deviceConfigPath}`,
+    );
+  }
+
+  const source = readJson(deviceConfigPath);
+  const previousDid = String(source.id ?? "");
+  if (!previousDid) {
+    throw new Error(
+      `cannot publish SN did:web identity: ${deviceConfigPath} misses id`,
+    );
+  }
+  const verificationMethods = source.verificationMethod;
+  const deviceKeyX = Array.isArray(verificationMethods)
+    ? (verificationMethods[0] as Record<string, unknown> | undefined)
+      ?.publicKeyJwk
+    : undefined;
+  const publicKeyX = deviceKeyX && typeof deviceKeyX === "object"
+    ? String((deviceKeyX as Record<string, unknown>).x ?? "")
+    : "";
+  if (!publicKeyX) {
+    throw new Error(
+      `cannot publish SN did:web identity: ${deviceConfigPath} misses verificationMethod[0].publicKeyJwk.x`,
+    );
+  }
+
+  const authoritativeDid = `did:web:sn.${snBaseHost}`;
+  const document = cloneDeviceDocumentWithDid(
+    source,
+    previousDid,
+    authoritativeDid,
+    authoritativeDid,
+  );
+
+  const wellKnownDir = ensureDir(
+    path.join(targetDir, SN_DID_WEB_ROOT_DIR, ".well-known"),
+  );
+  const didDocumentPath = path.join(wellKnownDir, "did.json");
+  writeJson(didDocumentPath, document);
+  // Explicit DeviceDocument lookup uses the same authority material.
+  writeJson(path.join(wellKnownDir, "device.json"), document);
+
+  const canonicalDeviceDid = `did:dev:${publicKeyX}`;
+  const stackDocument = cloneDeviceDocumentWithDid(
+    source,
+    previousDid,
+    canonicalDeviceDid,
+    authoritativeDid,
+  );
+  writeJson(deviceConfigPath, stackDocument);
+  console.log(
+    `  SN RTCP identity: ${canonicalDeviceDid}; authority alias: ${authoritativeDid} -> ${didDocumentPath}`,
+  );
+  return didDocumentPath;
 }
 
 function isProvisionSnDbFile(name: string): boolean {
@@ -518,6 +656,7 @@ async function makeSnConfigs(
   }
 
   discardProvisionSnDb(targetDir);
+  materializeSnDidWebDocuments(targetDir, snBaseHost);
   ensureDir(path.join(targetDir, SN_AUTH_DATA_DIR));
   // params.json 会随部署目录整体复制到另一台机器，运行态路径必须相对于
   // web3_gateway 的工作目录，不能泄漏 provision 时的宿主机输出路径。
@@ -787,36 +926,109 @@ function decodeJwtPayload(jwt: string): Record<string, unknown> {
 interface SeedUserEnvView {
   bootConfigJwt: string;
   deviceMiniDocJwt: string;
+  deviceDocJwt: string;
+  deviceDoc: Record<string, unknown>;
   pkx: string;
   zoneBootJson: Record<string, unknown>;
 }
 
-// 读取（缺失则先构建）用户 env，取出种子需要的签名 JWT 与公钥。
+function findFilesNamed(root: string, fileName: string): string[] {
+  if (!fs.existsSync(root)) {
+    return [];
+  }
+  const result: string[] = [];
+  for (const entry of fs.readdirSync(root, { withFileTypes: true })) {
+    const entryPath = path.join(root, entry.name);
+    if (entry.isDirectory()) {
+      result.push(...findFilesNamed(entryPath, fileName));
+    } else if (entry.isFile() && entry.name === fileName) {
+      result.push(entryPath);
+    }
+  }
+  return result;
+}
+
+function readDeviceDocJwt(userDir: string, deviceName: string): string {
+  const nodeDir = path.join(userDir, deviceName);
+  const nodeIdentityPath = path.join(nodeDir, "node_identity.json");
+  if (fs.existsSync(nodeIdentityPath)) {
+    const nodeIdentity = readJson(nodeIdentityPath);
+    if (
+      typeof nodeIdentity.device_doc_jwt === "string" &&
+      nodeIdentity.device_doc_jwt.trim()
+    ) {
+      return nodeIdentity.device_doc_jwt.trim();
+    }
+  }
+
+  const matches = findFilesNamed(
+    path.join(nodeDir, "local", "identity"),
+    "device_doc.jwt",
+  );
+  if (matches.length > 1) {
+    throw new Error(
+      `user env ${userDir} has ambiguous device_doc.jwt files for ${deviceName}: ${
+        matches.join(", ")
+      }`,
+    );
+  }
+  return matches.length === 1 ? fs.readFileSync(matches[0], "utf8").trim() : "";
+}
+
+// 读取（缺失或仍是旧身份布局则先重建）用户 env，取出种子需要的完整
+// DeviceDocument、mini document、boot document 与 owner 公钥。RTCP v3 的
+// authority-current 验证需要完整 DeviceDocument；TXT DEV mini document
+// 只能继续承担 DNS/bootstrap 兼容职责。
 async function loadSeedUserEnv(
   envRoot: string,
   user: SnSeedUserSpec,
 ): Promise<SeedUserEnvView> {
   const params = getParamsFromGroupName(user.groupName);
   const userDir = path.join(envRoot, params.zone_id);
+  let deviceDocJwt = readDeviceDocJwt(userDir, params.node_name);
   if (
-    !fs.existsSync(path.join(userDir, params.node_name, "node_identity.json"))
+    !fs.existsSync(
+      path.join(userDir, params.node_name, "node_identity.json"),
+    ) ||
+    !deviceDocJwt
   ) {
-    console.log(`user env missing, generate: ${userDir}`);
+    console.log(
+      `user env missing RTCP v3 identity material, generate: ${userDir}`,
+    );
     await buildUserEnv(params, envRoot);
+    deviceDocJwt = readDeviceDocJwt(userDir, params.node_name);
   }
   const zoneRecord = readJson(path.join(userDir, "zone_txt_record.json"));
   const bootConfigJwt = String(zoneRecord.boot_config_jwt ?? "");
   const deviceMiniDocJwt = String(zoneRecord.device_mini_doc_jwt ?? "");
   const pkx = String(zoneRecord.pkx ?? "");
-  if (!bootConfigJwt || !deviceMiniDocJwt || !pkx) {
+  if (!bootConfigJwt || !deviceMiniDocJwt || !deviceDocJwt || !pkx) {
     throw new Error(
-      `user env ${userDir} zone_txt_record.json misses boot_config_jwt/device_mini_doc_jwt/pkx`,
+      `user env ${userDir} misses boot_config_jwt/device_mini_doc_jwt/device_doc.jwt/pkx`,
+    );
+  }
+  const deviceDoc = decodeJwtPayload(deviceDocJwt);
+  const expectedDeviceDid = user.userDomain
+    ? `did:web:${params.node_name}.${user.userDomain}`
+    : `did:bns:${params.node_name}.${user.username}`;
+  if (deviceDoc.id !== expectedDeviceDid) {
+    throw new Error(
+      `user env ${userDir} device_doc.jwt id ${
+        String(deviceDoc.id)
+      } does not match ${expectedDeviceDid}`,
     );
   }
   const zoneBootJson = readJson(
     path.join(userDir, `${params.zone_id}.zone.json`),
   );
-  return { bootConfigJwt, deviceMiniDocJwt, pkx, zoneBootJson };
+  return {
+    bootConfigJwt,
+    deviceMiniDocJwt,
+    deviceDocJwt,
+    deviceDoc,
+    pkx,
+    zoneBootJson,
+  };
 }
 
 function yamlQuote(value: string): string {
@@ -878,9 +1090,13 @@ function toZoneDocumentJson(
  *   owner            {"id":"did:bns:<u>","x":<pkx>}          PKX TXT / resolve_owner
  *   zone             env zone.json 补全 ZoneDocument 必填字段  见 toZoneDocumentJson
  *   boot             签名 boot JWT 原文（inline_text_file）    原子文档；BOOT= TXT 取 jwt
- *   device_mini_doc  {"devices":{"<ood>":{payload+jwt}}}      设备解析 + DEV= TXT
- * did:web 用户（userDomain）只上链 owner——其 ZoneDocument 权威在 SN 的
- * user_domain 机制（见 makeSnAuthSeedConfig），不在 BNS。
+ *   device_mini_doc  {"devices":{"<ood>":<完整 DeviceDocument>},
+ *                     "mini_device_jwts":{...},
+ *                     "device_document_jwts":{...}}
+ *                    完整文档供 RTCP authority-current；mini JWT 只供 DEV= TXT
+ * did:web 用户（userDomain）的 ZoneDocument 权威仍在 SN user_domain 机制，
+ * 但其 canonical BNS zone 也必须发布完整设备文档，供 SN 的 did:web upper
+ * resolver 在客户端首次 keep-tunnel（OOD 尚未在线）时回答。
  */
 export async function makeBnsDvSeedConfig(
   targetDir: string,
@@ -928,23 +1144,28 @@ export async function makeBnsDvSeedConfig(
         `      - doc_type: boot`,
         `        inline_text_file: ${yamlQuote(bootRel)}`,
       );
-
-      const params = getParamsFromGroupName(user.groupName);
-      const miniPayload = decodeJwtPayload(env.deviceMiniDocJwt);
-      const miniRel = `${docsRootName}/${user.username}/device_mini_doc.json`;
-      writeJson(path.join(userDocsDir, "device_mini_doc.json"), {
-        devices: {
-          [params.node_name]: {
-            ...miniPayload,
-            mini_config_jwt: env.deviceMiniDocJwt,
-          },
-        },
-      });
-      docLines.push(
-        `      - doc_type: device_mini_doc`,
-        `        inline_json_file: ${yamlQuote(miniRel)}`,
-      );
     }
+
+    const params = getParamsFromGroupName(user.groupName);
+    const miniRel = `${docsRootName}/${user.username}/device_mini_doc.json`;
+    writeJson(path.join(userDocsDir, "device_mini_doc.json"), {
+      // Keep the authoritative document body byte-for-byte equivalent at the
+      // JSON payload level to the JWT sent in RTCP Hello. Compatibility JWTs
+      // live in sibling maps so they do not alter the DeviceDocument revision.
+      devices: {
+        [params.node_name]: env.deviceDoc,
+      },
+      mini_device_jwts: {
+        [params.node_name]: env.deviceMiniDocJwt,
+      },
+      device_document_jwts: {
+        [params.node_name]: env.deviceDocJwt,
+      },
+    });
+    docLines.push(
+      `      - doc_type: device_mini_doc`,
+      `        inline_json_file: ${yamlQuote(miniRel)}`,
+    );
 
     txs.push(
       [
@@ -1376,6 +1597,11 @@ async function main(): Promise<void> {
   console.log(`  SN database: ${snDbPath}`);
   console.log(
     `  SN token key dir: ${path.join(targetDir, SN_AUTH_DATA_DIR)}`,
+  );
+  console.log(
+    `  SN did:web authority: ${
+      path.join(targetDir, SN_DID_WEB_ROOT_DIR, ".well-known", "did.json")
+    }`,
   );
   console.log("Template/operator files that should be present:");
   console.log(`  - ${path.join(targetDir, WEB3_GATEWAY_CONFIG_FILE)}`);

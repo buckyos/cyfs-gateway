@@ -84,6 +84,7 @@ pub enum RtcpAnonymousAdmission {
 pub enum RtcpNamedMinRelation {
     #[default]
     SameZone,
+    KnownOwner,
     Any,
 }
 
@@ -1628,6 +1629,51 @@ impl RTcpInner {
         }
     }
 
+    fn validate_named_relation(
+        &self,
+        device_document: &DeviceDocument,
+        verified: &VerifiedDidDocument,
+    ) -> Result<(), TunnelError> {
+        match self.security.inbound_admission.named_min_relation {
+            RtcpNamedMinRelation::Any => Ok(()),
+            RtcpNamedMinRelation::KnownOwner => {
+                if !verified.usable_as_authz_subject
+                    || verified.authz_owner.is_none()
+                    || verified.validity.owner_document_source.is_none()
+                {
+                    return Err(TunnelError::DocumentError(format!(
+                        "verified identity {} has no trusted owner evidence",
+                        verified.subject_did.to_string()
+                    )));
+                }
+                Ok(())
+            }
+            RtcpNamedMinRelation::SameZone => {
+                let expected_owner = self.this_owner_did.as_ref().ok_or_else(|| {
+                    TunnelError::DocumentError(
+                        "same_zone admission requires a local owner anchor".to_string(),
+                    )
+                })?;
+                let expected_zone = self.this_zone_did.as_ref().ok_or_else(|| {
+                    TunnelError::DocumentError(
+                        "same_zone admission requires a local zone anchor".to_string(),
+                    )
+                })?;
+                if !verified.usable_as_authz_subject
+                    || verified.validity.owner_document_source.is_none()
+                    || verified.authz_owner.as_ref() != Some(expected_owner)
+                    || device_document.zone_did.as_ref() != Some(expected_zone)
+                {
+                    return Err(TunnelError::DocumentError(format!(
+                        "verified identity {} is outside local owner/zone",
+                        verified.subject_did.to_string()
+                    )));
+                }
+                Ok(())
+            }
+        }
+    }
+
     async fn resolve_source_device_info(
         &self,
         hello_body: &RTcpHelloBody,
@@ -1694,28 +1740,7 @@ impl RTcpInner {
                     ));
                 }
 
-                if self.security.inbound_admission.named_min_relation
-                    == RtcpNamedMinRelation::SameZone
-                {
-                    let expected_owner = self.this_owner_did.as_ref().ok_or_else(|| {
-                        TunnelError::DocumentError(
-                            "same_zone admission requires a local owner anchor".to_string(),
-                        )
-                    })?;
-                    let expected_zone = self.this_zone_did.as_ref().ok_or_else(|| {
-                        TunnelError::DocumentError(
-                            "same_zone admission requires a local zone anchor".to_string(),
-                        )
-                    })?;
-                    if verified.authz_owner.as_ref() != Some(expected_owner)
-                        || device_doc.zone_did.as_ref() != Some(expected_zone)
-                    {
-                        return Err(TunnelError::DocumentError(format!(
-                            "verified identity {} is outside local owner/zone",
-                            verified.subject_did.to_string()
-                        )));
-                    }
-                }
+                self.validate_named_relation(&device_doc, &verified)?;
 
                 let identity_trust = Self::trust_from_verified(&verified);
                 let verified_cache_entry = Some(PendingVerifiedCacheEntry {
@@ -7621,7 +7646,7 @@ mod tests {
     // 模拟持钥证明与授权完成后显式提交 Verified cache,之后即使权威源断网,
     // strict resolve_did 也能命中,不再需要宽松策略。
     #[tokio::test]
-    async fn test_rtcp_authority_anchored_device_doc_jwt_hits_trusted_cache() {
+    async fn test_rtcp_authority_anchored_known_owner_hits_trusted_cache() {
         let _ = init_name_lib_for_test(&HashMap::new()).await;
 
         let (owner_signing_key, owner_pkcs8_bytes) = generate_ed25519_key();
@@ -7796,6 +7821,37 @@ mod tests {
         .unwrap();
         assert_eq!(verified.subject_did, device_did);
         assert_eq!(verified.authz_owner, Some(owner_did.clone()));
+        assert!(
+            verified.validity.owner_document_source.is_some(),
+            "known_owner requires trusted OwnerDocument evidence"
+        );
+        let mut known_owner_inner = RTcpInner::new(
+            DID::new("dev", "known-owner-admission-server"),
+            "127.0.0.1:0".to_string(),
+            None,
+            None,
+            Arc::new(MockRTcpListener::new()),
+        );
+        known_owner_inner
+            .security
+            .inbound_admission
+            .named_min_relation = RtcpNamedMinRelation::KnownOwner;
+        known_owner_inner
+            .validate_named_relation(&device_doc, &verified)
+            .expect("owner-backed AuthSubject must pass known_owner admission");
+
+        let mut ownerless_verified = verified.clone();
+        ownerless_verified.authz_owner = None;
+        ownerless_verified.usable_as_authz_subject = false;
+        ownerless_verified.validity.owner_document_source = None;
+        let err = known_owner_inner
+            .validate_named_relation(&device_doc, &ownerless_verified)
+            .expect_err("identity without trusted owner evidence must fail known_owner admission");
+        assert!(
+            err.to_string().contains("no trusted owner evidence"),
+            "unexpected error: {}",
+            err
+        );
         let verified_key = jwk_to_ed25519_pk(&device_doc.get_default_key().unwrap()).unwrap();
         assert_eq!(
             canonical_dev_did_from_ed25519_pk(&verified_key),

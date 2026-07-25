@@ -2205,7 +2205,9 @@ impl SnResolver {
         doc_type: &str,
     ) -> SnResolverResult<SnDidResolveResponse> {
         match doc_type {
-            "doc" => {
+            // `device` is the canonical name-lib DidDocType used by RTCP v3.
+            // `doc` remains the legacy SN resolver spelling during migration.
+            "doc" | "device" => {
                 let device_doc = self
                     .resolve_device_mini_doc(zone_name, obj_name, None)
                     .await?;
@@ -4312,9 +4314,24 @@ mod tests {
                 json!({
                     "devices": {
                         "ood1": {
-                            "did": "did:dev:abc",
-                            "mini_config_jwt": "jwt"
+                            "id": "did:bns:ood1.testuser",
+                            "owner": "did:bns:testuser",
+                            "device_type": "ood",
+                            "name": "ood1",
+                            "verificationMethod": [{
+                                "id": "#main_key",
+                                "controller": "did:bns:ood1.testuser",
+                                "type": "Ed25519VerificationKey2020",
+                                "publicKeyJwk": {
+                                    "kty": "OKP",
+                                    "crv": "Ed25519",
+                                    "x": "abc"
+                                }
+                            }]
                         }
+                    },
+                    "mini_device_jwts": {
+                        "ood1": "mini-jwt"
                     }
                 }),
             ),
@@ -4329,6 +4346,21 @@ mod tests {
 
         assert_eq!(resolved.source, SnDidDocumentSource::DeviceMiniDocument);
         assert_eq!(resolved.doc_type, "ood1");
+
+        let device_did = DID::from_str("did:bns:ood1.testuser").unwrap();
+        let resolved = resolver
+            .resolve_did(&device_did, Some("device"), None)
+            .await
+            .unwrap();
+        assert_eq!(resolved.source, SnDidDocumentSource::DeviceMiniDocument);
+        assert_eq!(resolved.doc_type, "device");
+        let document = resolved.document.to_json_value().unwrap();
+        assert_eq!(document["id"], "did:bns:ood1.testuser");
+        assert_eq!(document["owner"], "did:bns:testuser");
+        assert_eq!(
+            document["verificationMethod"][0]["publicKeyJwk"]["x"],
+            "abc"
+        );
     }
 
     #[tokio::test]

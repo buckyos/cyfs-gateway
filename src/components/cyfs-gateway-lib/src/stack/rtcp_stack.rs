@@ -2397,6 +2397,22 @@ inbound_self_declared_fallback: true
         };
         assert!(removed.to_string().contains("unknown field"));
 
+        let known_owner: RtcpStackConfig = serde_yaml_ng::from_str(
+            r#"
+id: known-owner
+protocol: rtcp
+bind: 127.0.0.1:2981
+hook_point: []
+inbound_admission:
+  named_min_relation: known_owner
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            known_owner.inbound_admission.named_min_relation,
+            crate::RtcpNamedMinRelation::KnownOwner
+        );
+
         let unsupported = match serde_yaml_ng::from_str::<RtcpStackConfig>(
             r#"
 id: unsupported-relation

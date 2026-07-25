@@ -206,7 +206,12 @@ challenge；完整 key confirmation 结束前 tunnel 不会注册或替换旧 tu
    `resolve_and_verify_device_document_jwt`：
    `LocalAndZone`、`allow_stale_cache=true`、unverified/self-signed fallback 全关；
 6. 拒绝 local older/conflict 和 authority NotCurrent；
-7. `same_zone` 只信任验证结果的 `authz_owner` 和 owner 背书文档中的 `zone_did`；
+7. 关系档位只消费验证结果：
+   - `same_zone` 要求 `authz_owner` 与本机 owner 相同，且 owner 背书文档中的
+     `zone_did` 与本机 zone 相同；
+   - `known_owner` 要求结果可作为 `AuthSubject` 授权、`authz_owner` 非空，并带可信
+     OwnerDocument evidence；
+   - `any` 不增加关系约束，但仍必须先完成上述 name-client 文档验证；
 8. 将 trust、canonical DID、owner/zone（只有验证成功时）交给 listener；
 9. 持钥证明、key confirmation、listener 授权都成功后才提交 verified cache 并注册
    tunnel。
@@ -380,8 +385,9 @@ stacks:
 ```
 
 安全默认值是 authority-current、TXT bootstrap 关闭、anonymous 拒绝、same-zone。
-`same_owner` 等未实现枚举值、已删除的 `inbound_self_declared_fallback` 和其它未知字段会
-导致配置反序列化失败，不会静默忽略。
+`named_min_relation` 支持 `same_zone`、`known_owner`、`any`。`same_owner` 等未实现枚举值、
+已删除的 `inbound_self_declared_fallback` 和其它未知字段会导致配置反序列化失败，不会
+静默忽略。
 
 Identity manager 实际探测：
 

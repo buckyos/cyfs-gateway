@@ -194,7 +194,7 @@ stacks:
     #     dns_txt_bootstrap: false       # non-authoritative compatibility mode; keep false on public stacks
     #   inbound_admission:
     #     anonymous: reject              # no self-declared document fallback exists
-    #     named_min_relation: same_zone  # same_zone | any
+    #     named_min_relation: same_zone  # same_zone | known_owner | any
     #     authority_reconfirm_max_age: unlimited
     #   liveness:
     #     ping_interval_secs: 30
