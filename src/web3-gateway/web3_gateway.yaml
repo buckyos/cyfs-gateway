@@ -20,6 +20,27 @@ servers:
     # C 类种子(激活码/sn_user 账号/user_domain 绑定)幂等导入;相对路径按
     # 配置目录解析,文件不存在时自动跳过(部署目录没有种子也能正常启动)。
     seed_path: "sn_seed.yaml"
+    # 一体化 Web3 Gateway 同时承载 relay 数据面。SN 启动时幂等注册本节点，
+    # 并为 seed 用户补齐动态 assignment；单 IP 部署按 relay 双地址契约填满
+    # 两个 slot，DNS 输出时会去重。
+    local_relay_node:
+      relay_id: "embedded-web3-gateway"
+      relay_sn: "sn.{{sn_host}}"
+      ips:
+        - "{{sn_ip}}"
+        - "{{sn_ip}}"
+      public_host: "sn.{{sn_host}}"
+      http_endpoint: null
+      rtcp_endpoint: null
+      region: null
+      isp: null
+      tags:
+        - "embedded"
+      capabilities:
+        - "http_relay"
+        - "rtcp_relay"
+      status: active
+      capacity_score: 100
 
   local_dns:
     type: local_dns
@@ -92,6 +113,22 @@ stacks:
   dns_udp:
     bind: "{{dns_bind}}"
     protocol: udp
+    hook_point:
+      main:
+        id: main
+        priority: 1
+        blocks:
+          default:
+            id: default
+            priority: 1
+            block: |
+              return "server main_dns";
+
+  # DNS responses larger than the client's advertised UDP size set TC; clients
+  # then retry the same query over TCP on the same address and port.
+  dns_tcp:
+    bind: "{{dns_bind}}"
+    protocol: tcp
     hook_point:
       main:
         id: main

@@ -32,7 +32,7 @@
       "sudo rm -f /opt/web3-gateway/anvil.pid",
       "cd /opt/web3-gateway && sudo uv run ./init_anvil.py --fresh --install-foundry --configure-sn-bns-proxy",
       "sudo systemd-run --unit=web3-gateway-dev --collect --working-directory=/opt/web3-gateway --property=StandardOutput=append:/opt/web3-gateway/start.log --property=StandardError=append:/opt/web3-gateway/start.log /usr/local/bin/uv run ./start.py",
-      "for i in $(seq 1 90); do ss -lntu | grep -q ':443 ' && ss -lnu | grep -q ':53 ' && curl -skS --resolve sn.devtests.org:443:127.0.0.1 --max-time 2 https://sn.devtests.org/kapi/sn >/dev/null 2>&1 && exit 0; sleep 1; done; echo 'web3-gateway did not become healthy' >&2; exit 1"
+      "for i in $(seq 1 90); do ss -lntu | grep -q ':443 ' && ss -lnu | grep -q ':53 ' && ss -lnt | grep -q ':53 ' && curl -skS --resolve sn.devtests.org:443:127.0.0.1 --max-time 2 https://sn.devtests.org/kapi/sn >/dev/null 2>&1 && exit 0; sleep 1; done; echo 'web3-gateway did not become healthy' >&2; exit 1"
     ],
     "start_bg": [
       "sudo systemd-run --unit=web3-gateway-dev --collect --working-directory=/opt/web3-gateway --property=StandardOutput=append:/opt/web3-gateway/start.log --property=StandardError=append:/opt/web3-gateway/start.log /usr/local/bin/uv run ./start.py"

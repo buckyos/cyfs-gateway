@@ -267,12 +267,11 @@ fn seed_user_activation_code(username: &str) -> String {
     format!("seed-user-{}", username)
 }
 
-/// 从文件导入。文件不存在 → `Ok(None)`（调用方记日志后跳过）；
-/// 读取/解析/导入失败 → `Err`（调用方 fail fast）。
-pub async fn import_sn_seed_from_path(
-    auth_db: &SqliteSnAuthDB,
-    seed_path: &Path,
-) -> SnResult<Option<SnSeedImportReport>> {
+/// 从文件加载。文件不存在 → `Ok(None)`；读取/解析失败 → `Err`。
+///
+/// 启动器需要保留解析后的用户名，为一体化 gateway 的本机 relay 补齐动态
+/// assignment；assignment 本身仍不属于 seed 数据。
+pub fn load_sn_seed_from_path(seed_path: &Path) -> SnResult<Option<SnSeedConfig>> {
     if !seed_path.exists() {
         return Ok(None);
     }
@@ -284,7 +283,18 @@ pub async fn import_sn_seed_from_path(
             e
         )
     })?;
-    let seed = parse_sn_seed_config(text.as_str())?;
+    parse_sn_seed_config(text.as_str()).map(Some)
+}
+
+/// 从文件导入。文件不存在 → `Ok(None)`（调用方记日志后跳过）；
+/// 读取/解析/导入失败 → `Err`（调用方 fail fast）。
+pub async fn import_sn_seed_from_path(
+    auth_db: &SqliteSnAuthDB,
+    seed_path: &Path,
+) -> SnResult<Option<SnSeedImportReport>> {
+    let Some(seed) = load_sn_seed_from_path(seed_path)? else {
+        return Ok(None);
+    };
     let report = import_sn_seed(auth_db, &seed).await?;
     Ok(Some(report))
 }

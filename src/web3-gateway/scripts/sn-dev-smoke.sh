@@ -11,7 +11,7 @@
 #
 # 验证 seed 确实生效（对应 doc/SN/SN-seed-config-TODO.md §3.3 的 curl/dig 面）：
 #   S1 DNS A     alice.web3.devtests.org -> sn_ip（本机模式 127.0.0.1；VM 模式为 VM IP）
-#   S2 DNS TXT   alice.web3.devtests.org 含 PKX= / BOOT= / DEV=
+#   S2 DNS TXT   alice.web3.devtests.org 经 UDP 与 TCP 均含 PKX= / BOOT= / DEV=
 #   S3 链上种子  GET /1.0/identifiers/did:bns:alice 经 indexer 投影解析成功
 #   S4 user_domain 种子  GET /1.0/identifiers/did:web:charlie.me 解析成功
 #   S5 纯 Web3 位  did:bns:dave（无 sn_user 行）仍可经 BNS 路径解析
@@ -235,6 +235,9 @@ dns_a_matches_expected() {
 dns_txt_has() { # dns_txt_has <marker>
   dig +short +time=3 +tries=1 @"$DNS_SERVER" -p "$DNS_PORT" "$ALICE_HOST" TXT | grep -Fq "$1"
 }
+dns_txt_tcp_has() { # dns_txt_tcp_has <marker>
+  dig +tcp +short +time=3 +tries=1 @"$DNS_SERVER" -p "$DNS_PORT" "$ALICE_HOST" TXT | grep -Fq "$1"
+}
 identifiers_ok() { # identifiers_ok <did>
   # 当前兼容 API 顶层返回 boot/user_name；旧 DID 文档形态可能返回 id/oods。
   # 任一形态都说明 resolver 成功返回了可用文档。
@@ -443,6 +446,7 @@ check "S1 DNS A $ALICE_HOST -> $EXPECTED_A" dns_a_matches_expected
 check "S2 DNS TXT contains PKX=" dns_txt_has "PKX="
 check "S2 DNS TXT contains BOOT=" dns_txt_has "BOOT="
 check "S2 DNS TXT contains DEV=" dns_txt_has "DEV="
+check "S2 DNS TXT over TCP contains DEV=" dns_txt_tcp_has "DEV="
 check "S3 resolve did:bns:alice via indexer projection" identifiers_ok "did:bns:alice"
 check "S4 resolve did:web:charlie.me via user_domain seed" identifiers_ok "did:web:charlie.me"
 check "S5 resolve did:bns:dave (pure Web3, no sn_user row)" identifiers_ok "did:bns:dave"

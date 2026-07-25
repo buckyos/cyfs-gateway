@@ -15,6 +15,17 @@ fn web3_gateway_uses_one_sn_server_and_a_fixed_loopback_zone_resolver_stack() {
         .collect();
     assert_eq!(sn_servers.len(), 1);
     assert_eq!(sn_servers[0].0, "web3_sn");
+    let local_relay = &sn_servers[0].1["local_relay_node"];
+    assert_eq!(local_relay["relay_id"], "embedded-web3-gateway");
+    assert_eq!(local_relay["relay_sn"], "sn.{{sn_host}}");
+    assert_eq!(
+        local_relay["ips"].as_array().unwrap(),
+        &vec![
+            Value::String("{{sn_ip}}".to_string()),
+            Value::String("{{sn_ip}}".to_string())
+        ]
+    );
+    assert_eq!(local_relay["status"], "active");
 
     let stack = &config["stacks"]["sn_zone_resolver_tcp"];
     assert_eq!(stack["protocol"], "tcp");
@@ -24,6 +35,16 @@ fn web3_gateway_uses_one_sn_server_and_a_fixed_loopback_zone_resolver_stack() {
         .as_str()
         .unwrap();
     assert!(dispatch.contains("return \"server web3_sn\""));
+
+    let dns_udp = &config["stacks"]["dns_udp"];
+    let dns_tcp = &config["stacks"]["dns_tcp"];
+    assert_eq!(dns_udp["protocol"], "udp");
+    assert_eq!(dns_tcp["protocol"], "tcp");
+    assert_eq!(dns_tcp["bind"], dns_udp["bind"]);
+    assert_eq!(
+        dns_tcp["hook_point"]["main"]["blocks"]["default"]["block"],
+        dns_udp["hook_point"]["main"]["blocks"]["default"]["block"]
+    );
 
     let rtcp = &config["stacks"]["main_rtcp"];
     assert_eq!(

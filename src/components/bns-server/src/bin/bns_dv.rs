@@ -289,6 +289,7 @@ async fn run_on_init_txs(
     }
     let evm_config = BnsEvmClientConfig::anvil(rpc, contract, chain_id);
     let controller = BnsEvmControllerClient::new(evm_config.clone(), &runtime.private_key)?
+        .with_dynamic_tx_params(true)
         .with_receipt_wait(Some(runtime.receipt_wait));
     let api: Arc<dyn BnsIndexerApi> = Arc::new(BnsContractServerHandler::new(
         SqliteBnsRegistryStore::open(db)?,
@@ -621,6 +622,7 @@ fn resolve_mutation_signer(
         .into());
     }
     let owner_controller = BnsEvmControllerClient::new(evm_config.clone(), owner_key)?
+        .with_dynamic_tx_params(true)
         .with_receipt_wait(Some(runtime.receipt_wait));
     Ok((Some(owner_controller), owner_signer))
 }
@@ -1176,21 +1178,24 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        std::fs::write(
-            &device_file,
-            serde_json::to_vec(&json!({
-                "id": "did:bns:alice",
-                "devices": {
-                    "ood1": {
-                        "id": "did:dev:ood1",
-                        "device_name": "ood1",
-                        "marker": "device-from-on-init"
-                    }
+        // Keep this close to the contract's 4 KiB inline-document limit. Together
+        // with the other initial documents it needs more than the old fixed
+        // 3,000,000 gas limit and guards the devtest seed path against regression.
+        let device_document = serde_json::to_vec(&json!({
+            "id": "did:bns:alice",
+            "devices": {
+                "ood1": {
+                    "id": "did:dev:ood1",
+                    "device_name": "ood1",
+                    "marker": "device-from-on-init",
+                    "padding": "x".repeat(3_600)
                 }
-            }))
-            .unwrap(),
-        )
+            }
+        }))
         .unwrap();
+        assert!(device_document.len() > 3_500);
+        assert!(device_document.len() <= 4 * 1024);
+        std::fs::write(&device_file, device_document).unwrap();
 
         let config_file = temp.path().join("seed.yaml");
         std::fs::write(
@@ -1382,7 +1387,18 @@ on_init_txs:
         )
         .await
         .unwrap();
-        let doc = server_api.resolve_document("alice", "zone").await.unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let doc = loop {
+            let doc = server_api.resolve_document("alice", "zone").await.unwrap();
+            if doc.document_state.version >= 2 {
+                break doc;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "indexer did not project the replayed document"
+            );
+            sleep(Duration::from_millis(50)).await;
+        };
         assert_eq!(doc.document_state.version, 2);
         let value: Value =
             serde_json::from_slice(&doc.document_state.document.inline_document).unwrap();

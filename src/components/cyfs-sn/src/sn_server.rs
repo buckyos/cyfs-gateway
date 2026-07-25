@@ -25,10 +25,10 @@ use crate::sn_resolver::{
     SnDeviceInfoResolverReader, SnResolver, SnResolverConfig, SnResolverErrorKind, SnResolverRef,
 };
 use crate::{
-    GeoIpResolverConfig, RelayAllocationConfig, SnAuthDBRef, SnAuthDbClient,
-    SnDeviceEndpointUpdate, SnDeviceInfoDBRef, SnDeviceInfoDbClient, SnDeviceRole, SnDeviceState,
-    SnDeviceStateUpdate, SnEndpointProtocol, SnEndpointScope, SnEndpointSource, SnNatType,
-    SnResult, SqliteSnAuthDB, SqliteSnDeviceInfoDB, XdbGeoIpResolver,
+    AllocateZoneRelayReq, GeoIpResolverConfig, RelayAllocationConfig, RelayNodeRegistration,
+    SnAuthDBRef, SnAuthDbClient, SnDeviceEndpointUpdate, SnDeviceInfoDBRef, SnDeviceInfoDbClient,
+    SnDeviceRole, SnDeviceState, SnDeviceStateUpdate, SnEndpointProtocol, SnEndpointScope,
+    SnEndpointSource, SnNatType, SnResult, SqliteSnAuthDB, SqliteSnDeviceInfoDB, XdbGeoIpResolver,
 };
 use ::kRPC::*;
 use async_trait::async_trait;
@@ -1798,6 +1798,13 @@ pub struct SNServerConfig {
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub relay_allocation: Option<RelayAllocationConfig>,
+    /// 与 SN 同进程部署的一体化 relay。配置后启动器会幂等注册该节点，并为
+    /// `seed_path` 中已存在但尚未分配 relay 的用户执行自动分配。
+    ///
+    /// assignment 是运行态数据，仍不写入 `sn_seed.yaml`。
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub local_relay_node: Option<RelayNodeRegistration>,
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sn_controller_kid: Option<String>,
@@ -2122,6 +2129,7 @@ impl ServerFactory for SnServerFactory {
             .geoip
             .take()
             .map(Self::resolve_geoip_config);
+        let mut seed_users = Vec::new();
 
         let auth_db: SnAuthDBRef = if let Some(url) = auth_db_url.as_deref() {
             info!("sn server uses remote auth_db provider: {}", url);
@@ -2164,14 +2172,27 @@ impl ServerFactory for SnServerFactory {
             // 启动失败（坏种子不能静默）。语义见 sn_seed.rs 模块注释。
             if let Some(seed_path) = config.seed_path.as_deref() {
                 let resolved = crate::resolve_sn_seed_path(seed_path);
-                match crate::import_sn_seed_from_path(&auth_db, resolved.as_path()).await {
+                match crate::load_sn_seed_from_path(resolved.as_path()) {
                     Ok(None) => {
                         info!(
                             "sn seed config {} not found; skip seed import",
                             resolved.display()
                         );
                     }
-                    Ok(Some(report)) => {
+                    Ok(Some(seed)) => {
+                        let report = crate::import_sn_seed(&auth_db, &seed).await.map_err(|e| {
+                            server_err!(
+                                ServerErrorCode::InvalidConfig,
+                                "import sn seed config {} failed: {}",
+                                resolved.display(),
+                                e
+                            )
+                        })?;
+                        seed_users = seed
+                            .users
+                            .iter()
+                            .map(|user| user.username.trim().to_string())
+                            .collect();
                         info!("sn seed imported from {}: {}", resolved.display(), report);
                     }
                     Err(e) => {
@@ -2186,6 +2207,61 @@ impl ServerFactory for SnServerFactory {
             }
             Arc::new(auth_db)
         };
+        if let Some(local_relay_node) = config.local_relay_node.as_ref() {
+            let relay = auth_db
+                .register_relay_node(local_relay_node.clone())
+                .await
+                .map_err(|e| {
+                    server_err!(
+                        ServerErrorCode::InvalidConfig,
+                        "register local relay node {} failed: {}",
+                        local_relay_node.relay_id,
+                        e
+                    )
+                })?;
+            info!(
+                "sn local relay node registered: relay_id={} relay_sn={} ips={:?}",
+                relay.relay_id, relay.relay_sn, relay.ips
+            );
+
+            for username in seed_users {
+                if !auth_db
+                    .is_user_exist(username.as_str())
+                    .await
+                    .map_err(|e| {
+                        server_err!(
+                            ServerErrorCode::InvalidConfig,
+                            "check seed user {} before relay allocation failed: {}",
+                            username,
+                            e
+                        )
+                    })?
+                {
+                    warn!(
+                        "skip local relay allocation for seed user {} because the user was not imported",
+                        username
+                    );
+                    continue;
+                }
+                let mut req = AllocateZoneRelayReq::new(username.clone());
+                req.reason = "seed_bootstrap".to_string();
+                let assignment = auth_db.allocate_zone_relay(req).await.map_err(|e| {
+                    server_err!(
+                        ServerErrorCode::InvalidConfig,
+                        "allocate local relay for seed user {} failed: {}",
+                        username,
+                        e
+                    )
+                })?;
+                info!(
+                    "sn seed user relay ready: zone={} relay_id={} relay_sn={} generation={}",
+                    assignment.zone,
+                    assignment.relay_id,
+                    assignment.relay_sn,
+                    assignment.generation
+                );
+            }
+        }
         let capabilities = auth_db.capabilities().await.map_err(|e| {
             server_err!(
                 ServerErrorCode::InvalidConfig,
@@ -2255,7 +2331,7 @@ impl ServerFactory for SnServerFactory {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{RelayNodeRegistration, SnAuthDB};
+    use crate::SnAuthDB;
     use buckyos_kit::init_logging;
     use cyfs_gateway_lib::hyper_serve_http;
     use std::time::SystemTime;
@@ -2783,6 +2859,95 @@ mod tests {
         assert!(error.contains("seed_path cannot be used with remote auth_db"));
     }
 
+    #[tokio::test]
+    async fn local_relay_bootstrap_repairs_missing_seed_user_assignment() {
+        let bns_addr = spawn_test_http_server(Arc::new(ReadinessTestServer::new(
+            ReadinessServerMode::Ready,
+        )))
+        .await;
+        let db = tempfile::NamedTempFile::with_suffix(".db").unwrap();
+        let auth_dir = tempfile::tempdir().unwrap();
+        let seed_dir = tempfile::tempdir().unwrap();
+        let seed_path = seed_dir.path().join("sn_seed.yaml");
+        let seed_yaml = r#"
+users:
+  - username: seedrelayuser
+    email: seedrelayuser@example.com
+    password: devtest-password
+    owner_public_key: seed-relay-owner-key
+"#;
+        std::fs::write(seed_path.as_path(), seed_yaml).unwrap();
+
+        // Reproduce an existing VM database: the seed user is present, but no
+        // relay node or assignment was created by the old startup path.
+        let auth_db = SqliteSnAuthDB::new_by_path(db.path().to_str().unwrap())
+            .await
+            .unwrap();
+        auth_db.initialize_database().await.unwrap();
+        let seed = crate::load_sn_seed_from_path(seed_path.as_path())
+            .unwrap()
+            .unwrap();
+        crate::import_sn_seed(&auth_db, &seed).await.unwrap();
+        assert!(auth_db
+            .get_zone_relay("seedrelayuser")
+            .await
+            .unwrap()
+            .is_none());
+
+        let config: SNServerConfig = serde_json::from_value(json!({
+            "id": "local-relay-bootstrap",
+            "host": "sn.test",
+            "bns_server_url": format!("http://{}", bns_addr),
+            "db_path": db.path().to_str().unwrap(),
+            "auth_data_dir": auth_dir.path().to_str().unwrap(),
+            "seed_path": seed_path.to_str().unwrap(),
+            "local_relay_node": {
+                "relay_id": "embedded-test",
+                "relay_sn": "sn.test",
+                "ips": ["192.0.2.10", "192.0.2.10"],
+                "public_host": "sn.test",
+                "http_endpoint": null,
+                "rtcp_endpoint": null,
+                "region": null,
+                "isp": null,
+                "tags": ["embedded"],
+                "capabilities": ["http_relay", "rtcp_relay"],
+                "status": "active",
+                "capacity_score": 100
+            }
+        }))
+        .unwrap();
+        let servers = SnServerFactory::new()
+            .create(Arc::new(config), None)
+            .await
+            .unwrap();
+        assert_eq!(servers.len(), 3);
+
+        let relay = auth_db
+            .get_relay_node("embedded-test")
+            .await
+            .unwrap()
+            .expect("local relay node");
+        assert_eq!(relay.ips[0], relay.ips[1]);
+        let assignment = auth_db
+            .get_zone_relay("seedrelayuser")
+            .await
+            .unwrap()
+            .expect("seed user relay assignment");
+        assert_eq!(assignment.relay_id, "embedded-test");
+        assert_eq!(assignment.relay_sn, "sn.test");
+        assert_eq!(
+            auth_db
+                .get_zone_info("seedrelayuser")
+                .await
+                .unwrap()
+                .unwrap()
+                .relay_sn
+                .as_deref(),
+            Some("sn.test")
+        );
+    }
+
     #[test]
     fn test_split_host_name() {
         let req_host = "home.lzc.web3.buckyos.io".to_string();
@@ -2819,6 +2984,7 @@ mod tests {
         assert!(config.boot_jwt.is_none());
         assert!(config.owner_pkx.is_none());
         assert!(config.device_jwt.is_empty());
+        assert!(config.local_relay_node.is_none());
         assert_eq!(config.bns_server_url, "http://127.0.0.1:18080");
         assert_eq!(config.auth_db.as_deref(), Some("http://auth-provider:8080"));
         assert!(SNServer::parse_server_ip(None).unwrap().is_none());

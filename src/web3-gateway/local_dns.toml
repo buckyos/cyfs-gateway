@@ -1,6 +1,6 @@
-# Deployment-specific bns.<sn_host> -> sn_ip is appended here by
-# make_sn_config.ts. This file is loaded directly and does not support
-# params.json {{...}} template expansion.
+# Deployment-specific bns.<sn_host> and sn.<sn_host> -> sn_ip records are
+# appended here by make_sn_config.ts. This file is loaded directly and does
+# not support params.json {{...}} template expansion.
 
 ["test.buckyos.io"]
 ttl = 3600

@@ -4,6 +4,7 @@ use crate::sn_resolver::{
 };
 use async_trait::async_trait;
 use bns_client::{BnsClientError, BnsRpcApi, BnsRpcClient, DocumentStatus};
+use name_lib::EncodedDocument;
 use serde_json::Value;
 
 pub struct BnsRpcDocumentReader {
@@ -69,11 +70,22 @@ impl BnsRpcDocumentReader {
             return Ok(None);
         }
 
-        serde_json::from_slice::<Value>(bytes)
+        if let Ok(value) = serde_json::from_slice::<Value>(bytes) {
+            return Ok(Some(value));
+        }
+
+        let jwt = std::str::from_utf8(bytes).map_err(|e| {
+            Self::backend_error(
+                format!("decode BNS inline owner document {}/{}", name, doc_type).as_str(),
+                e,
+            )
+        })?;
+        EncodedDocument::Jwt(jwt.trim().to_string())
+            .to_json_value()
             .map(Some)
             .map_err(|e| {
                 Self::backend_error(
-                    format!("decode BNS inline JSON document {}/{}", name, doc_type).as_str(),
+                    format!("decode BNS inline owner JWT document {}/{}", name, doc_type).as_str(),
                     e,
                 )
             })
@@ -172,5 +184,44 @@ impl BnsDocumentReader for BnsRpcDocumentReader {
                 ttl: None,
             },
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+    use serde_json::json;
+
+    #[test]
+    fn owner_config_accepts_compact_jwt_stored_in_bns() {
+        let owner = json!({
+            "id": "did:bns:alice",
+            "verificationMethod": [{
+                "id": "#main_key",
+                "controller": "did:bns:alice",
+                "publicKeyJwk": {
+                    "kty": "OKP",
+                    "crv": "Ed25519",
+                    "x": "owner-key"
+                }
+            }],
+            "authentication": ["#main_key"],
+            "exp": 2_058_838_939u64,
+            "iat": 1_735_689_600u64,
+            "version_seq": 0,
+            "name": "alice",
+            "display_name": "alice"
+        });
+        let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"EdDSA"}"#);
+        let payload = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&owner).unwrap());
+        let jwt = format!("{header}.{payload}.signature");
+
+        let decoded =
+            BnsRpcDocumentReader::decode_inline_document_value(jwt.as_bytes(), "alice", "owner")
+                .unwrap()
+                .unwrap();
+
+        assert_eq!(decoded, owner);
     }
 }
