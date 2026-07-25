@@ -251,6 +251,19 @@ struct ResolvedHandshakeIdentity {
     ed25519_pk_der: [u8; 32],
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct VerifiedTunnelIdentity {
+    logical_did: String,
+    document_revision: DocumentRevision,
+}
+
+#[derive(Clone)]
+struct PendingVerifiedCacheEntry {
+    did: DID,
+    document: EncodedDocument,
+    identity: VerifiedTunnelIdentity,
+}
+
 struct VerifiedSourceDevice {
     source_device_id: String,
     canonical_dev_did: DID,
@@ -259,7 +272,7 @@ struct VerifiedSourceDevice {
     // A document that passed name-client's expected-owner verification.  It is
     // deliberately not cached yet: the responder first requires the peer to
     // prove possession of the device key and pass application authorization.
-    verified_cache_entry: Option<(DID, EncodedDocument)>,
+    verified_cache_entry: Option<PendingVerifiedCacheEntry>,
 }
 
 // Decode a hex-encoded 32-byte X25519 public key. Used by both Hello and
@@ -1084,16 +1097,17 @@ impl RTcpInner {
     }
 
     fn commit_verified_cache_entry(
-        entry: Option<(DID, EncodedDocument)>,
-    ) -> NSResult<Option<(DID, CacheWriteOutcome)>> {
-        let Some((did, document)) = entry else {
+        entry: Option<PendingVerifiedCacheEntry>,
+    ) -> NSResult<Option<(VerifiedTunnelIdentity, CacheWriteOutcome)>> {
+        let Some(entry) = entry else {
             return Ok(None);
         };
         let client = GLOBAL_NAME_CLIENT
             .get()
             .ok_or_else(|| NSError::InvalidState("name client not initialized".to_string()))?;
-        let outcome = client.add_verified_cache(did.clone(), Some(DidDocType::Device), document)?;
-        Ok(Some((did, outcome)))
+        let outcome =
+            client.add_verified_cache(entry.did, Some(DidDocType::Device), entry.document)?;
+        Ok(Some((entry.identity, outcome)))
     }
 
     // 第 2 级回落:用 payload 自声明 owner 验签 + 观察缓存写入。只能证明"JWT 能
@@ -1216,8 +1230,18 @@ impl RTcpInner {
                         // 缓存提交推迟到 peer 完成 tunnel-token 持钥证明、key
                         // confirmation 与 listener 授权之后。这样 verify 不产生
                         // 隐式写入,攻击者也不能只靠提交一份文档推进 high-water。
-                        let verified_cache_entry =
-                            Some((verified.subject_did.clone(), verified.document.clone()));
+                        // Preserve name-client's revision object verbatim.  Its
+                        // iat + content-hash semantics are also used by the
+                        // active-tunnel identity index; RTCP must not invent a
+                        // second revision parser or ordering.
+                        let verified_cache_entry = Some(PendingVerifiedCacheEntry {
+                            did: verified.subject_did.clone(),
+                            document: verified.document.clone(),
+                            identity: VerifiedTunnelIdentity {
+                                logical_did: verified.subject_did.to_string(),
+                                document_revision: verified.revision.clone(),
+                            },
+                        });
                         return Ok(VerifiedSourceDevice {
                             source_device_id: verified.subject_did.to_string(),
                             canonical_dev_did: canonical_dev_did_from_ed25519_pk(&ed25519_pk),
@@ -1688,38 +1712,6 @@ impl RTcpInner {
             return;
         }
 
-        // The document is accepted only after the peer has proved possession
-        // of its device key, completed key confirmation, and passed the
-        // application listener's authorization.  Commit it now as RTCP's
-        // high-water/CAS step.  A concurrent newer or conflicting acceptance
-        // wins in name-client's iat-only merge; this tunnel must then be
-        // rejected instead of silently authorizing a rollback.
-        match Self::commit_verified_cache_entry(verified_cache_entry) {
-            Ok(Some((did, outcome))) if outcome.stored() => {
-                debug!(
-                    "accepted device document {} into verified cache: {:?}",
-                    did.to_string(),
-                    outcome
-                );
-            }
-            Ok(Some((_did, outcome))) => {
-                warn!(
-                    "reject rtcp tunnel from {} {}: accepted device document cache commit \
-                     lost freshness race: {:?}",
-                    source_device_id, source_addr, outcome
-                );
-                return;
-            }
-            Ok(None) => {}
-            Err(err) => {
-                warn!(
-                    "reject rtcp tunnel from {} {}: cannot commit accepted device document: {}",
-                    source_device_id, source_addr, err
-                );
-                return;
-            }
-        }
-
         let tunnel = RTcpTunnel::new(
             self.stream_helper.clone(),
             self.this_device_did.clone(),
@@ -1731,17 +1723,37 @@ impl RTcpInner {
             aes_key,
             self.listener.clone(),
         );
-
         let tunnel_key = self.format_tunnel_key(&source_dev_did, None);
-        if let Some(old_tunnel) = self
+
+        // The document is accepted only after the peer has proved possession
+        // of its device key, completed key confirmation, and passed the
+        // application listener's authorization.  Commit it now as RTCP's
+        // high-water/CAS step.  A concurrent newer or conflicting acceptance
+        // wins in name-client's DocumentRevision merge.  RTcpTunnelMap holds
+        // a dedicated commit guard across this cache CAS and the subsequent
+        // map/index publication, closing the gap where an old successful CAS
+        // could otherwise resume after a newer tunnel's index scan.
+        let accepted = match self
             .tunnel_map
-            .replace_authenticated_inbound(&tunnel_key, tunnel.clone())
+            .complete_authenticated_inbound(&tunnel_key, tunnel.clone(), verified_cache_entry)
             .await
         {
-            // replace_authenticated_inbound marks the old instance closed in
-            // the map critical section. Finish waiter cleanup and transport
-            // shutdown only after releasing the map lock.
-            old_tunnel.close().await;
+            Ok(accepted) => accepted,
+            Err(err) => {
+                warn!(
+                    "reject rtcp tunnel from {} {}: cannot commit accepted device document: {}",
+                    source_device_id, source_addr, err
+                );
+                tunnel.close().await;
+                return;
+            }
+        };
+        if !accepted {
+            warn!(
+                "reject rtcp tunnel from {} {} after verified-cache arbitration",
+                source_device_id, source_addr
+            );
+            return;
         }
 
         info!(
@@ -3692,19 +3704,90 @@ pub type RTcpListenerRef = Arc<dyn RTcpListener>;
 
 #[derive(Clone)]
 struct RTcpTunnelMap {
-    tunnel_map: Arc<Mutex<HashMap<String, RTcpTunnel>>>,
+    tunnel_map: Arc<Mutex<RTcpTunnelMapState>>,
+    // Serializes the verified-cache CAS result with publication into the
+    // primary/secondary indexes.  Without this guard, old A could receive
+    // Inserted, pause before indexing, let new B commit + scan, then resume
+    // and publish itself after B's scan.  The map mutex is never held during
+    // the cache write, and this guard is dropped before transport shutdown.
+    authenticated_commit_lock: Arc<Mutex<()>>,
+}
+
+#[derive(Default)]
+struct RTcpTunnelMapState {
+    tunnels: HashMap<String, RTcpTunnel>,
+    verified_by_logical_did: HashMap<String, HashMap<u64, VerifiedTunnelIndexEntry>>,
+    logical_did_by_instance: HashMap<u64, String>,
+}
+
+#[derive(Clone)]
+struct VerifiedTunnelIndexEntry {
+    instance_id: u64,
+    canonical_key: String,
+    document_revision: DocumentRevision,
+    tunnel: RTcpTunnel,
+}
+
+struct InboundTunnelRegistration {
+    accepted: bool,
+    replaced: Option<RTcpTunnel>,
+    superseded: Vec<RTcpTunnel>,
+    rejected: Option<RTcpTunnel>,
+}
+
+impl RTcpTunnelMapState {
+    fn remove_verified_instance(&mut self, instance_id: u64) -> bool {
+        let Some(logical_did) = self.logical_did_by_instance.remove(&instance_id) else {
+            return false;
+        };
+        let remove_logical_bucket =
+            if let Some(entries) = self.verified_by_logical_did.get_mut(&logical_did) {
+                entries.remove(&instance_id);
+                entries.is_empty()
+            } else {
+                false
+            };
+        if remove_logical_bucket {
+            self.verified_by_logical_did.remove(&logical_did);
+        }
+        true
+    }
+
+    fn remove_primary_if_instance(&mut self, tunnel_key: &str, instance_id: u64) -> bool {
+        let is_current = self
+            .tunnels
+            .get(tunnel_key)
+            .map(|current| current.instance_id() == instance_id)
+            .unwrap_or(false);
+        if is_current {
+            self.tunnels.remove(tunnel_key);
+        }
+        is_current
+    }
+}
+
+// DocumentRevision deliberately exposes no total ordering: iat orders
+// revisions, while the content hash distinguishes identity from a same-iat
+// conflict.  "Strictly older" therefore follows name-client's own documented
+// semantics and never uses the hash as a tie-breaker.
+fn document_revision_is_strictly_older(
+    candidate: &DocumentRevision,
+    current: &DocumentRevision,
+) -> bool {
+    candidate.iat < current.iat
 }
 
 impl RTcpTunnelMap {
     pub fn new() -> Self {
         RTcpTunnelMap {
-            tunnel_map: Arc::new(Mutex::new(HashMap::new())),
+            tunnel_map: Arc::new(Mutex::new(RTcpTunnelMapState::default())),
+            authenticated_commit_lock: Arc::new(Mutex::new(())),
         }
     }
 
     pub async fn get_tunnel(&self, tunnel_key: &str) -> Option<RTcpTunnel> {
         let all_tunnel = self.tunnel_map.lock().await;
-        all_tunnel.get(tunnel_key).cloned()
+        all_tunnel.tunnels.get(tunnel_key).cloned()
     }
 
     // Outbound creators retain first-wins semantics: concurrent local dials
@@ -3715,9 +3798,9 @@ impl RTcpTunnelMap {
         tunnel: RTcpTunnel,
     ) -> Result<(), RTcpTunnel> {
         let mut all_tunnel = self.tunnel_map.lock().await;
-        if let Some(existing) = all_tunnel.get(tunnel_key) {
+        if let Some(existing) = all_tunnel.tunnels.get(tunnel_key).cloned() {
             if !existing.is_closed() {
-                return Err(existing.clone());
+                return Err(existing);
             }
             debug!(
                 "replace closed outbound RTcp tunnel {} instance {} with instance {}",
@@ -3725,13 +3808,14 @@ impl RTcpTunnelMap {
                 existing.instance_id(),
                 tunnel.instance_id()
             );
+            all_tunnel.remove_verified_instance(existing.instance_id());
         }
         info!(
             "register outbound RTcp tunnel {} instance {}",
             tunnel_key,
             tunnel.instance_id()
         );
-        all_tunnel.insert(tunnel_key.to_owned(), tunnel);
+        all_tunnel.tunnels.insert(tunnel_key.to_owned(), tunnel);
         Ok(())
     }
 
@@ -3744,11 +3828,29 @@ impl RTcpTunnelMap {
         &self,
         tunnel_key: &str,
         tunnel: RTcpTunnel,
-    ) -> Option<RTcpTunnel> {
+        verified_identity: Option<VerifiedTunnelIdentity>,
+    ) -> InboundTunnelRegistration {
         let mut all_tunnel = self.tunnel_map.lock().await;
-        let old_tunnel = all_tunnel.insert(tunnel_key.to_owned(), tunnel.clone());
+        if tunnel.is_closed() {
+            // A delayed handshake-completion callback may race with an
+            // authority/supersession kick.  It must not republish the closed
+            // instance or scan and kick unrelated tunnels.
+            all_tunnel.remove_primary_if_instance(tunnel_key, tunnel.instance_id());
+            all_tunnel.remove_verified_instance(tunnel.instance_id());
+            return InboundTunnelRegistration {
+                accepted: false,
+                replaced: None,
+                superseded: Vec::new(),
+                rejected: Some(tunnel),
+            };
+        }
+
+        let old_tunnel = all_tunnel
+            .tunnels
+            .insert(tunnel_key.to_owned(), tunnel.clone());
         if let Some(old_tunnel) = old_tunnel.as_ref() {
             old_tunnel.mark_closed();
+            all_tunnel.remove_verified_instance(old_tunnel.instance_id());
             info!(
                 "replace authenticated inbound RTcp tunnel {}: instance {} -> {}",
                 tunnel_key,
@@ -3762,33 +3864,311 @@ impl RTcpTunnelMap {
                 tunnel.instance_id()
             );
         }
-        old_tunnel
+
+        let mut superseded = Vec::new();
+        if let Some(identity) = verified_identity {
+            let logical_did = identity.logical_did.clone();
+            let new_revision = identity.document_revision.clone();
+            let new_entry = VerifiedTunnelIndexEntry {
+                instance_id: tunnel.instance_id(),
+                canonical_key: tunnel_key.to_owned(),
+                document_revision: new_revision.clone(),
+                tunnel: tunnel.clone(),
+            };
+            all_tunnel
+                .verified_by_logical_did
+                .entry(logical_did.clone())
+                .or_default()
+                .insert(tunnel.instance_id(), new_entry);
+            all_tunnel
+                .logical_did_by_instance
+                .insert(tunnel.instance_id(), logical_did.clone());
+
+            let indexed: Vec<VerifiedTunnelIndexEntry> = all_tunnel
+                .verified_by_logical_did
+                .get(&logical_did)
+                .map(|entries| entries.values().cloned().collect())
+                .unwrap_or_default();
+            let mut stale_instance_ids = Vec::new();
+
+            for entry in indexed {
+                if entry.instance_id == tunnel.instance_id() {
+                    continue;
+                }
+
+                if entry.tunnel.is_closed() {
+                    stale_instance_ids.push(entry.instance_id);
+                    all_tunnel.remove_primary_if_instance(&entry.canonical_key, entry.instance_id);
+                    continue;
+                }
+
+                if document_revision_is_strictly_older(&entry.document_revision, &new_revision) {
+                    // Mark under the map lock so no operation can start on the
+                    // superseded key after the new revision is published.
+                    // Waiter cleanup and transport shutdown remain lock-free.
+                    entry.tunnel.mark_closed();
+                    stale_instance_ids.push(entry.instance_id);
+                    all_tunnel.remove_primary_if_instance(&entry.canonical_key, entry.instance_id);
+                    info!(
+                        "close superseded verified RTcp tunnel for {}: key {}, instance {}, \
+                         revision {:?} -> {:?}",
+                        logical_did,
+                        entry.canonical_key,
+                        entry.instance_id,
+                        entry.document_revision,
+                        new_revision
+                    );
+                    superseded.push(entry.tunnel);
+                    continue;
+                }
+
+                if entry.document_revision.iat == new_revision.iat {
+                    if entry.document_revision == new_revision {
+                        if entry.canonical_key != tunnel_key {
+                            warn!(
+                                "same verified document revision for {} is active under different \
+                                 canonical keys: {} (instance {}) and {} (instance {}); keep both",
+                                logical_did,
+                                entry.canonical_key,
+                                entry.instance_id,
+                                tunnel_key,
+                                tunnel.instance_id()
+                            );
+                        }
+                    } else {
+                        error!(
+                            "conflicting same-iat verified document revisions for {} remain active: \
+                             {:?} under {} and {:?} under {}; keep both",
+                            logical_did,
+                            entry.document_revision,
+                            entry.canonical_key,
+                            new_revision,
+                            tunnel_key
+                        );
+                    }
+                }
+            }
+
+            for instance_id in stale_instance_ids {
+                all_tunnel.remove_verified_instance(instance_id);
+            }
+        }
+
+        InboundTunnelRegistration {
+            accepted: true,
+            replaced: old_tunnel,
+            superseded,
+            rejected: None,
+        }
+    }
+
+    // Complete the post-authentication handshake milestone. The dedicated
+    // commit lock serializes name-client's cache CAS together with map/index
+    // publication:
+    //
+    // - if old A is indexed before new B commits, B's scan closes A;
+    // - if B commits first, A cannot have received a successful old outcome
+    //   outside the lock; its later add_verified_cache returns IgnoredOlder
+    //   and A closes without indexing.
+    //
+    // This also closes the "A got Inserted but paused before indexing" gap:
+    // B cannot commit or scan until A has published and released the guard.
+    pub async fn complete_authenticated_inbound(
+        &self,
+        tunnel_key: &str,
+        tunnel: RTcpTunnel,
+        verified_cache_entry: Option<PendingVerifiedCacheEntry>,
+    ) -> NSResult<bool> {
+        let registration = if let Some(entry) = verified_cache_entry {
+            let _commit_guard = self.authenticated_commit_lock.lock().await;
+            let verified_commit = RTcpInner::commit_verified_cache_entry(Some(entry))?;
+            if let Some((identity, outcome)) = verified_commit.as_ref() {
+                debug!(
+                    "verified-cache arbitration for accepted device document {}: {:?}",
+                    identity.logical_did, outcome
+                );
+            }
+            self.arbitrate_authenticated_inbound(tunnel_key, tunnel, verified_commit)
+                .await
+        } else {
+            self.arbitrate_authenticated_inbound(tunnel_key, tunnel, None)
+                .await
+        };
+
+        // The commit guard and map mutex are both gone before close() clears
+        // waiters or shuts down a transport.
+        Ok(Self::finish_authenticated_registration(registration).await)
+    }
+
+    #[cfg(test)]
+    async fn complete_authenticated_inbound_with_outcome(
+        &self,
+        tunnel_key: &str,
+        tunnel: RTcpTunnel,
+        verified_commit: Option<(VerifiedTunnelIdentity, CacheWriteOutcome)>,
+    ) -> bool {
+        let registration = if verified_commit.is_some() {
+            let _commit_guard = self.authenticated_commit_lock.lock().await;
+            self.arbitrate_authenticated_inbound(tunnel_key, tunnel, verified_commit)
+                .await
+        } else {
+            self.arbitrate_authenticated_inbound(tunnel_key, tunnel, None)
+                .await
+        };
+        Self::finish_authenticated_registration(registration).await
+    }
+
+    async fn arbitrate_authenticated_inbound(
+        &self,
+        tunnel_key: &str,
+        tunnel: RTcpTunnel,
+        verified_commit: Option<(VerifiedTunnelIdentity, CacheWriteOutcome)>,
+    ) -> InboundTunnelRegistration {
+        let verified_identity = match verified_commit {
+            Some((identity, outcome)) if outcome.stored() => {
+                match DID::from_str(&identity.logical_did) {
+                    Ok(did) if did.method != "dev" => Some(identity),
+                    _ => {
+                        // A cryptographically verified key DID may still be
+                        // cached, but it is not a logical/named identity and
+                        // must not gain a bucket in the revocation index.
+                        debug!(
+                            "do not index non-named verified RTcp identity {}",
+                            identity.logical_did
+                        );
+                        None
+                    }
+                }
+            }
+            Some((identity, outcome)) => {
+                warn!(
+                    "reject authenticated inbound RTcp tunnel {} instance {} for verified \
+                     identity {} after cache arbitration: {:?}",
+                    tunnel_key,
+                    tunnel.instance_id(),
+                    identity.logical_did,
+                    outcome
+                );
+                // The instance may already have been marked closed by a
+                // concurrent kick. compare-and-remove makes this cleanup safe.
+                tunnel.mark_closed();
+                self.remove_if_current(tunnel_key, &tunnel).await;
+                return InboundTunnelRegistration {
+                    accepted: false,
+                    replaced: None,
+                    superseded: Vec::new(),
+                    rejected: Some(tunnel),
+                };
+            }
+            None => None,
+        };
+
+        self.replace_authenticated_inbound(tunnel_key, tunnel, verified_identity)
+            .await
+    }
+
+    async fn finish_authenticated_registration(registration: InboundTunnelRegistration) -> bool {
+        if let Some(rejected) = registration.rejected {
+            rejected.close().await;
+        }
+        if let Some(replaced) = registration.replaced {
+            replaced.close().await;
+        }
+        for superseded in registration.superseded {
+            superseded.close().await;
+        }
+        registration.accepted
     }
 
     // Remove only when the map still points at the exact instance whose run
     // loop is exiting. A superseded tunnel must never delete its replacement.
+    // Its secondary-index entry is independently compare-removed even when
+    // the primary slot has already moved to a newer instance.
     pub async fn remove_if_current(&self, tunnel_key: &str, tunnel: &RTcpTunnel) -> bool {
         let mut all_tunnel = self.tunnel_map.lock().await;
         let is_current = all_tunnel
+            .tunnels
             .get(tunnel_key)
             .map(|current| current.is_same_instance(tunnel))
             .unwrap_or(false);
         if is_current {
-            all_tunnel.remove(tunnel_key);
+            all_tunnel.tunnels.remove(tunnel_key);
             debug!(
                 "remove current RTcp tunnel {} instance {}",
                 tunnel_key,
                 tunnel.instance_id()
             );
-            true
         } else {
             debug!(
                 "skip removing stale RTcp tunnel {} instance {}",
                 tunnel_key,
                 tunnel.instance_id()
             );
-            false
         }
+        all_tunnel.remove_verified_instance(tunnel.instance_id());
+        is_current
+    }
+
+    // AuthorityNotCurrent/definite-negative handling reuses this entry point:
+    // only authoritatively verified named tunnels are indexed, so an
+    // anonymous or self-declared name can never target this operation.
+    // Instances are marked and detached while locked, then shut down outside
+    // the critical section.  The commit guard prevents an accepted handshake
+    // from sitting between cache CAS and index publication while a negative
+    // authority result scans the bucket.
+    pub async fn close_verified_identity(&self, logical_did: &str, reason: &str) -> usize {
+        let _commit_guard = self.authenticated_commit_lock.lock().await;
+        let tunnels = {
+            let mut all_tunnel = self.tunnel_map.lock().await;
+            let entries = all_tunnel
+                .verified_by_logical_did
+                .remove(logical_did)
+                .unwrap_or_default();
+            let mut tunnels = Vec::with_capacity(entries.len());
+            for (instance_id, entry) in entries {
+                all_tunnel.logical_did_by_instance.remove(&instance_id);
+                entry.tunnel.mark_closed();
+                all_tunnel.remove_primary_if_instance(&entry.canonical_key, instance_id);
+                info!(
+                    "close verified RTcp tunnel for {} after {}: key {}, instance {}, revision {:?}",
+                    logical_did, reason, entry.canonical_key, instance_id, entry.document_revision
+                );
+                tunnels.push(entry.tunnel);
+            }
+            tunnels
+        };
+        drop(_commit_guard);
+
+        let count = tunnels.len();
+        for tunnel in tunnels {
+            tunnel.close().await;
+        }
+        count
+    }
+
+    #[cfg(test)]
+    async fn primary_len(&self) -> usize {
+        self.tunnel_map.lock().await.tunnels.len()
+    }
+
+    #[cfg(test)]
+    async fn verified_identity_len(&self, logical_did: &str) -> usize {
+        self.tunnel_map
+            .lock()
+            .await
+            .verified_by_logical_did
+            .get(logical_did)
+            .map(HashMap::len)
+            .unwrap_or(0)
+    }
+
+    #[cfg(test)]
+    async fn is_verified_instance_indexed(&self, tunnel: &RTcpTunnel) -> bool {
+        self.tunnel_map
+            .lock()
+            .await
+            .logical_did_by_instance
+            .contains_key(&tunnel.instance_id())
     }
 }
 #[cfg(test)]
@@ -3837,6 +4217,16 @@ mod tests {
         )
     }
 
+    fn verified_test_identity(logical_did: &str, iat: u64, hash: &str) -> VerifiedTunnelIdentity {
+        VerifiedTunnelIdentity {
+            logical_did: logical_did.to_string(),
+            document_revision: DocumentRevision {
+                iat,
+                content_hash: hash.to_string(),
+            },
+        }
+    }
+
     #[tokio::test]
     async fn inbound_tunnel_replace_is_atomic_and_cleanup_is_instance_safe() {
         let map = RTcpTunnelMap::new();
@@ -3844,11 +4234,11 @@ mod tests {
         let (old_tunnel, _old_peer) = test_tunnel(1);
         let (new_tunnel, _new_peer) = test_tunnel(2);
 
-        assert!(
-            map.replace_authenticated_inbound(key, old_tunnel.clone())
-                .await
-                .is_none()
-        );
+        let first = map
+            .replace_authenticated_inbound(key, old_tunnel.clone(), None)
+            .await;
+        assert!(first.accepted);
+        assert!(first.replaced.is_none());
         assert!(
             map.get_tunnel(key)
                 .await
@@ -3857,8 +4247,11 @@ mod tests {
         );
 
         let replaced = map
-            .replace_authenticated_inbound(key, new_tunnel.clone())
-            .await
+            .replace_authenticated_inbound(key, new_tunnel.clone(), None)
+            .await;
+        assert!(replaced.accepted);
+        let replaced = replaced
+            .replaced
             .expect("second authenticated inbound tunnel must replace the first");
         assert!(replaced.is_same_instance(&old_tunnel));
         assert!(old_tunnel.is_closed());
@@ -3903,7 +4296,7 @@ mod tests {
             tasks.push(tokio::spawn(async move {
                 barrier.wait().await;
                 tokio::time::sleep(Duration::from_millis(index as u64 * 5)).await;
-                map.replace_authenticated_inbound(key, tunnel).await;
+                map.replace_authenticated_inbound(key, tunnel, None).await;
             }));
         }
 
@@ -3913,11 +4306,291 @@ mod tests {
 
         let current = map.get_tunnel(key).await.unwrap();
         assert!(current.is_same_instance(tunnels.last().unwrap()));
-        assert_eq!(map.tunnel_map.lock().await.len(), 1);
+        assert_eq!(map.primary_len().await, 1);
         for tunnel in &tunnels[..TUNNEL_COUNT - 1] {
             assert!(tunnel.is_closed());
         }
         assert!(!tunnels.last().unwrap().is_closed());
+    }
+
+    #[tokio::test]
+    async fn newer_verified_revision_closes_old_key_and_old_cleanup_is_safe() {
+        let map = RTcpTunnelMap::new();
+        let logical_did = "did:web:rotation.example";
+        let old_key = "local_did:dev:old-key";
+        let new_key = "local_did:dev:new-key";
+        let (old_tunnel, _old_peer) = test_tunnel(40);
+        let (new_tunnel, _new_peer) = test_tunnel(41);
+
+        assert!(
+            map.complete_authenticated_inbound_with_outcome(
+                old_key,
+                old_tunnel.clone(),
+                Some((
+                    verified_test_identity(logical_did, 1, "rev-1"),
+                    CacheWriteOutcome::Inserted,
+                )),
+            )
+            .await
+        );
+        assert!(
+            map.complete_authenticated_inbound_with_outcome(
+                new_key,
+                new_tunnel.clone(),
+                Some((
+                    verified_test_identity(logical_did, 2, "rev-2"),
+                    CacheWriteOutcome::ReplacedOlder,
+                )),
+            )
+            .await
+        );
+
+        assert!(old_tunnel.is_closed());
+        assert!(!new_tunnel.is_closed());
+        assert!(map.get_tunnel(old_key).await.is_none());
+        assert!(
+            map.get_tunnel(new_key)
+                .await
+                .unwrap()
+                .is_same_instance(&new_tunnel)
+        );
+        assert!(!map.is_verified_instance_indexed(&old_tunnel).await);
+        assert!(map.is_verified_instance_indexed(&new_tunnel).await);
+        assert_eq!(map.verified_identity_len(logical_did).await, 1);
+
+        assert!(
+            !map.remove_if_current(old_key, &old_tunnel).await,
+            "the old revision's delayed run-loop cleanup must not affect the new key"
+        );
+        assert!(
+            map.get_tunnel(new_key)
+                .await
+                .unwrap()
+                .is_same_instance(&new_tunnel)
+        );
+    }
+
+    #[tokio::test]
+    async fn older_revision_losing_cache_race_closes_itself_without_indexing() {
+        let map = RTcpTunnelMap::new();
+        let logical_did = "did:web:race.example";
+        let new_key = "local_did:dev:race-new";
+        let old_key = "local_did:dev:race-old";
+        let (new_tunnel, _new_peer) = test_tunnel(42);
+        let (late_old_tunnel, _old_peer) = test_tunnel(43);
+
+        // B commits and scans first.  A reaches the cache serialization
+        // point later, receives IgnoredOlder, and must self-close instead of
+        // entering the index.  This is the opposite ordering from the
+        // rotation test above and closes the other half of the race.
+        assert!(
+            map.complete_authenticated_inbound_with_outcome(
+                new_key,
+                new_tunnel.clone(),
+                Some((
+                    verified_test_identity(logical_did, 2, "rev-2"),
+                    CacheWriteOutcome::Inserted,
+                )),
+            )
+            .await
+        );
+        assert!(
+            !map.complete_authenticated_inbound_with_outcome(
+                old_key,
+                late_old_tunnel.clone(),
+                Some((
+                    verified_test_identity(logical_did, 1, "rev-1"),
+                    CacheWriteOutcome::IgnoredOlder,
+                )),
+            )
+            .await
+        );
+
+        assert!(late_old_tunnel.is_closed());
+        assert!(!new_tunnel.is_closed());
+        assert!(map.get_tunnel(old_key).await.is_none());
+        assert!(!map.is_verified_instance_indexed(&late_old_tunnel).await);
+        assert_eq!(map.verified_identity_len(logical_did).await, 1);
+    }
+
+    #[tokio::test]
+    async fn key_only_tunnel_is_not_indexed_or_kicked_by_named_revision() {
+        let map = RTcpTunnelMap::new();
+        let logical_did = "did:web:unverified-claim.example";
+        let key_only_key = "local_did:dev:key-only";
+        let named_key = "local_did:dev:verified";
+        let (key_only_tunnel, _key_only_peer) = test_tunnel(44);
+        let (named_tunnel, _named_peer) = test_tunnel(45);
+        let (verified_key_did_tunnel, _verified_key_did_peer) = test_tunnel(54);
+
+        assert!(
+            map.complete_authenticated_inbound_with_outcome(
+                key_only_key,
+                key_only_tunnel.clone(),
+                None
+            )
+            .await
+        );
+        assert!(
+            map.complete_authenticated_inbound_with_outcome(
+                "local_did:dev:verified-key-did",
+                verified_key_did_tunnel.clone(),
+                Some((
+                    verified_test_identity("did:dev:verified-key-only", 2, "key-revision"),
+                    CacheWriteOutcome::AlreadyPresent,
+                )),
+            )
+            .await
+        );
+        assert!(
+            map.complete_authenticated_inbound_with_outcome(
+                named_key,
+                named_tunnel.clone(),
+                Some((
+                    verified_test_identity(logical_did, 2, "rev-2"),
+                    CacheWriteOutcome::Inserted,
+                )),
+            )
+            .await
+        );
+
+        assert!(!key_only_tunnel.is_closed());
+        assert!(!map.is_verified_instance_indexed(&key_only_tunnel).await);
+        assert!(
+            !map.is_verified_instance_indexed(&verified_key_did_tunnel)
+                .await
+        );
+        assert!(map.is_verified_instance_indexed(&named_tunnel).await);
+        assert_eq!(map.primary_len().await, 3);
+    }
+
+    #[tokio::test]
+    async fn same_revision_uses_slot_replacement_without_cross_key_kick() {
+        let map = RTcpTunnelMap::new();
+        let logical_did = "did:web:same-revision.example";
+        let same_key = "local_did:dev:same-key";
+        let other_key = "local_did:dev:unexpected-other-key";
+        let identity = verified_test_identity(logical_did, 7, "same-document");
+        let (first, _first_peer) = test_tunnel(46);
+        let (same_slot_new, _same_slot_peer) = test_tunnel(47);
+        let (other_slot, _other_slot_peer) = test_tunnel(48);
+
+        assert!(
+            map.complete_authenticated_inbound_with_outcome(
+                same_key,
+                first.clone(),
+                Some((identity.clone(), CacheWriteOutcome::Inserted)),
+            )
+            .await
+        );
+        assert!(
+            map.complete_authenticated_inbound_with_outcome(
+                same_key,
+                same_slot_new.clone(),
+                Some((identity.clone(), CacheWriteOutcome::AlreadyPresent)),
+            )
+            .await
+        );
+        assert!(first.is_closed());
+        assert!(!same_slot_new.is_closed());
+        assert_eq!(map.verified_identity_len(logical_did).await, 1);
+
+        // A single document normally implies one canonical device key.  If
+        // the impossible-looking cross-key state is observed, log it but do
+        // not invent an ordering or close either same-revision tunnel.
+        assert!(
+            map.complete_authenticated_inbound_with_outcome(
+                other_key,
+                other_slot.clone(),
+                Some((identity, CacheWriteOutcome::AlreadyPresent)),
+            )
+            .await
+        );
+        assert!(!same_slot_new.is_closed());
+        assert!(!other_slot.is_closed());
+        assert_eq!(map.verified_identity_len(logical_did).await, 2);
+    }
+
+    #[tokio::test]
+    async fn verified_index_cleanup_tracks_normal_and_abnormal_exit() {
+        let map = RTcpTunnelMap::new();
+        let logical_did = "did:web:cleanup.example";
+        let first_key = "local_did:dev:cleanup-1";
+        let second_key = "local_did:dev:cleanup-2";
+        let identity = verified_test_identity(logical_did, 9, "same-document");
+        let (normal, _normal_peer) = test_tunnel(49);
+        let (abnormal, _abnormal_peer) = test_tunnel(50);
+
+        assert!(
+            map.complete_authenticated_inbound_with_outcome(
+                first_key,
+                normal.clone(),
+                Some((identity.clone(), CacheWriteOutcome::Inserted)),
+            )
+            .await
+        );
+        assert!(
+            map.complete_authenticated_inbound_with_outcome(
+                second_key,
+                abnormal.clone(),
+                Some((identity, CacheWriteOutcome::AlreadyPresent)),
+            )
+            .await
+        );
+        assert_eq!(map.verified_identity_len(logical_did).await, 2);
+
+        assert!(map.remove_if_current(first_key, &normal).await);
+        assert_eq!(map.verified_identity_len(logical_did).await, 1);
+        abnormal.mark_closed();
+        assert!(map.remove_if_current(second_key, &abnormal).await);
+        assert_eq!(map.verified_identity_len(logical_did).await, 0);
+        assert_eq!(map.primary_len().await, 0);
+    }
+
+    #[tokio::test]
+    async fn authority_negative_closes_all_verified_instances_only() {
+        let map = RTcpTunnelMap::new();
+        let logical_did = "did:web:authority-negative.example";
+        let identity = verified_test_identity(logical_did, 11, "same-document");
+        let (first, _first_peer) = test_tunnel(51);
+        let (second, _second_peer) = test_tunnel(52);
+        let (key_only, _key_only_peer) = test_tunnel(53);
+
+        assert!(
+            map.complete_authenticated_inbound_with_outcome(
+                "local_did:dev:authority-1",
+                first.clone(),
+                Some((identity.clone(), CacheWriteOutcome::Inserted)),
+            )
+            .await
+        );
+        assert!(
+            map.complete_authenticated_inbound_with_outcome(
+                "local_did:dev:authority-2",
+                second.clone(),
+                Some((identity, CacheWriteOutcome::AlreadyPresent)),
+            )
+            .await
+        );
+        assert!(
+            map.complete_authenticated_inbound_with_outcome(
+                "local_did:dev:authority-key-only",
+                key_only.clone(),
+                None,
+            )
+            .await
+        );
+
+        assert_eq!(
+            map.close_verified_identity(logical_did, "AuthorityNotCurrent")
+                .await,
+            2
+        );
+        assert!(first.is_closed());
+        assert!(second.is_closed());
+        assert!(!key_only.is_closed());
+        assert_eq!(map.verified_identity_len(logical_did).await, 0);
+        assert_eq!(map.primary_len().await, 1);
     }
 
     #[tokio::test]

@@ -1,12 +1,14 @@
 # RTCP 新入站 Tunnel 替换旧 Tunnel TODO
 
-状态：已完成（2026-07-24）
+状态：已完成（2026-07-24）；后续任务「按逻辑 DID 踢除与 tunnel map 二级索引」
+同日完成（见文末）
 
 相关文档：
 
 - [rtcp.md](rtcp.md)
 - [rtcp_v2_review.md](rtcp_v2_review.md)
 - [tunnel框架.md](../tunnel框架.md)
+- [rtcp on new tunnel 身份验证.txt](rtcp%20on%20new%20tunnel%20身份验证.txt)
 
 主要实现：
 
@@ -20,6 +22,12 @@
 - `run()` 可被 close 主动唤醒；自然退出同样进入幂等 close，Open/ROpen/Pong 和 pending HelloStream waiter 会快速释放。
 - `ping`、`ping_rtt`、stream/datagram 创建、reconnect 和入站 Open/ROpen 处理均检查 closed 状态。
 - 出站路径仍为 first-wins，但只在存活实例间生效：map 中的 closed 实例不参与复用，`create_tunnel` 会先 `remove_if_current` 再重新拨号，`register_outbound_if_absent` 也会替换已 closed 的旧值；入站完整认证和准入后的路径为 last-accepted-wins。
+- tunnel map 增加 `verified 逻辑 DID -> 多个活跃 instance` 二级索引；索引项携带 canonical key、`instance_id` 和上游 `DocumentRevision`。
+- verified cache 的 `CacheWriteOutcome` 成为 revision 并发仲裁点：当前/同版文档注册并扫描踢除旧 revision，旧版/冲突/负状态结果让本 tunnel 自关闭且不入索引。
+- verified cache CAS 到主/二级索引发布由专用提交锁串行化，消除“旧 A 已获
+  `Inserted`、尚未入索引，新 B 已提交并完成扫描，A 再迟到发布”的窗口；权威否定
+  批量关闭同样经过该锁。
+- 按逻辑 DID 的 supersession 与权威否定批量关闭都在锁内同步标记并摘除，锁外完成 waiter/transport shutdown；KeyOnly 和自声明回落 tunnel 不进入具名索引。
 
 ## 目标
 
@@ -30,7 +38,7 @@
 - 被替换的旧 Tunnel 必须关闭。
 - 旧 Tunnel 随后退出读循环时，不得把已经替换进 map 的新 Tunnel 删除。
 
-本文只定义 RTCP Stack 内的 Tunnel 仲裁和生命周期。私钥吊销、设备封禁、DID 文档换钥以及存量业务 stream 的强制撤销不在本任务范围内。
+本文只定义 RTCP Stack 内的 Tunnel 仲裁和生命周期。私钥吊销、设备封禁以及存量业务 stream 的强制撤销不在本任务范围内。DID 文档换钥后的旧 tunnel 踢除原本也在范围外，现已作为后续任务收编进文末「按逻辑 DID 踢除与 tunnel map 二级索引」一节。
 
 ## 修复前问题
 
@@ -234,3 +242,99 @@ cargo test -p cyfs-gateway-lib --lib -- --test-threads=1
 - 未认证、重放、key-confirmation 失败或 listener 拒绝的连接不能踢掉旧 Tunnel。
 - 名字 DID 与对应 `did:dev` 使用相同 canonical key，并遵循同一替换规则。
 - RTCP v2 的 anti-replay 和前向安全性质不因本修复退化。
+
+## 后续任务：按逻辑 DID 踢除与 tunnel map 二级索引（已完成）
+
+状态：已完成（2026-07-24）
+
+背景：[rtcp on new tunnel 身份验证.txt](rtcp%20on%20new%20tunnel%20身份验证.txt) 第⑪步
+要求：具名 tunnel 握手提交（verified cache 落盘）后，踢除绑定同一逻辑 DID、
+`doc_revision` 更旧的活跃 tunnel。这是既定吊销策略（不做定时器重验，依赖"新 tunnel
+踢旧 tunnel"，见该文 D1）在 **key 轮换**场景下成立的必要条件：owner 发布新 device
+document 通常伴随换 key，新 key ⇒ 新 canonical dev DID ⇒ 新 tunnel key ⇒ **不同 map
+槽位**，本文档已完成的同槽位 last-accepted-wins 替换永远碰不到持旧 key 的旧 tunnel。
+
+因此 tunnel map 必须补充按逻辑 DID 检索活跃 tunnel 的能力。
+
+### 规范语义
+
+1. 主索引不变：tunnel 槽位仍按 canonical key（含 bootstrap 后缀）仲裁，出站
+   first-wins、入站 last-accepted-wins 行为不变。二级索引只用于踢除与观测，
+   不参与出站复用/拨号决策。
+2. 新增二级索引：`verified 逻辑 DID -> { (instance_id, canonical_key, doc_revision) }`。
+   - 只有以**已验证具名身份**准入的 tunnel 进入索引；KeyOnly/未验证声明不得按其
+     声明的名字入索引——声明不是身份，匿名输入不得获得影响任何具名 tunnel
+     存活的能力。
+   - 同一逻辑 DID 允许同时对应多个 canonical key（轮换窗口内新旧 key 并存、
+     direct/bootstrap 变体），索引是一对多。
+   - `doc_revision` 的比较使用上游 `DocumentRevision` 语义（iat + hash），不自行
+     发明排序。
+3. 踢除触发点：握手完成回调中 `add_verified_cache` 之后，以 **`CacheWriteOutcome`
+   作为 revision 仲裁**，让上游 verified cache 成为并发提交的串行化点：
+   - `Inserted` / `ReplacedOlder` / `AlreadyPresent`：本 tunnel 文档为当前已知最新
+     （或同版）⇒ 遍历同 DID 索引项，close 所有 `doc_revision` 严格更旧的实例；
+   - `IgnoredOlder` / `RejectedConflict` / `BlockedByNegativeState`：本 tunnel 自己的
+     文档已过时或被否定 ⇒ 不踢别人，close 自己。
+4. 同 revision：同 canonical key 由既有同槽替换仲裁；不同 canonical key 出现同
+   revision 属异常（一文档一 key），记日志，不踢除。
+5. 后台权威确认得到 AuthorityNotCurrent / Definite 否定时，除踢除触发它的 tunnel
+   外，经二级索引 close 该 DID 全部旧 revision 实例（复用同一踢除入口）。
+6. 存量业务 stream 处理与同槽替换一致：关闭控制 tunnel、阻止新建 stream，不扩展
+   为全会话吊销。
+
+### 实现要求
+
+1. 索引项携带 `instance_id`；插入与主 map 的入站认证注册在同一里程碑
+   （`replace_authenticated_inbound` 成功处，此时 `doc_revision` 已知）；删除只允许
+   本实例按 compare-and-remove 移除自己的条目，与主 map 的 `remove_if_current` 在
+   同一清理路径执行。任何退出路径不得在索引中遗留已 close 的实例；踢除遍历对
+   closed 实例是幂等 no-op 并顺手摘除。
+2. 锁纪律与主 map 相同：临界区内只做标记/摘除，close/shutdown 在锁外；不得同时
+   持有主 map 锁与索引锁执行 I/O。
+3. 竞态闭合论证（实现注释或测试中必须体现）：设 A 持旧 revision、B 持新 revision
+   并发完成握手——
+   - A 先入索引、B 后提交：B 的踢除扫描命中 A ⇒ A 被 close；
+   - A 在 B 扫描之后才提交：A 的 `add_verified_cache` 得到 `IgnoredOlder` ⇒ A 自
+     close（A 的准入 freshness 检查此时通常也已能拒绝）。
+   两侧合起来保证无存活窗口。
+4. 握手完成回调对已 closed 的 tunnel 必须是 no-op + 自清理：被踢后迟到的 commit
+   不得写索引、不得再踢除他人。
+
+### 测试清单
+
+- [x] 轮换踢除：DID X 的 tunnel A（rev1, key K1）活跃；tunnel B（X, rev2, key K2）
+      完成提交后 A 被 close、B 存活；A 延迟退出不影响 B。
+- [x] 并发乱序提交：A(rev1) 与 B(rev2) 并发握手，任意提交顺序终态仅 B 存活；
+      覆盖"A 在 B 扫描后才提交 → `IgnoredOlder` 自 close"分支。
+- [x] 未验证声明不入索引：KeyOnly tunnel 声明 DID X，不出现在索引中，B 提交时
+      不受影响也不被误踢。
+- [x] 同 revision 不误踢：同 key 同 revision 的替换由同槽逻辑仲裁，索引扫描不
+      close 新 current 实例。
+- [x] 索引无泄漏：tunnel 正常/异常退出后索引条目移除，索引规模有界于活跃具名
+      tunnel 数。
+- [x] 权威否定批量踢除：负结果经索引 close 该 DID 全部旧实例。
+
+### 验收标准
+
+- key 轮换后，旧 key tunnel 在新文档随任一新握手提交后被关闭，全程零额外网络
+  I/O、无定时器。
+- 匿名/未验证输入无法通过声明名字影响任何具名 tunnel 的存活。
+- 索引维护遵守 `instance_id`/compare-and-remove 纪律，旧实例迟到退出不影响新实例。
+- 主 map 的 canonical key 仲裁语义（出站 first-wins、入站 last-accepted-wins）不因
+  二级索引改变。
+
+### 实现与验证
+
+- 主索引和二级索引收敛到同一个 `RTcpTunnelMapState` mutex，注册、标记 closed、
+  compare-and-remove 和索引摘除在同一临界区完成；所有异步 `close()` 均在锁外执行。
+- verified cache CAS 与随后的 map/index 发布由 `authenticated_commit_lock` 串行化；
+  权威否定批量关闭也先取得该锁。map mutex 不跨 cache I/O，提交锁不跨 tunnel
+  transport shutdown。
+- 二级索引只接收权威锚定验证成功并提交 verified cache 的身份；自声明回落与裸
+  `did:dev`/KeyOnly 路径的 commit metadata 为 `None`，不会进入具名索引。
+- `DocumentRevision` 直接来自 `VerifiedDidDocument.revision`；严格新旧只按上游定义的
+  `iat` 比较，content hash 只用于识别同文档或 same-iat conflict。
+- `cargo test -p cyfs-gateway-lib rtcp::rtcp::tests -- --test-threads=1`：
+  35 passed，0 failed。
+- `cargo test -p cyfs-gateway-lib --lib -- --test-threads=1`：
+  351 passed，0 failed。

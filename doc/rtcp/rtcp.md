@@ -502,10 +502,13 @@ IV/nonce 选择规则：
 6. 现场生成一次性 X25519 密钥对 `(resp_secret, resp_public)` 和随机 `challenge`，签发 `ack_token`（`aud == "buckyos-rtcp-v2-ack"`，`peer_xpub == Hello.xpub`），并以**明文**形式把 `HelloAck { ack_token, challenge, responder_id }` 发到承载流上。
 7. 用 `(resp_secret, Hello.xpub)` 做 ECDH，走 §5.4.1 的 HKDF 派生 `(aes_key, iv)`；把承载流包成 `EncryptedStream`（responder 方向），等待 AEAD 形式的 `HelloAckConfirm` 并校验 `challenge_echo`。
 8. 只有 key-confirmation 成功后，才调用 `listener.on_new_tunnel(...)` 做准入控制。
-9. 准入通过后提交本次握手携带且已经验证的设备文档（如有）；只有 freshness/CAS 提交成功，才把这条连接包装成 tunnel，并标记 `can_direct = false`。
+9. 准入通过后提交本次握手携带且已经验证的设备文档（如有），并使用 `CacheWriteOutcome` 作为 revision 并发仲裁结果：
+   - `Inserted` / `ReplacedOlder` / `AlreadyPresent` 表示本 tunnel 的文档是当前已知最新或同版，可以继续注册；
+   - `IgnoredOlder` / `RejectedConflict` / `BlockedByNegativeState`（以及其他未落盘结果）表示本 tunnel 输掉 freshness/CAS 仲裁，立即关闭且不得进入 tunnel map。
 10. 按 canonical DEV DID 计算 tunnel key，在一次 map mutex 临界区内把新 tunnel 原子替换为 current。接收端采用 **last accepted connection wins**：“新”按完成全部认证、key-confirmation、listener 准入、设备文档提交并执行原子替换的顺序定义，不按 TCP accept 顺序、握手开始时间或源 IP 定义。
-11. 如果同 key 已有旧 tunnel，旧实例在 map 临界区内先被同步标记为 closed；释放 map 锁后再清理 waiter、关闭写半边并唤醒旧实例的读循环。未通过前述任一步骤的连接不得替换或关闭旧 tunnel。
-12. 启动新 tunnel 读循环；读循环退出时只在 map 仍指向自身 `instance_id` 的情况下删除 entry。旧实例延迟退出不得删除替换后的新实例。
+11. 对权威锚定验证成功的具名身份，同时写入二级索引 `logical DID -> {(instance_id, canonical key, DocumentRevision)}`。同一临界区内扫描该 DID 的其他活跃实例：`iat` 严格更旧的实例被标记 closed，并从主索引和二级索引摘除；同 revision 不按 hash 人为排序，不执行跨 key 踢除。裸 `did:dev`、KeyOnly 和自声明回落身份不进入该索引。
+12. 如果同 key 已有旧 tunnel，旧实例在 map 临界区内先被同步标记为 closed；释放 map 锁后再清理 waiter、关闭写半边并唤醒旧实例的读循环。跨 key 的旧 revision 也遵守相同的“锁内标记/摘除，锁外异步关闭”纪律。未通过前述任一步骤的连接不得替换或关闭旧 tunnel。
+13. 启动新 tunnel 读循环；读循环退出时只在 map 仍指向自身 `instance_id` 的情况下删除主 entry，同时按 `instance_id` compare-and-remove 自己的二级索引项。旧实例延迟退出不得删除替换后的新实例。
 
 ### 6.3 当前实现上的重要事实
 
@@ -524,7 +527,7 @@ RTCP 的 tunnel key 只用于协议栈内部复用和去重，不是对外 URL �
 - direct tunnel key: `<local_dev_did>_<remote_dev_did>`
 - bootstrap-backed tunnel key: `<local_dev_did>_<remote_dev_did>|bootstrap=<bootstrap_url>`
 
-这个规则保证每个 `<设备对, 承载路径>` 任意时刻只有一个 current tunnel。direct 与不同 bootstrap URL 属于不同承载路径，不互相替换。名字 DID 的公钥发生变化时，解析出的 remote DEV DID 也会变化，旧 tunnel 不应继续被复用；协议栈应建立新 tunnel，并让旧 tunnel 自然断开或被清理。
+这个规则保证每个 `<设备对, 承载路径>` 任意时刻只有一个 current tunnel。direct 与不同 bootstrap URL 属于不同承载路径，不互相执行同槽替换。名字 DID 的公钥发生变化时，解析出的 remote DEV DID 也会变化；协议栈建立新 tunnel 后，会通过 verified 逻辑 DID 二级索引关闭该身份所有 `DocumentRevision` 严格更旧的 tunnel，因此换钥后的旧 canonical key 不会继续存活。
 
 反过来，如果用户把同一个设备公钥绑定到多个名字，这些名字会解析到同一个 canonical DEV DID，并共享同一条 tunnel。对 RTCP 来说这是同一个设备，不是多个逻辑设备。用同一把设备公钥表达多个逻辑设备会导致 tunnel 复用、keep_tunnel 状态、准入策略和日志语义混淆；这违反“每个逻辑设备必须有不同设备公钥”的原则，不应通过 name-based tunnel key 兼容。
 
@@ -533,6 +536,9 @@ RTCP 的 tunnel key 只用于协议栈内部复用和去重，不是对外 URL �
 - 客户端主动创建 tunnel 时采用 first-wins：拨号前复用已有 current tunnel；并发拨号竞速只注册第一个成功实例，多建出的实例关闭并返回 current。
 - 服务端接收已完整认证和准入的 tunnel 时采用 last-accepted-wins：新实例原子替换旧实例，旧实例立即进入 closed 状态。
 - 每个 `RTcpTunnel` 有稳定的进程内 `instance_id`。读循环清理使用 compare-and-remove；只有 map 仍指向自己的实例时才能删除 entry。
+- 主索引只负责 canonical key 仲裁；verified 逻辑 DID 二级索引只用于换钥吊销和权威否定后的批量关闭，不参与客户端复用或拨号决策。
+- 二级索引采用一对多结构，允许轮换窗口中的新旧 canonical key 和不同承载路径同时被观测；只有上游权威锚定验证成功的具名身份进入索引，匿名/未验证声明没有按名字关闭 tunnel 的能力。
+- verified cache CAS 与随后的 map/index 发布由专用提交锁串行化。旧 A 先注册时，新 B 的索引扫描关闭 A；新 B 先提交和扫描时，迟到的旧 A 从 cache 得到 `IgnoredOlder` 并自关闭；旧 A 已获 `Inserted` 但尚未发布索引时，新 B 也不能越过它提交和扫描。权威否定批量关闭经过同一提交锁。map mutex 不跨 cache I/O，提交锁不跨 tunnel transport shutdown。
 
 ## 7. Open 流程
 
