@@ -65,12 +65,16 @@ impl RTcpStreamBuildHelper {
         self.notify_ropen_stream.notify_waiters();
     }
 
-    pub async fn new_wait_stream(&self, key: &str) {
+    pub async fn new_wait_stream(&self, key: &str) -> Result<(), std::io::Error> {
         let mut map = self.wait_ropen_stream_map.lock().await;
-        if let Some(_ret) = map.insert(key.to_string(), WaitStream::Waiting) {
-            // FIXME: should we return error here?
-            error!("new_wait_stream: key {} already exists", key);
+        if map.contains_key(key) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                format!("wait stream key {} already exists", key),
+            ));
         }
+        map.insert(key.to_string(), WaitStream::Waiting);
+        Ok(())
     }
 
     /// Force-remove a waiting entry. Safe to call even if the entry is

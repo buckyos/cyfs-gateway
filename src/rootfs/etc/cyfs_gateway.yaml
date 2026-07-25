@@ -186,9 +186,29 @@ stacks:
     #     security_root_path: ./security
     #   # Legacy explicit identity config is still supported:
     #   # key_path: ./sn_private_key.pem
-    #   # device_config_path: ./device.doc.jwt  # did:dev 可用 JSON；逻辑 DID 必须配置 JWT，Hello 会携带 device_doc_jwt
-    #   # device_doc_jwt: <owner-signed-device-doc-jwt> # optional inline alternative to device_config_path/device.doc.jwt
+    #   # device_config_path: ./device.jwt  # identity manager probes device.jwt / device_doc.jwt / did.json
+    #   # device_doc_jwt: <owner-signed-device-doc-jwt> # optional inline alternative
     #   # name: optional_name
+    #   peer_identity:
+    #     requirement: authority_current # authority_current | trusted_snapshot
+    #     dns_txt_bootstrap: false       # non-authoritative compatibility mode; keep false on public stacks
+    #   inbound_admission:
+    #     anonymous: reject              # no self-declared document fallback exists
+    #     named_min_relation: same_zone  # same_zone | any
+    #     authority_reconfirm_max_age: unlimited
+    #   liveness:
+    #     ping_interval_secs: 30
+    #     pong_timeout_secs: 10
+    #     max_missed_pongs: 3
+    #   limits:
+    #     max_pending_handshakes: 256
+    #     handshake_requests_per_second: 16
+    #     handshake_request_burst: 32
+    #     max_pending_stream_builds_per_tunnel: 64
+    #     max_datagram_bytes: 65507
+    #     handshake_timeout_secs: 15
+    #     stream_requests_per_second: 32
+    #     stream_request_burst: 64
     #   reuse_address: false
     #   io_dump_file: rtcp.dump
     #   hook_point: { }

@@ -6,18 +6,26 @@ use tokio::io::{AsyncReadExt, ReadHalf, WriteHalf};
 use tokio::net::UdpSocket;
 use tokio::sync::Mutex;
 
+pub const MAX_RTCP_DATAGRAM_BYTES: usize = 65_507;
+
 #[derive(Clone)]
 pub struct AsyncStreamWithDatagram {
     send: Arc<Mutex<WriteHalf<Box<dyn AsyncStream>>>>,
     recv: Arc<Mutex<ReadHalf<Box<dyn AsyncStream>>>>,
+    max_datagram_bytes: usize,
 }
 
 impl AsyncStreamWithDatagram {
     pub fn new(stream: Box<dyn AsyncStream>) -> Self {
+        Self::new_with_limit(stream, MAX_RTCP_DATAGRAM_BYTES)
+    }
+
+    pub fn new_with_limit(stream: Box<dyn AsyncStream>, max_datagram_bytes: usize) -> Self {
         let (recv, send) = tokio::io::split(stream);
         AsyncStreamWithDatagram {
             send: Arc::new(Mutex::new(send)),
             recv: Arc::new(Mutex::new(recv)),
+            max_datagram_bytes: max_datagram_bytes.min(MAX_RTCP_DATAGRAM_BYTES),
         }
     }
 
@@ -34,6 +42,15 @@ impl AsyncStreamWithDatagram {
         }
 
         let datagram_len = u32::from_be_bytes(len_buffer) as usize;
+        if datagram_len > self.max_datagram_bytes {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "rtcp datagram length {} exceeds protocol limit {}",
+                    datagram_len, self.max_datagram_bytes
+                ),
+            ));
+        }
         if datagram_len > buffer.len() {
             let msg = format!(
                 "recv datagram error with insufficient buffer: datagram_len={}, buffer_len={}",
@@ -58,6 +75,16 @@ impl AsyncStreamWithDatagram {
     }
 
     pub async fn send_datagram(&self, buffer: &[u8]) -> Result<usize, std::io::Error> {
+        if buffer.len() > self.max_datagram_bytes {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "rtcp datagram length {} exceeds protocol limit {}",
+                    buffer.len(),
+                    self.max_datagram_bytes
+                ),
+            ));
+        }
         let mut stream = self.send.lock().await;
 
         //TODO: u16 is enough?
@@ -80,8 +107,12 @@ pub struct RTcpTunnelDatagramClient {
 
 impl RTcpTunnelDatagramClient {
     pub fn new(stream: Box<dyn AsyncStream>) -> Self {
+        Self::new_with_limit(stream, MAX_RTCP_DATAGRAM_BYTES)
+    }
+
+    pub fn new_with_limit(stream: Box<dyn AsyncStream>, max_datagram_bytes: usize) -> Self {
         Self {
-            stream: AsyncStreamWithDatagram::new(stream),
+            stream: AsyncStreamWithDatagram::new_with_limit(stream, max_datagram_bytes),
         }
     }
 }
@@ -152,7 +183,7 @@ impl DatagramForwarder {
 
     async fn run_recv(&self) -> Result<(), std::io::Error> {
         loop {
-            let mut buffer = [0u8; 1024 * 5];
+            let mut buffer = [0u8; MAX_RTCP_DATAGRAM_BYTES];
             let (size, _) = self.client.recv_from(&mut buffer).await?;
             if size > 0 {
                 let buffer = &buffer[..size];
@@ -163,10 +194,54 @@ impl DatagramForwarder {
 
     async fn run_send(&self) -> Result<(), std::io::Error> {
         loop {
-            let mut buffer = [0u8; 1024 * 5];
+            let mut buffer = [0u8; MAX_RTCP_DATAGRAM_BYTES];
             let size = self.stream.recv_datagram(&mut buffer).await?;
             let buffer = &buffer[..size];
             self.client.send(buffer).await?;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::AsyncWriteExt;
+
+    #[tokio::test]
+    async fn datagram_limit_is_symmetric_and_send_rejection_preserves_framing() {
+        let (a, b) = tokio::io::duplex(256 * 1024);
+        let sender = AsyncStreamWithDatagram::new(Box::new(a));
+        let receiver = AsyncStreamWithDatagram::new(Box::new(b));
+        let too_large = vec![0u8; MAX_RTCP_DATAGRAM_BYTES + 1];
+        let err = sender.send_datagram(&too_large).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+
+        let payload = vec![0x5a; MAX_RTCP_DATAGRAM_BYTES];
+        let expected = payload.clone();
+        let send = tokio::spawn(async move {
+            assert_eq!(
+                sender.send_datagram(&payload).await.unwrap(),
+                MAX_RTCP_DATAGRAM_BYTES
+            );
+        });
+        let mut received = vec![0u8; MAX_RTCP_DATAGRAM_BYTES];
+        assert_eq!(
+            receiver.recv_datagram(&mut received).await.unwrap(),
+            MAX_RTCP_DATAGRAM_BYTES
+        );
+        assert_eq!(received, expected);
+        send.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn oversized_declared_datagram_is_rejected_before_payload_read() {
+        let (mut raw, framed) = tokio::io::duplex(64);
+        raw.write_all(&((MAX_RTCP_DATAGRAM_BYTES as u32) + 1).to_be_bytes())
+            .await
+            .unwrap();
+        let receiver = AsyncStreamWithDatagram::new(Box::new(framed));
+        let mut buffer = vec![0u8; MAX_RTCP_DATAGRAM_BYTES];
+        let err = receiver.recv_datagram(&mut buffer).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
     }
 }
