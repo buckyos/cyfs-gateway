@@ -24,8 +24,8 @@ const DOMAIN_BINDING_REVOKED: &str = "revoked";
 const DOMAIN_BINDING_SUPERSEDED: &str = "superseded";
 const SESSION_ACTIVE: &str = "active";
 const SESSION_REVOKED: &str = "revoked";
-pub const SN_AUTH_DB_SCHEMA_VERSION: u32 = 2;
-pub const SN_AUTH_DB_CONTRACT_VERSION: u32 = 2;
+pub const SN_AUTH_DB_SCHEMA_VERSION: u32 = 3;
+pub const SN_AUTH_DB_CONTRACT_VERSION: u32 = 3;
 pub const USER_DNS_DEFAULT_TTL: u32 = 600;
 pub const USER_DNS_MIN_TTL: u32 = 30;
 pub const USER_DNS_MAX_TTL: u32 = 86_400;
@@ -509,6 +509,23 @@ pub struct RegisterUserWithRelayAllocationReq {
     pub source_version: Option<String>,
 }
 
+/// trusted seed/import 专用注册请求：与普通注册一样必须携带完整密码凭证，
+/// `users` / `user_auth` / `zone_info` / 可选 domain binding 在同一事务写入。
+/// 同一结构体直接用作 S2S wire request（共用 serde schema，避免 DTO 漂移）。
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RegisterUserWithOwnerKeyReq {
+    pub active_code: String,
+    pub username: String,
+    pub email: String,
+    pub password_hash: String,
+    pub password_salt: String,
+    pub password_algo: String,
+    pub public_key: String,
+    pub zone_config: String,
+    pub user_domain: Option<String>,
+    pub sn_ips: Option<String>,
+}
+
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum RegistrationRelayAllocation {
@@ -637,26 +654,15 @@ pub trait SnAuthDB: Send + Sync + 'static {
             relay: Some(relay),
         })
     }
-    async fn create_auth(
-        &self,
-        username: &str,
-        password_hash: &str,
-        password_salt: &str,
-        password_algo: &str,
-    ) -> SnResult<bool>;
     async fn is_user_exist(&self, username: &str) -> SnResult<bool>;
     async fn get_user_by_email(&self, email: &str) -> SnResult<Option<SNUserInfo>>;
     /// trusted 路径（seed/import）专用：不经 DNS PKX proof 直接注册并激活
     /// `user_domain` 绑定。不得从对外 RPC 直接暴露。
+    /// 与普通注册同样必须携带密码凭证，`user_auth` 随账号原子创建；
+    /// 不存在"先建 user、稍后补 credential"的路径。
     async fn register_user_with_owner_key(
         &self,
-        active_code: &str,
-        username: &str,
-        email: &str,
-        public_key: &str,
-        zone_config: &str,
-        user_domain: Option<String>,
-        sn_ips: Option<String>,
+        req: RegisterUserWithOwnerKeyReq,
     ) -> SnResult<bool>;
     async fn get_user_by_public_key(
         &self,
@@ -878,18 +884,6 @@ impl SnAuthDB for RemoteSnAuthDB {
         self.client.register_user_with_relay_allocation(req).await
     }
 
-    async fn create_auth(
-        &self,
-        username: &str,
-        password_hash: &str,
-        password_salt: &str,
-        password_algo: &str,
-    ) -> SnResult<bool> {
-        self.client
-            .create_auth(username, password_hash, password_salt, password_algo)
-            .await
-    }
-
     async fn is_user_exist(&self, username: &str) -> SnResult<bool> {
         self.client.is_user_exist(username).await
     }
@@ -900,25 +894,9 @@ impl SnAuthDB for RemoteSnAuthDB {
 
     async fn register_user_with_owner_key(
         &self,
-        active_code: &str,
-        username: &str,
-        email: &str,
-        public_key: &str,
-        zone_config: &str,
-        user_domain: Option<String>,
-        sn_ips: Option<String>,
+        req: RegisterUserWithOwnerKeyReq,
     ) -> SnResult<bool> {
-        self.client
-            .register_user_with_owner_key(
-                active_code,
-                username,
-                email,
-                public_key,
-                zone_config,
-                user_domain,
-                sn_ips,
-            )
-            .await
+        self.client.register_user_with_owner_key(req).await
     }
 
     async fn get_user_by_public_key(
@@ -1280,9 +1258,6 @@ impl SqliteSnAuthDB {
                 singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
                 version INTEGER NOT NULL
             )",
-            "INSERT INTO sn_auth_schema (singleton_id, version)
-             VALUES (1, 2)
-             ON CONFLICT(singleton_id) DO NOTHING",
             "CREATE TABLE IF NOT EXISTS activation_codes (
                 code TEXT PRIMARY KEY,
                 used INTEGER NOT NULL DEFAULT 0
@@ -1415,11 +1390,44 @@ impl SqliteSnAuthDB {
                 .await
                 .map_err(|e| Self::db_err("initialize fresh AuthDB schema failed", e))?;
         }
+        sqlx::query(
+            "INSERT INTO sn_auth_schema (singleton_id, version)
+             VALUES (1, ?1)
+             ON CONFLICT(singleton_id) DO NOTHING",
+        )
+        .bind(SN_AUTH_DB_SCHEMA_VERSION as i64)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| Self::db_err("initialize fresh AuthDB schema failed", e))?;
         tx.commit()
             .await
             .map_err(|e| Self::db_err("commit AuthDB schema failed", e))?;
 
+        self.assert_no_passwordless_users().await?;
         self.relay_manager.initialize_database().await?;
+        Ok(())
+    }
+
+    /// 启动不变量：schema v3 起 passwordless user 不再是合法状态。外键只保证
+    /// `user_auth -> users`，反向约束由原子注册事务 + 本校验保证；命中即视为
+    /// 数据库来自旧 contract、中断的旧流程或外部写坏，fail fast 而不自动修复。
+    async fn assert_no_passwordless_users(&self) -> SnResult<()> {
+        let orphans = sqlx::query_scalar::<_, String>(
+            "SELECT u.username
+             FROM users u
+             LEFT JOIN user_auth a ON a.username = u.username
+             WHERE a.username IS NULL
+             ORDER BY u.username LIMIT 16",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| Self::db_err("check passwordless users failed", e))?;
+        if !orphans.is_empty() {
+            return Err(Self::db_err(
+                "AuthDB invariant violated: users without user_auth, recreate database",
+                orphans.join(", "),
+            ));
+        }
         Ok(())
     }
 
@@ -1911,6 +1919,33 @@ impl SqliteSnAuthDB {
         Ok(user)
     }
 
+    /// 所有注册路径共用的 `user_auth` INSERT 与错误映射；只允许在创建同一
+    /// 用户 `users` 行的事务内调用，保证账号与凭证原子成对。
+    async fn insert_user_auth_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        username: &str,
+        password_hash: &str,
+        password_salt: &str,
+        password_algo: &str,
+        now: i64,
+    ) -> SnResult<()> {
+        sqlx::query(
+            "INSERT INTO user_auth
+                (username, password_hash, password_salt, password_algo,
+                 created_at, updated_at, last_login_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?5, NULL)",
+        )
+        .bind(username)
+        .bind(password_hash)
+        .bind(password_salt)
+        .bind(password_algo)
+        .bind(now)
+        .execute(&mut **tx)
+        .await
+        .map_err(|e| Self::db_err("insert auth failed", e))?;
+        Ok(())
+    }
+
     async fn register_user_tx(
         tx: &mut Transaction<'_, Sqlite>,
         active_code: &str,
@@ -1978,20 +2013,15 @@ impl SqliteSnAuthDB {
         .await
         .map_err(|e| Self::insert_user_err(email, e))?;
 
-        sqlx::query(
-            "INSERT INTO user_auth
-                (username, password_hash, password_salt, password_algo,
-                 created_at, updated_at, last_login_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?5, NULL)",
+        Self::insert_user_auth_tx(
+            tx,
+            username,
+            password_hash,
+            password_salt,
+            password_algo,
+            now,
         )
-        .bind(username)
-        .bind(password_hash)
-        .bind(password_salt)
-        .bind(password_algo)
-        .bind(now)
-        .execute(&mut **tx)
-        .await
-        .map_err(|e| Self::db_err("insert auth failed", e))?;
+        .await?;
 
         sqlx::query("UPDATE activation_codes SET used = 1 WHERE code = ?1")
             .bind(active_code)
@@ -2261,58 +2291,6 @@ impl SnAuthDB for SqliteSnAuthDB {
         })
     }
 
-    async fn create_auth(
-        &self,
-        username: &str,
-        password_hash: &str,
-        password_salt: &str,
-        password_algo: &str,
-    ) -> SnResult<bool> {
-        let _locker =
-            async_named_locker::Locker::get_locker(format!("username_{}", username)).await;
-        let user_count =
-            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM users WHERE username = ?1")
-                .bind(username)
-                .fetch_one(&self.pool)
-                .await
-                .map_err(|e| Self::db_err("query user count failed", e))?;
-        if user_count == 0 {
-            return Err(sn_err!(
-                SnErrorCode::NotFound,
-                "cannot create auth for missing user: {}",
-                username
-            ));
-        }
-
-        let auth_count =
-            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM user_auth WHERE username = ?1")
-                .bind(username)
-                .fetch_one(&self.pool)
-                .await
-                .map_err(|e| Self::db_err("query user auth count failed", e))?;
-        if auth_count > 0 {
-            return Ok(false);
-        }
-
-        let now = Self::now_secs() as i64;
-        sqlx::query(
-            "INSERT INTO user_auth
-                (username, password_hash, password_salt, password_algo,
-                 created_at, updated_at, last_login_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?5, NULL)",
-        )
-        .bind(username)
-        .bind(password_hash)
-        .bind(password_salt)
-        .bind(password_algo)
-        .bind(now)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| Self::db_err("insert auth failed", e))?;
-
-        Ok(true)
-    }
-
     async fn is_user_exist(&self, username: &str) -> SnResult<bool> {
         let count = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM users WHERE username = ?1")
             .bind(username)
@@ -2342,15 +2320,24 @@ impl SnAuthDB for SqliteSnAuthDB {
 
     async fn register_user_with_owner_key(
         &self,
-        active_code: &str,
-        username: &str,
-        email: &str,
-        public_key: &str,
-        zone_config: &str,
-        user_domain: Option<String>,
-        sn_ips: Option<String>,
+        req: RegisterUserWithOwnerKeyReq,
     ) -> SnResult<bool> {
-        let email = canonical_email(email)?;
+        let RegisterUserWithOwnerKeyReq {
+            active_code,
+            username,
+            email,
+            password_hash,
+            password_salt,
+            password_algo,
+            public_key,
+            zone_config,
+            user_domain,
+            sn_ips,
+        } = req;
+        let active_code = active_code.as_str();
+        let username = username.as_str();
+        let zone_config = zone_config.as_str();
+        let email = canonical_email(email.as_str())?;
         let _locker =
             async_named_locker::Locker::get_locker(format!("active_code_{}", active_code)).await;
         let _email_locker =
@@ -2363,6 +2350,14 @@ impl SnAuthDB for SqliteSnAuthDB {
         } else {
             None
         };
+        if password_hash.trim().is_empty()
+            || password_salt.trim().is_empty()
+            || password_algo.trim().is_empty()
+        {
+            return Err(Self::invalid_input(
+                "owner-key registration requires complete password credentials",
+            ));
+        }
         let mut tx = self
             .pool
             .begin()
@@ -2413,7 +2408,7 @@ impl SnAuthDB for SqliteSnAuthDB {
         .bind(email.as_str())
         .bind(UserState::Active.to_string())
         .bind(username)
-        .bind(public_key)
+        .bind(public_key.as_str())
         .bind(active_code)
         .bind(zone_config)
         .bind(canonical_domain.as_deref())
@@ -2422,6 +2417,16 @@ impl SnAuthDB for SqliteSnAuthDB {
         .execute(&mut *tx)
         .await
         .map_err(|e| Self::insert_user_err(email.as_str(), e))?;
+
+        Self::insert_user_auth_tx(
+            &mut tx,
+            username,
+            password_hash.as_str(),
+            password_salt.as_str(),
+            password_algo.as_str(),
+            now,
+        )
+        .await?;
 
         sqlx::query(
             "INSERT INTO zone_info
@@ -2444,7 +2449,7 @@ impl SnAuthDB for SqliteSnAuthDB {
 
         if let Some(domain) = canonical_domain.as_deref() {
             // seed/import 捷径：不经 DNS proof 直接激活（含 supersede 语义）。
-            let pkx = pkx_value(public_key)?;
+            let pkx = pkx_value(public_key.as_str())?;
             Self::activate_binding_tx(&mut tx, username, domain, pkx.as_str(), now).await?;
         }
 
@@ -4303,9 +4308,9 @@ mod tests {
             .fetch_all(&db.pool)
             .await
             .map_err(|e| SqliteSnAuthDB::db_err("read user DNS indexes failed", e))?;
-        assert!(name_indexes.iter().any(|row| {
-            row.get::<String, _>("name") == "idx_user_dns_names_owner_name"
-        }));
+        assert!(name_indexes
+            .iter()
+            .any(|row| { row.get::<String, _>("name") == "idx_user_dns_names_owner_name" }));
         let rrset_sql = sqlx::query_scalar::<_, String>(
             "SELECT sql FROM sqlite_master
              WHERE type = 'table' AND name = 'user_dns_rrsets'",
@@ -4879,12 +4884,21 @@ mod tests {
 
         // 未知 session → None。
         assert!(db.get_account_session("missing").await?.is_none());
+        // passwordless user 不再是合法状态：session 前置账号走完整注册。
         for username in ["alice", "bob"] {
-            sqlx::query("INSERT INTO users (username) VALUES (?1)")
-                .bind(username)
-                .execute(&db.pool)
-                .await
-                .map_err(|e| SqliteSnAuthDB::db_err("insert session test user failed", e))?;
+            let code = format!("session-code-{username}");
+            db.insert_activation_code(code.as_str()).await?;
+            assert!(
+                db.register_user(
+                    code.as_str(),
+                    username,
+                    format!("{username}@example.com").as_str(),
+                    "h",
+                    "s",
+                    "pbkdf2",
+                )
+                .await?
+            );
         }
 
         db.create_account_session("a1", "alice", "sn-refresh", 1, 100)
@@ -5217,6 +5231,178 @@ mod tests {
         assert!(error
             .to_string()
             .contains("incompatible schema, recreate database"));
+        Ok(())
+    }
+
+    /// fresh schema 写入 version 3，capabilities 报告 contract/schema 同版。
+    #[tokio::test]
+    async fn test_fresh_schema_and_capabilities_report_version_3() -> SnResult<()> {
+        let (_tmp_dir, db) = new_test_db().await?;
+        let stored: i64 =
+            sqlx::query_scalar("SELECT version FROM sn_auth_schema WHERE singleton_id = 1")
+                .fetch_one(&db.pool)
+                .await
+                .map_err(|e| SqliteSnAuthDB::db_err("read schema version failed", e))?;
+        assert_eq!(stored, SN_AUTH_DB_SCHEMA_VERSION as i64);
+
+        let capabilities = db.capabilities().await?;
+        assert_eq!(capabilities.contract_version, SN_AUTH_DB_CONTRACT_VERSION);
+        assert_eq!(capabilities.schema_version, SN_AUTH_DB_SCHEMA_VERSION);
+        assert_eq!(capabilities.contract_version, 3);
+        assert_eq!(capabilities.schema_version, 3);
+        Ok(())
+    }
+
+    /// 启动不变量：`users` 有行而 `user_auth` 无对应行（passwordless user）
+    /// 时 `initialize_database` 必须失败，不自动修复。
+    #[tokio::test]
+    async fn test_startup_rejects_passwordless_users() -> SnResult<()> {
+        let (_tmp_dir, db) = new_test_db().await?;
+        db.insert_activation_code("invariant-code").await?;
+        assert!(
+            db.register_user(
+                "invariant-code",
+                "alice",
+                "alice@example.com",
+                "h",
+                "s",
+                "pbkdf2",
+            )
+            .await?
+        );
+        // 重放启动校验：完整账号通过。
+        db.initialize_database().await?;
+
+        // 模拟旧 contract / 中断流程留下的 passwordless user。
+        sqlx::query("DELETE FROM user_auth WHERE username = 'alice'")
+            .execute(&db.pool)
+            .await
+            .map_err(|e| SqliteSnAuthDB::db_err("drop auth row failed", e))?;
+        let error = db.initialize_database().await.unwrap_err();
+        assert!(error.to_string().contains("AuthDB invariant violated"));
+        assert!(error.to_string().contains("alice"));
+        Ok(())
+    }
+
+    fn owner_key_req(active_code: &str, username: &str) -> RegisterUserWithOwnerKeyReq {
+        RegisterUserWithOwnerKeyReq {
+            active_code: active_code.to_string(),
+            username: username.to_string(),
+            email: format!("{username}@example.com"),
+            password_hash: "hash".to_string(),
+            password_salt: "salt".to_string(),
+            password_algo: "pbkdf2".to_string(),
+            public_key: format!(r#"{{"crv":"Ed25519","kty":"OKP","x":"{username}-x"}}"#),
+            zone_config: "zone-cfg".to_string(),
+            user_domain: None,
+            sn_ips: None,
+        }
+    }
+
+    /// owner-key 注册与普通注册同一不变量：users/user_auth/zone_info 原子成对，
+    /// 密码可走现有 PBKDF2 校验路径登录。
+    #[tokio::test]
+    async fn test_register_user_with_owner_key_creates_credentials_atomically() -> SnResult<()> {
+        use crate::sn_auth_manager::{hash_password, verify_password, PASSWORD_ALGO};
+
+        let (_tmp_dir, db) = new_test_db().await?;
+        db.insert_activation_code("owner-code").await?;
+        let (hash, salt) = hash_password("seed-pwd")
+            .map_err(|e| sn_err!(SnErrorCode::Failed, "hash failed: {:?}", e))?;
+        let mut req = owner_key_req("owner-code", "alice");
+        req.password_hash = hash;
+        req.password_salt = salt;
+        req.password_algo = PASSWORD_ALGO.to_string();
+        req.user_domain = Some("alice.me".to_string());
+        assert!(db.register_user_with_owner_key(req).await?);
+
+        let user = db.get_user_info("alice").await?.unwrap();
+        assert_eq!(user.user_domain.as_deref(), Some("alice.me"));
+        let auth = db.get_auth("alice").await?.unwrap();
+        assert_eq!(auth.password_algo, PASSWORD_ALGO);
+        assert!(verify_password("seed-pwd", &auth).map_err(|e| sn_err!(
+            SnErrorCode::Failed,
+            "verify failed: {:?}",
+            e
+        ))?);
+        assert!(!verify_password("wrong-pwd", &auth).map_err(|e| sn_err!(
+            SnErrorCode::Failed,
+            "verify failed: {:?}",
+            e
+        ))?);
+        assert_eq!(db.get_zone_info("alice").await?.unwrap().bns_name, "alice");
+        assert!(!db.check_active_code("owner-code").await?);
+        // 启动不变量校验通过（凭证与账号成对）。
+        db.initialize_database().await?;
+
+        // 缺失凭证的请求被拒绝：不存在"先建号后补密码"的入口。
+        db.insert_activation_code("owner-code-2").await?;
+        let mut incomplete = owner_key_req("owner-code-2", "bob");
+        incomplete.password_hash = String::new();
+        let error = db
+            .register_user_with_owner_key(incomplete)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), SnErrorCode::InvalidInput);
+        assert!(!db.is_user_exist("bob").await?);
+        assert!(db.check_active_code("owner-code-2").await?);
+        Ok(())
+    }
+
+    /// owner-key 注册的 `user_auth` INSERT 失败时整个事务回滚：
+    /// user/zone/domain/auth 均不存在，激活码未消费。
+    #[tokio::test]
+    async fn test_register_user_with_owner_key_rolls_back_on_auth_failure() -> SnResult<()> {
+        let (_tmp_dir, db) = new_test_db().await?;
+        db.insert_activation_code("atomic-code").await?;
+        sqlx::query(
+            "CREATE TRIGGER fail_user_auth_insert BEFORE INSERT ON user_auth
+             BEGIN SELECT RAISE(ABORT, 'injected auth insert failure'); END",
+        )
+        .execute(&db.pool)
+        .await
+        .map_err(|e| SqliteSnAuthDB::db_err("create abort trigger failed", e))?;
+
+        let mut req = owner_key_req("atomic-code", "alice");
+        req.user_domain = Some("alice.me".to_string());
+        let error = db.register_user_with_owner_key(req).await.unwrap_err();
+        assert_eq!(error.code(), SnErrorCode::DBError);
+        assert!(error.to_string().contains("injected auth insert failure"));
+
+        assert!(!db.is_user_exist("alice").await?);
+        assert!(db.get_auth("alice").await?.is_none());
+        assert!(db.get_user_by_domain("alice.me").await?.is_none());
+        let zone_rows: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM zone_info WHERE username = 'alice'")
+                .fetch_one(&db.pool)
+                .await
+                .map_err(|e| SqliteSnAuthDB::db_err("count zone rows failed", e))?;
+        assert_eq!(zone_rows, 0);
+        let binding_rows: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM user_domain_bindings WHERE owner = 'alice'")
+                .fetch_one(&db.pool)
+                .await
+                .map_err(|e| SqliteSnAuthDB::db_err("count binding rows failed", e))?;
+        assert_eq!(binding_rows, 0);
+        assert!(db.check_active_code("atomic-code").await?);
+
+        // 排除注入故障后同一激活码可完整注册。
+        sqlx::query("DROP TRIGGER fail_user_auth_insert")
+            .execute(&db.pool)
+            .await
+            .map_err(|e| SqliteSnAuthDB::db_err("drop abort trigger failed", e))?;
+        let mut retry = owner_key_req("atomic-code", "alice");
+        retry.user_domain = Some("alice.me".to_string());
+        assert!(db.register_user_with_owner_key(retry).await?);
+        assert!(db.get_auth("alice").await?.is_some());
+        assert_eq!(
+            db.get_user_by_domain("alice.me")
+                .await?
+                .unwrap()
+                .username
+                .as_deref(),
+            Some("alice")
+        );
         Ok(())
     }
 

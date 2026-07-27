@@ -1,12 +1,13 @@
 use super::read_cache::RemoteReadCache;
 use crate::{
     sn_err, AccountSession, AllocateZoneRelayReq, AssignZoneRelayReq, DomainBinding,
-    RegisterUserWithRelayAllocationReq, RegisterUserWithRelayAllocationResult,
-    RelayAdmissionDecision, RelayAdmissionReq, RelayAssignment, RelayHeartbeat, RelayMigrationReq,
-    RelayNode, RelayNodeAddressUpdate, RelayNodeHealth, RelayNodeIpMapReq, RelayNodeIpMapSnapshot,
-    RelayNodeRegistration, SNUserInfo, SnAuthDB, SnAuthDbCapabilities, SnAuthInfo,
-    SnClearStateResult, SnError, SnErrorCode, SnResult, UserDnsChangePage, UserDnsLookup,
-    UserDnsMutationResult, UserDnsRecordType, UserDnsRrset, UserState, ZoneInfo, ZoneInfoPatch,
+    RegisterUserWithOwnerKeyReq, RegisterUserWithRelayAllocationReq,
+    RegisterUserWithRelayAllocationResult, RelayAdmissionDecision, RelayAdmissionReq,
+    RelayAssignment, RelayHeartbeat, RelayMigrationReq, RelayNode, RelayNodeAddressUpdate,
+    RelayNodeHealth, RelayNodeIpMapReq, RelayNodeIpMapSnapshot, RelayNodeRegistration, SNUserInfo,
+    SnAuthDB, SnAuthDbCapabilities, SnAuthInfo, SnClearStateResult, SnError, SnErrorCode, SnResult,
+    UserDnsChangePage, UserDnsLookup, UserDnsMutationResult, UserDnsRecordType, UserDnsRrset,
+    UserState, ZoneInfo, ZoneInfoPatch,
 };
 use ::kRPC::{kRPC, RPCErrors, RPCHandler, RPCRequest, RPCResponse, RPCResult};
 use async_trait::async_trait;
@@ -32,7 +33,6 @@ pub const METHOD_CLEAR_STATE_BY_ACTIVE_CODE: &str = "sn_auth_db.clear_state_by_a
 pub const METHOD_REGISTER_USER: &str = "sn_auth_db.register_user";
 pub const METHOD_REGISTER_USER_WITH_RELAY_ALLOCATION: &str =
     "sn_auth_db.register_user_with_relay_allocation";
-pub const METHOD_CREATE_AUTH: &str = "sn_auth_db.create_auth";
 pub const METHOD_IS_USER_EXIST: &str = "sn_auth_db.is_user_exist";
 pub const METHOD_GET_USER_BY_EMAIL: &str = "sn_auth_db.get_user_by_email";
 pub const METHOD_REGISTER_USER_WITH_OWNER_KEY: &str = "sn_auth_db.register_user_with_owner_key";
@@ -304,32 +304,6 @@ impl SnAuthDbRegisterUserReq {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SnAuthDbCreateAuthReq {
-    pub username: String,
-    pub password_hash: String,
-    pub password_salt: String,
-    pub password_algo: String,
-}
-
-impl SnAuthDbCreateAuthReq {
-    pub fn new(
-        username: &str,
-        password_hash: &str,
-        password_salt: &str,
-        password_algo: &str,
-    ) -> Self {
-        Self {
-            username: username.to_string(),
-            password_hash: password_hash.to_string(),
-            password_salt: password_salt.to_string(),
-            password_algo: password_algo.to_string(),
-        }
-    }
-
-    impl_req_from_json!(SnAuthDbCreateAuthReq);
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SnAuthDbUsernameReq {
     pub username: String,
 }
@@ -357,41 +331,6 @@ impl SnAuthDbUsernameReq {
     }
 
     impl_req_from_json!(SnAuthDbUsernameReq);
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SnAuthDbRegisterUserWithOwnerKeyReq {
-    pub active_code: String,
-    pub username: String,
-    pub email: String,
-    pub public_key: String,
-    pub zone_config: String,
-    pub user_domain: Option<String>,
-    pub sn_ips: Option<String>,
-}
-
-impl SnAuthDbRegisterUserWithOwnerKeyReq {
-    pub fn new(
-        active_code: &str,
-        username: &str,
-        email: &str,
-        public_key: &str,
-        zone_config: &str,
-        user_domain: Option<String>,
-        sn_ips: Option<String>,
-    ) -> Self {
-        Self {
-            active_code: active_code.to_string(),
-            username: username.to_string(),
-            email: email.to_string(),
-            public_key: public_key.to_string(),
-            zone_config: zone_config.to_string(),
-            user_domain,
-            sn_ips,
-        }
-    }
-
-    impl_req_from_json!(SnAuthDbRegisterUserWithOwnerKeyReq);
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1122,34 +1061,6 @@ impl SnAuthDB for SnAuthDbClient {
         }
     }
 
-    async fn create_auth(
-        &self,
-        username: &str,
-        password_hash: &str,
-        password_salt: &str,
-        password_algo: &str,
-    ) -> SnResult<bool> {
-        match self {
-            Self::InProcess(handler) => {
-                handler
-                    .create_auth(username, password_hash, password_salt, password_algo)
-                    .await
-            }
-            Self::KRPC(_) => {
-                self.call(
-                    METHOD_CREATE_AUTH,
-                    &SnAuthDbCreateAuthReq::new(
-                        username,
-                        password_hash,
-                        password_salt,
-                        password_algo,
-                    ),
-                )
-                .await
-            }
-        }
-    }
-
     async fn is_user_exist(&self, username: &str) -> SnResult<bool> {
         match self {
             Self::InProcess(handler) => handler.is_user_exist(username).await,
@@ -1172,43 +1083,11 @@ impl SnAuthDB for SnAuthDbClient {
 
     async fn register_user_with_owner_key(
         &self,
-        active_code: &str,
-        username: &str,
-        email: &str,
-        public_key: &str,
-        zone_config: &str,
-        user_domain: Option<String>,
-        sn_ips: Option<String>,
+        req: RegisterUserWithOwnerKeyReq,
     ) -> SnResult<bool> {
         match self {
-            Self::InProcess(handler) => {
-                handler
-                    .register_user_with_owner_key(
-                        active_code,
-                        username,
-                        email,
-                        public_key,
-                        zone_config,
-                        user_domain,
-                        sn_ips,
-                    )
-                    .await
-            }
-            Self::KRPC(_) => {
-                self.call(
-                    METHOD_REGISTER_USER_WITH_OWNER_KEY,
-                    &SnAuthDbRegisterUserWithOwnerKeyReq::new(
-                        active_code,
-                        username,
-                        email,
-                        public_key,
-                        zone_config,
-                        user_domain,
-                        sn_ips,
-                    ),
-                )
-                .await
-            }
+            Self::InProcess(handler) => handler.register_user_with_owner_key(req).await,
+            Self::KRPC(_) => self.call(METHOD_REGISTER_USER_WITH_OWNER_KEY, &req).await,
         }
     }
 
@@ -1820,20 +1699,6 @@ where
                     &req,
                 )
             }
-            METHOD_CREATE_AUTH | "create_auth" => {
-                let parsed = SnAuthDbCreateAuthReq::from_json(req.params.clone())?;
-                rpc_envelope_response(
-                    self.0
-                        .create_auth(
-                            &parsed.username,
-                            &parsed.password_hash,
-                            &parsed.password_salt,
-                            &parsed.password_algo,
-                        )
-                        .await,
-                    &req,
-                )
-            }
             METHOD_IS_USER_EXIST | "is_user_exist" => {
                 let parsed = SnAuthDbUsernameReq::from_json(req.params.clone())?;
                 rpc_envelope_response(self.0.is_user_exist(&parsed.username).await, &req)
@@ -1843,21 +1708,8 @@ where
                 rpc_envelope_response(self.0.get_user_by_email(&parsed.email).await, &req)
             }
             METHOD_REGISTER_USER_WITH_OWNER_KEY | "register_user_with_owner_key" => {
-                let parsed = SnAuthDbRegisterUserWithOwnerKeyReq::from_json(req.params.clone())?;
-                rpc_envelope_response(
-                    self.0
-                        .register_user_with_owner_key(
-                            &parsed.active_code,
-                            &parsed.username,
-                            &parsed.email,
-                            &parsed.public_key,
-                            &parsed.zone_config,
-                            parsed.user_domain,
-                            parsed.sn_ips,
-                        )
-                        .await,
-                    &req,
-                )
+                let parsed = parse_request::<RegisterUserWithOwnerKeyReq>(req.params.clone())?;
+                rpc_envelope_response(self.0.register_user_with_owner_key(parsed).await, &req)
             }
             METHOD_GET_USER_BY_PUBLIC_KEY | "get_user_by_public_key" => {
                 let parsed = SnAuthDbPublicKeyReq::from_json(req.params.clone())?;
@@ -2335,45 +2187,50 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_relay_rpc_handler_roundtrips_node_map_and_not_modified() {
-        use crate::SqliteSnAuthDB;
+    async fn dispatch<T: DeserializeOwned>(
+        handler: &SnAuthDbRpcHandler<crate::SqliteSnAuthDB>,
+        method: &str,
+        params: Value,
+    ) -> SnResult<T> {
         use std::net::{IpAddr, Ipv4Addr};
+        let request = RPCRequest::new(method, params);
+        let response = handler
+            .handle_rpc_call(request, IpAddr::V4(Ipv4Addr::LOCALHOST))
+            .await
+            .map_err(|e| {
+                sn_err!(
+                    SnErrorCode::RemoteError,
+                    "loopback RPC transport failed: {}",
+                    e
+                )
+            })?;
+        let value = match response.result {
+            RPCResult::Success(value) => value,
+            RPCResult::Failed(error) => {
+                return Err(sn_err!(SnErrorCode::RemoteError, "{}", error));
+            }
+        };
+        serde_json::from_value::<SnAuthDbRpcEnvelope<T>>(value)
+            .map_err(|e| sn_err!(SnErrorCode::RemoteError, "decode envelope failed: {}", e))?
+            .into_result()
+    }
 
-        async fn dispatch<T: DeserializeOwned>(
-            handler: &SnAuthDbRpcHandler<SqliteSnAuthDB>,
-            method: &str,
-            params: Value,
-        ) -> SnResult<T> {
-            let request = RPCRequest::new(method, params);
-            let response = handler
-                .handle_rpc_call(request, IpAddr::V4(Ipv4Addr::LOCALHOST))
-                .await
-                .map_err(|e| {
-                    sn_err!(
-                        SnErrorCode::RemoteError,
-                        "loopback relay RPC transport failed: {}",
-                        e
-                    )
-                })?;
-            let value = match response.result {
-                RPCResult::Success(value) => value,
-                RPCResult::Failed(error) => {
-                    return Err(sn_err!(SnErrorCode::RemoteError, "{}", error));
-                }
-            };
-            serde_json::from_value::<SnAuthDbRpcEnvelope<T>>(value)
-                .map_err(|e| sn_err!(SnErrorCode::RemoteError, "decode envelope failed: {}", e))?
-                .into_result()
-        }
-
+    async fn new_loopback_handler() -> (tempfile::TempDir, SnAuthDbRpcHandler<crate::SqliteSnAuthDB>)
+    {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("auth.sqlite3");
-        let db = SqliteSnAuthDB::new_by_path(path.to_string_lossy().as_ref())
+        let db = crate::SqliteSnAuthDB::new_by_path(path.to_string_lossy().as_ref())
             .await
             .unwrap();
         db.initialize_database().await.unwrap();
-        let handler = SnAuthDbRpcHandler::new(db);
+        (temp, SnAuthDbRpcHandler::new(db))
+    }
+
+    #[tokio::test]
+    async fn test_relay_rpc_handler_roundtrips_node_map_and_not_modified() {
+        use std::net::IpAddr;
+
+        let (_temp, handler) = new_loopback_handler().await;
         let registration = RelayNodeRegistration {
             relay_id: "relay-a".to_string(),
             relay_sn: "relay-a.example".to_string(),
@@ -2426,5 +2283,88 @@ mod tests {
         .await
         .unwrap();
         assert!(not_modified.is_none());
+    }
+
+    /// owner-key 注册 wire request 携带三个密码 credential 字段 round-trip；
+    /// 旧 `sn_auth_db.create_auth` 与短 alias `create_auth` 均已从路由删除，
+    /// 统一返回 unknown method（contract v3 breaking change）。
+    #[tokio::test]
+    async fn test_owner_key_registration_roundtrip_and_create_auth_routes_removed() {
+        use std::net::{IpAddr, Ipv4Addr};
+
+        let (_temp, handler) = new_loopback_handler().await;
+        dispatch::<()>(
+            &handler,
+            METHOD_INSERT_ACTIVATION_CODE,
+            serde_json::to_value(SnAuthDbInsertActivationCodeReq::new("owner-code")).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let req = RegisterUserWithOwnerKeyReq {
+            active_code: "owner-code".to_string(),
+            username: "alice".to_string(),
+            email: "alice@example.com".to_string(),
+            password_hash: "wire-hash".to_string(),
+            password_salt: "wire-salt".to_string(),
+            password_algo: "pbkdf2".to_string(),
+            public_key: r#"{"crv":"Ed25519","kty":"OKP","x":"alice-x"}"#.to_string(),
+            zone_config: "zone-cfg".to_string(),
+            user_domain: Some("alice.me".to_string()),
+            sn_ips: None,
+        };
+        let registered: bool = dispatch(
+            &handler,
+            METHOD_REGISTER_USER_WITH_OWNER_KEY,
+            serde_json::to_value(&req).unwrap(),
+        )
+        .await
+        .unwrap();
+        assert!(registered);
+
+        // 凭证与账号在同一事务落库，get_auth 可读回三个 credential 字段。
+        let auth: Option<SnAuthInfo> = dispatch(
+            &handler,
+            METHOD_GET_AUTH,
+            serde_json::to_value(SnAuthDbUsernameReq::new("alice")).unwrap(),
+        )
+        .await
+        .unwrap();
+        let auth = auth.expect("auth row must exist");
+        assert_eq!(auth.password_hash, "wire-hash");
+        assert_eq!(auth.password_salt, "wire-salt");
+        assert_eq!(auth.password_algo, "pbkdf2");
+
+        // 缺 credential 字段的旧版 wire request 解析失败（schema 强制同步升级）。
+        let mut legacy = serde_json::to_value(&req).unwrap();
+        legacy.as_object_mut().unwrap().remove("password_hash");
+        legacy.as_object_mut().unwrap().remove("password_salt");
+        legacy.as_object_mut().unwrap().remove("password_algo");
+        let request = RPCRequest::new(METHOD_REGISTER_USER_WITH_OWNER_KEY, legacy);
+        let error = handler
+            .handle_rpc_call(request, IpAddr::V4(Ipv4Addr::LOCALHOST))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, RPCErrors::ParseRequestError(_)));
+
+        for method in ["sn_auth_db.create_auth", "create_auth"] {
+            let request = RPCRequest::new(
+                method,
+                serde_json::json!({
+                    "username": "alice",
+                    "password_hash": "h",
+                    "password_salt": "s",
+                    "password_algo": "pbkdf2",
+                }),
+            );
+            let error = handler
+                .handle_rpc_call(request, IpAddr::V4(Ipv4Addr::LOCALHOST))
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(&error, RPCErrors::UnknownMethod(m) if m == method),
+                "{method} must be unknown, got {error:?}"
+            );
+        }
     }
 }

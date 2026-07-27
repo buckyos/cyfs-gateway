@@ -1938,6 +1938,25 @@ impl SnServerFactory {
         ))
     }
 
+    /// AuthDB provider 准入：contract/schema 严格同版（不支持新旧混跑），
+    /// 未同步升级的 remote provider 在流量进入前被拒绝。
+    fn ensure_auth_db_capabilities(capabilities: &crate::SnAuthDbCapabilities) -> ServerResult<()> {
+        if capabilities.contract_version != crate::SN_AUTH_DB_CONTRACT_VERSION
+            || capabilities.schema_version != crate::SN_AUTH_DB_SCHEMA_VERSION
+            || !capabilities.user_dns_rrsets
+            || !capabilities.user_dns_change_feed
+        {
+            return Err(server_err!(
+                ServerErrorCode::InvalidConfig,
+                "incompatible AuthDB capability: expected contract {} / schema {} with user DNS RRsets/change feed, got {:?}",
+                crate::SN_AUTH_DB_CONTRACT_VERSION,
+                crate::SN_AUTH_DB_SCHEMA_VERSION,
+                capabilities
+            ));
+        }
+        Ok(())
+    }
+
     /// 解析 BNS proxy controller key 配置。
     /// 返回 (key specs, require_user_asset_owner, allowed_operations)。
     fn resolve_bns_proxy_key_specs(
@@ -2269,19 +2288,7 @@ impl ServerFactory for SnServerFactory {
                 e
             )
         })?;
-        if capabilities.contract_version != crate::SN_AUTH_DB_CONTRACT_VERSION
-            || capabilities.schema_version != crate::SN_AUTH_DB_SCHEMA_VERSION
-            || !capabilities.user_dns_rrsets
-            || !capabilities.user_dns_change_feed
-        {
-            return Err(server_err!(
-                ServerErrorCode::InvalidConfig,
-                "incompatible AuthDB capability: expected contract {} / schema {} with user DNS RRsets/change feed, got {:?}",
-                crate::SN_AUTH_DB_CONTRACT_VERSION,
-                crate::SN_AUTH_DB_SCHEMA_VERSION,
-                capabilities
-            ));
-        }
+        Self::ensure_auth_db_capabilities(&capabilities)?;
 
         let device_info_db: SnDeviceInfoDBRef = if let Some(url) = device_info_db_url.as_deref() {
             info!("sn server uses remote device_info_db provider: {}", url);
@@ -2343,6 +2350,46 @@ mod tests {
     const ANVIL_PRIVATE_KEY: &str =
         "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
     const ANVIL_ADDRESS: &str = "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266";
+
+    /// AuthDB provider 准入是严格同版比较：旧 contract/schema（如 v2）在流量
+    /// 进入前被拒绝，当前版本（contract 3 / schema 3）可启动。
+    #[test]
+    fn test_auth_db_capability_gate_rejects_stale_contract() {
+        let current = crate::SnAuthDbCapabilities {
+            contract_version: crate::SN_AUTH_DB_CONTRACT_VERSION,
+            schema_version: crate::SN_AUTH_DB_SCHEMA_VERSION,
+            user_dns_rrsets: true,
+            user_dns_change_feed: true,
+        };
+        assert_eq!(crate::SN_AUTH_DB_CONTRACT_VERSION, 3);
+        assert_eq!(crate::SN_AUTH_DB_SCHEMA_VERSION, 3);
+        assert!(SnServerFactory::ensure_auth_db_capabilities(&current).is_ok());
+
+        for stale in [
+            crate::SnAuthDbCapabilities {
+                contract_version: 2,
+                ..current.clone()
+            },
+            crate::SnAuthDbCapabilities {
+                schema_version: 2,
+                ..current.clone()
+            },
+            crate::SnAuthDbCapabilities {
+                user_dns_rrsets: false,
+                ..current.clone()
+            },
+            crate::SnAuthDbCapabilities {
+                user_dns_change_feed: false,
+                ..current.clone()
+            },
+        ] {
+            let error = SnServerFactory::ensure_auth_db_capabilities(&stale).unwrap_err();
+            assert!(
+                error.to_string().contains("incompatible AuthDB capability"),
+                "{stale:?} must be rejected"
+            );
+        }
+    }
 
     fn test_relay_registration(relay_id: &str, relay_sn: &str) -> RelayNodeRegistration {
         RelayNodeRegistration {

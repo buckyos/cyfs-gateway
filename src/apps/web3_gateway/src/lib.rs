@@ -60,12 +60,9 @@ mod tests {
         let composition = std::sync::Arc::new(build_gateway_composition().unwrap());
         let parser = GatewayConfigParser::new(composition);
         let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../web3-gateway");
-        for name in [
-            "web3_gateway.yaml",
-            "web3_dns.yaml",
-            "web3_relay.yaml",
-            "web3_sn_api.yaml",
-        ] {
+        // 拆分部署模板（web3_dns/web3_relay/web3_sn_api）已随 0fd33bd1 移出仓库，
+        // 仓内只保留合并版 web3_gateway.yaml（其 includes 覆盖 params/website）。
+        for name in ["web3_gateway.yaml"] {
             let loaded = load_config_from_file(&gateway_app_profile(), &base.join(name))
                 .await
                 .unwrap_or_else(|e| panic!("load {} failed: {}", name, e));

@@ -142,17 +142,13 @@ pub(crate) async fn handle_auth(
             let _email_locker =
                 async_named_locker::Locker::get_locker(format!("sn_auth_register_email_{}", email))
                     .await;
+            // 用户名占用只看 `users`：注册原子写入 `users + user_auth`，
+            // 不存在 orphan auth/user 状态，无需再预查 `get_auth`。
             if server
                 .auth_db()
                 .is_user_exist(username.as_str())
                 .await
                 .into_rpc()?
-                || server
-                    .auth_db()
-                    .get_auth(username.as_str())
-                    .await
-                    .into_rpc()?
-                    .is_some()
             {
                 return Err(parse_error(
                     SnApiErrorCode::UsernameAlreadyExists,

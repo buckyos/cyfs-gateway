@@ -22,6 +22,7 @@ use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
 use web3_gateway::{gateway_service_main, GatewayParams};
 
+const SN_HOST: &str = "sn.local.test";
 const BNS_NAME: &str = "bnsalice";
 const BNS_ASSET_OWNER: &str = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const BNS_GATEWAY_DEVICE: &str = "gateway1";
@@ -270,12 +271,9 @@ servers:
     boot_jwt: ""
     owner_pkx: ""
     device_jwt: []
-    db_type: sqlite
     db_path: {}
     auth_data_dir: {}
-    bns_rpc_url: http://{}
-    bns_evm:
-      controller_private_key: "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
+    bns_server_url: http://{}
 "#,
         sn_db.path().to_string_lossy(),
         auth_dir.path().to_string_lossy(),
@@ -345,8 +343,11 @@ servers:
     let resolver_config = ResolverConfig::from_parts(None, vec![], name_server_configs);
     let resolver = TokioAsyncResolver::tokio(resolver_config, ResolverOpts::default());
 
+    // 权威 DNS 语义：SN 只应答托管 zone（web3.<server_host> 与 active
+    // user_domain）内的名字，BNS name 以 <name>.web3.<server_host> 查询。
+    let bns_fqdn = format!("{}.web3.{}.", BNS_NAME, SN_HOST);
     let ips = resolver
-        .lookup_ip(format!("{}.", BNS_NAME))
+        .lookup_ip(bns_fqdn.as_str())
         .await
         .unwrap()
         .iter()
@@ -354,7 +355,7 @@ servers:
     assert_eq!(ips, vec![IpAddr::from_str(BNS_GATEWAY_IP).unwrap()]);
 
     let txt = resolver
-        .txt_lookup(format!("{}.", BNS_NAME))
+        .txt_lookup(bns_fqdn.as_str())
         .await
         .unwrap()
         .iter()

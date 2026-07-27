@@ -117,6 +117,11 @@ e2e 覆盖见 sn_server.rs `test_sn_device_token_report_paths`。
 
 - `user_auth` 表保存上述全部字段（sn_auth.rs:316-324）。
 - V2 使用 `pbkdf2-sha256-100000`，salt 为 16 字节随机值，hash 为 32 字节结果的 hex（sn_auth_manager.rs:16-17、97-101、195-210）。
+- Beta2.2 起（schema/contract v3）：所有注册路径（`auth.register` 与
+  seed/import 的 `register_user_with_owner_key`）都在同一个数据库事务内
+  原子写入 `users + user_auth`；post-create 的 `create_auth` 能力已从
+  trait、SQLite 实现和 S2S wire contract 中删除。`users` 中的每个账号都
+  必须在 `user_auth` 中有对应行，启动校验发现 passwordless user 即失败。
 
 服务端不得存储明文密码。RPC 参数名里历史上使用 `pwd_hash`，但当前 V2 实际会把该值再次 PBKDF2 后保存（register/login 直接把 `pwd_hash` 喂给 `hash_password`/`verify_password`，auth.rs:71、116）；后续接口命名应澄清为 `password` 或明确客户端预哈希语义，避免“双 hash”语义不清。
 
@@ -569,8 +574,11 @@ RPC 层可以使用 breaking API，不要求保留旧 method alias。内部不�
 - `SnAuthDB` trait（sn_auth.rs:144-247）。
 - SQLite 初始化 `activation_codes`、`users`、`user_auth`、`user_domain_history`、`user_domain_bindings`、`zone_info`、`account_sessions`（sn_auth.rs:282-408）。
 - 32 位随机激活码生成、查询、写入（sn_auth.rs:417-425、835-893）。
-- `register_user` 事务化注册（含 zone_info 写入与激活码标记）。
-- `create_auth`、`get_user_info`、`get_user_by_domain`、`get_auth`、`update_last_login`、`set_user_state`。
+- `register_user` 事务化注册（含 zone_info 写入与激活码标记）；
+  `register_user_with_owner_key`（trusted seed/import）同样在单事务内原子写入
+  `users`、`user_auth`、`zone_info` 与可选 domain binding。Beta2.2 起不再有
+  post-create 的 `create_auth`（业务 API 与 S2S wire 均已删除）。
+- `get_user_info`、`get_user_by_domain`、`get_auth`、`update_last_login`、`set_user_state`。
 - user_domain 绑定 DB 层（阶段二重写）：`activate_user_domain_binding`/`unbind_user_domain` + supersede 事务（`activate_binding_tx`，sn_auth.rs:1013-1119、1876-1960）；history 仅审计，无冲突检查。
 - 独立 `zone_info`：`get_zone_info`/`update_zone_info`/`update_zone_relay_sn` + backfill（sn_auth.rs:1883-2041、548-600）。
 - `account_sessions` 撤销表方法：`create_account_session`/`revoke_account_session`/`revoke_user_sessions`/`get_account_session`（sn_auth.rs:2125-2218），签发/校验/登出路径已接线（见 account_session 小节）。
@@ -590,10 +598,19 @@ RPC 层可以使用 breaking API，不要求保留旧 method alias。内部不�
 
 ### Beta2.2 数据库升级
 
-AuthDB schema version 为 2。旧版、无版本或含旧 compat 表的数据库启动会返回
-`incompatible schema, recreate database`，不执行 ALTER/copy migration。部署必须同时升级
-SN、AuthDB provider 和客户端，并在停服后删除旧测试数据库、由新版本创建 fresh schema；
-不支持新旧 provider 混跑。
+AuthDB schema version 与 S2S contract version 均为 3。旧版、无版本或含旧 compat 表的
+数据库启动会返回 `incompatible schema, recreate database`，不执行 ALTER/copy migration。
+部署必须同时升级 SN、AuthDB provider 和客户端，并在停服后删除旧测试数据库、由新版本
+创建 fresh schema；不支持新旧 provider 混跑（`SNServer` 启动时严格比较 provider 的
+contract/schema capability，旧 contract 在流量进入前被拒绝）。
+
+v2 → v3 表的列定义不变，version bump 表达语义变化：passwordless user 不再是合法状态。
+`create_auth`（含 S2S `sn_auth_db.create_auth` 与短 alias）被彻底删除，
+`register_user_with_owner_key` 的 wire request 增加 `password_hash` / `password_salt` /
+`password_algo` 三个必填 credential 字段（与 core `RegisterUserWithOwnerKeyReq` 共用同一
+serde schema）。本地 AuthDB 启动时执行 orphan-user 校验（`users` LEFT JOIN `user_auth`
+必须无缺失行），seed/import 遇到存量 passwordless user 直接 fail fast，不用种子密码
+补建凭证；修改/找回密码将来走独立、显式鉴权的 credential mutation API。
 
 ### 阶段二待实现（主要差距）
 

@@ -10,6 +10,10 @@
 //! - **幂等契约 = ensure-exists**：种子只保证"存在"。已存在 → no-op；
 //!   已存在且内容不一致 → `warn!` 并跳过（绝不覆盖运行中的账号/密码）；
 //!   带相同 seed 二次启动零写入、无副作用。
+//! - **凭证只随首次原子创建写入**：新用户经 `register_user_with_owner_key`
+//!   在单个事务内创建 `users` + `user_auth` + `zone_info` + 可选 domain
+//!   binding；seed 绝不为存量账号补建、覆盖或重置密码——存量用户缺
+//!   `user_auth` 属 DB invariant 破坏，导入返回错误让启动 fail fast。
 //! - 与 bns_dv 的 `BnsDvInitConfig` 同风格：snake_case YAML。本结构体是格式
 //!   真值；src/make_sn_config.ts 中的 TS interface 只是镜像，勿漂移。
 //!
@@ -21,7 +25,9 @@ use std::path::{Path, PathBuf};
 use log::*;
 use serde::{Deserialize, Serialize};
 
-use crate::sn_auth::{canonical_email, SnAuthDB, SqliteSnAuthDB, ZoneInfoPatch};
+use crate::sn_auth::{
+    canonical_email, RegisterUserWithOwnerKeyReq, SnAuthDB, SqliteSnAuthDB, ZoneInfoPatch,
+};
 use crate::sn_auth_manager::{hash_password, PASSWORD_ALGO};
 use crate::{sn_err, SnErrorCode, SnResult};
 
@@ -130,8 +136,13 @@ pub fn resolve_sn_seed_path(seed_path: &str) -> PathBuf {
 
 /// 从 YAML 文本解析并做结构校验（格式坏 → Err，调用方 fail fast）。
 pub fn parse_sn_seed_config(text: &str) -> SnResult<SnSeedConfig> {
-    let seed: SnSeedConfig = serde_yaml_ng::from_str(text)
-        .map_err(|e| sn_err!(SnErrorCode::InvalidInput, "parse sn seed config failed: {}", e))?;
+    let seed: SnSeedConfig = serde_yaml_ng::from_str(text).map_err(|e| {
+        sn_err!(
+            SnErrorCode::InvalidInput,
+            "parse sn seed config failed: {}",
+            e
+        )
+    })?;
     validate_sn_seed_config(&seed)?;
     Ok(seed)
 }
@@ -140,7 +151,10 @@ fn validate_sn_seed_config(seed: &SnSeedConfig) -> SnResult<()> {
     let mut seen_codes = std::collections::HashSet::new();
     for code in &seed.activation_codes {
         if code.trim().is_empty() {
-            return Err(sn_err!(SnErrorCode::InvalidInput, "seed activation code is empty"));
+            return Err(sn_err!(
+                SnErrorCode::InvalidInput,
+                "seed activation code is empty"
+            ));
         }
         if !seen_codes.insert(code.trim()) {
             return Err(sn_err!(
@@ -155,7 +169,10 @@ fn validate_sn_seed_config(seed: &SnSeedConfig) -> SnResult<()> {
     let mut seen_emails = std::collections::HashSet::new();
     for user in &seed.users {
         if user.username.trim().is_empty() {
-            return Err(sn_err!(SnErrorCode::InvalidInput, "seed user username is empty"));
+            return Err(sn_err!(
+                SnErrorCode::InvalidInput,
+                "seed user username is empty"
+            ));
         }
         if user.password.is_empty() {
             return Err(sn_err!(
@@ -331,8 +348,24 @@ pub async fn import_sn_seed(
 
         if auth_db.is_user_exist(username).await? {
             let existing = auth_db.get_user_info(username).await?.ok_or_else(|| {
-                sn_err!(SnErrorCode::DBError, "user {} exists but unreadable", username)
+                sn_err!(
+                    SnErrorCode::DBError,
+                    "user {} exists but unreadable",
+                    username
+                )
             })?;
+            // seed password 只在首次原子创建时使用；存量账号缺 `user_auth`
+            // 意味着数据库来自旧 contract、中断的旧流程或外部写坏——用种子
+            // 密码静默接管不是安全的迁移策略，也不计作普通 conflict：
+            // 返回 DB invariant error 让启动 fail fast。
+            if auth_db.get_auth(username).await?.is_none() {
+                return Err(sn_err!(
+                    SnErrorCode::DBError,
+                    "AuthDB invariant violated: seed user {} exists without user_auth; \
+                     recreate database instead of backfilling seed password",
+                    username
+                ));
+            }
             let mut mismatches: Vec<&str> = Vec::new();
             if existing.public_key != public_key {
                 mismatches.push("owner_public_key");
@@ -349,23 +382,6 @@ pub async fn import_sn_seed(
                 }
             }
             if mismatches.is_empty() {
-                if auth_db.get_auth(username).await?.is_none() {
-                    let (password_hash, password_salt) = hash_password(user.password.as_str())
-                        .map_err(|e| {
-                            sn_err!(SnErrorCode::Failed, "hash seed password failed: {}", e)
-                        })?;
-                    if auth_db
-                        .create_auth(
-                            username,
-                            password_hash.as_str(),
-                            password_salt.as_str(),
-                            PASSWORD_ALGO,
-                        )
-                        .await?
-                    {
-                        report.users_updated += 1;
-                    }
-                }
                 if let Some(self_cert) = user.self_cert {
                     if existing.self_cert != self_cert {
                         auth_db.update_user_self_cert(username, self_cert).await?;
@@ -395,8 +411,9 @@ pub async fn import_sn_seed(
             continue;
         }
 
-        // 先计算凭证，再创建 users 主行，最后插入受外键约束的 user_auth。
-        // 中途失败后重放 seed 会从已存在用户分支继续，且不会制造孤儿 auth 行。
+        // 先在内存中计算 PBKDF2 凭证，随注册请求一次提交：users / user_auth /
+        // zone_info / 可选 domain binding 在同一个数据库事务内落库，中途失败
+        // 整体回滚且不消费激活码，不存在"已激活但无法登录"的中间态。
         let (password_hash, password_salt) = hash_password(user.password.as_str())
             .map_err(|e| sn_err!(SnErrorCode::Failed, "hash seed password failed: {}", e))?;
 
@@ -408,15 +425,18 @@ pub async fn import_sn_seed(
         // 绑定直接置 verified/active（绕过 domain proof 流程）——仅 seed 路径
         // 允许这么做，线上绑定必须走 domain.bind 的服务端外部 DNS PKX proof。
         let registered = auth_db
-            .register_user_with_owner_key(
-                code.as_str(),
-                username,
-                email.as_str(),
-                public_key.as_str(),
-                zone_document_jwt.unwrap_or(""),
-                domain_entry.map(|entry| entry.domain.trim().to_string()),
-                None,
-            )
+            .register_user_with_owner_key(RegisterUserWithOwnerKeyReq {
+                active_code: code.clone(),
+                username: username.to_string(),
+                email: email.clone(),
+                password_hash,
+                password_salt,
+                password_algo: PASSWORD_ALGO.to_string(),
+                public_key: public_key.clone(),
+                zone_config: zone_document_jwt.unwrap_or("").to_string(),
+                user_domain: domain_entry.map(|entry| entry.domain.trim().to_string()),
+                sn_ips: None,
+            })
             .await?;
         if !registered {
             warn!(
@@ -425,20 +445,6 @@ pub async fn import_sn_seed(
             );
             report.conflicts_skipped += 1;
             continue;
-        }
-        let auth_created = auth_db
-            .create_auth(
-                username,
-                password_hash.as_str(),
-                password_salt.as_str(),
-                PASSWORD_ALGO,
-            )
-            .await?;
-        if !auth_created {
-            warn!(
-                "sn seed user {}: auth row already exists; keep it",
-                username
-            );
         }
         // bns_name 缺省即 username（register 已写入）；显式给出且不同时补投影。
         if let Some(bns_name) = user.bns_name.as_deref() {
@@ -687,18 +693,20 @@ user_domains:
 
         import_sn_seed(&db, &seed).await.expect("import seed");
 
-        assert!(!db
-            .get_user_info("alice")
-            .await
-            .unwrap()
-            .expect("alice")
-            .self_cert);
-        assert!(!db
-            .get_zone_info("alice")
-            .await
-            .unwrap()
-            .expect("alice zone_info")
-            .self_cert);
+        assert!(
+            !db.get_user_info("alice")
+                .await
+                .unwrap()
+                .expect("alice")
+                .self_cert
+        );
+        assert!(
+            !db.get_zone_info("alice")
+                .await
+                .unwrap()
+                .expect("alice zone_info")
+                .self_cert
+        );
     }
 
     #[tokio::test]
@@ -734,23 +742,24 @@ user_domains:
     async fn test_sn_seed_conflict_keeps_existing_data() {
         let (_tmp, db, _db_path) = new_test_db().await;
 
-        // 预置一个同名但公钥不同的 alice（模拟运行中的真实账号）。
+        // 预置一个同名但公钥不同的 alice（模拟运行中的真实账号）：
+        // 密码凭证随 owner-key 注册在同一事务原子写入。
         db.insert_activation_code("pre-code").await.unwrap();
         let (hash, salt) = hash_password("real-user-pwd").unwrap();
         assert!(db
-            .register_user_with_owner_key(
-                "pre-code",
-                "alice",
-                "alice@buckyos.org",
-                r#"{"crv":"Ed25519","kty":"OKP","x":"existing-different-key"}"#,
-                "existing-zone-cfg",
-                None,
-                None,
-            )
-            .await
-            .unwrap());
-        assert!(db
-            .create_auth("alice", hash.as_str(), salt.as_str(), PASSWORD_ALGO)
+            .register_user_with_owner_key(RegisterUserWithOwnerKeyReq {
+                active_code: "pre-code".to_string(),
+                username: "alice".to_string(),
+                email: "alice@buckyos.org".to_string(),
+                password_hash: hash,
+                password_salt: salt,
+                password_algo: PASSWORD_ALGO.to_string(),
+                public_key: r#"{"crv":"Ed25519","kty":"OKP","x":"existing-different-key"}"#
+                    .to_string(),
+                zone_config: "existing-zone-cfg".to_string(),
+                user_domain: None,
+                sn_ips: None,
+            })
             .await
             .unwrap());
 
@@ -771,6 +780,37 @@ user_domains:
         let auth = db.get_auth("alice").await.unwrap().expect("alice auth");
         assert!(verify_password("real-user-pwd", &auth).expect("verify"));
         assert!(!verify_password("devtest-pwd", &auth).expect("verify"));
+    }
+
+    #[tokio::test]
+    async fn test_sn_seed_fails_fast_on_existing_passwordless_user() {
+        let (_tmp, db, db_path) = new_test_db().await;
+        let seed = parse_sn_seed_config(sample_seed_yaml().as_str()).expect("parse seed");
+        import_sn_seed(&db, &seed).await.expect("first import");
+
+        // 模拟旧 contract / 中断流程留下的 passwordless user（外部连接直改）。
+        use sqlx::sqlite::SqlitePoolOptions;
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(format!("sqlite://{}", db_path.display()).as_str())
+            .await
+            .expect("open raw connection");
+        sqlx::query("DELETE FROM user_auth WHERE username = 'alice'")
+            .execute(&pool)
+            .await
+            .expect("drop auth row");
+        pool.close().await;
+
+        // 重放 seed：不补建凭证，返回明确的 invariant error（启动 fail fast）。
+        let error = import_sn_seed(&db, &seed)
+            .await
+            .expect_err("must fail fast");
+        assert!(error.to_string().contains("AuthDB invariant violated"));
+        assert!(error.to_string().contains("alice"));
+        assert!(
+            db.get_auth("alice").await.unwrap().is_none(),
+            "seed must not backfill credentials for existing users"
+        );
     }
 
     #[tokio::test]
