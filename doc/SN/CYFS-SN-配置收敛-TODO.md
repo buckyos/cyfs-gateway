@@ -222,9 +222,9 @@ pub device_info_db: Option<String>,
 这两个字段的值均是 provider base URL：
 
 - `auth_db: http://provider:8080` 归一化为
-  `http://provider:8080/kapi/sn/s2s/auth-db`；
+  `http://provider:8080/s2s/sn/auth-db`；
 - `device_info_db: http://provider:8080` 归一化为
-  `http://provider:8080/kapi/sn/s2s/device-info-db`。
+  `http://provider:8080/s2s/sn/device-info-db`。
 
 显式配置为空字符串时应返回 `InvalidConfig`，不得当作未配置后静默回退
 本地 backend。

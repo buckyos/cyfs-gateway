@@ -317,7 +317,7 @@ document。
 文件：
 
 - `src/components/cyfs-sn/src/sn_auth.rs`
-- `src/components/cyfs-sn/src/s2s_api/sn_auth_db.rs`
+- `src/components/cyfs-sn/src/s2s/sn_auth_db.rs`
 - `src/components/cyfs-gateway-api/`
 - 生产 AuthDB provider
 

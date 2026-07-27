@@ -18,7 +18,7 @@ use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-pub const SN_AUTH_DB_RPC_PATH: &str = "/kapi/sn/s2s/auth-db";
+pub const SN_AUTH_DB_RPC_PATH: &str = "/s2s/sn/auth-db";
 // Auth metadata changes relatively infrequently; bound staleness without caching
 // the in-process SQLite path used by all-in-one deployments.
 const SN_AUTH_DB_READ_CACHE_TTL: Duration = Duration::from_secs(5);
@@ -2029,11 +2029,11 @@ mod tests {
     fn test_normalize_sn_auth_db_url() {
         assert_eq!(
             normalize_sn_auth_db_url("http://127.0.0.1:8080"),
-            "http://127.0.0.1:8080/kapi/sn/s2s/auth-db"
+            "http://127.0.0.1:8080/s2s/sn/auth-db"
         );
         assert_eq!(
-            normalize_sn_auth_db_url("http://127.0.0.1:8080/kapi/sn/s2s/auth-db/"),
-            "http://127.0.0.1:8080/kapi/sn/s2s/auth-db"
+            normalize_sn_auth_db_url("http://127.0.0.1:8080/s2s/sn/auth-db/"),
+            "http://127.0.0.1:8080/s2s/sn/auth-db"
         );
     }
 
@@ -2067,7 +2067,7 @@ mod tests {
     #[test]
     fn test_krpc_client_clones_share_read_cache() {
         let client = SnAuthDbClient::new_krpc(Arc::new(kRPC::new(
-            "http://127.0.0.1:1/kapi/sn/s2s/auth-db",
+            "http://127.0.0.1:1/s2s/sn/auth-db",
             None,
         )));
         let cloned = client.clone();
@@ -2082,7 +2082,7 @@ mod tests {
     #[tokio::test]
     async fn test_krpc_client_serves_cached_negative_read_without_transport() {
         let client = SnAuthDbClient::new_krpc(Arc::new(kRPC::new(
-            "http://127.0.0.1:1/kapi/sn/s2s/auth-db",
+            "http://127.0.0.1:1/s2s/sn/auth-db",
             None,
         )));
         let SnAuthDbClient::KRPC(remote) = &client else {

@@ -806,26 +806,26 @@ pub trait SnAuthDB: Send + Sync + 'static {
 /// Remote SnAuthDB backed by the sn_auth_db S2S KRPC API.
 #[derive(Clone)]
 pub struct RemoteSnAuthDB {
-    client: crate::s2s_api::SnAuthDbClient,
+    client: crate::s2s::SnAuthDbClient,
 }
 
 impl RemoteSnAuthDB {
-    pub fn new(client: crate::s2s_api::SnAuthDbClient) -> Self {
+    pub fn new(client: crate::s2s::SnAuthDbClient) -> Self {
         Self { client }
     }
 
     pub fn new_krpc(client: std::sync::Arc<::kRPC::kRPC>) -> Self {
-        Self::new(crate::s2s_api::SnAuthDbClient::new_krpc(client))
+        Self::new(crate::s2s::SnAuthDbClient::new_krpc(client))
     }
 
     pub fn new_krpc_url(auth_db_url: &str, session_token: Option<String>) -> Self {
-        Self::new(crate::s2s_api::SnAuthDbClient::new_krpc_url(
+        Self::new(crate::s2s::SnAuthDbClient::new_krpc_url(
             auth_db_url,
             session_token,
         ))
     }
 
-    pub fn client(&self) -> &crate::s2s_api::SnAuthDbClient {
+    pub fn client(&self) -> &crate::s2s::SnAuthDbClient {
         &self.client
     }
 }

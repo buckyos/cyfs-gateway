@@ -168,26 +168,26 @@ pub trait SnDeviceInfoDB: Send + Sync + 'static {
 /// Remote SnDeviceInfoDB backed by the sn_device_info_db S2S KRPC API.
 #[derive(Clone)]
 pub struct RemoteSnDeviceInfoDB {
-    client: crate::s2s_api::SnDeviceInfoDbClient,
+    client: crate::s2s::SnDeviceInfoDbClient,
 }
 
 impl RemoteSnDeviceInfoDB {
-    pub fn new(client: crate::s2s_api::SnDeviceInfoDbClient) -> Self {
+    pub fn new(client: crate::s2s::SnDeviceInfoDbClient) -> Self {
         Self { client }
     }
 
     pub fn new_krpc(client: Arc<::kRPC::kRPC>) -> Self {
-        Self::new(crate::s2s_api::SnDeviceInfoDbClient::new_krpc(client))
+        Self::new(crate::s2s::SnDeviceInfoDbClient::new_krpc(client))
     }
 
     pub fn new_krpc_url(device_info_db_url: &str, session_token: Option<String>) -> Self {
-        Self::new(crate::s2s_api::SnDeviceInfoDbClient::new_krpc_url(
+        Self::new(crate::s2s::SnDeviceInfoDbClient::new_krpc_url(
             device_info_db_url,
             session_token,
         ))
     }
 
-    pub fn client(&self) -> &crate::s2s_api::SnDeviceInfoDbClient {
+    pub fn client(&self) -> &crate::s2s::SnDeviceInfoDbClient {
         &self.client
     }
 }

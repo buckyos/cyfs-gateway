@@ -1,7 +1,7 @@
 mod api;
 pub mod name_info_cache;
 mod relay_mgr;
-pub mod s2s_api;
+pub mod s2s;
 mod sn_auth;
 mod sn_auth_manager;
 mod sn_authority;
@@ -17,7 +17,7 @@ mod sn_server;
 
 pub use name_info_cache::*;
 pub use relay_mgr::*;
-pub use s2s_api::*;
+pub use s2s::*;
 pub use sn_auth::*;
 pub use sn_bns_proxy::*;
 pub use sn_bns_signer::*;

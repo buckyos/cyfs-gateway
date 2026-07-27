@@ -12,7 +12,7 @@ use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-pub const SN_DEVICE_INFO_DB_RPC_PATH: &str = "/kapi/sn/s2s/device-info-db";
+pub const SN_DEVICE_INFO_DB_RPC_PATH: &str = "/s2s/sn/device-info-db";
 // Device online/block state is more time-sensitive than AuthDB metadata.
 const SN_DEVICE_INFO_DB_READ_CACHE_TTL: Duration = Duration::from_secs(1);
 const SN_DEVICE_INFO_DB_READ_CACHE_CAPACITY: usize = 4096;
@@ -788,11 +788,11 @@ mod tests {
     fn test_normalize_sn_device_info_db_url() {
         assert_eq!(
             normalize_sn_device_info_db_url("http://127.0.0.1:8080"),
-            "http://127.0.0.1:8080/kapi/sn/s2s/device-info-db"
+            "http://127.0.0.1:8080/s2s/sn/device-info-db"
         );
         assert_eq!(
-            normalize_sn_device_info_db_url("http://127.0.0.1:8080/kapi/sn/s2s/device-info-db/"),
-            "http://127.0.0.1:8080/kapi/sn/s2s/device-info-db"
+            normalize_sn_device_info_db_url("http://127.0.0.1:8080/s2s/sn/device-info-db/"),
+            "http://127.0.0.1:8080/s2s/sn/device-info-db"
         );
     }
 
@@ -832,7 +832,7 @@ mod tests {
     #[test]
     fn test_krpc_client_clones_share_read_cache() {
         let client = SnDeviceInfoDbClient::new_krpc(Arc::new(kRPC::new(
-            "http://127.0.0.1:1/kapi/sn/s2s/device-info-db",
+            "http://127.0.0.1:1/s2s/sn/device-info-db",
             None,
         )));
         let cloned = client.clone();
@@ -848,7 +848,7 @@ mod tests {
     #[tokio::test]
     async fn test_krpc_client_serves_cached_negative_read_without_transport() {
         let client = SnDeviceInfoDbClient::new_krpc(Arc::new(kRPC::new(
-            "http://127.0.0.1:1/kapi/sn/s2s/device-info-db",
+            "http://127.0.0.1:1/s2s/sn/device-info-db",
             None,
         )));
         let SnDeviceInfoDbClient::KRPC(remote) = &client else {

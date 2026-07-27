@@ -267,7 +267,7 @@ pub struct UserRelayInfo {
 所有接口沿用 AuthDB S2S 路径：
 
 ```text
-/kapi/sn/s2s/auth-db
+/s2s/sn/auth-db
 ```
 
 不再新增独立 `sn_relay_manager` endpoint。

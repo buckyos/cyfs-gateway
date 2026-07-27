@@ -7,7 +7,7 @@
 相关实现：
 
 - [`sn_auth.rs`](../../src/components/cyfs-sn/src/sn_auth.rs)
-- [`s2s_api/sn_auth_db.rs`](../../src/components/cyfs-sn/src/s2s_api/sn_auth_db.rs)
+- [`s2s/sn_auth_db.rs`](../../src/components/cyfs-sn/src/s2s/sn_auth_db.rs)
 - [`sn_seed.rs`](../../src/components/cyfs-sn/src/sn_seed.rs)
 - [`api/auth.rs`](../../src/components/cyfs-sn/src/api/auth.rs)
 - [`SN-Auth.md`](./SN-Auth.md)
