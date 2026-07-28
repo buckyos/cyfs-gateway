@@ -13,6 +13,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 pub const SN_DEVICE_INFO_DB_RPC_PATH: &str = "/s2s/sn/device-info-db";
+pub const SN_DEVICE_INFO_DB_S2S_RPC_PATH: &str = "/s2s/sn-device-info-db";
 // Device online/block state is more time-sensitive than AuthDB metadata.
 const SN_DEVICE_INFO_DB_READ_CACHE_TTL: Duration = Duration::from_secs(1);
 const SN_DEVICE_INFO_DB_READ_CACHE_CAPACITY: usize = 4096;
@@ -763,6 +764,19 @@ pub fn normalize_sn_device_info_db_url(device_info_db_url: &str) -> String {
     format!("{}{}", trimmed, SN_DEVICE_INFO_DB_RPC_PATH)
 }
 
+pub fn normalize_sn_device_info_db_s2s_url(device_info_db_url: &str) -> String {
+    let trimmed = device_info_db_url.trim_end_matches('/');
+    for path in [
+        SN_DEVICE_INFO_DB_S2S_RPC_PATH,
+        SN_DEVICE_INFO_DB_RPC_PATH,
+    ] {
+        if let Some(base) = trimmed.strip_suffix(path) {
+            return format!("{}{}", base, SN_DEVICE_INFO_DB_S2S_RPC_PATH);
+        }
+    }
+    format!("{}{}", trimmed, SN_DEVICE_INFO_DB_S2S_RPC_PATH)
+}
+
 fn rpc_envelope_response<T: Serialize>(
     result: SnResult<T>,
     req: &RPCRequest,
@@ -793,6 +807,16 @@ mod tests {
         assert_eq!(
             normalize_sn_device_info_db_url("http://127.0.0.1:8080/s2s/sn/device-info-db/"),
             "http://127.0.0.1:8080/s2s/sn/device-info-db"
+        );
+        assert_eq!(
+            normalize_sn_device_info_db_s2s_url("http://127.0.0.1:8080"),
+            "http://127.0.0.1:8080/s2s/sn-device-info-db"
+        );
+        assert_eq!(
+            normalize_sn_device_info_db_s2s_url(
+                "http://127.0.0.1:8080/s2s/sn/device-info-db/"
+            ),
+            "http://127.0.0.1:8080/s2s/sn-device-info-db"
         );
     }
 

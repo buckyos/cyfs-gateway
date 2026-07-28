@@ -215,16 +215,22 @@ bns_proxy:
 在 `SNServerConfig` 中增加：
 
 ```rust
-pub auth_db: Option<String>,
-pub device_info_db: Option<String>,
+pub app_did: Option<String>,
+pub auth_db: Option<SnRemoteProviderConfig>,
+pub device_info_db: Option<SnRemoteProviderConfig>,
 ```
 
-这两个字段的值均是 provider base URL：
+HTTPS provider 继续使用字符串 base URL 和原有路径：
 
-- `auth_db: http://provider:8080` 归一化为
-  `http://provider:8080/s2s/sn/auth-db`；
-- `device_info_db: http://provider:8080` 归一化为
-  `http://provider:8080/s2s/sn/device-info-db`。
+- `auth_db: https://provider:8443` 归一化为
+  `https://provider:8443/s2s/sn/auth-db`；
+- `device_info_db: https://provider:8443` 归一化为
+  `https://provider:8443/s2s/sn/device-info-db`。
+
+HTTP provider 使用对象形式配置 `url`、`remote_app_did` 和
+Base64URL Ed25519 `remote_public_key`，同时由顶层 `app_did` 定位本机
+DID Identity 私钥。Payload S2S 路径分别归一化为
+`/s2s/sn-auth-db` 和 `/s2s/sn-device-info-db`。
 
 显式配置为空字符串时应返回 `InvalidConfig`，不得当作未配置后静默回退
 本地 backend。

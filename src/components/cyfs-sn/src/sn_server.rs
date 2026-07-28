@@ -1758,6 +1758,35 @@ impl HttpServer for SNServer {
     }
 }
 
+/// 远程 SN DB provider 配置。
+///
+/// HTTPS 沿用字符串 URL；HTTP 必须使用对象形式，同时固定远端应用 DID
+/// 与 Ed25519 公钥，供 kRPC S2S Payload Protection 使用。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum SnRemoteProviderConfig {
+    Url(String),
+    S2s(SnS2sRemoteProviderConfig),
+}
+
+impl SnRemoteProviderConfig {
+    fn url(&self) -> &str {
+        match self {
+            Self::Url(url) => url,
+            Self::S2s(config) => &config.url,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SnS2sRemoteProviderConfig {
+    pub url: String,
+    pub remote_app_did: String,
+    /// 远端 Ed25519 公钥的 Base64URL（无 padding）编码。
+    pub remote_public_key: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SNServerConfig {
@@ -1816,10 +1845,15 @@ pub struct SNServerConfig {
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bns_proxy: Option<SNBnsProxyConfig>,
+    /// SN 作为 HTTP S2S 调用方使用的本地应用 DID。kRPC 根据该 DID
+    /// 通过 DID Identity 默认目录自动加载 authentication 私钥。
+    /// 仅使用本地存储或 HTTPS provider 时可省略。
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub auth_db: Option<String>,
+    pub app_did: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub device_info_db: Option<String>,
+    pub auth_db: Option<SnRemoteProviderConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_info_db: Option<SnRemoteProviderConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub db_path: Option<String>,
 }
@@ -1839,6 +1873,25 @@ impl ServerConfig for SNServerConfig {
 }
 
 pub struct SnServerFactory;
+
+#[derive(Clone)]
+struct SnLocalS2sIdentity {
+    service_appid: String,
+    current_zone_did: DID,
+    provider: Arc<dyn ::kRPC::s2s::S2sKeyAgreementProvider>,
+}
+
+impl SnLocalS2sIdentity {
+    fn config(&self) -> ::kRPC::s2s::S2sLocalIdentityConfig {
+        ::kRPC::s2s::S2sLocalIdentityConfig::new(
+            self.service_appid.clone(),
+            self.current_zone_did.clone(),
+            ::kRPC::s2s::S2sLocalKeySource::Provider {
+                provider: self.provider.clone(),
+            },
+        )
+    }
+}
 
 impl SnServerFactory {
     pub fn new() -> Self {
@@ -1916,25 +1969,288 @@ impl SnServerFactory {
         })
     }
 
-    fn remote_db_url(value: &Option<String>, field: &str) -> ServerResult<Option<String>> {
-        let Some(value) = value.as_deref() else {
-            return Ok(None);
+    fn validate_remote_provider(
+        value: &Option<SnRemoteProviderConfig>,
+        field: &str,
+    ) -> ServerResult<()> {
+        let Some(value) = value.as_ref() else {
+            return Ok(());
         };
-        let value = value.trim();
-        if value.is_empty() {
+        if value.url().trim().is_empty() {
             return Err(server_err!(
                 ServerErrorCode::InvalidConfig,
-                "{} cannot be empty",
+                "{} url cannot be empty",
                 field
             ));
         }
-        Ok(Some(value.to_string()))
+        let url = url::Url::parse(value.url().trim()).map_err(|error| {
+            server_err!(
+                ServerErrorCode::InvalidConfig,
+                "invalid {} url {}: {}",
+                field,
+                value.url(),
+                error
+            )
+        })?;
+        match url.scheme() {
+            "https" => {}
+            "http" if matches!(value, SnRemoteProviderConfig::S2s(_)) => {}
+            "http" => {
+                return Err(server_err!(
+                    ServerErrorCode::InvalidConfig,
+                    "{} uses HTTP; configure it as an object with url, remote_app_did and remote_public_key",
+                    field
+                ));
+            }
+            scheme => {
+                return Err(server_err!(
+                    ServerErrorCode::InvalidConfig,
+                    "{} url scheme must be http or https, got {}",
+                    field,
+                    scheme
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_remote_providers(config: &SNServerConfig) -> ServerResult<()> {
+        Self::validate_remote_provider(&config.auth_db, "auth_db")?;
+        Self::validate_remote_provider(&config.device_info_db, "device_info_db")
+    }
+
+    fn parse_pinned_ed25519_public_key(
+        value: &str,
+        field: &str,
+    ) -> ServerResult<[u8; 32]> {
+        use base64::Engine as _;
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+
+        let decoded = URL_SAFE_NO_PAD.decode(value.trim()).map_err(|error| {
+            server_err!(
+                ServerErrorCode::InvalidConfig,
+                "{} remote_public_key must be Base64URL without padding: {}",
+                field,
+                error
+            )
+        })?;
+        decoded.try_into().map_err(|decoded: Vec<u8>| {
+            server_err!(
+                ServerErrorCode::InvalidConfig,
+                "{} remote_public_key must decode to 32 bytes, got {}",
+                field,
+                decoded.len()
+            )
+        })
+    }
+
+    fn load_local_s2s_identity(
+        app_did: Option<&str>,
+        roots: IdentityRoots,
+    ) -> ServerResult<SnLocalS2sIdentity> {
+        let app_did = app_did
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                server_err!(
+                    ServerErrorCode::InvalidConfig,
+                    "app_did is required for HTTP S2S providers"
+                )
+            })?;
+        let service_did =
+            ::kRPC::s2s::parse_canonical_service_did(app_did).map_err(|error| {
+                server_err!(
+                    ServerErrorCode::InvalidConfig,
+                    "invalid app_did {}: {}",
+                    app_did,
+                    error
+                )
+            })?;
+        let current_zone_did = service_did.upper_did().ok_or_else(|| {
+            server_err!(
+                ServerErrorCode::InvalidConfig,
+                "app_did {} must be a service DID below a did:web or did:bns zone",
+                app_did
+            )
+        })?;
+        let service_appid = service_did
+            .id
+            .split(['.', ':'])
+            .next()
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                server_err!(
+                    ServerErrorCode::InvalidConfig,
+                    "app_did {} has no service app id",
+                    app_did
+                )
+            })?
+            .to_string();
+        let derived =
+            ::kRPC::s2s::derive_service_did(&service_appid, &current_zone_did).map_err(|error| {
+                server_err!(
+                    ServerErrorCode::InvalidConfig,
+                    "cannot derive service DID from app_did {}: {}",
+                    app_did,
+                    error
+                )
+            })?;
+        if derived != service_did {
+            return Err(server_err!(
+                ServerErrorCode::InvalidConfig,
+                "app_did {} is not a canonical single-level service DID",
+                app_did
+            ));
+        }
+        let provider =
+            IdentityManagerS2sKeyProvider::load(roots, service_did).map_err(|error| {
+                server_err!(
+                    ServerErrorCode::InvalidConfig,
+                    "load S2S identity for app_did {} failed: {}",
+                    app_did,
+                    error
+                )
+            })?;
+        Ok(SnLocalS2sIdentity {
+            service_appid,
+            current_zone_did,
+            provider: Arc::new(provider),
+        })
+    }
+
+    fn default_local_s2s_identity(
+        app_did: Option<&str>,
+    ) -> ServerResult<SnLocalS2sIdentity> {
+        let roots = IdentityRoots::from_env_or_buckyos_root().map_err(|error| {
+            server_err!(
+                ServerErrorCode::InvalidConfig,
+                "resolve DID Identity roots failed: {}",
+                error
+            )
+        })?;
+        Self::load_local_s2s_identity(app_did, roots)
+    }
+
+    fn needs_http_s2s(provider: &SnRemoteProviderConfig) -> ServerResult<bool> {
+        let url = url::Url::parse(provider.url().trim()).map_err(|error| {
+            server_err!(
+                ServerErrorCode::InvalidConfig,
+                "invalid remote provider url {}: {}",
+                provider.url(),
+                error
+            )
+        })?;
+        match url.scheme() {
+            "https" => Ok(false),
+            "http" => Ok(true),
+            scheme => Err(server_err!(
+                ServerErrorCode::InvalidConfig,
+                "remote provider url scheme must be http or https, got {}",
+                scheme
+            )),
+        }
+    }
+
+    async fn build_remote_krpc(
+        provider: &SnRemoteProviderConfig,
+        local_identity: Option<&SnLocalS2sIdentity>,
+        normalize_tls_url: fn(&str) -> String,
+        normalize_s2s_url: fn(&str) -> String,
+        field: &str,
+    ) -> ServerResult<Arc<kRPC>> {
+        if !Self::needs_http_s2s(provider)? {
+            let endpoint = normalize_tls_url(provider.url().trim());
+            let client = kRPC::new_with_transport(
+                endpoint.as_str(),
+                None,
+                KrpcTransportSecurity::Tls,
+            )
+            .await
+            .map_err(|error| {
+                server_err!(
+                    ServerErrorCode::InvalidConfig,
+                    "create HTTPS {} client failed: {}",
+                    field,
+                    error
+                )
+            })?;
+            return Ok(Arc::new(client));
+        }
+
+        let SnRemoteProviderConfig::S2s(remote) = provider else {
+            return Err(server_err!(
+                ServerErrorCode::InvalidConfig,
+                "{} uses HTTP; configure it as an object with url, remote_app_did and remote_public_key",
+                field
+            ));
+        };
+        let endpoint = normalize_s2s_url(provider.url().trim());
+        let local_identity = local_identity.ok_or_else(|| {
+            server_err!(
+                ServerErrorCode::InvalidConfig,
+                "app_did is required for HTTP {}",
+                field
+            )
+        })?;
+        let remote_did =
+            ::kRPC::s2s::parse_canonical_service_did(remote.remote_app_did.trim()).map_err(
+                |error| {
+                    server_err!(
+                        ServerErrorCode::InvalidConfig,
+                        "invalid {} remote_app_did {}: {}",
+                        field,
+                        remote.remote_app_did,
+                        error
+                    )
+                },
+            )?;
+        let remote_public_key =
+            Self::parse_pinned_ed25519_public_key(&remote.remote_public_key, field)?;
+        let s2s_config = ::kRPC::s2s::S2sClientConfig::with_pinned_key(
+            local_identity.config(),
+            remote_did,
+            remote_public_key,
+        );
+        let client = kRPC::new_with_transport(
+            endpoint.as_str(),
+            None,
+            KrpcTransportSecurity::S2sPayloadV1(s2s_config),
+        )
+        .await
+        .map_err(|error| {
+            server_err!(
+                ServerErrorCode::InvalidConfig,
+                "create HTTP S2S {} client failed: {}",
+                field,
+                error
+            )
+        })?;
+        Ok(Arc::new(client))
+    }
+
+    fn any_http_s2s_provider(config: &SNServerConfig) -> ServerResult<bool> {
+        for provider in [&config.auth_db, &config.device_info_db]
+            .into_iter()
+            .flatten()
+        {
+            if Self::needs_http_s2s(provider)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn remote_db_url(value: &Option<SnRemoteProviderConfig>) -> Option<String> {
+        value
+            .as_ref()
+            .map(|provider| provider.url().trim().to_string())
     }
 
     fn remote_db_urls(config: &SNServerConfig) -> ServerResult<(Option<String>, Option<String>)> {
+        Self::validate_remote_providers(config)?;
         Ok((
-            Self::remote_db_url(&config.auth_db, "auth_db")?,
-            Self::remote_db_url(&config.device_info_db, "device_info_db")?,
+            Self::remote_db_url(&config.auth_db),
+            Self::remote_db_url(&config.device_info_db),
         ))
     }
 
@@ -2133,16 +2449,48 @@ impl ServerFactory for SnServerFactory {
                 config.server_type()
             ))?;
 
-        let (bns_client, system_info) = Self::probe_bns_rpc(config).await?;
-
         let db_path = Self::sqlite_db_path(config);
-        let (auth_db_url, device_info_db_url) = Self::remote_db_urls(config)?;
+        let (auth_db_url, _) = Self::remote_db_urls(config)?;
         if auth_db_url.is_some() && config.seed_path.is_some() {
             return Err(server_err!(
                 ServerErrorCode::InvalidConfig,
                 "seed_path cannot be used with remote auth_db; import seed data through the provider side"
             ));
         }
+        let local_s2s_identity = if Self::any_http_s2s_provider(config)? {
+            Some(Self::default_local_s2s_identity(config.app_did.as_deref())?)
+        } else {
+            None
+        };
+        let auth_db_krpc = if let Some(provider) = config.auth_db.as_ref() {
+            Some(
+                Self::build_remote_krpc(
+                    provider,
+                    local_s2s_identity.as_ref(),
+                    crate::normalize_sn_auth_db_url,
+                    crate::normalize_sn_auth_db_s2s_url,
+                    "auth_db",
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
+        let device_info_db_krpc = if let Some(provider) = config.device_info_db.as_ref() {
+            Some(
+                Self::build_remote_krpc(
+                    provider,
+                    local_s2s_identity.as_ref(),
+                    crate::normalize_sn_device_info_db_url,
+                    crate::normalize_sn_device_info_db_s2s_url,
+                    "device_info_db",
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
+        let (bns_client, system_info) = Self::probe_bns_rpc(config).await?;
         let mut allocation_config = config.relay_allocation.clone().unwrap_or_default();
         allocation_config.geoip = allocation_config
             .geoip
@@ -2150,9 +2498,11 @@ impl ServerFactory for SnServerFactory {
             .map(Self::resolve_geoip_config);
         let mut seed_users = Vec::new();
 
-        let auth_db: SnAuthDBRef = if let Some(url) = auth_db_url.as_deref() {
-            info!("sn server uses remote auth_db provider: {}", url);
-            Arc::new(SnAuthDbClient::new_krpc_url(url, None))
+        let auth_db: SnAuthDBRef = if let (Some(provider), Some(krpc)) =
+            (config.auth_db.as_ref(), auth_db_krpc)
+        {
+            info!("sn server uses remote auth_db provider: {}", provider.url());
+            Arc::new(SnAuthDbClient::new_krpc(krpc))
         } else {
             let mut auth_db = SqliteSnAuthDB::new_by_path(db_path.as_str())
                 .await
@@ -2290,9 +2640,14 @@ impl ServerFactory for SnServerFactory {
         })?;
         Self::ensure_auth_db_capabilities(&capabilities)?;
 
-        let device_info_db: SnDeviceInfoDBRef = if let Some(url) = device_info_db_url.as_deref() {
-            info!("sn server uses remote device_info_db provider: {}", url);
-            Arc::new(SnDeviceInfoDbClient::new_krpc_url(url, None))
+        let device_info_db: SnDeviceInfoDBRef = if let (Some(provider), Some(krpc)) =
+            (config.device_info_db.as_ref(), device_info_db_krpc)
+        {
+            info!(
+                "sn server uses remote device_info_db provider: {}",
+                provider.url()
+            );
+            Arc::new(SnDeviceInfoDbClient::new_krpc(krpc))
         } else {
             let device_info_db = SqliteSnDeviceInfoDB::new_by_path(db_path.as_str())
                 .await
@@ -2339,8 +2694,10 @@ impl ServerFactory for SnServerFactory {
 mod tests {
     use super::*;
     use crate::SnAuthDB;
+    use base64::Engine as _;
     use buckyos_kit::init_logging;
     use cyfs_gateway_lib::hyper_serve_http;
+    use sha2::{Digest, Sha256};
     use std::time::SystemTime;
     use tokio::net::{TcpListener, TcpStream};
 
@@ -2350,6 +2707,58 @@ mod tests {
     const ANVIL_PRIVATE_KEY: &str =
         "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
     const ANVIL_ADDRESS: &str = "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266";
+
+    fn write_s2s_identity(
+        temp: &tempfile::TempDir,
+        service_did: &DID,
+        seed: [u8; 32],
+    ) -> (IdentityRoots, [u8; 32]) {
+        let roots = IdentityRoots::new(
+            temp.path().join("local").join("identity"),
+            temp.path().join("security"),
+        );
+        let secret = ::kRPC::s2s::SecretEd25519Key::from_seed(seed);
+        let public = secret.public_key();
+        let dir = roots.security_dir(&service_did.to_string()).unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut pkcs8 = vec![
+            0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x04, 0x22,
+            0x04, 0x20,
+        ];
+        pkcs8.extend_from_slice(&seed);
+        let key_path = dir.join("authentication.private.pem");
+        std::fs::write(
+            &key_path,
+            format!(
+                "-----BEGIN PRIVATE KEY-----\n{}\n-----END PRIVATE KEY-----\n",
+                base64::engine::general_purpose::STANDARD.encode(pkcs8)
+            ),
+        )
+        .unwrap();
+        let keyref = json!({
+            "schema": "buckyos.identity.keyref.v1",
+            "kind": "key",
+            "did": service_did.to_string(),
+            "usage": "authentication",
+            "algorithm": "Ed25519",
+            "public_key_fingerprint":
+                format!("sha256:{}", hex::encode(Sha256::digest(public))),
+            "mode": "file",
+            "exportable": true,
+            "ref": {
+                "type": "file",
+                "path": key_path.to_string_lossy(),
+                "format": "pkcs8-pem"
+            }
+        });
+        std::fs::write(
+            dir.join("authentication.keyref.json"),
+            serde_json::to_vec_pretty(&keyref).unwrap(),
+        )
+        .unwrap();
+        (roots, public)
+    }
 
     /// AuthDB provider 准入是严格同版比较：旧 contract/schema（如 v2）在流量
     /// 进入前被拒绝，当前版本（contract 3 / schema 3）可启动。
@@ -2894,7 +3303,11 @@ mod tests {
         assert!(write_error.contains("BNS proxy is not configured"));
 
         let mut remote_seed = base;
-        remote_seed["auth_db"] = json!("http://auth-provider:8080");
+        remote_seed["auth_db"] = json!({
+            "url": "http://auth-provider:8080",
+            "remote_app_did": "did:web:sn-db.example",
+            "remote_public_key": "T4Quc1L6Ogu4N2tTKOvneV1yYnBcmhP89B_RsuFsJZ8"
+        });
         remote_seed["seed_path"] = json!("sn_seed.yaml");
         let config: SNServerConfig = serde_json::from_value(remote_seed).unwrap();
         let error = SnServerFactory::new()
@@ -3022,8 +3435,13 @@ users:
             "type": "sn",
             "host": "buckyos.ai",
             "bns_server_url": "http://127.0.0.1:18080",
-            "auth_db": "http://auth-provider:8080",
-            "device_info_db": "http://device-provider:8080",
+            "app_did": "did:web:sn.example",
+            "auth_db": {
+                "url": "http://auth-provider:8080",
+                "remote_app_did": "did:web:auth-provider.example",
+                "remote_public_key": "T4Quc1L6Ogu4N2tTKOvneV1yYnBcmhP89B_RsuFsJZ8"
+            },
+            "device_info_db": "https://device-provider:8443",
             "db_path": "/var/lib/cyfs/sn.sqlite3"
         });
         let config: SNServerConfig = serde_json::from_value(config).unwrap();
@@ -3033,7 +3451,18 @@ users:
         assert!(config.device_jwt.is_empty());
         assert!(config.local_relay_node.is_none());
         assert_eq!(config.bns_server_url, "http://127.0.0.1:18080");
-        assert_eq!(config.auth_db.as_deref(), Some("http://auth-provider:8080"));
+        assert_eq!(config.app_did.as_deref(), Some("did:web:sn.example"));
+        assert_eq!(
+            config.auth_db.as_ref().map(SnRemoteProviderConfig::url),
+            Some("http://auth-provider:8080")
+        );
+        assert_eq!(
+            config
+                .device_info_db
+                .as_ref()
+                .map(SnRemoteProviderConfig::url),
+            Some("https://device-provider:8443")
+        );
         assert!(SNServer::parse_server_ip(None).unwrap().is_none());
         let invalid_ip = SNServer::parse_server_ip(Some("not-an-ip"))
             .err()
@@ -3087,9 +3516,12 @@ users:
     fn auth_and_device_backends_are_selected_independently() {
         for (auth_db, device_info_db) in [
             (None, None),
-            (Some("http://auth:8080"), None),
-            (None, Some("http://device:8080")),
-            (Some("http://auth:8080"), Some("http://device:8080")),
+            (Some("https://auth:8443"), None),
+            (None, Some("https://device:8443")),
+            (
+                Some("https://auth:8443"),
+                Some("https://device:8443"),
+            ),
         ] {
             let config: SNServerConfig = serde_json::from_value(json!({
                 "id": "test",
@@ -3122,8 +3554,98 @@ users:
                 .err()
                 .unwrap()
                 .to_string();
-            assert!(error.contains(&format!("{} cannot be empty", field)));
+            assert!(error.contains(&format!("{} url cannot be empty", field)));
         }
+    }
+
+    #[tokio::test]
+    async fn remote_provider_uses_tls_or_identity_backed_http_s2s() {
+        let https = SnRemoteProviderConfig::Url("https://provider.example".to_string());
+        assert!(
+            SnServerFactory::build_remote_krpc(
+                &https,
+                None,
+                crate::normalize_sn_auth_db_url,
+                crate::normalize_sn_auth_db_s2s_url,
+                "auth_db",
+            )
+            .await
+            .is_ok()
+        );
+
+        let insecure_http = SnRemoteProviderConfig::Url("http://provider.example".to_string());
+        let error = SnServerFactory::build_remote_krpc(
+            &insecure_http,
+            None,
+            crate::normalize_sn_auth_db_url,
+            crate::normalize_sn_auth_db_s2s_url,
+            "auth_db",
+        )
+        .await
+        .err()
+        .unwrap()
+        .to_string();
+        assert!(error.contains("configure it as an object"), "{error}");
+
+        let temp = tempfile::tempdir().unwrap();
+        let app_did = DID::new("web", "sn-api.example.com");
+        let (roots, _) = write_s2s_identity(&temp, &app_did, [3u8; 32]);
+        let local =
+            SnServerFactory::load_local_s2s_identity(Some(&app_did.to_string()), roots).unwrap();
+        let remote_public =
+            ::kRPC::s2s::SecretEd25519Key::from_seed([9u8; 32]).public_key();
+        let http_s2s = SnRemoteProviderConfig::S2s(SnS2sRemoteProviderConfig {
+            url: "http://provider.example".to_string(),
+            remote_app_did: "did:web:sn-db.example.com".to_string(),
+            remote_public_key: base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .encode(remote_public),
+        });
+        assert!(
+            SnServerFactory::build_remote_krpc(
+                &http_s2s,
+                Some(&local),
+                crate::normalize_sn_auth_db_url,
+                crate::normalize_sn_auth_db_s2s_url,
+                "auth_db",
+            )
+            .await
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn local_s2s_identity_requires_a_canonical_service_did() {
+        let temp = tempfile::tempdir().unwrap();
+        let roots = IdentityRoots::new(
+            temp.path().join("local").join("identity"),
+            temp.path().join("security"),
+        );
+        let missing = SnServerFactory::load_local_s2s_identity(None, roots.clone())
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(missing.contains("app_did is required"), "{missing}");
+
+        let zone = SnServerFactory::load_local_s2s_identity(
+            Some("did:web:example.com"),
+            roots.clone(),
+        )
+        .err()
+        .unwrap()
+        .to_string();
+        assert!(zone.contains("must be a service DID"), "{zone}");
+
+        let nested = SnServerFactory::load_local_s2s_identity(
+            Some("did:web:a.example.com:path"),
+            roots,
+        )
+        .err()
+        .unwrap()
+        .to_string();
+        assert!(
+            nested.contains("not a canonical single-level service DID"),
+            "{nested}"
+        );
     }
 
     #[tokio::test]

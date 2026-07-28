@@ -19,6 +19,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 pub const SN_AUTH_DB_RPC_PATH: &str = "/s2s/sn/auth-db";
+pub const SN_AUTH_DB_S2S_RPC_PATH: &str = "/s2s/sn-auth-db";
 // Auth metadata changes relatively infrequently; bound staleness without caching
 // the in-process SQLite path used by all-in-one deployments.
 const SN_AUTH_DB_READ_CACHE_TTL: Duration = Duration::from_secs(5);
@@ -2007,6 +2008,16 @@ pub fn normalize_sn_auth_db_url(auth_db_url: &str) -> String {
     format!("{}{}", trimmed, SN_AUTH_DB_RPC_PATH)
 }
 
+pub fn normalize_sn_auth_db_s2s_url(auth_db_url: &str) -> String {
+    let trimmed = auth_db_url.trim_end_matches('/');
+    for path in [SN_AUTH_DB_S2S_RPC_PATH, SN_AUTH_DB_RPC_PATH] {
+        if let Some(base) = trimmed.strip_suffix(path) {
+            return format!("{}{}", base, SN_AUTH_DB_S2S_RPC_PATH);
+        }
+    }
+    format!("{}{}", trimmed, SN_AUTH_DB_S2S_RPC_PATH)
+}
+
 fn rpc_envelope_response<T: Serialize>(
     result: SnResult<T>,
     req: &RPCRequest,
@@ -2034,6 +2045,14 @@ mod tests {
         assert_eq!(
             normalize_sn_auth_db_url("http://127.0.0.1:8080/s2s/sn/auth-db/"),
             "http://127.0.0.1:8080/s2s/sn/auth-db"
+        );
+        assert_eq!(
+            normalize_sn_auth_db_s2s_url("http://127.0.0.1:8080"),
+            "http://127.0.0.1:8080/s2s/sn-auth-db"
+        );
+        assert_eq!(
+            normalize_sn_auth_db_s2s_url("http://127.0.0.1:8080/s2s/sn/auth-db/"),
+            "http://127.0.0.1:8080/s2s/sn-auth-db"
         );
     }
 
