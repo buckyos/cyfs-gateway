@@ -18,8 +18,8 @@ use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-pub const SN_AUTH_DB_RPC_PATH: &str = "/s2s/sn/auth-db";
-pub const SN_AUTH_DB_S2S_RPC_PATH: &str = "/s2s/sn-auth-db";
+pub const SN_AUTH_DB_RPC_PATH: &str = "/s2s/sn-auth-db";
+pub const SN_AUTH_DB_S2S_RPC_PATH: &str = SN_AUTH_DB_RPC_PATH;
 // Auth metadata changes relatively infrequently; bound staleness without caching
 // the in-process SQLite path used by all-in-one deployments.
 const SN_AUTH_DB_READ_CACHE_TTL: Duration = Duration::from_secs(5);
@@ -2009,13 +2009,7 @@ pub fn normalize_sn_auth_db_url(auth_db_url: &str) -> String {
 }
 
 pub fn normalize_sn_auth_db_s2s_url(auth_db_url: &str) -> String {
-    let trimmed = auth_db_url.trim_end_matches('/');
-    for path in [SN_AUTH_DB_S2S_RPC_PATH, SN_AUTH_DB_RPC_PATH] {
-        if let Some(base) = trimmed.strip_suffix(path) {
-            return format!("{}{}", base, SN_AUTH_DB_S2S_RPC_PATH);
-        }
-    }
-    format!("{}{}", trimmed, SN_AUTH_DB_S2S_RPC_PATH)
+    normalize_sn_auth_db_url(auth_db_url)
 }
 
 fn rpc_envelope_response<T: Serialize>(
@@ -2040,18 +2034,18 @@ mod tests {
     fn test_normalize_sn_auth_db_url() {
         assert_eq!(
             normalize_sn_auth_db_url("http://127.0.0.1:8080"),
-            "http://127.0.0.1:8080/s2s/sn/auth-db"
+            "http://127.0.0.1:8080/s2s/sn-auth-db"
         );
         assert_eq!(
-            normalize_sn_auth_db_url("http://127.0.0.1:8080/s2s/sn/auth-db/"),
-            "http://127.0.0.1:8080/s2s/sn/auth-db"
+            normalize_sn_auth_db_url("http://127.0.0.1:8080/s2s/sn-auth-db/"),
+            "http://127.0.0.1:8080/s2s/sn-auth-db"
         );
         assert_eq!(
             normalize_sn_auth_db_s2s_url("http://127.0.0.1:8080"),
             "http://127.0.0.1:8080/s2s/sn-auth-db"
         );
         assert_eq!(
-            normalize_sn_auth_db_s2s_url("http://127.0.0.1:8080/s2s/sn/auth-db/"),
+            normalize_sn_auth_db_s2s_url("http://127.0.0.1:8080/s2s/sn-auth-db/"),
             "http://127.0.0.1:8080/s2s/sn-auth-db"
         );
     }
@@ -2086,7 +2080,7 @@ mod tests {
     #[test]
     fn test_krpc_client_clones_share_read_cache() {
         let client = SnAuthDbClient::new_krpc(Arc::new(kRPC::new(
-            "http://127.0.0.1:1/s2s/sn/auth-db",
+            "http://127.0.0.1:1/s2s/sn-auth-db",
             None,
         )));
         let cloned = client.clone();
@@ -2101,7 +2095,7 @@ mod tests {
     #[tokio::test]
     async fn test_krpc_client_serves_cached_negative_read_without_transport() {
         let client = SnAuthDbClient::new_krpc(Arc::new(kRPC::new(
-            "http://127.0.0.1:1/s2s/sn/auth-db",
+            "http://127.0.0.1:1/s2s/sn-auth-db",
             None,
         )));
         let SnAuthDbClient::KRPC(remote) = &client else {

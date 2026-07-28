@@ -220,12 +220,12 @@ pub auth_db: Option<SnRemoteProviderConfig>,
 pub device_info_db: Option<SnRemoteProviderConfig>,
 ```
 
-HTTPS provider 继续使用字符串 base URL 和原有路径：
+HTTPS provider 继续使用字符串 base URL，路径采用标准两级结构：
 
 - `auth_db: https://provider:8443` 归一化为
-  `https://provider:8443/s2s/sn/auth-db`；
+  `https://provider:8443/s2s/sn-auth-db`；
 - `device_info_db: https://provider:8443` 归一化为
-  `https://provider:8443/s2s/sn/device-info-db`。
+  `https://provider:8443/s2s/sn-device-info-db`。
 
 HTTP provider 使用对象形式配置 `url`、`remote_app_did` 和
 Base64URL Ed25519 `remote_public_key`，同时由顶层 `app_did` 定位本机
