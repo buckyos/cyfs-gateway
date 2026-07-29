@@ -11,3 +11,4 @@ deployments/*.tmp
 .openzeppelin/unknown-31337.json
 var/
 dv-env.json
+node_modules/
