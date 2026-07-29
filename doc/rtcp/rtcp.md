@@ -14,7 +14,9 @@ review 结论见 [RTCP Authoritative Peer Key Resolution](RTCP-Authoritative-Pee
 - `src/components/cyfs-gateway-lib/src/stack/rtcp_stack.rs`：配置和 process-chain 授权。
 
 配置示例见 [cyfs_gateway.yaml](../../src/rootfs/etc/cyfs_gateway.yaml)，tunnel 准入示例见
-[rtcp_on_new_tunnel_hook_point_example.md](../rtcp_on_new_tunnel_hook_point_example.md)。
+[rtcp_on_new_tunnel_hook_point_example.md](rtcp_on_new_tunnel_hook_point_example.md)。
+已有域名和 HTTPS 服务、希望增加 RTCP 的节点可直接参考
+[HTTPS + RTCP 过渡节点快速部署](rtcp_https_transition_quickstart.md)。
 
 ## 1. 连接模型
 
