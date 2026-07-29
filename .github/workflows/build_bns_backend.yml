@@ -50,11 +50,18 @@ jobs:
         working-directory: ./src
         run: buckyos-build amd64 --skip-web --select bns_dv cyfs_gateway
 
+      - name: Stage bns_dv artifact
+        working-directory: ./src
+        run: |
+          install -d bns_dv-artifact
+          install -m 0755 web3-gateway/bns_dv bns_dv-artifact/bns_dv
+          install -m 0644 components/bns-server/start_bns_dv.ts bns_dv-artifact/start_bns_dv.ts
+
       - name: Upload bns_dv artifact
         uses: actions/upload-artifact@v4
         with:
           name: bns_dv-${{ steps.project.outputs.version }}-linux-amd64
-          path: ./src/web3-gateway/bns_dv
+          path: ./src/bns_dv-artifact/
           if-no-files-found: error
 
       - name: Upload cyfs-gateway artifact
