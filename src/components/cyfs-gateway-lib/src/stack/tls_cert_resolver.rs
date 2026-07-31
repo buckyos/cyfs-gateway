@@ -352,11 +352,7 @@ fn describe_identity_cert_candidate(
             identity,
             raw_host_uri,
             describe_path(&paths.fullchain),
-            paths
-                .private_key
-                .as_ref()
-                .map(|path| describe_path(path))
-                .unwrap_or_else(|| "none".to_string())
+            describe_path(&paths.private_key)
         ),
         Err(err) => format!("match_type={match_type}, input={identity}, error={err}"),
     }

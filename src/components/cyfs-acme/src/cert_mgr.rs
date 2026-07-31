@@ -523,10 +523,7 @@ fn install_identity_certificate(
     let paths = roots
         .x509_paths(identity, IdentityUsage::Server)
         .map_err(|e| anyhow::anyhow!("calculate identity x509 paths failed: {}", e))?;
-    let private_key_path = paths
-        .private_key
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("server private key path is not available"))?;
+    let private_key_path = &paths.private_key;
 
     let mut staged = Vec::new();
     let stage_result = (|| -> Result<()> {
@@ -558,7 +555,9 @@ fn install_identity_certificate(
         })?;
     }
 
-    remove_legacy_keyref(&paths.keyref)?;
+    if let Some(keyref_path) = paths.keyref.as_deref() {
+        remove_legacy_keyref(keyref_path)?;
+    }
     sync_parent_dir(&paths.fullchain)?;
     sync_parent_dir(private_key_path)?;
     Ok(())
@@ -1625,8 +1624,9 @@ mod tests {
         let paths = roots
             .x509_paths("example.com", IdentityUsage::Server)
             .unwrap();
-        std::fs::create_dir_all(paths.keyref.parent().unwrap()).unwrap();
-        std::fs::write(&paths.keyref, "stale keyref").unwrap();
+        let keyref_path = paths.keyref.as_ref().unwrap();
+        std::fs::create_dir_all(keyref_path.parent().unwrap()).unwrap();
+        std::fs::write(keyref_path, "stale keyref").unwrap();
 
         install_identity_certificate(
             &roots,
@@ -1643,8 +1643,8 @@ mod tests {
         assert!(paths.chain.exists());
         assert!(paths.fullchain.exists());
         assert!(paths.metadata.exists());
-        assert!(paths.private_key.unwrap().exists());
-        assert!(!paths.keyref.exists());
+        assert!(paths.private_key.exists());
+        assert!(!keyref_path.exists());
     }
 
     #[test]

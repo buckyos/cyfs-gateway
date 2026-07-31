@@ -1876,20 +1876,41 @@ pub struct SnServerFactory;
 
 #[derive(Clone)]
 struct SnLocalS2sIdentity {
-    service_appid: String,
-    current_zone_did: DID,
-    provider: Arc<dyn ::kRPC::s2s::S2sKeyAgreementProvider>,
+    service_did: DID,
+    roots: IdentityRoots,
 }
 
-impl SnLocalS2sIdentity {
-    fn config(&self) -> ::kRPC::s2s::S2sLocalIdentityConfig {
-        ::kRPC::s2s::S2sLocalIdentityConfig::new(
-            self.service_appid.clone(),
-            self.current_zone_did.clone(),
-            ::kRPC::s2s::S2sLocalKeySource::Provider {
-                provider: self.provider.clone(),
-            },
-        )
+struct SnPinnedS2sPublicKeyProvider {
+    remote_service_did: DID,
+    remote_public_key: [u8; 32],
+    token: ::kRPC::s2s::S2sProviderChangeToken,
+}
+
+impl SnPinnedS2sPublicKeyProvider {
+    fn new(remote_service_did: DID, remote_public_key: [u8; 32]) -> Self {
+        Self {
+            remote_service_did,
+            remote_public_key,
+            token: ::kRPC::s2s::S2sProviderChangeToken::fixed(1),
+        }
+    }
+}
+
+impl ::kRPC::s2s::S2sPublicKeyProvider for SnPinnedS2sPublicKeyProvider {
+    fn lookup(&self, target_did: &DID) -> ::kRPC::s2s::S2sResult<::kRPC::s2s::S2sProviderLookup> {
+        let generation = self.token.generation();
+        if target_did != &self.remote_service_did {
+            return Ok(::kRPC::s2s::S2sProviderLookup::NotManaged { generation });
+        }
+
+        Ok(::kRPC::s2s::S2sProviderLookup::Managed {
+            key: ::kRPC::s2s::S2sPeerPublicKey::new(self.remote_public_key, 1),
+            generation,
+        })
+    }
+
+    fn change_token(&self) -> ::kRPC::s2s::S2sProviderChangeToken {
+        self.token.clone()
     }
 }
 
@@ -2057,53 +2078,17 @@ impl SnServerFactory {
                     "app_did is required for HTTP S2S providers"
                 )
             })?;
-        let service_did =
-            ::kRPC::s2s::parse_canonical_service_did(app_did).map_err(|error| {
-                server_err!(
-                    ServerErrorCode::InvalidConfig,
-                    "invalid app_did {}: {}",
-                    app_did,
-                    error
-                )
-            })?;
-        let current_zone_did = service_did.upper_did().ok_or_else(|| {
+        let service_did = parse_canonical_did(app_did).map_err(|error| {
             server_err!(
                 ServerErrorCode::InvalidConfig,
-                "app_did {} must be a service DID below a did:web or did:bns zone",
-                app_did
+                "invalid app_did {}: {}",
+                app_did,
+                error
             )
         })?;
-        let service_appid = service_did
-            .id
-            .split(['.', ':'])
-            .next()
-            .filter(|value| !value.is_empty())
-            .ok_or_else(|| {
-                server_err!(
-                    ServerErrorCode::InvalidConfig,
-                    "app_did {} has no service app id",
-                    app_did
-                )
-            })?
-            .to_string();
-        let derived =
-            ::kRPC::s2s::derive_service_did(&service_appid, &current_zone_did).map_err(|error| {
-                server_err!(
-                    ServerErrorCode::InvalidConfig,
-                    "cannot derive service DID from app_did {}: {}",
-                    app_did,
-                    error
-                )
-            })?;
-        if derived != service_did {
-            return Err(server_err!(
-                ServerErrorCode::InvalidConfig,
-                "app_did {} is not a canonical single-level service DID",
-                app_did
-            ));
-        }
-        let provider =
-            IdentityManagerS2sKeyProvider::load(roots, service_did).map_err(|error| {
+        roots
+            .load_local_default_ed25519_identity(&service_did)
+            .map_err(|error| {
                 server_err!(
                     ServerErrorCode::InvalidConfig,
                     "load S2S identity for app_did {} failed: {}",
@@ -2111,11 +2096,7 @@ impl SnServerFactory {
                     error
                 )
             })?;
-        Ok(SnLocalS2sIdentity {
-            service_appid,
-            current_zone_did,
-            provider: Arc::new(provider),
-        })
+        Ok(SnLocalS2sIdentity { service_did, roots })
     }
 
     fn default_local_s2s_identity(
@@ -2192,25 +2173,28 @@ impl SnServerFactory {
                 field
             )
         })?;
-        let remote_did =
-            ::kRPC::s2s::parse_canonical_service_did(remote.remote_app_did.trim()).map_err(
-                |error| {
-                    server_err!(
-                        ServerErrorCode::InvalidConfig,
-                        "invalid {} remote_app_did {}: {}",
-                        field,
-                        remote.remote_app_did,
-                        error
-                    )
-                },
-            )?;
+        let remote_did = parse_canonical_did(remote.remote_app_did.trim()).map_err(|error| {
+            server_err!(
+                ServerErrorCode::InvalidConfig,
+                "invalid {} remote_app_did {}: {}",
+                field,
+                remote.remote_app_did,
+                error
+            )
+        })?;
         let remote_public_key =
             Self::parse_pinned_ed25519_public_key(&remote.remote_public_key, field)?;
-        let s2s_config = ::kRPC::s2s::S2sClientConfig::with_pinned_key(
-            local_identity.config(),
-            remote_did,
+        let public_key_provider = Arc::new(SnPinnedS2sPublicKeyProvider::new(
+            remote_did.clone(),
             remote_public_key,
+        ));
+        let runtime = ::kRPC::s2s::S2sRuntime::provider_only(
+            local_identity.roots.clone(),
+            public_key_provider,
         );
+        let s2s_config =
+            ::kRPC::s2s::S2sClientConfig::new(local_identity.service_did.clone(), remote_did)
+                .with_runtime(runtime);
         let client = kRPC::new_with_transport(
             endpoint.as_str(),
             None,
@@ -2697,7 +2681,6 @@ mod tests {
     use base64::Engine as _;
     use buckyos_kit::init_logging;
     use cyfs_gateway_lib::hyper_serve_http;
-    use sha2::{Digest, Sha256};
     use std::time::SystemTime;
     use tokio::net::{TcpListener, TcpStream};
 
@@ -2708,6 +2691,17 @@ mod tests {
         "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
     const ANVIL_ADDRESS: &str = "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266";
 
+    fn ed25519_public_key(seed: [u8; 32]) -> [u8; 32] {
+        use ring::signature::KeyPair as _;
+
+        ring::signature::Ed25519KeyPair::from_seed_unchecked(&seed)
+            .unwrap()
+            .public_key()
+            .as_ref()
+            .try_into()
+            .unwrap()
+    }
+
     fn write_s2s_identity(
         temp: &tempfile::TempDir,
         service_did: &DID,
@@ -2717,44 +2711,53 @@ mod tests {
             temp.path().join("local").join("identity"),
             temp.path().join("security"),
         );
-        let secret = ::kRPC::s2s::SecretEd25519Key::from_seed(seed);
-        let public = secret.public_key();
-        let dir = roots.security_dir(&service_did.to_string()).unwrap();
-        std::fs::create_dir_all(&dir).unwrap();
+        let public = ed25519_public_key(seed);
+        let public_dir = roots.public_dir(&service_did.to_string()).unwrap();
+        let security_dir = roots.security_dir(&service_did.to_string()).unwrap();
+        std::fs::create_dir_all(&public_dir).unwrap();
+        std::fs::create_dir_all(&security_dir).unwrap();
+        std::fs::write(
+            public_dir.join("did.json"),
+            serde_json::to_vec_pretty(&json!({
+                "@context": [
+                    "https://www.w3.org/ns/did/v1",
+                    "https://buckyos.ai/ns/did/v1"
+                ],
+                "id": service_did.to_string(),
+                "verificationMethod": [{
+                    "id": "#main_key",
+                    "type": "JsonWebKey2020",
+                    "controller": service_did.to_string(),
+                    "publicKeyJwk": {
+                        "kty": "OKP",
+                        "crv": "Ed25519",
+                        "x": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(public)
+                    }
+                }],
+                "authentication": ["#main_key"],
+                "service": [{
+                    "id": "#did-object",
+                    "type": "DIDObjectService",
+                    "serviceEndpoint": format!("https://{}/", service_did.to_raw_host_name()),
+                    "profile": "https://example.com/service-profile.json"
+                }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
 
         let mut pkcs8 = vec![
             0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x04, 0x22,
             0x04, 0x20,
         ];
         pkcs8.extend_from_slice(&seed);
-        let key_path = dir.join("authentication.private.pem");
+        let key_path = security_dir.join("authentication.private.pem");
         std::fs::write(
             &key_path,
             format!(
                 "-----BEGIN PRIVATE KEY-----\n{}\n-----END PRIVATE KEY-----\n",
                 base64::engine::general_purpose::STANDARD.encode(pkcs8)
             ),
-        )
-        .unwrap();
-        let keyref = json!({
-            "schema": "buckyos.identity.keyref.v1",
-            "kind": "key",
-            "did": service_did.to_string(),
-            "usage": "authentication",
-            "algorithm": "Ed25519",
-            "public_key_fingerprint":
-                format!("sha256:{}", hex::encode(Sha256::digest(public))),
-            "mode": "file",
-            "exportable": true,
-            "ref": {
-                "type": "file",
-                "path": key_path.to_string_lossy(),
-                "format": "pkcs8-pem"
-            }
-        });
-        std::fs::write(
-            dir.join("authentication.keyref.json"),
-            serde_json::to_vec_pretty(&keyref).unwrap(),
         )
         .unwrap();
         (roots, public)
@@ -3592,8 +3595,7 @@ users:
         let (roots, _) = write_s2s_identity(&temp, &app_did, [3u8; 32]);
         let local =
             SnServerFactory::load_local_s2s_identity(Some(&app_did.to_string()), roots).unwrap();
-        let remote_public =
-            ::kRPC::s2s::SecretEd25519Key::from_seed([9u8; 32]).public_key();
+        let remote_public = ed25519_public_key([9u8; 32]);
         let http_s2s = SnRemoteProviderConfig::S2s(SnS2sRemoteProviderConfig {
             url: "http://provider.example".to_string(),
             remote_app_did: "did:web:sn-db.example.com".to_string(),
@@ -3614,7 +3616,7 @@ users:
     }
 
     #[test]
-    fn local_s2s_identity_requires_a_canonical_service_did() {
+    fn local_s2s_identity_requires_a_canonical_did() {
         let temp = tempfile::tempdir().unwrap();
         let roots = IdentityRoots::new(
             temp.path().join("local").join("identity"),
@@ -3626,26 +3628,17 @@ users:
             .to_string();
         assert!(missing.contains("app_did is required"), "{missing}");
 
-        let zone = SnServerFactory::load_local_s2s_identity(
-            Some("did:web:example.com"),
-            roots.clone(),
-        )
-        .err()
-        .unwrap()
-        .to_string();
-        assert!(zone.contains("must be a service DID"), "{zone}");
-
-        let nested = SnServerFactory::load_local_s2s_identity(
-            Some("did:web:a.example.com:path"),
-            roots,
-        )
-        .err()
-        .unwrap()
-        .to_string();
-        assert!(
-            nested.contains("not a canonical single-level service DID"),
-            "{nested}"
-        );
+        for app_did in [
+            "example.com",
+            "did:WEB:example.com",
+            "did:web:example.com#main_key",
+        ] {
+            let error = SnServerFactory::load_local_s2s_identity(Some(app_did), roots.clone())
+                .err()
+                .unwrap()
+                .to_string();
+            assert!(error.contains("invalid app_did"), "{error}");
+        }
     }
 
     #[tokio::test]
