@@ -38,3 +38,6 @@ src/apps/cyfs_gateway/acme_account.json
 acme_account.json
 src/web3-gateway/bns_dv
 src/deno.lock
+src/apps/bns-webui/pnpm-lock.yaml
+src/apps/bns-webui/dist/
+src/apps/bns-webui/node_modules/
