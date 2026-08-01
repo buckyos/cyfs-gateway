@@ -1,11 +1,16 @@
 # BNS WebUI 产品需求文档（PRD）
 
 - 产品名称：BNS WebUI
-- 文档版本：v1.0
+- 文档版本：v1.1
 - 面向协议版本：Beta2.2
 - 文档状态：Draft
-- 日期：2026-07-30
+- 日期：2026-07-31
 - 需求原则：写操作由用户钱包直接调用 BNS Proxy 合约；状态查询统一调用 bns-server
+
+修订记录：
+
+- v1.1（2026-07-31）：依据产品语音需求，加入产品分层定位（2.1、G5）、账号与资产心智模型（5.1、第 7 节、9.3、9.6）、续期公共性定位（9.5）、安全中心与场景化引导（9.16、9.18、9.23）、代办注册与接管（9.24），以及使用权收据 / 经济模型 / 股权化等未来预留（16.4）。
+- v1.0（2026-07-30）：首版，以仓库实际实现为准的实现映射。
 
 ---
 
@@ -26,11 +31,18 @@
 1. BNS 业务合约对外只有一个 UUPS Proxy 地址。WebUI 不得向 Facet 地址发交易。
 2. 合约当前路由 28 个业务 selector，其中 15 个会改变状态。
 3. bns-server 当前实际暴露 13 个 kRPC method，而现有 `BNS-API.md` 中“11 个方法”的总览已落后于代码；新增的实际方法是 `system.info` 和 `tx.prepare`。
-4. 普通 Web3 钱包写入不使用 `tx.submit_raw`，也不依赖 `tx.prepare`。钱包直接通过其 EVM Provider 向 Proxy 发送交易。
+4. 普通 Web3 钱包写入不使用 `tx.submit_raw`，也不依赖 `tx.prepare`。钱包直接通过其 EVM Provider 向 Proxy 发送交易。仅当链节点对浏览器不可达（内网测试链）时，才由部署配置显式开启这两个方法组成的中继投递，属于测试路径，见 8.5。
 5. 所有页面状态、名称状态、文档、authority、事件和交易状态均从 bns-server 查询，不以合约 view call 作为产品数据源。
 6. 一笔写操作存在两个完成阶段：
    - 链上交易成功；
    - bns-indexer 完成投影、bns-server 查询结果可见。
+
+v1.1 起，本 PRD 同时包含两类内容，阅读时须区分：
+
+- **实现映射**：以仓库当前实现为准的接口、字段与流程约束（原有全部章节）；
+- **产品心智层**：把既有能力翻译成一般用户可理解的账号 / 资产 / 安全概念（2.1、5.1、第 7 节、9.23、9.24），以及明确标注“未实现”的未来预留（16.4）。
+
+心智层只改变信息的组织与默认曝光程度，不改变第 4 节的读写边界，也不允许用文案掩盖 6.4 的语义缺口；所有未实现的规划一律集中在 16.4，不与当前实现混写。
 
 ---
 
@@ -45,6 +57,16 @@ BNS WebUI 的目标是为普通用户和高级用户提供一个钱包驱动的�
 - 管理自己持有或有权控制的名称；
 - 清晰理解交易确认、Indexer 同步和最终可查询状态之间的差异；
 - 在高风险操作前看到权限、版本 guard 和不可逆影响。
+
+### 2.1 产品定位：分层递进，不做“合约浏览器”
+
+WebUI 的底线能力，是让合约的主要功能、数据和状态可查询、可操作。但它不应停留在开发辅助工具：传统合约浏览器技术味过强，本产品用分层递进的方式管理信息密度，让默认界面贴近一般用户的心理认知：
+
+1. **第一层（默认）**：账号与资产。一级名称即账号（5.1），页面语言使用“账号 / 作品 / 买来的资产 / 安全”这类概念，不直接暴露合约术语；
+2. **第二层（进阶）**：名称详情、文档版本、authority、controller、guard 等协议对象，供高级用户展开；
+3. **第三层（原始）**：raw JSON、hash、bytes、事件与交易细节，延续“如实呈现”原则。
+
+分层只改变默认曝光程度与信息组织：任何一层的数据来源、读写边界（第 4 节）与语义缺口披露（6.4）完全一致。
 
 ---
 
@@ -95,15 +117,24 @@ UI 必须显式区分：
 5. 链上成功、等待索引；
 6. bns-server 投影已更新。
 
+#### G5：贴近一般用户的心智分层
+
+- 默认视图用账号 / 资产语言组织（5.1、9.3），协议对象收进进阶层；
+- 吊销、永久禁用等高风险协议操作提供面向普通人的场景化引导入口（安全中心，9.23）；
+- 代办注册的服务商关系以可理解方式呈现，并在条件满足时引导用户接管（9.24）；
+- 任何一层都不伪造服务端不具备的数据，不掩盖 6.4 的缺口。
+
 ### 3.2 非目标
 
 v1 不包含：
 
 - 私钥托管、助记词导入、WebUI 自行签名；
-- 通过 bns-server 的 `tx.submit_raw` 代理普通钱包交易；
+- 在生产部署中通过 bns-server 的 `tx.submit_raw` 代理钱包交易（该中继仅作为内网测试链的测试路径，默认关闭且不进用户界面，见 8.5）；
 - 合约升级、Facet 管理、Proxy ownership 等治理后台；
 - NFT 市场能力；当前 BNS 不是 ERC-721，不能使用 `ownerOf`、`safeTransferFrom`；
-- 法币、Token 定价或自动收款；当前注册与续期函数虽然是 `payable`，但合约没有消费或校验 `msg.value`；
+- 法币、Token 定价或自动收款；当前注册与续期函数虽然是 `payable`，但合约没有消费或校验 `msg.value`（名称经济模型属未来预留，见 16.4）；
+- 使用权购买、购买收据与“我的库”式消费体验；链上当前没有使用权收据机制（未来预留见 16.4）；
+- 名称资产的部分股权化（基于名称发行 token；见 16.4）；
 - 从 bns-server 不存在的接口伪造“完整 authority key 列表”“完整 controller rule 列表”或“完整文档类型列表”；
 - 历史 `iat` DID 解析。当前 DID Resolver 对 `iat` 查询返回 501。
 
@@ -131,10 +162,14 @@ flowchart LR
 | 行为 | 唯一产品数据路径 | 禁止路径 |
 | --- | --- | --- |
 | 查询名称、owner、文档、authority、事件 | WebUI → bns-server | WebUI 直接调用合约 view |
-| 提交写交易 | WebUI → Wallet → EVM RPC → BNS Proxy | WebUI → `tx.submit_raw` |
+| 提交写交易 | WebUI → Wallet → EVM RPC → BNS Proxy | 生产部署走 `tx.submit_raw` |
 | 查询交易状态 | WebUI → bns-server `tx.query_state` | 仅依赖钱包弹窗状态 |
 | 查询 Indexer 后状态 | WebUI 轮询相关 bns-server 查询 | 看到 receipt 后立即假设页面状态已更新 |
 | ABI 编码 | WebUI 本地使用聚合 ABI | 调用某个 Facet 地址 |
+
+写交易存在一条例外路径：当链节点对浏览器不可达（典型为内网测试链）时，允许由部署配置
+显式开启 `tx.prepare` + `tx.submit_raw` 的中继投递。它是**测试路径，不是产品写路径**，
+默认关闭、不进用户界面，详见 8.5。生产部署一律走上表的直连路径。
 
 钱包 RPC 的 `eth_estimateGas` 或交易模拟只用于待提交交易的准备和 revert 预检，不得把模拟
 返回值作为页面业务状态源；页面展示的业务状态仍只来自 bns-server。
@@ -149,7 +184,32 @@ flowchart LR
 
 ## 5. 用户与权限模型
 
-### 5.1 用户角色
+### 5.1 账号与资产心智模型
+
+这是 v1.1 起页面组织的第一原则，把协议对象翻译成一般用户可理解的概念。它是纯前端视图层约定，不引入新接口，也不改变授权模型。
+
+#### 一级名称即账号
+
+- 本体系的核心是名称的 owner：钱包地址下持有一个或多个一级名称，一级名称之下再挂一批二级名称；
+- 对大多数用户，一级名称只有一个。产品把一级名称直接呈现为“账号”，用户无需理解“一级名称的整体管理”——他的理解就是：一级名称就是账号；
+- 只有一个一级名称时，界面只显示该账号；有多个时，采用传统产品的“快速账号切换”交互（顶部账号切换器，见 7.1），当前账号决定默认展示哪一棵名称树；
+- 账号切换是纯前端视图切换，不发起链上交易，不改变钱包连接与授权状态。
+
+#### 资产按来源分三组
+
+| 分组 | 定义 | 归属维度 | v1 状态 |
+| --- | --- | --- | --- |
+| 我的作品（我创建的资产） | 当前账号及其名下的二级名称、文档等，原则上是“我创建的东西” | 按账号（一级名称）归组 | v1 实现，分组规则见 9.3 |
+| 我买来的资产 | 从他人处买入产权的名称（例：`book.bob` 原属 Bob，产权转移给我），投资性持有，类似“我是股东” | 按钱包地址归组，跨账号，不塞进任何一级名称之下 | v1 以“结构上不属于我的账号的持有名称”呈现；链上购买撮合机制未实现 |
+| 我买过的使用权 | 付费获得他人资产的使用权，凭公开的购买收据表达（君子协议，不做强 DRM） | 按钱包地址 | 未实现，见 16.4；未来在本产品中只展示购买收据，消费体验属另一产品域 |
+
+补充约定：
+
+- “作品”一词待定，命名原则是“我创建的东西”；文案走 code + 参数机制，保留替换空间；
+- 产权与使用权必须区分：买断产权后名称的 `asset_owner` 变为我；买使用权只产生一张公开收据，名称仍属原 owner。v1 链上只有产权转移（`transferName`）一种机制，UI 中任何“购买”动词都不得暗示存在链上撮合或支付；
+- 大众化的使用权购买（类 Steam 的“库”）是独立的 C 端产品域，本 WebUI 不承载浏览与消费，未来只需要能看到购买收据。
+
+### 5.2 用户角色
 
 | 角色 | 是否需要钱包 | 主要能力 |
 | --- | --- | --- |
@@ -160,7 +220,7 @@ flowchart LR
 | 高级用户 | 是 | authority、policy、原子 batch、hash 和底层参数编辑 |
 | 协议运维 | 是 | checkpoint/合约治理；不属于 v1 普通用户界面 |
 
-### 5.2 Asset Owner 与 Effective Owner 必须分开显示
+### 5.3 Asset Owner 与 Effective Owner 必须分开显示
 
 - `asset_owner`：名称资产记录中的 EVM 地址，也是 `name.query_by_addr` 的查询条件。
 - `semantic_owner`：只允许 `unset` 或 `bns_name`，不允许直接设置 `chain_account`。
@@ -170,9 +230,9 @@ flowchart LR
   - semantic owner 为 BNS name：使用该 BNS name 的 authority set。
 - `owner_source`：`asset_owner_fallback`、`explicit_semantic_owner` 或 `parent_inherited`。
 
-产品文案不得把“我的名称”直接解释成“我能管理的全部名称”。`name.query_by_addr` 只能列出当前地址作为 `asset_owner` 的名称，不能列出通过 BNS authority key、controller rule 或父名称继承可控制的名称。
+产品文案不得把“我的账号与资产”解释成“我能管理的全部名称”。`name.query_by_addr` 只能列出当前地址作为 `asset_owner` 的名称，不能列出通过 BNS authority key、controller rule 或父名称继承可控制的名称。
 
-### 5.3 CallAuthority 自动构造
+### 5.4 CallAuthority 自动构造
 
 WebUI 根据用户选择的授权路径构造 `CallAuthority`，但最终身份始终由合约使用 `msg.sender` 校验。
 
@@ -265,18 +325,21 @@ WebUI 根据用户选择的授权路径构造 `CallAuthority`，但最终身份�
 - Indexer 状态提示；
 - 连接钱包按钮；
 - 当前账户及切换/断开；
+- 当前账号（一级名称）与快速切换器：仅持有一个一级名称时不显示切换器，多个时按 5.1 的账号切换交互；
 - 交易中心入口。
 
 ### 7.2 一级导航
 
 1. 首页
 2. 搜索与解析
-3. 我的名称
-4. 注册名称
-5. 交易中心
-6. 事件浏览器
-7. 高级工具
-8. 设置
+3. 我的账号（当前账号视图：账号信息与名下作品，见 9.3）
+4. 我买来的资产（钱包维度的投资持有，见 9.3）
+5. 注册名称
+6. 安全中心（吊销与永久禁用的场景化引导，见 9.23）
+7. 交易中心
+8. 事件浏览器
+9. 高级工具
+10. 设置
 
 ### 7.3 名称详情页二级导航
 
@@ -287,7 +350,7 @@ WebUI 根据用户选择的授权路径构造 `CallAuthority`，但最终身份�
 5. Alias 与支付
 6. Namespace
 7. 活动记录
-8. 危险操作
+8. 危险操作（吊销与永久禁用等；安全中心从 9.23 引导进入本 tab 的具体流程）
 
 ---
 
@@ -348,6 +411,39 @@ WebUI 只做可解释的预检。合约是最终授权方，前端不能把预�
 
 ### 8.5 写交易通用流程
 
+一笔写交易需要三样东西：**calldata**、**签名**、**能把交易送进链节点的通道**。
+前两样没有分歧——calldata 由 WebUI 生成，签名只能由用户钱包完成；
+分歧只在第三样，因此存在两条投递路径。
+
+#### 8.5.1 两条投递路径
+
+| 模式 | 广播方 | 定位 | 启用方式 |
+| --- | --- | --- | --- |
+| `wallet_direct` 直连 | 钱包自己配置的 EVM RPC | **产品写路径**，默认 | 默认 |
+| `server_relay` 中继 | bns-server 的 `eth_sendRawTransaction` | **测试路径**，不是产品写路径 | 部署配置显式开启 |
+
+中继模式要解决的唯一问题是：**测试链/私链没有浏览器可达的 RPC**。
+anvil 常常只跑在开发机或 VM 内网，bns-server 连得上、浏览器连不上，
+此时钱包即使添加了自定义网络也广播不出去。`tx.prepare` 的存在就是为此——
+它替代了“客户端自己查 nonce/gas/fee”，使 WebUI 在完全没有链 RPC 时也能构造交易。
+
+**中继模式不是通用回退**，有一条硬约束：
+
+> 中继需要一份**已签名的 raw transaction**，而取得它只能靠 `eth_signTransaction`。
+> 主流注入式钱包（MetaMask 等）**不实现该方法**，只提供 `eth_sendTransaction`。
+
+因此中继仅在以下场景可用：支持 `eth_signTransaction` 的钱包（Frame、部分硬件签名器、
+部分 WalletConnect 对端）、浏览器之外的外部签名方、e2e 与开发工具。
+WebUI 必须在**进入写表单阶段**就探测钱包能力并给出可解释的拒绝与替代方案，
+不得等到用户点击提交才失败。
+
+**路径选择优先级：直连 > `wallet_addEthereumChain` 后直连 > 中继。**
+只要链节点对浏览器可达（网络可达且 CORS 允许），就应按 8.3 引导用户添加网络后走直连。
+
+投递模式属于**部署配置**，不进用户界面，不允许终端用户在页面上切换。
+
+#### 8.5.2 直连流程（产品路径）
+
 ```mermaid
 sequenceDiagram
     actor User as 用户
@@ -378,21 +474,71 @@ sequenceDiagram
     UI-->>User: 已确认并完成索引
 ```
 
-具体要求：
+#### 8.5.3 中继流程（测试路径）
+
+```mermaid
+sequenceDiagram
+    actor User as 用户
+    participant UI as WebUI
+    participant Server as bns-server
+    participant Wallet as Web3 Wallet
+    participant Chain as BNS Proxy / 测试链
+    participant Indexer as bns-indexer
+
+    UI->>Server: 查询当前 name_seq / version / owner
+    Server-->>UI: 投影状态
+    UI->>UI: 构造 CallAuthority、MutationGuard、calldata
+    UI->>Server: tx.prepare(from, calldata)
+    Server-->>UI: nonce / gas_limit / EIP-1559 fee / chain_id / contract
+    UI->>UI: 核对 chain_id 与 contract 仍等于本次会话锚定值
+    UI->>Wallet: eth_signTransaction（只签名，不广播）
+    Wallet->>User: 展示交易确认
+    User-->>Wallet: 确认
+    Wallet-->>UI: raw transaction
+    UI->>Server: tx.submit_raw(raw_tx)
+    Server->>Chain: eth_sendRawTransaction
+    Chain-->>Server: tx_hash
+    Server-->>UI: tx_hash
+    Note over UI,Indexer: 之后与直连完全相同：tx.query_state 轮询 + 投影收敛
+```
+
+中继模式的额外约束：
+
+- `tx.prepare` 会重新读一次 `system.info`。若返回的 `chain_id` 或 `contract_address`
+  与本次会话锚定值不一致，说明服务端在会话期间被切换到了另一条链或另一份合约，
+  **必须中止**，不得照签。
+- `nonce` 来自 `eth_getTransactionCount(from, "pending")`，已包含 mempool 中未打包的交易。
+- 签名后的 raw transaction 会经过页面并交给 bns-server。签名不可篡改，
+  但 bns-server 具备**丢弃或延迟**该交易的能力；这也是中继只作为测试路径的原因之一。
+
+#### 8.5.4 两条路径的共同要求
 
 1. ABI 编码目标必须是 `system.info.contract_address`。
 2. 普通交易 `value` 固定为 0。
-3. 先使用钱包 RPC `eth_estimateGas`；支持时可进行模拟并解码 custom error。
-4. 由钱包决定最终 gas/fee；WebUI 不替用户静默覆盖钱包费用设置。
-5. 钱包返回 `tx_hash` 后立即写入本地交易中心。
-6. 使用 `tx.query_state` 轮询交易：
+3. 钱包确认前必须向用户展示：方法名、Proxy 地址、chain ID、value、关键参数，
+   以及**本次交易由谁广播**（钱包自身 RPC / bns-server 中继）。
+4. 拿到 `tx_hash` 后立即写入本地交易中心。
+5. 使用 `tx.query_state` 轮询交易：
    - 前 30 秒每 2 秒；
    - 30 秒～5 分钟每 5 秒；
    - 之后降为每 15 秒并允许用户停止。
-7. `succeeded` 后继续轮询业务查询，直至目标字段达到预期值。
-8. 5 分钟内未投影成功时显示“链上已成功，Indexer 尚未同步”，不得显示失败。
-9. `reverted` 时显示失败；当前 `tx.query_state` 不提供 revert reason，优先展示提交前模拟错误，否则提示用户查看区块浏览器或 RPC 调试信息。
-10. `not_found` 不是确定失败。它可能表示节点未见过、mempool 丢弃、同 nonce 替换或历史裁剪。
+6. `succeeded` 后继续轮询业务查询，直至目标字段达到预期值。
+7. 5 分钟内未投影成功时显示“链上已成功，Indexer 尚未同步”，不得显示失败。
+8. `reverted` 时显示失败；当前 `tx.query_state` 不提供 revert reason，优先展示提交前
+   模拟错误，否则提示用户查看区块浏览器或 RPC 调试信息。
+9. `not_found` 不是确定失败。它可能表示节点未见过、mempool 丢弃、同 nonce 替换或历史裁剪。
+10. 不提供交易加速 / 取消 / 替换入口。交易的高级操作由钱包负责，WebUI 只做引导；
+    因此也不维护 nonce 与 replacement 关系。
+
+#### 8.5.5 两条路径的差异
+
+| 环节 | 直连 | 中继 |
+| --- | --- | --- |
+| gas 估算 | 钱包 `eth_estimateGas` | `tx.prepare` 的 `estimated_gas` / `gas_limit` |
+| 提交前 revert 模拟与 custom error 解码 | 支持时可做 | **不可用**（`eth_call` 同样需要链连接），UI 需明确说明 |
+| 最终 gas/fee 决定方 | 钱包与用户；WebUI 不得静默覆盖 | `tx.prepare`；必须在确认页如实告知用户 |
+| 钱包 RPC 依赖 | 必须有该 chainId 的可用 RPC | 不需要 |
+| 钱包能力要求 | `eth_sendTransaction` | `eth_signTransaction`（多数钱包不支持） |
 
 ### 8.6 MutationGuard
 
@@ -426,7 +572,7 @@ sequenceDiagram
 - 全局名称/DID 搜索；
 - 钱包连接卡片；
 - 服务状态：HTTP、`system.info.ready`、chain ID、Proxy 地址；
-- 当前账户持有名称数量及前 5 项；
+- 当前账号（一级名称）卡片、名下资产数量及前 5 项；多账号时展示切换入口；
 - pending、confirmed-but-indexing、failed 交易数量；
 - 最新事件；
 - 常用入口：注册名称、发布文档、查看 DID。
@@ -490,7 +636,9 @@ sequenceDiagram
 
 ---
 
-### 9.3 我的名称
+### 9.3 我的账号与资产
+
+本页承载 5.1 的账号 / 资产心智。数据仍然只来自 `name.query_by_addr`（按 `asset_owner` 查询），在其结果上做纯前端分组，不引入新接口。
 
 #### 数据来源
 
@@ -509,6 +657,18 @@ sequenceDiagram
 
 使用 `next_cursor` 翻页。
 
+#### 前端分组规则
+
+对返回名称做确定性结构分组：
+
+1. **账号**：顶级名称。恰好一个时直接作为当前账号；多个时全部进入顶部账号切换器（含买入的顶级名称——账号本身就是可交易资产）；
+2. **当前账号的作品**：二级名称 `{label}.{parent}`，且 `parent` 属于我的顶级名称集合，归入对应账号视图，随账号切换过滤；
+3. **我买来的资产**：二级名称的 `parent` 不属于我的任何顶级名称（典型如受让的 `book.bob`），归入钱包维度的独立列表，不随账号切换过滤。
+
+分组按名称结构推导，不追溯取得方式（例如买入的 `x.alice` 若 `alice` 是我的账号，仍归入作品组）；精确来源需要事件回扫，v1 不做。每一项都是普通名称，点击进入统一的名称详情页。
+
+受让二级名称的控制权提示：`parent` 不属于我时，若该名称 semantic owner 保持 Unset，effective owner 按 5.3 规则仍继承原父名称 owner——这类条目必须显示“仅持有、控制权仍在父名称 owner”状态。正确做法是在转移交易中一并设置 semantic owner（见 9.6）；事后补设需要现任 effective owner（即原父名称 owner）配合执行 9.7。
+
 #### 列表字段
 
 - 名称；
@@ -522,7 +682,7 @@ sequenceDiagram
 
 #### 限制提示
 
-页面标题使用“我持有的名称”，副标题说明它按 `asset_owner` 查询。另提供搜索入口，用于进入通过 authority、controller 或父名称继承管理但不由当前地址持有的名称。
+账号视图标题使用“我的账号”，资产列表副标题说明按 `asset_owner` 查询。该查询不能列出通过 authority、controller 或父名称继承可管理、但不由当前地址持有的名称（见 5.3），也不能列出名下 `asset_owner` 已设置为其他地址的二级名称。另提供搜索入口进入这些名称。
 
 ---
 
@@ -539,7 +699,7 @@ registerName(...)
 字段：
 
 - name；
-- asset owner，默认当前钱包；
+- asset owner，默认当前钱包（可指定他人地址；代办注册场景见 9.24）；
 - duration；
 - grace period；
 - renewable；
@@ -616,6 +776,12 @@ registerName(...)
 renewName(name, duration)
 ```
 
+#### 产品定位：续期是公共维护行为
+
+任何地址都可以为任何名称续期，这是设计意图而非鉴权缺口：续期注入的价值只会变成名称的有效时间，是一次性、不可退回的公共行为，与调用者是否使用该名称无关。考虑到公共名称的特点，体系明确允许任何人为名称注入维护费用。
+
+因此除“我的账号与资产”外，任意名称详情页都提供“为它续期”入口（给别人续费），满足下列要求即可发起。当前合约续期只消耗 gas（`value = 0`，duration 为显式参数）；未来经济模型接入后，续期金额将按当时价格即时换算为有效期（见 16.4），本入口的交互框架保持不变。
+
 要求：
 
 - duration > 0；
@@ -629,7 +795,8 @@ UI 必须在确认页显示：
 - 当前 expire time；
 - 新 expire time 的估算；
 - grace delta；
-- “任何账户都可代续期”的说明。
+- “任何账户都可代续期，续期只增加有效期、不可撤回”的说明；
+- 调用者不是名称持有人时，明确显示“正在为他人名称续期”。
 
 成功收敛条件：`expire_at` 增加且 `name_seq` 增加。
 
@@ -662,7 +829,8 @@ transferName(...)
 - 这是 BNS 自定义转移，不是 ERC-721 transfer；
 - Unset 对顶级名称表示回退到新 asset owner，对二级名称表示继承父 owner；
 - 当前 `transferName` 不检查 `transferable` flag，UI 展示该事实，不以它作为错误的安全承诺；
-- 交易会同时改变 asset owner 和 semantic owner，需展示 before/after 对比。
+- 交易会同时改变 asset owner 和 semantic owner，需展示 before/after 对比；
+- 跨账号转移二级名称（parent 不属于受让方）时，semantic owner 传 Unset 意味着受让方只得到持有权、控制权仍随父名称 owner（5.3 继承规则）。确认页必须显式提示，并默认引导设置为受让方的 BNS name（目标名称须 Active 且有 active authentication key）。
 
 高风险确认：
 
@@ -1035,13 +1203,25 @@ setPaymentTarget(...)
 
 ---
 
-### 9.16 Owner Document IAT Floor
+### 9.16 吊销历史签发（Owner IAT Floor）
 
 对应合约：
 
 ```solidity
 setMinDocumentIat(...)
 ```
+
+#### 用户场景（安全中心“吊销”入口，见 9.23）
+
+体系内大量二级名称不上链：例如设备名称 `laptop.alice`，由 owner 私钥离线签发 device document，经 RTCP 协议与区块网络 reserve 使用。设备丢失或私钥疑似泄露后：
+
+- 攻击者可以继续持有旧签发的文档与设备密钥，冒充 `laptop.alice` 行事；
+- owner 并不知道泄露私钥签发过的完整文档列表（这些文档默认不上链），无法逐个精确吊销；
+- owner 通常仍想继续使用这些名称，只希望“某个时间点之前签发的全部失效”。
+
+合约为此提供的通用入口就是本操作：吊销以 IAT（签发时间）为阈值——设备丢了用户说不出文档版本号，但说得出大概什么时候丢的，这也是用 IAT 取代早期版本号方案的原因。用户选定一个时间后，该名称 owner 签发的、`iat` 早于该时间的链下文档（含未上链的二级名称 / 设备文档）一律视为无效；第三方校验方收到来自旧私钥的身份请求时，会在链上查询该阈值，把落在阈值之前的 document 判为无效。吊销后 owner 用当前私钥重新签发仍需要的文档即可恢复使用。
+
+体系对 device 本身的能力另有独立限制，合约层的这个入口是通用兜底。合约调用本身很简单，本操作的产品复杂度全部在引导上：安全中心必须讲清什么情况该吊销（设备丢失、私钥疑似泄露）、影响范围（该 owner 签发的链下文档批量失效）、吊销之后要做什么（重新签发）。
 
 字段：
 
@@ -1119,6 +1299,17 @@ releaseName(...)
 - Released 名称重新注册可能继承旧 authority/document/policy/alias 存储，v1 普通注册流程暂时阻断；
 - Tombstoned 名称不能重新注册；
 - Tombstone 是不可逆的协议级危险操作。
+
+#### 用户场景（安全中心“永久禁用”入口，见 9.23）
+
+`TombstoneForever` 在产品层呈现为“永久禁用（ban）”，引导文案覆盖两类典型动机：
+
+- **被盗用后的信用止损**：名称（常见是二级名称）被盗用并产生大量不良行为后，彻底禁用它往往是对信用负责的选择——代价是包括 owner 自己在内，谁都不能再使用它；
+- **实体消亡**：公司等主体不再存续、名称在法律上无人继承时，可以把一级名称也 ban 掉，宣告它成为 dead name，此后不再有任何活动。
+
+引导必须强调禁用对所有人生效、包括 owner 本人，这是与信用绑定的一次性决定，必须谨慎。
+
+未来经济模型（见 16.4）接入后，有持有成本的名称 ban 即持有：禁用期间维护费用不可少，需一次性预付（例如 ban 三年就要一次交足三年费用）。v1 合约没有该约束，确认页文案不得做出与之矛盾的承诺。
 
 交互：
 
@@ -1241,6 +1432,66 @@ GET /1.0/identifiers/did:bns:{name}?type={doc_type}
 
 ---
 
+### 9.23 安全中心
+
+安全中心是一级导航入口（7.2），本身不新增任何合约操作，是既有高危操作的场景化引导壳，服务 G5：合约入口本身很简单，普通用户缺的是“什么情况下该做什么”。
+
+页面组织为场景卡片，每张卡片先讲场景与后果，再进入对应小节的具体流程：
+
+| 场景卡片 | 引导问题 | 落地操作 |
+| --- | --- | --- |
+| 设备丢失 / 私钥疑似泄露 | 还想继续用这个名称，但要让旧签发全部失效 | 吊销历史签发（9.16） |
+| 名称被盗用、要彻底止损 | 接受包括自己在内的所有人永远不能再用 | 永久禁用（9.18 TombstoneForever） |
+| 想收回代办授权 | 已有自己的 gas，改为自主管理 | 接管（9.24） |
+
+要求：
+
+- 卡片文案面向普通人，先答“为什么、什么时候”，再进具体流程；
+- 进入具体流程后，二次确认、guard、before/after 展示与 13.3 的高风险要求不因入口不同而减省；
+- 安全中心不提供任何“一键处理”，每个操作仍是独立、显式确认的交易。
+
+---
+
+### 9.24 代办注册与接管（服务商模式）
+
+优先级 P1。本节全部基于既有合约能力，无新增接口。
+
+#### 场景
+
+新用户的钱包地址往往没有任何 gas，无法自行发起注册——这是传统 DNS 里由注册商代办的同一个问题。因此支持代办：服务商 B 用自己的钱包发起 `registerName`，把 asset owner 指定为用户 A 的地址；交易由 B 付费，名称从第一天起就属于 A（对 A 是免手续费体验）。
+
+为了让 B 能在 A 授权下继续代办后续操作，B 在同一笔注册交易中写入以 B 为 principal 的 controller rule。产品语言把这类授权称为“请求秘钥”：A 始终是最大权限方，随时可以单方面收回，也可以中途把授权从服务商 1 换到服务商 2。
+
+#### 现状映射（Beta2.2 全部可用）
+
+| 产品概念 | 链上机制 |
+| --- | --- |
+| 代办注册 | 顶级注册公开（`CallAuthority.role = None`），`registerName` 的 asset owner 可指定为任意地址（9.4） |
+| 请求秘钥（授权服务商） | 注册时的 initial controller rules，或后续 `setControllerPolicy`（9.13） |
+| 收回请求秘钥 | A 作为 effective owner 调用 `setControllerPolicy` 全量替换，清空或不再包含 B 的 rule |
+| 更换服务商 | 同一替换调用，把 controller principal 从服务商 1 换成服务商 2 |
+| 代付续期 | `renewName` 无 authority 要求，B 可直接为 A 的名称续期（9.5） |
+
+#### 接管提示
+
+对一般用户，这套机制以“服务商”概念呈现，不展开 controller 术语。体系鼓励用户最终自付 gas、自主管理。满足以下条件时，WebUI 在“我的账号与资产”和安全中心显示接管引导：
+
+- 当前钱包持有名称（有资产）；
+- 钱包地址已有可用 gas（能自行发起交易；余额通过钱包 Provider 查询，不属于业务状态）；
+- 有迹象表明名称仍存在代办授权。
+
+引导文案：你已经有自己的手续费，建议尽早通知服务商并收回代办授权，改为自主管理。
+
+受 9.13 所述查询缺口限制（bns-server 无 `controller.get_policy`），“是否仍存在代办授权”当前只能从事件（controller policy 相关事件的 policy hash 非零）或本地记录推断；UI 必须标注推断来源，不得断言。缺口补齐（17.1 第 4 条）后可升级为确定性提示。
+
+#### 风险边界
+
+- 代办不改变授权模型：合约始终按 `msg.sender` 校验，B 只能执行 rule 允许的 doc type 与 permission；
+- “请求秘钥”不得映射为 authority key（authentication）——那等于把 owner 级权限交给服务商；WebUI 的代办流程只生成 controller rule；
+- 收回操作是 9.13 的全量替换语义，确认页必须提示“本次调用会替换全部现有规则”；A 若还有其他 controller 授权，需一并重新填写。
+
+---
+
 ## 10. 合约写接口映射
 
 所有调用目标均为 BNS Proxy。
@@ -1254,7 +1505,7 @@ GET /1.0/identifiers/did:bns:{name}?type={doc_type}
 | `releaseName` | Release/Tombstone | Owner | name state、owner | P0 |
 | `setNamespacePolicy` | Namespace | Owner/Controller | name state、owner | P1 |
 | `updateAuthorityKeys` | Authority keys | Owner | name state、owner、authority set/key | P1 |
-| `setMinDocumentIat` | Owner IAT floor | Owner | name state、owner | P1 |
+| `setMinDocumentIat` | 吊销历史签发（Owner IAT floor） | Owner | name state、owner | P1 |
 | `publishDocument` | 发布/更新文档 | Owner/Controller | name state、owner、document | P0 |
 | `revokeDocument` | 撤销文档 | Owner/Controller | name state、owner、document | P0 |
 | `setControllerPolicy` | 替换 controller rules | Owner | name state、owner、events | P1，受查询缺口限制 |
@@ -1292,10 +1543,10 @@ Router/Proxy 治理方法 `addFacets`、`replaceFacet`、`removeFacet`、`upgrad
 | `authority.get_key` | `{name, kid}` | `AuthorityKey \| null` | 已知 key 查询 |
 | `document.resolve` | `{name, doc_type}` | `ResolveResult` | 当前文档 |
 | `document.get_version` | `{name, doc_type, version}` | `DocumentState \| null` | 历史版本 |
-| `name.query_by_addr` | `{address, cursor, limit}` | `BnsNamePage` | 我持有的名称 |
+| `name.query_by_addr` | `{address, cursor, limit}` | `BnsNamePage` | 我的账号与资产（按 asset_owner） |
 | `tx.query_state` | `{tx_hash}` | `BnsTxState` | 交易跟踪 |
-| `tx.submit_raw` | `{raw_tx}` | `{tx_hash}` | 实际存在；普通 WebUI 禁用 |
-| `tx.prepare` | `{from, calldata}` | nonce/gas/fee/chain/contract | 实际存在；普通钱包流程不依赖 |
+| `tx.submit_raw` | `{raw_tx}` | `{tx_hash}` | 仅中继投递（测试路径）使用，见 8.5 |
+| `tx.prepare` | `{from, calldata}` | nonce/gas/fee/chain/contract | 仅中继投递使用；直连流程不依赖 |
 | `events.list` | `{from_seq, limit}` | `EventLogRecord[]` | 活动记录 |
 | `checkpoint.latest` | `{}` | `LogCheckpoint \| null` | 高级只读 |
 
@@ -1495,7 +1746,8 @@ kRPC `sys` 支持可选 session token。若部署要求 token：
 
 - bns-server 健康和 `system.info`；
 - EIP-1193/EIP-6963/WalletConnect；
-- 搜索、名称详情、我的名称；
+- 搜索、名称详情；
+- 我的账号与资产：账号切换、作品 / 买来的资产分组（9.3）；
 - 顶级名称注册；
 - 续期；
 - semantic owner；
@@ -1518,6 +1770,8 @@ kRPC `sys` 支持可选 session token。若部署要求 token：
 - min document iat；
 - applyMutations；
 - DID Resolver 图形化；
+- 安全中心场景化引导（9.23）；
+- 代办注册与接管提示（9.24，受 controller 查询缺口限制）；
 - 高级 raw data 和导入导出。
 
 ### 16.3 P2：协议运维
@@ -1528,6 +1782,33 @@ kRPC `sys` 支持可选 session token。若部署要求 token：
 - 审计与治理流程。
 
 P2 需要独立治理 PRD，不直接继承普通钱包交互。
+
+### 16.4 未来预留（不在任何已排期版本）
+
+以下内容来自产品规划，链上与 bns-server 均未实现。列出的目的：给 UI 预留信息位与结构，并防止 v1 文案做出与未来机制矛盾的承诺。本节不得作为当前功能的开发依据。
+
+#### 使用权与购买收据
+
+- 名称资产可标记为付费使用；购买使用权得到一张公开收据，任何人随时可验证“Alice 购买了 Bob 某资产的使用权”；
+- 君子协议定位：不做强 DRM，收据即全部凭证，不引入更复杂的机制；
+- 消费侧体验（类 Steam 的“我的库”）是独立的 C 端产品域；本 WebUI 未来只需要展示购买收据，不承载浏览与消费；
+- v1：非目标（3.2），仅在 5.1 的资产分组中保留概念位。
+
+#### 名称经济模型
+
+- 长度 ≥ 8 字符的名称默认是永久名称：持有只有合约调用成本，没有维护费用；
+- 存在一套确定性评分机制：长度 < 8 字符的名称必然落在阈值之内成为高价值名称；≥ 8 字符的名称也可能经算法判定为高价值名称。高价值名称进入经济模型：持有需要按时间支付维护费用，类似传统 DNS 的按年注册费——这是对稀缺资源不得不做的事；
+- 生命周期：欠费后名称由活动（active）转为停用（deactive），最终失效；失效后回到未注册状态，任何人可重新注册；
+- 续期即充值：任何人都可以给任何名称注入维护费用（公共行为，与 9.5 的定位一致），金额按当时价格即时换算并立刻更新有效期，一次性、不可退回，与是否使用名称无关；价格是否浮动另行定义；
+- 经济模型名称的 ban 即持有：禁用期间维护费用不可少，需一次性预付整个禁用期（例如 ban 三年需一次交足三年费用）；断供则走正常失效流程；
+- 该方向 ENS 已有大量实践，规则预计与 ENS 接近；BNS 现阶段专注名称用途而非名称经济，实现节奏靠后；
+- 对 v1 UI 的预留要求：名称详情已展示有效期 / 续费时间（9.2）；预留“名称类别”（永久 / 高价值）展示位；9.5 的续期交互框架在金额换算模型接入后保持不变。
+
+#### 资产股权化
+
+- 未来可能支持购买名称资产的部分股权，前提是 owner 基于该名称发行 token；
+- 与“我买来的资产”（5.1）同属钱包维度的投资持有；
+- v1 不实现，不预留界面。
 
 ---
 
@@ -1552,7 +1833,8 @@ P2 需要独立治理 PRD，不直接继承普通钱包交互。
 4. `controller.get_policy`
    - 完整 rules；
    - policy hash；
-   - policy sequence。
+   - policy sequence；
+   - 同时解锁 9.13 的常规管理与 9.24 的确定性接管提示。
 5. `alias.get`
    - 不依赖某个文档存在。
 6. `events.list` 增加 name/doc type/event type 过滤。
@@ -1577,7 +1859,10 @@ P2 需要独立治理 PRD，不直接继承普通钱包交互。
 ### 18.1 读写边界
 
 - Network 面板证明所有业务状态请求都发往 `/kapi/bns` 或 DID Resolver；
-- 普通钱包写操作不调用 `tx.prepare` 或 `tx.submit_raw`；
+- 生产部署（`deliveryMode = wallet_direct`）的写操作不调用 `tx.prepare` 或 `tx.submit_raw`；
+- 中继投递默认关闭，且无法从用户界面开启；
+- 钱包不支持 `eth_signTransaction` 时，中继模式在进入写表单阶段即给出拒绝与替代方案，
+  不会走到弹钱包才失败；
 - 所有写交易的 `to` 均为 `system.info.contract_address`；
 - 不向 Facet 地址发交易。
 
@@ -1596,7 +1881,9 @@ P2 需要独立治理 PRD，不直接继承普通钱包交互。
 - 完成 stale name seq、stale parent seq、stale document version 测试；
 - 4097-byte inline 文档在钱包前被阻断；
 - 二级以上深度名称在钱包前被阻断；
-- Tombstone 需要强确认且完成后显示不可重新注册。
+- Tombstone 需要强确认且完成后显示不可重新注册；
+- 多顶级名称的账号切换与作品 / 买来的资产分组按 9.3 规则归组正确，受让二级名称显示“仅持有”状态；
+- 安全中心各场景卡片可进入对应流程，确认要求与直接入口完全一致。
 
 ### 18.4 一致性
 
@@ -1622,6 +1909,8 @@ P2 需要独立治理 PRD，不直接继承普通钱包交互。
 - Desktop + Mobile 信息架构；
 - 钱包连接和网络错误全状态；
 - 名称详情各 tab；
+- 账号切换器与账号 / 资产分组视图；
+- 安全中心场景卡片与吊销 / 永久禁用 / 接管引导文案；
 - 注册、文档、转移、authority、policy、危险操作流程；
 - 交易中心状态机；
 - 空状态、Indexer 延迟和服务故障态；
@@ -1630,10 +1919,11 @@ P2 需要独立治理 PRD，不直接继承普通钱包交互。
 ### 前端
 
 - 聚合 IBns ABI；
-- EIP-1193/EIP-6963/WalletConnect adapter；
+- EIP-1193/EIP-6963/WalletConnect adapter，含 `eth_signTransaction` 能力探测；
 - kRPC Client 与 BNS envelope decoder；
 - Principal、CallAuthority、MutationGuard builder；
 - bytes32 label/hash、address bytes、inline SHA-256 codec；
+- 交易投递策略（直连 / 中继）及其可用性预检；
 - transaction state machine；
 - custom error decoder；
 - 本地交易恢复；
