@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
+    "dev:live": "vite --mode live --port 5179",
     "build": "tsc -b && vite build",
     "check": "tsc -b",
     "preview": "vite preview",
