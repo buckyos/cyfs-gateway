@@ -7,7 +7,11 @@
     "dev": "vite",
     "build": "tsc -b && vite build",
     "check": "tsc -b",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:live": "BNS_LIVE_URL=https://bns.buckyos.io vitest run src/bns_model/__tests__/live.test.ts",
+    "capture:fixtures": "node scripts/capture-fixtures.mjs > src/bns_model/__tests__/fixtures/live_responses.json"
   },
   "dependencies": {
     "clsx": "^2.1.1",
@@ -22,6 +26,7 @@
     "@types/react-dom": "^19.2.3",
     "@vitejs/plugin-react": "^6.0.1",
     "typescript": "~5.9.3",
-    "vite": "^8.0.1"
+    "vite": "^8.0.1",
+    "vitest": "^4.1.10"
   }
 }
