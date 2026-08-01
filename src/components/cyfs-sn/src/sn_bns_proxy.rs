@@ -58,6 +58,11 @@ pub struct SNBnsProxyConfig {
     /// publish_document）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allowed_operations: Option<Vec<String>>,
+    /// EIP-1559 fee source. `dynamic` uses the BNS server `tx.prepare`
+    /// suggestion; `zero` keeps its nonce/gas estimate but signs with zero fee
+    /// caps for chains that explicitly accept fee-free transactions.
+    #[serde(default)]
+    pub tx_fee_mode: SnBnsTxFeeMode,
 }
 
 impl SNBnsProxyConfig {
@@ -88,6 +93,14 @@ impl SNBnsProxyConfig {
         }
         Ok(operations)
     }
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SnBnsTxFeeMode {
+    #[default]
+    Dynamic,
+    Zero,
 }
 
 /// 一把 controller key 的配置。私钥来源三选一：env / file / inline。

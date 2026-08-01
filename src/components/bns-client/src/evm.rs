@@ -391,6 +391,7 @@ pub struct BnsEvmControllerClient {
     submission_lock: tokio::sync::Mutex<()>,
     receipt_wait: Option<BnsEvmReceiptWaitConfig>,
     dynamic_tx_params: bool,
+    zero_fee_override: bool,
 }
 
 impl BnsEvmControllerClient {
@@ -445,6 +446,7 @@ impl BnsEvmControllerClient {
             submission_lock: tokio::sync::Mutex::new(()),
             receipt_wait: None,
             dynamic_tx_params: false,
+            zero_fee_override: false,
         }
     }
 
@@ -486,6 +488,14 @@ impl BnsEvmControllerClient {
         self
     }
 
+    /// Override the BNS server fee suggestion with a zero-fee EIP-1559
+    /// transaction. This is intended for chains that explicitly accept
+    /// `max_fee_per_gas = 0` and `max_priority_fee_per_gas = 0`.
+    pub fn with_zero_fee_override(mut self, enabled: bool) -> Self {
+        self.zero_fee_override = enabled;
+        self
+    }
+
     pub fn signer_address(&self) -> Option<Address> {
         self.default_signer_address
     }
@@ -520,6 +530,15 @@ impl BnsEvmControllerClient {
                     ))
                     .await?;
                 let to = parse_address(&prepared.contract_address, "contract_address")?;
+                let (max_fee_per_gas, max_priority_fee_per_gas) =
+                    if self.zero_fee_override {
+                        (0, 0)
+                    } else {
+                        (
+                            prepared.max_fee_per_gas,
+                            prepared.max_priority_fee_per_gas,
+                        )
+                    };
                 Ok(build_eip1559_contract_tx(
                     call,
                     Eip1559TxParams {
@@ -527,8 +546,8 @@ impl BnsEvmControllerClient {
                         nonce: prepared.nonce,
                         to,
                         gas_limit: prepared.gas_limit,
-                        max_fee_per_gas: prepared.max_fee_per_gas,
-                        max_priority_fee_per_gas: prepared.max_priority_fee_per_gas,
+                        max_fee_per_gas,
+                        max_priority_fee_per_gas,
                         value: U256::ZERO,
                     },
                 ))

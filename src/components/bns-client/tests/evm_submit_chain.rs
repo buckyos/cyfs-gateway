@@ -331,8 +331,36 @@ async fn controller_auto_nonce_signs_and_submits_via_bns_server() {
     assert_eq!(decoded.recover_signer().unwrap(), ANVIL_ADDRESS);
     assert_eq!(decoded.tx().nonce, 5);
     assert_eq!(decoded.tx().chain_id, 31_337);
+    assert_eq!(decoded.tx().gas_limit, 120_000);
+    assert_eq!(decoded.tx().max_fee_per_gas, 3_000_000_000);
+    assert_eq!(decoded.tx().max_priority_fee_per_gas, 1_000_000_000);
     // 没有走 eth_sendRawTransaction（提交目标是 server，不是链 RPC）。
     assert!(eth.sent().is_empty());
+}
+
+#[tokio::test]
+async fn controller_can_override_bns_server_suggestion_with_zero_fees() {
+    let eth = MockEthRpc::start(5).await;
+    let server = Arc::new(CapturingBnsServer::new());
+    let controller = BnsEvmControllerClient::new_with_bns_server_submitter(
+        config(&eth.endpoint),
+        Arc::new(bns_client::StaticBnsEvmKeyManager::new(ANVIL_PRIVATE_KEY).unwrap()),
+        server.clone(),
+    )
+    .with_zero_fee_override(true);
+
+    let submission = controller
+        .register_name(&register_req("alice"))
+        .await
+        .unwrap();
+
+    assert_eq!(submission.nonce, 5);
+    let received = server.received();
+    assert_eq!(received.len(), 1);
+    let decoded = decode_signed_eip1559(&received[0]).unwrap();
+    assert_eq!(decoded.tx().gas_limit, 120_000);
+    assert_eq!(decoded.tx().max_fee_per_gas, 0);
+    assert_eq!(decoded.tx().max_priority_fee_per_gas, 0);
 }
 
 #[tokio::test]

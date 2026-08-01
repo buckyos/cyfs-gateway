@@ -2341,11 +2341,17 @@ impl SnServerFactory {
                         )
                     },
                 )?;
-            let evm_controller = Arc::new(BnsEvmControllerClient::new_with_bns_server_submitter(
-                evm_config.clone(),
-                Arc::new(key_manager),
-                client.clone(),
-            ));
+            let evm_controller = Arc::new(
+                BnsEvmControllerClient::new_with_bns_server_submitter(
+                    evm_config.clone(),
+                    Arc::new(key_manager),
+                    client.clone(),
+                )
+                .with_zero_fee_override(matches!(
+                    proxy_config.tx_fee_mode,
+                    crate::SnBnsTxFeeMode::Zero
+                )),
+            );
             let principal = Principal::chain_account(info.address_hex.clone());
             let mut controller_config = SnBnsControllerConfig::new(
                 principal.clone(),
@@ -2409,9 +2415,10 @@ impl SnServerFactory {
             )
         })?;
         info!(
-            "sn bns proxy enabled: controllers={:?} require_user_asset_owner={}",
+            "sn bns proxy enabled: controllers={:?} require_user_asset_owner={} tx_fee_mode={:?}",
             proxy.controller_addresses(),
-            require_user_asset_owner
+            require_user_asset_owner,
+            proxy_config.tx_fee_mode
         );
         Ok(Some(Arc::new(proxy)))
     }
@@ -3654,6 +3661,7 @@ users:
             "bns_server_url": "http://127.0.0.1:18080",
             "bns_proxy": {
                 "require_user_asset_owner": false,
+                "tx_fee_mode": "zero",
                 "controllers": [{
                     "id": "default",
                     "private_key": ANVIL_PRIVATE_KEY
@@ -3661,6 +3669,10 @@ users:
             }
         });
         let config: SNServerConfig = serde_json::from_value(config).unwrap();
+        assert_eq!(
+            config.bns_proxy.as_ref().unwrap().tx_fee_mode,
+            crate::SnBnsTxFeeMode::Zero
+        );
         let proxy = SnServerFactory::build_bns_proxy(
             &config,
             db.path().to_str().unwrap(),
@@ -3708,6 +3720,10 @@ users:
             }
         });
         let config: SNServerConfig = serde_json::from_value(config).unwrap();
+        assert_eq!(
+            config.bns_proxy.as_ref().unwrap().tx_fee_mode,
+            crate::SnBnsTxFeeMode::Dynamic
+        );
         let proxy = SnServerFactory::build_bns_proxy(
             &config,
             db.path().to_str().unwrap(),

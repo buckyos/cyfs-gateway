@@ -11,7 +11,7 @@ pub fn build_gateway_composition() -> anyhow::Result<GatewayComposition> {
     builder.install(DnsGatewayModule::new())?;
     builder.install(SocksGatewayModule::new())?;
     builder.install(TunGatewayModule::new())?;
-    builder.install(SnGatewayModule::new())?;
+    //builder.install(SnGatewayModule::new())?;
     builder.install(TrafficGatewayModule::new())?;
     builder.build()
 }

@@ -13,7 +13,13 @@ pnpm run dev        # http://localhost:5178/，默认演示模式
 pnpm run dev:live   # http://localhost:5179/，直连 https://bns.buckyos.io 真实数据（读 .env.live）
 pnpm run check      # tsc
 pnpm test           # bns_model 单测（243 个，离线）
+pnpm run seed:live  # ⚠ 会写测试链：用临时账号在 bns.buckyos.io 留一组名称状态供 UI 走查
 ```
+
+`seed:live`（`src/bns_model/__tests__/live_write.test.ts`）同时是 `write/abi.ts` 对真实合约的
+契约验证：viem 临时密钥 + 中继投递（tx.prepare → 本地签名 → tx.submit_raw，PRD 8.5.3），
+gas 从 anvil 默认 0 号账户（公开测试密钥）注资。场景：注册顶级名 → 发布 zone 文档 →
+注册二级名 → 转移二级名（semantic 保持 Unset，制造「仅持有」）→ 无关账号公共续期。
 
 ## 两种运行模式
 
