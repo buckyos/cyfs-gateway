@@ -26,6 +26,7 @@ REQUIRED_FILES = (
     "web3_gateway",
     "bns_dv",
     "web3_gateway.yaml",
+    "region-probe-config.json",
     "params.json",
     "sn_seed.yaml",
     "bns_dv_seed.yaml",
@@ -53,6 +54,7 @@ REQUIRED_DIRS = (
 DEPLOYMENT_CONFIG_FILES = (
     "params.json",
     "web3_gateway.yaml",
+    "region-probe-config.json",
     "machine.json",
     "sn_seed.yaml",
     "bns_dv_seed.yaml",

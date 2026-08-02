@@ -177,7 +177,7 @@ wait_for "contract code at $CONTRACT" 30 contract_deployed "$CONTRACT"
 # diff 干净）由 e2e_sn_seed 用独立 scratch rootfs 验证。
 if [ "$MODE" = "fresh" ]; then
   echo "[sn-dev-up] staging rootfs templates into $ROOTFS"
-  for f in web3_gateway.yaml local_dns.toml website.yaml params.json; do
+  for f in web3_gateway.yaml region-probe-config.json local_dns.toml website.yaml params.json; do
     cp "$APP_DIR/$f" "$ROOTFS/$f"
   done
 

@@ -20,6 +20,8 @@ servers:
     # C 类种子(激活码/sn_user 账号/user_domain 绑定)幂等导入;相对路径按
     # 配置目录解析,文件不存在时自动跳过(部署目录没有种子也能正常启动)。
     seed_path: "sn_seed.yaml"
+    # 激活前匿名发布的 Region 探测配置；相对路径按本配置目录解析。
+    region_probe_config_path: "region-probe-config.json"
     # 一体化 Web3 Gateway 同时承载 relay 数据面。SN 启动时幂等注册本节点，
     # 并为 seed 用户补齐动态 assignment；单 IP 部署按 relay 双地址契约填满
     # 两个 slot，DNS 输出时会去重。

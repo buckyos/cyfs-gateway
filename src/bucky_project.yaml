@@ -39,6 +39,7 @@ apps:
       - website.yaml
       - params.json
       - local_dns.toml
+      - region-probe-config.json
     clean_paths: []
 rust_env:
   OPENSSL_STATIC: "1"
