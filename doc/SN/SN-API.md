@@ -35,9 +35,15 @@ RPC method 必须使用 `namespace.method` 形式。当前实现不再做 legacy
 | `/kapi/sn/auth` | 公网 | 账号、会话、user/zone profile、user_domain、user DNS record | `auth.*`、`user.*`、`zone.*`、`domain.*` |
 | `/kapi/sn/deviceinfo` | 公网 | 设备在线态上报、在线态查询、OOD 连接信息解析 | `device.*`、`deviceinfo.*` |
 | `/kapi/sn/bns-proxy` | 公网 | SN 代付 gas 的受限 BNS 写代理 | `bns.publish_dns_txt`、`bns.publish_document` |
+| `/kapi/sn/region-probe-config.json` | 公网匿名 | 发布 Region 探测 schema v1 JSON | `GET`，非 kRPC |
 | `/` | 本机管理面（仅 loopback） | 运维管理、bns-proxy 内部/恢复方法 | `admin.clear_state_by_active_code`、`bns.publish_relay_assignment`、`bns.register_name_bootstrap` |
 
 路径是强约束。方法发到非首选路径会返回 unknown method，例如 `auth.check_username` 不能再发到 `/kapi/sn`；`bns.publish_relay_assignment` / `bns.register_name_bootstrap` 不能发到 `/kapi/sn/bns-proxy`，只能由本机 loopback 客户端发到 `/`。非 loopback 来源访问 `/` 统一返回 HTTP 404。
+
+Region 探测配置由 `SNServerConfig.region_probe_config_path` 指向的外部 JSON 文件提供，支持
+`ETag` / `If-None-Match` 和 `Cache-Control: public, max-age=300`。未配置返回 404；路径已配置
+但文件缺失、过期或校验失败返回 503，且不影响 `auth.register`。完整 schema 与客户端降级
+语义见《BuckyOS 边缘 Region 的探测需求》。
 
 ## 3. 认证规则
 

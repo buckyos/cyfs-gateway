@@ -1,22 +1,335 @@
 use ::kRPC::*;
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use jsonwebtoken::EncodingKey;
 use log::warn;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::net::IpAddr;
 use std::result::Result;
 use std::str::FromStr;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use url::Url;
 
 const SN_ROOT_PATH: &str = "/kapi/sn";
 const SN_AUTH_PATH: &str = "/kapi/sn/auth";
 const SN_DEVICEINFO_PATH: &str = "/kapi/sn/deviceinfo";
 const SN_BNS_PROXY_PATH: &str = "/kapi/sn/bns-proxy";
 const LEGACY_SN_BNS_PATH: &str = "/kapi/sn/bns";
+pub const SN_REGION_PROBE_CONFIG_PATH: &str = "/kapi/sn/region-probe-config.json";
+pub const SN_REGION_PROBE_SCHEMA_VERSION: u32 = 1;
+pub const SN_REGION_PROBE_MAX_CONFIG_BYTES: usize = 1024 * 1024;
+pub const SN_REGION_PROBE_MAX_REGIONS: usize = 64;
+pub const SN_REGION_PROBE_MAX_URLS_PER_REGION: usize = 16;
+pub const SN_REGION_PROBE_MAX_TOTAL_URLS: usize = 256;
+pub const SN_REGION_PROBE_FETCH_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SnRegionProbeMethod {
+    TcpConnect,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SnRegionProbeIpFamily {
+    Ipv4,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SnRegionProbePolicy {
+    pub probe_method: SnRegionProbeMethod,
+    pub samples_per_url: u8,
+    pub connect_timeout_ms: u64,
+    pub round_timeout_ms: u64,
+    pub max_concurrency: usize,
+    pub ip_family: SnRegionProbeIpFamily,
+    pub minimum_valid_urls: usize,
+    pub confident_ratio: f64,
+    pub cache_ttl_sec: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SnRegionProbeUrl {
+    pub id: String,
+    pub url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SnRegionProbeRegion {
+    pub region_id: String,
+    #[serde(default)]
+    pub priority: i32,
+    pub probe_urls: Vec<SnRegionProbeUrl>,
+}
+
+/// SN 发布的 Region 探测配置。未知 JSON 字段会被 serde 忽略，以允许 schema v1
+/// 在不破坏旧客户端的前提下增加可选字段。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SnRegionProbeConfig {
+    pub schema_version: u32,
+    pub config_version: String,
+    pub generated_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+    pub policy: SnRegionProbePolicy,
+    pub regions: Vec<SnRegionProbeRegion>,
+}
+
+impl SnRegionProbeConfig {
+    pub fn validate(&self) -> std::result::Result<(), String> {
+        self.validate_at(Utc::now())
+    }
+
+    pub fn validate_at(&self, now: DateTime<Utc>) -> std::result::Result<(), String> {
+        if self.schema_version != SN_REGION_PROBE_SCHEMA_VERSION {
+            return Err(format!(
+                "unsupported schema_version {}, expected {}",
+                self.schema_version, SN_REGION_PROBE_SCHEMA_VERSION
+            ));
+        }
+        let config_version = self.config_version.trim();
+        if config_version.is_empty()
+            || config_version.len() > 128
+            || config_version != self.config_version
+            || config_version.chars().any(char::is_control)
+        {
+            return Err(
+                "config_version must be 1..=128 non-control bytes without surrounding whitespace"
+                    .to_string(),
+            );
+        }
+        if self.generated_at >= self.expires_at {
+            return Err("expires_at must be later than generated_at".to_string());
+        }
+        if self.expires_at <= now {
+            return Err("region probe config is expired".to_string());
+        }
+
+        let policy = &self.policy;
+        if !(1..=3).contains(&policy.samples_per_url) {
+            return Err("samples_per_url must be in 1..=3".to_string());
+        }
+        if policy.connect_timeout_ms == 0 || policy.connect_timeout_ms > 10_000 {
+            return Err("connect_timeout_ms must be in 1..=10000".to_string());
+        }
+        if policy.round_timeout_ms == 0 || policy.round_timeout_ms > 30_000 {
+            return Err("round_timeout_ms must be in 1..=30000".to_string());
+        }
+        if policy.max_concurrency == 0 || policy.max_concurrency > 32 {
+            return Err("max_concurrency must be in 1..=32".to_string());
+        }
+        if policy.minimum_valid_urls < 2
+            || policy.minimum_valid_urls > SN_REGION_PROBE_MAX_URLS_PER_REGION
+        {
+            return Err(format!(
+                "minimum_valid_urls must be in 2..={}",
+                SN_REGION_PROBE_MAX_URLS_PER_REGION
+            ));
+        }
+        if !policy.confident_ratio.is_finite()
+            || policy.confident_ratio <= 0.0
+            || policy.confident_ratio > 1.0
+        {
+            return Err("confident_ratio must be finite and in (0, 1]".to_string());
+        }
+        if policy.cache_ttl_sec == 0 || policy.cache_ttl_sec > 21_600 {
+            return Err("cache_ttl_sec must be in 1..=21600".to_string());
+        }
+
+        if self.regions.is_empty() || self.regions.len() > SN_REGION_PROBE_MAX_REGIONS {
+            return Err(format!(
+                "regions must contain 1..={} entries",
+                SN_REGION_PROBE_MAX_REGIONS
+            ));
+        }
+
+        let mut region_ids = HashSet::new();
+        let mut probe_ids = HashSet::new();
+        let mut origins: HashMap<String, String> = HashMap::new();
+        let mut total_urls = 0usize;
+        for region in &self.regions {
+            if !is_canonical_sn_region_id(region.region_id.as_str()) {
+                return Err(format!(
+                    "invalid canonical region_id {:?}",
+                    region.region_id
+                ));
+            }
+            if !region_ids.insert(region.region_id.as_str()) {
+                return Err(format!("duplicate region_id {:?}", region.region_id));
+            }
+            if region.probe_urls.len() < 2
+                || region.probe_urls.len() > SN_REGION_PROBE_MAX_URLS_PER_REGION
+            {
+                return Err(format!(
+                    "region {} must contain 2..={} probe_urls",
+                    region.region_id, SN_REGION_PROBE_MAX_URLS_PER_REGION
+                ));
+            }
+            if policy.minimum_valid_urls > region.probe_urls.len() {
+                return Err(format!(
+                    "region {} has fewer probe_urls than minimum_valid_urls",
+                    region.region_id
+                ));
+            }
+            total_urls += region.probe_urls.len();
+            if total_urls > SN_REGION_PROBE_MAX_TOTAL_URLS {
+                return Err(format!(
+                    "config contains more than {} probe URLs",
+                    SN_REGION_PROBE_MAX_TOTAL_URLS
+                ));
+            }
+
+            for probe in &region.probe_urls {
+                if probe.id.is_empty()
+                    || probe.id.len() > 128
+                    || probe.id.trim() != probe.id
+                    || probe.id.chars().any(char::is_control)
+                {
+                    return Err(format!(
+                        "probe URL id in region {} must be 1..=128 non-control bytes without surrounding whitespace",
+                        region.region_id
+                    ));
+                }
+                if !probe_ids.insert(probe.id.as_str()) {
+                    return Err(format!("duplicate probe URL id {:?}", probe.id));
+                }
+
+                let parsed = Url::parse(probe.url.as_str())
+                    .map_err(|error| format!("invalid probe URL {:?}: {}", probe.url, error))?;
+                if parsed.scheme() != "https" {
+                    return Err(format!("probe URL {:?} must use https", probe.url));
+                }
+                if parsed.host_str().is_none()
+                    || !parsed.username().is_empty()
+                    || parsed.password().is_some()
+                {
+                    return Err(format!(
+                        "probe URL {:?} must be absolute and must not contain userinfo",
+                        probe.url
+                    ));
+                }
+                if parsed.port_or_known_default() != Some(443) {
+                    return Err(format!("probe URL {:?} must use port 443", probe.url));
+                }
+                if let Some(ip) = parsed
+                    .host_str()
+                    .and_then(|host| host.parse::<IpAddr>().ok())
+                {
+                    if !matches!(ip, IpAddr::V4(_)) || !is_public_sn_probe_ip(ip) {
+                        return Err(format!(
+                            "probe URL {:?} has a non-public or unsupported literal IP",
+                            probe.url
+                        ));
+                    }
+                }
+                let origin = parsed.origin().ascii_serialization();
+                if let Some(existing_region) = origins.get(origin.as_str()) {
+                    if existing_region != &region.region_id {
+                        return Err(format!(
+                            "probe origin {} is assigned to both {} and {}",
+                            origin, existing_region, region.region_id
+                        ));
+                    }
+                    return Err(format!(
+                        "probe origin {} is duplicated in region {}",
+                        origin, region.region_id
+                    ));
+                }
+                origins.insert(origin, region.region_id.clone());
+            }
+        }
+        Ok(())
+    }
+}
+
+pub fn is_canonical_sn_region_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value.split('-').all(|part| {
+            !part.is_empty()
+                && part
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+        })
+}
+
+/// 将注册请求中的非可信 Region 提示规范化为配置使用的 canonical ID。
+/// 空白、`_`、`/`、`.`、`-` 和重复分隔符会收敛为单个 `-`；其他字符、非 ASCII
+/// 字母数字以及超过 128 字节的输入会被拒绝。
+pub fn normalize_sn_region_id_hint(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() || value.len() > 128 {
+        return None;
+    }
+
+    let mut normalized = String::with_capacity(value.len());
+    let mut separator_pending = false;
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() {
+            if separator_pending && !normalized.is_empty() {
+                normalized.push('-');
+            }
+            separator_pending = false;
+            normalized.push(char::from(byte.to_ascii_lowercase()));
+        } else if matches!(byte, b'-' | b'_' | b'/' | b'.') || byte.is_ascii_whitespace() {
+            separator_pending = !normalized.is_empty();
+        } else {
+            return None;
+        }
+    }
+    (!normalized.is_empty()).then_some(normalized)
+}
+
+/// DNS 解析后、发起 TCP connect 前使用的保守公网地址检查。schema v1 只支持 IPv4；
+/// loopback、私网、链路本地、共享地址、文档地址、基准测试网段、多播和保留地址均拒绝。
+pub fn is_public_sn_probe_ip(ip: IpAddr) -> bool {
+    let IpAddr::V4(ip) = ip else {
+        return false;
+    };
+    let [a, b, c, _] = ip.octets();
+    !(a == 0
+        || a == 10
+        || a == 127
+        || (a == 100 && (64..=127).contains(&b))
+        || (a == 169 && b == 254)
+        || (a == 172 && (16..=31).contains(&b))
+        || (a == 192 && b == 0 && c == 0)
+        || (a == 192 && b == 0 && c == 2)
+        || (a == 192 && b == 88 && c == 99)
+        || (a == 192 && b == 168)
+        || (a == 198 && (b == 18 || b == 19))
+        || (a == 198 && b == 51 && c == 100)
+        || (a == 203 && b == 0 && c == 113)
+        || a >= 224)
+}
+
+pub fn parse_sn_region_probe_config(
+    json: &[u8],
+) -> std::result::Result<SnRegionProbeConfig, String> {
+    let config: SnRegionProbeConfig = serde_json::from_slice(json)
+        .map_err(|error| format!("parse region probe config JSON failed: {}", error))?;
+    config.validate()?;
+    Ok(config)
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SnRegionProbeConfigDocument {
+    pub config: SnRegionProbeConfig,
+    pub etag: Option<String>,
+    pub cache_control: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum SnRegionProbeConfigFetch {
+    Modified(SnRegionProbeConfigDocument),
+    NotModified,
+    NotConfigured,
+}
 
 /// `aud` claim of a device-signed SN access token. SN 账号 token 的 aud 是
 /// `sn`，设备 token 用独立 aud 隔离，两边的校验路径互不接受对方的 token。
@@ -88,6 +401,156 @@ fn normalize_sn_url(sn_url: &str, target: SnRpcTarget) -> String {
     }
 
     format!("{}{}", trimmed, path)
+}
+
+fn normalize_sn_region_probe_url(sn_url: &str) -> Result<Url, RPCErrors> {
+    let mut url = Url::parse(sn_url.trim()).map_err(|error| {
+        RPCErrors::ReasonError(format!(
+            "invalid SN base URL for region probe config: {}",
+            error
+        ))
+    })?;
+    if url.scheme() != "https" {
+        return Err(RPCErrors::ReasonError(
+            "region probe config must be fetched from the target SN over HTTPS".to_string(),
+        ));
+    }
+    if url.host_str().is_none() || !url.username().is_empty() || url.password().is_some() {
+        return Err(RPCErrors::ReasonError(
+            "SN region probe config URL must have a host and no userinfo".to_string(),
+        ));
+    }
+    url.set_query(None);
+    url.set_fragment(None);
+
+    let trimmed_path = url.path().trim_end_matches('/');
+    let mut base_path = trimmed_path;
+    for known_suffix in [
+        SN_REGION_PROBE_CONFIG_PATH,
+        SN_BNS_PROXY_PATH,
+        SN_DEVICEINFO_PATH,
+        SN_AUTH_PATH,
+        LEGACY_SN_BNS_PATH,
+        SN_ROOT_PATH,
+    ] {
+        if let Some(base) = trimmed_path.strip_suffix(known_suffix) {
+            base_path = base;
+            break;
+        }
+    }
+    url.set_path(format!("{}{}", base_path, SN_REGION_PROBE_CONFIG_PATH).as_str());
+    Ok(url)
+}
+
+/// 匿名获取目标 SN 的 Region 探测配置。重定向被禁用，响应体和总耗时均有本地上限。
+/// `304` 与 `404` 作为正常降级结果返回；网络错误、其他状态或非法配置返回错误，调用方
+/// 应按激活流程尝试缓存或 fail open，而不是阻断 `auth.register`。
+pub async fn fetch_sn_region_probe_config(
+    sn_url: &str,
+    etag: Option<&str>,
+) -> Result<SnRegionProbeConfigFetch, RPCErrors> {
+    let url = normalize_sn_region_probe_url(sn_url)?;
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(SN_REGION_PROBE_FETCH_TIMEOUT)
+        .build()
+        .map_err(|error| {
+            RPCErrors::ReasonError(format!(
+                "build SN region probe HTTP client failed: {}",
+                error
+            ))
+        })?;
+    let mut request = client
+        .get(url.clone())
+        .header(reqwest::header::ACCEPT, "application/json");
+    if let Some(etag) = etag {
+        let value = reqwest::header::HeaderValue::from_str(etag).map_err(|error| {
+            RPCErrors::ReasonError(format!("invalid cached region probe ETag: {}", error))
+        })?;
+        request = request.header(reqwest::header::IF_NONE_MATCH, value);
+    }
+    let mut response = request.send().await.map_err(|error| {
+        RPCErrors::ReasonError(format!(
+            "fetch SN region probe config from {} failed: {}",
+            url, error
+        ))
+    })?;
+
+    match response.status() {
+        reqwest::StatusCode::NOT_MODIFIED => return Ok(SnRegionProbeConfigFetch::NotModified),
+        reqwest::StatusCode::NOT_FOUND => return Ok(SnRegionProbeConfigFetch::NotConfigured),
+        reqwest::StatusCode::OK => {}
+        status => {
+            return Err(RPCErrors::ReasonError(format!(
+                "fetch SN region probe config from {} returned HTTP {}",
+                url, status
+            )));
+        }
+    }
+
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    if !content_type
+        .split(';')
+        .next()
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("application/json"))
+    {
+        return Err(RPCErrors::ReasonError(format!(
+            "SN region probe config from {} has unsupported Content-Type {:?}",
+            url, content_type
+        )));
+    }
+    if response
+        .content_length()
+        .is_some_and(|length| length > SN_REGION_PROBE_MAX_CONFIG_BYTES as u64)
+    {
+        return Err(RPCErrors::ReasonError(format!(
+            "SN region probe config from {} exceeds {} bytes",
+            url, SN_REGION_PROBE_MAX_CONFIG_BYTES
+        )));
+    }
+
+    let response_etag = response
+        .headers()
+        .get(reqwest::header::ETAG)
+        .and_then(|value| value.to_str().ok())
+        .map(ToString::to_string);
+    let cache_control = response
+        .headers()
+        .get(reqwest::header::CACHE_CONTROL)
+        .and_then(|value| value.to_str().ok())
+        .map(ToString::to_string);
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|error| {
+        RPCErrors::ReasonError(format!(
+            "read SN region probe config from {} failed: {}",
+            url, error
+        ))
+    })? {
+        if body.len().saturating_add(chunk.len()) > SN_REGION_PROBE_MAX_CONFIG_BYTES {
+            return Err(RPCErrors::ReasonError(format!(
+                "SN region probe config from {} exceeds {} bytes",
+                url, SN_REGION_PROBE_MAX_CONFIG_BYTES
+            )));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    let config = parse_sn_region_probe_config(body.as_slice()).map_err(|error| {
+        RPCErrors::ReasonError(format!(
+            "invalid SN region probe config from {}: {}",
+            url, error
+        ))
+    })?;
+    Ok(SnRegionProbeConfigFetch::Modified(
+        SnRegionProbeConfigDocument {
+            config,
+            etag: response_etag,
+            cache_control,
+        },
+    ))
 }
 
 fn new_sn_krpc(sn_url: &str, session_token: Option<String>, target: SnRpcTarget) -> Box<kRPC> {
@@ -1057,7 +1520,42 @@ pub async fn get_real_sn_host_name(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Duration as ChronoDuration;
     use serde_json::json;
+
+    fn valid_region_probe_config_json() -> Value {
+        let now = Utc::now();
+        json!({
+            "schema_version": 1,
+            "config_version": "test-v1",
+            "generated_at": (now - ChronoDuration::minutes(1)).to_rfc3339(),
+            "expires_at": (now + ChronoDuration::hours(1)).to_rfc3339(),
+            "policy": {
+                "probe_method": "tcp_connect",
+                "samples_per_url": 2,
+                "connect_timeout_ms": 1500,
+                "round_timeout_ms": 3000,
+                "max_concurrency": 8,
+                "ip_family": "ipv4",
+                "minimum_valid_urls": 2,
+                "confident_ratio": 0.75,
+                "cache_ttl_sec": 21600
+            },
+            "regions": [{
+                "region_id": "us-west",
+                "priority": 100,
+                "probe_urls": [{
+                    "id": "us-west-a",
+                    "url": "https://a.us-west.probe.example/path",
+                    "provider": "provider-a"
+                }, {
+                    "id": "us-west-b",
+                    "url": "https://b.us-west.probe.example/"
+                }]
+            }],
+            "future_optional_field": {"ignored": true}
+        })
+    }
 
     #[test]
     fn normalize_sn_url_routes_every_known_base_to_the_requested_target() {
@@ -1084,6 +1582,99 @@ mod tests {
                 normalize_sn_url(base, SnRpcTarget::BnsProxy),
                 "https://sn.example/kapi/sn/bns-proxy"
             );
+        }
+    }
+
+    #[test]
+    fn region_probe_url_uses_anonymous_resource_on_the_same_https_origin() {
+        for base in [
+            "https://sn.example",
+            "https://sn.example/kapi/sn",
+            "https://sn.example/kapi/sn/auth",
+            "https://sn.example/kapi/sn/region-probe-config.json",
+        ] {
+            assert_eq!(
+                normalize_sn_region_probe_url(base).unwrap().as_str(),
+                "https://sn.example/kapi/sn/region-probe-config.json"
+            );
+        }
+        assert!(normalize_sn_region_probe_url("http://sn.example").is_err());
+        assert!(normalize_sn_region_probe_url("https://user@sn.example").is_err());
+    }
+
+    #[test]
+    fn region_probe_config_accepts_schema_v1_and_ignores_future_fields() {
+        let bytes = serde_json::to_vec(&valid_region_probe_config_json()).unwrap();
+        let config = parse_sn_region_probe_config(bytes.as_slice()).unwrap();
+        assert_eq!(config.schema_version, SN_REGION_PROBE_SCHEMA_VERSION);
+        assert_eq!(config.config_version, "test-v1");
+        assert_eq!(config.regions[0].region_id, "us-west");
+        assert_eq!(config.regions[0].probe_urls.len(), 2);
+    }
+
+    #[test]
+    fn region_probe_config_rejects_invalid_ids_urls_and_expiry() {
+        let mut duplicate_origin = valid_region_probe_config_json();
+        duplicate_origin["regions"][0]["probe_urls"][1]["url"] =
+            json!("https://a.us-west.probe.example/other-path");
+        assert!(
+            parse_sn_region_probe_config(&serde_json::to_vec(&duplicate_origin).unwrap())
+                .unwrap_err()
+                .contains("duplicated")
+        );
+
+        let mut invalid_region = valid_region_probe_config_json();
+        invalid_region["regions"][0]["region_id"] = json!("US_WEST");
+        assert!(
+            parse_sn_region_probe_config(&serde_json::to_vec(&invalid_region).unwrap())
+                .unwrap_err()
+                .contains("region_id")
+        );
+
+        let mut unsafe_port = valid_region_probe_config_json();
+        unsafe_port["regions"][0]["probe_urls"][0]["url"] =
+            json!("https://a.us-west.probe.example:8443/");
+        assert!(
+            parse_sn_region_probe_config(&serde_json::to_vec(&unsafe_port).unwrap())
+                .unwrap_err()
+                .contains("port 443")
+        );
+
+        let mut private_literal = valid_region_probe_config_json();
+        private_literal["regions"][0]["probe_urls"][0]["url"] = json!("https://127.0.0.1/");
+        assert!(
+            parse_sn_region_probe_config(&serde_json::to_vec(&private_literal).unwrap())
+                .unwrap_err()
+                .contains("non-public")
+        );
+
+        let mut expired = valid_region_probe_config_json();
+        expired["generated_at"] = json!((Utc::now() - ChronoDuration::hours(2)).to_rfc3339());
+        expired["expires_at"] = json!((Utc::now() - ChronoDuration::hours(1)).to_rfc3339());
+        assert!(
+            parse_sn_region_probe_config(&serde_json::to_vec(&expired).unwrap())
+                .unwrap_err()
+                .contains("expired")
+        );
+    }
+
+    #[test]
+    fn region_hint_normalization_matches_register_contract() {
+        assert_eq!(
+            normalize_sn_region_id_hint("  US__West / 2  ").as_deref(),
+            Some("us-west-2")
+        );
+        assert_eq!(
+            normalize_sn_region_id_hint("auto"),
+            Some("auto".to_string())
+        );
+        assert!(normalize_sn_region_id_hint("日本").is_none());
+        assert!(normalize_sn_region_id_hint("us@west").is_none());
+        assert!(is_canonical_sn_region_id("us-west-2"));
+        assert!(!is_canonical_sn_region_id("US-west"));
+        assert!(is_public_sn_probe_ip("8.8.8.8".parse().unwrap()));
+        for address in ["127.0.0.1", "10.0.0.1", "192.168.1.1", "203.0.113.1", "::1"] {
+            assert!(!is_public_sn_probe_ip(address.parse().unwrap()));
         }
     }
 

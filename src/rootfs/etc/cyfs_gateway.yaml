@@ -306,6 +306,7 @@ stacks:
   #   device_jwt:                 # optional; DEV for host/sn.<host>/aliases TXT only
   #     - "<jwt>"                 # omit all three when self bootstrap is not required
   #   aliases: []                 # optional
+  #   region_probe_config_path: ./region-probe-config.json # optional anonymous Region probe config
   #   bns_server_url: http://127.0.0.1:13450  # required base URL; no /kapi/bns
   #   bns_proxy:                  # optional; presence enables write capability
   #     require_user_asset_owner: true

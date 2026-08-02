@@ -1,4 +1,5 @@
 use crate::{sn_err, SnDeviceInfoDBRef, SnDeviceState, SnError, SnErrorCode, SnResult};
+use cyfs_gateway_api::normalize_sn_region_id_hint;
 use log::{debug, info, warn};
 use serde::{Deserialize, Serialize};
 use sfo_ip::{CachePolicy, Searcher};
@@ -1423,7 +1424,7 @@ impl SqliteSnRelayManager {
         let preferred_region = req
             .preferred_region
             .as_deref()
-            .and_then(Self::normalize_match_label);
+            .and_then(normalize_sn_region_id_hint);
         if req.preferred_region.is_some() && preferred_region.is_none() {
             debug!(
                 "relay allocation ignored invalid preferred region: zone={}",
@@ -1566,7 +1567,7 @@ impl SqliteSnRelayManager {
         let preferred_region = req
             .preferred_region
             .as_deref()
-            .and_then(Self::normalize_match_label);
+            .and_then(normalize_sn_region_id_hint);
         sqlx::query(
             "INSERT INTO relay_allocation_pending
                 (zone, preferred_region, reason, source_version, attempts, last_error,
@@ -1602,7 +1603,7 @@ impl SqliteSnRelayManager {
         let preferred_region = req
             .preferred_region
             .as_deref()
-            .and_then(Self::normalize_match_label);
+            .and_then(normalize_sn_region_id_hint);
         sqlx::query(
             "INSERT INTO relay_allocation_pending
                 (zone, preferred_region, reason, source_version, attempts, last_error,
@@ -1700,7 +1701,7 @@ impl SqliteSnRelayManager {
         let preferred_region = req
             .preferred_region
             .as_deref()
-            .and_then(Self::normalize_match_label);
+            .and_then(normalize_sn_region_id_hint);
         if req.preferred_region.is_some() && preferred_region.is_none() {
             debug!(
                 "relay allocation ignored invalid preferred region: zone={}",

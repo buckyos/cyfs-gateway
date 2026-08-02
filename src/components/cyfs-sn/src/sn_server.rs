@@ -38,7 +38,10 @@ use bns_client::{
 };
 use buckyos_kit::{get_buckyos_service_data_dir, is_valid_name, NameType};
 pub use cyfs_gateway_api::SnOodInfo as OODInfo;
-use cyfs_gateway_api::{SnCheckActiveCodeResp, SnOodState};
+use cyfs_gateway_api::{
+    normalize_sn_region_id_hint, parse_sn_region_probe_config, SnCheckActiveCodeResp, SnOodState,
+    SnRegionProbeConfig, SN_REGION_PROBE_CONFIG_PATH, SN_REGION_PROBE_MAX_CONFIG_BYTES,
+};
 use cyfs_gateway_lib::server_err;
 use cyfs_gateway_lib::{
     get_gateway_main_config_dir, qa_json_to_rpc_request, DnsQueryResult,
@@ -54,13 +57,14 @@ use name_client::*;
 use name_lib::*;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 use std::{
     net::{IpAddr, Ipv4Addr},
     result::Result,
@@ -70,6 +74,214 @@ const CLEAR_STATE_ACTIVE_CODE: &str = "zX6cV7bN8mK9lJ0hG1fD";
 const RESERVED_USER_NAMES_FILE_ENV: &str = "BUCKYOS_SN_RESERVED_NAMES_FILE";
 const RESERVED_USER_NAMES_FILE: &str = "reserved_user_names.txt";
 const INTERNAL_ZONE_RESOLVER_ADDR: &str = "127.0.0.1:3180";
+const REGION_PROBE_HTTP_CACHE_MAX_AGE_SECS: u64 = 300;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum RegionProbeFileFingerprint {
+    Present {
+        len: u64,
+        modified: Option<SystemTime>,
+    },
+    Missing,
+}
+
+#[derive(Clone)]
+struct PublishedRegionProbeConfig {
+    config: SnRegionProbeConfig,
+    semantic_json: Arc<Value>,
+    body: Arc<[u8]>,
+    etag: Arc<str>,
+}
+
+#[derive(Clone)]
+enum RegionProbeConfigStatus {
+    NotConfigured,
+    Available(Arc<PublishedRegionProbeConfig>),
+    Unavailable(Arc<str>),
+}
+
+struct RegionProbeConfigFileState {
+    fingerprint: Option<RegionProbeFileFingerprint>,
+    status: RegionProbeConfigStatus,
+    last_accepted: Option<Arc<PublishedRegionProbeConfig>>,
+}
+
+#[derive(Default)]
+struct RegionProbeResponseMetrics {
+    ok: AtomicU64,
+    not_modified: AtomicU64,
+    not_found: AtomicU64,
+    unavailable: AtomicU64,
+}
+
+struct RegionProbeConfigPublisher {
+    path: Option<PathBuf>,
+    state: RwLock<RegionProbeConfigFileState>,
+    metrics: RegionProbeResponseMetrics,
+}
+
+impl RegionProbeConfigPublisher {
+    fn new(path: Option<PathBuf>) -> Self {
+        let publisher = Self {
+            path,
+            state: RwLock::new(RegionProbeConfigFileState {
+                fingerprint: None,
+                status: RegionProbeConfigStatus::NotConfigured,
+                last_accepted: None,
+            }),
+            metrics: RegionProbeResponseMetrics::default(),
+        };
+        publisher.refresh();
+        publisher
+    }
+
+    fn load_file(path: &Path) -> std::result::Result<PublishedRegionProbeConfig, String> {
+        let body = std::fs::read(path).map_err(|error| {
+            format!(
+                "read region probe config {} failed: {}",
+                path.display(),
+                error
+            )
+        })?;
+        if body.len() > SN_REGION_PROBE_MAX_CONFIG_BYTES {
+            return Err(format!(
+                "region probe config {} exceeds {} bytes",
+                path.display(),
+                SN_REGION_PROBE_MAX_CONFIG_BYTES
+            ));
+        }
+        let config = parse_sn_region_probe_config(body.as_slice()).map_err(|error| {
+            format!(
+                "validate region probe config {} failed: {}",
+                path.display(),
+                error
+            )
+        })?;
+        let semantic_json = serde_json::from_slice(body.as_slice()).map_err(|error| {
+            format!(
+                "parse region probe config {} for version tracking failed: {}",
+                path.display(),
+                error
+            )
+        })?;
+        let etag = format!("\"{}\"", hex::encode(Sha256::digest(body.as_slice())));
+        Ok(PublishedRegionProbeConfig {
+            config,
+            semantic_json: Arc::new(semantic_json),
+            body: Arc::from(body),
+            etag: Arc::from(etag),
+        })
+    }
+
+    fn refresh(&self) {
+        let Some(path) = self.path.as_ref() else {
+            return;
+        };
+        let metadata = std::fs::metadata(path);
+        let fingerprint = match metadata.as_ref() {
+            Ok(metadata) => RegionProbeFileFingerprint::Present {
+                len: metadata.len(),
+                modified: metadata.modified().ok(),
+            },
+            Err(_) => RegionProbeFileFingerprint::Missing,
+        };
+        if self
+            .state
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .fingerprint
+            .as_ref()
+            == Some(&fingerprint)
+        {
+            return;
+        }
+
+        let last_accepted = self
+            .state
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .last_accepted
+            .clone();
+        let status = match metadata {
+            Ok(metadata) if metadata.len() > SN_REGION_PROBE_MAX_CONFIG_BYTES as u64 => {
+                RegionProbeConfigStatus::Unavailable(Arc::from(format!(
+                    "region probe config {} exceeds {} bytes",
+                    path.display(),
+                    SN_REGION_PROBE_MAX_CONFIG_BYTES
+                )))
+            }
+            Ok(_) => match Self::load_file(path) {
+                Ok(published)
+                    if last_accepted.as_ref().is_some_and(|previous| {
+                        previous.config.config_version == published.config.config_version
+                            && previous.semantic_json != published.semantic_json
+                    }) =>
+                {
+                    RegionProbeConfigStatus::Unavailable(Arc::from(format!(
+                        "region probe config {} changed content without changing config_version {}",
+                        path.display(),
+                        published.config.config_version
+                    )))
+                }
+                Ok(published) => {
+                    info!(
+                        "SN region probe config loaded: path={} schema_version={} config_version={} regions={} etag={}",
+                        path.display(),
+                        published.config.schema_version,
+                        published.config.config_version,
+                        published.config.regions.len(),
+                        published.etag
+                    );
+                    RegionProbeConfigStatus::Available(Arc::new(published))
+                }
+                Err(error) => RegionProbeConfigStatus::Unavailable(Arc::from(error)),
+            },
+            Err(error) => RegionProbeConfigStatus::Unavailable(Arc::from(format!(
+                "stat region probe config {} failed: {}",
+                path.display(),
+                error
+            ))),
+        };
+        if let RegionProbeConfigStatus::Unavailable(error) = &status {
+            warn!("SN region probe config unavailable: {}", error);
+        }
+        let next_last_accepted = match &status {
+            RegionProbeConfigStatus::Available(published) => Some(published.clone()),
+            _ => last_accepted,
+        };
+        *self
+            .state
+            .write()
+            .unwrap_or_else(|error| error.into_inner()) = RegionProbeConfigFileState {
+            fingerprint: Some(fingerprint),
+            status,
+            last_accepted: next_last_accepted,
+        };
+    }
+
+    fn status(&self) -> RegionProbeConfigStatus {
+        self.refresh();
+        self.state
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .status
+            .clone()
+    }
+
+    fn record(&self, status: StatusCode) {
+        let counter = match status {
+            StatusCode::OK => &self.metrics.ok,
+            StatusCode::NOT_MODIFIED => &self.metrics.not_modified,
+            StatusCode::NOT_FOUND => &self.metrics.not_found,
+            _ => &self.metrics.unavailable,
+        };
+        let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
+        debug!(
+            "SN region probe config response: status={} count={}",
+            status, count
+        );
+    }
+}
 
 fn is_internal_zone_resolver_ingress(info: &StreamInfo) -> bool {
     info.dst_addr
@@ -228,6 +440,8 @@ pub struct SNServer {
     pkx_txt_resolver: DnsTxtResolverRef,
     /// `did:bns:<username>` owner document / authority key 读取（PKX 权威来源）。
     bns_owner_reader: Arc<BnsRpcDocumentReader>,
+    region_probe_config: Arc<RegionProbeConfigPublisher>,
+    region_probe_diagnosed_etag: Arc<RwLock<Option<String>>>,
 }
 
 impl SNServer {
@@ -351,6 +565,12 @@ impl SNServer {
         bns_client: BnsRpcClient,
         bns_proxy: Option<Arc<SnBnsProxy>>,
     ) -> ServerResult<Self> {
+        let region_probe_config = Arc::new(RegionProbeConfigPublisher::new(
+            server_config
+                .region_probe_config_path
+                .as_deref()
+                .map(resolve_region_probe_config_path),
+        ));
         let server_host = server_config.host;
         let server_ip = Self::parse_server_ip(server_config.ip.as_deref())?;
         let server_aliases = server_config.aliases;
@@ -397,7 +617,7 @@ impl SNServer {
                 .unwrap_or(DEFAULT_PKX_DOH_URL),
         );
 
-        Ok(SNServer {
+        let server = SNServer {
             id: server_config.id,
             auth_db,
             device_info_db,
@@ -410,7 +630,199 @@ impl SNServer {
             bns_proxy,
             pkx_txt_resolver,
             bns_owner_reader,
+            region_probe_config,
+            region_probe_diagnosed_etag: Arc::new(RwLock::new(None)),
+        };
+        server.diagnose_region_probe_relay_namespaces().await;
+        Ok(server)
+    }
+
+    async fn diagnose_region_probe_relay_namespaces(&self) {
+        let RegionProbeConfigStatus::Available(published) = self.region_probe_config.status()
+        else {
+            return;
+        };
+        if self
+            .region_probe_diagnosed_etag
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_deref()
+            == Some(published.etag.as_ref())
+        {
+            return;
+        }
+        let nodes = match self.auth_db.list_relay_nodes().await {
+            Ok(nodes) => nodes,
+            Err(error) => {
+                warn!(
+                    "cannot diagnose Region probe config against relay namespace: {}",
+                    error
+                );
+                return;
+            }
+        };
+        let mut relay_regions = HashSet::new();
+        for node in nodes {
+            if let Some(region) = node.region.as_deref().and_then(normalize_sn_region_id_hint) {
+                relay_regions.insert(region);
+            }
+            for tag in node.tags {
+                let Some((namespace, value)) = tag.split_once(':') else {
+                    continue;
+                };
+                if namespace.trim().eq_ignore_ascii_case("region") {
+                    if let Some(region) = normalize_sn_region_id_hint(value) {
+                        relay_regions.insert(region);
+                    }
+                }
+            }
+        }
+
+        for region in &published.config.regions {
+            if !relay_regions.contains(region.region_id.as_str()) {
+                warn!(
+                    "SN region probe config region has no currently registered relay namespace match: config_version={} region_id={}",
+                    published.config.config_version,
+                    region.region_id
+                );
+            }
+        }
+        *self
+            .region_probe_diagnosed_etag
+            .write()
+            .unwrap_or_else(|error| error.into_inner()) = Some(published.etag.to_string());
+        for relay_region in relay_regions {
+            if !published
+                .config
+                .regions
+                .iter()
+                .any(|region| region.region_id == relay_region)
+            {
+                debug!(
+                    "registered relay region is not advertised for probing: config_version={} region_id={}",
+                    published.config.config_version, relay_region
+                );
+            }
+        }
+    }
+
+    fn if_none_match_matches(value: &str, etag: &str) -> bool {
+        let expected = etag.strip_prefix("W/").unwrap_or(etag);
+        value.split(',').any(|candidate| {
+            let candidate = candidate.trim();
+            candidate == "*" || candidate.strip_prefix("W/").unwrap_or(candidate) == expected
         })
+    }
+
+    fn region_probe_response(
+        &self,
+        request: &http::Request<BoxBody<Bytes, ServerError>>,
+    ) -> http::Response<BoxBody<Bytes, ServerError>> {
+        if request.method() != Method::GET {
+            self.region_probe_config
+                .record(StatusCode::METHOD_NOT_ALLOWED);
+            return Response::builder()
+                .status(StatusCode::METHOD_NOT_ALLOWED)
+                .header("Access-Control-Allow-Origin", "*")
+                .header("Allow", "GET, OPTIONS")
+                .body(BoxBody::new(
+                    Full::new(Bytes::from_static(b"Method Not Allowed"))
+                        .map_err(|never| match never {})
+                        .boxed(),
+                ))
+                .unwrap();
+        }
+
+        match self.region_probe_config.status() {
+            RegionProbeConfigStatus::NotConfigured => {
+                self.region_probe_config.record(StatusCode::NOT_FOUND);
+                Response::builder()
+                    .status(StatusCode::NOT_FOUND)
+                    .header("Access-Control-Allow-Origin", "*")
+                    .header(
+                        "Cache-Control",
+                        format!("public, max-age={REGION_PROBE_HTTP_CACHE_MAX_AGE_SECS}"),
+                    )
+                    .body(BoxBody::new(
+                        Full::new(Bytes::from_static(b"Not Found"))
+                            .map_err(|never| match never {})
+                            .boxed(),
+                    ))
+                    .unwrap()
+            }
+            RegionProbeConfigStatus::Unavailable(error) => {
+                warn!("SN region probe config GET unavailable: {}", error);
+                self.region_probe_config
+                    .record(StatusCode::SERVICE_UNAVAILABLE);
+                Response::builder()
+                    .status(StatusCode::SERVICE_UNAVAILABLE)
+                    .header("Access-Control-Allow-Origin", "*")
+                    .header("Cache-Control", "no-store")
+                    .body(BoxBody::new(
+                        Full::new(Bytes::from_static(b"Region probe config unavailable"))
+                            .map_err(|never| match never {})
+                            .boxed(),
+                    ))
+                    .unwrap()
+            }
+            RegionProbeConfigStatus::Available(published) => {
+                if published.config.expires_at <= chrono::Utc::now() {
+                    warn!(
+                        "SN region probe config GET unavailable: config_version={} is expired",
+                        published.config.config_version
+                    );
+                    self.region_probe_config
+                        .record(StatusCode::SERVICE_UNAVAILABLE);
+                    return Response::builder()
+                        .status(StatusCode::SERVICE_UNAVAILABLE)
+                        .header("Access-Control-Allow-Origin", "*")
+                        .header("Cache-Control", "no-store")
+                        .body(BoxBody::new(
+                            Full::new(Bytes::from_static(b"Region probe config unavailable"))
+                                .map_err(|never| match never {})
+                                .boxed(),
+                        ))
+                        .unwrap();
+                }
+                let cache_control =
+                    format!("public, max-age={REGION_PROBE_HTTP_CACHE_MAX_AGE_SECS}");
+                if request
+                    .headers()
+                    .get(http::header::IF_NONE_MATCH)
+                    .and_then(|value| value.to_str().ok())
+                    .is_some_and(|value| {
+                        Self::if_none_match_matches(value, published.etag.as_ref())
+                    })
+                {
+                    self.region_probe_config.record(StatusCode::NOT_MODIFIED);
+                    return Response::builder()
+                        .status(StatusCode::NOT_MODIFIED)
+                        .header("Access-Control-Allow-Origin", "*")
+                        .header("Cache-Control", cache_control)
+                        .header("ETag", published.etag.as_ref())
+                        .body(BoxBody::new(
+                            Full::new(Bytes::new())
+                                .map_err(|never| match never {})
+                                .boxed(),
+                        ))
+                        .unwrap();
+                }
+
+                self.region_probe_config.record(StatusCode::OK);
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header("Access-Control-Allow-Origin", "*")
+                    .header("Content-Type", "application/json")
+                    .header("Cache-Control", cache_control)
+                    .header("ETag", published.etag.as_ref())
+                    .body(BoxBody::new(
+                        Full::new(Bytes::copy_from_slice(published.body.as_ref()))
+                            .map_err(|never| match never {})
+                            .boxed(),
+                    ))
+                    .unwrap()
+            }
+        }
     }
 
     pub fn name_info_cache(&self) -> NameInfoCacheRef {
@@ -1469,6 +1881,11 @@ impl HttpServer for SNServer {
                 .unwrap());
         }
 
+        if path == SN_REGION_PROBE_CONFIG_PATH {
+            self.diagnose_region_probe_relay_namespaces().await;
+            return Ok(self.region_probe_response(&request));
+        }
+
         if path.starts_with(SN_DID_RESOLVER_ROUTE_PREFIX) && request.method() == Method::GET {
             let did_str = path
                 .trim_start_matches(SN_DID_RESOLVER_ROUTE_PREFIX)
@@ -1787,6 +2204,16 @@ pub struct SnS2sRemoteProviderConfig {
     pub remote_public_key: String,
 }
 
+/// 相对路径按网关主配置目录解析，与 `seed_path` / local DNS 文件一致。
+pub fn resolve_region_probe_config_path(config_path: &str) -> PathBuf {
+    let path = Path::new(config_path);
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        get_gateway_main_config_dir().join(path)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SNServerConfig {
@@ -1807,6 +2234,11 @@ pub struct SNServerConfig {
     pub aliases: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub auth_data_dir: Option<String>,
+    /// 匿名发布到 `/kapi/sn/region-probe-config.json` 的 schema v1 JSON 文件。
+    /// 相对路径按网关主配置目录解析；未配置时该路径返回 404，文件无效时返回 503，
+    /// 两种情况都不影响 `auth.register`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub region_probe_config_path: Option<String>,
     /// C 类种子文件（sn_seed.yaml）路径；相对路径按网关主配置目录解析
     /// （与 local_dns 的 file_path 同语义）。文件缺失时跳过导入。
     #[serde(default)]
@@ -3922,6 +4354,26 @@ users:
         Arc<SNServer>,
         Arc<bns_indexer::CentralizedBnsRegistry<bns_indexer::SqliteBnsRegistryStore>>,
     ) {
+        build_sn_with_bns_proxy_and_region_config(
+            db_path,
+            auth_dir,
+            require_user_asset_owner,
+            fail_receipt_wait,
+            None,
+        )
+        .await
+    }
+
+    async fn build_sn_with_bns_proxy_and_region_config(
+        db_path: &str,
+        auth_dir: &std::path::Path,
+        require_user_asset_owner: bool,
+        fail_receipt_wait: bool,
+        region_probe_config_path: Option<&std::path::Path>,
+    ) -> (
+        Arc<SNServer>,
+        Arc<bns_indexer::CentralizedBnsRegistry<bns_indexer::SqliteBnsRegistryStore>>,
+    ) {
         let auth_db = SqliteSnAuthDB::new_by_path(db_path).await.unwrap();
         auth_db.initialize_database().await.unwrap();
         auth_db
@@ -3981,7 +4433,7 @@ users:
         )
         .unwrap();
 
-        let config = json!({
+        let mut config = json!({
             "id": "test-bns-proxy",
             "host": "buckyos.ai",
             "ip": "127.0.0.1",
@@ -3990,6 +4442,9 @@ users:
             "device_jwt": [],
             "auth_data_dir": auth_dir.to_str().unwrap(),
         });
+        if let Some(path) = region_probe_config_path {
+            config["region_probe_config_path"] = json!(path.to_str().unwrap());
+        }
         let config: SNServerConfig = serde_json::from_value(config).unwrap();
         let sn = Arc::new(
             SNServer::new(
@@ -4003,6 +4458,189 @@ users:
             .unwrap(),
         );
         (sn, registry)
+    }
+
+    fn test_region_probe_config(version: &str, include_eu: bool) -> Value {
+        let now = chrono::Utc::now();
+        let mut regions = vec![json!({
+            "region_id": "us-west",
+            "priority": 100,
+            "probe_urls": [{
+                "id": "us-west-a",
+                "url": "https://a.us-west.probe.example/",
+                "provider": "provider-a"
+            }, {
+                "id": "us-west-b",
+                "url": "https://b.us-west.probe.example/",
+                "provider": "provider-b"
+            }]
+        })];
+        if include_eu {
+            regions.push(json!({
+                "region_id": "eu-central",
+                "priority": 90,
+                "probe_urls": [{
+                    "id": "eu-central-a",
+                    "url": "https://a.eu-central.probe.example/"
+                }, {
+                    "id": "eu-central-b",
+                    "url": "https://b.eu-central.probe.example/"
+                }]
+            }));
+        }
+        json!({
+            "schema_version": 1,
+            "config_version": version,
+            "generated_at": (now - chrono::Duration::minutes(1)).to_rfc3339(),
+            "expires_at": (now + chrono::Duration::hours(1)).to_rfc3339(),
+            "policy": {
+                "probe_method": "tcp_connect",
+                "samples_per_url": 2,
+                "connect_timeout_ms": 1500,
+                "round_timeout_ms": 3000,
+                "max_concurrency": 8,
+                "ip_family": "ipv4",
+                "minimum_valid_urls": 2,
+                "confident_ratio": 0.75,
+                "cache_ttl_sec": 21600
+            },
+            "regions": regions
+        })
+    }
+
+    #[tokio::test]
+    async fn region_probe_config_is_anonymous_cached_and_fail_open() {
+        init_logging("sn", false);
+
+        let unconfigured_db = tempfile::NamedTempFile::with_suffix(".db").unwrap();
+        let unconfigured_auth = tempfile::tempdir().unwrap();
+        let (unconfigured, _) = build_sn_with_bns_proxy(
+            unconfigured_db.path().to_str().unwrap(),
+            unconfigured_auth.path(),
+            false,
+            false,
+        )
+        .await;
+        let unconfigured_addr = spawn_test_http_server(unconfigured).await;
+        let client = reqwest::Client::new();
+        let unconfigured_response = client
+            .get(format!(
+                "http://{}{}",
+                unconfigured_addr, SN_REGION_PROBE_CONFIG_PATH
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(unconfigured_response.status(), StatusCode::NOT_FOUND);
+
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("region-probe-config.json");
+        std::fs::write(
+            &config_path,
+            serde_json::to_vec_pretty(&test_region_probe_config("test-v1", false)).unwrap(),
+        )
+        .unwrap();
+        let db = tempfile::NamedTempFile::with_suffix(".db").unwrap();
+        let auth_dir = tempfile::tempdir().unwrap();
+        let (sn, _) = build_sn_with_bns_proxy_and_region_config(
+            db.path().to_str().unwrap(),
+            auth_dir.path(),
+            false,
+            false,
+            Some(&config_path),
+        )
+        .await;
+        let http_addr = spawn_test_http_server(sn).await;
+        let base_url = format!("http://{}", http_addr);
+        let config_url = format!("{}{}", base_url, SN_REGION_PROBE_CONFIG_PATH);
+
+        let response = client.get(&config_url).send().await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(http::header::CONTENT_TYPE).unwrap(),
+            "application/json"
+        );
+        assert_eq!(
+            response.headers().get(http::header::CACHE_CONTROL).unwrap(),
+            "public, max-age=300"
+        );
+        assert!(response.headers().get(http::header::SET_COOKIE).is_none());
+        let etag_v1 = response
+            .headers()
+            .get(http::header::ETAG)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        let body: SnRegionProbeConfig = response.json().await.unwrap();
+        assert_eq!(body.config_version, "test-v1");
+
+        let not_modified = client
+            .get(&config_url)
+            .header(http::header::IF_NONE_MATCH, format!("W/{etag_v1}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(not_modified.status(), StatusCode::NOT_MODIFIED);
+        assert!(not_modified.bytes().await.unwrap().is_empty());
+
+        let wrong_method = client.post(&config_url).send().await.unwrap();
+        assert_eq!(wrong_method.status(), StatusCode::METHOD_NOT_ALLOWED);
+
+        std::fs::write(
+            &config_path,
+            serde_json::to_vec_pretty(&test_region_probe_config("test-v1", true)).unwrap(),
+        )
+        .unwrap();
+        let stale_version = client.get(&config_url).send().await.unwrap();
+        assert_eq!(stale_version.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        std::fs::write(&config_path, b"{}").unwrap();
+        let unavailable = client.get(&config_url).send().await.unwrap();
+        assert_eq!(unavailable.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            unavailable
+                .headers()
+                .get(http::header::CACHE_CONTROL)
+                .unwrap(),
+            "no-store"
+        );
+
+        // Region 配置损坏不影响注册主路径；没有 relay 时沿用既有 pending/fallback 语义。
+        let register = kRPC::new(format!("{}/kapi/sn/auth", base_url).as_str(), None)
+            .call(
+                "auth.register",
+                json!({
+                    "name": "regionconfiguser",
+                    "email": "region-config@example.com",
+                    "pwd_hash": "12345678",
+                    "active_code": CLEAR_STATE_ACTIVE_CODE,
+                    "region": "unknown-region"
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(register["code"], 0);
+
+        std::fs::write(
+            &config_path,
+            serde_json::to_vec_pretty(&test_region_probe_config("test-v2", true)).unwrap(),
+        )
+        .unwrap();
+        let refreshed = client.get(&config_url).send().await.unwrap();
+        assert_eq!(refreshed.status(), StatusCode::OK);
+        assert_ne!(
+            refreshed
+                .headers()
+                .get(http::header::ETAG)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            etag_v1
+        );
+        let refreshed_body: SnRegionProbeConfig = refreshed.json().await.unwrap();
+        assert_eq!(refreshed_body.config_version, "test-v2");
+        assert_eq!(refreshed_body.regions.len(), 2);
     }
 
     #[tokio::test]

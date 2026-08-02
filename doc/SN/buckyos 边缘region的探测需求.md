@@ -35,7 +35,9 @@
 - `node_active` 如何在注册前产生该可选字段；
 - 手工选择、自动探测、缓存和失败降级之间的优先级。
 
-本文不声称 Region 配置发布接口和 `node_active` 探测器已经实现。
+当前 `cyfs-gateway` 已实现 Region 配置 DTO/校验、`sn_client` 匿名 GET helper，以及
+`cyfs-sn` 的文件加载、匿名发布、ETag/缓存和失败降级；`node_active` 探测器仍不在本仓库
+实现。
 
 ---
 
