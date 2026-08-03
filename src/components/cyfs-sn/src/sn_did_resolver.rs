@@ -1272,12 +1272,23 @@ mod tests {
     use super::*;
     use crate::sn_resolver::{
         BnsDocument, BnsDocumentReader, BnsOwner, BootDocument, SnAuthReader, SnResolver,
-        SnResolverConfig, ZoneDocument, BNS_DOC_DEVICE_MINI,
+        SnResolverConfig, ZoneDocument,
     };
     use crate::ZoneInfo;
     use std::collections::HashMap;
 
     const OWNER_X: &str = "T4Quc1L6Ogu4N2tTKOvneV1yYnBcmhP89B_RsuFsJZ8";
+
+    fn compact_test_jwt(payload: &Value) -> String {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine;
+
+        format!(
+            "{}.{}.signature",
+            URL_SAFE_NO_PAD.encode(br#"{"alg":"EdDSA"}"#),
+            URL_SAFE_NO_PAD.encode(serde_json::to_vec(payload).unwrap())
+        )
+    }
 
     #[derive(Default)]
     struct StaticAuthReader {
@@ -1402,6 +1413,7 @@ mod tests {
             jwt: None,
             boot_jwt: None,
             devices: HashMap::new(),
+            mini_device_jwts: HashMap::new(),
             gateway_device_name: None,
             gateway_ips: Vec::new(),
             ttl: None,
@@ -1730,10 +1742,11 @@ mod tests {
             }],
             "authentication": ["did:bns:ood1.alice#main_key"],
         });
+        let device_jwt = compact_test_jwt(&document);
         let mut bns = StaticBnsReader::default();
         bns.documents.insert(
-            ("ood1.alice".to_string(), BNS_DOC_DEVICE_MINI.to_string()),
-            BnsDocument::json("ood1.alice", BNS_DOC_DEVICE_MINI, document.clone()),
+            ("alice".to_string(), "ood1".to_string()),
+            BnsDocument::jwt("alice", "ood1", device_jwt.clone()),
         );
         let resolver = resolver_with_users_and_bns(
             vec![auth_user(
@@ -1752,14 +1765,15 @@ mod tests {
             ))
             .await
             .unwrap();
-        let encoded = EncodedDocument::JsonLd(document);
+        let encoded = EncodedDocument::Jwt(device_jwt.clone());
         let body: Value = serde_json::from_str(response.body_for_accept(None).as_str()).unwrap();
         let metadata = &body["didDocumentMetadata"]["buckyos"];
 
-        assert_eq!(body["didDocument"]["id"], "did:bns:ood1.alice");
+        assert_eq!(body["didDocument"], device_jwt);
         assert_eq!(metadata["docType"], "device");
         assert_eq!(metadata["documentStatus"], "active");
         assert_eq!(metadata["effectiveOwner"], "did:bns:alice");
+        assert_eq!(metadata["source"], "bns_document");
         assert_eq!(metadata["documentVersion"], 42);
         assert_eq!(
             metadata["docHash"],
@@ -1809,26 +1823,27 @@ mod tests {
     #[tokio::test]
     async fn internal_zone_resolver_keeps_web_device_identity_and_owner_metadata() {
         let document = json!({
-            "id": "did:bns:ood1.alice",
-            "owner": "did:bns:alice",
+            "id": "did:web:ood1.example.com",
+            "owner": "did:web:example.com",
             "iat": 42,
             "exp": 253_402_300_799_u64,
             "verificationMethod": [{
-                "id": "did:bns:ood1.alice#main_key",
+                "id": "did:web:ood1.example.com#main_key",
                 "type": "JsonWebKey2020",
-                "controller": "did:bns:ood1.alice",
+                "controller": "did:web:ood1.example.com",
                 "publicKeyJwk": {
                     "kty": "OKP",
                     "crv": "Ed25519",
                     "x": OWNER_X,
                 }
             }],
-            "authentication": ["did:bns:ood1.alice#main_key"],
+            "authentication": ["did:web:ood1.example.com#main_key"],
         });
+        let device_jwt = compact_test_jwt(&document);
         let mut bns = StaticBnsReader::default();
         bns.documents.insert(
-            ("ood1.alice".to_string(), BNS_DOC_DEVICE_MINI.to_string()),
-            BnsDocument::json("ood1.alice", BNS_DOC_DEVICE_MINI, document),
+            ("alice".to_string(), "ood1".to_string()),
+            BnsDocument::jwt("alice", "ood1", device_jwt.clone()),
         );
         let mut user = auth_user("alice", UserState::Active, auth_db_owner_key().as_str());
         user.user_domain = Some("example.com".to_string());
@@ -1845,13 +1860,10 @@ mod tests {
         let body: Value = serde_json::from_str(response.body_for_accept(None).as_str()).unwrap();
         let metadata = &body["didDocumentMetadata"]["buckyos"];
 
-        assert_eq!(body["didDocument"]["id"], "did:web:ood1.example.com");
-        assert_eq!(
-            body["didDocument"]["owner"], "did:web:example.com",
-            "the rewritten document must keep the Web authority boundary"
-        );
+        assert_eq!(body["didDocument"], device_jwt);
         assert_eq!(metadata["effectiveOwner"], "did:web:example.com");
         assert_eq!(metadata["canonicalZone"], "did:bns:alice");
+        assert_eq!(metadata["source"], "bns_document");
     }
 
     #[tokio::test]

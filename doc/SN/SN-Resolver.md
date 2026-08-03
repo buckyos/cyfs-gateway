@@ -330,7 +330,7 @@ resolve_gateway_by_hostname(hostname) -> GatewayResolution
 - `zone`: 优先返回 BNS `zone` document；SN 注册用户可由 AuthDB zone cache 生成
   `AuthDbProjection`。
 - `boot`: 返回 BNS `boot` document。
-- 其它 `doc_type`: 解释为 device_name 或普通 document type，只查询 BNS document。
+- 其它 `doc_type`: 解释为 device_name 或普通 document type，只查询 BNS document。Node Active 使用 `(name=<owner>, doc_type=<device_name>)` 发布独立 DeviceDocument JWT，命中时原样返回 JWT。
 
 已实现：`resolve_bns_did` 对 BNS 文档和 AuthDB zone/boot projection 明确标注来源；
 不存在 local DID document fallback。
@@ -341,13 +341,14 @@ resolve_gateway_by_hostname(hostname) -> GatewayResolution
 
 默认 `doc_type=doc`：
 
-- `doc`: 返回 device 的 `device_mini_doc` / DeviceConfig。
+- `doc` / `device`: 从父 BNS name 的 `doc_type=<device_name>` 文档槽位返回独立 DeviceDocument JWT 原文。该文档不存在或不是 compact JWT 时明确失败，不回退到 mini doc 或 ZoneDocument JSON 投影。
+- `device_mini_doc`: 返回设备的 DeviceMiniDocument。
 - `info`: 返回设备在线信息的公开投影。
 - 其它 `doc_type`: 查询对应 BNS document，缺失返回结构化 not-found。
 
 已实现：`resolve_device_mini_doc` 的优先级是 child 名独立 BNS 文档
-（`device_mini_doc` / `doc`）→ zone 级聚合 `device_mini_doc` → `zone` document 内嵌
-`devices` map。设备在线信息只来自 `SnDeviceInfoDB`；在线态绝不生成或冒充静态文档。
+（仅 `device_mini_doc`）→ zone 级聚合 `device_mini_doc` → ZoneDocument
+`mini_device_jwts` map。`ZoneDocument.devices` 是 full DeviceDocument JSON payload，不参与 mini 解析，也不参与 DeviceDocument JWT 的 revision/hash 比较。设备在线信息只来自 `SnDeviceInfoDB`；在线态绝不生成或冒充静态文档。
 含 `.` 的 owner 经 `user_domain` 映射到 username。
 
 ### did:web
@@ -528,7 +529,7 @@ Beta2.2 已完成的退役与一致性工作：
 3. [已完成] 把 `NameServer::query`（`sn_server.rs:3665`）、`query_did`（`sn_server.rs:3145`）、`query_device_by_hostname`（`sn_server.rs:2587`）改为调用 resolver 并做兼容投影。
 4. [已完成] 接入 BNS RPC document reader，读取 `zone`、`boot`、
    `device_mini_doc`、`dns_txt`；device mini doc 同时支持 child 文档、独立聚合文档和
-   `zone` 内嵌 `devices` map，缺失不回退旧表。
+   `zone` 内嵌 `mini_device_jwts` map，缺失不回退到 `devices` 或旧表。
 5. [已完成] 把 gateway device 从硬编码 `ood1` 改成读取 BNS `zone/boot`，`ood1` 仅作兜底默认（`resolve_gateway_for_zone`，`sn_resolver.rs:1260`）。
 6. [已完成] 显式 user DNS RRset 迁入 AuthDB，并使用 revision/change feed 做多副本正负缓存失效。
 7. [已完成] 删除 compat store reader、legacy device/DID fallback 和重复转换 helper。
