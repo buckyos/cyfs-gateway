@@ -53,6 +53,50 @@ pub use sfo_result::err as stack_err;
 pub use sfo_result::into_err as into_stack_err;
 use url::Url;
 
+/// Best-effort dual-stack support for wildcard IPv6 listeners.
+///
+/// A bind such as `[::]:443` is intended as a convenient "listen on both
+/// families" form.  `IPV6_V6ONLY` defaults vary across operating systems and
+/// host policy, so explicitly try to disable it before binding.  This remains
+/// best-effort: strict dual-stack deployments can use separate IPv4 and IPv6
+/// stacks, while a platform that rejects the option can still start an
+/// IPv6-only listener.
+pub(crate) fn try_enable_dual_stack(socket: &socket2::Socket, bind_addr: std::net::SocketAddr) {
+    if !is_unspecified_ipv6_bind(bind_addr) {
+        return;
+    }
+
+    if let Err(error) = socket.set_only_v6(false) {
+        log::warn!(
+            "failed to disable IPV6_V6ONLY for wildcard bind {}: {}; continuing with platform default",
+            bind_addr,
+            error
+        );
+    }
+}
+
+fn is_unspecified_ipv6_bind(bind_addr: std::net::SocketAddr) -> bool {
+    matches!(
+        bind_addr,
+        std::net::SocketAddr::V6(bind_addr_v6) if bind_addr_v6.ip().is_unspecified()
+    )
+}
+
+#[cfg(test)]
+mod dual_stack_tests {
+    use super::is_unspecified_ipv6_bind;
+
+    #[test]
+    fn only_ipv6_wildcard_bind_requests_dual_stack() {
+        assert!(is_unspecified_ipv6_bind("[::]:443".parse().unwrap()));
+        assert!(!is_unspecified_ipv6_bind("[::1]:443".parse().unwrap()));
+        assert!(!is_unspecified_ipv6_bind(
+            "[2001:db8::1]:443".parse().unwrap()
+        ));
+        assert!(!is_unspecified_ipv6_bind("0.0.0.0:443".parse().unwrap()));
+    }
+}
+
 /// Insert a `<prefix>addr` / `<prefix>ip` / `<prefix>port` group into a REQ
 /// map collection. `prefix` is a source-layer prefix such as `source_`,
 /// `conn_source_` or `real_source_`.

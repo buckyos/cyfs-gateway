@@ -1377,6 +1377,7 @@ impl UdpStackInner {
                     StackErrorCode::IoError,
                     "create socket error"
                 ))?;
+        super::try_enable_dual_stack(&socket, addr);
 
         socket.set_nonblocking(true).map_err(into_stack_err!(
             StackErrorCode::IoError,

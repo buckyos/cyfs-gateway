@@ -1950,6 +1950,7 @@ impl RTcpInner {
                     error!("{}", msg);
                     TunnelError::BindError(msg)
                 })?;
+        crate::stack::try_enable_dual_stack(&socket, addr);
         socket.set_nonblocking(true).map_err(|e| {
             let msg = format!("set nonblocking error:{}", e);
             error!("{}", msg);
