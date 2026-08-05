@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -9,7 +9,7 @@ use bns_evm::{
     AuthorityKeyStatus as EvmAuthorityKeyStatus, AuthorityKeyUpdate as EvmAuthorityKeyUpdate,
     AuthoritySetState as EvmAuthoritySetState, BlockRange, Bns, BnsCall, BnsChainClient,
     ContractRead, DocumentRef as EvmDocumentRef, DocumentState as EvmDocumentState,
-    DocumentStatus as EvmDocumentStatus, EthBlock, EthLog, NameState as EvmNameState,
+    DocumentStatus as EvmDocumentStatus, EthBlock, NameState as EvmNameState,
     NameStatus as EvmNameStatus, OwnerSource as EvmOwnerSource, Principal as EvmPrincipal,
     PrincipalKind as EvmPrincipalKind, RpcLogFilter, B256,
 };
@@ -245,9 +245,8 @@ where
         };
         let logs = self.chain_client.get_logs(&filter).await?;
         let mut projector = ContractEventProjector::new();
-        let mut decoded_txs: HashMap<B256, Option<BnsCall>> = HashMap::new();
         let mut protocol_events_seen = 0;
-        let mut registry_events_stored = 0;
+        let mut registry_records = Vec::new();
 
         for log in logs.iter().filter(|log| !log.removed) {
             let observed_at = now_timestamp();
@@ -256,22 +255,29 @@ where
                     protocol_events_seen += 1;
                 }
                 ProjectedContractEvent::Registry(record) => {
-                    let decoded_call = if record_needs_decoded_call(&record) {
-                        self.decoded_call_for_log(log, &mut decoded_txs).await?
-                    } else {
-                        None
-                    };
-                    let projection = self
-                        .projection_for_record(&record, decoded_call.as_ref())
-                        .await?;
-                    self.store.transact(|tx| {
-                        tx.put_event_record(&record)?;
-                        projection.apply(tx)
-                    })?;
-                    registry_events_stored += 1;
+                    registry_records.push((record, log.transaction_hash));
                 }
                 ProjectedContractEvent::Router | ProjectedContractEvent::Infrastructure => {}
             }
+        }
+
+        let snapshot = self.load_projection_snapshot(&registry_records).await?;
+        let mut decoded_txs: HashMap<B256, Option<BnsCall>> = HashMap::new();
+        let mut registry_events_stored = 0;
+        for (record, transaction_hash) in registry_records {
+            let decoded_call = if record_needs_decoded_call(&record) {
+                self.decoded_call_for_hash(transaction_hash, &mut decoded_txs)
+                    .await?
+            } else {
+                None
+            };
+            let projection =
+                self.projection_for_record(&record, decoded_call.as_ref(), &snapshot)?;
+            self.store.transact(|tx| {
+                tx.put_event_record(&record)?;
+                projection.apply(tx)
+            })?;
+            registry_events_stored += 1;
         }
 
         let block_hash = self.block_hash_string(to_block, Some(&latest_head)).await?;
@@ -406,12 +412,12 @@ where
         })
     }
 
-    async fn decoded_call_for_log(
+    async fn decoded_call_for_hash(
         &self,
-        log: &EthLog,
+        tx_hash: Option<B256>,
         decoded_txs: &mut HashMap<B256, Option<BnsCall>>,
     ) -> BnsRegistryResult<Option<BnsCall>> {
-        let Some(tx_hash) = log.transaction_hash else {
+        let Some(tx_hash) = tx_hash else {
             return Ok(None);
         };
         if let Some(decoded) = decoded_txs.get(&tx_hash) {
@@ -426,7 +432,133 @@ where
         Ok(decoded)
     }
 
-    async fn projection_for_record(
+    async fn load_projection_snapshot(
+        &self,
+        records: &[(EventLogRecord, Option<B256>)],
+    ) -> BnsRegistryResult<ProjectionSnapshot> {
+        let mut seen = HashSet::new();
+        let mut reads = Vec::new();
+        for (record, _) in records {
+            for read in projection_reads_for_record(record) {
+                if seen.insert(read.clone()) {
+                    reads.push(read);
+                }
+            }
+        }
+        let calls = reads
+            .iter()
+            .map(|read| read.contract_read(self.contract))
+            .collect::<Vec<_>>();
+        let outputs = self.chain_client.multicall(&calls).await?;
+        if outputs.len() != reads.len() {
+            return Err(BnsRegistryError::InvalidConfig(format!(
+                "BNS projection batch returned {} values for {} reads",
+                outputs.len(),
+                reads.len()
+            )));
+        }
+        let mut snapshot = ProjectionSnapshot::default();
+        for (read, output) in reads.into_iter().zip(outputs) {
+            snapshot.insert(read, &output)?;
+        }
+        Ok(snapshot)
+    }
+
+    fn projection_for_record(
+        &self,
+        record: &EventLogRecord,
+        decoded_call: Option<&BnsCall>,
+        snapshot: &ProjectionSnapshot,
+    ) -> BnsRegistryResult<ContractProjectionWrite> {
+        snapshot.projection_for_record(record, decoded_call)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum ProjectionReadKey {
+    Name(String),
+    Document(String, String, u64),
+    AuthoritySet(String),
+    Alias(String),
+    LatestCheckpoint,
+}
+
+impl ProjectionReadKey {
+    fn contract_read(&self, contract: Address) -> ContractRead {
+        match self {
+            Self::Name(name) => {
+                ContractRead::new(contract, &Bns::queryNameStateCall { name: name.clone() })
+            }
+            Self::Document(name, doc_type, version) => ContractRead::new(
+                contract,
+                &Bns::getDocumentVersionCall {
+                    name: name.clone(),
+                    docType: doc_type.clone(),
+                    version: *version,
+                },
+            ),
+            Self::AuthoritySet(name) => {
+                ContractRead::new(contract, &Bns::getAuthoritySetCall { name: name.clone() })
+            }
+            Self::Alias(name) => {
+                ContractRead::new(contract, &Bns::getAliasCall { name: name.clone() })
+            }
+            Self::LatestCheckpoint => ContractRead::new(contract, &Bns::latestCheckpointCall {}),
+        }
+    }
+}
+
+#[derive(Default)]
+struct ProjectionSnapshot {
+    names: HashMap<String, Option<NameState>>,
+    documents: HashMap<(String, String, u64), Option<DocumentState>>,
+    authority_sets: HashMap<String, AuthoritySetState>,
+    aliases: HashMap<String, AliasState>,
+    checkpoint: Option<LogCheckpoint>,
+}
+
+impl ProjectionSnapshot {
+    fn insert(&mut self, read: ProjectionReadKey, output: &[u8]) -> BnsRegistryResult<()> {
+        match read {
+            ProjectionReadKey::Name(name) => {
+                let state = name_state_from_evm(
+                    decode_contract_return::<Bns::queryNameStateCall>(output)?,
+                )?;
+                self.names.insert(
+                    name,
+                    (state.status != NameStatus::Available).then_some(state),
+                );
+            }
+            ProjectionReadKey::Document(name, doc_type, version) => {
+                let state = document_state_from_evm(decode_contract_return::<
+                    Bns::getDocumentVersionCall,
+                >(output)?)?;
+                self.documents.insert(
+                    (name, doc_type, version),
+                    (state.status != DocumentStatus::Missing).then_some(state),
+                );
+            }
+            ProjectionReadKey::AuthoritySet(name) => {
+                let state = authority_set_from_evm(decode_contract_return::<
+                    Bns::getAuthoritySetCall,
+                >(output)?)?;
+                self.authority_sets.insert(name, state);
+            }
+            ProjectionReadKey::Alias(name) => {
+                let state =
+                    alias_state_from_evm(decode_contract_return::<Bns::getAliasCall>(output)?)?;
+                self.aliases.insert(name, state);
+            }
+            ProjectionReadKey::LatestCheckpoint => {
+                self.checkpoint = Some(checkpoint_from_evm(decode_contract_return::<
+                    Bns::latestCheckpointCall,
+                >(output)?)?);
+            }
+        }
+        Ok(())
+    }
+
+    fn projection_for_record(
         &self,
         record: &EventLogRecord,
         decoded_call: Option<&BnsCall>,
@@ -440,7 +572,7 @@ where
             | RegistryEvent::NameReleased { name, .. }
             | RegistryEvent::OwnerDocumentIatFloorUpdated { name, .. }
             | RegistryEvent::NamespacePolicyUpdated { name, .. } => {
-                self.push_name_state(&mut write, name).await?;
+                self.push_name(&mut write, name)?;
             }
             RegistryEvent::DocumentPublished {
                 name,
@@ -448,8 +580,8 @@ where
                 version,
                 ..
             } => {
-                self.push_name_and_document_state(&mut write, name, doc_type, *version)
-                    .await?;
+                self.push_name(&mut write, name)?;
+                self.push_document(&mut write, name, doc_type, *version)?;
             }
             RegistryEvent::DocumentRevoked {
                 name,
@@ -457,11 +589,14 @@ where
                 new_version,
                 ..
             } => {
-                self.push_name_and_document_state(&mut write, name, doc_type, *new_version)
-                    .await?;
+                self.push_name(&mut write, name)?;
+                self.push_document(&mut write, name, doc_type, *new_version)?;
             }
             RegistryEvent::AuthorityKeysUpdated { name, .. } => {
-                let set = self.read_authority_set(name).await?;
+                let set =
+                    self.authority_sets.get(name).cloned().ok_or_else(|| {
+                        missing_projection_read(format!("authority set for {name}"))
+                    })?;
                 write.authority_sets.push(set);
                 for key in authority_keys_from_call(decoded_call, name)? {
                     write.authority_keys.push((canonical_bns_name(name)?, key));
@@ -470,7 +605,7 @@ where
             RegistryEvent::ControllerPolicyUpdated {
                 name, policy_hash, ..
             } => {
-                self.push_name_state(&mut write, name).await?;
+                self.push_name(&mut write, name)?;
                 if let Some(rules) = controller_rules_from_call(decoded_call, name)? {
                     write.controller_policies.push((
                         canonical_bns_name(name)?,
@@ -480,7 +615,13 @@ where
                 }
             }
             RegistryEvent::DidAliasSet { name, .. } => {
-                self.push_name_and_alias_state(&mut write, name).await?;
+                self.push_name(&mut write, name)?;
+                write.aliases.push(
+                    self.aliases
+                        .get(name)
+                        .cloned()
+                        .ok_or_else(|| missing_projection_read(format!("alias for {name}")))?,
+                );
             }
             RegistryEvent::PaymentTargetUpdated {
                 name,
@@ -488,136 +629,102 @@ where
                 version,
                 ..
             } => {
-                self.push_name_and_document_state(&mut write, name, doc_type, *version)
-                    .await?;
+                self.push_name(&mut write, name)?;
+                self.push_document(&mut write, name, doc_type, *version)?;
             }
             RegistryEvent::LogCheckpointPublished { .. } => {
-                write.checkpoints.push(self.read_latest_checkpoint().await?);
+                write.checkpoints.push(
+                    self.checkpoint
+                        .clone()
+                        .ok_or_else(|| missing_projection_read("latest checkpoint"))?,
+                );
             }
         }
         Ok(write)
     }
 
-    async fn push_name_state(
-        &self,
-        write: &mut ContractProjectionWrite,
-        name: &str,
-    ) -> BnsRegistryResult<()> {
-        if let Some(state) = self.read_name_state(name).await? {
-            write.names.push(state);
+    fn push_name(&self, write: &mut ContractProjectionWrite, name: &str) -> BnsRegistryResult<()> {
+        let state = self
+            .names
+            .get(name)
+            .ok_or_else(|| missing_projection_read(format!("name state for {name}")))?;
+        if let Some(state) = state {
+            write.names.push(state.clone());
         }
         Ok(())
     }
 
-    async fn push_name_and_document_state(
+    fn push_document(
         &self,
         write: &mut ContractProjectionWrite,
         name: &str,
         doc_type: &str,
         version: u64,
     ) -> BnsRegistryResult<()> {
-        let name_call = Bns::queryNameStateCall {
-            name: name.to_string(),
-        };
-        let document_call = Bns::getDocumentVersionCall {
-            name: name.to_string(),
-            docType: doc_type.to_string(),
+        let state = self
+            .documents
+            .get(&(name.to_string(), doc_type.to_string(), version))
+            .ok_or_else(|| {
+                missing_projection_read(format!("document {name}/{doc_type}/{version}"))
+            })?;
+        if let Some(state) = state {
+            write.documents.push(state.clone());
+        }
+        Ok(())
+    }
+}
+
+fn projection_reads_for_record(record: &EventLogRecord) -> Vec<ProjectionReadKey> {
+    match &record.event {
+        RegistryEvent::NameRegistered { name, .. }
+        | RegistryEvent::NameRenewed { name, .. }
+        | RegistryEvent::NameAssetTransferred { name, .. }
+        | RegistryEvent::NameOwnerUpdated { name, .. }
+        | RegistryEvent::NameReleased { name, .. }
+        | RegistryEvent::OwnerDocumentIatFloorUpdated { name, .. }
+        | RegistryEvent::NamespacePolicyUpdated { name, .. }
+        | RegistryEvent::ControllerPolicyUpdated { name, .. } => {
+            vec![ProjectionReadKey::Name(name.clone())]
+        }
+        RegistryEvent::DocumentPublished {
+            name,
+            doc_type,
             version,
-        };
-        let outputs = self
-            .chain_client
-            .multicall(&[
-                ContractRead::new(self.contract, &name_call),
-                ContractRead::new(self.contract, &document_call),
-            ])
-            .await?;
-
-        let name_state = name_state_from_evm(decode_contract_return::<Bns::queryNameStateCall>(
-            &outputs[0],
-        )?)?;
-        if name_state.status != NameStatus::Available {
-            write.names.push(name_state);
+            ..
         }
-        let document_state = document_state_from_evm(decode_contract_return::<
-            Bns::getDocumentVersionCall,
-        >(&outputs[1])?)?;
-        if document_state.status != DocumentStatus::Missing {
-            write.documents.push(document_state);
+        | RegistryEvent::PaymentTargetUpdated {
+            name,
+            doc_type,
+            version,
+            ..
+        } => vec![
+            ProjectionReadKey::Name(name.clone()),
+            ProjectionReadKey::Document(name.clone(), doc_type.clone(), *version),
+        ],
+        RegistryEvent::DocumentRevoked {
+            name,
+            doc_type,
+            new_version,
+            ..
+        } => vec![
+            ProjectionReadKey::Name(name.clone()),
+            ProjectionReadKey::Document(name.clone(), doc_type.clone(), *new_version),
+        ],
+        RegistryEvent::AuthorityKeysUpdated { name, .. } => {
+            vec![ProjectionReadKey::AuthoritySet(name.clone())]
         }
-        Ok(())
-    }
-
-    async fn push_name_and_alias_state(
-        &self,
-        write: &mut ContractProjectionWrite,
-        name: &str,
-    ) -> BnsRegistryResult<()> {
-        let name_call = Bns::queryNameStateCall {
-            name: name.to_string(),
-        };
-        let alias_call = Bns::getAliasCall {
-            name: name.to_string(),
-        };
-        let outputs = self
-            .chain_client
-            .multicall(&[
-                ContractRead::new(self.contract, &name_call),
-                ContractRead::new(self.contract, &alias_call),
-            ])
-            .await?;
-
-        let name_state = name_state_from_evm(decode_contract_return::<Bns::queryNameStateCall>(
-            &outputs[0],
-        )?)?;
-        if name_state.status != NameStatus::Available {
-            write.names.push(name_state);
-        }
-        write
-            .aliases
-            .push(alias_state_from_evm(decode_contract_return::<
-                Bns::getAliasCall,
-            >(&outputs[1])?)?);
-        Ok(())
-    }
-
-    async fn read_name_state(&self, name: &str) -> BnsRegistryResult<Option<NameState>> {
-        let state = self
-            .chain_client
-            .call_contract(
-                self.contract,
-                &Bns::queryNameStateCall {
-                    name: name.to_string(),
-                },
-            )
-            .await?;
-        let state = name_state_from_evm(state)?;
-        if state.status == NameStatus::Available {
-            Ok(None)
-        } else {
-            Ok(Some(state))
+        RegistryEvent::DidAliasSet { name, .. } => vec![
+            ProjectionReadKey::Name(name.clone()),
+            ProjectionReadKey::Alias(name.clone()),
+        ],
+        RegistryEvent::LogCheckpointPublished { .. } => {
+            vec![ProjectionReadKey::LatestCheckpoint]
         }
     }
+}
 
-    async fn read_authority_set(&self, name: &str) -> BnsRegistryResult<AuthoritySetState> {
-        let state = self
-            .chain_client
-            .call_contract(
-                self.contract,
-                &Bns::getAuthoritySetCall {
-                    name: name.to_string(),
-                },
-            )
-            .await?;
-        authority_set_from_evm(state)
-    }
-
-    async fn read_latest_checkpoint(&self) -> BnsRegistryResult<LogCheckpoint> {
-        let checkpoint = self
-            .chain_client
-            .call_contract(self.contract, &Bns::latestCheckpointCall {})
-            .await?;
-        checkpoint_from_evm(checkpoint)
-    }
+fn missing_projection_read(detail: impl Into<String>) -> BnsRegistryError {
+    BnsRegistryError::InvalidConfig(format!("BNS projection batch is missing {}", detail.into()))
 }
 
 fn record_needs_decoded_call(record: &EventLogRecord) -> bool {

@@ -852,6 +852,91 @@ async fn sync_projects_document_published_via_mixed_eth_call_strategy() {
 }
 
 #[tokio::test]
+async fn sync_deduplicates_projection_reads_across_registry_events() {
+    let tx_hash = B256::repeat_byte(0xDE);
+    let logs = vec![
+        protocol_event_log(6, 0x43, 1),
+        event_log_json_with_tx(
+            &Bns::NameRegistered {
+                nameHash: B256::repeat_byte(0x09),
+                name: "alice".to_string(),
+                assetOwner: OWNER,
+                actor: ACTOR,
+                expireAt: 1_000,
+                lineageEpoch: 0,
+                nameSeq: 1,
+            },
+            1,
+            tx_hash,
+        ),
+        protocol_event_log(7, 0x44, 1),
+        event_log_json_with_tx(
+            &Bns::DocumentPublished {
+                nameHash: B256::repeat_byte(0x09),
+                name: "alice".to_string(),
+                docType: "dns_txt".to_string(),
+                version: 3,
+                actor: ACTOR,
+                contentHash: B256::repeat_byte(0x22),
+                documentStateHash: B256::repeat_byte(0x33),
+            },
+            1,
+            tx_hash,
+        ),
+    ];
+    let multicall_return = format!(
+        "0x{}",
+        hex::encode(TestMulticall3::aggregateCall::abi_encode_returns(
+            &TestMulticall3::aggregateReturn {
+                blockNumber: U256::from(1),
+                returnData: vec![
+                    Bytes::from(Bns::queryNameStateCall::abi_encode_returns(
+                        &evm_name_state("alice", 2),
+                    )),
+                    Bytes::from(Bns::getDocumentVersionCall::abi_encode_returns(
+                        &evm_document_state("alice", "dns_txt", 3),
+                    )),
+                ],
+            },
+        ))
+    );
+    let mock = MockEthRpc::start(MockConfig {
+        chain_id: 31_337,
+        block_number: 1,
+        logs_json: logs,
+        multicall_return: Some(multicall_return),
+        ..Default::default()
+    })
+    .await;
+    let store = SqliteBnsRegistryStore::open_memory().unwrap();
+
+    let outcome = sync_bns_contract_once(
+        &store,
+        with_endpoint(config_for_chain(31_337), &mock.endpoint),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(outcome.registry_events_stored, 2);
+    assert_eq!(
+        mock.eth_call_calls(),
+        1,
+        "the repeated name read and document read share one Multicall"
+    );
+    assert_eq!(mock.transaction_lookup_calls(), 0);
+    let (name, document) = store
+        .transact(|tx| {
+            Ok((
+                tx.get_name("alice")?,
+                tx.get_current_document("alice", "dns_txt")?,
+            ))
+        })
+        .unwrap();
+    assert_eq!(name.unwrap().name_seq, 2);
+    assert_eq!(document.unwrap().version, 3);
+}
+
+#[tokio::test]
 async fn sync_backfills_controller_rules_from_decoded_call() {
     // ControllerPolicyUpdated 事件不携带 rules：indexer 用 decode_bns_call（按 tx hash）补全入参。
     let tx_hash = B256::repeat_byte(0xCA);
