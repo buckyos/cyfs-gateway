@@ -1,15 +1,16 @@
 use std::collections::HashMap;
 use std::str::FromStr;
+use std::sync::Arc;
 use std::time::Duration;
 
 use bns_evm::{
     decode_bns_call, Address, AliasKind as EvmAliasKind, AliasState as EvmAliasState,
     AuthorityKey as EvmAuthorityKey, AuthorityKeyStatus as EvmAuthorityKeyStatus,
     AuthorityKeyUpdate as EvmAuthorityKeyUpdate, AuthoritySetState as EvmAuthoritySetState,
-    BlockRange, Bns, BnsCall, DocumentRef as EvmDocumentRef, DocumentState as EvmDocumentState,
-    DocumentStatus as EvmDocumentStatus, EthLog, EthRpcClient, NameState as EvmNameState,
-    NameStatus as EvmNameStatus, OwnerSource as EvmOwnerSource, Principal as EvmPrincipal,
-    PrincipalKind as EvmPrincipalKind, RpcLogFilter, B256,
+    BlockRange, Bns, BnsCall, BnsChainClient, DocumentRef as EvmDocumentRef,
+    DocumentState as EvmDocumentState, DocumentStatus as EvmDocumentStatus, EthLog,
+    NameState as EvmNameState, NameStatus as EvmNameStatus, OwnerSource as EvmOwnerSource,
+    Principal as EvmPrincipal, PrincipalKind as EvmPrincipalKind, RpcLogFilter, B256,
 };
 use serde::{Deserialize, Serialize};
 
@@ -132,7 +133,7 @@ where
 {
     store: &'a S,
     config: BnsIndexerSyncConfig,
-    rpc: EthRpcClient,
+    chain_client: Arc<BnsChainClient>,
     contract: Address,
     source: String,
 }
@@ -142,14 +143,22 @@ where
     S: BnsRegistryStore,
 {
     pub fn new(store: &'a S, config: BnsIndexerSyncConfig) -> BnsRegistryResult<Self> {
+        let chain_client = Arc::new(BnsChainClient::new(config.source.rpc_endpoint.clone()));
+        Self::new_with_chain_client(store, config, chain_client)
+    }
+
+    pub fn new_with_chain_client(
+        store: &'a S,
+        config: BnsIndexerSyncConfig,
+        chain_client: Arc<BnsChainClient>,
+    ) -> BnsRegistryResult<Self> {
         config.validate()?;
         let contract = config.source.contract_address()?;
         let source = config.source.source_id()?;
-        let rpc = EthRpcClient::new(config.source.rpc_endpoint.clone());
         Ok(Self {
             store,
             config,
-            rpc,
+            chain_client,
             contract,
             source,
         })
@@ -164,7 +173,7 @@ where
     }
 
     pub async fn sync_once(&self) -> BnsRegistryResult<BnsIndexerSyncOutcome> {
-        let remote_chain_id = self.rpc.chain_id().await?;
+        let remote_chain_id = self.chain_client.chain_id().await?;
         if remote_chain_id != self.config.source.chain_id {
             return Err(BnsRegistryError::InvalidConfig(format!(
                 "BNS indexer configured for chain_id {}, but RPC {} returned chain_id {}",
@@ -172,7 +181,7 @@ where
             )));
         }
 
-        let latest_block = self.rpc.block_number().await?;
+        let latest_block = self.chain_client.block_number().await?;
         let reorg_detected = self.reset_projection_if_reorged(latest_block).await?;
         let target_block = latest_block.saturating_sub(self.config.confirmations);
         let from_block = self.next_block_to_sync()?;
@@ -199,7 +208,7 @@ where
             to_block: BlockRange::Number(to_block),
             topics: Vec::new(),
         };
-        let logs = self.rpc.get_logs(&filter).await?;
+        let logs = self.chain_client.get_logs(&filter).await?;
         let mut projector = ContractEventProjector::new();
         let mut decoded_txs: HashMap<B256, Option<BnsCall>> = HashMap::new();
         let mut protocol_events_seen = 0;
@@ -304,7 +313,7 @@ where
 
     async fn block_hash_string(&self, block_number: u64) -> BnsRegistryResult<String> {
         let block = self
-            .rpc
+            .chain_client
             .block_by_number(block_number)
             .await?
             .ok_or_else(|| {
@@ -340,7 +349,7 @@ where
             return Ok(decoded.clone());
         }
 
-        let decoded = match self.rpc.transaction_by_hash(tx_hash).await? {
+        let decoded = match self.chain_client.transaction_by_hash(tx_hash).await? {
             Some(tx) => Some(decode_bns_call(&tx.input)?),
             None => None,
         };
@@ -451,7 +460,7 @@ where
 
     async fn read_name_state(&self, name: &str) -> BnsRegistryResult<Option<NameState>> {
         let state = self
-            .rpc
+            .chain_client
             .call_contract(
                 self.contract,
                 &Bns::queryNameStateCall {
@@ -474,7 +483,7 @@ where
         version: u64,
     ) -> BnsRegistryResult<Option<DocumentState>> {
         let state = self
-            .rpc
+            .chain_client
             .call_contract(
                 self.contract,
                 &Bns::getDocumentVersionCall {
@@ -494,7 +503,7 @@ where
 
     async fn read_authority_set(&self, name: &str) -> BnsRegistryResult<AuthoritySetState> {
         let state = self
-            .rpc
+            .chain_client
             .call_contract(
                 self.contract,
                 &Bns::getAuthoritySetCall {
@@ -507,7 +516,7 @@ where
 
     async fn read_alias(&self, name: &str) -> BnsRegistryResult<AliasState> {
         let state = self
-            .rpc
+            .chain_client
             .call_contract(
                 self.contract,
                 &Bns::getAliasCall {
@@ -520,7 +529,7 @@ where
 
     async fn read_latest_checkpoint(&self) -> BnsRegistryResult<LogCheckpoint> {
         let checkpoint = self
-            .rpc
+            .chain_client
             .call_contract(self.contract, &Bns::latestCheckpointCall {})
             .await?;
         checkpoint_from_evm(checkpoint)

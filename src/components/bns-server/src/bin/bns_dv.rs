@@ -22,6 +22,7 @@ use bns_client::{
     BnsEvmTxSubmission, BnsIndexerApi, BnsIndexerClient, BnsPublishDocumentReq, BnsRegisterNameReq,
     StaticBnsEvmKeyManager,
 };
+use bns_evm::BnsChainClient;
 use bns_indexer::{
     default_document_update, BnsBlockSyncSourceConfig, BnsContractEventIndexer,
     BnsIndexerSyncConfig, CallAuthority, DocumentRef, DocumentStatus, MutationGuard, NameState,
@@ -200,10 +201,16 @@ async fn serve(flags: HashMap<String, String>) -> Result<(), DynError> {
     // server 与 indexer 各开一条到同一 SQLite 文件的连接（WAL 并发）。
     let server_store = SqliteBnsRegistryStore::open(&db)?;
     let indexer_store = SqliteBnsRegistryStore::open(&db)?;
+    let chain_client = Arc::new(BnsChainClient::new(rpc.clone()));
 
     // indexer 轮询循环。
+    let indexer_chain_client = chain_client.clone();
     tokio::spawn(async move {
-        let indexer = match BnsContractEventIndexer::new(&indexer_store, sync_config.clone()) {
+        let indexer = match BnsContractEventIndexer::new_with_chain_client(
+            &indexer_store,
+            sync_config.clone(),
+            indexer_chain_client,
+        ) {
             Ok(indexer) => indexer,
             Err(err) => {
                 eprintln!("[indexer] config error: {err}");
@@ -234,9 +241,9 @@ async fn serve(flags: HashMap<String, String>) -> Result<(), DynError> {
     run_on_init_txs(&flags, &rpc, &contract, chain_id, &db).await?;
 
     let server: Arc<dyn HttpServer> = Arc::new(
-        BnsContractHttpServer::from_contract_store_with_chain_config(
+        BnsContractHttpServer::from_contract_store_with_chain_client(
             server_store,
-            rpc.clone(),
+            chain_client,
             contract.clone(),
             chain_id,
         ),
