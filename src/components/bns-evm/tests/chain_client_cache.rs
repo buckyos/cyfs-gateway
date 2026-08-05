@@ -12,6 +12,8 @@ struct MockRpc {
     endpoint: String,
     receipt_calls: Arc<AtomicUsize>,
     transaction_calls: Arc<AtomicUsize>,
+    gas_price_calls: Arc<AtomicUsize>,
+    priority_fee_calls: Arc<AtomicUsize>,
 }
 
 impl MockRpc {
@@ -20,8 +22,12 @@ impl MockRpc {
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
         let receipt_calls = Arc::new(AtomicUsize::new(0));
         let transaction_calls = Arc::new(AtomicUsize::new(0));
+        let gas_price_calls = Arc::new(AtomicUsize::new(0));
+        let priority_fee_calls = Arc::new(AtomicUsize::new(0));
         let receipt_counter = receipt_calls.clone();
         let transaction_counter = transaction_calls.clone();
+        let gas_price_counter = gas_price_calls.clone();
+        let priority_fee_counter = priority_fee_calls.clone();
         tokio::spawn(async move {
             loop {
                 let Ok((mut stream, _)) = listener.accept().await else {
@@ -29,6 +35,8 @@ impl MockRpc {
                 };
                 let receipt_counter = receipt_counter.clone();
                 let transaction_counter = transaction_counter.clone();
+                let gas_price_counter = gas_price_counter.clone();
+                let priority_fee_counter = priority_fee_counter.clone();
                 tokio::spawn(async move {
                     let request = read_http_request(&mut stream).await;
                     let body = request
@@ -51,6 +59,14 @@ impl MockRpc {
                             transaction_counter.fetch_add(1, Ordering::SeqCst);
                             serde_json::Value::Null
                         }
+                        "eth_gasPrice" => {
+                            gas_price_counter.fetch_add(1, Ordering::SeqCst);
+                            serde_json::Value::String("0x64".to_string())
+                        }
+                        "eth_maxPriorityFeePerGas" => {
+                            priority_fee_counter.fetch_add(1, Ordering::SeqCst);
+                            serde_json::Value::String("0x2".to_string())
+                        }
                         _ => serde_json::Value::Null,
                     };
                     let response_body = serde_json::to_string(&serde_json::json!({
@@ -72,8 +88,25 @@ impl MockRpc {
             endpoint,
             receipt_calls,
             transaction_calls,
+            gas_price_calls,
+            priority_fee_calls,
         }
     }
+}
+
+#[tokio::test]
+async fn fee_suggestion_is_cached_within_one_head() {
+    let mock = MockRpc::start().await;
+    let client = BnsChainClient::new(&mock.endpoint);
+
+    let first = client.suggest_eip1559_fees().await.unwrap();
+    let second = client.suggest_eip1559_fees().await.unwrap();
+
+    assert_eq!(first, second);
+    assert_eq!(first.max_fee_per_gas, 202);
+    assert_eq!(first.max_priority_fee_per_gas, 2);
+    assert_eq!(mock.gas_price_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(mock.priority_fee_calls.load(Ordering::SeqCst), 1);
 }
 
 async fn read_http_request(stream: &mut TcpStream) -> String {

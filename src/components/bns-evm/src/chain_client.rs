@@ -29,6 +29,7 @@ sol! {
 pub const MULTICALL3_ADDRESS: Address = address!("cA11bde05977b3631167028862bE2a173976CA11");
 const PENDING_TRANSACTION_TTL: Duration = Duration::from_secs(2);
 const NOT_FOUND_TRANSACTION_TTL: Duration = Duration::from_secs(5);
+const FEE_SUGGESTION_TTL: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContractRead {
@@ -47,6 +48,13 @@ pub enum TransactionLookup {
 struct CachedTransactionLookup {
     state: TransactionLookup,
     expires_at: Option<Instant>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CachedFeeSuggestion {
+    fees: Eip1559FeeSuggestion,
+    head_hash: Option<B256>,
+    expires_at: Instant,
 }
 
 impl ContractRead {
@@ -82,6 +90,8 @@ pub struct BnsChainClient {
     latest_block: Mutex<Option<EthBlock>>,
     transaction_cache: Mutex<HashMap<B256, CachedTransactionLookup>>,
     transaction_locks: Mutex<HashMap<B256, Arc<tokio::sync::Mutex<()>>>>,
+    fee_cache: Mutex<Option<CachedFeeSuggestion>>,
+    fee_lock: tokio::sync::Mutex<()>,
 }
 
 impl BnsChainClient {
@@ -94,6 +104,8 @@ impl BnsChainClient {
             latest_block: Mutex::new(None),
             transaction_cache: Mutex::new(HashMap::new()),
             transaction_locks: Mutex::new(HashMap::new()),
+            fee_cache: Mutex::new(None),
+            fee_lock: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -110,6 +122,8 @@ impl BnsChainClient {
             latest_block: Mutex::new(None),
             transaction_cache: Mutex::new(HashMap::new()),
             transaction_locks: Mutex::new(HashMap::new()),
+            fee_cache: Mutex::new(None),
+            fee_lock: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -274,7 +288,41 @@ impl BnsChainClient {
     }
 
     pub async fn suggest_eip1559_fees(&self) -> BnsEvmResult<Eip1559FeeSuggestion> {
-        self.rpc.suggest_eip1559_fees().await
+        if let Some(fees) = self.cached_fee_suggestion() {
+            return Ok(fees);
+        }
+        let _guard = self.fee_lock.lock().await;
+        if let Some(fees) = self.cached_fee_suggestion() {
+            return Ok(fees);
+        }
+
+        let fees = self.rpc.suggest_eip1559_fees().await?;
+        let head_hash = self
+            .latest_block
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|head| head.hash);
+        *self.fee_cache.lock().unwrap() = Some(CachedFeeSuggestion {
+            fees,
+            head_hash,
+            expires_at: Instant::now() + FEE_SUGGESTION_TTL,
+        });
+        Ok(fees)
+    }
+
+    fn cached_fee_suggestion(&self) -> Option<Eip1559FeeSuggestion> {
+        let current_head_hash = self
+            .latest_block
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|head| head.hash);
+        let cache = self.fee_cache.lock().unwrap();
+        cache.as_ref().and_then(|cached| {
+            (cached.expires_at > Instant::now() && cached.head_hash == current_head_hash)
+                .then_some(cached.fees)
+        })
     }
 
     pub async fn estimate_gas(
