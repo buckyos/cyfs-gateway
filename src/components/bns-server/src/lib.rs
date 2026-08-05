@@ -130,9 +130,12 @@ where
         let contract = self.contract_address.as_deref().ok_or_else(|| {
             BnsClientError::unsupported("BNS server contract_address is not configured")
         })?;
-        let contract = Address::from_str(contract).map_err(|error| {
-            BnsClientError::Serialization(format!("invalid BNS contract_address: {error}"))
-        })?;
+        let contract = match self.chain_client.contract_address() {
+            Some(contract) => contract,
+            None => Address::from_str(contract).map_err(|error| {
+                BnsClientError::Serialization(format!("invalid BNS contract_address: {error}"))
+            })?,
+        };
         let actual_chain_id = self
             .chain_client
             .chain_id()

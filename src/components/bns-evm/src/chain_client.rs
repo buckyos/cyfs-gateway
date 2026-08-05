@@ -1,3 +1,5 @@
+use std::sync::OnceLock;
+
 use alloy_primitives::{address, Address, Bytes, B256};
 use alloy_sol_types::{sol, SolCall};
 use serde::de::DeserializeOwned;
@@ -57,12 +59,31 @@ where
 #[derive(Debug)]
 pub struct BnsChainClient {
     rpc: EthRpcClient,
+    expected_chain_id: Option<u64>,
+    contract_address: Option<Address>,
+    chain_id: OnceLock<u64>,
 }
 
 impl BnsChainClient {
     pub fn new(endpoint: impl Into<String>) -> Self {
         Self {
             rpc: EthRpcClient::new(endpoint),
+            expected_chain_id: None,
+            contract_address: None,
+            chain_id: OnceLock::new(),
+        }
+    }
+
+    pub fn new_with_chain_config(
+        endpoint: impl Into<String>,
+        contract_address: Address,
+        chain_id: u64,
+    ) -> Self {
+        Self {
+            rpc: EthRpcClient::new(endpoint),
+            expected_chain_id: Some(chain_id),
+            contract_address: Some(contract_address),
+            chain_id: OnceLock::new(),
         }
     }
 
@@ -75,8 +96,32 @@ impl BnsChainClient {
         &self.rpc
     }
 
+    pub fn configured_chain_id(&self) -> Option<u64> {
+        self.expected_chain_id
+    }
+
+    pub fn contract_address(&self) -> Option<Address> {
+        self.contract_address
+    }
+
+    pub async fn validate_chain(&self) -> BnsEvmResult<()> {
+        self.chain_id().await.map(|_| ())
+    }
+
     pub async fn chain_id(&self) -> BnsEvmResult<u64> {
-        self.rpc.chain_id().await
+        if let Some(chain_id) = self.chain_id.get() {
+            return Ok(*chain_id);
+        }
+        let actual = self.rpc.chain_id().await?;
+        if let Some(expected) = self.expected_chain_id {
+            if actual != expected {
+                return Err(BnsEvmError::Rpc(format!(
+                    "BNS chain id mismatch: configured {expected}, RPC returned {actual}"
+                )));
+            }
+        }
+        let _ = self.chain_id.set(actual);
+        Ok(actual)
     }
 
     pub async fn block_number(&self) -> BnsEvmResult<u64> {

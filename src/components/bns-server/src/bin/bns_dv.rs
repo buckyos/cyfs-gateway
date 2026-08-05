@@ -201,7 +201,12 @@ async fn serve(flags: HashMap<String, String>) -> Result<(), DynError> {
     // server 与 indexer 各开一条到同一 SQLite 文件的连接（WAL 并发）。
     let server_store = SqliteBnsRegistryStore::open(&db)?;
     let indexer_store = SqliteBnsRegistryStore::open(&db)?;
-    let chain_client = Arc::new(BnsChainClient::new(rpc.clone()));
+    let chain_client = Arc::new(BnsChainClient::new_with_chain_config(
+        rpc.clone(),
+        source.contract_address()?,
+        chain_id,
+    ));
+    chain_client.validate_chain().await?;
 
     // indexer 轮询循环。
     let indexer_chain_client = chain_client.clone();

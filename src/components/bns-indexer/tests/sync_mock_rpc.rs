@@ -66,6 +66,7 @@ struct MockEthRpc {
     config: Arc<Mutex<MockConfig>>,
     get_logs_calls: Arc<Mutex<u64>>,
     eth_call_calls: Arc<Mutex<u64>>,
+    chain_id_calls: Arc<AtomicUsize>,
 }
 
 impl MockEthRpc {
@@ -75,9 +76,11 @@ impl MockEthRpc {
         let config = Arc::new(Mutex::new(config));
         let get_logs_calls = Arc::new(Mutex::new(0u64));
         let eth_call_calls = Arc::new(Mutex::new(0u64));
+        let chain_id_calls = Arc::new(AtomicUsize::new(0));
         let cfg = config.clone();
         let calls = get_logs_calls.clone();
         let view_calls = eth_call_calls.clone();
+        let network_calls = chain_id_calls.clone();
         tokio::spawn(async move {
             loop {
                 let (mut stream, _) = match listener.accept().await {
@@ -87,6 +90,7 @@ impl MockEthRpc {
                 let cfg = cfg.clone();
                 let calls = calls.clone();
                 let view_calls = view_calls.clone();
+                let network_calls = network_calls.clone();
                 tokio::spawn(async move {
                     let request = read_http_request(&mut stream).await;
                     let body = request
@@ -97,7 +101,8 @@ impl MockEthRpc {
                         serde_json::from_str(&body).unwrap_or(serde_json::Value::Null);
                     let id = req["id"].clone();
                     let method = req["method"].as_str().unwrap_or("");
-                    let result = handle_method(method, &req, &cfg, &calls, &view_calls);
+                    let result =
+                        handle_method(method, &req, &cfg, &calls, &view_calls, &network_calls);
                     let payload = serde_json::json!({"jsonrpc":"2.0","id":id,"result":result});
                     let body = serde_json::to_string(&payload).unwrap();
                     // 每个连接只服务一次请求即关闭；用 `Connection: close` 显式告知客户端
@@ -116,6 +121,7 @@ impl MockEthRpc {
             config,
             get_logs_calls,
             eth_call_calls,
+            chain_id_calls,
         }
     }
 
@@ -130,6 +136,10 @@ impl MockEthRpc {
     fn eth_call_calls(&self) -> u64 {
         *self.eth_call_calls.lock().unwrap()
     }
+
+    fn chain_id_calls(&self) -> usize {
+        self.chain_id_calls.load(Ordering::SeqCst)
+    }
 }
 
 fn handle_method(
@@ -138,10 +148,14 @@ fn handle_method(
     cfg: &Arc<Mutex<MockConfig>>,
     calls: &Arc<Mutex<u64>>,
     view_calls: &Arc<Mutex<u64>>,
+    network_calls: &Arc<AtomicUsize>,
 ) -> serde_json::Value {
     let cfg = cfg.lock().unwrap();
     match method {
-        "eth_chainId" => serde_json::Value::String(format!("0x{:x}", cfg.chain_id)),
+        "eth_chainId" => {
+            network_calls.fetch_add(1, Ordering::SeqCst);
+            serde_json::Value::String(format!("0x{:x}", cfg.chain_id))
+        }
         "eth_blockNumber" => serde_json::Value::String(format!("0x{:x}", cfg.block_number)),
         "eth_getLogs" => {
             *calls.lock().unwrap() += 1;
@@ -646,6 +660,11 @@ async fn polling_loop_runs_sync_once_repeatedly() {
     assert!(
         outcomes.load(Ordering::SeqCst) >= 2,
         "polling loop should call sync_once more than once"
+    );
+    assert_eq!(
+        mock.chain_id_calls(),
+        1,
+        "one indexer instance caches the validated chain id"
     );
 }
 

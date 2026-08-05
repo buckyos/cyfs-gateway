@@ -155,6 +155,21 @@ where
     ) -> BnsRegistryResult<Self> {
         config.validate()?;
         let contract = config.source.contract_address()?;
+        if let Some(configured_contract) = chain_client.contract_address() {
+            if configured_contract != contract {
+                return Err(BnsRegistryError::InvalidConfig(format!(
+                    "BNS chain client contract {configured_contract:#x} does not match indexer contract {contract:#x}"
+                )));
+            }
+        }
+        if let Some(configured_chain_id) = chain_client.configured_chain_id() {
+            if configured_chain_id != config.source.chain_id {
+                return Err(BnsRegistryError::InvalidConfig(format!(
+                    "BNS chain client chain_id {configured_chain_id} does not match indexer chain_id {}",
+                    config.source.chain_id
+                )));
+            }
+        }
         let source = config.source.source_id()?;
         Ok(Self {
             store,
