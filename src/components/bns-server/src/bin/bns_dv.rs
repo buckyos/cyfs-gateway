@@ -12,6 +12,9 @@
 //!
 //! 这是开发/调试用工具（被 scripts/dv-up.sh / dv-smoke.sh 调用），不是生产服务。
 
+#[path = "bns_dv/cluster.rs"]
+mod bns_dv_cluster;
+
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -22,6 +25,7 @@ use bns_client::{
     BnsEvmTxSubmission, BnsIndexerApi, BnsIndexerClient, BnsPublishDocumentReq, BnsRegisterNameReq,
     StaticBnsEvmKeyManager,
 };
+use bns_dv_cluster::{create_database_parent, merge_cluster_serve_flags};
 use bns_evm::BnsChainClient;
 use bns_indexer::{
     default_document_update, BnsBlockSyncSourceConfig, BnsContractEventIndexer,
@@ -165,13 +169,17 @@ async fn main() {
 async fn run() -> Result<(), DynError> {
     let mut args = std::env::args().skip(1);
     let command = args.next().unwrap_or_default();
-    let flags = parse_flags(args.collect());
+    let mut flags = parse_flags(args.collect());
+    if command == "serve" && flags.contains_key("cluster") {
+        flags = merge_cluster_serve_flags(flags)?;
+    }
     match command.as_str() {
         "serve" => serve(flags).await,
         "smoke" => smoke(flags).await,
         other => Err(format!(
             "unknown subcommand `{other}`; expected `serve` or `smoke`\n\
              usage:\n  \
+             bns-dv serve --cluster [--rpc <url>] [--contract <addr>] [--chain-id <n>] [--db <path>] [--listen <addr>] [--start-block n] [--confirmations n] [--interval-ms n] [--max-block-span n]\n  \
              bns-dv serve --rpc <url> --contract <addr> --chain-id <n> --db <path> --listen <addr> [--start-block n] [--confirmations n] [--interval-ms n] [--max-block-span n] [--config seed.yaml] [--seed-key 0x..]\n  \
              bns-dv smoke --server <url> --rpc <url> --contract <addr> --chain-id <n> --key <0x..> [--name alice] [--timeout-ms n]"
         )
@@ -191,6 +199,10 @@ async fn serve(flags: HashMap<String, String>) -> Result<(), DynError> {
     let confirmations: u64 = flags.get("confirmations").map_or(Ok(0), |v| v.parse())?;
     let interval_ms: u64 = flags.get("interval-ms").map_or(Ok(15_000), |v| v.parse())?;
     let max_block_span: u64 = flags.get("max-block-span").map_or(Ok(500), |v| v.parse())?;
+
+    if flags.contains_key("cluster") {
+        create_database_parent(&db)?;
+    }
 
     let mut source = BnsBlockSyncSourceConfig::anvil(rpc.clone(), contract.clone(), start_block);
     source.chain_id = chain_id;
@@ -961,7 +973,7 @@ async fn smoke(flags: HashMap<String, String>) -> Result<(), DynError> {
     Ok(())
 }
 
-// ===== 简易 --flag value 解析 =====
+// ===== cluster 配置和简易 --flag value 解析 =====
 
 fn parse_flags(args: Vec<String>) -> HashMap<String, String> {
     let mut flags = HashMap::new();
@@ -970,6 +982,8 @@ fn parse_flags(args: Vec<String>) -> HashMap<String, String> {
         if let Some(name) = arg.strip_prefix("--") {
             if let Some((k, v)) = name.split_once('=') {
                 flags.insert(k.to_string(), v.to_string());
+            } else if name == "cluster" {
+                flags.insert(name.to_string(), "true".to_string());
             } else {
                 let value = iter.next().unwrap_or_default();
                 flags.insert(name.to_string(), value);
@@ -1005,6 +1019,20 @@ mod tests {
 
     const CHAIN_ID: u64 = 31_337;
     const DEPLOYER_KEY: &str = "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d";
+
+    #[test]
+    fn cluster_flag_does_not_consume_the_next_option() {
+        let parsed = parse_flags(vec![
+            "--cluster".to_string(),
+            "--rpc".to_string(),
+            "http://override:8545".to_string(),
+        ]);
+        assert_eq!(parsed.get("cluster").map(String::as_str), Some("true"));
+        assert_eq!(
+            parsed.get("rpc").map(String::as_str),
+            Some("http://override:8545")
+        );
+    }
 
     fn e2e_tools_available() -> bool {
         fn has(bin: &str) -> bool {
