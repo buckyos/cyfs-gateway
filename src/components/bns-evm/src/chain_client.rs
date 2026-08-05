@@ -1,4 +1,6 @@
-use std::sync::{Mutex, OnceLock};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use alloy_primitives::{address, Address, Bytes, B256};
 use alloy_sol_types::{sol, SolCall};
@@ -25,11 +27,26 @@ sol! {
 }
 
 pub const MULTICALL3_ADDRESS: Address = address!("cA11bde05977b3631167028862bE2a173976CA11");
+const PENDING_TRANSACTION_TTL: Duration = Duration::from_secs(2);
+const NOT_FOUND_TRANSACTION_TTL: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContractRead {
     pub target: Address,
     pub calldata: Bytes,
+}
+
+#[derive(Debug, Clone)]
+pub enum TransactionLookup {
+    Mined(EthTransactionReceipt),
+    Pending,
+    NotFound,
+}
+
+#[derive(Debug, Clone)]
+struct CachedTransactionLookup {
+    state: TransactionLookup,
+    expires_at: Option<Instant>,
 }
 
 impl ContractRead {
@@ -63,6 +80,8 @@ pub struct BnsChainClient {
     contract_address: Option<Address>,
     chain_id: OnceLock<u64>,
     latest_block: Mutex<Option<EthBlock>>,
+    transaction_cache: Mutex<HashMap<B256, CachedTransactionLookup>>,
+    transaction_locks: Mutex<HashMap<B256, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 impl BnsChainClient {
@@ -73,6 +92,8 @@ impl BnsChainClient {
             contract_address: None,
             chain_id: OnceLock::new(),
             latest_block: Mutex::new(None),
+            transaction_cache: Mutex::new(HashMap::new()),
+            transaction_locks: Mutex::new(HashMap::new()),
         }
     }
 
@@ -87,6 +108,8 @@ impl BnsChainClient {
             contract_address: Some(contract_address),
             chain_id: OnceLock::new(),
             latest_block: Mutex::new(None),
+            transaction_cache: Mutex::new(HashMap::new()),
+            transaction_locks: Mutex::new(HashMap::new()),
         }
     }
 
@@ -146,13 +169,96 @@ impl BnsChainClient {
             .await?
             .ok_or_else(|| BnsEvmError::Rpc("latest EVM block is missing".to_string()))?;
         let mut cached = self.latest_block.lock().unwrap();
+        let reorg_from = cached
+            .as_ref()
+            .and_then(|previous| reorg_invalidation_start(previous, &block));
         let changed = cached.as_ref() != Some(&block);
         *cached = Some(block.clone());
+        drop(cached);
+        if let Some(block_number) = reorg_from {
+            self.invalidate_mined_receipts_from(block_number);
+        }
         Ok((block, changed))
     }
 
     pub fn cached_latest_block(&self) -> Option<EthBlock> {
         self.latest_block.lock().unwrap().clone()
+    }
+
+    pub async fn transaction_lookup(&self, tx_hash: B256) -> BnsEvmResult<TransactionLookup> {
+        if let Some(state) = self.cached_transaction_lookup(tx_hash) {
+            return Ok(state);
+        }
+
+        let lock = {
+            let mut locks = self.transaction_locks.lock().unwrap();
+            locks
+                .entry(tx_hash)
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+                .clone()
+        };
+        let guard = lock.lock().await;
+        if let Some(state) = self.cached_transaction_lookup(tx_hash) {
+            drop(guard);
+            self.remove_unused_transaction_lock(tx_hash, &lock);
+            return Ok(state);
+        }
+
+        let state = match self.rpc.transaction_receipt(tx_hash).await? {
+            Some(receipt) => TransactionLookup::Mined(receipt),
+            None => match self.rpc.transaction_by_hash(tx_hash).await? {
+                Some(_) => TransactionLookup::Pending,
+                None => TransactionLookup::NotFound,
+            },
+        };
+        let expires_at = match state {
+            TransactionLookup::Mined(_) => None,
+            TransactionLookup::Pending => Some(Instant::now() + PENDING_TRANSACTION_TTL),
+            TransactionLookup::NotFound => Some(Instant::now() + NOT_FOUND_TRANSACTION_TTL),
+        };
+        self.transaction_cache.lock().unwrap().insert(
+            tx_hash,
+            CachedTransactionLookup {
+                state: state.clone(),
+                expires_at,
+            },
+        );
+        drop(guard);
+        self.remove_unused_transaction_lock(tx_hash, &lock);
+        Ok(state)
+    }
+
+    pub fn invalidate_mined_receipts_from(&self, block_number: u64) {
+        self.transaction_cache
+            .lock()
+            .unwrap()
+            .retain(|_, cached| match &cached.state {
+                TransactionLookup::Mined(receipt) => receipt
+                    .block_number
+                    .is_none_or(|number| number < block_number),
+                TransactionLookup::Pending | TransactionLookup::NotFound => true,
+            });
+    }
+
+    fn cached_transaction_lookup(&self, tx_hash: B256) -> Option<TransactionLookup> {
+        let now = Instant::now();
+        let mut cache = self.transaction_cache.lock().unwrap();
+        let expired = cache
+            .get(&tx_hash)
+            .and_then(|cached| cached.expires_at)
+            .is_some_and(|expires_at| expires_at <= now);
+        if expired {
+            cache.remove(&tx_hash);
+            return None;
+        }
+        cache.get(&tx_hash).map(|cached| cached.state.clone())
+    }
+
+    fn remove_unused_transaction_lock(&self, tx_hash: B256, lock: &Arc<tokio::sync::Mutex<()>>) {
+        let mut locks = self.transaction_locks.lock().unwrap();
+        if Arc::strong_count(lock) == 2 {
+            locks.remove(&tx_hash);
+        }
     }
 
     pub async fn transaction_count(&self, address: Address) -> BnsEvmResult<u64> {
@@ -261,5 +367,25 @@ impl BnsChainClient {
         R: DeserializeOwned,
     {
         self.rpc.call_nullable(method, params).await
+    }
+}
+
+fn reorg_invalidation_start(previous: &EthBlock, current: &EthBlock) -> Option<u64> {
+    match (previous.number, current.number) {
+        (Some(previous_number), Some(current_number)) if current_number < previous_number => {
+            Some(current_number.saturating_add(1))
+        }
+        (Some(previous_number), Some(current_number))
+            if current_number == previous_number && current.hash != previous.hash =>
+        {
+            Some(current_number)
+        }
+        (Some(previous_number), Some(current_number))
+            if current_number == previous_number.saturating_add(1)
+                && current.parent_hash != previous.hash =>
+        {
+            Some(0)
+        }
+        _ => None,
     }
 }

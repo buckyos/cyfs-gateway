@@ -21,7 +21,9 @@ pub use bindings::{
     OwnerPolicyUpdate, OwnerResolution, OwnerSource, Principal, PrincipalKind, PurchaseContext,
     RegisterOptions, ReleaseMode, ResolveResult,
 };
-pub use chain_client::{decode_contract_return, BnsChainClient, ContractRead, MULTICALL3_ADDRESS};
+pub use chain_client::{
+    decode_contract_return, BnsChainClient, ContractRead, TransactionLookup, MULTICALL3_ADDRESS,
+};
 pub use rpc::{
     BlockRange, Eip1559FeeSuggestion, EthBlock, EthLog, EthRpcClient, EthTransaction,
     EthTransactionReceipt, RpcLogFilter,

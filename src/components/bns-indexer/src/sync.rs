@@ -366,6 +366,7 @@ where
         };
 
         if should_reset {
+            self.chain_client.invalidate_mined_receipts_from(0);
             self.store
                 .transact(|tx| tx.reset_indexer_projection(&self.source))?;
         }

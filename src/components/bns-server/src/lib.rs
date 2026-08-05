@@ -23,7 +23,7 @@ use bns_client::{
     METHOD_QUERY_TX_STATE, METHOD_RESOLVE_DOCUMENT, METHOD_RESOLVE_OWNER, METHOD_SUBMIT_RAW_TX,
     METHOD_SYSTEM_INFO,
 };
-use bns_evm::{Address, BnsChainClient, EthRpcClient, B256};
+use bns_evm::{Address, BnsChainClient, EthRpcClient, TransactionLookup, B256};
 use bns_indexer::{
     canonical_bns_name, canonical_doc_type, did_bns_from_name, is_top_level_name,
     name_from_did_bns, now_timestamp, parent_name, AliasKind, AuthorityKey, AuthoritySetState,
@@ -256,52 +256,54 @@ where
             BnsClientError::Serialization(format!("invalid tx_hash `{tx_hash}`: {error}"))
         })?;
         let canonical_hash = format!("{hash:#x}");
-        if let Some(receipt) = self
+        let lookup = self
             .chain_client
-            .transaction_receipt(hash)
+            .transaction_lookup(hash)
             .await
-            .map_err(BnsClientError::from)?
-        {
-            let block_number = receipt.block_number;
-            let confirmations = match block_number {
-                Some(block_number) => self
-                    .chain_client
-                    .block_number()
-                    .await
-                    .map_err(BnsClientError::from)?
-                    .checked_sub(block_number)
-                    .map_or(0, |depth| depth.saturating_add(1)),
-                None => 0,
-            };
-            return Ok(BnsTxState {
+            .map_err(BnsClientError::from)?;
+        match lookup {
+            TransactionLookup::Mined(receipt) => {
+                let block_number = receipt.block_number;
+                let confirmations = match block_number {
+                    Some(block_number) => {
+                        let latest_block = match self.chain_client.cached_latest_block() {
+                            Some(head) => head.number.unwrap_or(0),
+                            None => self
+                                .chain_client
+                                .block_number()
+                                .await
+                                .map_err(BnsClientError::from)?,
+                        };
+                        latest_block
+                            .checked_sub(block_number)
+                            .map_or(0, |depth| depth.saturating_add(1))
+                    }
+                    None => 0,
+                };
+                Ok(BnsTxState {
+                    tx_hash: canonical_hash,
+                    state: if receipt.status == Some(0) {
+                        BnsTxExecutionState::Reverted
+                    } else {
+                        BnsTxExecutionState::Succeeded
+                    },
+                    block_number,
+                    confirmations,
+                })
+            }
+            TransactionLookup::Pending => Ok(BnsTxState {
                 tx_hash: canonical_hash,
-                state: if receipt.status == Some(0) {
-                    BnsTxExecutionState::Reverted
-                } else {
-                    BnsTxExecutionState::Succeeded
-                },
-                block_number,
-                confirmations,
-            });
+                state: BnsTxExecutionState::Pending,
+                block_number: None,
+                confirmations: 0,
+            }),
+            TransactionLookup::NotFound => Ok(BnsTxState {
+                tx_hash: canonical_hash,
+                state: BnsTxExecutionState::NotFound,
+                block_number: None,
+                confirmations: 0,
+            }),
         }
-
-        let state = if self
-            .chain_client
-            .transaction_by_hash(hash)
-            .await
-            .map_err(BnsClientError::from)?
-            .is_some()
-        {
-            BnsTxExecutionState::Pending
-        } else {
-            BnsTxExecutionState::NotFound
-        };
-        Ok(BnsTxState {
-            tx_hash: canonical_hash,
-            state,
-            block_number: None,
-            confirmations: 0,
-        })
     }
 
     async fn submit_raw_tx(&self, req: BnsSubmitRawTxReq) -> BnsClientResult<BnsSubmitRawTxResp> {
