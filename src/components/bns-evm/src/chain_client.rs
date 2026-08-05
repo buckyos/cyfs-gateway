@@ -1,4 +1,4 @@
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 use alloy_primitives::{address, Address, Bytes, B256};
 use alloy_sol_types::{sol, SolCall};
@@ -62,6 +62,7 @@ pub struct BnsChainClient {
     expected_chain_id: Option<u64>,
     contract_address: Option<Address>,
     chain_id: OnceLock<u64>,
+    latest_block: Mutex<Option<EthBlock>>,
 }
 
 impl BnsChainClient {
@@ -71,6 +72,7 @@ impl BnsChainClient {
             expected_chain_id: None,
             contract_address: None,
             chain_id: OnceLock::new(),
+            latest_block: Mutex::new(None),
         }
     }
 
@@ -84,6 +86,7 @@ impl BnsChainClient {
             expected_chain_id: Some(chain_id),
             contract_address: Some(contract_address),
             chain_id: OnceLock::new(),
+            latest_block: Mutex::new(None),
         }
     }
 
@@ -126,6 +129,30 @@ impl BnsChainClient {
 
     pub async fn block_number(&self) -> BnsEvmResult<u64> {
         self.rpc.block_number().await
+    }
+
+    /// Return the latest header and whether it differs from the previously
+    /// cached header. Backlog processing can pass `false` to reuse one head.
+    pub async fn latest_block(&self, refresh: bool) -> BnsEvmResult<(EthBlock, bool)> {
+        if !refresh {
+            if let Some(block) = self.latest_block.lock().unwrap().clone() {
+                return Ok((block, false));
+            }
+        }
+
+        let block = self
+            .rpc
+            .latest_block()
+            .await?
+            .ok_or_else(|| BnsEvmError::Rpc("latest EVM block is missing".to_string()))?;
+        let mut cached = self.latest_block.lock().unwrap();
+        let changed = cached.as_ref() != Some(&block);
+        *cached = Some(block.clone());
+        Ok((block, changed))
+    }
+
+    pub fn cached_latest_block(&self) -> Option<EthBlock> {
+        self.latest_block.lock().unwrap().clone()
     }
 
     pub async fn transaction_count(&self, address: Address) -> BnsEvmResult<u64> {

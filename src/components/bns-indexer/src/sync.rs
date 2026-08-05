@@ -9,7 +9,7 @@ use bns_evm::{
     AuthorityKeyStatus as EvmAuthorityKeyStatus, AuthorityKeyUpdate as EvmAuthorityKeyUpdate,
     AuthoritySetState as EvmAuthoritySetState, BlockRange, Bns, BnsCall, BnsChainClient,
     ContractRead, DocumentRef as EvmDocumentRef, DocumentState as EvmDocumentState,
-    DocumentStatus as EvmDocumentStatus, EthLog, NameState as EvmNameState,
+    DocumentStatus as EvmDocumentStatus, EthBlock, EthLog, NameState as EvmNameState,
     NameStatus as EvmNameStatus, OwnerSource as EvmOwnerSource, Principal as EvmPrincipal,
     PrincipalKind as EvmPrincipalKind, RpcLogFilter, B256,
 };
@@ -191,6 +191,13 @@ where
     }
 
     pub async fn sync_once(&self) -> BnsRegistryResult<BnsIndexerSyncOutcome> {
+        self.sync_once_with_head_refresh(true).await
+    }
+
+    async fn sync_once_with_head_refresh(
+        &self,
+        refresh_head: bool,
+    ) -> BnsRegistryResult<BnsIndexerSyncOutcome> {
         let remote_chain_id = self.chain_client.chain_id().await?;
         if remote_chain_id != self.config.source.chain_id {
             return Err(BnsRegistryError::InvalidConfig(format!(
@@ -199,8 +206,18 @@ where
             )));
         }
 
-        let latest_block = self.chain_client.block_number().await?;
-        let reorg_detected = self.reset_projection_if_reorged(latest_block).await?;
+        let (latest_head, head_changed) = self.chain_client.latest_block(refresh_head).await?;
+        let latest_block = latest_head.number.ok_or_else(|| {
+            BnsRegistryError::InvalidConfig(format!(
+                "BNS indexer latest block from RPC {} has no number",
+                self.config.source.rpc_endpoint
+            ))
+        })?;
+        let reorg_detected = if head_changed {
+            self.reset_projection_if_reorged(&latest_head).await?
+        } else {
+            false
+        };
         let target_block = latest_block.saturating_sub(self.config.confirmations);
         let from_block = self.next_block_to_sync()?;
         if from_block > target_block {
@@ -253,7 +270,7 @@ where
             }
         }
 
-        let block_hash = self.block_hash_string(to_block).await?;
+        let block_hash = self.block_hash_string(to_block, Some(&latest_head)).await?;
         let cursor = IndexerCursor {
             source: self.source.clone(),
             block_number: to_block,
@@ -287,8 +304,9 @@ where
         } else {
             interval
         };
+        let mut refresh_head = true;
         loop {
-            let outcome = self.sync_once().await;
+            let outcome = self.sync_once_with_head_refresh(refresh_head).await;
             let has_backlog = outcome.as_ref().is_ok_and(|outcome| {
                 outcome.to_block.is_some_and(|to_block| {
                     to_block
@@ -299,6 +317,7 @@ where
             });
             let delay = polling_delay(interval, outcome.is_err(), has_backlog);
             on_sync(outcome);
+            refresh_head = !has_backlog;
             if !delay.is_zero() {
                 tokio::time::sleep(delay).await;
             }
@@ -318,17 +337,25 @@ where
             .transact(|tx| tx.get_indexer_cursor(&self.source))
     }
 
-    async fn reset_projection_if_reorged(&self, latest_block: u64) -> BnsRegistryResult<bool> {
+    async fn reset_projection_if_reorged(&self, latest_head: &EthBlock) -> BnsRegistryResult<bool> {
         let Some(mut cursor) = self.cursor()? else {
             return Ok(false);
         };
+        let latest_block = latest_head.number.ok_or_else(|| {
+            BnsRegistryError::InvalidConfig("BNS latest block has no number".to_string())
+        })?;
 
         let should_reset = if cursor.block_number > latest_block {
             true
         } else if let Some(expected_hash) = cursor.block_hash.as_deref() {
-            self.block_hash_string(cursor.block_number).await? != expected_hash
+            self.block_hash_string(cursor.block_number, Some(latest_head))
+                .await?
+                != expected_hash
         } else {
-            cursor.block_hash = Some(self.block_hash_string(cursor.block_number).await?);
+            cursor.block_hash = Some(
+                self.block_hash_string(cursor.block_number, Some(latest_head))
+                    .await?,
+            );
             cursor.updated_at = now_timestamp();
             self.store.transact(|tx| tx.put_indexer_cursor(&cursor))?;
             false
@@ -341,17 +368,24 @@ where
         Ok(should_reset)
     }
 
-    async fn block_hash_string(&self, block_number: u64) -> BnsRegistryResult<String> {
-        let block = self
-            .chain_client
-            .block_by_number(block_number)
-            .await?
-            .ok_or_else(|| {
-                BnsRegistryError::InvalidConfig(format!(
-                    "BNS indexer cannot read block {block_number} from RPC {}",
-                    self.config.source.rpc_endpoint
-                ))
-            })?;
+    async fn block_hash_string(
+        &self,
+        block_number: u64,
+        latest_head: Option<&EthBlock>,
+    ) -> BnsRegistryResult<String> {
+        let block = if latest_head.is_some_and(|head| head.number == Some(block_number)) {
+            latest_head.cloned().unwrap()
+        } else {
+            self.chain_client
+                .block_by_number(block_number)
+                .await?
+                .ok_or_else(|| {
+                    BnsRegistryError::InvalidConfig(format!(
+                        "BNS indexer cannot read block {block_number} from RPC {}",
+                        self.config.source.rpc_endpoint
+                    ))
+                })?
+        };
         if let Some(actual_number) = block.number {
             if actual_number != block_number {
                 return Err(BnsRegistryError::InvalidConfig(format!(

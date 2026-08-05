@@ -67,6 +67,7 @@ struct MockEthRpc {
     get_logs_calls: Arc<Mutex<u64>>,
     eth_call_calls: Arc<Mutex<u64>>,
     chain_id_calls: Arc<AtomicUsize>,
+    latest_block_calls: Arc<AtomicUsize>,
 }
 
 impl MockEthRpc {
@@ -77,10 +78,12 @@ impl MockEthRpc {
         let get_logs_calls = Arc::new(Mutex::new(0u64));
         let eth_call_calls = Arc::new(Mutex::new(0u64));
         let chain_id_calls = Arc::new(AtomicUsize::new(0));
+        let latest_block_calls = Arc::new(AtomicUsize::new(0));
         let cfg = config.clone();
         let calls = get_logs_calls.clone();
         let view_calls = eth_call_calls.clone();
         let network_calls = chain_id_calls.clone();
+        let head_calls = latest_block_calls.clone();
         tokio::spawn(async move {
             loop {
                 let (mut stream, _) = match listener.accept().await {
@@ -91,6 +94,7 @@ impl MockEthRpc {
                 let calls = calls.clone();
                 let view_calls = view_calls.clone();
                 let network_calls = network_calls.clone();
+                let head_calls = head_calls.clone();
                 tokio::spawn(async move {
                     let request = read_http_request(&mut stream).await;
                     let body = request
@@ -101,8 +105,15 @@ impl MockEthRpc {
                         serde_json::from_str(&body).unwrap_or(serde_json::Value::Null);
                     let id = req["id"].clone();
                     let method = req["method"].as_str().unwrap_or("");
-                    let result =
-                        handle_method(method, &req, &cfg, &calls, &view_calls, &network_calls);
+                    let result = handle_method(
+                        method,
+                        &req,
+                        &cfg,
+                        &calls,
+                        &view_calls,
+                        &network_calls,
+                        &head_calls,
+                    );
                     let payload = serde_json::json!({"jsonrpc":"2.0","id":id,"result":result});
                     let body = serde_json::to_string(&payload).unwrap();
                     // 每个连接只服务一次请求即关闭；用 `Connection: close` 显式告知客户端
@@ -122,6 +133,7 @@ impl MockEthRpc {
             get_logs_calls,
             eth_call_calls,
             chain_id_calls,
+            latest_block_calls,
         }
     }
 
@@ -140,6 +152,10 @@ impl MockEthRpc {
     fn chain_id_calls(&self) -> usize {
         self.chain_id_calls.load(Ordering::SeqCst)
     }
+
+    fn latest_block_calls(&self) -> usize {
+        self.latest_block_calls.load(Ordering::SeqCst)
+    }
 }
 
 fn handle_method(
@@ -149,6 +165,7 @@ fn handle_method(
     calls: &Arc<Mutex<u64>>,
     view_calls: &Arc<Mutex<u64>>,
     network_calls: &Arc<AtomicUsize>,
+    head_calls: &Arc<AtomicUsize>,
 ) -> serde_json::Value {
     let cfg = cfg.lock().unwrap();
     match method {
@@ -162,8 +179,13 @@ fn handle_method(
             serde_json::Value::Array(cfg.logs_json.clone())
         }
         "eth_getBlockByNumber" => {
-            let block_number =
-                parse_rpc_quantity(req["params"][0].as_str().unwrap_or("0x0")).unwrap();
+            let block_tag = req["params"][0].as_str().unwrap_or("0x0");
+            let block_number = if block_tag == "latest" {
+                head_calls.fetch_add(1, Ordering::SeqCst);
+                cfg.block_number
+            } else {
+                parse_rpc_quantity(block_tag).unwrap()
+            };
             serde_json::json!({
                 "number": format!("0x{block_number:x}"),
                 "hash": cfg
@@ -693,6 +715,11 @@ async fn polling_loop_processes_backlog_without_idle_sleep() {
 
     assert_eq!(*observed.lock().unwrap(), [Some(0), Some(1), Some(2)]);
     assert_eq!(mock.get_logs_calls(), 3);
+    assert_eq!(
+        mock.latest_block_calls(),
+        1,
+        "one latest header is reused while draining backlog"
+    );
 }
 
 #[tokio::test]
