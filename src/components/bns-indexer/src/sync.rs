@@ -4,13 +4,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bns_evm::{
-    decode_bns_call, Address, AliasKind as EvmAliasKind, AliasState as EvmAliasState,
-    AuthorityKey as EvmAuthorityKey, AuthorityKeyStatus as EvmAuthorityKeyStatus,
-    AuthorityKeyUpdate as EvmAuthorityKeyUpdate, AuthoritySetState as EvmAuthoritySetState,
-    BlockRange, Bns, BnsCall, BnsChainClient, DocumentRef as EvmDocumentRef,
-    DocumentState as EvmDocumentState, DocumentStatus as EvmDocumentStatus, EthLog,
-    NameState as EvmNameState, NameStatus as EvmNameStatus, OwnerSource as EvmOwnerSource,
-    Principal as EvmPrincipal, PrincipalKind as EvmPrincipalKind, RpcLogFilter, B256,
+    decode_bns_call, decode_contract_return, Address, AliasKind as EvmAliasKind,
+    AliasState as EvmAliasState, AuthorityKey as EvmAuthorityKey,
+    AuthorityKeyStatus as EvmAuthorityKeyStatus, AuthorityKeyUpdate as EvmAuthorityKeyUpdate,
+    AuthoritySetState as EvmAuthoritySetState, BlockRange, Bns, BnsCall, BnsChainClient,
+    ContractRead, DocumentRef as EvmDocumentRef, DocumentState as EvmDocumentState,
+    DocumentStatus as EvmDocumentStatus, EthLog, NameState as EvmNameState,
+    NameStatus as EvmNameStatus, OwnerSource as EvmOwnerSource, Principal as EvmPrincipal,
+    PrincipalKind as EvmPrincipalKind, RpcLogFilter, B256,
 };
 use serde::{Deserialize, Serialize};
 
@@ -379,8 +380,7 @@ where
                 version,
                 ..
             } => {
-                self.push_name_state(&mut write, name).await?;
-                self.push_document_state(&mut write, name, doc_type, *version)
+                self.push_name_and_document_state(&mut write, name, doc_type, *version)
                     .await?;
             }
             RegistryEvent::DocumentRevoked {
@@ -389,8 +389,7 @@ where
                 new_version,
                 ..
             } => {
-                self.push_name_state(&mut write, name).await?;
-                self.push_document_state(&mut write, name, doc_type, *new_version)
+                self.push_name_and_document_state(&mut write, name, doc_type, *new_version)
                     .await?;
             }
             RegistryEvent::AuthorityKeysUpdated { name, .. } => {
@@ -413,9 +412,7 @@ where
                 }
             }
             RegistryEvent::DidAliasSet { name, .. } => {
-                self.push_name_state(&mut write, name).await?;
-                let alias = self.read_alias(name).await?;
-                write.aliases.push(alias);
+                self.push_name_and_alias_state(&mut write, name).await?;
             }
             RegistryEvent::PaymentTargetUpdated {
                 name,
@@ -423,8 +420,7 @@ where
                 version,
                 ..
             } => {
-                self.push_name_state(&mut write, name).await?;
-                self.push_document_state(&mut write, name, doc_type, *version)
+                self.push_name_and_document_state(&mut write, name, doc_type, *version)
                     .await?;
             }
             RegistryEvent::LogCheckpointPublished { .. } => {
@@ -445,16 +441,74 @@ where
         Ok(())
     }
 
-    async fn push_document_state(
+    async fn push_name_and_document_state(
         &self,
         write: &mut ContractProjectionWrite,
         name: &str,
         doc_type: &str,
         version: u64,
     ) -> BnsRegistryResult<()> {
-        if let Some(state) = self.read_document_state(name, doc_type, version).await? {
-            write.documents.push(state);
+        let name_call = Bns::queryNameStateCall {
+            name: name.to_string(),
+        };
+        let document_call = Bns::getDocumentVersionCall {
+            name: name.to_string(),
+            docType: doc_type.to_string(),
+            version,
+        };
+        let outputs = self
+            .chain_client
+            .multicall(&[
+                ContractRead::new(self.contract, &name_call),
+                ContractRead::new(self.contract, &document_call),
+            ])
+            .await?;
+
+        let name_state = name_state_from_evm(decode_contract_return::<Bns::queryNameStateCall>(
+            &outputs[0],
+        )?)?;
+        if name_state.status != NameStatus::Available {
+            write.names.push(name_state);
         }
+        let document_state = document_state_from_evm(decode_contract_return::<
+            Bns::getDocumentVersionCall,
+        >(&outputs[1])?)?;
+        if document_state.status != DocumentStatus::Missing {
+            write.documents.push(document_state);
+        }
+        Ok(())
+    }
+
+    async fn push_name_and_alias_state(
+        &self,
+        write: &mut ContractProjectionWrite,
+        name: &str,
+    ) -> BnsRegistryResult<()> {
+        let name_call = Bns::queryNameStateCall {
+            name: name.to_string(),
+        };
+        let alias_call = Bns::getAliasCall {
+            name: name.to_string(),
+        };
+        let outputs = self
+            .chain_client
+            .multicall(&[
+                ContractRead::new(self.contract, &name_call),
+                ContractRead::new(self.contract, &alias_call),
+            ])
+            .await?;
+
+        let name_state = name_state_from_evm(decode_contract_return::<Bns::queryNameStateCall>(
+            &outputs[0],
+        )?)?;
+        if name_state.status != NameStatus::Available {
+            write.names.push(name_state);
+        }
+        write
+            .aliases
+            .push(alias_state_from_evm(decode_contract_return::<
+                Bns::getAliasCall,
+            >(&outputs[1])?)?);
         Ok(())
     }
 
@@ -476,31 +530,6 @@ where
         }
     }
 
-    async fn read_document_state(
-        &self,
-        name: &str,
-        doc_type: &str,
-        version: u64,
-    ) -> BnsRegistryResult<Option<DocumentState>> {
-        let state = self
-            .chain_client
-            .call_contract(
-                self.contract,
-                &Bns::getDocumentVersionCall {
-                    name: name.to_string(),
-                    docType: doc_type.to_string(),
-                    version,
-                },
-            )
-            .await?;
-        let state = document_state_from_evm(state)?;
-        if state.status == DocumentStatus::Missing {
-            Ok(None)
-        } else {
-            Ok(Some(state))
-        }
-    }
-
     async fn read_authority_set(&self, name: &str) -> BnsRegistryResult<AuthoritySetState> {
         let state = self
             .chain_client
@@ -512,19 +541,6 @@ where
             )
             .await?;
         authority_set_from_evm(state)
-    }
-
-    async fn read_alias(&self, name: &str) -> BnsRegistryResult<AliasState> {
-        let state = self
-            .chain_client
-            .call_contract(
-                self.contract,
-                &Bns::getAliasCall {
-                    name: name.to_string(),
-                },
-            )
-            .await?;
-        alias_state_from_evm(state)
     }
 
     async fn read_latest_checkpoint(&self) -> BnsRegistryResult<LogCheckpoint> {

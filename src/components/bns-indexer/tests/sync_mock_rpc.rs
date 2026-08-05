@@ -16,8 +16,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use alloy_sol_types::{SolCall, SolEvent};
-use bns_evm::{address, Address, Bns, B256};
+use alloy_sol_types::{sol, SolCall, SolEvent};
+use bns_evm::{address, Address, Bns, Bytes, B256, MULTICALL3_ADDRESS, U256};
 use bns_indexer::{
     sync_bns_contract_once, BnsBlockSyncSourceConfig, BnsContractEventIndexer,
     BnsIndexerSyncConfig, BnsRegistryError, BnsRegistryStore, DocumentStatus, NameStatus,
@@ -30,6 +30,20 @@ const CONTRACT: &str = "0x2222222222222222222222222222222222222222";
 const ACTOR: Address = address!("1000000000000000000000000000000000000001");
 const OWNER: Address = address!("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
 
+sol! {
+    interface TestMulticall3 {
+        struct Call {
+            address target;
+            bytes callData;
+        }
+
+        function aggregate(Call[] calldata calls)
+            external
+            payable
+            returns (uint256 blockNumber, bytes[] memory returnData);
+    }
+}
+
 // ===== Mock JSON-RPC 服务 =====
 
 #[derive(Default, Clone)]
@@ -39,6 +53,8 @@ struct MockConfig {
     logs_json: Vec<serde_json::Value>,
     // selector(hex, no 0x) -> eth_call 返回 hex（含 0x）。
     eth_call_returns: HashMap<String, String>,
+    // Multicall3 aggregate 返回值（含 0x）；未设置时模拟目标链不支持并触发回退。
+    multicall_return: Option<String>,
     // tx hash(lowercase, 含 0x) -> input calldata hex（含 0x），供 decode_bns_call 补全入参。
     txs: HashMap<String, String>,
     // block number -> block hash（含 0x），用于游标 reorg 检测。
@@ -49,6 +65,7 @@ struct MockEthRpc {
     endpoint: String,
     config: Arc<Mutex<MockConfig>>,
     get_logs_calls: Arc<Mutex<u64>>,
+    eth_call_calls: Arc<Mutex<u64>>,
 }
 
 impl MockEthRpc {
@@ -57,8 +74,10 @@ impl MockEthRpc {
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
         let config = Arc::new(Mutex::new(config));
         let get_logs_calls = Arc::new(Mutex::new(0u64));
+        let eth_call_calls = Arc::new(Mutex::new(0u64));
         let cfg = config.clone();
         let calls = get_logs_calls.clone();
+        let view_calls = eth_call_calls.clone();
         tokio::spawn(async move {
             loop {
                 let (mut stream, _) = match listener.accept().await {
@@ -67,6 +86,7 @@ impl MockEthRpc {
                 };
                 let cfg = cfg.clone();
                 let calls = calls.clone();
+                let view_calls = view_calls.clone();
                 tokio::spawn(async move {
                     let request = read_http_request(&mut stream).await;
                     let body = request
@@ -77,7 +97,7 @@ impl MockEthRpc {
                         serde_json::from_str(&body).unwrap_or(serde_json::Value::Null);
                     let id = req["id"].clone();
                     let method = req["method"].as_str().unwrap_or("");
-                    let result = handle_method(method, &req, &cfg, &calls);
+                    let result = handle_method(method, &req, &cfg, &calls, &view_calls);
                     let payload = serde_json::json!({"jsonrpc":"2.0","id":id,"result":result});
                     let body = serde_json::to_string(&payload).unwrap();
                     // 每个连接只服务一次请求即关闭；用 `Connection: close` 显式告知客户端
@@ -95,6 +115,7 @@ impl MockEthRpc {
             endpoint,
             config,
             get_logs_calls,
+            eth_call_calls,
         }
     }
 
@@ -105,6 +126,10 @@ impl MockEthRpc {
     fn get_logs_calls(&self) -> u64 {
         *self.get_logs_calls.lock().unwrap()
     }
+
+    fn eth_call_calls(&self) -> u64 {
+        *self.eth_call_calls.lock().unwrap()
+    }
 }
 
 fn handle_method(
@@ -112,6 +137,7 @@ fn handle_method(
     req: &serde_json::Value,
     cfg: &Arc<Mutex<MockConfig>>,
     calls: &Arc<Mutex<u64>>,
+    view_calls: &Arc<Mutex<u64>>,
 ) -> serde_json::Value {
     let cfg = cfg.lock().unwrap();
     match method {
@@ -142,6 +168,15 @@ fn handle_method(
             }
         }
         "eth_call" => {
+            *view_calls.lock().unwrap() += 1;
+            let to = req["params"][0]["to"].as_str().unwrap_or("");
+            if to.eq_ignore_ascii_case(&format!("{MULTICALL3_ADDRESS:#x}")) {
+                return cfg
+                    .multicall_return
+                    .clone()
+                    .map(serde_json::Value::String)
+                    .unwrap_or_else(|| serde_json::Value::String("0x".to_string()));
+            }
             let data = req["params"][0]["data"].as_str().unwrap_or("");
             let selector = data.trim_start_matches("0x").get(0..8).unwrap_or("");
             cfg.eth_call_returns
@@ -654,11 +689,28 @@ async fn sync_projects_document_published_via_mixed_eth_call_strategy() {
         ),
     ];
 
+    let multicall_return = format!(
+        "0x{}",
+        hex::encode(TestMulticall3::aggregateCall::abi_encode_returns(
+            &TestMulticall3::aggregateReturn {
+                blockNumber: U256::from(1),
+                returnData: vec![
+                    Bytes::from(Bns::queryNameStateCall::abi_encode_returns(
+                        &evm_name_state("alice", 2),
+                    )),
+                    Bytes::from(Bns::getDocumentVersionCall::abi_encode_returns(
+                        &evm_document_state("alice", "dns_txt", 3),
+                    )),
+                ],
+            },
+        ))
+    );
     let mock = MockEthRpc::start(MockConfig {
         chain_id: 31_337,
         block_number: 1,
         logs_json: logs,
         eth_call_returns,
+        multicall_return: Some(multicall_return),
         txs: HashMap::new(),
         ..Default::default()
     })
@@ -671,6 +723,7 @@ async fn sync_projects_document_published_via_mixed_eth_call_strategy() {
         .unwrap();
     assert_eq!(outcome.protocol_events_seen, 1);
     assert_eq!(outcome.registry_events_stored, 1);
+    assert_eq!(mock.eth_call_calls(), 1, "two reads use one Multicall");
 
     // 投影 = eth_call 拉回的最新快照（而非事件字段回放）。
     let (name_state, doc_state, events) = store

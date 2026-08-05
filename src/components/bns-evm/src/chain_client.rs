@@ -1,12 +1,53 @@
-use alloy_primitives::{Address, Bytes, B256};
-use alloy_sol_types::SolCall;
+use alloy_primitives::{address, Address, Bytes, B256};
+use alloy_sol_types::{sol, SolCall};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 
 use crate::{
-    BnsEvmResult, Eip1559FeeSuggestion, EthBlock, EthLog, EthRpcClient, EthTransaction,
-    EthTransactionReceipt, RpcLogFilter,
+    BnsEvmError, BnsEvmResult, Eip1559FeeSuggestion, EthBlock, EthLog, EthRpcClient,
+    EthTransaction, EthTransactionReceipt, RpcLogFilter,
 };
+
+sol! {
+    interface Multicall3 {
+        struct Call {
+            address target;
+            bytes callData;
+        }
+
+        function aggregate(Call[] calldata calls)
+            external
+            payable
+            returns (uint256 blockNumber, bytes[] memory returnData);
+    }
+}
+
+pub const MULTICALL3_ADDRESS: Address = address!("cA11bde05977b3631167028862bE2a173976CA11");
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContractRead {
+    pub target: Address,
+    pub calldata: Bytes,
+}
+
+impl ContractRead {
+    pub fn new<C>(target: Address, call: &C) -> Self
+    where
+        C: SolCall,
+    {
+        Self {
+            target,
+            calldata: call.abi_encode().into(),
+        }
+    }
+}
+
+pub fn decode_contract_return<C>(output: &[u8]) -> BnsEvmResult<C::Return>
+where
+    C: SolCall,
+{
+    C::abi_decode_returns(output).map_err(|err| BnsEvmError::Abi(err.to_string()))
+}
 
 /// Shared entry point for all long-lived BNS service access to an EVM chain.
 ///
@@ -80,6 +121,41 @@ impl BnsChainClient {
         C: SolCall,
     {
         self.rpc.call_contract(to, call).await
+    }
+
+    /// Execute independent latest-state reads through Multicall3.
+    ///
+    /// A missing or incompatible Multicall3 deployment is transparent to
+    /// callers: the original calls are replayed individually in order.
+    pub async fn multicall(&self, calls: &[ContractRead]) -> BnsEvmResult<Vec<Bytes>> {
+        if calls.len() <= 1 {
+            return self.call_individually(calls).await;
+        }
+
+        let aggregate = Multicall3::aggregateCall {
+            calls: calls
+                .iter()
+                .map(|call| Multicall3::Call {
+                    target: call.target,
+                    callData: call.calldata.clone(),
+                })
+                .collect(),
+        };
+        if let Ok(result) = self.rpc.call_contract(MULTICALL3_ADDRESS, &aggregate).await {
+            if result.returnData.len() == calls.len() {
+                return Ok(result.returnData);
+            }
+        }
+
+        self.call_individually(calls).await
+    }
+
+    async fn call_individually(&self, calls: &[ContractRead]) -> BnsEvmResult<Vec<Bytes>> {
+        let mut outputs = Vec::with_capacity(calls.len());
+        for call in calls {
+            outputs.push(self.rpc.eth_call(call.target, &call.calldata).await?);
+        }
+        Ok(outputs)
     }
 
     pub async fn get_logs(&self, filter: &RpcLogFilter) -> BnsEvmResult<Vec<EthLog>> {
