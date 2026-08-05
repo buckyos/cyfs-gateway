@@ -669,6 +669,33 @@ async fn polling_loop_runs_sync_once_repeatedly() {
 }
 
 #[tokio::test]
+async fn polling_loop_processes_backlog_without_idle_sleep() {
+    let mock = MockEthRpc::start(MockConfig {
+        chain_id: 31_337,
+        block_number: 2,
+        logs_json: Vec::new(),
+        ..Default::default()
+    })
+    .await;
+    let store = SqliteBnsRegistryStore::open_memory().unwrap();
+    let mut config = with_endpoint(config_for_chain(31_337), &mock.endpoint);
+    config.max_block_span = 1;
+    let indexer = BnsContractEventIndexer::new(&store, config).unwrap();
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let outcomes = observed.clone();
+
+    tokio::select! {
+        _ = indexer.run_polling_loop(Duration::from_secs(3_600), move |outcome| {
+            outcomes.lock().unwrap().push(outcome.unwrap().to_block);
+        }) => panic!("polling loop should not return"),
+        _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+    }
+
+    assert_eq!(*observed.lock().unwrap(), [Some(0), Some(1), Some(2)]);
+    assert_eq!(mock.get_logs_calls(), 3);
+}
+
+#[tokio::test]
 async fn sync_projects_document_published_via_mixed_eth_call_strategy() {
     // 混合投影：DocumentPublished 事件只定位 name/doc，随后 eth_call 拉权威态写投影。
     let mut eth_call_returns = HashMap::new();

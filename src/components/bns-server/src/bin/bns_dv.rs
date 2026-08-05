@@ -172,7 +172,7 @@ async fn run() -> Result<(), DynError> {
         other => Err(format!(
             "unknown subcommand `{other}`; expected `serve` or `smoke`\n\
              usage:\n  \
-             bns-dv serve --rpc <url> --contract <addr> --chain-id <n> --db <path> --listen <addr> [--start-block n] [--confirmations n] [--interval-ms n] [--config seed.yaml] [--seed-key 0x..]\n  \
+             bns-dv serve --rpc <url> --contract <addr> --chain-id <n> --db <path> --listen <addr> [--start-block n] [--confirmations n] [--interval-ms n] [--max-block-span n] [--config seed.yaml] [--seed-key 0x..]\n  \
              bns-dv smoke --server <url> --rpc <url> --contract <addr> --chain-id <n> --key <0x..> [--name alice] [--timeout-ms n]"
         )
         .into()),
@@ -189,12 +189,14 @@ async fn serve(flags: HashMap<String, String>) -> Result<(), DynError> {
     let listen = require(&flags, "listen")?;
     let start_block: u64 = flags.get("start-block").map_or(Ok(0), |v| v.parse())?;
     let confirmations: u64 = flags.get("confirmations").map_or(Ok(0), |v| v.parse())?;
-    let interval_ms: u64 = flags.get("interval-ms").map_or(Ok(1000), |v| v.parse())?;
+    let interval_ms: u64 = flags.get("interval-ms").map_or(Ok(15_000), |v| v.parse())?;
+    let max_block_span: u64 = flags.get("max-block-span").map_or(Ok(500), |v| v.parse())?;
 
     let mut source = BnsBlockSyncSourceConfig::anvil(rpc.clone(), contract.clone(), start_block);
     source.chain_id = chain_id;
     let mut sync_config = BnsIndexerSyncConfig::new(source.clone());
     sync_config.confirmations = confirmations;
+    sync_config.max_block_span = max_block_span;
     sync_config.validate()?;
     let source_id = source.source_id()?;
 
@@ -264,7 +266,8 @@ async fn serve(flags: HashMap<String, String>) -> Result<(), DynError> {
 
     eprintln!(
         "[serve] bns-dv ready\n  rpc={rpc}\n  contract={contract}\n  chain_id={chain_id}\n  \
-         source={source_id}\n  db={db}\n  listen=http://{listen}  (rpc_path={})",
+         source={source_id}\n  db={db}\n  interval_ms={interval_ms}\n  \
+         max_block_span={max_block_span}\n  listen=http://{listen}  (rpc_path={})",
         server_rpc_path()
     );
 

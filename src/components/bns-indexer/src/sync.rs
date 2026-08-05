@@ -100,7 +100,7 @@ impl BnsIndexerSyncConfig {
         Self {
             source,
             confirmations: 0,
-            max_block_span: 1_000,
+            max_block_span: 500,
         }
     }
 
@@ -289,9 +289,19 @@ where
         };
         loop {
             let outcome = self.sync_once().await;
-            let delay = polling_delay(interval, outcome.is_err());
+            let has_backlog = outcome.as_ref().is_ok_and(|outcome| {
+                outcome.to_block.is_some_and(|to_block| {
+                    to_block
+                        < outcome
+                            .latest_block
+                            .saturating_sub(self.config.confirmations)
+                })
+            });
+            let delay = polling_delay(interval, outcome.is_err(), has_backlog);
             on_sync(outcome);
-            tokio::time::sleep(delay).await;
+            if !delay.is_zero() {
+                tokio::time::sleep(delay).await;
+            }
         }
     }
 
@@ -571,9 +581,11 @@ where
     }
 }
 
-fn polling_delay(idle_interval: Duration, failed: bool) -> Duration {
+fn polling_delay(idle_interval: Duration, failed: bool, has_backlog: bool) -> Duration {
     if failed {
         CHAIN_ERROR_RETRY_INTERVAL
+    } else if has_backlog {
+        Duration::ZERO
     } else {
         idle_interval
     }
@@ -586,12 +598,16 @@ mod polling_tests {
     #[test]
     fn chain_errors_use_fixed_retry_delay() {
         assert_eq!(
-            polling_delay(Duration::from_secs(15), true),
+            polling_delay(Duration::from_secs(15), true, true),
             Duration::from_secs(30)
         );
         assert_eq!(
-            polling_delay(Duration::from_secs(15), false),
+            polling_delay(Duration::from_secs(15), false, false),
             Duration::from_secs(15)
+        );
+        assert_eq!(
+            polling_delay(Duration::from_secs(15), false, true),
+            Duration::ZERO
         );
     }
 }
