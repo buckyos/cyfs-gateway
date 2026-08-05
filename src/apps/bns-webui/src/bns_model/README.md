@@ -179,9 +179,10 @@ createBnsModel({ serverUrl, deliveryMode: 'server_relay' })
 
 ```ts
 createBnsModel({
-  serverUrl: import.meta.env.VITE_BNS_SERVER_URL,
-  expectedContractAddress: import.meta.env.VITE_BNS_CONTRACT_ADDRESS, // 构建期注入
-  expectedChainId: 31337,
+  serverUrl: import.meta.env.VITE_BNS_SERVER_URL ?? 'https://bns.buckyos.ai',
+  expectedContractAddress:
+    import.meta.env.VITE_BNS_CONTRACT_ADDRESS ?? '0x68aD9f8f551e2f9115B6b38d3D4CA02A847c43CC',
+  expectedChainId: Number(import.meta.env.VITE_BNS_CHAIN_ID ?? 10),
 })
 ```
 
@@ -271,9 +272,10 @@ import { createBnsModel } from './bns_model'
 import { BnsModelProvider } from './bns_model/react'
 
 const model = createBnsModel({
-  serverUrl: import.meta.env.VITE_BNS_SERVER_URL ?? 'http://127.0.0.1:18080',
-  expectedChainId: 11155420,          // 可选，用于与 system.info 二次比对
-  expectedContractAddress: '0x…',     // 可选
+  serverUrl: import.meta.env.VITE_BNS_SERVER_URL ?? 'https://bns.buckyos.ai',
+  expectedChainId: Number(import.meta.env.VITE_BNS_CHAIN_ID ?? 10),
+  expectedContractAddress:
+    import.meta.env.VITE_BNS_CONTRACT_ADDRESS ?? '0x68aD9f8f551e2f9115B6b38d3D4CA02A847c43CC',
 })
 
 createRoot(root).render(

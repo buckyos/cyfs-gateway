@@ -2,12 +2,12 @@
  * 入口：组装 BnsModel 并挂载 React 应用。
  *
  * 两种运行模式：
- * - 演示模式（默认）：未配置 `VITE_BNS_SERVER_URL` 时，注入浏览器内假 bns-server、
- *   演示钱包与演示 codec。页面走的仍是真实 bns_model 管线，读写闭环完整可交互。
- * - 真实模式：配置 `VITE_BNS_SERVER_URL` 后直连真实 bns-server。
+ * - 真实模式（默认）：直连 `https://bns.buckyos.ai`，环境变量可覆盖部署参数。
  *   生产口径要求同时注入 `VITE_BNS_CONTRACT_ADDRESS` 作为比对锚点（contractTrust=pinned，
- *   PRD 8.1）；未注入锚点时按 `server` 信任运行，只应用于本地联调。
+ *   PRD 8.1）；默认值已钉死当前 OP Mainnet 部署。
  *   真实模式当前未接入浏览器钱包适配器与 ABI codec，写入口会按 writeGate 显示只读原因。
+ * - 演示模式（显式）：设置 `VITE_BNS_DEMO_MODE=true`，注入浏览器内假 bns-server、
+ *   演示钱包与演示 codec。页面走的仍是真实 bns_model 管线，读写闭环完整可交互。
  */
 
 import { createRoot } from 'react-dom/client'
@@ -18,21 +18,18 @@ import { BnsModelProvider } from './bns_model/react'
 import { createDemoSetup } from './demo'
 import './styles.css'
 
-const liveUrl = import.meta.env.VITE_BNS_SERVER_URL as string | undefined
-const pinnedContract = import.meta.env.VITE_BNS_CONTRACT_ADDRESS as string | undefined
+const DEFAULT_BNS_SERVER_URL = 'https://bns.buckyos.ai'
+const DEFAULT_BNS_CHAIN_ID = 10
+const DEFAULT_BNS_CONTRACT_ADDRESS = '0x68aD9f8f551e2f9115B6b38d3D4CA02A847c43CC'
+
+const demoMode = import.meta.env.VITE_BNS_DEMO_MODE === 'true'
+const liveUrl = (import.meta.env.VITE_BNS_SERVER_URL as string | undefined) || DEFAULT_BNS_SERVER_URL
+const pinnedContract =
+  (import.meta.env.VITE_BNS_CONTRACT_ADDRESS as string | undefined) || DEFAULT_BNS_CONTRACT_ADDRESS
 const expectedChainRaw = import.meta.env.VITE_BNS_CHAIN_ID as string | undefined
 
-const demoMode = !liveUrl
-
 let model: BnsModel
-if (liveUrl) {
-  model = createBnsModel({
-    serverUrl: liveUrl,
-    expectedChainId: expectedChainRaw ? Number(expectedChainRaw) : null,
-    expectedContractAddress: pinnedContract ?? null,
-    contractTrust: pinnedContract ? 'pinned' : 'server',
-  })
-} else {
+if (demoMode) {
   const demo = createDemoSetup()
   model = createBnsModel(
     {
@@ -43,6 +40,13 @@ if (liveUrl) {
     },
     demo.adapters,
   )
+} else {
+  model = createBnsModel({
+    serverUrl: liveUrl,
+    expectedChainId: expectedChainRaw ? Number(expectedChainRaw) : DEFAULT_BNS_CHAIN_ID,
+    expectedContractAddress: pinnedContract,
+    contractTrust: 'pinned',
+  })
 }
 
 if (import.meta.env.DEV) {

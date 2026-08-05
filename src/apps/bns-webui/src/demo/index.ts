@@ -1,7 +1,7 @@
 /**
  * 演示模式组装入口。
  *
- * 未配置 `VITE_BNS_SERVER_URL` 时，main.tsx 使用这里的适配器组建 BnsModel：
+ * 设置 `VITE_BNS_DEMO_MODE=true` 时，main.tsx 使用这里的适配器组建 BnsModel：
  * 页面消费的仍是真实 bns_model 管线，只是三个端口被换成浏览器内实现。
  */
 

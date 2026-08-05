@@ -130,8 +130,8 @@ export function SettingsPage({ demoMode }: { demoMode: boolean }) {
             </button>
           </div>
           <Note tone="neutral">
-            连接真实 bns-server：启动时设置 <code>VITE_BNS_SERVER_URL</code>（只读浏览），
-            生产写路径还需注入 <code>VITE_BNS_CONTRACT_ADDRESS</code> 与真实钱包 / ABI 适配器。
+            连接默认真实 bns-server：取消 <code>VITE_BNS_DEMO_MODE=true</code> 后重新启动；
+            生产写路径还需接入真实钱包 / ABI 适配器。
           </Note>
         </section>
       ) : null}
