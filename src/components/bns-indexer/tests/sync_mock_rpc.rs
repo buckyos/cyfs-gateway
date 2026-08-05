@@ -68,6 +68,7 @@ struct MockEthRpc {
     eth_call_calls: Arc<Mutex<u64>>,
     chain_id_calls: Arc<AtomicUsize>,
     latest_block_calls: Arc<AtomicUsize>,
+    transaction_lookup_calls: Arc<AtomicUsize>,
 }
 
 impl MockEthRpc {
@@ -79,11 +80,13 @@ impl MockEthRpc {
         let eth_call_calls = Arc::new(Mutex::new(0u64));
         let chain_id_calls = Arc::new(AtomicUsize::new(0));
         let latest_block_calls = Arc::new(AtomicUsize::new(0));
+        let transaction_lookup_calls = Arc::new(AtomicUsize::new(0));
         let cfg = config.clone();
         let calls = get_logs_calls.clone();
         let view_calls = eth_call_calls.clone();
         let network_calls = chain_id_calls.clone();
         let head_calls = latest_block_calls.clone();
+        let transaction_calls = transaction_lookup_calls.clone();
         tokio::spawn(async move {
             loop {
                 let (mut stream, _) = match listener.accept().await {
@@ -95,6 +98,7 @@ impl MockEthRpc {
                 let view_calls = view_calls.clone();
                 let network_calls = network_calls.clone();
                 let head_calls = head_calls.clone();
+                let transaction_calls = transaction_calls.clone();
                 tokio::spawn(async move {
                     let request = read_http_request(&mut stream).await;
                     let body = request
@@ -113,6 +117,7 @@ impl MockEthRpc {
                         &view_calls,
                         &network_calls,
                         &head_calls,
+                        &transaction_calls,
                     );
                     let payload = serde_json::json!({"jsonrpc":"2.0","id":id,"result":result});
                     let body = serde_json::to_string(&payload).unwrap();
@@ -134,6 +139,7 @@ impl MockEthRpc {
             eth_call_calls,
             chain_id_calls,
             latest_block_calls,
+            transaction_lookup_calls,
         }
     }
 
@@ -156,6 +162,10 @@ impl MockEthRpc {
     fn latest_block_calls(&self) -> usize {
         self.latest_block_calls.load(Ordering::SeqCst)
     }
+
+    fn transaction_lookup_calls(&self) -> usize {
+        self.transaction_lookup_calls.load(Ordering::SeqCst)
+    }
 }
 
 fn handle_method(
@@ -166,6 +176,7 @@ fn handle_method(
     view_calls: &Arc<Mutex<u64>>,
     network_calls: &Arc<AtomicUsize>,
     head_calls: &Arc<AtomicUsize>,
+    transaction_calls: &Arc<AtomicUsize>,
 ) -> serde_json::Value {
     let cfg = cfg.lock().unwrap();
     match method {
@@ -197,6 +208,7 @@ fn handle_method(
             })
         }
         "eth_getTransactionByHash" => {
+            transaction_calls.fetch_add(1, Ordering::SeqCst);
             let hash = req["params"][0].as_str().unwrap_or("").to_lowercase();
             match cfg.txs.get(&hash) {
                 Some(input) => serde_json::json!({ "hash": hash, "input": input }),
@@ -746,9 +758,11 @@ async fn sync_projects_document_published_via_mixed_eth_call_strategy() {
     );
 
     // 日志：ProtocolEvent（携带 seq/logRoot）+ DocumentPublished（具体事件）。
+    // 普通文档事件即使带 tx hash，也不需要读取交易 calldata。
+    let tx_hash = B256::repeat_byte(0xDD);
     let logs = vec![
         protocol_event_log(7, 0x44, 1),
-        event_log_json(
+        event_log_json_with_tx(
             &Bns::DocumentPublished {
                 nameHash: B256::repeat_byte(0x09),
                 name: "alice".to_string(),
@@ -759,6 +773,7 @@ async fn sync_projects_document_published_via_mixed_eth_call_strategy() {
                 documentStateHash: B256::repeat_byte(0x33),
             },
             1,
+            tx_hash,
         ),
     ];
 
@@ -797,6 +812,11 @@ async fn sync_projects_document_published_via_mixed_eth_call_strategy() {
     assert_eq!(outcome.protocol_events_seen, 1);
     assert_eq!(outcome.registry_events_stored, 1);
     assert_eq!(mock.eth_call_calls(), 1, "two reads use one Multicall");
+    assert_eq!(
+        mock.transaction_lookup_calls(),
+        0,
+        "document projection does not need transaction calldata"
+    );
 
     // 投影 = eth_call 拉回的最新快照（而非事件字段回放）。
     let (name_state, doc_state, events) = store
@@ -913,6 +933,7 @@ async fn sync_backfills_controller_rules_from_decoded_call() {
     .await
     .unwrap();
     assert_eq!(outcome.registry_events_stored, 1);
+    assert_eq!(mock.transaction_lookup_calls(), 1);
 
     let rules = store
         .transact(|tx| tx.get_controller_policy("alice"))

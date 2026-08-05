@@ -256,7 +256,11 @@ where
                     protocol_events_seen += 1;
                 }
                 ProjectedContractEvent::Registry(record) => {
-                    let decoded_call = self.decoded_call_for_log(log, &mut decoded_txs).await?;
+                    let decoded_call = if record_needs_decoded_call(&record) {
+                        self.decoded_call_for_log(log, &mut decoded_txs).await?
+                    } else {
+                        None
+                    };
                     let projection = self
                         .projection_for_record(&record, decoded_call.as_ref())
                         .await?;
@@ -613,6 +617,13 @@ where
             .await?;
         checkpoint_from_evm(checkpoint)
     }
+}
+
+fn record_needs_decoded_call(record: &EventLogRecord) -> bool {
+    matches!(
+        &record.event,
+        RegistryEvent::AuthorityKeysUpdated { .. } | RegistryEvent::ControllerPolicyUpdated { .. }
+    )
 }
 
 fn polling_delay(idle_interval: Duration, failed: bool, has_backlog: bool) -> Duration {
