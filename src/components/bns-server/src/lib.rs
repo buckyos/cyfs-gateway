@@ -23,7 +23,7 @@ use bns_client::{
     METHOD_QUERY_TX_STATE, METHOD_RESOLVE_DOCUMENT, METHOD_RESOLVE_OWNER, METHOD_SUBMIT_RAW_TX,
     METHOD_SYSTEM_INFO,
 };
-use bns_evm::{Address, EthRpcClient, B256};
+use bns_evm::{Address, BnsChainClient, EthRpcClient, TransactionLookup, B256};
 use bns_indexer::{
     canonical_bns_name, canonical_doc_type, did_bns_from_name, is_top_level_name,
     name_from_did_bns, now_timestamp, parent_name, AliasKind, AuthorityKey, AuthoritySetState,
@@ -59,7 +59,7 @@ where
     S: BnsRegistryStore,
 {
     store: S,
-    eth_rpc: EthRpcClient,
+    chain_client: Arc<BnsChainClient>,
     contract_address: Option<String>,
     expected_chain_id: Option<u64>,
 }
@@ -71,7 +71,7 @@ where
     pub fn new(store: S, evm_rpc_endpoint: impl Into<String>) -> Self {
         Self {
             store,
-            eth_rpc: EthRpcClient::new(evm_rpc_endpoint),
+            chain_client: Arc::new(BnsChainClient::new(evm_rpc_endpoint)),
             contract_address: None,
             expected_chain_id: None,
         }
@@ -85,7 +85,21 @@ where
     ) -> Self {
         Self {
             store,
-            eth_rpc: EthRpcClient::new(evm_rpc_endpoint),
+            chain_client: Arc::new(BnsChainClient::new(evm_rpc_endpoint)),
+            contract_address: Some(contract_address.into()),
+            expected_chain_id: Some(chain_id),
+        }
+    }
+
+    pub fn new_with_chain_client(
+        store: S,
+        chain_client: Arc<BnsChainClient>,
+        contract_address: impl Into<String>,
+        chain_id: u64,
+    ) -> Self {
+        Self {
+            store,
+            chain_client,
             contract_address: Some(contract_address.into()),
             expected_chain_id: Some(chain_id),
         }
@@ -96,7 +110,11 @@ where
     }
 
     pub fn evm_rpc(&self) -> &EthRpcClient {
-        &self.eth_rpc
+        self.chain_client.rpc()
+    }
+
+    pub fn chain_client(&self) -> &Arc<BnsChainClient> {
+        &self.chain_client
     }
 }
 
@@ -112,11 +130,14 @@ where
         let contract = self.contract_address.as_deref().ok_or_else(|| {
             BnsClientError::unsupported("BNS server contract_address is not configured")
         })?;
-        let contract = Address::from_str(contract).map_err(|error| {
-            BnsClientError::Serialization(format!("invalid BNS contract_address: {error}"))
-        })?;
+        let contract = match self.chain_client.contract_address() {
+            Some(contract) => contract,
+            None => Address::from_str(contract).map_err(|error| {
+                BnsClientError::Serialization(format!("invalid BNS contract_address: {error}"))
+            })?,
+        };
         let actual_chain_id = self
-            .eth_rpc
+            .chain_client
             .chain_id()
             .await
             .map_err(BnsClientError::from)?;
@@ -235,58 +256,60 @@ where
             BnsClientError::Serialization(format!("invalid tx_hash `{tx_hash}`: {error}"))
         })?;
         let canonical_hash = format!("{hash:#x}");
-        if let Some(receipt) = self
-            .eth_rpc
-            .transaction_receipt(hash)
+        let lookup = self
+            .chain_client
+            .transaction_lookup(hash)
             .await
-            .map_err(BnsClientError::from)?
-        {
-            let block_number = receipt.block_number;
-            let confirmations = match block_number {
-                Some(block_number) => self
-                    .eth_rpc
-                    .block_number()
-                    .await
-                    .map_err(BnsClientError::from)?
-                    .checked_sub(block_number)
-                    .map_or(0, |depth| depth.saturating_add(1)),
-                None => 0,
-            };
-            return Ok(BnsTxState {
+            .map_err(BnsClientError::from)?;
+        match lookup {
+            TransactionLookup::Mined(receipt) => {
+                let block_number = receipt.block_number;
+                let confirmations = match block_number {
+                    Some(block_number) => {
+                        let latest_block = match self.chain_client.cached_latest_block() {
+                            Some(head) => head.number.unwrap_or(0),
+                            None => self
+                                .chain_client
+                                .block_number()
+                                .await
+                                .map_err(BnsClientError::from)?,
+                        };
+                        latest_block
+                            .checked_sub(block_number)
+                            .map_or(0, |depth| depth.saturating_add(1))
+                    }
+                    None => 0,
+                };
+                Ok(BnsTxState {
+                    tx_hash: canonical_hash,
+                    state: if receipt.status == Some(0) {
+                        BnsTxExecutionState::Reverted
+                    } else {
+                        BnsTxExecutionState::Succeeded
+                    },
+                    block_number,
+                    confirmations,
+                })
+            }
+            TransactionLookup::Pending => Ok(BnsTxState {
                 tx_hash: canonical_hash,
-                state: if receipt.status == Some(0) {
-                    BnsTxExecutionState::Reverted
-                } else {
-                    BnsTxExecutionState::Succeeded
-                },
-                block_number,
-                confirmations,
-            });
+                state: BnsTxExecutionState::Pending,
+                block_number: None,
+                confirmations: 0,
+            }),
+            TransactionLookup::NotFound => Ok(BnsTxState {
+                tx_hash: canonical_hash,
+                state: BnsTxExecutionState::NotFound,
+                block_number: None,
+                confirmations: 0,
+            }),
         }
-
-        let state = if self
-            .eth_rpc
-            .transaction_by_hash(hash)
-            .await
-            .map_err(BnsClientError::from)?
-            .is_some()
-        {
-            BnsTxExecutionState::Pending
-        } else {
-            BnsTxExecutionState::NotFound
-        };
-        Ok(BnsTxState {
-            tx_hash: canonical_hash,
-            state,
-            block_number: None,
-            confirmations: 0,
-        })
     }
 
     async fn submit_raw_tx(&self, req: BnsSubmitRawTxReq) -> BnsClientResult<BnsSubmitRawTxResp> {
         let raw_tx = req.raw_tx_bytes()?;
         let tx_hash = self
-            .eth_rpc
+            .chain_client
             .send_raw_transaction(&raw_tx)
             .await
             .map_err(BnsClientError::from)?;
@@ -305,18 +328,18 @@ where
         })?;
         let calldata = req.calldata_bytes()?;
         let nonce = self
-            .eth_rpc
+            .chain_client
             .transaction_count(from)
             .await
             .map_err(BnsClientError::from)?;
         let estimated_gas = self
-            .eth_rpc
+            .chain_client
             .estimate_gas(from, contract, calldata.as_slice())
             .await
             .map_err(BnsClientError::from)?;
         let gas_buffer = estimated_gas / 5 + u64::from(estimated_gas % 5 != 0);
         let fees = self
-            .eth_rpc
+            .chain_client
             .suggest_eip1559_fees()
             .await
             .map_err(BnsClientError::from)?;
@@ -619,6 +642,23 @@ where
             BnsContractServerHandler::new_with_chain_config(
                 store,
                 evm_rpc_endpoint,
+                contract_address,
+                chain_id,
+            ),
+            BnsIndexerHttpServerConfig::default().with_rpc_path(BNS_SERVER_RPC_PATH),
+        )
+    }
+
+    pub fn from_contract_store_with_chain_client(
+        store: S,
+        chain_client: Arc<BnsChainClient>,
+        contract_address: impl Into<String>,
+        chain_id: u64,
+    ) -> Self {
+        Self::with_config(
+            BnsContractServerHandler::new_with_chain_client(
+                store,
+                chain_client,
                 contract_address,
                 chain_id,
             ),

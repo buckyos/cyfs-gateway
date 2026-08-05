@@ -1,13 +1,15 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
+use std::sync::Arc;
 use std::time::Duration;
 
 use bns_evm::{
-    decode_bns_call, Address, AliasKind as EvmAliasKind, AliasState as EvmAliasState,
-    AuthorityKey as EvmAuthorityKey, AuthorityKeyStatus as EvmAuthorityKeyStatus,
-    AuthorityKeyUpdate as EvmAuthorityKeyUpdate, AuthoritySetState as EvmAuthoritySetState,
-    BlockRange, Bns, BnsCall, DocumentRef as EvmDocumentRef, DocumentState as EvmDocumentState,
-    DocumentStatus as EvmDocumentStatus, EthLog, EthRpcClient, NameState as EvmNameState,
+    decode_bns_call, decode_contract_return, Address, AliasKind as EvmAliasKind,
+    AliasState as EvmAliasState, AuthorityKey as EvmAuthorityKey,
+    AuthorityKeyStatus as EvmAuthorityKeyStatus, AuthorityKeyUpdate as EvmAuthorityKeyUpdate,
+    AuthoritySetState as EvmAuthoritySetState, BlockRange, Bns, BnsCall, BnsChainClient,
+    ContractRead, DocumentRef as EvmDocumentRef, DocumentState as EvmDocumentState,
+    DocumentStatus as EvmDocumentStatus, EthBlock, NameState as EvmNameState,
     NameStatus as EvmNameStatus, OwnerSource as EvmOwnerSource, Principal as EvmPrincipal,
     PrincipalKind as EvmPrincipalKind, RpcLogFilter, B256,
 };
@@ -20,6 +22,8 @@ use crate::{
     EventLogRecord, IndexerCursor, LogCheckpoint, NameState, NameStatus, OwnerSource, Principal,
     ProjectedContractEvent, RegistryEvent, ZERO_HASH,
 };
+
+const CHAIN_ERROR_RETRY_INTERVAL: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BnsBlockSyncSourceConfig {
@@ -96,7 +100,7 @@ impl BnsIndexerSyncConfig {
         Self {
             source,
             confirmations: 0,
-            max_block_span: 1_000,
+            max_block_span: 500,
         }
     }
 
@@ -132,7 +136,7 @@ where
 {
     store: &'a S,
     config: BnsIndexerSyncConfig,
-    rpc: EthRpcClient,
+    chain_client: Arc<BnsChainClient>,
     contract: Address,
     source: String,
 }
@@ -142,14 +146,37 @@ where
     S: BnsRegistryStore,
 {
     pub fn new(store: &'a S, config: BnsIndexerSyncConfig) -> BnsRegistryResult<Self> {
+        let chain_client = Arc::new(BnsChainClient::new(config.source.rpc_endpoint.clone()));
+        Self::new_with_chain_client(store, config, chain_client)
+    }
+
+    pub fn new_with_chain_client(
+        store: &'a S,
+        config: BnsIndexerSyncConfig,
+        chain_client: Arc<BnsChainClient>,
+    ) -> BnsRegistryResult<Self> {
         config.validate()?;
         let contract = config.source.contract_address()?;
+        if let Some(configured_contract) = chain_client.contract_address() {
+            if configured_contract != contract {
+                return Err(BnsRegistryError::InvalidConfig(format!(
+                    "BNS chain client contract {configured_contract:#x} does not match indexer contract {contract:#x}"
+                )));
+            }
+        }
+        if let Some(configured_chain_id) = chain_client.configured_chain_id() {
+            if configured_chain_id != config.source.chain_id {
+                return Err(BnsRegistryError::InvalidConfig(format!(
+                    "BNS chain client chain_id {configured_chain_id} does not match indexer chain_id {}",
+                    config.source.chain_id
+                )));
+            }
+        }
         let source = config.source.source_id()?;
-        let rpc = EthRpcClient::new(config.source.rpc_endpoint.clone());
         Ok(Self {
             store,
             config,
-            rpc,
+            chain_client,
             contract,
             source,
         })
@@ -164,7 +191,14 @@ where
     }
 
     pub async fn sync_once(&self) -> BnsRegistryResult<BnsIndexerSyncOutcome> {
-        let remote_chain_id = self.rpc.chain_id().await?;
+        self.sync_once_with_head_refresh(true).await
+    }
+
+    async fn sync_once_with_head_refresh(
+        &self,
+        refresh_head: bool,
+    ) -> BnsRegistryResult<BnsIndexerSyncOutcome> {
+        let remote_chain_id = self.chain_client.chain_id().await?;
         if remote_chain_id != self.config.source.chain_id {
             return Err(BnsRegistryError::InvalidConfig(format!(
                 "BNS indexer configured for chain_id {}, but RPC {} returned chain_id {}",
@@ -172,8 +206,18 @@ where
             )));
         }
 
-        let latest_block = self.rpc.block_number().await?;
-        let reorg_detected = self.reset_projection_if_reorged(latest_block).await?;
+        let (latest_head, head_changed) = self.chain_client.latest_block(refresh_head).await?;
+        let latest_block = latest_head.number.ok_or_else(|| {
+            BnsRegistryError::InvalidConfig(format!(
+                "BNS indexer latest block from RPC {} has no number",
+                self.config.source.rpc_endpoint
+            ))
+        })?;
+        let reorg_detected = if head_changed {
+            self.reset_projection_if_reorged(&latest_head).await?
+        } else {
+            false
+        };
         let target_block = latest_block.saturating_sub(self.config.confirmations);
         let from_block = self.next_block_to_sync()?;
         if from_block > target_block {
@@ -199,11 +243,10 @@ where
             to_block: BlockRange::Number(to_block),
             topics: Vec::new(),
         };
-        let logs = self.rpc.get_logs(&filter).await?;
+        let logs = self.chain_client.get_logs(&filter).await?;
         let mut projector = ContractEventProjector::new();
-        let mut decoded_txs: HashMap<B256, Option<BnsCall>> = HashMap::new();
         let mut protocol_events_seen = 0;
-        let mut registry_events_stored = 0;
+        let mut registry_records = Vec::new();
 
         for log in logs.iter().filter(|log| !log.removed) {
             let observed_at = now_timestamp();
@@ -212,21 +255,37 @@ where
                     protocol_events_seen += 1;
                 }
                 ProjectedContractEvent::Registry(record) => {
-                    let decoded_call = self.decoded_call_for_log(log, &mut decoded_txs).await?;
-                    let projection = self
-                        .projection_for_record(&record, decoded_call.as_ref())
-                        .await?;
-                    self.store.transact(|tx| {
-                        tx.put_event_record(&record)?;
-                        projection.apply(tx)
-                    })?;
-                    registry_events_stored += 1;
+                    registry_records.push((record, log.transaction_hash));
                 }
                 ProjectedContractEvent::Router | ProjectedContractEvent::Infrastructure => {}
             }
         }
 
-        let block_hash = self.block_hash_string(to_block).await?;
+        let mut decoded_txs: HashMap<B256, Option<BnsCall>> = HashMap::new();
+        let mut projection_records = Vec::with_capacity(registry_records.len());
+        for (record, transaction_hash) in registry_records {
+            let decoded_call = if record_needs_decoded_call(&record) {
+                self.decoded_call_for_hash(transaction_hash, &mut decoded_txs)
+                    .await?
+            } else {
+                None
+            };
+            projection_records.push((record, decoded_call));
+        }
+
+        let snapshot = self.load_projection_snapshot(&projection_records).await?;
+        let mut registry_events_stored = 0;
+        for (record, decoded_call) in projection_records {
+            let projection =
+                self.projection_for_record(&record, decoded_call.as_ref(), &snapshot)?;
+            self.store.transact(|tx| {
+                tx.put_event_record(&record)?;
+                projection.apply(tx)
+            })?;
+            registry_events_stored += 1;
+        }
+
+        let block_hash = self.block_hash_string(to_block, Some(&latest_head)).await?;
         let cursor = IndexerCursor {
             source: self.source.clone(),
             block_number: to_block,
@@ -260,9 +319,23 @@ where
         } else {
             interval
         };
+        let mut refresh_head = true;
         loop {
-            on_sync(self.sync_once().await);
-            tokio::time::sleep(interval).await;
+            let outcome = self.sync_once_with_head_refresh(refresh_head).await;
+            let has_backlog = outcome.as_ref().is_ok_and(|outcome| {
+                outcome.to_block.is_some_and(|to_block| {
+                    to_block
+                        < outcome
+                            .latest_block
+                            .saturating_sub(self.config.confirmations)
+                })
+            });
+            let delay = polling_delay(interval, outcome.is_err(), has_backlog);
+            on_sync(outcome);
+            refresh_head = !has_backlog;
+            if !delay.is_zero() {
+                tokio::time::sleep(delay).await;
+            }
         }
     }
 
@@ -279,40 +352,56 @@ where
             .transact(|tx| tx.get_indexer_cursor(&self.source))
     }
 
-    async fn reset_projection_if_reorged(&self, latest_block: u64) -> BnsRegistryResult<bool> {
+    async fn reset_projection_if_reorged(&self, latest_head: &EthBlock) -> BnsRegistryResult<bool> {
         let Some(mut cursor) = self.cursor()? else {
             return Ok(false);
         };
+        let latest_block = latest_head.number.ok_or_else(|| {
+            BnsRegistryError::InvalidConfig("BNS latest block has no number".to_string())
+        })?;
 
         let should_reset = if cursor.block_number > latest_block {
             true
         } else if let Some(expected_hash) = cursor.block_hash.as_deref() {
-            self.block_hash_string(cursor.block_number).await? != expected_hash
+            self.block_hash_string(cursor.block_number, Some(latest_head))
+                .await?
+                != expected_hash
         } else {
-            cursor.block_hash = Some(self.block_hash_string(cursor.block_number).await?);
+            cursor.block_hash = Some(
+                self.block_hash_string(cursor.block_number, Some(latest_head))
+                    .await?,
+            );
             cursor.updated_at = now_timestamp();
             self.store.transact(|tx| tx.put_indexer_cursor(&cursor))?;
             false
         };
 
         if should_reset {
+            self.chain_client.invalidate_mined_receipts_from(0);
             self.store
                 .transact(|tx| tx.reset_indexer_projection(&self.source))?;
         }
         Ok(should_reset)
     }
 
-    async fn block_hash_string(&self, block_number: u64) -> BnsRegistryResult<String> {
-        let block = self
-            .rpc
-            .block_by_number(block_number)
-            .await?
-            .ok_or_else(|| {
-                BnsRegistryError::InvalidConfig(format!(
-                    "BNS indexer cannot read block {block_number} from RPC {}",
-                    self.config.source.rpc_endpoint
-                ))
-            })?;
+    async fn block_hash_string(
+        &self,
+        block_number: u64,
+        latest_head: Option<&EthBlock>,
+    ) -> BnsRegistryResult<String> {
+        let block = if latest_head.is_some_and(|head| head.number == Some(block_number)) {
+            latest_head.cloned().unwrap()
+        } else {
+            self.chain_client
+                .block_by_number(block_number)
+                .await?
+                .ok_or_else(|| {
+                    BnsRegistryError::InvalidConfig(format!(
+                        "BNS indexer cannot read block {block_number} from RPC {}",
+                        self.config.source.rpc_endpoint
+                    ))
+                })?
+        };
         if let Some(actual_number) = block.number {
             if actual_number != block_number {
                 return Err(BnsRegistryError::InvalidConfig(format!(
@@ -328,19 +417,19 @@ where
         })
     }
 
-    async fn decoded_call_for_log(
+    async fn decoded_call_for_hash(
         &self,
-        log: &EthLog,
+        tx_hash: Option<B256>,
         decoded_txs: &mut HashMap<B256, Option<BnsCall>>,
     ) -> BnsRegistryResult<Option<BnsCall>> {
-        let Some(tx_hash) = log.transaction_hash else {
+        let Some(tx_hash) = tx_hash else {
             return Ok(None);
         };
         if let Some(decoded) = decoded_txs.get(&tx_hash) {
             return Ok(decoded.clone());
         }
 
-        let decoded = match self.rpc.transaction_by_hash(tx_hash).await? {
+        let decoded = match self.chain_client.transaction_by_hash(tx_hash).await? {
             Some(tx) => Some(decode_bns_call(&tx.input)?),
             None => None,
         };
@@ -348,7 +437,133 @@ where
         Ok(decoded)
     }
 
-    async fn projection_for_record(
+    async fn load_projection_snapshot(
+        &self,
+        records: &[(EventLogRecord, Option<BnsCall>)],
+    ) -> BnsRegistryResult<ProjectionSnapshot> {
+        let mut seen = HashSet::new();
+        let mut reads = Vec::new();
+        for (record, decoded_call) in records {
+            for read in projection_reads_for_record(record, decoded_call.as_ref()) {
+                if seen.insert(read.clone()) {
+                    reads.push(read);
+                }
+            }
+        }
+        let calls = reads
+            .iter()
+            .map(|read| read.contract_read(self.contract))
+            .collect::<Vec<_>>();
+        let outputs = self.chain_client.multicall(&calls).await?;
+        if outputs.len() != reads.len() {
+            return Err(BnsRegistryError::InvalidConfig(format!(
+                "BNS projection batch returned {} values for {} reads",
+                outputs.len(),
+                reads.len()
+            )));
+        }
+        let mut snapshot = ProjectionSnapshot::default();
+        for (read, output) in reads.into_iter().zip(outputs) {
+            snapshot.insert(read, &output)?;
+        }
+        Ok(snapshot)
+    }
+
+    fn projection_for_record(
+        &self,
+        record: &EventLogRecord,
+        decoded_call: Option<&BnsCall>,
+        snapshot: &ProjectionSnapshot,
+    ) -> BnsRegistryResult<ContractProjectionWrite> {
+        snapshot.projection_for_record(record, decoded_call)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum ProjectionReadKey {
+    Name(String),
+    Document(String, String, u64),
+    AuthoritySet(String),
+    Alias(String),
+    LatestCheckpoint,
+}
+
+impl ProjectionReadKey {
+    fn contract_read(&self, contract: Address) -> ContractRead {
+        match self {
+            Self::Name(name) => {
+                ContractRead::new(contract, &Bns::queryNameStateCall { name: name.clone() })
+            }
+            Self::Document(name, doc_type, version) => ContractRead::new(
+                contract,
+                &Bns::getDocumentVersionCall {
+                    name: name.clone(),
+                    docType: doc_type.clone(),
+                    version: *version,
+                },
+            ),
+            Self::AuthoritySet(name) => {
+                ContractRead::new(contract, &Bns::getAuthoritySetCall { name: name.clone() })
+            }
+            Self::Alias(name) => {
+                ContractRead::new(contract, &Bns::getAliasCall { name: name.clone() })
+            }
+            Self::LatestCheckpoint => ContractRead::new(contract, &Bns::latestCheckpointCall {}),
+        }
+    }
+}
+
+#[derive(Default)]
+struct ProjectionSnapshot {
+    names: HashMap<String, Option<NameState>>,
+    documents: HashMap<(String, String, u64), Option<DocumentState>>,
+    authority_sets: HashMap<String, AuthoritySetState>,
+    aliases: HashMap<String, AliasState>,
+    checkpoint: Option<LogCheckpoint>,
+}
+
+impl ProjectionSnapshot {
+    fn insert(&mut self, read: ProjectionReadKey, output: &[u8]) -> BnsRegistryResult<()> {
+        match read {
+            ProjectionReadKey::Name(name) => {
+                let state = name_state_from_evm(
+                    decode_contract_return::<Bns::queryNameStateCall>(output)?,
+                )?;
+                self.names.insert(
+                    name,
+                    (state.status != NameStatus::Available).then_some(state),
+                );
+            }
+            ProjectionReadKey::Document(name, doc_type, version) => {
+                let state = document_state_from_evm(decode_contract_return::<
+                    Bns::getDocumentVersionCall,
+                >(output)?)?;
+                self.documents.insert(
+                    (name, doc_type, version),
+                    (state.status != DocumentStatus::Missing).then_some(state),
+                );
+            }
+            ProjectionReadKey::AuthoritySet(name) => {
+                let state = authority_set_from_evm(decode_contract_return::<
+                    Bns::getAuthoritySetCall,
+                >(output)?)?;
+                self.authority_sets.insert(name, state);
+            }
+            ProjectionReadKey::Alias(name) => {
+                let state =
+                    alias_state_from_evm(decode_contract_return::<Bns::getAliasCall>(output)?)?;
+                self.aliases.insert(name, state);
+            }
+            ProjectionReadKey::LatestCheckpoint => {
+                self.checkpoint = Some(checkpoint_from_evm(decode_contract_return::<
+                    Bns::latestCheckpointCall,
+                >(output)?)?);
+            }
+        }
+        Ok(())
+    }
+
+    fn projection_for_record(
         &self,
         record: &EventLogRecord,
         decoded_call: Option<&BnsCall>,
@@ -362,7 +577,7 @@ where
             | RegistryEvent::NameReleased { name, .. }
             | RegistryEvent::OwnerDocumentIatFloorUpdated { name, .. }
             | RegistryEvent::NamespacePolicyUpdated { name, .. } => {
-                self.push_name_state(&mut write, name).await?;
+                self.push_name(&mut write, name)?;
             }
             RegistryEvent::DocumentPublished {
                 name,
@@ -370,9 +585,8 @@ where
                 version,
                 ..
             } => {
-                self.push_name_state(&mut write, name).await?;
-                self.push_document_state(&mut write, name, doc_type, *version)
-                    .await?;
+                self.push_name(&mut write, name)?;
+                self.push_document(&mut write, name, doc_type, *version)?;
             }
             RegistryEvent::DocumentRevoked {
                 name,
@@ -380,12 +594,14 @@ where
                 new_version,
                 ..
             } => {
-                self.push_name_state(&mut write, name).await?;
-                self.push_document_state(&mut write, name, doc_type, *new_version)
-                    .await?;
+                self.push_name(&mut write, name)?;
+                self.push_document(&mut write, name, doc_type, *new_version)?;
             }
             RegistryEvent::AuthorityKeysUpdated { name, .. } => {
-                let set = self.read_authority_set(name).await?;
+                let set =
+                    self.authority_sets.get(name).cloned().ok_or_else(|| {
+                        missing_projection_read(format!("authority set for {name}"))
+                    })?;
                 write.authority_sets.push(set);
                 for key in authority_keys_from_call(decoded_call, name)? {
                     write.authority_keys.push((canonical_bns_name(name)?, key));
@@ -394,7 +610,7 @@ where
             RegistryEvent::ControllerPolicyUpdated {
                 name, policy_hash, ..
             } => {
-                self.push_name_state(&mut write, name).await?;
+                self.push_name(&mut write, name)?;
                 if let Some(rules) = controller_rules_from_call(decoded_call, name)? {
                     write.controller_policies.push((
                         canonical_bns_name(name)?,
@@ -404,9 +620,13 @@ where
                 }
             }
             RegistryEvent::DidAliasSet { name, .. } => {
-                self.push_name_state(&mut write, name).await?;
-                let alias = self.read_alias(name).await?;
-                write.aliases.push(alias);
+                self.push_name(&mut write, name)?;
+                write.aliases.push(
+                    self.aliases
+                        .get(name)
+                        .cloned()
+                        .ok_or_else(|| missing_projection_read(format!("alias for {name}")))?,
+                );
             }
             RegistryEvent::PaymentTargetUpdated {
                 name,
@@ -414,116 +634,182 @@ where
                 version,
                 ..
             } => {
-                self.push_name_state(&mut write, name).await?;
-                self.push_document_state(&mut write, name, doc_type, *version)
-                    .await?;
+                self.push_name(&mut write, name)?;
+                self.push_document(&mut write, name, doc_type, *version)?;
             }
             RegistryEvent::LogCheckpointPublished { .. } => {
-                write.checkpoints.push(self.read_latest_checkpoint().await?);
+                if let Some(checkpoint) = checkpoint_from_event_and_call(record, decoded_call)? {
+                    write.checkpoints.push(checkpoint);
+                } else {
+                    write.checkpoints.push(
+                        self.checkpoint
+                            .clone()
+                            .ok_or_else(|| missing_projection_read("latest checkpoint"))?,
+                    );
+                }
             }
         }
         Ok(write)
     }
 
-    async fn push_name_state(
-        &self,
-        write: &mut ContractProjectionWrite,
-        name: &str,
-    ) -> BnsRegistryResult<()> {
-        if let Some(state) = self.read_name_state(name).await? {
-            write.names.push(state);
+    fn push_name(&self, write: &mut ContractProjectionWrite, name: &str) -> BnsRegistryResult<()> {
+        let state = self
+            .names
+            .get(name)
+            .ok_or_else(|| missing_projection_read(format!("name state for {name}")))?;
+        if let Some(state) = state {
+            write.names.push(state.clone());
         }
         Ok(())
     }
 
-    async fn push_document_state(
+    fn push_document(
         &self,
         write: &mut ContractProjectionWrite,
         name: &str,
         doc_type: &str,
         version: u64,
     ) -> BnsRegistryResult<()> {
-        if let Some(state) = self.read_document_state(name, doc_type, version).await? {
-            write.documents.push(state);
+        let state = self
+            .documents
+            .get(&(name.to_string(), doc_type.to_string(), version))
+            .ok_or_else(|| {
+                missing_projection_read(format!("document {name}/{doc_type}/{version}"))
+            })?;
+        if let Some(state) = state {
+            write.documents.push(state.clone());
         }
         Ok(())
     }
+}
 
-    async fn read_name_state(&self, name: &str) -> BnsRegistryResult<Option<NameState>> {
-        let state = self
-            .rpc
-            .call_contract(
-                self.contract,
-                &Bns::queryNameStateCall {
-                    name: name.to_string(),
-                },
-            )
-            .await?;
-        let state = name_state_from_evm(state)?;
-        if state.status == NameStatus::Available {
-            Ok(None)
-        } else {
-            Ok(Some(state))
+fn projection_reads_for_record(
+    record: &EventLogRecord,
+    decoded_call: Option<&BnsCall>,
+) -> Vec<ProjectionReadKey> {
+    match &record.event {
+        RegistryEvent::NameRegistered { name, .. }
+        | RegistryEvent::NameRenewed { name, .. }
+        | RegistryEvent::NameAssetTransferred { name, .. }
+        | RegistryEvent::NameOwnerUpdated { name, .. }
+        | RegistryEvent::NameReleased { name, .. }
+        | RegistryEvent::OwnerDocumentIatFloorUpdated { name, .. }
+        | RegistryEvent::NamespacePolicyUpdated { name, .. }
+        | RegistryEvent::ControllerPolicyUpdated { name, .. } => {
+            vec![ProjectionReadKey::Name(name.clone())]
         }
-    }
-
-    async fn read_document_state(
-        &self,
-        name: &str,
-        doc_type: &str,
-        version: u64,
-    ) -> BnsRegistryResult<Option<DocumentState>> {
-        let state = self
-            .rpc
-            .call_contract(
-                self.contract,
-                &Bns::getDocumentVersionCall {
-                    name: name.to_string(),
-                    docType: doc_type.to_string(),
-                    version,
-                },
-            )
-            .await?;
-        let state = document_state_from_evm(state)?;
-        if state.status == DocumentStatus::Missing {
-            Ok(None)
-        } else {
-            Ok(Some(state))
+        RegistryEvent::DocumentPublished {
+            name,
+            doc_type,
+            version,
+            ..
         }
+        | RegistryEvent::PaymentTargetUpdated {
+            name,
+            doc_type,
+            version,
+            ..
+        } => vec![
+            ProjectionReadKey::Name(name.clone()),
+            ProjectionReadKey::Document(name.clone(), doc_type.clone(), *version),
+        ],
+        RegistryEvent::DocumentRevoked {
+            name,
+            doc_type,
+            new_version,
+            ..
+        } => vec![
+            ProjectionReadKey::Name(name.clone()),
+            ProjectionReadKey::Document(name.clone(), doc_type.clone(), *new_version),
+        ],
+        RegistryEvent::AuthorityKeysUpdated { name, .. } => {
+            vec![ProjectionReadKey::AuthoritySet(name.clone())]
+        }
+        RegistryEvent::DidAliasSet { name, .. } => vec![
+            ProjectionReadKey::Name(name.clone()),
+            ProjectionReadKey::Alias(name.clone()),
+        ],
+        RegistryEvent::LogCheckpointPublished { .. }
+            if matches!(decoded_call, Some(BnsCall::publishLogCheckpoint(_))) =>
+        {
+            Vec::new()
+        }
+        RegistryEvent::LogCheckpointPublished { .. } => vec![ProjectionReadKey::LatestCheckpoint],
     }
+}
 
-    async fn read_authority_set(&self, name: &str) -> BnsRegistryResult<AuthoritySetState> {
-        let state = self
-            .rpc
-            .call_contract(
-                self.contract,
-                &Bns::getAuthoritySetCall {
-                    name: name.to_string(),
-                },
-            )
-            .await?;
-        authority_set_from_evm(state)
+fn missing_projection_read(detail: impl Into<String>) -> BnsRegistryError {
+    BnsRegistryError::InvalidConfig(format!("BNS projection batch is missing {}", detail.into()))
+}
+
+fn record_needs_decoded_call(record: &EventLogRecord) -> bool {
+    matches!(
+        &record.event,
+        RegistryEvent::AuthorityKeysUpdated { .. }
+            | RegistryEvent::ControllerPolicyUpdated { .. }
+            | RegistryEvent::LogCheckpointPublished { .. }
+    )
+}
+
+fn checkpoint_from_event_and_call(
+    record: &EventLogRecord,
+    decoded_call: Option<&BnsCall>,
+) -> BnsRegistryResult<Option<LogCheckpoint>> {
+    let RegistryEvent::LogCheckpointPublished {
+        log_root,
+        last_seq,
+        issued_at,
+        external_anchor,
+    } = &record.event
+    else {
+        return Ok(None);
+    };
+    let Some(BnsCall::publishLogCheckpoint(call)) = decoded_call else {
+        return Ok(None);
+    };
+    let call_anchor = hash_string(call.externalAnchor);
+    if call_anchor != *external_anchor {
+        return Err(BnsRegistryError::InvalidMutation(format!(
+            "checkpoint event external anchor {external_anchor} does not match transaction calldata {call_anchor}"
+        )));
     }
+    Ok(Some(LogCheckpoint {
+        log_root: log_root.clone(),
+        last_seq: *last_seq,
+        issued_at: *issued_at,
+        issuer: principal_from_evm(call.issuer.clone())?,
+        external_anchor: external_anchor.clone(),
+    }))
+}
 
-    async fn read_alias(&self, name: &str) -> BnsRegistryResult<AliasState> {
-        let state = self
-            .rpc
-            .call_contract(
-                self.contract,
-                &Bns::getAliasCall {
-                    name: name.to_string(),
-                },
-            )
-            .await?;
-        alias_state_from_evm(state)
+fn polling_delay(idle_interval: Duration, failed: bool, has_backlog: bool) -> Duration {
+    if failed {
+        CHAIN_ERROR_RETRY_INTERVAL
+    } else if has_backlog {
+        Duration::ZERO
+    } else {
+        idle_interval
     }
+}
 
-    async fn read_latest_checkpoint(&self) -> BnsRegistryResult<LogCheckpoint> {
-        let checkpoint = self
-            .rpc
-            .call_contract(self.contract, &Bns::latestCheckpointCall {})
-            .await?;
-        checkpoint_from_evm(checkpoint)
+#[cfg(test)]
+mod polling_tests {
+    use super::*;
+
+    #[test]
+    fn chain_errors_use_fixed_retry_delay() {
+        assert_eq!(
+            polling_delay(Duration::from_secs(15), true, true),
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            polling_delay(Duration::from_secs(15), false, false),
+            Duration::from_secs(15)
+        );
+        assert_eq!(
+            polling_delay(Duration::from_secs(15), false, true),
+            Duration::ZERO
+        );
     }
 }
 

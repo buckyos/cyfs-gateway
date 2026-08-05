@@ -74,7 +74,7 @@ impl EthLog {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EthBlock {
     #[serde(default, deserialize_with = "deserialize_optional_quantity")]
@@ -246,6 +246,11 @@ impl EthRpcClient {
             json!([quantity_hex(block_number), false]),
         )
         .await
+    }
+
+    pub async fn latest_block(&self) -> BnsEvmResult<Option<EthBlock>> {
+        self.call_nullable("eth_getBlockByNumber", json!(["latest", false]))
+            .await
     }
 
     pub async fn transaction_by_hash(&self, tx_hash: B256) -> BnsEvmResult<Option<EthTransaction>> {

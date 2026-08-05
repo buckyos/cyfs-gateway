@@ -16,8 +16,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use alloy_sol_types::{SolCall, SolEvent};
-use bns_evm::{address, Address, Bns, B256};
+use alloy_sol_types::{sol, SolCall, SolEvent};
+use bns_evm::{address, Address, Bns, Bytes, B256, MULTICALL3_ADDRESS, U256};
 use bns_indexer::{
     sync_bns_contract_once, BnsBlockSyncSourceConfig, BnsContractEventIndexer,
     BnsIndexerSyncConfig, BnsRegistryError, BnsRegistryStore, DocumentStatus, NameStatus,
@@ -30,6 +30,20 @@ const CONTRACT: &str = "0x2222222222222222222222222222222222222222";
 const ACTOR: Address = address!("1000000000000000000000000000000000000001");
 const OWNER: Address = address!("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
 
+sol! {
+    interface TestMulticall3 {
+        struct Call {
+            address target;
+            bytes callData;
+        }
+
+        function aggregate(Call[] calldata calls)
+            external
+            payable
+            returns (uint256 blockNumber, bytes[] memory returnData);
+    }
+}
+
 // ===== Mock JSON-RPC 服务 =====
 
 #[derive(Default, Clone)]
@@ -39,6 +53,8 @@ struct MockConfig {
     logs_json: Vec<serde_json::Value>,
     // selector(hex, no 0x) -> eth_call 返回 hex（含 0x）。
     eth_call_returns: HashMap<String, String>,
+    // Multicall3 aggregate 返回值（含 0x）；未设置时模拟目标链不支持并触发回退。
+    multicall_return: Option<String>,
     // tx hash(lowercase, 含 0x) -> input calldata hex（含 0x），供 decode_bns_call 补全入参。
     txs: HashMap<String, String>,
     // block number -> block hash（含 0x），用于游标 reorg 检测。
@@ -49,6 +65,10 @@ struct MockEthRpc {
     endpoint: String,
     config: Arc<Mutex<MockConfig>>,
     get_logs_calls: Arc<Mutex<u64>>,
+    eth_call_calls: Arc<Mutex<u64>>,
+    chain_id_calls: Arc<AtomicUsize>,
+    latest_block_calls: Arc<AtomicUsize>,
+    transaction_lookup_calls: Arc<AtomicUsize>,
 }
 
 impl MockEthRpc {
@@ -57,8 +77,16 @@ impl MockEthRpc {
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
         let config = Arc::new(Mutex::new(config));
         let get_logs_calls = Arc::new(Mutex::new(0u64));
+        let eth_call_calls = Arc::new(Mutex::new(0u64));
+        let chain_id_calls = Arc::new(AtomicUsize::new(0));
+        let latest_block_calls = Arc::new(AtomicUsize::new(0));
+        let transaction_lookup_calls = Arc::new(AtomicUsize::new(0));
         let cfg = config.clone();
         let calls = get_logs_calls.clone();
+        let view_calls = eth_call_calls.clone();
+        let network_calls = chain_id_calls.clone();
+        let head_calls = latest_block_calls.clone();
+        let transaction_calls = transaction_lookup_calls.clone();
         tokio::spawn(async move {
             loop {
                 let (mut stream, _) = match listener.accept().await {
@@ -67,6 +95,10 @@ impl MockEthRpc {
                 };
                 let cfg = cfg.clone();
                 let calls = calls.clone();
+                let view_calls = view_calls.clone();
+                let network_calls = network_calls.clone();
+                let head_calls = head_calls.clone();
+                let transaction_calls = transaction_calls.clone();
                 tokio::spawn(async move {
                     let request = read_http_request(&mut stream).await;
                     let body = request
@@ -77,7 +109,16 @@ impl MockEthRpc {
                         serde_json::from_str(&body).unwrap_or(serde_json::Value::Null);
                     let id = req["id"].clone();
                     let method = req["method"].as_str().unwrap_or("");
-                    let result = handle_method(method, &req, &cfg, &calls);
+                    let result = handle_method(
+                        method,
+                        &req,
+                        &cfg,
+                        &calls,
+                        &view_calls,
+                        &network_calls,
+                        &head_calls,
+                        &transaction_calls,
+                    );
                     let payload = serde_json::json!({"jsonrpc":"2.0","id":id,"result":result});
                     let body = serde_json::to_string(&payload).unwrap();
                     // 每个连接只服务一次请求即关闭；用 `Connection: close` 显式告知客户端
@@ -95,6 +136,10 @@ impl MockEthRpc {
             endpoint,
             config,
             get_logs_calls,
+            eth_call_calls,
+            chain_id_calls,
+            latest_block_calls,
+            transaction_lookup_calls,
         }
     }
 
@@ -105,6 +150,22 @@ impl MockEthRpc {
     fn get_logs_calls(&self) -> u64 {
         *self.get_logs_calls.lock().unwrap()
     }
+
+    fn eth_call_calls(&self) -> u64 {
+        *self.eth_call_calls.lock().unwrap()
+    }
+
+    fn chain_id_calls(&self) -> usize {
+        self.chain_id_calls.load(Ordering::SeqCst)
+    }
+
+    fn latest_block_calls(&self) -> usize {
+        self.latest_block_calls.load(Ordering::SeqCst)
+    }
+
+    fn transaction_lookup_calls(&self) -> usize {
+        self.transaction_lookup_calls.load(Ordering::SeqCst)
+    }
 }
 
 fn handle_method(
@@ -112,18 +173,30 @@ fn handle_method(
     req: &serde_json::Value,
     cfg: &Arc<Mutex<MockConfig>>,
     calls: &Arc<Mutex<u64>>,
+    view_calls: &Arc<Mutex<u64>>,
+    network_calls: &Arc<AtomicUsize>,
+    head_calls: &Arc<AtomicUsize>,
+    transaction_calls: &Arc<AtomicUsize>,
 ) -> serde_json::Value {
     let cfg = cfg.lock().unwrap();
     match method {
-        "eth_chainId" => serde_json::Value::String(format!("0x{:x}", cfg.chain_id)),
+        "eth_chainId" => {
+            network_calls.fetch_add(1, Ordering::SeqCst);
+            serde_json::Value::String(format!("0x{:x}", cfg.chain_id))
+        }
         "eth_blockNumber" => serde_json::Value::String(format!("0x{:x}", cfg.block_number)),
         "eth_getLogs" => {
             *calls.lock().unwrap() += 1;
             serde_json::Value::Array(cfg.logs_json.clone())
         }
         "eth_getBlockByNumber" => {
-            let block_number =
-                parse_rpc_quantity(req["params"][0].as_str().unwrap_or("0x0")).unwrap();
+            let block_tag = req["params"][0].as_str().unwrap_or("0x0");
+            let block_number = if block_tag == "latest" {
+                head_calls.fetch_add(1, Ordering::SeqCst);
+                cfg.block_number
+            } else {
+                parse_rpc_quantity(block_tag).unwrap()
+            };
             serde_json::json!({
                 "number": format!("0x{block_number:x}"),
                 "hash": cfg
@@ -135,6 +208,7 @@ fn handle_method(
             })
         }
         "eth_getTransactionByHash" => {
+            transaction_calls.fetch_add(1, Ordering::SeqCst);
             let hash = req["params"][0].as_str().unwrap_or("").to_lowercase();
             match cfg.txs.get(&hash) {
                 Some(input) => serde_json::json!({ "hash": hash, "input": input }),
@@ -142,6 +216,15 @@ fn handle_method(
             }
         }
         "eth_call" => {
+            *view_calls.lock().unwrap() += 1;
+            let to = req["params"][0]["to"].as_str().unwrap_or("");
+            if to.eq_ignore_ascii_case(&format!("{MULTICALL3_ADDRESS:#x}")) {
+                return cfg
+                    .multicall_return
+                    .clone()
+                    .map(serde_json::Value::String)
+                    .unwrap_or_else(|| serde_json::Value::String("0x".to_string()));
+            }
             let data = req["params"][0]["data"].as_str().unwrap_or("");
             let selector = data.trim_start_matches("0x").get(0..8).unwrap_or("");
             cfg.eth_call_returns
@@ -612,6 +695,43 @@ async fn polling_loop_runs_sync_once_repeatedly() {
         outcomes.load(Ordering::SeqCst) >= 2,
         "polling loop should call sync_once more than once"
     );
+    assert_eq!(
+        mock.chain_id_calls(),
+        1,
+        "one indexer instance caches the validated chain id"
+    );
+}
+
+#[tokio::test]
+async fn polling_loop_processes_backlog_without_idle_sleep() {
+    let mock = MockEthRpc::start(MockConfig {
+        chain_id: 31_337,
+        block_number: 2,
+        logs_json: Vec::new(),
+        ..Default::default()
+    })
+    .await;
+    let store = SqliteBnsRegistryStore::open_memory().unwrap();
+    let mut config = with_endpoint(config_for_chain(31_337), &mock.endpoint);
+    config.max_block_span = 1;
+    let indexer = BnsContractEventIndexer::new(&store, config).unwrap();
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let outcomes = observed.clone();
+
+    tokio::select! {
+        _ = indexer.run_polling_loop(Duration::from_secs(3_600), move |outcome| {
+            outcomes.lock().unwrap().push(outcome.unwrap().to_block);
+        }) => panic!("polling loop should not return"),
+        _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+    }
+
+    assert_eq!(*observed.lock().unwrap(), [Some(0), Some(1), Some(2)]);
+    assert_eq!(mock.get_logs_calls(), 3);
+    assert_eq!(
+        mock.latest_block_calls(),
+        1,
+        "one latest header is reused while draining backlog"
+    );
 }
 
 #[tokio::test]
@@ -638,9 +758,11 @@ async fn sync_projects_document_published_via_mixed_eth_call_strategy() {
     );
 
     // 日志：ProtocolEvent（携带 seq/logRoot）+ DocumentPublished（具体事件）。
+    // 普通文档事件即使带 tx hash，也不需要读取交易 calldata。
+    let tx_hash = B256::repeat_byte(0xDD);
     let logs = vec![
         protocol_event_log(7, 0x44, 1),
-        event_log_json(
+        event_log_json_with_tx(
             &Bns::DocumentPublished {
                 nameHash: B256::repeat_byte(0x09),
                 name: "alice".to_string(),
@@ -651,14 +773,32 @@ async fn sync_projects_document_published_via_mixed_eth_call_strategy() {
                 documentStateHash: B256::repeat_byte(0x33),
             },
             1,
+            tx_hash,
         ),
     ];
 
+    let multicall_return = format!(
+        "0x{}",
+        hex::encode(TestMulticall3::aggregateCall::abi_encode_returns(
+            &TestMulticall3::aggregateReturn {
+                blockNumber: U256::from(1),
+                returnData: vec![
+                    Bytes::from(Bns::queryNameStateCall::abi_encode_returns(
+                        &evm_name_state("alice", 2),
+                    )),
+                    Bytes::from(Bns::getDocumentVersionCall::abi_encode_returns(
+                        &evm_document_state("alice", "dns_txt", 3),
+                    )),
+                ],
+            },
+        ))
+    );
     let mock = MockEthRpc::start(MockConfig {
         chain_id: 31_337,
         block_number: 1,
         logs_json: logs,
         eth_call_returns,
+        multicall_return: Some(multicall_return),
         txs: HashMap::new(),
         ..Default::default()
     })
@@ -671,6 +811,12 @@ async fn sync_projects_document_published_via_mixed_eth_call_strategy() {
         .unwrap();
     assert_eq!(outcome.protocol_events_seen, 1);
     assert_eq!(outcome.registry_events_stored, 1);
+    assert_eq!(mock.eth_call_calls(), 1, "two reads use one Multicall");
+    assert_eq!(
+        mock.transaction_lookup_calls(),
+        0,
+        "document projection does not need transaction calldata"
+    );
 
     // 投影 = eth_call 拉回的最新快照（而非事件字段回放）。
     let (name_state, doc_state, events) = store
@@ -703,6 +849,91 @@ async fn sync_projects_document_published_via_mixed_eth_call_strategy() {
         events[0].log_root,
         format!("{:#x}", B256::repeat_byte(0x44))
     );
+}
+
+#[tokio::test]
+async fn sync_deduplicates_projection_reads_across_registry_events() {
+    let tx_hash = B256::repeat_byte(0xDE);
+    let logs = vec![
+        protocol_event_log(6, 0x43, 1),
+        event_log_json_with_tx(
+            &Bns::NameRegistered {
+                nameHash: B256::repeat_byte(0x09),
+                name: "alice".to_string(),
+                assetOwner: OWNER,
+                actor: ACTOR,
+                expireAt: 1_000,
+                lineageEpoch: 0,
+                nameSeq: 1,
+            },
+            1,
+            tx_hash,
+        ),
+        protocol_event_log(7, 0x44, 1),
+        event_log_json_with_tx(
+            &Bns::DocumentPublished {
+                nameHash: B256::repeat_byte(0x09),
+                name: "alice".to_string(),
+                docType: "dns_txt".to_string(),
+                version: 3,
+                actor: ACTOR,
+                contentHash: B256::repeat_byte(0x22),
+                documentStateHash: B256::repeat_byte(0x33),
+            },
+            1,
+            tx_hash,
+        ),
+    ];
+    let multicall_return = format!(
+        "0x{}",
+        hex::encode(TestMulticall3::aggregateCall::abi_encode_returns(
+            &TestMulticall3::aggregateReturn {
+                blockNumber: U256::from(1),
+                returnData: vec![
+                    Bytes::from(Bns::queryNameStateCall::abi_encode_returns(
+                        &evm_name_state("alice", 2),
+                    )),
+                    Bytes::from(Bns::getDocumentVersionCall::abi_encode_returns(
+                        &evm_document_state("alice", "dns_txt", 3),
+                    )),
+                ],
+            },
+        ))
+    );
+    let mock = MockEthRpc::start(MockConfig {
+        chain_id: 31_337,
+        block_number: 1,
+        logs_json: logs,
+        multicall_return: Some(multicall_return),
+        ..Default::default()
+    })
+    .await;
+    let store = SqliteBnsRegistryStore::open_memory().unwrap();
+
+    let outcome = sync_bns_contract_once(
+        &store,
+        with_endpoint(config_for_chain(31_337), &mock.endpoint),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(outcome.registry_events_stored, 2);
+    assert_eq!(
+        mock.eth_call_calls(),
+        1,
+        "the repeated name read and document read share one Multicall"
+    );
+    assert_eq!(mock.transaction_lookup_calls(), 0);
+    let (name, document) = store
+        .transact(|tx| {
+            Ok((
+                tx.get_name("alice")?,
+                tx.get_current_document("alice", "dns_txt")?,
+            ))
+        })
+        .unwrap();
+    assert_eq!(name.unwrap().name_seq, 2);
+    assert_eq!(document.unwrap().version, 3);
 }
 
 #[tokio::test]
@@ -787,6 +1018,7 @@ async fn sync_backfills_controller_rules_from_decoded_call() {
     .await
     .unwrap();
     assert_eq!(outcome.registry_events_stored, 1);
+    assert_eq!(mock.transaction_lookup_calls(), 1);
 
     let rules = store
         .transact(|tx| tx.get_controller_policy("alice"))
@@ -1240,6 +1472,79 @@ async fn sync_projects_log_checkpoint_and_overwrites_on_last_seq_conflict() {
     assert_eq!(second.last_seq, 9);
     assert_eq!(second.issued_at, 200);
     assert_eq!(second.log_root, format!("{:#x}", B256::repeat_byte(0xC2)));
+}
+
+#[tokio::test]
+async fn sync_projects_checkpoint_from_event_and_calldata_without_eth_call() {
+    let tx_hash = B256::repeat_byte(0xCF);
+    let external_anchor = B256::repeat_byte(0xA5);
+    let issuer = bns_evm::Principal {
+        kind: bns_evm::PrincipalKind::ChainAccount,
+        value: bns_evm::Bytes::copy_from_slice(OWNER.as_slice()),
+    };
+    let calldata = Bns::publishLogCheckpointCall {
+        issuer: issuer.clone(),
+        externalAnchor: external_anchor,
+    }
+    .abi_encode();
+    let mut txs = HashMap::new();
+    txs.insert(
+        format!("{tx_hash:#x}").to_lowercase(),
+        format!("0x{}", hex::encode(calldata)),
+    );
+    let logs = vec![
+        protocol_event_log(12, 0xC3, 1),
+        event_log_json_with_tx(
+            &Bns::LogCheckpointPublished {
+                logRoot: B256::repeat_byte(0xC3),
+                actor: ACTOR,
+                lastSeq: 11,
+                issuedAt: 300,
+                externalAnchor: external_anchor,
+            },
+            1,
+            tx_hash,
+        ),
+    ];
+    let mock = MockEthRpc::start(MockConfig {
+        chain_id: 31_337,
+        block_number: 1,
+        logs_json: logs,
+        txs,
+        ..Default::default()
+    })
+    .await;
+    let store = SqliteBnsRegistryStore::open_memory().unwrap();
+
+    sync_bns_contract_once(
+        &store,
+        with_endpoint(config_for_chain(31_337), &mock.endpoint),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(mock.transaction_lookup_calls(), 1);
+    assert_eq!(
+        mock.eth_call_calls(),
+        0,
+        "complete event and calldata projection skips latestCheckpoint"
+    );
+    let checkpoint = store
+        .transact(|tx| tx.latest_checkpoint())
+        .unwrap()
+        .expect("checkpoint projected");
+    assert_eq!(
+        checkpoint.log_root,
+        format!("{:#x}", B256::repeat_byte(0xC3))
+    );
+    assert_eq!(checkpoint.last_seq, 11);
+    assert_eq!(checkpoint.issued_at, 300);
+    assert_eq!(
+        checkpoint.issuer.kind,
+        bns_indexer::PrincipalKind::ChainAccount
+    );
+    assert_eq!(checkpoint.issuer.value, format!("{OWNER:#x}"));
+    assert_eq!(checkpoint.external_anchor, format!("{external_anchor:#x}"));
 }
 
 fn sample_name_state() -> bns_indexer::NameState {

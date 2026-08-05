@@ -10,7 +10,17 @@ const SETTINGS_KEYS = new Set([
   "start_block",
   "confirmations",
   "interval_ms",
+  "max_block_span",
 ]);
+const REQUIRED_SETTINGS_KEYS = [
+  "contract",
+  "chain_id",
+  "db",
+  "listen",
+  "start_block",
+  "confirmations",
+  "interval_ms",
+] as const;
 
 type JsonRecord = Record<string, unknown>;
 
@@ -23,6 +33,7 @@ export interface BnsDvConfig {
   readonly startBlock: number;
   readonly confirmations: number;
   readonly intervalMs: number;
+  readonly maxBlockSpan: number;
 }
 
 function invalid(message: string): never {
@@ -137,7 +148,7 @@ export function parseBnsDvConfig(
       }`,
     );
   }
-  for (const key of SETTINGS_KEYS) {
+  for (const key of REQUIRED_SETTINGS_KEYS) {
     if (!Object.hasOwn(settings, key)) {
       invalid(`apps.${APP_ID}.settings.${key} is missing`);
     }
@@ -165,6 +176,11 @@ export function parseBnsDvConfig(
       `apps.${APP_ID}.settings.interval_ms`,
       1,
     ),
+    maxBlockSpan: integer(
+      settings.max_block_span ?? 500,
+      `apps.${APP_ID}.settings.max_block_span`,
+      1,
+    ),
   });
 }
 
@@ -187,6 +203,8 @@ export function buildBnsDvArgs(config: BnsDvConfig): string[] {
     String(config.confirmations),
     "--interval-ms",
     String(config.intervalMs),
+    "--max-block-span",
+    String(config.maxBlockSpan),
   ];
 }
 
