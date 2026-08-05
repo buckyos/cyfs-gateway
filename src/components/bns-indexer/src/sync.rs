@@ -23,6 +23,8 @@ use crate::{
     ProjectedContractEvent, RegistryEvent, ZERO_HASH,
 };
 
+const CHAIN_ERROR_RETRY_INTERVAL: Duration = Duration::from_secs(30);
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BnsBlockSyncSourceConfig {
     pub network: String,
@@ -286,8 +288,10 @@ where
             interval
         };
         loop {
-            on_sync(self.sync_once().await);
-            tokio::time::sleep(interval).await;
+            let outcome = self.sync_once().await;
+            let delay = polling_delay(interval, outcome.is_err());
+            on_sync(outcome);
+            tokio::time::sleep(delay).await;
         }
     }
 
@@ -564,6 +568,31 @@ where
             .call_contract(self.contract, &Bns::latestCheckpointCall {})
             .await?;
         checkpoint_from_evm(checkpoint)
+    }
+}
+
+fn polling_delay(idle_interval: Duration, failed: bool) -> Duration {
+    if failed {
+        CHAIN_ERROR_RETRY_INTERVAL
+    } else {
+        idle_interval
+    }
+}
+
+#[cfg(test)]
+mod polling_tests {
+    use super::*;
+
+    #[test]
+    fn chain_errors_use_fixed_retry_delay() {
+        assert_eq!(
+            polling_delay(Duration::from_secs(15), true),
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            polling_delay(Duration::from_secs(15), false),
+            Duration::from_secs(15)
+        );
     }
 }
 

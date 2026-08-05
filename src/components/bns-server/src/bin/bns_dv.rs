@@ -206,7 +206,15 @@ async fn serve(flags: HashMap<String, String>) -> Result<(), DynError> {
         source.contract_address()?,
         chain_id,
     ));
-    chain_client.validate_chain().await?;
+    loop {
+        match chain_client.validate_chain().await {
+            Ok(()) => break,
+            Err(err) => {
+                eprintln!("[chain] startup validation failed: {err}; retrying in 30 seconds");
+                tokio::time::sleep(Duration::from_secs(30)).await;
+            }
+        }
+    }
 
     // indexer 轮询循环。
     let indexer_chain_client = chain_client.clone();
