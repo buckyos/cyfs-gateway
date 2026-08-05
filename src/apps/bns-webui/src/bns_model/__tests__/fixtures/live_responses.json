@@ -1,5 +1,5 @@
 {
-  "_note": "captured from https://bns.buckyos.io — 真实响应，请勿手工编辑；用 scripts/capture-fixtures.mjs 重新抓取",
+  "_note": "captured from https://bns.buckyos.ai — 真实响应，请勿手工编辑；用 scripts/capture-fixtures.mjs 重新抓取",
   "name": "test-iobns-20260715-01",
   "address": "0x90f79bf6eb2c4f870365e785982e1f101e93b906",
   "krpc": {

@@ -1,4 +1,4 @@
-const BASE = 'https://bns.buckyos.io'
+const BASE = 'https://bns.buckyos.ai'
 const NAME = 'test-iobns-20260715-01'
 const ADDR = '0x90f79bf6eb2c4f870365e785982e1f101e93b906'
 let seq = 0

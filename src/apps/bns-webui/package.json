@@ -11,8 +11,8 @@
     "preview": "vite preview",
     "test": "vitest run",
     "test:watch": "vitest",
-    "test:live": "BNS_LIVE_URL=https://bns.buckyos.io vitest run src/bns_model/__tests__/live.test.ts",
-    "seed:live": "BNS_LIVE_WRITE_URL=https://bns.buckyos.io vitest run src/bns_model/__tests__/live_write.test.ts",
+    "test:live": "BNS_LIVE_URL=https://bns.buckyos.ai vitest run src/bns_model/__tests__/live.test.ts",
+    "seed:live": "BNS_LIVE_WRITE_URL=https://bns.buckyos.ai vitest run src/bns_model/__tests__/live_write.test.ts",
     "capture:fixtures": "node scripts/capture-fixtures.mjs > src/bns_model/__tests__/fixtures/live_responses.json"
   },
   "dependencies": {

@@ -2,7 +2,7 @@
  * 契约测试：直接打线上 bns-server。
  *
  * 默认跳过；需要显式提供地址：
- *   BNS_LIVE_URL=https://bns.buckyos.io pnpm run test:live
+ *   BNS_LIVE_URL=https://bns.buckyos.ai pnpm run test:live
  *
  * 它验证的是**服务端契约有没有变**（方法名、信封形状、错误码、可空语义、
  * DID Resolver 四种回答），而不是重复单测里的业务逻辑。全部只读，不含任何写操作。

@@ -2,7 +2,7 @@
  * Live 写路径契约验证 + UI 种子数据工具（显式 opt-in，会写测试链！）。
  *
  * ```bash
- * pnpm run seed:live     # = BNS_LIVE_WRITE_URL=https://bns.buckyos.io vitest run 本文件
+ * pnpm run seed:live     # = BNS_LIVE_WRITE_URL=https://bns.buckyos.ai vitest run 本文件
  * ```
  *
  * 做两件事：

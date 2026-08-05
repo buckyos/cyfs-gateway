@@ -85,14 +85,14 @@ describe('DID Resolver 状态机', () => {
 })
 
 describe('DID 在 URL 里的编码', () => {
-  const config = resolveConfig({ serverUrl: 'https://bns.buckyos.io' })
+  const config = resolveConfig({ serverUrl: 'https://bns.buckyos.ai' })
 
   it('冒号必须保持原样', () => {
     // bns-server 对未解码的原始 path 做 strip_prefix + starts_with("did:")，
     // 整体 encodeURIComponent 会让它 400 invalidDid。
     expect(encodeDidPathSegment(`did:bns:${fixtures.name}`)).toBe(`did:bns:${fixtures.name}`)
     expect(didResolverEndpoint(config, 'did:bns:alice')).toBe(
-      'https://bns.buckyos.io/1.0/identifiers/did:bns:alice',
+      'https://bns.buckyos.ai/1.0/identifiers/did:bns:alice',
     )
   })
 

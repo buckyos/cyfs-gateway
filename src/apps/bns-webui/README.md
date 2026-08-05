@@ -10,10 +10,10 @@ View 层直接接在 `src/bns_model`（MVC 的 M+C 层，见其 README）之上�
 ```bash
 pnpm install
 pnpm run dev        # http://localhost:5178/，默认演示模式
-pnpm run dev:live   # http://localhost:5179/，直连 https://bns.buckyos.io 真实数据（读 .env.live）
+pnpm run dev:live   # http://localhost:5179/，直连 https://bns.buckyos.ai 真实数据（读 .env.live）
 pnpm run check      # tsc
 pnpm test           # bns_model 单测（243 个，离线）
-pnpm run seed:live  # ⚠ 会写测试链：用临时账号在 bns.buckyos.io 留一组名称状态供 UI 走查
+pnpm run seed:live  # ⚠ 会写测试链：用临时账号在 bns.buckyos.ai 留一组名称状态供 UI 走查
 ```
 
 `seed:live`（`src/bns_model/__tests__/live_write.test.ts`）同时是 `write/abi.ts` 对真实合约的
@@ -26,7 +26,7 @@ gas 从 anvil 默认 0 号账户（公开测试密钥）注资。场景：注册
 | 模式 | 触发条件 | 行为 |
 | --- | --- | --- |
 | 演示模式（默认） | 未设置 `VITE_BNS_SERVER_URL` | 注入浏览器内假 bns-server（13 个 kRPC method + `/health` + DID Resolver，报文与 wire 层 1:1）、演示钱包与演示 calldata codec。写交易走完整两阶段生命周期：链上确认约 1.3s、投影延迟约 2.2s，刻意保留 Indexing 窗口。世界数据存于页面内存，刷新重置；演示钱包的连接授权与本地交易记录存 localStorage。 |
-| 真实模式 | 设置 `VITE_BNS_SERVER_URL`（`pnpm run dev:live` 使用仓库内 `.env.live`，已钉死 bns.buckyos.io 的 chain 31337 与 Proxy 地址） | 直连真实 bns-server 只读浏览。生产口径需同时注入 `VITE_BNS_CONTRACT_ADDRESS`（contractTrust=pinned，PRD 8.1）与 `VITE_BNS_CHAIN_ID`；缺锚点时回落为 `server` 信任（仅限联调）。真实钱包（EIP-6963）与 ABI codec（viem）适配器尚未接线，写入口按 `writeGate.reason` 显示只读原因。 |
+| 真实模式 | 设置 `VITE_BNS_SERVER_URL`（`pnpm run dev:live` 使用仓库内 `.env.live`，已钉死 bns.buckyos.ai 的 chain 31337 与 Proxy 地址） | 直连真实 bns-server 只读浏览。生产口径需同时注入 `VITE_BNS_CONTRACT_ADDRESS`（contractTrust=pinned，PRD 8.1）与 `VITE_BNS_CHAIN_ID`；缺锚点时回落为 `server` 信任（仅限联调）。真实钱包（EIP-6963）与 ABI codec（viem）适配器尚未接线，写入口按 `writeGate.reason` 显示只读原因。 |
 
 ## 目录
 

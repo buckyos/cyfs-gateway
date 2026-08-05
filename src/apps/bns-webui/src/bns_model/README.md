@@ -312,7 +312,7 @@ model.setCalldataCodec(createViemCodec())
 
 ```bash
 pnpm test           # 243 个单测，离线，全部基于线上抓回的真实报文
-pnpm run test:live  # 22 个契约测试，直连 https://bns.buckyos.io，只读
+pnpm run test:live  # 22 个契约测试，直连 https://bns.buckyos.ai，只读
 ```
 
 ### 单测（`__tests__/*.test.ts`）
