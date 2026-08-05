@@ -1474,6 +1474,79 @@ async fn sync_projects_log_checkpoint_and_overwrites_on_last_seq_conflict() {
     assert_eq!(second.log_root, format!("{:#x}", B256::repeat_byte(0xC2)));
 }
 
+#[tokio::test]
+async fn sync_projects_checkpoint_from_event_and_calldata_without_eth_call() {
+    let tx_hash = B256::repeat_byte(0xCF);
+    let external_anchor = B256::repeat_byte(0xA5);
+    let issuer = bns_evm::Principal {
+        kind: bns_evm::PrincipalKind::ChainAccount,
+        value: bns_evm::Bytes::copy_from_slice(OWNER.as_slice()),
+    };
+    let calldata = Bns::publishLogCheckpointCall {
+        issuer: issuer.clone(),
+        externalAnchor: external_anchor,
+    }
+    .abi_encode();
+    let mut txs = HashMap::new();
+    txs.insert(
+        format!("{tx_hash:#x}").to_lowercase(),
+        format!("0x{}", hex::encode(calldata)),
+    );
+    let logs = vec![
+        protocol_event_log(12, 0xC3, 1),
+        event_log_json_with_tx(
+            &Bns::LogCheckpointPublished {
+                logRoot: B256::repeat_byte(0xC3),
+                actor: ACTOR,
+                lastSeq: 11,
+                issuedAt: 300,
+                externalAnchor: external_anchor,
+            },
+            1,
+            tx_hash,
+        ),
+    ];
+    let mock = MockEthRpc::start(MockConfig {
+        chain_id: 31_337,
+        block_number: 1,
+        logs_json: logs,
+        txs,
+        ..Default::default()
+    })
+    .await;
+    let store = SqliteBnsRegistryStore::open_memory().unwrap();
+
+    sync_bns_contract_once(
+        &store,
+        with_endpoint(config_for_chain(31_337), &mock.endpoint),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(mock.transaction_lookup_calls(), 1);
+    assert_eq!(
+        mock.eth_call_calls(),
+        0,
+        "complete event and calldata projection skips latestCheckpoint"
+    );
+    let checkpoint = store
+        .transact(|tx| tx.latest_checkpoint())
+        .unwrap()
+        .expect("checkpoint projected");
+    assert_eq!(
+        checkpoint.log_root,
+        format!("{:#x}", B256::repeat_byte(0xC3))
+    );
+    assert_eq!(checkpoint.last_seq, 11);
+    assert_eq!(checkpoint.issued_at, 300);
+    assert_eq!(
+        checkpoint.issuer.kind,
+        bns_indexer::PrincipalKind::ChainAccount
+    );
+    assert_eq!(checkpoint.issuer.value, format!("{OWNER:#x}"));
+    assert_eq!(checkpoint.external_anchor, format!("{external_anchor:#x}"));
+}
+
 fn sample_name_state() -> bns_indexer::NameState {
     bns_indexer::NameState {
         name: "alice".to_string(),

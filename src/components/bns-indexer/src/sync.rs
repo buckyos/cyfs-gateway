@@ -261,9 +261,8 @@ where
             }
         }
 
-        let snapshot = self.load_projection_snapshot(&registry_records).await?;
         let mut decoded_txs: HashMap<B256, Option<BnsCall>> = HashMap::new();
-        let mut registry_events_stored = 0;
+        let mut projection_records = Vec::with_capacity(registry_records.len());
         for (record, transaction_hash) in registry_records {
             let decoded_call = if record_needs_decoded_call(&record) {
                 self.decoded_call_for_hash(transaction_hash, &mut decoded_txs)
@@ -271,6 +270,12 @@ where
             } else {
                 None
             };
+            projection_records.push((record, decoded_call));
+        }
+
+        let snapshot = self.load_projection_snapshot(&projection_records).await?;
+        let mut registry_events_stored = 0;
+        for (record, decoded_call) in projection_records {
             let projection =
                 self.projection_for_record(&record, decoded_call.as_ref(), &snapshot)?;
             self.store.transact(|tx| {
@@ -434,12 +439,12 @@ where
 
     async fn load_projection_snapshot(
         &self,
-        records: &[(EventLogRecord, Option<B256>)],
+        records: &[(EventLogRecord, Option<BnsCall>)],
     ) -> BnsRegistryResult<ProjectionSnapshot> {
         let mut seen = HashSet::new();
         let mut reads = Vec::new();
-        for (record, _) in records {
-            for read in projection_reads_for_record(record) {
+        for (record, decoded_call) in records {
+            for read in projection_reads_for_record(record, decoded_call.as_ref()) {
                 if seen.insert(read.clone()) {
                     reads.push(read);
                 }
@@ -633,11 +638,15 @@ impl ProjectionSnapshot {
                 self.push_document(&mut write, name, doc_type, *version)?;
             }
             RegistryEvent::LogCheckpointPublished { .. } => {
-                write.checkpoints.push(
-                    self.checkpoint
-                        .clone()
-                        .ok_or_else(|| missing_projection_read("latest checkpoint"))?,
-                );
+                if let Some(checkpoint) = checkpoint_from_event_and_call(record, decoded_call)? {
+                    write.checkpoints.push(checkpoint);
+                } else {
+                    write.checkpoints.push(
+                        self.checkpoint
+                            .clone()
+                            .ok_or_else(|| missing_projection_read("latest checkpoint"))?,
+                    );
+                }
             }
         }
         Ok(write)
@@ -674,7 +683,10 @@ impl ProjectionSnapshot {
     }
 }
 
-fn projection_reads_for_record(record: &EventLogRecord) -> Vec<ProjectionReadKey> {
+fn projection_reads_for_record(
+    record: &EventLogRecord,
+    decoded_call: Option<&BnsCall>,
+) -> Vec<ProjectionReadKey> {
     match &record.event {
         RegistryEvent::NameRegistered { name, .. }
         | RegistryEvent::NameRenewed { name, .. }
@@ -717,9 +729,12 @@ fn projection_reads_for_record(record: &EventLogRecord) -> Vec<ProjectionReadKey
             ProjectionReadKey::Name(name.clone()),
             ProjectionReadKey::Alias(name.clone()),
         ],
-        RegistryEvent::LogCheckpointPublished { .. } => {
-            vec![ProjectionReadKey::LatestCheckpoint]
+        RegistryEvent::LogCheckpointPublished { .. }
+            if matches!(decoded_call, Some(BnsCall::publishLogCheckpoint(_))) =>
+        {
+            Vec::new()
         }
+        RegistryEvent::LogCheckpointPublished { .. } => vec![ProjectionReadKey::LatestCheckpoint],
     }
 }
 
@@ -730,8 +745,41 @@ fn missing_projection_read(detail: impl Into<String>) -> BnsRegistryError {
 fn record_needs_decoded_call(record: &EventLogRecord) -> bool {
     matches!(
         &record.event,
-        RegistryEvent::AuthorityKeysUpdated { .. } | RegistryEvent::ControllerPolicyUpdated { .. }
+        RegistryEvent::AuthorityKeysUpdated { .. }
+            | RegistryEvent::ControllerPolicyUpdated { .. }
+            | RegistryEvent::LogCheckpointPublished { .. }
     )
+}
+
+fn checkpoint_from_event_and_call(
+    record: &EventLogRecord,
+    decoded_call: Option<&BnsCall>,
+) -> BnsRegistryResult<Option<LogCheckpoint>> {
+    let RegistryEvent::LogCheckpointPublished {
+        log_root,
+        last_seq,
+        issued_at,
+        external_anchor,
+    } = &record.event
+    else {
+        return Ok(None);
+    };
+    let Some(BnsCall::publishLogCheckpoint(call)) = decoded_call else {
+        return Ok(None);
+    };
+    let call_anchor = hash_string(call.externalAnchor);
+    if call_anchor != *external_anchor {
+        return Err(BnsRegistryError::InvalidMutation(format!(
+            "checkpoint event external anchor {external_anchor} does not match transaction calldata {call_anchor}"
+        )));
+    }
+    Ok(Some(LogCheckpoint {
+        log_root: log_root.clone(),
+        last_seq: *last_seq,
+        issued_at: *issued_at,
+        issuer: principal_from_evm(call.issuer.clone())?,
+        external_anchor: external_anchor.clone(),
+    }))
 }
 
 fn polling_delay(idle_interval: Duration, failed: bool, has_backlog: bool) -> Duration {
