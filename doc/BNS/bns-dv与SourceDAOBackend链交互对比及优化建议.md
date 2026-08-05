@@ -443,87 +443,88 @@ SourceDAOBackend 的主要节省来自“大部分事件直接更新 storage”�
 - 每个 `OPT` 必须对应且只对应一次提交；实现时不得顺带合入下一项方案；
 - 当前代码快照中以下优化均未实现，因此全部标为 `[TODO]`。完成某项后，在本节把它更新为 `[DONE <full commit hash>]`。
 
-### OPT-01 `[TODO]` 抽出并统一使用 `BnsChainClient`
+### OPT-01 `[DONE ecfecafc553df6177dd8033eb4f1744fa2431f64]` 抽出并统一使用 `BnsChainClient`
 
-- **提交：** 待实现，一次提交。
+- **提交：** `ecfecafc553df6177dd8033eb4f1744fa2431f64`
 - **目标：** 在 `bns-evm` 新增单独的 `BnsChainClient` 实例，`bns_dv` 创建唯一 `Arc`，indexer 和 server 的所有直接链交互改经该实例。
 - **影响：** 只调整内部链访问边界和构造装配；RPC 方法、次数、时序和返回值保持不变。
 - **兼容：** 保留既有 public trait/构造入口；不改变 crate 依赖方向；不修改 `BnsEvmControllerClient`、cyfs-sn 或 WebUI，不把本地测试初始化使用的 Controller 接入服务侧共享实例。
 - **验收：** 现有测试全部通过；mock RPC 调用序列与改造前一致；`bns_dv` 内 indexer/server 不再各自创建长期 `EthRpcClient`。
 
-### OPT-02 `[TODO]` 用 Multicall 聚合顺序 `eth_call`
+### OPT-02 `[DONE b51c1c1f16c979a666ce49c5d3c555ab64a0cfac]` 用 Multicall 聚合顺序 `eth_call`
 
-- **提交：** 待实现，一次提交。
+- **提交：** `b51c1c1f16c979a666ce49c5d3c555ab64a0cfac`
 - **目标：** 在 `BnsChainClient` 增加 Multicall3 聚合入口，把同一投影过程或同步分片内相互独立的 latest view call 收集后一次执行；失败才回退到逐个 `eth_call`。
 - **影响：** 正常路径把一组 N 次 `eth_call` 降为 1 次，可直接大幅降低 RPC provider 的 `eth_call`/credit 消耗；继续使用现有 endpoint 和目标链能力，不新增运行服务、合约部署、上下游依赖或 Controller 改动。
 - **验收：** mock 中 N 个可聚合读取只产生一次 `eth_call`，结果与原路径逐字段一致；Multicall 失败时可靠回退；通过现有 API 页面确认 `eth_call` 消耗下降。
 
-### OPT-03 `[TODO]` 缓存链级不变量
+### OPT-03 `[DONE 7a81d8d44a247e6e2d02a29817f72b03e16a6e66]` 缓存链级不变量
 
-- **提交：** 待实现，一次提交。
+- **提交：** `7a81d8d44a247e6e2d02a29817f72b03e16a6e66`
 - **目标：** `chain_id` 和 contract address 在 `BnsChainClient` 启动时验证并缓存；只在连接切换、连续错误或低频安全审计时复核。
 - **影响：** 删除每个 `sync_once` 和每个 `system.info`/`tx.prepare` 对 chain ID 的重复读取；对外返回值不变。
 - **验收：** 空闲运行时不再每秒出现 `eth_chainId`；错误 endpoint/chain 仍能在启动或切换时被拒绝。
 
-### OPT-04 `[TODO]` 按调用来源统一链错误处理
+### OPT-04 `[DONE 60f6001ccf14952b9a1b894a69d8bed50af097b7]` 按调用来源统一链错误处理
 
-- **提交：** 待实现，一次提交。
+- **提交：** `60f6001ccf14952b9a1b894a69d8bed50af097b7`
 - **目标：** 采用 SourceDAOBackend 的简单规则：启动校验、indexer 等后台链操作发生任意错误后固定暂停 30 秒再重试；外部 API 触发的链操作发生错误时立即返回，由外部调用方重新请求。
 - **影响：** 不引入指数退避、jitter、按错误码区分的重试阶梯或请求内自动重试。正常成功路径不变；`eth_sendRawTransaction` 错误也直接返回，不在 server 内自动重发。
 - **验收：** mock 任意后台 RPC 错误后，下一次尝试固定发生在 30 秒后并能从持久化状态继续；mock `system.info`、`tx.prepare`、`tx.submit_raw`、`tx.query_state` 链错误均立即返回，单次 API 请求内没有 sleep，也不重试该次失败的 RPC。
 
-### OPT-05 `[TODO]` 改为 backlog/idle 分离的同步调度
+### OPT-05 `[DONE 7b6fcd67af2c8e533812584efcd4bc2e08626fc8]` 改为 backlog/idle 分离的同步调度
 
-- **提交：** 待实现，一次提交。
+- **提交：** `7b6fcd67af2c8e533812584efcd4bc2e08626fc8`
 - **目标：** 有 backlog 时连续处理分片；追平后才按现有 `interval_ms` sleep，默认值改为 15000 ms。将现有 `max_block_span` 默认值从 1000 改为 500，并新增 `bns_dv serve --max-block-span <n>` 覆盖入口。
 - **影响：** `interval_ms` 只控制 idle 链头检查；`max_block_span` 只控制单次 backlog 处理的区块长度。改变默认轮询间隔和分片大小，但不改变扫描边界、cursor、事件顺序或投影语义。
 - **验收：** 默认配置下，无活动时每 15 秒检查一次链头；1501 个 block 的 backlog 按 500、500、500、1 连续处理且分片间不 sleep；显式 `--interval-ms` 和 `--max-block-span` 均生效；错误路径遵循 OPT-04 的固定 30 秒等待。
 
-### OPT-06 `[TODO]` 合并 latest head 与 reorg 校验
+### OPT-06 `[DONE d5fd9d60c4640a32a3e047b7b6114784a3556c49]` 合并 latest head 与 reorg 校验
 
-- **提交：** 待实现，一次提交。
+- **提交：** `d5fd9d60c4640a32a3e047b7b6114784a3556c49`
 - **目标：** 缓存 latest header；链头不变时不重复读取同一 cursor block；链头变化时校验必要 ancestor，并保留低频同高度 reorg 审计。
 - **影响：** 减少 `eth_blockNumber + eth_getBlockByNumber(cursor)` 的重复组合；保留现有 reset/replay 行为。
 - **验收：** 15 秒 idle 配置下后台链头量接近 5,760 次/天；已有 reorg 测试继续通过；同高度 reorg 审计可触发 reset。
 
-### OPT-07 `[TODO]` transaction lookup lazy 化
+### OPT-07 `[DONE 020cc9686958d96947e110563d091db05247c21c]` transaction lookup lazy 化
 
-- **提交：** 待实现，一次提交。
+- **提交：** `020cc9686958d96947e110563d091db05247c21c`
 - **目标：** 只有 `AuthorityKeysUpdated`、`ControllerPolicyUpdated` 等真正使用 calldata 的事件才调用 `eth_getTransactionByHash`。
 - **影响：** 只删除未使用的链读取，不改变任何投影结果。
 - **验收：** 普通 name/document 事件不产生 transaction lookup；authority/controller 投影与当前结果逐字段一致。
 
-### OPT-08 `[TODO]` 缓存并合并 `tx.query_state`
+### OPT-08 `[DONE 071cd70fc4de7762704066aaec7931914946ccb4]` 缓存并合并 `tx.query_state`
 
-- **提交：** 待实现，一次提交。
+- **提交：** `071cd70fc4de7762704066aaec7931914946ccb4`
 - **目标：** 在 `BnsChainClient` 对同一 tx hash 做 singleflight、receipt cache、pending/not-found 短 TTL；确认数由共享 head 计算。
 - **影响：** kRPC、WebUI、cyfs-sn 和 controller 完全不改；短 TTL 内允许返回同一状态快照。
 - **验收：** 100 个并发相同 tx 查询在一个 TTL 窗口只形成一组上游读取；reorg 能失效相关 receipt；状态机结果不变。
 
-### OPT-09 `[TODO]` 缓存 `tx.prepare` 的不变量和 fee suggestion
+### OPT-09 `[DONE 095c24e06c3153dab1c8bedb1bb195d123dc97aa]` 缓存 `tx.prepare` 的不变量和 fee suggestion
 
-- **提交：** 待实现，一次提交。
+- **提交：** `095c24e06c3153dab1c8bedb1bb195d123dc97aa`
 - **目标：** 使用已验证 chain/contract，fee 按 head 或 2～5 秒 TTL 缓存；pending nonce 和 gas estimate 仍逐请求读取。
 - **影响：** 常规 prepare 从 5 次链 RPC 降到 2～3 次；不改变签名参数结构，不缓存任意钱包 nonce。
 - **验收：** fee cache 命中/失效符合预期；连续外部钱包交易不发生 nonce 冲突；现有 prepare 测试通过。
 
-### OPT-10 `[TODO]` 同步批次内去重 latest 状态补读
+### OPT-10 `[DONE a37ddb305b791e7de7ec7fe97deaa7fda6004fcd]` 同步批次内去重 latest 状态补读
 
-- **提交：** 待实现，一次提交。
+- **提交：** `a37ddb305b791e7de7ec7fe97deaa7fda6004fcd`
 - **目标：** 先收集完整日志分片，再按 transaction、name、document、authority、alias、checkpoint key 去重补读。
 - **影响：** 会调整一个分片内的投影组织方式，但继续从 latest 补读，event 记录顺序和最终 SQLite 状态不变。
 - **验收：** 同一交易的 NameRegistered/DocumentPublished 不重复读取同一 name；多历史变更完整追赶后最终状态与链上 latest 一致。
 
-### OPT-11 `[TODO]` 事件/calldata 优先投影
+### OPT-11 `[DONE cac7640910b2a7cdbda66cbb2fed8a2f314fa934]` 事件/calldata 优先投影
 
-- **提交：** 待实现，一次提交。
+- **提交：** `cac7640910b2a7cdbda66cbb2fed8a2f314fa934`
 - **目标：** 对 event/calldata 已包含完整信息的状态直接投影，只有信息不足时才 latest `eth_call`。
+- **实现边界：** 保留 authority key/controller rule 的 calldata 投影；checkpoint 由 event 与 calldata 完整恢复并校验 `externalAnchor`，不再调用 `latestCheckpoint`。alias `setAt`、name/document 时间字段等无法从 event/calldata 严格恢复的状态仍走 latest 补读，不猜测缺失字段。
 - **影响：** 改动 projector，范围和回归风险最大；只有 OPT-01～OPT-10 后链 API 消耗仍不达标时才实施。
 - **验收：** 固定历史区间的新旧 projector 最终 SQLite 逐字段一致；事件 hash/root 校验完整；所有业务 API 和 controller 保持不变。
 
-### OPT-12 `[TODO]` CD 系统适配：原生支持 `--cluster`
+### OPT-12 `[DONE f51428b91fc5f31a9456a168e2a146dc8df4d17a]` CD 系统适配：原生支持 `--cluster`
 
-- **提交：** 待实现，一次提交。
+- **提交：** `f51428b91fc5f31a9456a168e2a146dc8df4d17a`
 - **目标：** 为 `bns_dv serve` 新增 `--cluster` 选项。指定后由进程在启动时读取固定位置的 `/etc/cluster_config/cluster_config.json` 和 `/etc/security/security_config.json`，并映射成现有 `serve` 配置：`security.chain_rpc_url` 对应 `--rpc`，`apps.bns_dv.settings` 下的 `contract`、`chain_id`、`db`、`listen`、`start_block`、`confirmations`、`interval_ms` 分别对应现有同名命令行能力；可选 `max_block_span` 对应 OPT-05 新增的 `--max-block-span`，缺省时使用 500。
 - **覆盖规则：** 先加载 cluster/security 配置，再合并本次显式指定的其他命令行参数；命令行参数优先，覆盖文件中的对应值。未指定 `--cluster` 时完全沿用当前命令行解析、必填项和默认值行为。
 - **迁移边界：** 将当前 `start_bns_dv.ts` 中“读取和校验固定配置文件、转换为现有命令行参数”的能力下沉到 `bns_dv`；不新增另一套业务配置语义，不修改现有参数名称、Controller、链交互或上下游 API。`start_bns_dv.ts` 可在 CD 切换完成前保留为兼容入口；cluster/security 配置本身不提供 seed 或初始化交易，只有本地测试脚本显式传入 `--config`/`--seed-config` 时才进入既有初始化路径。
