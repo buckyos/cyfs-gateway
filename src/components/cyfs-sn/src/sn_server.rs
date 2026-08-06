@@ -2739,6 +2739,21 @@ impl SnServerFactory {
 
         let (key_specs, require_user_asset_owner, allowed_operations) =
             Self::resolve_bns_proxy_key_specs(proxy_config)?;
+        let mut allowed_operation_names = allowed_operations
+            .iter()
+            .map(|operation| operation.as_str())
+            .collect::<Vec<_>>();
+        allowed_operation_names.sort_unstable();
+        info!(
+            "initializing sn bns proxy: chain_id={} contract_address={} controllers={} \
+             allowed_operations={:?} require_user_asset_owner={} tx_fee_mode={:?}",
+            evm_config.chain_id,
+            evm_config.contract_address,
+            key_specs.len(),
+            allowed_operation_names,
+            require_user_asset_owner,
+            proxy_config.tx_fee_mode,
+        );
         let signer_vault = Arc::new(
             SnBnsTxSigner::new(&evm_config, allowed_operations.clone(), key_specs).map_err(
                 |e| {
@@ -2806,6 +2821,15 @@ impl SnServerFactory {
                     e
                 )
             })?;
+            info!(
+                "sn bns controller initialized: controller_id={} controller_address={} \
+                 weight={} chain_id={} contract_address={}",
+                info.id,
+                info.address_hex,
+                info.weight,
+                evm_config.chain_id,
+                evm_config.contract_address,
+            );
             controllers.push(SnBnsProxyController {
                 id: info.id,
                 address: info.address_hex,

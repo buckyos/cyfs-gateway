@@ -17,8 +17,9 @@ use bns_evm::{
     EthRpcClient, EthTransactionReceipt, MutationGuard as EvmMutationGuard,
     OwnerPolicyUpdate as EvmOwnerPolicyUpdate, Principal as EvmPrincipal,
     PrincipalKind as EvmPrincipalKind, RegisterOptions as EvmRegisterOptions, SignedEip1559Tx,
-    SolCall, TxEip1559, B256, U256,
+    SolCall, TxEip1559, TxKind, B256, U256,
 };
+use log::info;
 use serde::{Deserialize, Serialize};
 use tokio::time::{sleep, Duration, Instant};
 
@@ -571,6 +572,10 @@ impl BnsEvmControllerClient {
                 return Err(error);
             }
         };
+        let contract_address = match &tx.to {
+            TxKind::Call(address) => format!("{address:#x}"),
+            TxKind::Create => "<create>".to_string(),
+        };
         let signed = match self.key_manager.sign_transaction(request, tx).await {
             Ok(signed) => signed,
             Err(error) => {
@@ -588,6 +593,22 @@ impl BnsEvmControllerClient {
 
         match self.submit_raw_tx(&signed.raw_tx).await {
             Ok(tx_hash) => {
+                info!(
+                    "bns evm contract transaction submitted: operation={} name={} doc_type={} \
+                     contract_address={} from={} chain_id={} nonce={} tx_hash={}",
+                    request.operation.as_str(),
+                    if request.name.is_empty() {
+                        "-"
+                    } else {
+                        request.name.as_str()
+                    },
+                    request.doc_type.as_deref().unwrap_or("-"),
+                    contract_address,
+                    signed.signer,
+                    signed.chain_id,
+                    signed.nonce,
+                    tx_hash,
+                );
                 let receipt = match self.receipt_wait {
                     Some(config) => Some(self.wait_for_receipt(tx_hash.as_str(), config).await?),
                     None => None,
