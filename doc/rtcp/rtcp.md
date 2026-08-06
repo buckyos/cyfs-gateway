@@ -278,8 +278,11 @@ candidate key 降级为 `KeyDid`，不携带 owner/zone，不写授权缓存。
 
 - authority current：写 verified cache，并把该 DID 的 tunnel 单向升级为
   `MethodAuthorityCurrent`；
-- AuthorityNotCurrent 或 definite rejection：写 RTCP 负结果状态，并通过逻辑 DID
-  二级索引关闭该身份的 tunnel；
+- authority 证明候选文档是 `DifferentDocument` 或 `Superseded`，或验证返回
+  definite rejection：写 RTCP 负结果状态，并通过逻辑 DID 二级索引关闭该身份的
+  tunnel；
+- authority 对未发布设备文档返回 `NegativeStatus(Missing/Expired/Migrated)`：保留
+  Host/Zone snapshot trust，但不升级为 `MethodAuthorityCurrent`；
 - unavailable/timeout：保留原 snapshot trust，不踢 tunnel。
 
 `authority_reconfirm_max_age: unlimited` 表示每进程生命周期只确认一次；有限秒数使用懒

@@ -1568,6 +1568,28 @@ impl RTcpInner {
         }
     }
 
+    // A remote authority lookup for an unpublished logical DeviceDocument
+    // reports NotCurrent(NegativeStatus(Missing)).  That is not a revocation:
+    // the OwnerDocument can still authenticate the candidate and the trusted
+    // Host/Zone snapshot remains the admission evidence.  Only an authority
+    // receipt proving that another document is current is a definite reason to
+    // tear down tunnels here.  Terminal negative states are returned as
+    // VerifyError::RejectedByNegativeState and handled by the error branch in
+    // maybe_spawn_authority_confirmation.
+    fn authority_confirmation_rejects_snapshot(authority: &AuthorityFreshness) -> bool {
+        matches!(
+            authority,
+            AuthorityFreshness::NotCurrent {
+                reason: AuthorityNotCurrentReason::DifferentDocument
+                    | AuthorityNotCurrentReason::Superseded
+                    | AuthorityNotCurrentReason::NegativeStatus(
+                        DocumentStatus::Revoked | DocumentStatus::Tombstoned,
+                    ),
+                ..
+            }
+        )
+    }
+
     fn commit_verified_cache_entry(
         entry: Option<PendingVerifiedCacheEntry>,
     ) -> NSResult<Option<(VerifiedTunnelIdentity, CacheWriteOutcome)>> {
@@ -2609,10 +2631,8 @@ impl RTcpInner {
                     }
                 }
                 Ok(Ok((_document, verified))) => {
-                    if matches!(
-                        &verified.freshness.authority,
-                        AuthorityFreshness::NotCurrent { .. }
-                    ) {
+                    if Self::authority_confirmation_rejects_snapshot(&verified.freshness.authority)
+                    {
                         warn!(
                             "RTCP authority confirmation denied {} from {}: {:?}",
                             identity_key, source_ip, verified.freshness.authority
@@ -2621,6 +2641,14 @@ impl RTcpInner {
                             .close_verified_identity(&identity_key, "AuthorityNotCurrent")
                             .await;
                         next_state = AuthorityConfirmationState::Negative(completed_at);
+                    } else if matches!(
+                        &verified.freshness.authority,
+                        AuthorityFreshness::NotCurrent { .. }
+                    ) {
+                        info!(
+                            "RTCP authority confirmation did not establish a current published device document for {} from {}; retaining snapshot trust: {:?}",
+                            identity_key, source_ip, verified.freshness.authority
+                        );
                     } else {
                         warn!(
                             "RTCP authority confirmation for {} returned no current receipt",
@@ -5749,6 +5777,47 @@ mod tests {
                 iat,
                 content_hash: hash.to_string(),
             },
+        }
+    }
+
+    fn authority_not_current(reason: AuthorityNotCurrentReason) -> AuthorityFreshness {
+        AuthorityFreshness::NotCurrent {
+            reason,
+            authority_seq: None,
+            current_document_iat: None,
+            checked_at: 1,
+            source: "test-authority".to_string(),
+        }
+    }
+
+    #[test]
+    fn authority_confirmation_keeps_unpublished_device_snapshot() {
+        for status in [
+            DocumentStatus::Missing,
+            DocumentStatus::Expired,
+            DocumentStatus::Migrated,
+        ] {
+            let authority =
+                authority_not_current(AuthorityNotCurrentReason::NegativeStatus(status));
+            assert!(
+                !RTcpInner::authority_confirmation_rejects_snapshot(&authority),
+                "non-terminal authority status must retain trusted snapshot: {:?}",
+                authority
+            );
+        }
+
+        for reason in [
+            AuthorityNotCurrentReason::DifferentDocument,
+            AuthorityNotCurrentReason::Superseded,
+            AuthorityNotCurrentReason::NegativeStatus(DocumentStatus::Revoked),
+            AuthorityNotCurrentReason::NegativeStatus(DocumentStatus::Tombstoned),
+        ] {
+            let authority = authority_not_current(reason);
+            assert!(
+                RTcpInner::authority_confirmation_rejects_snapshot(&authority),
+                "a conflicting, superseded, or terminal document must reject the snapshot: {:?}",
+                authority
+            );
         }
     }
 
