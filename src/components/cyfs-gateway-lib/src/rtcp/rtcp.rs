@@ -465,6 +465,47 @@ struct InitiatorHandshakeState {
     responder_trust: RtcpIdentityTrust,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RtcpAddressResolutionContext {
+    target_did: DID,
+    options: ResolveIpOptions,
+}
+
+impl RtcpAddressResolutionContext {
+    fn without_device_info(
+        target_did: DID,
+        target_kind: ResolveIpTargetKind,
+        zone_relation: ResolveIpZoneRelation,
+    ) -> Self {
+        Self {
+            target_did,
+            options: ResolveIpOptions::without_device_info(target_kind, zone_relation),
+        }
+    }
+
+    fn verified_same_zone_device(
+        target_did: DID,
+        zone_did: DID,
+        source: SameZoneEvidenceSource,
+    ) -> Self {
+        let evidence =
+            VerifiedSameZoneDevice::from_verified_relation(target_did.clone(), zone_did, source);
+        Self {
+            target_did,
+            options: ResolveIpOptions::verified_same_zone_device(evidence),
+        }
+    }
+
+    async fn resolve_ips(&self) -> NSResult<Vec<std::net::IpAddr>> {
+        resolve_ips_with_options(self.target_did.to_string().as_str(), self.options.clone()).await
+    }
+}
+
+enum ResolvedHandshakeDocument {
+    Device(DeviceDocument),
+    Zone(ZoneDocument),
+}
+
 #[derive(Clone, Debug)]
 struct ResolvedHandshakeIdentity {
     semantic_did: DID,
@@ -472,6 +513,7 @@ struct ResolvedHandshakeIdentity {
     ed25519_pk_der: [u8; 32],
     trust: RtcpIdentityTrust,
     resolver_id: Option<String>,
+    address_resolution: RtcpAddressResolutionContext,
     // True when the semantic DID is a logical *device* name whose resolution
     // must obey the one-to-one binding to its canonical DEV DID: DeviceDocument
     // resolutions and DNS TXT bootstrap hints. False for direct did:dev
@@ -704,6 +746,11 @@ impl RTcpInner {
                         ed25519_pk_der: exchange_key,
                         trust: RtcpIdentityTrust::DnsTxtBootstrap,
                         resolver_id: Some(format!("dns-txt:{}", web_host)),
+                        address_resolution: RtcpAddressResolutionContext::without_device_info(
+                            remote_did.clone(),
+                            ResolveIpTargetKind::Unknown,
+                            ResolveIpZoneRelation::Unknown,
+                        ),
                         binds_logical_name: true,
                     }));
                 }
@@ -728,6 +775,11 @@ impl RTcpInner {
                             ed25519_pk_der: exchange_key,
                             trust: RtcpIdentityTrust::DnsTxtBootstrap,
                             resolver_id: Some(format!("dns-txt:{}", web_host)),
+                            address_resolution: RtcpAddressResolutionContext::without_device_info(
+                                remote_did.clone(),
+                                ResolveIpTargetKind::Unknown,
+                                ResolveIpZoneRelation::Unknown,
+                            ),
                             binds_logical_name: true,
                         }));
                     }
@@ -744,34 +796,33 @@ impl RTcpInner {
         Ok(None)
     }
 
-    // Returns the exchange key together with whether the semantic DID names a
-    // device (DeviceDocument) rather than a zone (ZoneDocument). Only device
-    // names enter the one-to-one logical-name binding.
+    // Returns the exchange key together with the authority-validated target
+    // document kind. The parsed document is also used to derive the address
+    // resolution scope without consulting DeviceInfo.
     fn exchange_key_from_resolved_document(
         resolved: &ResolvedDocument,
-    ) -> Result<([u8; 32], bool), String> {
+    ) -> Result<([u8; 32], ResolvedHandshakeDocument), String> {
         let document_value = resolved
             .document
             .clone()
             .to_json_value()
             .map_err(|e| format!("decode resolved DID document failed: {}", e))?;
-        let (exchange_key, is_device_document) = if document_value.get("device_type").is_some() {
+        let (exchange_key, target_document) = if document_value.get("device_type").is_some() {
+            let device_document = DeviceDocument::decode(&resolved.document, None)
+                .map_err(|e| format!("decode resolved DeviceDocument failed: {}", e))?;
+            let exchange_key = device_document.get_exchange_key(None);
             (
-                DeviceDocument::decode(&resolved.document, None)
-                    .map_err(|e| format!("decode resolved DeviceDocument failed: {}", e))?
-                    .get_exchange_key(None),
-                true,
+                exchange_key,
+                ResolvedHandshakeDocument::Device(device_document),
             )
         } else if document_value.get("hostname").is_some() {
             let zone_document = ZoneDocument::decode(&resolved.document, None)
                 .map_err(|e| format!("decode resolved ZoneDocument failed: {}", e))?;
-            (
-                zone_document
-                    .get_default_zone_gateway()
-                    .and_then(|gateway| zone_document.get_device_document(&gateway))
-                    .and_then(|device| device.get_exchange_key(None)),
-                false,
-            )
+            let exchange_key = zone_document
+                .get_default_zone_gateway()
+                .and_then(|gateway| zone_document.get_device_document(&gateway))
+                .and_then(|device| device.get_exchange_key(None));
+            (exchange_key, ResolvedHandshakeDocument::Zone(zone_document))
         } else {
             return Err("resolved DID document is neither DeviceDocument nor ZoneDocument".into());
         };
@@ -779,7 +830,73 @@ impl RTcpInner {
             exchange_key.ok_or_else(|| "resolved DID document has no exchange key".to_string())?;
         let key = jwk_to_ed25519_pk(&jwk)
             .map_err(|e| format!("decode resolved Ed25519 exchange key failed: {}", e))?;
-        Ok((key, is_device_document))
+        Ok((key, target_document))
+    }
+
+    fn address_resolution_for_document(
+        &self,
+        target_did: &DID,
+        target_document: &ResolvedHandshakeDocument,
+    ) -> RtcpAddressResolutionContext {
+        match target_document {
+            ResolvedHandshakeDocument::Device(device_document) => {
+                let Some(local_zone_did) = self.this_zone_did.as_ref() else {
+                    return RtcpAddressResolutionContext::without_device_info(
+                        target_did.clone(),
+                        ResolveIpTargetKind::Device,
+                        ResolveIpZoneRelation::Unknown,
+                    );
+                };
+                let Some(target_zone_did) = device_document.zone_did.as_ref() else {
+                    return RtcpAddressResolutionContext::without_device_info(
+                        target_did.clone(),
+                        ResolveIpTargetKind::Device,
+                        ResolveIpZoneRelation::Unknown,
+                    );
+                };
+                if target_zone_did != local_zone_did {
+                    return RtcpAddressResolutionContext::without_device_info(
+                        target_did.clone(),
+                        ResolveIpTargetKind::Device,
+                        ResolveIpZoneRelation::CrossZone,
+                    );
+                }
+                let Some(local_owner_did) = self.this_owner_did.as_ref() else {
+                    return RtcpAddressResolutionContext::without_device_info(
+                        target_did.clone(),
+                        ResolveIpTargetKind::Device,
+                        ResolveIpZoneRelation::Unknown,
+                    );
+                };
+                if device_document.owner != *local_owner_did {
+                    return RtcpAddressResolutionContext::without_device_info(
+                        target_did.clone(),
+                        ResolveIpTargetKind::Device,
+                        ResolveIpZoneRelation::CrossZone,
+                    );
+                }
+
+                RtcpAddressResolutionContext::verified_same_zone_device(
+                    target_did.clone(),
+                    local_zone_did.clone(),
+                    SameZoneEvidenceSource::VerifiedHandshakeIdentity,
+                )
+            }
+            ResolvedHandshakeDocument::Zone(zone_document) => {
+                let zone_relation = match self.this_zone_did.as_ref() {
+                    Some(local_zone_did) if zone_document.id == *local_zone_did => {
+                        ResolveIpZoneRelation::SameZone
+                    }
+                    Some(_) => ResolveIpZoneRelation::CrossZone,
+                    None => ResolveIpZoneRelation::Unknown,
+                };
+                RtcpAddressResolutionContext::without_device_info(
+                    target_did.clone(),
+                    ResolveIpTargetKind::Zone,
+                    zone_relation,
+                )
+            }
+        }
     }
 
     fn authority_error_allows_txt_bootstrap(err: &NSError) -> bool {
@@ -810,6 +927,11 @@ impl RTcpInner {
                 ed25519_pk_der: exchange_key,
                 trust: RtcpIdentityTrust::KeyDid,
                 resolver_id: None,
+                address_resolution: RtcpAddressResolutionContext::without_device_info(
+                    remote_did.clone(),
+                    ResolveIpTargetKind::Device,
+                    ResolveIpZoneRelation::Unknown,
+                ),
                 binds_logical_name: false,
             });
         }
@@ -871,9 +993,13 @@ impl RTcpInner {
                         }
                     }
                 };
-                let (exchange_key, is_device_document) =
+                let (exchange_key, target_document) =
                     Self::exchange_key_from_resolved_document(&resolved)?;
                 let canonical_dev_did = canonical_dev_did_from_ed25519_pk(&exchange_key);
+                let address_resolution =
+                    self.address_resolution_for_document(remote_did, &target_document);
+                let binds_logical_name =
+                    matches!(target_document, ResolvedHandshakeDocument::Device(_));
                 info!(
                     "resolved RTCP peer {} as {} with trust {} via {:?}",
                     remote_did.to_string(),
@@ -887,7 +1013,8 @@ impl RTcpInner {
                     ed25519_pk_der: exchange_key,
                     trust,
                     resolver_id: metadata.resolver_id.clone(),
-                    binds_logical_name: is_device_document,
+                    address_resolution,
+                    binds_logical_name,
                 })
             }
             Err(primary_err) => {
@@ -1178,6 +1305,7 @@ impl RTcpInner {
             self.stream_helper.clone(),
             self.this_device_did.clone(),
             remote_stack,
+            responder_identity.address_resolution.clone(),
             true,
             encrypted_stream,
             peer_addr,
@@ -2429,6 +2557,11 @@ impl RTcpInner {
             self.stream_helper.clone(),
             self.this_device_did.clone(),
             &remote_stack,
+            RtcpAddressResolutionContext::without_device_info(
+                remote_stack.did.clone(),
+                ResolveIpTargetKind::Device,
+                ResolveIpZoneRelation::Unknown,
+            ),
             false,
             encrypted_stream,
             Some(source_addr),
@@ -2843,6 +2976,7 @@ impl RTcpInner {
                 self.stream_helper.clone(),
                 self.this_device_did.clone(),
                 &remote_stack,
+                responder_identity.address_resolution.clone(),
                 true,
                 encrypted_stream,
                 None,
@@ -2898,15 +3032,23 @@ impl RTcpInner {
             return result;
         }
 
-        // 1） resolve remote ip list. name_client::resolve_ips already applies
-        // address ordering based on its RFC 8305 / addr-rtt policy.
-        let resolve_name = remote_stack.did.to_string();
+        // 1） Resolve with the scope produced by the verified handshake
+        // identity. name-client applies its RFC 8305 / addr-rtt ordering after
+        // enforcing the DeviceInfo policy.
+        let resolve_name = responder_identity.address_resolution.target_did.to_string();
         debug!(
-            "resolve remote device {} (canonical {}) ips by {}",
-            target_device_id, remote_device_id, resolve_name
+            "resolve remote device {} (canonical {}) ips by {} with target_kind={:?}, zone_relation={:?}",
+            target_device_id,
+            remote_device_id,
+            resolve_name,
+            responder_identity.address_resolution.options.target_kind(),
+            responder_identity
+                .address_resolution
+                .options
+                .zone_relation(),
         );
 
-        let candidate_ips = match resolve_ips(resolve_name.as_str()).await {
+        let candidate_ips = match responder_identity.address_resolution.resolve_ips().await {
             Ok(ips) if !ips.is_empty() => ips,
             Ok(_) => {
                 let msg = format!(
@@ -3427,6 +3569,10 @@ struct RTcpTunnel {
     instance_id: u64,
     build_helper: RTcpStreamBuildHelper,
     remote_stack: RTcpTargetStackEP,
+    // Bound to the verified handshake identity and copied unchanged from the
+    // initial address lookup. Reconnects must not reconstruct scope from the
+    // target name or fall back to the context-free resolver API.
+    address_resolution: RtcpAddressResolutionContext,
     can_direct: bool,
     // Direct reconnect target for tunnels carried by a direct TCP socket. None
     // when the tunnel was bootstrapped through a nested stream URL and the
@@ -3505,6 +3651,7 @@ impl RTcpTunnel {
         build_helper: RTcpStreamBuildHelper,
         this_device: DID,
         remote_stack: &RTcpTargetStackEP,
+        address_resolution: RtcpAddressResolutionContext,
         can_direct: bool,
         encrypted_stream: EncryptedStream<RTcpBearingStream>,
         peer_addr: Option<SocketAddr>,
@@ -3524,6 +3671,7 @@ impl RTcpTunnel {
             instance_id: NEXT_RTCP_TUNNEL_INSTANCE_ID.fetch_add(1, Ordering::Relaxed),
             build_helper,
             remote_stack: this_remote_stack,
+            address_resolution,
             can_direct, //Considering the limit of port mapping, the default configuration is configured as "NoDirect" mode
             peer_addr,
             bootstrap,
@@ -3930,12 +4078,11 @@ impl RTcpTunnel {
 
         // §6.5 of doc/arch/gateway/服务的多链路选择.md: every OpenStream is a
         // chance to re-select among the device's currently advertised IPs.
-        // Re-resolve here so newly published IPs (e.g. a fresh DeviceInfo
-        // upload) become reachable without tearing down the control tunnel,
-        // and reorder so the previously-winning IP is tried first. The
-        // resolve_ips lookup is cache-backed in name_client and degrades to
-        // the cached `peer_addr` if it fails, so we never lose the fast path
-        // when DNS hiccups.
+        // Re-resolve here so newly published permitted addresses become
+        // reachable without tearing down the control tunnel, and reorder so
+        // the previously-winning IP is tried first. The exact scope/evidence
+        // from the verified handshake is reused; notably, cross-zone and
+        // non-device targets remain no-Info for the tunnel's whole lifetime.
         let last_addr = *peer_addr_handle.lock().unwrap();
         let candidates = self.collect_reconnect_candidates(last_addr).await;
 
@@ -3951,12 +4098,12 @@ impl RTcpTunnel {
     // can never strip the only known good path.
     async fn collect_reconnect_candidates(&self, last_addr: SocketAddr) -> Vec<SocketAddr> {
         let port = self.remote_stack.stack_port;
-        let resolve_name = self.remote_stack.did.to_string();
-        let resolved = match resolve_ips(resolve_name.as_str()).await {
+        let resolve_name = self.address_resolution.target_did.to_string();
+        let resolved = match self.address_resolution.resolve_ips().await {
             Ok(ips) => ips,
             Err(e) => {
                 debug!(
-                    "rtcp reconnect resolve_ips({}) failed: {} -- falling back to cached peer addr {}",
+                    "rtcp reconnect scoped resolve_ips({}) failed: {} -- falling back to cached peer addr {}",
                     resolve_name, e, last_addr
                 );
                 Vec::new()
@@ -5744,6 +5891,11 @@ mod tests {
                 RTcpStreamBuildHelper::new(),
                 DID::new("dev", "rtcp-map-test-local"),
                 &remote_stack,
+                RtcpAddressResolutionContext::without_device_info(
+                    remote_stack.did.clone(),
+                    ResolveIpTargetKind::Unknown,
+                    ResolveIpZoneRelation::Unknown,
+                ),
                 false,
                 encrypted_stream,
                 None,
@@ -5754,6 +5906,150 @@ mod tests {
             ),
             peer,
         )
+    }
+
+    fn assert_device_info_disabled(
+        context: &RtcpAddressResolutionContext,
+        target_kind: ResolveIpTargetKind,
+        zone_relation: ResolveIpZoneRelation,
+    ) {
+        assert_eq!(context.options.target_kind(), target_kind);
+        assert_eq!(context.options.zone_relation(), zone_relation);
+        assert!(matches!(
+            context.options.device_info_policy(),
+            DeviceInfoPolicy::Disabled
+        ));
+    }
+
+    #[test]
+    fn address_resolution_scope_requires_verified_same_zone_device_relation() {
+        let owner_did = DID::from_str("did:web:owner.scope.test").unwrap();
+        let local_zone_did = DID::from_str("did:web:zone.scope.test").unwrap();
+        let target_did = DID::from_str("did:web:device.scope.test").unwrap();
+        let mut inner = RTcpInner::new(
+            DID::new("dev", "scope-local"),
+            "127.0.0.1:0".to_string(),
+            None,
+            None,
+            Arc::new(MockRTcpListener::new()),
+        );
+        inner.this_owner_did = Some(owner_did.clone());
+        inner.this_zone_did = Some(local_zone_did.clone());
+
+        let (mut same_zone_device, _) = test_device_config("scope-same-zone");
+        same_zone_device.owner = owner_did.clone();
+        same_zone_device.zone_did = Some(local_zone_did.clone());
+        let same_zone_context = inner.address_resolution_for_document(
+            &target_did,
+            &ResolvedHandshakeDocument::Device(same_zone_device.clone()),
+        );
+        assert_eq!(
+            same_zone_context.options.target_kind(),
+            ResolveIpTargetKind::Device
+        );
+        assert_eq!(
+            same_zone_context.options.zone_relation(),
+            ResolveIpZoneRelation::SameZone
+        );
+        match same_zone_context.options.device_info_policy() {
+            DeviceInfoPolicy::VerifiedSameZone(evidence) => {
+                assert_eq!(evidence.target_did(), &target_did);
+                assert_eq!(evidence.zone_did(), &local_zone_did);
+                assert_eq!(
+                    evidence.source(),
+                    SameZoneEvidenceSource::VerifiedHandshakeIdentity
+                );
+            }
+            DeviceInfoPolicy::Disabled => panic!("verified same-zone device must allow Info"),
+        }
+
+        let mut cross_zone_device = same_zone_device.clone();
+        cross_zone_device.zone_did = Some(DID::from_str("did:web:other-zone.scope.test").unwrap());
+        let cross_zone_context = inner.address_resolution_for_document(
+            &target_did,
+            &ResolvedHandshakeDocument::Device(cross_zone_device),
+        );
+        assert_device_info_disabled(
+            &cross_zone_context,
+            ResolveIpTargetKind::Device,
+            ResolveIpZoneRelation::CrossZone,
+        );
+
+        let mut unknown_zone_device = same_zone_device;
+        unknown_zone_device.zone_did = None;
+        let unknown_context = inner.address_resolution_for_document(
+            &target_did,
+            &ResolvedHandshakeDocument::Device(unknown_zone_device),
+        );
+        assert_device_info_disabled(
+            &unknown_context,
+            ResolveIpTargetKind::Device,
+            ResolveIpZoneRelation::Unknown,
+        );
+
+        let (zone_signing_key, _) = generate_ed25519_key();
+        let zone_jwk = serde_json::from_value(encode_ed25519_sk_to_pk_jwk(&zone_signing_key))
+            .expect("test zone JWK");
+        let remote_zone_did = DID::from_str("did:web:sn.remote-zone.scope.test").unwrap();
+        let remote_zone_document =
+            ZoneDocument::new(remote_zone_did.clone(), owner_did, zone_jwk);
+        let zone_context = inner.address_resolution_for_document(
+            &remote_zone_did,
+            &ResolvedHandshakeDocument::Zone(remote_zone_document),
+        );
+        assert_device_info_disabled(
+            &zone_context,
+            ResolveIpTargetKind::Zone,
+            ResolveIpZoneRelation::CrossZone,
+        );
+    }
+
+    #[test]
+    fn cross_zone_scope_is_preserved_for_initial_and_reconnect_resolution() {
+        let remote_did = DID::from_str("did:web:sn.cross-zone.test").unwrap();
+        let initial_context = RtcpAddressResolutionContext::without_device_info(
+            remote_did.clone(),
+            ResolveIpTargetKind::Zone,
+            ResolveIpZoneRelation::CrossZone,
+        );
+        assert_device_info_disabled(
+            &initial_context,
+            ResolveIpTargetKind::Zone,
+            ResolveIpZoneRelation::CrossZone,
+        );
+
+        let (bearing, _peer) = tokio::io::duplex(64 * 1024);
+        let encrypted_stream = EncryptedStream::new(
+            Box::new(bearing) as RTcpBearingStream,
+            &[41; 32],
+            &[42; 16],
+            EncryptionRole::Initiator,
+        );
+        let remote_stack = RTcpTargetStackEP {
+            did: remote_did,
+            stack_port: DEFAULT_RTCP_STACK_PORT,
+            bootstrap_stream_url: None,
+        };
+        let tunnel = RTcpTunnel::new(
+            RTcpStreamBuildHelper::new(),
+            DID::new("dev", "scope-reuse-local"),
+            &remote_stack,
+            initial_context.clone(),
+            true,
+            encrypted_stream,
+            Some(SocketAddr::from(([127, 0, 0, 1], DEFAULT_RTCP_STACK_PORT))),
+            None,
+            [41; 32],
+            &RtcpLimitsConfig::default(),
+            Arc::new(MockRTcpListener::new()),
+        );
+
+        assert_eq!(tunnel.address_resolution, initial_context);
+        assert_device_info_disabled(
+            &tunnel.address_resolution,
+            ResolveIpTargetKind::Zone,
+            ResolveIpZoneRelation::CrossZone,
+        );
     }
 
     // The canonical DEV DID follows the content hash: rotating to a new
@@ -5873,6 +6169,11 @@ mod tests {
             RTcpStreamBuildHelper::new(),
             DID::new("dev", "rtcp-quota-local"),
             &remote_stack,
+            RtcpAddressResolutionContext::without_device_info(
+                remote_stack.did.clone(),
+                ResolveIpTargetKind::Unknown,
+                ResolveIpZoneRelation::Unknown,
+            ),
             false,
             encrypted_stream,
             None,
