@@ -104,18 +104,9 @@ jobs:
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
-      - name: Package static site
-        env:
-          VERSION: ${{ steps.project.outputs.version }}
-        run: |
-          tar -C src/apps/bns-webui/dist -czf "bns-webui-${VERSION}.tar.gz" .
-          sha256sum "bns-webui-${VERSION}.tar.gz" > "bns-webui-${VERSION}.tar.gz.sha256"
-
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: bns-webui-${{ steps.project.outputs.version }}
-          path: |
-            bns-webui-${{ steps.project.outputs.version }}.tar.gz
-            bns-webui-${{ steps.project.outputs.version }}.tar.gz.sha256
+          path: src/apps/bns-webui/dist/
           if-no-files-found: error
