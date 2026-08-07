@@ -561,7 +561,8 @@ relay 地址的 DNS 规则：
 - [x] assignment 指向未知 node 时返回 SERVFAIL，不回退当前 SN IP。
 - [x] map cache miss 会刷新一次；revision 未变化不重复下载完整快照。
 - [x] node IP 更新后，在约定 TTL 内 DNS reader 返回新地址。
-- [x] BNS `gateway_ips` 或用户直连地址存在时，不错误注入 relay IP。
+- [x] BNS `gateway_ips` 或 WAN 用户直连地址存在时，不错误注入 relay IP。
+- [x] LAN/NAT 用户即使有局域网或上报的直连地址，DNS 仍包含当前分配的 relay IP。
 - [x] IPv4-mapped IPv6、重复 IP 和地址顺序有稳定、明确的行为。
 
 ### 12.3 端到端

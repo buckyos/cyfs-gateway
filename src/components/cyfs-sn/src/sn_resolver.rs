@@ -1945,6 +1945,14 @@ impl SnResolver {
             push_exportable_ip(&mut addresses, ip);
         }
 
+        // `net_id` is owner-signed topology information. Prefer it over the
+        // online-state heuristic because a LAN/NAT device may report a global
+        // address which is useful to local clients but is not a public gateway
+        // address. Such zones must still publish their assigned relay IPs.
+        let requires_relay = device_document_requires_sn_relay(device_doc)
+            .or_else(|| online.map(|online| !online.is_wan_device))
+            .unwrap_or(false);
+
         if let Some(online) = online {
             for value in online
                 .public_ips
@@ -1970,7 +1978,10 @@ impl SnResolver {
             }
         }
 
-        if addresses.is_empty() {
+        // Relay is required for LAN/NAT zones even when local/direct addresses
+        // were collected above. It also remains the last-resort route for any
+        // zone without a usable direct address.
+        if requires_relay || addresses.is_empty() {
             let assignment = self
                 .relay_reader
                 .get_zone_relay(zone.zone_name.as_str())
@@ -2923,7 +2934,6 @@ fn device_doc_from_value(
     })
 }
 
-#[cfg(test)]
 fn device_document_requires_sn_relay(device_doc: &DeviceMiniDocument) -> Option<bool> {
     let net_id = device_doc
         .document
@@ -3790,8 +3800,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn direct_device_address_does_not_inject_relay_address() {
-        let resolver = test_resolver_with_bns(StaticBnsReader::default());
+    async fn nat_device_includes_assigned_relay_even_when_online_state_looks_wan() {
+        let resolver = test_resolver_with_bns(StaticBnsReader::default()).with_relay_reader(
+            Arc::new(StaticRelayReader {
+                assignment: test_relay_assignment("testuser"),
+                ips: Some([
+                    "192.0.2.10".parse::<IpAddr>().unwrap(),
+                    "198.51.100.20".parse::<IpAddr>().unwrap(),
+                ]),
+            }),
+        );
         let zone = ZoneResolution {
             input: "testuser.web3.buckyos.test".to_string(),
             canonical_name: "testuser".to_string(),
@@ -3842,8 +3860,104 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(!addresses.contains(&"192.0.2.10".parse::<IpAddr>().unwrap()));
+        assert!(addresses.contains(&"192.0.2.10".parse::<IpAddr>().unwrap()));
+        assert!(addresses.contains(&"198.51.100.20".parse::<IpAddr>().unwrap()));
         assert!(addresses.contains(&"2600:1700:1150:9440::49".parse::<IpAddr>().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn nat_zone_dns_returns_direct_addresses_before_assigned_relay_addresses() {
+        let mut bns = StaticBnsReader::default();
+        bns.owners.insert(
+            "alice".to_string(),
+            BnsOwner {
+                name: "alice".to_string(),
+                effective_owner: None,
+                owner_config: None,
+            },
+        );
+        bns.documents.insert(
+            ("alice".to_string(), BNS_DOC_DEVICE_MINI.to_string()),
+            BnsDocument::json(
+                "alice",
+                BNS_DOC_DEVICE_MINI,
+                json!({
+                    "devices": {
+                        "ood1": {
+                            "did": "did:dev:alice-ood",
+                            "net_id": "nat",
+                            "all_ip": ["192.168.1.143"]
+                        }
+                    }
+                }),
+            ),
+        );
+        let resolver = SnResolver::new_with_bns(
+            SnResolverConfig::new("buckyos.test", None, None, None, Vec::new()),
+            Arc::new(StaticAuthReader::default()),
+            Arc::new(bns),
+        )
+        .with_relay_reader(Arc::new(StaticRelayReader {
+            assignment: test_relay_assignment("alice"),
+            ips: Some([
+                "192.0.2.10".parse::<IpAddr>().unwrap(),
+                "198.51.100.20".parse::<IpAddr>().unwrap(),
+            ]),
+        }));
+
+        let resolution = resolver
+            .resolve_dns("alice.web3.buckyos.test", RecordType::A)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            resolution.addresses,
+            ["192.168.1.143", "192.0.2.10", "198.51.100.20"]
+                .into_iter()
+                .map(|ip| ip.parse::<IpAddr>().unwrap())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn wan_device_with_direct_address_does_not_require_relay_assignment() {
+        let resolver = test_resolver_with_bns(StaticBnsReader::default());
+        let zone = ZoneResolution {
+            input: "testuser.web3.buckyos.test".to_string(),
+            canonical_name: "testuser".to_string(),
+            zone_name: "testuser".to_string(),
+            owner: BnsOwner {
+                name: "testuser".to_string(),
+                effective_owner: None,
+                owner_config: None,
+            },
+            owner_from_auth_db: false,
+            zone_doc: ZoneDocument::empty(),
+            boot_doc: BootDocument::empty(),
+            user_domain: None,
+            self_cert: false,
+            relay_sn: None,
+            source: ZoneResolutionSource::BnsName,
+        };
+        let device_doc = DeviceMiniDocument {
+            zone_name: "testuser".to_string(),
+            device_name: "ood1".to_string(),
+            did: "did:dev:test-device".to_string(),
+            mini_config_jwt: None,
+            document: Some(json!({
+                "net_id": "wan",
+                "all_ip": ["198.51.100.30"]
+            })),
+            ttl: None,
+            version: None,
+        };
+
+        let addresses = resolver
+            .resolve_gateway_addresses(&zone, &device_doc, None)
+            .await
+            .unwrap();
+
+        assert_eq!(addresses, vec!["198.51.100.30".parse::<IpAddr>().unwrap()]);
     }
 
     #[tokio::test]

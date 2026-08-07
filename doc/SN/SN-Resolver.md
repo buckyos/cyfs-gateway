@@ -277,7 +277,7 @@ BNS 域名：
 当前实现状态：
 
 - 已实现：A/AAAA 优先返回 `zone_doc.gateway_ips`（`resolve_dns`，`sn_resolver.rs:995`），否则从 `zone`/`boot` 文档派生 gateway device（`resolve_gateway_for_zone`，`sn_resolver.rs:1260`）。**`ood1` 已降级为兜底默认 `DEFAULT_LEGACY_GATEWAY_DEVICE`（`sn_resolver.rs:22`），仅在 `zone`/`boot` 都未声明 gateway device 时使用，主路径不再硬编码**。地址过滤/去重已实现：loopback、`172.16.0.0/12`、record type 分流、去重（`is_filtered_zonegate_ip` / `push_exportable_ip` / `push_dns_address`，`sn_resolver.rs:2473`）。在线态来自 `sn_device_info`（`get_device_state_by_name`，`sn_resolver.rs:1272`）。
-- 待实现（阶段二）：非 WAN device 的入口地址追加目前沿用旧行为，追加用户 `zone_info.sn_ips`（或 `server_ip`），而非按设计追加“当前分配 relay 的地址”（`resolve_gateway_addresses`，`sn_resolver.rs:1356`）。**resolver 完全没有按来源 `from_ip` 选内/外网地址**：`resolve_dns` 不接收 `from_ip`，`resolve_gateway_addresses` 无条件吐出全部 public+private+endpoint IP；`SnDeviceStateView` 虽带 `nat_type`/`from_ip`/`is_wan_device`，resolver 只用了 `is_wan_device`。
+- 已实现：非 WAN device 根据 owner-signed device document 的 `net_id`（缺失时回退 `is_wan_device`）追加当前 assignment 对应 relay node 的地址；即使同时存在局域网或上报的直连地址，relay 仍作为外网入口保留。**resolver 尚未按来源 `from_ip` 选内/外网地址**：`resolve_dns` 不接收 `from_ip`，`resolve_gateway_addresses` 会返回全部 public+private+endpoint IP。
 - 遗留清理待完成：旧的 `get_user_zonegate_address`（仍绑定 `ood1`）和 `query_device_by_hostname` 中查询 `ood1` 的兜底分支仍在 `sn_server.rs`，仅在 resolver 返回空时才执行（见“迁移步骤”）。
 
 ## Hostname 到 Gateway 解析
