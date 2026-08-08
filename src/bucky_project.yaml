@@ -22,6 +22,7 @@ apps:
     modules:
       cyfs_gateway: bin/cyfs-gateway/
       test_server: bin/test-server/
+      etc/cyfs_gateway/: etc/cyfs_gateway/
     data_paths: []
     clean_paths: []
   web3-gateway:
