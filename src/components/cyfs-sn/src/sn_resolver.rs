@@ -14,7 +14,7 @@ use jsonwebtoken::{
     jwk::{AlgorithmParameters, Jwk},
     DecodingKey,
 };
-use log::{debug, warn};
+use log::{debug, info, warn};
 use name_client::{NameInfo, RecordType};
 use name_lib::{EncodedDocument, DID};
 use serde::{Deserialize, Serialize};
@@ -1501,6 +1501,19 @@ impl SnResolver {
             for ip in zone.zone_doc.gateway_ips.iter().copied() {
                 push_dns_address(&mut addresses, ip, record_type);
             }
+            let gateway_device_name = zone
+                .zone_doc
+                .gateway_device_name
+                .as_deref()
+                .or(zone.boot_doc.gateway_device_name.as_deref())
+                .unwrap_or(self.config.legacy_gateway_device_name.as_str());
+            log_gateway_address_result(
+                zone.zone_name.as_str(),
+                gateway_device_name,
+                "zone_document_gateway_ips",
+                "explicit_wan",
+                &addresses,
+            );
             return Ok(DnsResolution {
                 hostname,
                 record_type,
@@ -1511,11 +1524,36 @@ impl SnResolver {
             });
         }
 
-        let gateway = self
+        let gateway_addresses = match self
             .resolve_gateway_for_zone(hostname.as_str(), &zone)
-            .await?;
+            .await
+        {
+            Ok(gateway) => gateway.addresses,
+            // DNS can safely publish the zone's assigned relay without a
+            // gateway identity document. Keep identity-bearing gateway
+            // resolution strict, but fail safe for reachability when the mini
+            // document has not been published or synchronized yet.
+            Err(error) if error.kind() == SnResolverErrorKind::DeviceNotFound => {
+                let addresses = self.resolve_assigned_relay_addresses(&zone).await?;
+                let gateway_device_name = zone
+                    .zone_doc
+                    .gateway_device_name
+                    .as_deref()
+                    .or(zone.boot_doc.gateway_device_name.as_deref())
+                    .unwrap_or(self.config.legacy_gateway_device_name.as_str());
+                log_gateway_address_result(
+                    zone.zone_name.as_str(),
+                    gateway_device_name,
+                    "gateway_device_document_missing_defaults_to_relay",
+                    "unknown_assumed_nat",
+                    &addresses,
+                );
+                addresses
+            }
+            Err(error) => return Err(error),
+        };
         let mut addresses = Vec::new();
-        for ip in gateway.addresses.iter().copied() {
+        for ip in gateway_addresses {
             // 设备来源的 IP 已在 resolve_gateway_addresses 内做过 zonegate
             // 过滤；SN 中继回退地址不再过滤（dev-local 下是 127.0.0.1）。
             push_dns_address_unfiltered(&mut addresses, ip, record_type);
@@ -1945,13 +1983,12 @@ impl SnResolver {
             push_exportable_ip(&mut addresses, ip);
         }
 
-        // `net_id` is owner-signed topology information. Prefer it over the
-        // online-state heuristic because a LAN/NAT device may report a global
-        // address which is useful to local clients but is not a public gateway
-        // address. Such zones must still publish their assigned relay IPs.
-        let requires_relay = device_document_requires_sn_relay(device_doc)
-            .or_else(|| online.map(|online| !online.is_wan_device))
-            .unwrap_or(false);
+        // `net_id` is owner-signed topology information. Only an explicit WAN
+        // declaration is strong enough to suppress relay publication. Public
+        // addresses observed in online state can be NAT egress or host/VM
+        // addresses and therefore must not turn an unknown topology into WAN.
+        let declared_network_type = device_document_network_type(device_doc);
+        let requires_relay = device_document_requires_sn_relay(device_doc);
 
         if let Some(online) = online {
             for value in online
@@ -1977,45 +2014,75 @@ impl SnResolver {
                 collect_ips_from_value_path(value, &[key], &mut addresses);
             }
         }
+        let has_direct_address = !addresses.is_empty();
 
         // Relay is required for LAN/NAT zones even when local/direct addresses
         // were collected above. It also remains the last-resort route for any
         // zone without a usable direct address.
         if requires_relay || addresses.is_empty() {
-            let assignment = self
-                .relay_reader
-                .get_zone_relay(zone.zone_name.as_str())
-                .await?
-                .ok_or_else(|| {
-                    SnResolverError::backend(format!(
-                        "relay assignment is missing for {}",
-                        zone.zone_name
-                    ))
-                })?;
-            if assignment.state == RelayAssignmentState::Suspended {
-                return Err(SnResolverError::backend(format!(
-                    "relay assignment for {} is suspended",
-                    zone.zone_name
-                )));
-            }
-            let relay_ips = self
-                .relay_reader
-                .get_relay_node_ips(assignment.relay_id.as_str())
-                .await?
-                .ok_or_else(|| {
-                    SnResolverError::backend(format!(
-                        "relay assignment for {} points to unknown node {}",
-                        zone.zone_name, assignment.relay_id
-                    ))
-                })?;
-            for ip in relay_ips {
+            for ip in self.resolve_assigned_relay_addresses(zone).await? {
                 if !addresses.contains(&ip) {
                     addresses.push(ip);
                 }
             }
         }
 
+        let (reason, network_type) = match declared_network_type.as_deref() {
+            Some(network_type) if network_type.starts_with("wan") && has_direct_address => {
+                ("explicit_wan_uses_direct_addresses", network_type)
+            }
+            Some(network_type) if network_type.starts_with("wan") => (
+                "explicit_wan_without_direct_address_uses_relay",
+                network_type,
+            ),
+            Some(network_type) => ("explicit_non_wan_requires_relay", network_type),
+            None => (
+                "network_type_unknown_defaults_to_relay",
+                "unknown_assumed_nat",
+            ),
+        };
+        log_gateway_address_result(
+            zone.zone_name.as_str(),
+            device_doc.device_name.as_str(),
+            reason,
+            network_type,
+            &addresses,
+        );
+
         Ok(addresses)
+    }
+
+    async fn resolve_assigned_relay_addresses(
+        &self,
+        zone: &ZoneResolution,
+    ) -> SnResolverResult<Vec<IpAddr>> {
+        let assignment = self
+            .relay_reader
+            .get_zone_relay(zone.zone_name.as_str())
+            .await?
+            .ok_or_else(|| {
+                SnResolverError::backend(format!(
+                    "relay assignment is missing for {}",
+                    zone.zone_name
+                ))
+            })?;
+        if assignment.state == RelayAssignmentState::Suspended {
+            return Err(SnResolverError::backend(format!(
+                "relay assignment for {} is suspended",
+                zone.zone_name
+            )));
+        }
+        let relay_ips = self
+            .relay_reader
+            .get_relay_node_ips(assignment.relay_id.as_str())
+            .await?
+            .ok_or_else(|| {
+                SnResolverError::backend(format!(
+                    "relay assignment for {} points to unknown node {}",
+                    zone.zone_name, assignment.relay_id
+                ))
+            })?;
+        Ok(relay_ips.into_iter().collect())
     }
 
     async fn resolve_zone_txt(&self, zone: &ZoneResolution) -> SnResolverResult<Vec<String>> {
@@ -2934,19 +3001,34 @@ fn device_doc_from_value(
     })
 }
 
-fn device_document_requires_sn_relay(device_doc: &DeviceMiniDocument) -> Option<bool> {
-    let net_id = device_doc
+fn device_document_network_type(device_doc: &DeviceMiniDocument) -> Option<String> {
+    device_doc
         .document
-        .as_ref()?
-        .get("net_id")?
-        .as_str()?
-        .trim()
-        .to_ascii_lowercase();
-    if net_id.is_empty() {
-        return None;
-    }
+        .as_ref()
+        .and_then(|document| document.get("net_id"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|net_id| !net_id.is_empty())
+        .map(str::to_ascii_lowercase)
+}
 
-    Some(!net_id.starts_with("wan"))
+fn device_document_requires_sn_relay(device_doc: &DeviceMiniDocument) -> bool {
+    device_document_network_type(device_doc)
+        .map(|net_id| !net_id.starts_with("wan"))
+        .unwrap_or(true)
+}
+
+fn log_gateway_address_result(
+    zone_name: &str,
+    device_name: &str,
+    reason: &str,
+    network_type: &str,
+    addresses: &[IpAddr],
+) {
+    info!(
+        "sn_resolver gateway address result: zone={} device={} reason={} network_type={} ips={:?}",
+        zone_name, device_name, reason, network_type, addresses
+    );
 }
 
 fn device_public_key_x(value: &Value) -> Option<String> {
@@ -3780,27 +3862,16 @@ mod tests {
             version: None,
         };
 
-        assert_eq!(
-            device_document_requires_sn_relay(&device(Some("nat"))),
-            Some(true)
-        );
-        assert_eq!(
-            device_document_requires_sn_relay(&device(Some("portmap"))),
-            Some(true)
-        );
-        assert_eq!(
-            device_document_requires_sn_relay(&device(Some("wan"))),
-            Some(false)
-        );
-        assert_eq!(
-            device_document_requires_sn_relay(&device(Some("wan_dyn"))),
-            Some(false)
-        );
-        assert_eq!(device_document_requires_sn_relay(&device(None)), None);
+        assert!(device_document_requires_sn_relay(&device(Some("nat"))));
+        assert!(device_document_requires_sn_relay(&device(Some("portmap"))));
+        assert!(!device_document_requires_sn_relay(&device(Some("wan"))));
+        assert!(!device_document_requires_sn_relay(&device(Some("wan_dyn"))));
+        assert!(device_document_requires_sn_relay(&device(Some(""))));
+        assert!(device_document_requires_sn_relay(&device(None)));
     }
 
     #[tokio::test]
-    async fn nat_device_includes_assigned_relay_even_when_online_state_looks_wan() {
+    async fn unknown_topology_includes_assigned_relay_even_when_online_state_looks_wan() {
         let resolver = test_resolver_with_bns(StaticBnsReader::default()).with_relay_reader(
             Arc::new(StaticRelayReader {
                 assignment: test_relay_assignment("testuser"),
@@ -3833,7 +3904,6 @@ mod tests {
             did: "did:dev:test-device".to_string(),
             mini_config_jwt: None,
             document: Some(json!({
-                "net_id": "nat",
                 "all_ip": ["2600:1700:1150:9440::49", "192.168.1.143"]
             })),
             ttl: None,
@@ -3913,6 +3983,49 @@ mod tests {
         assert_eq!(
             resolution.addresses,
             ["192.168.1.143", "192.0.2.10", "198.51.100.20"]
+                .into_iter()
+                .map(|ip| ip.parse::<IpAddr>().unwrap())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn dns_uses_assigned_relay_when_gateway_device_document_is_missing() {
+        let mut bns = StaticBnsReader::default();
+        bns.owners.insert(
+            "alice".to_string(),
+            BnsOwner {
+                name: "alice".to_string(),
+                effective_owner: None,
+                owner_config: None,
+            },
+        );
+        let resolver = SnResolver::new_with_bns(
+            SnResolverConfig::new("buckyos.test", None, None, None, Vec::new()),
+            Arc::new(StaticAuthReader::default()),
+            Arc::new(bns),
+        )
+        .with_relay_reader(Arc::new(StaticRelayReader {
+            assignment: test_relay_assignment("alice"),
+            ips: Some([
+                "192.0.2.10".parse::<IpAddr>().unwrap(),
+                "198.51.100.20".parse::<IpAddr>().unwrap(),
+            ]),
+        }));
+
+        let gateway_error = resolver
+            .resolve_gateway_by_hostname("alice.web3.buckyos.test")
+            .await
+            .unwrap_err();
+        assert_eq!(gateway_error.kind(), SnResolverErrorKind::DeviceNotFound);
+
+        let resolution = resolver
+            .resolve_dns("alice.web3.buckyos.test", RecordType::A)
+            .await
+            .unwrap();
+        assert_eq!(
+            resolution.addresses,
+            ["192.0.2.10", "198.51.100.20"]
                 .into_iter()
                 .map(|ip| ip.parse::<IpAddr>().unwrap())
                 .collect::<Vec<_>>()

@@ -236,11 +236,13 @@ A/AAAA 查询返回的 IP 不是单一来源，而是 `sn_resolver` 按优先级
 第 4 步的地址合成顺序（全部叠加，不是互斥），核心区别在于设备是否公网可达：
 
 - 先并入 `zone` 文档里的 `gateway_ips`。
-- **设备签名文档的 `net_id` 不以 `wan` 开头，或文档未声明 `net_id` 且在线态 `is_wan_device == false` 时**：注入 SN relay 出口地址——优先用该 zone 分配的 `zone_info.sn_ips`（`get_user_sn_ips`），若为空则回退到 `config.server_ip`。签名的 `net_id` 优先于公网 IP 形状推断，避免 NAT OOD 因上报宿主机全局 IPv6 而被误判为 WAN。这是"NAT 后设备默认把流量引到 SN 兜底中转"的关键。
-- **设备签名文档的 `net_id` 以 `wan` 开头，或文档未声明 `net_id` 且在线态判定为 WAN 时**：跳过 SN 注入，直接用设备自己的公网地址。
+- **设备签名文档的 `net_id` 不以 `wan` 开头，缺失、为空或无法识别时**：追加当前 assignment 对应 relay node 的地址。即使设备上报了公网形状的地址，也不能据此取消 relay；该地址可能只是 NAT 出口或宿主机/VM 地址。这是“NAT 后设备默认保留 relay 外网入口”的关键。
+- **只有设备签名文档的 `net_id` 明确以 `wan` 开头时**：跳过 relay 注入，直接使用设备自己的公网地址。
 - 再依次并入设备上报的 `public_ips`、`private_ips`、`active_endpoints` 中的 host，以及兼容设备文档和 `device_mini_doc` 内 `ip`/`ips`/`all_ip`/`addresses` 字段里的地址。
 
-当签名 device document 没有 `net_id` 时，WAN/公网回退判定来自 `update_ood_info` 上报时保存的在线态：`sn_device_info` 把设备 `reported_ip`、`reported_ips` 和 SN 实际观测到的 `from_ip`（请求真实来源 IP）一起做公网/私网分类，只要其中存在一个公网 IP，就置 `wan_ip` 并令 `is_wan_device = true`。这个启发式结果只在权威文档未声明拓扑时使用。
+`sn_device_info` 仍会把设备 `reported_ip`、`reported_ips` 和 SN 观测到的 `from_ip` 做公网/私网分类并生成 `is_wan_device`，但这个启发式结果只描述在线地址形状，不再用于取消 DNS relay 地址。
+
+如果 gateway device mini document 尚未发布或同步，DNS 无法确认 WAN 声明，因此同样按 NAT 处理，直接返回当前 assignment 对应的 relay 地址；需要设备 DID 的 gateway 解析接口仍保持严格并返回 `DeviceNotFound`。
 
 最后所有候选地址都经过过滤再返回：
 
