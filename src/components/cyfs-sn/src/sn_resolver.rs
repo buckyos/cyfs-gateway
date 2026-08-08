@@ -180,6 +180,7 @@ pub enum DnsResolutionSource {
     ExplicitRecord,
     BnsDocument,
     DeviceOnlineInfo,
+    RelayAssignment,
     SnSelf,
 }
 
@@ -1496,6 +1497,18 @@ impl SnResolver {
             });
         }
 
+        // Standard DNS clients cannot reliably control or preserve address
+        // preference when an A RRset contains multiple candidates. Return one
+        // deterministic IPv4 address: an explicitly configured public gateway
+        // address wins; otherwise use the assigned relay. Device-reported
+        // addresses remain available through gateway resolution for our own
+        // clients, but never participate in standard A-record resolution.
+        if record_type == RecordType::A {
+            return self
+                .resolve_standard_dns_ipv4(hostname.as_str(), &zone)
+                .await;
+        }
+
         if !zone.zone_doc.gateway_ips.is_empty() {
             let mut addresses = Vec::new();
             for ip in zone.zone_doc.gateway_ips.iter().copied() {
@@ -1862,6 +1875,67 @@ impl SnResolver {
             addresses,
             relay_sn: zone.relay_sn.clone(),
             self_cert: zone.self_cert,
+        })
+    }
+
+    async fn resolve_standard_dns_ipv4(
+        &self,
+        hostname: &str,
+        zone: &ZoneResolution,
+    ) -> SnResolverResult<DnsResolution> {
+        let gateway_device_name = zone
+            .zone_doc
+            .gateway_device_name
+            .as_deref()
+            .or(zone.boot_doc.gateway_device_name.as_deref())
+            .unwrap_or(self.config.legacy_gateway_device_name.as_str());
+
+        let mut addresses = Vec::new();
+        for ip in zone.zone_doc.gateway_ips.iter().copied() {
+            push_dns_address(&mut addresses, ip, RecordType::A);
+            if !addresses.is_empty() {
+                break;
+            }
+        }
+        if !addresses.is_empty() {
+            log_gateway_address_result(
+                zone.zone_name.as_str(),
+                gateway_device_name,
+                "standard_dns_explicit_public_ipv4",
+                "explicit_wan",
+                &addresses,
+            );
+            return Ok(DnsResolution {
+                hostname: hostname.to_string(),
+                record_type: RecordType::A,
+                ttl: zone.zone_doc.ttl.unwrap_or(self.config.default_ttl),
+                addresses,
+                txt: Vec::new(),
+                source: DnsResolutionSource::BnsDocument,
+            });
+        }
+
+        let addresses = self
+            .resolve_assigned_relay_addresses(zone)
+            .await?
+            .into_iter()
+            .find(IpAddr::is_ipv4)
+            .into_iter()
+            .collect::<Vec<_>>();
+        log_gateway_address_result(
+            zone.zone_name.as_str(),
+            gateway_device_name,
+            "standard_dns_no_explicit_public_ipv4_uses_relay",
+            "assumed_nat",
+            &addresses,
+        );
+        Ok(DnsResolution {
+            hostname: hostname.to_string(),
+            record_type: RecordType::A,
+            ttl: self.config.default_ttl,
+            addresses,
+            txt: Vec::new(),
+            source: DnsResolutionSource::RelayAssignment,
         })
     }
 
@@ -2595,7 +2669,19 @@ fn explicit_dns_rrset(
             for value in &rrset.values {
                 if let Some(ip) = parse_ip_or_socket_addr(value.as_str()) {
                     push_dns_address_unfiltered(&mut addresses, ip, record_type);
+                    if record_type == RecordType::A && !addresses.is_empty() {
+                        break;
+                    }
                 }
+            }
+            if record_type == RecordType::A {
+                log_gateway_address_result(
+                    hostname,
+                    "-",
+                    "standard_dns_explicit_user_a_record",
+                    "explicit_wan",
+                    &addresses,
+                );
             }
             Ok(DnsResolution {
                 hostname: hostname.to_string(),
@@ -3262,6 +3348,21 @@ mod tests {
             Ok((relay_id == self.assignment.relay_id)
                 .then_some(self.ips)
                 .flatten())
+        }
+    }
+
+    struct FailingDeviceOnlineReader;
+
+    #[async_trait]
+    impl DeviceOnlineReader for FailingDeviceOnlineReader {
+        async fn get_device_state_by_name(
+            &self,
+            _zone: &str,
+            _device_name: &str,
+        ) -> SnResolverResult<Option<SnDeviceStateView>> {
+            Err(SnResolverError::backend(
+                "standard A-record resolution must not query device online state",
+            ))
         }
     }
 
@@ -3936,7 +4037,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn nat_zone_dns_returns_direct_addresses_before_assigned_relay_addresses() {
+    async fn nat_zone_a_dns_ignores_device_addresses_and_returns_one_relay_ipv4() {
         let mut bns = StaticBnsReader::default();
         bns.owners.insert(
             "alice".to_string(),
@@ -3982,7 +4083,143 @@ mod tests {
 
         assert_eq!(
             resolution.addresses,
-            ["192.168.1.143", "192.0.2.10", "198.51.100.20"]
+            ["192.0.2.10"]
+                .into_iter()
+                .map(|ip| ip.parse::<IpAddr>().unwrap())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(resolution.source, DnsResolutionSource::RelayAssignment);
+    }
+
+    #[tokio::test]
+    async fn standard_a_dns_does_not_read_wan_device_document_or_online_addresses() {
+        let mut bns = StaticBnsReader::default();
+        bns.owners.insert(
+            "alice".to_string(),
+            BnsOwner {
+                name: "alice".to_string(),
+                effective_owner: None,
+                owner_config: None,
+            },
+        );
+        bns.documents.insert(
+            ("alice".to_string(), BNS_DOC_DEVICE_MINI.to_string()),
+            BnsDocument::json(
+                "alice",
+                BNS_DOC_DEVICE_MINI,
+                json!({
+                    "devices": {
+                        "ood1": {
+                            "did": "did:dev:alice-ood",
+                            "net_id": "wan",
+                            "all_ip": ["203.0.113.30"]
+                        }
+                    }
+                }),
+            ),
+        );
+        let resolver = SnResolver::new_with_bns(
+            SnResolverConfig::new("buckyos.test", None, None, None, Vec::new()),
+            Arc::new(StaticAuthReader::default()),
+            Arc::new(bns),
+        )
+        .with_device_online_reader(Arc::new(FailingDeviceOnlineReader))
+        .with_relay_reader(Arc::new(StaticRelayReader {
+            assignment: test_relay_assignment("alice"),
+            ips: Some([
+                "192.0.2.10".parse::<IpAddr>().unwrap(),
+                "198.51.100.20".parse::<IpAddr>().unwrap(),
+            ]),
+        }));
+
+        let resolution = resolver
+            .resolve_dns("alice.web3.buckyos.test", RecordType::A)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            resolution.addresses,
+            vec!["192.0.2.10".parse::<IpAddr>().unwrap()]
+        );
+    }
+
+    #[tokio::test]
+    async fn standard_a_dns_uses_only_first_explicit_gateway_ipv4() {
+        let mut bns = StaticBnsReader::default();
+        bns.owners.insert(
+            "alice".to_string(),
+            BnsOwner {
+                name: "alice".to_string(),
+                effective_owner: None,
+                owner_config: None,
+            },
+        );
+        bns.documents.insert(
+            ("alice".to_string(), BNS_DOC_ZONE.to_string()),
+            BnsDocument::json(
+                "alice",
+                BNS_DOC_ZONE,
+                json!({
+                    "gateway_ips": [
+                        "198.51.100.30",
+                        "198.51.100.31",
+                        "2001:db8::30"
+                    ]
+                }),
+            ),
+        );
+        let resolver = SnResolver::new_with_bns(
+            SnResolverConfig::new("buckyos.test", None, None, None, Vec::new()),
+            Arc::new(StaticAuthReader::default()),
+            Arc::new(bns),
+        );
+
+        let a = resolver
+            .resolve_dns("alice.web3.buckyos.test", RecordType::A)
+            .await
+            .unwrap();
+        assert_eq!(
+            a.addresses,
+            vec!["198.51.100.30".parse::<IpAddr>().unwrap()]
+        );
+        assert_eq!(a.source, DnsResolutionSource::BnsDocument);
+
+        let aaaa = resolver
+            .resolve_dns("alice.web3.buckyos.test", RecordType::AAAA)
+            .await
+            .unwrap();
+        assert_eq!(
+            aaaa.addresses,
+            vec!["2001:db8::30".parse::<IpAddr>().unwrap()]
+        );
+    }
+
+    #[test]
+    fn explicit_a_rrset_returns_one_address_while_aaaa_keeps_existing_behavior() {
+        let a_rrset = UserDnsRrset {
+            name: "www.example.test".to_string(),
+            record_type: UserDnsRecordType::A,
+            ttl: 60,
+            values: vec!["198.51.100.40".to_string(), "198.51.100.41".to_string()],
+            revision: 1,
+        };
+        let a = explicit_dns_rrset("www.example.test", RecordType::A, &a_rrset).unwrap();
+        assert_eq!(
+            a.addresses,
+            vec!["198.51.100.40".parse::<IpAddr>().unwrap()]
+        );
+
+        let aaaa_rrset = UserDnsRrset {
+            name: "www.example.test".to_string(),
+            record_type: UserDnsRecordType::Aaaa,
+            ttl: 60,
+            values: vec!["2001:db8::40".to_string(), "2001:db8::41".to_string()],
+            revision: 1,
+        };
+        let aaaa = explicit_dns_rrset("www.example.test", RecordType::AAAA, &aaaa_rrset).unwrap();
+        assert_eq!(
+            aaaa.addresses,
+            ["2001:db8::40", "2001:db8::41"]
                 .into_iter()
                 .map(|ip| ip.parse::<IpAddr>().unwrap())
                 .collect::<Vec<_>>()
@@ -4025,7 +4262,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             resolution.addresses,
-            ["192.0.2.10", "198.51.100.20"]
+            ["192.0.2.10"]
                 .into_iter()
                 .map(|ip| ip.parse::<IpAddr>().unwrap())
                 .collect::<Vec<_>>()
@@ -4081,7 +4318,7 @@ mod tests {
                     "192.0.2.10".parse().unwrap(),
                     "198.51.100.20".parse().unwrap(),
                 ],
-                vec!["192.0.2.10", "198.51.100.20"],
+                vec!["192.0.2.10"],
                 Vec::<&str>::new(),
             ),
             (

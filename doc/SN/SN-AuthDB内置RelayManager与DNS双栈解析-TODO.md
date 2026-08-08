@@ -408,24 +408,26 @@ Web3 SN resolver 的 relay 路径改为：
 
 ### 8.2 地址选择
 
-现有直接地址优先级保持不变：
+标准 DNS A 地址选择：
 
-1. BNS `zone.gateway_ips`
-2. user_domain 显式 A/AAAA
-3. 可直接到达的 gateway/device 地址
-4. 需要 relay 时，使用该 user/zone assignment 对应 node 的两个 IP
+1. user_domain 显式 A RRset 只取第一个有效 IPv4。
+2. BNS `zone.gateway_ips` 只取配置顺序中的第一个可导出 IPv4。
+3. 没有显式公网 IPv4 时，使用该 user/zone assignment 对应 node 按 slot 顺序的第一个 IPv4。
+4. gateway/device 上报地址不进入标准 A RRset，只供自有客户端地址发现使用。
+
+AAAA 暂时保持原地址合成与过滤行为。
 
 relay 地址的 DNS 规则：
 
 | Node 的两个 IP | A 查询 | AAAA 查询 |
 | --- | --- | --- |
-| 两个 IPv4 | 返回两个 IPv4 | 权威 NODATA |
+| 两个 IPv4 | 返回 slot 顺序中的第一个 IPv4 | 权威 NODATA |
 | 一个 IPv4、一个 IPv6 | 返回 IPv4 | 返回 IPv6 |
 | 两个 IPv6 | 权威 NODATA | 返回两个 IPv6 |
 
 附加要求：
 
-- A 只返回 `IpAddr::V4`；AAAA 只返回 `IpAddr::V6`。
+- A 最多返回一个 `IpAddr::V4`；AAAA 只返回 `IpAddr::V6`。
 - 同一 RRset 去重并保持稳定顺序；不得把 IPv4-mapped IPv6 错发为 A。
 - 没有请求地址族属于正常 NODATA，不是 NXDOMAIN，也不是后端错误。
 - relay-required user 缺少 assignment、assignment 指向未知 node、node address
@@ -555,14 +557,14 @@ relay 地址的 DNS 规则：
 
 ### 12.2 DNS
 
-- [x] 两 IPv4：A 返回两条，AAAA 返回权威 NODATA。
+- [x] 两 IPv4：A 返回 slot 顺序中的第一条，AAAA 返回权威 NODATA。
 - [x] IPv4+IPv6：A/AAAA 各返回对应地址。
 - [x] 两 IPv6：AAAA 返回两条，A 返回权威 NODATA。
 - [x] assignment 指向未知 node 时返回 SERVFAIL，不回退当前 SN IP。
 - [x] map cache miss 会刷新一次；revision 未变化不重复下载完整快照。
 - [x] node IP 更新后，在约定 TTL 内 DNS reader 返回新地址。
-- [x] BNS `gateway_ips` 或 WAN 用户直连地址存在时，不错误注入 relay IP。
-- [x] LAN/NAT 用户即使有局域网或上报的直连地址，DNS 仍包含当前分配的 relay IP。
+- [x] BNS `gateway_ips` 存在多个 IPv4 时，标准 A 只返回配置顺序中的第一条。
+- [x] 无显式公网 IPv4 时，标准 A 忽略 gateway/device 上报地址且只返回一个 relay IPv4。
 - [x] IPv4-mapped IPv6、重复 IP 和地址顺序有稳定、明确的行为。
 
 ### 12.3 端到端

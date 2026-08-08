@@ -104,7 +104,7 @@ ZoneResolution {
 
 ### GatewayResolution
 
-用于 HTTP relay、DNS A/AAAA 和 node_daemon 查询 gateway：
+用于 HTTP relay、DNS AAAA、自有客户端地址发现和 node_daemon 查询 gateway；标准 DNS A 不通过该多地址结构选址：
 
 ```text
 GatewayResolution {
@@ -207,14 +207,15 @@ ACME 等短期记录产生链上 gas，具体 API 边界见 `SN-API.md` 的 `use
 - 精确命中 `user_domain` 时，映射到对应 `sn_user` / BNS name。
 - 命中 `user_domain` 的子域名时，保留相对子域名作为 service/subhost。
 - 如果存在显式 AuthDB RRset，优先返回该 RRset。
-- 如果没有显式 A/AAAA，则解析该 zone 的 gateway device 并返回当前可达地址。
+- 如果没有显式 A，则按“一个显式 `gateway_ips` IPv4，否则一个 relay IPv4”的规则返回；如果没有显式 AAAA，仍解析 gateway device 的 IPv6 地址。
 - 如果没有显式 TXT，则合并 BNS `zone`、`boot`、`dns_txt` 生成 TXT。
 
 当前实现状态：
 
 - 已实现：`resolve_dns` 先读 AuthDB 结构化 RRset；`get_user_by_domain` 按最长 active
-  suffix 匹配父 `user_domain`；无显式 A/AAAA 时组合 BNS static config、DeviceInfo endpoint
-  和 relay assignment，无显式 TXT 时合并 BNS `zone` / `boot` / `dns_txt`。
+  suffix 匹配父 `user_domain`；无显式 A 时选择一个 `gateway_ips` 或 relay IPv4，
+  无显式 AAAA 时沿用 BNS static config、DeviceInfo endpoint 和 relay assignment 合成，
+  无显式 TXT 时合并 BNS `zone` / `boot` / `dns_txt`。
 
 ### 普通公网域名
 
@@ -254,30 +255,27 @@ ACME `_acme-challenge` 属于 `dns_txt` document 的典型使用场景。写入�
 
 BNS 域名：
 
-1. 如果 BNS `zone` document 明确声明 `gateway_ips`，优先返回这些 IP。
-2. 否则从 `zone` 或 `boot` document 得到 gateway device name。
-3. 读取对应 `device_mini_doc`，确认 device DID 和 zone/device_name。
-4. 查询 `sn_device_info` 获得在线态和当前可达地址。
-5. 按 record type 过滤 IPv4/IPv6，去重后返回。
+1. A 查询只返回一个明确 IPv4：`zone.gateway_ips` 中第一个可导出的 IPv4，若不存在则返回 assignment 对应 relay node 按 slot 顺序的第一个 IPv4。
+2. 标准 A 查询不读取 gateway `device_mini_doc` 或 `sn_device_info` 上报地址。
+3. AAAA 暂时保持原逻辑：显式 `gateway_ips` 优先，否则从 `zone`/`boot` 得到 gateway device、读取 `device_mini_doc` 和在线态后按 IPv6 过滤返回。
 
 非 BNS `user_domain`：
 
-1. 如果本地兼容 DNS record 中有显式 A/AAAA，直接返回该 record。
+1. 如果本地兼容 DNS record 中有显式 A/AAAA，直接返回该 record；显式 A RRset 只取第一个有效 IPv4，AAAA 暂时保持原行为。
 2. 否则映射到 BNS name，走 BNS 域名的 gateway device 查询流程。
 
 地址选择规则：
 
 - 不返回 loopback 地址。
 - 不返回 Docker bridge 常见地址段 `172.16.0.0/12`。
-- IPv4 只进入 A，IPv6 只进入 AAAA。
+- A 只返回一个 IPv4，AAAA 只返回 IPv6。
 - 同一个 IP 去重。
-- 如果设备不是 WAN device，可以追加当前分配的 relay/sn IP 作为入口地址。
-- `sn_device_info` 的上报地址只表示在线态和可达性，不决定 gateway device 的权威身份。
+- 标准 A 查询不使用 `sn_device_info` 上报地址；这些多地址只供 `resolve_gateway_by_hostname` 等自有客户端路径使用，由客户端自主决定选择顺序。
 
 当前实现状态：
 
-- 已实现：A/AAAA 优先返回 `zone_doc.gateway_ips`（`resolve_dns`，`sn_resolver.rs:995`），否则从 `zone`/`boot` 文档派生 gateway device（`resolve_gateway_for_zone`，`sn_resolver.rs:1260`）。**`ood1` 已降级为兜底默认 `DEFAULT_LEGACY_GATEWAY_DEVICE`（`sn_resolver.rs:22`），仅在 `zone`/`boot` 都未声明 gateway device 时使用，主路径不再硬编码**。地址过滤/去重已实现：loopback、`172.16.0.0/12`、record type 分流、去重（`is_filtered_zonegate_ip` / `push_exportable_ip` / `push_dns_address`，`sn_resolver.rs:2473`）。在线态来自 `sn_device_info`（`get_device_state_by_name`，`sn_resolver.rs:1272`）。
-- 已实现：只有 owner-signed device document 的 `net_id` 明确以 `wan` 开头时才不追加 relay；`net_id` 缺失、为空或无法识别时一律按 NAT 处理，不使用在线态的 `is_wan_device` 推断来取消 relay。即使同时存在局域网或上报的直连地址，relay 仍作为外网入口保留；gateway device mini document 尚未发布或同步时，DNS 也直接返回 assignment 对应的 relay 地址，但需要设备身份的 `resolve_gateway_by_hostname` 仍返回 `DeviceNotFound`。**resolver 尚未按来源 `from_ip` 选内/外网地址**：`resolve_dns` 不接收 `from_ip`，`resolve_gateway_addresses` 会返回全部 public+private+endpoint IP。
+- 已实现：标准 A 查询由 `resolve_standard_dns_ipv4` 返回单一明确地址；显式 `zone.gateway_ips` IPv4 优先，否则只返回 assignment 对应 relay node 的第一个 IPv4（`source = RelayAssignment`）。该路径不解析 gateway device，也不读取 `sn_device_info`。
+- 已实现：`resolve_gateway_by_hostname` 等自有客户端路径仍通过 `resolve_gateway_addresses` 返回 public+private+endpoint+relay 多地址；只有 owner-signed device document 的 `net_id` 明确以 `wan` 开头时才不追加 relay，未知拓扑一律按 NAT 处理。
 - 遗留清理待完成：旧的 `get_user_zonegate_address`（仍绑定 `ood1`）和 `query_device_by_hostname` 中查询 `ood1` 的兜底分支仍在 `sn_server.rs`，仅在 resolver 返回空时才执行（见“迁移步骤”）。
 
 ## Hostname 到 Gateway 解析
@@ -503,7 +501,7 @@ resolve_relay_for_zone(zone)
   - BNS static document、DeviceInfo online state、AuthDB projection 使用独立 reader 和来源；
     不存在 legacy device/DID fallback。
   - TXT 合并 `zone`+`boot`+`dns_txt`（`resolve_zone_txt`，`sn_resolver.rs:1405`）。
-  - A/AAAA 优先 `gateway_ips`、否则从 `zone`/`boot` 派生 gateway device，`ood1` 降级为兜底默认 `DEFAULT_LEGACY_GATEWAY_DEVICE`（`sn_resolver.rs:22`）。
+  - A 返回单一明确 IPv4：显式 `gateway_ips` IPv4 优先，否则选择 relay node 的第一个 IPv4；AAAA 保持原 gateway device 地址解析逻辑。
   - IP 过滤/去重：loopback、`172.16.0.0/12`、record type 分流（`sn_resolver.rs:2473`）。
 - 接入点（`src/components/cyfs-sn/src/sn_server.rs`）：`NameServer::query` →
   `resolver.resolve_dns`；DID HTTP 路径 → `resolver.resolve_did`；
@@ -542,7 +540,7 @@ Beta2.2 已完成的退役与一致性工作：
 - `sn.<server_host>`、`<server_host>`、alias 的 A/AAAA/TXT。
 - `alice.web3.<server_host>`、`home.alice.web3.<server_host>`、`www-alice.web3.<server_host>` 的 username 提取。
 - BNS name 的 TXT 合并：`zone`、`boot`、`dns_txt`。
-- BNS name 的 A/AAAA：显式 `gateway_ips` 优先；无显式 IP 时走 gateway device 在线态。
+- BNS name 的 A：显式 `gateway_ips` 取一个 IPv4，否则取一个 relay IPv4，且不读取 device 在线态；AAAA 保持原 gateway device 在线态逻辑。
 - user_domain 精确命中和子域名命中。
 - user_domain 显式 A/AAAA/TXT record 优先。
 - gateway device 不再固定为 `ood1`。
