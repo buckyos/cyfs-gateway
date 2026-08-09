@@ -11,7 +11,7 @@ pub fn build_gateway_composition() -> anyhow::Result<GatewayComposition> {
     builder.install(DnsGatewayModule::new())?;
     builder.install(SocksGatewayModule::new())?;
     builder.install(TunGatewayModule::new())?;
-    //builder.install(SnGatewayModule::new())?;
+    builder.install(SnClientGatewayModule::new())?;
     builder.install(TrafficGatewayModule::new())?;
     builder.build()
 }
@@ -47,6 +47,25 @@ mod tests {
     fn profile_and_capabilities_are_stable() {
         let app = app().unwrap();
         assert_eq!(app.profile(), &GatewayAppProfile::cyfs_gateway());
+        assert_eq!(
+            app.composition().manifest().acme_dns_providers,
+            vec!["sn-dns"]
+        );
+        assert!(app
+            .composition()
+            .manifest()
+            .modules
+            .contains(&"sn-client".to_string()));
+        assert!(!app
+            .composition()
+            .manifest()
+            .modules
+            .contains(&"sn".to_string()));
+        assert!(!app
+            .composition()
+            .manifest()
+            .servers
+            .contains(&"sn".to_string()));
         assert_eq!(
             app.composition().manifest().stacks,
             ["quic", "rtcp", "tcp", "tls", "tun", "udp"].map(str::to_string)

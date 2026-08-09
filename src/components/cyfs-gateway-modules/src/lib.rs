@@ -355,6 +355,38 @@ impl GatewayModule for TunGatewayModule {
     }
 }
 
+/// SN client capabilities shared by gateways that consume SN services without
+/// necessarily hosting an SN server themselves.
+pub struct SnClientGatewayModule;
+
+impl SnClientGatewayModule {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl Default for SnClientGatewayModule {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl GatewayModule for SnClientGatewayModule {
+    fn id(&self) -> &'static str {
+        "sn-client"
+    }
+
+    fn install(&self, builder: &mut GatewayCompositionBuilder) -> Result<()> {
+        let data_path =
+            buckyos_kit::get_buckyos_service_data_dir(builder.profile().service_data_namespace)
+                .join("sn_dns");
+        builder.register_acme_dns_provider("sn-dns", AcmeSnProviderFactory::new(data_path))?;
+        Ok(())
+    }
+}
+
+/// SN server capability. Client-side SN integrations are installed separately
+/// through [`SnClientGatewayModule`].
 pub struct SnGatewayModule;
 
 impl SnGatewayModule {
@@ -375,10 +407,6 @@ impl GatewayModule for SnGatewayModule {
     }
 
     fn install(&self, builder: &mut GatewayCompositionBuilder) -> Result<()> {
-        let data_path =
-            buckyos_kit::get_buckyos_service_data_dir(builder.profile().service_data_namespace)
-                .join("sn_dns");
-        builder.register_acme_dns_provider("sn-dns", AcmeSnProviderFactory::new(data_path))?;
         builder.register_server(GatewayServerRegistration::new(
             "sn",
             "sn",
@@ -557,6 +585,7 @@ mod tests {
         builder.install(DnsGatewayModule::new()).unwrap();
         builder.install(SocksGatewayModule::new()).unwrap();
         builder.install(TunGatewayModule::new()).unwrap();
+        builder.install(SnClientGatewayModule::new()).unwrap();
         builder.install(SnGatewayModule::new()).unwrap();
         builder.install(TrafficGatewayModule::new()).unwrap();
         builder.build().unwrap()
@@ -611,12 +640,19 @@ mod tests {
         assert_eq!(tun.manifest().modules, vec!["tun"]);
         assert_eq!(tun.manifest().stacks, vec!["tun"]);
 
+        let mut sn_client = GatewayCompositionBuilder::new(profile.clone());
+        sn_client.install(SnClientGatewayModule::new()).unwrap();
+        let sn_client = sn_client.build().unwrap();
+        assert_eq!(sn_client.manifest().modules, vec!["sn-client"]);
+        assert!(sn_client.manifest().servers.is_empty());
+        assert_eq!(sn_client.manifest().acme_dns_providers, vec!["sn-dns"]);
+
         let mut sn = GatewayCompositionBuilder::new(profile);
         sn.install(SnGatewayModule::new()).unwrap();
         let sn = sn.build().unwrap();
         assert_eq!(sn.manifest().modules, vec!["sn"]);
         assert_eq!(sn.manifest().servers, vec!["sn"]);
-        assert_eq!(sn.manifest().acme_dns_providers, vec!["sn-dns"]);
+        assert!(sn.manifest().acme_dns_providers.is_empty());
 
         let mut traffic = GatewayCompositionBuilder::new(profile);
         traffic.install(TrafficGatewayModule::new()).unwrap();

@@ -2682,11 +2682,12 @@ impl SnServerFactory {
             (&config.auth_db, "auth_db"),
             (&config.device_info_db, "device_info_db"),
         ] {
-            if let Some(provider) = provider
-                && Self::resolve_remote_transport_security(provider, field)?
+            if let Some(provider) = provider {
+                if Self::resolve_remote_transport_security(provider, field)?
                     == ResolvedRemoteTransportSecurity::S2sPayloadV1
-            {
-                return Ok(true);
+                {
+                    return Ok(true);
+                }
             }
         }
         Ok(false)
