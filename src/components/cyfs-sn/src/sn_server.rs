@@ -2177,8 +2177,9 @@ impl HttpServer for SNServer {
 
 /// 远程 SN DB provider 配置。
 ///
-/// HTTPS 沿用字符串 URL；HTTP 必须使用对象形式，同时固定远端应用 DID
-/// 与 Ed25519 公钥，供 kRPC S2S Payload Protection 使用。
+/// HTTPS 沿用字符串 URL；HTTP 必须使用对象形式。对象缺省启用 kRPC S2S
+/// Payload Protection，也可以通过 `transport_security: plaintext` 显式使用
+/// 普通 JSON/HTTP 传输。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum SnRemoteProviderConfig {
@@ -2199,9 +2200,28 @@ impl SnRemoteProviderConfig {
 #[serde(deny_unknown_fields)]
 pub struct SnS2sRemoteProviderConfig {
     pub url: String,
+    /// HTTP provider 的传输安全策略。缺省保持现有行为，启用 S2S Payload v1；
+    /// 显式设为 `plaintext` 时使用普通 JSON/HTTP 传输。
+    #[serde(default)]
+    pub transport_security: SnHttpTransportSecurity,
     pub remote_app_did: String,
     /// 远端 Ed25519 公钥的 Base64URL（无 padding）编码。
     pub remote_public_key: String,
+}
+
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SnHttpTransportSecurity {
+    Plaintext,
+    #[default]
+    S2sPayloadV1,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum ResolvedRemoteTransportSecurity {
+    Plaintext,
+    Tls,
+    S2sPayloadV1,
 }
 
 /// 相对路径按网关主配置目录解析，与 `seed_path` / local DNS 文件一致。
@@ -2436,35 +2456,47 @@ impl SnServerFactory {
                 field
             ));
         }
-        let url = url::Url::parse(value.url().trim()).map_err(|error| {
+        Self::resolve_remote_transport_security(value, field)?;
+        Ok(())
+    }
+
+    fn resolve_remote_transport_security(
+        provider: &SnRemoteProviderConfig,
+        field: &str,
+    ) -> ServerResult<ResolvedRemoteTransportSecurity> {
+        let url = url::Url::parse(provider.url().trim()).map_err(|error| {
             server_err!(
                 ServerErrorCode::InvalidConfig,
                 "invalid {} url {}: {}",
                 field,
-                value.url(),
+                provider.url(),
                 error
             )
         })?;
         match url.scheme() {
-            "https" => {}
-            "http" if matches!(value, SnRemoteProviderConfig::S2s(_)) => {}
-            "http" => {
-                return Err(server_err!(
+            "https" => Ok(ResolvedRemoteTransportSecurity::Tls),
+            "http" => match provider {
+                SnRemoteProviderConfig::S2s(remote) => match remote.transport_security {
+                    SnHttpTransportSecurity::Plaintext => {
+                        Ok(ResolvedRemoteTransportSecurity::Plaintext)
+                    }
+                    SnHttpTransportSecurity::S2sPayloadV1 => {
+                        Ok(ResolvedRemoteTransportSecurity::S2sPayloadV1)
+                    }
+                },
+                SnRemoteProviderConfig::Url(_) => Err(server_err!(
                     ServerErrorCode::InvalidConfig,
                     "{} uses HTTP; configure it as an object with url, remote_app_did and remote_public_key",
                     field
-                ));
-            }
-            scheme => {
-                return Err(server_err!(
-                    ServerErrorCode::InvalidConfig,
-                    "{} url scheme must be http or https, got {}",
-                    field,
-                    scheme
-                ));
-            }
+                )),
+            },
+            scheme => Err(server_err!(
+                ServerErrorCode::InvalidConfig,
+                "{} url scheme must be http or https, got {}",
+                field,
+                scheme
+            )),
         }
-        Ok(())
     }
 
     fn validate_remote_providers(config: &SNServerConfig) -> ServerResult<()> {
@@ -2507,7 +2539,7 @@ impl SnServerFactory {
             .ok_or_else(|| {
                 server_err!(
                     ServerErrorCode::InvalidConfig,
-                    "app_did is required for HTTP S2S providers"
+                    "app_did is required for s2s_payload_v1 providers"
                 )
             })?;
         let service_did = parse_canonical_did(app_did).map_err(|error| {
@@ -2544,26 +2576,6 @@ impl SnServerFactory {
         Self::load_local_s2s_identity(app_did, roots)
     }
 
-    fn needs_http_s2s(provider: &SnRemoteProviderConfig) -> ServerResult<bool> {
-        let url = url::Url::parse(provider.url().trim()).map_err(|error| {
-            server_err!(
-                ServerErrorCode::InvalidConfig,
-                "invalid remote provider url {}: {}",
-                provider.url(),
-                error
-            )
-        })?;
-        match url.scheme() {
-            "https" => Ok(false),
-            "http" => Ok(true),
-            scheme => Err(server_err!(
-                ServerErrorCode::InvalidConfig,
-                "remote provider url scheme must be http or https, got {}",
-                scheme
-            )),
-        }
-    }
-
     async fn build_remote_krpc(
         provider: &SnRemoteProviderConfig,
         local_identity: Option<&SnLocalS2sIdentity>,
@@ -2571,23 +2583,44 @@ impl SnServerFactory {
         normalize_s2s_url: fn(&str) -> String,
         field: &str,
     ) -> ServerResult<Arc<kRPC>> {
-        if !Self::needs_http_s2s(provider)? {
-            let endpoint = normalize_tls_url(provider.url().trim());
-            let client = kRPC::new_with_transport(
-                endpoint.as_str(),
-                None,
-                KrpcTransportSecurity::Tls,
-            )
-            .await
-            .map_err(|error| {
-                server_err!(
-                    ServerErrorCode::InvalidConfig,
-                    "create HTTPS {} client failed: {}",
-                    field,
-                    error
+        match Self::resolve_remote_transport_security(provider, field)? {
+            ResolvedRemoteTransportSecurity::Tls => {
+                let endpoint = normalize_tls_url(provider.url().trim());
+                let client = kRPC::new_with_transport(
+                    endpoint.as_str(),
+                    None,
+                    KrpcTransportSecurity::Tls,
                 )
-            })?;
-            return Ok(Arc::new(client));
+                .await
+                .map_err(|error| {
+                    server_err!(
+                        ServerErrorCode::InvalidConfig,
+                        "create HTTPS {} client failed: {}",
+                        field,
+                        error
+                    )
+                })?;
+                return Ok(Arc::new(client));
+            }
+            ResolvedRemoteTransportSecurity::Plaintext => {
+                let endpoint = normalize_s2s_url(provider.url().trim());
+                let client = kRPC::new_with_transport(
+                    endpoint.as_str(),
+                    None,
+                    KrpcTransportSecurity::Plaintext,
+                )
+                .await
+                .map_err(|error| {
+                    server_err!(
+                        ServerErrorCode::InvalidConfig,
+                        "create plaintext HTTP {} client failed: {}",
+                        field,
+                        error
+                    )
+                })?;
+                return Ok(Arc::new(client));
+            }
+            ResolvedRemoteTransportSecurity::S2sPayloadV1 => {}
         }
 
         let SnRemoteProviderConfig::S2s(remote) = provider else {
@@ -2601,7 +2634,7 @@ impl SnServerFactory {
         let local_identity = local_identity.ok_or_else(|| {
             server_err!(
                 ServerErrorCode::InvalidConfig,
-                "app_did is required for HTTP {}",
+                "app_did is required for s2s_payload_v1 {}",
                 field
             )
         })?;
@@ -2644,12 +2677,15 @@ impl SnServerFactory {
         Ok(Arc::new(client))
     }
 
-    fn any_http_s2s_provider(config: &SNServerConfig) -> ServerResult<bool> {
-        for provider in [&config.auth_db, &config.device_info_db]
-            .into_iter()
-            .flatten()
-        {
-            if Self::needs_http_s2s(provider)? {
+    fn any_s2s_payload_provider(config: &SNServerConfig) -> ServerResult<bool> {
+        for (provider, field) in [
+            (&config.auth_db, "auth_db"),
+            (&config.device_info_db, "device_info_db"),
+        ] {
+            if let Some(provider) = provider
+                && Self::resolve_remote_transport_security(provider, field)?
+                    == ResolvedRemoteTransportSecurity::S2sPayloadV1
+            {
                 return Ok(true);
             }
         }
@@ -2904,7 +2940,7 @@ impl ServerFactory for SnServerFactory {
                 "seed_path cannot be used with remote auth_db; import seed data through the provider side"
             ));
         }
-        let local_s2s_identity = if Self::any_http_s2s_provider(config)? {
+        let local_s2s_identity = if Self::any_s2s_payload_provider(config)? {
             Some(Self::default_local_s2s_identity(config.app_did.as_deref())?)
         } else {
             None
@@ -3918,6 +3954,13 @@ users:
         assert!(config.local_relay_node.is_none());
         assert_eq!(config.bns_server_url, "http://127.0.0.1:18080");
         assert_eq!(config.app_did.as_deref(), Some("did:web:sn.example"));
+        let SnRemoteProviderConfig::S2s(auth_db) = config.auth_db.as_ref().unwrap() else {
+            panic!("HTTP auth_db must decode as an object provider");
+        };
+        assert_eq!(
+            auth_db.transport_security,
+            SnHttpTransportSecurity::S2sPayloadV1
+        );
         assert_eq!(
             config.auth_db.as_ref().map(SnRemoteProviderConfig::url),
             Some("http://auth-provider:8080")
@@ -4025,7 +4068,7 @@ users:
     }
 
     #[tokio::test]
-    async fn remote_provider_uses_tls_or_identity_backed_http_s2s() {
+    async fn remote_provider_supports_tls_plaintext_and_identity_backed_http_s2s() {
         let https = SnRemoteProviderConfig::Url("https://provider.example".to_string());
         assert!(
             SnServerFactory::build_remote_krpc(
@@ -4059,8 +4102,33 @@ users:
         let local =
             SnServerFactory::load_local_s2s_identity(Some(&app_did.to_string()), roots).unwrap();
         let remote_public = ed25519_public_key([9u8; 32]);
+        let http_plaintext = SnRemoteProviderConfig::S2s(SnS2sRemoteProviderConfig {
+            url: "http://provider.example".to_string(),
+            transport_security: SnHttpTransportSecurity::Plaintext,
+            remote_app_did: "did:web:sn-db.example.com".to_string(),
+            remote_public_key: base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .encode(remote_public),
+        });
+        assert_eq!(
+            SnServerFactory::resolve_remote_transport_security(&http_plaintext, "auth_db")
+                .unwrap(),
+            ResolvedRemoteTransportSecurity::Plaintext
+        );
+        assert!(
+            SnServerFactory::build_remote_krpc(
+                &http_plaintext,
+                None,
+                crate::normalize_sn_auth_db_url,
+                crate::normalize_sn_auth_db_s2s_url,
+                "auth_db",
+            )
+            .await
+            .is_ok()
+        );
+
         let http_s2s = SnRemoteProviderConfig::S2s(SnS2sRemoteProviderConfig {
             url: "http://provider.example".to_string(),
+            transport_security: SnHttpTransportSecurity::default(),
             remote_app_did: "did:web:sn-db.example.com".to_string(),
             remote_public_key: base64::engine::general_purpose::URL_SAFE_NO_PAD
                 .encode(remote_public),
@@ -4076,6 +4144,29 @@ users:
             .await
             .is_ok()
         );
+    }
+
+    #[test]
+    fn http_provider_transport_security_is_strictly_parsed() {
+        let plaintext: SnRemoteProviderConfig = serde_json::from_value(json!({
+            "url": "http://provider.example",
+            "transport_security": "plaintext",
+            "remote_app_did": "did:web:sn-db.example.com",
+            "remote_public_key": "unused-for-plaintext"
+        }))
+        .unwrap();
+        assert_eq!(
+            SnServerFactory::resolve_remote_transport_security(&plaintext, "auth_db").unwrap(),
+            ResolvedRemoteTransportSecurity::Plaintext
+        );
+
+        let invalid = serde_json::from_value::<SnRemoteProviderConfig>(json!({
+            "url": "http://provider.example",
+            "transport_security": "disabled",
+            "remote_app_did": "did:web:sn-db.example.com",
+            "remote_public_key": "unused"
+        }));
+        assert!(invalid.is_err());
     }
 
     #[test]

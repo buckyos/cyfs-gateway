@@ -313,9 +313,10 @@ stacks:
   #     controllers:
   #       - id: default
   #         private_key_env: BNS_PRIVATE_KEY
-  #   app_did: did:web:sn-api.example              # local identity; required for HTTP S2S
+  #   app_did: did:web:sn-api.example              # local identity; required for s2s_payload_v1
   #   auth_db:                                     # HTTPS may remain a URL string
   #     url: http://auth-provider:8080
+  #     transport_security: s2s_payload_v1          # optional; default, or plaintext
   #     remote_app_did: did:web:sn-db.example
   #     remote_public_key: T4Quc1L6Ogu4N2tTKOvneV1yYnBcmhP89B_RsuFsJZ8
   #   device_info_db: https://device-provider:8443 # optional; local SQLite if absent
