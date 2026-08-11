@@ -1171,7 +1171,7 @@ impl SqliteSnAuthDB {
             .foreign_keys(true)
             .busy_timeout(Duration::from_secs(5));
         let pool = SqlitePoolOptions::new()
-            .max_connections(300)
+            .max_connections(8)
             .connect_with(options)
             .await
             .map_err(|e| Self::db_err(format!("open file: {:?}", path), e))?;

@@ -1694,7 +1694,7 @@ impl NameServer for SNServer {
         record_type: Option<RecordType>,
         _from_ip: Option<IpAddr>,
     ) -> ServerResult<NameInfo> {
-        info!(
+        debug!(
             "sn server process name query: {} record_type: {:?}",
             name, record_type
         );
@@ -1724,14 +1724,14 @@ impl NameServer for SNServer {
                 .query(req_real_name.as_str(), record_type)
             {
                 Some(NameInfoCacheQueryResult::Hit(name_info)) => {
-                    info!(
+                    debug!(
                         "sn server name cache hit: {} record_type: {:?}",
                         req_real_name, record_type
                     );
                     return Ok(name_info);
                 }
                 Some(NameInfoCacheQueryResult::Tombstone) => {
-                    info!(
+                    debug!(
                         "sn server name cache tombstone hit: {} record_type: {:?}",
                         req_real_name, record_type
                     );
@@ -1750,7 +1750,7 @@ impl NameServer for SNServer {
             );
         }
 
-        info!(
+        debug!(
             "sn server name cache miss: {} record_type: {:?}",
             req_real_name, record_type
         );

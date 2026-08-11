@@ -292,7 +292,7 @@ impl SqliteSnDeviceInfoDB {
             .create_if_missing(true)
             .journal_mode(SqliteJournalMode::Wal);
         let pool = SqlitePoolOptions::new()
-            .max_connections(300)
+            .max_connections(8)
             .connect_with(options)
             .await
             .map_err(into_sn_err!(SnErrorCode::DBError, "open file: {:?}", path))?;
