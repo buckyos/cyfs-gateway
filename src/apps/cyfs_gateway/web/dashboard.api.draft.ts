@@ -129,6 +129,7 @@ export const GW_RPC = {
   get_system_info: "get_system_info",
   get_overview_snapshot: "get_overview_snapshot",
   set_ui_mode: "set_ui_mode",
+  add_name_provider: "add_name_provider",
 
   // --- Security ---
   list_tokens: "list_tokens",
@@ -219,6 +220,14 @@ export interface SystemInfo {
     port: number;
     loopback_trusted: boolean; // 127.0.0.1 免授权
   };
+}
+
+export interface AddNameProviderResult {
+  provider: string;
+  url: string;
+  resolver_host: string;
+  scheme: "http" | "https";
+  trust_level: number;
 }
 
 export type ActionKind = "direct" | "proxy" | "blocked" | "failed" | "accepted";
@@ -621,6 +630,17 @@ export async function set_ui_mode(mode: UiMode): Promise<boolean> {
   let params: JsonObject = { mode };
   let result = (await rpc_client.call(GW_RPC.set_ui_mode, params)) as KRpcRawResponse;
   return result["code"] === 0;
+}
+
+export async function add_name_provider(url: string, trust_level?: number): Promise<AddNameProviderResult> {
+  let rpc_client = new buckyos.kRPCClient(GATEWAY_RPC_URL);
+  let params: JsonObject = { url };
+  if (trust_level !== undefined) {
+    params["trust_level"] = trust_level;
+  }
+  let result = (await rpc_client.call(GW_RPC.add_name_provider, params)) as KRpcRawResponse;
+  ensureOk(GW_RPC.add_name_provider, result);
+  return pickData<AddNameProviderResult>(result);
 }
 
 // -----------------------------

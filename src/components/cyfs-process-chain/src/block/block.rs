@@ -5,6 +5,7 @@ use crate::cmd::*;
 use crate::collection::{CollectionValue, NumberValue};
 use std::fmt;
 use std::ops::Deref;
+use std::str::FromStr;
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum Operator {
@@ -50,6 +51,14 @@ pub enum CommandArg {
     // and parsed runtime value.
     // Examples: true/false/null/123/12.5
     TypedLiteral(String, CollectionValue),
+
+    // Fresh List collection literal, constructed at runtime from the contained args.
+    // Example: [1, "two", $REQ.port]
+    ListLiteral(Vec<CommandArg>),
+
+    // Fresh Map collection literal with static string keys and dynamic values.
+    // Example: {"kind": "app", app_id: $REQ.appId}
+    MapLiteral(Vec<(String, CommandArg)>),
 
     // A command arg that is a variable, like $VAR_NAME ${VAR_NAME}
     Var(String), // A reference to a variable, like $VAR_NAME
@@ -246,6 +255,8 @@ impl CommandArg {
             | CommandArg::TypedLiteral(s, _) => s.as_str(),
             CommandArg::Var(s) => s.as_str(),
             CommandArg::CommandSubstitution(_) => "[command substitution]",
+            CommandArg::ListLiteral(_) => "[list literal]",
+            CommandArg::MapLiteral(_) => "[map literal]",
         }
     }
 
@@ -253,9 +264,9 @@ impl CommandArg {
         matches!(self, CommandArg::CommandSubstitution(_))
     }
 
-    pub fn as_command_substitution(&self) -> Option<&Box<Expression>> {
+    pub fn as_command_substitution(&self) -> Option<&Expression> {
         if let CommandArg::CommandSubstitution(cmd) = self {
-            Some(cmd)
+            Some(cmd.as_ref())
         } else {
             None
         }
@@ -425,9 +436,10 @@ impl CommandItem {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum AssignKind {
     // Normal assignment, use KEY=VALUE, var is visible in the current process chain
+    #[default]
     Chain,
 
     // Local assignment, use local KEY=VALUE, var is only visible in the current block
@@ -435,12 +447,6 @@ pub enum AssignKind {
 
     // Global assignment, use export KEY=VALUE, var is visible in all process chains
     Global,
-}
-
-impl Default for AssignKind {
-    fn default() -> Self {
-        AssignKind::Chain // Default to chain level assignment
-    }
 }
 
 impl AssignKind {
@@ -451,8 +457,12 @@ impl AssignKind {
             AssignKind::Global => "global",
         }
     }
+}
 
-    pub fn from_str(s: &str) -> Result<Self, String> {
+impl FromStr for AssignKind {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "chain" => Ok(AssignKind::Chain),
             "block" => Ok(AssignKind::Block),
@@ -488,7 +498,7 @@ impl Expression {
         matches!(self, Expression::Group(_))
     }
 
-    pub fn as_group(&self) -> Option<&Vec<(Option<Operator>, Expression, Option<Operator>)>> {
+    pub fn as_group(&self) -> Option<&ExpressionChain> {
         if let Expression::Group(group) = self {
             Some(group)
         } else {
@@ -506,6 +516,20 @@ pub struct IfBranch {
 #[derive(Debug, Clone)]
 pub struct IfStatement {
     pub branches: Vec<IfBranch>,
+    pub else_lines: Option<Vec<Line>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CaseBranch {
+    pub condition: ExpressionChain,
+    pub lines: Vec<Line>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CaseStatement {
+    pub subject: Option<CommandArg>,
+    pub binding_var: Option<String>,
+    pub branches: Vec<CaseBranch>,
     pub else_lines: Option<Vec<Line>>,
 }
 
@@ -543,6 +567,7 @@ pub struct MatchResultStatement {
 pub struct Statement {
     pub expressions: ExpressionChain,
     pub if_statement: Option<IfStatement>,
+    pub case_statement: Option<CaseStatement>,
     pub for_statement: Option<ForStatement>,
     pub match_result_statement: Option<MatchResultStatement>,
 }
@@ -552,6 +577,7 @@ impl Statement {
         Self {
             expressions,
             if_statement: None,
+            case_statement: None,
             for_statement: None,
             match_result_statement: None,
         }
@@ -561,6 +587,17 @@ impl Statement {
         Self {
             expressions: Vec::new(),
             if_statement: Some(if_statement),
+            case_statement: None,
+            for_statement: None,
+            match_result_statement: None,
+        }
+    }
+
+    pub fn new_case(case_statement: CaseStatement) -> Self {
+        Self {
+            expressions: Vec::new(),
+            if_statement: None,
+            case_statement: Some(case_statement),
             for_statement: None,
             match_result_statement: None,
         }
@@ -570,6 +607,7 @@ impl Statement {
         Self {
             expressions: Vec::new(),
             if_statement: None,
+            case_statement: None,
             for_statement: Some(for_statement),
             match_result_statement: None,
         }
@@ -579,6 +617,7 @@ impl Statement {
         Self {
             expressions: Vec::new(),
             if_statement: None,
+            case_statement: None,
             for_statement: None,
             match_result_statement: Some(match_result_statement),
         }

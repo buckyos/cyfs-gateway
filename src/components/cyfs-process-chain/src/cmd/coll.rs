@@ -1,4 +1,4 @@
-use super::cmd::*;
+use super::types::*;
 use crate::block::{CommandArg, CommandArgs};
 use crate::chain::{Context, EnvLevel, ParserContext};
 use crate::collection::{
@@ -1410,14 +1410,14 @@ Examples:
                     .long("global")
                     .visible_alias("export")
                     .action(clap::ArgAction::SetTrue)
-                    .conflicts_with_all(&["chain", "block"])
+                    .conflicts_with_all(["chain", "block"])
                     .help("Use global scope"),
             )
             .arg(
                 Arg::new("chain")
                     .long("chain")
                     .action(clap::ArgAction::SetTrue)
-                    .conflicts_with_all(&["global", "block"])
+                    .conflicts_with_all(["global", "block"])
                     .help("Use chain scope (default)"),
             )
             .arg(
@@ -1425,7 +1425,7 @@ Examples:
                     .visible_alias("local")
                     .long("block")
                     .action(clap::ArgAction::SetTrue)
-                    .conflicts_with_all(&["global", "chain"])
+                    .conflicts_with_all(["global", "chain"])
                     .help("Use block scope"),
             )
             .arg(
@@ -1870,14 +1870,14 @@ Examples:
                 Arg::new("global")
                     .long("global")
                     .visible_alias("export")
-                    .conflicts_with_all(&["chain", "block"])
+                    .conflicts_with_all(["chain", "block"])
                     .action(clap::ArgAction::SetTrue)
                     .help("Use global scope"),
             )
             .arg(
                 Arg::new("chain")
                     .long("chain")
-                    .conflicts_with_all(&["global", "block"])
+                    .conflicts_with_all(["global", "block"])
                     .action(clap::ArgAction::SetTrue)
                     .help("Use chain scope (default)"),
             )
@@ -1885,7 +1885,7 @@ Examples:
                 Arg::new("block")
                     .long("block")
                     .visible_alias("local")
-                    .conflicts_with_all(&["global", "chain"])
+                    .conflicts_with_all(["global", "chain"])
                     .action(clap::ArgAction::SetTrue)
                     .help("Use block scope"),
             )
@@ -2434,13 +2434,7 @@ impl CommandExecutor for MapRemoveCommandExecutor {
                 }
             }
             CollectionValue::MultiMap(collection) => {
-                if values.is_empty() {
-                    return Ok(CommandResult::error_with_string(
-                        "No values provided for multi-map remove".to_string(),
-                    ));
-                }
-
-                let ret = if values.len() == 0 {
+                let ret = if values.is_empty() {
                     match collection.remove_all(&key).await? {
                         Some(ret) => Some(join_set_collection_values(&ret).await?),
                         None => None,

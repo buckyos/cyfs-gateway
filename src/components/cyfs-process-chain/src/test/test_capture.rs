@@ -27,6 +27,24 @@ const PROCESS_CHAIN_CAPTURE: &str = r#"
 </process_chain_lib>
 "#;
 
+const PROCESS_CHAIN_CAPTURE_PATH_TARGET: &str = r#"
+<process_chain_lib id="capture_path_lib" priority="100">
+    <process_chain id="chain1">
+        <block id="block1">
+            <![CDATA[
+                map-create --block payload;
+                capture --value payload.value --status payload.status --ok payload.ok $(append "path" "");
+                eq $payload.value "path" || return --from lib "fail_path_value";
+                eq $payload.status "success" || return --from lib "fail_path_status";
+                eq $payload.ok true || return --from lib "fail_path_ok";
+
+                return --from lib "ok";
+            ]]>
+        </block>
+    </process_chain>
+</process_chain_lib>
+"#;
+
 #[tokio::test]
 async fn test_capture_command() {
     TermLogger::init(
@@ -55,4 +73,105 @@ async fn test_capture_command() {
 
     let output = hook_point_env.pipe().stdout.clone_string();
     info!("{}", output);
+}
+
+#[tokio::test]
+async fn test_capture_command_supports_path_targets() {
+    TermLogger::init(
+        LevelFilter::Info,
+        Config::default(),
+        TerminalMode::Mixed,
+        ColorChoice::Auto,
+    )
+    .unwrap_or_else(|_| {
+        let _ = SimpleLogger::init(LevelFilter::Info, Config::default());
+    });
+
+    let hook_point = HookPoint::new("test_capture_path_target");
+    hook_point
+        .load_process_chain_lib("capture_path_lib", 0, PROCESS_CHAIN_CAPTURE_PATH_TARGET)
+        .await
+        .unwrap();
+
+    let data_dir = std::env::temp_dir().join("cyfs-process-chain-test-capture-path-target");
+    std::fs::create_dir_all(&data_dir).unwrap();
+    let hook_point_env = HookPointEnv::new("test-capture-path-target", data_dir);
+    let exec = hook_point_env.link_hook_point(&hook_point).await.unwrap();
+
+    let ret = exec.execute_lib("capture_path_lib").await.unwrap();
+    assert_eq!(ret.value(), "ok");
+}
+
+#[tokio::test]
+async fn test_capture_command_preserves_outer_scope_values() {
+    TermLogger::init(
+        LevelFilter::Info,
+        Config::default(),
+        TerminalMode::Mixed,
+        ColorChoice::Auto,
+    )
+    .unwrap_or_else(|_| {
+        let _ = SimpleLogger::init(LevelFilter::Info, Config::default());
+    });
+
+    let hook_point = HookPoint::new("test_capture_outer_scope");
+    hook_point
+        .load_process_chain_lib("capture_lib", 0, PROCESS_CHAIN_CAPTURE)
+        .await
+        .unwrap();
+
+    let data_dir = std::env::temp_dir().join("cyfs-process-chain-test-capture-outer-scope");
+    std::fs::create_dir_all(&data_dir).unwrap();
+    let hook_point_env = HookPointEnv::new("test-capture-outer-scope", data_dir);
+
+    hook_point_env
+        .hook_point_env()
+        .create("v1", CollectionValue::String("outer-v1".to_string()))
+        .await
+        .unwrap();
+    hook_point_env
+        .hook_point_env()
+        .create("s1", CollectionValue::String("outer-s1".to_string()))
+        .await
+        .unwrap();
+    hook_point_env
+        .hook_point_env()
+        .create("ok1", CollectionValue::Bool(false))
+        .await
+        .unwrap();
+
+    let exec = hook_point_env.link_hook_point(&hook_point).await.unwrap();
+    let ret = exec.execute_lib("capture_lib").await.unwrap();
+    assert_eq!(ret.value(), "ok");
+
+    assert_eq!(
+        hook_point_env
+            .hook_point_env()
+            .get("v1")
+            .await
+            .unwrap()
+            .unwrap()
+            .as_str(),
+        Some("outer-v1")
+    );
+    assert_eq!(
+        hook_point_env
+            .hook_point_env()
+            .get("s1")
+            .await
+            .unwrap()
+            .unwrap()
+            .as_str(),
+        Some("outer-s1")
+    );
+    assert_eq!(
+        hook_point_env
+            .hook_point_env()
+            .get("ok1")
+            .await
+            .unwrap()
+            .unwrap()
+            .as_bool(),
+        Some(false)
+    );
 }

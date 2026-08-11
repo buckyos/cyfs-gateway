@@ -114,7 +114,9 @@ delete --block tmp_value
 | 命令 | 规范语法 | 说明 |
 | --- | --- | --- |
 | `match` | `match [--no-ignore-case] <value> <glob>` | glob 匹配，默认大小写不敏感 |
-| `match-reg` | `match-reg [--capture name] [--no-ignore-case] <value> <regex>` | 正则匹配；可把 capture 写回 `name[0]`、`name[1]`... |
+| `match-reg` | `match-reg [--capture name] [--no-ignore-case] <value> <regex>` | 正则匹配；可把匹配结果写入一个新的 List，并通过 `name[0]`、`name[1]`... 访问 |
+| `match-path` | `match-path [--capture name] [--ignore-case] <value> <pattern>` | path 模板匹配；默认按 `/` 分段，支持 `{name}` 捕获和尾部 `**` |
+| `match-host` | `match-host [--capture name] [--no-ignore-case] <value> <pattern>` | host 模板匹配；默认按 `.` 分 label，支持 `{name}` 捕获和尾部 `**` |
 | `eq` | `eq [--ignore-case] [--loose] <left> <right>` | 相等比较；默认强类型比较 |
 | `ne` | `ne [--ignore-case] [--loose] <left> <right>` | 不等比较 |
 | `gt` | `gt [--loose] <left> <right>` | 数值大于 |
@@ -127,7 +129,17 @@ delete --block tmp_value
 
 - `match` 用 glob，不是正则。
 - `match-reg` 用 Rust regex；`--capture name` 会写环境变量：
-  - `name[0]`、`name[1]`、`name[2]` ...
+  - 会创建一个新的 List 变量
+  - `name[0]` 是完整匹配文本
+  - `name[1]` 是第一个捕获组
+  - `name[2]` 是第二个捕获组，以此类推
+  - 未命中的可选捕获组会写成 `Null`，以保持索引稳定
+- `match-path` / `match-host` 用模板，不是 regex：
+  - `match-path` 默认按 `/` 分段，默认大小写敏感
+  - `match-host` 默认按 `.` 分 label，默认大小写不敏感
+  - `{name}` 只会在单个 segment / label 内捕获，不会跨默认分隔符
+  - `**` 匹配剩余所有 segment / label，并且必须在最后
+  - `--capture name` 同样会写一个新的 List：`name[0]` 是完整匹配文本，后续索引按模板捕获顺序排列
 - `eq` / `ne`：
   - 默认强类型比较
   - `--ignore-case` 只对字符串比较有意义
@@ -139,6 +151,8 @@ delete --block tmp_value
 ```txt
 match $REQ.path "/api/*" && call-server api;
 match-reg --capture hp $REQ.host "^([a-zA-Z0-9_]+)[-.]" || reject;
+match-path --capture cap $REQ.path "${route_prefix}/{node}/{plane}/**" || reject;
+match-host --capture cap $REQ.host "{app}.${THIS_ZONE_HOST}" || reject;
 eq --ignore-case $REQ.method "GET" && accept;
 gt --loose $REQ.content_length 1048576 && reject;
 range $REQ.target.port 1000 2000 && accept;
@@ -149,10 +163,14 @@ range $REQ.target.port 1000 2000 && accept;
 | 命令 | 规范语法 | 说明 |
 | --- | --- | --- |
 | `rewrite` | `rewrite <$var> <glob> <template>` | 用 glob 重写变量值；会回写原变量 |
+| `rewrite-path` | `rewrite-path [--ignore-case] <$var> <pattern> <template>` | 用 path 模板重写变量值；支持 `{name}` 和尾部 `**` |
+| `rewrite-host` | `rewrite-host [--no-ignore-case] <$var> <pattern> <template>` | 用 host 模板重写变量值；支持 `{name}` 和尾部 `**` |
 | `rewrite-reg` | `rewrite-reg <$var> <regex> <template>` | 用正则重写变量值；模板里可用 `$1`、`$2` |
 | `replace` | `replace [-i|--ignore-case] <$var> <match> <replacement>` | 替换变量值中的子串；会回写原变量 |
 | `append` | `append <a> <b> [more...]` | 直接拼接多个参数并返回新字符串 |
 | `slice` | `slice <string> <start:end>` | 按字节区间切片；要求 UTF-8 边界合法 |
+| `strip-prefix` | `strip-prefix [-i|--ignore-case] <value> <prefix>` | 去掉前缀并返回剩余 tail；不修改原变量 |
+| `strip-suffix` | `strip-suffix [-i|--ignore-case] <value> <suffix>` | 去掉后缀并返回剩余 head；不修改原变量 |
 | `strlen` | `strlen <string>` | 返回字符串长度；当前实现按字节数计算 |
 | `starts-with` | `starts-with [-i|--ignore-case] <string> <prefix>` | 前缀判断 |
 | `ends-with` | `ends-with [-i|--ignore-case] <string> <suffix>` | 后缀判断 |
@@ -162,15 +180,27 @@ range $REQ.target.port 1000 2000 && accept;
 ### 字符串命令细节
 
 - `rewrite` 适合 glob 改写，比如路径前缀、host 模板。
+- `rewrite-path` / `rewrite-host` 使用和 `match-path` / `match-host` 相同的模板规则：
+  - `{name}` 捕获单个 segment / label
+  - `**` 匹配剩余尾部；若 pattern 里有 `**`，template 里也可放一个独立 segment 的 `**` 来拼接剩余尾部
+  - pattern 中的捕获名必须唯一
 - `rewrite-reg` 的 canonical 名是 `rewrite-reg`；不要写成 `rewrite_reg`。
-- `replace` / `rewrite` / `rewrite-reg` 都会修改原变量。
+- `replace` / `rewrite` / `rewrite-path` / `rewrite-host` / `rewrite-reg` 都会修改原变量。
+- `strip-prefix` / `strip-suffix` 只返回裁剪结果，不会回写原变量：
+  - 匹配成功时返回 success 和剩余字符串
+  - 完全相等时返回空字符串
+  - 未命中时返回 error
 - `append` 只返回结果，不会自动写回变量；需要配合赋值：
 
 ```txt
 local full_url=$(append "https://" $REQ.host $REQ.url)
 rewrite $REQ.url "/kapi/my-service/*" "/kapi/*"
+rewrite-path $REQ.path "/kapi/{service}/**" "/api/{service}/**"
+rewrite-host $REQ.host "{app}.${THIS_ZONE_HOST}" "{app}-internal.${THIS_ZONE_HOST}"
 rewrite-reg $REQ.url "^/test/(\\w+)(?:/(\\d+))?" "/new/$1/$2"
 replace -i $REQ.host ".internal" ".svc"
+local tail=$(strip-prefix $REQ.path "/api")
+local head=$(strip-suffix $REQ.host ".example.com")
 slice $REQ.path 0:10
 strlen $REQ.path
 starts-with $REQ.path "/api/"
@@ -310,7 +340,7 @@ map my_coll $(echo ${key}) reduce $(echo ${sum})
 | 命令 | 规范语法 | 说明 |
 | --- | --- | --- |
 | `call-server` | `call-server <server_id>` | 返回 `server <id>` 动作，把处理交给另一个 server 配置对象 |
-| `forward` | `forward [round_robin\|ip_hash] <upstream...>` / `forward [round_robin\|ip_hash] --map <map>` | 返回 `forward "..."` 动作；支持多上游与权重 |
+| `forward` | `forward [algorithm] <upstream...> [group-options]` / `forward [algorithm] --map <map> [group-options]` | 单目标或多候选 upstream 转发；group 形态支持执行阶段重试 |
 | `redirect` | `redirect <location> [301\|302\|303\|307\|308]` | 返回 HTTP 重定向响应 |
 | `error` | `error <status 400..599> [message]` | 返回 HTTP 错误响应；这是网关 HTTP 响应命令，不是 core control `error --from ...` |
 
@@ -335,16 +365,42 @@ forward "http://127.0.0.1:8080"
 forward tcp:///127.0.0.1:80 tcp:///127.0.0.1:81
 forward ip_hash tcp:///127.0.0.1:80,weight=3 tcp:///127.0.0.1:81,weight=1
 forward round_robin --map $UPSTREAMS
+forward round_robin --map $PRIMARY --backup-map $BACKUP --next-upstream error,timeout --tries 3 --next-upstream-timeout 5s
+forward consistent_hash --hash-key "$session_id" --map $UPSTREAMS --next-upstream error,timeout --tries 2
+forward least_time --map $UPSTREAMS --next-upstream error,timeout --tries 3
 ```
 
 说明：
 
 - `forward` 缺省算法是 `round_robin`
-- 支持 `ip_hash`
+- 算法支持 `round_robin` / `rr`、`ip_hash`、`hash`、`consistent_hash`、`least_time`
+- `hash` / `consistent_hash` 必须同时传入 `--hash-key <resolved-value>`
 - inline upstream 可写 `url,weight=N`
 - `--map` 需要一个 map，key 是 upstream URL，value 是权重
+- `--backup-map` 需要同样结构的 map，并把其中 URL 标记为 backup 候选
 - upstream 的基础语法是 URL，而不是裸的 `host:port`
 - 命令本身只校验“URL 能否解析”，具体 scheme 是否可运行，要看消费这个 `forward` 动作的入口
+
+兼容模式与 group 模式必须分开理解：
+
+- 单 URL，或未使用 group 选项的旧多 URL 语法：命令只选出一个 URL，返回 `forward "<selected_url>"`；该目标执行失败时不会在同一次请求内换目标
+- 使用 `--backup-map`、`--next-upstream`、`--tries`、`--next-upstream-timeout`、`--max-fails`、`--fail-timeout`、`--group` 等 group 选项，或使用 `hash` / `consistent_hash` / `least_time`：命令构造候选计划；有效的多候选 plan 返回内部 `forward-group` 动作，由执行层按策略尝试候选。单 URL 且未启用重试时默认仍会退化成普通 `forward`，除非使用 `--force-group`
+
+group 常用参数：
+
+| 参数 | 说明 |
+| --- | --- |
+| `--next-upstream error,timeout` | 建链错误或超时时允许尝试下一候选；传 `off` 关闭 |
+| `--tries N` | 单次请求最多尝试 N 个候选；有重试条件但省略时最多尝试全部候选 |
+| `--next-upstream-timeout 5s` | 全部候选共享的总墙钟时间预算 |
+| `--max-fails N` | 候选进入临时失败窗口前的失败次数，默认 1 |
+| `--fail-timeout 10s` | 临时失败窗口，默认 10 秒 |
+| `--group name` | 失败状态分组名，不是预定义 upstream 的引用名 |
+| `--max-body-buffer 64KB` | HTTP 状态码重试的请求体缓冲上限 |
+
+HTTP 入口还接受 `http_5xx`、`http_502`、`http_503`、`http_504` 条件。状态码重试默认仅用于幂等方法；加入 `non_idempotent` 才允许 POST/PATCH 等非幂等方法，并会带来重复提交风险。stream/datagram 只在建链或 client 创建阶段重试，开始传输后不会静默切换。
+
+`--server-map` / `--provider-retry-scope` 属于 provider-first 高级模型。当前只保证同一 provider 的 routes 相邻排序，执行层尚未按 retry scope 强制截断跨 provider 重试；命令预检目前也仍要求同时存在 inline upstream、`--map` 或 `--backup-map`。因此不能把 `--server-map` 单独作为稳定入口，也不能把 retry scope 当成有状态业务的隔离保证。
 
 常见 upstream URL 形态：
 
@@ -367,7 +423,7 @@ socks://user:pass@127.0.0.1:1080
 - `rtcp://...` / `rudp://...` 常用于远端 tunnel 目标
 - 如果省略 scheme，例如 `127.0.0.1:8080`，不应当视为规范写法
 
-如果用户追问不同 scheme 的运行时语义、path 如何解释、HTTP `forward` 会不会拼接原请求 URI，转到 [data-forwarding.md](data-forwarding.md)。
+如果用户追问 group 重试边界、不同 scheme 的运行时语义、path 如何解释、HTTP `forward` 会不会拼接原请求 URI，转到 [data-forwarding.md](data-forwarding.md)。
 
 ### 8.2 Probe / 协议探测命令
 
@@ -440,7 +496,7 @@ call global::geo_lookup $REQ_real_remote_ip
 - 控制流：`goto` `exec` `invoke` `return` `error` `exit` `break` `accept` `reject` `drop`
 - 变量：赋值语法、`delete` `type` `to-bool` `to-number` `is-null` `is-bool` `is-number` `capture`
 - 匹配：`match` `match-reg` `eq` `ne` `gt` `ge` `lt` `le` `range`
-- 字符串：`rewrite` `rewrite-reg` `replace` `append` `slice` `strlen` `starts-with` `ends-with` `url_encode` `url_decode`
+- 字符串：`rewrite` `rewrite-path` `rewrite-host` `rewrite-reg` `replace` `append` `slice` `strip-prefix` `strip-suffix` `strlen` `starts-with` `ends-with` `url_encode` `url_decode`
 - 集合：`match-include`、所有 `list-*` / `set-*` / `map-*`
 - 聚合：`map`
 - 网关宿主扩展：`call-server` `forward` `redirect` `error` `http-probe` `https-sni-probe` `proxy-protocol-probe` `verify-jwt` `parse-cookie` `set-limit` `set-stat` `in-time-range` `num-cmp`

@@ -1,0 +1,36 @@
+{
+  "name": "bns-webui",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "dev:demo": "VITE_BNS_DEMO_MODE=true vite --port 5179",
+    "dev:live": "vite --mode live --port 5179",
+    "build": "tsc -b && vite build",
+    "check": "tsc -b",
+    "preview": "vite preview",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:live": "BNS_LIVE_URL=https://bns.buckyos.ai vitest run src/bns_model/__tests__/live.test.ts",
+    "seed:live": "BNS_LIVE_WRITE_URL=https://bns.buckyos.ai vitest run src/bns_model/__tests__/live_write.test.ts",
+    "capture:fixtures": "node scripts/capture-fixtures.mjs > src/bns_model/__tests__/fixtures/live_responses.json"
+  },
+  "dependencies": {
+    "clsx": "^2.1.1",
+    "lucide-react": "^1.7.0",
+    "react": "^19.2.4",
+    "react-dom": "^19.2.4",
+    "react-router-dom": "^7.13.2"
+  },
+  "devDependencies": {
+    "@types/node": "^24.12.0",
+    "@types/react": "^19.2.14",
+    "@types/react-dom": "^19.2.3",
+    "@vitejs/plugin-react": "^6.0.1",
+    "typescript": "~5.9.3",
+    "viem": "^2.55.10",
+    "vite": "^8.0.1",
+    "vitest": "^4.1.10"
+  }
+}

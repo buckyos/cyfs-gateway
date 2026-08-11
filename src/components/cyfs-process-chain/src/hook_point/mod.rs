@@ -1,7 +1,8 @@
 mod env;
-mod hook_point;
 mod loader;
+#[path = "hook_point.rs"]
+mod types;
 
 pub use env::*;
-pub use hook_point::*;
 pub use loader::*;
+pub use types::*;

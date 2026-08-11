@@ -9,11 +9,6 @@ on:
                 required: false
                 type: boolean
                 default: false
-        outputs:
-            full_version:
-                value: ${{jobs.build.outputs.full_version}}
-            short_version:
-                value: ${{jobs.build.outputs.short_version}}
 jobs:
   build:
     name: build
@@ -61,13 +56,6 @@ jobs:
       if: ${{ inputs.arch == 'x86_64' }}
       run: |
             tar -czvf web3-gateway-amd64.tar.gz -C ./src web3-gateway
-    - name: Get Version
-      id: get_version
-      run: |
-        full_version=`./src/rootfs/bin/cyfs-gateway/cyfs_gateway --version|grep -oP '\d+(?:\.\d+)*\+build\S+'`
-        echo "full_version=$full_version" >> $GITHUB_OUTPUT
-        short_version=`./src/rootfs/bin/cyfs-gateway/cyfs_gateway --version|grep -oP '\d+(?:\.\d+)*\+build\d+'`
-        echo "short_version=$short_version" >> $GITHUB_OUTPUT
     - name: Upload
       uses: actions/upload-artifact@v4
       id: upload
@@ -83,7 +71,3 @@ jobs:
         name: web3-gateway-amd64
         path: web3-gateway-amd64.tar.gz
         if-no-files-found: error
-    outputs:
-      full_version: ${{ steps.get_version.outputs.full_version }}
-      short_version: ${{ steps.get_version.outputs.short_version }}
-

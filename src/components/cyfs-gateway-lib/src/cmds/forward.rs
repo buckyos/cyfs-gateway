@@ -1,9 +1,16 @@
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 
-use clap::{Arg, Command};
+use clap::{Arg, ArgAction, Command};
 use cyfs_process_chain::*;
 use url::Url;
+
+use crate::forward::{
+    BalanceMethod, DEFAULT_MAX_BODY_BUFFER_BYTES, FORWARD_CMD, FORWARD_GROUP_CMD,
+    ForwardFailureRegistry, ForwardPlan, ForwardSelector, ForwardServer, ForwardTarget,
+    NextUpstreamPolicy, ProviderPolicy, parse_duration_str, parse_size_str,
+};
 
 #[derive(Clone, Debug)]
 struct UpstreamNode {
@@ -15,6 +22,7 @@ pub struct Forward {
     name: String,
     cmd: Command,
     rr_counter: AtomicUsize,
+    selector: ForwardSelector,
 }
 
 impl Forward {
@@ -30,12 +38,103 @@ Examples:
     forward ip_hash tcp:///127.0.0.1:80,weight=3 tcp:///127.0.0.1:81,weight=1
     forward round_robin --map $UPSTREAMS
     forward ip_hash --map $UPSTREAMS
+    forward round_robin --map $PRIMARY --backup-map $BACKUP \
+            --next-upstream error,timeout --tries 3
+    forward hash --hash-key "$cookie_session_id" --map $UPSTREAMS
+    forward consistent_hash --hash-key "$user_id" --map $UPSTREAMS
+    forward least_time --map $UPSTREAMS --next-upstream error,timeout --tries 3
+    forward --map $POOL --next-upstream error,timeout,http_5xx --tries 3 \
+            --max-body-buffer 64KB
                 "#,
             )
             .arg(
                 Arg::new("upstream_map")
                     .long("map")
                     .help("Map collection variable containing <url, weight> pairs")
+                    .required(false)
+                    .num_args(1),
+            )
+            .arg(
+                Arg::new("backup_map")
+                    .long("backup-map")
+                    .help("Map collection of <url, weight> backup peers (group forward)")
+                    .required(false)
+                    .num_args(1),
+            )
+            .arg(
+                Arg::new("next_upstream")
+                    .long("next-upstream")
+                    .help("Conditions to retry on, e.g. 'error,timeout' or 'off'")
+                    .required(false)
+                    .num_args(1),
+            )
+            .arg(
+                Arg::new("tries")
+                    .long("tries")
+                    .help("Maximum number of candidate attempts (group forward)")
+                    .required(false)
+                    .num_args(1),
+            )
+            .arg(
+                Arg::new("next_upstream_timeout")
+                    .long("next-upstream-timeout")
+                    .help("Total timeout budget across all candidate attempts")
+                    .required(false)
+                    .num_args(1),
+            )
+            .arg(
+                Arg::new("max_fails")
+                    .long("max-fails")
+                    .help("Default per-candidate max_fails before ejection")
+                    .required(false)
+                    .num_args(1),
+            )
+            .arg(
+                Arg::new("fail_timeout")
+                    .long("fail-timeout")
+                    .help("Default per-candidate fail_timeout, e.g. 10s")
+                    .required(false)
+                    .num_args(1),
+            )
+            .arg(
+                Arg::new("group")
+                    .long("group")
+                    .help("Logical name of the upstream group (used for failure state)")
+                    .required(false)
+                    .num_args(1),
+            )
+            .arg(
+                Arg::new("force_group")
+                    .long("force-group")
+                    .help("Always emit forward-group, even for single-URL plans")
+                    .required(false)
+                    .action(ArgAction::SetTrue),
+            )
+            .arg(
+                Arg::new("hash_key")
+                    .long("hash-key")
+                    .help("Captured value used by hash / consistent_hash balance methods")
+                    .required(false)
+                    .num_args(1),
+            )
+            .arg(
+                Arg::new("max_body_buffer")
+                    .long("max-body-buffer")
+                    .help("Max request body bytes to buffer for HTTP-status retry, e.g. 64KB")
+                    .required(false)
+                    .num_args(1),
+            )
+            .arg(
+                Arg::new("server_map")
+                    .long("server-map")
+                    .help("Map collection of <server_id, route-map> for provider-first plans")
+                    .required(false)
+                    .num_args(1),
+            )
+            .arg(
+                Arg::new("provider_retry_scope")
+                    .long("provider-retry-scope")
+                    .help("Provider failover scope: routes_only (default) or across_servers")
                     .required(false)
                     .num_args(1),
             )
@@ -49,6 +148,7 @@ Examples:
             name: "forward".to_string(),
             cmd,
             rr_counter: AtomicUsize::new(0),
+            selector: ForwardSelector::new(),
         }
     }
 
@@ -109,7 +209,10 @@ Examples:
         }
 
         let first = dest_urls[0].as_str();
-        if first == "round_robin" || first == "ip_hash" {
+        if matches!(
+            first,
+            "round_robin" | "rr" | "ip_hash" | "hash" | "consistent_hash" | "least_time"
+        ) {
             return Ok((first.to_string(), dest_urls[1..].to_vec()));
         }
 
@@ -238,20 +341,22 @@ Examples:
         Ok(dest_urls)
     }
 
-    fn collect_map_upstreams_arg(
+    fn collect_map_arg(
         args: &[CollectionValue],
         matches: &clap::ArgMatches,
+        flag: &str,
     ) -> Result<Option<MapCollectionRef>, String> {
-        let Some(index) = matches.index_of("upstream_map") else {
+        let Some(index) = matches.index_of(flag) else {
             return Ok(None);
         };
 
         let arg = args
             .get(index)
-            .ok_or_else(|| format!("Missing upstream map argument at position {}", index))?;
+            .ok_or_else(|| format!("Missing {} argument at position {}", flag, index))?;
         let map = arg.as_map().ok_or_else(|| {
             format!(
-                "Invalid --map argument: expected map collection, got {}",
+                "Invalid --{} argument: expected map collection, got {}",
+                flag.replace('_', "-"),
                 arg.get_type()
             )
         })?;
@@ -339,14 +444,25 @@ Examples:
         hash
     }
 
+    // Source IP lookup order: trusted restored source first, then the
+    // effective source, then the HTTP compat scalar. Keeps one `forward
+    // ip_hash` config working across HTTP and non-HTTP process chains.
     async fn extract_source_ip(context: &Context) -> Option<IpAddr> {
         if let Ok(Some(req)) = context.env().get("REQ", None).await {
             if let Some(req) = req.into_map() {
-                if let Ok(Some(value)) = req.get("source_ip").await {
-                    if let Some(ip) = value.as_str().and_then(|v| v.parse::<IpAddr>().ok()) {
-                        return Some(ip);
+                for key in ["real_source_ip", "source_ip"] {
+                    if let Ok(Some(value)) = req.get(key).await {
+                        if let Some(ip) = value.as_str().and_then(|v| v.parse::<IpAddr>().ok()) {
+                            return Some(ip);
+                        }
                     }
                 }
+            }
+        }
+
+        if let Ok(Some(value)) = context.env().get("REQ_remote_ip", None).await {
+            if let Some(ip) = value.as_str().and_then(|v| v.parse::<IpAddr>().ok()) {
+                return Some(ip);
             }
         }
 
@@ -395,6 +511,302 @@ Examples:
             )),
         }
     }
+
+    fn group_options_present(matches: &clap::ArgMatches) -> bool {
+        matches.contains_id("backup_map")
+            || matches.contains_id("next_upstream")
+            || matches.contains_id("tries")
+            || matches.contains_id("next_upstream_timeout")
+            || matches.contains_id("max_fails")
+            || matches.contains_id("fail_timeout")
+            || matches.contains_id("group")
+            || matches.contains_id("hash_key")
+            || matches.contains_id("max_body_buffer")
+            || matches.contains_id("server_map")
+            || matches.contains_id("provider_retry_scope")
+            || matches.get_flag("force_group")
+    }
+
+    fn parse_optional_str(matches: &clap::ArgMatches, name: &str) -> Option<String> {
+        matches.get_one::<String>(name).cloned()
+    }
+
+    fn build_next_upstream_policy(
+        matches: &clap::ArgMatches,
+    ) -> Result<NextUpstreamPolicy, String> {
+        let conds_spec = Self::parse_optional_str(matches, "next_upstream");
+        let tries_spec = Self::parse_optional_str(matches, "tries");
+        let timeout_spec = Self::parse_optional_str(matches, "next_upstream_timeout");
+        let body_buf_spec = Self::parse_optional_str(matches, "max_body_buffer");
+
+        let (conditions, off_explicit) = match &conds_spec {
+            Some(s) => NextUpstreamPolicy::parse_conditions(s)?,
+            None => (Vec::new(), false),
+        };
+
+        let tries = match tries_spec {
+            Some(s) => s
+                .parse::<u32>()
+                .map_err(|e| format!("invalid --tries '{}': {}", s, e))?,
+            None => {
+                if conditions.is_empty() {
+                    1
+                } else {
+                    // Default to "try every candidate at most once" when retry is enabled.
+                    0
+                }
+            }
+        };
+
+        let timeout = match timeout_spec {
+            Some(s) => Some(parse_duration_str(&s)?),
+            None => None,
+        };
+
+        if off_explicit {
+            return Ok(NextUpstreamPolicy::off());
+        }
+
+        let any_http_status = conditions.iter().any(|c| c.is_http_status());
+        // When HTTP-status retry is enabled, default to a small body
+        // buffer so the executor can replay safely. Callers can opt
+        // out by setting `--max-body-buffer 0`.
+        let max_body_buffer_bytes = match body_buf_spec {
+            Some(s) => parse_size_str(&s)?,
+            None if any_http_status => DEFAULT_MAX_BODY_BUFFER_BYTES,
+            None => 0,
+        };
+
+        Ok(NextUpstreamPolicy {
+            conditions,
+            tries,
+            timeout,
+            max_body_buffer_bytes,
+        })
+    }
+
+    async fn build_targets_from_map(
+        map: &MapCollectionRef,
+        backup: bool,
+        max_fails: u32,
+        fail_timeout: Duration,
+    ) -> Result<Vec<ForwardTarget>, String> {
+        let nodes = Self::parse_upstream_map(map).await?;
+        Ok(nodes
+            .into_iter()
+            .map(|n| ForwardTarget {
+                url: n.url,
+                weight: n.weight,
+                backup,
+                max_fails,
+                fail_timeout,
+                server_id: None,
+            })
+            .collect())
+    }
+
+    /// Build a provider-first server list from a `--server-map` map.
+    /// Outer keys are server ids; the corresponding values must be
+    /// nested `<url, weight>` map collections describing that server's
+    /// routes (§5 of `forward机制升级需求.md`).
+    async fn build_servers_from_map(
+        map: &MapCollectionRef,
+        max_fails: u32,
+        fail_timeout: Duration,
+    ) -> Result<Vec<ForwardServer>, String> {
+        let mut entries = map.dump().await?;
+        entries.sort_by(|left, right| left.0.cmp(&right.0));
+
+        let mut servers = Vec::with_capacity(entries.len());
+        for (server_id, route_value) in entries {
+            let route_map = route_value.as_map().ok_or_else(|| {
+                format!(
+                    "Invalid --server-map entry for '{}': expected nested map of <url, weight>, got {}",
+                    server_id,
+                    route_value.get_type()
+                )
+            })?;
+            let nodes = Self::parse_upstream_map(route_map).await?;
+            if nodes.is_empty() {
+                return Err(format!(
+                    "Invalid --server-map entry for '{}': route map is empty",
+                    server_id
+                ));
+            }
+            let routes = nodes
+                .into_iter()
+                .map(|n| ForwardTarget {
+                    url: n.url,
+                    weight: n.weight,
+                    backup: false,
+                    max_fails,
+                    fail_timeout,
+                    server_id: Some(server_id.clone()),
+                })
+                .collect();
+            servers.push(ForwardServer {
+                id: server_id,
+                weight: 1,
+                backup: false,
+                routes,
+                max_fails,
+                fail_timeout,
+            });
+        }
+        Ok(servers)
+    }
+
+    fn build_targets_from_inline(
+        nodes: Vec<UpstreamNode>,
+        backup: bool,
+        max_fails: u32,
+        fail_timeout: Duration,
+    ) -> Vec<ForwardTarget> {
+        nodes
+            .into_iter()
+            .map(|n| ForwardTarget {
+                url: n.url,
+                weight: n.weight,
+                backup,
+                max_fails,
+                fail_timeout,
+                server_id: None,
+            })
+            .collect()
+    }
+
+    async fn build_group_plan(
+        &self,
+        context: &Context,
+        matches: &clap::ArgMatches,
+        algo: &str,
+        inline_nodes: Vec<UpstreamNode>,
+        primary_map: Option<MapCollectionRef>,
+        backup_map: Option<MapCollectionRef>,
+        server_map: Option<MapCollectionRef>,
+    ) -> Result<ForwardPlan, String> {
+        let max_fails = match Self::parse_optional_str(matches, "max_fails") {
+            Some(s) => s
+                .parse::<u32>()
+                .map_err(|e| format!("invalid --max-fails '{}': {}", s, e))?,
+            None => 1,
+        };
+        let fail_timeout = match Self::parse_optional_str(matches, "fail_timeout") {
+            Some(s) => parse_duration_str(&s)?,
+            None => Duration::from_secs(10),
+        };
+
+        let servers = match server_map {
+            Some(map) => Self::build_servers_from_map(&map, max_fails, fail_timeout).await?,
+            None => Vec::new(),
+        };
+
+        // Provider-first plan: server-map expands into the flat candidate
+        // list (with server_id retained for retry-scope decisions). Inline
+        // nodes / --map / --backup-map remain available alongside servers
+        // and are concatenated after server-derived candidates so the
+        // executor still sees a single attempt order.
+        let mut candidates = Vec::new();
+        if !servers.is_empty() {
+            candidates.extend(ForwardPlan::candidates_from_servers(&servers));
+        }
+        candidates.extend(Self::build_targets_from_inline(
+            inline_nodes,
+            false,
+            max_fails,
+            fail_timeout,
+        ));
+        if let Some(map) = primary_map {
+            candidates
+                .extend(Self::build_targets_from_map(&map, false, max_fails, fail_timeout).await?);
+        }
+        if let Some(map) = backup_map {
+            candidates
+                .extend(Self::build_targets_from_map(&map, true, max_fails, fail_timeout).await?);
+        }
+
+        if candidates.is_empty() {
+            return Err(
+                "forward requires at least one upstream, --map or --server-map".to_string(),
+            );
+        }
+
+        // Resolve the balance method. For hash variants the executor
+        // needs the value of `--hash-key` so the captured key is what
+        // routes the request — `algo` is just a marker.
+        let balance = match algo {
+            "hash" => {
+                let key = Self::parse_optional_str(matches, "hash_key")
+                    .ok_or_else(|| "hash balance method requires --hash-key".to_string())?;
+                BalanceMethod::Hash { key }
+            }
+            "consistent_hash" => {
+                let key = Self::parse_optional_str(matches, "hash_key").ok_or_else(|| {
+                    "consistent_hash balance method requires --hash-key".to_string()
+                })?;
+                BalanceMethod::ConsistentHash { key }
+            }
+            _ => BalanceMethod::parse(algo)?,
+        };
+
+        let next_upstream = Self::build_next_upstream_policy(matches)?;
+        let group = Self::parse_optional_str(matches, "group");
+        let provider_policy = match Self::parse_optional_str(matches, "provider_retry_scope") {
+            Some(s) => match s.as_str() {
+                "routes_only" => ProviderPolicy {
+                    retry_scope: crate::forward::ProviderRouteRetry::RoutesOnly,
+                },
+                "across_servers" => ProviderPolicy {
+                    retry_scope: crate::forward::ProviderRouteRetry::AcrossServers,
+                },
+                _ => {
+                    return Err(format!(
+                        "invalid --provider-retry-scope '{}': expected routes_only or across_servers",
+                        s
+                    ));
+                }
+            },
+            None => ProviderPolicy::default(),
+        };
+
+        let hash_key_value = match &balance {
+            BalanceMethod::Hash { .. } | BalanceMethod::ConsistentHash { .. } => {
+                Self::parse_optional_str(matches, "hash_key")
+            }
+            _ => None,
+        };
+
+        let mut plan = ForwardPlan {
+            group,
+            balance,
+            next_upstream,
+            candidates,
+            hash_key_value,
+            servers,
+            provider_policy,
+        };
+        plan.validate()?;
+
+        // Apply selector to produce an attempt-ordered candidate list.
+        // `LeastTime` plans are not RTT-sorted here: that step lives in
+        // the executor where a `TunnelManager` is available. The
+        // selector treats `LeastTime` as a no-op for ordering.
+        let source_ip = match &plan.balance {
+            BalanceMethod::IpHash => Self::extract_source_ip(context).await,
+            _ => None,
+        };
+        let registry = ForwardFailureRegistry::global();
+        let ordered = self.selector.select(&plan, registry, source_ip);
+        plan.candidates = ordered;
+
+        // Cap tries to the number of candidates we actually have.
+        let cap = plan.candidates.len() as u32;
+        if plan.next_upstream.tries == 0 || plan.next_upstream.tries > cap {
+            plan.next_upstream.tries = cap.max(1);
+        }
+
+        Ok(plan)
+    }
 }
 
 #[async_trait::async_trait]
@@ -422,13 +834,43 @@ impl ExternalCommand for Forward {
 
         let (_algo, upstream_specs) = Self::split_algo_and_upstreams(dest_urls)?;
         let has_map = matches.index_of("upstream_map").is_some();
+        let has_backup_map = matches.index_of("backup_map").is_some();
 
-        if upstream_specs.is_empty() && !has_map {
+        if upstream_specs.is_empty() && !has_map && !has_backup_map {
             return Err("forward requires at least one upstream or --map".to_string());
         }
 
         if upstream_specs.len() > 1 {
             Self::parse_upstreams(upstream_specs)?;
+        }
+
+        if let Some(s) = matches.get_one::<String>("next_upstream") {
+            NextUpstreamPolicy::parse_conditions(s)?;
+        }
+        if let Some(s) = matches.get_one::<String>("tries") {
+            s.parse::<u32>()
+                .map_err(|e| format!("invalid --tries '{}': {}", s, e))?;
+        }
+        if let Some(s) = matches.get_one::<String>("next_upstream_timeout") {
+            parse_duration_str(s)?;
+        }
+        if let Some(s) = matches.get_one::<String>("max_fails") {
+            s.parse::<u32>()
+                .map_err(|e| format!("invalid --max-fails '{}': {}", s, e))?;
+        }
+        if let Some(s) = matches.get_one::<String>("fail_timeout") {
+            parse_duration_str(s)?;
+        }
+        if let Some(s) = matches.get_one::<String>("max_body_buffer") {
+            parse_size_str(s)?;
+        }
+        if let Some(s) = matches.get_one::<String>("provider_retry_scope") {
+            if !matches!(s.as_str(), "routes_only" | "across_servers") {
+                return Err(format!(
+                    "invalid --provider-retry-scope '{}': expected routes_only or across_servers",
+                    s
+                ));
+            }
         }
 
         Ok(())
@@ -453,14 +895,53 @@ impl ExternalCommand for Forward {
             })?;
 
         let dest_urls = Self::collect_inline_upstream_specs(args, &matches)?;
-        let upstream_map = Self::collect_map_upstreams_arg(args, &matches)?;
+        let primary_map = Self::collect_map_arg(args, &matches, "upstream_map")?;
+        let backup_map = Self::collect_map_arg(args, &matches, "backup_map")?;
+        let server_map = Self::collect_map_arg(args, &matches, "server_map")?;
 
         let (algo, inline_upstream_specs) = Self::split_algo_and_upstreams(dest_urls)?;
-        let mut upstreams = Vec::new();
-        if !inline_upstream_specs.is_empty() {
-            upstreams.extend(Self::parse_upstreams(inline_upstream_specs)?);
+        let inline_nodes = if inline_upstream_specs.is_empty() {
+            Vec::new()
+        } else {
+            Self::parse_upstreams(inline_upstream_specs)?
+        };
+
+        let want_group = Self::group_options_present(&matches)
+            || matches!(algo.as_str(), "hash" | "consistent_hash" | "least_time");
+        let force_group = matches.get_flag("force_group");
+
+        if want_group {
+            let plan = self
+                .build_group_plan(
+                    context,
+                    &matches,
+                    algo.as_str(),
+                    inline_nodes,
+                    primary_map,
+                    backup_map,
+                    server_map,
+                )
+                .await?;
+            // Single-URL group plans degrade to plain `forward "<url>"` for
+            // backward compatibility with executors that haven't been
+            // upgraded yet, unless --force-group is set.
+            if plan.is_single_url() && !force_group {
+                let url = plan.candidates[0].url.clone();
+                return Ok(CommandResult::return_with_string(
+                    CommandControlLevel::Lib,
+                    format!(r#"{} "{}""#, FORWARD_CMD, url),
+                ));
+            }
+            let encoded = plan.encode()?;
+            return Ok(CommandResult::return_with_string(
+                CommandControlLevel::Lib,
+                format!(r#"{} "{}""#, FORWARD_GROUP_CMD, encoded),
+            ));
         }
-        if let Some(map) = upstream_map {
+
+        // Legacy single-URL selection path.
+        let mut upstreams = inline_nodes;
+        if let Some(map) = primary_map {
             upstreams.extend(Self::parse_upstream_map(&map).await?);
         }
 
@@ -477,7 +958,7 @@ impl ExternalCommand for Forward {
 
         Ok(CommandResult::return_with_string(
             CommandControlLevel::Lib,
-            format!(r#"forward "{}""#, selected),
+            format!(r#"{} "{}""#, FORWARD_CMD, selected),
         ))
     }
 }
@@ -485,7 +966,112 @@ impl ExternalCommand for Forward {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cyfs_process_chain::{CollectionValue, CommandArg, CommandArgs, MemoryMapCollection};
+    use crate::global_process_chains::{create_process_chain_executor, execute_stream_chain};
+    use crate::{ProcessChainConfigs, ServerManager, get_external_commands};
+    use cyfs_process_chain::{
+        CollectionValue, CommandArg, CommandArgs, CommandControl, MemoryMapCollection,
+        StreamRequest,
+    };
+    use std::sync::{Arc, Mutex};
+
+    /// Run a stream chain with `forward ip_hash` over two weight-1 upstreams
+    /// and return the selected URL (None when selection failed).
+    ///
+    /// nginx_ip_hash picks the FIRST upstream for 203.0.113.9 and the SECOND
+    /// for 10.0.0.1, so the selected URL reveals which source IP was used.
+    async fn run_ip_hash_chain(
+        mut request: StreamRequest,
+        remote_ip_env: Option<&str>,
+    ) -> Option<String> {
+        let chains = r#"
+- id: main
+  priority: 1
+  blocks:
+    - id: main
+      block: |
+        forward ip_hash "tcp:///10.0.0.1:1000,weight=1" "tcp:///10.0.0.2:1000,weight=1";
+"#;
+        let chains: ProcessChainConfigs = serde_yaml_ng::from_str(chains).unwrap();
+        let servers = Arc::new(ServerManager::new());
+        let (executor, _hook_env) = create_process_chain_executor(
+            &chains,
+            None,
+            None,
+            Some(get_external_commands(Arc::downgrade(&servers))),
+            None,
+        )
+        .await
+        .unwrap();
+        if let Some(ip) = remote_ip_env {
+            executor
+                .global_env()
+                .create("REQ_remote_ip", CollectionValue::String(ip.to_string()))
+                .await
+                .unwrap();
+        }
+        let (client, _server) = tokio::io::duplex(16);
+        request.incoming_stream = Arc::new(Mutex::new(Some(Box::new(client))));
+
+        let ret = match execute_stream_chain(executor, request).await {
+            Ok((ret, _stream)) => ret,
+            Err(_) => return None,
+        };
+        if let Some(CommandControl::Return(ret)) = ret.as_control() {
+            if let CollectionValue::String(value) = &ret.value {
+                let list = shlex::split(value.as_str())?;
+                if list.len() == 2 && list[0] == "forward" {
+                    return Some(list[1].clone());
+                }
+            }
+        }
+        None
+    }
+
+    const FIRST_UPSTREAM: &str = "tcp:///10.0.0.1:1000";
+    const SECOND_UPSTREAM: &str = "tcp:///10.0.0.2:1000";
+
+    #[tokio::test]
+    async fn test_ip_hash_prefers_real_source_ip() {
+        // real_source_ip (203.0.113.9 -> first) must win over
+        // source_ip (10.0.0.1 -> second).
+        let mut request = StreamRequest::default();
+        request.source_addr = Some("10.0.0.1:80".parse().unwrap());
+        request.real_source_addr = Some("203.0.113.9:70".parse().unwrap());
+        let selected = run_ip_hash_chain(request, None).await;
+        assert_eq!(selected.as_deref(), Some(FIRST_UPSTREAM));
+    }
+
+    #[tokio::test]
+    async fn test_ip_hash_uses_source_ip_without_real_source() {
+        let mut request = StreamRequest::default();
+        request.source_addr = Some("10.0.0.1:80".parse().unwrap());
+        let selected = run_ip_hash_chain(request, None).await;
+        assert_eq!(selected.as_deref(), Some(SECOND_UPSTREAM));
+    }
+
+    #[tokio::test]
+    async fn test_ip_hash_falls_back_to_req_remote_ip() {
+        // No REQ source fields at all (HTTP-style env): the scalar
+        // REQ_remote_ip compat variable must be used.
+        let request = StreamRequest::default();
+        let selected = run_ip_hash_chain(request, Some("203.0.113.9")).await;
+        assert_eq!(selected.as_deref(), Some(FIRST_UPSTREAM));
+    }
+
+    #[tokio::test]
+    async fn test_ip_hash_prefers_req_source_ip_over_remote_ip_env() {
+        let mut request = StreamRequest::default();
+        request.source_addr = Some("10.0.0.1:80".parse().unwrap());
+        let selected = run_ip_hash_chain(request, Some("203.0.113.9")).await;
+        assert_eq!(selected.as_deref(), Some(SECOND_UPSTREAM));
+    }
+
+    #[tokio::test]
+    async fn test_ip_hash_without_any_source_fails() {
+        let request = StreamRequest::default();
+        let selected = run_ip_hash_chain(request, None).await;
+        assert_eq!(selected, None);
+    }
 
     #[tokio::test]
     async fn test_parse_upstream_map_supports_string_and_number_weights() {
@@ -537,6 +1123,87 @@ mod tests {
         ]);
 
         forward.check(&args).unwrap();
+    }
+
+    #[test]
+    fn test_check_accepts_group_flags() {
+        let forward = Forward::new();
+        let args = CommandArgs::new(vec![
+            CommandArg::Literal("forward".to_string()),
+            CommandArg::Literal("--map".to_string()),
+            CommandArg::Var("$UPSTREAMS".to_string()),
+            CommandArg::Literal("--backup-map".to_string()),
+            CommandArg::Var("$BACKUP".to_string()),
+            CommandArg::Literal("--next-upstream".to_string()),
+            CommandArg::Literal("error,timeout".to_string()),
+            CommandArg::Literal("--tries".to_string()),
+            CommandArg::Literal("3".to_string()),
+            CommandArg::Literal("--fail-timeout".to_string()),
+            CommandArg::Literal("10s".to_string()),
+        ]);
+
+        forward.check(&args).unwrap();
+    }
+
+    #[test]
+    fn test_check_rejects_unknown_next_upstream_condition() {
+        let forward = Forward::new();
+        let args = CommandArgs::new(vec![
+            CommandArg::Literal("forward".to_string()),
+            CommandArg::Literal("tcp:///127.0.0.1:80".to_string()),
+            CommandArg::Literal("--next-upstream".to_string()),
+            CommandArg::Literal("error,foo".to_string()),
+        ]);
+
+        assert!(forward.check(&args).is_err());
+    }
+
+    #[test]
+    fn test_check_accepts_status_retry_flags() {
+        let forward = Forward::new();
+        let args = CommandArgs::new(vec![
+            CommandArg::Literal("forward".to_string()),
+            CommandArg::Literal("--map".to_string()),
+            CommandArg::Var("$UPSTREAMS".to_string()),
+            CommandArg::Literal("--next-upstream".to_string()),
+            CommandArg::Literal("error,timeout,http_5xx,non_idempotent".to_string()),
+            CommandArg::Literal("--tries".to_string()),
+            CommandArg::Literal("3".to_string()),
+            CommandArg::Literal("--max-body-buffer".to_string()),
+            CommandArg::Literal("128KB".to_string()),
+        ]);
+
+        forward.check(&args).unwrap();
+    }
+
+    #[test]
+    fn test_check_accepts_hash_and_least_time_algos() {
+        let forward = Forward::new();
+        for algo in ["hash", "consistent_hash", "least_time"] {
+            let args = CommandArgs::new(vec![
+                CommandArg::Literal("forward".to_string()),
+                CommandArg::Literal(algo.to_string()),
+                CommandArg::Literal("--map".to_string()),
+                CommandArg::Var("$UPSTREAMS".to_string()),
+                CommandArg::Literal("--hash-key".to_string()),
+                CommandArg::Literal("user-42".to_string()),
+            ]);
+            forward.check(&args).unwrap();
+        }
+    }
+
+    #[test]
+    fn test_check_rejects_invalid_provider_retry_scope() {
+        let forward = Forward::new();
+        let args = CommandArgs::new(vec![
+            CommandArg::Literal("forward".to_string()),
+            CommandArg::Literal("--map".to_string()),
+            CommandArg::Var("$UPSTREAMS".to_string()),
+            CommandArg::Literal("--provider-retry-scope".to_string()),
+            CommandArg::Literal("invalid".to_string()),
+        ]);
+
+        assert!(forward.check(&args).is_err());
     }
 
     #[test]

@@ -1,8 +1,9 @@
-use super::cmd::*;
+use super::types::*;
 use crate::block::{AssignKind, CommandArg, CommandArgs};
 use crate::chain::EnvLevel;
 use crate::chain::{Context, ParserContext};
 use clap::{Arg, ArgAction, Command};
+use std::str::FromStr;
 use std::sync::Arc;
 
 pub struct AssignCommandParser {
@@ -73,7 +74,7 @@ impl CommandParser for AssignCommandParser {
             msg
         })?;
 
-        let kind = AssignKind::from_str(&kind).map_err(|e| {
+        let kind = AssignKind::from_str(kind).map_err(|e| {
             let msg = format!("Invalid assign command kind: {:?}, {}", args[0], e);
             error!("{}", msg);
             msg

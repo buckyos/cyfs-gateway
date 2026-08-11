@@ -3,34 +3,179 @@ use super::http_compression::{
     apply_response_compression,
 };
 use super::{into_server_err, server_err};
+use crate::forward::{
+    BalanceMethod, ForwardFailureRegistry, ForwardPlan, HttpMethodClass, NextUpstreamCondition,
+    apply_least_time_via_tunnel_mgr,
+};
 use crate::global_process_chains::{GlobalProcessChainsRef, create_process_chain_executor};
-use crate::tunnel_connector::TunnelConnector;
+use crate::tunnel_url_status::TunnelFailureReason;
 use crate::{
     GlobalCollectionManagerRef, HttpRequestHeaderMap, HttpRequestProcessChainVars,
-    HttpResponseHeaderMap, HttpServer,
-    JsExternalsManagerRef, ProcessChainConfigs, Server, ServerConfig, ServerContext,
-    ServerContextRef, ServerError, ServerErrorCode, ServerFactory, ServerManagerWeakRef,
-    ServerResult, StreamInfo, TunnelManager, get_external_commands,
+    HttpResponseHeaderMap, HttpServer, JsExternalsManagerRef, ProcessChainConfigs,
+    RequestSourceInfo, Server, ServerConfig, ServerContext, ServerContextRef, ServerError,
+    ServerErrorCode, ServerFactory, ServerManagerWeakRef, ServerResult, StreamInfo, TunnelManager,
+    get_external_commands,
 };
-use cyfs_process_chain::{CollectionValue, CommandControl, ProcessChainLibExecutor};
+use cyfs_process_chain::{CollectionValue, CommandControl, EnvRef, ProcessChainLibExecutor};
 use http::Version;
 use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full};
 use hyper::body::Bytes;
 use hyper::{Request, StatusCode, http};
-use hyper_util::client::legacy::Client;
-use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::rt::TokioIo;
 use regex::Regex;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{ClientConfig, DigitallySignedStruct, Error as TlsError, SignatureScheme};
 use serde::{Deserialize, Serialize};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use tokio::net::{TcpStream, lookup_host};
 use tokio::time::{Duration, timeout};
 use tokio_rustls::TlsConnector;
 use url::Url;
+
+/// A trusted upstream entry: a single IP (`10.0.0.1`) or a CIDR block
+/// (`10.0.0.0/8`, `fd00::/8`).
+#[derive(Debug, Clone)]
+pub struct TrustedUpstreamMatcher {
+    network: IpAddr,
+    prefix_len: u8,
+}
+
+impl TrustedUpstreamMatcher {
+    pub fn parse(pattern: &str) -> Result<Self, String> {
+        let pattern = pattern.trim();
+        let (addr_str, prefix) = match pattern.split_once('/') {
+            Some((addr, prefix)) => {
+                let prefix: u8 = prefix
+                    .parse()
+                    .map_err(|_| format!("invalid CIDR prefix in '{}'", pattern))?;
+                (addr, Some(prefix))
+            }
+            None => (pattern, None),
+        };
+        let network: IpAddr = addr_str
+            .trim()
+            .parse()
+            .map_err(|_| format!("invalid IP address in '{}'", pattern))?;
+        let max_prefix = match network {
+            IpAddr::V4(_) => 32,
+            IpAddr::V6(_) => 128,
+        };
+        let prefix_len = prefix.unwrap_or(max_prefix);
+        if prefix_len > max_prefix {
+            return Err(format!("CIDR prefix out of range in '{}'", pattern));
+        }
+        Ok(Self {
+            network,
+            prefix_len,
+        })
+    }
+
+    pub fn matches(&self, ip: &IpAddr) -> bool {
+        fn prefix_eq(a: &[u8], b: &[u8], prefix_len: u8) -> bool {
+            let full = (prefix_len / 8) as usize;
+            let rem = prefix_len % 8;
+            if a[..full] != b[..full] {
+                return false;
+            }
+            if rem == 0 {
+                return true;
+            }
+            let mask = 0xffu8 << (8 - rem);
+            (a[full] & mask) == (b[full] & mask)
+        }
+        match (&self.network, ip) {
+            (IpAddr::V4(net), IpAddr::V4(ip)) => {
+                prefix_eq(&net.octets(), &ip.octets(), self.prefix_len)
+            }
+            (IpAddr::V6(net), IpAddr::V6(ip)) => {
+                prefix_eq(&net.octets(), &ip.octets(), self.prefix_len)
+            }
+            _ => false,
+        }
+    }
+}
+
+pub fn parse_trusted_upstreams(patterns: &[String]) -> ServerResult<Vec<TrustedUpstreamMatcher>> {
+    patterns
+        .iter()
+        .map(|pattern| {
+            TrustedUpstreamMatcher::parse(pattern)
+                .map_err(|e| server_err!(ServerErrorCode::InvalidConfig, "{}", e))
+        })
+        .collect()
+}
+
+fn parse_forwarded_entry(entry: &str) -> Option<(String, IpAddr)> {
+    let entry = entry.trim();
+    if entry.is_empty() {
+        return None;
+    }
+    if let Ok(addr) = entry.parse::<SocketAddr>() {
+        return Some((entry.to_string(), addr.ip()));
+    }
+    if let Ok(ip) = entry.parse::<IpAddr>() {
+        return Some((entry.to_string(), ip));
+    }
+    None
+}
+
+/// Derive the original client address from forwarded headers sent by a
+/// trusted upstream. Walks `X-Forwarded-For` right-to-left, skipping trusted
+/// hops; the first untrusted entry is the client (if every entry is trusted,
+/// the leftmost one is used). A malformed entry poisons the whole header.
+/// Falls back to `X-Real-IP` (+ optional `X-Real-Port`).
+fn resolve_trusted_forwarded_source(
+    headers: &http::HeaderMap,
+    trusted: &[TrustedUpstreamMatcher],
+) -> Option<String> {
+    let mut entries: Vec<String> = Vec::new();
+    for value in headers.get_all("x-forwarded-for") {
+        if let Ok(value) = value.to_str() {
+            entries.extend(
+                value
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty()),
+            );
+        }
+    }
+
+    let mut candidate: Option<String> = None;
+    for entry in entries.iter().rev() {
+        match parse_forwarded_entry(entry) {
+            Some((addr, ip)) => {
+                candidate = Some(addr);
+                if !trusted.iter().any(|m| m.matches(&ip)) {
+                    break;
+                }
+            }
+            None => {
+                candidate = None;
+                break;
+            }
+        }
+    }
+    if candidate.is_some() {
+        return candidate;
+    }
+
+    let real_ip = headers.get("x-real-ip")?.to_str().ok()?.trim().to_string();
+    if let Ok(addr) = real_ip.parse::<SocketAddr>() {
+        return Some(addr.to_string());
+    }
+    let ip = real_ip.parse::<IpAddr>().ok()?;
+    if let Some(port) = headers
+        .get("x-real-port")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().parse::<u16>().ok())
+    {
+        return Some(SocketAddr::new(ip, port).to_string());
+    }
+    Some(ip.to_string())
+}
 
 pub struct ProcessChainHttpServerBuilder {
     id: Option<String>,
@@ -44,6 +189,7 @@ pub struct ProcessChainHttpServerBuilder {
     tunnel_manager: Option<TunnelManager>,
     global_collection_manager: Option<GlobalCollectionManagerRef>,
     compression: HttpCompressionSettings,
+    trusted_upstreams: Vec<String>,
 }
 
 // Add setter methods for HttpServerBuilder
@@ -106,6 +252,14 @@ impl ProcessChainHttpServerBuilder {
         self
     }
 
+    /// Upstream IPs/CIDRs whose `X-Forwarded-For` / `X-Real-IP` headers may be
+    /// converted into `real_source_*`. Forwarded headers from any other peer
+    /// are treated as plain input data.
+    pub fn trusted_upstreams(mut self, trusted_upstreams: Vec<String>) -> Self {
+        self.trusted_upstreams = trusted_upstreams;
+        self
+    }
+
     pub async fn build(self) -> ServerResult<ProcessChainHttpServer> {
         ProcessChainHttpServer::create_server(self).await
     }
@@ -151,6 +305,7 @@ pub struct ProcessChainHttpServer {
     post_executor: Option<Arc<Mutex<ProcessChainLibExecutor>>>,
     tunnel_manager: TunnelManager,
     compression: HttpCompressionSettings,
+    trusted_upstreams: Vec<TrustedUpstreamMatcher>,
 }
 
 #[derive(Debug)]
@@ -236,59 +391,120 @@ impl ProcessChainHttpServer {
     }
 
     fn upstream_sni_host(request_url: &Url) -> ServerResult<String> {
-        request_url.host_str().map(|h| h.to_string()).ok_or_else(|| {
-            server_err!(
-                ServerErrorCode::InvalidConfig,
-                "Missing SNI host for upstream: {}",
-                request_url
-            )
-        })
+        request_url
+            .host_str()
+            .map(|h| h.to_string())
+            .ok_or_else(|| {
+                server_err!(
+                    ServerErrorCode::InvalidConfig,
+                    "Missing SNI host for upstream: {}",
+                    request_url
+                )
+            })
+    }
+
+    /// Connect outcome carrying the bucket needed for tunnel_mgr history
+    /// classification (§6.7.3). Used by `connect_upstream_with_fallback`
+    /// so callers can write the right `TunnelFailureReason` without
+    /// re-parsing error strings.
+    fn classify_connect_errors(errors: &[(String, String, bool)]) -> TunnelFailureReason {
+        // errors: (addr, message, is_timeout)
+        // Prefer the most specific bucket. ConnectRefused beats Timeout
+        // beats anything else, since refusal is a definitive signal that
+        // the host exists but isn't listening.
+        let mut saw_refused = false;
+        let mut saw_timeout = false;
+        for (_, msg, is_timeout) in errors {
+            if *is_timeout {
+                saw_timeout = true;
+            } else if msg.to_ascii_lowercase().contains("refused") {
+                saw_refused = true;
+            }
+        }
+        if saw_refused {
+            TunnelFailureReason::ConnectRefused
+        } else if saw_timeout {
+            TunnelFailureReason::ConnectTimeout
+        } else {
+            TunnelFailureReason::PreConnectRoute
+        }
     }
 
     async fn connect_upstream_candidates(
         candidates: Vec<SocketAddr>,
-    ) -> ServerResult<(TcpStream, SocketAddr)> {
+    ) -> Result<(TcpStream, SocketAddr), (TunnelFailureReason, String)> {
         if candidates.is_empty() {
-            return Err(server_err!(
-                ServerErrorCode::InvalidConfig,
-                "No upstream socket addresses resolved"
+            return Err((
+                TunnelFailureReason::PreConnectDns,
+                "No upstream socket addresses resolved".to_string(),
             ));
         }
 
-        let mut errors = Vec::new();
+        let mut errors: Vec<(String, String, bool)> = Vec::new();
         for addr in candidates {
-            match timeout(Self::HTTPS_UPSTREAM_CONNECT_TIMEOUT, TcpStream::connect(addr)).await {
+            match timeout(
+                Self::HTTPS_UPSTREAM_CONNECT_TIMEOUT,
+                TcpStream::connect(addr),
+            )
+            .await
+            {
                 Ok(Ok(stream)) => return Ok((stream, addr)),
-                Ok(Err(err)) => errors.push(format!("{} ({})", addr, err)),
-                Err(_) => errors.push(format!("{} (connect timeout)", addr)),
+                Ok(Err(err)) => errors.push((addr.to_string(), err.to_string(), false)),
+                Err(_) => errors.push((addr.to_string(), "connect timeout".to_string(), true)),
             }
         }
 
-        Err(server_err!(
-            ServerErrorCode::InvalidConfig,
-            "Failed to connect upstream candidates: {}",
-            errors.join(", ")
-        ))
+        let reason = Self::classify_connect_errors(&errors);
+        let msg = errors
+            .into_iter()
+            .map(|(a, m, _)| format!("{} ({})", a, m))
+            .collect::<Vec<_>>()
+            .join(", ");
+        Err((reason, msg))
     }
 
     async fn connect_upstream_with_fallback(
         connect_host: &str,
         connect_port: u16,
-    ) -> ServerResult<(TcpStream, SocketAddr)> {
-        let candidates: Vec<SocketAddr> = lookup_host((connect_host, connect_port))
-            .await
-            .map_err(|e| {
-                server_err!(
-                    ServerErrorCode::InvalidConfig,
-                    "Failed to resolve upstream {}:{}: {}",
-                    connect_host,
-                    connect_port,
-                    e
-                )
-            })?
-            .collect();
-
+    ) -> Result<(TcpStream, SocketAddr), (TunnelFailureReason, String)> {
+        let candidates: Vec<SocketAddr> = match lookup_host((connect_host, connect_port)).await {
+            Ok(it) => it.collect(),
+            Err(e) => {
+                return Err((
+                    TunnelFailureReason::PreConnectDns,
+                    format!("resolve {}:{} failed: {}", connect_host, connect_port, e),
+                ));
+            }
+        };
         Self::connect_upstream_candidates(candidates).await
+    }
+
+    /// Best-effort: parse a candidate URL string into a `Url` suitable
+    /// as the tunnel_mgr history key. Returns `None` if parsing fails;
+    /// callers fall back to skipping history writeback in that case
+    /// (we never want history bookkeeping to mask the real error).
+    fn upstream_history_key(target_url: &str) -> Option<Url> {
+        Url::parse(target_url).ok()
+    }
+
+    fn origin_form_uri(raw_uri: &str) -> String {
+        if raw_uri.starts_with('/') {
+            return raw_uri.to_string();
+        }
+
+        if let Ok(url) = Url::parse(raw_uri) {
+            let mut origin = url.path().to_string();
+            if origin.is_empty() {
+                origin.push('/');
+            }
+            if let Some(query) = url.query() {
+                origin.push('?');
+                origin.push_str(query);
+            }
+            return origin;
+        }
+
+        raw_uri.to_string()
     }
 
     pub fn builder() -> ProcessChainHttpServerBuilder {
@@ -304,6 +520,7 @@ impl ProcessChainHttpServer {
             tunnel_manager: None,
             global_collection_manager: None,
             compression: HttpCompressionSettings::default(),
+            trusted_upstreams: Vec::new(),
         }
     }
 
@@ -380,6 +597,7 @@ impl ProcessChainHttpServer {
         } else {
             None
         };
+        let trusted_upstreams = parse_trusted_upstreams(&builder.trusted_upstreams)?;
         Ok(ProcessChainHttpServer {
             id: builder.id.unwrap(),
             version,
@@ -389,6 +607,7 @@ impl ProcessChainHttpServer {
             post_executor,
             tunnel_manager: builder.tunnel_manager.unwrap(),
             compression: builder.compression,
+            trusted_upstreams,
         })
     }
 
@@ -427,15 +646,56 @@ impl ProcessChainHttpServer {
         target_url: &str,
         info: &StreamInfo,
     ) -> ServerResult<http::Response<BoxBody<Bytes, ServerError>>> {
-        let org_url = req.uri().to_string();
+        let mut slot = Some(req);
+        self.forward_to_candidate(&mut slot, target_url, info).await
+    }
+
+    /// Forward the request held by `req_slot` to `target_url`.
+    ///
+    /// Per §6.3 of `forward机制升级需求.md` the caller must distinguish
+    /// connect-stage failures (retryable on next candidate) from
+    /// after-body-consumed failures (not retryable). This is signalled
+    /// through `req_slot`:
+    /// - `Ok(resp)`: `*req_slot == None`. The body has been sent.
+    /// - `Err(_)` with `*req_slot == Some(_)`: failure occurred during
+    ///   DNS / TCP / TLS / http1 handshake / tunnel open. The body is
+    ///   intact and the caller may retry against another candidate.
+    /// - `Err(_)` with `*req_slot == None`: failure occurred after the
+    ///   body started transmitting. Not retryable.
+    async fn forward_to_candidate(
+        &self,
+        req_slot: &mut Option<http::Request<BoxBody<Bytes, ServerError>>>,
+        target_url: &str,
+        info: &StreamInfo,
+    ) -> ServerResult<http::Response<BoxBody<Bytes, ServerError>>> {
+        let (org_url, mut header, method, version, host_header) = {
+            let req_ref = req_slot
+                .as_ref()
+                .expect("forward_to_candidate: req_slot must be Some on entry");
+            let mut h = req_ref.headers().clone();
+            Self::inject_forward_headers(&mut h, info);
+            let host = req_ref
+                .headers()
+                .get("host")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string());
+            (
+                req_ref.uri().to_string(),
+                h,
+                req_ref.method().clone(),
+                req_ref.version(),
+                host,
+            )
+        };
+        let client_origin_uri = Self::origin_form_uri(org_url.as_str());
         // Trim URL boundary slashes so we don't end up with "//" when target_url ends with '/'
-        // and org_url starts with '/'.
-        let raw_url = if target_url.ends_with('/') || org_url.starts_with('/') {
+        // and the request path starts with '/'.
+        let raw_url = if target_url.ends_with('/') || client_origin_uri.starts_with('/') {
             let base = target_url.trim_end_matches('/');
-            let path = org_url.trim_start_matches('/');
+            let path = client_origin_uri.trim_start_matches('/');
             format!("{}/{}", base, path)
         } else {
-            format!("{}{}", target_url, org_url)
+            format!("{}{}", target_url, client_origin_uri)
         };
         let request_url = Url::parse(&raw_url).map_err(|e| {
             server_err!(
@@ -445,22 +705,104 @@ impl ProcessChainHttpServer {
                 e
             )
         })?;
+        let upstream_origin_uri = Self::origin_form_uri(request_url.as_str());
         debug!("handle_upstream url: {}", request_url);
+        // Per §6.7 we report the outcome of every business attempt to
+        // tunnel_mgr against the *candidate* URL (target_url), not the
+        // joined request_url with the user's path. Otherwise every
+        // distinct path becomes a separate history entry. Skip writeback
+        // when the candidate URL fails to parse — that's a config error,
+        // not a reachability signal.
+        let history_key = Self::upstream_history_key(target_url);
         let scheme = request_url.scheme();
         match scheme {
             "http" => {
-                let client: Client<_, BoxBody<Bytes, Box<dyn std::error::Error + Send + Sync>>> =
-                    Client::builder(TokioExecutor::new()).build_http();
-                let mut header = req.headers().clone();
-                Self::inject_forward_headers(&mut header, info);
-                let method = req.method().clone();
+                let connect_host = request_url.host_str().ok_or_else(|| {
+                    server_err!(
+                        ServerErrorCode::InvalidConfig,
+                        "Missing upstream host in url: {}",
+                        request_url
+                    )
+                })?;
+                let connect_port = request_url.port_or_known_default().ok_or_else(|| {
+                    server_err!(
+                        ServerErrorCode::InvalidConfig,
+                        "Missing upstream port in url: {}",
+                        request_url
+                    )
+                })?;
+
+                // Pre-flight TCP connect to validate reachability before
+                // the body is consumed. Failure here keeps `req_slot`
+                // intact so the caller can retry on another candidate
+                // per §6.3.
+                let started = std::time::Instant::now();
+                let (tcp_stream, connected_addr) =
+                    match Self::connect_upstream_with_fallback(connect_host, connect_port).await {
+                        Ok(v) => v,
+                        Err((reason, msg)) => {
+                            if let Some(key) = history_key.as_ref() {
+                                self.tunnel_manager
+                                    .record_business_failure(key, reason, Some(&msg))
+                                    .await;
+                            }
+                            return Err(server_err!(
+                                ServerErrorCode::InvalidConfig,
+                                "Failed to connect upstream candidates: {}",
+                                msg
+                            ));
+                        }
+                    };
+
+                let (mut sender, conn) =
+                    match hyper::client::conn::http1::handshake(TokioIo::new(tcp_stream)).await {
+                        Ok(v) => v,
+                        Err(e) => {
+                            if let Some(key) = history_key.as_ref() {
+                                let detail = e.to_string();
+                                self.tunnel_manager
+                                    .record_business_failure(
+                                        key,
+                                        TunnelFailureReason::TunnelOpen,
+                                        Some(&detail),
+                                    )
+                                    .await;
+                            }
+                            return Err(server_err!(
+                                ServerErrorCode::StreamError,
+                                "Failed to build http client connection to {}: {}",
+                                connected_addr,
+                                e
+                            ));
+                        }
+                    };
+
+                if let Some(key) = history_key.as_ref() {
+                    self.tunnel_manager
+                        .record_business_success(key, Some(started.elapsed()))
+                        .await;
+                }
+                tokio::spawn(async move {
+                    if let Err(e) = conn.await {
+                        debug!("http upstream connection closed with error: {}", e);
+                    }
+                });
+
+                let _ = version;
+                let _ = host_header;
+                // Connection up — taking the body now is the
+                // commitment point. Any subsequent failure is
+                // post-body and non-retryable.
+                let req = req_slot
+                    .take()
+                    .expect("forward_to_candidate: req_slot drained mid-flight");
                 let body = req
                     .into_body()
                     .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
                     .boxed();
                 let mut upstream_req = Request::builder()
                     .method(method)
-                    .uri(request_url.as_str())
+                    .uri(upstream_origin_uri.as_str())
                     .body(body)
                     .map_err(|e| {
                         server_err!(
@@ -469,10 +811,9 @@ impl ProcessChainHttpServer {
                             e
                         )
                     })?;
+                *upstream_req.headers_mut() = std::mem::take(&mut header);
 
-                *upstream_req.headers_mut() = header;
-
-                let resp = client.request(upstream_req).await.map_err(|e| {
+                let resp = sender.send_request(upstream_req).await.map_err(|e| {
                     server_err!(
                         ServerErrorCode::InvalidConfig,
                         "Failed to request upstream {}: {}",
@@ -489,10 +830,7 @@ impl ProcessChainHttpServer {
                 Ok(resp)
             }
             "https" => {
-                let mut header = req.headers().clone();
-                Self::inject_forward_headers(&mut header, info);
-                let method = req.method().clone();
-                let upstream_http_version = match req.version() {
+                let upstream_http_version = match version {
                     http::Version::HTTP_10 => http::Version::HTTP_10,
                     http::Version::HTTP_11 => http::Version::HTTP_11,
                     _ => http::Version::HTTP_11,
@@ -516,8 +854,28 @@ impl ProcessChainHttpServer {
                 // SNI must target the upstream host, not the inbound Host header.
                 let sni_host = Self::upstream_sni_host(&request_url)?;
 
+                // Wall-clock timer for "connection establishment" — TCP
+                // connect through hyper handshake. send_request /
+                // upstream app processing is excluded so RTT history
+                // reflects path quality, not application latency.
+                let started = std::time::Instant::now();
+
                 let (tcp_stream, connected_addr) =
-                    Self::connect_upstream_with_fallback(connect_host, connect_port).await?;
+                    match Self::connect_upstream_with_fallback(connect_host, connect_port).await {
+                        Ok(v) => v,
+                        Err((reason, msg)) => {
+                            if let Some(key) = history_key.as_ref() {
+                                self.tunnel_manager
+                                    .record_business_failure(key, reason, Some(&msg))
+                                    .await;
+                            }
+                            return Err(server_err!(
+                                ServerErrorCode::InvalidConfig,
+                                "Failed to connect upstream candidates: {}",
+                                msg
+                            ));
+                        }
+                    };
 
                 let tls_config = ClientConfig::builder_with_provider(Arc::new(
                     rustls::crypto::ring::default_provider(),
@@ -538,42 +896,78 @@ impl ProcessChainHttpServer {
                         e
                     )
                 })?;
-                let tls_stream = tls_connector
-                    .connect(server_name, tcp_stream)
-                    .await
-                    .map_err(|e| {
-                        server_err!(
+                let tls_stream = match tls_connector.connect(server_name, tcp_stream).await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        if let Some(key) = history_key.as_ref() {
+                            let detail = e.to_string();
+                            self.tunnel_manager
+                                .record_business_failure(
+                                    key,
+                                    TunnelFailureReason::TlsHandshake,
+                                    Some(&detail),
+                                )
+                                .await;
+                        }
+                        return Err(server_err!(
                             ServerErrorCode::InvalidConfig,
                             "Failed tls handshake with upstream {} via {}: {}",
                             sni_host,
                             connected_addr,
                             e
-                        )
-                    })?;
+                        ));
+                    }
+                };
 
                 let (mut sender, conn) =
-                    hyper::client::conn::http1::handshake(TokioIo::new(tls_stream))
-                        .await
-                        .map_err(|e| {
-                            server_err!(
+                    match hyper::client::conn::http1::handshake(TokioIo::new(tls_stream)).await {
+                        Ok(v) => v,
+                        Err(e) => {
+                            if let Some(key) = history_key.as_ref() {
+                                let detail = e.to_string();
+                                self.tunnel_manager
+                                    .record_business_failure(
+                                        key,
+                                        TunnelFailureReason::TunnelOpen,
+                                        Some(&detail),
+                                    )
+                                    .await;
+                            }
+                            return Err(server_err!(
                                 ServerErrorCode::StreamError,
                                 "Failed to build https client connection: {}",
                                 e
-                            )
-                        })?;
+                            ));
+                        }
+                    };
+
+                // Connection establishment succeeded — record reachable
+                // with the elapsed RTT before we even attempt the
+                // request. send_request failures from here on are
+                // upstream app health, not URL reachability (§6.7.2),
+                // so they are NOT mirrored back to tunnel_mgr.
+                if let Some(key) = history_key.as_ref() {
+                    self.tunnel_manager
+                        .record_business_success(key, Some(started.elapsed()))
+                        .await;
+                }
                 tokio::spawn(async move {
                     if let Err(e) = conn.await {
                         debug!("https upstream connection closed with error: {}", e);
                     }
                 });
 
+                let _ = host_header;
+                let req = req_slot
+                    .take()
+                    .expect("forward_to_candidate: req_slot drained mid-flight");
                 let body = req
                     .into_body()
                     .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
                     .boxed();
                 let mut upstream_req = Request::builder()
                     .method(method)
-                    .uri(org_url)
+                    .uri(upstream_origin_uri.as_str())
                     .version(upstream_http_version)
                     .body(body)
                     .map_err(|e| {
@@ -583,17 +977,17 @@ impl ProcessChainHttpServer {
                             e
                         )
                     })?;
-                *upstream_req.headers_mut() = header;
+                *upstream_req.headers_mut() = std::mem::take(&mut header);
 
                 let resp = sender.send_request(upstream_req).await.map_err(|e| {
-                        server_err!(
-                            ServerErrorCode::InvalidConfig,
-                            "Failed to request https upstream {} via {}: {}",
-                            sni_host,
-                            connected_addr,
-                            e
-                        )
-                    })?;
+                    server_err!(
+                        ServerErrorCode::InvalidConfig,
+                        "Failed to request https upstream {} via {}: {}",
+                        sni_host,
+                        connected_addr,
+                        e
+                    )
+                })?;
                 let resp = resp.map(|body| {
                     body.map_err(|e| {
                         ServerError::new(ServerErrorCode::StreamError, format!("{:?}", e))
@@ -603,46 +997,77 @@ impl ProcessChainHttpServer {
                 Ok(resp)
             }
             _ => {
-                let tunnel_connector = TunnelConnector {
-                    target_stream_url: target_url.to_string(),
-                    tunnel_manager: self.tunnel_manager.clone(),
+                // Pre-flight: open the tunnel stream first so a tunnel
+                // open failure leaves `req_slot` intact for the caller
+                // to retry on another candidate. tunnel_manager itself
+                // writes URL history on the underlying open per §6.7.
+                let tunnel_url = Url::parse(target_url).map_err(|e| {
+                    server_err!(
+                        ServerErrorCode::InvalidConfig,
+                        "invalid forward url {}: {}",
+                        target_url,
+                        e
+                    )
+                })?;
+                let stream = match self.tunnel_manager.open_stream_by_url(&tunnel_url).await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        return Err(server_err!(
+                            ServerErrorCode::TunnelError,
+                            "Failed to open tunnel to {}: {}",
+                            target_url,
+                            e
+                        ));
+                    }
                 };
 
-                let client: Client<
-                    TunnelConnector,
-                    BoxBody<Bytes, Box<dyn std::error::Error + Send + Sync>>,
-                > = Client::builder(TokioExecutor::new()).build(tunnel_connector);
+                let (mut sender, conn) = match hyper::client::conn::http1::handshake(TokioIo::new(
+                    crate::tunnel_connector::TunnelStreamConnection::new(stream),
+                ))
+                .await
+                {
+                    Ok(v) => v,
+                    Err(e) => {
+                        return Err(server_err!(
+                            ServerErrorCode::StreamError,
+                            "Failed to build tunnel client connection to {}: {}",
+                            target_url,
+                            e
+                        ));
+                    }
+                };
+                tokio::spawn(async move {
+                    if let Err(e) = conn.await {
+                        debug!("tunnel upstream connection closed with error: {}", e);
+                    }
+                });
 
-                let mut header = req.headers().clone();
-                Self::inject_forward_headers(&mut header, info);
-                let mut host_name = "localhost".to_string();
-                let hname = req.headers().get("host");
-                if hname.is_some() {
-                    host_name = hname.unwrap().to_str().unwrap().to_string();
-                }
-                let fake_url = format!("http://{}{}", host_name, org_url);
-                let method = req.method().clone();
+                let _ = version;
+                let req = req_slot
+                    .take()
+                    .expect("forward_to_candidate: req_slot drained mid-flight");
                 let body = req
                     .into_body()
                     .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
                     .boxed();
                 let mut upstream_req = Request::builder()
                     .method(method)
-                    .uri(fake_url)
+                    .uri(client_origin_uri.as_str())
                     .body(body)
                     .map_err(|e| {
-                    server_err!(
-                        ServerErrorCode::BadRequest,
-                        "Failed to build upstream_req: {}",
-                        e
-                    )
-                })?;
+                        server_err!(
+                            ServerErrorCode::BadRequest,
+                            "Failed to build upstream_req: {}",
+                            e
+                        )
+                    })?;
+                *upstream_req.headers_mut() = std::mem::take(&mut header);
 
-                *upstream_req.headers_mut() = header;
-                let resp = client.request(upstream_req).await.map_err(|e| {
+                let resp = sender.send_request(upstream_req).await.map_err(|e| {
                     server_err!(
                         ServerErrorCode::TunnelError,
-                        "Failed to request upstream: {}",
+                        "Failed to request upstream {}: {}",
+                        target_url,
                         e
                     )
                 })?;
@@ -652,9 +1077,383 @@ impl ProcessChainHttpServer {
                     })
                     .boxed()
                 });
-                return Ok(resp);
+                Ok(resp)
             }
         }
+    }
+
+    /// Walk the candidates of a `ForwardPlan`, performing a connection-stage
+    /// probe on each (TCP connect / TLS handshake / tunnel open) and
+    /// forwarding the request through the first reachable candidate.
+    ///
+    /// Stage 2 (§6.3): connection-stage failure → next candidate.
+    /// Stage 3 (§6.3 + §8 阶段3): when the policy enables HTTP-status retry
+    /// (`http_5xx`, `http_502`, etc.), the request body is buffered up to
+    /// `policy.max_body_buffer_bytes` and replayed against the next
+    /// candidate. Buffering is suppressed for non-idempotent methods
+    /// unless the policy explicitly opts in via `non_idempotent`. If the
+    /// body exceeds the buffer cap we fall back to "send once" semantics
+    /// for the chosen candidate so an oversized POST doesn't quietly
+    /// behave differently — the caller sees the upstream's actual
+    /// response.
+    /// Stage 4 (§8 阶段4): when `plan.balance == LeastTime` we ask
+    /// tunnel_mgr for an RTT-sorted candidate order before iterating.
+    async fn handle_forward_group_upstream(
+        &self,
+        req: http::Request<BoxBody<Bytes, ServerError>>,
+        plan: &ForwardPlan,
+        info: &StreamInfo,
+    ) -> ServerResult<http::Response<BoxBody<Bytes, ServerError>>> {
+        // Stage 4: RTT-aware reordering before iteration.
+        let mut plan_local;
+        let plan: &ForwardPlan = if matches!(plan.balance, BalanceMethod::LeastTime) {
+            plan_local = plan.clone();
+            apply_least_time_via_tunnel_mgr(&mut plan_local, &self.tunnel_manager).await;
+            &plan_local
+        } else {
+            plan
+        };
+
+        let policy = &plan.next_upstream;
+
+        // Stage 3: decide whether HTTP-status retry is possible for
+        // this request. Conditions:
+        //   - policy enables some HTTP status condition,
+        //   - tries > 1,
+        //   - method is idempotent OR policy explicitly opted in via
+        //     `non_idempotent`,
+        //   - max_body_buffer_bytes > 0.
+        let method_class = HttpMethodClass::classify(req.method().as_str());
+        let method_replay_allowed = method_class.is_idempotent() || policy.allow_non_idempotent();
+        let http_status_retry_armed = policy.is_enabled()
+            && policy.any_http_status()
+            && method_replay_allowed
+            && policy.max_body_buffer_bytes > 0;
+
+        if http_status_retry_armed {
+            return self
+                .handle_forward_group_with_status_retry(req, plan, info)
+                .await;
+        }
+
+        // Stage 2 path: connection-stage retry only, body forwarded
+        // once after probing the chosen candidate.
+        self.handle_forward_group_connect_only(req, plan, info)
+            .await
+    }
+
+    /// Connection-stage retry only (§6.3). The body is sent only after
+    /// `forward_to_candidate` confirms the connection is up; failures
+    /// before that point leave `req_slot` populated so we can retry on
+    /// the next candidate. Once a candidate has consumed the body we
+    /// surface its result without further retry.
+    async fn handle_forward_group_connect_only(
+        &self,
+        req: http::Request<BoxBody<Bytes, ServerError>>,
+        plan: &ForwardPlan,
+        info: &StreamInfo,
+    ) -> ServerResult<http::Response<BoxBody<Bytes, ServerError>>> {
+        let registry = ForwardFailureRegistry::global();
+        let group_key = plan.failure_state_key();
+        let policy = &plan.next_upstream;
+        let candidate_count = plan.candidates.len();
+        let max_attempts = if !policy.is_enabled() {
+            candidate_count.min(1).max(1)
+        } else if policy.tries == 0 {
+            candidate_count
+        } else {
+            (policy.tries as usize).min(candidate_count)
+        };
+        let deadline = policy.timeout.map(|d| std::time::Instant::now() + d);
+
+        let mut last_err: Option<ServerError> = None;
+        let mut req_slot = Some(req);
+
+        for (idx, candidate) in plan.candidates.iter().enumerate() {
+            if idx >= max_attempts {
+                break;
+            }
+            if req_slot.is_none() {
+                // Body already consumed by a prior candidate but the
+                // upstream-side failure was non-retryable. Surface what
+                // we have rather than loop without a request.
+                break;
+            }
+            if let Some(d) = deadline {
+                if std::time::Instant::now() >= d {
+                    last_err.get_or_insert_with(|| {
+                        server_err!(
+                            ServerErrorCode::TunnelError,
+                            "forward-group {} next_upstream timeout exceeded before idx={}",
+                            group_key,
+                            idx
+                        )
+                    });
+                    break;
+                }
+            }
+
+            let attempt_fut = self.forward_to_candidate(&mut req_slot, &candidate.url, info);
+            let (attempt_res, attempt_cond) = match deadline {
+                Some(d) => {
+                    let remaining = d.saturating_duration_since(std::time::Instant::now());
+                    match timeout(remaining, attempt_fut).await {
+                        Ok(r) => (r, NextUpstreamCondition::Error),
+                        Err(_) => (
+                            Err(server_err!(
+                                ServerErrorCode::TunnelError,
+                                "forward-group {} forward to {} timed out (next_upstream budget {}ms)",
+                                group_key,
+                                candidate.url,
+                                policy.timeout.unwrap_or_default().as_millis()
+                            )),
+                            NextUpstreamCondition::Timeout,
+                        ),
+                    }
+                }
+                None => (attempt_fut.await, NextUpstreamCondition::Error),
+            };
+            match attempt_res {
+                Ok(resp) => {
+                    registry.record_success(&group_key, &candidate.url);
+                    log::debug!(
+                        "forward-group {}: http selected candidate idx={} url={}",
+                        group_key,
+                        idx,
+                        candidate.url
+                    );
+                    return Ok(resp);
+                }
+                Err(e) => {
+                    log::debug!(
+                        "forward-group {}: http candidate {} (idx {}) failed: {}",
+                        group_key,
+                        candidate.url,
+                        idx,
+                        e
+                    );
+                    registry.record_failure(
+                        &group_key,
+                        &candidate.url,
+                        candidate.max_fails,
+                        candidate.fail_timeout,
+                    );
+                    last_err = Some(e);
+                    if req_slot.is_none() {
+                        // Body was consumed before/during this attempt;
+                        // we cannot replay on another candidate.
+                        break;
+                    }
+                    if !policy.is_enabled()
+                        || !policy.allows(attempt_cond)
+                        || idx + 1 >= max_attempts
+                    {
+                        break;
+                    }
+                    continue;
+                }
+            }
+        }
+
+        Err(last_err.unwrap_or_else(|| {
+            server_err!(
+                ServerErrorCode::TunnelError,
+                "forward-group {} exhausted candidates",
+                group_key
+            )
+        }))
+    }
+
+    /// Status-aware retry. Buffers the body up to
+    /// `policy.max_body_buffer_bytes`, then walks candidates until one
+    /// returns a non-retryable status. Connection-stage failures and
+    /// matching upstream HTTP statuses both consume an attempt.
+    async fn handle_forward_group_with_status_retry(
+        &self,
+        req: http::Request<BoxBody<Bytes, ServerError>>,
+        plan: &ForwardPlan,
+        info: &StreamInfo,
+    ) -> ServerResult<http::Response<BoxBody<Bytes, ServerError>>> {
+        let registry = ForwardFailureRegistry::global();
+        let group_key = plan.failure_state_key();
+        let policy = &plan.next_upstream;
+        let candidate_count = plan.candidates.len();
+        let max_attempts = if !policy.is_enabled() {
+            candidate_count.min(1).max(1)
+        } else if policy.tries == 0 {
+            candidate_count
+        } else {
+            (policy.tries as usize).min(candidate_count)
+        };
+
+        let (req_parts, body) = req.into_parts();
+        let buffered_body = match Self::buffer_body(body, policy.max_body_buffer_bytes).await? {
+            Some(b) => b,
+            None => {
+                // Body exceeded the configured cap. We can no longer
+                // safely replay; degrade to the connect-only path with
+                // a placeholder empty body — we already consumed the
+                // original. To avoid silently dropping the body we
+                // surface a 413-style error so callers notice this is a
+                // configuration issue (cap too small), not a black
+                // hole.
+                log::warn!(
+                    "forward-group {}: body exceeded max_body_buffer_bytes={}, status-retry disabled",
+                    group_key,
+                    policy.max_body_buffer_bytes
+                );
+                return Err(server_err!(
+                    ServerErrorCode::BadRequest,
+                    "request body exceeded forward group max_body_buffer_bytes={}",
+                    policy.max_body_buffer_bytes
+                ));
+            }
+        };
+
+        let mut last_err: Option<ServerError> = None;
+        let mut last_status_resp: Option<http::Response<BoxBody<Bytes, ServerError>>> = None;
+        let deadline = policy.timeout.map(|d| std::time::Instant::now() + d);
+
+        for (idx, candidate) in plan.candidates.iter().enumerate() {
+            if idx >= max_attempts {
+                break;
+            }
+            if let Some(d) = deadline {
+                if std::time::Instant::now() >= d {
+                    last_err.get_or_insert_with(|| {
+                        server_err!(
+                            ServerErrorCode::TunnelError,
+                            "forward-group {} next_upstream timeout exceeded before idx={}",
+                            group_key,
+                            idx
+                        )
+                    });
+                    break;
+                }
+            }
+            let body = Self::full_body(buffered_body.clone());
+            let mut attempt_req = http::Request::from_parts(req_parts.clone(), body);
+            Self::set_content_length(&mut attempt_req);
+            let mut req_slot = Some(attempt_req);
+
+            let attempt_fut = self.forward_to_candidate(&mut req_slot, &candidate.url, info);
+            let (attempt_res, attempt_cond) = match deadline {
+                Some(d) => {
+                    let remaining = d.saturating_duration_since(std::time::Instant::now());
+                    match timeout(remaining, attempt_fut).await {
+                        Ok(r) => (r, NextUpstreamCondition::Error),
+                        Err(_) => (
+                            Err(server_err!(
+                                ServerErrorCode::TunnelError,
+                                "forward-group {} forward to {} timed out (next_upstream budget {}ms)",
+                                group_key,
+                                candidate.url,
+                                policy.timeout.unwrap_or_default().as_millis()
+                            )),
+                            NextUpstreamCondition::Timeout,
+                        ),
+                    }
+                }
+                None => (attempt_fut.await, NextUpstreamCondition::Error),
+            };
+            match attempt_res {
+                Ok(r) => {
+                    let status = r.status().as_u16();
+                    if policy.matches_http_status(status) && idx + 1 < max_attempts {
+                        log::debug!(
+                            "forward-group {}: candidate {} returned {}, retrying next candidate",
+                            group_key,
+                            candidate.url,
+                            status
+                        );
+                        registry.record_failure(
+                            &group_key,
+                            &candidate.url,
+                            candidate.max_fails,
+                            candidate.fail_timeout,
+                        );
+                        last_status_resp = Some(r);
+                        continue;
+                    }
+                    registry.record_success(&group_key, &candidate.url);
+                    log::debug!(
+                        "forward-group {}: http selected candidate idx={} url={} (status-retry armed)",
+                        group_key,
+                        idx,
+                        candidate.url
+                    );
+                    return Ok(r);
+                }
+                Err(e) => {
+                    log::debug!(
+                        "forward-group {}: candidate {} request failed: {}",
+                        group_key,
+                        candidate.url,
+                        e
+                    );
+                    registry.record_failure(
+                        &group_key,
+                        &candidate.url,
+                        candidate.max_fails,
+                        candidate.fail_timeout,
+                    );
+                    last_err = Some(e);
+                    if !policy.allows(attempt_cond) || idx + 1 >= max_attempts {
+                        break;
+                    }
+                    continue;
+                }
+            }
+        }
+
+        if let Some(r) = last_status_resp {
+            return Ok(r);
+        }
+
+        Err(last_err.unwrap_or_else(|| {
+            server_err!(
+                ServerErrorCode::TunnelError,
+                "forward-group {} exhausted candidates",
+                group_key
+            )
+        }))
+    }
+
+    /// Buffer at most `cap` bytes of the request body. Returns
+    /// `Ok(Some(bytes))` if the body fit within the cap, `Ok(None)`
+    /// if it exceeded the cap (in which case retry is no longer safe
+    /// for this request).
+    async fn buffer_body(
+        body: BoxBody<Bytes, ServerError>,
+        cap: u64,
+    ) -> ServerResult<Option<Bytes>> {
+        let cap = cap as usize;
+        let collected = body.collect().await.map_err(|e| {
+            server_err!(
+                ServerErrorCode::StreamError,
+                "buffering request body failed: {:?}",
+                e
+            )
+        })?;
+        let bytes = collected.to_bytes();
+        if bytes.len() > cap {
+            return Ok(None);
+        }
+        Ok(Some(bytes))
+    }
+
+    fn full_body(bytes: Bytes) -> BoxBody<Bytes, ServerError> {
+        Full::new(bytes).map_err(|e| match e {}).boxed()
+    }
+
+    fn set_content_length(req: &mut http::Request<BoxBody<Bytes, ServerError>>) {
+        use hyper::body::Body;
+        let len = req.body().size_hint().exact().unwrap_or(0);
+        if let Ok(v) = http::HeaderValue::from_str(&len.to_string()) {
+            req.headers_mut().insert(http::header::CONTENT_LENGTH, v);
+        }
+        // Replayable bodies can't keep Transfer-Encoding: chunked.
+        req.headers_mut().remove(http::header::TRANSFER_ENCODING);
     }
 
     fn parse_redirect_status_code(status: Option<&str>) -> ServerResult<StatusCode> {
@@ -763,6 +1562,65 @@ impl ProcessChainHttpServer {
         Ok(response)
     }
 
+    /// Resolve the source variables for one request: stream info first, then
+    /// forwarded headers when (and only when) the direct previous hop is a
+    /// trusted upstream and no stronger mechanism already restored a source.
+    fn resolve_request_sources(
+        &self,
+        info: &StreamInfo,
+        headers: &http::HeaderMap,
+    ) -> RequestSourceInfo {
+        let mut sources = RequestSourceInfo::from_stream_info(info);
+        if self.trusted_upstreams.is_empty() {
+            return sources;
+        }
+        if sources.real_source_addr.is_some() {
+            // PROXY protocol / tunnel identity already restored the source;
+            // that mechanism outranks forwarded headers.
+            return sources;
+        }
+        let direct_hop = sources
+            .conn_source_ip
+            .as_deref()
+            .or(sources.source_ip.as_deref());
+        let Some(direct_hop_ip) = direct_hop.and_then(|ip| ip.parse::<IpAddr>().ok()) else {
+            return sources;
+        };
+        if !self
+            .trusted_upstreams
+            .iter()
+            .any(|m| m.matches(&direct_hop_ip))
+        {
+            return sources;
+        }
+        if let Some(real) = resolve_trusted_forwarded_source(headers, &self.trusted_upstreams) {
+            sources.set_real_source(&real);
+        }
+        sources
+    }
+
+    async fn create_source_env_vars(
+        global_env: &EnvRef,
+        sources: &RequestSourceInfo,
+    ) -> ServerResult<()> {
+        for (name, value) in [
+            ("REQ_remote_ip", sources.source_ip.as_ref()),
+            ("REQ_remote_port", sources.source_port.as_ref()),
+            ("REQ_conn_remote_ip", sources.conn_source_ip.as_ref()),
+            ("REQ_conn_remote_port", sources.conn_source_port.as_ref()),
+            ("REQ_real_remote_ip", sources.real_source_ip.as_ref()),
+            ("REQ_real_remote_port", sources.real_source_port.as_ref()),
+        ] {
+            if let Some(value) = value {
+                global_env
+                    .create(name, CollectionValue::String(value.clone()))
+                    .await
+                    .map_err(|e| server_err!(ServerErrorCode::ProcessChainError, "{}", e))?;
+            }
+        }
+        Ok(())
+    }
+
     // Post-hook rules:
     // - post_hook_point is optional; when absent, response is returned as-is.
     // - RESP is a header-only map (no status/version keys).
@@ -771,6 +1629,7 @@ impl ProcessChainHttpServer {
         &self,
         resp: http::Response<BoxBody<Bytes, ServerError>>,
         info: Option<&StreamInfo>,
+        sources: Option<&RequestSourceInfo>,
     ) -> ServerResult<http::Response<BoxBody<Bytes, ServerError>>> {
         let post_executor = match &self.post_executor {
             Some(executor) => executor.lock().unwrap().fork(),
@@ -779,61 +1638,10 @@ impl ProcessChainHttpServer {
 
         let resp_map = HttpResponseHeaderMap::new(resp);
         let global_env = post_executor.global_env();
+        if let Some(sources) = sources {
+            Self::create_source_env_vars(global_env, sources).await?;
+        }
         if let Some(info) = info {
-            if let Some(src_addr) = info.src_addr.as_ref() {
-                if let Ok(socket_addr) = src_addr.parse::<SocketAddr>() {
-                    global_env
-                        .create(
-                            "REQ_remote_ip",
-                            CollectionValue::String(socket_addr.ip().to_string()),
-                        )
-                        .await
-                        .map_err(|e| server_err!(ServerErrorCode::ProcessChainError, "{}", e))?;
-                    global_env
-                        .create(
-                            "REQ_remote_port",
-                            CollectionValue::String(socket_addr.port().to_string()),
-                        )
-                        .await
-                        .map_err(|e| server_err!(ServerErrorCode::ProcessChainError, "{}", e))?;
-                }
-            }
-            if let Some(src_addr) = info.conn_src_addr.as_ref() {
-                if let Ok(socket_addr) = src_addr.parse::<SocketAddr>() {
-                    global_env
-                        .create(
-                            "REQ_conn_remote_ip",
-                            CollectionValue::String(socket_addr.ip().to_string()),
-                        )
-                        .await
-                        .map_err(|e| server_err!(ServerErrorCode::ProcessChainError, "{}", e))?;
-                    global_env
-                        .create(
-                            "REQ_conn_remote_port",
-                            CollectionValue::String(socket_addr.port().to_string()),
-                        )
-                        .await
-                        .map_err(|e| server_err!(ServerErrorCode::ProcessChainError, "{}", e))?;
-                }
-            }
-            if let Some(src_addr) = info.real_src_addr.as_ref() {
-                if let Ok(socket_addr) = src_addr.parse::<SocketAddr>() {
-                    global_env
-                        .create(
-                            "REQ_real_remote_ip",
-                            CollectionValue::String(socket_addr.ip().to_string()),
-                        )
-                        .await
-                        .map_err(|e| server_err!(ServerErrorCode::ProcessChainError, "{}", e))?;
-                    global_env
-                        .create(
-                            "REQ_real_remote_port",
-                            CollectionValue::String(socket_addr.port().to_string()),
-                        )
-                        .await
-                        .map_err(|e| server_err!(ServerErrorCode::ProcessChainError, "{}", e))?;
-                }
-            }
             if let Some(dst_addr) = info.dst_addr.as_ref() {
                 if let Ok(socket_addr) = dst_addr.parse::<SocketAddr>() {
                     global_env
@@ -908,10 +1716,11 @@ impl ProcessChainHttpServer {
         resp: ServerResult<http::Response<BoxBody<Bytes, ServerError>>>,
         req_info: &CompressionRequestInfo,
         info: Option<&StreamInfo>,
+        sources: Option<&RequestSourceInfo>,
     ) -> ServerResult<http::Response<BoxBody<Bytes, ServerError>>> {
         match resp {
             Ok(resp) => {
-                let resp = self.apply_post_chain(resp, info).await?;
+                let resp = self.apply_post_chain(resp, info, sources).await?;
                 apply_response_compression(resp, req_info, &self.compression)
             }
             Err(err) => Err(err),
@@ -927,6 +1736,7 @@ impl HttpServer for ProcessChainHttpServer {
         info: StreamInfo,
     ) -> ServerResult<http::Response<BoxBody<Bytes, ServerError>>> {
         let req_info = CompressionRequestInfo::from_request(&req);
+        let sources = self.resolve_request_sources(&info, req.headers());
         let mut req = match apply_request_decompression(req, &self.compression) {
             Ok(req) => req,
             Err(err) => {
@@ -937,7 +1747,7 @@ impl HttpServer for ProcessChainHttpServer {
                 );
                 *response.status_mut() = StatusCode::BAD_REQUEST;
                 return self
-                    .apply_post_chain_result(Ok(response), &req_info, Some(&info))
+                    .apply_post_chain_result(Ok(response), &req_info, Some(&info), Some(&sources))
                     .await;
             }
         };
@@ -975,68 +1785,15 @@ impl HttpServer for ProcessChainHttpServer {
         let executor = { self.executor.lock().unwrap().fork() };
 
         let global_env = executor.global_env();
-        if let Some(src_addr) = info.src_addr.as_ref() {
-            if let Ok(socket_addr) = src_addr.parse::<SocketAddr>() {
-                process_chain_vars.req_remote_ip = Some(socket_addr.ip().to_string());
-                process_chain_vars.req_remote_port = Some(socket_addr.port().to_string());
-                global_env
-                    .create(
-                        "REQ_remote_ip",
-                        CollectionValue::String(socket_addr.ip().to_string()),
-                    )
-                    .await
-                    .map_err(|e| server_err!(ServerErrorCode::ProcessChainError, "{}", e))?;
-                global_env
-                    .create(
-                        "REQ_remote_port",
-                        CollectionValue::String(socket_addr.port().to_string()),
-                    )
-                    .await
-                    .map_err(|e| server_err!(ServerErrorCode::ProcessChainError, "{}", e))?;
-            }
-        }
-        if let Some(src_addr) = info.conn_src_addr.as_ref() {
-            if let Ok(socket_addr) = src_addr.parse::<SocketAddr>() {
-                process_chain_vars.req_conn_remote_ip = Some(socket_addr.ip().to_string());
-                process_chain_vars.req_conn_remote_port = Some(socket_addr.port().to_string());
-                global_env
-                    .create(
-                        "REQ_conn_remote_ip",
-                        CollectionValue::String(socket_addr.ip().to_string()),
-                    )
-                    .await
-                    .map_err(|e| server_err!(ServerErrorCode::ProcessChainError, "{}", e))?;
-                global_env
-                    .create(
-                        "REQ_conn_remote_port",
-                        CollectionValue::String(socket_addr.port().to_string()),
-                    )
-                    .await
-                    .map_err(|e| server_err!(ServerErrorCode::ProcessChainError, "{}", e))?;
-            }
-        }
-        if let Some(src_addr) = info.real_src_addr.as_ref() {
-            if let Ok(socket_addr) = src_addr.parse::<SocketAddr>() {
-                process_chain_vars.req_real_remote_ip = Some(socket_addr.ip().to_string());
-                process_chain_vars.req_real_remote_port = Some(socket_addr.port().to_string());
-                global_env
-                    .create(
-                        "REQ_real_remote_ip",
-                        CollectionValue::String(socket_addr.ip().to_string()),
-                    )
-                    .await
-                    .map_err(|e| server_err!(ServerErrorCode::ProcessChainError, "{}", e))?;
-                global_env
-                    .create(
-                        "REQ_real_remote_port",
-                        CollectionValue::String(socket_addr.port().to_string()),
-                    )
-                    .await
-                    .map_err(|e| server_err!(ServerErrorCode::ProcessChainError, "{}", e))?;
-            }
-        }
+        process_chain_vars.req_remote_ip = sources.source_ip.clone();
+        process_chain_vars.req_remote_port = sources.source_port.clone();
+        process_chain_vars.req_conn_remote_ip = sources.conn_source_ip.clone();
+        process_chain_vars.req_conn_remote_port = sources.conn_source_port.clone();
+        process_chain_vars.req_real_remote_ip = sources.real_source_ip.clone();
+        process_chain_vars.req_real_remote_port = sources.real_source_port.clone();
+        Self::create_source_env_vars(global_env, &sources).await?;
         req.extensions_mut().insert(process_chain_vars);
-        let req_map = HttpRequestHeaderMap::new(req);
+        let req_map = HttpRequestHeaderMap::new_with_sources(req, sources.clone());
         if let Some(dst_addr) = info.dst_addr.as_ref() {
             if let Ok(socket_addr) = dst_addr.parse::<SocketAddr>() {
                 global_env
@@ -1101,7 +1858,7 @@ impl HttpServer for ProcessChainHttpServer {
                         .boxed(),
                 );
                 return self
-                    .apply_post_chain_result(Ok(response), &req_info, Some(&info))
+                    .apply_post_chain_result(Ok(response), &req_info, Some(&info), Some(&sources))
                     .await;
             } else if ret.is_reject() {
                 debug!(
@@ -1112,7 +1869,7 @@ impl HttpServer for ProcessChainHttpServer {
                     http::Response::new(Full::new(Bytes::new()).map_err(|e| match e {}).boxed());
                 *response.status_mut() = StatusCode::FORBIDDEN;
                 return self
-                    .apply_post_chain_result(Ok(response), &req_info, Some(&info))
+                    .apply_post_chain_result(Ok(response), &req_info, Some(&info), Some(&sources))
                     .await;
             }
             if let Some(CommandControl::Error(ret)) = ret.as_control() {
@@ -1127,7 +1884,7 @@ impl HttpServer for ProcessChainHttpServer {
                 );
                 *response.status_mut() = StatusCode::BAD_GATEWAY;
                 return self
-                    .apply_post_chain_result(Ok(response), &req_info, Some(&info))
+                    .apply_post_chain_result(Ok(response), &req_info, Some(&info), Some(&sources))
                     .await;
             }
             if let Some(CommandControl::Return(ret)) = ret.as_control() {
@@ -1143,7 +1900,12 @@ impl HttpServer for ProcessChainHttpServer {
                     );
                     *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
                     return self
-                        .apply_post_chain_result(Ok(response), &req_info, Some(&info))
+                        .apply_post_chain_result(
+                            Ok(response),
+                            &req_info,
+                            Some(&info),
+                            Some(&sources),
+                        )
                         .await;
                 };
                 if let Some(list) = shlex::split(value.as_str()) {
@@ -1154,7 +1916,12 @@ impl HttpServer for ProcessChainHttpServer {
                         );
                         *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
                         return self
-                            .apply_post_chain_result(Ok(response), &req_info, Some(&info))
+                            .apply_post_chain_result(
+                                Ok(response),
+                                &req_info,
+                                Some(&info),
+                                Some(&sources),
+                            )
                             .await;
                     }
 
@@ -1177,7 +1944,12 @@ impl HttpServer for ProcessChainHttpServer {
                                 if let Some(service) = server_mgr.get_http_server(server_id) {
                                     let resp = service.serve_request(post_req, info.clone()).await;
                                     return self
-                                        .apply_post_chain_result(resp, &req_info, Some(&info))
+                                        .apply_post_chain_result(
+                                            resp,
+                                            &req_info,
+                                            Some(&info),
+                                            Some(&sources),
+                                        )
                                         .await;
                                 }
                             } else {
@@ -1199,7 +1971,41 @@ impl HttpServer for ProcessChainHttpServer {
                                 .handle_forward_upstream(post_req, target_url, &info)
                                 .await;
                             return self
-                                .apply_post_chain_result(resp, &req_info, Some(&info))
+                                .apply_post_chain_result(
+                                    resp,
+                                    &req_info,
+                                    Some(&info),
+                                    Some(&sources),
+                                )
+                                .await;
+                        }
+                        "forward-group" => {
+                            if list.len() < 2 {
+                                return Err(server_err!(
+                                    ServerErrorCode::InvalidConfig,
+                                    "invalid forward-group command"
+                                ));
+                            }
+                            let plan = ForwardPlan::decode(list[1].as_str()).map_err(|e| {
+                                server_err!(
+                                    ServerErrorCode::InvalidConfig,
+                                    "invalid forward plan: {}",
+                                    e
+                                )
+                            })?;
+                            let post_req = req_map.into_request().map_err(|e| {
+                                server_err!(ServerErrorCode::ProcessChainError, "{}", e)
+                            })?;
+                            let resp = self
+                                .handle_forward_group_upstream(post_req, &plan, &info)
+                                .await;
+                            return self
+                                .apply_post_chain_result(
+                                    resp,
+                                    &req_info,
+                                    Some(&info),
+                                    Some(&sources),
+                                )
                                 .await;
                         }
                         "redirect" => {
@@ -1221,7 +2027,12 @@ impl HttpServer for ProcessChainHttpServer {
                                 Self::parse_redirect_status_code(list.get(2).map(|v| v.as_str()))?;
                             let resp = self.build_redirect_response(location, status)?;
                             return self
-                                .apply_post_chain_result(Ok(resp), &req_info, Some(&info))
+                                .apply_post_chain_result(
+                                    Ok(resp),
+                                    &req_info,
+                                    Some(&info),
+                                    Some(&sources),
+                                )
                                 .await;
                         }
                         "error" => {
@@ -1235,7 +2046,12 @@ impl HttpServer for ProcessChainHttpServer {
                             let message = list.get(2).map(|v| v.as_str());
                             let resp = self.build_error_response(status, message)?;
                             return self
-                                .apply_post_chain_result(Ok(resp), &req_info, Some(&info))
+                                .apply_post_chain_result(
+                                    Ok(resp),
+                                    &req_info,
+                                    Some(&info),
+                                    Some(&sources),
+                                )
                                 .await;
                         }
                         _ => {
@@ -1256,7 +2072,7 @@ impl HttpServer for ProcessChainHttpServer {
         let mut response =
             http::Response::new(Full::new(Bytes::new()).map_err(|e| match e {}).boxed());
         *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
-        self.apply_post_chain_result(Ok(response), &req_info, Some(&info))
+        self.apply_post_chain_result(Ok(response), &req_info, Some(&info), Some(&sources))
             .await
     }
 
@@ -1335,6 +2151,11 @@ pub struct ProcessChainHttpServerConfig {
     pub hook_point: ProcessChainConfigs,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub post_hook_point: Option<ProcessChainConfigs>,
+    /// Upstream IPs/CIDRs whose `X-Forwarded-For` / `X-Real-IP` headers may be
+    /// converted into `real_source_*`. Empty (default) means forwarded headers
+    /// from any peer are treated as plain input data.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub trusted_upstreams: Vec<String>,
     #[serde(default)]
     pub gzip: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1450,7 +2271,8 @@ impl ServerFactory for ProcessChainHttpServerFactory {
             .tunnel_manager(context.tunnel_manager.clone())
             .global_process_chains(context.global_process_chains.clone())
             .js_externals(context.js_externals.clone())
-            .global_collection_manager(context.global_collection_manager.clone());
+            .global_collection_manager(context.global_collection_manager.clone())
+            .trusted_upstreams(config.trusted_upstreams.clone());
         let compression = ProcessChainHttpServerBuilder::build_compression_settings(config)?;
         builder = builder.compression(compression);
         if config.h3_port.is_some() {
@@ -1575,6 +2397,300 @@ mod tests {
         }
     }
 
+    /// Reflects every `x-test-*` request header back as a response header, so
+    /// process-chain `map-add REQ ...` effects become observable.
+    struct EchoHeadersServer {
+        id: String,
+    }
+
+    #[async_trait::async_trait]
+    impl HttpServer for EchoHeadersServer {
+        async fn serve_request(
+            &self,
+            req: http::Request<BoxBody<Bytes, ServerError>>,
+            _info: StreamInfo,
+        ) -> ServerResult<http::Response<BoxBody<Bytes, ServerError>>> {
+            let mut builder = http::Response::builder().status(StatusCode::OK);
+            for (name, value) in req.headers() {
+                if name.as_str().starts_with("x-test-") {
+                    builder = builder.header(name, value);
+                }
+            }
+            builder
+                .body(Full::new(Bytes::new()).map_err(|e| match e {}).boxed())
+                .map_err(|e| {
+                    server_err!(
+                        ServerErrorCode::BadRequest,
+                        "Failed to build response: {}",
+                        e
+                    )
+                })
+        }
+
+        fn id(&self) -> String {
+            self.id.clone()
+        }
+
+        fn http_version(&self) -> Version {
+            Version::HTTP_11
+        }
+
+        fn http3_port(&self) -> Option<u16> {
+            None
+        }
+    }
+
+    const SOURCE_VARS_CHAIN: &str = r#"
+- id: main
+  priority: 1
+  blocks:
+    - id: main
+      block: |
+        map-add REQ X-Test-Source "S:${REQ.source_ip}:${REQ.source_port}";
+        map-add REQ X-Test-Conn "C:${REQ.conn_source_ip}:${REQ.conn_source_port}";
+        map-add REQ X-Test-Real "R:${REQ.real_source_ip}:${REQ.real_source_port}";
+        map-add REQ X-Test-Remote "REM:${REQ_remote_ip}:${REQ_remote_port}";
+        map-add REQ X-Test-Real-Remote "RR:${REQ_real_remote_ip}";
+        return "server echo-headers";
+"#;
+
+    async fn build_source_vars_server(
+        trusted_upstreams: Vec<String>,
+    ) -> (ProcessChainHttpServer, Arc<ServerManager>) {
+        let mock_server_mgr = Arc::new(ServerManager::new());
+        mock_server_mgr
+            .add_server(Server::Http(Arc::new(EchoHeadersServer {
+                id: "echo-headers".to_string(),
+            })))
+            .unwrap();
+        let chains: ProcessChainConfigs = serde_yaml_ng::from_str(SOURCE_VARS_CHAIN).unwrap();
+        let server = ProcessChainHttpServer::builder()
+            .id("test_source_vars")
+            .version("HTTP/1.1".to_string())
+            .hook_point(chains)
+            .tunnel_manager(TunnelManager::new())
+            .server_mgr(Arc::downgrade(&mock_server_mgr))
+            .trusted_upstreams(trusted_upstreams)
+            .build()
+            .await
+            .unwrap();
+        (server, mock_server_mgr)
+    }
+
+    fn source_vars_request(headers: &[(&str, &str)]) -> http::Request<BoxBody<Bytes, ServerError>> {
+        let mut builder = http::Request::builder()
+            .method("GET")
+            .uri("http://localhost/");
+        for (name, value) in headers {
+            builder = builder.header(*name, *value);
+        }
+        builder
+            .body(Full::new(Bytes::new()).map_err(|e| match e {}).boxed())
+            .unwrap()
+    }
+
+    fn header_str<'a>(
+        resp: &'a http::Response<BoxBody<Bytes, ServerError>>,
+        name: &str,
+    ) -> &'a str {
+        resp.headers()
+            .get(name)
+            .map(|value| value.to_str().unwrap())
+            .unwrap_or("<missing>")
+    }
+
+    #[test]
+    fn test_trusted_upstream_matcher() {
+        let exact = TrustedUpstreamMatcher::parse("10.0.0.1").unwrap();
+        assert!(exact.matches(&"10.0.0.1".parse().unwrap()));
+        assert!(!exact.matches(&"10.0.0.2".parse().unwrap()));
+
+        let net = TrustedUpstreamMatcher::parse("10.0.0.0/8").unwrap();
+        assert!(net.matches(&"10.255.1.2".parse().unwrap()));
+        assert!(!net.matches(&"11.0.0.1".parse().unwrap()));
+
+        let narrow = TrustedUpstreamMatcher::parse("192.168.1.4/31").unwrap();
+        assert!(narrow.matches(&"192.168.1.4".parse().unwrap()));
+        assert!(narrow.matches(&"192.168.1.5".parse().unwrap()));
+        assert!(!narrow.matches(&"192.168.1.6".parse().unwrap()));
+
+        let v6 = TrustedUpstreamMatcher::parse("fd00::/8").unwrap();
+        assert!(v6.matches(&"fd12::1".parse().unwrap()));
+        assert!(!v6.matches(&"fe80::1".parse().unwrap()));
+        // Address family mismatch never matches.
+        assert!(!v6.matches(&"10.0.0.1".parse().unwrap()));
+
+        assert!(TrustedUpstreamMatcher::parse("not-an-ip").is_err());
+        assert!(TrustedUpstreamMatcher::parse("10.0.0.0/33").is_err());
+        assert!(TrustedUpstreamMatcher::parse("10.0.0.0/x").is_err());
+    }
+
+    #[test]
+    fn test_resolve_trusted_forwarded_source_cases() {
+        let trusted = vec![
+            TrustedUpstreamMatcher::parse("127.0.0.0/8").unwrap(),
+            TrustedUpstreamMatcher::parse("10.0.0.0/8").unwrap(),
+        ];
+
+        let mut headers = http::HeaderMap::new();
+        headers.insert("x-forwarded-for", "203.0.113.7, 10.1.2.3".parse().unwrap());
+        assert_eq!(
+            resolve_trusted_forwarded_source(&headers, &trusted),
+            Some("203.0.113.7".to_string())
+        );
+
+        // Rightmost untrusted entry wins even if further-left entries exist.
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            "x-forwarded-for",
+            "198.51.100.1, 203.0.113.7, 10.1.2.3".parse().unwrap(),
+        );
+        assert_eq!(
+            resolve_trusted_forwarded_source(&headers, &trusted),
+            Some("203.0.113.7".to_string())
+        );
+
+        // All entries trusted: leftmost is used.
+        let mut headers = http::HeaderMap::new();
+        headers.insert("x-forwarded-for", "10.9.9.9, 10.1.2.3".parse().unwrap());
+        assert_eq!(
+            resolve_trusted_forwarded_source(&headers, &trusted),
+            Some("10.9.9.9".to_string())
+        );
+
+        // Malformed entry poisons X-Forwarded-For; falls back to X-Real-IP.
+        let mut headers = http::HeaderMap::new();
+        headers.insert("x-forwarded-for", "garbage, 10.1.2.3".parse().unwrap());
+        headers.insert("x-real-ip", "198.51.100.9".parse().unwrap());
+        headers.insert("x-real-port", "7777".parse().unwrap());
+        assert_eq!(
+            resolve_trusted_forwarded_source(&headers, &trusted),
+            Some("198.51.100.9:7777".to_string())
+        );
+
+        // No forwarded info at all.
+        let headers = http::HeaderMap::new();
+        assert_eq!(resolve_trusted_forwarded_source(&headers, &trusted), None);
+
+        // Entry with a port is preserved as-is.
+        let mut headers = http::HeaderMap::new();
+        headers.insert("x-forwarded-for", "203.0.113.7:4443".parse().unwrap());
+        assert_eq!(
+            resolve_trusted_forwarded_source(&headers, &trusted),
+            Some("203.0.113.7:4443".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_http_source_vars_direct_connection() {
+        let (server, _mgr) = build_source_vars_server(vec![]).await;
+        // Forged headers must not leak into the reserved source keys.
+        let request = source_vars_request(&[
+            ("source_ip", "6.6.6.6"),
+            ("real_source_ip", "7.7.7.7"),
+            ("X-Forwarded-For", "8.8.8.8"),
+        ]);
+        let resp = server
+            .serve_request(request, StreamInfo::new("192.168.1.9:5555".to_string()))
+            .await
+            .unwrap();
+
+        assert_eq!(header_str(&resp, "X-Test-Source"), "S:192.168.1.9:5555");
+        assert_eq!(header_str(&resp, "X-Test-Conn"), "C:192.168.1.9:5555");
+        assert_eq!(header_str(&resp, "X-Test-Real"), "R::");
+        assert_eq!(header_str(&resp, "X-Test-Remote"), "REM:192.168.1.9:5555");
+        assert_eq!(header_str(&resp, "X-Test-Real-Remote"), "RR:");
+    }
+
+    #[tokio::test]
+    async fn test_http_source_vars_stream_restored_source() {
+        // A stack-level trusted mechanism (e.g. PROXY protocol) filled
+        // StreamInfo.real_src_addr; the HTTP layer must expose it untouched.
+        let (server, _mgr) = build_source_vars_server(vec![]).await;
+        let request = source_vars_request(&[]);
+        let info = StreamInfo::with_addrs(
+            Some("127.0.0.1:9000".to_string()),
+            Some("198.51.100.7:6001".to_string()),
+        );
+        let resp = server.serve_request(request, info).await.unwrap();
+
+        assert_eq!(header_str(&resp, "X-Test-Source"), "S:198.51.100.7:6001");
+        assert_eq!(header_str(&resp, "X-Test-Conn"), "C:127.0.0.1:9000");
+        assert_eq!(header_str(&resp, "X-Test-Real"), "R:198.51.100.7:6001");
+        assert_eq!(header_str(&resp, "X-Test-Remote"), "REM:198.51.100.7:6001");
+        assert_eq!(header_str(&resp, "X-Test-Real-Remote"), "RR:198.51.100.7");
+    }
+
+    #[tokio::test]
+    async fn test_http_source_vars_trusted_upstream_xff() {
+        let (server, _mgr) =
+            build_source_vars_server(vec!["127.0.0.0/8".to_string(), "10.0.0.0/8".to_string()])
+                .await;
+        let request = source_vars_request(&[("X-Forwarded-For", "203.0.113.7, 10.1.2.3")]);
+        let resp = server
+            .serve_request(request, StreamInfo::new("127.0.0.1:4000".to_string()))
+            .await
+            .unwrap();
+
+        // Trusted hops are skipped right-to-left; the client IP becomes the
+        // real (and effective) source; the conn source stays the direct hop.
+        assert_eq!(header_str(&resp, "X-Test-Source"), "S:203.0.113.7:");
+        assert_eq!(header_str(&resp, "X-Test-Conn"), "C:127.0.0.1:4000");
+        assert_eq!(header_str(&resp, "X-Test-Real"), "R:203.0.113.7:");
+        assert_eq!(header_str(&resp, "X-Test-Remote"), "REM:203.0.113.7:");
+        assert_eq!(header_str(&resp, "X-Test-Real-Remote"), "RR:203.0.113.7");
+    }
+
+    #[tokio::test]
+    async fn test_http_source_vars_untrusted_forwarded_headers_ignored() {
+        // The direct hop is NOT in the trusted set: forwarded headers stay
+        // plain input data and must not fabricate real_source_*.
+        let (server, _mgr) = build_source_vars_server(vec!["10.0.0.0/8".to_string()]).await;
+        let request = source_vars_request(&[
+            ("X-Forwarded-For", "203.0.113.7"),
+            ("X-Real-IP", "203.0.113.8"),
+        ]);
+        let resp = server
+            .serve_request(request, StreamInfo::new("127.0.0.1:4000".to_string()))
+            .await
+            .unwrap();
+
+        assert_eq!(header_str(&resp, "X-Test-Source"), "S:127.0.0.1:4000");
+        assert_eq!(header_str(&resp, "X-Test-Conn"), "C:127.0.0.1:4000");
+        assert_eq!(header_str(&resp, "X-Test-Real"), "R::");
+        assert_eq!(header_str(&resp, "X-Test-Remote"), "REM:127.0.0.1:4000");
+        assert_eq!(header_str(&resp, "X-Test-Real-Remote"), "RR:");
+    }
+
+    #[tokio::test]
+    async fn test_http_source_vars_trusted_x_real_ip_fallback() {
+        let (server, _mgr) = build_source_vars_server(vec!["127.0.0.0/8".to_string()]).await;
+        let request =
+            source_vars_request(&[("X-Real-IP", "198.51.100.9"), ("X-Real-Port", "7777")]);
+        let resp = server
+            .serve_request(request, StreamInfo::new("127.0.0.1:4000".to_string()))
+            .await
+            .unwrap();
+
+        assert_eq!(header_str(&resp, "X-Test-Real"), "R:198.51.100.9:7777");
+        assert_eq!(header_str(&resp, "X-Test-Source"), "S:198.51.100.9:7777");
+        assert_eq!(header_str(&resp, "X-Test-Remote"), "REM:198.51.100.9:7777");
+    }
+
+    #[tokio::test]
+    async fn test_http_source_vars_stream_mechanism_outranks_forwarded_headers() {
+        let (server, _mgr) = build_source_vars_server(vec!["127.0.0.0/8".to_string()]).await;
+        let request = source_vars_request(&[("X-Forwarded-For", "203.0.113.7")]);
+        let info = StreamInfo::with_addrs(
+            Some("127.0.0.1:4000".to_string()),
+            Some("198.51.100.7:6001".to_string()),
+        );
+        let resp = server.serve_request(request, info).await.unwrap();
+
+        assert_eq!(header_str(&resp, "X-Test-Real"), "R:198.51.100.7:6001");
+        assert_eq!(header_str(&resp, "X-Test-Source"), "S:198.51.100.7:6001");
+    }
+
     async fn gzip_bytes(data: &[u8]) -> Bytes {
         let cursor = Cursor::new(data.to_vec());
         let reader = tokio::io::BufReader::new(cursor);
@@ -1610,6 +2726,20 @@ mod tests {
         assert!(builder.post_hook_point.is_none());
         assert!(builder.global_process_chains.is_none());
         assert!(builder.server_mgr.is_none());
+    }
+
+    #[test]
+    fn test_origin_form_uri_normalizes_absolute_uri() {
+        assert_eq!(
+            ProcessChainHttpServer::origin_form_uri(
+                "http://127.0.0.1:3180/.cluster/klog/ood2/raft/append-entries?x=1",
+            ),
+            "/.cluster/klog/ood2/raft/append-entries?x=1"
+        );
+        assert_eq!(
+            ProcessChainHttpServer::origin_form_uri("/kapi/klog-service"),
+            "/kapi/klog-service"
+        );
     }
 
     #[tokio::test]
@@ -2707,6 +3837,94 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_process_chain_http_server_forward_http_base_path_keeps_origin_form_uri() {
+        use http_body_util::BodyExt;
+        use tokio::net::TcpListener;
+
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = upstream_listener.accept().await.unwrap();
+            let service = hyper::service::service_fn(
+                |req: http::Request<hyper::body::Incoming>| async move {
+                    assert_eq!(req.uri().scheme_str(), None);
+                    assert_eq!(req.uri().authority(), None);
+                    assert_eq!(req.uri().to_string(), "/base/v1/chat?x=1");
+                    let _ = req.collect().await;
+                    Ok::<_, ServerError>(
+                        http::Response::builder()
+                            .status(StatusCode::OK)
+                            .body(
+                                Full::new(Bytes::from("base path success"))
+                                    .map_err(|e| match e {})
+                                    .boxed(),
+                            )
+                            .unwrap(),
+                    )
+                },
+            );
+
+            let _ = hyper::server::conn::http1::Builder::new()
+                .serve_connection(TokioIo::new(stream), service)
+                .await;
+        });
+
+        let mock_server_mgr = Arc::new(ServerManager::new());
+        let chains = format!(
+            r#"
+- id: main
+  priority: 1
+  blocks:
+    - id: main
+      block: |
+        forward http://{}/base/;
+        "#,
+            upstream_addr
+        );
+
+        let chains: ProcessChainConfigs = serde_yaml_ng::from_str(&chains).unwrap();
+        let http_server = Arc::new(
+            ProcessChainHttpServer::builder()
+                .id("test_forward_http_base_path")
+                .version("HTTP/1.1".to_string())
+                .hook_point(chains)
+                .server_mgr(Arc::downgrade(&mock_server_mgr))
+                .tunnel_manager(TunnelManager::new())
+                .build()
+                .await
+                .unwrap(),
+        );
+
+        let (client, server) = tokio::io::duplex(1024);
+        tokio::spawn(async move {
+            hyper_serve_http(Box::new(server), http_server, StreamInfo::default())
+                .await
+                .unwrap();
+        });
+
+        let request = http::Request::builder()
+            .method("GET")
+            .uri("/v1/chat?x=1")
+            .body(Full::new(Bytes::new()).map_err(|e| match e {}).boxed())
+            .unwrap();
+
+        let (mut sender, conn) = hyper::client::conn::http1::Builder::new()
+            .handshake(TokioIo::new(client))
+            .await
+            .unwrap();
+
+        tokio::spawn(async move {
+            conn.await.unwrap();
+        });
+
+        let resp = sender.send_request(request).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = resp.collect().await.unwrap().to_bytes();
+        assert_eq!(body, Bytes::from("base path success"));
+    }
+
+    #[tokio::test]
     async fn test_process_chain_http_server_forward_tcp() {
         tokio::spawn(async move {
             use http_body_util::BodyExt;
@@ -2796,6 +4014,233 @@ mod tests {
 
         let body = resp.collect().await.unwrap().to_bytes();
         assert_eq!(body, Bytes::from("forward success"));
+    }
+
+    #[tokio::test]
+    async fn test_process_chain_http_server_two_hop_tcp_forward_keeps_origin_form_uri() {
+        use http_body_util::BodyExt;
+        use tokio::net::TcpListener;
+
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = upstream_listener.accept().await.unwrap();
+            let service = hyper::service::service_fn(
+                |req: http::Request<hyper::body::Incoming>| async move {
+                    assert_eq!(req.uri().scheme_str(), None);
+                    assert_eq!(req.uri().authority(), None);
+                    assert_eq!(
+                        req.uri().to_string(),
+                        "/.cluster/klog-it-dv/ood2/raft/append-entries"
+                    );
+                    let _ = req.collect().await;
+                    Ok::<_, ServerError>(
+                        http::Response::builder()
+                            .status(StatusCode::OK)
+                            .body(
+                                Full::new(Bytes::from("two-hop success"))
+                                    .map_err(|e| match e {})
+                                    .boxed(),
+                            )
+                            .unwrap(),
+                    )
+                },
+            );
+
+            let _ = hyper::server::conn::http1::Builder::new()
+                .serve_connection(TokioIo::new(stream), service)
+                .await;
+        });
+
+        let target_server_mgr = Arc::new(ServerManager::new());
+        let target_chains = format!(
+            r#"
+- id: main
+  priority: 1
+  blocks:
+    - id: main
+      block: |
+        forward tcp:///{};
+        "#,
+            upstream_addr
+        );
+        let target_chains: ProcessChainConfigs = serde_yaml_ng::from_str(&target_chains).unwrap();
+        let target_gateway = Arc::new(
+            ProcessChainHttpServer::builder()
+                .id("target_gateway")
+                .version("HTTP/1.1".to_string())
+                .hook_point(target_chains)
+                .server_mgr(Arc::downgrade(&target_server_mgr))
+                .tunnel_manager(TunnelManager::new())
+                .build()
+                .await
+                .unwrap(),
+        );
+
+        let target_gateway_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_gateway_addr = target_gateway_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = target_gateway_listener.accept().await.unwrap();
+            hyper_serve_http(Box::new(stream), target_gateway, StreamInfo::default())
+                .await
+                .unwrap();
+        });
+
+        let source_server_mgr = Arc::new(ServerManager::new());
+        let source_chains = format!(
+            r#"
+- id: main
+  priority: 1
+  blocks:
+    - id: main
+      block: |
+        forward tcp:///{};
+        "#,
+            target_gateway_addr
+        );
+        let source_chains: ProcessChainConfigs = serde_yaml_ng::from_str(&source_chains).unwrap();
+        let source_gateway = Arc::new(
+            ProcessChainHttpServer::builder()
+                .id("source_gateway")
+                .version("HTTP/1.1".to_string())
+                .hook_point(source_chains)
+                .server_mgr(Arc::downgrade(&source_server_mgr))
+                .tunnel_manager(TunnelManager::new())
+                .build()
+                .await
+                .unwrap(),
+        );
+
+        let (client, server) = tokio::io::duplex(1024);
+        tokio::spawn(async move {
+            hyper_serve_http(Box::new(server), source_gateway, StreamInfo::default())
+                .await
+                .unwrap();
+        });
+
+        let request = http::Request::builder()
+            .method("POST")
+            .uri("/.cluster/klog-it-dv/ood2/raft/append-entries")
+            .header("host", "127.0.0.1:3180")
+            .body(Full::new(Bytes::new()).map_err(|e| match e {}).boxed())
+            .unwrap();
+
+        let (mut sender, conn) = hyper::client::conn::http1::Builder::new()
+            .handshake(TokioIo::new(client))
+            .await
+            .unwrap();
+
+        tokio::spawn(async move {
+            conn.await.unwrap();
+        });
+
+        let resp = sender.send_request(request).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = resp.collect().await.unwrap().to_bytes();
+        assert_eq!(body, Bytes::from("two-hop success"));
+    }
+
+    #[tokio::test]
+    async fn test_process_chain_http_server_uses_forward_plan_from_process_chain() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::net::TcpListener;
+
+        let closed_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let closed_addr = closed_listener.local_addr().unwrap();
+        drop(closed_listener);
+
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let hit_count = Arc::new(AtomicUsize::new(0));
+        let upstream_hit_count = hit_count.clone();
+        tokio::spawn(async move {
+            let (stream, _) = upstream_listener.accept().await.unwrap();
+            let service =
+                hyper::service::service_fn(move |req: http::Request<hyper::body::Incoming>| {
+                    let upstream_hit_count = upstream_hit_count.clone();
+                    async move {
+                        upstream_hit_count.fetch_add(1, Ordering::SeqCst);
+                        assert_eq!(req.uri().path(), "/plan");
+                        let _ = req.collect().await;
+                        Ok::<_, ServerError>(
+                            http::Response::builder()
+                                .status(StatusCode::OK)
+                                .body(
+                                    Full::new(Bytes::from("forward plan success"))
+                                        .map_err(|e| match e {})
+                                        .boxed(),
+                                )
+                                .unwrap(),
+                        )
+                    }
+                });
+
+            let _ = hyper::server::conn::http1::Builder::new()
+                .serve_connection(TokioIo::new(stream), service)
+                .await;
+        });
+
+        let mock_server_mgr = Arc::new(ServerManager::new());
+        let chains = format!(
+            r#"
+- id: main
+  priority: 1
+  blocks:
+    - id: main
+      block: |
+        forward round_robin --next-upstream "error,timeout" --tries 2 http://{} http://{};
+        "#,
+            closed_addr, upstream_addr
+        );
+
+        let chains: ProcessChainConfigs = serde_yaml_ng::from_str(&chains).unwrap();
+
+        let result = ProcessChainHttpServer::builder()
+            .id("test_forward_group_plan")
+            .version("HTTP/1.1".to_string())
+            .hook_point(chains)
+            .server_mgr(Arc::downgrade(&mock_server_mgr))
+            .tunnel_manager(TunnelManager::new())
+            .build()
+            .await;
+
+        assert!(
+            result.is_ok(),
+            "forward group plan server should build: {:?}",
+            result.err()
+        );
+        let http_server = Arc::new(result.unwrap());
+
+        let (client, server) = tokio::io::duplex(128);
+
+        tokio::spawn(async move {
+            hyper_serve_http(Box::new(server), http_server, StreamInfo::default())
+                .await
+                .unwrap();
+        });
+
+        let request = http::Request::builder()
+            .method("GET")
+            .uri("/plan")
+            .body(Full::new(Bytes::new()).map_err(|e| match e {}).boxed())
+            .unwrap();
+
+        let (mut sender, conn) = hyper::client::conn::http1::Builder::new()
+            .handshake(TokioIo::new(client))
+            .await
+            .unwrap();
+
+        tokio::spawn(async move {
+            conn.await.unwrap();
+        });
+
+        let resp = sender.send_request(request).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = resp.collect().await.unwrap().to_bytes();
+        assert_eq!(body, Bytes::from("forward plan success"));
+        assert_eq!(hit_count.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -2893,12 +4338,11 @@ mod tests {
         let unreachable_v6: SocketAddr = "[2001:db8::1]:443".parse().unwrap();
         let closed_v4: SocketAddr = "127.0.0.1:9".parse().unwrap();
 
-        let err = ProcessChainHttpServer::connect_upstream_candidates(vec![unreachable_v6, closed_v4])
-            .await
-            .unwrap_err();
+        let (_reason, msg) =
+            ProcessChainHttpServer::connect_upstream_candidates(vec![unreachable_v6, closed_v4])
+                .await
+                .unwrap_err();
 
-        let msg = err.msg().to_string();
-        assert!(msg.contains("Failed to connect upstream candidates"));
         assert!(msg.contains("2001:db8::1"));
         assert!(msg.contains("127.0.0.1:9"));
     }
@@ -3244,6 +4688,7 @@ mod tests {
             h3_port: None,
             hook_point: ProcessChainConfigs::default(),
             post_hook_point: None,
+            trusted_upstreams: Vec::new(),
             gzip: false,
             gzip_types: Vec::new(),
             gzip_min_length: default_gzip_min_length(),

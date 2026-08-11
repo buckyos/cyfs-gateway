@@ -51,7 +51,7 @@ impl HyperHttpRequestHeaderMap {
 
         let visitor = Arc::new(Box::new(wrapper) as Box<dyn VariableVisitor>);
         for (id, _, _) in HTTP_REQUEST_HEADER_VARS {
-            env.create(*id, CollectionValue::Visitor(Arc::clone(&visitor)))
+            env.create(id, CollectionValue::Visitor(Arc::clone(&visitor)))
                 .await?;
         }
 

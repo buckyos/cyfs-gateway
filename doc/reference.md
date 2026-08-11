@@ -497,6 +497,100 @@ Examples:
   rewrite host "api.*.domain.com" "svc-*.internal"
 ```
 
+### `rewrite-path`
+```
+Rewrite a path-like variable using segment templates.
+
+Usage: rewrite-path [OPTIONS] <var> <pattern> <template>
+
+Arguments:
+  <var>
+          The variable to rewrite
+
+  <pattern>
+          The template pattern to match
+
+  <template>
+          The rewrite template
+
+Options:
+      --ignore-case
+          Perform case-insensitive matching (default is case-sensitive)
+
+  -h, --help
+          Print help
+
+
+Arguments:
+  <var>       The path-like variable to rewrite (e.g. $REQ.path)
+  <pattern>   The template pattern to match against
+  <template>  The rewrite template using {name} and optional ** rest splice
+
+Options:
+  --ignore-case   Perform case-insensitive matching (default is case-sensitive)
+
+Behavior:
+  - Uses '/' as the default segment separator.
+  - <pattern> and <template> are evaluated dynamically at runtime.
+  - Capture names in <pattern> must be unique.
+  - <pattern> follows the same template rules as match-path:
+      {name} captures one segment and ** matches the remaining segments at the end.
+  - <template> can reference named captures using {name}.
+  - If <pattern> contains **, <template> may include a segment ** to splice the matched remaining segments.
+  - If <pattern> does not match, returns error and leaves the variable unchanged.
+
+Examples:
+  rewrite-path $REQ.path "/kapi/{service}/**" "/api/{service}/**"
+  rewrite-path $REQ.path "${route_prefix}/{node}/{plane}/**" "/klog/{node}/{plane}/**"
+```
+
+### `rewrite-host`
+```
+Rewrite a host-like variable using segment templates.
+
+Usage: rewrite-host [OPTIONS] <var> <pattern> <template>
+
+Arguments:
+  <var>
+          The variable to rewrite
+
+  <pattern>
+          The template pattern to match
+
+  <template>
+          The rewrite template
+
+Options:
+      --no-ignore-case
+          Perform case-sensitive matching (default is case-insensitive)
+
+  -h, --help
+          Print help
+
+
+Arguments:
+  <var>       The host-like variable to rewrite (e.g. $REQ.host)
+  <pattern>   The template pattern to match against
+  <template>  The rewrite template using {name} and optional ** rest splice
+
+Options:
+  --no-ignore-case   Perform case-sensitive matching (default is case-insensitive)
+
+Behavior:
+  - Uses '.' as the default segment separator.
+  - <pattern> and <template> are evaluated dynamically at runtime.
+  - Capture names in <pattern> must be unique.
+  - <pattern> follows the same template rules as match-host:
+      {name} captures one host label and ** matches the remaining labels at the end.
+  - <template> can reference named captures using {name}.
+  - If <pattern> contains **, <template> may include a segment ** to splice the matched remaining labels.
+  - If <pattern> does not match, returns error and leaves the variable unchanged.
+
+Examples:
+  rewrite-host $REQ.host "{app}.${THIS_ZONE_HOST}" "{app}-internal.${THIS_ZONE_HOST}"
+  rewrite-host $REQ.host "{app}.**" "{app}.internal.**"
+```
+
 ### `rewrite-reg`
 ```
 Rewrite a variable using a regular expression and a replacement template.
@@ -563,6 +657,84 @@ Behavior:
 Examples:
   slice "abcdef" 1:4
   slice $REQ.url 0:10
+```
+
+### `strip-prefix`
+```
+Strip a prefix from a string and return the remaining tail.
+
+Usage: strip-prefix [OPTIONS] <value> <prefix>
+
+Arguments:
+  <value>
+          Input string to strip
+
+  <prefix>
+          Prefix to remove
+
+Options:
+  -i, --ignore-case
+          Perform case-insensitive comparison
+
+  -h, --help
+          Print help
+
+
+Arguments:
+  <value>      The full input string or variable.
+  <prefix>     The prefix to remove.
+
+Behavior:
+  - Both arguments are evaluated dynamically at runtime.
+  - If <value> starts with <prefix>, returns success with the remaining tail.
+  - If <value> equals <prefix>, returns success with an empty string.
+  - Comparison is case-sensitive by default.
+  - If <value> does not start with <prefix>, returns error and leaves the value unchanged.
+  - Does not modify any variable or environment.
+
+Examples:
+  strip-prefix "/api/v1/users" "/api"
+  strip-prefix --ignore-case "/API/v1/users" "/api"
+  strip-prefix $REQ.url $route_prefix
+```
+
+### `strip-suffix`
+```
+Strip a suffix from a string and return the remaining head.
+
+Usage: strip-suffix [OPTIONS] <value> <suffix>
+
+Arguments:
+  <value>
+          Input string to strip
+
+  <suffix>
+          Suffix to remove
+
+Options:
+  -i, --ignore-case
+          Perform case-insensitive comparison
+
+  -h, --help
+          Print help
+
+
+Arguments:
+  <value>      The full input string or variable.
+  <suffix>     The suffix to remove.
+
+Behavior:
+  - Both arguments are evaluated dynamically at runtime.
+  - If <value> ends with <suffix>, returns success with the remaining head.
+  - If <value> equals <suffix>, returns success with an empty string.
+  - Comparison is case-sensitive by default.
+  - If <value> does not end with <suffix>, returns error and leaves the value unchanged.
+  - Does not modify any variable or environment.
+
+Examples:
+  strip-suffix "/api/v1/users" "/users"
+  strip-suffix --ignore-case "/api/v1/USERS" "/users"
+  strip-suffix $REQ.host $zone_suffix
 ```
 
 ### `starts-with`
@@ -975,7 +1147,7 @@ Options:
           Perform case-sensitive matching (default is case-insensitive)
 
       --capture <name>
-          Name to use when storing regex captures into the environment
+          Store regex match results into a fresh List variable
 
   -h, --help
           Print help
@@ -986,20 +1158,120 @@ Arguments:
   <pattern>    The regular expression to match against.
 
 Options:
-  --capture name   Capture groups into environment variables like name[0], name[1], ...
+  --capture name   Store regex match results into a fresh List variable accessible as name[0], name[1], ...
   --no-ignore-case   Perform case-sensitive matching (default is case-insensitive)
 
 Behavior:
   - Uses Rust-style regular expressions.
   - If the pattern matches, the command returns success, otherwise it returns error.
-  - If --capture is provided, matched groups are saved into environment as:
-      name[0] is the first capture group,
-      name[1] is the second capture group, etc.
+  - If --capture is provided, match results are saved into a fresh List as:
+      name[0] is the full matched text,
+      name[1] is the first capture group,
+      name[2] is the second capture group, etc.
+  - Unmatched optional capture groups are stored as Null to preserve indexes.
   - Default behavior is case-insensitive matching.
 
 Examples:
   match-reg $REQ_HEADER.host "^(.*)\.local$"
   match-reg --capture parts $REQ_HEADER.host "^(.+)\.(local|dev)$"
+```
+
+### `match-path`
+```
+Match a path-like value using segment templates. Supports optional capture.
+
+Usage: match-path [OPTIONS] <value> <pattern>
+
+Arguments:
+  <value>
+          The input string or variable to match
+
+  <pattern>
+          The template pattern to match against
+
+Options:
+      --ignore-case
+          Perform case-insensitive matching (default is case-sensitive)
+
+      --capture <name>
+          Store template match results into a fresh List variable
+
+  -h, --help
+          Print help
+
+
+Arguments:
+  <value>      The path-like string to match.
+  <pattern>    The template pattern to match against.
+
+Options:
+  --capture name   Store template match results into a fresh List variable accessible as name[0], name[1], ...
+  --ignore-case    Perform case-insensitive matching (default is case-sensitive)
+
+Behavior:
+  - Uses '/' as the default segment separator.
+  - Pattern is evaluated dynamically at runtime.
+  - Capture names in the pattern must be unique.
+  - `{name}` captures text inside a single segment and never crosses '/'.
+  - `**` matches the remaining segments and must appear as the last segment.
+  - If --capture is provided, match results are saved into a fresh List as:
+      name[0] is the full matched text,
+      name[1] is the first template capture,
+      name[2] is the second template capture, etc.
+  - Matching is case-sensitive by default.
+
+Examples:
+  match-path $REQ.path "/kapi/{service_id}/**"
+  match-path --capture parts $REQ.path "${route_prefix}/{node}/{plane}/**"
+```
+
+### `match-host`
+```
+Match a host-like value using segment templates. Supports optional capture.
+
+Usage: match-host [OPTIONS] <value> <pattern>
+
+Arguments:
+  <value>
+          The input string or variable to match
+
+  <pattern>
+          The template pattern to match against
+
+Options:
+      --no-ignore-case
+          Perform case-sensitive matching (default is case-insensitive)
+
+      --capture <name>
+          Store template match results into a fresh List variable
+
+  -h, --help
+          Print help
+
+
+Arguments:
+  <value>      The host-like string to match.
+  <pattern>    The template pattern to match against.
+
+Options:
+  --capture name     Store template match results into a fresh List variable accessible as name[0], name[1], ...
+  --no-ignore-case   Perform case-sensitive matching (default is case-insensitive)
+
+Behavior:
+  - Uses '.' as the default segment separator.
+  - Pattern is evaluated dynamically at runtime.
+  - Capture names in the pattern must be unique.
+  - `{name}` captures text inside a single host label and never crosses '.'.
+  - `**` matches the remaining labels and must appear as the last segment.
+  - If --capture is provided, match results are saved into a fresh List as:
+      name[0] is the full matched text,
+      name[1] is the first template capture,
+      name[2] is the second template capture, etc.
+  - Matching is case-insensitive by default.
+
+Examples:
+  match-host $REQ.host "{app}.${THIS_ZONE_HOST}"
+  match-host --capture host $REQ.host "{app}-${THIS_ZONE_HOST}"
 ```
 
 ### `range`
@@ -1059,4 +1331,3 @@ Examples:
 
 
 ### ANSWER
-

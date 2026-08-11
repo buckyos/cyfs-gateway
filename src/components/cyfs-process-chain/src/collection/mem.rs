@@ -1,5 +1,5 @@
 use super::coll::*;
-use indexmap::{IndexMap, IndexSet};
+use indexmap::IndexSet;
 use std::collections::HashSet as StdHashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -22,6 +22,7 @@ impl<'a> Drop for TraverseGuard<'a> {
     }
 }
 
+#[derive(Default)]
 pub struct MemoryListCollection {
     data: AsyncRwLock<Vec<CollectionValue>>,
     transverse_counter: AtomicU32, // Indicates if a traversal is currently happening
@@ -29,10 +30,7 @@ pub struct MemoryListCollection {
 
 impl MemoryListCollection {
     pub fn new() -> Self {
-        Self {
-            data: AsyncRwLock::new(Vec::new()),
-            transverse_counter: AtomicU32::new(0),
-        }
+        Self::default()
     }
 
     pub fn new_ref() -> ListCollectionRef {
@@ -204,6 +202,7 @@ impl ListCollection for MemoryListCollection {
     }
 }
 
+#[derive(Default)]
 pub struct MemorySetCollection {
     data: AsyncRwLock<OrderedStringSet>,
     transverse_counter: AtomicU32, // Indicates if a traversal is currently happening
@@ -211,10 +210,7 @@ pub struct MemorySetCollection {
 
 impl MemorySetCollection {
     pub fn new() -> Self {
-        Self {
-            data: AsyncRwLock::new(IndexSet::new()),
-            transverse_counter: AtomicU32::new(0),
-        }
+        Self::default()
     }
 
     pub fn new_ref() -> SetCollectionRef {
@@ -290,7 +286,7 @@ impl SetCollection for MemorySetCollection {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct MemoryMapCollection {
     data: Arc<AsyncRwLock<OrderedStringMap<CollectionValue>>>,
     transverse_counter: Arc<AtomicU32>, // Indicates if a traversal is currently happening
@@ -298,10 +294,7 @@ pub struct MemoryMapCollection {
 
 impl MemoryMapCollection {
     pub fn new() -> Self {
-        Self {
-            data: Arc::new(AsyncRwLock::new(IndexMap::new())),
-            transverse_counter: Arc::new(AtomicU32::new(0)),
-        }
+        Self::default()
     }
 
     pub fn new_ref() -> MapCollectionRef {
@@ -562,7 +555,7 @@ impl MapCollection for MemoryMapCollection {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct MemoryMultiMapCollection {
     data: Arc<AsyncRwLock<OrderedStringMap<OrderedStringSet>>>,
     transverse_counter: Arc<AtomicU32>, // Indicates if a traversal is currently happening
@@ -570,10 +563,7 @@ pub struct MemoryMultiMapCollection {
 
 impl MemoryMultiMapCollection {
     pub fn new() -> Self {
-        Self {
-            data: Arc::new(AsyncRwLock::new(IndexMap::new())),
-            transverse_counter: Arc::new(AtomicU32::new(0)),
-        }
+        Self::default()
     }
 
     pub(crate) fn from_map(map: OrderedStringMap<OrderedStringSet>) -> Self {
@@ -650,10 +640,10 @@ impl MultiMapCollection for MemoryMultiMapCollection {
 
     async fn get(&self, key: &str) -> Result<Option<String>, String> {
         let data = self.data.read().await;
-        if let Some(set) = data.get(key) {
-            if let Some(first_value) = set.iter().next() {
-                return Ok(Some(first_value.clone()));
-            }
+        if let Some(set) = data.get(key)
+            && let Some(first_value) = set.iter().next()
+        {
+            return Ok(Some(first_value.clone()));
         }
 
         Ok(None)

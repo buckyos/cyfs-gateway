@@ -1,4 +1,4 @@
-use super::cmd::*;
+use super::types::*;
 use crate::CommandArgEvaluator;
 use crate::block::{CommandArg, CommandArgs};
 use crate::chain::{Context, ParserContext};
@@ -207,12 +207,12 @@ impl CommandExecutor for EchoCommandExecutor {
             }
 
             // If suppress_newline is false, append a newline
-            if !self.suppress_newline {
-                if let Err(e) = stdout.write_all(b"\n").await {
-                    let msg = format!("Failed to write newline to stdout: {}", e);
-                    error!("{}", msg);
-                    return Err(msg);
-                }
+            if !self.suppress_newline
+                && let Err(e) = stdout.write_all(b"\n").await
+            {
+                let msg = format!("Failed to write newline to stdout: {}", e);
+                error!("{}", msg);
+                return Err(msg);
             }
 
             // Flush the output to ensure it is written immediately

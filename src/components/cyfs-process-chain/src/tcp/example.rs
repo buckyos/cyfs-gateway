@@ -122,7 +122,7 @@ async fn on_new_connection(
 
     // Register the request map in the environment
     let env = exec.chain_env();
-    request_map.register(&env).await.unwrap();
+    request_map.register(env).await.unwrap();
 
     // Execute the hook point
     let ret: Result<CommandResult, String> = exec.execute_lib().await;

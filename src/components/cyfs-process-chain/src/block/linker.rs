@@ -1,12 +1,12 @@
-use super::block::{
-    Block, CommandArg, CommandItem, Expression, ForStatement, IfStatement, Line,
-    MatchResultStatement, Statement,
-};
 use super::exec::BlockExecuter;
 use super::parser::BlockParser;
+use super::types::{
+    Block, CaseStatement, CommandArg, CommandItem, Expression, ForStatement, IfStatement, Line,
+    MatchResultStatement, Statement,
+};
 use crate::chain::{Context, MissingVarPolicy, ParserContextRef};
 use crate::cmd::CommandParserFactory;
-use crate::collection::CollectionValue;
+use crate::collection::{CollectionValue, MemoryListCollection, MemoryMapCollection};
 
 pub struct BlockCommandLinker {
     context: ParserContextRef,
@@ -39,6 +39,10 @@ impl BlockCommandLinker {
             self.link_if_statement(if_statement)?;
             return Ok(());
         }
+        if let Some(case_statement) = statement.case_statement.as_mut() {
+            self.link_case_statement(case_statement)?;
+            return Ok(());
+        }
         if let Some(for_statement) = statement.for_statement.as_mut() {
             self.link_for_statement(for_statement)?;
             return Ok(());
@@ -67,6 +71,31 @@ impl BlockCommandLinker {
         }
 
         if let Some(else_lines) = if_statement.else_lines.as_mut() {
+            for line in else_lines {
+                self.link_line(line)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn link_case_statement(&self, case_statement: &mut CaseStatement) -> Result<(), String> {
+        if let Some(subject) = case_statement.subject.as_mut()
+            && let Some(exp) = subject.as_command_substitution_mut()
+        {
+            self.link_expression(exp)?;
+        }
+
+        for branch in &mut case_statement.branches {
+            for (_, expr, _) in &mut branch.condition {
+                self.link_expression(expr)?;
+            }
+            for line in &mut branch.lines {
+                self.link_line(line)?;
+            }
+        }
+
+        if let Some(else_lines) = case_statement.else_lines.as_mut() {
             for line in else_lines {
                 self.link_line(line)?;
             }
@@ -589,6 +618,17 @@ impl CommandArgEvaluator {
             .join(".")
     }
 
+    fn parse_list_index(segment_key: &str, current_var_path: &str) -> Result<usize, String> {
+        segment_key.parse::<usize>().map_err(|e| {
+            let msg = format!(
+                "Invalid list index '{}' while resolving '{}': {}",
+                segment_key, current_var_path, e
+            );
+            warn!("{}", msg);
+            msg
+        })
+    }
+
     #[async_recursion::async_recursion]
     async fn resolve_segment_key(
         segment: &VarPathSegment,
@@ -664,9 +704,7 @@ impl CommandArgEvaluator {
                 continue;
             }
             if ch == ']' {
-                if bracket_depth > 0 {
-                    bracket_depth -= 1;
-                }
+                bracket_depth = bracket_depth.saturating_sub(1);
                 i += ch.len_utf8();
                 continue;
             }
@@ -677,9 +715,7 @@ impl CommandArgEvaluator {
                 continue;
             }
             if ch == ')' {
-                if paren_depth > 0 {
-                    paren_depth -= 1;
-                }
+                paren_depth = paren_depth.saturating_sub(1);
                 i += ch.len_utf8();
                 continue;
             }
@@ -788,6 +824,23 @@ impl CommandArgEvaluator {
             let is_last = index == parsed.len() - 1;
 
             let next_value = match current_value {
+                Some(CollectionValue::List(list)) => {
+                    let list_index = match Self::parse_list_index(&segment_key, &current_key) {
+                        Ok(index) => index,
+                        Err(msg) => {
+                            if access.optional {
+                                return Ok(VarEvalResult::Missing {
+                                    key: Self::normalize_segment_list(&resolved_segments),
+                                    explicit: true,
+                                });
+                            }
+
+                            return Err(msg);
+                        }
+                    };
+
+                    list.get(list_index).await?
+                }
                 Some(CollectionValue::Map(map)) => map.get(&segment_key).await?,
                 Some(CollectionValue::Set(set)) => {
                     if is_last {
@@ -898,6 +951,21 @@ impl CommandArgEvaluator {
             CommandArg::Literal(value) => CollectionValue::String(value.clone()),
             CommandArg::StringLiteral(value) => CollectionValue::String(value.clone()),
             CommandArg::TypedLiteral(_, value) => value.clone(),
+            CommandArg::ListLiteral(items) => {
+                let list = MemoryListCollection::new_ref();
+                for item in items {
+                    list.push(Self::evaluate(item, context).await?).await?;
+                }
+                CollectionValue::List(list)
+            }
+            CommandArg::MapLiteral(entries) => {
+                let map = MemoryMapCollection::new_ref();
+                for (key, value) in entries {
+                    map.insert(key, Self::evaluate(value, context).await?)
+                        .await?;
+                }
+                CollectionValue::Map(map)
+            }
             CommandArg::Var(var) => {
                 debug!("Resolving variable: {}", var);
                 let policy = context.env().policy();

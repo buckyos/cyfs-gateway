@@ -1,8 +1,9 @@
-use super::cmd::*;
+use super::template::TemplateMatcher;
+use super::types::*;
 use crate::block::{CommandArg, CommandArgs};
 use crate::chain::{Context, ParserContext};
-use crate::collection::CollectionValue;
-use clap::{Arg, ArgAction, Command};
+use crate::collection::{CollectionValue, MemoryListCollection, MemoryMapCollection};
+use clap::{Arg, ArgAction, ArgMatches, Command};
 use globset::{GlobBuilder, GlobMatcher};
 use regex::{Regex, RegexBuilder};
 use std::sync::Arc;
@@ -154,11 +155,52 @@ impl CommandExecutor for MatchCommandExecutor {
 }
 
 // Match regex command, like: match-reg REQ_HEADER.host "^(.*)\.local$"
-// If capture is provided, it will capture the matched groups into the environment with name `name[i]`
+// If capture is provided, it stores match results in a fresh List accessible by `name[i]`
 /*
 * match-reg some_input "^pattern$"
 * match-reg --capture name some_input "^pattern$"
 */
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct MatchCaptureTargets {
+    positional: Option<String>,
+    named: Option<String>,
+}
+
+fn parse_capture_target_name(
+    matches: &ArgMatches,
+    args: &CommandArgs,
+    arg_name: &str,
+) -> Result<Option<String>, String> {
+    match matches.index_of(arg_name) {
+        Some(index) => {
+            let name = args[index].as_literal_str().ok_or_else(|| {
+                let msg = format!("Capture name must be a literal string: {:?}", args[index]);
+                error!("{}", msg);
+                msg
+            })?;
+            Ok(Some(name.to_string()))
+        }
+        None => Ok(None),
+    }
+}
+
+fn parse_capture_targets(
+    matches: &ArgMatches,
+    args: &CommandArgs,
+) -> Result<MatchCaptureTargets, String> {
+    let positional = parse_capture_target_name(matches, args, "capture")?;
+    let named = parse_capture_target_name(matches, args, "capture_named")?;
+
+    if positional.is_some() && positional == named {
+        let msg = "capture and capture-named must use different variable names".to_string();
+        error!("{}", msg);
+        return Err(msg);
+    }
+
+    Ok(MatchCaptureTargets { positional, named })
+}
+
 pub struct MatchRegexCommandParser {
     cmd: Command,
 }
@@ -166,7 +208,7 @@ pub struct MatchRegexCommandParser {
 impl MatchRegexCommandParser {
     pub fn new() -> Self {
         let cmd = Command::new("match-reg")
-            .about("Match a value against a regular expression. Supports optional named capture.")
+            .about("Match a value against a regular expression. Supports optional capture.")
             .after_help(
                 r#"
 Arguments:
@@ -174,20 +216,26 @@ Arguments:
   <pattern>    The regular expression to match against.
 
 Options:
-  --capture name   Capture groups into environment variables like name[0], name[1], ...
+  --capture name   Store regex match results into a fresh List variable accessible as name[0], name[1], ...
+  --capture-named name   Store named regex captures into a fresh Map variable accessible as name.group
   --no-ignore-case   Perform case-sensitive matching (default is case-insensitive)
 
 Behavior:
   - Uses Rust-style regular expressions.
   - If the pattern matches, the command returns success, otherwise it returns error.
-  - If --capture is provided, matched groups are saved into environment as:
-      name[0] is the first capture group,
-      name[1] is the second capture group, etc.
+  - If --capture is provided, match results are saved into a fresh List as:
+      name[0] is the full matched text,
+      name[1] is the first capture group,
+      name[2] is the second capture group, etc.
+  - If --capture-named is provided, named capture groups `(?P<name>...)` are saved into a fresh Map.
+  - Unmatched optional named capture groups are stored as Null to preserve keys.
+  - Unmatched optional capture groups are stored as Null to preserve indexes.
   - Default behavior is case-insensitive matching.
 
 Examples:
   match-reg $REQ_HEADER.host "^(.*)\.local$"
   match-reg --capture parts $REQ_HEADER.host "^(.+)\.(local|dev)$"
+  match-reg --capture-named host $REQ_HEADER.host "^(?P<app>.+)\.(?P<zone>local|dev)$"
 "#,
             )
             .arg(
@@ -200,7 +248,13 @@ Examples:
                 Arg::new("capture")
                     .long("capture")
                     .value_name("name")
-                    .help("Name to use when storing regex captures into the environment"),
+                    .help("Store regex match results into a fresh List variable"),
+            )
+            .arg(
+                Arg::new("capture_named")
+                    .long("capture-named")
+                    .value_name("name")
+                    .help("Store named regex captures into a fresh Map variable"),
             )
             .arg(
                 Arg::new("value")
@@ -242,17 +296,7 @@ impl CommandParser for MatchRegexCommandParser {
                 msg
             })?;
 
-        let capture = match matches.index_of("capture") {
-            Some(index) => {
-                let name = args[index].as_literal_str().ok_or_else(|| {
-                    let msg = format!("Capture name must be a literal string: {:?}", args[index]);
-                    error!("{}", msg);
-                    msg
-                })?;
-                Some(name.to_string())
-            }
-            None => None,
-        };
+        let capture_targets = parse_capture_targets(&matches, args)?;
 
         let value_index = matches.index_of("value").ok_or_else(|| {
             let msg = "Value argument is required for match-reg command".to_string();
@@ -285,7 +329,7 @@ impl CommandParser for MatchRegexCommandParser {
                 msg
             })?;
 
-        let cmd = MatchRegexCommandExecutor::new(value, pattern, capture);
+        let cmd = MatchRegexCommandExecutor::new(value, pattern, capture_targets);
 
         Ok(Arc::new(Box::new(cmd)))
     }
@@ -293,18 +337,47 @@ impl CommandParser for MatchRegexCommandParser {
 
 // Match regex command executer
 pub struct MatchRegexCommandExecutor {
-    pub capture: Option<String>, // Optional capture group name
+    pub capture_targets: MatchCaptureTargets,
     pub value: CommandArg,
     pub pattern: Regex,
 }
 
 impl MatchRegexCommandExecutor {
-    pub fn new(value: CommandArg, pattern: Regex, capture: Option<String>) -> Self {
+    pub fn new(value: CommandArg, pattern: Regex, capture_targets: MatchCaptureTargets) -> Self {
         Self {
             value,
             pattern,
-            capture,
+            capture_targets,
         }
+    }
+
+    async fn build_capture_list(caps: &regex::Captures<'_>) -> Result<CollectionValue, String> {
+        let list = MemoryListCollection::new_ref();
+        for cap in caps.iter() {
+            let value = cap
+                .map(|m| CollectionValue::String(m.as_str().to_owned()))
+                .unwrap_or(CollectionValue::Null);
+            list.push(value).await?;
+        }
+
+        Ok(CollectionValue::List(list))
+    }
+
+    async fn build_named_capture_map(
+        &self,
+        caps: &regex::Captures<'_>,
+    ) -> Result<CollectionValue, String> {
+        let map = MemoryMapCollection::new_ref();
+
+        for name in self.pattern.capture_names().flatten() {
+            let value = caps
+                .name(name)
+                .map(|m| CollectionValue::String(m.as_str().to_owned()))
+                .unwrap_or(CollectionValue::Null);
+            map.insert(name, value).await?;
+        }
+
+        Ok(CollectionValue::Map(map))
     }
 }
 
@@ -316,20 +389,354 @@ impl CommandExecutor for MatchRegexCommandExecutor {
 
         // Match the value
         if let Some(caps) = self.pattern.captures(&value) {
-            if let Some(name) = &self.capture {
-                for (i, cap) in caps.iter().enumerate() {
-                    if let Some(m) = cap {
-                        // TODO: Add env level support, such as --capture export/local name
-                        context
-                            .env()
-                            .set(
-                                format!("{}[{}]", name, i).as_str(),
-                                CollectionValue::String(m.as_str().to_owned()),
-                                None,
-                            )
-                            .await?;
-                    }
-                }
+            if let Some(name) = &self.capture_targets.positional {
+                let capture_list = Self::build_capture_list(&caps).await?;
+                // TODO: Add env level support, such as --capture export/local name
+                context.env().set(name, capture_list, None).await?;
+            }
+            if let Some(name) = &self.capture_targets.named {
+                let capture_map = self.build_named_capture_map(&caps).await?;
+                context.env().set(name, capture_map, None).await?;
+            }
+
+            Ok(CommandResult::success_with_value(CollectionValue::Bool(
+                true,
+            )))
+        } else {
+            Ok(CommandResult::error_with_value(CollectionValue::Bool(
+                false,
+            )))
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct TemplateMatchDefaults {
+    separator: char,
+    ignore_case: bool,
+}
+
+pub struct MatchPathCommandParser {
+    cmd: Command,
+}
+
+impl MatchPathCommandParser {
+    pub fn new() -> Self {
+        let cmd = Command::new("match-path")
+            .about("Match a path-like value using segment templates. Supports optional capture.")
+            .after_help(
+                r#"
+Arguments:
+  <value>      The path-like string to match.
+  <pattern>    The template pattern to match against.
+
+Options:
+  --capture name   Store template match results into a fresh List variable accessible as name[0], name[1], ...
+  --capture-named name   Store named template captures into a fresh Map variable accessible as name.key
+  --ignore-case    Perform case-insensitive matching (default is case-sensitive)
+
+Behavior:
+  - Uses '/' as the default segment separator.
+  - Pattern is evaluated dynamically at runtime.
+  - `{name}` captures text inside a single segment and never crosses '/'.
+  - `**` matches the remaining segments and must appear as the last segment.
+  - If --capture is provided, match results are saved into a fresh List as:
+      name[0] is the full matched text,
+      name[1] is the first template capture,
+      name[2] is the second template capture, etc.
+  - If --capture-named is provided, each `{name}` capture is saved into a fresh Map entry.
+  - Matching is case-sensitive by default.
+
+Examples:
+  match-path $REQ.path "/kapi/{service_id}/**"
+  match-path --capture parts $REQ.path "${route_prefix}/{node}/{plane}/**"
+  match-path --capture-named route $REQ.path "${route_prefix}/{node}/{plane}/**"
+"#,
+            )
+            .arg(
+                Arg::new("ignore_case")
+                    .long("ignore-case")
+                    .action(ArgAction::SetTrue)
+                    .help("Perform case-insensitive matching (default is case-sensitive)"),
+            )
+            .arg(
+                Arg::new("capture")
+                    .long("capture")
+                    .value_name("name")
+                    .help("Store template match results into a fresh List variable"),
+            )
+            .arg(
+                Arg::new("capture_named")
+                    .long("capture-named")
+                    .value_name("name")
+                    .help("Store named template captures into a fresh Map variable"),
+            )
+            .arg(
+                Arg::new("value")
+                    .required(true)
+                    .help("The input string or variable to match"),
+            )
+            .arg(
+                Arg::new("pattern")
+                    .required(true)
+                    .help("The template pattern"),
+            );
+
+        Self { cmd }
+    }
+}
+
+impl CommandParser for MatchPathCommandParser {
+    fn group(&self) -> CommandGroup {
+        CommandGroup::Match
+    }
+
+    fn help(&self, _name: &str, help_type: CommandHelpType) -> String {
+        command_help(help_type, &self.cmd)
+    }
+
+    fn parse(
+        &self,
+        _context: &ParserContext,
+        str_args: Vec<&str>,
+        args: &CommandArgs,
+    ) -> Result<CommandExecutorRef, String> {
+        parse_template_match_command(
+            &self.cmd,
+            "match-path",
+            str_args,
+            args,
+            TemplateMatchDefaults {
+                separator: '/',
+                ignore_case: false,
+            },
+            Some("ignore_case"),
+            None,
+        )
+    }
+}
+
+pub struct MatchHostCommandParser {
+    cmd: Command,
+}
+
+impl MatchHostCommandParser {
+    pub fn new() -> Self {
+        let cmd = Command::new("match-host")
+            .about("Match a host-like value using segment templates. Supports optional capture.")
+            .after_help(
+                r#"
+Arguments:
+  <value>      The host-like string to match.
+  <pattern>    The template pattern to match against.
+
+Options:
+  --capture name     Store template match results into a fresh List variable accessible as name[0], name[1], ...
+  --capture-named name   Store named template captures into a fresh Map variable accessible as name.key
+  --no-ignore-case   Perform case-sensitive matching (default is case-insensitive)
+
+Behavior:
+  - Uses '.' as the default segment separator.
+  - Pattern is evaluated dynamically at runtime.
+  - `{name}` captures text inside a single host label and never crosses '.'.
+  - `**` matches the remaining labels and must appear as the last segment.
+  - If --capture is provided, match results are saved into a fresh List as:
+      name[0] is the full matched text,
+      name[1] is the first template capture,
+      name[2] is the second template capture, etc.
+  - If --capture-named is provided, each `{name}` capture is saved into a fresh Map entry.
+  - Matching is case-insensitive by default.
+
+Examples:
+  match-host $REQ.host "{app}.${THIS_ZONE_HOST}"
+  match-host --capture host $REQ.host "{app}-${THIS_ZONE_HOST}"
+  match-host --capture-named host $REQ.host "{app}-${THIS_ZONE_HOST}"
+"#,
+            )
+            .arg(
+                Arg::new("no_ignore_case")
+                    .long("no-ignore-case")
+                    .action(ArgAction::SetTrue)
+                    .help("Perform case-sensitive matching (default is case-insensitive)"),
+            )
+            .arg(
+                Arg::new("capture")
+                    .long("capture")
+                    .value_name("name")
+                    .help("Store template match results into a fresh List variable"),
+            )
+            .arg(
+                Arg::new("capture_named")
+                    .long("capture-named")
+                    .value_name("name")
+                    .help("Store named template captures into a fresh Map variable"),
+            )
+            .arg(
+                Arg::new("value")
+                    .required(true)
+                    .help("The input string or variable to match"),
+            )
+            .arg(
+                Arg::new("pattern")
+                    .required(true)
+                    .help("The template pattern"),
+            );
+
+        Self { cmd }
+    }
+}
+
+impl CommandParser for MatchHostCommandParser {
+    fn group(&self) -> CommandGroup {
+        CommandGroup::Match
+    }
+
+    fn help(&self, _name: &str, help_type: CommandHelpType) -> String {
+        command_help(help_type, &self.cmd)
+    }
+
+    fn parse(
+        &self,
+        _context: &ParserContext,
+        str_args: Vec<&str>,
+        args: &CommandArgs,
+    ) -> Result<CommandExecutorRef, String> {
+        parse_template_match_command(
+            &self.cmd,
+            "match-host",
+            str_args,
+            args,
+            TemplateMatchDefaults {
+                separator: '.',
+                ignore_case: true,
+            },
+            None,
+            Some("no_ignore_case"),
+        )
+    }
+}
+
+fn parse_template_match_command(
+    cmd: &Command,
+    command_name: &str,
+    str_args: Vec<&str>,
+    args: &CommandArgs,
+    defaults: TemplateMatchDefaults,
+    ignore_case_flag: Option<&str>,
+    no_ignore_case_flag: Option<&str>,
+) -> Result<CommandExecutorRef, String> {
+    let matches = cmd.clone().try_get_matches_from(&str_args).map_err(|e| {
+        let msg = format!("Invalid {} command: {:?}, {}", command_name, str_args, e);
+        error!("{}", msg);
+        msg
+    })?;
+
+    let capture_targets = parse_capture_targets(&matches, args)?;
+
+    let value_index = matches.index_of("value").ok_or_else(|| {
+        let msg = format!("Value argument is required for {} command", command_name);
+        error!("{}", msg);
+        msg
+    })?;
+    let value = args[value_index].clone();
+
+    let pattern_index = matches.index_of("pattern").ok_or_else(|| {
+        let msg = format!("Pattern argument is required for {} command", command_name);
+        error!("{}", msg);
+        msg
+    })?;
+    let pattern = args[pattern_index].clone();
+
+    let ignore_case = if let Some(flag) = ignore_case_flag {
+        matches.get_flag(flag)
+    } else if let Some(flag) = no_ignore_case_flag {
+        !matches.get_flag(flag)
+    } else {
+        defaults.ignore_case
+    };
+
+    let exec = TemplateMatchCommandExecutor::new(
+        command_name.to_owned(),
+        value,
+        pattern,
+        capture_targets,
+        defaults.separator,
+        ignore_case,
+    );
+    Ok(Arc::new(Box::new(exec)))
+}
+
+pub struct TemplateMatchCommandExecutor {
+    command_name: String,
+    capture_targets: MatchCaptureTargets,
+    value: CommandArg,
+    pattern: CommandArg,
+    separator: char,
+    ignore_case: bool,
+}
+
+impl TemplateMatchCommandExecutor {
+    pub fn new(
+        command_name: String,
+        value: CommandArg,
+        pattern: CommandArg,
+        capture_targets: MatchCaptureTargets,
+        separator: char,
+        ignore_case: bool,
+    ) -> Self {
+        Self {
+            command_name,
+            capture_targets,
+            value,
+            pattern,
+            separator,
+            ignore_case,
+        }
+    }
+
+    async fn build_capture_list(
+        full_match: &str,
+        captures: &[String],
+    ) -> Result<CollectionValue, String> {
+        let list = MemoryListCollection::new_ref();
+        list.push(CollectionValue::String(full_match.to_owned()))
+            .await?;
+        for capture in captures {
+            list.push(CollectionValue::String(capture.clone())).await?;
+        }
+
+        Ok(CollectionValue::List(list))
+    }
+
+    async fn build_named_capture_map(
+        captures: &std::collections::HashMap<String, String>,
+    ) -> Result<CollectionValue, String> {
+        let map = MemoryMapCollection::new_ref();
+        for (name, value) in captures {
+            map.insert(name, CollectionValue::String(value.clone()))
+                .await?;
+        }
+
+        Ok(CollectionValue::Map(map))
+    }
+}
+
+#[async_trait::async_trait]
+impl CommandExecutor for TemplateMatchCommandExecutor {
+    async fn exec(&self, context: &Context) -> Result<CommandResult, String> {
+        let value = self.value.evaluate_string(context).await?;
+        let pattern = self.pattern.evaluate_string(context).await?;
+        let matcher = TemplateMatcher::new(&self.command_name, self.separator, self.ignore_case);
+
+        if let Some(result) = matcher.match_template(&value, &pattern)? {
+            if let Some(name) = &self.capture_targets.positional {
+                let capture_list =
+                    Self::build_capture_list(&value, result.positional_captures()).await?;
+                context.env().set(name, capture_list, None).await?;
+            }
+            if let Some(name) = &self.capture_targets.named {
+                let capture_map = Self::build_named_capture_map(result.named_captures()).await?;
+                context.env().set(name, capture_map, None).await?;
             }
 
             Ok(CommandResult::success_with_value(CollectionValue::Bool(
@@ -486,19 +893,27 @@ impl EQCommandExecutor {
         }
     }
 
-    fn compare_strict(&self, left: &CollectionValue, right: &CollectionValue) -> bool {
-        if self.ignore_case {
-            if let (CollectionValue::String(lhs), CollectionValue::String(rhs)) = (left, right) {
-                return lhs.eq_ignore_ascii_case(rhs);
-            }
+    fn compare_strict_with_options(
+        ignore_case: bool,
+        left: &CollectionValue,
+        right: &CollectionValue,
+    ) -> bool {
+        if ignore_case
+            && let (CollectionValue::String(lhs), CollectionValue::String(rhs)) = (left, right)
+        {
+            return lhs.eq_ignore_ascii_case(rhs);
         }
 
         left == right
     }
 
-    fn compare_loose(&self, left: &CollectionValue, right: &CollectionValue) -> bool {
+    fn compare_loose_with_options(
+        ignore_case: bool,
+        left: &CollectionValue,
+        right: &CollectionValue,
+    ) -> bool {
         if let (CollectionValue::String(lhs), CollectionValue::String(rhs)) = (left, right) {
-            return if self.ignore_case {
+            return if ignore_case {
                 lhs.eq_ignore_ascii_case(rhs)
             } else {
                 lhs == rhs
@@ -519,15 +934,34 @@ impl EQCommandExecutor {
 
         if let (CollectionValue::String(_), CollectionValue::Number(_))
         | (CollectionValue::Number(_), CollectionValue::String(_)) = (left, right)
-        {
-            if let (Some(lhs), Some(rhs)) =
+            && let (Some(lhs), Some(rhs)) =
                 (Self::as_loose_number(left), Self::as_loose_number(right))
-            {
-                return lhs == rhs;
-            }
+        {
+            return lhs == rhs;
         }
 
         left == right
+    }
+
+    pub fn compare_values(
+        ignore_case: bool,
+        loose: bool,
+        left: &CollectionValue,
+        right: &CollectionValue,
+    ) -> bool {
+        if loose {
+            Self::compare_loose_with_options(ignore_case, left, right)
+        } else {
+            Self::compare_strict_with_options(ignore_case, left, right)
+        }
+    }
+
+    fn compare_strict(&self, left: &CollectionValue, right: &CollectionValue) -> bool {
+        Self::compare_strict_with_options(self.ignore_case, left, right)
+    }
+
+    fn compare_loose(&self, left: &CollectionValue, right: &CollectionValue) -> bool {
+        Self::compare_loose_with_options(self.ignore_case, left, right)
     }
 }
 
@@ -682,23 +1116,7 @@ impl CommandExecutor for NECommandExecutor {
         let value1 = self.value1.evaluate(context).await?;
         let value2 = self.value2.evaluate(context).await?;
 
-        let eq = if self.loose {
-            EQCommandExecutor {
-                ignore_case: self.ignore_case,
-                loose: true,
-                value1: self.value1.clone(),
-                value2: self.value2.clone(),
-            }
-            .compare_loose(&value1, &value2)
-        } else {
-            EQCommandExecutor {
-                ignore_case: self.ignore_case,
-                loose: false,
-                value1: self.value1.clone(),
-                value2: self.value2.clone(),
-            }
-            .compare_strict(&value1, &value2)
-        };
+        let eq = EQCommandExecutor::compare_values(self.ignore_case, self.loose, &value1, &value2);
 
         if !eq {
             Ok(CommandResult::success_with_value(CollectionValue::Bool(
@@ -709,6 +1127,156 @@ impl CommandExecutor for NECommandExecutor {
                 false,
             )))
         }
+    }
+}
+
+pub struct OneOfCommandParser {
+    cmd: Command,
+}
+
+impl OneOfCommandParser {
+    pub fn new() -> Self {
+        let cmd = Command::new("oneof")
+            .about("Check whether a value equals any candidate value.")
+            .after_help(
+                r#"
+Check whether a value equals any candidate.
+
+Arguments:
+  <value>           The value to compare.
+  <candidate>...    One or more candidate values.
+
+Options:
+  --ignore-case     Perform case-insensitive comparison (string-string only)
+  --loose           Enable loose comparison for string/number
+
+Behavior:
+  - Comparison semantics are identical to `eq`.
+  - Candidates are evaluated from left to right.
+  - Succeeds on the first matching candidate.
+  - Returns error if no candidate matches.
+
+Examples:
+  oneof $REQ.path "/login" "/logout" "/refresh"
+  oneof --ignore-case $REQ.method "get" "head"
+  oneof --loose $REQ.port 80 "443"
+"#,
+            )
+            .arg(
+                Arg::new("ignore_case")
+                    .long("ignore-case")
+                    .short('i')
+                    .action(ArgAction::SetTrue)
+                    .help("Enable case-insensitive comparison"),
+            )
+            .arg(
+                Arg::new("loose")
+                    .long("loose")
+                    .short('l')
+                    .action(ArgAction::SetTrue)
+                    .help("Enable loose comparison for string/number"),
+            )
+            .arg(
+                Arg::new("value")
+                    .required(true)
+                    .help("The value to compare"),
+            )
+            .arg(
+                Arg::new("candidates")
+                    .required(true)
+                    .num_args(1..)
+                    .help("One or more candidate values"),
+            );
+
+        Self { cmd }
+    }
+}
+
+impl CommandParser for OneOfCommandParser {
+    fn group(&self) -> CommandGroup {
+        CommandGroup::Match
+    }
+
+    fn help(&self, _name: &str, help_type: CommandHelpType) -> String {
+        command_help(help_type, &self.cmd)
+    }
+
+    fn parse(
+        &self,
+        _context: &ParserContext,
+        str_args: Vec<&str>,
+        args: &CommandArgs,
+    ) -> Result<CommandExecutorRef, String> {
+        let matches = self
+            .cmd
+            .clone()
+            .try_get_matches_from(&str_args)
+            .map_err(|e| {
+                let msg = format!("Invalid oneof command: {:?}, {}", str_args, e);
+                error!("{}", msg);
+                msg
+            })?;
+
+        let ignore_case = matches.get_flag("ignore_case");
+        let loose = matches.get_flag("loose");
+
+        let value_index = matches.index_of("value").ok_or_else(|| {
+            let msg = "Value argument is required for oneof command".to_string();
+            error!("{}", msg);
+            msg
+        })?;
+        let value = args[value_index].clone();
+
+        let candidates = matches
+            .indices_of("candidates")
+            .ok_or_else(|| {
+                let msg = "At least one candidate is required for oneof command".to_string();
+                error!("{}", msg);
+                msg
+            })?
+            .map(|index| args[index].clone())
+            .collect();
+
+        let cmd = OneOfCommandExecutor {
+            ignore_case,
+            loose,
+            value,
+            candidates,
+        };
+
+        Ok(Arc::new(Box::new(cmd)))
+    }
+}
+
+pub struct OneOfCommandExecutor {
+    pub ignore_case: bool,
+    pub loose: bool,
+    pub value: CommandArg,
+    pub candidates: Vec<CommandArg>,
+}
+
+#[async_trait::async_trait]
+impl CommandExecutor for OneOfCommandExecutor {
+    async fn exec(&self, context: &Context) -> Result<CommandResult, String> {
+        let value = self.value.evaluate(context).await?;
+
+        for candidate in &self.candidates {
+            let candidate_value = candidate.evaluate(context).await?;
+            if EQCommandExecutor::compare_values(
+                self.ignore_case,
+                self.loose,
+                &value,
+                &candidate_value,
+            ) {
+                return Ok(CommandResult::success_with_value(CollectionValue::Bool(
+                    true,
+                )));
+            }
+        }
+
+        Ok(CommandResult::error_with_value(CollectionValue::Bool(
+            false,
+        )))
     }
 }
 
@@ -952,12 +1520,12 @@ impl CommandParser for RangeCommandParser {
             msg
         })?;
         let value = args[value_index].clone();
-        if value.is_literal() {
-            if let Err(e) = value.as_literal_str().unwrap().parse::<f64>() {
-                let msg = format!("Invalid range command value: {:?}: {}", value, e);
-                error!("{}", msg);
-                return Err(msg);
-            }
+        if value.is_literal()
+            && let Err(e) = value.as_literal_str().unwrap().parse::<f64>()
+        {
+            let msg = format!("Invalid range command value: {:?}: {}", value, e);
+            error!("{}", msg);
+            return Err(msg);
         }
 
         // Get the range bounds and check they are valid numbers if is literal
@@ -967,12 +1535,12 @@ impl CommandParser for RangeCommandParser {
             msg
         })?;
         let begin = args[begin_index].clone();
-        if begin.is_literal() {
-            if let Err(e) = begin.as_literal_str().unwrap().parse::<f64>() {
-                let msg = format!("Invalid range command begin value: {:?}: {}", begin, e);
-                error!("{}", msg);
-                return Err(msg);
-            }
+        if begin.is_literal()
+            && let Err(e) = begin.as_literal_str().unwrap().parse::<f64>()
+        {
+            let msg = format!("Invalid range command begin value: {:?}: {}", begin, e);
+            error!("{}", msg);
+            return Err(msg);
         }
         let end_index = matches.index_of("end").ok_or_else(|| {
             let msg = "End argument is required for range command".to_string();
@@ -981,12 +1549,12 @@ impl CommandParser for RangeCommandParser {
         })?;
 
         let end = args[end_index].clone();
-        if end.is_literal() {
-            if let Err(e) = end.as_literal_str().unwrap().parse::<f64>() {
-                let msg = format!("Invalid range command end value: {:?}: {}", end, e);
-                error!("{}", msg);
-                return Err(msg);
-            }
+        if end.is_literal()
+            && let Err(e) = end.as_literal_str().unwrap().parse::<f64>()
+        {
+            let msg = format!("Invalid range command end value: {:?}: {}", end, e);
+            error!("{}", msg);
+            return Err(msg);
         }
 
         let cmd = RangeCommandExecutor::new(value, begin, end);

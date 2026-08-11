@@ -136,24 +136,120 @@ Options:
 
 Arguments:
   <var>       The variable to rewrite (e.g. $REQ.url)
-  <pattern>   A glob-style pattern to match (e.g. /kapi/my-service/*)
-  <template>  A replacement template using * wildcard (e.g. /kapi/*)
+  <pattern>   A case-insensitive glob pattern to match
+  <template>  The replacement string or trailing-* template
 
 Behavior:
-  - Performs case-insensitive glob pattern match.
-  - Supports only a single '*' wildcard in pattern/template.
-  - Rewrites the variable if pattern matches, replacing the '*' part.
+  - Performs case-insensitive glob pattern matching.
+  - If <pattern> does not match, returns error and leaves the variable unchanged.
+  - If <pattern> ends with '*' and <template> also ends with '*', preserves the
+    matched suffix by appending it to <template> without its trailing '*'.
+  - Otherwise, if <pattern> matches, rewrites the variable to <template> as-is.
 
 Examples:
   rewrite $REQ.url "/kapi/my-service/*" "/kapi/*"
-  rewrite host "api.*.domain.com" "svc-*.internal"
+  rewrite $REQ.host "*.example.com" "backend.internal"
+```
+
+### `rewrite-path`
+```
+Rewrite a path-like variable using segment templates.
+
+Usage: rewrite-path [OPTIONS] <var> <pattern> <template>
+
+Arguments:
+  <var>
+          The variable to rewrite
+
+  <pattern>
+          The template pattern to match
+
+  <template>
+          The rewrite template
+
+Options:
+      --ignore-case
+          Perform case-insensitive matching (default is case-sensitive)
+
+  -h, --help
+          Print help
+
+
+Arguments:
+  <var>       The path-like variable to rewrite (e.g. $REQ.path)
+  <pattern>   The template pattern to match against
+  <template>  The rewrite template using {name} and optional ** rest splice
+
+Options:
+  --ignore-case   Perform case-insensitive matching (default is case-sensitive)
+
+Behavior:
+  - Uses '/' as the default segment separator.
+  - <pattern> and <template> are evaluated dynamically at runtime.
+  - Capture names in <pattern> must be unique.
+  - <pattern> follows the same template rules as match-path:
+      {name} captures one segment and ** matches the remaining segments at the end.
+  - <template> can reference named captures using {name}.
+  - If <pattern> contains **, <template> may include a segment ** to splice the matched remaining segments.
+  - If <pattern> does not match, returns error and leaves the variable unchanged.
+
+Examples:
+  rewrite-path $REQ.path "/kapi/{service}/**" "/api/{service}/**"
+  rewrite-path $REQ.path "${route_prefix}/{node}/{plane}/**" "/klog/{node}/{plane}/**"
+```
+
+### `rewrite-host`
+```
+Rewrite a host-like variable using segment templates.
+
+Usage: rewrite-host [OPTIONS] <var> <pattern> <template>
+
+Arguments:
+  <var>
+          The variable to rewrite
+
+  <pattern>
+          The template pattern to match
+
+  <template>
+          The rewrite template
+
+Options:
+      --no-ignore-case
+          Perform case-sensitive matching (default is case-insensitive)
+
+  -h, --help
+          Print help
+
+
+Arguments:
+  <var>       The host-like variable to rewrite (e.g. $REQ.host)
+  <pattern>   The template pattern to match against
+  <template>  The rewrite template using {name} and optional ** rest splice
+
+Options:
+  --no-ignore-case   Perform case-sensitive matching (default is case-insensitive)
+
+Behavior:
+  - Uses '.' as the default segment separator.
+  - <pattern> and <template> are evaluated dynamically at runtime.
+  - Capture names in <pattern> must be unique.
+  - <pattern> follows the same template rules as match-host:
+      {name} captures one host label and ** matches the remaining labels at the end.
+  - <template> can reference named captures using {name}.
+  - If <pattern> contains **, <template> may include a segment ** to splice the matched remaining labels.
+  - If <pattern> does not match, returns error and leaves the variable unchanged.
+
+Examples:
+  rewrite-host $REQ.host "{app}.${THIS_ZONE_HOST}" "{app}-internal.${THIS_ZONE_HOST}"
+  rewrite-host $REQ.host "{app}.**" "{app}.internal.**"
 ```
 
 ### `rewrite-reg`
 ```
 Rewrite a variable using a regular expression and a replacement template.
 
-Usage: rewrite-regex <var> <regex> <template>
+Usage: rewrite-reg <var> <regex> <template>
 
 Arguments:
   <var>
@@ -177,11 +273,13 @@ Arguments:
 
 Behavior:
   - If the regex matches, rewrites the variable with the template.
+  - Only '$' followed by one ASCII digit is treated as a capture reference.
+    Other '$' characters are kept literally.
   - Unmatched captures are replaced with empty strings.
-  - If the pattern does not match, the variable remains unchanged.
+  - If the pattern does not match, returns error and leaves the variable unchanged.
 
 Examples:
-  rewrite-regex $REQ.url "^/test/(\\w+)(?:/(\\d+))?" "/new/$1/$2"
+  rewrite-reg $REQ.url "^/test/(\\w+)(?:/(\\d+))?" "/new/$1/$2"
 ```
 
 ### `slice`
@@ -256,6 +354,131 @@ Examples:
   starts-with "example.com" "test"      → false
 ```
 
+### `split`
+```
+Split a string into segments using a delimiter.
+
+Usage: split [OPTIONS] <value> <delimiter>
+
+Arguments:
+  <value>
+          Input string to split
+
+  <delimiter>
+          Delimiter string used for splitting
+
+Options:
+      --capture <name>
+          Store split segments into a fresh List variable
+
+      --skip-empty
+          Drop empty segments from the result
+
+  -h, --help
+          Print help
+
+
+Arguments:
+  <value>       The input string or variable.
+  <delimiter>   The delimiter string used to split the input.
+
+Options:
+  --capture <name>   Store segments into a fresh List variable accessible as name[0], name[1], ...
+  --skip-empty       Drop empty segments from the result
+
+Behavior:
+  - Both arguments are evaluated dynamically at runtime.
+  - Returns a List of string segments.
+  - By default, empty segments are preserved, including leading or trailing ones.
+  - If --skip-empty is set, empty segments are removed from both the returned list and captured slots.
+  - If --capture is set, <name> is replaced with a fresh List containing the split segments.
+  - <name> must be a literal variable name or path.
+  - Empty delimiter is invalid and returns a runtime error.
+
+Examples:
+  split "/a/b/c" "/"
+  split --skip-empty "/.cluster/klog/ood1/admin/" "/"
+  split --capture parts $REQ.path $delimiter
+```
+
+### `strip-prefix`
+```
+Strip a prefix from a string and return the remaining tail.
+
+Usage: strip-prefix [OPTIONS] <value> <prefix>
+
+Arguments:
+  <value>
+          Input string to strip
+
+  <prefix>
+          Prefix to remove
+
+Options:
+  -i, --ignore-case
+          Perform case-insensitive comparison
+
+  -h, --help
+          Print help
+
+
+Arguments:
+  <value>      The full input string or variable.
+  <prefix>     The prefix to remove.
+
+Behavior:
+  - Both arguments are evaluated dynamically at runtime.
+  - If <value> starts with <prefix>, returns success with the remaining tail.
+  - If <value> equals <prefix>, returns success with an empty string.
+  - Comparison is case-sensitive by default.
+  - If <value> does not start with <prefix>, returns error and leaves the value unchanged.
+  - Does not modify any variable or environment.
+
+Examples:
+  strip-prefix "/api/v1/users" "/api"
+  strip-prefix --ignore-case "/API/v1/users" "/api"
+  strip-prefix $REQ.url $route_prefix
+```
+
+### `strip-suffix`
+```
+Strip a suffix from a string and return the remaining head.
+
+Usage: strip-suffix [OPTIONS] <value> <suffix>
+
+Arguments:
+  <value>
+          Input string to strip
+
+  <suffix>
+          Suffix to remove
+
+Options:
+  -i, --ignore-case
+          Perform case-insensitive comparison
+
+  -h, --help
+          Print help
+
+
+Arguments:
+  <value>      The full input string or variable.
+  <suffix>     The suffix to remove.
+
+Behavior:
+  - Both arguments are evaluated dynamically at runtime.
+  - If <value> ends with <suffix>, returns success with the remaining head.
+  - If <value> equals <suffix>, returns success with an empty string.
+  - Comparison is case-sensitive by default.
+  - If <value> does not end with <suffix>, returns error and leaves the value unchanged.
+  - Does not modify any variable or environment.
+
+Examples:
+  strip-suffix "/api/v1/users" "/users"
+  strip-suffix --ignore-case "/api/v1/USERS" "/users"
+  strip-suffix $REQ.host $zone_suffix
+```
+
 ### `strlen`
 ```
 Return the character length of a string.
@@ -282,6 +505,259 @@ Examples:
   strlen "abc"
   strlen "你好"
   strlen $REQ.path
+```
+
+## uri
+
+### `url_encode`
+```
+Percent-encode a string so it can be safely embedded in a URL.
+
+Usage: url_encode <string>
+
+Arguments:
+  <string>
+          Input string to percent-encode
+
+Options:
+  -h, --help
+          Print help
+
+
+Behavior:
+  - Encodes reserved URL characters using percent-encoding.
+  - Leaves RFC 3986 unreserved characters unchanged.
+  - Does not modify environment or variables.
+
+Examples:
+  url_encode "https://example.com/callback?a=1&b=2"
+  url_encode $REQ.url
+```
+
+### `url_decode`
+```
+Decode a percent-encoded URL string.
+
+Usage: url_decode <string>
+
+Arguments:
+  <string>
+          Input string to percent-decode
+
+Options:
+  -h, --help
+          Print help
+
+
+Behavior:
+  - Decodes `%XX` escape sequences.
+  - Returns a runtime error for malformed escape sequences or invalid UTF-8.
+  - Does not modify environment or variables.
+
+Examples:
+  url_decode "https%3A%2F%2Fexample.com%2Fcallback%3Fa%3D1%26b%3D2"
+  url_decode $encoded_url
+```
+
+### `parse-authority` / `parse-auth`
+```
+Parse an authority string into a typed Map.
+
+Usage: parse-authority [OPTIONS] <value>
+       parse-auth [OPTIONS] <value>
+
+Arguments:
+  <value>
+          Input authority-like string to parse
+
+Options:
+      --default-port <port>
+          Default port to use when the input has no explicit port
+
+  -h, --help
+          Print help
+
+
+Behavior:
+  - Accepts authority-like input such as `example.com`, `example.com:3180`, `user:pass@[::1]:8080`.
+  - Returns a fresh Map with fields: `host`, `port`, `has_port`, `userinfo`.
+  - `host` preserves IPv6 brackets when present.
+  - `port` is Number when present or defaulted, otherwise Null.
+  - `has_port` is true only when the input explicitly contains a port.
+  - `userinfo` is returned as raw text before `@`, without percent-decoding.
+  - Full URLs such as `https://example.com/path` are not accepted.
+  - Returns error for invalid authority syntax or invalid default port.
+
+Examples:
+  parse-authority $REQ.host
+  parse-authority --default-port 3180 $REQ.host
+  parse-auth "user:pass@[::1]:8080"
+```
+
+### `parse-uri`
+```
+Parse an absolute URI string into a typed Map.
+
+Usage: parse-uri <value>
+
+Arguments:
+  <value>
+          Input absolute URI string to parse
+
+Options:
+  -h, --help
+          Print help
+
+
+Behavior:
+  - Accepts absolute URI input and parses it with `url::Url`.
+  - Returns a fresh Map with fields: `scheme`, `authority`, `host`, `port`, `effective_port`, `has_port`, `username`, `password`, `path`, `query`, `fragment`.
+  - `authority` is Null when the URI has no authority component.
+  - `host` preserves IPv6 brackets when present.
+  - `port` reflects the normalized serialized port; known default ports are omitted.
+  - `effective_port` includes known scheme defaults such as `https -> 443`.
+  - `username` is always returned as a String and may be empty.
+  - `password`, `query`, and `fragment` are Null when absent.
+  - Relative references or invalid URI syntax return error.
+
+Examples:
+  parse-uri "https://user:pass@example.com:8443/api/v1?q=1#frag"
+  parse-uri $REQ.ext.url
+```
+
+### `build-uri`
+```
+Build an absolute URI string from a typed Map.
+
+Usage: build-uri <parts>
+
+Arguments:
+  <parts>
+          Map or map literal describing the URI parts
+
+Options:
+  -h, --help
+          Print help
+
+
+Behavior:
+  - Expects a typed Map.
+  - Supported input keys: `scheme`, `authority`, `host`, `port`, `username`, `password`, `path`, `query`, `fragment`.
+  - `authority` is used only when `host` is absent.
+  - Parsed-output helper keys `effective_port` and `has_port` are accepted and ignored.
+  - Structured authority fields (`host`, `port`, `username`, `password`) take precedence over `authority`.
+  - For `http`, `https`, `ws`, `wss`, and `ftp`, `host` or `authority` is required.
+  - Returns a normalized absolute URI string.
+  - Invalid field types or invalid URI components return error.
+
+Examples:
+  build-uri {
+    "scheme": "https",
+    "host": "example.com",
+    "path": "/oauth/login",
+    "query": "redirect_url=%2Fdashboard"
+  }
+
+  capture --value parsed $(parse-uri "https://user:pass@example.com:8443/api/v1?q=1#frag")
+  build-uri $parsed
+```
+
+### `parse-query`
+```
+Parse a URL query string into a typed MultiMap.
+
+Usage: parse-query <value>
+
+Arguments:
+  <value>
+          Input query string to parse
+
+Options:
+  -h, --help
+          Print help
+
+
+Behavior:
+  - Parses the input using `application/x-www-form-urlencoded` rules.
+  - A leading `?` is ignored when present.
+  - `+` is decoded as space.
+  - Returns a fresh MultiMap whose keys and values are decoded strings.
+  - Missing `=` is treated as an empty value.
+  - Duplicate identical values under the same key are deduplicated by MultiMap set semantics.
+  - Malformed percent-encoding or invalid UTF-8 returns error.
+
+Examples:
+  parse-query "redirect_url=%2Fdashboard&tag=alpha&tag=beta"
+  parse-query $parsed.query
+```
+
+### `build-query`
+```
+Build a URL query string from a typed Map or MultiMap.
+
+Usage: build-query <params>
+
+Arguments:
+  <params>
+          Map or MultiMap describing the query parameters
+
+Options:
+  -h, --help
+          Print help
+
+
+Behavior:
+  - Accepts a typed Map or MultiMap.
+  - Uses `application/x-www-form-urlencoded` encoding.
+  - Returns a query string without a leading `?`.
+  - For Map values, String/Number/Bool/Null are supported.
+  - Map Null values are serialized as empty values (`key=`).
+  - For MultiMap values, each key may serialize to multiple `key=value` pairs.
+  - The output is normalized by collection iteration order, not original raw pair order.
+
+Examples:
+  build-query {
+    "redirect_url": "/dashboard",
+    "page": 2,
+    "exact": true
+  }
+
+  capture --value params $(parse-query "tag=alpha&tag=beta")
+  build-query $params
+```
+
+### `query-get`
+```
+Read one or more values from a raw query string or parsed query MultiMap.
+
+Usage: query-get [OPTIONS] <query> <key>
+
+Arguments:
+  <query>
+          Raw query string or parsed query MultiMap
+
+  <key>
+          Query key to read
+
+Options:
+      --all
+          Return all values as a List
+
+  -h, --help
+          Print help
+
+
+Behavior:
+  - Accepts either a raw query string (with optional leading `?`) or a typed MultiMap from `parse-query`.
+  - By default, returns the first value for the key as a String.
+  - With `--all`, returns all values for the key as a List of Strings.
+  - Missing key returns a runtime error.
+  - Raw query input is parsed using the same rules as `parse-query`.
+
+Examples:
+  query-get "redirect_url=%2Fdashboard" "redirect_url"
+  capture --value params $(parse-query "tag=alpha&tag=beta")
+  query-get --all $params "tag"
 ```
 
 ## debug
@@ -335,6 +811,8 @@ Supported forms:
   - Bracket path:
       $geoByIp[$REQ.clientIp]
       ${geoByIp["1.2.3.4"].country}
+      $records[0].name
+      $matrix[1][0]
 
   - Optional/safe access:
       ${geoByIp[$REQ.clientIp]?.country}
@@ -346,6 +824,7 @@ Supported forms:
 
 Semantics:
   - `?.` / `?[...]` mark the following segment as optional.
+  - Bracket path supports both map keys and list indices.
   - Optional segment missing or type mismatch does not trigger strict missing-var error.
   - Optional missing without `??` yields empty string.
   - `??` only applies when left side is missing.
@@ -354,6 +833,39 @@ Semantics:
 Default RHS support:
   - Supported: string literal, variable expression.
   - Not supported yet: command substitution `$(...)` on RHS of `??`.
+```
+
+### Map And List Literals
+```
+These are DSL expression rules for constructing fresh collection values.
+
+Supported forms:
+  - List literal:
+      []
+      ["a", 1, $REQ.port]
+      [{"node": $REQ.nodeId}, ["raft", "inter"], null]
+
+  - Map literal:
+      {"kind": "app", "app_id": $REQ.appId}
+      {kind: "service", target: $TARGET_SERVICE_INFO}
+      {"meta": {"region.code": $REQ.regionCode}, "ports": [$REQ.port, 3180]}
+
+Semantics:
+  - `[...]` constructs a fresh List collection.
+  - `{...}` constructs a fresh Map collection.
+  - Map keys are static string keys in v1:
+      bare identifier keys like `kind`
+      or quoted keys like `"region.code"` / `'region.code'`
+  - Values may be string literals, typed literals, variables, command substitutions, or nested map/list literals.
+  - A fresh collection instance is created each time the expression is evaluated.
+  - These literals reuse the existing collection runtime types; they do not introduce a separate `Object` type.
+  - Multi-line literals are supported as long as the surrounding `[]` / `{}` / `()` stay balanced until the statement closes.
+  - Set literal is not supported yet.
+
+Typical use:
+  - local route={"kind": "app", "target": $TARGET_APP_INFO}
+  - return --from block {"kind": "service", "service_id": $SERVICE_ID}
+  - local segments=["klog", $node_name, $plane]
 ```
 
 ### `assign`
@@ -1204,6 +1716,29 @@ Examples:
   if $REQ.role !== "admin" then ...
 ```
 
+### `oneof`
+```
+Check whether a value equals any candidate value.
+
+Usage: oneof [OPTIONS] <value> <candidate>...
+
+Options:
+  -i, --ignore-case   Case-insensitive for string-string only
+  -l, --loose         Enable loose comparison for string/number
+
+Behavior:
+  - Comparison semantics are identical to `eq`.
+  - `<value>` and all candidates are evaluated dynamically at runtime.
+  - Candidates are tested from left to right.
+  - Succeeds on the first matching candidate.
+  - Returns error if no candidate matches.
+
+Examples:
+  oneof $REQ.path "/login" "/logout" "/refresh"
+  oneof --ignore-case $REQ.method "get" "head"
+  oneof --loose $REQ.port 80 "443"
+```
+
 ### `gt` / `ge` / `lt` / `le`
 ```
 Numeric comparison commands.
@@ -1280,7 +1815,7 @@ Examples:
 
 ### `match-reg`
 ```
-Match a value against a regular expression. Supports optional named capture.
+Match a value against a regular expression. Supports optional capture.
 
 Usage: match-reg [OPTIONS] <value> <pattern>
 
@@ -1296,7 +1831,10 @@ Options:
           Perform case-sensitive matching (default is case-insensitive)
 
       --capture <name>
-          Name to use when storing regex captures into the environment
+          Store regex match results into a fresh List variable
+
+      --capture-named <name>
+          Store named regex captures into a fresh Map variable
 
   -h, --help
           Print help
@@ -1307,20 +1845,139 @@ Arguments:
   <pattern>    The regular expression to match against.
 
 Options:
-  --capture name   Capture groups into environment variables like name[0], name[1], ...
+  --capture name   Store regex match results into a fresh List variable accessible as name[0], name[1], ...
+  --capture-named name   Store named regex captures into a fresh Map variable accessible as name.group
   --no-ignore-case   Perform case-sensitive matching (default is case-insensitive)
 
 Behavior:
   - Uses Rust-style regular expressions.
   - If the pattern matches, the command returns success, otherwise it returns error.
-  - If --capture is provided, matched groups are saved into environment as:
-      name[0] is the first capture group,
-      name[1] is the second capture group, etc.
+  - If --capture is provided, match results are saved into a fresh List as:
+      name[0] is the full matched text,
+      name[1] is the first capture group,
+      name[2] is the second capture group, etc.
+  - If --capture-named is provided, named capture groups `(?P<name>...)` are saved into a fresh Map.
+  - Unmatched optional named capture groups are stored as Null to preserve keys.
+  - Unmatched optional capture groups are stored as Null to preserve indexes.
+  - --capture and --capture-named may be used together, but they must use different variable names.
   - Default behavior is case-insensitive matching.
 
 Examples:
   match-reg $REQ_HEADER.host "^(.*)\.local$"
   match-reg --capture parts $REQ_HEADER.host "^(.+)\.(local|dev)$"
+  match-reg --capture-named host $REQ_HEADER.host "^(?P<app>.+)\.(?P<zone>local|dev)$"
+```
+
+### `match-path`
+```
+Match a path-like value using segment templates. Supports optional capture.
+
+Usage: match-path [OPTIONS] <value> <pattern>
+
+Arguments:
+  <value>
+          The input string or variable to match
+
+  <pattern>
+          The template pattern to match against
+
+Options:
+      --ignore-case
+          Perform case-insensitive matching (default is case-sensitive)
+
+      --capture <name>
+          Store template match results into a fresh List variable
+
+      --capture-named <name>
+          Store named template captures into a fresh Map variable
+
+  -h, --help
+          Print help
+
+
+Arguments:
+  <value>      The path-like string to match.
+  <pattern>    The template pattern to match against.
+
+Options:
+  --capture name   Store template match results into a fresh List variable accessible as name[0], name[1], ...
+  --capture-named name   Store named template captures into a fresh Map variable accessible as name.key
+  --ignore-case    Perform case-insensitive matching (default is case-sensitive)
+
+Behavior:
+  - Uses '/' as the default segment separator.
+  - Pattern is evaluated dynamically at runtime.
+  - Capture names in the pattern must be unique.
+  - `{name}` captures text inside a single segment and never crosses '/'.
+  - `**` matches the remaining segments and must appear as the last segment.
+  - If --capture is provided, match results are saved into a fresh List as:
+      name[0] is the full matched text,
+      name[1] is the first template capture,
+      name[2] is the second template capture, etc.
+  - If --capture-named is provided, each `{name}` capture is saved into a fresh Map entry.
+  - --capture and --capture-named may be used together, but they must use different variable names.
+  - Matching is case-sensitive by default.
+
+Examples:
+  match-path $REQ.path "/kapi/{service_id}/**"
+  match-path --capture parts $REQ.path "${route_prefix}/{node}/{plane}/**"
+  match-path --capture-named route $REQ.path "${route_prefix}/{node}/{plane}/**"
+```
+
+### `match-host`
+```
+Match a host-like value using segment templates. Supports optional capture.
+
+Usage: match-host [OPTIONS] <value> <pattern>
+
+Arguments:
+  <value>
+          The input string or variable to match
+
+  <pattern>
+          The template pattern to match against
+
+Options:
+      --no-ignore-case
+          Perform case-sensitive matching (default is case-insensitive)
+
+      --capture <name>
+          Store template match results into a fresh List variable
+
+      --capture-named <name>
+          Store named template captures into a fresh Map variable
+
+  -h, --help
+          Print help
+
+
+Arguments:
+  <value>      The host-like string to match.
+  <pattern>    The template pattern to match against.
+
+Options:
+  --capture name     Store template match results into a fresh List variable accessible as name[0], name[1], ...
+  --capture-named name   Store named template captures into a fresh Map variable accessible as name.key
+  --no-ignore-case   Perform case-sensitive matching (default is case-insensitive)
+
+Behavior:
+  - Uses '.' as the default segment separator.
+  - Pattern is evaluated dynamically at runtime.
+  - Capture names in the pattern must be unique.
+  - `{name}` captures text inside a single host label and never crosses '.'.
+  - `**` matches the remaining labels and must appear as the last segment.
+  - If --capture is provided, match results are saved into a fresh List as:
+      name[0] is the full matched text,
+      name[1] is the first template capture,
+      name[2] is the second template capture, etc.
+  - If --capture-named is provided, each `{name}` capture is saved into a fresh Map entry.
+  - --capture and --capture-named may be used together, but they must use different variable names.
+  - Matching is case-insensitive by default.
+
+Examples:
+  match-host $REQ.host "{app}.${THIS_ZONE_HOST}"
+  match-host --capture host $REQ.host "{app}-${THIS_ZONE_HOST}"
+  match-host --capture-named host $REQ.host "{app}-${THIS_ZONE_HOST}"
 ```
 
 ### `range`
@@ -1610,6 +2267,45 @@ ARGUMENT PASSING:
 EXAMPLES:
   invoke --chain auth_flow --arg user $REQ.user --arg pass $REQ.pass
   invoke --block helper_block --arg req $REQ
+```
+
+### `first-ok`
+```
+Try command substitutions left-to-right and return the first successful result.
+
+Usage: first-ok <commands>...
+
+Arguments:
+  <commands>...
+          Candidate sub-commands in command substitution form: $(...)
+
+Options:
+  -h, --help
+          Print help
+
+
+DESCRIPTION:
+  first-ok is a result-level fallback combinator. It executes each command
+  substitution from left to right and returns the first `success(value)`.
+
+BEHAVIOR:
+  - `success(value)`    => stop immediately and return that success.
+  - `error(value)`      => remember it and continue with the next candidate.
+  - `control(...)`      => propagate immediately without swallowing it.
+  - If all candidates return `error(value)`, the last error is returned.
+
+NOTES:
+  - All inputs must be command substitutions: `$(...)`.
+  - This is intended for sequential fallback of parsing/lookup helpers,
+    not for general branching logic.
+
+EXAMPLES:
+  first-ok $(strip-prefix $path $route_prefix) $(strip-prefix $path "/api")
+
+  local target=$(first-ok
+    $(parse-authority $REQ.host)
+    $(parse-authority --default-port 3180 $REQ.dest_host)
+  )
 ```
 
 ### `goto`
@@ -1927,6 +2623,55 @@ Examples:
 ```
 These are DSL syntax forms, not standalone commands. They are parsed at the
 statement level, so they do not appear in the command registry.
+```
+
+### `case` / `when` / `else` / `end`
+```
+Branch with first-match-wins semantics.
+
+Syntax:
+  case then
+      when <condition> then
+          ...
+      when <condition> then
+          ...
+      else
+          ...
+  end
+
+  case <subject> as <name> then
+      when <condition> then
+          ...
+      else
+          ...
+  end
+
+Behavior:
+  - Branches are evaluated in order.
+  - The first `when` whose condition succeeds is selected.
+  - If no branch matches, `else` runs when present; otherwise the statement is a no-op.
+  - In `case <subject> as <name> then`, `<subject>` is evaluated once before branch dispatch and exposed as a block-local alias variable.
+  - The alias is available in both `when` conditions and branch bodies, and the outer block variable is restored after the case statement finishes.
+  - `when` conditions reuse the same expression-chain syntax as `if`.
+  - Subject form only binds the alias; it does not auto-inject the subject into `when` commands.
+  - Control actions such as `return` / `error` / `exit` / `goto` are not allowed in `when` conditions.
+
+Examples:
+  case then
+      when match-reg $REQ.host "^admin\\." then
+          return --from lib "host_admin";
+      when strip-prefix $REQ.path "/api" then
+          return --from lib "api_path";
+      else
+          return --from lib "default";
+  end
+
+  case $REQ.path as path then
+      when match $path "/api/*" then
+          return --from lib "api";
+      when strip-prefix $path "/kapi" then
+          return --from lib "kapi";
+  end
 ```
 
 ### `if` / `elif` / `else` / `end`

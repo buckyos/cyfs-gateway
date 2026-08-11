@@ -20,12 +20,14 @@ x25519-dalek = { version = "*", features = ["static_secrets","getrandom"] }
 ed25519-dalek = { version = "*", features = ["rand_core"] }
 ed25519_to_curve25519 = "*"
 sha2.workspace = true
+hkdf.workspace = true
 url.workspace = true
 lazy_static.workspace = true
 once_cell.workspace = true
 fern = "*"
 chrono.workspace = true
 aes = "0.8.4"
+aes-gcm = { version = "0.10", features = ["aes", "alloc"] }
 ctr = "0.9.2"
 cipher = "0.4.4"
 futures.workspace = true
@@ -74,11 +76,14 @@ sfo-ip = "0.1"
 
 buckyos-kit.workspace = true
 kRPC.workspace = true
+buckyos-http-server.workspace = true
 name-client.workspace = true
 name-lib.workspace = true
-ndn-lib = { git = "https://github.com/buckyos/cyfs-ndn.git", package = "ndn-lib", branch = "main"}
-ndm = { git = "https://github.com/buckyos/cyfs-ndn.git", package = "ndm", branch = "main" }
-named_store = { git = "https://github.com/buckyos/cyfs-ndn.git", package = "named_store", branch = "main" }
+ndn-lib.workspace = true
+named_store.workspace = true
+ndn-toolkit.workspace = true
+
+cyfs-gateway-api.workspace = true
 cyfs-process-chain = { path = "../cyfs-process-chain" }
 cyfs-acme = { path = "../cyfs-acme" }
 cyfs-lookup = { path = "../cyfs-lookup" }

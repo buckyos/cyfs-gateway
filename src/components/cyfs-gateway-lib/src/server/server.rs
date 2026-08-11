@@ -1,6 +1,7 @@
 use crate::server::dns_server::NameServer;
-use crate::{QAServer, ServerError, ServerErrorCode, ServerResult, server_err};
-use ::kRPC::{RPCHandler, RPCRequest, RPCResponse, RPCResult};
+use crate::{
+    HttpServer, QAServer, ServerError, ServerErrorCode, ServerResult, StreamInfo, server_err,
+};
 use as_any::AsAny;
 use buckyos_kit::AsyncStream;
 use cyfs_process_chain::{
@@ -9,12 +10,11 @@ use cyfs_process_chain::{
     VariableVisitorWrapperForMapCollection,
 };
 use http::uri::{Parts, PathAndQuery};
-use http::{HeaderName, Method, Request, Response, StatusCode, Uri};
+use http::{HeaderName, Method, Uri};
 use http_body_util::combinators::BoxBody;
-use http_body_util::{BodyExt, Full};
 use hyper::body::Bytes;
-use hyper_util::rt::{TokioExecutor, TokioIo};
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::str::FromStr;
 use std::sync::atomic::AtomicU32;
 use std::sync::{Arc, Mutex, Weak};
@@ -137,17 +137,6 @@ impl Server {
 }
 
 #[derive(Default, Debug, Clone)]
-pub struct StreamInfo {
-    pub src_addr: Option<String>,
-    pub dst_addr: Option<String>,
-    pub conn_src_addr: Option<String>,
-    pub real_src_addr: Option<String>,
-    pub source_mac: Option<String>,
-    pub source_hostname: Option<String>,
-    pub source_online_secs: Option<String>,
-}
-
-#[derive(Default, Debug, Clone)]
 pub struct HttpRequestProcessChainVars {
     pub req_remote_ip: Option<String>,
     pub req_remote_port: Option<String>,
@@ -157,47 +146,119 @@ pub struct HttpRequestProcessChainVars {
     pub req_real_remote_port: Option<String>,
 }
 
-impl StreamInfo {
-    pub fn new(src_addr: String) -> Self {
-        Self {
-            src_addr: Some(src_addr.clone()),
-            dst_addr: None,
-            conn_src_addr: Some(src_addr),
-            real_src_addr: None,
-            source_mac: None,
-            source_hostname: None,
-            source_online_secs: None,
+/// Source variables resolved from a [`StreamInfo`] (and optionally from
+/// trusted forwarded headers) for one HTTP request.
+///
+/// - `source_*`: effective source seen by this hook point (real source when a
+///   trusted restore exists, otherwise the connection source)
+/// - `conn_source_*`: connection-layer direct previous hop
+/// - `real_source_*`: source restored through a trusted mechanism only; never
+///   fabricated when no trusted mechanism applies
+///
+/// `*_addr` keeps the raw address string (usually `IP:PORT`, may be a bare IP
+/// when restored from forwarded headers); `*_ip` / `*_port` are only present
+/// when they can be derived.
+#[derive(Default, Debug, Clone)]
+pub struct RequestSourceInfo {
+    pub source_addr: Option<String>,
+    pub source_ip: Option<String>,
+    pub source_port: Option<String>,
+    pub conn_source_addr: Option<String>,
+    pub conn_source_ip: Option<String>,
+    pub conn_source_port: Option<String>,
+    pub real_source_addr: Option<String>,
+    pub real_source_ip: Option<String>,
+    pub real_source_port: Option<String>,
+}
+
+/// Reserved source keys exposed through the HTTP `REQ` map. These keys always
+/// resolve from the connection's [`RequestSourceInfo`] and never fall back to
+/// same-named HTTP headers, so clients cannot forge them.
+pub const HTTP_REQ_SOURCE_KEYS: [&str; 9] = [
+    "source_addr",
+    "source_ip",
+    "source_port",
+    "conn_source_addr",
+    "conn_source_ip",
+    "conn_source_port",
+    "real_source_addr",
+    "real_source_ip",
+    "real_source_port",
+];
+
+fn addr_group_from_str(addr: &str) -> (Option<String>, Option<String>, Option<String>) {
+    if let Ok(socket_addr) = addr.parse::<SocketAddr>() {
+        (
+            Some(addr.to_string()),
+            Some(socket_addr.ip().to_string()),
+            Some(socket_addr.port().to_string()),
+        )
+    } else if addr.parse::<std::net::IpAddr>().is_ok() {
+        (Some(addr.to_string()), Some(addr.to_string()), None)
+    } else {
+        (Some(addr.to_string()), None, None)
+    }
+}
+
+impl RequestSourceInfo {
+    pub fn is_reserved_key(key: &str) -> bool {
+        HTTP_REQ_SOURCE_KEYS.contains(&key)
+    }
+
+    pub fn from_stream_info(info: &StreamInfo) -> Self {
+        let mut this = Self::default();
+        if let Some(addr) = info.src_addr.as_deref() {
+            (this.source_addr, this.source_ip, this.source_port) = addr_group_from_str(addr);
         }
-    }
-
-    pub fn with_addrs(conn_src_addr: Option<String>, real_src_addr: Option<String>) -> Self {
-        let src_addr = real_src_addr.clone().or_else(|| conn_src_addr.clone());
-        Self {
-            src_addr,
-            dst_addr: None,
-            conn_src_addr,
-            real_src_addr,
-            source_mac: None,
-            source_hostname: None,
-            source_online_secs: None,
+        if let Some(addr) = info.conn_src_addr.as_deref() {
+            (
+                this.conn_source_addr,
+                this.conn_source_ip,
+                this.conn_source_port,
+            ) = addr_group_from_str(addr);
         }
+        if let Some(addr) = info.real_src_addr.as_deref() {
+            (
+                this.real_source_addr,
+                this.real_source_ip,
+                this.real_source_port,
+            ) = addr_group_from_str(addr);
+        }
+        this
     }
 
-    pub fn with_device_info(
-        mut self,
-        source_mac: Option<String>,
-        source_hostname: Option<String>,
-        source_online_secs: Option<String>,
-    ) -> Self {
-        self.source_mac = source_mac;
-        self.source_hostname = source_hostname;
-        self.source_online_secs = source_online_secs;
-        self
+    /// Install `addr` as the trusted restored source and make it the
+    /// effective source as well.
+    pub fn set_real_source(&mut self, addr: &str) {
+        (
+            self.real_source_addr,
+            self.real_source_ip,
+            self.real_source_port,
+        ) = addr_group_from_str(addr);
+        (self.source_addr, self.source_ip, self.source_port) = addr_group_from_str(addr);
     }
 
-    pub fn with_dst_addr(mut self, dst_addr: Option<String>) -> Self {
-        self.dst_addr = dst_addr;
-        self
+    pub fn get(&self, key: &str) -> Option<&str> {
+        let value = match key {
+            "source_addr" => &self.source_addr,
+            "source_ip" => &self.source_ip,
+            "source_port" => &self.source_port,
+            "conn_source_addr" => &self.conn_source_addr,
+            "conn_source_ip" => &self.conn_source_ip,
+            "conn_source_port" => &self.conn_source_port,
+            "real_source_addr" => &self.real_source_addr,
+            "real_source_ip" => &self.real_source_ip,
+            "real_source_port" => &self.real_source_port,
+            _ => &None,
+        };
+        value.as_deref()
+    }
+
+    fn present_entries(&self) -> Vec<(&'static str, String)> {
+        HTTP_REQ_SOURCE_KEYS
+            .iter()
+            .filter_map(|key| self.get(key).map(|value| (*key, value.to_string())))
+            .collect()
     }
 }
 
@@ -227,6 +288,7 @@ pub fn str_to_http_version(version: &str) -> Option<http::Version> {
 pub struct HttpRequestHeaderMap {
     request: Arc<RwLock<http::Request<BoxBody<Bytes, ServerError>>>>,
     transverse_counter: Arc<AtomicU32>, // Indicates if a traversal is currently happening
+    sources: Arc<RequestSourceInfo>,
 }
 
 impl HttpRequestHeaderMap {
@@ -234,6 +296,18 @@ impl HttpRequestHeaderMap {
         Self {
             request: Arc::new(RwLock::new(request)),
             transverse_counter: Arc::new(AtomicU32::new(0)), // Initialize counter to 0
+            sources: Arc::new(RequestSourceInfo::default()),
+        }
+    }
+
+    pub fn new_with_sources(
+        request: http::Request<BoxBody<Bytes, ServerError>>,
+        sources: RequestSourceInfo,
+    ) -> Self {
+        Self {
+            request: Arc::new(RwLock::new(request)),
+            transverse_counter: Arc::new(AtomicU32::new(0)),
+            sources: Arc::new(sources),
         }
     }
 
@@ -301,6 +375,12 @@ impl MapCollection for HttpRequestHeaderMap {
             return Err(msg);
         }
 
+        if RequestSourceInfo::is_reserved_key(key) {
+            let msg = format!("Cannot insert read-only source variable '{}'", key);
+            warn!("{}", msg);
+            return Err(msg);
+        }
+
         let mut request = self.request.write().await;
         let header = value.try_as_str()?.parse().map_err(|e| {
             let msg = format!("Invalid header value '{}': {}", value, e);
@@ -331,6 +411,12 @@ impl MapCollection for HttpRequestHeaderMap {
     ) -> Result<Option<CollectionValue>, String> {
         if self.is_during_traversal() {
             let msg = format!("Cannot insert header '{}' during traversal", key);
+            warn!("{}", msg);
+            return Err(msg);
+        }
+
+        if RequestSourceInfo::is_reserved_key(key) {
+            let msg = format!("Cannot set read-only source variable '{}'", key);
             warn!("{}", msg);
             return Err(msg);
         }
@@ -427,6 +513,15 @@ impl MapCollection for HttpRequestHeaderMap {
     }
 
     async fn get(&self, key: &str) -> Result<Option<CollectionValue>, String> {
+        if RequestSourceInfo::is_reserved_key(key) {
+            // Reserved source keys resolve from stream info only; a
+            // same-named HTTP header must never shadow them.
+            return Ok(self
+                .sources
+                .get(key)
+                .map(|value| CollectionValue::String(value.to_string())));
+        }
+
         let request = self.request.read().await;
         if key == "path" {
             Ok(Some(CollectionValue::String(
@@ -458,6 +553,9 @@ impl MapCollection for HttpRequestHeaderMap {
     }
 
     async fn contains_key(&self, key: &str) -> Result<bool, String> {
+        if RequestSourceInfo::is_reserved_key(key) {
+            return Ok(self.sources.get(key).is_some());
+        }
         let request = self.request.read().await;
         if key == "path" || key == "method" || key == "uri" || key == "version" {
             return Ok(true);
@@ -468,6 +566,12 @@ impl MapCollection for HttpRequestHeaderMap {
     async fn remove(&self, key: &str) -> Result<Option<CollectionValue>, String> {
         if self.is_during_traversal() {
             let msg = format!("Cannot remove header '{}' during traversal", key);
+            warn!("{}", msg);
+            return Err(msg);
+        }
+
+        if RequestSourceInfo::is_reserved_key(key) {
+            let msg = format!("Cannot remove read-only source variable '{}'", key);
             warn!("{}", msg);
             return Err(msg);
         }
@@ -526,7 +630,17 @@ impl MapCollection for HttpRequestHeaderMap {
         {
             return Ok(());
         }
+        for (key, value) in self.sources.present_entries() {
+            if !callback.call(key, &CollectionValue::String(value)).await? {
+                return Ok(());
+            }
+        }
         for (key, value) in request.headers().iter() {
+            if RequestSourceInfo::is_reserved_key(key.as_str()) {
+                // Reserved source keys never resolve to headers; skip the
+                // colliding header to keep the traversal view consistent.
+                continue;
+            }
             if let Ok(value_str) = value.to_str() {
                 if !callback
                     .call(key.as_str(), &CollectionValue::String(value_str.to_owned()))
@@ -560,7 +674,13 @@ impl MapCollection for HttpRequestHeaderMap {
             "version".to_string(),
             CollectionValue::String(format!("{:?}", request.version())),
         ));
+        for (key, value) in self.sources.present_entries() {
+            result.push((key.to_string(), CollectionValue::String(value)));
+        }
         for (key, value) in request.headers().iter() {
+            if RequestSourceInfo::is_reserved_key(key.as_str()) {
+                continue;
+            }
             if let Ok(value_str) = value.to_str() {
                 result.push((
                     key.as_str().to_string(),
@@ -822,246 +942,6 @@ impl VariableVisitor for HttpRequestUrlVisitor {
     }
 }
 
-#[async_trait::async_trait]
-pub trait HttpServer: Send + Sync + 'static {
-    async fn serve_request(
-        &self,
-        req: http::Request<BoxBody<Bytes, ServerError>>,
-        info: StreamInfo,
-    ) -> ServerResult<http::Response<BoxBody<Bytes, ServerError>>>;
-    fn id(&self) -> String;
-    fn http_version(&self) -> http::Version;
-    fn http3_port(&self) -> Option<u16>;
-}
-
-pub async fn serve_http_by_rpc_handler<T: RPCHandler + Send + Sync + 'static>(
-    req: http::Request<BoxBody<Bytes, ServerError>>,
-    info: StreamInfo,
-    rpc_handler: &T,
-) -> ServerResult<http::Response<BoxBody<Bytes, ServerError>>> {
-    if req.method() != hyper::Method::POST {
-        return Ok(http::Response::builder()
-            .status(hyper::StatusCode::METHOD_NOT_ALLOWED)
-            .body(BoxBody::new(
-                http_body_util::Full::new(Bytes::from_static(b"Method Not Allowed"))
-                    .map_err(|never| match never {})
-                    .boxed(),
-            ))
-            .map_err(|e| {
-                server_err!(
-                    ServerErrorCode::BadRequest,
-                    "Failed to build response: {}",
-                    e
-                )
-            })?);
-    }
-
-    let client_ip = match info.src_addr.as_ref() {
-        Some(addr) => match addr.parse::<std::net::SocketAddr>() {
-            Ok(sa) => sa.ip(),
-            Err(e) => {
-                error!("parse client ip {} err {}", addr, e);
-                return Ok(http::Response::builder()
-                    .status(hyper::StatusCode::BAD_REQUEST)
-                    .body(BoxBody::new(
-                        http_body_util::Full::new(Bytes::from_static(b"Bad Request"))
-                            .map_err(|never| match never {})
-                            .boxed(),
-                    ))
-                    .map_err(|e| {
-                        server_err!(
-                            ServerErrorCode::BadRequest,
-                            "Failed to build response: {}",
-                            e
-                        )
-                    })?);
-            }
-        },
-        None => {
-            error!("Failed to get client ip");
-            return Ok(http::Response::builder()
-                .status(hyper::StatusCode::BAD_REQUEST)
-                .body(BoxBody::new(
-                    http_body_util::Full::new(Bytes::from_static(b"Bad Request"))
-                        .map_err(|never| match never {})
-                        .boxed(),
-                ))
-                .map_err(|e| {
-                    server_err!(
-                        ServerErrorCode::BadRequest,
-                        "Failed to build response: {}",
-                        e
-                    )
-                })?);
-        }
-    };
-
-    let body_bytes = match req.collect().await {
-        Ok(data) => data.to_bytes(),
-        Err(e) => {
-            return Ok(http::Response::builder()
-                .status(hyper::StatusCode::BAD_REQUEST)
-                .body(BoxBody::new(
-                    http_body_util::Full::new(Bytes::from(format!("Failed to read body: {:?}", e)))
-                        .map_err(|never| match never {})
-                        .boxed(),
-                ))
-                .map_err(|e| {
-                    server_err!(
-                        ServerErrorCode::BadRequest,
-                        "Failed to build response: {}",
-                        e
-                    )
-                })?);
-        }
-    };
-
-    let body_str = match String::from_utf8(body_bytes.to_vec()) {
-        Ok(s) => s,
-        Err(e) => {
-            return Ok(http::Response::builder()
-                .status(hyper::StatusCode::BAD_REQUEST)
-                .body(BoxBody::new(
-                    http_body_util::Full::new(Bytes::from(format!(
-                        "Failed to convert body to string: {}",
-                        e
-                    )))
-                    .map_err(|never| match never {})
-                    .boxed(),
-                ))
-                .map_err(|e| {
-                    server_err!(
-                        ServerErrorCode::BadRequest,
-                        "Failed to build response: {}",
-                        e
-                    )
-                })?);
-        }
-    };
-
-    debug!("|==>recv kRPC req: {}", body_str);
-
-    let rpc_request: RPCRequest = match serde_json::from_str(body_str.as_str()) {
-        Ok(rpc_request) => rpc_request,
-        Err(e) => {
-            return Ok(http::Response::builder()
-                .status(hyper::StatusCode::BAD_REQUEST)
-                .body(BoxBody::new(
-                    http_body_util::Full::new(Bytes::from(format!(
-                        "Failed to parse request body to RPCRequest: {}",
-                        e
-                    )))
-                    .map_err(|never| match never {})
-                    .boxed(),
-                ))
-                .map_err(|e| {
-                    server_err!(
-                        ServerErrorCode::BadRequest,
-                        "Failed to build response: {}",
-                        e
-                    )
-                })?);
-        }
-    };
-
-    let rpc_seq = rpc_request.seq;
-    let rpc_trace_id = rpc_request.trace_id.clone();
-    let resp: RPCResponse = match rpc_handler.handle_rpc_call(rpc_request, client_ip).await {
-        Ok(resp) => resp,
-        Err(e) => {
-            warn!("Failed to handle rpc call: {}", e);
-            RPCResponse {
-                result: RPCResult::Failed(e.to_string()),
-                seq: rpc_seq,
-                trace_id: rpc_trace_id,
-            }
-        }
-    };
-
-    let body_json = serde_json::to_string(&resp).map_err(|e| {
-        server_err!(
-            ServerErrorCode::EncodeError,
-            "Failed to convert response to string: {}",
-            e
-        )
-    })?;
-
-    Ok(http::Response::builder()
-        .body(BoxBody::new(
-            http_body_util::Full::new(Bytes::from(body_json))
-                .map_err(|never| match never {})
-                .boxed(),
-        ))
-        .map_err(|e| {
-            server_err!(
-                ServerErrorCode::InvalidData,
-                "Failed to build response: {}",
-                e
-            )
-        })?)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use ::kRPC::RPCErrors;
-    use async_trait::async_trait;
-    use serde_json::json;
-    use std::net::IpAddr;
-
-    struct ErrorRpcHandler;
-
-    #[async_trait]
-    impl RPCHandler for ErrorRpcHandler {
-        async fn handle_rpc_call(
-            &self,
-            _req: RPCRequest,
-            _ip_from: IpAddr,
-        ) -> Result<RPCResponse, RPCErrors> {
-            Err(RPCErrors::ReasonError("boom".to_string()))
-        }
-    }
-
-    #[tokio::test]
-    async fn serve_http_by_rpc_handler_returns_rpc_error_response() {
-        let mut rpc_request = RPCRequest::new("test", json!({ "ok": false }));
-        rpc_request.seq = 42;
-        rpc_request.trace_id = Some("trace-1".to_string());
-
-        let request = http::Request::builder()
-            .method("POST")
-            .uri("http://localhost/krpc")
-            .body(
-                Full::new(Bytes::from(serde_json::to_string(&rpc_request).unwrap()))
-                    .map_err(|never| match never {})
-                    .boxed(),
-            )
-            .unwrap();
-
-        let response = serve_http_by_rpc_handler(
-            request,
-            StreamInfo::new("127.0.0.1:12345".to_string()),
-            &ErrorRpcHandler,
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(response.status(), StatusCode::OK);
-
-        let rpc_response: RPCResponse =
-            serde_json::from_slice(&response.collect().await.unwrap().to_bytes()).unwrap();
-
-        assert_eq!(
-            rpc_response,
-            RPCResponse {
-                result: RPCResult::Failed("Failed due to reason: boom".to_string()),
-                seq: 42,
-                trace_id: Some("trace-1".to_string()),
-            }
-        );
-    }
-}
-
 pub struct DatagramInfo {
     pub src_addr: Option<String>,
     pub dst_addr: Option<String>,
@@ -1160,22 +1040,15 @@ impl ServerManager {
 
     /// 通过 id 和 trait_type 获取 server
     pub fn get_server_by_type(&self, id: &str, trait_type: &str) -> Option<Server> {
-        let key = if id.contains(".") {
-            id.to_string()
-        } else {
-            Server::build_key(id, trait_type)
-        };
-
-        let result = self.get_server_by_key(&key);
-        if result.is_none() {
-            return None;
-        }
-        let result = result.unwrap();
-        if result.trait_type() == trait_type {
-            return Some(result);
+        // Accept an explicitly typed full key, but do not treat every dotted
+        // server id (for example, a DNS name) as a full key.
+        if let Some(server) = self.get_server_by_key(id) {
+            if server.trait_type() == trait_type {
+                return Some(server);
+            }
         }
 
-        None
+        self.get_server_by_key(&Server::build_key(id, trait_type))
     }
 
     pub fn get_http_server(&self, id: &str) -> Option<Arc<dyn HttpServer>> {
@@ -1304,289 +1177,119 @@ impl ServerManager {
 pub type ServerManagerRef = Arc<ServerManager>;
 pub type ServerManagerWeakRef = Weak<ServerManager>;
 
-pub async fn hyper_serve_http(
-    stream: Box<dyn AsyncStream>,
-    server: Arc<dyn HttpServer>,
-    info: StreamInfo,
-) -> ServerResult<()> {
-    if server.http_version() <= http::Version::HTTP_11 {
-        hyper::server::conn::http1::Builder::new()
-            .serve_connection(TokioIo::new(stream), hyper::service::service_fn(|req| {
-                let server = server.clone();
-                let info = info.clone();
-                async move {
-                    let (parts, body) = req.into_parts();
-                    let req = Request::new(BoxBody::new(body)).map_err(|e| server_err!(ServerErrorCode::BadRequest, "{}", e)).boxed();
-                    let req = Request::from_parts(parts, req);
-                    let remote = info.src_addr.clone().unwrap_or_else(|| "unknown".to_string());
-                    let method_is_options = req.method() == Method::OPTIONS;
-                    let method = req.method().to_string();
-                    let host = req
-                        .headers()
-                        .get("host")
-                        .and_then(|h| h.to_str().ok())
-                        .unwrap_or("none")
-                        .to_string();
-                    let uri = req.uri().to_string();
-                    log::debug!(
-                        "recv http request:remote {} method {} host {} path {}",
-                        remote,
-                        method,
-                        host,
-                        uri,
-                    );
-                    match server.serve_request(req, info).await {
-                        Ok(resp) => {
-                            if resp.status() == StatusCode::FORBIDDEN {
-                                if method_is_options {
-                                    log::warn!(
-                                        "http_forbidden server={} remote={} method={} host={} uri={}",
-                                        server.id(),
-                                        remote,
-                                        method,
-                                        host,
-                                        uri,
-                                    );
-                                } else {
-                                    log::debug!(
-                                        "http_forbidden server={} remote={} method={} host={} uri={}",
-                                        server.id(),
-                                        remote,
-                                        method,
-                                        host,
-                                        uri,
-                                    );
-                                }
-                            }
-                            Ok(resp)
-                        }
-                        Err(e) => {
-                            log::error!("http error {}", e);
-                            Response::builder()
-                                .status(StatusCode::INTERNAL_SERVER_ERROR)
-                                .body(Full::new(Bytes::from(e.msg().to_string()))
-                                    .map_err(|e| server_err!(ServerErrorCode::BadRequest, "{:?}", e)).boxed())
-                                .map_err(|e| server_err!(ServerErrorCode::StreamError, "{:?}", e))
-                        }
-                    }
-                }
-            })).await.map_err(|e| server_err!(ServerErrorCode::StreamError, "{e}"))?;
-    } else if server.http_version() == http::Version::HTTP_3 && server.http3_port().is_some() {
-        hyper_util::server::conn::auto::Builder::new(TokioExecutor::new())
-            .serve_connection(TokioIo::new(stream), hyper::service::service_fn(|req| {
-                let server = server.clone();
-                let info = info.clone();
-                async move {
-                    let (parts, body) = req.into_parts();
-                    let req = Request::new(BoxBody::new(body))
-                        .map_err(|e| server_err!(ServerErrorCode::BadRequest, "{}", e)).boxed();
-                    let req = Request::from_parts(parts, req);
-                    let http3_port = server.http3_port().unwrap();
-                    let remote = info.src_addr.clone().unwrap_or_else(|| "unknown".to_string());
-                    let method_is_options = req.method() == Method::OPTIONS;
-                    let method = req.method().to_string();
-                    let host = req
-                        .headers()
-                        .get("host")
-                        .and_then(|h| h.to_str().ok())
-                        .unwrap_or("none")
-                        .to_string();
-                    let uri = req.uri().to_string();
-                    log::debug!(
-                        "recv http request:remote {} method {} host {} path {}",
-                        remote,
-                        method,
-                        host,
-                        uri,
-                    );
-                    match server.serve_request(req, info).await {
-                        Ok(mut res) => {
-                            res.headers_mut().insert(
-                                http::header::ALT_SVC,
-                                http::HeaderValue::from_str(format!("h3=\":{http3_port}\"; ma=86400").as_str()).unwrap(),
-                            );
-                            if res.status() == StatusCode::FORBIDDEN {
-                                if method_is_options {
-                                    log::warn!(
-                                        "http_forbidden server={} remote={} method={} host={} uri={}",
-                                        server.id(),
-                                        remote,
-                                        method,
-                                        host,
-                                        uri,
-                                    );
-                                } else {
-                                    log::debug!(
-                                        "http_forbidden server={} remote={} method={} host={} uri={}",
-                                        server.id(),
-                                        remote,
-                                        method,
-                                        host,
-                                        uri,
-                                    );
-                                }
-                            }
-                            Ok(res)
-                        },
-                        Err(e) => {
-                            log::error!("http error {}", e);
-                            Response::builder()
-                                .status(StatusCode::INTERNAL_SERVER_ERROR)
-                                .body(Full::new(Bytes::from(e.msg().to_string()))
-                                    .map_err(|e| server_err!(ServerErrorCode::BadRequest, "{:?}", e)).boxed())
-                                .map_err(|e| server_err!(ServerErrorCode::StreamError, "{:?}", e))
-                        }
-                    }
-                }
-            })).await.map_err(|e| server_err!(ServerErrorCode::StreamError, "{e}"))?;
-    } else {
-        hyper_util::server::conn::auto::Builder::new(TokioExecutor::new())
-            .serve_connection(TokioIo::new(stream), hyper::service::service_fn(|req| {
-                let server = server.clone();
-                let info = info.clone();
-                async move {
-                    let (parts, body) = req.into_parts();
-                    let req = Request::new(BoxBody::new(body))
-                        .map_err(|e| server_err!(ServerErrorCode::BadRequest, "{}", e)).boxed();
-                    let req = Request::from_parts(parts, req);
-                    let remote = info.src_addr.clone().unwrap_or_else(|| "unknown".to_string());
-                    let method_is_options = req.method() == Method::OPTIONS;
-                    let method = req.method().to_string();
-                    let host = req
-                        .headers()
-                        .get("host")
-                        .and_then(|h| h.to_str().ok())
-                        .unwrap_or("none")
-                        .to_string();
-                    let uri = req.uri().to_string();
-                    log::debug!(
-                        "recv http request:remote {} method {} host {} path {}",
-                        remote,
-                        method,
-                        host,
-                        uri,
-                    );
-                    match server.serve_request(req, info).await {
-                        Ok(resp) => {
-                            if resp.status() == StatusCode::FORBIDDEN {
-                                if method_is_options {
-                                    log::warn!(
-                                        "http_forbidden server={} remote={} method={} host={} uri={}",
-                                        server.id(),
-                                        remote,
-                                        method,
-                                        host,
-                                        uri,
-                                    );
-                                } else {
-                                    log::debug!(
-                                        "http_forbidden server={} remote={} method={} host={} uri={}",
-                                        server.id(),
-                                        remote,
-                                        method,
-                                        host,
-                                        uri,
-                                    );
-                                }
-                            }
-                            Ok(resp)
-                        }
-                        Err(e) => {
-                            log::error!("http error {}", e);
-                            Response::builder()
-                                .status(StatusCode::INTERNAL_SERVER_ERROR)
-                                .body(Full::new(Bytes::from(e.msg().to_string()))
-                                    .map_err(|e| server_err!(ServerErrorCode::BadRequest, "{:?}", e)).boxed())
-                                .map_err(|e| server_err!(ServerErrorCode::StreamError, "{:?}", e))
-                        }
-                    }
-                }
-            })).await.map_err(|e| server_err!(ServerErrorCode::StreamError, "{e}"))?;
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use http_body_util::{BodyExt, Full};
+
+    fn test_request(headers: &[(&str, &str)]) -> http::Request<BoxBody<Bytes, ServerError>> {
+        let mut builder = http::Request::builder().method("GET").uri("/test");
+        for (name, value) in headers {
+            builder = builder.header(*name, *value);
+        }
+        builder
+            .body(Full::new(Bytes::new()).map_err(|e| match e {}).boxed())
+            .unwrap()
     }
 
-    Ok(())
-}
+    #[test]
+    fn test_request_source_info_from_stream_info() {
+        let info = StreamInfo::with_addrs(
+            Some("127.0.0.1:9000".to_string()),
+            Some("198.51.100.7:6001".to_string()),
+        );
+        let sources = RequestSourceInfo::from_stream_info(&info);
+        assert_eq!(sources.source_ip.as_deref(), Some("198.51.100.7"));
+        assert_eq!(sources.source_port.as_deref(), Some("6001"));
+        assert_eq!(sources.conn_source_addr.as_deref(), Some("127.0.0.1:9000"));
+        assert_eq!(sources.real_source_ip.as_deref(), Some("198.51.100.7"));
 
-pub async fn hyper_serve_http1(
-    stream: Box<dyn AsyncStream>,
-    server: Arc<dyn HttpServer>,
-    info: StreamInfo,
-) -> ServerResult<()> {
-    hyper::server::conn::http1::Builder::new()
-        .serve_connection(
-            TokioIo::new(stream),
-            hyper::service::service_fn(|req| {
-                let server = server.clone();
-                let info = info.clone();
-                async move {
-                    let (parts, body) = req.into_parts();
-                    let req = Request::new(BoxBody::new(body))
-                        .map_err(|e| server_err!(ServerErrorCode::BadRequest, "{}", e))
-                        .boxed();
-                    let req = Request::from_parts(parts, req);
-                    let remote = info
-                        .src_addr
-                        .clone()
-                        .unwrap_or_else(|| "unknown".to_string());
-                    let method_is_options = req.method() == Method::OPTIONS;
-                    let method = req.method().to_string();
-                    let host = req
-                        .headers()
-                        .get("host")
-                        .and_then(|h| h.to_str().ok())
-                        .unwrap_or("none")
-                        .to_string();
-                    let uri = req.uri().to_string();
-                    log::debug!(
-                        "recv http request:remote {} method {} host {} path {}",
-                        remote,
-                        method,
-                        host,
-                        uri,
-                    );
-                    match server.serve_request(req, info).await {
-                        Ok(resp) => {
-                            if resp.status() == StatusCode::FORBIDDEN {
-                                if method_is_options {
-                                    log::warn!(
-                                    "http_forbidden server={} remote={} method={} host={} uri={}",
-                                    server.id(),
-                                    remote,
-                                    method,
-                                    host,
-                                    uri,
-                                );
-                                } else {
-                                    log::debug!(
-                                    "http_forbidden server={} remote={} method={} host={} uri={}",
-                                    server.id(),
-                                    remote,
-                                    method,
-                                    host,
-                                    uri,
-                                );
-                                }
-                            }
-                            Ok(resp)
-                        }
-                        Err(e) => {
-                            log::error!("http error {}", e);
-                            Response::builder()
-                                .status(StatusCode::INTERNAL_SERVER_ERROR)
-                                .body(
-                                    Full::new(Bytes::from(e.msg().to_string()))
-                                        .map_err(|e| {
-                                            server_err!(ServerErrorCode::BadRequest, "{:?}", e)
-                                        })
-                                        .boxed(),
-                                )
-                                .map_err(|e| server_err!(ServerErrorCode::StreamError, "{:?}", e))
-                        }
-                    }
-                }
-            }),
-        )
-        .await
-        .map_err(|e| server_err!(ServerErrorCode::StreamError, "{e}"))?;
-    Ok(())
+        // Bare-IP real source (e.g. restored from X-Forwarded-For): the ip is
+        // derivable but the port is not.
+        let mut sources =
+            RequestSourceInfo::from_stream_info(&StreamInfo::new("192.168.1.9:5555".to_string()));
+        assert_eq!(sources.real_source_addr, None);
+        sources.set_real_source("203.0.113.7");
+        assert_eq!(sources.real_source_addr.as_deref(), Some("203.0.113.7"));
+        assert_eq!(sources.real_source_ip.as_deref(), Some("203.0.113.7"));
+        assert_eq!(sources.real_source_port, None);
+        // Effective source follows the restored value.
+        assert_eq!(sources.source_ip.as_deref(), Some("203.0.113.7"));
+    }
+
+    #[tokio::test]
+    async fn test_http_req_map_reserved_source_keys() {
+        let info = StreamInfo::with_addrs(
+            Some("127.0.0.1:9000".to_string()),
+            Some("198.51.100.7:6001".to_string()),
+        );
+        let sources = RequestSourceInfo::from_stream_info(&info);
+        // Forged same-named headers must never shadow the reserved keys.
+        let req = test_request(&[("source_ip", "6.6.6.6"), ("x-plain", "1")]);
+        let map = HttpRequestHeaderMap::new_with_sources(req, sources);
+
+        let get = |key: &str| {
+            let map = map.clone();
+            let key = key.to_string();
+            async move {
+                map.get(&key)
+                    .await
+                    .unwrap()
+                    .map(|v| v.try_as_str().unwrap().to_string())
+            }
+        };
+
+        assert_eq!(get("source_ip").await.as_deref(), Some("198.51.100.7"));
+        assert_eq!(
+            get("source_addr").await.as_deref(),
+            Some("198.51.100.7:6001")
+        );
+        assert_eq!(get("conn_source_ip").await.as_deref(), Some("127.0.0.1"));
+        assert_eq!(get("conn_source_port").await.as_deref(), Some("9000"));
+        assert_eq!(get("real_source_ip").await.as_deref(), Some("198.51.100.7"));
+        // Normal headers still resolve.
+        assert_eq!(get("x-plain").await.as_deref(), Some("1"));
+
+        assert!(map.contains_key("real_source_addr").await.unwrap());
+
+        // Reserved keys are read-only.
+        assert!(
+            map.insert("source_ip", CollectionValue::String("9.9.9.9".to_string()))
+                .await
+                .is_err()
+        );
+        assert!(
+            map.insert_new(
+                "real_source_ip",
+                CollectionValue::String("9.9.9.9".to_string())
+            )
+            .await
+            .is_err()
+        );
+        assert!(map.remove("conn_source_addr").await.is_err());
+
+        // dump: reserved keys come from stream info; the forged header is
+        // dropped so the view stays consistent with get().
+        let dumped = map.dump().await.unwrap();
+        let dumped: std::collections::HashMap<String, String> = dumped
+            .into_iter()
+            .map(|(k, v)| (k, v.try_as_str().unwrap().to_string()))
+            .collect();
+        assert_eq!(
+            dumped.get("source_ip").map(String::as_str),
+            Some("198.51.100.7")
+        );
+        assert_eq!(dumped.get("x-plain").map(String::as_str), Some("1"));
+    }
+
+    #[tokio::test]
+    async fn test_http_req_map_absent_source_keys() {
+        // No stream info at all: reserved keys resolve to None instead of
+        // falling back to forged headers.
+        let req = test_request(&[("real_source_ip", "7.7.7.7")]);
+        let map = HttpRequestHeaderMap::new(req);
+        assert!(map.get("real_source_ip").await.unwrap().is_none());
+        assert!(!map.contains_key("real_source_ip").await.unwrap());
+        assert!(map.get("source_addr").await.unwrap().is_none());
+    }
 }

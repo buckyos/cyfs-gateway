@@ -67,7 +67,7 @@ impl HttpsSniProbe {
         }
 
         // Skip Compression Methods
-        if pos + 1 <= buffer.len() {
+        if pos < buffer.len() {
             let comp_len = buffer[pos] as usize;
             pos += 1 + comp_len;
         }
@@ -144,6 +144,12 @@ Examples:
 
     pub fn name(&self) -> &str {
         &self.name
+    }
+}
+
+impl Default for HttpsSniProbeCommand {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

@@ -1,4 +1,4 @@
-use super::block::*;
+use super::types::*;
 use crate::collection::{CollectionValue, NumberValue};
 use nom::{
     IResult, Parser,
@@ -23,10 +23,74 @@ pub struct BlockParser {
 enum LineControlKeyword {
     Else,
     Elif,
+    When,
     End,
     Ok,
     Err,
     Control,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct LogicalLineState {
+    paren_depth: usize,
+    bracket_depth: usize,
+    brace_depth: usize,
+    quote: Option<char>,
+    escaped_in_quote: bool,
+}
+
+impl LogicalLineState {
+    fn consume(&mut self, input: &str) {
+        for ch in input.chars() {
+            if let Some(quote) = self.quote {
+                if self.escaped_in_quote {
+                    self.escaped_in_quote = false;
+                    continue;
+                }
+
+                if ch == '\\' {
+                    self.escaped_in_quote = true;
+                    continue;
+                }
+
+                if ch == quote {
+                    self.quote = None;
+                }
+
+                continue;
+            }
+
+            match ch {
+                '"' | '\'' => self.quote = Some(ch),
+                '(' => self.paren_depth += 1,
+                ')' => {
+                    if self.paren_depth > 0 {
+                        self.paren_depth -= 1;
+                    }
+                }
+                '[' => self.bracket_depth += 1,
+                ']' => {
+                    if self.bracket_depth > 0 {
+                        self.bracket_depth -= 1;
+                    }
+                }
+                '{' => self.brace_depth += 1,
+                '}' => {
+                    if self.brace_depth > 0 {
+                        self.brace_depth -= 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn is_open(&self) -> bool {
+        self.quote.is_some()
+            || self.paren_depth > 0
+            || self.bracket_depth > 0
+            || self.brace_depth > 0
+    }
 }
 
 impl BlockParser {
@@ -89,6 +153,116 @@ impl BlockParser {
         }
     }
 
+    fn parse_map_literal_key(input: &str) -> IResult<&str, String> {
+        let double_quoted = delimited(
+            char('"'),
+            map(
+                opt(escaped_transform(
+                    is_not("\\\""),
+                    '\\',
+                    alt((
+                        value("\\", tag("\\")),
+                        value("\"", tag("\"")),
+                        value("\n", tag("n")),
+                        value("\t", tag("t")),
+                        value("\r", tag("r")),
+                        value(" ", tag(" ")),
+                    )),
+                )),
+                |s: Option<String>| s.unwrap_or_default(),
+            ),
+            char('"'),
+        );
+
+        let single_quoted = delimited(
+            char('\''),
+            map(opt(is_not("'")), |s: Option<&str>| {
+                s.unwrap_or("").to_string()
+            }),
+            char('\''),
+        );
+
+        let bare_key = map(
+            recognize(pair(
+                alt((alpha1, tag("_"))),
+                many0(alt((alphanumeric1, tag("_"), tag("-"), tag(".")))),
+            )),
+            |s: &str| s.to_string(),
+        );
+
+        preceded(space0, alt((double_quoted, single_quoted, bare_key))).parse(input)
+    }
+
+    fn parse_list_literal(input: &str) -> IResult<&str, CommandArg> {
+        let (mut rest, _) = preceded(space0, char('[')).parse(input)?;
+        let mut items = Vec::new();
+
+        loop {
+            let (next, _) = space0.parse(rest)?;
+            rest = next;
+
+            if let Some(next) = rest.strip_prefix(']') {
+                return Ok((next, CommandArg::ListLiteral(items)));
+            }
+
+            let (next, value) = Self::parse_arg(rest)?;
+            items.push(value);
+
+            let (next, _) = space0.parse(next)?;
+            rest = next;
+
+            if let Some(next) = rest.strip_prefix(',') {
+                let (next, _) = space0.parse(next)?;
+                rest = next;
+
+                if let Some(next) = rest.strip_prefix(']') {
+                    return Ok((next, CommandArg::ListLiteral(items)));
+                }
+
+                continue;
+            }
+
+            let (next, _) = char(']').parse(rest)?;
+            return Ok((next, CommandArg::ListLiteral(items)));
+        }
+    }
+
+    fn parse_map_literal(input: &str) -> IResult<&str, CommandArg> {
+        let (mut rest, _) = preceded(space0, char('{')).parse(input)?;
+        let mut entries = Vec::new();
+
+        loop {
+            let (next, _) = space0.parse(rest)?;
+            rest = next;
+
+            if let Some(next) = rest.strip_prefix('}') {
+                return Ok((next, CommandArg::MapLiteral(entries)));
+            }
+
+            let (next, key) = Self::parse_map_literal_key(rest)?;
+            let (next, _) = preceded(space0, char(':')).parse(next)?;
+            let (next, value) = Self::parse_arg(next)?;
+            entries.push((key, value));
+
+            let (next, _) = space0.parse(next)?;
+            rest = next;
+
+            if let Some(next) = rest.strip_prefix(',') {
+                let (next, _) = space0.parse(next)?;
+                rest = next;
+
+                if let Some(next) = rest.strip_prefix('}') {
+                    return Ok((next, CommandArg::MapLiteral(entries)));
+                }
+
+                continue;
+            }
+
+            let (next, _) = char('}').parse(rest)?;
+            return Ok((next, CommandArg::MapLiteral(entries)));
+        }
+    }
+
     pub fn new(id: &str) -> Self {
         Self { id: id.to_owned() }
     }
@@ -96,7 +270,7 @@ impl BlockParser {
 
 impl BlockParser {
     pub fn parse(&self, block: &str) -> Result<Block, String> {
-        let lines: Vec<&str> = Self::split_lines(block);
+        let lines: Vec<String> = Self::split_lines(block);
         let mut block = Block::new(&self.id);
 
         if lines.is_empty() {
@@ -121,23 +295,41 @@ impl BlockParser {
 
     // Block contains multiple lines, first split them into lines
     // The lines are separated by '\n' or '\r\n' or '\r' for different OS
-    fn split_lines(block: &str) -> Vec<&str> {
-        block
-            .split(|c| c == '\n' || c == '\r')
-            .map(|line| line.trim_end_matches('\r').trim()) // Remove '\r' at the end of line if any
-            .filter(|line| {
-                if line.is_empty() {
-                    return false; // Filter out empty lines
-                }
+    fn split_lines(block: &str) -> Vec<String> {
+        let mut lines = Vec::new();
+        let mut current = String::new();
+        let mut state = LogicalLineState::default();
 
-                // Filter out lines that are comments
-                !line.starts_with('#') && !line.starts_with("//")
-            }) // Filter out empty lines
-            .collect()
+        for raw_line in block.split(['\n', '\r']) {
+            let line = raw_line.trim_end_matches('\r').trim();
+            if line.is_empty() {
+                continue;
+            }
+
+            if line.starts_with('#') || line.starts_with("//") {
+                continue;
+            }
+
+            if !current.is_empty() {
+                current.push(' ');
+            }
+            current.push_str(line);
+            state.consume(line);
+
+            if !state.is_open() {
+                lines.push(std::mem::take(&mut current));
+            }
+        }
+
+        if !current.is_empty() {
+            lines.push(current);
+        }
+
+        lines
     }
 
     fn parse_lines(
-        lines: &[&str],
+        lines: &[String],
         mut index: usize,
         stop_at_control_keywords: bool,
     ) -> Result<(Vec<Line>, usize), String> {
@@ -161,6 +353,8 @@ impl BlockParser {
             debug!("Parsing line {}: {}", index, line);
             let (parsed_line, next_index) = if Self::is_if_header(line) {
                 Self::parse_if_statement(lines, index)?
+            } else if Self::is_case_header(line) {
+                Self::parse_case_statement(lines, index)?
             } else if Self::is_for_header(line) {
                 Self::parse_for_statement(lines, index)?
             } else if Self::is_match_result_header(line) {
@@ -181,6 +375,9 @@ impl BlockParser {
         let line = line.trim();
         if line == "else" {
             return Some(LineControlKeyword::Else);
+        }
+        if line.starts_with("when ") && line.ends_with(" then") {
+            return Some(LineControlKeyword::When);
         }
         if line == "end" {
             return Some(LineControlKeyword::End);
@@ -204,6 +401,11 @@ impl BlockParser {
     fn is_if_header(line: &str) -> bool {
         let line = line.trim();
         line.starts_with("if ") && line.ends_with(" then")
+    }
+
+    fn is_case_header(line: &str) -> bool {
+        let line = line.trim();
+        line.starts_with("case") && line.ends_with("then")
     }
 
     fn is_for_header(line: &str) -> bool {
@@ -359,7 +561,7 @@ impl BlockParser {
         Ok(condition)
     }
 
-    fn parse_if_statement(lines: &[&str], index: usize) -> Result<(Line, usize), String> {
+    fn parse_if_statement(lines: &[String], index: usize) -> Result<(Line, usize), String> {
         let if_source = lines[index].trim().to_string();
         let mut branches = Vec::new();
         let mut else_lines = None;
@@ -432,6 +634,163 @@ impl BlockParser {
         });
         let line = Line {
             source: if_source,
+            statements: vec![statement],
+        };
+
+        Ok((line, cursor))
+    }
+
+    fn parse_case_header(line: &str) -> Result<(Option<CommandArg>, Option<String>), String> {
+        let line = line.trim();
+        let body = line
+            .strip_prefix("case")
+            .ok_or_else(|| format!("Invalid 'case' header: '{}'", line))?
+            .trim_start();
+        let body = body.strip_suffix("then").ok_or_else(|| {
+            let msg = format!("'case' header must end with 'then': '{}'", line);
+            error!("{}", msg);
+            msg
+        })?;
+        let body = body.trim_end();
+
+        if body.is_empty() {
+            return Ok((None, None));
+        }
+
+        let (rest, subject) = Self::parse_arg(body).map_err(|e| {
+            let msg = format!("Parse 'case' subject error: '{}', {:?}", line, e);
+            error!("{}", msg);
+            msg
+        })?;
+
+        let rest = rest.trim();
+        let binding = rest.strip_prefix("as ").ok_or_else(|| {
+            let msg = format!(
+                "'case' subject form requires 'as <name>' after the subject: '{}'",
+                line
+            );
+            error!("{}", msg);
+            msg
+        })?;
+
+        let binding = binding.trim();
+        if !Self::is_valid_loop_var_name(binding) {
+            let msg = format!("Invalid case binding variable '{}'", binding);
+            error!("{}", msg);
+            return Err(msg);
+        }
+
+        Ok((Some(subject), Some(binding.to_string())))
+    }
+
+    fn parse_case_statement(lines: &[String], index: usize) -> Result<(Line, usize), String> {
+        let case_source = lines[index].trim().to_string();
+        let (subject, binding_var) = Self::parse_case_header(case_source.as_str())?;
+
+        let mut branches = Vec::new();
+        let mut else_lines = None;
+        let mut cursor = index + 1;
+
+        if cursor >= lines.len() {
+            let msg = format!(
+                "Missing 'when'/'end' for case statement starting at line {}: '{}'",
+                index + 1,
+                case_source
+            );
+            error!("{}", msg);
+            return Err(msg);
+        }
+
+        let first_control_line = lines[cursor].trim();
+        let mut current_condition = match Self::line_control_keyword(first_control_line) {
+            Some(LineControlKeyword::When) => Self::parse_if_condition(first_control_line, "when")?,
+            Some(other) => {
+                let msg = format!(
+                    "Case statement requires a 'when ... then' branch at line {}, got '{}'",
+                    cursor + 1,
+                    Self::line_control_keyword_name(other)
+                );
+                error!("{}", msg);
+                return Err(msg);
+            }
+            None => {
+                let msg = format!(
+                    "Case statement requires a 'when ... then' branch at line {}",
+                    cursor + 1
+                );
+                error!("{}", msg);
+                return Err(msg);
+            }
+        };
+        cursor += 1;
+
+        loop {
+            let (branch_lines, next_cursor) = Self::parse_lines(lines, cursor, true)?;
+            branches.push(CaseBranch {
+                condition: current_condition,
+                lines: branch_lines,
+            });
+
+            if next_cursor >= lines.len() {
+                let msg = format!(
+                    "Missing 'end' for case statement starting at line {}: '{}'",
+                    index + 1,
+                    case_source
+                );
+                error!("{}", msg);
+                return Err(msg);
+            }
+
+            let control_line = lines[next_cursor].trim();
+            match Self::line_control_keyword(control_line) {
+                Some(LineControlKeyword::When) => {
+                    current_condition = Self::parse_if_condition(control_line, "when")?;
+                    cursor = next_cursor + 1;
+                }
+                Some(LineControlKeyword::Else) => {
+                    let (parsed_else_lines, end_cursor) =
+                        Self::parse_lines(lines, next_cursor + 1, true)?;
+
+                    if end_cursor >= lines.len() || lines[end_cursor].trim() != "end" {
+                        let msg = format!(
+                            "Missing 'end' after else branch for case starting at line {}",
+                            index + 1
+                        );
+                        error!("{}", msg);
+                        return Err(msg);
+                    }
+
+                    else_lines = Some(parsed_else_lines);
+                    cursor = end_cursor + 1;
+                    break;
+                }
+                Some(LineControlKeyword::End) => {
+                    cursor = next_cursor + 1;
+                    break;
+                }
+                Some(other) => {
+                    let msg = format!(
+                        "Unexpected control keyword '{}' in case statement at line {}",
+                        Self::line_control_keyword_name(other),
+                        next_cursor + 1
+                    );
+                    error!("{}", msg);
+                    return Err(msg);
+                }
+                None => unreachable!(
+                    "parse_lines(stop_at_control_keywords=true) must stop at a control keyword"
+                ),
+            }
+        }
+
+        let statement = Statement::new_case(CaseStatement {
+            subject,
+            binding_var,
+            branches,
+            else_lines,
+        });
+        let line = Line {
+            source: case_source,
             statements: vec![statement],
         };
 
@@ -546,7 +905,10 @@ impl BlockParser {
         ))
     }
 
-    fn parse_match_result_statement(lines: &[&str], index: usize) -> Result<(Line, usize), String> {
+    fn parse_match_result_statement(
+        lines: &[String],
+        index: usize,
+    ) -> Result<(Line, usize), String> {
         let source = lines[index].trim().to_string();
         let command = Self::parse_match_result_command(source.as_str())?;
         let mut ok_branch = None;
@@ -672,6 +1034,7 @@ impl BlockParser {
         match keyword {
             LineControlKeyword::Else => "else",
             LineControlKeyword::Elif => "elif",
+            LineControlKeyword::When => "when",
             LineControlKeyword::End => "end",
             LineControlKeyword::Ok => "ok",
             LineControlKeyword::Err => "err",
@@ -679,7 +1042,7 @@ impl BlockParser {
         }
     }
 
-    fn parse_for_statement(lines: &[&str], index: usize) -> Result<(Line, usize), String> {
+    fn parse_for_statement(lines: &[String], index: usize) -> Result<(Line, usize), String> {
         let for_source = lines[index].trim().to_string();
         let (key_var, value_var, iterable) = Self::parse_for_header(for_source.as_str())?;
 
@@ -760,9 +1123,7 @@ impl BlockParser {
     }
 
     // Parse expressions with operators
-    fn parse_expressions(
-        input: &str,
-    ) -> IResult<&str, Vec<(Option<Operator>, Expression, Option<Operator>)>> {
+    fn parse_expressions(input: &str) -> IResult<&str, ExpressionChain> {
         debug!("Parsing expressions: {}", input);
         let input = input.trim();
         if input.is_empty() {
@@ -864,7 +1225,8 @@ impl BlockParser {
     */
 
     /// Parse assign expression with = or without value
-    /// This supports both `export KEY=VALUE` and `export KEY`
+    /// This supports `export KEY=VALUE`, `export KEY`, and collection-path
+    /// assignment like `${REQ.host} = example.com`.
     fn parse_assign(input: &str) -> IResult<&str, Expression> {
         debug!("Parsing assign: {}", input);
         let (input, kind) = opt(terminated(
@@ -881,16 +1243,27 @@ impl BlockParser {
 
         debug!("Parsed assign kind: {}, {:?}", input, kind);
 
-        let (input, key) = recognize(pair(
-            alt((alpha1, tag("_"))),
-            many0(alt((alphanumeric1, tag("_")))),
-        ))
-        .parse(input)?;
+        let (input, key) = Self::parse_assign_key(input)?;
 
         debug!("Parsed assign key: {}, {:?}", input, key);
 
         let (input, _) = space0(input)?;
-        let (input, value) = opt(preceded(char('='), Self::parse_arg)).parse(input)?;
+        let (input, value) = if input.starts_with('=') {
+            // Let comparison sugar handle `==` / `===` instead of treating the
+            // first '=' as an assignment operator.
+            if input.starts_with("==") {
+                return Err(nom::Err::Error(nom::error::Error::from_error_kind(
+                    input,
+                    ErrorKind::Tag,
+                )));
+            }
+
+            let (input, _) = char('=').parse(input)?;
+            let (input, value) = Self::parse_arg(input)?;
+            (input, Some(value))
+        } else {
+            (input, None)
+        };
 
         debug!("Parsed assign value: {}, {:?}", input, value);
 
@@ -905,18 +1278,40 @@ impl BlockParser {
         let kind = kind.unwrap_or_default();
         let mut args = vec![
             CommandArg::Literal(kind.as_str().to_string()),
-            CommandArg::Literal(key.to_string()),
+            CommandArg::Literal(key),
         ];
 
-        if value.is_some() {
-            args.push(value.unwrap());
-        } else {
-            // For assignments without value, such as: export KEY
+        if let Some(value) = value {
+            args.push(value);
         }
 
         let args = CommandArgs::new(args);
         let cmd = CommandItem::new("assign".to_string(), args);
         Ok((input, Expression::Command(cmd)))
+    }
+
+    fn parse_assign_key(input: &str) -> IResult<&str, String> {
+        preceded(
+            space0,
+            alt((
+                map(Self::parse_var_braced, |arg| match arg {
+                    CommandArg::Var(key) => key,
+                    _ => unreachable!("parse_var_braced only returns CommandArg::Var"),
+                }),
+                map(Self::parse_var_dollar, |arg| match arg {
+                    CommandArg::Var(key) => key,
+                    _ => unreachable!("parse_var_dollar only returns CommandArg::Var"),
+                }),
+                map(
+                    recognize(pair(
+                        alt((alpha1, tag("_"))),
+                        many0(alt((alphanumeric1, tag("_")))),
+                    )),
+                    |s: &str| s.to_string(),
+                ),
+            )),
+        )
+        .parse(input)
     }
 
     // Parse infix comparison sugar:
@@ -1078,7 +1473,7 @@ impl BlockParser {
                         // Wrap multiple args into a command substitution
                         let args = vec![CommandArg::Literal("append".to_string())]
                             .into_iter()
-                            .chain(args.into_iter())
+                            .chain(args)
                             .collect::<Vec<_>>();
                         CommandArg::CommandSubstitution(Box::new(Expression::Command(
                             CommandItem::new("append".to_string(), CommandArgs::new(args)),
@@ -1177,7 +1572,12 @@ impl BlockParser {
             // End of current arg token, only when not inside dynamic/bracket segment
             if paren_depth == 0
                 && bracket_depth == 0
-                && (ch.is_whitespace() || ch == ';' || ch == ')')
+                && (ch.is_whitespace()
+                    || ch == ';'
+                    || ch == ')'
+                    || ch == ','
+                    || ch == ']'
+                    || ch == '}')
             {
                 break;
             }
@@ -1352,9 +1752,9 @@ impl BlockParser {
     fn parse_command_subst(input: &str) -> IResult<&str, CommandArg> {
         let (rest, _) = tag("$(")(input)?;
         let mut depth = 1;
-        let mut chars = rest.char_indices();
+        let chars = rest.char_indices();
 
-        while let Some((idx, c)) = chars.next() {
+        for (idx, c) in chars {
             match c {
                 '(' => depth += 1,
                 ')' => {
@@ -1436,7 +1836,7 @@ impl BlockParser {
                 nom::Err::Error(nom::error::Error::from_error_kind(input, ErrorKind::Tag))
             })?;
 
-            if ch.is_whitespace() || ch == ';' {
+            if ch.is_whitespace() || ch == ';' || ch == ',' || ch == ']' || ch == '}' {
                 break;
             }
 
@@ -1498,7 +1898,7 @@ impl BlockParser {
         } else {
             let args = vec![CommandArg::Literal("append".to_string())]
                 .into_iter()
-                .chain(parts.into_iter())
+                .chain(parts)
                 .collect::<Vec<_>>();
             CommandArg::CommandSubstitution(Box::new(Expression::Command(CommandItem::new(
                 "append".to_string(),
@@ -1517,6 +1917,8 @@ impl BlockParser {
                 Self::parse_command_subst,         // $(...)
                 Self::parse_var_braced,            // ${VAR}
                 Self::parse_var_dollar,            // $VAR
+                Self::parse_map_literal,           // {...}
+                Self::parse_list_literal,          // [...]
                 Self::parse_interpolated_unquoted, // a.($b).($c)
                 Self::parse_literal,               // "..." or '...' or unquoted
                 Self::parse_option,                // -o or --option
@@ -1592,6 +1994,124 @@ mod tests {
         let (input, arg) = BlockParser::parse_literal("tcp://127.0.0.1:8083").unwrap();
         assert_eq!(input, "");
         assert_eq!(arg.as_literal_str().unwrap(), "tcp://127.0.0.1:8083");
+    }
+
+    #[test]
+    fn test_parse_collection_literals() {
+        let (input, arg) =
+            BlockParser::parse_arg(r#"{"kind": "app", app_id: $REQ.appId, "tags": ["a", 2]}"#)
+                .unwrap();
+        assert_eq!(input, "");
+
+        match arg {
+            CommandArg::MapLiteral(entries) => {
+                assert_eq!(entries.len(), 3);
+                assert_eq!(entries[0].0, "kind");
+                assert_eq!(entries[1].0, "app_id");
+                assert_eq!(entries[2].0, "tags");
+
+                assert!(matches!(entries[0].1, CommandArg::StringLiteral(_)));
+                assert!(matches!(entries[1].1, CommandArg::Var(_)));
+
+                match &entries[2].1 {
+                    CommandArg::ListLiteral(items) => {
+                        assert_eq!(items.len(), 2);
+                        assert!(matches!(items[0], CommandArg::StringLiteral(_)));
+                        assert!(matches!(items[1], CommandArg::TypedLiteral(_, _)));
+                    }
+                    other => panic!("expected list literal, got {:?}", other),
+                }
+            }
+            other => panic!("expected map literal, got {:?}", other),
+        }
+
+        let (input, arg) =
+            BlockParser::parse_arg(r#"[{"node": $REQ.node}, ["raft", "inter"], null]"#).unwrap();
+        assert_eq!(input, "");
+
+        match arg {
+            CommandArg::ListLiteral(items) => {
+                assert_eq!(items.len(), 3);
+                assert!(matches!(items[0], CommandArg::MapLiteral(_)));
+                assert!(matches!(items[1], CommandArg::ListLiteral(_)));
+                assert!(matches!(
+                    items[2],
+                    CommandArg::TypedLiteral(_, CollectionValue::Null)
+                ));
+            }
+            other => panic!("expected list literal, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_multiline_collection_literal_block() {
+        let parser = BlockParser::new("test_block");
+        let block_str = r#"
+            local route={
+                "kind": "app",
+                "target": {
+                    "node_id": $REQ.nodeId
+                },
+                "ports": [
+                    3180,
+                    3181
+                ]
+            };
+            return --from lib $route.target.node_id;
+        "#;
+
+        let block = parser.parse(block_str).unwrap();
+        assert_eq!(block.lines.len(), 2);
+
+        let statement = &block.lines[0].statements[0];
+        let assign = statement.expressions[0].1.as_command().unwrap();
+        assert_eq!(assign.command.name, "assign");
+        assert!(matches!(assign.command.args[2], CommandArg::MapLiteral(_)));
+    }
+
+    #[test]
+    fn test_parse_case_statement() {
+        let parser = BlockParser::new("test_block");
+        let block_str = r#"
+            case then
+                when match-reg $REQ.host "^admin\\." then
+                    return --from lib "admin";
+                when strip-prefix $REQ.path "/api" then
+                    return --from lib "api";
+                else
+                    return --from lib "default";
+                end
+        "#;
+
+        let block = parser.parse(block_str).unwrap();
+        assert_eq!(block.lines.len(), 1);
+
+        let statement = &block.lines[0].statements[0];
+        let case_statement = statement.case_statement.as_ref().unwrap();
+        assert!(case_statement.subject.is_none());
+        assert!(case_statement.binding_var.is_none());
+        assert_eq!(case_statement.branches.len(), 2);
+        assert!(case_statement.else_lines.is_some());
+    }
+
+    #[test]
+    fn test_parse_case_statement_with_subject_alias() {
+        let parser = BlockParser::new("test_block");
+        let block_str = r#"
+            case $REQ.path as path then
+                when match $path "/api/*" then
+                    return --from lib "api";
+                end
+        "#;
+
+        let block = parser.parse(block_str).unwrap();
+        assert_eq!(block.lines.len(), 1);
+
+        let statement = &block.lines[0].statements[0];
+        let case_statement = statement.case_statement.as_ref().unwrap();
+        assert!(matches!(case_statement.subject, Some(CommandArg::Var(_))));
+        assert_eq!(case_statement.binding_var.as_deref(), Some("path"));
+        assert_eq!(case_statement.branches.len(), 1);
     }
 
     #[test]
@@ -1869,6 +2389,22 @@ mod tests {
         assert_eq!(cmd.command.args[1].as_literal_str(), Some("--loose"));
         assert!(matches!(cmd.command.args[2], CommandArg::Var(_)));
         assert!(matches!(cmd.command.args[3], CommandArg::StringLiteral(_)));
+    }
+
+    #[test]
+    fn test_parse_var_path_assignment_sugar() {
+        let (rest, expr) = BlockParser::parse_expression("${REQ.host} = www.buckyos.com").unwrap();
+        assert_eq!(rest, "");
+
+        let cmd = expr.as_command().unwrap();
+        assert_eq!(cmd.command.name, "assign");
+        assert_eq!(cmd.command.args.len(), 3);
+        assert_eq!(cmd.command.args[0].as_literal_str(), Some("chain"));
+        assert_eq!(cmd.command.args[1].as_literal_str(), Some("REQ.host"));
+        assert_eq!(
+            cmd.command.args[2].as_literal_str(),
+            Some("www.buckyos.com")
+        );
     }
 
     #[test]

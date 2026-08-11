@@ -1,4 +1,4 @@
-use super::hook_point::{HookPoint, HookPointExecutor, HookPointExecutorRef};
+use super::types::{HookPoint, HookPointExecutor, HookPointExecutorRef};
 use crate::chain::*;
 use crate::cmd::{ExternalCommand, ExternalCommandRef};
 use crate::collection::*;
@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
 // Options for linking a hook point
+#[derive(Default)]
 pub struct LinkHookPointOptions {
     // The environment for the hook point, if None, the hook point env in current HookPointEnv will be used
     pub hook_point_env: Option<EnvRef>,
@@ -18,16 +19,6 @@ pub struct LinkHookPointOptions {
 
     // The execution policy for the linked executor, if None, use policy in current HookPointEnv
     pub execution_policy: Option<ExecutionPolicy>,
-}
-
-impl Default for LinkHookPointOptions {
-    fn default() -> Self {
-        Self {
-            hook_point_env: None,
-            pipe: None,
-            execution_policy: None,
-        }
-    }
 }
 
 pub struct HookPointEnv {

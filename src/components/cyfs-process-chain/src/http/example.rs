@@ -112,7 +112,7 @@ async fn pre_process_request(
     {
         // Register visitors for the request headers in the chain environment
         let chain_env = exec.chain_env();
-        req_map.register_visitors(&chain_env).await.unwrap();
+        req_map.register_visitors(chain_env).await.unwrap();
 
         let req_collection = Arc::new(Box::new(req_map.clone()) as Box<dyn MapCollection>);
         chain_env

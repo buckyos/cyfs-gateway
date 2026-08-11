@@ -19,7 +19,6 @@ use xmltree::Element;
 </process_chain>
 </root>
  */
-
 pub struct ProcessChainXMLLoader {}
 
 impl ProcessChainXMLLoader {
@@ -29,10 +28,7 @@ impl ProcessChainXMLLoader {
         config: &str,
     ) -> Result<ProcessChainLibRef, String> {
         let chains = Self::parse(config)?;
-        let chains = chains
-            .into_iter()
-            .map(|chain| Arc::new(chain))
-            .collect::<Vec<_>>();
+        let chains = chains.into_iter().map(Arc::new).collect::<Vec<_>>();
 
         let lib = ProcessChainListLib::new(id, priority, chains);
         let lib = Arc::new(Box::new(lib) as Box<dyn ProcessChainLib>);
@@ -144,10 +140,7 @@ impl ProcessChainJSONLoader {
         content: &str,
     ) -> Result<ProcessChainLibRef, String> {
         let chains = Self::parse(content)?;
-        let chains = chains
-            .into_iter()
-            .map(|chain| Arc::new(chain))
-            .collect::<Vec<_>>();
+        let chains = chains.into_iter().map(Arc::new).collect::<Vec<_>>();
 
         let lib = ProcessChainListLib::new(id, priority, chains);
         let lib = Arc::new(Box::new(lib) as Box<dyn ProcessChainLib>);

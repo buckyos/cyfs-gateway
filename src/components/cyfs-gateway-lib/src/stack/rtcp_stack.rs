@@ -1,37 +1,48 @@
 use std::collections::HashSet;
 use std::net::SocketAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 
 use buckyos_kit::AsyncStream;
 use cyfs_process_chain::{
     CollectionValue, CommandControl, MemoryMapCollection, ProcessChainLibExecutor,
 };
+use name_client::{DidDocType, IdentityMaterial, IdentityRoots, IdentityUsage};
 use name_lib::{
-    DIDDocumentTrait, DeviceConfig, EncodedDocument, encode_ed25519_pkcs8_sk_to_pk, get_x_from_jwk,
-    load_raw_private_key,
+    DID, DIDDocumentTrait, DeviceDocument, EncodedDocument, encode_ed25519_pkcs8_sk_to_pk,
+    get_x_from_jwk, load_raw_private_key,
 };
 use serde::{Deserialize, Serialize};
 use sfo_io::{LimitStream, StatStream};
 use url::Url;
 
+use crate::forward::ForwardPlan;
 use crate::global_process_chains::{
     GlobalProcessChainsRef, create_process_chain_executor, execute_chain,
 };
-use crate::rtcp::{AsyncStreamWithDatagram, RTcpTunnelDatagramClient};
+use crate::rtcp::{
+    AsyncStreamWithDatagram, RTcpTunnelDatagramClient, validate_rtcp_hostname_form_did,
+};
 use crate::stack::limiter::Limiter;
 use crate::stack::{
-    datagram_forward, get_limit_info, get_source_addr_from_req_env,
-    probe_proxy_protocol_stream, stream_forward,
+    datagram_forward, datagram_forward_group, get_limit_info, get_source_addr_from_req_env,
+    insert_req_source_addr_group, probe_proxy_protocol_stream, stream_forward,
+    stream_forward_group,
+};
+use crate::tunnel_url_status::{
+    TunnelProbeOptions, TunnelUrlProber, TunnelUrlProberRef, TunnelUrlState, TunnelUrlStatus,
+    TunnelUrlStatusSource, normalize_tunnel_url,
 };
 use crate::{
     ConnectionInfo, ConnectionManagerRef, DatagramInfo, DumpStream, GlobalCollectionManagerRef,
     HandleConnectionController, IoDumpStackConfig, JsExternalsManagerRef, LimiterManagerRef,
-    MutComposedSpeedStat, MutComposedSpeedStatRef, ProcessChainConfigs, RTcp, RTcpListener, Server,
-    ServerManagerRef, Stack, StackConfig, StackContext, StackErrorCode, StackFactory,
-    StackProtocol, StackRef, StackResult, StatManagerRef, StreamInfo, TunnelBox, TunnelBuilder,
-    TunnelEndpoint, TunnelError, TunnelManager, TunnelResult, create_io_dump_stack_config,
-    get_external_commands, get_stat_info, has_scheme, hyper_serve_http, into_stack_err, stack_err,
+    MutComposedSpeedStat, MutComposedSpeedStatRef, ProcessChainConfigs, RTcp, RTcpListener,
+    RtcpInboundAdmissionConfig, RtcpLimitsConfig, RtcpLivenessConfig, RtcpPeerIdentityConfig,
+    RtcpSecurityConfig, Server, ServerManagerRef, Stack, StackConfig, StackContext, StackErrorCode,
+    StackFactory, StackProtocol, StackRef, StackResult, StatManagerRef, StreamInfo, TunnelBox,
+    TunnelBuilder, TunnelEndpoint, TunnelError, TunnelManager, TunnelResult,
+    create_io_dump_stack_config, get_external_commands, get_stat_info, has_scheme,
+    hyper_serve_http, into_stack_err, stack_err,
 };
 
 #[derive(Clone)]
@@ -79,6 +90,7 @@ struct RtcpConnectionHandler {
     on_new_tunnel_executor: Option<ProcessChainLibExecutor>,
     connection_manager: Option<ConnectionManagerRef>,
     io_dump: Option<IoDumpStackConfig>,
+    max_datagram_bytes: usize,
 }
 
 impl RtcpConnectionHandler {
@@ -88,6 +100,25 @@ impl RtcpConnectionHandler {
         env: Arc<RtcpStackContext>,
         connection_manager: Option<ConnectionManagerRef>,
         io_dump: Option<IoDumpStackConfig>,
+    ) -> StackResult<Self> {
+        Self::create_with_max_datagram(
+            hook_point,
+            on_new_tunnel_hook_point,
+            env,
+            connection_manager,
+            io_dump,
+            crate::rtcp::MAX_RTCP_DATAGRAM_BYTES,
+        )
+        .await
+    }
+
+    async fn create_with_max_datagram(
+        hook_point: ProcessChainConfigs,
+        on_new_tunnel_hook_point: Option<ProcessChainConfigs>,
+        env: Arc<RtcpStackContext>,
+        connection_manager: Option<ConnectionManagerRef>,
+        io_dump: Option<IoDumpStackConfig>,
+        max_datagram_bytes: usize,
     ) -> StackResult<Self> {
         let (executor, _) = create_process_chain_executor(
             &hook_point,
@@ -119,6 +150,7 @@ impl RtcpConnectionHandler {
             on_new_tunnel_executor,
             connection_manager,
             io_dump,
+            max_datagram_bytes,
         })
     }
 
@@ -159,6 +191,7 @@ impl RtcpConnectionHandler {
             on_new_tunnel_executor,
             connection_manager: self.connection_manager.clone(),
             io_dump,
+            max_datagram_bytes: self.max_datagram_bytes,
         })
     }
 
@@ -183,12 +216,43 @@ impl RtcpConnectionHandler {
         )
         .await
         .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
+        insert_req_source_addr_group(&map, "conn_source_", source_addr).await?;
         map.insert(
             "source_device_id",
             CollectionValue::String(endpoint.device_id.clone()),
         )
         .await
         .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
+        // The RTCP handshake authenticated this DID; expose it as the trusted
+        // origin identity plus the current effective identity alias.
+        map.insert(
+            "real_source_did",
+            CollectionValue::String(endpoint.device_id.clone()),
+        )
+        .await
+        .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
+        map.insert(
+            "source_did",
+            CollectionValue::String(endpoint.device_id.clone()),
+        )
+        .await
+        .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
+        if let Some(canonical_device_id) = endpoint.canonical_device_id.as_ref() {
+            map.insert(
+                "source_canonical_device_id",
+                CollectionValue::String(canonical_device_id.clone()),
+            )
+            .await
+            .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
+        }
+        if let Some(identity_trust) = endpoint.identity_trust.as_ref() {
+            map.insert(
+                "source_identity_trust",
+                CollectionValue::String(identity_trust.clone()),
+            )
+            .await
+            .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
+        }
         if let Some(source_device_info) = source_device_info {
             if let Some(device_name) = source_device_info.name {
                 map.insert("source_device_name", CollectionValue::String(device_name))
@@ -261,6 +325,36 @@ impl RtcpConnectionHandler {
         )
         .await
         .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
+        // The RTCP handshake authenticated this DID; expose it as the trusted
+        // origin identity plus the current effective identity alias.
+        map.insert(
+            "real_source_did",
+            CollectionValue::String(endpoint.device_id.clone()),
+        )
+        .await
+        .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
+        map.insert(
+            "source_did",
+            CollectionValue::String(endpoint.device_id.clone()),
+        )
+        .await
+        .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
+        if let Some(canonical_device_id) = endpoint.canonical_device_id.as_ref() {
+            map.insert(
+                "source_canonical_device_id",
+                CollectionValue::String(canonical_device_id.clone()),
+            )
+            .await
+            .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
+        }
+        if let Some(identity_trust) = endpoint.identity_trust.as_ref() {
+            map.insert(
+                "source_identity_trust",
+                CollectionValue::String(identity_trust.clone()),
+            )
+            .await
+            .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
+        }
         map.insert(
             "source_addr",
             CollectionValue::String(request_source_addr_str.clone()),
@@ -279,6 +373,10 @@ impl RtcpConnectionHandler {
         )
         .await
         .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
+        insert_req_source_addr_group(&map, "conn_source_", remote_addr).await?;
+        if let Some(proxy_source_addr) = proxy_source_addr {
+            insert_req_source_addr_group(&map, "real_source_", proxy_source_addr).await?;
+        }
         map.insert("dest_addr", CollectionValue::String(local_addr.to_string()))
             .await
             .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
@@ -297,6 +395,12 @@ impl RtcpConnectionHandler {
         map.insert("protocol", CollectionValue::String(protocol))
             .await
             .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
+        map.insert(
+            "stream_purpose",
+            CollectionValue::String("stream".to_string()),
+        )
+        .await
+        .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
         map.insert("path", CollectionValue::String(path))
             .await
             .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
@@ -415,6 +519,37 @@ impl RtcpConnectionHandler {
                             )
                             .await?;
                         }
+                        "forward-group" => {
+                            if list.len() < 2 {
+                                return Err(stack_err!(
+                                    StackErrorCode::InvalidConfig,
+                                    "invalid forward-group command"
+                                ));
+                            }
+                            let plan = ForwardPlan::decode(list[1].as_str()).map_err(|e| {
+                                stack_err!(
+                                    StackErrorCode::InvalidConfig,
+                                    "invalid forward plan: {}",
+                                    e
+                                )
+                            })?;
+                            let stream = if limiter.is_some() {
+                                let (read_limit, write_limit) =
+                                    limiter.as_ref().unwrap().new_limit_session();
+                                let limit_stream =
+                                    LimitStream::new(stream, read_limit, write_limit);
+                                Box::new(limit_stream)
+                            } else {
+                                stream
+                            };
+                            stream_forward_group(
+                                stream,
+                                &plan,
+                                &self.env.tunnel_manager,
+                                Some(&stream_info),
+                            )
+                            .await?;
+                        }
                         "server" => {
                             if list.len() < 2 {
                                 return Err(stack_err!(
@@ -498,6 +633,36 @@ impl RtcpConnectionHandler {
         )
         .await
         .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
+        // The RTCP handshake authenticated this DID; expose it as the trusted
+        // origin identity plus the current effective identity alias.
+        map.insert(
+            "real_source_did",
+            CollectionValue::String(endpoint.device_id.clone()),
+        )
+        .await
+        .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
+        map.insert(
+            "source_did",
+            CollectionValue::String(endpoint.device_id.clone()),
+        )
+        .await
+        .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
+        if let Some(canonical_device_id) = endpoint.canonical_device_id.as_ref() {
+            map.insert(
+                "source_canonical_device_id",
+                CollectionValue::String(canonical_device_id.clone()),
+            )
+            .await
+            .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
+        }
+        if let Some(identity_trust) = endpoint.identity_trust.as_ref() {
+            map.insert(
+                "source_identity_trust",
+                CollectionValue::String(identity_trust.clone()),
+            )
+            .await
+            .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
+        }
         map.insert(
             "source_addr",
             CollectionValue::String(remote_addr.to_string()),
@@ -516,6 +681,7 @@ impl RtcpConnectionHandler {
         )
         .await
         .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
+        insert_req_source_addr_group(&map, "conn_source_", remote_addr).await?;
         map.insert("dest_addr", CollectionValue::String(local_addr.to_string()))
             .await
             .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
@@ -534,6 +700,12 @@ impl RtcpConnectionHandler {
         map.insert("protocol", CollectionValue::String(protocol))
             .await
             .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
+        map.insert(
+            "stream_purpose",
+            CollectionValue::String("datagram".to_string()),
+        )
+        .await
+        .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
         map.insert("path", CollectionValue::String(path))
             .await
             .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
@@ -624,9 +796,48 @@ impl RtcpConnectionHandler {
                             } else {
                                 datagram
                             };
-                            let datagram_stream = Box::new(RTcpTunnelDatagramClient::new(stream));
+                            let datagram_stream =
+                                Box::new(RTcpTunnelDatagramClient::new_with_limit(
+                                    stream,
+                                    self.max_datagram_bytes,
+                                ));
                             datagram_forward(datagram_stream, target, &self.env.tunnel_manager)
                                 .await?;
+                        }
+                        "forward-group" => {
+                            if list.len() < 2 {
+                                return Err(stack_err!(
+                                    StackErrorCode::InvalidConfig,
+                                    "invalid forward-group command"
+                                ));
+                            }
+                            let plan = ForwardPlan::decode(list[1].as_str()).map_err(|e| {
+                                stack_err!(
+                                    StackErrorCode::InvalidConfig,
+                                    "invalid forward plan: {}",
+                                    e
+                                )
+                            })?;
+                            let stream = if limiter.is_some() {
+                                let (read_limit, write_limit) =
+                                    limiter.as_ref().unwrap().new_limit_session();
+                                let limit_stream =
+                                    LimitStream::new(datagram, read_limit, write_limit);
+                                Box::new(limit_stream)
+                            } else {
+                                datagram
+                            };
+                            let datagram_stream =
+                                Box::new(RTcpTunnelDatagramClient::new_with_limit(
+                                    stream,
+                                    self.max_datagram_bytes,
+                                ));
+                            datagram_forward_group(
+                                datagram_stream,
+                                &plan,
+                                &self.env.tunnel_manager,
+                            )
+                            .await?;
                         }
                         "server" => {
                             if list.len() < 2 {
@@ -648,8 +859,12 @@ impl RtcpConnectionHandler {
                                         } else {
                                             datagram
                                         };
-                                        let datagram_stream = AsyncStreamWithDatagram::new(stream);
-                                        let mut buf = vec![0; 4096];
+                                        let datagram_stream =
+                                            AsyncStreamWithDatagram::new_with_limit(
+                                                stream,
+                                                self.max_datagram_bytes,
+                                            );
+                                        let mut buf = vec![0; self.max_datagram_bytes];
                                         loop {
                                             let len = datagram_stream
                                                 .recv_datagram(&mut buf)
@@ -947,11 +1162,13 @@ impl RTcpListener for Listener {
 
 struct RtcpTunnelBuilder {
     rtcp: Arc<RTcp>,
+    prober: Arc<RtcpUrlProber>,
 }
 
 impl RtcpTunnelBuilder {
     pub fn new(rtcp: Arc<RTcp>) -> Self {
-        RtcpTunnelBuilder { rtcp }
+        let prober = Arc::new(RtcpUrlProber { rtcp: rtcp.clone() });
+        RtcpTunnelBuilder { rtcp, prober }
     }
 }
 
@@ -963,12 +1180,35 @@ impl TunnelBuilder for RtcpTunnelBuilder {
     ) -> TunnelResult<Box<dyn TunnelBox>> {
         self.rtcp.create_tunnel(tunnel_stack_id).await
     }
+
+    fn url_prober(&self) -> Option<TunnelUrlProberRef> {
+        Some(self.prober.clone())
+    }
+}
+
+struct RtcpUrlProber {
+    rtcp: Arc<RTcp>,
+}
+
+#[async_trait::async_trait]
+impl TunnelUrlProber for RtcpUrlProber {
+    async fn probe_url(
+        &self,
+        url: &Url,
+        options: &TunnelProbeOptions,
+    ) -> TunnelResult<TunnelUrlStatus> {
+        self.rtcp.probe_url(url, options).await
+    }
 }
 
 pub struct RtcpStack {
     id: String,
     bind_addr: String,
+    device_id: String,
+    device_public_key: String,
     keep_tunnel: Vec<String>,
+    liveness: RtcpLivenessConfig,
+    security: RtcpSecurityConfig,
     reuse_address: bool,
     rtcp: Mutex<Option<RTcp>>,
     rtcp_ref: Mutex<Option<Arc<RTcp>>>,
@@ -989,53 +1229,451 @@ fn load_device_config_from_path(
     content: &str,
     path: &str,
     public_key: &str,
-) -> StackResult<(DeviceConfig, Option<String>)> {
-    if let Ok(device_config) = serde_json::from_str::<DeviceConfig>(content) {
-        let default_key = device_config.get_default_key().ok_or(stack_err!(
-            StackErrorCode::InvalidConfig,
-            "device config {} has no default key",
-            path
-        ))?;
-        let x_of_auth_key = get_x_from_jwk(&default_key).map_err(into_stack_err!(
-            StackErrorCode::InvalidConfig,
-            "device config {} has no auth key",
-            path
-        ))?;
-        if x_of_auth_key != public_key {
-            return Err(stack_err!(
-                StackErrorCode::InvalidConfig,
-                "device config {} public key not match",
-                path
-            ));
-        }
+    expected_did: Option<&DID>,
+) -> StackResult<(DeviceDocument, Option<String>)> {
+    if let Ok(device_config) = serde_json::from_str::<DeviceDocument>(content) {
+        validate_device_config_identity(&device_config, path, public_key, expected_did)?;
         return Ok((device_config, None));
     }
 
     let jwt = content.trim();
-    let device_config = DeviceConfig::decode(&EncodedDocument::Jwt(jwt.to_string()), None)
+    let device_config = DeviceDocument::decode(&EncodedDocument::Jwt(jwt.to_string()), None)
         .map_err(into_stack_err!(
             StackErrorCode::InvalidConfig,
             "parse device config jwt {} failed",
             path
         ))?;
-    let default_key = device_config.get_default_key().ok_or(stack_err!(
-        StackErrorCode::InvalidConfig,
-        "device config {} has no default key",
-        path
-    ))?;
-    let x_of_auth_key = get_x_from_jwk(&default_key).map_err(into_stack_err!(
+    validate_device_config_identity(&device_config, path, public_key, expected_did)?;
+    Ok((device_config, Some(jwt.to_string())))
+}
+
+fn validate_device_config_identity(
+    device_config: &DeviceDocument,
+    source: &str,
+    public_key: &str,
+    expected_did: Option<&DID>,
+) -> StackResult<()> {
+    let auth_key = device_config
+        .get_key_by_scope("authentication")
+        .map(|(_, _, jwk)| jwk)
+        .or_else(|| device_config.get_default_key())
+        .ok_or(stack_err!(
+            StackErrorCode::InvalidConfig,
+            "device config {} has no authentication key",
+            source
+        ))?;
+    let x_of_auth_key = get_x_from_jwk(&auth_key).map_err(into_stack_err!(
         StackErrorCode::InvalidConfig,
         "device config {} has no auth key",
-        path
+        source
     ))?;
     if x_of_auth_key != public_key {
         return Err(stack_err!(
             StackErrorCode::InvalidConfig,
             "device config {} public key not match",
-            path
+            source
         ));
     }
-    Ok((device_config, Some(jwt.to_string())))
+
+    if let Some(expected_did) = expected_did
+        && &device_config.id != expected_did
+    {
+        return Err(stack_err!(
+            StackErrorCode::InvalidConfig,
+            "device config {} id {} does not match configured identity {}",
+            source,
+            device_config.id.to_string(),
+            expected_did.to_string()
+        ));
+    }
+
+    Ok(())
+}
+
+struct RtcpIdentityMaterial {
+    device_config: DeviceDocument,
+    device_doc_jwt: Option<String>,
+    private_key: [u8; 48],
+    public_key: String,
+}
+
+fn normalize_device_doc_jwt(value: &str) -> StackResult<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(stack_err!(
+            StackErrorCode::InvalidConfig,
+            "device_doc_jwt is empty"
+        ));
+    }
+    Ok(value.to_string())
+}
+
+// buckyos 节点(node_daemon/make_config)落盘的设备文档 JWT 文件名;
+// name-client IdentityRoots 的约定名是 device.jwt,两者都要探测。
+const BUCKYOS_DEVICE_DOC_JWT_FILE_NAME: &str = "device_doc.jwt";
+
+// 逻辑名(非 did:dev)的 rtcp stack 必须持有 owner 签名的 device doc jwt
+// 才能向对端证明身份,但 boot_gateway.yaml 等 legacy 配置的
+// device_config_path 指向的是未签名的 did.json。buckyos 的身份布局把
+// owner 签名的 device_doc.jwt 写在同一目录,这里按约定探测并采用它,
+// 避免要求所有存量配置改写。探测失败只告警不报错:did:dev 栈不需要
+// jwt,逻辑名栈随后会被 require_device_doc_jwt_for_logical_did 拦下。
+fn probe_sibling_device_doc_jwt(
+    device_config_path: &Path,
+    public_key: &str,
+    expected_did: &DID,
+) -> Option<(DeviceDocument, String)> {
+    let dir = device_config_path.parent()?;
+    for file_name in [BUCKYOS_DEVICE_DOC_JWT_FILE_NAME, "device.jwt"] {
+        let candidate = dir.join(file_name);
+        if !candidate.exists() {
+            continue;
+        }
+        let content = match std::fs::read_to_string(candidate.as_path()) {
+            Ok(content) => content,
+            Err(e) => {
+                warn!(
+                    "read sibling device doc jwt {} failed: {}",
+                    candidate.display(),
+                    e
+                );
+                continue;
+            }
+        };
+        match load_device_config_from_path(
+            content.as_str(),
+            candidate.to_string_lossy().as_ref(),
+            public_key,
+            Some(expected_did),
+        ) {
+            Ok((device_config, Some(jwt))) => {
+                info!(
+                    "loaded device doc jwt for {} from {}",
+                    expected_did.to_string(),
+                    candidate.display()
+                );
+                return Some((device_config, jwt));
+            }
+            Ok((_, None)) => {
+                warn!(
+                    "sibling device doc {} is not a jwt, ignored",
+                    candidate.display()
+                );
+            }
+            Err(e) => {
+                warn!(
+                    "sibling device doc jwt {} rejected: {}",
+                    candidate.display(),
+                    e
+                );
+            }
+        }
+    }
+    None
+}
+
+fn require_device_doc_jwt_for_logical_did(
+    device_config: &DeviceDocument,
+    device_doc_jwt: Option<&String>,
+) -> StackResult<()> {
+    if device_config.id.method == "dev" {
+        return Ok(());
+    }
+
+    if device_doc_jwt
+        .map(|jwt| !jwt.trim().is_empty())
+        .unwrap_or(false)
+    {
+        return Ok(());
+    }
+
+    Err(stack_err!(
+        StackErrorCode::InvalidConfig,
+        "rtcp stack did {} is not did:dev; device_doc_jwt is required",
+        device_config.id.to_string()
+    ))
+}
+
+fn apply_explicit_device_doc_jwt(
+    mut material: RtcpIdentityMaterial,
+    device_doc_jwt: Option<&str>,
+) -> StackResult<RtcpIdentityMaterial> {
+    if let Some(device_doc_jwt) = device_doc_jwt {
+        let device_doc_jwt = normalize_device_doc_jwt(device_doc_jwt)?;
+        let (device_config, loaded_device_doc_jwt) = load_device_config_from_path(
+            device_doc_jwt.as_str(),
+            "device_doc_jwt",
+            &material.public_key,
+            Some(&material.device_config.id),
+        )?;
+        material.device_config = device_config;
+        material.device_doc_jwt = loaded_device_doc_jwt;
+    }
+
+    require_device_doc_jwt_for_logical_did(
+        &material.device_config,
+        material.device_doc_jwt.as_ref(),
+    )?;
+    Ok(material)
+}
+
+fn build_rtcp_identity_roots(
+    identity_manager: Option<&RtcpIdentityManagerConfig>,
+) -> StackResult<IdentityRoots> {
+    let mut roots = IdentityRoots::from_env_or_buckyos_root().map_err(|e| {
+        stack_err!(
+            StackErrorCode::InvalidConfig,
+            "load identity manager roots failed: {}",
+            e
+        )
+    })?;
+    if let Some(identity_manager) = identity_manager {
+        if let Some(public_root_path) = identity_manager.public_root_path.as_ref() {
+            roots.public_root = PathBuf::from(public_root_path);
+        }
+        if let Some(security_root_path) = identity_manager.security_root_path.as_ref() {
+            roots.security_root = PathBuf::from(security_root_path);
+        }
+    }
+    Ok(roots)
+}
+
+fn require_rtcp_hostname_form_did(did: &DID, context: &str) -> StackResult<()> {
+    if let Err(e) = validate_rtcp_hostname_form_did(did, context) {
+        return Err(stack_err!(StackErrorCode::InvalidConfig, "{}", e));
+    }
+    Ok(())
+}
+
+fn require_rtcp_identity_material_hostname_form(
+    material: RtcpIdentityMaterial,
+) -> StackResult<RtcpIdentityMaterial> {
+    require_rtcp_hostname_form_did(&material.device_config.id, "rtcp identity")?;
+    Ok(material)
+}
+
+fn has_legacy_rtcp_identity_config(config: &RtcpStackConfig) -> bool {
+    config.key_path.is_some() || config.device_config_path.is_some() || config.name.is_some()
+}
+
+async fn load_rtcp_identity_material(
+    config: &RtcpStackConfig,
+) -> StackResult<RtcpIdentityMaterial> {
+    if let Some(identity) = config.identity.as_deref() {
+        if has_legacy_rtcp_identity_config(config) {
+            return Err(stack_err!(
+                StackErrorCode::InvalidConfig,
+                "rtcp identity cannot be mixed with key_path/device_config_path/name"
+            ));
+        }
+        return load_rtcp_identity_from_manager(
+            identity,
+            config.identity_manager.as_ref(),
+            config.device_doc_jwt.as_deref(),
+        )
+        .await;
+    }
+
+    if config.identity_manager.is_some() {
+        return Err(stack_err!(
+            StackErrorCode::InvalidConfig,
+            "rtcp identity is required when identity_manager is configured"
+        ));
+    }
+
+    load_legacy_rtcp_identity_material(config).await
+}
+
+async fn load_legacy_rtcp_identity_material(
+    config: &RtcpStackConfig,
+) -> StackResult<RtcpIdentityMaterial> {
+    let key_path = config.key_path.as_deref().ok_or(stack_err!(
+        StackErrorCode::InvalidConfig,
+        "key_path is required"
+    ))?;
+    let private_key = load_raw_private_key(Path::new(key_path)).map_err(into_stack_err!(
+        StackErrorCode::InvalidConfig,
+        "load private key {} failed",
+        key_path
+    ))?;
+    let public_key = encode_ed25519_pkcs8_sk_to_pk(&private_key);
+    let (device_config, device_doc_jwt) = if let Some(path) = config.device_config_path.as_ref() {
+        let content = tokio::fs::read_to_string(path)
+            .await
+            .map_err(into_stack_err!(
+                StackErrorCode::InvalidConfig,
+                "load device config {} failed",
+                path
+            ))?;
+        let (device_config, device_doc_jwt) =
+            load_device_config_from_path(content.as_str(), path, &public_key, None)?;
+        // 只在逻辑名(必须有 jwt 才能启动)时探测:did:dev 的 hello 不带
+        // doc_jwt 时对端零解析成本即可验证,不要平白增加 owner 解析负担。
+        if device_doc_jwt.is_none()
+            && config.device_doc_jwt.is_none()
+            && device_config.id.method != "dev"
+        {
+            match probe_sibling_device_doc_jwt(Path::new(path), &public_key, &device_config.id) {
+                Some((device_config, jwt)) => (device_config, Some(jwt)),
+                None => (device_config, None),
+            }
+        } else {
+            (device_config, device_doc_jwt)
+        }
+    } else if let Some(device_doc_jwt) = config.device_doc_jwt.as_deref() {
+        let device_doc_jwt = normalize_device_doc_jwt(device_doc_jwt)?;
+        load_device_config_from_path(device_doc_jwt.as_str(), "device_doc_jwt", &public_key, None)?
+    } else {
+        if config.name.is_none() {
+            return Err(stack_err!(
+                StackErrorCode::InvalidConfig,
+                "name is required"
+            ));
+        }
+        (
+            DeviceDocument::new(config.name.as_ref().unwrap().as_str(), public_key.clone()),
+            None,
+        )
+    };
+
+    let material = RtcpIdentityMaterial {
+        device_config,
+        device_doc_jwt,
+        private_key,
+        public_key,
+    };
+
+    let material = apply_explicit_device_doc_jwt(material, config.device_doc_jwt.as_deref())?;
+    require_rtcp_identity_material_hostname_form(material)
+}
+
+async fn load_rtcp_identity_from_manager(
+    identity: &str,
+    identity_manager: Option<&RtcpIdentityManagerConfig>,
+    device_doc_jwt: Option<&str>,
+) -> StackResult<RtcpIdentityMaterial> {
+    let identity = identity.trim();
+    if identity.is_empty() {
+        return Err(stack_err!(
+            StackErrorCode::InvalidConfig,
+            "rtcp identity is empty"
+        ));
+    }
+    let expected_did = DID::from_str(identity).map_err(into_stack_err!(
+        StackErrorCode::InvalidConfig,
+        "invalid rtcp identity {}",
+        identity
+    ))?;
+    require_rtcp_hostname_form_did(&expected_did, "rtcp identity")?;
+    let roots = build_rtcp_identity_roots(identity_manager)?;
+    let private_key_path = roots
+        .security_file(
+            identity,
+            IdentityUsage::Authentication,
+            IdentityMaterial::PrivateKey,
+        )
+        .map_err(into_stack_err!(
+            StackErrorCode::InvalidConfig,
+            "resolve rtcp identity private key failed"
+        ))?;
+    let private_key = load_raw_private_key(private_key_path.as_path()).map_err(into_stack_err!(
+        StackErrorCode::InvalidConfig,
+        "load rtcp identity private key {} failed",
+        private_key_path.display()
+    ))?;
+    let public_key = encode_ed25519_pkcs8_sk_to_pk(&private_key);
+
+    if let Some(device_doc_jwt) = device_doc_jwt {
+        let device_doc_jwt = normalize_device_doc_jwt(device_doc_jwt)?;
+        let (device_config, device_doc_jwt) = load_device_config_from_path(
+            device_doc_jwt.as_str(),
+            "device_doc_jwt",
+            &public_key,
+            Some(&expected_did),
+        )?;
+        let material = RtcpIdentityMaterial {
+            device_config,
+            device_doc_jwt,
+            private_key,
+            public_key,
+        };
+        require_device_doc_jwt_for_logical_did(
+            &material.device_config,
+            material.device_doc_jwt.as_ref(),
+        )?;
+        return require_rtcp_identity_material_hostname_form(material);
+    }
+
+    let device_doc_jwt_path = roots
+        .public_file(
+            identity,
+            IdentityUsage::Authentication,
+            IdentityMaterial::DidDocJwt(Some(DidDocType::Device)),
+        )
+        .map_err(into_stack_err!(
+            StackErrorCode::InvalidConfig,
+            "resolve rtcp identity device doc jwt failed"
+        ))?;
+    // buckyos 落盘用的是 device_doc.jwt(见 buckyos-api device_identity),
+    // 与 name-client 的 device.jwt 约定并存,两个名字都探测。
+    let buckyos_device_doc_jwt_path = roots
+        .public_dir(identity)
+        .map_err(into_stack_err!(
+            StackErrorCode::InvalidConfig,
+            "resolve rtcp identity public dir failed"
+        ))?
+        .join(BUCKYOS_DEVICE_DOC_JWT_FILE_NAME);
+    let did_json_path = roots
+        .public_file(
+            identity,
+            IdentityUsage::Authentication,
+            IdentityMaterial::DidDocJson(None),
+        )
+        .map_err(into_stack_err!(
+            StackErrorCode::InvalidConfig,
+            "resolve rtcp identity did.json failed"
+        ))?;
+
+    let (document_path, prefer_jwt) = if device_doc_jwt_path.exists() {
+        (device_doc_jwt_path, true)
+    } else if buckyos_device_doc_jwt_path.exists() {
+        (buckyos_device_doc_jwt_path, true)
+    } else {
+        (did_json_path, false)
+    };
+    let content = tokio::fs::read_to_string(&document_path)
+        .await
+        .map_err(into_stack_err!(
+            StackErrorCode::InvalidConfig,
+            "load rtcp identity document {} failed",
+            document_path.display()
+        ))?;
+    let (device_config, device_doc_jwt) = load_device_config_from_path(
+        content.as_str(),
+        document_path.to_string_lossy().as_ref(),
+        &public_key,
+        Some(&expected_did),
+    )?;
+
+    if prefer_jwt && device_doc_jwt.is_none() {
+        return Err(stack_err!(
+            StackErrorCode::InvalidConfig,
+            "rtcp identity {} must contain a device document jwt",
+            document_path.display()
+        ));
+    }
+
+    let material = RtcpIdentityMaterial {
+        device_config,
+        device_doc_jwt,
+        private_key,
+        public_key,
+    };
+    require_device_doc_jwt_for_logical_did(
+        &material.device_config,
+        material.device_doc_jwt.as_ref(),
+    )?;
+    require_rtcp_identity_material_hostname_form(material)
 }
 
 impl RtcpStack {
@@ -1047,6 +1685,15 @@ impl RtcpStack {
         for tunnel in self.keep_tunnel.iter().cloned() {
             self.start_keep_tunnel(tunnel);
         }
+    }
+
+    fn record_liveness_probe(missed_pongs: &mut u32, reachable: bool, max_missed: u32) -> bool {
+        if reachable {
+            *missed_pongs = 0;
+            return false;
+        }
+        *missed_pongs = missed_pongs.saturating_add(1);
+        *missed_pongs >= max_missed
     }
 
     fn start_keep_tunnel(&self, tunnel: String) {
@@ -1061,35 +1708,75 @@ impl RtcpStack {
         };
 
         let tunnel_manager = self.tunnel_manager.clone();
+        let rtcp = match self.rtcp_ref.lock().unwrap().clone() {
+            Some(rtcp) => rtcp,
+            None => {
+                warn!(
+                    "RTCP runtime is not available for keep tunnel {}",
+                    tunnel_url
+                );
+                return;
+            }
+        };
+        let liveness = self.liveness.clone();
         tokio::task::spawn(async move {
+            // Pin the keep_tunnel URL so its URL history is never evicted
+            // by LRU pressure -- it is a configured, long-lived URL.
+            tunnel_manager.pin_tunnel_url(&tunnel_url).await;
+            let mut missed_pongs = 0u32;
             loop {
-                let last_ok;
-                match tunnel_manager.get_tunnel(&tunnel_url, None).await {
-                    Err(err) => {
-                        warn!("Error getting tunnel: {}", err);
-                        last_ok = false;
-                    }
-                    Ok(tunnel) => match tunnel.ping().await {
-                        Err(err) => {
-                            warn!("Error pinging tunnel: {}", err);
-                            last_ok = false;
-                        }
-                        Ok(_) => {
-                            last_ok = true;
-                        }
-                    },
+                let options = TunnelProbeOptions {
+                    force_probe: true,
+                    timeout_ms: Some(liveness.pong_timeout_secs.saturating_mul(1000)),
+                    ..TunnelProbeOptions::default()
+                };
+                let mut status = match rtcp.probe_url(&tunnel_url, &options).await {
+                    Ok(status) => status,
+                    Err(err) => crate::tunnel_url_status::unreachable_status(
+                        &tunnel_url,
+                        &normalize_tunnel_url(&tunnel_url),
+                        crate::tunnel_mgr::now_ms(),
+                        TunnelUrlStatusSource::KeepAlive,
+                        format!("keep-tunnel probe: {}", err),
+                    ),
+                };
+                status.source = TunnelUrlStatusSource::KeepAlive;
+                let last_ok = status.state == TunnelUrlState::Reachable;
+                tunnel_manager.record_status_observation(status).await;
+
+                if Self::record_liveness_probe(
+                    &mut missed_pongs,
+                    last_ok,
+                    liveness.max_missed_pongs,
+                ) {
+                    warn!(
+                        "RTCP keep tunnel {} missed Pong ({}/{})",
+                        tunnel_url, missed_pongs, liveness.max_missed_pongs
+                    );
+                    rtcp.close_tunnel_for_url(&tunnel_url, "keep-tunnel liveness exhausted")
+                        .await;
+                    missed_pongs = 0;
+                } else if !last_ok {
+                    warn!(
+                        "RTCP keep tunnel {} missed Pong ({}/{})",
+                        tunnel_url, missed_pongs, liveness.max_missed_pongs
+                    );
                 }
 
-                if last_ok {
-                    tokio::time::sleep(std::time::Duration::from_secs(60 * 2)).await;
-                } else {
-                    tokio::time::sleep(std::time::Duration::from_secs(15)).await;
-                }
+                tokio::time::sleep(std::time::Duration::from_secs(liveness.ping_interval_secs))
+                    .await;
             }
         });
     }
 
     async fn create(mut builder: RtcpStackBuilder) -> StackResult<Self> {
+        builder.security.validate().map_err(|e| {
+            stack_err!(
+                StackErrorCode::InvalidConfig,
+                "invalid rtcp security config: {}",
+                e
+            )
+        })?;
         if builder.id.is_none() {
             return Err(stack_err!(StackErrorCode::InvalidConfig, "id is required"));
         }
@@ -1122,8 +1809,23 @@ impl RtcpStack {
         let bind_addr = builder.bind_addr.clone().unwrap();
         let keep_tunnel = sanitize_keep_tunnels(&builder.keep_tunnel);
         let device_config = builder.device_config.take().unwrap();
-        let device_doc_jwt = builder.device_doc_jwt.take();
-        let private_key = builder.private_key.take();
+        let device_id = device_config.id.to_string();
+        let private_key = builder.private_key.take().unwrap();
+        let device_public_key = encode_ed25519_pkcs8_sk_to_pk(&private_key);
+        let device_doc_jwt = builder
+            .device_doc_jwt
+            .take()
+            .map(|jwt| normalize_device_doc_jwt(jwt.as_str()))
+            .transpose()?;
+        if let Some(device_doc_jwt) = device_doc_jwt.as_ref() {
+            load_device_config_from_path(
+                device_doc_jwt.as_str(),
+                "device_doc_jwt",
+                &device_public_key,
+                Some(&device_config.id),
+            )?;
+        }
+        require_device_doc_jwt_for_logical_did(&device_config, device_doc_jwt.as_ref())?;
         let connection_manager = builder.connection_manager.clone();
         let stack_context = if let Some(stack_context) = builder.stack_context.take() {
             stack_context
@@ -1133,12 +1835,13 @@ impl RtcpStack {
                 "stack_context is required"
             ));
         };
-        let handler = RtcpConnectionHandler::create(
+        let handler = RtcpConnectionHandler::create_with_max_datagram(
             builder.hook_point.unwrap(),
             builder.on_new_tunnel_hook_point.take(),
             stack_context.clone(),
             connection_manager.clone(),
             builder.io_dump,
+            builder.security.limits.max_datagram_bytes,
         )
         .await?;
         let handler = Arc::new(RwLock::new(Arc::new(handler)));
@@ -1150,15 +1853,36 @@ impl RtcpStack {
         let mut rtcp = RTcp::new(
             device_config.id.clone(),
             bind_addr.clone(),
-            private_key,
+            Some(private_key),
             device_doc_jwt,
             Arc::new(listener),
         );
+        rtcp.set_security_config(builder.security.clone())
+            .map_err(|e| stack_err!(StackErrorCode::InvalidConfig, "{}", e))?;
+        info!(
+            "RTCP v3 security for stack {}: peer requirement={:?}, DNS TXT bootstrap={}, \
+             inbound anonymous={:?}, named relation={:?}; self-declared fallback is unavailable",
+            id,
+            builder.security.peer_identity.requirement,
+            builder.security.peer_identity.dns_txt_bootstrap,
+            builder.security.inbound_admission.anonymous,
+            builder.security.inbound_admission.named_min_relation
+        );
+        if builder.security.peer_identity.dns_txt_bootstrap {
+            warn!(
+                "RTCP stack {} explicitly enables non-authoritative DNS TXT identity bootstrap",
+                id
+            );
+        }
         rtcp.set_reuse_address(builder.reuse_address);
         Ok(Self {
             id,
             bind_addr,
+            device_id,
+            device_public_key,
             keep_tunnel,
+            liveness: builder.security.liveness.clone(),
+            security: builder.security.clone(),
             reuse_address: builder.reuse_address,
             rtcp: Mutex::new(Some(rtcp)),
             rtcp_ref: Mutex::new(None),
@@ -1186,6 +1910,9 @@ impl Stack for RtcpStack {
 
     async fn start(&self) -> StackResult<()> {
         let mut rtcp = { self.rtcp.lock().unwrap().take().unwrap() };
+        // Provide the tunnel framework entry point so create_tunnel can build
+        // bootstrap streams when the stack id carries a `params@remote` prefix.
+        rtcp.set_tunnel_manager(self.tunnel_manager.clone());
         rtcp.start()
             .await
             .map_err(|e| stack_err!(StackErrorCode::IoError, "start rtcp failed: {:?}", e))?;
@@ -1228,6 +1955,39 @@ impl Stack for RtcpStack {
                 "reuse_address unmatch"
             ));
         }
+        let updated_security = RtcpSecurityConfig {
+            peer_identity: config.peer_identity.clone(),
+            inbound_admission: config.inbound_admission.clone(),
+            liveness: config.liveness.clone(),
+            limits: config.limits.clone(),
+        };
+        updated_security.validate().map_err(|e| {
+            stack_err!(
+                StackErrorCode::InvalidConfig,
+                "invalid rtcp security config: {}",
+                e
+            )
+        })?;
+        if updated_security != self.security {
+            return Err(stack_err!(
+                StackErrorCode::InvalidConfig,
+                "rtcp security policy change requires stack restart"
+            ));
+        }
+
+        let identity_material = load_rtcp_identity_material(config).await?;
+        if identity_material.device_config.id.to_string() != self.device_id {
+            return Err(stack_err!(
+                StackErrorCode::InvalidConfig,
+                "rtcp identity change requires stack restart"
+            ));
+        }
+        if identity_material.public_key != self.device_public_key {
+            return Err(stack_err!(
+                StackErrorCode::InvalidConfig,
+                "rtcp private key change requires stack restart"
+            ));
+        }
 
         let env = match context {
             Some(context) => {
@@ -1253,12 +2013,13 @@ impl Stack for RtcpStack {
         )
         .await
         .map_err(|e| stack_err!(StackErrorCode::InvalidConfig, "{e}"))?;
-        let handler = RtcpConnectionHandler::create(
+        let handler = RtcpConnectionHandler::create_with_max_datagram(
             config.hook_point.clone(),
             config.on_new_tunnel_hook_point.clone(),
             env,
             self.connection_manager.clone(),
             io_dump,
+            config.limits.max_datagram_bytes,
         )
         .await?;
         *self.prepare_handler.write().unwrap() = Some(Arc::new(handler));
@@ -1280,7 +2041,7 @@ pub struct RtcpStackBuilder {
     id: Option<String>,
     bind_addr: Option<String>,
     keep_tunnel: Vec<String>,
-    device_config: Option<DeviceConfig>,
+    device_config: Option<DeviceDocument>,
     device_doc_jwt: Option<String>,
     private_key: Option<[u8; 48]>,
     hook_point: Option<ProcessChainConfigs>,
@@ -1289,6 +2050,7 @@ pub struct RtcpStackBuilder {
     stack_context: Option<Arc<RtcpStackContext>>,
     io_dump: Option<IoDumpStackConfig>,
     reuse_address: bool,
+    security: RtcpSecurityConfig,
 }
 
 impl RtcpStackBuilder {
@@ -1306,6 +2068,7 @@ impl RtcpStackBuilder {
             stack_context: None,
             io_dump: None,
             reuse_address: false,
+            security: RtcpSecurityConfig::default(),
         }
     }
 
@@ -1324,7 +2087,7 @@ impl RtcpStackBuilder {
         self
     }
 
-    pub fn device_config(mut self, device_config: DeviceConfig) -> Self {
+    pub fn device_config(mut self, device_config: DeviceDocument) -> Self {
         self.device_config = Some(device_config);
         self
     }
@@ -1372,12 +2135,36 @@ impl RtcpStackBuilder {
         self
     }
 
+    pub fn security(mut self, security: RtcpSecurityConfig) -> Self {
+        self.security = security;
+        self
+    }
+
     pub async fn build(self) -> StackResult<RtcpStack> {
         RtcpStack::create(self).await
     }
 }
 
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct RtcpIdentityManagerConfig {
+    #[serde(
+        default,
+        alias = "public_root",
+        alias = "public_identity_root",
+        alias = "public_identity_root_path",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub public_root_path: Option<String>,
+    #[serde(
+        default,
+        alias = "security_root",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub security_root_path: Option<String>,
+}
+
 #[derive(Serialize, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct RtcpStackConfig {
     pub id: String,
     pub protocol: StackProtocol,
@@ -1387,8 +2174,27 @@ pub struct RtcpStackConfig {
     pub keep_tunnel: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub on_new_tunnel_hook_point: Option<Vec<crate::ProcessChainConfig>>,
-    pub key_path: String,
+    #[serde(
+        default,
+        alias = "did",
+        alias = "device_did",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub identity: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub identity_manager: Option<RtcpIdentityManagerConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub device_config_path: Option<String>,
+    #[serde(
+        default,
+        alias = "device-doc-jwt",
+        alias = "device_document_jwt",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub device_doc_jwt: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub io_dump_file: Option<String>,
@@ -1401,6 +2207,14 @@ pub struct RtcpStackConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub io_dump_max_download_bytes_per_conn: Option<String>,
     pub reuse_address: Option<bool>,
+    #[serde(default)]
+    pub peer_identity: RtcpPeerIdentityConfig,
+    #[serde(default)]
+    pub inbound_admission: RtcpInboundAdmissionConfig,
+    #[serde(default)]
+    pub liveness: RtcpLivenessConfig,
+    #[serde(default)]
+    pub limits: RtcpLimitsConfig,
 }
 
 impl crate::StackConfig for RtcpStackConfig {
@@ -1442,35 +2256,7 @@ impl StackFactory for RtcpStackFactory {
                 "invalid rtcp stack config"
             ))?;
 
-        let private_key =
-            load_raw_private_key(Path::new(config.key_path.as_str())).map_err(into_stack_err!(
-                StackErrorCode::InvalidConfig,
-                "load private key {} failed",
-                config.key_path
-            ))?;
-        let public_key = encode_ed25519_pkcs8_sk_to_pk(&private_key);
-        let (device_config, device_doc_jwt) = if config.device_config_path.is_some() {
-            let path = config.device_config_path.as_ref().unwrap();
-            let content = tokio::fs::read_to_string(path)
-                .await
-                .map_err(into_stack_err!(
-                    StackErrorCode::InvalidConfig,
-                    "load device config {} failed",
-                    path
-                ))?;
-            load_device_config_from_path(content.as_str(), path, &public_key)?
-        } else {
-            if config.name.is_none() {
-                return Err(stack_err!(
-                    StackErrorCode::InvalidConfig,
-                    "name is required"
-                ));
-            }
-            (
-                DeviceConfig::new(config.name.as_ref().unwrap().as_str(), public_key),
-                None,
-            )
-        };
+        let identity_material = load_rtcp_identity_material(config).await?;
         let stack_context = context
             .as_ref()
             .as_any()
@@ -1495,16 +2281,22 @@ impl StackFactory for RtcpStackFactory {
             .bind(config.bind.clone())
             .keep_tunnel(config.keep_tunnel.clone())
             .connection_manager(self.connection_manager.clone())
-            .device_config(device_config)
-            .private_key(private_key)
-            .hook_point(config.hook_point.clone());
+            .device_config(identity_material.device_config)
+            .private_key(identity_material.private_key)
+            .hook_point(config.hook_point.clone())
+            .security(RtcpSecurityConfig {
+                peer_identity: config.peer_identity.clone(),
+                inbound_admission: config.inbound_admission.clone(),
+                liveness: config.liveness.clone(),
+                limits: config.limits.clone(),
+            });
         let stack = if let Some(on_new_tunnel_hook_point) = config.on_new_tunnel_hook_point.clone()
         {
             stack.on_new_tunnel_hook_point(on_new_tunnel_hook_point)
         } else {
             stack
         };
-        let stack = if let Some(device_doc_jwt) = device_doc_jwt {
+        let stack = if let Some(device_doc_jwt) = identity_material.device_doc_jwt {
             stack.device_doc_jwt(device_doc_jwt)
         } else {
             stack
@@ -1537,11 +2329,15 @@ fn sanitize_keep_tunnels(keep_tunnels: &[String]) -> Vec<String> {
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
-    use super::{RtcpConnectionHandler, sanitize_keep_tunnels};
+    use super::{
+        RtcpConnectionHandler, RtcpIdentityManagerConfig, load_rtcp_identity_material,
+        sanitize_keep_tunnels,
+    };
     use crate::global_process_chains::GlobalProcessChains;
     use crate::{
         ConnectionManager, DatagramInfo, DefaultLimiterManager, GlobalCollectionManager,
-        LimiterManagerRef, ProcessChainConfigs, RtcpStack, RtcpStackConfig, RtcpStackContext,
+        LimiterManagerRef, ProcessChainConfigs, RtcpInboundAdmissionConfig, RtcpLimitsConfig,
+        RtcpLivenessConfig, RtcpPeerIdentityConfig, RtcpStack, RtcpStackConfig, RtcpStackContext,
         RtcpStackFactory, Server, ServerManager, ServerManagerRef, ServerResult, Stack,
         StackContext, StackFactory, StackProtocol, StatManager, StatManagerRef, StreamInfo,
         StreamServer, TunnelEndpoint, TunnelManager, create_io_dump_stack_config,
@@ -1549,15 +2345,104 @@ mod tests {
     };
     use buckyos_kit::AsyncStream;
     use jsonwebtoken::EncodingKey;
-    use name_client::{NameInfo, add_nameinfo_cache, init_name_lib_for_test, update_did_cache};
+    use name_client::{
+        DidDocType, IdentityMaterial, IdentityRoots, IdentityUsage, NameInfo, add_nameinfo_cache,
+        add_observed_cache, init_name_lib_for_test,
+    };
     use name_lib::{
-        DIDDocumentTrait, DeviceConfig, EncodedDocument, encode_ed25519_sk_to_pk_jwk,
+        DID, DIDDocumentTrait, DeviceDocument, EncodedDocument, encode_ed25519_sk_to_pk_jwk,
         generate_ed25519_key, generate_ed25519_key_pair,
     };
     use std::collections::HashMap;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[test]
+    fn rtcp_security_config_defaults_fail_closed_and_rejects_removed_keys() {
+        let config: RtcpStackConfig = serde_yaml_ng::from_str(
+            r#"
+id: secure-defaults
+protocol: rtcp
+bind: 127.0.0.1:2981
+hook_point: []
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            config.peer_identity.requirement,
+            crate::RtcpPeerIdentityRequirement::AuthorityCurrent
+        );
+        assert!(!config.peer_identity.dns_txt_bootstrap);
+        assert_eq!(
+            config.inbound_admission.anonymous,
+            crate::RtcpAnonymousAdmission::Reject
+        );
+        assert_eq!(
+            config.inbound_admission.named_min_relation,
+            crate::RtcpNamedMinRelation::SameZone
+        );
+
+        let removed = match serde_yaml_ng::from_str::<RtcpStackConfig>(
+            r#"
+id: removed-fallback
+protocol: rtcp
+bind: 127.0.0.1:2981
+hook_point: []
+inbound_self_declared_fallback: true
+"#,
+        ) {
+            Ok(_) => panic!("removed self-declared fallback key must be rejected"),
+            Err(err) => err,
+        };
+        assert!(removed.to_string().contains("unknown field"));
+
+        let known_owner: RtcpStackConfig = serde_yaml_ng::from_str(
+            r#"
+id: known-owner
+protocol: rtcp
+bind: 127.0.0.1:2981
+hook_point: []
+inbound_admission:
+  named_min_relation: known_owner
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            known_owner.inbound_admission.named_min_relation,
+            crate::RtcpNamedMinRelation::KnownOwner
+        );
+
+        let unsupported = match serde_yaml_ng::from_str::<RtcpStackConfig>(
+            r#"
+id: unsupported-relation
+protocol: rtcp
+bind: 127.0.0.1:2981
+hook_point: []
+inbound_admission:
+  named_min_relation: same_owner
+"#,
+        ) {
+            Ok(_) => panic!("unimplemented named relation must be rejected"),
+            Err(err) => err,
+        };
+        assert!(unsupported.to_string().contains("unknown variant"));
+    }
+
+    #[test]
+    fn rtcp_liveness_requires_consecutive_missed_pongs() {
+        let mut missed = 0;
+        assert!(!RtcpStack::record_liveness_probe(&mut missed, false, 3));
+        assert!(!RtcpStack::record_liveness_probe(&mut missed, false, 3));
+        assert_eq!(missed, 2);
+        assert!(!RtcpStack::record_liveness_probe(&mut missed, true, 3));
+        assert_eq!(missed, 0);
+        assert!(!RtcpStack::record_liveness_probe(&mut missed, false, 3));
+        assert!(!RtcpStack::record_liveness_probe(&mut missed, false, 3));
+        assert!(RtcpStack::record_liveness_probe(&mut missed, false, 3));
+        assert_eq!(missed, 3);
+    }
+
     use tokio::net::{TcpListener, UdpSocket};
     use url::Url;
 
@@ -1596,11 +2481,101 @@ mod tests {
         ))
     }
 
+    fn build_rtcp_identity_config(
+        id: &str,
+        bind: &str,
+        identity: &str,
+        roots: &IdentityRoots,
+    ) -> RtcpStackConfig {
+        RtcpStackConfig {
+            id: id.to_string(),
+            protocol: StackProtocol::Rtcp,
+            bind: bind.to_string(),
+            hook_point: vec![],
+            keep_tunnel: vec![],
+            on_new_tunnel_hook_point: None,
+            identity: Some(identity.to_string()),
+            identity_manager: Some(RtcpIdentityManagerConfig {
+                public_root_path: Some(roots.public_root.to_string_lossy().to_string()),
+                security_root_path: Some(roots.security_root.to_string_lossy().to_string()),
+            }),
+            key_path: None,
+            device_config_path: None,
+            device_doc_jwt: None,
+            name: None,
+            io_dump_file: None,
+            io_dump_rotate_size: None,
+            io_dump_rotate_max_files: None,
+            io_dump_max_upload_bytes_per_conn: None,
+            io_dump_max_download_bytes_per_conn: None,
+            reuse_address: None,
+            peer_identity: RtcpPeerIdentityConfig::default(),
+            inbound_admission: RtcpInboundAdmissionConfig::default(),
+            liveness: RtcpLivenessConfig::default(),
+            limits: RtcpLimitsConfig::default(),
+        }
+    }
+
+    fn write_rtcp_identity_files(
+        roots: &IdentityRoots,
+        identity: &str,
+        private_key_pem: &str,
+        did_json: Option<&DeviceDocument>,
+        device_doc_jwt: Option<&str>,
+    ) {
+        let public_dir = roots.public_dir(identity).unwrap();
+        let security_dir = roots.security_dir(identity).unwrap();
+        std::fs::create_dir_all(&public_dir).unwrap();
+        std::fs::create_dir_all(&security_dir).unwrap();
+        let private_key_path = roots
+            .security_file(
+                identity,
+                IdentityUsage::Authentication,
+                IdentityMaterial::PrivateKey,
+            )
+            .unwrap();
+        std::fs::write(private_key_path, private_key_pem).unwrap();
+        if let Some(did_json) = did_json {
+            let did_json_path = roots
+                .public_file(
+                    identity,
+                    IdentityUsage::Authentication,
+                    IdentityMaterial::DidDocJson(None),
+                )
+                .unwrap();
+            std::fs::write(did_json_path, serde_json::to_string(did_json).unwrap()).unwrap();
+        }
+        if let Some(device_doc_jwt) = device_doc_jwt {
+            let device_doc_jwt_path = roots
+                .public_file(
+                    identity,
+                    IdentityUsage::Authentication,
+                    IdentityMaterial::DidDocJwt(Some(DidDocType::Device)),
+                )
+                .unwrap();
+            std::fs::write(device_doc_jwt_path, device_doc_jwt).unwrap();
+        }
+    }
+
+    async fn build_factory_context() -> Arc<dyn StackContext> {
+        let collection_manager = GlobalCollectionManager::create(vec![]).await.unwrap();
+        Arc::new(RtcpStackContext::new(
+            Arc::new(ServerManager::new()),
+            TunnelManager::new(),
+            Arc::new(DefaultLimiterManager::new()),
+            StatManager::new(),
+            Some(Arc::new(GlobalProcessChains::new())),
+            Some(collection_manager),
+            None,
+        ))
+    }
+
     #[tokio::test]
     async fn test_rtcp_stack_creation() {
         let (signing_key, pkcs8_bytes) = generate_ed25519_key();
         let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
-        let device_config = DeviceConfig::new_by_jwk("test", serde_json::from_value(jwk).unwrap());
+        let device_config =
+            DeviceDocument::new_by_jwk("test", serde_json::from_value(jwk).unwrap());
 
         let result = RtcpStack::builder().build().await;
         assert!(result.is_err());
@@ -1687,6 +2662,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_rtcp_stack_builder_requires_device_doc_jwt_for_logical_did() {
+        let (signing_key, pkcs8_bytes) = generate_ed25519_key();
+        let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
+        let mut device_config =
+            DeviceDocument::new_by_jwk("logical-test", serde_json::from_value(jwk).unwrap());
+        device_config.id = DID::new("web", "logical.example.com");
+
+        let result = RtcpStack::builder()
+            .id("logical-test")
+            .bind("127.0.0.1:0".to_string())
+            .device_config(device_config)
+            .private_key(pkcs8_bytes)
+            .hook_point(vec![])
+            .stack_context(build_stack_context(
+                Arc::new(ServerManager::new()),
+                TunnelManager::new(),
+                Arc::new(DefaultLimiterManager::new()),
+                StatManager::new(),
+                Some(Arc::new(GlobalProcessChains::new())),
+            ))
+            .build()
+            .await;
+
+        let err = result.as_ref().err().unwrap().to_string();
+        assert!(err.contains("device_doc_jwt"), "unexpected error: {}", err);
+    }
+
+    #[tokio::test]
     async fn test_rtcp_on_new_tunnel_hook_point_rejects_source_device() {
         let on_new_tunnel_hook_point = r#"
 - id: main
@@ -1720,6 +2723,8 @@ mod tests {
                 TunnelEndpoint {
                     device_id: "blocked-device".to_string(),
                     port: 2981,
+                    canonical_device_id: None,
+                    identity_trust: None,
                 },
                 "127.0.0.1:41000".parse().unwrap(),
                 None,
@@ -1732,6 +2737,8 @@ mod tests {
                 TunnelEndpoint {
                     device_id: "allowed-device".to_string(),
                     port: 2981,
+                    canonical_device_id: None,
+                    identity_trust: None,
                 },
                 "127.0.0.1:41001".parse().unwrap(),
                 None,
@@ -1741,20 +2748,177 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_rtcp_on_new_tunnel_exposes_authenticated_did_and_conn_source() {
+        // The handshake-authenticated DID must be visible as the trusted
+        // real_source_did, with source_did as the effective-identity alias,
+        // alongside the connection-layer source group.
+        let on_new_tunnel_hook_point = r#"
+- id: main
+  priority: 1
+  blocks:
+    - id: main
+      block: |
+        !eq ${REQ.real_source_did} "did:dev:blocked" && !eq ${REQ.conn_source_ip} "10.9.9.9" && return "ok";
+        eq ${REQ.source_did} ${REQ.real_source_did} && eq ${REQ.source_device_id} ${REQ.real_source_did} && reject;
+        "#;
+        let on_new_tunnel_hook_point: ProcessChainConfigs =
+            serde_yaml_ng::from_str(on_new_tunnel_hook_point).unwrap();
+
+        let handler = RtcpConnectionHandler::create(
+            vec![],
+            Some(on_new_tunnel_hook_point),
+            build_stack_context(
+                Arc::new(ServerManager::new()),
+                TunnelManager::new(),
+                Arc::new(DefaultLimiterManager::new()),
+                StatManager::new(),
+                Some(Arc::new(GlobalProcessChains::new())),
+            ),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Matching DID: the second line proves source_did/source_device_id
+        // alias the authenticated DID (reject only fires when all eq hold).
+        let rejected = handler
+            .handle_new_tunnel(
+                TunnelEndpoint {
+                    device_id: "did:dev:blocked".to_string(),
+                    port: 2981,
+                    canonical_device_id: None,
+                    identity_trust: None,
+                },
+                "127.0.0.1:41002".parse().unwrap(),
+                None,
+            )
+            .await;
+        assert!(rejected.is_err());
+
+        // Same chain keyed on conn_source_ip: proves the connection-layer
+        // source group is populated.
+        let rejected = handler
+            .handle_new_tunnel(
+                TunnelEndpoint {
+                    device_id: "did:dev:other".to_string(),
+                    port: 2981,
+                    canonical_device_id: None,
+                    identity_trust: None,
+                },
+                "10.9.9.9:41003".parse().unwrap(),
+                None,
+            )
+            .await;
+        assert!(rejected.is_err());
+
+        let accepted = handler
+            .handle_new_tunnel(
+                TunnelEndpoint {
+                    device_id: "did:dev:other".to_string(),
+                    port: 2981,
+                    canonical_device_id: None,
+                    identity_trust: None,
+                },
+                "127.0.0.1:41004".parse().unwrap(),
+                None,
+            )
+            .await;
+        assert!(accepted.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_rtcp_stream_source_vars_with_proxy_protocol() {
+        // Streams over an authenticated RTCP tunnel expose:
+        // - real_source_did / source_did: the handshake-authenticated DID
+        // - source_canonical_device_id / source_identity_trust: provenance
+        // - conn_source_*: the tunnel peer socket address
+        // - real_source_* / source_*: the PROXY-protocol-restored origin
+        // - protocol/purpose and destination fields for authorization
+        // The chain only forwards when all of them match.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let echo_port = listener.local_addr().unwrap().port();
+
+        let chains = format!(
+            r#"
+- id: main
+  priority: 1
+  blocks:
+    - id: main
+      block: |
+        eq ${{REQ.real_source_did}} "did:web:peer.example" && eq ${{REQ.source_did}} "did:web:peer.example" && eq ${{REQ.source_canonical_device_id}} "did:dev:peer-key" && eq ${{REQ.source_identity_trust}} "trusted_zone_snapshot" && eq ${{REQ.real_source_ip}} "203.0.113.9" && eq ${{REQ.real_source_port}} "5678" && eq ${{REQ.conn_source_ip}} "127.0.0.1" && eq ${{REQ.conn_source_port}} "52000" && eq ${{REQ.source_ip}} "203.0.113.9" && eq ${{REQ.dest_host}} "service.example" && eq ${{REQ.dest_port}} "80" && eq ${{REQ.protocol}} "tcp" && eq ${{REQ.stream_purpose}} "stream" && forward tcp:///127.0.0.1:{echo_port};
+        drop;
+"#
+        );
+        let chains: ProcessChainConfigs = serde_yaml_ng::from_str(&chains).unwrap();
+
+        let handler = RtcpConnectionHandler::create(
+            chains,
+            None,
+            build_stack_context(
+                Arc::new(ServerManager::new()),
+                TunnelManager::new(),
+                Arc::new(DefaultLimiterManager::new()),
+                StatManager::new(),
+                Some(Arc::new(GlobalProcessChains::new())),
+            ),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let (near, mut far) = tokio::io::duplex(1024);
+        far.write_all(b"PROXY TCP4 203.0.113.9 127.0.0.1 5678 80\r\nhello")
+            .await
+            .unwrap();
+
+        let handle = tokio::spawn(async move {
+            handler
+                .handle_stream(
+                    Box::new(near),
+                    "tcp".to_string(),
+                    Some("service.example".to_string()),
+                    80,
+                    "".to_string(),
+                    TunnelEndpoint {
+                        device_id: "did:web:peer.example".to_string(),
+                        port: 2981,
+                        canonical_device_id: Some("did:dev:peer-key".to_string()),
+                        identity_trust: Some("trusted_zone_snapshot".to_string()),
+                    },
+                    crate::MutComposedSpeedStat::new(),
+                    "127.0.0.1:52000".parse().unwrap(),
+                    "127.0.0.1:2981".parse().unwrap(),
+                )
+                .await
+        });
+
+        let accepted = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+            .await
+            .expect("process chain did not forward: source vars not exposed as expected");
+        let (mut conn, _) = accepted.unwrap();
+        let mut buf = [0u8; 5];
+        conn.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"hello");
+        drop(conn);
+        drop(far);
+        let _ = handle.await;
+    }
+
+    #[tokio::test]
     async fn test_rtcp_stack_reject() {
         let _ = init_name_lib_for_test(&HashMap::new()).await;
         let (signing_key, pkcs8_bytes) = generate_ed25519_key();
         let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
         let mut device_config =
-            DeviceConfig::new_by_jwk("test1", serde_json::from_value(jwk).unwrap());
+            DeviceDocument::new_by_jwk("test1", serde_json::from_value(jwk).unwrap());
         device_config.iat = chrono::Utc::now().timestamp() as u64;
         device_config.exp = chrono::Utc::now().timestamp() as u64 + 1000;
         let id1 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        update_did_cache(device_config.id.clone(), None, encoded_doc)
-            .await
-            .unwrap();
+        add_observed_cache(device_config.id.clone(), None, encoded_doc, None).unwrap();
         add_nameinfo_cache(
             device_config.id.to_string().as_str(),
             NameInfo::from_address(
@@ -1804,15 +2968,13 @@ mod tests {
         let (signing_key, pkcs8_bytes) = generate_ed25519_key();
         let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
         let mut device_config =
-            DeviceConfig::new_by_jwk("test1", serde_json::from_value(jwk).unwrap());
+            DeviceDocument::new_by_jwk("test1", serde_json::from_value(jwk).unwrap());
         device_config.iat = chrono::Utc::now().timestamp() as u64;
         device_config.exp = chrono::Utc::now().timestamp() as u64 + 1000;
         let _id2 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        update_did_cache(device_config.id.clone(), None, encoded_doc)
-            .await
-            .unwrap();
+        add_observed_cache(device_config.id.clone(), None, encoded_doc, None).unwrap();
         add_nameinfo_cache(
             device_config.id.to_string().as_str(),
             NameInfo::from_address(
@@ -1870,7 +3032,10 @@ mod tests {
             .await;
         assert!(result.is_ok());
         let ret = stream.read(&mut [0; 1024]).await;
-        assert!(ret.is_err());
+        match ret {
+            Ok(0) | Err(_) => {}
+            Ok(n) => panic!("reject should not return application data, got {} bytes", n),
+        }
 
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         assert_eq!(connection_manager.get_all_connection_info().len(), 0);
@@ -1881,13 +3046,12 @@ mod tests {
         let _ = init_name_lib_for_test(&HashMap::new()).await;
         let (signing_key, pkcs8_bytes) = generate_ed25519_key();
         let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
-        let device_config = DeviceConfig::new_by_jwk("test1", serde_json::from_value(jwk).unwrap());
+        let device_config =
+            DeviceDocument::new_by_jwk("test1", serde_json::from_value(jwk).unwrap());
         let id1 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        update_did_cache(device_config.id.clone(), None, encoded_doc)
-            .await
-            .unwrap();
+        add_observed_cache(device_config.id.clone(), None, encoded_doc, None).unwrap();
         add_nameinfo_cache(
             device_config.id.to_string().as_str(),
             NameInfo::from_address(
@@ -1936,13 +3100,12 @@ mod tests {
 
         let (signing_key, pkcs8_bytes) = generate_ed25519_key();
         let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
-        let device_config = DeviceConfig::new_by_jwk("test1", serde_json::from_value(jwk).unwrap());
+        let device_config =
+            DeviceDocument::new_by_jwk("test1", serde_json::from_value(jwk).unwrap());
         let _id2 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        update_did_cache(device_config.id.clone(), None, encoded_doc)
-            .await
-            .unwrap();
+        add_observed_cache(device_config.id.clone(), None, encoded_doc, None).unwrap();
         add_nameinfo_cache(
             device_config.id.to_string().as_str(),
             NameInfo::from_address(
@@ -2000,7 +3163,10 @@ mod tests {
             .await;
         assert!(result.is_ok());
         let ret = stream.read(&mut [0; 1024]).await;
-        assert!(ret.is_err());
+        match ret {
+            Ok(0) | Err(_) => {}
+            Ok(n) => panic!("drop should not return application data, got {} bytes", n),
+        }
 
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         assert_eq!(connection_manager.get_all_connection_info().len(), 0);
@@ -2011,13 +3177,12 @@ mod tests {
         let _ = init_name_lib_for_test(&HashMap::new()).await;
         let (signing_key, pkcs8_bytes) = generate_ed25519_key();
         let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
-        let device_config = DeviceConfig::new_by_jwk("test1", serde_json::from_value(jwk).unwrap());
+        let device_config =
+            DeviceDocument::new_by_jwk("test1", serde_json::from_value(jwk).unwrap());
         let id1 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        update_did_cache(device_config.id.clone(), None, encoded_doc)
-            .await
-            .unwrap();
+        add_observed_cache(device_config.id.clone(), None, encoded_doc, None).unwrap();
         add_nameinfo_cache(
             device_config.id.to_string().as_str(),
             NameInfo::from_address(
@@ -2066,13 +3231,12 @@ mod tests {
 
         let (signing_key, pkcs8_bytes) = generate_ed25519_key();
         let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
-        let device_config = DeviceConfig::new_by_jwk("test1", serde_json::from_value(jwk).unwrap());
+        let device_config =
+            DeviceDocument::new_by_jwk("test1", serde_json::from_value(jwk).unwrap());
         let _id2 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        update_did_cache(device_config.id.clone(), None, encoded_doc)
-            .await
-            .unwrap();
+        add_observed_cache(device_config.id.clone(), None, encoded_doc, None).unwrap();
         add_nameinfo_cache(
             device_config.id.to_string().as_str(),
             NameInfo::from_address(
@@ -2157,13 +3321,12 @@ mod tests {
         let _ = init_name_lib_for_test(&HashMap::new()).await;
         let (signing_key, pkcs8_bytes) = generate_ed25519_key();
         let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
-        let device_config = DeviceConfig::new_by_jwk("test1", serde_json::from_value(jwk).unwrap());
+        let device_config =
+            DeviceDocument::new_by_jwk("test1", serde_json::from_value(jwk).unwrap());
         let id1 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        update_did_cache(device_config.id.clone(), None, encoded_doc)
-            .await
-            .unwrap();
+        add_observed_cache(device_config.id.clone(), None, encoded_doc, None).unwrap();
         add_nameinfo_cache(
             device_config.id.to_string().as_str(),
             NameInfo::from_address(
@@ -2212,13 +3375,12 @@ mod tests {
 
         let (signing_key, pkcs8_bytes) = generate_ed25519_key();
         let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
-        let device_config = DeviceConfig::new_by_jwk("test1", serde_json::from_value(jwk).unwrap());
+        let device_config =
+            DeviceDocument::new_by_jwk("test1", serde_json::from_value(jwk).unwrap());
         let _id2 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        update_did_cache(device_config.id.clone(), None, encoded_doc)
-            .await
-            .unwrap();
+        add_observed_cache(device_config.id.clone(), None, encoded_doc, None).unwrap();
         add_nameinfo_cache(
             device_config.id.to_string().as_str(),
             NameInfo::from_address(
@@ -2317,13 +3479,12 @@ mod tests {
         let _ = init_name_lib_for_test(&HashMap::new()).await;
         let (signing_key, pkcs8_bytes) = generate_ed25519_key();
         let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
-        let device_config = DeviceConfig::new_by_jwk("test1", serde_json::from_value(jwk).unwrap());
+        let device_config =
+            DeviceDocument::new_by_jwk("test1", serde_json::from_value(jwk).unwrap());
         let id1 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        update_did_cache(device_config.id.clone(), None, encoded_doc)
-            .await
-            .unwrap();
+        add_observed_cache(device_config.id.clone(), None, encoded_doc, None).unwrap();
         add_nameinfo_cache(
             device_config.id.to_string().as_str(),
             NameInfo::from_address(
@@ -2378,13 +3539,12 @@ mod tests {
 
         let (signing_key, pkcs8_bytes) = generate_ed25519_key();
         let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
-        let device_config = DeviceConfig::new_by_jwk("test1", serde_json::from_value(jwk).unwrap());
+        let device_config =
+            DeviceDocument::new_by_jwk("test1", serde_json::from_value(jwk).unwrap());
         let _id2 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        update_did_cache(device_config.id.clone(), None, encoded_doc)
-            .await
-            .unwrap();
+        add_observed_cache(device_config.id.clone(), None, encoded_doc, None).unwrap();
         add_nameinfo_cache(
             device_config.id.to_string().as_str(),
             NameInfo::from_address(
@@ -2457,17 +3617,17 @@ mod tests {
     async fn test_rtcp_io_dump_raw_single_roundtrip() {
         let _ = init_name_lib_for_test(&HashMap::new()).await;
         let (s1, k1) = generate_ed25519_key();
-        let d1 = DeviceConfig::new_by_jwk(
+        let d1 = DeviceDocument::new_by_jwk(
             "test1",
             serde_json::from_value(encode_ed25519_sk_to_pk_jwk(&s1)).unwrap(),
         );
         let id1 = d1.id.clone();
-        update_did_cache(
+        add_observed_cache(
             d1.id.clone(),
             None,
             EncodedDocument::JsonLd(serde_json::to_value(&d1).unwrap()),
+            None,
         )
-        .await
         .unwrap();
         add_nameinfo_cache(
             d1.id.to_string().as_str(),
@@ -2521,16 +3681,16 @@ mod tests {
         stack1.start().await.unwrap();
 
         let (s2, k2) = generate_ed25519_key();
-        let d2 = DeviceConfig::new_by_jwk(
+        let d2 = DeviceDocument::new_by_jwk(
             "test2",
             serde_json::from_value(encode_ed25519_sk_to_pk_jwk(&s2)).unwrap(),
         );
-        update_did_cache(
+        add_observed_cache(
             d2.id.clone(),
             None,
             EncodedDocument::JsonLd(serde_json::to_value(&d2).unwrap()),
+            None,
         )
-        .await
         .unwrap();
         add_nameinfo_cache(
             d2.id.to_string().as_str(),
@@ -2582,17 +3742,17 @@ mod tests {
     async fn test_rtcp_io_dump_raw_flush_on_upload_limit() {
         let _ = init_name_lib_for_test(&HashMap::new()).await;
         let (s1, k1) = generate_ed25519_key();
-        let d1 = DeviceConfig::new_by_jwk(
+        let d1 = DeviceDocument::new_by_jwk(
             "test1",
             serde_json::from_value(encode_ed25519_sk_to_pk_jwk(&s1)).unwrap(),
         );
         let id1 = d1.id.clone();
-        update_did_cache(
+        add_observed_cache(
             d1.id.clone(),
             None,
             EncodedDocument::JsonLd(serde_json::to_value(&d1).unwrap()),
+            None,
         )
-        .await
         .unwrap();
         add_nameinfo_cache(
             d1.id.to_string().as_str(),
@@ -2646,16 +3806,16 @@ mod tests {
         stack1.start().await.unwrap();
 
         let (s2, k2) = generate_ed25519_key();
-        let d2 = DeviceConfig::new_by_jwk(
+        let d2 = DeviceDocument::new_by_jwk(
             "test2",
             serde_json::from_value(encode_ed25519_sk_to_pk_jwk(&s2)).unwrap(),
         );
-        update_did_cache(
+        add_observed_cache(
             d2.id.clone(),
             None,
             EncodedDocument::JsonLd(serde_json::to_value(&d2).unwrap()),
+            None,
         )
-        .await
         .unwrap();
         add_nameinfo_cache(
             d2.id.to_string().as_str(),
@@ -2747,17 +3907,17 @@ mod tests {
     async fn test_rtcp_io_dump_http_multi_requests_same_connection() {
         let _ = init_name_lib_for_test(&HashMap::new()).await;
         let (s1, k1) = generate_ed25519_key();
-        let d1 = DeviceConfig::new_by_jwk(
+        let d1 = DeviceDocument::new_by_jwk(
             "test1",
             serde_json::from_value(encode_ed25519_sk_to_pk_jwk(&s1)).unwrap(),
         );
         let id1 = d1.id.clone();
-        update_did_cache(
+        add_observed_cache(
             d1.id.clone(),
             None,
             EncodedDocument::JsonLd(serde_json::to_value(&d1).unwrap()),
+            None,
         )
-        .await
         .unwrap();
         add_nameinfo_cache(
             d1.id.to_string().as_str(),
@@ -2810,16 +3970,16 @@ mod tests {
         stack1.start().await.unwrap();
 
         let (s2, k2) = generate_ed25519_key();
-        let d2 = DeviceConfig::new_by_jwk(
+        let d2 = DeviceDocument::new_by_jwk(
             "test2",
             serde_json::from_value(encode_ed25519_sk_to_pk_jwk(&s2)).unwrap(),
         );
-        update_did_cache(
+        add_observed_cache(
             d2.id.clone(),
             None,
             EncodedDocument::JsonLd(serde_json::to_value(&d2).unwrap()),
+            None,
         )
-        .await
         .unwrap();
         add_nameinfo_cache(
             d2.id.to_string().as_str(),
@@ -2884,17 +4044,17 @@ mod tests {
     async fn test_rtcp_io_dump_http_flush_on_upload_limit() {
         let _ = init_name_lib_for_test(&HashMap::new()).await;
         let (s1, k1) = generate_ed25519_key();
-        let d1 = DeviceConfig::new_by_jwk(
+        let d1 = DeviceDocument::new_by_jwk(
             "test1",
             serde_json::from_value(encode_ed25519_sk_to_pk_jwk(&s1)).unwrap(),
         );
         let id1 = d1.id.clone();
-        update_did_cache(
+        add_observed_cache(
             d1.id.clone(),
             None,
             EncodedDocument::JsonLd(serde_json::to_value(&d1).unwrap()),
+            None,
         )
-        .await
         .unwrap();
         add_nameinfo_cache(
             d1.id.to_string().as_str(),
@@ -2947,16 +4107,16 @@ mod tests {
         stack1.start().await.unwrap();
 
         let (s2, k2) = generate_ed25519_key();
-        let d2 = DeviceConfig::new_by_jwk(
+        let d2 = DeviceDocument::new_by_jwk(
             "test2",
             serde_json::from_value(encode_ed25519_sk_to_pk_jwk(&s2)).unwrap(),
         );
-        update_did_cache(
+        add_observed_cache(
             d2.id.clone(),
             None,
             EncodedDocument::JsonLd(serde_json::to_value(&d2).unwrap()),
+            None,
         )
-        .await
         .unwrap();
         add_nameinfo_cache(
             d2.id.to_string().as_str(),
@@ -3010,13 +4170,12 @@ mod tests {
         let _ = init_name_lib_for_test(&HashMap::new()).await;
         let (signing_key, pkcs8_bytes) = generate_ed25519_key();
         let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
-        let device_config = DeviceConfig::new_by_jwk("test1", serde_json::from_value(jwk).unwrap());
+        let device_config =
+            DeviceDocument::new_by_jwk("test1", serde_json::from_value(jwk).unwrap());
         let id1 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        update_did_cache(device_config.id.clone(), None, encoded_doc)
-            .await
-            .unwrap();
+        add_observed_cache(device_config.id.clone(), None, encoded_doc, None).unwrap();
         add_nameinfo_cache(
             device_config.id.to_string().as_str(),
             NameInfo::from_address(
@@ -3066,13 +4225,12 @@ mod tests {
 
         let (signing_key, pkcs8_bytes) = generate_ed25519_key();
         let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
-        let device_config = DeviceConfig::new_by_jwk("test1", serde_json::from_value(jwk).unwrap());
+        let device_config =
+            DeviceDocument::new_by_jwk("test1", serde_json::from_value(jwk).unwrap());
         let _id2 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        update_did_cache(device_config.id.clone(), None, encoded_doc)
-            .await
-            .unwrap();
+        add_observed_cache(device_config.id.clone(), None, encoded_doc, None).unwrap();
         add_nameinfo_cache(
             device_config.id.to_string().as_str(),
             NameInfo::from_address(
@@ -3142,13 +4300,12 @@ mod tests {
         let _ = init_name_lib_for_test(&HashMap::new()).await;
         let (signing_key, pkcs8_bytes) = generate_ed25519_key();
         let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
-        let device_config = DeviceConfig::new_by_jwk("test1", serde_json::from_value(jwk).unwrap());
+        let device_config =
+            DeviceDocument::new_by_jwk("test1", serde_json::from_value(jwk).unwrap());
         let id1 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        update_did_cache(device_config.id.clone(), None, encoded_doc)
-            .await
-            .unwrap();
+        add_observed_cache(device_config.id.clone(), None, encoded_doc, None).unwrap();
         add_nameinfo_cache(
             device_config.id.to_string().as_str(),
             NameInfo::from_address(
@@ -3198,13 +4355,12 @@ mod tests {
 
         let (signing_key, pkcs8_bytes) = generate_ed25519_key();
         let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
-        let device_config = DeviceConfig::new_by_jwk("test1", serde_json::from_value(jwk).unwrap());
+        let device_config =
+            DeviceDocument::new_by_jwk("test1", serde_json::from_value(jwk).unwrap());
         let _id2 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        update_did_cache(device_config.id.clone(), None, encoded_doc)
-            .await
-            .unwrap();
+        add_observed_cache(device_config.id.clone(), None, encoded_doc, None).unwrap();
         add_nameinfo_cache(
             device_config.id.to_string().as_str(),
             NameInfo::from_address(
@@ -3274,13 +4430,12 @@ mod tests {
         let _ = init_name_lib_for_test(&HashMap::new()).await;
         let (signing_key, pkcs8_bytes) = generate_ed25519_key();
         let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
-        let device_config = DeviceConfig::new_by_jwk("test1", serde_json::from_value(jwk).unwrap());
+        let device_config =
+            DeviceDocument::new_by_jwk("test1", serde_json::from_value(jwk).unwrap());
         let id1 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        update_did_cache(device_config.id.clone(), None, encoded_doc)
-            .await
-            .unwrap();
+        add_observed_cache(device_config.id.clone(), None, encoded_doc, None).unwrap();
         add_nameinfo_cache(
             device_config.id.to_string().as_str(),
             NameInfo::from_address(
@@ -3330,13 +4485,12 @@ mod tests {
 
         let (signing_key, pkcs8_bytes) = generate_ed25519_key();
         let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
-        let device_config = DeviceConfig::new_by_jwk("test1", serde_json::from_value(jwk).unwrap());
+        let device_config =
+            DeviceDocument::new_by_jwk("test1", serde_json::from_value(jwk).unwrap());
         let _id2 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        update_did_cache(device_config.id.clone(), None, encoded_doc)
-            .await
-            .unwrap();
+        add_observed_cache(device_config.id.clone(), None, encoded_doc, None).unwrap();
         add_nameinfo_cache(
             device_config.id.to_string().as_str(),
             NameInfo::from_address(
@@ -3420,13 +4574,12 @@ mod tests {
         let _ = init_name_lib_for_test(&HashMap::new()).await;
         let (signing_key, pkcs8_bytes) = generate_ed25519_key();
         let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
-        let device_config = DeviceConfig::new_by_jwk("test1", serde_json::from_value(jwk).unwrap());
+        let device_config =
+            DeviceDocument::new_by_jwk("test1", serde_json::from_value(jwk).unwrap());
         let id1 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        update_did_cache(device_config.id.clone(), None, encoded_doc)
-            .await
-            .unwrap();
+        add_observed_cache(device_config.id.clone(), None, encoded_doc, None).unwrap();
         add_nameinfo_cache(
             device_config.id.to_string().as_str(),
             NameInfo::from_address(
@@ -3476,13 +4629,12 @@ mod tests {
 
         let (signing_key, pkcs8_bytes) = generate_ed25519_key();
         let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
-        let device_config = DeviceConfig::new_by_jwk("test1", serde_json::from_value(jwk).unwrap());
+        let device_config =
+            DeviceDocument::new_by_jwk("test1", serde_json::from_value(jwk).unwrap());
         let _id2 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        update_did_cache(device_config.id.clone(), None, encoded_doc)
-            .await
-            .unwrap();
+        add_observed_cache(device_config.id.clone(), None, encoded_doc, None).unwrap();
         add_nameinfo_cache(
             device_config.id.to_string().as_str(),
             NameInfo::from_address(
@@ -3553,13 +4705,12 @@ mod tests {
         let _ = init_name_lib_for_test(&HashMap::new()).await;
         let (signing_key, pkcs8_bytes) = generate_ed25519_key();
         let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
-        let device_config = DeviceConfig::new_by_jwk("test1", serde_json::from_value(jwk).unwrap());
+        let device_config =
+            DeviceDocument::new_by_jwk("test1", serde_json::from_value(jwk).unwrap());
         let id1 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        update_did_cache(device_config.id.clone(), None, encoded_doc)
-            .await
-            .unwrap();
+        add_observed_cache(device_config.id.clone(), None, encoded_doc, None).unwrap();
         add_nameinfo_cache(
             device_config.id.to_string().as_str(),
             NameInfo::from_address(
@@ -3617,13 +4768,12 @@ mod tests {
 
         let (signing_key, pkcs8_bytes) = generate_ed25519_key();
         let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
-        let device_config = DeviceConfig::new_by_jwk("test1", serde_json::from_value(jwk).unwrap());
+        let device_config =
+            DeviceDocument::new_by_jwk("test1", serde_json::from_value(jwk).unwrap());
         let _id2 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        update_did_cache(device_config.id.clone(), None, encoded_doc)
-            .await
-            .unwrap();
+        add_observed_cache(device_config.id.clone(), None, encoded_doc, None).unwrap();
         add_nameinfo_cache(
             device_config.id.to_string().as_str(),
             NameInfo::from_address(
@@ -3701,13 +4851,12 @@ mod tests {
         let _ = init_name_lib_for_test(&HashMap::new()).await;
         let (signing_key, pkcs8_bytes) = generate_ed25519_key();
         let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
-        let device_config = DeviceConfig::new_by_jwk("test1", serde_json::from_value(jwk).unwrap());
+        let device_config =
+            DeviceDocument::new_by_jwk("test1", serde_json::from_value(jwk).unwrap());
         let id1 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        update_did_cache(device_config.id.clone(), None, encoded_doc)
-            .await
-            .unwrap();
+        add_observed_cache(device_config.id.clone(), None, encoded_doc, None).unwrap();
         add_nameinfo_cache(
             device_config.id.to_string().as_str(),
             NameInfo::from_address(
@@ -3766,13 +4915,12 @@ mod tests {
 
         let (signing_key, pkcs8_bytes) = generate_ed25519_key();
         let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
-        let device_config = DeviceConfig::new_by_jwk("test1", serde_json::from_value(jwk).unwrap());
+        let device_config =
+            DeviceDocument::new_by_jwk("test1", serde_json::from_value(jwk).unwrap());
         let _id2 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        update_did_cache(device_config.id.clone(), None, encoded_doc)
-            .await
-            .unwrap();
+        add_observed_cache(device_config.id.clone(), None, encoded_doc, None).unwrap();
         add_nameinfo_cache(
             device_config.id.to_string().as_str(),
             NameInfo::from_address(
@@ -3853,13 +5001,12 @@ mod tests {
         let _ = init_name_lib_for_test(&HashMap::new()).await;
         let (signing_key, pkcs8_bytes) = generate_ed25519_key();
         let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
-        let device_config = DeviceConfig::new_by_jwk("test1", serde_json::from_value(jwk).unwrap());
+        let device_config =
+            DeviceDocument::new_by_jwk("test1", serde_json::from_value(jwk).unwrap());
         let id1 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        update_did_cache(device_config.id.clone(), None, encoded_doc)
-            .await
-            .unwrap();
+        add_observed_cache(device_config.id.clone(), None, encoded_doc, None).unwrap();
         add_nameinfo_cache(
             device_config.id.to_string().as_str(),
             NameInfo::from_address(
@@ -3925,13 +5072,12 @@ mod tests {
 
         let (signing_key, pkcs8_bytes) = generate_ed25519_key();
         let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
-        let device_config = DeviceConfig::new_by_jwk("test1", serde_json::from_value(jwk).unwrap());
+        let device_config =
+            DeviceDocument::new_by_jwk("test1", serde_json::from_value(jwk).unwrap());
         let _id2 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        update_did_cache(device_config.id.clone(), None, encoded_doc)
-            .await
-            .unwrap();
+        add_observed_cache(device_config.id.clone(), None, encoded_doc, None).unwrap();
         add_nameinfo_cache(
             device_config.id.to_string().as_str(),
             NameInfo::from_address(
@@ -4012,13 +5158,12 @@ mod tests {
         let _ = init_name_lib_for_test(&HashMap::new()).await;
         let (signing_key, pkcs8_bytes) = generate_ed25519_key();
         let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
-        let device_config = DeviceConfig::new_by_jwk("test1", serde_json::from_value(jwk).unwrap());
+        let device_config =
+            DeviceDocument::new_by_jwk("test1", serde_json::from_value(jwk).unwrap());
         let id1 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        update_did_cache(device_config.id.clone(), None, encoded_doc)
-            .await
-            .unwrap();
+        add_observed_cache(device_config.id.clone(), None, encoded_doc, None).unwrap();
         add_nameinfo_cache(
             device_config.id.to_string().as_str(),
             NameInfo::from_address(
@@ -4084,13 +5229,12 @@ mod tests {
 
         let (signing_key, pkcs8_bytes) = generate_ed25519_key();
         let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
-        let device_config = DeviceConfig::new_by_jwk("test1", serde_json::from_value(jwk).unwrap());
+        let device_config =
+            DeviceDocument::new_by_jwk("test1", serde_json::from_value(jwk).unwrap());
         let _id2 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        update_did_cache(device_config.id.clone(), None, encoded_doc)
-            .await
-            .unwrap();
+        add_observed_cache(device_config.id.clone(), None, encoded_doc, None).unwrap();
         add_nameinfo_cache(
             device_config.id.to_string().as_str(),
             NameInfo::from_address(
@@ -4193,13 +5337,12 @@ mod tests {
         let _ = init_name_lib_for_test(&HashMap::new()).await;
         let (signing_key, pkcs8_bytes) = generate_ed25519_key();
         let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
-        let device_config = DeviceConfig::new_by_jwk("test1", serde_json::from_value(jwk).unwrap());
+        let device_config =
+            DeviceDocument::new_by_jwk("test1", serde_json::from_value(jwk).unwrap());
         let id1 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        update_did_cache(device_config.id.clone(), None, encoded_doc)
-            .await
-            .unwrap();
+        add_observed_cache(device_config.id.clone(), None, encoded_doc, None).unwrap();
         add_nameinfo_cache(
             device_config.id.to_string().as_str(),
             NameInfo::from_address(
@@ -4252,13 +5395,12 @@ mod tests {
 
         let (signing_key, pkcs8_bytes) = generate_ed25519_key();
         let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
-        let device_config = DeviceConfig::new_by_jwk("test1", serde_json::from_value(jwk).unwrap());
+        let device_config =
+            DeviceDocument::new_by_jwk("test1", serde_json::from_value(jwk).unwrap());
         let _id2 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        update_did_cache(device_config.id.clone(), None, encoded_doc)
-            .await
-            .unwrap();
+        add_observed_cache(device_config.id.clone(), None, encoded_doc, None).unwrap();
         add_nameinfo_cache(
             device_config.id.to_string().as_str(),
             NameInfo::from_address(
@@ -4329,13 +5471,12 @@ mod tests {
         let _ = init_name_lib_for_test(&HashMap::new()).await;
         let (signing_key, pkcs8_bytes) = generate_ed25519_key();
         let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
-        let device_config = DeviceConfig::new_by_jwk("test1", serde_json::from_value(jwk).unwrap());
+        let device_config =
+            DeviceDocument::new_by_jwk("test1", serde_json::from_value(jwk).unwrap());
         let id1 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        update_did_cache(device_config.id.clone(), None, encoded_doc)
-            .await
-            .unwrap();
+        add_observed_cache(device_config.id.clone(), None, encoded_doc, None).unwrap();
         add_nameinfo_cache(
             device_config.id.to_string().as_str(),
             NameInfo::from_address(
@@ -4390,13 +5531,12 @@ mod tests {
 
         let (signing_key, pkcs8_bytes) = generate_ed25519_key();
         let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
-        let device_config = DeviceConfig::new_by_jwk("test1", serde_json::from_value(jwk).unwrap());
+        let device_config =
+            DeviceDocument::new_by_jwk("test1", serde_json::from_value(jwk).unwrap());
         let _id2 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        update_did_cache(device_config.id.clone(), None, encoded_doc)
-            .await
-            .unwrap();
+        add_observed_cache(device_config.id.clone(), None, encoded_doc, None).unwrap();
         add_nameinfo_cache(
             device_config.id.to_string().as_str(),
             NameInfo::from_address(
@@ -4488,13 +5628,12 @@ mod tests {
         let _ = init_name_lib_for_test(&HashMap::new()).await;
         let (signing_key, pkcs8_bytes) = generate_ed25519_key();
         let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
-        let device_config = DeviceConfig::new_by_jwk("test1", serde_json::from_value(jwk).unwrap());
+        let device_config =
+            DeviceDocument::new_by_jwk("test1", serde_json::from_value(jwk).unwrap());
         let id1 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        update_did_cache(device_config.id.clone(), None, encoded_doc)
-            .await
-            .unwrap();
+        add_observed_cache(device_config.id.clone(), None, encoded_doc, None).unwrap();
         add_nameinfo_cache(
             device_config.id.to_string().as_str(),
             NameInfo::from_address(
@@ -4551,13 +5690,12 @@ mod tests {
 
         let (signing_key, pkcs8_bytes) = generate_ed25519_key();
         let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
-        let device_config = DeviceConfig::new_by_jwk("test1", serde_json::from_value(jwk).unwrap());
+        let device_config =
+            DeviceDocument::new_by_jwk("test1", serde_json::from_value(jwk).unwrap());
         let _id2 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        update_did_cache(device_config.id.clone(), None, encoded_doc)
-            .await
-            .unwrap();
+        add_observed_cache(device_config.id.clone(), None, encoded_doc, None).unwrap();
         add_nameinfo_cache(
             device_config.id.to_string().as_str(),
             NameInfo::from_address(
@@ -4639,13 +5777,12 @@ mod tests {
         let _ = init_name_lib_for_test(&HashMap::new()).await;
         let (signing_key, pkcs8_bytes) = generate_ed25519_key();
         let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
-        let device_config = DeviceConfig::new_by_jwk("test1", serde_json::from_value(jwk).unwrap());
+        let device_config =
+            DeviceDocument::new_by_jwk("test1", serde_json::from_value(jwk).unwrap());
         let id1 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        update_did_cache(device_config.id.clone(), None, encoded_doc)
-            .await
-            .unwrap();
+        add_observed_cache(device_config.id.clone(), None, encoded_doc, None).unwrap();
         add_nameinfo_cache(
             device_config.id.to_string().as_str(),
             NameInfo::from_address(
@@ -4709,13 +5846,12 @@ mod tests {
 
         let (signing_key, pkcs8_bytes) = generate_ed25519_key();
         let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
-        let device_config = DeviceConfig::new_by_jwk("test1", serde_json::from_value(jwk).unwrap());
+        let device_config =
+            DeviceDocument::new_by_jwk("test1", serde_json::from_value(jwk).unwrap());
         let _id2 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        update_did_cache(device_config.id.clone(), None, encoded_doc)
-            .await
-            .unwrap();
+        add_observed_cache(device_config.id.clone(), None, encoded_doc, None).unwrap();
         add_nameinfo_cache(
             device_config.id.to_string().as_str(),
             NameInfo::from_address(
@@ -4797,13 +5933,12 @@ mod tests {
         let _ = init_name_lib_for_test(&HashMap::new()).await;
         let (signing_key, pkcs8_bytes) = generate_ed25519_key();
         let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
-        let device_config = DeviceConfig::new_by_jwk("test1", serde_json::from_value(jwk).unwrap());
+        let device_config =
+            DeviceDocument::new_by_jwk("test1", serde_json::from_value(jwk).unwrap());
         let id1 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        update_did_cache(device_config.id.clone(), None, encoded_doc)
-            .await
-            .unwrap();
+        add_observed_cache(device_config.id.clone(), None, encoded_doc, None).unwrap();
         add_nameinfo_cache(
             device_config.id.to_string().as_str(),
             NameInfo::from_address(
@@ -4867,13 +6002,12 @@ mod tests {
 
         let (signing_key, pkcs8_bytes) = generate_ed25519_key();
         let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
-        let device_config = DeviceConfig::new_by_jwk("test1", serde_json::from_value(jwk).unwrap());
+        let device_config =
+            DeviceDocument::new_by_jwk("test1", serde_json::from_value(jwk).unwrap());
         let _id2 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        update_did_cache(device_config.id.clone(), None, encoded_doc)
-            .await
-            .unwrap();
+        add_observed_cache(device_config.id.clone(), None, encoded_doc, None).unwrap();
         add_nameinfo_cache(
             device_config.id.to_string().as_str(),
             NameInfo::from_address(
@@ -4965,8 +6099,10 @@ mod tests {
         let key_file = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(key_file.path(), signing_key).unwrap();
 
-        let device_config =
-            DeviceConfig::new_by_jwk("test", serde_json::from_value(pkcs8_bytes.clone()).unwrap());
+        let device_config = DeviceDocument::new_by_jwk(
+            "test",
+            serde_json::from_value(pkcs8_bytes.clone()).unwrap(),
+        );
         let device_doc = serde_json::to_string(&device_config).unwrap();
         let config_file = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(config_file.path(), device_doc).unwrap();
@@ -4978,8 +6114,11 @@ mod tests {
             hook_point: vec![],
             keep_tunnel: vec![],
             on_new_tunnel_hook_point: None,
-            key_path: key_file.path().to_string_lossy().to_string(),
+            identity: None,
+            identity_manager: None,
+            key_path: Some(key_file.path().to_string_lossy().to_string()),
             device_config_path: None,
+            device_doc_jwt: None,
             name: Some("test".to_string()),
             io_dump_file: None,
             io_dump_rotate_size: None,
@@ -4987,6 +6126,10 @@ mod tests {
             io_dump_max_upload_bytes_per_conn: None,
             io_dump_max_download_bytes_per_conn: None,
             reuse_address: None,
+            peer_identity: RtcpPeerIdentityConfig::default(),
+            inbound_admission: RtcpInboundAdmissionConfig::default(),
+            liveness: RtcpLivenessConfig::default(),
+            limits: RtcpLimitsConfig::default(),
         };
 
         let stack_context: Arc<dyn StackContext> = Arc::new(RtcpStackContext::new(
@@ -5010,8 +6153,11 @@ mod tests {
             hook_point: vec![],
             keep_tunnel: vec![],
             on_new_tunnel_hook_point: None,
-            key_path: key_file.path().to_string_lossy().to_string(),
+            identity: None,
+            identity_manager: None,
+            key_path: Some(key_file.path().to_string_lossy().to_string()),
             device_config_path: Some(config_file.path().to_string_lossy().to_string()),
+            device_doc_jwt: None,
             name: Some("test".to_string()),
             io_dump_file: None,
             io_dump_rotate_size: None,
@@ -5019,6 +6165,10 @@ mod tests {
             io_dump_max_upload_bytes_per_conn: None,
             io_dump_max_download_bytes_per_conn: None,
             reuse_address: None,
+            peer_identity: RtcpPeerIdentityConfig::default(),
+            inbound_admission: RtcpInboundAdmissionConfig::default(),
+            liveness: RtcpLivenessConfig::default(),
+            limits: RtcpLimitsConfig::default(),
         };
 
         let ret = factory
@@ -5029,10 +6179,10 @@ mod tests {
         let (owner_signing_key, owner_pkcs8_bytes) = generate_ed25519_key();
         let owner_jwk = encode_ed25519_sk_to_pk_jwk(&owner_signing_key);
         let owner_config =
-            DeviceConfig::new_by_jwk("owner", serde_json::from_value(owner_jwk).unwrap());
+            DeviceDocument::new_by_jwk("owner", serde_json::from_value(owner_jwk).unwrap());
         let owner_private_key = EncodingKey::from_ed_der(&owner_pkcs8_bytes);
         let mut jwt_device_config =
-            DeviceConfig::new_by_jwk("test-jwt", serde_json::from_value(pkcs8_bytes).unwrap());
+            DeviceDocument::new_by_jwk("test-jwt", serde_json::from_value(pkcs8_bytes).unwrap());
         jwt_device_config.owner = owner_config.id.clone();
         let jwt_device_doc = match jwt_device_config.encode(Some(&owner_private_key)).unwrap() {
             EncodedDocument::Jwt(jwt) => jwt,
@@ -5048,8 +6198,11 @@ mod tests {
             hook_point: vec![],
             keep_tunnel: vec![],
             on_new_tunnel_hook_point: None,
-            key_path: key_file.path().to_string_lossy().to_string(),
+            identity: None,
+            identity_manager: None,
+            key_path: Some(key_file.path().to_string_lossy().to_string()),
             device_config_path: Some(jwt_config_file.path().to_string_lossy().to_string()),
+            device_doc_jwt: None,
             name: Some("test".to_string()),
             io_dump_file: None,
             io_dump_rotate_size: None,
@@ -5057,10 +6210,376 @@ mod tests {
             io_dump_max_upload_bytes_per_conn: None,
             io_dump_max_download_bytes_per_conn: None,
             reuse_address: None,
+            peer_identity: RtcpPeerIdentityConfig::default(),
+            inbound_admission: RtcpInboundAdmissionConfig::default(),
+            liveness: RtcpLivenessConfig::default(),
+            limits: RtcpLimitsConfig::default(),
         };
 
         let ret = factory.create(Arc::new(config), stack_context).await;
         assert!(ret.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_factory_loads_identity_manager_config() {
+        let temp = tempfile::tempdir().unwrap();
+        let roots = IdentityRoots::new(temp.path().join("identity"), temp.path().join("security"));
+        let (private_key_pem, public_jwk) = generate_ed25519_key_pair();
+        let device_config = DeviceDocument::new_by_jwk(
+            "identity-device",
+            serde_json::from_value(public_jwk).unwrap(),
+        );
+        let identity = device_config.id.to_string();
+        write_rtcp_identity_files(
+            &roots,
+            &identity,
+            &private_key_pem,
+            Some(&device_config),
+            None,
+        );
+
+        let factory = RtcpStackFactory::new(ConnectionManager::new());
+        let stack_context = build_factory_context().await;
+        let config = build_rtcp_identity_config("identity-test", "127.0.0.1:0", &identity, &roots);
+
+        let ret = factory.create(Arc::new(config), stack_context).await;
+        assert!(ret.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_logical_rtcp_identity_requires_device_doc_jwt() {
+        let temp = tempfile::tempdir().unwrap();
+        let roots = IdentityRoots::new(temp.path().join("identity"), temp.path().join("security"));
+        let (private_key_pem, public_jwk) = generate_ed25519_key_pair();
+        let mut device_config = DeviceDocument::new_by_jwk(
+            "logical-device",
+            serde_json::from_value(public_jwk).unwrap(),
+        );
+        device_config.id = DID::new("web", "logical-device.example.com");
+        let identity = device_config.id.to_string();
+        write_rtcp_identity_files(
+            &roots,
+            &identity,
+            &private_key_pem,
+            Some(&device_config),
+            None,
+        );
+
+        let config =
+            build_rtcp_identity_config("logical-missing-jwt", "127.0.0.1:0", &identity, &roots);
+        let ret = load_rtcp_identity_material(&config).await;
+        let err = ret.as_ref().err().unwrap().to_string();
+        assert!(err.contains("device_doc_jwt"), "unexpected error: {}", err);
+    }
+
+    #[tokio::test]
+    async fn test_rtcp_identity_rejects_did_url_path_form() {
+        let temp = tempfile::tempdir().unwrap();
+        let roots = IdentityRoots::new(temp.path().join("identity"), temp.path().join("security"));
+        let identity = "did:web:logical-device.example.com:user:alice";
+        let config =
+            build_rtcp_identity_config("logical-path-did", "127.0.0.1:0", identity, &roots);
+
+        let ret = load_rtcp_identity_material(&config).await;
+        let err = ret.as_ref().err().unwrap().to_string();
+        assert!(err.contains("hostname-form"), "unexpected error: {}", err);
+    }
+
+    #[tokio::test]
+    async fn test_logical_rtcp_identity_loads_device_doc_jwt() {
+        let temp = tempfile::tempdir().unwrap();
+        let roots = IdentityRoots::new(temp.path().join("identity"), temp.path().join("security"));
+        let (private_key_pem, public_jwk) = generate_ed25519_key_pair();
+
+        let (owner_signing_key, owner_pkcs8_bytes) = generate_ed25519_key();
+        let owner_jwk = encode_ed25519_sk_to_pk_jwk(&owner_signing_key);
+        let owner_config =
+            DeviceDocument::new_by_jwk("owner", serde_json::from_value(owner_jwk).unwrap());
+        let owner_private_key = EncodingKey::from_ed_der(&owner_pkcs8_bytes);
+
+        let mut device_config = DeviceDocument::new_by_jwk(
+            "logical-device",
+            serde_json::from_value(public_jwk).unwrap(),
+        );
+        device_config.id = DID::new("web", "logical-device.example.com");
+        device_config.owner = owner_config.id.clone();
+        let identity = device_config.id.to_string();
+        let device_doc_jwt = match device_config.encode(Some(&owner_private_key)).unwrap() {
+            EncodedDocument::Jwt(jwt) => jwt,
+            _ => panic!("device config encode should return jwt"),
+        };
+        write_rtcp_identity_files(
+            &roots,
+            &identity,
+            &private_key_pem,
+            None,
+            Some(&device_doc_jwt),
+        );
+
+        let config = build_rtcp_identity_config("logical-jwt", "127.0.0.1:0", &identity, &roots);
+        let material = load_rtcp_identity_material(&config).await.unwrap();
+        assert_eq!(
+            material.device_config.id,
+            DID::new("web", "logical-device.example.com")
+        );
+        assert_eq!(
+            material.device_doc_jwt.as_deref(),
+            Some(device_doc_jwt.as_str())
+        );
+    }
+
+    fn build_legacy_rtcp_identity_config(
+        id: &str,
+        key_path: &std::path::Path,
+        device_config_path: &std::path::Path,
+    ) -> RtcpStackConfig {
+        RtcpStackConfig {
+            id: id.to_string(),
+            protocol: StackProtocol::Rtcp,
+            bind: "127.0.0.1:0".to_string(),
+            hook_point: vec![],
+            keep_tunnel: vec![],
+            on_new_tunnel_hook_point: None,
+            identity: None,
+            identity_manager: None,
+            key_path: Some(key_path.to_string_lossy().to_string()),
+            device_config_path: Some(device_config_path.to_string_lossy().to_string()),
+            device_doc_jwt: None,
+            name: None,
+            io_dump_file: None,
+            io_dump_rotate_size: None,
+            io_dump_rotate_max_files: None,
+            io_dump_max_upload_bytes_per_conn: None,
+            io_dump_max_download_bytes_per_conn: None,
+            reuse_address: None,
+            peer_identity: RtcpPeerIdentityConfig::default(),
+            inbound_admission: RtcpInboundAdmissionConfig::default(),
+            liveness: RtcpLivenessConfig::default(),
+            limits: RtcpLimitsConfig::default(),
+        }
+    }
+
+    // buckyos OOD 布局:did.json(未签名) 与 owner 签名的 device_doc.jwt
+    // 同目录。legacy 配置只给 device_config_path 时必须能拾取 sibling jwt,
+    // 否则逻辑名 stack 无法启动(boot_gateway.yaml 回归场景)。
+    #[tokio::test]
+    async fn test_legacy_rtcp_identity_loads_sibling_device_doc_jwt() {
+        let temp = tempfile::tempdir().unwrap();
+        let (private_key_pem, public_jwk) = generate_ed25519_key_pair();
+
+        let (owner_signing_key, owner_pkcs8_bytes) = generate_ed25519_key();
+        let owner_jwk = encode_ed25519_sk_to_pk_jwk(&owner_signing_key);
+        let owner_config =
+            DeviceDocument::new_by_jwk("owner", serde_json::from_value(owner_jwk).unwrap());
+        let owner_private_key = EncodingKey::from_ed_der(&owner_pkcs8_bytes);
+
+        let mut device_config =
+            DeviceDocument::new_by_jwk("ood1", serde_json::from_value(public_jwk).unwrap());
+        device_config.id = DID::new("bns", "ood1.alice");
+        device_config.owner = owner_config.id.clone();
+        let device_doc_jwt = match device_config.encode(Some(&owner_private_key)).unwrap() {
+            EncodedDocument::Jwt(jwt) => jwt,
+            _ => panic!("device config encode should return jwt"),
+        };
+
+        let key_path = temp.path().join("authentication.private.pem");
+        std::fs::write(&key_path, &private_key_pem).unwrap();
+        let did_json_path = temp.path().join("did.json");
+        std::fs::write(
+            &did_json_path,
+            serde_json::to_string(&device_config).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(temp.path().join("device_doc.jwt"), &device_doc_jwt).unwrap();
+
+        let config =
+            build_legacy_rtcp_identity_config("legacy-sibling-jwt", &key_path, &did_json_path);
+        let material = load_rtcp_identity_material(&config).await.unwrap();
+        assert_eq!(material.device_config.id, DID::new("bns", "ood1.alice"));
+        assert_eq!(
+            material.device_doc_jwt.as_deref(),
+            Some(device_doc_jwt.as_str())
+        );
+    }
+
+    // sibling jwt 的 id 与 did.json 不一致时必须被忽略,逻辑名 stack 仍然
+    // 因缺少可信 jwt 而拒绝启动,不能拿错误身份顶包。
+    #[tokio::test]
+    async fn test_legacy_rtcp_identity_ignores_mismatched_sibling_jwt() {
+        let temp = tempfile::tempdir().unwrap();
+        let (private_key_pem, public_jwk) = generate_ed25519_key_pair();
+
+        let (owner_signing_key, owner_pkcs8_bytes) = generate_ed25519_key();
+        let owner_jwk = encode_ed25519_sk_to_pk_jwk(&owner_signing_key);
+        let owner_config =
+            DeviceDocument::new_by_jwk("owner", serde_json::from_value(owner_jwk).unwrap());
+        let owner_private_key = EncodingKey::from_ed_der(&owner_pkcs8_bytes);
+
+        let mut device_config =
+            DeviceDocument::new_by_jwk("ood1", serde_json::from_value(public_jwk.clone()).unwrap());
+        device_config.id = DID::new("bns", "ood1.alice");
+        device_config.owner = owner_config.id.clone();
+
+        let mut other_device_config =
+            DeviceDocument::new_by_jwk("ood2", serde_json::from_value(public_jwk).unwrap());
+        other_device_config.id = DID::new("bns", "ood2.alice");
+        other_device_config.owner = owner_config.id.clone();
+        let mismatched_jwt = match other_device_config
+            .encode(Some(&owner_private_key))
+            .unwrap()
+        {
+            EncodedDocument::Jwt(jwt) => jwt,
+            _ => panic!("device config encode should return jwt"),
+        };
+
+        let key_path = temp.path().join("authentication.private.pem");
+        std::fs::write(&key_path, &private_key_pem).unwrap();
+        let did_json_path = temp.path().join("did.json");
+        std::fs::write(
+            &did_json_path,
+            serde_json::to_string(&device_config).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(temp.path().join("device_doc.jwt"), &mismatched_jwt).unwrap();
+
+        let config =
+            build_legacy_rtcp_identity_config("legacy-mismatch-jwt", &key_path, &did_json_path);
+        let err = load_rtcp_identity_material(&config)
+            .await
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(err.contains("device_doc_jwt"), "unexpected error: {}", err);
+    }
+
+    // buckyos 落盘的文件名是 device_doc.jwt(而不是 name-client 约定的
+    // device.jwt),identity 配置也必须能找到它。
+    #[tokio::test]
+    async fn test_identity_manager_loads_buckyos_device_doc_jwt_file_name() {
+        let temp = tempfile::tempdir().unwrap();
+        let roots = IdentityRoots::new(temp.path().join("identity"), temp.path().join("security"));
+        let (private_key_pem, public_jwk) = generate_ed25519_key_pair();
+
+        let (owner_signing_key, owner_pkcs8_bytes) = generate_ed25519_key();
+        let owner_jwk = encode_ed25519_sk_to_pk_jwk(&owner_signing_key);
+        let owner_config =
+            DeviceDocument::new_by_jwk("owner", serde_json::from_value(owner_jwk).unwrap());
+        let owner_private_key = EncodingKey::from_ed_der(&owner_pkcs8_bytes);
+
+        let mut device_config = DeviceDocument::new_by_jwk(
+            "logical-device",
+            serde_json::from_value(public_jwk).unwrap(),
+        );
+        device_config.id = DID::new("web", "logical-device.example.com");
+        device_config.owner = owner_config.id.clone();
+        let identity = device_config.id.to_string();
+        let device_doc_jwt = match device_config.encode(Some(&owner_private_key)).unwrap() {
+            EncodedDocument::Jwt(jwt) => jwt,
+            _ => panic!("device config encode should return jwt"),
+        };
+
+        write_rtcp_identity_files(&roots, &identity, &private_key_pem, None, None);
+        let buckyos_jwt_path = roots
+            .public_dir(&identity)
+            .unwrap()
+            .join(super::BUCKYOS_DEVICE_DOC_JWT_FILE_NAME);
+        std::fs::write(buckyos_jwt_path, &device_doc_jwt).unwrap();
+
+        let config =
+            build_rtcp_identity_config("buckyos-jwt-name", "127.0.0.1:0", &identity, &roots);
+        let material = load_rtcp_identity_material(&config).await.unwrap();
+        assert_eq!(
+            material.device_config.id,
+            DID::new("web", "logical-device.example.com")
+        );
+        assert_eq!(
+            material.device_doc_jwt.as_deref(),
+            Some(device_doc_jwt.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_identity_manager_prefers_device_doc_jwt() {
+        let temp = tempfile::tempdir().unwrap();
+        let roots = IdentityRoots::new(temp.path().join("identity"), temp.path().join("security"));
+        let (private_key_pem, public_jwk) = generate_ed25519_key_pair();
+        let json_device_config = DeviceDocument::new_by_jwk(
+            "json-device",
+            serde_json::from_value(public_jwk.clone()).unwrap(),
+        );
+        let identity = json_device_config.id.to_string();
+
+        let (owner_signing_key, owner_pkcs8_bytes) = generate_ed25519_key();
+        let owner_jwk = encode_ed25519_sk_to_pk_jwk(&owner_signing_key);
+        let owner_config =
+            DeviceDocument::new_by_jwk("owner", serde_json::from_value(owner_jwk).unwrap());
+        let owner_private_key = EncodingKey::from_ed_der(&owner_pkcs8_bytes);
+        let mut jwt_device_config =
+            DeviceDocument::new_by_jwk("jwt-device", serde_json::from_value(public_jwk).unwrap());
+        jwt_device_config.owner = owner_config.id.clone();
+        let device_doc_jwt = match jwt_device_config.encode(Some(&owner_private_key)).unwrap() {
+            EncodedDocument::Jwt(jwt) => jwt,
+            _ => panic!("device config encode should return jwt"),
+        };
+
+        write_rtcp_identity_files(
+            &roots,
+            &identity,
+            &private_key_pem,
+            Some(&json_device_config),
+            Some(&device_doc_jwt),
+        );
+        let config = build_rtcp_identity_config("identity-jwt", "127.0.0.1:0", &identity, &roots);
+
+        let material = load_rtcp_identity_material(&config).await.unwrap();
+        assert_eq!(material.device_config.name, "jwt-device");
+        assert_eq!(
+            material.device_doc_jwt.as_deref(),
+            Some(device_doc_jwt.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_prepare_update_rejects_identity_switch() {
+        let temp = tempfile::tempdir().unwrap();
+        let roots = IdentityRoots::new(temp.path().join("identity"), temp.path().join("security"));
+        let (private_key_pem1, public_jwk1) = generate_ed25519_key_pair();
+        let device_config1 =
+            DeviceDocument::new_by_jwk("device-1", serde_json::from_value(public_jwk1).unwrap());
+        let identity1 = device_config1.id.to_string();
+        write_rtcp_identity_files(
+            &roots,
+            &identity1,
+            &private_key_pem1,
+            Some(&device_config1),
+            None,
+        );
+
+        let (private_key_pem2, public_jwk2) = generate_ed25519_key_pair();
+        let device_config2 =
+            DeviceDocument::new_by_jwk("device-2", serde_json::from_value(public_jwk2).unwrap());
+        let identity2 = device_config2.id.to_string();
+        write_rtcp_identity_files(
+            &roots,
+            &identity2,
+            &private_key_pem2,
+            Some(&device_config2),
+            None,
+        );
+
+        let factory = RtcpStackFactory::new(ConnectionManager::new());
+        let stack_context = build_factory_context().await;
+        let config1 =
+            build_rtcp_identity_config("identity-update", "127.0.0.1:0", &identity1, &roots);
+        let stack = factory
+            .create(Arc::new(config1), stack_context)
+            .await
+            .unwrap();
+
+        let config2 =
+            build_rtcp_identity_config("identity-update", "127.0.0.1:0", &identity2, &roots);
+        let ret = stack.prepare_update(Arc::new(config2), None).await;
+        assert!(ret.is_err());
     }
 
     #[test]

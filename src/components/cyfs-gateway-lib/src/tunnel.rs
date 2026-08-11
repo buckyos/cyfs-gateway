@@ -1,4 +1,5 @@
 use crate::TunnelResult;
+use crate::tunnel_url_status::TunnelUrlProberRef;
 use async_trait::async_trait;
 use buckyos_kit::AsyncStream;
 use std::net::IpAddr;
@@ -8,6 +9,8 @@ use std::net::SocketAddr;
 pub struct TunnelEndpoint {
     pub device_id: String,
     pub port: u16,
+    pub canonical_device_id: Option<String>,
+    pub identity_trust: Option<String>,
 }
 
 #[async_trait]
@@ -86,6 +89,13 @@ pub trait TunnelBuilder: Send + Sync + 'static {
         &self,
         tunnel_stack_id: Option<&str>,
     ) -> TunnelResult<Box<dyn TunnelBox>>;
+
+    /// Optional URL-level prober. Schemes that don't yet implement
+    /// proper probing return `None`, and `TunnelManager` will produce
+    /// `Unsupported` results for those URLs.
+    fn url_prober(&self) -> Option<TunnelUrlProberRef> {
+        None
+    }
 }
 
 #[async_trait]

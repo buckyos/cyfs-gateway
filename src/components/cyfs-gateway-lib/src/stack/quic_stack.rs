@@ -5,24 +5,30 @@ use std::os::fd::{FromRawFd, IntoRawFd};
 #[cfg(windows)]
 use std::os::windows::io::{FromRawSocket, IntoRawSocket};
 
+use crate::forward::ForwardPlan;
 use crate::global_process_chains::{
     GlobalProcessChainsRef, create_process_chain_executor, execute_chain,
 };
 use crate::stack::limiter::Limiter;
-use crate::stack::tls_cert_resolver::ResolvesServerCertUsingSni;
-use crate::stack::{TlsCertResolver, get_limit_info, probe_proxy_protocol_stream, stream_forward};
+use crate::stack::tls_cert_resolver::{
+    IdentityCertResolver, ResolvesServerCertUsingSni, TlsIdentityCertConfig,
+};
+use crate::stack::tls_stack::build_identity_cert_config;
+use crate::stack::{
+    TlsCertResolver, get_limit_info, insert_req_source_addr_group, probe_proxy_protocol_stream,
+    stream_forward, stream_forward_group,
+};
 use crate::{
     ComposedSpeedStat, ConnectionController, ConnectionInfo, ConnectionManagerRef, DumpStream,
     GlobalCollectionManagerRef, HandleConnectionController, IoDumpStackConfig,
     JsExternalsManagerRef, LimiterManagerRef, ProcessChainConfig, ProcessChainConfigs,
     SelfCertMgrRef, Server, ServerError, ServerErrorCode, ServerManagerRef, Stack, StackCertConfig,
     StackConfig, StackContext, StackErrorCode, StackFactory, StackProtocol, StackRef, StackResult,
-    StatManagerRef, StreamInfo, TlsDomainConfig, TunnelManager, create_io_dump_stack_config,
-    get_external_commands, get_stat_info, into_stack_err, load_certs, load_key, server_err,
-    stack_err,
+    StatManagerRef, StreamInfo, TlsIdentityManagerConfig, TunnelManager,
+    create_io_dump_stack_config, get_external_commands, get_stat_info, into_stack_err, load_certs,
+    load_key, server_err, stack_err,
 };
 use buckyos_kit::AsyncStream;
-use cyfs_acme::{AcmeCertManagerRef, AcmeItem, ChallengeType};
 use cyfs_process_chain::{
     CollectionValue, CommandControl, MemoryMapCollection, ProcessChainLibExecutor,
 };
@@ -40,6 +46,7 @@ use pin_project::pin_project;
 use quinn::Incoming;
 use quinn::crypto::rustls::{HandshakeData, QuicServerConfig};
 use rustls::ServerConfig;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::ResolvesServerCert;
 use rustls::sign::CertifiedKey;
 use sfo_io::{
@@ -65,7 +72,6 @@ pub struct QuicStackContext {
     pub tunnel_manager: TunnelManager,
     pub limiter_manager: LimiterManagerRef,
     pub stat_manager: StatManagerRef,
-    pub acme_manager: AcmeCertManagerRef,
     pub self_cert_mgr: SelfCertMgrRef,
     pub global_process_chains: Option<GlobalProcessChainsRef>,
     pub global_collection_manager: Option<GlobalCollectionManagerRef>,
@@ -78,7 +84,6 @@ impl QuicStackContext {
         tunnel_manager: TunnelManager,
         limiter_manager: LimiterManagerRef,
         stat_manager: StatManagerRef,
-        acme_manager: AcmeCertManagerRef,
         self_cert_mgr: SelfCertMgrRef,
         global_process_chains: Option<GlobalProcessChainsRef>,
         global_collection_manager: Option<GlobalCollectionManagerRef>,
@@ -89,7 +94,6 @@ impl QuicStackContext {
             tunnel_manager,
             limiter_manager,
             stat_manager,
-            acme_manager,
             self_cert_mgr,
             global_process_chains,
             global_collection_manager,
@@ -101,6 +105,28 @@ impl QuicStackContext {
 impl StackContext for QuicStackContext {
     fn stack_protocol(&self) -> StackProtocol {
         StackProtocol::Quic
+    }
+}
+
+pub struct QuicDomainConfig {
+    pub domain: String,
+    pub certs: Option<Vec<CertificateDer<'static>>>,
+    pub key: Option<PrivateKeyDer<'static>>,
+}
+
+impl Clone for QuicDomainConfig {
+    fn clone(&self) -> Self {
+        Self {
+            domain: self.domain.clone(),
+            certs: self.certs.clone(),
+            key: match &self.key {
+                None => None,
+                Some(PrivateKeyDer::Pkcs8(key)) => Some(PrivateKeyDer::Pkcs8(key.clone_key())),
+                Some(PrivateKeyDer::Pkcs1(key)) => Some(PrivateKeyDer::Pkcs1(key.clone_key())),
+                Some(PrivateKeyDer::Sec1(key)) => Some(PrivateKeyDer::Sec1(key.clone_key())),
+                Some(_) => panic!("Unsupported key type"),
+            },
+        }
     }
 }
 
@@ -136,53 +162,57 @@ impl QuicConnectionHandler {
     }
 
     fn build_cert_resolver(
-        certs: Vec<TlsDomainConfig>,
+        certs: Vec<QuicDomainConfig>,
+        identity_certs: Option<TlsIdentityCertConfig>,
         env: &QuicStackContext,
     ) -> StackResult<Arc<dyn ResolvesServerCert>> {
         let crypto_provider = rustls::crypto::ring::default_provider();
-        let external_resolver = Some(env.acme_manager.clone() as Arc<dyn ResolvesServerCert>);
-        let cert_resolver = Arc::new(ResolvesServerCertUsingSni::new(external_resolver));
+        let cert_resolver = Arc::new(ResolvesServerCertUsingSni::new());
         let mut self_cert = false;
         for cert_config in certs.into_iter() {
             if cert_config.domain == "*" {
                 self_cert = true;
                 continue;
             }
-            if let (Some(certs), Some(key)) = (cert_config.certs, cert_config.key) {
-                let cert_key = CertifiedKey::from_der(certs, key, &crypto_provider).map_err(
-                    into_stack_err!(
-                        StackErrorCode::InvalidTlsCert,
-                        "parse {} cert failed",
+            match (cert_config.certs, cert_config.key) {
+                (Some(certs), Some(key)) => {
+                    let cert_key = CertifiedKey::from_der(certs, key, &crypto_provider).map_err(
+                        into_stack_err!(
+                            StackErrorCode::InvalidTlsCert,
+                            "parse {} cert failed",
+                            cert_config.domain
+                        ),
+                    )?;
+                    cert_resolver
+                        .add(&cert_config.domain, cert_key)
+                        .map_err(|e| {
+                            stack_err!(
+                                StackErrorCode::InvalidConfig,
+                                "add {} cert failed.err {}",
+                                cert_config.domain,
+                                e
+                            )
+                        })?;
+                }
+                (None, None) => {}
+                _ => {
+                    return Err(stack_err!(
+                        StackErrorCode::InvalidConfig,
+                        "cert and key must both be configured for {}",
                         cert_config.domain
-                    ),
-                )?;
-                cert_resolver
-                    .add(&cert_config.domain, cert_key)
-                    .map_err(|e| {
-                        stack_err!(
-                            StackErrorCode::InvalidConfig,
-                            "add {} cert failed.err {}",
-                            cert_config.domain,
-                            e
-                        )
-                    })?;
-            } else {
-                env.acme_manager
-                    .add_acme_item(AcmeItem::new(
-                        cert_config.domain,
-                        cert_config.acme_type.unwrap_or(ChallengeType::TlsAlpn01),
-                        cert_config.data,
-                    ))
-                    .map_err(|e| stack_err!(StackErrorCode::InvalidConfig, "{e}"))?;
+                    ));
+                }
             }
         }
+        let mut cert: Arc<dyn ResolvesServerCert> = cert_resolver;
+        if let Some(identity_certs) = identity_certs {
+            cert = IdentityCertResolver::new(identity_certs, Some(cert));
+        }
+
         let cert: Arc<dyn ResolvesServerCert> = if self_cert {
-            Arc::new(TlsCertResolver::new(
-                cert_resolver,
-                Some(env.self_cert_mgr.clone()),
-            ))
+            Arc::new(TlsCertResolver::new(cert, Some(env.self_cert_mgr.clone())))
         } else {
-            cert_resolver
+            cert
         };
         Ok(cert)
     }
@@ -242,6 +272,7 @@ impl QuicConnectionHandler {
         )
         .await
         .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
+        insert_req_source_addr_group(&map, "conn_source_", remote_addr).await?;
         map.insert("dest_addr", CollectionValue::String(local_addr.to_string()))
             .await
             .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
@@ -334,13 +365,26 @@ impl QuicConnectionHandler {
                     let speed_stat = ComposedSpeedStat::new(speed_groups);
                     let cmd = list[0].as_str();
                     match cmd {
-                        "forward" => {
+                        "forward" | "forward-group" => {
                             if list.len() < 2 {
                                 return Err(stack_err!(
                                     StackErrorCode::InvalidConfig,
-                                    "invalid forward command"
+                                    "invalid {} command",
+                                    list[0]
                                 ));
                             }
+                            let is_group = list[0].as_str() == "forward-group";
+                            let plan: Option<ForwardPlan> = if is_group {
+                                Some(ForwardPlan::decode(list[1].as_str()).map_err(|e| {
+                                    stack_err!(
+                                        StackErrorCode::InvalidConfig,
+                                        "invalid forward plan: {}",
+                                        e
+                                    )
+                                })?)
+                            } else {
+                                None
+                            };
                             let speed_stat = speed_stat.clone();
                             loop {
                                 let (send, recv) = connection
@@ -362,20 +406,19 @@ impl QuicConnectionHandler {
                                     };
                                 let (stream, proxy_source_addr) =
                                     probe_proxy_protocol_stream(stream).await?;
-                                let request_source_addr =
-                                    proxy_source_addr.unwrap_or(remote_addr);
+                                let request_source_addr = proxy_source_addr.unwrap_or(remote_addr);
                                 let stream_info = StreamInfo::with_addrs(
                                     Some(remote_addr.to_string()),
                                     proxy_source_addr.map(|a| a.to_string()),
                                 )
                                 .with_dst_addr(Some(local_addr.to_string()))
                                 .with_device_info(
-                                    device_info.as_ref().and_then(|v| {
-                                        v.mac().map(|m| m.to_string())
-                                    }),
-                                    device_info.as_ref().and_then(|v| {
-                                        v.hostname().map(|h| h.to_string())
-                                    }),
+                                    device_info
+                                        .as_ref()
+                                        .and_then(|v| v.mac().map(|m| m.to_string())),
+                                    device_info
+                                        .as_ref()
+                                        .and_then(|v| v.hostname().map(|h| h.to_string())),
                                     device_info
                                         .as_ref()
                                         .map(|v| v.today_online_seconds().to_string()),
@@ -384,7 +427,10 @@ impl QuicConnectionHandler {
                                 let stat_stream =
                                     StatStream::new_with_tracker(stream, speed_stat.clone());
                                 let speed = stat_stream.get_speed_stat();
-                                let target = list[1].clone();
+                                let target_or_plan: Result<String, ForwardPlan> = match &plan {
+                                    Some(p) => Err(p.clone()),
+                                    None => Ok(list[1].clone()),
+                                };
                                 let stream: Box<dyn AsyncStream> = if limiter.is_some() {
                                     let (read_limit, write_limit) =
                                         limiter.as_ref().unwrap().new_limit_session();
@@ -397,14 +443,27 @@ impl QuicConnectionHandler {
                                 let tunnel_manager = self.env.tunnel_manager.clone();
                                 let forward_info = stream_info.clone();
                                 let handle = tokio::spawn(async move {
-                                    if let Err(e) = stream_forward(
-                                        stream,
-                                        target.as_str(),
-                                        &tunnel_manager,
-                                        Some(&forward_info),
-                                    )
-                                    .await
-                                    {
+                                    let result = match target_or_plan {
+                                        Ok(target) => {
+                                            stream_forward(
+                                                stream,
+                                                target.as_str(),
+                                                &tunnel_manager,
+                                                Some(&forward_info),
+                                            )
+                                            .await
+                                        }
+                                        Err(plan) => {
+                                            stream_forward_group(
+                                                stream,
+                                                &plan,
+                                                &tunnel_manager,
+                                                Some(&forward_info),
+                                            )
+                                            .await
+                                        }
+                                    };
+                                    if let Err(e) = result {
                                         log::error!("stream forward error: {}", e);
                                     }
                                 });
@@ -619,19 +678,18 @@ impl QuicConnectionHandler {
                                             )
                                             .with_dst_addr(Some(local_addr.to_string()))
                                             .with_device_info(
-                                                device_info.as_ref().and_then(|v| {
-                                                    v.mac().map(|m| m.to_string())
-                                                }),
+                                                device_info
+                                                    .as_ref()
+                                                    .and_then(|v| v.mac().map(|m| m.to_string())),
                                                 device_info.as_ref().and_then(|v| {
                                                     v.hostname().map(|h| h.to_string())
                                                 }),
-                                                device_info.as_ref().map(|v| {
-                                                    v.today_online_seconds().to_string()
-                                                }),
+                                                device_info
+                                                    .as_ref()
+                                                    .map(|v| v.today_online_seconds().to_string()),
                                             );
-                                            if let Err(e) = server
-                                                .serve_connection(stream, info)
-                                                .await
+                                            if let Err(e) =
+                                                server.serve_connection(stream, info).await
                                             {
                                                 log::error!("server error: {}", e);
                                             }
@@ -670,26 +728,24 @@ impl QuicConnectionHandler {
     }
 }
 
-async fn build_tls_domain_configs(certs: &[StackCertConfig]) -> StackResult<Vec<TlsDomainConfig>> {
+async fn build_quic_domain_configs(
+    certs: &[StackCertConfig],
+) -> StackResult<Vec<QuicDomainConfig>> {
     let mut cert_list = Vec::with_capacity(certs.len());
     for cert_config in certs.iter() {
         if cert_config.cert_path.is_some() && cert_config.key_path.is_some() {
             let certs = load_certs(cert_config.cert_path.as_deref().unwrap()).await?;
             let key = load_key(cert_config.key_path.as_deref().unwrap()).await?;
-            cert_list.push(TlsDomainConfig {
+            cert_list.push(QuicDomainConfig {
                 domain: cert_config.domain.clone(),
-                acme_type: None,
                 certs: Some(certs),
                 key: Some(key),
-                data: None,
             });
         } else {
-            cert_list.push(TlsDomainConfig {
+            cert_list.push(QuicDomainConfig {
                 domain: cert_config.domain.clone(),
-                acme_type: cert_config.acme_type.clone(),
                 certs: None,
                 key: None,
-                data: cert_config.data.clone(),
             });
         }
     }
@@ -1418,6 +1474,7 @@ impl QuicStackInner {
                     StackErrorCode::IoError,
                     "create socket error"
                 ))?;
+        super::try_enable_dual_stack(&socket, addr);
         socket.set_nonblocking(true).map_err(into_stack_err!(
             StackErrorCode::IoError,
             "set nonblocking error"
@@ -1543,8 +1600,11 @@ impl QuicStack {
         )
         .await?;
         let handler = Arc::new(RwLock::new(Arc::new(handler)));
-        let certs =
-            QuicConnectionHandler::build_cert_resolver(builder.certs, stack_context.as_ref())?;
+        let certs = QuicConnectionHandler::build_cert_resolver(
+            builder.certs,
+            builder.identity_certs,
+            stack_context.as_ref(),
+        )?;
 
         Ok(QuicStack {
             inner: Arc::new(QuicStackInner {
@@ -1667,7 +1727,8 @@ pub struct QuicStackBuilder {
     id: Option<String>,
     bind: Option<String>,
     hook_point: Option<ProcessChainConfigs>,
-    certs: Vec<TlsDomainConfig>,
+    certs: Vec<QuicDomainConfig>,
+    identity_certs: Option<TlsIdentityCertConfig>,
     alpn_protocols: Vec<Vec<u8>>,
     concurrency: u32,
     reuse_address: bool,
@@ -1683,6 +1744,7 @@ impl QuicStackBuilder {
             bind: None,
             hook_point: None,
             certs: vec![],
+            identity_certs: None,
             concurrency: 1024,
             alpn_protocols: vec![],
             reuse_address: false,
@@ -1706,8 +1768,13 @@ impl QuicStackBuilder {
         self
     }
 
-    pub fn add_certs(mut self, certs: Vec<TlsDomainConfig>) -> Self {
+    pub fn add_certs(mut self, certs: Vec<QuicDomainConfig>) -> Self {
         self.certs = certs;
+        self
+    }
+
+    pub(crate) fn identity_certs(mut self, identity_certs: Option<TlsIdentityCertConfig>) -> Self {
+        self.identity_certs = identity_certs;
         self
     }
 
@@ -1757,6 +1824,11 @@ pub struct QuicStackConfig {
     pub bind: SocketAddr,
     pub concurrency: Option<u32>,
     pub hook_point: Vec<ProcessChainConfig>,
+    #[serde(default)]
+    pub hosts: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub identity_manager: Option<TlsIdentityManagerConfig>,
+    #[serde(default)]
     pub certs: Vec<StackCertConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub alpn_protocols: Option<Vec<String>>,
@@ -1811,7 +1883,9 @@ impl StackFactory for QuicStackFactory {
                 StackErrorCode::InvalidConfig,
                 "invalid quic stack config"
             ))?;
-        let cert_list = build_tls_domain_configs(&config.certs).await?;
+        let cert_list = build_quic_domain_configs(&config.certs).await?;
+        let identity_certs =
+            build_identity_cert_config(&config.hosts, config.identity_manager.as_ref())?;
         let stack_context = context
             .as_ref()
             .as_any()
@@ -1837,6 +1911,7 @@ impl StackFactory for QuicStackFactory {
             .connection_manager(self.connection_manager.clone())
             .hook_point(config.hook_point.clone())
             .add_certs(cert_list)
+            .identity_certs(identity_certs)
             .alpn_protocols(
                 config
                     .alpn_protocols
@@ -1860,13 +1935,13 @@ impl StackFactory for QuicStackFactory {
 mod tests {
     use crate::global_process_chains::{GlobalProcessChains, GlobalProcessChainsRef};
     use crate::{
-        AcmeCertManager, AcmeCertManagerRef, CertManagerConfig, ConnectionManager,
-        DefaultLimiterManager, GlobalCollectionManager, GlobalCollectionManagerRef,
-        LimiterManagerRef, ProcessChainConfigs, ProcessChainHttpServer, QuicStack, QuicStackConfig,
-        QuicStackContext, QuicStackFactory, SelfCertConfig, SelfCertMgr, SelfCertMgrRef, Server,
-        ServerManager, ServerManagerRef, ServerResult, Stack, StackContext, StackFactory,
-        StackProtocol, StatManager, StatManagerRef, StreamInfo, StreamServer, TlsDomainConfig,
-        TunnelManager, create_io_dump_stack_config, decode_io_dump_frames,
+        ConnectionManager, DefaultLimiterManager, GlobalCollectionManager,
+        GlobalCollectionManagerRef, LimiterManagerRef, ProcessChainConfigs, ProcessChainHttpServer,
+        QuicDomainConfig, QuicStack, QuicStackConfig, QuicStackContext, QuicStackFactory,
+        SelfCertConfig, SelfCertMgr, SelfCertMgrRef, Server, ServerManager, ServerManagerRef,
+        ServerResult, Stack, StackContext, StackFactory, StackProtocol, StatManager,
+        StatManagerRef, StreamInfo, StreamServer, TunnelManager, create_io_dump_stack_config,
+        decode_io_dump_frames,
     };
     use buckyos_kit::AsyncStream;
     use h3::error::{ConnectionError, StreamError};
@@ -1888,7 +1963,6 @@ mod tests {
         tunnel_manager: TunnelManager,
         limiter_manager: LimiterManagerRef,
         stat_manager: StatManagerRef,
-        acme_manager: AcmeCertManagerRef,
         self_cert_mgr: SelfCertMgrRef,
         global_process_chains: Option<GlobalProcessChainsRef>,
         global_collection_manager: Option<GlobalCollectionManagerRef>,
@@ -1898,7 +1972,6 @@ mod tests {
             tunnel_manager,
             limiter_manager,
             stat_manager,
-            acme_manager,
             self_cert_mgr,
             global_process_chains,
             global_collection_manager,
@@ -1948,9 +2021,6 @@ mod tests {
         let tunnel_manager = TunnelManager::new();
         let limiter_manager = Arc::new(DefaultLimiterManager::new());
         let stat_manager = StatManager::new();
-        let acme_manager = AcmeCertManager::create(CertManagerConfig::default())
-            .await
-            .unwrap();
         let self_cert_mgr = SelfCertMgr::create(SelfCertConfig::default())
             .await
             .unwrap();
@@ -1959,7 +2029,6 @@ mod tests {
             tunnel_manager.clone(),
             limiter_manager.clone(),
             stat_manager.clone(),
-            acme_manager.clone(),
             self_cert_mgr.clone(),
             None,
             None,
@@ -1977,7 +2046,6 @@ mod tests {
             tunnel_manager.clone(),
             limiter_manager.clone(),
             stat_manager.clone(),
-            acme_manager.clone(),
             self_cert_mgr.clone(),
             Some(Arc::new(GlobalProcessChains::new())),
             None,
@@ -1986,14 +2054,12 @@ mod tests {
             .id("test")
             .bind("127.0.0.1:9080")
             .hook_point(vec![])
-            .add_certs(vec![TlsDomainConfig {
+            .add_certs(vec![QuicDomainConfig {
                 domain: "www.buckyos.com".to_string(),
-                acme_type: None,
                 certs: Some(vec![cert_key.cert.der().clone()]),
                 key: Some(PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
                     cert_key.signing_key.serialize_der(),
                 ))),
-                data: None,
             }])
             .stack_context(stack_context)
             .build()
@@ -2021,9 +2087,6 @@ mod tests {
             TunnelManager::new(),
             Arc::new(DefaultLimiterManager::new()),
             StatManager::new(),
-            AcmeCertManager::create(CertManagerConfig::default())
-                .await
-                .unwrap(),
             SelfCertMgr::create(SelfCertConfig::default())
                 .await
                 .unwrap(),
@@ -2034,14 +2097,12 @@ mod tests {
             .id("test")
             .bind("127.0.0.1:9180")
             .hook_point(chains)
-            .add_certs(vec![TlsDomainConfig {
+            .add_certs(vec![QuicDomainConfig {
                 domain: "www.buckyos.com".to_string(),
-                acme_type: None,
                 certs: Some(vec![cert_key.cert.der().clone()]),
                 key: Some(PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
                     cert_key.signing_key.serialize_der(),
                 ))),
-                data: None,
             }])
             .stack_context(stack_context)
             .build()
@@ -2097,9 +2158,6 @@ mod tests {
             TunnelManager::new(),
             Arc::new(DefaultLimiterManager::new()),
             StatManager::new(),
-            AcmeCertManager::create(CertManagerConfig::default())
-                .await
-                .unwrap(),
             SelfCertMgr::create(SelfCertConfig::default())
                 .await
                 .unwrap(),
@@ -2110,14 +2168,12 @@ mod tests {
             .id("test")
             .bind("127.0.0.1:9181")
             .hook_point(chains)
-            .add_certs(vec![TlsDomainConfig {
+            .add_certs(vec![QuicDomainConfig {
                 domain: "www.buckyos.com".to_string(),
-                acme_type: None,
                 certs: Some(vec![cert_key.cert.der().clone()]),
                 key: Some(PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
                     cert_key.signing_key.serialize_der(),
                 ))),
-                data: None,
             }])
             .stack_context(stack_context)
             .build()
@@ -2179,9 +2235,6 @@ mod tests {
             TunnelManager::new(),
             Arc::new(DefaultLimiterManager::new()),
             StatManager::new(),
-            AcmeCertManager::create(CertManagerConfig::default())
-                .await
-                .unwrap(),
             SelfCertMgr::create(self_cert_config).await.unwrap(),
             Some(Arc::new(GlobalProcessChains::new())),
             None,
@@ -2190,12 +2243,10 @@ mod tests {
             .id("test")
             .bind("127.0.0.1:9193")
             .hook_point(chains)
-            .add_certs(vec![TlsDomainConfig {
+            .add_certs(vec![QuicDomainConfig {
                 domain: "*".to_string(),
-                acme_type: None,
                 certs: None,
                 key: None,
-                data: None,
             }])
             .stack_context(stack_context)
             .build()
@@ -2343,9 +2394,6 @@ mod tests {
             tunnel_manager,
             Arc::new(DefaultLimiterManager::new()),
             StatManager::new(),
-            AcmeCertManager::create(CertManagerConfig::default())
-                .await
-                .unwrap(),
             SelfCertMgr::create(SelfCertConfig::default())
                 .await
                 .unwrap(),
@@ -2356,14 +2404,12 @@ mod tests {
             .id("test")
             .bind("127.0.0.1:9185")
             .hook_point(chains)
-            .add_certs(vec![TlsDomainConfig {
+            .add_certs(vec![QuicDomainConfig {
                 domain: "www.buckyos.com".to_string(),
-                acme_type: None,
                 certs: Some(vec![cert_key.cert.der().clone()]),
                 key: Some(PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
                     cert_key.signing_key.serialize_der(),
                 ))),
-                data: None,
             }])
             .stack_context(stack_context)
             .build()
@@ -2463,9 +2509,6 @@ mod tests {
             tunnel_manager,
             Arc::new(DefaultLimiterManager::new()),
             StatManager::new(),
-            AcmeCertManager::create(CertManagerConfig::default())
-                .await
-                .unwrap(),
             SelfCertMgr::create(SelfCertConfig::default())
                 .await
                 .unwrap(),
@@ -2476,14 +2519,12 @@ mod tests {
             .id("test")
             .bind("127.0.0.1:9186")
             .hook_point(chains)
-            .add_certs(vec![TlsDomainConfig {
+            .add_certs(vec![QuicDomainConfig {
                 domain: "www.buckyos.com".to_string(),
-                acme_type: None,
                 certs: Some(vec![cert_key.cert.der().clone()]),
                 key: Some(PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
                     cert_key.signing_key.serialize_der(),
                 ))),
-                data: None,
             }])
             .alpn_protocols(vec![b"h2".to_vec(), b"h3".to_vec()])
             .stack_context(stack_context)
@@ -2592,9 +2633,6 @@ mod tests {
             TunnelManager::new(),
             Arc::new(DefaultLimiterManager::new()),
             StatManager::new(),
-            AcmeCertManager::create(CertManagerConfig::default())
-                .await
-                .unwrap(),
             SelfCertMgr::create(SelfCertConfig::default())
                 .await
                 .unwrap(),
@@ -2617,14 +2655,12 @@ mod tests {
             .id("quic-raw")
             .bind("127.0.0.1:9197")
             .hook_point(chains)
-            .add_certs(vec![TlsDomainConfig {
+            .add_certs(vec![QuicDomainConfig {
                 domain: "www.buckyos.com".to_string(),
-                acme_type: None,
                 certs: Some(vec![cert_key.cert.der().clone()]),
                 key: Some(PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
                     cert_key.signing_key.serialize_der(),
                 ))),
-                data: None,
             }])
             .stack_context(ctx)
             .io_dump(io_dump)
@@ -2687,9 +2723,6 @@ mod tests {
             TunnelManager::new(),
             Arc::new(DefaultLimiterManager::new()),
             StatManager::new(),
-            AcmeCertManager::create(CertManagerConfig::default())
-                .await
-                .unwrap(),
             SelfCertMgr::create(SelfCertConfig::default())
                 .await
                 .unwrap(),
@@ -2712,14 +2745,12 @@ mod tests {
             .id("quic-raw-limit")
             .bind("127.0.0.1:9199")
             .hook_point(chains)
-            .add_certs(vec![TlsDomainConfig {
+            .add_certs(vec![QuicDomainConfig {
                 domain: "www.buckyos.com".to_string(),
-                acme_type: None,
                 certs: Some(vec![cert_key.cert.der().clone()]),
                 key: Some(PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
                     cert_key.signing_key.serialize_der(),
                 ))),
-                data: None,
             }])
             .stack_context(ctx)
             .io_dump(io_dump)
@@ -2818,9 +2849,6 @@ mod tests {
             TunnelManager::new(),
             Arc::new(DefaultLimiterManager::new()),
             StatManager::new(),
-            AcmeCertManager::create(CertManagerConfig::default())
-                .await
-                .unwrap(),
             SelfCertMgr::create(SelfCertConfig::default())
                 .await
                 .unwrap(),
@@ -2843,14 +2871,12 @@ mod tests {
             .id("quic-http")
             .bind("127.0.0.1:9198")
             .hook_point(chains)
-            .add_certs(vec![TlsDomainConfig {
+            .add_certs(vec![QuicDomainConfig {
                 domain: "www.buckyos.com".to_string(),
-                acme_type: None,
                 certs: Some(vec![cert_key.cert.der().clone()]),
                 key: Some(PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
                     cert_key.signing_key.serialize_der(),
                 ))),
-                data: None,
             }])
             .stack_context(ctx)
             .io_dump(io_dump)
@@ -2922,9 +2948,6 @@ mod tests {
             TunnelManager::new(),
             Arc::new(DefaultLimiterManager::new()),
             StatManager::new(),
-            AcmeCertManager::create(CertManagerConfig::default())
-                .await
-                .unwrap(),
             SelfCertMgr::create(SelfCertConfig::default())
                 .await
                 .unwrap(),
@@ -2947,14 +2970,12 @@ mod tests {
             .id("quic-http-limit")
             .bind("127.0.0.1:9200")
             .hook_point(chains)
-            .add_certs(vec![TlsDomainConfig {
+            .add_certs(vec![QuicDomainConfig {
                 domain: "www.buckyos.com".to_string(),
-                acme_type: None,
                 certs: Some(vec![cert_key.cert.der().clone()]),
                 key: Some(PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
                     cert_key.signing_key.serialize_der(),
                 ))),
-                data: None,
             }])
             .stack_context(ctx)
             .io_dump(io_dump)
@@ -3018,9 +3039,6 @@ mod tests {
             tunnel_manager,
             Arc::new(DefaultLimiterManager::new()),
             StatManager::new(),
-            AcmeCertManager::create(CertManagerConfig::default())
-                .await
-                .unwrap(),
             SelfCertMgr::create(SelfCertConfig::default())
                 .await
                 .unwrap(),
@@ -3031,14 +3049,12 @@ mod tests {
             .id("test")
             .bind("127.0.0.1:9188")
             .hook_point(chains)
-            .add_certs(vec![TlsDomainConfig {
+            .add_certs(vec![QuicDomainConfig {
                 domain: "www.buckyos.com".to_string(),
-                acme_type: None,
                 certs: Some(vec![cert_key.cert.der().clone()]),
                 key: Some(PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
                     cert_key.signing_key.serialize_der(),
                 ))),
-                data: None,
             }])
             .stack_context(stack_context)
             .build()
@@ -3115,9 +3131,6 @@ mod tests {
             tunnel_manager,
             Arc::new(DefaultLimiterManager::new()),
             stat_manager.clone(),
-            AcmeCertManager::create(CertManagerConfig::default())
-                .await
-                .unwrap(),
             SelfCertMgr::create(SelfCertConfig::default())
                 .await
                 .unwrap(),
@@ -3128,14 +3141,12 @@ mod tests {
             .id("test")
             .bind("127.0.0.1:9189")
             .hook_point(chains)
-            .add_certs(vec![TlsDomainConfig {
+            .add_certs(vec![QuicDomainConfig {
                 domain: "www.buckyos.com".to_string(),
-                acme_type: None,
                 certs: Some(vec![cert_key.cert.der().clone()]),
                 key: Some(PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
                     cert_key.signing_key.serialize_der(),
                 ))),
-                data: None,
             }])
             .stack_context(stack_context)
             .build()
@@ -3225,9 +3236,6 @@ mod tests {
             tunnel_manager,
             Arc::new(DefaultLimiterManager::new()),
             stat_manager.clone(),
-            AcmeCertManager::create(CertManagerConfig::default())
-                .await
-                .unwrap(),
             SelfCertMgr::create(SelfCertConfig::default())
                 .await
                 .unwrap(),
@@ -3238,14 +3246,12 @@ mod tests {
             .id("test")
             .bind("127.0.0.1:9190")
             .hook_point(chains)
-            .add_certs(vec![TlsDomainConfig {
+            .add_certs(vec![QuicDomainConfig {
                 domain: "www.buckyos.com".to_string(),
-                acme_type: None,
                 certs: Some(vec![cert_key.cert.der().clone()]),
                 key: Some(PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
                     cert_key.signing_key.serialize_der(),
                 ))),
-                data: None,
             }])
             .stack_context(stack_context)
             .build()
@@ -3350,9 +3356,6 @@ mod tests {
             tunnel_manager,
             limiter_manager,
             stat_manager.clone(),
-            AcmeCertManager::create(CertManagerConfig::default())
-                .await
-                .unwrap(),
             SelfCertMgr::create(SelfCertConfig::default())
                 .await
                 .unwrap(),
@@ -3363,14 +3366,12 @@ mod tests {
             .id("test")
             .bind("127.0.0.1:9191")
             .hook_point(chains)
-            .add_certs(vec![TlsDomainConfig {
+            .add_certs(vec![QuicDomainConfig {
                 domain: "www.buckyos.com".to_string(),
-                acme_type: None,
                 certs: Some(vec![cert_key.cert.der().clone()]),
                 key: Some(PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
                     cert_key.signing_key.serialize_der(),
                 ))),
-                data: None,
             }])
             .stack_context(stack_context)
             .build()
@@ -3475,9 +3476,6 @@ mod tests {
             tunnel_manager,
             limiter_manager,
             stat_manager.clone(),
-            AcmeCertManager::create(CertManagerConfig::default())
-                .await
-                .unwrap(),
             SelfCertMgr::create(SelfCertConfig::default())
                 .await
                 .unwrap(),
@@ -3488,14 +3486,12 @@ mod tests {
             .id("test")
             .bind("127.0.0.1:9192")
             .hook_point(chains)
-            .add_certs(vec![TlsDomainConfig {
+            .add_certs(vec![QuicDomainConfig {
                 domain: "www.buckyos.com".to_string(),
-                acme_type: None,
                 certs: Some(vec![cert_key.cert.der().clone()]),
                 key: Some(PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
                     cert_key.signing_key.serialize_der(),
                 ))),
-                data: None,
             }])
             .stack_context(stack_context)
             .build()
@@ -3562,10 +3558,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_factory() {
-        let mut cert_config = CertManagerConfig::default();
-        let data_dir = tempfile::tempdir().unwrap();
-        cert_config.keystore_path = data_dir.path().to_string_lossy().to_string();
-        let cert_manager = AcmeCertManager::create(cert_config).await.unwrap();
         let self_cert_mgr = SelfCertMgr::create(SelfCertConfig::default())
             .await
             .unwrap();
@@ -3584,6 +3576,8 @@ mod tests {
             bind: "127.0.0.1:3345".parse().unwrap(),
             concurrency: None,
             hook_point: vec![],
+            hosts: vec![],
+            identity_manager: None,
             certs: vec![],
             alpn_protocols: None,
             io_dump_file: None,
@@ -3598,7 +3592,6 @@ mod tests {
             tunnel_manager,
             limiter_manager,
             stat_manager,
-            cert_manager,
             self_cert_mgr,
             Some(global_process_chains),
             Some(collection_manager),
@@ -3606,5 +3599,36 @@ mod tests {
         ));
         let ret = factory.create(Arc::new(config), stack_context).await;
         assert!(ret.is_ok());
+    }
+
+    #[test]
+    fn test_quic_stack_config_uses_identity_hosts() {
+        let config: QuicStackConfig = serde_yaml_ng::from_str(
+            r#"
+id: quic_test
+protocol: quic
+bind: 127.0.0.1:4433
+hosts:
+  - example.com
+  - "*.example.org"
+identity_manager:
+  public_root_path: /tmp/identity
+  security_root_path: /tmp/security
+hook_point: []
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.hosts, vec!["example.com", "*.example.org"]);
+        assert!(config.certs.is_empty());
+        let identity_manager = config.identity_manager.unwrap();
+        assert_eq!(
+            identity_manager.public_root_path.as_deref(),
+            Some("/tmp/identity")
+        );
+        assert_eq!(
+            identity_manager.security_root_path.as_deref(),
+            Some("/tmp/security")
+        );
     }
 }

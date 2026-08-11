@@ -44,10 +44,81 @@ pub enum StackErrorCode {
 }
 pub type StackResult<T> = sfo_result::Result<T, StackErrorCode>;
 pub type StackError = sfo_result::Error<StackErrorCode>;
+use crate::forward::{
+    ForwardFailureRegistry, ForwardPlan, NextUpstreamCondition, NextUpstreamPolicy,
+    apply_least_time_via_tunnel_mgr,
+};
 use crate::{DatagramClientBox, TunnelManager};
 pub use sfo_result::err as stack_err;
 pub use sfo_result::into_err as into_stack_err;
 use url::Url;
+
+/// Best-effort dual-stack support for wildcard IPv6 listeners.
+///
+/// A bind such as `[::]:443` is intended as a convenient "listen on both
+/// families" form.  `IPV6_V6ONLY` defaults vary across operating systems and
+/// host policy, so explicitly try to disable it before binding.  This remains
+/// best-effort: strict dual-stack deployments can use separate IPv4 and IPv6
+/// stacks, while a platform that rejects the option can still start an
+/// IPv6-only listener.
+pub(crate) fn try_enable_dual_stack(socket: &socket2::Socket, bind_addr: std::net::SocketAddr) {
+    if !is_unspecified_ipv6_bind(bind_addr) {
+        return;
+    }
+
+    if let Err(error) = socket.set_only_v6(false) {
+        log::warn!(
+            "failed to disable IPV6_V6ONLY for wildcard bind {}: {}; continuing with platform default",
+            bind_addr,
+            error
+        );
+    }
+}
+
+fn is_unspecified_ipv6_bind(bind_addr: std::net::SocketAddr) -> bool {
+    matches!(
+        bind_addr,
+        std::net::SocketAddr::V6(bind_addr_v6) if bind_addr_v6.ip().is_unspecified()
+    )
+}
+
+#[cfg(test)]
+mod dual_stack_tests {
+    use super::is_unspecified_ipv6_bind;
+
+    #[test]
+    fn only_ipv6_wildcard_bind_requests_dual_stack() {
+        assert!(is_unspecified_ipv6_bind("[::]:443".parse().unwrap()));
+        assert!(!is_unspecified_ipv6_bind("[::1]:443".parse().unwrap()));
+        assert!(!is_unspecified_ipv6_bind(
+            "[2001:db8::1]:443".parse().unwrap()
+        ));
+        assert!(!is_unspecified_ipv6_bind("0.0.0.0:443".parse().unwrap()));
+    }
+}
+
+/// Insert a `<prefix>addr` / `<prefix>ip` / `<prefix>port` group into a REQ
+/// map collection. `prefix` is a source-layer prefix such as `source_`,
+/// `conn_source_` or `real_source_`.
+pub async fn insert_req_source_addr_group(
+    map: &cyfs_process_chain::MapCollectionRef,
+    prefix: &str,
+    addr: std::net::SocketAddr,
+) -> StackResult<()> {
+    for (suffix, value) in [
+        ("addr", addr.to_string()),
+        ("ip", addr.ip().to_string()),
+        ("port", addr.port().to_string()),
+    ] {
+        map.insert(
+            format!("{}{}", prefix, suffix).as_str(),
+            CollectionValue::String(value),
+        )
+        .await
+        .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
+    }
+    Ok(())
+}
 
 pub async fn get_source_addr_from_req_env(
     global_env: &cyfs_process_chain::EnvRef,
@@ -103,12 +174,9 @@ pub async fn stream_forward(
         if let Some(info) = info {
             let src_addr = info.src_addr.as_deref();
             let dst_addr = info.dst_addr.as_deref();
-            let _ = proxy_protocol::write_proxy_v2_preamble(
-                &mut forward_stream,
-                src_addr,
-                dst_addr,
-            )
-            .await?;
+            let _ =
+                proxy_protocol::write_proxy_v2_preamble(&mut forward_stream, src_addr, dst_addr)
+                    .await?;
         }
     }
 
@@ -118,6 +186,197 @@ pub async fn stream_forward(
             StackErrorCode::StreamError,
             "target {target}"
         ))?;
+    Ok(())
+}
+
+/// Walk the candidate list of a `ForwardPlan` until we successfully open a
+/// stream tunnel, then run `copy_bidirectional`. Retries are connection-stage
+/// only — once a candidate has been opened we never silently fail over.
+///
+/// Implements §6.4 of `forward机制升级需求.md`. Honors `policy.timeout`
+/// as a wall-clock budget that caps the total cost of all candidate
+/// attempts (§6.3 "next_upstream_tries 和 next_upstream_timeout 必须限
+/// 制单次请求的最大尝试成本"). The timer starts before the first
+/// attempt and any remaining slice is passed to `tokio::time::timeout`
+/// per attempt, so a slow candidate cannot blow past the budget.
+pub async fn stream_forward_group(
+    stream: Box<dyn AsyncStream>,
+    plan: &ForwardPlan,
+    tunnel_manager: &TunnelManager,
+    info: Option<&crate::StreamInfo>,
+) -> StackResult<()> {
+    // Stage 4: re-order plan candidates by RTT before iterating when
+    // the plan asked for least-time selection. Best-effort: any failure
+    // in tunnel_mgr leaves the original order untouched.
+    let mut plan_local;
+    let plan: &ForwardPlan = if matches!(plan.balance, crate::forward::BalanceMethod::LeastTime) {
+        plan_local = plan.clone();
+        apply_least_time_via_tunnel_mgr(&mut plan_local, tunnel_manager).await;
+        &plan_local
+    } else {
+        plan
+    };
+    let registry = ForwardFailureRegistry::global();
+    let group_key = plan.failure_state_key();
+    let policy = &plan.next_upstream;
+    let max_attempts = policy_max_attempts(policy, plan.candidates.len());
+    let deadline = policy.timeout.map(|d| std::time::Instant::now() + d);
+
+    let mut last_err: Option<StackError> = None;
+    let mut last_target_url: Option<String> = None;
+    let mut chosen: Option<(usize, Box<dyn AsyncStream>, String, bool)> = None;
+
+    for (idx, candidate) in plan.candidates.iter().enumerate() {
+        if idx >= max_attempts {
+            break;
+        }
+        // Bail before issuing the next attempt if we're already out of
+        // budget — even if `tries` would still allow another. This keeps
+        // a long candidate list from amortizing a tight timeout into
+        // many failed but cheap attempts that still over-shoot.
+        if let Some(d) = deadline {
+            if std::time::Instant::now() >= d {
+                last_err.get_or_insert_with(|| {
+                    stack_err!(
+                        StackErrorCode::TunnelError,
+                        "forward-group {} next_upstream timeout exceeded before idx={}",
+                        group_key,
+                        idx
+                    )
+                });
+                break;
+            }
+        }
+
+        let url = match Url::parse(&candidate.url) {
+            Ok(u) => u,
+            Err(e) => {
+                let err = stack_err!(
+                    StackErrorCode::InvalidConfig,
+                    "invalid forward url {}: {}",
+                    candidate.url,
+                    e
+                );
+                last_err = Some(err);
+                last_target_url = Some(candidate.url.clone());
+                registry.record_failure(
+                    &group_key,
+                    &candidate.url,
+                    candidate.max_fails,
+                    candidate.fail_timeout,
+                );
+                if !should_continue(policy, idx, max_attempts, NextUpstreamCondition::Error) {
+                    break;
+                }
+                continue;
+            }
+        };
+
+        let emit_proxy_v2 = url
+            .query_pairs()
+            .any(|(k, v)| k == "proxy_protocol" && v.eq_ignore_ascii_case("v2"));
+
+        let attempt = tunnel_manager.open_stream_by_url(&url);
+        let (result, cond) = match deadline {
+            Some(d) => {
+                let remaining = d.saturating_duration_since(std::time::Instant::now());
+                match tokio::time::timeout(remaining, attempt).await {
+                    Ok(r) => (
+                        r.map_err(|e| crate::TunnelError::ConnectError(e.to_string())),
+                        NextUpstreamCondition::Error,
+                    ),
+                    Err(_) => (
+                        Err(crate::TunnelError::ConnectError(format!(
+                            "next_upstream timeout exceeded ({}ms budget) on {}",
+                            policy.timeout.unwrap_or_default().as_millis(),
+                            candidate.url,
+                        ))),
+                        NextUpstreamCondition::Timeout,
+                    ),
+                }
+            }
+            None => (
+                attempt
+                    .await
+                    .map_err(|e| crate::TunnelError::ConnectError(e.to_string())),
+                NextUpstreamCondition::Error,
+            ),
+        };
+
+        match result {
+            Ok(forward_stream) => {
+                registry.record_success(&group_key, &candidate.url);
+                chosen = Some((idx, forward_stream, candidate.url.clone(), emit_proxy_v2));
+                break;
+            }
+            Err(e) => {
+                let err = stack_err!(
+                    StackErrorCode::TunnelError,
+                    "open upstream {} failed: {}",
+                    candidate.url,
+                    e
+                );
+                log::debug!(
+                    "forward-group {}: candidate {} (idx {}) failed to open: {}",
+                    group_key,
+                    candidate.url,
+                    idx,
+                    err
+                );
+                registry.record_failure(
+                    &group_key,
+                    &candidate.url,
+                    candidate.max_fails,
+                    candidate.fail_timeout,
+                );
+                last_err = Some(err);
+                last_target_url = Some(candidate.url.clone());
+                if !should_continue(policy, idx, max_attempts, cond) {
+                    break;
+                }
+            }
+        }
+    }
+
+    let (idx, mut forward_stream, target_url, emit_proxy_v2) = match chosen {
+        Some(v) => v,
+        None => {
+            return Err(last_err.unwrap_or_else(|| {
+                stack_err!(
+                    StackErrorCode::TunnelError,
+                    "forward-group {} exhausted candidates",
+                    group_key
+                )
+            }));
+        }
+    };
+
+    log::debug!(
+        "forward-group {}: selected candidate idx={} url={}",
+        group_key,
+        idx,
+        target_url
+    );
+
+    let mut stream = stream;
+    if emit_proxy_v2 {
+        if let Some(info) = info {
+            let src_addr = info.src_addr.as_deref();
+            let dst_addr = info.dst_addr.as_deref();
+            let _ =
+                proxy_protocol::write_proxy_v2_preamble(&mut forward_stream, src_addr, dst_addr)
+                    .await?;
+        }
+    }
+
+    tokio::io::copy_bidirectional(&mut stream, forward_stream.as_mut())
+        .await
+        .map_err(into_stack_err!(
+            StackErrorCode::StreamError,
+            "target {target_url}"
+        ))?;
+
+    let _ = last_target_url; // suppress unused
     Ok(())
 }
 
@@ -140,6 +399,178 @@ pub async fn datagram_forward(
         .await
         .map_err(into_stack_err!(StackErrorCode::TunnelError))?;
     Ok(())
+}
+
+/// Walk the candidate list of a `ForwardPlan` for datagram forwarding.
+/// Connection-stage retry only: once a datagram client has been created, a
+/// failure inside `copy_datagram_bidirectional` is propagated, never retried
+/// transparently. Implements §6.5. Honors `policy.timeout` as a wall-clock
+/// budget (see `stream_forward_group`).
+pub async fn datagram_forward_group(
+    datagram: Box<dyn DatagramClientBox>,
+    plan: &ForwardPlan,
+    tunnel_manager: &TunnelManager,
+) -> StackResult<()> {
+    let mut plan_local;
+    let plan: &ForwardPlan = if matches!(plan.balance, crate::forward::BalanceMethod::LeastTime) {
+        plan_local = plan.clone();
+        apply_least_time_via_tunnel_mgr(&mut plan_local, tunnel_manager).await;
+        &plan_local
+    } else {
+        plan
+    };
+    let registry = ForwardFailureRegistry::global();
+    let group_key = plan.failure_state_key();
+    let policy = &plan.next_upstream;
+    let max_attempts = policy_max_attempts(policy, plan.candidates.len());
+    let deadline = policy.timeout.map(|d| std::time::Instant::now() + d);
+
+    let mut last_err: Option<StackError> = None;
+    let mut chosen: Option<(usize, Box<dyn DatagramClientBox>, String)> = None;
+
+    for (idx, candidate) in plan.candidates.iter().enumerate() {
+        if idx >= max_attempts {
+            break;
+        }
+        if let Some(d) = deadline {
+            if std::time::Instant::now() >= d {
+                last_err.get_or_insert_with(|| {
+                    stack_err!(
+                        StackErrorCode::TunnelError,
+                        "forward-group {} next_upstream timeout exceeded before idx={}",
+                        group_key,
+                        idx
+                    )
+                });
+                break;
+            }
+        }
+        let url = match Url::parse(&candidate.url) {
+            Ok(u) => u,
+            Err(e) => {
+                let err = stack_err!(
+                    StackErrorCode::InvalidConfig,
+                    "invalid forward url {}: {}",
+                    candidate.url,
+                    e
+                );
+                last_err = Some(err);
+                registry.record_failure(
+                    &group_key,
+                    &candidate.url,
+                    candidate.max_fails,
+                    candidate.fail_timeout,
+                );
+                if !should_continue(policy, idx, max_attempts, NextUpstreamCondition::Error) {
+                    break;
+                }
+                continue;
+            }
+        };
+        let attempt = tunnel_manager.create_datagram_client_by_url(&url);
+        let (result, cond) = match deadline {
+            Some(d) => {
+                let remaining = d.saturating_duration_since(std::time::Instant::now());
+                match tokio::time::timeout(remaining, attempt).await {
+                    Ok(r) => (
+                        r.map_err(|e| crate::TunnelError::ConnectError(e.to_string())),
+                        NextUpstreamCondition::Error,
+                    ),
+                    Err(_) => (
+                        Err(crate::TunnelError::ConnectError(format!(
+                            "next_upstream timeout exceeded ({}ms budget) on {}",
+                            policy.timeout.unwrap_or_default().as_millis(),
+                            candidate.url,
+                        ))),
+                        NextUpstreamCondition::Timeout,
+                    ),
+                }
+            }
+            None => (
+                attempt
+                    .await
+                    .map_err(|e| crate::TunnelError::ConnectError(e.to_string())),
+                NextUpstreamCondition::Error,
+            ),
+        };
+        match result {
+            Ok(client) => {
+                registry.record_success(&group_key, &candidate.url);
+                chosen = Some((idx, client, candidate.url.clone()));
+                break;
+            }
+            Err(e) => {
+                let err = stack_err!(
+                    StackErrorCode::TunnelError,
+                    "create datagram client {} failed: {}",
+                    candidate.url,
+                    e
+                );
+                log::debug!(
+                    "forward-group {}: datagram candidate {} (idx {}) failed: {}",
+                    group_key,
+                    candidate.url,
+                    idx,
+                    err
+                );
+                registry.record_failure(
+                    &group_key,
+                    &candidate.url,
+                    candidate.max_fails,
+                    candidate.fail_timeout,
+                );
+                last_err = Some(err);
+                if !should_continue(policy, idx, max_attempts, cond) {
+                    break;
+                }
+            }
+        }
+    }
+
+    let (_idx, forward_datagram, _target) = match chosen {
+        Some(v) => v,
+        None => {
+            return Err(last_err.unwrap_or_else(|| {
+                stack_err!(
+                    StackErrorCode::TunnelError,
+                    "forward-group {} exhausted datagram candidates",
+                    group_key
+                )
+            }));
+        }
+    };
+
+    copy_datagram_bidirectional(datagram, forward_datagram)
+        .await
+        .map_err(into_stack_err!(StackErrorCode::TunnelError))?;
+    Ok(())
+}
+
+fn policy_max_attempts(policy: &NextUpstreamPolicy, candidate_count: usize) -> usize {
+    if !policy.is_enabled() {
+        return candidate_count.min(1).max(1);
+    }
+    let tries = policy.tries as usize;
+    if tries == 0 {
+        candidate_count
+    } else {
+        tries.min(candidate_count)
+    }
+}
+
+fn should_continue(
+    policy: &NextUpstreamPolicy,
+    attempted_idx: usize,
+    max_attempts: usize,
+    cond: NextUpstreamCondition,
+) -> bool {
+    if !policy.is_enabled() {
+        return false;
+    }
+    if !policy.allows(cond) {
+        return false;
+    }
+    attempted_idx + 1 < max_attempts
 }
 
 #[allow(unreachable_code)]

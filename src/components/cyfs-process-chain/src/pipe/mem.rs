@@ -1,4 +1,4 @@
-use super::pipe::CommandPipe;
+use super::types::CommandPipe;
 use std::io::Cursor;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -13,10 +13,7 @@ pub struct SharedMemoryOutput {
 
 impl SharedMemoryOutput {
     pub fn new() -> Self {
-        let buffer = Cursor::new(Vec::new());
-        let buffer = BufWriter::new(buffer);
-        let buffer = Arc::new(Mutex::new(buffer));
-        Self { buffer }
+        Self::default()
     }
 
     pub fn clone_buffer(&self) -> Vec<u8> {
@@ -48,6 +45,15 @@ impl SharedMemoryOutput {
 
         let cursor = buffer.into_inner();
         Ok(cursor.into_inner())
+    }
+}
+
+impl Default for SharedMemoryOutput {
+    fn default() -> Self {
+        let buffer = Cursor::new(Vec::new());
+        let buffer = BufWriter::new(buffer);
+        let buffer = Arc::new(Mutex::new(buffer));
+        Self { buffer }
     }
 }
 

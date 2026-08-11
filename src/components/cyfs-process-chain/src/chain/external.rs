@@ -1,6 +1,7 @@
 use crate::collection::CollectionValue;
 use std::any::Any;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::RwLock as AsyncRwLock;
 
 #[async_trait::async_trait]
@@ -24,6 +25,37 @@ pub trait EnvExternal: Any + Send + Sync {
     /// Remove the variable with the given key from the environment.
     /// If the key does not exist, return None.
     async fn remove(&self, key: &str) -> Result<Option<CollectionValue>, String>;
+
+    /// Gets a value only when this external environment handles the key.
+    async fn get_existing(&self, key: &str) -> Result<(bool, Option<CollectionValue>), String> {
+        if self.contains(key).await? {
+            Ok((true, self.get(key).await?))
+        } else {
+            Ok((false, None))
+        }
+    }
+
+    /// Sets a value only when this external environment already handles the key.
+    async fn set_existing(
+        &self,
+        key: &str,
+        value: CollectionValue,
+    ) -> Result<(bool, Option<CollectionValue>), String> {
+        if self.contains(key).await? {
+            Ok((true, self.set(key, value).await?))
+        } else {
+            Ok((false, None))
+        }
+    }
+
+    /// Removes a value only when this external environment handles the key.
+    async fn remove_existing(&self, key: &str) -> Result<(bool, Option<CollectionValue>), String> {
+        if self.contains(key).await? {
+            Ok((true, self.remove(key).await?))
+        } else {
+            Ok((false, None))
+        }
+    }
 }
 
 pub type EnvExternalRef = Arc<Box<dyn EnvExternal>>;
@@ -35,13 +67,17 @@ struct EnvExternalItem {
 
 pub struct EnvExternalManager {
     external: AsyncRwLock<Vec<EnvExternalItem>>,
+    external_count: AtomicUsize,
 }
 
 impl EnvExternalManager {
     pub fn new() -> Self {
-        Self {
-            external: AsyncRwLock::new(Vec::new()),
-        }
+        Self::default()
+    }
+
+    /// Returns true when at least one external environment is registered.
+    pub fn has_external(&self) -> bool {
+        self.external_count.load(Ordering::Acquire) > 0
     }
 
     pub async fn add_external(&self, id: &str, value: EnvExternalRef) -> Result<(), String> {
@@ -56,6 +92,7 @@ impl EnvExternalManager {
             id: id.to_owned(),
             value,
         });
+        self.external_count.fetch_add(1, Ordering::Release);
         Ok(())
     }
 
@@ -63,6 +100,7 @@ impl EnvExternalManager {
         let mut lock = self.external.write().await;
         if let Some(pos) = lock.iter().position(|item| item.id == id) {
             let item = lock.remove(pos);
+            self.external_count.fetch_sub(1, Ordering::Release);
             Ok(Some(item.value))
         } else {
             let msg = format!("External environment with id '{}' not found", id);
@@ -98,8 +136,8 @@ impl EnvExternalManager {
     pub async fn get(&self, key: &str) -> Result<(bool, Option<CollectionValue>), String> {
         let lock = self.external.read().await;
         for item in lock.iter() {
-            if item.value.contains(key).await? {
-                let value = item.value.get(key).await?;
+            let (handled, value) = item.value.get_existing(key).await?;
+            if handled {
                 return Ok((true, value));
             }
         }
@@ -116,8 +154,8 @@ impl EnvExternalManager {
     ) -> Result<(bool, Option<CollectionValue>), String> {
         let lock = self.external.read().await;
         for item in lock.iter() {
-            if item.value.contains(key).await? {
-                let old_value = item.value.set(key, value.clone()).await?;
+            let (handled, old_value) = item.value.set_existing(key, value.clone()).await?;
+            if handled {
                 return Ok((true, old_value));
             }
         }
@@ -131,12 +169,21 @@ impl EnvExternalManager {
     pub async fn remove(&self, key: &str) -> Result<(bool, Option<CollectionValue>), String> {
         let lock = self.external.read().await;
         for item in lock.iter() {
-            if item.value.contains(key).await? {
-                let old_value = item.value.remove(key).await?;
+            let (handled, old_value) = item.value.remove_existing(key).await?;
+            if handled {
                 return Ok((true, old_value));
             }
         }
 
         Ok((false, None))
+    }
+}
+
+impl Default for EnvExternalManager {
+    fn default() -> Self {
+        Self {
+            external: AsyncRwLock::new(Vec::new()),
+            external_count: AtomicUsize::new(0),
+        }
     }
 }

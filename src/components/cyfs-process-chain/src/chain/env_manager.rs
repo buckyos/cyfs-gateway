@@ -8,15 +8,28 @@ use std::sync::{Arc, RwLock};
 
 enum PathCollection {
     Root(EnvRef),
+    List(ListCollectionRef),
     Map(MapCollectionRef),
     Set(SetCollectionRef),           // Only for the last part of the path
     MultiMap(MultiMapCollectionRef), // Only for the last part of the path
 }
 
 impl PathCollection {
+    fn parse_list_index(key: &str) -> Result<usize, String> {
+        key.parse::<usize>().map_err(|e| {
+            let msg = format!("Invalid list index '{}': {}", key, e);
+            warn!("{}", msg);
+            msg
+        })
+    }
+
     pub async fn get(&self, key: &str) -> Result<Option<CollectionValue>, String> {
         match self {
             PathCollection::Root(env) => env.get(key).await,
+            PathCollection::List(list) => {
+                let index = Self::parse_list_index(key)?;
+                list.get(index).await
+            }
             PathCollection::Map(map) => map.get(key).await,
             PathCollection::Set(set) => match set.contains(key).await? {
                 true => Ok(Some(CollectionValue::String(key.to_string()))),
@@ -25,13 +38,29 @@ impl PathCollection {
             PathCollection::MultiMap(multi_map) => multi_map
                 .get_many(key)
                 .await
-                .map(|value| value.map(|set| CollectionValue::Set(set))),
+                .map(|value| value.map(CollectionValue::Set)),
         }
     }
 
     pub async fn insert_new(&self, key: &str, value: CollectionValue) -> Result<bool, String> {
         match self {
             PathCollection::Root(env) => env.create(key, value).await,
+            PathCollection::List(list) => {
+                let index = Self::parse_list_index(key)?;
+                let len = list.len().await?;
+                if index > len {
+                    let msg = format!("List index out of bounds for create: {} > {}", index, len);
+                    warn!("{}", msg);
+                    return Err(msg);
+                }
+
+                if index == len {
+                    list.insert(index, value).await?;
+                    Ok(true)
+                } else {
+                    Ok(false)
+                }
+            }
             PathCollection::Map(map) => map.insert_new(key, value).await,
             PathCollection::Set(set) => {
                 if let CollectionValue::String(s) = value {
@@ -60,6 +89,20 @@ impl PathCollection {
     ) -> Result<Option<CollectionValue>, String> {
         match self {
             PathCollection::Root(env) => env.set(key, value).await,
+            PathCollection::List(list) => {
+                let index = Self::parse_list_index(key)?;
+                let len = list.len().await?;
+                if index < len {
+                    list.set(index, value).await
+                } else if index == len {
+                    list.insert(index, value).await?;
+                    Ok(None)
+                } else {
+                    let msg = format!("List index out of bounds for set: {} > {}", index, len);
+                    warn!("{}", msg);
+                    Err(msg)
+                }
+            }
             PathCollection::Map(map) => map.insert(key, value).await,
             PathCollection::Set(set) => {
                 if let CollectionValue::String(s) = value {
@@ -91,6 +134,10 @@ impl PathCollection {
     pub async fn remove(&self, key: &str) -> Result<Option<CollectionValue>, String> {
         match self {
             PathCollection::Root(env) => env.remove(key).await,
+            PathCollection::List(list) => {
+                let index = Self::parse_list_index(key)?;
+                list.remove(index).await
+            }
             PathCollection::Map(map) => map.remove(key).await,
             PathCollection::Set(set) => {
                 if set.contains(key).await? {
@@ -102,11 +149,7 @@ impl PathCollection {
             }
             PathCollection::MultiMap(multi_map) => {
                 let ret = multi_map.remove_all(key).await?;
-                if ret.is_some() {
-                    Ok(Some(CollectionValue::Set(ret.unwrap())))
-                } else {
-                    Ok(None)
-                }
+                Ok(ret.map(CollectionValue::Set))
             }
         }
     }
@@ -173,6 +216,13 @@ pub struct EnvManager {
 }
 
 impl EnvManager {
+    pub(crate) fn is_simple_root_key(key: &str) -> bool {
+        !key.is_empty()
+            && key
+                .chars()
+                .all(|ch| !matches!(ch, '.' | '[' | ']' | '\\' | '(' | ')') && !ch.is_whitespace())
+    }
+
     pub fn get_log_level(&self) -> Level {
         let global_level = self.global.log_level();
         let chain_level = self.chain.log_level();
@@ -451,31 +501,39 @@ impl EnvManager {
         parts
     }
 
-    pub fn get_var_level(&self, key: &str) -> EnvLevel {
-        // Use the first part of the key to determine the level
-        let key_list = Self::parse_var(key);
-        let key = key_list[0].as_str();
-
+    fn get_var_level_for_root(&self, key: &str) -> EnvLevel {
         let tracker = self.var_level_tracker.read().unwrap();
         tracker.get(key).cloned().unwrap_or_default()
     }
 
+    pub fn get_var_level(&self, key: &str) -> EnvLevel {
+        if Self::is_simple_root_key(key) {
+            return self.get_var_level_for_root(key);
+        }
+
+        let key_list = Self::parse_var(key);
+        self.get_var_level_for_root(key_list[0].as_str())
+    }
+
     // Get the exact tracked level entry for a variable.
     // Returns None when there is no tracker entry (different from get_var_level defaulting).
-    pub fn var_level_entry(&self, key: &str) -> Option<EnvLevel> {
-        let key_list = Self::parse_var(key);
-        let key = key_list[0].as_str();
-
+    fn var_level_entry_for_root(&self, key: &str) -> Option<EnvLevel> {
         let tracker = self.var_level_tracker.read().unwrap();
         tracker.get(key).cloned()
     }
 
+    pub fn var_level_entry(&self, key: &str) -> Option<EnvLevel> {
+        if Self::is_simple_root_key(key) {
+            return self.var_level_entry_for_root(key);
+        }
+
+        let key_list = Self::parse_var(key);
+        self.var_level_entry_for_root(key_list[0].as_str())
+    }
+
     // Restore tracked level entry precisely.
     // Some(level) => set entry, None => remove entry.
-    pub fn restore_var_level_entry(&self, key: &str, level: Option<EnvLevel>) {
-        let key_list = Self::parse_var(key);
-        let key = key_list[0].as_str();
-
+    fn restore_var_level_entry_for_root(&self, key: &str, level: Option<EnvLevel>) {
         let mut tracker = self.var_level_tracker.write().unwrap();
         match level {
             Some(level) => {
@@ -504,11 +562,17 @@ impl EnvManager {
         }
     }
 
-    pub fn change_var_level(&self, key: &str, level: Option<EnvLevel>) {
-        // Use the first part of the key to determine the level
-        let key_list = Self::parse_var(key);
-        let key = key_list[0].as_str();
+    pub fn restore_var_level_entry(&self, key: &str, level: Option<EnvLevel>) {
+        if Self::is_simple_root_key(key) {
+            self.restore_var_level_entry_for_root(key, level);
+            return;
+        }
 
+        let key_list = Self::parse_var(key);
+        self.restore_var_level_entry_for_root(key_list[0].as_str(), level);
+    }
+
+    fn change_var_level_for_root(&self, key: &str, level: Option<EnvLevel>) {
         let level = level.unwrap_or_default();
         let mut tracker = self.var_level_tracker.write().unwrap();
         match tracker.entry(key.to_string()) {
@@ -538,6 +602,27 @@ impl EnvManager {
                 }
             }
         }
+    }
+
+    pub fn change_var_level(&self, key: &str, level: Option<EnvLevel>) {
+        if Self::is_simple_root_key(key) {
+            self.change_var_level_for_root(key, level);
+            return;
+        }
+
+        let key_list = Self::parse_var(key);
+        self.change_var_level_for_root(key_list[0].as_str(), level);
+    }
+
+    fn should_change_var_level_for_root(&self, key: &str, level: EnvLevel) -> bool {
+        match self.var_level_entry_for_root(key) {
+            Some(current_level) => current_level != level,
+            None => level != EnvLevel::default(),
+        }
+    }
+
+    fn resolve_level(&self, key: &str, level: Option<EnvLevel>) -> EnvLevel {
+        level.unwrap_or_else(|| self.get_var_level_for_root(key))
     }
 
     /*
@@ -592,15 +677,22 @@ impl EnvManager {
         value: CollectionValue,
         level: EnvLevel,
     ) -> Result<bool, String> {
+        if Self::is_simple_root_key(key) {
+            let ret = self.get_env(level).create(key, value).await?;
+            if ret && self.should_change_var_level_for_root(key, level) {
+                self.change_var_level_for_root(key, Some(level));
+            }
+
+            return Ok(ret);
+        }
+
         let key_list = Self::parse_var(key);
-        let key_refs: Vec<&str> = key_list.iter().map(|s| s.as_str()).collect();
+        let root_key = key_list[0].as_str();
 
-        // let level = level.unwrap_or_default();
-        let ret = self.create_inner(level, &key_refs, value).await?;
+        let ret = self.create_inner(level, &key_list, value).await?;
 
-        if ret {
-            // Track the variable's level
-            self.change_var_level(key, Some(level));
+        if ret && self.should_change_var_level_for_root(root_key, level) {
+            self.change_var_level_for_root(root_key, Some(level));
         }
 
         Ok(ret)
@@ -610,32 +702,28 @@ impl EnvManager {
     // The middle part of the key_list must be a map collection
     async fn get_parent_collection_by_path(
         &self,
-        key_list: &[&str],
+        key_list: &[String],
         level: EnvLevel,
     ) -> Result<Option<PathCollection>, String> {
-        let env = match level {
-            EnvLevel::Global => self.global.clone(),
-            EnvLevel::Chain => self.chain.clone(),
-            EnvLevel::Block => self.block.clone(),
-        };
-
-        let mut current = PathCollection::Root(env);
+        let mut current = PathCollection::Root(self.get_env(level).clone());
         let sub_key_list = &key_list[0..key_list.len() - 1];
         for (i, part) in sub_key_list.iter().enumerate() {
-            if let Some(value) = current.get(part).await? {
+            if let Some(value) = current.get(part.as_str()).await? {
                 if let CollectionValue::Map(map) = value {
                     current = PathCollection::Map(map);
+                } else if let CollectionValue::List(list) = value {
+                    current = PathCollection::List(list);
                 } else {
                     if let CollectionValue::MultiMap(multi_map) = &value {
                         if i == sub_key_list.len() - 1 {
                             // Last part can be a multi-map
                             return Ok(Some(PathCollection::MultiMap(multi_map.clone())));
                         }
-                    } else if let CollectionValue::Set(set) = &value {
-                        if i == sub_key_list.len() - 1 {
-                            // Last part can be a set
-                            return Ok(Some(PathCollection::Set(set.clone())));
-                        }
+                    } else if let CollectionValue::Set(set) = &value
+                        && i == sub_key_list.len() - 1
+                    {
+                        // Last part can be a set
+                        return Ok(Some(PathCollection::Set(set.clone())));
                     }
 
                     let msg = format!("Expected a map at '{}', found: {}", part, value);
@@ -653,11 +741,10 @@ impl EnvManager {
     async fn create_inner(
         &self,
         level: EnvLevel,
-        key_list: &[&str],
+        key_list: &[String],
         value: CollectionValue,
     ) -> Result<bool, String> {
-        let parent = self.get_parent_collection_by_path(&key_list, level).await?;
-        if parent.is_none() {
+        let Some(coll) = self.get_parent_collection_by_path(key_list, level).await? else {
             // If parent is None, caller need to create the collection on the path
             let msg = format!(
                 "Parent collection not found for key list '{:?}', please create the collection first",
@@ -665,10 +752,8 @@ impl EnvManager {
             );
             warn!("{}", msg);
             return Err(msg);
-        }
-
-        let coll = parent.unwrap();
-        let key = key_list.last().unwrap();
+        };
+        let key = key_list.last().unwrap().as_str();
         coll.insert_new(key, value).await
     }
 
@@ -722,15 +807,50 @@ impl EnvManager {
             key,
             value
         );
-        let key_list = Self::parse_var(key);
-        let key_refs: Vec<&str> = key_list.iter().map(|s| s.as_str()).collect();
-        let level = match level {
-            Some(l) => l,
-            None => self.get_var_level(key_refs[0]),
-        };
 
-        let ret = self.set_inner(level, &key_refs, value).await?;
-        self.change_var_level(key_refs[0], Some(level));
+        if Self::is_simple_root_key(key) {
+            let level = self.resolve_level(key, level);
+            return self.set_simple_root_at_level(key, value, level).await;
+        }
+
+        let key_list = Self::parse_var(key);
+        let root_key = key_list[0].as_str();
+        let level = self.resolve_level(root_key, level);
+
+        let ret = self.set_inner(level, &key_list, value).await?;
+        if self.should_change_var_level_for_root(root_key, level) {
+            self.change_var_level_for_root(root_key, Some(level));
+        }
+
+        Ok(ret)
+    }
+
+    pub(crate) async fn set_simple_root_at_level(
+        &self,
+        key: &str,
+        value: CollectionValue,
+        level: EnvLevel,
+    ) -> Result<Option<CollectionValue>, String> {
+        debug_assert!(Self::is_simple_root_key(key));
+
+        let ret = self.get_env(level).set(key, value).await?;
+        if self.should_change_var_level_for_root(key, level) {
+            self.change_var_level_for_root(key, Some(level));
+        }
+
+        Ok(ret)
+    }
+
+    pub(crate) async fn set_simple_root_at_explicit_level(
+        &self,
+        key: &str,
+        value: CollectionValue,
+        level: EnvLevel,
+    ) -> Result<Option<CollectionValue>, String> {
+        debug_assert!(Self::is_simple_root_key(key));
+
+        let ret = self.get_env(level).set(key, value).await?;
+        self.change_var_level_for_root(key, Some(level));
 
         Ok(ret)
     }
@@ -738,7 +858,7 @@ impl EnvManager {
     async fn set_inner(
         &self,
         level: EnvLevel,
-        key_list: &[&str],
+        key_list: &[String],
         value: CollectionValue,
     ) -> Result<Option<CollectionValue>, String> {
         let parent = self.get_parent_collection_by_path(key_list, level).await?;
@@ -752,7 +872,7 @@ impl EnvManager {
         }
 
         let coll = parent.unwrap();
-        let key = key_list.last().unwrap();
+        let key = key_list.last().unwrap().as_str();
         coll.insert(key, value).await
     }
 
@@ -761,20 +881,21 @@ impl EnvManager {
         key: &str,
         level: Option<EnvLevel>,
     ) -> Result<Option<CollectionValue>, String> {
-        let key_list = Self::parse_var(key);
-        let key_refs: Vec<&str> = key_list.iter().map(|s| s.as_str()).collect();
-        let level = match level {
-            Some(l) => l,
-            None => self.get_var_level(key_refs[0]),
-        };
+        if Self::is_simple_root_key(key) {
+            let level = self.resolve_level(key, level);
+            return self.get_env(level).get(key).await;
+        }
 
-        self.get_inner(level, &key_refs).await
+        let key_list = Self::parse_var(key);
+        let level = self.resolve_level(key_list[0].as_str(), level);
+
+        self.get_inner(level, &key_list).await
     }
 
     async fn get_inner(
         &self,
         level: EnvLevel,
-        key_list: &[&str],
+        key_list: &[String],
     ) -> Result<Option<CollectionValue>, String> {
         log!(
             self.get_log_level(),
@@ -792,7 +913,7 @@ impl EnvManager {
         }
 
         let coll = parent.unwrap();
-        let key = key_list.last().unwrap();
+        let key = key_list.last().unwrap().as_str();
         coll.get(key).await
     }
 
@@ -801,20 +922,21 @@ impl EnvManager {
         key: &str,
         level: Option<EnvLevel>,
     ) -> Result<Option<CollectionValue>, String> {
-        let key_list = Self::parse_var(key);
-        let key_refs: Vec<&str> = key_list.iter().map(|s| s.as_str()).collect();
-        let level = match level {
-            Some(l) => l,
-            None => self.get_var_level(key_refs[0]),
-        };
+        if Self::is_simple_root_key(key) {
+            let level = self.resolve_level(key, level);
+            return self.get_env(level).remove(key).await;
+        }
 
-        self.remove_inner(level, &key_refs).await
+        let key_list = Self::parse_var(key);
+        let level = self.resolve_level(key_list[0].as_str(), level);
+
+        self.remove_inner(level, &key_list).await
     }
 
     async fn remove_inner(
         &self,
         level: EnvLevel,
-        key_list: &[&str],
+        key_list: &[String],
     ) -> Result<Option<CollectionValue>, String> {
         let parent = self.get_parent_collection_by_path(key_list, level).await?;
         if parent.is_none() {
@@ -827,14 +949,19 @@ impl EnvManager {
         }
 
         let coll = parent.unwrap();
-        let key = key_list.last().unwrap();
+        let key = key_list.last().unwrap().as_str();
         coll.remove(key).await
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::EnvManager;
+    use super::{EnvLevel, EnvManager};
+    use crate::chain::Env;
+    use crate::collection::{
+        CollectionValue, ListCollection, MapCollection, MemoryListCollection, MemoryMapCollection,
+    };
+    use std::sync::Arc;
 
     #[test]
     fn test_parse_var_dynamic_segments() {
@@ -887,6 +1014,376 @@ mod tests {
                 "$REQ.clientIp".to_string(),
                 "country".to_string()
             ]
+        );
+
+        assert_eq!(
+            EnvManager::parse_var("records[0].payload.key"),
+            vec![
+                "records".to_string(),
+                "0".to_string(),
+                "payload".to_string(),
+                "key".to_string()
+            ]
+        );
+
+        assert_eq!(
+            EnvManager::parse_var("matrix[1][0]"),
+            vec!["matrix".to_string(), "1".to_string(), "0".to_string()]
+        );
+    }
+
+    async fn make_record_entry(key: &str, name: &str) -> Arc<Box<dyn MapCollection>> {
+        let map = Arc::new(Box::new(MemoryMapCollection::new()) as Box<dyn MapCollection>);
+        map.insert("key", CollectionValue::String(key.to_string()))
+            .await
+            .unwrap();
+        map.insert("name", CollectionValue::String(name.to_string()))
+            .await
+            .unwrap();
+        map
+    }
+
+    async fn make_route_config(prefix: &str, target: &str) -> Arc<Box<dyn MapCollection>> {
+        let route = Arc::new(Box::new(MemoryMapCollection::new()) as Box<dyn MapCollection>);
+        route
+            .insert("prefix", CollectionValue::String(prefix.to_string()))
+            .await
+            .unwrap();
+        route
+            .insert("target", CollectionValue::String(target.to_string()))
+            .await
+            .unwrap();
+
+        let config = Arc::new(Box::new(MemoryMapCollection::new()) as Box<dyn MapCollection>);
+        config
+            .insert("route", CollectionValue::Map(route))
+            .await
+            .unwrap();
+        config
+    }
+
+    #[tokio::test]
+    async fn test_list_path_supports_set_and_remove() {
+        let global = Arc::new(Env::new(EnvLevel::Global, None));
+        let chain = global.create_child_env(EnvLevel::Chain);
+        let manager = EnvManager::new(global, chain);
+
+        let records = Arc::new(Box::new(MemoryListCollection::new()) as Box<dyn ListCollection>);
+        records
+            .push(CollectionValue::Map(
+                make_record_entry("alpha", "first").await,
+            ))
+            .await
+            .unwrap();
+        records
+            .push(CollectionValue::Map(
+                make_record_entry("beta", "second").await,
+            ))
+            .await
+            .unwrap();
+        records
+            .push(CollectionValue::Map(
+                make_record_entry("gamma", "third").await,
+            ))
+            .await
+            .unwrap();
+
+        manager
+            .create("records", CollectionValue::List(records), EnvLevel::Chain)
+            .await
+            .unwrap();
+
+        manager
+            .set(
+                "records[0].key",
+                CollectionValue::String("updated".to_string()),
+                Some(EnvLevel::Chain),
+            )
+            .await
+            .unwrap();
+
+        let first_key = manager
+            .get("records[0].key", Some(EnvLevel::Chain))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(first_key.as_str(), Some("updated"));
+
+        let removed = manager
+            .remove("records[1]", Some(EnvLevel::Chain))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(removed.is_map(), "expected removed list item to be map");
+
+        let shifted_name = manager
+            .get("records[1].name", Some(EnvLevel::Chain))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(shifted_name.as_str(), Some("third"));
+    }
+
+    #[tokio::test]
+    async fn test_simple_root_key_implicit_set_follows_tracked_level() {
+        let global = Arc::new(Env::new(EnvLevel::Global, None));
+        let chain = global.create_child_env(EnvLevel::Chain);
+        let manager = EnvManager::new(global, chain);
+
+        manager
+            .create(
+                "shared",
+                CollectionValue::String("global".to_string()),
+                EnvLevel::Global,
+            )
+            .await
+            .unwrap();
+        manager
+            .create(
+                "shared",
+                CollectionValue::String("chain".to_string()),
+                EnvLevel::Chain,
+            )
+            .await
+            .unwrap();
+        manager
+            .create(
+                "shared",
+                CollectionValue::String("block".to_string()),
+                EnvLevel::Block,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(manager.get_var_level("shared"), EnvLevel::Block);
+
+        manager
+            .set(
+                "shared",
+                CollectionValue::String("block-updated".to_string()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            manager
+                .get("shared", Some(EnvLevel::Block))
+                .await
+                .unwrap()
+                .unwrap()
+                .as_str(),
+            Some("block-updated")
+        );
+        assert_eq!(
+            manager
+                .get("shared", Some(EnvLevel::Chain))
+                .await
+                .unwrap()
+                .unwrap()
+                .as_str(),
+            Some("chain")
+        );
+        assert_eq!(
+            manager
+                .get("shared", Some(EnvLevel::Global))
+                .await
+                .unwrap()
+                .unwrap()
+                .as_str(),
+            Some("global")
+        );
+
+        manager
+            .set(
+                "shared",
+                CollectionValue::String("chain-updated".to_string()),
+                Some(EnvLevel::Chain),
+            )
+            .await
+            .unwrap();
+        assert_eq!(manager.get_var_level("shared"), EnvLevel::Chain);
+
+        manager
+            .set(
+                "shared",
+                CollectionValue::String("chain-implicit".to_string()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            manager
+                .get("shared", Some(EnvLevel::Block))
+                .await
+                .unwrap()
+                .unwrap()
+                .as_str(),
+            Some("block-updated")
+        );
+        assert_eq!(
+            manager
+                .get("shared", Some(EnvLevel::Chain))
+                .await
+                .unwrap()
+                .unwrap()
+                .as_str(),
+            Some("chain-implicit")
+        );
+        assert_eq!(
+            manager
+                .get("shared", Some(EnvLevel::Global))
+                .await
+                .unwrap()
+                .unwrap()
+                .as_str(),
+            Some("global")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_path_set_follows_tracked_root_level_and_preserves_other_levels() {
+        let global = Arc::new(Env::new(EnvLevel::Global, None));
+        let chain = global.create_child_env(EnvLevel::Chain);
+        let manager = EnvManager::new(global, chain);
+
+        manager
+            .create(
+                "config",
+                CollectionValue::Map(make_route_config("global-prefix", "global-target").await),
+                EnvLevel::Global,
+            )
+            .await
+            .unwrap();
+        manager
+            .create(
+                "config",
+                CollectionValue::Map(make_route_config("chain-prefix", "chain-target").await),
+                EnvLevel::Chain,
+            )
+            .await
+            .unwrap();
+        manager
+            .create(
+                "config",
+                CollectionValue::Map(make_route_config("block-prefix", "block-target").await),
+                EnvLevel::Block,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(manager.get_var_level("config"), EnvLevel::Block);
+
+        manager
+            .set(
+                "config.route.prefix",
+                CollectionValue::String("block-prefix-updated".to_string()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            manager
+                .get("config.route.prefix", Some(EnvLevel::Block))
+                .await
+                .unwrap()
+                .unwrap()
+                .as_str(),
+            Some("block-prefix-updated")
+        );
+        assert_eq!(
+            manager
+                .get("config.route.prefix", Some(EnvLevel::Chain))
+                .await
+                .unwrap()
+                .unwrap()
+                .as_str(),
+            Some("chain-prefix")
+        );
+        assert_eq!(
+            manager
+                .get("config.route.prefix", Some(EnvLevel::Global))
+                .await
+                .unwrap()
+                .unwrap()
+                .as_str(),
+            Some("global-prefix")
+        );
+
+        manager
+            .set(
+                "config.route.target",
+                CollectionValue::String("chain-target-updated".to_string()),
+                Some(EnvLevel::Chain),
+            )
+            .await
+            .unwrap();
+        assert_eq!(manager.get_var_level("config"), EnvLevel::Chain);
+
+        manager
+            .set(
+                "config.route.prefix",
+                CollectionValue::String("chain-prefix-implicit".to_string()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            manager
+                .get("config.route.prefix", Some(EnvLevel::Block))
+                .await
+                .unwrap()
+                .unwrap()
+                .as_str(),
+            Some("block-prefix-updated")
+        );
+        assert_eq!(
+            manager
+                .get("config.route.target", Some(EnvLevel::Block))
+                .await
+                .unwrap()
+                .unwrap()
+                .as_str(),
+            Some("block-target")
+        );
+        assert_eq!(
+            manager
+                .get("config.route.prefix", Some(EnvLevel::Chain))
+                .await
+                .unwrap()
+                .unwrap()
+                .as_str(),
+            Some("chain-prefix-implicit")
+        );
+        assert_eq!(
+            manager
+                .get("config.route.target", Some(EnvLevel::Chain))
+                .await
+                .unwrap()
+                .unwrap()
+                .as_str(),
+            Some("chain-target-updated")
+        );
+        assert_eq!(
+            manager
+                .get("config.route.prefix", Some(EnvLevel::Global))
+                .await
+                .unwrap()
+                .unwrap()
+                .as_str(),
+            Some("global-prefix")
+        );
+        assert_eq!(
+            manager
+                .get("config.route.target", Some(EnvLevel::Global))
+                .await
+                .unwrap()
+                .unwrap()
+                .as_str(),
+            Some("global-target")
         );
     }
 }

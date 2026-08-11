@@ -138,24 +138,122 @@
 
 参数:
   <var>       要重写的变量，例如 $REQ.url
-  <pattern>   要匹配的 glob 模式，例如 /kapi/my-service/*
-  <template>  使用 * 通配符的替换模板，例如 /kapi/*
+  <pattern>   以大小写不敏感方式匹配的 glob 模式
+  <template>  替换字符串，或以 `*` 结尾的后缀透传模板
 
 行为:
   - 以大小写不敏感方式执行 glob 匹配。
-  - pattern/template 当前只支持一个 `*` 通配符。
-  - 如果匹配成功，则用模板替换 `*` 对应部分并重写变量值。
+  - 如果 <pattern> 未匹配，则返回 error，且变量保持不变。
+  - 如果 <pattern> 以 `*` 结尾且 <template> 也以 `*` 结尾，则保留匹配到的后缀，
+    并把该后缀追加到去掉末尾 `*` 的模板后面。
+  - 否则，只要 <pattern> 匹配成功，就直接把变量重写为 <template> 当前求值结果。
 
 示例:
   rewrite $REQ.url "/kapi/my-service/*" "/kapi/*"
-  rewrite host "api.*.domain.com" "svc-*.internal"
+  rewrite $REQ.host "*.example.com" "backend.internal"
+```
+
+### `rewrite-path`
+```
+使用按段模板重写 path 风格变量。
+
+用法: rewrite-path [OPTIONS] <var> <pattern> <template>
+
+参数:
+  <var>
+          要重写的变量
+
+  <pattern>
+          要匹配的模板模式
+
+  <template>
+          重写模板
+
+选项:
+      --ignore-case
+          执行大小写不敏感匹配（默认大小写敏感）
+
+  -h, --help
+          显示帮助
+
+
+参数:
+  <var>       要重写的 path 风格变量，例如 $REQ.path
+  <pattern>   用于匹配的模板模式
+  <template>  重写模板，可使用 {name} 和可选的 ** 剩余段拼接
+
+选项:
+  --ignore-case   执行大小写不敏感匹配（默认大小写敏感）
+
+行为:
+  - 使用 `/` 作为默认分段符。
+  - <pattern> 和 <template> 都会在运行时动态求值。
+  - <pattern> 中的捕获名必须唯一。
+  - <pattern> 遵循与 match-path 相同的模板规则：
+      {name} 捕获单个 segment，** 匹配末尾剩余所有 segment。
+  - <template> 可以用 {name} 引用捕获结果。
+  - 如果 <pattern> 含有 **，则 <template> 可以放置一个独立 segment 的 **，
+    用来拼接匹配到的剩余 segment。
+  - 如果 <pattern> 未命中，则返回 error，且变量保持不变。
+
+示例:
+  rewrite-path $REQ.path "/kapi/{service}/**" "/api/{service}/**"
+  rewrite-path $REQ.path "${route_prefix}/{node}/{plane}/**" "/klog/{node}/{plane}/**"
+```
+
+### `rewrite-host`
+```
+使用按段模板重写 host 风格变量。
+
+用法: rewrite-host [OPTIONS] <var> <pattern> <template>
+
+参数:
+  <var>
+          要重写的变量
+
+  <pattern>
+          要匹配的模板模式
+
+  <template>
+          重写模板
+
+选项:
+      --no-ignore-case
+          执行大小写敏感匹配（默认大小写不敏感）
+
+  -h, --help
+          显示帮助
+
+
+参数:
+  <var>       要重写的 host 风格变量，例如 $REQ.host
+  <pattern>   用于匹配的模板模式
+  <template>  重写模板，可使用 {name} 和可选的 ** 剩余 label 拼接
+
+选项:
+  --no-ignore-case   执行大小写敏感匹配（默认大小写不敏感）
+
+行为:
+  - 使用 `.` 作为默认分段符。
+  - <pattern> 和 <template> 都会在运行时动态求值。
+  - <pattern> 中的捕获名必须唯一。
+  - <pattern> 遵循与 match-host 相同的模板规则：
+      {name} 捕获单个 host label，** 匹配末尾剩余所有 label。
+  - <template> 可以用 {name} 引用捕获结果。
+  - 如果 <pattern> 含有 **，则 <template> 可以放置一个独立 segment 的 **，
+    用来拼接匹配到的剩余 label。
+  - 如果 <pattern> 未命中，则返回 error，且变量保持不变。
+
+示例:
+  rewrite-host $REQ.host "{app}.${THIS_ZONE_HOST}" "{app}-internal.${THIS_ZONE_HOST}"
+  rewrite-host $REQ.host "{app}.**" "{app}.internal.**"
 ```
 
 ### `rewrite-reg`
 ```
 使用正则表达式与替换模板重写变量。
 
-用法: rewrite-regex <var> <regex> <template>
+用法: rewrite-reg <var> <regex> <template>
 
 参数:
   <var>
@@ -179,11 +277,13 @@
 
 行为:
   - 如果正则匹配成功，则按模板重写变量值。
+  - 只有 `$` 后紧跟 1 位 ASCII 数字时，才会被当作捕获组引用；
+    其他 `$` 都按普通字符保留。
   - 未匹配到的捕获组会替换为空字符串。
-  - 如果未匹配成功，变量保持不变。
+  - 如果未匹配成功，则返回 error，且变量保持不变。
 
 示例:
-  rewrite-regex $REQ.url "^/test/(\\w+)(?:/(\\d+))?" "/new/$1/$2"
+  rewrite-reg $REQ.url "^/test/(\\w+)(?:/(\\d+))?" "/new/$1/$2"
 ```
 
 ### `slice`
@@ -258,6 +358,131 @@
   starts-with "example.com" "test"      → false
 ```
 
+### `split`
+```
+使用分隔符把字符串拆分成多个片段。
+
+用法: split [OPTIONS] <value> <delimiter>
+
+参数:
+  <value>
+          待拆分的输入字符串
+
+  <delimiter>
+          用于拆分的分隔符字符串
+
+选项:
+      --capture <name>
+          把拆分结果写入一个新的 List 变量
+
+      --skip-empty
+          丢弃空片段
+
+  -h, --help
+          显示帮助
+
+
+参数:
+  <value>       输入字符串或变量。
+  <delimiter>   用于拆分输入的分隔符字符串。
+
+选项:
+  --capture <name>   把片段写入一个新的 List 变量，可通过 name[0]、name[1]... 访问
+  --skip-empty       从返回结果和 capture 槽位中都移除空片段
+
+行为:
+  - 两个参数都在运行时动态求值。
+  - 返回一个由字符串片段组成的 List。
+  - 默认保留空片段，包括开头或结尾产生的空片段。
+  - 指定 --skip-empty 后，会同时从返回的 List 和 capture 槽位中移除空片段。
+  - 指定 --capture 后，会用一个新的 List 替换 <name>，其中包含拆分得到的所有片段。
+  - <name> 必须是字面量变量名或变量路径。
+  - 空分隔符是非法输入，会返回运行时错误。
+
+示例:
+  split "/a/b/c" "/"
+  split --skip-empty "/.cluster/klog/ood1/admin/" "/"
+  split --capture parts $REQ.path $delimiter
+```
+
+### `strip-prefix`
+```
+移除字符串前缀并返回剩余 tail。
+
+用法: strip-prefix [OPTIONS] <value> <prefix>
+
+参数:
+  <value>
+          要处理的输入字符串
+
+  <prefix>
+          要移除的前缀
+
+选项:
+  -i, --ignore-case
+          执行大小写不敏感比较
+
+  -h, --help
+          显示帮助
+
+
+参数:
+  <value>      完整输入字符串或变量。
+  <prefix>     要移除的前缀。
+
+行为:
+  - 两个参数都在运行时动态求值。
+  - 如果 <value> 以 <prefix> 开头，则 success 返回剩余 tail。
+  - 如果 <value> 与 <prefix> 完全相等，则 success 返回空字符串。
+  - 默认区分大小写。
+  - 如果 <value> 不以 <prefix> 开头，则返回 error，且原值不变。
+  - 不会修改任何变量或环境。
+
+示例:
+  strip-prefix "/api/v1/users" "/api"
+  strip-prefix --ignore-case "/API/v1/users" "/api"
+  strip-prefix $REQ.url $route_prefix
+```
+
+### `strip-suffix`
+```
+移除字符串后缀并返回剩余 head。
+
+用法: strip-suffix [OPTIONS] <value> <suffix>
+
+参数:
+  <value>
+          要处理的输入字符串
+
+  <suffix>
+          要移除的后缀
+
+选项:
+  -i, --ignore-case
+          执行大小写不敏感比较
+
+  -h, --help
+          显示帮助
+
+
+参数:
+  <value>      完整输入字符串或变量。
+  <suffix>     要移除的后缀。
+
+行为:
+  - 两个参数都在运行时动态求值。
+  - 如果 <value> 以 <suffix> 结尾，则 success 返回剩余 head。
+  - 如果 <value> 与 <suffix> 完全相等，则 success 返回空字符串。
+  - 默认区分大小写。
+  - 如果 <value> 不以 <suffix> 结尾，则返回 error，且原值不变。
+  - 不会修改任何变量或环境。
+
+示例:
+  strip-suffix "/api/v1/users" "/users"
+  strip-suffix --ignore-case "/api/v1/USERS" "/users"
+  strip-suffix $REQ.host $zone_suffix
+```
+
 ### `strlen`
 ```
 返回字符串长度。
@@ -284,6 +509,259 @@
   strlen "abc"
   strlen "你好"
   strlen $REQ.path
+```
+
+## uri URI
+
+### `url_encode`
+```
+对字符串执行 percent-encode，便于安全嵌入 URL。
+
+用法: url_encode <string>
+
+参数:
+  <string>
+          要做 percent-encode 的输入字符串
+
+选项:
+  -h, --help
+          显示帮助
+
+
+行为:
+  - 对保留 URL 字符执行 percent-encoding。
+  - RFC 3986 的 unreserved 字符保持不变。
+  - 不会修改环境或变量。
+
+示例:
+  url_encode "https://example.com/callback?a=1&b=2"
+  url_encode $REQ.url
+```
+
+### `url_decode`
+```
+解码 percent-encoded URL 字符串。
+
+用法: url_decode <string>
+
+参数:
+  <string>
+          要做 percent-decode 的输入字符串
+
+选项:
+  -h, --help
+          显示帮助
+
+
+行为:
+  - 解码 `%XX` 转义序列。
+  - 当转义序列非法，或解码后不是合法 UTF-8 时，返回运行时错误。
+  - 不会修改环境或变量。
+
+示例:
+  url_decode "https%3A%2F%2Fexample.com%2Fcallback%3Fa%3D1%26b%3D2"
+  url_decode $encoded_url
+```
+
+### `parse-authority` / `parse-auth`
+```
+将 authority 字符串解析为 typed Map。
+
+用法: parse-authority [OPTIONS] <value>
+     parse-auth [OPTIONS] <value>
+
+参数:
+  <value>
+          要解析的 authority 风格输入字符串
+
+选项:
+      --default-port <port>
+          当输入中没有显式端口时使用的默认端口
+
+  -h, --help
+          显示帮助
+
+
+行为:
+  - 接受 authority 风格输入，例如 `example.com`、`example.com:3180`、`user:pass@[::1]:8080`。
+  - 返回一个 fresh Map，包含字段：`host`、`port`、`has_port`、`userinfo`。
+  - 如果是 IPv6，`host` 会保留方括号形式。
+  - `port` 在存在显式端口或命中默认端口时返回 Number，否则返回 Null。
+  - `has_port` 仅在输入中显式带端口时为 true。
+  - `userinfo` 返回 `@` 之前的原始文本，不做 percent-decoding。
+  - 不接受 `https://example.com/path` 这类完整 URL。
+  - authority 语法非法，或默认端口非法时返回 error。
+
+示例:
+  parse-authority $REQ.host
+  parse-authority --default-port 3180 $REQ.host
+  parse-auth "user:pass@[::1]:8080"
+```
+
+### `parse-uri`
+```
+将绝对 URI 字符串解析为 typed Map。
+
+用法: parse-uri <value>
+
+参数:
+  <value>
+          要解析的绝对 URI 字符串
+
+选项:
+  -h, --help
+          显示帮助
+
+
+行为:
+  - 接受绝对 URI 输入，并使用 `url::Url` 解析。
+  - 返回一个 fresh Map，包含字段：`scheme`、`authority`、`host`、`port`、`effective_port`、`has_port`、`username`、`password`、`path`、`query`、`fragment`。
+  - 当 URI 不包含 authority 组件时，`authority` 为 Null。
+  - 如果是 IPv6，`host` 会保留方括号形式。
+  - `port` 反映规范化后的序列化端口；已知默认端口会被省略。
+  - `effective_port` 会补上已知 scheme 的默认端口，例如 `https -> 443`。
+  - `username` 始终返回 String，可能为空字符串。
+  - `password`、`query`、`fragment` 在缺失时返回 Null。
+  - 相对引用或非法 URI 语法会返回 error。
+
+示例:
+  parse-uri "https://user:pass@example.com:8443/api/v1?q=1#frag"
+  parse-uri $REQ.ext.url
+```
+
+### `build-uri`
+```
+根据 typed Map 构造绝对 URI 字符串。
+
+用法: build-uri <parts>
+
+参数:
+  <parts>
+          描述 URI 各字段的 Map 或 map literal
+
+选项:
+  -h, --help
+          显示帮助
+
+
+行为:
+  - 期望输入为 typed Map。
+  - 支持的输入 key：`scheme`、`authority`、`host`、`port`、`username`、`password`、`path`、`query`、`fragment`。
+  - 只有当 `host` 缺失时，才会使用 `authority`。
+  - `effective_port` 和 `has_port` 这两个 parse 输出辅助字段会被接受但忽略。
+  - 结构化 authority 字段（`host`、`port`、`username`、`password`）优先级高于 `authority`。
+  - 对于 `http`、`https`、`ws`、`wss`、`ftp`，必须提供 `host` 或 `authority`。
+  - 返回规范化后的绝对 URI 字符串。
+  - 字段类型非法或 URI 组件非法时返回 error。
+
+示例:
+  build-uri {
+    "scheme": "https",
+    "host": "example.com",
+    "path": "/oauth/login",
+    "query": "redirect_url=%2Fdashboard"
+  }
+
+  capture --value parsed $(parse-uri "https://user:pass@example.com:8443/api/v1?q=1#frag")
+  build-uri $parsed
+```
+
+### `parse-query`
+```
+将 URL query 字符串解析为 typed MultiMap。
+
+用法: parse-query <value>
+
+参数:
+  <value>
+          要解析的 query 字符串
+
+选项:
+  -h, --help
+          显示帮助
+
+
+行为:
+  - 按 `application/x-www-form-urlencoded` 规则解析输入。
+  - 如果存在前导 `?`，会自动忽略。
+  - `+` 会被解码为空格。
+  - 返回一个 fresh MultiMap，key 和 value 都是解码后的字符串。
+  - 缺少 `=` 时按空 value 处理。
+  - 同一 key 下完全重复的 value 会被 MultiMap 的 set 语义去重。
+  - percent-encoding 非法或 UTF-8 非法时返回 error。
+
+示例:
+  parse-query "redirect_url=%2Fdashboard&tag=alpha&tag=beta"
+  parse-query $parsed.query
+```
+
+### `build-query`
+```
+根据 typed Map 或 MultiMap 构造 URL query 字符串。
+
+用法: build-query <params>
+
+参数:
+  <params>
+          描述 query 参数的 Map 或 MultiMap
+
+选项:
+  -h, --help
+          显示帮助
+
+
+行为:
+  - 接受 typed Map 或 MultiMap。
+  - 使用 `application/x-www-form-urlencoded` 编码。
+  - 返回不带前导 `?` 的 query 字符串。
+  - 对 Map value，支持 String/Number/Bool/Null。
+  - Map 中的 Null value 会被序列化成空值（`key=`）。
+  - 对 MultiMap，同一 key 可以序列化出多个 `key=value` 对。
+  - 输出会按集合遍历顺序规范化，不保证保留原始 raw pair 顺序。
+
+示例:
+  build-query {
+    "redirect_url": "/dashboard",
+    "page": 2,
+    "exact": true
+  }
+
+  capture --value params $(parse-query "tag=alpha&tag=beta")
+  build-query $params
+```
+
+### `query-get`
+```
+从 raw query 字符串或已解析的 query MultiMap 中读取一个或多个值。
+
+用法: query-get [OPTIONS] <query> <key>
+
+参数:
+  <query>
+          raw query 字符串，或 `parse-query` 返回的 typed MultiMap
+
+  <key>
+          要读取的 query key
+
+选项:
+      --all
+          以 List 形式返回该 key 的所有值
+
+  -h, --help
+          显示帮助
+
+
+行为:
+  - 接受 raw query 字符串（可带前导 `?`），或 `parse-query` 返回的 typed MultiMap。
+  - 默认返回该 key 的第一个值，类型为 String。
+  - 使用 `--all` 时，返回该 key 的所有值，类型为 List<String>。
+  - key 不存在时返回运行时错误。
+  - raw query 输入按与 `parse-query` 相同的规则解析。
+
+示例:
+  query-get "redirect_url=%2Fdashboard" "redirect_url"
+  capture --value params $(parse-query "tag=alpha&tag=beta")
+  query-get --all $params "tag"
 ```
 
 ## debug 调试
@@ -337,6 +815,8 @@
   - 下标路径:
       $geoByIp[$REQ.clientIp]
       ${geoByIp["1.2.3.4"].country}
+      $records[0].name
+      $matrix[1][0]
 
   - 可选 / 安全访问:
       ${geoByIp[$REQ.clientIp]?.country}
@@ -348,6 +828,7 @@
 
 语义:
   - `?.` / `?[...]` 表示后续路径段为可选访问。
+  - 下标路径同时支持 map key 和 list 下标。
   - 可选路径段缺失，或类型不匹配时，不会触发严格 missing-var 错误。
   - 如果可选访问缺失且没有 `??`，则结果为空字符串。
   - `??` 只在左侧值缺失时生效。
@@ -356,6 +837,39 @@
 默认值右侧支持:
   - 已支持：字符串字面量、变量表达式。
   - 尚不支持：`??` 右侧直接使用命令替换 `$(...)`。
+```
+
+### Map / List 字面量
+```
+这些是用于构造 fresh collection value 的 DSL 表达式规则，不是独立命令。
+
+支持形式:
+  - List literal:
+      []
+      ["a", 1, $REQ.port]
+      [{"node": $REQ.nodeId}, ["raft", "inter"], null]
+
+  - Map literal:
+      {"kind": "app", "app_id": $REQ.appId}
+      {kind: "service", target: $TARGET_SERVICE_INFO}
+      {"meta": {"region.code": $REQ.regionCode}, "ports": [$REQ.port, 3180]}
+
+语义:
+  - `[...]` 会构造一个新的 List collection。
+  - `{...}` 会构造一个新的 Map collection。
+  - v1 里 map key 只支持静态字符串 key：
+      裸标识符 key，例如 `kind`
+      或带引号的 key，例如 `"region.code"` / `'region.code'`
+  - value 可以是字符串字面量、typed literal、变量、命令替换，或嵌套的 map/list literal。
+  - 每次表达式求值都会创建 fresh collection instance。
+  - 这些 literal 复用的是现有 collection runtime type，不会引入独立的 `Object` 类型。
+  - 只要外围 `[]` / `{}` / `()` 在 statement 结束前保持配对，就支持多行 literal。
+  - 暂不支持 Set literal。
+
+典型用法:
+  - local route={"kind": "app", "target": $TARGET_APP_INFO}
+  - return --from block {"kind": "service", "service_id": $SERVICE_ID}
+  - local segments=["klog", $node_name, $plane]
 ```
 
 ### `assign`
@@ -1203,6 +1717,29 @@
   if $REQ.role !== "admin" then ...
 ```
 
+### `oneof`
+```
+检查一个值是否等于任一候选值。
+
+用法: oneof [OPTIONS] <value> <candidate>...
+
+选项:
+  -i, --ignore-case   大小写不敏感比较，仅用于 string-string
+  -l, --loose         启用 string/number 宽松比较
+
+行为:
+  - 比较语义与 `eq` 完全一致。
+  - `<value>` 和所有候选值都会在运行时动态求值。
+  - 候选值按从左到右顺序测试。
+  - 命中第一个匹配项时返回 success。
+  - 如果没有任何候选值匹配，则返回 error。
+
+示例:
+  oneof $REQ.path "/login" "/logout" "/refresh"
+  oneof --ignore-case $REQ.method "get" "head"
+  oneof --loose $REQ.port 80 "443"
+```
+
 ### `gt` / `ge` / `lt` / `le`
 ```
 数值比较命令。
@@ -1295,7 +1832,10 @@
           执行大小写敏感匹配（默认大小写不敏感）
 
       --capture <name>
-          保存正则捕获到环境变量时使用的名称
+          把正则匹配结果写入一个新的 List 变量
+
+      --capture-named <name>
+          把命名正则捕获写入一个新的 Map 变量
 
   -h, --help
           显示帮助
@@ -1306,20 +1846,139 @@
   <pattern>    要使用的正则表达式。
 
 选项:
-  --capture name   将捕获组写入环境变量，例如 name[0]、name[1] ...
+  --capture name   将正则匹配结果写入一个新的 List 变量，可通过 name[0]、name[1] ... 访问
+  --capture-named name   将命名正则捕获写入一个新的 Map 变量，可通过 name.group 访问
   --no-ignore-case   执行大小写敏感匹配（默认大小写不敏感）
 
 行为:
   - 使用 Rust 风格正则表达式。
   - 如果模式匹配成功，则返回 success；否则返回 error。
-  - 如果提供 `--capture`，则捕获组会写入环境变量：
-      name[0] 表示第一个捕获组，
-      name[1] 表示第二个捕获组，以此类推。
+  - 如果提供 `--capture`，则匹配结果会写入一个新的 List：
+      name[0] 表示完整匹配文本，
+      name[1] 表示第一个捕获组，
+      name[2] 表示第二个捕获组，以此类推。
+  - 如果提供 `--capture-named`，则命名捕获组 `(?P<name>...)` 会写入一个新的 Map。
+  - 未命中的可选命名捕获组会写成 Null，以保持 key 稳定。
+  - 未命中的可选捕获组会写成 Null，以保持索引稳定。
+  - `--capture` 和 `--capture-named` 可以同时使用，但变量名必须不同。
   - 默认行为为大小写不敏感匹配。
 
 示例:
   match-reg $REQ_HEADER.host "^(.*)\.local$"
   match-reg --capture parts $REQ_HEADER.host "^(.+)\.(local|dev)$"
+  match-reg --capture-named host $REQ_HEADER.host "^(?P<app>.+)\.(?P<zone>local|dev)$"
+```
+
+### `match-path`
+```
+使用按段模板匹配 path 风格的值，支持可选捕获。
+
+用法: match-path [OPTIONS] <value> <pattern>
+
+参数:
+  <value>
+          要匹配的输入字符串或变量
+
+  <pattern>
+          要匹配的模板模式
+
+选项:
+      --ignore-case
+          执行大小写不敏感匹配（默认大小写敏感）
+
+      --capture <name>
+          把模板匹配结果写入一个新的 List 变量
+
+      --capture-named <name>
+          把命名模板捕获写入一个新的 Map 变量
+
+  -h, --help
+          显示帮助
+
+
+参数:
+  <value>      要匹配的 path 风格字符串。
+  <pattern>    要使用的模板模式。
+
+选项:
+  --capture name   将模板匹配结果写入一个新的 List 变量，可通过 name[0]、name[1] ... 访问
+  --capture-named name   将命名模板捕获写入一个新的 Map 变量，可通过 name.key 访问
+  --ignore-case    执行大小写不敏感匹配（默认大小写敏感）
+
+行为:
+  - 使用 `/` 作为默认分段符。
+  - pattern 会在运行时动态求值。
+  - pattern 中的捕获名必须唯一。
+  - `{name}` 会在单个 segment 内捕获文本，不会跨越 `/`。
+  - `**` 表示匹配剩余所有 segment，并且必须出现在最后一个 segment。
+  - 如果提供 `--capture`，则匹配结果会写入一个新的 List：
+      name[0] 表示完整匹配文本，
+      name[1] 表示第一个模板捕获，
+      name[2] 表示第二个模板捕获，以此类推。
+  - 如果提供 `--capture-named`，则每个 `{name}` 捕获都会写入一个新的 Map 项。
+  - `--capture` 和 `--capture-named` 可以同时使用，但变量名必须不同。
+  - 默认大小写敏感。
+
+示例:
+  match-path $REQ.path "/kapi/{service_id}/**"
+  match-path --capture parts $REQ.path "${route_prefix}/{node}/{plane}/**"
+  match-path --capture-named route $REQ.path "${route_prefix}/{node}/{plane}/**"
+```
+
+### `match-host`
+```
+使用按段模板匹配 host 风格的值，支持可选捕获。
+
+用法: match-host [OPTIONS] <value> <pattern>
+
+参数:
+  <value>
+          要匹配的输入字符串或变量
+
+  <pattern>
+          要匹配的模板模式
+
+选项:
+      --no-ignore-case
+          执行大小写敏感匹配（默认大小写不敏感）
+
+      --capture <name>
+          把模板匹配结果写入一个新的 List 变量
+
+      --capture-named <name>
+          把命名模板捕获写入一个新的 Map 变量
+
+  -h, --help
+          显示帮助
+
+
+参数:
+  <value>      要匹配的 host 风格字符串。
+  <pattern>    要使用的模板模式。
+
+选项:
+  --capture name     将模板匹配结果写入一个新的 List 变量，可通过 name[0]、name[1] ... 访问
+  --capture-named name   将命名模板捕获写入一个新的 Map 变量，可通过 name.key 访问
+  --no-ignore-case   执行大小写敏感匹配（默认大小写不敏感）
+
+行为:
+  - 使用 `.` 作为默认分段符。
+  - pattern 会在运行时动态求值。
+  - pattern 中的捕获名必须唯一。
+  - `{name}` 会在单个 host label 内捕获文本，不会跨越 `.`。
+  - `**` 表示匹配剩余所有 label，并且必须出现在最后一个 label。
+  - 如果提供 `--capture`，则匹配结果会写入一个新的 List：
+      name[0] 表示完整匹配文本，
+      name[1] 表示第一个模板捕获，
+      name[2] 表示第二个模板捕获，以此类推。
+  - 如果提供 `--capture-named`，则每个 `{name}` 捕获都会写入一个新的 Map 项。
+  - `--capture` 和 `--capture-named` 可以同时使用，但变量名必须不同。
+  - 默认大小写不敏感。
+
+示例:
+  match-host $REQ.host "{app}.${THIS_ZONE_HOST}"
+  match-host --capture host $REQ.host "{app}-${THIS_ZONE_HOST}"
+  match-host --capture-named host $REQ.host "{app}-${THIS_ZONE_HOST}"
 ```
 
 ### `range`
@@ -1598,6 +2257,44 @@ EXAMPLES:
 EXAMPLES:
   invoke --chain auth_flow --arg user $REQ.user --arg pass $REQ.pass
   invoke --block helper_block --arg req $REQ
+```
+
+### `first-ok`
+```
+依次执行多个命令替换，并返回第一个成功结果。
+
+用法: first-ok <commands>...
+
+参数:
+  <commands>...
+      候选子命令，必须使用命令替换形式：$(...)
+
+选项:
+  -h, --help
+      显示帮助
+
+
+说明:
+  `first-ok` 是一个结果级 fallback 组合命令。它会从左到右依次执行
+  每个命令替换，并返回第一个 `success(value)`。
+
+行为:
+  - `success(value)`    => 立即停止，并返回该 success。
+  - `error(value)`      => 记录后继续尝试下一个候选项。
+  - `control(...)`      => 立即向外传播，不会被吞掉。
+  - 如果所有候选项都返回 `error(value)`，则返回最后一个 error。
+
+说明:
+  - 所有输入都必须是命令替换：`$(...)`。
+  - 它适合做解析/查找类 helper 的顺序 fallback，不适合替代通用分支控制。
+
+EXAMPLES:
+  first-ok $(strip-prefix $path $route_prefix) $(strip-prefix $path "/api")
+
+  local target=$(first-ok
+    $(parse-authority $REQ.host)
+    $(parse-authority --default-port 3180 $REQ.dest_host)
+  )
 ```
 
 ### `goto`
@@ -1907,6 +2604,55 @@ EXAMPLES:
 ### 结构化语句总览
 ```
 这些是 DSL 语法级结构，不是独立命令。它们在 statement 层解析，因此不会出现在命令注册表中。
+```
+
+### `case` / `when` / `else` / `end`
+```
+按 first-match-wins 语义进行分支。
+
+语法:
+  case then
+      when <condition> then
+          ...
+      when <condition> then
+          ...
+      else
+          ...
+  end
+
+  case <subject> as <name> then
+      when <condition> then
+          ...
+      else
+          ...
+  end
+
+行为:
+  - 按顺序依次计算各个分支。
+  - 第一个成功的 `when` 分支会被选中。
+  - 如果都未命中，则执行 `else`；如果没有 `else`，该语句不做任何事。
+  - 在 `case <subject> as <name> then` 形式中，`<subject>` 会在分支分派前只求值一次，并绑定为一个 block-local alias 变量。
+  - 这个 alias 在 `when` 条件和命中的分支 body 里都可用，case 结束后会恢复外层同名 block 变量。
+  - `when` 条件复用与 `if` 相同的 expression-chain 语法。
+  - subject 形式只负责绑定 alias，不会自动把 subject 注入到 `when` 命令参数里。
+  - `return` / `error` / `exit` / `goto` 这类 control action 不允许出现在 `when` 条件中。
+
+示例:
+  case then
+      when match-reg $REQ.host "^admin\\." then
+          return --from lib "host_admin";
+      when strip-prefix $REQ.path "/api" then
+          return --from lib "api_path";
+      else
+          return --from lib "default";
+  end
+
+  case $REQ.path as path then
+      when match $path "/api/*" then
+          return --from lib "api";
+      when strip-prefix $path "/kapi" then
+          return --from lib "kapi";
+  end
 ```
 
 ### `if` / `elif` / `else` / `end`

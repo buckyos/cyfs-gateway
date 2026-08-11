@@ -80,9 +80,7 @@ enum ExternalCommandScope {
 
 impl ParserContext {
     pub fn new() -> Self {
-        Self {
-            external_commands: ExternalCommandFactory::new(),
-        }
+        Self::default()
     }
 
     pub fn get_external_command_factory(&self) -> &ExternalCommandFactory {
@@ -141,6 +139,14 @@ impl ParserContext {
         }
 
         (ExternalCommandScope::Auto, name)
+    }
+}
+
+impl Default for ParserContext {
+    fn default() -> Self {
+        Self {
+            external_commands: ExternalCommandFactory::new(),
+        }
     }
 }
 

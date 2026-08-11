@@ -1,4 +1,4 @@
-use super::cmd::*;
+use super::types::*;
 use crate::block::{CommandArg, CommandArgs};
 use crate::chain::{Context, ParserContext};
 use crate::collection::CollectionValue;
@@ -33,10 +33,7 @@ pub struct ExternalCommandFactory {
 
 impl ExternalCommandFactory {
     pub fn new() -> Self {
-        Self {
-            commands: Arc::new(Mutex::new(HashMap::new())),
-            js_command_executor: Arc::new(AsyncJavaScriptCommandExecutor::new()),
-        }
+        Self::default()
     }
 
     pub fn register(&self, name: &str, command: ExternalCommandRef) -> Result<(), String> {
@@ -99,10 +96,7 @@ impl ExternalCommandFactory {
 
 lazy_static::lazy_static! {
     // Global command parser factory instance
-    pub static ref EXTERNAL_COMMAND_FACTORY: ExternalCommandFactory = {
-        let factory = ExternalCommandFactory::new();
-        factory
-    };
+    pub static ref EXTERNAL_COMMAND_FACTORY: ExternalCommandFactory = ExternalCommandFactory::new();
 }
 
 // call <command> <args...>
@@ -143,6 +137,21 @@ Examples:
             );
 
         Self { cmd }
+    }
+}
+
+impl Default for ExternalCommandFactory {
+    fn default() -> Self {
+        Self {
+            commands: Arc::new(Mutex::new(HashMap::new())),
+            js_command_executor: Arc::new(AsyncJavaScriptCommandExecutor::new()),
+        }
+    }
+}
+
+impl Default for ExternalCommandParser {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

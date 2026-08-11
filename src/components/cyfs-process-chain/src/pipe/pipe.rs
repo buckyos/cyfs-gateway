@@ -23,19 +23,21 @@ impl CommandPipe {
         }
     }
 
-    pub fn default() -> Self {
-        Self {
-            stdin: Arc::new(Mutex::new(Box::new(tokio::io::empty()))),
-            stdout: Arc::new(Mutex::new(Box::new(tokio::io::sink()))),
-            stderr: Arc::new(Mutex::new(Box::new(tokio::io::sink()))),
-        }
-    }
-
     pub fn default_std() -> Self {
         Self {
             stdin: Arc::new(Mutex::new(Box::new(tokio::io::stdin()))),
             stdout: Arc::new(Mutex::new(Box::new(tokio::io::stdout()))),
             stderr: Arc::new(Mutex::new(Box::new(tokio::io::stderr()))),
+        }
+    }
+}
+
+impl Default for CommandPipe {
+    fn default() -> Self {
+        Self {
+            stdin: Arc::new(Mutex::new(Box::new(tokio::io::empty()))),
+            stdout: Arc::new(Mutex::new(Box::new(tokio::io::sink()))),
+            stderr: Arc::new(Mutex::new(Box::new(tokio::io::sink()))),
         }
     }
 }

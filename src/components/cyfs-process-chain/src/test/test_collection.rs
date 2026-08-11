@@ -176,6 +176,38 @@ const PROCESS_CHAIN_COLLECTION_PERSIST_READ: &str = r#"
 </root>
 "#;
 
+const PROCESS_CHAIN_MAP_REDUCE_EXTERNAL_SCOPE: &str = r#"
+<root>
+<process_chain id="main">
+    <block id="entry">
+        <![CDATA[
+            map-create --block routes;
+            map-add routes "k1" "v1";
+            map-add routes "k2" "v2";
+
+            capture --value last $(map $routes $(append $__key ":" $__value ":" $__key ":" $__value));
+            eq $last "k2:v2:k2:v2" || error --from lib "map_result_bad";
+
+            local seen="";
+            map $routes $(capture --value seen $(append $seen $__key ":" $__value "|"));
+            eq $seen "k1:v1|k2:v2|" || error --from lib "map_external_vars_bad";
+
+            capture --value assigned $(map $routes $(capture --value __value $(append $__value "set")));
+            eq $assigned "v2set" || error --from lib "map_external_set_bad";
+
+            capture --value removed $(map $routes $(delete __value));
+            eq $removed "v2" || error --from lib "map_external_remove_bad";
+
+            eq $__key "" || error --from lib "map_key_leaked";
+            eq $__value "" || error --from lib "map_value_leaked";
+
+            return --from lib "ok";
+        ]]>
+    </block>
+</process_chain>
+</root>
+"#;
+
 #[tokio::test]
 async fn test_collection_basic_semantics() -> Result<(), String> {
     init_test_logger();
@@ -193,6 +225,30 @@ async fn test_collection_basic_semantics() -> Result<(), String> {
     let hook_point_env = HookPointEnv::new("test-collection-basic", data_dir);
     let exec = hook_point_env.link_hook_point(&hook_point).await?;
     let ret = exec.execute_lib("test_collection_basic_lib").await?;
+    assert_eq!(ret.value(), "ok");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_map_reduce_external_vars_scope_cleanup() -> Result<(), String> {
+    init_test_logger();
+
+    let hook_point = HookPoint::new("test_map_reduce_external_scope");
+    hook_point
+        .load_process_chain_lib(
+            "test_map_reduce_external_scope_lib",
+            0,
+            PROCESS_CHAIN_MAP_REDUCE_EXTERNAL_SCOPE,
+        )
+        .await?;
+
+    let data_dir = new_test_data_dir("test-map-reduce-external-scope")?;
+    let hook_point_env = HookPointEnv::new("test-map-reduce-external-scope", data_dir);
+    let exec = hook_point_env.link_hook_point(&hook_point).await?;
+    let ret = exec
+        .execute_lib("test_map_reduce_external_scope_lib")
+        .await?;
     assert_eq!(ret.value(), "ok");
 
     Ok(())

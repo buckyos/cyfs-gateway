@@ -1,4 +1,5 @@
 mod complete;
-mod repl;
+#[path = "repl.rs"]
+mod types;
 
-pub use repl::*;
+pub use types::*;

@@ -70,10 +70,10 @@ fn error_handling_example() {
     let invalid_command = r#"echo "Unclosed quote"#;
     println!("无效命令: {}", invalid_command);
 
-    let mut shlex = Shlex::new(invalid_command);
+    let shlex = Shlex::new(invalid_command);
     let mut args = Vec::new();
 
-    while let Some(token) = shlex.next() {
+    for token in shlex {
         args.push(token.clone());
     }
 
@@ -84,9 +84,9 @@ fn error_handling_example() {
 /// 实用的命令行解析函数
 pub fn parse_command_line(command: &str) -> Result<Vec<String>, String> {
     let mut args = Vec::new();
-    let mut shlex = Shlex::new(command);
+    let shlex = Shlex::new(command);
 
-    while let Some(token) = shlex.next() {
+    for token in shlex {
         args.push(token.clone());
     }
 

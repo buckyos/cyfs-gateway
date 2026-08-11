@@ -4,15 +4,14 @@ use std::sync::{Arc, RwLock};
 
 pub const MAX_GOTO_COUNT: u32 = 128; // Maximum number of times the goto command can be executed in process chains execution
 
+#[derive(Default)]
 pub struct GotoCounter {
     pub count: AtomicU32, // The number of times the goto command has been executed
 }
 
 impl GotoCounter {
     pub fn new() -> Self {
-        Self {
-            count: AtomicU32::new(0),
-        }
+        Self::default()
     }
 
     pub fn increment(&self) -> Result<(), String> {
@@ -83,6 +82,7 @@ impl ExecPointerInner {
     }
 }
 
+#[derive(Default)]
 struct ExecPointerStack {
     stack: Vec<ExecPointerInner>, // Stack of execution pointers
 }
@@ -180,16 +180,14 @@ impl ExecPointerStack {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct ExecPointer {
     stack: Arc<RwLock<ExecPointerStack>>, // The inner state of the execution pointer
 }
 
 impl ExecPointer {
     pub fn new() -> Self {
-        Self {
-            stack: Arc::new(RwLock::new(ExecPointerStack::new())),
-        }
+        Self::default()
     }
 
     fn set_lib(&self, lib: ProcessChainLibRef) -> Result<(), String> {
@@ -256,7 +254,6 @@ pub struct ExecPointerLibGuard<'a> {
 
 impl<'a> ExecPointerLibGuard<'a> {
     // Return value must be handled by caller
-    #[must_use]
     pub fn new(pointer: &'a ExecPointer, lib: ProcessChainLibRef) -> Result<Self, String> {
         pointer.set_lib(lib)?;
         Ok(Self { pointer })
@@ -274,7 +271,6 @@ pub struct ExecPointerChainGuard<'a> {
 }
 
 impl<'a> ExecPointerChainGuard<'a> {
-    #[must_use]
     pub fn new(pointer: &'a ExecPointer, chain: ProcessChainRef) -> Result<Self, String> {
         pointer.set_chain(chain)?;
         Ok(Self { pointer })
@@ -292,7 +288,6 @@ pub struct ExecPointerBlockGuard<'a> {
 }
 
 impl<'a> ExecPointerBlockGuard<'a> {
-    #[must_use]
     pub fn new(pointer: &'a ExecPointer, block: &str) -> Result<Self, String> {
         pointer.set_block(block)?;
         Ok(Self { pointer })

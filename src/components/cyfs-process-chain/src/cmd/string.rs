@@ -1,7 +1,8 @@
-use super::cmd::*;
+use super::template::TemplateMatcher;
+use super::types::*;
 use crate::block::{CommandArg, CommandArgEvaluator, CommandArgs};
 use crate::chain::{Context, ParserContext};
-use crate::collection::{CollectionValue, NumberValue};
+use crate::collection::{CollectionValue, MemoryListCollection, NumberValue};
 use clap::{Arg, ArgAction, Command};
 use globset::{GlobBuilder, GlobMatcher};
 use regex::Regex;
@@ -21,17 +22,19 @@ impl RewriteCommandParser {
                 r#"
 Arguments:
   <var>       The variable to rewrite (e.g. $REQ.url)
-  <pattern>   A glob-style pattern to match (e.g. /kapi/my-service/*)
-  <template>  A replacement template using * wildcard (e.g. /kapi/*)
+  <pattern>   A case-insensitive glob pattern to match
+  <template>  The replacement string or trailing-* template
 
 Behavior:
-  - Performs case-insensitive glob pattern match.
-  - Supports only a single '*' wildcard in pattern/template.
-  - Rewrites the variable if pattern matches, replacing the '*' part.
+  - Performs case-insensitive glob pattern matching.
+  - If <pattern> does not match, returns error and leaves the variable unchanged.
+  - If <pattern> ends with '*' and <template> also ends with '*', preserves the
+    matched suffix by appending it to <template> without its trailing '*'.
+  - Otherwise, if <pattern> matches, rewrites the variable to <template> as-is.
 
 Examples:
   rewrite $REQ.url "/kapi/my-service/*" "/kapi/*"
-  rewrite host "api.*.domain.com" "svc-*.internal"
+  rewrite $REQ.host "*.example.com" "backend.internal"
 "#,
             )
             .arg(
@@ -228,7 +231,7 @@ pub struct RewriteRegexCommandParser {
 
 impl RewriteRegexCommandParser {
     pub fn new() -> Self {
-        let cmd = Command::new("rewrite-regex")
+        let cmd = Command::new("rewrite-reg")
             .about("Rewrite a variable using a regular expression and a replacement template.")
             .after_help(
                 r#"
@@ -239,11 +242,13 @@ Arguments:
 
 Behavior:
   - If the regex matches, rewrites the variable with the template.
+  - Only '$' followed by one ASCII digit is treated as a capture reference.
+    Other '$' characters are kept literally.
   - Unmatched captures are replaced with empty strings.
-  - If the pattern does not match, the variable remains unchanged.
+  - If the pattern does not match, returns error and leaves the variable unchanged.
 
 Examples:
-  rewrite-regex $REQ.url "^/test/(\\w+)(?:/(\\d+))?" "/new/$1/$2"
+  rewrite-reg $REQ.url "^/test/(\\w+)(?:/(\\d+))?" "/new/$1/$2"
 "#,
             )
             .arg(
@@ -370,24 +375,23 @@ impl CommandExecutor for RewriteRegexCommand {
 
             while let Some(c) = chars.next() {
                 if c == '$' {
-                    if let Some(&next_c) = chars.peek() {
-                        if next_c.is_ascii_digit() {
-                            chars.next(); // consume digit
-                            let idx = next_c.to_digit(10).ok_or_else(|| {
-                                let msg =
-                                    format!("Invalid digit after $ in template: {}", template);
-                                error!("{}", msg);
-                                msg
-                            })? as usize;
+                    if let Some(&next_c) = chars.peek()
+                        && next_c.is_ascii_digit()
+                    {
+                        chars.next(); // consume digit
+                        let idx = next_c.to_digit(10).ok_or_else(|| {
+                            let msg = format!("Invalid digit after $ in template: {}", template);
+                            error!("{}", msg);
+                            msg
+                        })? as usize;
 
-                            if let Some(m) = captures.get(idx) {
-                                result.push_str(m.as_str());
-                            } else {
-                                // if the capture group does not exist, we should skip it as empty
-                            }
-
-                            continue;
+                        if let Some(m) = captures.get(idx) {
+                            result.push_str(m.as_str());
+                        } else {
+                            // if the capture group does not exist, we should skip it as empty
                         }
+
+                        continue;
                     }
 
                     result.push('$'); // literal $
@@ -408,6 +412,308 @@ impl CommandExecutor for RewriteRegexCommand {
 
             Ok(CommandResult::success_with_string(result))
         } else {
+            Ok(CommandResult::error())
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct TemplateRewriteDefaults {
+    separator: char,
+    ignore_case: bool,
+}
+
+pub struct RewritePathCommandParser {
+    cmd: Command,
+}
+
+impl RewritePathCommandParser {
+    pub fn new() -> Self {
+        let cmd = Command::new("rewrite-path")
+            .about("Rewrite a path-like variable using segment templates.")
+            .after_help(
+                r#"
+Arguments:
+  <var>       The path-like variable to rewrite (e.g. $REQ.path)
+  <pattern>   The template pattern to match against
+  <template>  The rewrite template using {name} and optional ** rest splice
+
+Options:
+  --ignore-case   Perform case-insensitive matching (default is case-sensitive)
+
+Behavior:
+  - Uses '/' as the default segment separator.
+  - <pattern> and <template> are evaluated dynamically at runtime.
+  - <pattern> follows the same template rules as match-path:
+      {name} captures one segment and ** matches the remaining segments at the end.
+  - <template> can reference named captures using {name}.
+  - If <pattern> contains **, <template> may include a segment ** to splice the matched remaining segments.
+  - If <pattern> does not match, returns error and leaves the variable unchanged.
+
+Examples:
+  rewrite-path $REQ.path "/kapi/{service}/**" "/api/{service}/**"
+  rewrite-path $REQ.path "${route_prefix}/{node}/{plane}/**" "/klog/{node}/{plane}/**"
+"#,
+            )
+            .arg(
+                Arg::new("ignore_case")
+                    .long("ignore-case")
+                    .action(ArgAction::SetTrue)
+                    .help("Perform case-insensitive matching (default is case-sensitive)"),
+            )
+            .arg(Arg::new("var").required(true).help("The variable to rewrite"))
+            .arg(
+                Arg::new("pattern")
+                    .required(true)
+                    .help("The template pattern to match"),
+            )
+            .arg(
+                Arg::new("template")
+                    .required(true)
+                    .help("The rewrite template"),
+            );
+
+        Self { cmd }
+    }
+}
+
+impl CommandParser for RewritePathCommandParser {
+    fn group(&self) -> CommandGroup {
+        CommandGroup::String
+    }
+
+    fn help(&self, _name: &str, help_type: CommandHelpType) -> String {
+        command_help(help_type, &self.cmd)
+    }
+
+    fn parse(
+        &self,
+        _context: &ParserContext,
+        str_args: Vec<&str>,
+        args: &CommandArgs,
+    ) -> Result<CommandExecutorRef, String> {
+        parse_template_rewrite_command(
+            &self.cmd,
+            "rewrite-path",
+            str_args,
+            args,
+            TemplateRewriteDefaults {
+                separator: '/',
+                ignore_case: false,
+            },
+            Some("ignore_case"),
+            None,
+        )
+    }
+}
+
+pub struct RewriteHostCommandParser {
+    cmd: Command,
+}
+
+impl RewriteHostCommandParser {
+    pub fn new() -> Self {
+        let cmd = Command::new("rewrite-host")
+            .about("Rewrite a host-like variable using segment templates.")
+            .after_help(
+                r#"
+Arguments:
+  <var>       The host-like variable to rewrite (e.g. $REQ.host)
+  <pattern>   The template pattern to match against
+  <template>  The rewrite template using {name} and optional ** rest splice
+
+Options:
+  --no-ignore-case   Perform case-sensitive matching (default is case-insensitive)
+
+Behavior:
+  - Uses '.' as the default segment separator.
+  - <pattern> and <template> are evaluated dynamically at runtime.
+  - <pattern> follows the same template rules as match-host:
+      {name} captures one host label and ** matches the remaining labels at the end.
+  - <template> can reference named captures using {name}.
+  - If <pattern> contains **, <template> may include a segment ** to splice the matched remaining labels.
+  - If <pattern> does not match, returns error and leaves the variable unchanged.
+
+Examples:
+  rewrite-host $REQ.host "{app}.${zone}" "{app}-internal.{zone}"
+  rewrite-host $REQ.host "{app}.**" "{app}.internal.**"
+"#,
+            )
+            .arg(
+                Arg::new("no_ignore_case")
+                    .long("no-ignore-case")
+                    .action(ArgAction::SetTrue)
+                    .help("Perform case-sensitive matching (default is case-insensitive)"),
+            )
+            .arg(Arg::new("var").required(true).help("The variable to rewrite"))
+            .arg(
+                Arg::new("pattern")
+                    .required(true)
+                    .help("The template pattern to match"),
+            )
+            .arg(
+                Arg::new("template")
+                    .required(true)
+                    .help("The rewrite template"),
+            );
+
+        Self { cmd }
+    }
+}
+
+impl CommandParser for RewriteHostCommandParser {
+    fn group(&self) -> CommandGroup {
+        CommandGroup::String
+    }
+
+    fn help(&self, _name: &str, help_type: CommandHelpType) -> String {
+        command_help(help_type, &self.cmd)
+    }
+
+    fn parse(
+        &self,
+        _context: &ParserContext,
+        str_args: Vec<&str>,
+        args: &CommandArgs,
+    ) -> Result<CommandExecutorRef, String> {
+        parse_template_rewrite_command(
+            &self.cmd,
+            "rewrite-host",
+            str_args,
+            args,
+            TemplateRewriteDefaults {
+                separator: '.',
+                ignore_case: true,
+            },
+            None,
+            Some("no_ignore_case"),
+        )
+    }
+}
+
+fn parse_template_rewrite_command(
+    cmd: &Command,
+    command_name: &str,
+    str_args: Vec<&str>,
+    args: &CommandArgs,
+    defaults: TemplateRewriteDefaults,
+    ignore_case_flag: Option<&str>,
+    no_ignore_case_flag: Option<&str>,
+) -> Result<CommandExecutorRef, String> {
+    let matches = cmd.clone().try_get_matches_from(&str_args).map_err(|e| {
+        let msg = format!("Invalid {} command: {:?}, {}", command_name, str_args, e);
+        error!("{}", msg);
+        msg
+    })?;
+
+    let key_index = matches.index_of("var").ok_or_else(|| {
+        let msg = format!("Variable name is required for {} command", command_name);
+        error!("{}", msg);
+        msg
+    })?;
+    let key = args[key_index].clone();
+    if !key.is_var() {
+        let msg = format!(
+            "Invalid {} command: {:?}, the first argument must be a variable",
+            command_name, args
+        );
+        error!("{}", msg);
+        return Err(msg);
+    }
+
+    let pattern_index = matches.index_of("pattern").ok_or_else(|| {
+        let msg = format!("Pattern is required for {} command", command_name);
+        error!("{}", msg);
+        msg
+    })?;
+    let pattern = args[pattern_index].clone();
+
+    let template_index = matches.index_of("template").ok_or_else(|| {
+        let msg = format!("Template is required for {} command", command_name);
+        error!("{}", msg);
+        msg
+    })?;
+    let template = args[template_index].clone();
+
+    let ignore_case = if let Some(flag) = ignore_case_flag {
+        matches.get_flag(flag)
+    } else if let Some(flag) = no_ignore_case_flag {
+        !matches.get_flag(flag)
+    } else {
+        defaults.ignore_case
+    };
+
+    let exec = TemplateRewriteCommand::new(
+        command_name.to_owned(),
+        key,
+        pattern,
+        template,
+        defaults.separator,
+        ignore_case,
+    );
+    Ok(Arc::new(Box::new(exec)))
+}
+
+pub struct TemplateRewriteCommand {
+    command_name: String,
+    key: CommandArg,
+    pattern: CommandArg,
+    template: CommandArg,
+    separator: char,
+    ignore_case: bool,
+}
+
+impl TemplateRewriteCommand {
+    pub fn new(
+        command_name: String,
+        key: CommandArg,
+        pattern: CommandArg,
+        template: CommandArg,
+        separator: char,
+        ignore_case: bool,
+    ) -> Self {
+        Self {
+            command_name,
+            key,
+            pattern,
+            template,
+            separator,
+            ignore_case,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl CommandExecutor for TemplateRewriteCommand {
+    async fn exec(&self, context: &Context) -> Result<super::CommandResult, String> {
+        let key_value = self.key.evaluate_string(context).await?;
+        let pattern = self.pattern.evaluate_string(context).await?;
+        let template = self.template.evaluate_string(context).await?;
+        let matcher = TemplateMatcher::new(&self.command_name, self.separator, self.ignore_case);
+
+        if let Some(rewritten) = matcher.rewrite(&key_value, &pattern, &template)? {
+            context
+                .env()
+                .set(
+                    self.key.as_str(),
+                    CollectionValue::String(rewritten.clone()),
+                    None,
+                )
+                .await?;
+            info!(
+                "Rewritten value for {} via {}: {} -> {}",
+                self.key.as_str(),
+                self.command_name,
+                key_value,
+                rewritten
+            );
+
+            Ok(CommandResult::success_with_string(rewritten))
+        } else {
+            info!(
+                "{} pattern '{}' did not match '{}'",
+                self.command_name, pattern, key_value
+            );
             Ok(CommandResult::error())
         }
     }
@@ -577,13 +883,11 @@ impl CommandExecutor for StringReplaceCommand {
             } else {
                 None
             }
+        } else if key_value.contains(&match_text) {
+            let rewritten = Self::replace_case_sensitive(&key_value, &match_text, &new_text);
+            Some(rewritten)
         } else {
-            if key_value.contains(&match_text) {
-                let rewritten = Self::replace_case_sensitive(&key_value, &match_text, &new_text);
-                Some(rewritten)
-            } else {
-                None
-            }
+            None
         };
 
         // If a rewritten value is found, set it in the environment
@@ -726,241 +1030,6 @@ impl CommandExecutor for StringAppendCommand {
 
         // Return the result as a command result
         Ok(super::CommandResult::success_with_string(&result))
-    }
-}
-
-fn percent_encode_url_component(input: &str) -> String {
-    let mut encoded = String::with_capacity(input.len());
-    for byte in input.bytes() {
-        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
-            encoded.push(char::from(byte));
-        } else {
-            encoded.push('%');
-            encoded.push_str(&format!("{:02X}", byte));
-        }
-    }
-
-    encoded
-}
-
-fn decode_hex_digit(byte: u8) -> Result<u8, String> {
-    match byte {
-        b'0'..=b'9' => Ok(byte - b'0'),
-        b'a'..=b'f' => Ok(byte - b'a' + 10),
-        b'A'..=b'F' => Ok(byte - b'A' + 10),
-        _ => Err(format!(
-            "Invalid percent-encoded byte: '{}'",
-            char::from(byte)
-        )),
-    }
-}
-
-fn percent_decode_url_component(input: &str) -> Result<String, String> {
-    let bytes = input.as_bytes();
-    let mut decoded = Vec::with_capacity(bytes.len());
-    let mut index = 0;
-
-    while index < bytes.len() {
-        match bytes[index] {
-            b'%' => {
-                if index + 2 >= bytes.len() {
-                    let msg = format!("Incomplete percent-encoded sequence in '{}'", input);
-                    error!("{}", msg);
-                    return Err(msg);
-                }
-
-                let high = decode_hex_digit(bytes[index + 1])?;
-                let low = decode_hex_digit(bytes[index + 2])?;
-                decoded.push((high << 4) | low);
-                index += 3;
-            }
-            byte => {
-                decoded.push(byte);
-                index += 1;
-            }
-        }
-    }
-
-    String::from_utf8(decoded).map_err(|e| {
-        let msg = format!("Decoded URL string is not valid UTF-8: {}", e);
-        error!("{}", msg);
-        msg
-    })
-}
-
-pub struct UrlEncodeCommandParser {
-    cmd: Command,
-}
-
-impl UrlEncodeCommandParser {
-    pub fn new() -> Self {
-        let cmd = Command::new("url_encode")
-            .about("Percent-encode a string so it can be safely embedded in a URL.")
-            .after_help(
-                r#"
-Arguments:
-  <string>     The input string or variable to encode.
-
-Behavior:
-  - Encodes reserved URL characters using percent-encoding.
-  - Leaves RFC 3986 unreserved characters unchanged.
-  - Does not modify environment or variables.
-
-Examples:
-  url_encode "https://example.com/callback?a=1&b=2"
-  url_encode $REQ.url
-"#,
-            )
-            .arg(
-                Arg::new("string")
-                    .required(true)
-                    .help("Input string to percent-encode"),
-            );
-
-        Self { cmd }
-    }
-}
-
-impl CommandParser for UrlEncodeCommandParser {
-    fn group(&self) -> CommandGroup {
-        CommandGroup::String
-    }
-
-    fn help(&self, _name: &str, help_type: CommandHelpType) -> String {
-        command_help(help_type, &self.cmd)
-    }
-
-    fn parse(
-        &self,
-        _context: &ParserContext,
-        str_args: Vec<&str>,
-        args: &CommandArgs,
-    ) -> Result<CommandExecutorRef, String> {
-        let matches = self
-            .cmd
-            .clone()
-            .try_get_matches_from(&str_args)
-            .map_err(|e| {
-                let msg = format!("Invalid url_encode command: {:?}, {}", str_args, e);
-                error!("{}", msg);
-                msg
-            })?;
-
-        let string_index = matches.index_of("string").ok_or_else(|| {
-            let msg = format!("String value is required, but got: {:?}", args);
-            error!("{}", msg);
-            msg
-        })?;
-
-        let string_value = args[string_index].clone();
-        Ok(Arc::new(Box::new(UrlEncodeCommand::new(string_value))))
-    }
-}
-
-pub struct UrlEncodeCommand {
-    string: CommandArg,
-}
-
-impl UrlEncodeCommand {
-    pub fn new(string: CommandArg) -> Self {
-        Self { string }
-    }
-}
-
-#[async_trait::async_trait]
-impl CommandExecutor for UrlEncodeCommand {
-    async fn exec(&self, context: &Context) -> Result<super::CommandResult, String> {
-        let string_value = self.string.evaluate_string(context).await?;
-        let encoded = percent_encode_url_component(&string_value);
-        Ok(super::CommandResult::success_with_string(encoded))
-    }
-}
-
-pub struct UrlDecodeCommandParser {
-    cmd: Command,
-}
-
-impl UrlDecodeCommandParser {
-    pub fn new() -> Self {
-        let cmd = Command::new("url_decode")
-            .about("Decode a percent-encoded URL string.")
-            .after_help(
-                r#"
-Arguments:
-  <string>     The input string or variable to decode.
-
-Behavior:
-  - Decodes `%XX` escape sequences.
-  - Returns a runtime error for malformed escape sequences or invalid UTF-8.
-  - Does not modify environment or variables.
-
-Examples:
-  url_decode "https%3A%2F%2Fexample.com%2Fcallback%3Fa%3D1%26b%3D2"
-  url_decode $encoded_url
-"#,
-            )
-            .arg(
-                Arg::new("string")
-                    .required(true)
-                    .help("Input string to percent-decode"),
-            );
-
-        Self { cmd }
-    }
-}
-
-impl CommandParser for UrlDecodeCommandParser {
-    fn group(&self) -> CommandGroup {
-        CommandGroup::String
-    }
-
-    fn help(&self, _name: &str, help_type: CommandHelpType) -> String {
-        command_help(help_type, &self.cmd)
-    }
-
-    fn parse(
-        &self,
-        _context: &ParserContext,
-        str_args: Vec<&str>,
-        args: &CommandArgs,
-    ) -> Result<CommandExecutorRef, String> {
-        let matches = self
-            .cmd
-            .clone()
-            .try_get_matches_from(&str_args)
-            .map_err(|e| {
-                let msg = format!("Invalid url_decode command: {:?}, {}", str_args, e);
-                error!("{}", msg);
-                msg
-            })?;
-
-        let string_index = matches.index_of("string").ok_or_else(|| {
-            let msg = format!("String value is required, but got: {:?}", args);
-            error!("{}", msg);
-            msg
-        })?;
-
-        let string_value = args[string_index].clone();
-        Ok(Arc::new(Box::new(UrlDecodeCommand::new(string_value))))
-    }
-}
-
-pub struct UrlDecodeCommand {
-    string: CommandArg,
-}
-
-impl UrlDecodeCommand {
-    pub fn new(string: CommandArg) -> Self {
-        Self { string }
-    }
-}
-
-#[async_trait::async_trait]
-impl CommandExecutor for UrlDecodeCommand {
-    async fn exec(&self, context: &Context) -> Result<super::CommandResult, String> {
-        let string_value = self.string.evaluate_string(context).await?;
-        let decoded = percent_decode_url_component(&string_value)?;
-        Ok(super::CommandResult::success_with_string(decoded))
     }
 }
 
@@ -1141,6 +1210,200 @@ impl CommandExecutor for StringSliceCommand {
                 Ok(CommandResult::error())
             }
         }
+    }
+}
+
+// split <value> <delimiter>
+// This command splits a string into segments and optionally stores them in a fresh List capture.
+pub struct StringSplitCommandParser {
+    cmd: Command,
+}
+
+impl StringSplitCommandParser {
+    pub fn new() -> Self {
+        let cmd = Command::new("split")
+            .about("Split a string into segments using a delimiter.")
+            .after_help(
+                r#"
+Arguments:
+  <value>       The input string or variable.
+  <delimiter>   The delimiter string used to split the input.
+
+Options:
+  --capture <name>   Store segments into a fresh List variable accessible as name[0], name[1], ...
+  --skip-empty       Drop empty segments from the result
+
+Behavior:
+  - Both arguments are evaluated dynamically at runtime.
+  - Returns a List of string segments.
+  - By default, empty segments are preserved, including leading or trailing ones.
+  - If --skip-empty is set, empty segments are removed from both the returned list and captured slots.
+  - If --capture is set, <name> is replaced with a fresh List containing the split segments.
+  - <name> must be a literal variable name or path.
+  - Empty delimiter is invalid and returns a runtime error.
+
+Examples:
+  split "/a/b/c" "/"
+  split --skip-empty "/.cluster/klog/ood1/admin/" "/"
+  split --capture parts $REQ.path $delimiter
+"#,
+            )
+            .arg(
+                Arg::new("capture")
+                    .long("capture")
+                    .value_name("name")
+                    .help("Store split segments into a fresh List variable"),
+            )
+            .arg(
+                Arg::new("skip_empty")
+                    .long("skip-empty")
+                    .action(ArgAction::SetTrue)
+                    .help("Drop empty segments from the result"),
+            )
+            .arg(
+                Arg::new("value")
+                    .required(true)
+                    .help("Input string to split"),
+            )
+            .arg(
+                Arg::new("delimiter")
+                    .required(true)
+                    .help("Delimiter string used for splitting"),
+            );
+
+        Self { cmd }
+    }
+}
+
+impl CommandParser for StringSplitCommandParser {
+    fn group(&self) -> CommandGroup {
+        CommandGroup::String
+    }
+
+    fn help(&self, _name: &str, help_type: CommandHelpType) -> String {
+        command_help(help_type, &self.cmd)
+    }
+
+    fn parse(
+        &self,
+        _context: &ParserContext,
+        str_args: Vec<&str>,
+        args: &CommandArgs,
+    ) -> Result<CommandExecutorRef, String> {
+        let matches = self
+            .cmd
+            .clone()
+            .try_get_matches_from(&str_args)
+            .map_err(|e| {
+                let msg = format!("Invalid string split command: {:?}, {}", str_args, e);
+                error!("{}", msg);
+                msg
+            })?;
+
+        let capture = match matches.index_of("capture") {
+            Some(index) => {
+                let name = args[index].as_literal_str().ok_or_else(|| {
+                    let msg = format!("Capture name must be a literal string: {:?}", args[index]);
+                    error!("{}", msg);
+                    msg
+                })?;
+                Some(name.to_string())
+            }
+            None => None,
+        };
+
+        let skip_empty = matches.get_flag("skip_empty");
+
+        let value_index = matches.index_of("value").ok_or_else(|| {
+            let msg = format!("Value is required, but got: {:?}", args);
+            error!("{}", msg);
+            msg
+        })?;
+        let value = args[value_index].clone();
+
+        let delimiter_index = matches.index_of("delimiter").ok_or_else(|| {
+            let msg = format!("Delimiter is required, but got: {:?}", args);
+            error!("{}", msg);
+            msg
+        })?;
+        let delimiter = args[delimiter_index].clone();
+
+        let cmd = StringSplitCommand::new(value, delimiter, capture, skip_empty);
+
+        Ok(Arc::new(Box::new(cmd)))
+    }
+}
+
+pub struct StringSplitCommand {
+    value: CommandArg,
+    delimiter: CommandArg,
+    capture: Option<String>,
+    skip_empty: bool,
+}
+
+impl StringSplitCommand {
+    pub fn new(
+        value: CommandArg,
+        delimiter: CommandArg,
+        capture: Option<String>,
+        skip_empty: bool,
+    ) -> Self {
+        Self {
+            value,
+            delimiter,
+            capture,
+            skip_empty,
+        }
+    }
+
+    fn split_segments(
+        value: &str,
+        delimiter: &str,
+        skip_empty: bool,
+    ) -> Result<Vec<String>, String> {
+        if delimiter.is_empty() {
+            let msg = "Delimiter for split command cannot be empty".to_string();
+            error!("{}", msg);
+            return Err(msg);
+        }
+
+        Ok(value
+            .split(delimiter)
+            .filter(|segment| !skip_empty || !segment.is_empty())
+            .map(|segment| segment.to_owned())
+            .collect())
+    }
+
+    async fn build_list(segments: &[String]) -> Result<CollectionValue, String> {
+        let list = MemoryListCollection::new_ref();
+        for segment in segments {
+            list.push(CollectionValue::String(segment.clone())).await?;
+        }
+
+        Ok(CollectionValue::List(list))
+    }
+}
+
+#[async_trait::async_trait]
+impl CommandExecutor for StringSplitCommand {
+    async fn exec(&self, context: &Context) -> Result<super::CommandResult, String> {
+        let value = self.value.evaluate_string(context).await?;
+        let delimiter = self.delimiter.evaluate_string(context).await?;
+        let segments = Self::split_segments(&value, &delimiter, self.skip_empty)?;
+
+        if let Some(name) = &self.capture {
+            let capture_list = Self::build_list(&segments).await?;
+            context.env().set(name, capture_list, None).await?;
+        }
+
+        debug!(
+            "split value='{}' delimiter='{}' skip_empty={} segments={:?} capture={:?}",
+            value, delimiter, self.skip_empty, segments, self.capture
+        );
+
+        Ok(super::CommandResult::success_with_value(
+            Self::build_list(&segments).await?,
+        ))
     }
 }
 
@@ -1400,6 +1663,320 @@ impl CommandExecutor for StringStartsWithCommand {
             Ok(super::CommandResult::error_with_value(
                 CollectionValue::Bool(false),
             ))
+        }
+    }
+}
+
+// strip-prefix <value> <prefix>
+// This command removes a dynamic prefix from a string and returns the remaining tail.
+pub struct StringStripPrefixCommandParser {
+    cmd: Command,
+}
+
+impl StringStripPrefixCommandParser {
+    fn strip_prefix_ignore_case<'a>(value: &'a str, prefix: &str) -> Option<&'a str> {
+        if !value.to_lowercase().starts_with(&prefix.to_lowercase()) {
+            return None;
+        }
+
+        let prefix_char_count = prefix.chars().count();
+        let split_index = value
+            .char_indices()
+            .nth(prefix_char_count)
+            .map(|(index, _)| index)
+            .unwrap_or(value.len());
+        value.get(split_index..)
+    }
+
+    pub fn new() -> Self {
+        let cmd = Command::new("strip-prefix")
+            .about("Strip a prefix from a string and return the remaining tail.")
+            .after_help(
+                r#"
+Arguments:
+  <value>      The full input string or variable.
+  <prefix>     The prefix to remove.
+
+Options:
+  --ignore-case,-i   Perform case-insensitive comparison
+
+Behavior:
+  - Both arguments are evaluated dynamically at runtime.
+  - If <value> starts with <prefix>, returns success with the remaining tail.
+  - If <value> equals <prefix>, returns success with an empty string.
+  - Comparison is case-sensitive by default.
+  - If <value> does not start with <prefix>, returns error and leaves the value unchanged.
+  - Does not modify any variable or environment.
+
+Examples:
+  strip-prefix "/api/v1/users" "/api"
+  strip-prefix --ignore-case "/API/v1/users" "/api"
+  strip-prefix $REQ.url $route_prefix
+"#,
+            )
+            .arg(
+                Arg::new("ignore_case")
+                    .long("ignore-case")
+                    .short('i')
+                    .action(ArgAction::SetTrue)
+                    .help("Perform case-insensitive comparison"),
+            )
+            .arg(
+                Arg::new("value")
+                    .required(true)
+                    .help("Input string to strip"),
+            )
+            .arg(Arg::new("prefix").required(true).help("Prefix to remove"));
+
+        Self { cmd }
+    }
+}
+
+impl CommandParser for StringStripPrefixCommandParser {
+    fn group(&self) -> CommandGroup {
+        CommandGroup::String
+    }
+
+    fn help(&self, _name: &str, help_type: CommandHelpType) -> String {
+        command_help(help_type, &self.cmd)
+    }
+
+    fn parse(
+        &self,
+        _context: &ParserContext,
+        str_args: Vec<&str>,
+        args: &CommandArgs,
+    ) -> Result<CommandExecutorRef, String> {
+        let matches = self
+            .cmd
+            .clone()
+            .try_get_matches_from(&str_args)
+            .map_err(|e| {
+                let msg = format!("Invalid strip-prefix command: {:?}, {}", str_args, e);
+                error!("{}", msg);
+                msg
+            })?;
+
+        let ignore_case = matches.get_flag("ignore_case");
+
+        let value_index = matches.index_of("value").ok_or_else(|| {
+            let msg = format!("Value is required, but got: {:?}", args);
+            error!("{}", msg);
+            msg
+        })?;
+        let value = args[value_index].clone();
+
+        let prefix_index = matches.index_of("prefix").ok_or_else(|| {
+            let msg = format!("Prefix is required, but got: {:?}", args);
+            error!("{}", msg);
+            msg
+        })?;
+        let prefix = args[prefix_index].clone();
+
+        let cmd = StringStripPrefixCommand::new(value, prefix, ignore_case);
+
+        Ok(Arc::new(Box::new(cmd)))
+    }
+}
+
+pub struct StringStripPrefixCommand {
+    ignore_case: bool,
+    value: CommandArg,
+    prefix: CommandArg,
+}
+
+impl StringStripPrefixCommand {
+    pub fn new(value: CommandArg, prefix: CommandArg, ignore_case: bool) -> Self {
+        Self {
+            ignore_case,
+            value,
+            prefix,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl CommandExecutor for StringStripPrefixCommand {
+    async fn exec(&self, context: &Context) -> Result<super::CommandResult, String> {
+        let value = self.value.evaluate_string(context).await?;
+        let prefix = self.prefix.evaluate_string(context).await?;
+
+        let tail = if self.ignore_case {
+            StringStripPrefixCommandParser::strip_prefix_ignore_case(&value, &prefix)
+        } else {
+            value.strip_prefix(prefix.as_str())
+        };
+
+        if let Some(tail) = tail {
+            info!(
+                "strip-prefix matched value='{}' prefix='{}' ignore_case={} tail='{}'",
+                value, prefix, self.ignore_case, tail
+            );
+            Ok(super::CommandResult::success_with_string(tail))
+        } else {
+            debug!(
+                "strip-prefix not-matched value='{}' prefix='{}' ignore_case={}",
+                value, prefix, self.ignore_case
+            );
+            Ok(super::CommandResult::error())
+        }
+    }
+}
+
+// strip-suffix <value> <suffix>
+// This command removes a dynamic suffix from a string and returns the remaining head.
+pub struct StringStripSuffixCommandParser {
+    cmd: Command,
+}
+
+impl StringStripSuffixCommandParser {
+    fn strip_suffix_ignore_case<'a>(value: &'a str, suffix: &str) -> Option<&'a str> {
+        if !value.to_lowercase().ends_with(&suffix.to_lowercase()) {
+            return None;
+        }
+
+        let suffix_char_count = suffix.chars().count();
+        let value_char_count = value.chars().count();
+        let split_char_index = value_char_count.saturating_sub(suffix_char_count);
+        let split_index = value
+            .char_indices()
+            .nth(split_char_index)
+            .map(|(index, _)| index)
+            .unwrap_or(value.len());
+        value.get(..split_index)
+    }
+
+    pub fn new() -> Self {
+        let cmd = Command::new("strip-suffix")
+            .about("Strip a suffix from a string and return the remaining head.")
+            .after_help(
+                r#"
+Arguments:
+  <value>      The full input string or variable.
+  <suffix>     The suffix to remove.
+
+Options:
+  --ignore-case,-i   Perform case-insensitive comparison
+
+Behavior:
+  - Both arguments are evaluated dynamically at runtime.
+  - If <value> ends with <suffix>, returns success with the remaining head.
+  - If <value> equals <suffix>, returns success with an empty string.
+  - Comparison is case-sensitive by default.
+  - If <value> does not end with <suffix>, returns error and leaves the value unchanged.
+  - Does not modify any variable or environment.
+
+Examples:
+  strip-suffix "/api/v1/users" "/users"
+  strip-suffix --ignore-case "/api/v1/USERS" "/users"
+  strip-suffix $REQ.host $zone_suffix
+"#,
+            )
+            .arg(
+                Arg::new("ignore_case")
+                    .long("ignore-case")
+                    .short('i')
+                    .action(ArgAction::SetTrue)
+                    .help("Perform case-insensitive comparison"),
+            )
+            .arg(
+                Arg::new("value")
+                    .required(true)
+                    .help("Input string to strip"),
+            )
+            .arg(Arg::new("suffix").required(true).help("Suffix to remove"));
+
+        Self { cmd }
+    }
+}
+
+impl CommandParser for StringStripSuffixCommandParser {
+    fn group(&self) -> CommandGroup {
+        CommandGroup::String
+    }
+
+    fn help(&self, _name: &str, help_type: CommandHelpType) -> String {
+        command_help(help_type, &self.cmd)
+    }
+
+    fn parse(
+        &self,
+        _context: &ParserContext,
+        str_args: Vec<&str>,
+        args: &CommandArgs,
+    ) -> Result<CommandExecutorRef, String> {
+        let matches = self
+            .cmd
+            .clone()
+            .try_get_matches_from(&str_args)
+            .map_err(|e| {
+                let msg = format!("Invalid strip-suffix command: {:?}, {}", str_args, e);
+                error!("{}", msg);
+                msg
+            })?;
+
+        let ignore_case = matches.get_flag("ignore_case");
+
+        let value_index = matches.index_of("value").ok_or_else(|| {
+            let msg = format!("Value is required, but got: {:?}", args);
+            error!("{}", msg);
+            msg
+        })?;
+        let value = args[value_index].clone();
+
+        let suffix_index = matches.index_of("suffix").ok_or_else(|| {
+            let msg = format!("Suffix is required, but got: {:?}", args);
+            error!("{}", msg);
+            msg
+        })?;
+        let suffix = args[suffix_index].clone();
+
+        let cmd = StringStripSuffixCommand::new(value, suffix, ignore_case);
+
+        Ok(Arc::new(Box::new(cmd)))
+    }
+}
+
+pub struct StringStripSuffixCommand {
+    ignore_case: bool,
+    value: CommandArg,
+    suffix: CommandArg,
+}
+
+impl StringStripSuffixCommand {
+    pub fn new(value: CommandArg, suffix: CommandArg, ignore_case: bool) -> Self {
+        Self {
+            ignore_case,
+            value,
+            suffix,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl CommandExecutor for StringStripSuffixCommand {
+    async fn exec(&self, context: &Context) -> Result<super::CommandResult, String> {
+        let value = self.value.evaluate_string(context).await?;
+        let suffix = self.suffix.evaluate_string(context).await?;
+
+        let head = if self.ignore_case {
+            StringStripSuffixCommandParser::strip_suffix_ignore_case(&value, &suffix)
+        } else {
+            value.strip_suffix(suffix.as_str())
+        };
+
+        if let Some(head) = head {
+            info!(
+                "strip-suffix matched value='{}' suffix='{}' ignore_case={} head='{}'",
+                value, suffix, self.ignore_case, head
+            );
+            Ok(super::CommandResult::success_with_string(head))
+        } else {
+            debug!(
+                "strip-suffix not-matched value='{}' suffix='{}' ignore_case={}",
+                value, suffix, self.ignore_case
+            );
+            Ok(super::CommandResult::error())
         }
     }
 }

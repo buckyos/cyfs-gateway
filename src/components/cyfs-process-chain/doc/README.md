@@ -29,6 +29,8 @@
   - collection 后端现状评估（memory/json/sqlite 边界、当前结论与未来演进方向）。
 - [RFC_COLLECTION_SEMANTICS.md](./RFC_COLLECTION_SEMANTICS.md)
   - collection 语义与 backend 能力模型草案（引用、顺序、持久化、遍历约束与可移植性）。
+- [PERFORMANCE_TEST_PLAN.md](./PERFORMANCE_TEST_PLAN.md)
+  - `cyfs-process-chain` 性能测试设计与执行计划（benchmark 分层、case 矩阵、执行规范、报告模板）。
 - [RFC_TEMPLATE_LIBRARY.md](./RFC_TEMPLATE_LIBRARY.md)
   - 标准库与最佳实践模板草案（模板契约、错误码规范、分层落地路线）。
 - [MIGRATION_TYPED_LITERAL_BREAKING.md](./MIGRATION_TYPED_LITERAL_BREAKING.md)

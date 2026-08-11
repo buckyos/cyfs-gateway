@@ -1,0 +1,33 @@
+{
+  "name": "@buckyos/bns-contract",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "scripts": {
+    "compile": "hardhat build && npm run facets:check && npm run bindings:generate",
+    "compile:sync": "npm run compile && npm run abi:sync",
+    "test": "hardhat test solidity",
+    "facets:check": "node hardhat-scripts/check-facets.mjs",
+    "bindings:generate": "node hardhat-scripts/generate-bindings.mjs",
+    "abi:sync": "node hardhat-scripts/sync-abi.mjs",
+    "abi:check": "node hardhat-scripts/sync-abi.mjs --check",
+    "validate:upgrade": "hardhat run hardhat-scripts/validate-upgrade.ts",
+    "deploy": "hardhat run hardhat-scripts/deploy.ts",
+    "deploy:local": "hardhat run hardhat-scripts/deploy-local.ts --network anvil",
+    "deploy:op-mainnet": "hardhat run hardhat-scripts/deploy.ts --network opMainnet",
+    "smoke:anvil": "hardhat run hardhat-scripts/smoke.ts --network anvil",
+    "run:anvil": "hardhat run --network anvil"
+  },
+  "devDependencies": {
+    "@nomicfoundation/hardhat-ethers": "4.0.14",
+    "@openzeppelin/contracts": "5.6.1",
+    "@openzeppelin/contracts-upgradeable": "5.6.1",
+    "@openzeppelin/hardhat-upgrades": "4.0.2",
+    "@types/node": "^22.13.0",
+    "ethers": "6.17.0",
+    "hardhat": "^3.9.1",
+    "typescript": "^5.9.0"
+  }
+}

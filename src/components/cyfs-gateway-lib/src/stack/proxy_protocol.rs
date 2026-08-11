@@ -1,4 +1,4 @@
-use crate::{StackErrorCode, StackResult, into_stack_err, stack_err};
+use crate::{StackErrorCode, StackResult, TrustedUpstreamMatcher, into_stack_err, stack_err};
 use buckyos_kit::AsyncStream;
 use cyfs_process_chain::PrefixedStream;
 use std::net::{IpAddr, SocketAddr};
@@ -18,6 +18,35 @@ pub(crate) enum ProxyProbeResult {
         consumed: usize,
         source_addr: Option<SocketAddr>,
     },
+}
+
+pub fn parse_proxy_protocol_trusted_upstreams(
+    patterns: &[String],
+) -> StackResult<Vec<TrustedUpstreamMatcher>> {
+    patterns
+        .iter()
+        .map(|pattern| {
+            TrustedUpstreamMatcher::parse(pattern)
+                .map_err(|err| stack_err!(StackErrorCode::InvalidConfig, "{}", err))
+        })
+        .collect()
+}
+
+/// Parse PROXY headers only when the direct peer matches an explicitly trusted
+/// IP/CIDR. An empty list is fail-closed and treats the preamble as application
+/// data, so public clients cannot replace their connection identity.
+pub async fn probe_proxy_protocol_stream_from_trusted_upstream(
+    stream: Box<dyn AsyncStream>,
+    direct_peer: SocketAddr,
+    trusted_upstreams: &[TrustedUpstreamMatcher],
+) -> StackResult<(Box<dyn AsyncStream>, Option<SocketAddr>)> {
+    if !trusted_upstreams
+        .iter()
+        .any(|matcher| matcher.matches(&direct_peer.ip()))
+    {
+        return Ok((stream, None));
+    }
+    probe_proxy_protocol_stream(stream).await
 }
 
 /// Probe the inbound stream for a PROXY protocol (v1/v2) header and strip it.
@@ -276,13 +305,10 @@ pub async fn write_proxy_v2_preamble(
             SocketAddr::V6(_) => SocketAddr::new(IpAddr::from([0u8; 16]), 0),
         });
     let header = encode_proxy_v2_header(src, dst);
-    stream
-        .write_all(&header)
-        .await
-        .map_err(into_stack_err!(
-            StackErrorCode::StreamError,
-            "write proxy protocol header failed"
-        ))?;
+    stream.write_all(&header).await.map_err(into_stack_err!(
+        StackErrorCode::StreamError,
+        "write proxy protocol header failed"
+    ))?;
     Ok(true)
 }
 
@@ -346,5 +372,66 @@ mod tests {
     fn not_proxy_passthrough() {
         let data = b"GET / HTTP/1.1\r\n\r\n";
         matches!(parse_proxy_protocol(data), ProxyProbeResult::NotProxy);
+    }
+
+    #[tokio::test]
+    async fn untrusted_peer_cannot_spoof_loopback_with_proxy_header() {
+        let claimed_source: SocketAddr = "127.0.0.1:12345".parse().unwrap();
+        let destination: SocketAddr = "192.0.2.10:443".parse().unwrap();
+        let header = encode_proxy_v2_header(claimed_source, destination);
+        let (mut client, server) = tokio::io::duplex(1024);
+        client.write_all(&header).await.unwrap();
+
+        let direct_peer: SocketAddr = "198.51.100.20:40000".parse().unwrap();
+        let (mut stream, restored_source) = probe_proxy_protocol_stream_from_trusted_upstream(
+            Box::new(server),
+            direct_peer,
+            &[TrustedUpstreamMatcher::parse("127.0.0.1/32").unwrap()],
+        )
+        .await
+        .unwrap();
+        assert_eq!(restored_source, None);
+
+        let mut received = vec![0u8; header.len()];
+        stream.read_exact(&mut received).await.unwrap();
+        assert_eq!(received, header);
+    }
+
+    #[tokio::test]
+    async fn loopback_relay_can_restore_proxy_source() {
+        let claimed_source: SocketAddr = "198.51.100.20:40000".parse().unwrap();
+        let destination: SocketAddr = "127.0.0.1:3443".parse().unwrap();
+        let header = encode_proxy_v2_header(claimed_source, destination);
+        let (mut client, server) = tokio::io::duplex(1024);
+        client.write_all(&header).await.unwrap();
+
+        let direct_peer: SocketAddr = "127.0.0.1:50000".parse().unwrap();
+        let (_, restored_source) = probe_proxy_protocol_stream_from_trusted_upstream(
+            Box::new(server),
+            direct_peer,
+            &[TrustedUpstreamMatcher::parse("127.0.0.1/32").unwrap()],
+        )
+        .await
+        .unwrap();
+        assert_eq!(restored_source, Some(claimed_source));
+    }
+
+    #[tokio::test]
+    async fn configured_private_relay_can_restore_proxy_source() {
+        let claimed_source: SocketAddr = "198.51.100.20:40000".parse().unwrap();
+        let destination: SocketAddr = "10.20.0.15:3444".parse().unwrap();
+        let header = encode_proxy_v2_header(claimed_source, destination);
+        let (mut client, server) = tokio::io::duplex(1024);
+        client.write_all(&header).await.unwrap();
+
+        let direct_peer: SocketAddr = "10.20.0.8:50000".parse().unwrap();
+        let (_, restored_source) = probe_proxy_protocol_stream_from_trusted_upstream(
+            Box::new(server),
+            direct_peer,
+            &[TrustedUpstreamMatcher::parse("10.20.0.0/24").unwrap()],
+        )
+        .await
+        .unwrap();
+        assert_eq!(restored_source, Some(claimed_source));
     }
 }

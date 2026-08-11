@@ -1,6 +1,5 @@
 use super::action::ActionCommandParser;
 use super::capture::CaptureCommandParser;
-use super::cmd::*;
 use super::coll::*;
 use super::control::*;
 use super::debug::EchoCommandParser;
@@ -10,6 +9,8 @@ use super::map::*;
 use super::match_::*;
 use super::string::*;
 use super::type_::*;
+use super::types::*;
+use super::uri::*;
 use super::value::*;
 use super::var::*;
 use std::collections::HashMap;
@@ -22,9 +23,7 @@ pub struct CommandParserFactory {
 
 impl CommandParserFactory {
     pub fn new() -> Self {
-        Self {
-            parsers: Arc::new(Mutex::new(HashMap::new())),
-        }
+        Self::default()
     }
 
     pub fn register(&self, name: &str, parser: CommandParserRef) {
@@ -63,6 +62,7 @@ impl CommandParserFactory {
     pub fn init(&self) {
         // control command
         self.register("goto", Arc::new(Box::new(GotoCommandParser::new())));
+        self.register("first-ok", Arc::new(Box::new(FirstOkCommandParser::new())));
         self.register("exec", Arc::new(Box::new(ExecCommandParser::new())));
         self.register("invoke", Arc::new(Box::new(InvokeCommandParser::new())));
         self.register("return", Arc::new(Box::new(ReturnCommandParser::new())));
@@ -100,8 +100,17 @@ impl CommandParserFactory {
             "match-reg",
             Arc::new(Box::new(MatchRegexCommandParser::new())),
         );
+        self.register(
+            "match-path",
+            Arc::new(Box::new(MatchPathCommandParser::new())),
+        );
+        self.register(
+            "match-host",
+            Arc::new(Box::new(MatchHostCommandParser::new())),
+        );
         self.register("eq", Arc::new(Box::new(EQCommandParser::new())));
         self.register("ne", Arc::new(Box::new(NECommandParser::new())));
+        self.register("oneof", Arc::new(Box::new(OneOfCommandParser::new())));
         self.register("gt", Arc::new(Box::new(create_gt_parser())));
         self.register("ge", Arc::new(Box::new(create_ge_parser())));
         self.register("lt", Arc::new(Box::new(create_lt_parser())));
@@ -110,6 +119,14 @@ impl CommandParserFactory {
 
         // string command
         self.register("rewrite", Arc::new(Box::new(RewriteCommandParser::new())));
+        self.register(
+            "rewrite-path",
+            Arc::new(Box::new(RewritePathCommandParser::new())),
+        );
+        self.register(
+            "rewrite-host",
+            Arc::new(Box::new(RewriteHostCommandParser::new())),
+        );
         self.register(
             "rewrite-reg",
             Arc::new(Box::new(RewriteRegexCommandParser::new())),
@@ -124,6 +141,7 @@ impl CommandParserFactory {
             Arc::new(Box::new(StringAppendCommandParser::new())),
         );
         self.register("slice", Arc::new(Box::new(StringSliceCommandParser::new())));
+        self.register("split", Arc::new(Box::new(StringSplitCommandParser::new())));
         self.register(
             "strlen",
             Arc::new(Box::new(StringLengthCommandParser::new())),
@@ -133,9 +151,19 @@ impl CommandParserFactory {
             Arc::new(Box::new(StringStartsWithCommandParser::new())),
         );
         self.register(
+            "strip-prefix",
+            Arc::new(Box::new(StringStripPrefixCommandParser::new())),
+        );
+        self.register(
+            "strip-suffix",
+            Arc::new(Box::new(StringStripSuffixCommandParser::new())),
+        );
+        self.register(
             "ends-with",
             Arc::new(Box::new(StringEndsWithCommandParser::new())),
         );
+
+        // uri commands
         self.register(
             "url_encode",
             Arc::new(Box::new(UrlEncodeCommandParser::new())),
@@ -143,6 +171,36 @@ impl CommandParserFactory {
         self.register(
             "url_decode",
             Arc::new(Box::new(UrlDecodeCommandParser::new())),
+        );
+        self.register(
+            "parse-authority",
+            Arc::new(Box::new(ParseAuthorityCommandParser::new(
+                "parse-authority",
+            ))),
+        );
+        self.register(
+            "parse-auth",
+            Arc::new(Box::new(ParseAuthorityCommandParser::new("parse-auth"))),
+        );
+        self.register(
+            "parse-uri",
+            Arc::new(Box::new(ParseUriCommandParser::new())),
+        );
+        self.register(
+            "parse-query",
+            Arc::new(Box::new(ParseQueryCommandParser::new())),
+        );
+        self.register(
+            "build-uri",
+            Arc::new(Box::new(BuildUriCommandParser::new())),
+        );
+        self.register(
+            "build-query",
+            Arc::new(Box::new(BuildQueryCommandParser::new())),
+        );
+        self.register(
+            "query-get",
+            Arc::new(Box::new(QueryGetCommandParser::new())),
         );
 
         // collection commands
@@ -208,6 +266,14 @@ impl CommandParserFactory {
         let mut parsers = self.parsers.lock().unwrap();
         info!("Clearing all command parsers {}", parsers.len());
         parsers.clear();
+    }
+}
+
+impl Default for CommandParserFactory {
+    fn default() -> Self {
+        Self {
+            parsers: Arc::new(Mutex::new(HashMap::new())),
+        }
     }
 }
 
