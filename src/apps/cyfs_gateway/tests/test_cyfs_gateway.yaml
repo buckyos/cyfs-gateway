@@ -155,8 +155,6 @@ servers:
             priority: 1
             block: |
               starts-with ${REQ.path} "/test_return" && rewrite ${REQ.path} "/test_return*" "/*" && map-add REQ host www.buckyos.com && return "forward http://127.0.0.1:{{test2_port}}";
-              starts-with ${REQ.path} "/sn" && rewrite ${REQ.path} "/sn*" "/*" && call-server sn.http;
-
           default1:
             priority: 2
             block: |
@@ -242,20 +240,6 @@ servers:
             block: |
               resolve ${REQ.name} ${REQ.record_type} local_dns && return;
               resolve ${REQ.name} ${REQ.record_type} "223.5.5.5:53" && return;
-
-  sn:
-    type: sn
-    host: web3.buckyos.io
-    ip: 127.0.0.1
-    boot_jwt: "eyJhbGciOiJFZERTQSJ9.eyJvb2RzIjpbInNuIl0sImV4cCI6MjA1ODgzODkzOX0.SGem2FBRB0H2TcRWBRJCsCg5PYXzHW9X9853UChV_qzWHHhKxunZ-emotSnr9HufjL7avGEos1ifRjl9KTrzBg"
-    owner_pkx: "qJdNEtscIYwTo-I0K7iPEt_UZdBDRd4r16jdBfNR0tM"
-    device_jwt: ["eyJhbGciOiJFZERTQSJ9.eyJuIjoic24iLCJ4IjoiRlB2WTNXWFB4dVdQWUZ1d09ZMFFiaDBPNy1oaEtyNnRhMWpUY1g5T1JQSSIsImV4cCI6MjA1ODgzODkzOX0._YKR0y6E4JQJXDEG12WWFfY1pXyxtdSuigERZQXphnQAarDM02JIoXLNtad80U7T7lO_A4z_HbNDRJ9hMGKhCA"]
-    bns_server_url: {{bns_server_url}}
-    bns_proxy:
-      controllers:
-        - id: default
-          private_key: "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
-    db_path: {{sn_db}}
 
   socks_proxy:
     type: socks

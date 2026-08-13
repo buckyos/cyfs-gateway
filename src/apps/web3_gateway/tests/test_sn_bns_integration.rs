@@ -141,6 +141,7 @@ fn seed_bns_registry(db_path: &Path) {
                             (BNS_GATEWAY_DEVICE): {
                                 "id": BNS_GATEWAY_DID,
                                 "device_name": BNS_GATEWAY_DEVICE,
+                                "net_id": "wan",
                                 "addresses": ["203.0.113.12"],
                                 "mini_config_jwt": "bns-mini-config-jwt"
                             }
@@ -178,8 +179,13 @@ async fn wait_for_tcp(addr: SocketAddr) {
     panic!("server did not start on {}", addr);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 async fn gateway_sn_resolves_bns_documents_through_sn_only() {
+    let local = tokio::task::LocalSet::new();
+    local.run_until(run_gateway_sn_bns_integration()).await;
+}
+
+async fn run_gateway_sn_bns_integration() {
     init_logging("test_sn_bns_integration", false);
     let root_dir = tempfile::TempDir::new().unwrap();
     unsafe {
@@ -282,7 +288,7 @@ servers:
     std::fs::write(config_file.path(), config).unwrap();
 
     let config_path = config_file.path().to_path_buf();
-    let gateway_task = tokio::spawn(async move {
+    let gateway_task = tokio::task::spawn_local(async move {
         gateway_service_main(
             config_path.as_path(),
             GatewayParams {
@@ -312,7 +318,7 @@ servers:
 
     let device: serde_json::Value = http_client
         .get(format!(
-            "{}/did:bns:{}.{}?type=doc",
+            "{}/did:bns:{}.{}?type=device_mini_doc",
             did_endpoint, BNS_GATEWAY_DEVICE, BNS_NAME
         ))
         .send()

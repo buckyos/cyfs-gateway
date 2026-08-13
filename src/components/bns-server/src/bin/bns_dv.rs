@@ -158,12 +158,17 @@ struct ProjectedInitState {
     documents: Vec<ProjectedDocumentInfo>,
 }
 
-#[tokio::main]
+#[tokio::main(flavor = "current_thread")]
 async fn main() {
-    if let Err(err) = run().await {
-        eprintln!("bns-dv error: {err}");
-        std::process::exit(1);
-    }
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            if let Err(err) = run().await {
+                eprintln!("bns-dv error: {err}");
+                std::process::exit(1);
+            }
+        })
+        .await;
 }
 
 async fn run() -> Result<(), DynError> {

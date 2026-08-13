@@ -14,8 +14,6 @@ cyfs-gateway-modules = { path = "../../components/cyfs-gateway-modules" }
 
 [dev-dependencies]
 async-compression = { version = "0.4", features = ["tokio", "gzip", "deflate", "brotli"] }
-async-trait.workspace = true
-bns-client = { path = "../../components/bns-client" }
 buckyos-kit.workspace = true
 bytes.workspace = true
 cyfs-gateway-lib = { path = "../../components/cyfs-gateway-lib" }
@@ -25,7 +23,6 @@ http.workspace = true
 http-body-util.workspace = true
 hyper = { version = "1.8", features = ["full"] }
 hyper-util.workspace = true
-kRPC.workspace = true
 reqwest.workspace = true
 serde_json.workspace = true
 serde_yaml_ng.workspace = true

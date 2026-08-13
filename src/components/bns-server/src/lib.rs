@@ -38,7 +38,7 @@ use cyfs_gateway_lib::{
     ServerErrorCode, ServerResult, StreamInfo,
 };
 use http::{HeaderValue, Method, Response, StatusCode, Version};
-use http_body_util::combinators::BoxBody;
+use http_body_util::combinators::UnsyncBoxBody;
 use http_body_util::{BodyExt, Full};
 use kRPC::{RPCErrors, RPCHandler, RPCRequest, RPCResponse, RPCResult};
 use log::warn;
@@ -742,16 +742,16 @@ where
     }
 }
 
-#[async_trait]
+#[async_trait(?Send)]
 impl<T> HttpServer for BnsIndexerHttpServer<T>
 where
     T: BnsIndexerApi + 'static,
 {
     async fn serve_request(
         &self,
-        req: http::Request<BoxBody<Bytes, ServerError>>,
+        req: http::Request<UnsyncBoxBody<Bytes, ServerError>>,
         info: StreamInfo,
-    ) -> ServerResult<http::Response<BoxBody<Bytes, ServerError>>> {
+    ) -> ServerResult<http::Response<UnsyncBoxBody<Bytes, ServerError>>> {
         let path = req.uri().path().to_string();
 
         // The DID resolver binding is dispatched before the rpc_path check,
@@ -810,16 +810,16 @@ where
     }
 }
 
-#[async_trait]
+#[async_trait(?Send)]
 impl<T> HttpServer for BnsContractHttpServer<T>
 where
     T: BnsIndexerApi + 'static,
 {
     async fn serve_request(
         &self,
-        req: http::Request<BoxBody<Bytes, ServerError>>,
+        req: http::Request<UnsyncBoxBody<Bytes, ServerError>>,
         info: StreamInfo,
-    ) -> ServerResult<http::Response<BoxBody<Bytes, ServerError>>> {
+    ) -> ServerResult<http::Response<UnsyncBoxBody<Bytes, ServerError>>> {
         let path = req.uri().path().to_string();
 
         // The DID resolver binding is dispatched before the rpc_path check,
@@ -891,7 +891,7 @@ pub async fn serve_listener(
             )
         })?;
         let server = server.clone();
-        tokio::spawn(async move {
+        tokio::task::spawn_local(async move {
             let info = StreamInfo::new(remote_addr.to_string());
             if let Err(e) = hyper_serve_http(Box::new(stream), server, info).await {
                 warn!("bns-indexer http connection failed: {}", e);
@@ -927,7 +927,7 @@ pub fn spawn_listener(
             e
         )
     })?;
-    let task = tokio::spawn(serve_listener(listener, server));
+    let task = tokio::task::spawn_local(serve_listener(listener, server));
     Ok(BnsIndexerServerHandle { local_addr, task })
 }
 
@@ -955,7 +955,7 @@ async fn serve_did_resolver_request<T: BnsIndexerApi>(
     method: &Method,
     did: &str,
     query: Option<&str>,
-) -> ServerResult<Response<BoxBody<Bytes, ServerError>>> {
+) -> ServerResult<Response<UnsyncBoxBody<Bytes, ServerError>>> {
     if method == Method::OPTIONS {
         return response_with_cors(StatusCode::NO_CONTENT, "");
     }
@@ -1069,7 +1069,7 @@ fn did_resolution_failure_response(
     did: &str,
     doc_type: &str,
     error: &BnsClientError,
-) -> ServerResult<Response<BoxBody<Bytes, ServerError>>> {
+) -> ServerResult<Response<UnsyncBoxBody<Bytes, ServerError>>> {
     warn!("did resolver dependency failure for {did}#{doc_type}: {error}");
     let status = match error {
         BnsClientError::Transport(_) => StatusCode::BAD_GATEWAY,
@@ -1146,7 +1146,7 @@ fn did_resolution_state_response(
     doc_type: &str,
     status: DocumentStatus,
     result: Option<&ResolveResult>,
-) -> ServerResult<Response<BoxBody<Bytes, ServerError>>> {
+) -> ServerResult<Response<UnsyncBoxBody<Bytes, ServerError>>> {
     let http_status = match status {
         DocumentStatus::Active | DocumentStatus::Expired | DocumentStatus::Migrated => {
             StatusCode::OK
@@ -1269,7 +1269,8 @@ fn principal_did_string(principal: &Principal) -> Option<String> {
 
 /// Protocol §5 NotApplicable: reuse 404 but omit `buckyos.documentStatus`,
 /// so clients map the answer to "no opinion" instead of the strong Missing.
-fn did_resolution_not_applicable_response() -> ServerResult<Response<BoxBody<Bytes, ServerError>>> {
+fn did_resolution_not_applicable_response(
+) -> ServerResult<Response<UnsyncBoxBody<Bytes, ServerError>>> {
     did_resolution_json_response(
         StatusCode::NOT_FOUND,
         &json!({
@@ -1284,7 +1285,7 @@ fn did_resolution_error_response(
     status: StatusCode,
     error: &str,
     message: &str,
-) -> ServerResult<Response<BoxBody<Bytes, ServerError>>> {
+) -> ServerResult<Response<UnsyncBoxBody<Bytes, ServerError>>> {
     did_resolution_json_response(
         status,
         &json!({
@@ -1302,7 +1303,7 @@ fn did_resolution_error_response(
 fn did_resolution_json_response(
     status: StatusCode,
     envelope: &Value,
-) -> ServerResult<Response<BoxBody<Bytes, ServerError>>> {
+) -> ServerResult<Response<UnsyncBoxBody<Bytes, ServerError>>> {
     let body = serde_json::to_vec(envelope).map_err(|e| {
         server_err!(
             ServerErrorCode::EncodeError,
@@ -1349,7 +1350,7 @@ fn normalize_rpc_path(path: String) -> String {
 fn response_with_cors(
     status: StatusCode,
     body: impl Into<Bytes>,
-) -> ServerResult<Response<BoxBody<Bytes, ServerError>>> {
+) -> ServerResult<Response<UnsyncBoxBody<Bytes, ServerError>>> {
     let mut response = Response::builder()
         .status(status)
         .body(full_body(body.into()))
@@ -1364,8 +1365,10 @@ fn response_with_cors(
     Ok(response)
 }
 
-fn full_body(body: Bytes) -> BoxBody<Bytes, ServerError> {
-    Full::new(body).map_err(|never| match never {}).boxed()
+fn full_body(body: Bytes) -> UnsyncBoxBody<Bytes, ServerError> {
+    Full::new(body)
+        .map_err(|never| match never {})
+        .boxed_unsync()
 }
 
 fn add_cors_headers(headers: &mut http::HeaderMap) {

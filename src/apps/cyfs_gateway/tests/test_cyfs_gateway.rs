@@ -1,19 +1,13 @@
 #[cfg(test)]
 mod tests {
     use async_compression::tokio::bufread::GzipDecoder;
-    use bns_client::{BnsClientError, BnsRpcEnvelope, BnsSystemInfo, METHOD_SYSTEM_INFO};
     use buckyos_kit::init_logging;
     use bytes::Bytes;
     use cyfs_gateway::{
         gateway_service_main, read_login_token, GatewayControlClient, GatewayParams, CONTROL_SERVER,
     };
-    use cyfs_gateway_lib::{
-        hyper_serve_http, serve_http_by_rpc_handler, HttpServer, ServerError, ServerResult,
-        StreamInfo,
-    };
     use hickory_resolver::config::{NameServerConfig, Protocol, ResolverConfig, ResolverOpts};
     use hickory_resolver::TokioAsyncResolver;
-    use http_body_util::combinators::UnsyncBoxBody;
     use http_body_util::BodyExt;
     use http_body_util::Full;
     use hyper_util::rt::TokioIo;
@@ -23,7 +17,6 @@ mod tests {
     use std::net::{IpAddr, SocketAddr};
     use std::path::Path;
     use std::str::FromStr;
-    use std::sync::Arc;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
 
@@ -166,6 +159,19 @@ mod tests {
         socket.local_addr().unwrap().port()
     }
 
+    async fn connect_with_retry(addr: &str) -> TcpStream {
+        let mut last_error = None;
+        for _ in 0..100 {
+            match TcpStream::connect(addr).await {
+                Ok(stream) => return stream,
+                Err(err) => last_error = Some(err),
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+
+        panic!("failed to connect to {addr}: {last_error:?}");
+    }
+
     async fn start_echo_server() -> u16 {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -195,88 +201,6 @@ mod tests {
         });
 
         port
-    }
-
-    struct MockBnsReadinessServer;
-
-    #[async_trait::async_trait]
-    impl kRPC::RPCHandler for MockBnsReadinessServer {
-        async fn handle_rpc_call(
-            &self,
-            req: kRPC::RPCRequest,
-            _ip_from: IpAddr,
-        ) -> std::result::Result<kRPC::RPCResponse, kRPC::RPCErrors> {
-            let value = if req.method == METHOD_SYSTEM_INFO {
-                serde_json::to_value(BnsRpcEnvelope::success(BnsSystemInfo {
-                    ready: true,
-                    chain_id: 31_337,
-                    contract_address: "0x2222222222222222222222222222222222222222".to_string(),
-                }))
-                .unwrap()
-            } else {
-                serde_json::to_value(BnsRpcEnvelope::<serde_json::Value>::failure(
-                    BnsClientError::unsupported("mock only supports system.info"),
-                ))
-                .unwrap()
-            };
-            Ok(kRPC::RPCResponse::create_by_req(
-                kRPC::RPCResult::Success(value),
-                &req,
-            ))
-        }
-    }
-
-    #[async_trait::async_trait(?Send)]
-    impl HttpServer for MockBnsReadinessServer {
-        async fn serve_request(
-            &self,
-            req: http::Request<UnsyncBoxBody<Bytes, ServerError>>,
-            info: StreamInfo,
-        ) -> ServerResult<http::Response<UnsyncBoxBody<Bytes, ServerError>>> {
-            serve_http_by_rpc_handler(req, info, self).await
-        }
-
-        fn id(&self) -> String {
-            "mock-bns-readiness".to_string()
-        }
-
-        fn http_version(&self) -> http::Version {
-            http::Version::HTTP_11
-        }
-
-        fn http3_port(&self) -> Option<u16> {
-            None
-        }
-    }
-
-    async fn start_mock_bns_server() -> String {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        listener.set_nonblocking(true).unwrap();
-        let addr = listener.local_addr().unwrap();
-        let server: Arc<dyn HttpServer> = Arc::new(MockBnsReadinessServer);
-        std::thread::spawn(move || {
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap();
-            let local = tokio::task::LocalSet::new();
-            local.block_on(&runtime, async move {
-                let listener = TcpListener::from_std(listener).unwrap();
-                loop {
-                    let (stream, _) = listener.accept().await.unwrap();
-                    let server = server.clone();
-                    tokio::task::spawn_local(async move {
-                        let _ = hyper_serve_http(
-                            Box::new(stream),
-                            server,
-                            StreamInfo::new(addr.to_string()),
-                        )
-                        .await;
-                    });
-                }
-            });
-        });
-        format!("http://{}", addr)
     }
 
     async fn read_socks_addr(stream: &mut TcpStream, atyp: u8) -> Result<(), std::io::Error> {
@@ -421,8 +345,6 @@ mod tests {
         let test_ptcp_mix_addr = format!("127.0.0.1:{test_ptcp_mix_port}");
         let dispatch_port_str = dispatch_port.to_string();
         let dispatch_addr = format!("127.0.0.1:{dispatch_port}");
-        let bns_server_url = start_mock_bns_server().await;
-
         let config = include_str!("test_cyfs_gateway.yaml");
         let local_dns = include_str!("local_dns.toml");
         let config_file = tempfile::NamedTempFile::with_suffix(".yaml").unwrap();
@@ -458,10 +380,6 @@ function test_js_hook(context, host) {
             "{{test_js_hook_file}}",
             js_hook_file.path().to_str().unwrap(),
         );
-
-        let db = tempfile::NamedTempFile::with_suffix(".db").unwrap();
-        let config = config.replace("{{sn_db}}", db.path().to_str().unwrap());
-        let config = config.replace("{{bns_server_url}}", bns_server_url.as_str());
 
         let io_dump = tempfile::NamedTempFile::with_suffix(".dump").unwrap();
         let config = config.replace("{{test_io_dump}}", io_dump.path().to_str().unwrap());
@@ -530,13 +448,9 @@ function test_js_hook(context, host) {
             .unwrap();
         });
 
-        tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
-
         {
             //用tokio库创建一个tcpstream
-            let stream = tokio::net::TcpStream::connect(test1_addr.as_str())
-                .await
-                .unwrap();
+            let stream = connect_with_retry(test1_addr.as_str()).await;
 
             // 用hyper构造一个http请求
             let (mut sender, conn) = hyper::client::conn::http1::Builder::new()
@@ -756,39 +670,6 @@ function test_js_hook(context, host) {
         }
 
         {
-            let stream = tokio::net::TcpStream::connect(test1_addr.as_str())
-                .await
-                .unwrap();
-
-            let body = json!({
-                "method": "admin.clear_state_by_active_code",
-                "params": {
-                    "username": "test",
-                },
-                "sys": [1]
-            });
-            // 用hyper构造一个http请求
-            let (mut sender, conn) = hyper::client::conn::http1::Builder::new()
-                .handshake(TokioIo::new(stream))
-                .await
-                .unwrap();
-            let request = hyper::Request::post("/sn")
-                .header("Host", "web3.buckyos.com")
-                .version(hyper::Version::HTTP_11)
-                .body(Full::new(Bytes::from(
-                    serde_json::to_string(&body).unwrap().as_bytes().to_vec(),
-                )))
-                .unwrap();
-
-            tokio::spawn(async move {
-                conn.await.unwrap();
-            });
-
-            let response = sender.send_request(request).await.unwrap();
-            assert_eq!(response.status(), hyper::StatusCode::OK);
-        }
-
-        {
             let stream = tokio::net::TcpStream::connect(test_ptcp_mix_addr.as_str())
                 .await
                 .unwrap();
@@ -986,34 +867,25 @@ function test_js_hook(context, host) {
                 control_server.as_str(),
                 read_login_token(CONTROL_SERVER),
             );
-            let ret = cyfs_cmd_client.add_rule("server:www.buckyos.com:main:test2", r#"starts-with ${REQ.path} "/sn" && rewrite ${REQ.path} "/sn*" "/*" && call-server sn.http;"#).await;
+            let ret = cyfs_cmd_client.add_rule("server:www.buckyos.com:main:test2", r#"starts-with ${REQ.path} "/dynamic" && rewrite ${REQ.path} "/dynamic*" "/*" && call-server web3_dir;"#).await;
             assert!(ret.is_ok());
 
-            let ret = cyfs_cmd_client.add_rule("server:www_dir:main:test2", r#"starts-with ${REQ.path} "/sn" && rewrite ${REQ.path} "/sn*" "/*" && call-server sn.http;"#).await;
+            let ret = cyfs_cmd_client.add_rule("server:www_dir:main:test2", r#"starts-with ${REQ.path} "/dynamic" && rewrite ${REQ.path} "/dynamic*" "/*" && call-server web3_dir;"#).await;
             assert!(ret.is_err());
 
             let stream = tokio::net::TcpStream::connect(test1_addr.as_str())
                 .await
                 .unwrap();
 
-            let body = json!({
-                "method": "admin.clear_state_by_active_code",
-                "params": {
-                    "username": "test",
-                },
-                "sys": [1]
-            });
             // 用hyper构造一个http请求
             let (mut sender, conn) = hyper::client::conn::http1::Builder::new()
                 .handshake(TokioIo::new(stream))
                 .await
                 .unwrap();
-            let request = hyper::Request::post("/sn")
+            let request = hyper::Request::get("/dynamic/")
                 .header("Host", "test2.buckyos.com")
                 .version(hyper::Version::HTTP_11)
-                .body(Full::new(Bytes::from(
-                    serde_json::to_string(&body).unwrap().as_bytes().to_vec(),
-                )))
+                .body(Full::new(Bytes::new()))
                 .unwrap();
 
             tokio::spawn(async move {
@@ -1043,24 +915,15 @@ function test_js_hook(context, host) {
                 .await
                 .unwrap();
 
-            let body = json!({
-                "method": "admin.clear_state_by_active_code",
-                "params": {
-                    "username": "test",
-                },
-                "sys": [1]
-            });
             // 用hyper构造一个http请求
             let (mut sender, conn) = hyper::client::conn::http1::Builder::new()
                 .handshake(TokioIo::new(stream))
                 .await
                 .unwrap();
-            let request = hyper::Request::post("/sn")
+            let request = hyper::Request::get("/dynamic/")
                 .header("Host", "test2.buckyos.com")
                 .version(hyper::Version::HTTP_11)
-                .body(Full::new(Bytes::from(
-                    serde_json::to_string(&body).unwrap().as_bytes().to_vec(),
-                )))
+                .body(Full::new(Bytes::new()))
                 .unwrap();
 
             tokio::spawn(async move {
@@ -1068,7 +931,7 @@ function test_js_hook(context, host) {
             });
 
             let response = sender.send_request(request).await.unwrap();
-            assert_eq!(response.status(), hyper::StatusCode::METHOD_NOT_ALLOWED);
+            assert_eq!(response.status(), hyper::StatusCode::NOT_FOUND);
         }
 
         {
@@ -1076,34 +939,25 @@ function test_js_hook(context, host) {
                 control_server.as_str(),
                 read_login_token(CONTROL_SERVER),
             );
-            let ret = cyfs_cmd_client.append_rule("server:www.buckyos.com:main:test2", r#"starts-with ${REQ.path} "/sn" && rewrite ${REQ.path} "/sn*" "/*" && call-server sn.http;"#).await;
+            let ret = cyfs_cmd_client.append_rule("server:www.buckyos.com:main:test2", r#"starts-with ${REQ.path} "/dynamic" && rewrite ${REQ.path} "/dynamic*" "/*" && call-server web3_dir;"#).await;
             assert!(ret.is_ok());
 
-            let ret = cyfs_cmd_client.append_rule("server:www_dir:main:test2", r#"starts-with ${REQ.path} "/sn" && rewrite ${REQ.path} "/sn*" "/*" && call-server sn.http;"#).await;
+            let ret = cyfs_cmd_client.append_rule("server:www_dir:main:test2", r#"starts-with ${REQ.path} "/dynamic" && rewrite ${REQ.path} "/dynamic*" "/*" && call-server web3_dir;"#).await;
             assert!(ret.is_err());
 
             let stream = tokio::net::TcpStream::connect(test1_addr.as_str())
                 .await
                 .unwrap();
 
-            let body = json!({
-                "method": "admin.clear_state_by_active_code",
-                "params": {
-                    "username": "test",
-                },
-                "sys": [1]
-            });
             // 用hyper构造一个http请求
             let (mut sender, conn) = hyper::client::conn::http1::Builder::new()
                 .handshake(TokioIo::new(stream))
                 .await
                 .unwrap();
-            let request = hyper::Request::post("/sn")
+            let request = hyper::Request::get("/dynamic/")
                 .header("Host", "test2.buckyos.com")
                 .version(hyper::Version::HTTP_11)
-                .body(Full::new(Bytes::from(
-                    serde_json::to_string(&body).unwrap().as_bytes().to_vec(),
-                )))
+                .body(Full::new(Bytes::new()))
                 .unwrap();
 
             tokio::spawn(async move {
@@ -1111,7 +965,7 @@ function test_js_hook(context, host) {
             });
 
             let response = sender.send_request(request).await.unwrap();
-            assert_eq!(response.status(), hyper::StatusCode::METHOD_NOT_ALLOWED);
+            assert_eq!(response.status(), hyper::StatusCode::NOT_FOUND);
         }
 
         {
@@ -1128,24 +982,15 @@ function test_js_hook(context, host) {
                 .await
                 .unwrap();
 
-            let body = json!({
-                "method": "admin.clear_state_by_active_code",
-                "params": {
-                    "username": "test",
-                },
-                "sys": [1]
-            });
             // 用hyper构造一个http请求
             let (mut sender, conn) = hyper::client::conn::http1::Builder::new()
                 .handshake(TokioIo::new(stream))
                 .await
                 .unwrap();
-            let request = hyper::Request::post("/sn")
+            let request = hyper::Request::get("/dynamic/")
                 .header("Host", "test2.buckyos.com")
                 .version(hyper::Version::HTTP_11)
-                .body(Full::new(Bytes::from(
-                    serde_json::to_string(&body).unwrap().as_bytes().to_vec(),
-                )))
+                .body(Full::new(Bytes::new()))
                 .unwrap();
 
             tokio::spawn(async move {
@@ -1161,31 +1006,22 @@ function test_js_hook(context, host) {
                 control_server.as_str(),
                 read_login_token(CONTROL_SERVER),
             );
-            let ret = cyfs_cmd_client.set_rule("server:www.buckyos.com:main:test2", r#"starts-with ${REQ.path} "/snsn" && rewrite ${REQ.path} "/snsn*" "/*" && call-server sn.http;"#).await;
+            let ret = cyfs_cmd_client.set_rule("server:www.buckyos.com:main:test2", r#"starts-with ${REQ.path} "/dynamic-set" && rewrite ${REQ.path} "/dynamic-set*" "/*" && call-server web3_dir;"#).await;
             assert!(ret.is_ok());
 
             let stream = tokio::net::TcpStream::connect(test1_addr.as_str())
                 .await
                 .unwrap();
 
-            let body = json!({
-                "method": "admin.clear_state_by_active_code",
-                "params": {
-                    "username": "test",
-                },
-                "sys": [1]
-            });
             // 用hyper构造一个http请求
             let (mut sender, conn) = hyper::client::conn::http1::Builder::new()
                 .handshake(TokioIo::new(stream))
                 .await
                 .unwrap();
-            let request = hyper::Request::post("/snsn")
+            let request = hyper::Request::get("/dynamic-set/")
                 .header("Host", "test2.buckyos.com")
                 .version(hyper::Version::HTTP_11)
-                .body(Full::new(Bytes::from(
-                    serde_json::to_string(&body).unwrap().as_bytes().to_vec(),
-                )))
+                .body(Full::new(Bytes::new()))
                 .unwrap();
 
             tokio::spawn(async move {
@@ -1377,24 +1213,15 @@ function test_js_hook(context, host) {
                 .await
                 .unwrap();
 
-            let body = json!({
-                "method": "admin.clear_state_by_active_code",
-                "params": {
-                    "username": "test",
-                },
-                "sys": [1]
-            });
             // 用hyper构造一个http请求
             let (mut sender, conn) = hyper::client::conn::http1::Builder::new()
                 .handshake(TokioIo::new(stream))
                 .await
                 .unwrap();
-            let request = hyper::Request::post("/snsn")
+            let request = hyper::Request::get("/dynamic-set/")
                 .header("Host", "test2.buckyos.com")
                 .version(hyper::Version::HTTP_11)
-                .body(Full::new(Bytes::from(
-                    serde_json::to_string(&body).unwrap().as_bytes().to_vec(),
-                )))
+                .body(Full::new(Bytes::new()))
                 .unwrap();
 
             tokio::spawn(async move {
