@@ -11,7 +11,7 @@ use crate::{
     ServerManagerRef, SpeedStatRef, Stack, StackConfig, StackContext, StackError, StackErrorCode,
     StackFactory, StackProtocol, StackRef, StackResult, StatManagerRef, TunnelManager,
     create_io_dump_stack_config, dump_single_datagram, get_external_commands, get_stat_info,
-    into_stack_err, stack_err,
+    insert_req_source_addr_group, into_stack_err, stack_err,
 };
 use cyfs_process_chain::{
     CollectionValue, CommandControl, MemoryMapCollection, ProcessChainLibExecutor,
@@ -193,6 +193,7 @@ impl UdpDatagramHandler {
                 e
             )
         })?;
+        insert_req_source_addr_group(&map, "conn_source_", src_addr).await?;
 
         if let Some(device_info) = state
             .connection_manager
@@ -668,7 +669,10 @@ impl UdpDatagramHandler {
                                 ));
                             }
                             let server_name = list[1].to_string();
-                            if let Some(server) = self.env.servers.get_server(server_name.as_str())
+                            if let Some(server) = self
+                                .env
+                                .servers
+                                .get_server_by_type(server_name.as_str(), "datagram")
                             {
                                 if let Server::Datagram(datagram_server) = &server {
                                     let notify = Arc::new(Notify::new());
@@ -1685,7 +1689,12 @@ impl UdpStackInner {
             ipv4_transparent: transparent_mode(self.transparent, addr.is_ipv4()),
             ipv6_transparent: transparent_mode(self.transparent, addr.is_ipv6()),
         };
-        let mut service_config = UdpServiceConfig::new(addr).with_socket_options(socket_options);
+        let mut service_config = UdpServiceConfig::new(addr)
+            .with_socket_options(socket_options)
+            .with_socket_init_callback(move |socket| {
+                super::try_enable_dual_stack(socket, addr);
+                Ok(())
+            });
         if self.concurrency != u32::MAX {
             service_config =
                 service_config.with_max_concurrency_per_worker(self.concurrency as usize);

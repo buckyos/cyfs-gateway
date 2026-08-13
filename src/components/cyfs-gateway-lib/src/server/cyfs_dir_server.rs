@@ -58,9 +58,9 @@ use std::collections::HashMap;
 
 use crate::global_process_chains::{GlobalProcessChainsRef, create_process_chain_executor};
 use crate::{
-    GlobalCollectionManagerRef, HttpRequestHeaderMap, JsExternalsManagerRef, ProcessChainConfigs,
-    HttpServer, Server, ServerConfig, ServerContext, ServerContextRef, ServerError,
-    ServerErrorCode, ServerFactory, ServerManagerWeakRef, ServerResult, StreamInfo,
+    GlobalCollectionManagerRef, HttpRequestHeaderMap, HttpServer, JsExternalsManagerRef,
+    ProcessChainConfigs, RequestSourceInfo, Server, ServerConfig, ServerContext, ServerContextRef,
+    ServerError, ServerErrorCode, ServerFactory, ServerManagerWeakRef, ServerResult, StreamInfo,
     get_external_commands, into_server_err, server_err,
 };
 
@@ -222,6 +222,7 @@ impl CyfsDirServer {
     async fn run_chain(
         &self,
         req: Request<UnsyncBoxBody<Bytes, ServerError>>,
+        info: &StreamInfo,
     ) -> ServerResult<ChainOutcome> {
         let executor = match self.executor.as_ref() {
             Some(e) => e,
@@ -234,7 +235,8 @@ impl CyfsDirServer {
         // the chain runs.
         let global_env = executor.global_env().clone();
 
-        let req_map = HttpRequestHeaderMap::new(req);
+        let req_map =
+            HttpRequestHeaderMap::new_with_sources(req, RequestSourceInfo::from_stream_info(info));
         req_map
             .register_visitors(&global_env)
             .await
@@ -251,7 +253,9 @@ impl CyfsDirServer {
                 return Ok(ChainOutcome::Response(empty_response(StatusCode::OK)));
             }
             if ret.is_reject() {
-                return Ok(ChainOutcome::Response(empty_response(StatusCode::FORBIDDEN)));
+                return Ok(ChainOutcome::Response(empty_response(
+                    StatusCode::FORBIDDEN,
+                )));
             }
             if let Some(CommandControl::Error(e)) = ret.as_control() {
                 let msg = e.value.to_string();
@@ -321,11 +325,19 @@ impl CyfsDirServer {
                 );
             }
 
-            return Ok(ChainOutcome::Resolved(rewrite_to_o_link(req, &record.obj_id, &self.url_prefix)));
+            return Ok(ChainOutcome::Resolved(rewrite_to_o_link(
+                req,
+                &record.obj_id,
+                &self.url_prefix,
+            )));
         }
 
         if let Some(CollectionValue::String(obj_id)) = id_value {
-            return Ok(ChainOutcome::Resolved(rewrite_to_o_link(req, &obj_id, &self.url_prefix)));
+            return Ok(ChainOutcome::Resolved(rewrite_to_o_link(
+                req,
+                &obj_id,
+                &self.url_prefix,
+            )));
         }
 
         Ok(ChainOutcome::PassThrough(req))
@@ -339,7 +351,7 @@ impl HttpServer for CyfsDirServer {
         req: Request<UnsyncBoxBody<Bytes, ServerError>>,
         info: StreamInfo,
     ) -> Result<Response<UnsyncBoxBody<Bytes, ServerError>>, ServerError> {
-        let req = match self.run_chain(req).await {
+        let req = match self.run_chain(req, &info).await {
             Ok(ChainOutcome::Response(resp)) => return Ok(resp),
             Ok(ChainOutcome::Resolved(req)) | Ok(ChainOutcome::PassThrough(req)) => req,
             Err(e) => {
@@ -357,9 +369,7 @@ impl HttpServer for CyfsDirServer {
         let body = body.collect().await?.to_bytes();
         let req: Request<BoxBody<Bytes, bucky_http::ServerError>> = Request::from_parts(
             parts,
-            Full::new(body)
-                .map_err(|never| match never {})
-                .boxed(),
+            Full::new(body).map_err(|never| match never {}).boxed(),
         );
         let resp = bucky_http::HttpServer::serve_request(
             self.inner.as_ref(),
@@ -423,7 +433,9 @@ fn to_bucky_error_code(code: ServerErrorCode) -> bucky_http::ServerErrorCode {
         ServerErrorCode::EncodeError => bucky_http::ServerErrorCode::EncodeError,
         ServerErrorCode::DnsQueryError => bucky_http::ServerErrorCode::DnsQueryError,
         ServerErrorCode::InvalidDnsOpType => bucky_http::ServerErrorCode::InvalidDnsOpType,
-        ServerErrorCode::InvalidDnsMessageType => bucky_http::ServerErrorCode::InvalidDnsMessageType,
+        ServerErrorCode::InvalidDnsMessageType => {
+            bucky_http::ServerErrorCode::InvalidDnsMessageType
+        }
         ServerErrorCode::InvalidDnsRecordType => bucky_http::ServerErrorCode::InvalidDnsRecordType,
         ServerErrorCode::Rejected => bucky_http::ServerErrorCode::Rejected,
         ServerErrorCode::AlreadyExists => bucky_http::ServerErrorCode::AlreadyExists,
@@ -448,7 +460,9 @@ fn from_bucky_error_code(code: bucky_http::ServerErrorCode) -> ServerErrorCode {
         bucky_http::ServerErrorCode::EncodeError => ServerErrorCode::EncodeError,
         bucky_http::ServerErrorCode::DnsQueryError => ServerErrorCode::DnsQueryError,
         bucky_http::ServerErrorCode::InvalidDnsOpType => ServerErrorCode::InvalidDnsOpType,
-        bucky_http::ServerErrorCode::InvalidDnsMessageType => ServerErrorCode::InvalidDnsMessageType,
+        bucky_http::ServerErrorCode::InvalidDnsMessageType => {
+            ServerErrorCode::InvalidDnsMessageType
+        }
         bucky_http::ServerErrorCode::InvalidDnsRecordType => ServerErrorCode::InvalidDnsRecordType,
         bucky_http::ServerErrorCode::Rejected => ServerErrorCode::Rejected,
         bucky_http::ServerErrorCode::AlreadyExists => ServerErrorCode::AlreadyExists,
@@ -556,9 +570,7 @@ impl ServerFactory for CyfsDirServerFactory {
         let mut inner_cfg = NdnDirServerConfig::new(semantic_root, store_mgr.clone(), mode)
             .url_prefix(cfg.url_prefix.clone())
             .obj_id_in_host(cfg.obj_id_in_host)
-            .scan_interval(Duration::from_secs(
-                cfg.scan_interval_secs.max(1),
-            ));
+            .scan_interval(Duration::from_secs(cfg.scan_interval_secs.max(1)));
         if let Some(key) = signing_key {
             inner_cfg = inner_cfg.signing_key(key, signing_kid);
         }
@@ -628,7 +640,9 @@ fn empty_response(status: StatusCode) -> Response<UnsyncBoxBody<Bytes, ServerErr
 }
 
 fn full_body(data: Bytes) -> UnsyncBoxBody<Bytes, ServerError> {
-    Full::new(data).map_err(|never| match never {}).boxed_unsync()
+    Full::new(data)
+        .map_err(|never| match never {})
+        .boxed_unsync()
 }
 
 /// Rewrite the request URI so the inner [`NdnDirServer`] sees an O-Link:

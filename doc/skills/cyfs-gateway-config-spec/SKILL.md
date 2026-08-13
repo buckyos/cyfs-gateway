@@ -66,9 +66,14 @@ description: 用于独立讲解、审查、设计和排查 cyfs-gateway 配置�
   `socks` server：让支持代理的应用经 `target` / `rule_config` / `enable_tunnel` 接入远端资源
 - 讨论 `forward` 时，只能使用本 skill 已校验的语义：
   缺省算法 `round_robin`
-  可选算法 `ip_hash`
-  支持 inline upstream 与 `--map`
+  可选算法 `ip_hash`、`hash`、`consistent_hash`、`least_time`
+  支持 inline upstream、`--map` 与 `--backup-map`
   upstream 权重必须是正整数
+  旧多 URL 语法默认只预选一个 URL，不等于同请求自动故障切换
+  group 形态通过 `--next-upstream`、`--tries`、`--next-upstream-timeout` 控制执行阶段重试
+  stream/datagram 只在建链阶段重试；开始传输后不切换
+  HTTP 状态码重试受幂等方法、`non_idempotent` 和请求体缓冲上限约束
+- 讨论 provider-first `--server-map` / `--provider-retry-scope` 时，必须说明当前只完成模型解析与同 provider route 邻接排序，执行层尚未强制截断跨 provider retry，而且命令预检不允许只提供 `--server-map`；不能把它写成稳定的独立入口或有状态业务隔离保证。
 - 不能把 `forward`、`call-server` 这种业务流量转发动作，和 `tun` 的 IP 级配置、宿主机 IP 转发、静态路由混成同一层概念。
 - 讨论 `tun` 时，必须区分两层：
   `bind` / `mask` / `mtu` / timeout 等 IP 级参数
@@ -112,7 +117,8 @@ description: 用于独立讲解、审查、设计和排查 cyfs-gateway 配置�
 - 如果用户要求“完整支持列表”，必须指出：
   当前 `cyfs_gateway` 注册的 stack 协议是 `tcp`、`udp`、`tls`、`quic`、`rtcp`、`tun`
   当前注册的 server 类型是 `http`、`socks`、`dns`、`dir`、`control_server`、`local_dns`、`sn`、`acme_response`
-- 如果提到 `ndn`，必须注明：库里存在 `NdnServerConfig`，但当前 `src/apps/cyfs_gateway/src/lib.rs` 没有注册对应 parser/factory，不能当成当前应用支持项。
+- 如果提到 `ndn`，必须注明：旧版 `NdnServerConfig` 已移除，当前应用不支持该类型；
+  `cyfs://` 语义由已注册的 `cyfs-dir` 提供。
 - 如果用户要“独立规范文档”或“可复制的 skill”，只使用本 skill 自带 references 中的内容组织答案，不再要求回到仓库核对。
 - 如果用户要求“配置规范 + process chain 规则”，需要同时覆盖配置承载结构和 DSL 执行规则，而不是只给 YAML 结构。
 - 如果用户要求“完整命令列表”“某条命令怎么写”“某个 collection 命令的精确行为”，优先按 `process-chain-command-manual.md` 回答，并使用文档中的 canonical 命令名。

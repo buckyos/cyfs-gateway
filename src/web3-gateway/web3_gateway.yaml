@@ -7,14 +7,55 @@ servers:
     id: web3_sn
     type: sn
     host: "{{sn_host}}"
-    boot_jwt: "{{sn_boot_jwt}}"
-    owner_pkx: "{{sn_owner_pk}}"
-    device_jwt: ["{{sn_device_jwt}}"]
     ip: "{{sn_ip}}"
+    # SN 强依赖统一 BNS RPC；裸 host 会规范化为 /kapi/bns。
+    bns_server_url: "{{bns_server_url}}"
+    # 生产环境通过 secret 注入 controller key；缺失时 SN 初始化失败。
+    # dev-local/dev-vm profile 会替换为各自的受限 controller 列表。
+    bns_proxy:
+      require_user_asset_owner: true
+      controllers:
+        - id: default
+          private_key_env: BNS_SN_CONTROLLER_PRIVATE_KEY
+    # C 类种子(激活码/sn_user 账号/user_domain 绑定)幂等导入;相对路径按
+    # 配置目录解析,文件不存在时自动跳过(部署目录没有种子也能正常启动)。
+    seed_path: "sn_seed.yaml"
+    # 激活前匿名发布的 Region 探测配置；相对路径按本配置目录解析。
+    region_probe_config_path: "region-probe-config.json"
+    # 一体化 Web3 Gateway 同时承载 relay 数据面。SN 启动时幂等注册本节点，
+    # 并为 seed 用户补齐动态 assignment；单 IP 部署按 relay 双地址契约填满
+    # 两个 slot，DNS 输出时会去重。
+    local_relay_node:
+      relay_id: "embedded-web3-gateway"
+      relay_sn: "sn.{{sn_host}}"
+      ips:
+        - "{{sn_ip}}"
+        - "{{sn_ip}}"
+      public_host: "sn.{{sn_host}}"
+      http_endpoint: null
+      rtcp_endpoint: null
+      region: null
+      isp: null
+      tags:
+        - "embedded"
+      capabilities:
+        - "http_relay"
+        - "rtcp_relay"
+      status: active
+      capacity_score: 100
 
   local_dns:
     type: local_dns
     file_path: local_dns.toml
+
+  # did:web:sn.<sn_host> is the authority identity that RTCP clients resolve
+  # before opening a keep-tunnel. make_sn_config materializes did.json and
+  # device.json from the same SN device key under this deployment-relative root.
+  sn_did_web:
+    type: dir
+    root_path: "./sn_did_web"
+    autoindex: false
+    etag: true
 
   main_dns:
     id: main_dns
@@ -42,16 +83,37 @@ servers:
             id: default
             priority: 1
             block: |
+              eq ${REQ.host} "bns.{{sn_host}}" && return "forward {{bns_server_url}}";
+              eq ${REQ.host} "sn.{{sn_host}}" && eq ${REQ.path} "/.well-known/did.json" && return "server sn_did_web";
+              eq ${REQ.host} "sn.{{sn_host}}" && eq ${REQ.path} "/.well-known/device.json" && return "server sn_did_web";
               eq ${REQ.host} "sn.{{sn_host}}" && match ${REQ.path} "/1.0/identifiers/*" && return "server web3_sn";
               eq ${REQ.host} "sn.{{sn_host}}" && return "server web3_sn";
               eq ${REQ.host} "web3.{{sn_host}}" && return "server web3_sn";
-              map-create "QUESTION" && map-add "QUESTION" "dest_host" "${REQ.host}" && map-add "QUESTION" "method" "query_by_hostname";
+              map-create "QUESTION" && map-add "QUESTION" "dest_host" "${REQ.host}" && map-add "QUESTION" "method" "deviceinfo.resolve_ood_by_hostname";
               call qa "web3_sn" "QUESTION";
               match ${REQ.host} "*.*.web3.{{sn_host}}" && eq ${ANSWER.self_cert} "false" && return "error 503 self_cert_is_false_for_${REQ.host};_enable_self_cert_on_your_gateway";
               return "forward rtcp://${ANSWER.did_hostname}/:80";
 stacks:
+  # name-client's Zone cache endpoint. Keep this listener loopback-only: SN
+  # selects the InternalZoneResolver profile from transport dst_addr, and this
+  # stack dispatches to the same web3_sn instance used by the public API.
+  sn_zone_resolver_tcp:
+    bind: 127.0.0.1:3180
+    protocol: tcp
+    transparent: false
+    hook_point:
+      main:
+        id: main
+        priority: 1
+        blocks:
+          default:
+            id: default
+            priority: 1
+            block: |
+              return "server web3_sn";
+
   dns_udp:
-    bind: 0.0.0.0:53
+    bind: "{{dns_bind}}"
     protocol: udp
     hook_point:
       main:
@@ -64,11 +126,11 @@ stacks:
             block: |
               return "server main_dns";
 
-  main_rtcp:
-    bind: 0.0.0.0:2980
-    protocol: rtcp
-    key_path: ./sn_private_key.pem
-    device_config_path: ./sn_device_config.json
+  # DNS responses larger than the client's advertised UDP size set TC; clients
+  # then retry the same query over TCP on the same address and port.
+  dns_tcp:
+    bind: "{{dns_bind}}"
+    protocol: tcp
     hook_point:
       main:
         id: main
@@ -77,10 +139,45 @@ stacks:
           default:
             id: default
             priority: 1
-            # REQ里已经有了很多信息，所以直接设置 method 为 query_by_did 并调用 qa 来查询是否是认证设备
             block: |
-              map-add "REQ" "method" "query_by_did"
-              call qa "web3_sn" "REQ" && eq ${ANSWER.state} "active" && accept;
+              return "server main_dns";
+
+  main_rtcp:
+    bind: "{{rtcp_bind}}"
+    protocol: rtcp
+    # provision(createSnConfigs) 只生成平铺的 sn_private_key.pem /
+    # sn_device_config.json,没有 IdentityRoots 布局,所以这里走 legacy
+    # 身份配置。stack DID 为 did:dev 规范形式,发起方 create_tunnel 会把
+    # hello.to 规范化为 did:dev,SN 无需解析别名即可接受。
+    key_path: ./sn_private_key.pem
+    device_config_path: ./sn_device_config.json
+    peer_identity:
+      requirement: authority_current
+      dns_txt_bootstrap: false
+    # Web3 Gateway 接受任意可信的已知 owner，而不限制为 SN 自身所在 zone。
+    # known_owner 要求 name-client 给出可授权 owner 与可信 OwnerDocument
+    # 证据；anonymous=reject 保证验证不可用时不会降级为仅持有设备 key 的身份。
+    inbound_admission:
+      anonymous: reject
+      named_min_relation: known_owner
+      authority_reconfirm_max_age: unlimited
+    hook_point:
+      main:
+        id: main
+        priority: 1
+        blocks:
+          default:
+            id: default
+            priority: 1
+            # REQ里已经有了很多信息，所以直接设置 method 为 deviceinfo.resolve_ood_by_did 并调用 qa 来查询是否是认证设备。
+            # 判定是"注册设备且未被 ban"而不是 state=active（online）：
+            # RTCP 连接正是设备变得可达的手段，online 与否由 device.update
+            # 上报驱动，把它作为前置会造成设备重启后首连必拒的鸡生蛋问题。
+            block: |
+              map-add "REQ" "method" "deviceinfo.resolve_ood_by_did"
+              eq ${REQ.source_identity_trust} "trusted_host_snapshot" && call qa "web3_sn" "REQ" && !eq ${ANSWER.state} "banned" && accept;
+              eq ${REQ.source_identity_trust} "trusted_zone_snapshot" && call qa "web3_sn" "REQ" && !eq ${ANSWER.state} "banned" && accept;
+              eq ${REQ.source_identity_trust} "method_authority_current" && call qa "web3_sn" "REQ" && !eq ${ANSWER.state} "banned" && accept;
               reject;
 
     on_new_tunnel_hook_point:
@@ -92,14 +189,19 @@ stacks:
             id: default
             priority: 1
             # 隧道建立时校验 source_device_id 是否为认证设备，只允许认证设备 keep-tunnel
-            # 从转发的角度，也支持所有device.owner是合法用户的连接
+            # 从转发的角度，也支持所有device.owner是合法用户的连接。
+            # 与上面的 stream 级判定一致：resolve 成功=注册设备（认证已在
+            # RTCP 验证层完成），仅排除 banned；不要求 online（keep-tunnel
+            # 本身就是设备上线的前提，不能反过来依赖在线状态）。
             block: |
-              map-add "REQ" "method" "query_by_did"
-              call qa "web3_sn" "REQ" && eq ${ANSWER.state} "active" && accept;
+              map-add "REQ" "method" "deviceinfo.resolve_ood_by_did"
+              eq ${REQ.source_identity_trust} "trusted_host_snapshot" && call qa "web3_sn" "REQ" && !eq ${ANSWER.state} "banned" && accept;
+              eq ${REQ.source_identity_trust} "trusted_zone_snapshot" && call qa "web3_sn" "REQ" && !eq ${ANSWER.state} "banned" && accept;
+              eq ${REQ.source_identity_trust} "method_authority_current" && call qa "web3_sn" "REQ" && !eq ${ANSWER.state} "banned" && accept;
               reject;
 
   main_http_tcp:
-    bind: 0.0.0.0:80
+    bind: "{{http_bind}}"
     protocol: tcp
     hook_point:
       main:
@@ -113,15 +215,24 @@ stacks:
               return "server main_http";
   
   main_tls:
-    bind: 0.0.0.0:3443
+    bind: "{{tls_bind}}"
     protocol: tls
-    certs:
-      - domain: "sn.{{sn_host}}"
-        cert_path: ./{{sn_cer}}
-        key_path: ./{{sn_pem}}
-      - domain: "*.web3.{{sn_host}}"
-        cert_path: ./{{web3_cer}}
-        key_path: ./{{web3_pem}}
+    trusted_upstreams:
+      - "127.0.0.1/32"
+      - "::1/128"
+    hosts:
+      - host: "sn.{{sn_host}}"
+        cert_path: "{{sn_cer}}"
+        key_path: "{{sn_pem}}"
+      - host: "bns.{{sn_host}}"
+        cert_path: "{{sn_cer}}"
+        key_path: "{{sn_pem}}"
+      - host: "web3.{{sn_host}}"
+        cert_path: "{{web3_cer}}"
+        key_path: "{{web3_pem}}"
+      - host: "*.web3.{{sn_host}}"
+        cert_path: "{{web3_cer}}"
+        key_path: "{{web3_pem}}"
     hook_point:
       main:
         id: main
@@ -134,7 +245,7 @@ stacks:
               return "server main_http";
 
   tls_raw_forward:
-    bind: 0.0.0.0:443
+    bind: "{{sni_bind}}"
     protocol: tcp
     hook_point:
       main:
@@ -148,14 +259,15 @@ stacks:
               call https-sni-probe || reject; 
               map-create "REQ.ext";
               map-add "REQ.ext" "proxy_source_addr" "${REQ.source_addr}";
-              eq ${REQ.dest_host} "sn.{{sn_host}}" && return "forward tcp:///:3443";
-              eq ${REQ.dest_host} "www.{{sn_host}}" && return "forward tcp:///:3443";
-              eq ${REQ.dest_host} "{{sn_host}}" && return "forward tcp:///:3443";
-              eq ${REQ.dest_host} "web3.{{sn_host}}" && return "forward tcp:///:3443";
-              map-create "QUESTION" && map-add "QUESTION" "dest_host" "${REQ.dest_host}" && map-add "QUESTION" "method" "query_by_hostname";
+              eq ${REQ.dest_host} "bns.{{sn_host}}" && return "forward tcp:///:{{tls_port}}?proxy_protocol=v2";
+              eq ${REQ.dest_host} "sn.{{sn_host}}" && return "forward tcp:///:{{tls_port}}?proxy_protocol=v2";
+              eq ${REQ.dest_host} "www.{{sn_host}}" && return "forward tcp:///:{{tls_port}}?proxy_protocol=v2";
+              eq ${REQ.dest_host} "{{sn_host}}" && return "forward tcp:///:{{tls_port}}?proxy_protocol=v2";
+              eq ${REQ.dest_host} "web3.{{sn_host}}" && return "forward tcp:///:{{tls_port}}?proxy_protocol=v2";
+              map-create "QUESTION" && map-add "QUESTION" "dest_host" "${REQ.dest_host}" && map-add "QUESTION" "method" "deviceinfo.resolve_ood_by_hostname";
               call qa "web3_sn" "QUESTION";
               eq ${ANSWER.self_cert} "true" && return "forward rtcp://${ANSWER.did_hostname}/:443";
               match ${REQ.dest_host} "*.*.web3.{{sn_host}}" && eq ${ANSWER.self_cert} "false" && error --from chain "self_cert=false for ${REQ.dest_host}; enable self_cert to use nested web3 host over HTTPS";
-              match ${REQ.dest_host} "*.web3.{{sn_host}}" && return "forward tcp:///:3443";
+              match ${REQ.dest_host} "*.web3.{{sn_host}}" && return "forward tcp:///:{{tls_port}}?proxy_protocol=v2";
               reject;
   

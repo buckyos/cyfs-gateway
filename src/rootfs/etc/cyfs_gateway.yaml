@@ -15,6 +15,10 @@
 #   geo_block: ./scripts/geo_block.js
 #   custom_auth: ./scripts/custom_auth.js
 
+# identity_manager:      # Gateway-wide identity store for ACME, TLS, QUIC, and RTCP identity loading
+#   public_root_path: ./identity
+#   security_root_path: ./security
+
 # timers:               # periodic process-chain tasks (optional)
 #   clean_cache:
 #     timeout: 300      # seconds, must be > 0
@@ -50,9 +54,7 @@
 #       dns_provider: sn-dns
 #   check_interval: 43200          # certificate check interval (seconds), default 12h
 #   renew_before_expiry: 604800    # renew ahead of expiry (seconds), default 7d
-#   identity_manager:              # optional; defaults to BUCKYOS_IDENTITY_ROOT/BUCKYOS_SECURITY_ROOT or $BUCKYOS_ROOT/local/identity and $BUCKYOS_ROOT/security
-#     public_root_path: ./identity
-#     security_root_path: ./security
+#   # identity_manager is optional here; defaults to the Gateway-wide identity_manager above
 
 # tls_ca:             # self-signed/CA certificate config (optional)
 #   cert_path: ./ca.crt
@@ -111,6 +113,20 @@
 #           echo "hello";
 
 stacks:
+  # SN internal Zone Resolver deployment (enable only when the same config has
+  # one `type: sn` server named `sn`). The address and transparent setting are
+  # security invariants; cross-host access must use a protected sidecar/proxy.
+  # sn_zone_resolver_tcp:
+  #   protocol: tcp
+  #   bind: 127.0.0.1:3180
+  #   transparent: false
+  #   hook_point:
+  #     main:
+  #       blocks:
+  #         default:
+  #           block: |
+  #             return "server sn";
+
   http_tcp:
     # id comes from map key (here: http_tcp)
     protocol: tcp                 # tcp | udp | tls | quic | rtcp | tun
@@ -157,7 +173,10 @@ stacks:
     #   hosts: # TLS identities supported by this stack; certs are loaded through the identity manager path protocol
     #     - example.com
     #     - "*.example.org"
-    #   identity_manager: # optional; defaults to BUCKYOS_IDENTITY_ROOT/BUCKYOS_SECURITY_ROOT or $BUCKYOS_ROOT/local/identity and $BUCKYOS_ROOT/security
+    #     - host: cert.example.net # operator-managed certificate loaded directly from absolute paths
+    #       cert_path: /etc/ssl/certs/cert.example.net.fullchain.pem
+    #       key_path: /etc/ssl/private/cert.example.net.key
+    #   identity_manager: # optional stack-level override; prefer the Gateway-wide identity_manager
     #     public_root_path: ./identity
     #     security_root_path: ./security
     #   hook_point: { }
@@ -174,7 +193,7 @@ stacks:
     #   hosts: # QUIC identities supported by this stack; certs are loaded through the identity manager path protocol
     #     - example.com
     #     - "*.example.org"
-    #   identity_manager: # optional; defaults to BUCKYOS_IDENTITY_ROOT/BUCKYOS_SECURITY_ROOT or $BUCKYOS_ROOT/local/identity and $BUCKYOS_ROOT/security
+    #   identity_manager: # optional stack-level override; prefer the Gateway-wide identity_manager
     #     public_root_path: ./identity
     #     security_root_path: ./security
     #   hook_point: { }
@@ -182,9 +201,35 @@ stacks:
     # rtcp_example:
     #   protocol: rtcp
     #   bind: 0.0.0.0:2980
-    #   key_path: ./sn_private_key.pem
-    #   device_config_path: ./device.doc.jwt  # 也支持 JSON；只有配置 JWT 时，Hello 才会自动携带 device_doc_jwt
-    #   name: optional_name
+    #   identity: did:web:device.example.com # preferred; loads device identity from identity_manager roots
+    #   identity_manager: # optional stack-level override; prefer the Gateway-wide identity_manager
+    #     public_root_path: ./identity
+    #     security_root_path: ./security
+    #   # Legacy explicit identity config is still supported:
+    #   # key_path: ./sn_private_key.pem
+    #   # device_config_path: ./device.jwt  # identity manager probes device.jwt / device_doc.jwt / did.json
+    #   # device_doc_jwt: <owner-signed-device-doc-jwt> # optional inline alternative
+    #   # name: optional_name
+    #   peer_identity:
+    #     requirement: authority_current # authority_current | trusted_snapshot
+    #     dns_txt_bootstrap: false       # non-authoritative compatibility mode; keep false on public stacks
+    #   inbound_admission:
+    #     anonymous: reject              # no self-declared document fallback exists
+    #     named_min_relation: same_zone  # same_zone | known_owner | any
+    #     authority_reconfirm_max_age: unlimited
+    #   liveness:
+    #     ping_interval_secs: 30
+    #     pong_timeout_secs: 10
+    #     max_missed_pongs: 3
+    #   limits:
+    #     max_pending_handshakes: 256
+    #     handshake_requests_per_second: 16
+    #     handshake_request_burst: 32
+    #     max_pending_stream_builds_per_tunnel: 64
+    #     max_datagram_bytes: 65507
+    #     handshake_timeout_secs: 15
+    #     stream_requests_per_second: 32
+    #     stream_request_burst: 64
     #   reuse_address: false
     #   io_dump_file: rtcp.dump
     #   stream_idle_timeout: 600    # stream forwarding idle timeout (seconds), default 600
@@ -280,15 +325,27 @@ stacks:
   # sn_example:
   #   type: sn
   #   host: example.com
-  #   ip: 1.2.3.4
-  #   boot_jwt: "<jwt>"
-  #   owner_pkx: "<pkx>"
-  #   device_jwt:
-  #     - "<jwt>"
+  #   ip: 1.2.3.4                 # optional; self DNS/relay fallback
+  #   boot_jwt: "<jwt>"           # optional; BOOT for host/sn.<host>/aliases TXT only
+  #   owner_pkx: "<pkx>"          # optional; PKX for host/sn.<host>/aliases TXT only
+  #   device_jwt:                 # optional; DEV for host/sn.<host>/aliases TXT only
+  #     - "<jwt>"                 # omit all three when self bootstrap is not required
   #   aliases: []                 # optional
-  #   db_type: sqlite             # optional
-  #   db_params:
-  #     db_path: ./sn.db
+  #   region_probe_config_path: ./region-probe-config.json # optional anonymous Region probe config
+  #   bns_server_url: http://127.0.0.1:13450  # required base URL; no /kapi/bns
+  #   bns_proxy:                  # optional; presence enables write capability
+  #     require_user_asset_owner: true
+  #     controllers:
+  #       - id: default
+  #         private_key_env: BNS_PRIVATE_KEY
+  #   app_did: did:web:sn-api.example              # local identity; required for s2s_payload_v1
+  #   auth_db:                                     # HTTPS may remain a URL string
+  #     url: http://auth-provider:8080
+  #     transport_security: s2s_payload_v1          # optional; default, or plaintext
+  #     remote_app_did: did:web:sn-db.example
+  #     remote_public_key: T4Quc1L6Ogu4N2tTKOvneV1yYnBcmhP89B_RsuFsJZ8
+  #   device_info_db: https://device-provider:8443 # optional; local SQLite if absent
+  #   db_path: ./sn.db
 
   # socks_example:
   #   type: socks

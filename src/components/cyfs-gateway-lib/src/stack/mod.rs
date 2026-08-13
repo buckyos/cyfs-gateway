@@ -68,6 +68,73 @@ pub fn connect_timeout_from_secs(timeout_secs: Option<u64>) -> Duration {
     Duration::from_secs(timeout_secs.unwrap_or(DEFAULT_CONNECT_TIMEOUT_SECS))
 }
 
+/// Best-effort dual-stack support for wildcard IPv6 listeners.
+///
+/// A bind such as `[::]:443` is intended as a convenient "listen on both
+/// families" form.  `IPV6_V6ONLY` defaults vary across operating systems and
+/// host policy, so explicitly try to disable it before binding.  This remains
+/// best-effort: strict dual-stack deployments can use separate IPv4 and IPv6
+/// stacks, while a platform that rejects the option can still start an
+/// IPv6-only listener.
+pub(crate) fn try_enable_dual_stack(socket: &socket2::Socket, bind_addr: std::net::SocketAddr) {
+    if !is_unspecified_ipv6_bind(bind_addr) {
+        return;
+    }
+
+    if let Err(error) = socket.set_only_v6(false) {
+        log::warn!(
+            "failed to disable IPV6_V6ONLY for wildcard bind {}: {}; continuing with platform default",
+            bind_addr,
+            error
+        );
+    }
+}
+
+fn is_unspecified_ipv6_bind(bind_addr: std::net::SocketAddr) -> bool {
+    matches!(
+        bind_addr,
+        std::net::SocketAddr::V6(bind_addr_v6) if bind_addr_v6.ip().is_unspecified()
+    )
+}
+
+#[cfg(test)]
+mod dual_stack_tests {
+    use super::is_unspecified_ipv6_bind;
+
+    #[test]
+    fn only_ipv6_wildcard_bind_requests_dual_stack() {
+        assert!(is_unspecified_ipv6_bind("[::]:443".parse().unwrap()));
+        assert!(!is_unspecified_ipv6_bind("[::1]:443".parse().unwrap()));
+        assert!(!is_unspecified_ipv6_bind(
+            "[2001:db8::1]:443".parse().unwrap()
+        ));
+        assert!(!is_unspecified_ipv6_bind("0.0.0.0:443".parse().unwrap()));
+    }
+}
+
+/// Insert a `<prefix>addr` / `<prefix>ip` / `<prefix>port` group into a REQ
+/// map collection. `prefix` is a source-layer prefix such as `source_`,
+/// `conn_source_` or `real_source_`.
+pub async fn insert_req_source_addr_group(
+    map: &cyfs_process_chain::MapCollectionRef,
+    prefix: &str,
+    addr: std::net::SocketAddr,
+) -> StackResult<()> {
+    for (suffix, value) in [
+        ("addr", addr.to_string()),
+        ("ip", addr.ip().to_string()),
+        ("port", addr.port().to_string()),
+    ] {
+        map.insert(
+            format!("{}{}", prefix, suffix).as_str(),
+            CollectionValue::String(value),
+        )
+        .await
+        .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
+    }
+    Ok(())
+}
+
 pub async fn get_source_addr_from_req_env(
     global_env: &cyfs_process_chain::EnvRef,
 ) -> Option<String> {
@@ -512,9 +579,13 @@ pub async fn datagram_forward_group(
         }
     };
 
-    copy_datagram_bidirectional(datagram, forward_datagram, stream_idle_timeout_from_secs(None))
-        .await
-        .map_err(into_stack_err!(StackErrorCode::TunnelError))?;
+    copy_datagram_bidirectional(
+        datagram,
+        forward_datagram,
+        stream_idle_timeout_from_secs(None),
+    )
+    .await
+    .map_err(into_stack_err!(StackErrorCode::TunnelError))?;
     Ok(())
 }
 

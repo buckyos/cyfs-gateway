@@ -248,13 +248,15 @@ hook_point:
 - `on_new_tunnel_hook_point?`
 - `key_path`
 - `device_config_path?`
+- `device_doc_jwt?`
 - `name?`
 - `io_dump_*`
 - `reuse_address?`
 
 约束：
 
-- 未配置 `device_config_path` 时，`name` 必填
+- 未配置 `device_config_path` 和 `device_doc_jwt` 时，`name` 必填
+- 当 stack 的 DID 是逻辑名字（非 `did:dev:<pkx>`）时，必须通过 `device_config_path` 指向 JWT、配置 `device_doc_jwt`，或在 identity manager 中提供 `device.doc.jwt`
 
 ### `tun`
 
@@ -400,12 +402,22 @@ hook_point:
 
 - `host`
 - `ip`
-- `boot_jwt`
-- `owner_pkx`
-- `device_jwt`
-- `aliases`
-- `db_type?`
-- `db_params?`
+- `boot_jwt?`（仅用于 SN 自身 hostname 的兼容 BOOT TXT）
+- `owner_pkx?`（仅用于 SN 自身 hostname 的兼容 PKX TXT）
+- `device_jwt?`（仅用于 SN 自身 hostname 的兼容 DEV TXT；缺省为空数组）
+- `aliases?`
+- `auth_data_dir?`
+- `seed_path?`
+- `bns_server_url`
+- `bns_session_token?`
+- `pkx_doh_url?`
+- `relay_allocation?`
+- `sn_controller_kid?`
+- `allowed_controller_doc_types?`
+- `bns_proxy?`
+- `auth_db?`
+- `device_info_db?`
+- `db_path?`
 
 ### `control_server`
 

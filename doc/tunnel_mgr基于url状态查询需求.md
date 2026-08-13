@@ -17,7 +17,7 @@
 - `src/components/cyfs-gateway-lib/src/tls_tunnel.rs`
 - `src/components/cyfs-gateway-lib/src/quic_tunnel.rs`
 - `src/components/cyfs-gateway-lib/src/forward/least_time.rs`（`least_time` 消费 tunnel_mgr history 做 RTT 重排）
-- `src/apps/cyfs_gateway/src/gateway.rs`（控制面 `query_tunnel_url_statuses` / `tunnels_probe` / `/tunnels/probe` 包装）
+- `src/components/cyfs-gateway-app-lib/src/gateway.rs`（公共宿主中的控制面 `query_tunnel_url_statuses` / `tunnels_probe` / `/tunnels/probe` 包装）
 - `src/apps/cyfs_gateway/src/gateway_control_client.rs`
 
 > **实现进度速览（截至 2026-04-30）**

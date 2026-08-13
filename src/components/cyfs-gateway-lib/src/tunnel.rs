@@ -9,6 +9,8 @@ use std::net::SocketAddr;
 pub struct TunnelEndpoint {
     pub device_id: String,
     pub port: u16,
+    pub canonical_device_id: Option<String>,
+    pub identity_trust: Option<String>,
 }
 
 #[async_trait]

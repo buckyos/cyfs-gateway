@@ -1,13 +1,19 @@
 #[cfg(test)]
 mod tests {
     use async_compression::tokio::bufread::GzipDecoder;
+    use bns_client::{BnsClientError, BnsRpcEnvelope, BnsSystemInfo, METHOD_SYSTEM_INFO};
     use buckyos_kit::init_logging;
     use bytes::Bytes;
     use cyfs_gateway::{
-        CONTROL_SERVER, GatewayControlClient, GatewayParams, gateway_service_main, read_login_token,
+        gateway_service_main, read_login_token, GatewayControlClient, GatewayParams, CONTROL_SERVER,
     };
-    use hickory_resolver::TokioAsyncResolver;
+    use cyfs_gateway_lib::{
+        hyper_serve_http, serve_http_by_rpc_handler, HttpServer, ServerError, ServerResult,
+        StreamInfo,
+    };
     use hickory_resolver::config::{NameServerConfig, Protocol, ResolverConfig, ResolverOpts};
+    use hickory_resolver::TokioAsyncResolver;
+    use http_body_util::combinators::UnsyncBoxBody;
     use http_body_util::BodyExt;
     use http_body_util::Full;
     use hyper_util::rt::TokioIo;
@@ -17,6 +23,7 @@ mod tests {
     use std::net::{IpAddr, SocketAddr};
     use std::path::Path;
     use std::str::FromStr;
+    use std::sync::Arc;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
 
@@ -106,7 +113,6 @@ mod tests {
     const SOCKS_VERSION: u8 = 0x05;
     const SOCKS_AUTH_NONE: u8 = 0x00;
     const SOCKS_AUTH_USERNAME_PASSWORD: u8 = 0x02;
-    const SOCKS_AUTH_NO_ACCEPTABLE: u8 = 0xff;
     const SOCKS_CMD_CONNECT: u8 = 0x01;
     const SOCKS_ADDR_IPV4: u8 = 0x01;
     const SOCKS_ADDR_DOMAIN: u8 = 0x03;
@@ -189,6 +195,88 @@ mod tests {
         });
 
         port
+    }
+
+    struct MockBnsReadinessServer;
+
+    #[async_trait::async_trait]
+    impl kRPC::RPCHandler for MockBnsReadinessServer {
+        async fn handle_rpc_call(
+            &self,
+            req: kRPC::RPCRequest,
+            _ip_from: IpAddr,
+        ) -> std::result::Result<kRPC::RPCResponse, kRPC::RPCErrors> {
+            let value = if req.method == METHOD_SYSTEM_INFO {
+                serde_json::to_value(BnsRpcEnvelope::success(BnsSystemInfo {
+                    ready: true,
+                    chain_id: 31_337,
+                    contract_address: "0x2222222222222222222222222222222222222222".to_string(),
+                }))
+                .unwrap()
+            } else {
+                serde_json::to_value(BnsRpcEnvelope::<serde_json::Value>::failure(
+                    BnsClientError::unsupported("mock only supports system.info"),
+                ))
+                .unwrap()
+            };
+            Ok(kRPC::RPCResponse::create_by_req(
+                kRPC::RPCResult::Success(value),
+                &req,
+            ))
+        }
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl HttpServer for MockBnsReadinessServer {
+        async fn serve_request(
+            &self,
+            req: http::Request<UnsyncBoxBody<Bytes, ServerError>>,
+            info: StreamInfo,
+        ) -> ServerResult<http::Response<UnsyncBoxBody<Bytes, ServerError>>> {
+            serve_http_by_rpc_handler(req, info, self).await
+        }
+
+        fn id(&self) -> String {
+            "mock-bns-readiness".to_string()
+        }
+
+        fn http_version(&self) -> http::Version {
+            http::Version::HTTP_11
+        }
+
+        fn http3_port(&self) -> Option<u16> {
+            None
+        }
+    }
+
+    async fn start_mock_bns_server() -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server: Arc<dyn HttpServer> = Arc::new(MockBnsReadinessServer);
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let local = tokio::task::LocalSet::new();
+            local.block_on(&runtime, async move {
+                let listener = TcpListener::from_std(listener).unwrap();
+                loop {
+                    let (stream, _) = listener.accept().await.unwrap();
+                    let server = server.clone();
+                    tokio::task::spawn_local(async move {
+                        let _ = hyper_serve_http(
+                            Box::new(stream),
+                            server,
+                            StreamInfo::new(addr.to_string()),
+                        )
+                        .await;
+                    });
+                }
+            });
+        });
+        format!("http://{}", addr)
     }
 
     async fn read_socks_addr(stream: &mut TcpStream, atyp: u8) -> Result<(), std::io::Error> {
@@ -317,6 +405,7 @@ mod tests {
         let socks_stack_port = allocate_distinct_free_port(&mut used_tcp_ports).await;
         let upstream_socks_stack_port = allocate_distinct_free_port(&mut used_tcp_ports).await;
         let control_port = allocate_distinct_free_port(&mut used_tcp_ports).await;
+        let control_server_port = allocate_distinct_free_port(&mut used_tcp_ports).await;
         let control_server = format!("http://127.0.0.1:{control_port}");
         let test1_port = allocate_distinct_free_port(&mut used_tcp_ports).await;
         let test2_port = allocate_distinct_free_port(&mut used_tcp_ports).await;
@@ -332,6 +421,7 @@ mod tests {
         let test_ptcp_mix_addr = format!("127.0.0.1:{test_ptcp_mix_port}");
         let dispatch_port_str = dispatch_port.to_string();
         let dispatch_addr = format!("127.0.0.1:{dispatch_port}");
+        let bns_server_url = start_mock_bns_server().await;
 
         let config = include_str!("test_cyfs_gateway.yaml");
         let local_dns = include_str!("local_dns.toml");
@@ -371,6 +461,7 @@ function test_js_hook(context, host) {
 
         let db = tempfile::NamedTempFile::with_suffix(".db").unwrap();
         let config = config.replace("{{sn_db}}", db.path().to_str().unwrap());
+        let config = config.replace("{{bns_server_url}}", bns_server_url.as_str());
 
         let io_dump = tempfile::NamedTempFile::with_suffix(".dump").unwrap();
         let config = config.replace("{{test_io_dump}}", io_dump.path().to_str().unwrap());
@@ -412,6 +503,10 @@ function test_js_hook(context, host) {
         let config = config.replace(
             "{{test_ptcp_mix_port}}",
             test_ptcp_mix_port.to_string().as_str(),
+        );
+        let config = config.replace(
+            "{{control_server_port}}",
+            control_server_port.to_string().as_str(),
         );
         let config = config.replace(
             "{{echo_direct_port}}",
@@ -604,7 +699,7 @@ function test_js_hook(context, host) {
                 .handshake(TokioIo::new(stream))
                 .await
                 .unwrap();
-            let request = hyper::Request::get("/api")
+            let request = hyper::Request::get("/api/")
                 .header("Host", "web3.buckyos.com")
                 .version(hyper::Version::HTTP_11)
                 .body(Full::new(Bytes::new()))
@@ -636,7 +731,7 @@ function test_js_hook(context, host) {
                 .handshake(TokioIo::new(stream))
                 .await
                 .unwrap();
-            let request = hyper::Request::get("/test_return")
+            let request = hyper::Request::get("/test_return/")
                 .header("Host", "web3.buckyos.com")
                 .version(hyper::Version::HTTP_11)
                 .body(Full::new(Bytes::new()))
@@ -666,7 +761,7 @@ function test_js_hook(context, host) {
                 .unwrap();
 
             let body = json!({
-                "method": "check_username",
+                "method": "admin.clear_state_by_active_code",
                 "params": {
                     "username": "test",
                 },
@@ -902,7 +997,7 @@ function test_js_hook(context, host) {
                 .unwrap();
 
             let body = json!({
-                "method": "check_username",
+                "method": "admin.clear_state_by_active_code",
                 "params": {
                     "username": "test",
                 },
@@ -949,7 +1044,7 @@ function test_js_hook(context, host) {
                 .unwrap();
 
             let body = json!({
-                "method": "check_username",
+                "method": "admin.clear_state_by_active_code",
                 "params": {
                     "username": "test",
                 },
@@ -992,7 +1087,7 @@ function test_js_hook(context, host) {
                 .unwrap();
 
             let body = json!({
-                "method": "check_username",
+                "method": "admin.clear_state_by_active_code",
                 "params": {
                     "username": "test",
                 },
@@ -1034,7 +1129,7 @@ function test_js_hook(context, host) {
                 .unwrap();
 
             let body = json!({
-                "method": "check_username",
+                "method": "admin.clear_state_by_active_code",
                 "params": {
                     "username": "test",
                 },
@@ -1074,7 +1169,7 @@ function test_js_hook(context, host) {
                 .unwrap();
 
             let body = json!({
-                "method": "check_username",
+                "method": "admin.clear_state_by_active_code",
                 "params": {
                     "username": "test",
                 },
@@ -1283,7 +1378,7 @@ function test_js_hook(context, host) {
                 .unwrap();
 
             let body = json!({
-                "method": "check_username",
+                "method": "admin.clear_state_by_active_code",
                 "params": {
                     "username": "test",
                 },

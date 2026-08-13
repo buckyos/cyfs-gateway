@@ -11,8 +11,9 @@ use crate::stack::tls_cert_resolver::{
 };
 use crate::stack::tls_stack::build_identity_cert_config;
 use crate::stack::{
-    TlsCertResolver, connect_timeout_from_secs, get_limit_info, probe_proxy_protocol_stream,
-    stream_forward, stream_forward_group, stream_idle_timeout_from_secs,
+    TlsCertResolver, connect_timeout_from_secs, get_limit_info, insert_req_source_addr_group,
+    probe_proxy_protocol_stream, stream_forward, stream_forward_group,
+    stream_idle_timeout_from_secs,
 };
 use crate::{
     ComposedSpeedStat, ConnectionController, ConnectionInfo, ConnectionManagerRef, DumpStream,
@@ -498,6 +499,7 @@ impl QuicConnectionHandler {
         )
         .await
         .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
+        insert_req_source_addr_group(&map, "conn_source_", remote_addr).await?;
         map.insert("dest_addr", CollectionValue::String(local_addr.to_string()))
             .await
             .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
@@ -1697,12 +1699,16 @@ impl QuicStackInner {
             .bind_addr
             .parse()
             .map_err(into_stack_err!(StackErrorCode::InvalidConfig))?;
-
         let this = self.clone();
-        let config = UdpServiceConfig::new(addr).with_socket_options(SocketOptions {
-            reuse_address: self.reuse_address,
-            ..SocketOptions::default()
-        });
+        let config = UdpServiceConfig::new(addr)
+            .with_socket_options(SocketOptions {
+                reuse_address: self.reuse_address,
+                ..SocketOptions::default()
+            })
+            .with_socket_init_callback(move |socket| {
+                super::try_enable_dual_stack(socket, addr);
+                Ok(())
+            });
         QuicServer::serve_socket(&self.server_runtime, config, move |socket, worker_id| {
             let this = this.clone();
             let server_config = server_config.clone();
@@ -2233,8 +2239,8 @@ mod tests {
         ConnectionManager, DefaultLimiterManager, GlobalCollectionManager,
         GlobalCollectionManagerRef, LimiterManagerRef, ProcessChainConfigs, ProcessChainHttpServer,
         QuicDomainConfig, QuicStack, QuicStackConfig, QuicStackContext, QuicStackFactory,
-        SelfCertConfig, SelfCertMgr, SelfCertMgrRef, Server, ServerManager, ServerManagerRef,
-        ServerErrorCode, ServerResult, Stack, StackContext, StackFactory, StackProtocol,
+        SelfCertConfig, SelfCertMgr, SelfCertMgrRef, Server, ServerErrorCode, ServerManager,
+        ServerManagerRef, ServerResult, Stack, StackContext, StackFactory, StackProtocol,
         StatManager, StatManagerRef, StreamInfo, StreamServer, TunnelManager,
         create_io_dump_stack_config, decode_io_dump_frames, server_err,
     };

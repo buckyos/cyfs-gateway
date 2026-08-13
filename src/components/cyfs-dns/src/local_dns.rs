@@ -2,7 +2,7 @@ use cyfs_gateway_lib::{into_server_err, server_err, ServerError, ServerErrorCode
 use cyfs_gateway_lib::{
     NameServer, Server, ServerConfig, ServerContext, ServerContextRef, ServerFactory,
 };
-use name_client::{LocalConfigDnsProvider, NameInfo, NsProvider, RecordType};
+use name_client::{DidDocType, LocalConfigDnsProvider, NameInfo, NsProvider, RecordType};
 use name_lib::{EncodedDocument, NSError, DID};
 use serde::{Deserialize, Serialize};
 use std::net::IpAddr;
@@ -53,7 +53,7 @@ impl NameServer for LocalDns {
         from_ip: Option<IpAddr>,
     ) -> ServerResult<EncodedDocument> {
         self.local_provider
-            .query_did(did, fragment, from_ip)
+            .query_did(did, fragment.map(DidDocType::from), from_ip)
             .await
             .map_err(|e| match e {
                 NSError::NotFound(_) => ServerError::new(ServerErrorCode::NotFound, e.to_string()),

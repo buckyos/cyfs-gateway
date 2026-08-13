@@ -1,0 +1,25 @@
+[package]
+name = "web3_gateway"
+version.workspace = true
+edition = "2021"
+build = "build.rs"
+
+[dependencies]
+anyhow.workspace = true
+log.workspace = true
+tokio = { version = "*", features = ["full", "tracing"] }
+cyfs-gateway-app-lib = { path = "../../components/cyfs-gateway-app-lib" }
+cyfs-gateway-modules = { path = "../../components/cyfs-gateway-modules" }
+
+[dev-dependencies]
+async-trait.workspace = true
+bns-client = { path = "../../components/bns-client" }
+bns-indexer = { path = "../../components/bns-indexer" }
+bns-server = { path = "../../components/bns-server" }
+buckyos-kit.workspace = true
+cyfs-sn = { path = "../../components/cyfs-sn" }
+hickory-resolver = { version = "0.24", features = ["tokio"] }
+kRPC.workspace = true
+reqwest.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true

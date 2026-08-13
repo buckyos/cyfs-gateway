@@ -764,21 +764,27 @@ impl DirServer {
         } else {
             None
         };
-        let new_root_dir = Self::fs_canonicalize(file_io_mode, &root_path).await.map_err(|e| {
-            server_err!(
-                ServerErrorCode::IOError,
-                "Failed to canonicalize path: {}",
-                e
-            )
-        })?;
+        let new_root_dir = Self::fs_canonicalize(file_io_mode, &root_path)
+            .await
+            .map_err(|e| {
+                server_err!(
+                    ServerErrorCode::IOError,
+                    "Failed to canonicalize path: {}",
+                    e
+                )
+            })?;
         #[cfg(target_os = "linux")]
-        let root_dir_file = Arc::new(Self::open_std_file(file_io_mode, &new_root_dir).await.map_err(|e| {
-            server_err!(
-                ServerErrorCode::IOError,
-                "Failed to open root directory: {}",
-                e
-            )
-        })?);
+        let root_dir_file = Arc::new(
+            Self::open_std_file(file_io_mode, &new_root_dir)
+                .await
+                .map_err(|e| {
+                    server_err!(
+                        ServerErrorCode::IOError,
+                        "Failed to open root directory: {}",
+                        e
+                    )
+                })?,
+        );
         debug!("after normalize,root_dir is : {:?}", new_root_dir);
         Ok(DirServer {
             id: builder.id.unwrap(),
@@ -945,10 +951,7 @@ impl DirServer {
         self.open_path_in_root_cached(file_path).await
     }
 
-    async fn open_path_in_root_cached(
-        &self,
-        file_path: &Path,
-    ) -> std::io::Result<OpenedDirFile> {
+    async fn open_path_in_root_cached(&self, file_path: &Path) -> std::io::Result<OpenedDirFile> {
         let opened = self.open_path_in_root(file_path).await?;
         if let Some(cache) = &self.open_file_cache {
             cache.record_opened_file_metadata(file_path, &opened.metadata);
@@ -1048,7 +1051,9 @@ impl DirServer {
             };
             let file = if metadata.is_file() {
                 Some(match file_io_mode {
-                    DirServerFileIoMode::Async => DirReadFile::Tokio(tokio::fs::File::from_std(file)),
+                    DirServerFileIoMode::Async => {
+                        DirReadFile::Tokio(tokio::fs::File::from_std(file))
+                    }
                     DirServerFileIoMode::Sync => DirReadFile::Sync(file),
                 })
             } else {
@@ -1117,12 +1122,11 @@ impl DirServer {
                 .boxed_unsync());
         }
 
-        let stream =
-            ReaderStream::with_capacity(
-                file,
-                Self::file_stream_buffer_size(self.file_read_buffer_size, content_length),
-            )
-                .map_ok(Frame::data);
+        let stream = ReaderStream::with_capacity(
+            file,
+            Self::file_stream_buffer_size(self.file_read_buffer_size, content_length),
+        )
+        .map_ok(Frame::data);
 
         Ok(BodyExt::map_err(StreamBody::new(stream), |e| {
             server_err!(
@@ -1221,7 +1225,11 @@ impl DirServer {
             unreachable!("sync_range_body only accepts sync files");
         };
         std::io::Seek::seek(&mut file, std::io::SeekFrom::Start(start)).map_err(|e| {
-            server_err!(ServerErrorCode::IOError, "Failed to seek sync file range: {}", e)
+            server_err!(
+                ServerErrorCode::IOError,
+                "Failed to seek sync file range: {}",
+                e
+            )
         })?;
 
         if self.should_inline_file_body(content_length) {
@@ -1397,7 +1405,8 @@ impl DirServer {
         opened_file: OpenedDirFile,
         req_info: &DirFileRequestInfo,
         log_message: &str,
-    ) -> ServerResult<Result<http::Response<UnsyncBoxBody<Bytes, ServerError>>, OpenedDirFile>> {
+    ) -> ServerResult<Result<http::Response<UnsyncBoxBody<Bytes, ServerError>>, OpenedDirFile>>
+    {
         if !opened_file.metadata.is_file() {
             return Ok(Err(opened_file));
         }
@@ -1608,13 +1617,15 @@ impl DirServer {
     }
 
     async fn ensure_path_in_root(&self, path: &Path) -> ServerResult<PathBuf> {
-        let canonical_path = Self::fs_canonicalize(self.file_io_mode, path).await.map_err(|e| {
-            server_err!(
-                ServerErrorCode::IOError,
-                "Failed to canonicalize path: {}",
-                e
-            )
-        })?;
+        let canonical_path = Self::fs_canonicalize(self.file_io_mode, path)
+            .await
+            .map_err(|e| {
+                server_err!(
+                    ServerErrorCode::IOError,
+                    "Failed to canonicalize path: {}",
+                    e
+                )
+            })?;
         if !canonical_path.starts_with(&self.root_dir) {
             return Err(server_err!(
                 ServerErrorCode::InvalidParam,
@@ -1703,11 +1714,7 @@ impl DirServer {
         if self.file_io_mode == DirServerFileIoMode::Sync {
             let mut entries = Vec::new();
             for entry in std::fs::read_dir(dir_path).map_err(|e| {
-                server_err!(
-                    ServerErrorCode::IOError,
-                    "Failed to read directory: {}",
-                    e
-                )
+                server_err!(ServerErrorCode::IOError, "Failed to read directory: {}", e)
             })? {
                 let entry = entry.map_err(|e| {
                     server_err!(
@@ -1950,6 +1957,10 @@ pub struct DirServerConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
     pub root_path: String,
+    /// URL prefix stripped before resolving the request path under `root_path`.
+    /// Requests without the prefix retain the historical one-to-one mapping.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub index_file: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2136,6 +2147,10 @@ impl ServerFactory for DirServerFactory {
 
         if let Some(version) = &config.version {
             builder = builder.version(version.clone());
+        }
+
+        if let Some(base_url) = &config.base_url {
+            builder = builder.base_url(base_url.clone());
         }
 
         if let Some(index_file) = &config.index_file {
@@ -2351,6 +2366,7 @@ mod tests {
             ty: "dir".to_string(),
             version: None,
             root_path: temp_dir.path().to_string_lossy().to_string(),
+            base_url: None,
             index_file: None,
             fallback_file: None,
             autoindex: false,
@@ -2575,10 +2591,7 @@ mod tests {
         let resp = server.serve_file(&file_path, &req_info).await.unwrap();
         assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
         assert_eq!(resp.headers().get("Content-Length").unwrap(), "6");
-        assert_eq!(
-            resp.headers().get("Content-Range").unwrap(),
-            "bytes 4-9/16"
-        );
+        assert_eq!(resp.headers().get("Content-Range").unwrap(), "bytes 4-9/16");
         let body = resp.into_body().collect().await.unwrap().to_bytes();
         assert_eq!(body.as_ref(), b"456789");
 
@@ -2944,16 +2957,20 @@ mod tests {
             errors: true,
         });
 
-        assert!(cache
-            .stat_path(&missing_path, DirServerFileIoMode::Async)
-            .await
-            .is_not_found());
+        assert!(
+            cache
+                .stat_path(&missing_path, DirServerFileIoMode::Async)
+                .await
+                .is_not_found()
+        );
         assert!(cache.stat_cache.get(&missing_path).is_none());
 
-        assert!(cache
-            .stat_path(&missing_path, DirServerFileIoMode::Async)
-            .await
-            .is_not_found());
+        assert!(
+            cache
+                .stat_path(&missing_path, DirServerFileIoMode::Async)
+                .await
+                .is_not_found()
+        );
         assert!(cache.stat_cache.get(&missing_path).is_some());
     }
 
@@ -2981,7 +2998,9 @@ mod tests {
             6
         );
         assert!(cache.stat_cache.get(&file_path).is_none());
-        let cached = cache.stat_path(&file_path, DirServerFileIoMode::Async).await;
+        let cached = cache
+            .stat_path(&file_path, DirServerFileIoMode::Async)
+            .await;
         assert_eq!(cached.metadata().unwrap().len(), 6);
         assert!(cache.stat_cache.get(&file_path).is_some());
     }
@@ -3217,10 +3236,12 @@ mod tests {
             errors: false,
         });
 
-        assert!(cache
-            .stat_path(&missing_path, DirServerFileIoMode::Async)
-            .await
-            .is_not_found());
+        assert!(
+            cache
+                .stat_path(&missing_path, DirServerFileIoMode::Async)
+                .await
+                .is_not_found()
+        );
         assert!(cache.stat_cache.get(&missing_path).is_none());
     }
 
@@ -3543,5 +3564,80 @@ mod tests {
         if let Err(e) = result {
             assert_eq!(e.code(), ServerErrorCode::InvalidConfig);
         }
+    }
+
+    #[test]
+    fn test_dir_server_config_base_url_round_trip() {
+        let config: DirServerConfig = serde_yaml_ng::from_str(
+            r#"
+id: sn_did_web
+type: dir
+root_path: /opt/buckyos/local/identity/node1.example.com
+base_url: /.well-known
+autoindex: false
+etag: true
+"#,
+        )
+        .unwrap();
+        assert_eq!(config.base_url.as_deref(), Some("/.well-known"));
+        let round_tripped: DirServerConfig =
+            serde_json::from_str(&config.get_config_json()).unwrap();
+        assert_eq!(round_tripped.base_url.as_deref(), Some("/.well-known"));
+    }
+
+    async fn get_with_base_url(
+        root_path: &Path,
+        base_url: Option<&str>,
+        uri: &str,
+    ) -> (StatusCode, Vec<u8>) {
+        let mut builder = DirServer::builder()
+            .id("sn_did_web")
+            .root_path(root_path.to_path_buf());
+        if let Some(base_url) = base_url {
+            builder = builder.base_url(base_url);
+        }
+        let server = builder.build().await.unwrap();
+        let request = http::Request::builder()
+            .method("GET")
+            .uri(uri)
+            .body(
+                Full::new(Bytes::new())
+                    .map_err(|never| match never {})
+                    .boxed_unsync(),
+            )
+            .unwrap();
+        let response = server
+            .serve_request(request, StreamInfo::new("127.0.0.1:50000".to_string()))
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        (status, body.to_vec())
+    }
+
+    #[tokio::test]
+    async fn test_base_url_maps_mount_prefix_onto_flat_root() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        tokio::fs::write(temp_dir.path().join("did.json"), b"flat-did-doc")
+            .await
+            .unwrap();
+
+        let (status, body) = get_with_base_url(
+            temp_dir.path(),
+            Some("/.well-known"),
+            "/.well-known/did.json",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, b"flat-did-doc");
+
+        let (status, body) = get_with_base_url(temp_dir.path(), None, "/did.json").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, b"flat-did-doc");
+
+        let (status, body) =
+            get_with_base_url(temp_dir.path(), Some("/.well-known"), "/did.json").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, b"flat-did-doc");
     }
 }

@@ -1,7 +1,7 @@
 use super::{
     Stack, connect_timeout_from_secs, get_limit_info, get_source_addr_from_req_env,
-    probe_proxy_protocol_stream, stream_forward, stream_forward_group,
-    stream_idle_timeout_from_secs,
+    parse_proxy_protocol_trusted_upstreams, probe_proxy_protocol_stream_from_trusted_upstream,
+    stream_forward, stream_forward_group, stream_idle_timeout_from_secs,
 };
 use crate::forward::ForwardPlan;
 
@@ -16,10 +16,11 @@ use crate::stack::limiter::Limiter;
 use crate::{
     ConnectionController, ConnectionInfo, ConnectionManagerRef, DumpStream,
     GlobalCollectionManagerRef, IoDumpStackConfig, JsExternalsManagerRef, LimiterManagerRef,
-    MutComposedSpeedStat, MutComposedSpeedStatRef, ProcessChainConfig, ProcessChainConfigs, Server,
+    MutComposedSpeedStat, MutComposedSpeedStatRef, ProcessChainConfig, ProcessChainConfigs,
     ServerManagerRef, StackConfig, StackContext, StackErrorCode, StackFactory, StackProtocol,
-    StackRef, StatManagerRef, StreamInfo, TunnelManager, create_io_dump_stack_config,
-    get_external_commands, get_stat_info, hyper_serve_http, into_stack_err, stack_err,
+    StackRef, StatManagerRef, StreamInfo, TrustedUpstreamMatcher, TunnelManager,
+    create_io_dump_stack_config, get_external_commands, get_stat_info, hyper_serve_http,
+    into_stack_err, stack_err,
 };
 use cyfs_process_chain::{CollectionValue, CommandControl, ProcessChainLibExecutor, StreamRequest};
 use futures_util::future::{AbortHandle, Abortable};
@@ -81,6 +82,7 @@ struct TcpConnectionHandler {
     io_dump: Option<IoDumpStackConfig>,
     stream_idle_timeout: std::time::Duration,
     connect_timeout: std::time::Duration,
+    trusted_upstreams: Vec<TrustedUpstreamMatcher>,
 }
 
 impl TcpConnectionHandler {
@@ -91,6 +93,7 @@ impl TcpConnectionHandler {
         io_dump: Option<IoDumpStackConfig>,
         stream_idle_timeout: std::time::Duration,
         connect_timeout: std::time::Duration,
+        trusted_upstreams: Vec<String>,
     ) -> StackResult<Self> {
         let (executor, _) = create_process_chain_executor(
             &hook_point,
@@ -108,6 +111,7 @@ impl TcpConnectionHandler {
             io_dump,
             stream_idle_timeout,
             connect_timeout,
+            trusted_upstreams: parse_proxy_protocol_trusted_upstreams(&trusted_upstreams)?,
         })
     }
 
@@ -132,6 +136,7 @@ impl TcpConnectionHandler {
             io_dump,
             stream_idle_timeout: self.stream_idle_timeout,
             connect_timeout: self.connect_timeout,
+            trusted_upstreams: self.trusted_upstreams.clone(),
         })
     }
 
@@ -158,11 +163,18 @@ impl TcpConnectionHandler {
             } else {
                 Box::new(stream)
             };
-        let (req_stream, proxy_source_addr) = probe_proxy_protocol_stream(req_stream).await?;
+        let (req_stream, proxy_source_addr) = probe_proxy_protocol_stream_from_trusted_upstream(
+            req_stream,
+            remote_addr,
+            &self.trusted_upstreams,
+        )
+        .await?;
         let request_source_addr = proxy_source_addr.unwrap_or(remote_addr);
         let device_lookup_ip = request_source_addr.ip();
         let mut request = StreamRequest::new(req_stream, dest_addr);
         request.source_addr = Some(request_source_addr);
+        request.conn_source_addr = Some(remote_addr);
+        request.real_source_addr = proxy_source_addr;
         request.dest_port = dest_addr.port();
         if let Some(device_info) = self
             .connection_manager
@@ -327,32 +339,29 @@ impl TcpConnectionHandler {
                             };
 
                             let server_name = list[1].as_str();
-                            if let Some(server) = servers.get_server(server_name) {
-                                match server {
-                                    Server::Http(server) => {
-                                        hyper_serve_http(stream, server, stream_info.clone())
-                                            .await
-                                            .map_err(into_stack_err!(
-                                                StackErrorCode::ServerError,
-                                                "server {server_name}"
-                                            ))?;
-                                    }
-                                    Server::Stream(server) => {
-                                        server
-                                            .serve_connection(stream, stream_info.clone())
-                                            .await
-                                            .map_err(into_stack_err!(
-                                                StackErrorCode::ServerError,
-                                                "server {server_name}"
-                                            ))?;
-                                    }
-                                    _ => {
-                                        return Err(stack_err!(
-                                            StackErrorCode::InvalidConfig,
-                                            "unsupported server type {server_name}"
-                                        ));
-                                    }
-                                }
+                            // Resolve by compatible trait instead of relying on
+                            // HashMap iteration order when one logical server
+                            // exposes more than one interface.
+                            if let Some(server) = servers.get_http_server(server_name) {
+                                hyper_serve_http(stream, server, stream_info.clone())
+                                    .await
+                                    .map_err(into_stack_err!(
+                                        StackErrorCode::ServerError,
+                                        "server {server_name}"
+                                    ))?;
+                            } else if let Some(server) = servers.get_stream_server(server_name) {
+                                server
+                                    .serve_connection(stream, stream_info.clone())
+                                    .await
+                                    .map_err(into_stack_err!(
+                                        StackErrorCode::ServerError,
+                                        "server {server_name}"
+                                    ))?;
+                            } else if !servers.get_all_servers_by_id(server_name).is_empty() {
+                                return Err(stack_err!(
+                                    StackErrorCode::InvalidConfig,
+                                    "unsupported server type {server_name}"
+                                ));
                             }
                         }
                         v => {
@@ -428,6 +437,7 @@ impl TcpStack {
             concurrency: normalize_concurrency(DEFAULT_TCP_CONCURRENCY),
             stream_idle_timeout: stream_idle_timeout_from_secs(None),
             connect_timeout: connect_timeout_from_secs(None),
+            trusted_upstreams: Vec::new(),
         }
     }
 
@@ -471,6 +481,7 @@ impl TcpStack {
             config.io_dump,
             config.stream_idle_timeout,
             config.connect_timeout,
+            config.trusted_upstreams,
         )
         .await?;
 
@@ -510,7 +521,12 @@ impl TcpStack {
             ipv4_transparent: transparent_mode(self.transparent, addr.is_ipv4()),
             ipv6_transparent: transparent_mode(self.transparent, addr.is_ipv6()),
         };
-        let mut service_config = TcpServiceConfig::new(addr).with_socket_options(socket_options);
+        let mut service_config = TcpServiceConfig::new(addr)
+            .with_socket_options(socket_options)
+            .with_socket_init_callback(move |socket| {
+                super::try_enable_dual_stack(socket, addr);
+                Ok(())
+            });
         if self.concurrency != u32::MAX {
             service_config =
                 service_config.with_max_concurrency_per_worker(self.concurrency as usize);
@@ -728,6 +744,7 @@ impl Stack for TcpStack {
             io_dump,
             stream_idle_timeout_from_secs(config.stream_idle_timeout),
             connect_timeout_from_secs(config.connect_timeout),
+            config.trusted_upstreams.clone(),
         )
         .await?;
 
@@ -759,6 +776,7 @@ pub struct TcpStackBuilder {
     concurrency: u32,
     stream_idle_timeout: std::time::Duration,
     connect_timeout: std::time::Duration,
+    trusted_upstreams: Vec<String>,
 }
 
 impl TcpStackBuilder {
@@ -799,6 +817,11 @@ impl TcpStackBuilder {
 
     pub fn concurrency(mut self, concurrency: u32) -> Self {
         self.concurrency = normalize_concurrency(concurrency);
+        self
+    }
+
+    pub fn trusted_upstreams(mut self, trusted_upstreams: Vec<String>) -> Self {
+        self.trusted_upstreams = trusted_upstreams;
         self
     }
 
@@ -852,6 +875,8 @@ pub struct TcpStackConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub connect_timeout: Option<u64>,
     pub reuse_address: Option<bool>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub trusted_upstreams: Vec<String>,
     pub hook_point: Vec<ProcessChainConfig>,
 }
 
@@ -976,6 +1001,7 @@ impl StackFactory for TcpStackFactory {
             .transparent(config.transparent.unwrap_or(false))
             .reuse_address(config.reuse_address.unwrap_or(false))
             .concurrency(config.concurrency.unwrap_or(DEFAULT_TCP_CONCURRENCY))
+            .trusted_upstreams(config.trusted_upstreams.clone())
             .hook_point(config.hook_point.clone())
             .stack_context(handler_env)
             .io_dump(io_dump)
@@ -1294,6 +1320,108 @@ mod tests {
         }
         tokio::time::sleep(std::time::Duration::from_secs(10)).await;
         assert_eq!(connection_manager.get_all_connection_info().len(), 0);
+    }
+
+    async fn run_tcp_source_vars_case(
+        bind: &str,
+        chain_condition: &str,
+        client_payload: &[u8],
+        trusted_upstreams: Vec<String>,
+        expected_payload: &[u8; 5],
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let echo_port = listener.local_addr().unwrap().port();
+
+        let chains = format!(
+            r#"
+- id: main
+  priority: 1
+  blocks:
+    - id: main
+      block: |
+        {chain_condition} && forward tcp:///127.0.0.1:{echo_port};
+        drop;
+"#
+        );
+        let chains: ProcessChainConfigs = serde_yaml_ng::from_str(&chains).unwrap();
+
+        let handler_env = build_handler_env(
+            Arc::new(ServerManager::new()),
+            TunnelManager::new(),
+            Arc::new(DefaultLimiterManager::new()),
+            StatManager::new(),
+            Some(Arc::new(GlobalProcessChains::new())),
+        );
+        let stack = TcpStack::builder()
+            .server_runtime(test_server_runtime())
+            .id("test")
+            .bind(bind)
+            .hook_point(chains)
+            .trusted_upstreams(trusted_upstreams)
+            .stack_context(handler_env)
+            .build()
+            .await
+            .unwrap();
+        stack.start().await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        let mut client = TcpStream::connect(bind).await.unwrap();
+        client.write_all(client_payload).await.unwrap();
+
+        let accepted = tokio::time::timeout(std::time::Duration::from_secs(5), listener.accept())
+            .await
+            .expect("process chain did not forward: source vars not exposed as expected");
+        let (mut conn, _) = accepted.unwrap();
+        let mut buf = [0u8; 5];
+        conn.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, expected_payload);
+    }
+
+    #[tokio::test]
+    async fn test_tcp_stack_source_vars_direct_connection() {
+        // Direct connection: conn_source mirrors the effective source and no
+        // real_source_* is fabricated (missing keys expand to "").
+        run_tcp_source_vars_case(
+            "127.0.0.1:8180",
+            r#"eq ${REQ.real_source_ip} "" && eq ${REQ.conn_source_ip} "127.0.0.1" && eq ${REQ.source_ip} "127.0.0.1""#,
+            b"hello",
+            Vec::new(),
+            b"hello",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_tcp_stack_source_vars_proxy_protocol() {
+        // PROXY protocol restores the origin: it becomes both the trusted
+        // real_source_* and the effective source_*, while conn_source_* keeps
+        // the direct hop.
+        let mut payload = Vec::new();
+        payload.extend_from_slice(b"PROXY TCP4 203.0.113.9 127.0.0.1 5678 80\r\n");
+        payload.extend_from_slice(b"hello");
+        run_tcp_source_vars_case(
+            "127.0.0.1:8181",
+            r#"eq ${REQ.real_source_ip} "203.0.113.9" && eq ${REQ.real_source_port} "5678" && eq ${REQ.conn_source_ip} "127.0.0.1" && eq ${REQ.source_ip} "203.0.113.9" && eq ${REQ.source_port} "5678""#,
+            &payload,
+            vec!["127.0.0.1/32".to_string()],
+            b"hello",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_tcp_stack_untrusted_proxy_header_is_not_parsed() {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(b"PROXY TCP4 127.0.0.1 127.0.0.1 5678 80\r\n");
+        payload.extend_from_slice(b"hello");
+        run_tcp_source_vars_case(
+            "127.0.0.1:8182",
+            r#"eq ${REQ.real_source_ip} "" && eq ${REQ.conn_source_ip} "127.0.0.1" && eq ${REQ.source_ip} "127.0.0.1""#,
+            &payload,
+            Vec::new(),
+            b"PROXY",
+        )
+        .await;
     }
 
     #[tokio::test]
@@ -2006,6 +2134,7 @@ mod tests {
             stream_idle_timeout: None,
             connect_timeout: None,
             reuse_address: None,
+            trusted_upstreams: Vec::new(),
             hook_point: vec![],
         };
 

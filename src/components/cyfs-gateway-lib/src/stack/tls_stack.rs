@@ -9,16 +9,16 @@ use crate::stack::tls_cert_resolver::{
 };
 use crate::stack::{
     TlsCertResolver, connect_timeout_from_secs, get_limit_info, get_source_addr_from_req_env,
-    probe_proxy_protocol_stream, stream_forward, stream_forward_group,
-    stream_idle_timeout_from_secs,
+    parse_proxy_protocol_trusted_upstreams, probe_proxy_protocol_stream_from_trusted_upstream,
+    stream_forward, stream_forward_group, stream_idle_timeout_from_secs,
 };
 use crate::{
     ConnectionController, ConnectionInfo, ConnectionManagerRef, DumpStream,
     GlobalCollectionManagerRef, IoDumpStackConfig, JsExternalsManagerRef, LimiterManagerRef,
     MutComposedSpeedStat, MutComposedSpeedStatRef, ProcessChainConfigs, Server, ServerManagerRef,
     Stack, StackConfig, StackContext, StackErrorCode, StackProtocol, StackResult, StatManagerRef,
-    StreamInfo, TunnelManager, create_io_dump_stack_config, get_external_commands, get_stat_info,
-    hyper_serve_http, into_stack_err, stack_err,
+    StreamInfo, TrustedUpstreamMatcher, TunnelManager, create_io_dump_stack_config,
+    get_external_commands, get_stat_info, hyper_serve_http, into_stack_err, stack_err,
 };
 use cyfs_process_chain::{CollectionValue, CommandControl, ProcessChainLibExecutor, StreamRequest};
 use futures_util::future::{AbortHandle, Abortable};
@@ -128,6 +128,7 @@ struct TlsConnectionHandler {
     io_dump: Option<IoDumpStackConfig>,
     stream_idle_timeout: std::time::Duration,
     connect_timeout: std::time::Duration,
+    trusted_upstreams: Vec<TrustedUpstreamMatcher>,
 }
 
 impl TlsConnectionHandler {
@@ -141,6 +142,7 @@ impl TlsConnectionHandler {
         io_dump: Option<IoDumpStackConfig>,
         stream_idle_timeout: std::time::Duration,
         connect_timeout: std::time::Duration,
+        trusted_upstreams: Vec<String>,
     ) -> StackResult<Self> {
         let (executor, _) = create_process_chain_executor(
             &hook_point,
@@ -163,6 +165,7 @@ impl TlsConnectionHandler {
             io_dump,
             stream_idle_timeout,
             connect_timeout,
+            trusted_upstreams: parse_proxy_protocol_trusted_upstreams(&trusted_upstreams)?,
         })
     }
 
@@ -186,6 +189,7 @@ impl TlsConnectionHandler {
             io_dump: self.io_dump.clone(),
             stream_idle_timeout: self.stream_idle_timeout,
             connect_timeout: self.connect_timeout,
+            trusted_upstreams: self.trusted_upstreams.clone(),
         })
     }
 
@@ -272,7 +276,12 @@ impl TlsConnectionHandler {
             StackErrorCode::ServerError,
             "read remote addr failed"
         ))?;
-        let (stream, proxy_source_addr) = probe_proxy_protocol_stream(Box::new(stream)).await?;
+        let (stream, proxy_source_addr) = probe_proxy_protocol_stream_from_trusted_upstream(
+            Box::new(stream),
+            remote_addr,
+            &self.trusted_upstreams,
+        )
+        .await?;
         let request_source_addr = proxy_source_addr.unwrap_or(remote_addr);
 
         let tls_acceptor = TlsAcceptor::from(self.server_config.clone());
@@ -316,6 +325,8 @@ impl TlsConnectionHandler {
             };
         let mut request = StreamRequest::new(request_stream, local_addr);
         request.source_addr = Some(request_source_addr);
+        request.conn_source_addr = Some(remote_addr);
+        request.real_source_addr = proxy_source_addr;
         request.dest_port = local_addr.port();
         request.dest_host = server_name;
         if let Some(device_info) = self
@@ -592,6 +603,7 @@ impl TlsStack {
             config.io_dump,
             config.stream_idle_timeout,
             config.connect_timeout,
+            config.trusted_upstreams,
         )
         .await?;
 
@@ -619,7 +631,12 @@ impl TlsStack {
             ipv4_transparent: TransparentMode::Disabled,
             ipv6_transparent: TransparentMode::Disabled,
         };
-        let mut service_config = TcpServiceConfig::new(addr).with_socket_options(socket_options);
+        let mut service_config = TcpServiceConfig::new(addr)
+            .with_socket_options(socket_options)
+            .with_socket_init_callback(move |socket| {
+                super::try_enable_dual_stack(socket, addr);
+                Ok(())
+            });
         if self.concurrency != u32::MAX {
             service_config =
                 service_config.with_max_concurrency_per_worker(self.concurrency as usize);
@@ -831,11 +848,12 @@ impl Stack for TlsStack {
             .iter()
             .map(|s| s.as_bytes().to_vec())
             .collect();
+        let cert_list = build_tls_domain_configs(config).await?;
 
         let new_handler = TlsConnectionHandler::create(
             config.hook_point.clone(),
-            vec![],
-            build_identity_cert_config(&config.hosts, config.identity_manager.as_ref())?,
+            cert_list,
+            build_tls_identity_cert_config(&config.hosts, config.identity_manager.as_ref())?,
             alpn_protocols,
             env,
             self.connection_manager.clone(),
@@ -851,6 +869,7 @@ impl Stack for TlsStack {
             .map_err(|e| stack_err!(StackErrorCode::InvalidConfig, "{e}"))?,
             stream_idle_timeout_from_secs(config.stream_idle_timeout),
             connect_timeout_from_secs(config.connect_timeout),
+            config.trusted_upstreams.clone(),
         )
         .await?;
 
@@ -910,6 +929,32 @@ pub struct TlsIdentityManagerConfig {
     pub security_root_path: Option<String>,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum TlsHostConfig {
+    Host(String),
+    Cert(TlsHostCertConfig),
+}
+
+impl TlsHostConfig {
+    fn identity_host(&self) -> Option<&str> {
+        match self {
+            Self::Host(host) => Some(host.as_str()),
+            Self::Cert(_) => None,
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct TlsHostCertConfig {
+    #[serde(alias = "domain")]
+    pub host: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cert_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key_path: Option<String>,
+}
+
 #[derive(Serialize, Deserialize, Clone)]
 pub struct TlsStackConfig {
     pub id: String,
@@ -917,7 +962,7 @@ pub struct TlsStackConfig {
     pub bind: std::net::SocketAddr,
     pub hook_point: Vec<crate::ProcessChainConfig>,
     #[serde(default)]
-    pub hosts: Vec<String>,
+    pub hosts: Vec<TlsHostConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub identity_manager: Option<TlsIdentityManagerConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -939,6 +984,48 @@ pub struct TlsStackConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub connect_timeout: Option<u64>,
     pub reuse_address: Option<bool>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub trusted_upstreams: Vec<String>,
+}
+
+async fn build_tls_domain_configs(config: &TlsStackConfig) -> StackResult<Vec<TlsDomainConfig>> {
+    let mut cert_list = Vec::new();
+    for host_config in config.hosts.iter() {
+        let TlsHostConfig::Cert(host_config) = host_config else {
+            continue;
+        };
+        match (
+            host_config.cert_path.as_deref(),
+            host_config.key_path.as_deref(),
+        ) {
+            (Some(cert_path), Some(key_path)) => {
+                if !std::path::Path::new(cert_path).is_absolute()
+                    || !std::path::Path::new(key_path).is_absolute()
+                {
+                    return Err(stack_err!(
+                        StackErrorCode::InvalidConfig,
+                        "cert_path and key_path must be absolute paths for {}",
+                        host_config.host
+                    ));
+                }
+                let certs = load_certs(cert_path).await?;
+                let key = load_key(key_path).await?;
+                cert_list.push(TlsDomainConfig {
+                    domain: host_config.host.clone(),
+                    certs: Some(certs),
+                    key: Some(key),
+                });
+            }
+            _ => {
+                return Err(stack_err!(
+                    StackErrorCode::InvalidConfig,
+                    "cert_path and key_path must both be configured for {}",
+                    host_config.host
+                ));
+            }
+        }
+    }
+    Ok(cert_list)
 }
 
 impl crate::StackConfig for TlsStackConfig {
@@ -1011,6 +1098,17 @@ pub(crate) fn build_identity_cert_config(
     }))
 }
 
+fn build_tls_identity_cert_config(
+    hosts: &[TlsHostConfig],
+    identity_manager: Option<&TlsIdentityManagerConfig>,
+) -> StackResult<Option<TlsIdentityCertConfig>> {
+    let hosts = hosts
+        .iter()
+        .filter_map(|host| host.identity_host().map(ToOwned::to_owned))
+        .collect::<Vec<_>>();
+    build_identity_cert_config(&hosts, identity_manager)
+}
+
 pub struct TlsStackFactory {
     connection_manager: ConnectionManagerRef,
     server_runtime: ServerRuntime,
@@ -1040,8 +1138,9 @@ impl crate::StackFactory for TlsStackFactory {
                 "invalid tls stack config"
             ))?;
 
+        let cert_list = build_tls_domain_configs(config).await?;
         let identity_certs =
-            build_identity_cert_config(&config.hosts, config.identity_manager.as_ref())?;
+            build_tls_identity_cert_config(&config.hosts, config.identity_manager.as_ref())?;
 
         let stack_context = context
             .as_ref()
@@ -1069,6 +1168,7 @@ impl crate::StackFactory for TlsStackFactory {
             .server_runtime(self.server_runtime.clone())
             .connection_manager(self.connection_manager.clone())
             .hook_point(config.hook_point.clone())
+            .add_certs(cert_list)
             .identity_certs(identity_certs)
             .concurrency(config.concurrency.unwrap_or(DEFAULT_TLS_CONCURRENCY))
             .alpn_protocols(
@@ -1081,6 +1181,7 @@ impl crate::StackFactory for TlsStackFactory {
                     .collect(),
             )
             .reuse_address(config.reuse_address.unwrap_or(false))
+            .trusted_upstreams(config.trusted_upstreams.clone())
             .stack_context(stack_context)
             .io_dump(io_dump)
             .stream_idle_timeout(stream_idle_timeout_from_secs(config.stream_idle_timeout))
@@ -1106,6 +1207,7 @@ pub struct TlsStackBuilder {
     reuse_address: bool,
     stream_idle_timeout: std::time::Duration,
     connect_timeout: std::time::Duration,
+    trusted_upstreams: Vec<String>,
 }
 
 impl TlsStackBuilder {
@@ -1125,6 +1227,7 @@ impl TlsStackBuilder {
             reuse_address: false,
             stream_idle_timeout: stream_idle_timeout_from_secs(None),
             connect_timeout: connect_timeout_from_secs(None),
+            trusted_upstreams: Vec::new(),
         }
     }
 
@@ -1198,6 +1301,11 @@ impl TlsStackBuilder {
         self
     }
 
+    pub fn trusted_upstreams(mut self, trusted_upstreams: Vec<String>) -> Self {
+        self.trusted_upstreams = trusted_upstreams;
+        self
+    }
+
     pub async fn build(self) -> StackResult<TlsStack> {
         let stack = TlsStack::create(self).await?;
         Ok(stack)
@@ -1208,8 +1316,8 @@ impl TlsStackBuilder {
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::{
-        TlsConnectionHandler, TlsIdentityManagerConfig, build_identity_cert_config, load_certs,
-        load_key,
+        TlsConnectionHandler, TlsHostConfig, TlsIdentityManagerConfig, build_identity_cert_config,
+        build_tls_domain_configs, build_tls_identity_cert_config, load_certs, load_key,
     };
     use crate::global_process_chains::GlobalProcessChains;
     use crate::self_cert_mgr::{SelfCertConfig, SelfCertMgr, SelfCertMgrRef};
@@ -1228,7 +1336,7 @@ mod tests {
     use http_body_util::Full;
     use hyper::body::Bytes;
     use hyper_util::rt::{TokioExecutor, TokioIo};
-    use name_lib::{DeviceConfig, encode_ed25519_sk_to_pk_jwk, generate_ed25519_key};
+    use name_lib::{DeviceDocument, encode_ed25519_sk_to_pk_jwk, generate_ed25519_key};
     use rcgen::{
         BasicConstraints, CertificateParams, IsCa, Issuer, KeyPair, generate_simple_self_signed,
     };
@@ -1952,6 +2060,7 @@ mod tests {
             None,
             stream_idle_timeout_from_secs(None),
             connect_timeout_from_secs(None),
+            Vec::new(),
         )
         .await
         .unwrap();
@@ -2167,7 +2276,8 @@ mod tests {
 
         let (signing_key, _pkcs8_bytes) = generate_ed25519_key();
         let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
-        let _device_config = DeviceConfig::new_by_jwk("test", serde_json::from_value(jwk).unwrap());
+        let _device_config =
+            DeviceDocument::new_by_jwk("test", serde_json::from_value(jwk).unwrap());
 
         let config =
             ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
@@ -2279,7 +2389,8 @@ mod tests {
 
         let (signing_key, _pkcs8_bytes) = generate_ed25519_key();
         let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
-        let _device_config = DeviceConfig::new_by_jwk("test", serde_json::from_value(jwk).unwrap());
+        let _device_config =
+            DeviceDocument::new_by_jwk("test", serde_json::from_value(jwk).unwrap());
 
         let config =
             ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
@@ -2742,6 +2853,7 @@ mod tests {
             stream_idle_timeout: None,
             connect_timeout: None,
             reuse_address: None,
+            trusted_upstreams: Vec::new(),
         };
         let stack_context: Arc<dyn StackContext> = Arc::new(TlsStackContext::new(
             server_manager,
@@ -2775,7 +2887,13 @@ hook_point: []
         )
         .unwrap();
 
-        assert_eq!(config.hosts, vec!["example.com", "*.example.org"]);
+        assert_eq!(
+            config.hosts,
+            vec![
+                TlsHostConfig::Host("example.com".to_string()),
+                TlsHostConfig::Host("*.example.org".to_string())
+            ]
+        );
         let identity_manager = config.identity_manager.unwrap();
         assert_eq!(
             identity_manager.public_root_path.as_deref(),
@@ -2785,6 +2903,88 @@ hook_point: []
             identity_manager.security_root_path.as_deref(),
             Some("/tmp/security")
         );
+    }
+
+    #[tokio::test]
+    async fn test_tls_stack_config_loads_cert_paths() {
+        let cert_key = generate_simple_self_signed(vec!["cert.example.com".to_string()]).unwrap();
+        let tmp_dir = tempdir().unwrap();
+        let cert_path = tmp_dir.path().join("fullchain.pem");
+        let key_path = tmp_dir.path().join("leaf.key");
+        fs::write(&cert_path, cert_key.cert.pem()).await.unwrap();
+        fs::write(&key_path, cert_key.signing_key.serialize_pem())
+            .await
+            .unwrap();
+
+        let config: TlsStackConfig = serde_yaml_ng::from_str(&format!(
+            r#"
+id: tls_test
+protocol: tls
+bind: 127.0.0.1:443
+hosts:
+  - example.com
+  - host: cert.example.com
+    cert_path: {}
+    key_path: {}
+hook_point: []
+"#,
+            cert_path.display(),
+            key_path.display(),
+        ))
+        .unwrap();
+
+        let identity_certs = build_tls_identity_cert_config(&config.hosts, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(identity_certs.hosts.len(), 1);
+        assert_eq!(identity_certs.hosts[0].identity, "example.com");
+
+        let certs = build_tls_domain_configs(&config).await.unwrap();
+        assert_eq!(certs.len(), 1);
+        assert_eq!(certs[0].domain, "cert.example.com");
+        assert!(certs.iter().all(|item| item.certs.is_some()));
+        assert!(certs.iter().all(|item| item.key.is_some()));
+    }
+
+    #[tokio::test]
+    async fn test_tls_stack_config_rejects_relative_cert_paths() {
+        let config: TlsStackConfig = serde_yaml_ng::from_str(
+            r#"
+id: tls_test
+protocol: tls
+bind: 127.0.0.1:443
+hosts:
+  - host: cert.example.com
+    cert_path: ./fullchain.pem
+    key_path: ./leaf.key
+hook_point: []
+"#,
+        )
+        .unwrap();
+
+        let result = build_tls_domain_configs(&config).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_tls_stack_config_rejects_host_object_without_cert_paths() {
+        let config: TlsStackConfig = serde_yaml_ng::from_str(
+            r#"
+id: tls_test
+protocol: tls
+bind: 127.0.0.1:443
+hosts:
+  - host: cert.example.com
+hook_point: []
+"#,
+        )
+        .unwrap();
+
+        let identity_certs = build_tls_identity_cert_config(&config.hosts, None).unwrap();
+        assert!(identity_certs.is_none());
+
+        let result = build_tls_domain_configs(&config).await;
+        assert!(result.is_err());
     }
 
     #[test]

@@ -1,0 +1,12 @@
+{
+  "compilerOptions": {
+    "lib": ["ES2023"],
+    "target": "ES2023",
+    "module": "Node20",
+    "strict": true,
+    "skipLibCheck": true,
+    "types": ["node"],
+    "outDir": "dist"
+  },
+  "include": ["hardhat.config.ts", "hardhat-scripts/**/*.ts"]
+}

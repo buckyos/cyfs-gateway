@@ -56,7 +56,7 @@ pub use sfo_reuseport::{
 pub use stack::*;
 pub use timer_manager::*;
 
-use name_lib::DeviceConfig;
+use name_lib::DeviceDocument;
 use std::sync::Arc;
 use thiserror::Error;
 
@@ -88,7 +88,7 @@ pub enum TunnelError {
 pub type TunnelResult<T> = std::result::Result<T, TunnelError>;
 
 pub struct GatewayDevice {
-    pub config: DeviceConfig,
+    pub config: DeviceDocument,
     pub private_key: [u8; 48],
 }
 
