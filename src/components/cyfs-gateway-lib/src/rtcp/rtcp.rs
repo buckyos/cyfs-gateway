@@ -622,6 +622,15 @@ struct DirectTunnelAttempt {
     tunnel: RTcpTunnel,
 }
 
+struct EstablishedInboundTunnel {
+    tunnel: RTcpTunnel,
+    tunnel_key: String,
+    source_device_id: String,
+    source_addr: SocketAddr,
+    registration: InboundTunnelRegistration,
+    authority_confirmation: Option<(DID, String, std::net::IpAddr)>,
+}
+
 impl Drop for RTcpInner {
     fn drop(&mut self) {
         log::debug!("RTcpInner {} drop", self.this_device_did.to_string());
@@ -2160,16 +2169,7 @@ impl RTcpInner {
                 }
                 let this = this.clone();
                 task::spawn(async move {
-                    let deadline = Duration::from_secs(this.security.limits.handshake_timeout_secs);
-                    if timeout(deadline, this.serve_connection(stream, addr))
-                        .await
-                        .is_err()
-                    {
-                        warn!(
-                            "reject RTcp connection from {}: handshake deadline {:?} exceeded",
-                            addr, deadline
-                        );
-                    }
+                    this.serve_connection(stream, addr).await;
                 });
             }
         });
@@ -2177,7 +2177,31 @@ impl RTcpInner {
         Ok(handle)
     }
 
-    pub async fn serve_connection(self: &Arc<Self>, mut stream: TcpStream, addr: SocketAddr) {
+    pub async fn serve_connection(self: &Arc<Self>, stream: TcpStream, addr: SocketAddr) {
+        let deadline = Duration::from_secs(self.security.limits.handshake_timeout_secs);
+        let established = match timeout(deadline, self.establish_connection(stream, addr)).await {
+            Ok(established) => established,
+            Err(_) => {
+                warn!(
+                    "reject RTcp connection from {}: handshake deadline {:?} exceeded",
+                    addr, deadline
+                );
+                return;
+            }
+        };
+
+        let Some(established) = established else {
+            return;
+        };
+
+        self.run_established_inbound(established).await;
+    }
+
+    async fn establish_connection(
+        self: &Arc<Self>,
+        mut stream: TcpStream,
+        addr: SocketAddr,
+    ) -> Option<EstablishedInboundTunnel> {
         let source_info = addr.to_string();
         let first_package =
             RTcpTunnelPackage::read_package(Pin::new(&mut stream), true, source_info.as_str())
@@ -2188,7 +2212,7 @@ impl RTcpInner {
                 addr,
                 first_package.err().unwrap()
             );
-            return;
+            return None;
         }
 
         debug!(
@@ -2205,6 +2229,7 @@ impl RTcpInner {
                     session_key
                 );
                 self.on_new_stream(stream, session_key).await;
+                None
             }
             RTcpTunnelPackage::Hello(hello_package) => {
                 if !self.admit_handshake_source(addr.ip()).await {
@@ -2212,7 +2237,7 @@ impl RTcpInner {
                         "reject RTcp tunnel handshake from {}: per-IP rate exceeded",
                         addr
                     );
-                    return;
+                    return None;
                 }
                 let _handshake_permit = match self.pending_handshakes.clone().try_acquire_owned() {
                     Ok(permit) => permit,
@@ -2221,7 +2246,7 @@ impl RTcpInner {
                             "reject RTcp tunnel handshake from {}: pending quota exhausted",
                             addr
                         );
-                        return;
+                        return None;
                     }
                 };
                 debug!(
@@ -2232,12 +2257,71 @@ impl RTcpInner {
                     hello_package.body.to_id
                 );
 
-                self.on_new_tunnel(stream, hello_package).await;
+                // The pending-handshake permit is scoped to this future. It is
+                // released as soon as establishment returns, before the
+                // accepted tunnel enters its long-running control read loop.
+                self.on_new_tunnel(stream, hello_package).await
             }
             _ => {
                 error!("Unsupported first package type for rtcp stack: {}", addr);
+                None
             }
         }
+    }
+
+    async fn run_established_inbound(self: &Arc<Self>, established: EstablishedInboundTunnel) {
+        let EstablishedInboundTunnel {
+            tunnel,
+            tunnel_key,
+            source_device_id,
+            source_addr,
+            registration,
+            authority_confirmation,
+        } = established;
+
+        if !registration.accepted {
+            RTcpTunnelMap::finish_authenticated_registration(registration).await;
+            warn!(
+                "reject rtcp tunnel from {} {} after verified-cache arbitration",
+                source_device_id, source_addr
+            );
+            return;
+        }
+
+        // Publication is the final operation inside the handshake timeout.
+        // Cleanup of replaced instances must not delay the new tunnel's read
+        // loop, and cancellation of either cleanup task cannot unpublish the
+        // newly accepted instance.
+        task::spawn(async move {
+            RTcpTunnelMap::finish_authenticated_registration(registration).await;
+        });
+
+        info!(
+            "Tunnel {} accept from {} OK, instance {}, start running",
+            source_device_id.as_str(),
+            tunnel_key.as_str(),
+            tunnel.instance_id()
+        );
+
+        if let Some((logical_did, candidate_jwt, source_ip)) = authority_confirmation {
+            let this = self.clone();
+            task::spawn(async move {
+                this.maybe_spawn_authority_confirmation(logical_did, candidate_jwt, source_ip)
+                    .await;
+            });
+        }
+
+        tunnel.run().await;
+
+        info!(
+            "Tunnel {} instance {} end",
+            tunnel_key.as_str(),
+            tunnel.instance_id()
+        );
+
+        self.tunnel_map
+            .remove_if_current(&tunnel_key, &tunnel)
+            .await;
     }
 
     async fn on_new_stream(&self, stream: TcpStream, session_key: String) {
@@ -2253,7 +2337,11 @@ impl RTcpInner {
             .await;
     }
 
-    async fn on_new_tunnel(self: &Arc<Self>, stream: TcpStream, hello_package: RTcpHelloPackage) {
+    async fn on_new_tunnel(
+        self: &Arc<Self>,
+        stream: TcpStream,
+        hello_package: RTcpHelloPackage,
+    ) -> Option<EstablishedInboundTunnel> {
         let source_addr = match stream.peer_addr() {
             Ok(addr) => Some(addr),
             Err(e) => {
@@ -2270,7 +2358,7 @@ impl RTcpInner {
                 "reject rtcp tunnel from {}: hello.body.tunnel_token is none",
                 source_addr_log
             );
-            return;
+            return None;
         };
 
         // I1 steps ①–②: parse the signed claims without verification only to
@@ -2286,14 +2374,14 @@ impl RTcpInner {
                     "reject rtcp tunnel from {}: parse tunnel_token claims failed: {}",
                     source_addr_log, e
                 );
-                return;
+                return None;
             }
         };
         if let Err(err) =
             Self::validate_hello_signed_bindings(&unverified_claims, &hello_package.body)
         {
             warn!("reject rtcp tunnel from {}: {}", source_addr_log, err);
-            return;
+            return None;
         }
         let claimed_from = unverified_claims.from.clone();
 
@@ -2308,7 +2396,7 @@ impl RTcpInner {
                         "reject rtcp tunnel from {}: candidate identity invalid: {}",
                         source_addr_log, e
                     );
-                    return;
+                    return None;
                 }
             };
         let candidate_public_key = DecodingKey::from_ed_der(&candidate_key);
@@ -2325,7 +2413,7 @@ impl RTcpInner {
                     "reject rtcp tunnel from {}: verify hello possession token error:{}",
                     source_addr_log, e
                 );
-                return;
+                return None;
             }
         };
 
@@ -2343,7 +2431,7 @@ impl RTcpInner {
                 "reject rtcp tunnel from {}: token.to {} not accepted for this device {}: {}",
                 source_addr_log, hello_payload.to, this_host, e
             );
-            return;
+            return None;
         }
 
         // I1 step ⑤: now and only now may LocalAndZone assemble the trusted
@@ -2363,7 +2451,7 @@ impl RTcpInner {
                     "reject rtcp tunnel from {}: verify source device info error:{}",
                     source_addr_log, e
                 );
-                return;
+                return None;
             }
         };
         let source_device_id = source_device.source_device_id;
@@ -2394,7 +2482,7 @@ impl RTcpInner {
                     entry.identity.canonical_dev_did,
                     bound_logical
                 );
-                return;
+                return None;
             }
         }
 
@@ -2405,7 +2493,7 @@ impl RTcpInner {
                     "reject rtcp tunnel from {} {}: parser remote did error:{}",
                     source_device_id, source_addr_log, e
                 );
-                return;
+                return None;
             }
         };
         let now_ts = buckyos_get_unix_timestamp();
@@ -2432,7 +2520,7 @@ impl RTcpInner {
                 "reject rtcp tunnel from {} {}: replayed Hello nonce",
                 source_device_id, source_addr_log
             );
-            return;
+            return None;
         }
 
         let source_addr = match source_addr {
@@ -2442,14 +2530,14 @@ impl RTcpInner {
                     "reject rtcp tunnel from {}: peer addr unavailable",
                     source_device_id
                 );
-                return;
+                return None;
             }
         };
 
         let remote_stack = RTcpTargetStackEP::new(source_did, hello_package.body.my_port);
         if remote_stack.is_err() {
             error!("parser remote did error:{}", remote_stack.err().unwrap());
-            return;
+            return None;
         }
         let remote_stack = remote_stack.unwrap();
 
@@ -2479,7 +2567,7 @@ impl RTcpInner {
                     "reject rtcp tunnel from {} {}: generate ack token error:{}",
                     source_device_id, source_addr, e
                 );
-                return;
+                return None;
             }
         };
         let (ack_token, my_secret, my_xpub_bytes, my_nonce_hex) = ack_state;
@@ -2509,7 +2597,7 @@ impl RTcpInner {
                 "reject rtcp tunnel from {} {}: {}",
                 source_device_id, source_addr, e
             );
-            return;
+            return None;
         }
 
         let (aes_key, iv) = RTcpInner::derive_session_secrets(
@@ -2532,7 +2620,7 @@ impl RTcpInner {
                 "reject rtcp tunnel from {} {}: key confirmation failed: {}",
                 source_device_id, source_addr, e
             );
-            return;
+            return None;
         }
 
         let endpoint = TunnelEndpoint {
@@ -2550,7 +2638,7 @@ impl RTcpInner {
                 "reject rtcp tunnel from {} {}: {}",
                 endpoint.device_id, source_addr, e
             );
-            return;
+            return None;
         }
 
         let tunnel = RTcpTunnel::new(
@@ -2581,60 +2669,48 @@ impl RTcpInner {
         // a dedicated commit guard across this cache CAS and the subsequent
         // map/index publication, closing the gap where an old successful CAS
         // could otherwise resume after a newer tunnel's index scan.
-        let accepted = match self
+        let registration = match self
             .tunnel_map
-            .complete_authenticated_inbound(&tunnel_key, tunnel.clone(), verified_cache_entry)
+            .register_authenticated_inbound(&tunnel_key, tunnel.clone(), verified_cache_entry)
             .await
         {
-            Ok(accepted) => accepted,
+            Ok(registration) => registration,
             Err(err) => {
                 warn!(
                     "reject rtcp tunnel from {} {}: cannot commit accepted device document: {}",
                     source_device_id, source_addr, err
                 );
-                tunnel.close().await;
-                return;
+                tunnel.mark_closed();
+                return None;
             }
         };
-        if !accepted {
-            warn!(
-                "reject rtcp tunnel from {} {} after verified-cache arbitration",
-                source_device_id, source_addr
-            );
-            return;
-        }
 
-        info!(
-            "Tunnel {} accept from {} OK, instance {}, start running",
-            source_device_id.as_str(),
-            tunnel_key.as_str(),
-            tunnel.instance_id()
-        );
-        if matches!(
+        let authority_confirmation = if matches!(
             identity_trust,
             RtcpIdentityTrust::TrustedHostSnapshot | RtcpIdentityTrust::TrustedZoneSnapshot
         ) && claimed_source_did.method != "dev"
         {
-            if let Some(candidate_jwt) = hello_package.body.device_doc_jwt.clone() {
-                self.maybe_spawn_authority_confirmation(
-                    claimed_source_did,
-                    candidate_jwt,
-                    source_addr.ip(),
-                )
-                .await;
-            }
-        }
-        tunnel.run().await;
+            hello_package
+                .body
+                .device_doc_jwt
+                .clone()
+                .map(|candidate_jwt| (claimed_source_did, candidate_jwt, source_addr.ip()))
+        } else {
+            None
+        };
 
-        info!(
-            "Tunnel {} instance {} end",
-            tunnel_key.as_str(),
-            tunnel.instance_id()
-        );
-
-        self.tunnel_map
-            .remove_if_current(&tunnel_key, &tunnel)
-            .await;
+        // No await may be added after the map publication above. Returning
+        // immediately makes publication the cancellation boundary: timeout
+        // can cancel before registration, or observe this established value,
+        // but cannot leave a published tunnel without handing it to run().
+        Some(EstablishedInboundTunnel {
+            tunnel,
+            tunnel_key,
+            source_device_id,
+            source_addr,
+            registration,
+            authority_confirmation,
+        })
     }
 
     async fn maybe_spawn_authority_confirmation(
@@ -5601,6 +5677,24 @@ impl RTcpTunnelMap {
         tunnel: RTcpTunnel,
         verified_cache_entry: Option<PendingVerifiedCacheEntry>,
     ) -> NSResult<bool> {
+        let registration = self
+            .register_authenticated_inbound(tunnel_key, tunnel, verified_cache_entry)
+            .await?;
+
+        // The commit guard and map mutex are both gone before close() clears
+        // waiters or shuts down a transport.
+        Ok(Self::finish_authenticated_registration(registration).await)
+    }
+
+    // Register and return immediately after the atomic map publication. This
+    // is the final await in the timeout-bounded inbound handshake path: all
+    // transport shutdown and waiter cleanup happens after timeout returns.
+    async fn register_authenticated_inbound(
+        &self,
+        tunnel_key: &str,
+        tunnel: RTcpTunnel,
+        verified_cache_entry: Option<PendingVerifiedCacheEntry>,
+    ) -> NSResult<InboundTunnelRegistration> {
         let registration = if let Some(entry) = verified_cache_entry {
             let _commit_guard = self.authenticated_commit_lock.lock().await;
             let verified_commit = RTcpInner::commit_verified_cache_entry(Some(entry))?;
@@ -5617,9 +5711,7 @@ impl RTcpTunnelMap {
                 .await
         };
 
-        // The commit guard and map mutex are both gone before close() clears
-        // waiters or shuts down a transport.
-        Ok(Self::finish_authenticated_registration(registration).await)
+        Ok(registration)
     }
 
     #[cfg(test)]
@@ -8020,6 +8112,139 @@ mod tests {
             server_instance,
             "name/dev reuse must not create a second inbound connection"
         );
+    }
+
+    #[tokio::test]
+    async fn inbound_tunnel_outlives_handshake_deadline_and_releases_permit() {
+        let _ = init_name_lib_for_test(&HashMap::new()).await;
+        let (server_config, server_key) = test_device_config("handshake-lifetime-server");
+        let (client_one_config, client_one_key) =
+            test_device_config("handshake-lifetime-client-one");
+        let (client_two_config, client_two_key) =
+            test_device_config("handshake-lifetime-client-two");
+        cache_test_device(&server_config).await;
+        cache_test_device(&client_one_config).await;
+        cache_test_device(&client_two_config).await;
+
+        let server_port = unused_tcp_port();
+        let mut server = RTcp::new(
+            server_config.id.clone(),
+            format!("127.0.0.1:{}", server_port),
+            Some(server_key),
+            None,
+            Arc::new(MockRTcpListener::new()),
+        );
+        let mut server_security = RtcpSecurityConfig::default();
+        server_security.inbound_admission.anonymous = RtcpAnonymousAdmission::Allow;
+        server_security.inbound_admission.named_min_relation = RtcpNamedMinRelation::Any;
+        server_security.limits.handshake_timeout_secs = 1;
+        server_security.limits.max_pending_handshakes = 1;
+        server.set_security_config(server_security).unwrap();
+        server.start().await.unwrap();
+
+        let mut client_one = RTcp::new(
+            client_one_config.id.clone(),
+            format!("127.0.0.1:{}", unused_tcp_port()),
+            Some(client_one_key),
+            None,
+            Arc::new(MockRTcpListener::new()),
+        );
+        client_one.start().await.unwrap();
+        let mut client_two = RTcp::new(
+            client_two_config.id.clone(),
+            format!("127.0.0.1:{}", unused_tcp_port()),
+            Some(client_two_key),
+            None,
+            Arc::new(MockRTcpListener::new()),
+        );
+        client_two.start().await.unwrap();
+
+        let server_stack_id = format!("{}:{}", server_config.id.to_host_name(), server_port);
+        let client_one_tunnel = tokio::time::timeout(
+            Duration::from_secs(5),
+            client_one.create_tunnel(Some(&server_stack_id)),
+        )
+        .await
+        .expect("first RTCP handshake timed out")
+        .expect("first RTCP handshake failed");
+        let server_tunnel_key_one = format!(
+            "{}_{}",
+            server_config.id.to_string(),
+            client_one_config.id.to_string()
+        );
+        let server_tunnel_one =
+            wait_for_current_tunnel(&server.inner.tunnel_map, &server_tunnel_key_one, None).await;
+
+        // An established tunnel must release the pending-handshake permit
+        // immediately instead of retaining it for the lifetime of run().
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            client_two.create_tunnel(Some(&server_stack_id)),
+        )
+        .await
+        .expect("second RTCP handshake timed out while the first tunnel was established")
+        .expect("established tunnel retained the only pending-handshake permit");
+        let server_tunnel_key_two = format!(
+            "{}_{}",
+            server_config.id.to_string(),
+            client_two_config.id.to_string()
+        );
+        wait_for_current_tunnel(&server.inner.tunnel_map, &server_tunnel_key_two, None).await;
+
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        let current = server
+            .inner
+            .tunnel_map
+            .get_tunnel(&server_tunnel_key_one)
+            .await
+            .expect("established inbound tunnel disappeared after handshake deadline");
+        assert!(current.is_same_instance(&server_tunnel_one));
+        assert!(!current.is_closed());
+        current
+            .ping_rtt(Duration::from_secs(2))
+            .await
+            .expect("inbound control read loop stopped after handshake deadline");
+
+        let mut stream = tokio::time::timeout(
+            Duration::from_secs(5),
+            client_one_tunnel.open_stream("handshake-lifetime.test:80"),
+        )
+        .await
+        .expect("open_stream timed out after handshake deadline")
+        .expect("open_stream failed after handshake deadline");
+        stream.write_all(b"still-alive").await.unwrap();
+        let mut response = [0u8; 11];
+        stream.read_exact(&mut response).await.unwrap();
+        assert_eq!(&response, b"still-alive");
+    }
+
+    #[tokio::test]
+    async fn incomplete_first_packet_still_obeys_handshake_deadline() {
+        let (server_config, server_key) = test_device_config("handshake-timeout-server");
+        let server_port = unused_tcp_port();
+        let mut server = RTcp::new(
+            server_config.id,
+            format!("127.0.0.1:{}", server_port),
+            Some(server_key),
+            None,
+            Arc::new(MockRTcpListener::new()),
+        );
+        let mut security = RtcpSecurityConfig::default();
+        security.limits.handshake_timeout_secs = 1;
+        server.set_security_config(security).unwrap();
+        server.start().await.unwrap();
+
+        let mut stalled = TcpStream::connect(("127.0.0.1", server_port))
+            .await
+            .unwrap();
+        let mut byte = [0u8; 1];
+        match tokio::time::timeout(Duration::from_secs(2), stalled.read(&mut byte))
+            .await
+            .expect("stalled first packet was not closed by handshake deadline")
+        {
+            Ok(0) | Err(_) => {}
+            Ok(n) => panic!("server unexpectedly wrote {n} byte(s) to stalled handshake"),
+        }
     }
 
     #[tokio::test]
