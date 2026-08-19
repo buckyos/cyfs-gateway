@@ -579,12 +579,32 @@ struct VerifiedSourceDevice {
     verified_cache_entry: Option<PendingVerifiedCacheEntry>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AuthorityConfirmationTicket {
+    generation: u64,
+    document_revision: DocumentRevision,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AuthorityNegativeState {
+    completed_at: u64,
+    generation: u64,
+    reason: String,
+    rejected_revision: Option<DocumentRevision>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum AuthorityConfirmationState {
-    InFlight,
-    Confirmed(u64),
-    Negative(u64),
-    Unavailable(u64),
+    InFlight(AuthorityConfirmationTicket),
+    Confirmed {
+        completed_at: u64,
+        document_revision: DocumentRevision,
+    },
+    Negative(AuthorityNegativeState),
+    Unavailable {
+        completed_at: u64,
+        document_revision: DocumentRevision,
+    },
 }
 
 struct HandshakeRateState {
@@ -623,7 +643,6 @@ struct RTcpInner {
     security: RtcpSecurityConfig,
     pending_handshakes: Arc<Semaphore>,
     handshake_rates: Arc<Mutex<HashMap<std::net::IpAddr, HandshakeRateState>>>,
-    authority_confirmations: Arc<Mutex<HashMap<String, AuthorityConfirmationState>>>,
     authority_confirmation_slots: Arc<Semaphore>,
     // Used by create_tunnel to build a bootstrap stream through the tunnel
     // framework when the stack id carries a `params@remote` prefix. None means
@@ -694,7 +713,7 @@ struct EstablishedInboundTunnel {
     source_device_id: String,
     source_addr: SocketAddr,
     registration: InboundTunnelRegistration,
-    authority_confirmation: Option<(DID, String, std::net::IpAddr)>,
+    authority_confirmation: Option<(DID, String, std::net::IpAddr, DocumentRevision)>,
 }
 
 impl Drop for RTcpInner {
@@ -1458,7 +1477,6 @@ impl RTcpInner {
             pending_handshakes: Arc::new(Semaphore::new(security.limits.max_pending_handshakes)),
             handshake_rates: Arc::new(Mutex::new(HashMap::new())),
             security,
-            authority_confirmations: Arc::new(Mutex::new(HashMap::new())),
             authority_confirmation_slots: Arc::new(Semaphore::new(16)),
             tunnel_manager: None,
             nonce_cache: NonceCache::new(),
@@ -1794,6 +1812,110 @@ impl RTcpInner {
         )
     }
 
+    // A remembered authority Negative is fail-closed. Recovery is deliberately
+    // synchronous and exceptional: only a fresh RemoteAuthority answer whose
+    // exact DocumentRevision matches the presented candidate may clear it.
+    // The normal LocalAndZone path is not allowed to clear or age out this
+    // state, even if name-client's surrounding cache state changes.
+    async fn recover_negative_authority_candidate(
+        &self,
+        logical_did: &DID,
+        candidate_jwt: &str,
+    ) -> Result<(), TunnelError> {
+        let identity_key = logical_did.to_string();
+        let Some(negative) = self
+            .tunnel_map
+            .authority_negative_snapshot(&identity_key)
+            .await
+        else {
+            return Ok(());
+        };
+
+        let candidate_document = EncodedDocument::Jwt(candidate_jwt.to_string());
+        let candidate_revision = DocumentRevision::of(&candidate_document).ok_or_else(|| {
+            TunnelError::DocumentError(format!(
+                "authority Negative recovery candidate {} has no document revision",
+                identity_key
+            ))
+        })?;
+        info!(
+            "RTCP authority Negative recovery check for {} revision {:?}: state at {}, reason {}",
+            identity_key, candidate_revision, negative.completed_at, negative.reason
+        );
+
+        let permit = self
+            .authority_confirmation_slots
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| {
+                TunnelError::DocumentError(format!(
+                    "authority recovery unavailable for {}: confirmation slots closed",
+                    identity_key
+                ))
+            })?;
+        let _permit = permit;
+        let mut policy = ResolvePolicy::default();
+        policy.source = ResolveSourcePolicy::RemoteAuthority;
+        policy.allow_stale_cache = false;
+        policy.allow_unverified_cache_when_unavailable = false;
+        policy.allow_self_signed_when_missing = false;
+        let budget = Duration::from_secs(self.security.limits.handshake_timeout_secs.max(1));
+        let resolved = timeout(
+            budget,
+            resolve_did_ex(logical_did, Some(DidDocType::Device), policy),
+        )
+        .await
+        .map_err(|_| {
+            TunnelError::DocumentError(format!(
+                "authority recovery for {} timed out after {:?}; Negative remains active",
+                identity_key, budget
+            ))
+        })?
+        .map_err(|err| {
+            TunnelError::DocumentError(format!(
+                "authority recovery for {} failed: {}; Negative remains active",
+                identity_key, err
+            ))
+        })?;
+
+        if resolved.resolution_metadata.evidence != Some(BodyEvidence::Anchored) {
+            return Err(TunnelError::DocumentError(format!(
+                "authority recovery for {} returned non-anchored evidence {:?}",
+                identity_key, resolved.resolution_metadata.evidence
+            )));
+        }
+        let authority_revision = DocumentRevision::of(&resolved.document).ok_or_else(|| {
+            TunnelError::DocumentError(format!(
+                "authority Current document for {} has no document revision",
+                identity_key
+            ))
+        })?;
+        if authority_revision != candidate_revision {
+            return Err(TunnelError::DocumentError(format!(
+                "authority Negative rejects {} candidate revision {:?}; Current revision is {:?}",
+                identity_key, candidate_revision, authority_revision
+            )));
+        }
+
+        if !self
+            .tunnel_map
+            .clear_authority_negative_if_current(
+                &identity_key,
+                negative.generation,
+                &candidate_revision,
+                buckyos_get_unix_timestamp(),
+            )
+            .await
+        {
+            return Err(TunnelError::DocumentError(format!(
+                "authority state changed while recovering {}; retry required",
+                identity_key
+            )));
+        }
+        Ok(())
+    }
+
     fn commit_verified_cache_entry(
         entry: Option<PendingVerifiedCacheEntry>,
     ) -> NSResult<Option<(VerifiedTunnelIdentity, CacheWriteOutcome)>> {
@@ -2005,7 +2127,17 @@ impl RTcpInner {
 
                 self.validate_named_relation(&device_doc, &verified)?;
 
-                let identity_trust = Self::trust_from_verified(&verified);
+                let mut identity_trust = Self::trust_from_verified(&verified);
+                if self
+                    .tunnel_map
+                    .authority_confirmed_revision(
+                        &verified.subject_did.to_string(),
+                        &verified.revision,
+                    )
+                    .await
+                {
+                    identity_trust = RtcpIdentityTrust::MethodAuthorityCurrent;
+                }
                 let verified_cache_entry = Some(PendingVerifiedCacheEntry {
                     did: verified.subject_did.clone(),
                     document: verified.document.clone(),
@@ -2405,11 +2537,18 @@ impl RTcpInner {
             tunnel.instance_id()
         );
 
-        if let Some((logical_did, candidate_jwt, source_ip)) = authority_confirmation {
+        if let Some((logical_did, candidate_jwt, source_ip, document_revision)) =
+            authority_confirmation
+        {
             let this = self.clone();
             task::spawn(async move {
-                this.maybe_spawn_authority_confirmation(logical_did, candidate_jwt, source_ip)
-                    .await;
+                this.maybe_spawn_authority_confirmation(
+                    logical_did,
+                    candidate_jwt,
+                    source_ip,
+                    document_revision,
+                )
+                .await;
             });
         }
 
@@ -2536,6 +2675,32 @@ impl RTcpInner {
             return None;
         }
 
+        // A previously denied logical identity cannot re-enter through a
+        // LocalAndZone snapshot. The only recovery path is an exact fresh
+        // Current document from RemoteAuthority, and it completes before the
+        // application listener can observe the candidate.
+        if claimed_source_did.method != "dev" {
+            let Some(candidate_jwt) = hello_package.body.device_doc_jwt.as_deref() else {
+                warn!(
+                    "reject rtcp tunnel from {}: logical identity has no recovery candidate",
+                    source_addr_log
+                );
+                return None;
+            };
+            if let Err(err) = self
+                .recover_negative_authority_candidate(&claimed_source_did, candidate_jwt)
+                .await
+            {
+                warn!(
+                    "reject rtcp tunnel from {} {} before LocalAndZone/listener: {}",
+                    claimed_source_did.to_string(),
+                    source_addr_log,
+                    err
+                );
+                return None;
+            }
+        }
+
         // I1 step ⑤: now and only now may LocalAndZone assemble the trusted
         // snapshot and verify the owner-backed document.
         let source_device = match self
@@ -2561,6 +2726,9 @@ impl RTcpInner {
         let source_dev_did = source_device.canonical_dev_did;
         let identity_trust = source_device.identity_trust;
         let verified_cache_entry = source_device.verified_cache_entry;
+        let authority_candidate_revision = verified_cache_entry
+            .as_ref()
+            .map(|entry| entry.identity.document_revision.clone());
 
         // One-to-one binding pre-check before HelloAck, listener authorization
         // and publication: a named identity whose canonical DEV DID is bound
@@ -2844,7 +3012,16 @@ impl RTcpInner {
                 .body
                 .device_doc_jwt
                 .clone()
-                .map(|candidate_jwt| (claimed_source_did, candidate_jwt, source_addr.ip()))
+                .and_then(|candidate_jwt| {
+                    authority_candidate_revision.map(|document_revision| {
+                        (
+                            claimed_source_did,
+                            candidate_jwt,
+                            source_addr.ip(),
+                            document_revision,
+                        )
+                    })
+                })
         } else {
             None
         };
@@ -2867,6 +3044,7 @@ impl RTcpInner {
         logical_did: DID,
         candidate_jwt: String,
         source_ip: std::net::IpAddr,
+        document_revision: DocumentRevision,
     ) {
         let now = buckyos_get_unix_timestamp();
         let max_age = match self
@@ -2886,22 +3064,13 @@ impl RTcpInner {
             }
         };
         let identity_key = logical_did.to_string();
-        {
-            let mut states = self.authority_confirmations.lock().await;
-            let should_start = match states.get(&identity_key) {
-                None => true,
-                Some(AuthorityConfirmationState::InFlight) => false,
-                Some(AuthorityConfirmationState::Negative(_)) => false,
-                Some(AuthorityConfirmationState::Confirmed(at))
-                | Some(AuthorityConfirmationState::Unavailable(at)) => max_age
-                    .map(|age| now.saturating_sub(*at) >= age)
-                    .unwrap_or(false),
-            };
-            if !should_start {
-                return;
-            }
-            states.insert(identity_key.clone(), AuthorityConfirmationState::InFlight);
-        }
+        let Some(ticket) = self
+            .tunnel_map
+            .begin_authority_confirmation(&identity_key, &document_revision, now, max_age)
+            .await
+        else {
+            return;
+        };
 
         let this = self.clone();
         tokio::spawn(async move {
@@ -2912,7 +3081,16 @@ impl RTcpInner {
                 .await
             {
                 Ok(permit) => permit,
-                Err(_) => return,
+                Err(_) => {
+                    this.tunnel_map
+                        .complete_authority_unavailable_if_current(
+                            &identity_key,
+                            &ticket,
+                            buckyos_get_unix_timestamp(),
+                        )
+                        .await;
+                    return;
+                }
             };
             let _permit = permit;
             let mut policy = ResolvePolicy::default();
@@ -2932,7 +3110,6 @@ impl RTcpInner {
             .await;
 
             let completed_at = buckyos_get_unix_timestamp();
-            let mut next_state = AuthorityConfirmationState::Unavailable(completed_at);
             match confirmation {
                 Ok(Ok((_document, verified)))
                     if matches!(
@@ -2940,6 +3117,25 @@ impl RTcpInner {
                         AuthorityFreshness::Current { .. }
                     ) =>
                 {
+                    if verified.revision != ticket.document_revision {
+                        let reason = format!(
+                            "authority Current revision {:?} differs from admitted revision {:?}",
+                            verified.revision, ticket.document_revision
+                        );
+                        warn!(
+                            "RTCP authority confirmation rejected {} from {}: {}",
+                            identity_key, source_ip, reason
+                        );
+                        this.tunnel_map
+                            .complete_authority_negative_if_current(
+                                &identity_key,
+                                &ticket,
+                                completed_at,
+                                &reason,
+                            )
+                            .await;
+                        return;
+                    }
                     let cache_result = GLOBAL_NAME_CLIENT
                         .get()
                         .ok_or_else(|| {
@@ -2956,35 +3152,45 @@ impl RTcpInner {
                         Ok(outcome) if outcome.stored() => {
                             let upgraded = this
                                 .tunnel_map
-                                .upgrade_verified_identity_trust(
+                                .complete_authority_confirmed_if_current(
                                     &identity_key,
-                                    RtcpIdentityTrust::MethodAuthorityCurrent,
+                                    &ticket,
+                                    completed_at,
                                 )
                                 .await;
                             info!(
                                 "RTCP authority confirmation passed for {} from {}; upgraded {} tunnel(s), cache={:?}",
                                 identity_key, source_ip, upgraded, outcome
                             );
-                            next_state = AuthorityConfirmationState::Confirmed(completed_at);
                         }
                         Ok(outcome) => {
+                            let reason =
+                                format!("authority cache arbitration rejected: {:?}", outcome);
                             warn!(
                                 "RTCP authority confirmation cache arbitration rejected {} from {}: {:?}",
                                 identity_key, source_ip, outcome
                             );
                             this.tunnel_map
-                                .close_verified_identity(
+                                .complete_authority_negative_if_current(
                                     &identity_key,
-                                    "authority cache arbitration rejected",
+                                    &ticket,
+                                    completed_at,
+                                    &reason,
                                 )
                                 .await;
-                            next_state = AuthorityConfirmationState::Negative(completed_at);
                         }
                         Err(err) => {
                             warn!(
                                 "RTCP authority confirmation for {} passed but cache commit failed: {}",
                                 identity_key, err
                             );
+                            this.tunnel_map
+                                .complete_authority_unavailable_if_current(
+                                    &identity_key,
+                                    &ticket,
+                                    completed_at,
+                                )
+                                .await;
                         }
                     }
                 }
@@ -2995,10 +3201,16 @@ impl RTcpInner {
                             "RTCP authority confirmation denied {} from {}: {:?}",
                             identity_key, source_ip, verified.freshness.authority
                         );
+                        let reason =
+                            format!("AuthorityNotCurrent: {:?}", verified.freshness.authority);
                         this.tunnel_map
-                            .close_verified_identity(&identity_key, "AuthorityNotCurrent")
+                            .complete_authority_negative_if_current(
+                                &identity_key,
+                                &ticket,
+                                completed_at,
+                                &reason,
+                            )
                             .await;
-                        next_state = AuthorityConfirmationState::Negative(completed_at);
                     } else if matches!(
                         &verified.freshness.authority,
                         AuthorityFreshness::NotCurrent { .. }
@@ -3007,11 +3219,25 @@ impl RTcpInner {
                             "RTCP authority confirmation did not establish a current published device document for {} from {}; retaining snapshot trust: {:?}",
                             identity_key, source_ip, verified.freshness.authority
                         );
+                        this.tunnel_map
+                            .complete_authority_unavailable_if_current(
+                                &identity_key,
+                                &ticket,
+                                completed_at,
+                            )
+                            .await;
                     } else {
                         warn!(
                             "RTCP authority confirmation for {} returned no current receipt",
                             identity_key
                         );
+                        this.tunnel_map
+                            .complete_authority_unavailable_if_current(
+                                &identity_key,
+                                &ticket,
+                                completed_at,
+                            )
+                            .await;
                     }
                 }
                 Ok(Err(err)) if Self::is_definite_verify_rejection(&err) => {
@@ -3019,28 +3245,43 @@ impl RTcpInner {
                         "RTCP authority confirmation definitively rejected {} from {}: {}",
                         identity_key, source_ip, err
                     );
+                    let reason = format!("definite authority rejection: {}", err);
                     this.tunnel_map
-                        .close_verified_identity(&identity_key, "definite authority rejection")
+                        .complete_authority_negative_if_current(
+                            &identity_key,
+                            &ticket,
+                            completed_at,
+                            &reason,
+                        )
                         .await;
-                    next_state = AuthorityConfirmationState::Negative(completed_at);
                 }
                 Ok(Err(err)) => {
                     warn!(
                         "RTCP authority confirmation unavailable for {} from {}: {}",
                         identity_key, source_ip, err
                     );
+                    this.tunnel_map
+                        .complete_authority_unavailable_if_current(
+                            &identity_key,
+                            &ticket,
+                            completed_at,
+                        )
+                        .await;
                 }
                 Err(_) => {
                     warn!(
                         "RTCP authority confirmation for {} from {} timed out after {:?}",
                         identity_key, source_ip, budget
                     );
+                    this.tunnel_map
+                        .complete_authority_unavailable_if_current(
+                            &identity_key,
+                            &ticket,
+                            completed_at,
+                        )
+                        .await;
                 }
             }
-            this.authority_confirmations
-                .lock()
-                .await
-                .insert(identity_key, next_state);
         });
     }
 
@@ -3260,6 +3501,14 @@ impl RTcpInner {
                         warn!("{}", msg);
                         return Err(TunnelError::DocumentError(msg));
                     }
+                    OutboundRegisterError::AuthorityNegative(reason) => {
+                        let msg = format!(
+                            "rtcp target {} rejected by authority admission: {}",
+                            target_device_id, reason
+                        );
+                        warn!("{}", msg);
+                        return Err(TunnelError::DocumentError(msg));
+                    }
                 }
             }
             info!(
@@ -3362,7 +3611,11 @@ impl RTcpInner {
                     let tunnel = attempt.tunnel;
                     if let Err(err) = self
                         .tunnel_map
-                        .register_outbound_if_absent(&tunnel_key, tunnel.clone(), name_binding.as_ref())
+                        .register_outbound_if_absent(
+                            &tunnel_key,
+                            tunnel.clone(),
+                            name_binding.as_ref(),
+                        )
                         .await
                     {
                         tunnel.close().await;
@@ -3378,6 +3631,14 @@ impl RTcpInner {
                                 let msg = format!(
                                     "rtcp target {} rejected by one-to-one name binding: {}",
                                     target_device_id, conflict
+                                );
+                                warn!("{}", msg);
+                                return Err(TunnelError::DocumentError(msg));
+                            }
+                            OutboundRegisterError::AuthorityNegative(reason) => {
+                                let msg = format!(
+                                    "rtcp target {} rejected by authority admission: {}",
+                                    target_device_id, reason
                                 );
                                 warn!("{}", msg);
                                 return Err(TunnelError::DocumentError(msg));
@@ -5494,6 +5755,11 @@ struct RTcpTunnelMap {
     // and publish itself after B's scan.  The map mutex is never held during
     // the cache write, and this guard is dropped before transport shutdown.
     authenticated_commit_lock: Arc<Mutex<()>>,
+    // Terminal authority decisions and authenticated publication use the same
+    // commit lock, closing the gap where a tunnel could be published after a
+    // negative scan but before the Negative state became visible.
+    authority_confirmations: Arc<Mutex<HashMap<String, AuthorityConfirmationState>>>,
+    authority_state_generation: Arc<AtomicU64>,
 }
 
 #[derive(Default)]
@@ -5610,6 +5876,9 @@ enum OutboundRegisterError {
     // One-to-one arbitration: the canonical DEV DID is bound to another
     // verified logical name. The new tunnel must be closed, not registered.
     BindingConflict(String),
+    // A prior authority decision denied this logical identity. Outbound
+    // publication shares the same final gate as authenticated inbound.
+    AuthorityNegative(String),
 }
 
 impl RTcpTunnelMapState {
@@ -5732,7 +6001,163 @@ impl RTcpTunnelMap {
         RTcpTunnelMap {
             tunnel_map: Arc::new(Mutex::new(RTcpTunnelMapState::default())),
             authenticated_commit_lock: Arc::new(Mutex::new(())),
+            authority_confirmations: Arc::new(Mutex::new(HashMap::new())),
+            authority_state_generation: Arc::new(AtomicU64::new(1)),
         }
+    }
+
+    async fn begin_authority_confirmation(
+        &self,
+        logical_did: &str,
+        document_revision: &DocumentRevision,
+        now: u64,
+        max_age: Option<u64>,
+    ) -> Option<AuthorityConfirmationTicket> {
+        let mut states = self.authority_confirmations.lock().await;
+        let should_start = match states.get(logical_did) {
+            None => true,
+            Some(AuthorityConfirmationState::InFlight(_))
+            | Some(AuthorityConfirmationState::Negative(_)) => false,
+            Some(AuthorityConfirmationState::Confirmed {
+                completed_at,
+                document_revision: confirmed_revision,
+            })
+            | Some(AuthorityConfirmationState::Unavailable {
+                completed_at,
+                document_revision: confirmed_revision,
+            }) => {
+                confirmed_revision != document_revision
+                    || max_age
+                        .map(|age| now.saturating_sub(*completed_at) >= age)
+                        .unwrap_or(false)
+            }
+        };
+        if !should_start {
+            return None;
+        }
+
+        let ticket = AuthorityConfirmationTicket {
+            generation: self
+                .authority_state_generation
+                .fetch_add(1, Ordering::Relaxed),
+            document_revision: document_revision.clone(),
+        };
+        states.insert(
+            logical_did.to_string(),
+            AuthorityConfirmationState::InFlight(ticket.clone()),
+        );
+        Some(ticket)
+    }
+
+    async fn authority_negative_snapshot(
+        &self,
+        logical_did: &str,
+    ) -> Option<AuthorityNegativeState> {
+        match self.authority_confirmations.lock().await.get(logical_did) {
+            Some(AuthorityConfirmationState::Negative(negative)) => Some(negative.clone()),
+            _ => None,
+        }
+    }
+
+    async fn authority_confirmed_revision(
+        &self,
+        logical_did: &str,
+        document_revision: &DocumentRevision,
+    ) -> bool {
+        matches!(
+            self.authority_confirmations.lock().await.get(logical_did),
+            Some(AuthorityConfirmationState::Confirmed {
+                document_revision: confirmed_revision,
+                ..
+            }) if confirmed_revision == document_revision
+        )
+    }
+
+    async fn clear_authority_negative_if_current(
+        &self,
+        logical_did: &str,
+        negative_generation: u64,
+        document_revision: &DocumentRevision,
+        completed_at: u64,
+    ) -> bool {
+        let _commit_guard = self.authenticated_commit_lock.lock().await;
+        let mut states = self.authority_confirmations.lock().await;
+        let can_clear = match states.get(logical_did) {
+            Some(AuthorityConfirmationState::Negative(negative)) => {
+                negative.generation == negative_generation
+            }
+            Some(AuthorityConfirmationState::Confirmed {
+                document_revision: confirmed_revision,
+                ..
+            }) => return confirmed_revision == document_revision,
+            _ => false,
+        };
+        if !can_clear {
+            return false;
+        }
+        states.insert(
+            logical_did.to_string(),
+            AuthorityConfirmationState::Confirmed {
+                completed_at,
+                document_revision: document_revision.clone(),
+            },
+        );
+        info!(
+            "RTCP authority Negative recovered for {} with Current revision {:?}",
+            logical_did, document_revision
+        );
+        true
+    }
+
+    async fn complete_authority_unavailable_if_current(
+        &self,
+        logical_did: &str,
+        ticket: &AuthorityConfirmationTicket,
+        completed_at: u64,
+    ) {
+        let mut states = self.authority_confirmations.lock().await;
+        if matches!(
+            states.get(logical_did),
+            Some(AuthorityConfirmationState::InFlight(current)) if current == ticket
+        ) {
+            states.insert(
+                logical_did.to_string(),
+                AuthorityConfirmationState::Unavailable {
+                    completed_at,
+                    document_revision: ticket.document_revision.clone(),
+                },
+            );
+        }
+    }
+
+    async fn complete_authority_confirmed_if_current(
+        &self,
+        logical_did: &str,
+        ticket: &AuthorityConfirmationTicket,
+        completed_at: u64,
+    ) -> usize {
+        let _commit_guard = self.authenticated_commit_lock.lock().await;
+        let mut states = self.authority_confirmations.lock().await;
+        if !matches!(
+            states.get(logical_did),
+            Some(AuthorityConfirmationState::InFlight(current)) if current == ticket
+        ) {
+            return 0;
+        }
+        states.insert(
+            logical_did.to_string(),
+            AuthorityConfirmationState::Confirmed {
+                completed_at,
+                document_revision: ticket.document_revision.clone(),
+            },
+        );
+        drop(states);
+        self.upgrade_verified_identity_revision_trust(
+            logical_did,
+            &ticket.document_revision,
+            RtcpIdentityTrust::MethodAuthorityCurrent,
+        )
+        .await
     }
 
     pub async fn get_tunnel(&self, tunnel_key: &str) -> Option<RTcpTunnel> {
@@ -5750,6 +6175,19 @@ impl RTcpTunnelMap {
         tunnel_key: &str,
         binding: Option<&OutboundNameBinding>,
     ) -> Result<Option<RTcpTunnel>, String> {
+        let _commit_guard = if binding.is_some() {
+            Some(self.authenticated_commit_lock.lock().await)
+        } else {
+            None
+        };
+        if let Some(binding) = binding {
+            if let Some(negative) = self.authority_negative_snapshot(&binding.logical_did).await {
+                return Err(format!(
+                    "authority Negative rejects logical identity {}: {}",
+                    binding.logical_did, negative.reason
+                ));
+            }
+        }
         let mut all_tunnel = self.tunnel_map.lock().await;
         if let Some(binding) = binding {
             if let Some(bound_logical) = all_tunnel
@@ -5819,6 +6257,19 @@ impl RTcpTunnelMap {
         tunnel: RTcpTunnel,
         binding: Option<&OutboundNameBinding>,
     ) -> Result<(), OutboundRegisterError> {
+        let _commit_guard = if binding.is_some() {
+            Some(self.authenticated_commit_lock.lock().await)
+        } else {
+            None
+        };
+        if let Some(binding) = binding {
+            if let Some(negative) = self.authority_negative_snapshot(&binding.logical_did).await {
+                return Err(OutboundRegisterError::AuthorityNegative(format!(
+                    "authority Negative rejects logical identity {}: {}",
+                    binding.logical_did, negative.reason
+                )));
+            }
+        }
         let mut all_tunnel = self.tunnel_map.lock().await;
         if let Some(binding) = binding {
             if let Some(bound_logical) = all_tunnel
@@ -6142,7 +6593,55 @@ impl RTcpTunnelMap {
     ) -> NSResult<InboundTunnelRegistration> {
         let registration = if let Some(entry) = verified_cache_entry {
             let _commit_guard = self.authenticated_commit_lock.lock().await;
-            let verified_commit = RTcpInner::commit_verified_cache_entry(Some(entry))?;
+            let logical_did = entry.identity.logical_did.clone();
+            let document_revision = entry.identity.document_revision.clone();
+            let (negative, authority_confirmed) = {
+                let states = self.authority_confirmations.lock().await;
+                match states.get(&logical_did) {
+                    Some(AuthorityConfirmationState::Negative(negative)) => {
+                        (Some(negative.clone()), false)
+                    }
+                    Some(AuthorityConfirmationState::Confirmed {
+                        document_revision: confirmed_revision,
+                        ..
+                    }) if confirmed_revision == &document_revision => (None, true),
+                    _ => (None, false),
+                }
+            };
+            if let Some(negative) = negative {
+                let reason = format!(
+                    "authority Negative rejects identity {}: {} (at {}, rejected revision {:?})",
+                    logical_did, negative.reason, negative.completed_at, negative.rejected_revision
+                );
+                warn!(
+                    "reject authenticated inbound RTcp tunnel {} instance {} before cache commit: {}",
+                    tunnel_key,
+                    tunnel.instance_id(),
+                    reason
+                );
+                tunnel.mark_closed();
+                return Ok(InboundTunnelRegistration {
+                    accepted: false,
+                    rejection_reason: Some(reason),
+                    replaced: None,
+                    superseded: Vec::new(),
+                    rejected: Some(tunnel),
+                });
+            }
+
+            let mut verified_commit = RTcpInner::commit_verified_cache_entry(Some(entry))?;
+            if authority_confirmed {
+                if let Some((_, outcome)) = verified_commit.as_mut() {
+                    // Recovery first stores the exact Current document with
+                    // Published evidence. The later handshake commit carries
+                    // lower Verified evidence and is therefore IgnoredOlder;
+                    // the matching authority revision proves the content is
+                    // already present at a stronger evidence level.
+                    if *outcome == CacheWriteOutcome::IgnoredOlder {
+                        *outcome = CacheWriteOutcome::AlreadyPresent;
+                    }
+                }
+            }
             if let Some((identity, outcome)) = verified_commit.as_ref() {
                 debug!(
                     "verified-cache arbitration for accepted device document {}: {:?}",
@@ -6168,8 +6667,39 @@ impl RTcpTunnelMap {
     ) -> bool {
         let registration = if verified_commit.is_some() {
             let _commit_guard = self.authenticated_commit_lock.lock().await;
-            self.arbitrate_authenticated_inbound(tunnel_key, tunnel, verified_commit)
-                .await
+            let negative = if let Some((identity, _)) = verified_commit.as_ref() {
+                match self
+                    .authority_confirmations
+                    .lock()
+                    .await
+                    .get(&identity.logical_did)
+                    .cloned()
+                {
+                    Some(AuthorityConfirmationState::Negative(negative)) => {
+                        Some((identity.logical_did.clone(), negative))
+                    }
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            if let Some((logical_did, negative)) = negative {
+                let reason = format!(
+                    "authority Negative rejects identity {}: {}",
+                    logical_did, negative.reason
+                );
+                tunnel.mark_closed();
+                InboundTunnelRegistration {
+                    accepted: false,
+                    rejection_reason: Some(reason),
+                    replaced: None,
+                    superseded: Vec::new(),
+                    rejected: Some(tunnel),
+                }
+            } else {
+                self.arbitrate_authenticated_inbound(tunnel_key, tunnel, verified_commit)
+                    .await
+            }
         } else {
             self.arbitrate_authenticated_inbound(tunnel_key, tunnel, None)
                 .await
@@ -6272,49 +6802,74 @@ impl RTcpTunnelMap {
         is_current
     }
 
-    // AuthorityNotCurrent/definite-negative handling reuses this entry point:
-    // only verified named identities hold bindings, so an anonymous or
-    // self-declared name can never target this operation. It drains every
-    // instance bound to the logical name -- inbound committed tunnels and
-    // outbound tunnels created for the name alike. Instances are marked and
-    // detached while locked, then shut down outside the critical section.
-    // The commit guard prevents an accepted handshake from sitting between
-    // cache CAS and index publication while a negative authority result
-    // scans the bindings.
-    pub async fn close_verified_identity(&self, logical_did: &str, reason: &str) -> usize {
-        let _commit_guard = self.authenticated_commit_lock.lock().await;
-        let tunnels = {
-            let mut all_tunnel = self.tunnel_map.lock().await;
-            let bound_instance_ids: Vec<u64> = all_tunnel
-                .binding_by_instance
-                .iter()
-                .filter(|(_, binding)| binding.logical_did == logical_did)
-                .map(|(instance_id, _)| *instance_id)
-                .collect();
-            let mut tunnels = Vec::with_capacity(bound_instance_ids.len());
-            for instance_id in bound_instance_ids {
-                let Some(binding) = all_tunnel.binding_by_instance.get(&instance_id).cloned()
-                else {
-                    continue;
-                };
-                let revision = all_tunnel
-                    .verified_by_logical_did
-                    .get(logical_did)
-                    .and_then(|entries| entries.get(&instance_id))
-                    .map(|entry| entry.document_revision.clone());
-                binding.tunnel.mark_closed();
-                all_tunnel.remove_primary_if_instance(&binding.canonical_key, instance_id);
-                all_tunnel.remove_instance_binding(instance_id);
-                info!(
-                    "close verified RTcp tunnel for {} after {}: key {}, instance {}, revision {:?}",
-                    logical_did, reason, binding.canonical_key, instance_id, revision
-                );
-                tunnels.push(binding.tunnel);
-            }
-            tunnels
-        };
-        drop(_commit_guard);
+    async fn detach_verified_identity_instances(
+        &self,
+        logical_did: &str,
+        reason: &str,
+    ) -> Vec<RTcpTunnel> {
+        let mut all_tunnel = self.tunnel_map.lock().await;
+        let bound_instance_ids: Vec<u64> = all_tunnel
+            .binding_by_instance
+            .iter()
+            .filter(|(_, binding)| binding.logical_did == logical_did)
+            .map(|(instance_id, _)| *instance_id)
+            .collect();
+        let mut tunnels = Vec::with_capacity(bound_instance_ids.len());
+        for instance_id in bound_instance_ids {
+            let Some(binding) = all_tunnel.binding_by_instance.get(&instance_id).cloned() else {
+                continue;
+            };
+            let revision = all_tunnel
+                .verified_by_logical_did
+                .get(logical_did)
+                .and_then(|entries| entries.get(&instance_id))
+                .map(|entry| entry.document_revision.clone());
+            binding.tunnel.mark_closed();
+            all_tunnel.remove_primary_if_instance(&binding.canonical_key, instance_id);
+            all_tunnel.remove_instance_binding(instance_id);
+            info!(
+                "close verified RTcp tunnel for {} after {}: key {}, instance {}, revision {:?}",
+                logical_did, reason, binding.canonical_key, instance_id, revision
+            );
+            tunnels.push(binding.tunnel);
+        }
+        tunnels
+    }
 
+    async fn complete_authority_negative_if_current(
+        &self,
+        logical_did: &str,
+        ticket: &AuthorityConfirmationTicket,
+        completed_at: u64,
+        reason: &str,
+    ) -> usize {
+        let commit_guard = self.authenticated_commit_lock.lock().await;
+        let mut states = self.authority_confirmations.lock().await;
+        if !matches!(
+            states.get(logical_did),
+            Some(AuthorityConfirmationState::InFlight(current)) if current == ticket
+        ) {
+            debug!(
+                "ignore stale RTCP authority Negative for {} revision {:?}",
+                logical_did, ticket.document_revision
+            );
+            return 0;
+        }
+        states.insert(
+            logical_did.to_string(),
+            AuthorityConfirmationState::Negative(AuthorityNegativeState {
+                completed_at,
+                generation: ticket.generation,
+                reason: reason.to_string(),
+                rejected_revision: Some(ticket.document_revision.clone()),
+            }),
+        );
+        drop(states);
+
+        let tunnels = self
+            .detach_verified_identity_instances(logical_did, reason)
+            .await;
+        drop(commit_guard);
         let count = tunnels.len();
         for tunnel in tunnels {
             tunnel.close().await;
@@ -6322,9 +6877,57 @@ impl RTcpTunnelMap {
         count
     }
 
-    pub async fn upgrade_verified_identity_trust(
+    #[cfg(test)]
+    async fn force_authority_negative(
         &self,
         logical_did: &str,
+        rejected_revision: Option<DocumentRevision>,
+        reason: &str,
+    ) -> usize {
+        let commit_guard = self.authenticated_commit_lock.lock().await;
+        let generation = self
+            .authority_state_generation
+            .fetch_add(1, Ordering::Relaxed);
+        self.authority_confirmations.lock().await.insert(
+            logical_did.to_string(),
+            AuthorityConfirmationState::Negative(AuthorityNegativeState {
+                completed_at: buckyos_get_unix_timestamp(),
+                generation,
+                reason: reason.to_string(),
+                rejected_revision,
+            }),
+        );
+        let tunnels = self
+            .detach_verified_identity_instances(logical_did, reason)
+            .await;
+        drop(commit_guard);
+        let count = tunnels.len();
+        for tunnel in tunnels {
+            tunnel.close().await;
+        }
+        count
+    }
+
+    // Generic identity shutdown remains available for non-authority callers.
+    // Authority negatives use complete_authority_negative_if_current so the
+    // state write and this detach share one commit-lock critical section.
+    pub async fn close_verified_identity(&self, logical_did: &str, reason: &str) -> usize {
+        let commit_guard = self.authenticated_commit_lock.lock().await;
+        let tunnels = self
+            .detach_verified_identity_instances(logical_did, reason)
+            .await;
+        drop(commit_guard);
+        let count = tunnels.len();
+        for tunnel in tunnels {
+            tunnel.close().await;
+        }
+        count
+    }
+
+    async fn upgrade_verified_identity_revision_trust(
+        &self,
+        logical_did: &str,
+        document_revision: &DocumentRevision,
         trust: RtcpIdentityTrust,
     ) -> usize {
         let tunnels: Vec<RTcpTunnel> = self
@@ -6336,7 +6939,9 @@ impl RTcpTunnelMap {
             .map(|entries| {
                 entries
                     .values()
-                    .filter(|entry| !entry.tunnel.is_closed())
+                    .filter(|entry| {
+                        !entry.tunnel.is_closed() && &entry.document_revision == document_revision
+                    })
                     .map(|entry| entry.tunnel.clone())
                     .collect()
             })
@@ -7308,6 +7913,198 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn authority_negative_rejects_reconnect_without_publication() {
+        let map = RTcpTunnelMap::new();
+        let logical_did = "did:web:authority-reconnect.example";
+        let revision = DocumentRevision {
+            iat: 12,
+            content_hash: "rejected-document".to_string(),
+        };
+        let identity = verified_test_identity_bound(
+            logical_did,
+            revision.iat,
+            &revision.content_hash,
+            "did:dev:authority-reconnect",
+        );
+        let (initial, _initial_peer) = test_tunnel(54);
+        assert!(
+            map.complete_authenticated_inbound_with_outcome(
+                "local_did:dev:authority-reconnect",
+                initial.clone(),
+                Some((identity.clone(), CacheWriteOutcome::Inserted)),
+            )
+            .await
+        );
+        assert_eq!(map.verified_identity_len(logical_did).await, 1);
+        assert_eq!(
+            map.force_authority_negative(
+                logical_did,
+                Some(revision.clone()),
+                "AuthorityNotCurrent(Superseded)",
+            )
+            .await,
+            1
+        );
+        assert!(initial.is_closed());
+
+        let (candidate, _peer) = test_tunnel(56);
+        assert!(
+            !map.complete_authenticated_inbound_with_outcome(
+                "local_did:dev:authority-reconnect",
+                candidate.clone(),
+                Some((identity, CacheWriteOutcome::AlreadyPresent)),
+            )
+            .await
+        );
+        assert!(candidate.is_closed());
+        assert_eq!(map.primary_len().await, 0);
+        assert_eq!(map.verified_identity_len(logical_did).await, 0);
+        assert_eq!(map.binding_len().await, 0);
+        let negative = map
+            .authority_negative_snapshot(logical_did)
+            .await
+            .expect("Negative must remain active after rejected reconnect");
+        assert_eq!(negative.rejected_revision, Some(revision));
+    }
+
+    #[tokio::test]
+    async fn authority_negative_wins_race_with_inbound_commit() {
+        for round in 0..32u8 {
+            let map = RTcpTunnelMap::new();
+            let logical_did = format!("did:web:authority-race-{}.example", round);
+            let canonical_dev_did = format!("did:dev:authority-race-{}", round);
+            let tunnel_key = format!("local_{}", canonical_dev_did);
+            let revision = DocumentRevision {
+                iat: u64::from(round) + 20,
+                content_hash: format!("race-document-{}", round),
+            };
+            let identity = verified_test_identity_bound(
+                &logical_did,
+                revision.iat,
+                &revision.content_hash,
+                &canonical_dev_did,
+            );
+            let (candidate, peer) = test_tunnel(100u8.wrapping_add(round));
+            let barrier = Arc::new(tokio::sync::Barrier::new(3));
+
+            let commit_map = map.clone();
+            let commit_barrier = barrier.clone();
+            let commit_tunnel = candidate.clone();
+            let commit_key = tunnel_key.clone();
+            let commit = tokio::spawn(async move {
+                commit_barrier.wait().await;
+                commit_map
+                    .complete_authenticated_inbound_with_outcome(
+                        &commit_key,
+                        commit_tunnel,
+                        Some((identity, CacheWriteOutcome::Inserted)),
+                    )
+                    .await
+            });
+
+            let negative_map = map.clone();
+            let negative_barrier = barrier.clone();
+            let negative_did = logical_did.clone();
+            let negative_revision = revision.clone();
+            let negative = tokio::spawn(async move {
+                negative_barrier.wait().await;
+                negative_map
+                    .force_authority_negative(
+                        &negative_did,
+                        Some(negative_revision),
+                        "concurrent authority rejection",
+                    )
+                    .await
+            });
+
+            barrier.wait().await;
+            let _accepted_before_negative = commit.await.unwrap();
+            let _closed_by_negative = negative.await.unwrap();
+            assert!(candidate.is_closed(), "round {} left candidate open", round);
+            assert_eq!(map.primary_len().await, 0, "round {}", round);
+            assert_eq!(
+                map.verified_identity_len(&logical_did).await,
+                0,
+                "round {}",
+                round
+            );
+            assert_eq!(map.binding_len().await, 0, "round {}", round);
+            drop(peer);
+        }
+    }
+
+    #[tokio::test]
+    async fn authority_negative_clears_only_for_matching_current_generation() {
+        let map = RTcpTunnelMap::new();
+        let logical_did = "did:web:authority-recovery.example";
+        let rejected = DocumentRevision {
+            iat: 30,
+            content_hash: "rejected".to_string(),
+        };
+        let current = DocumentRevision {
+            iat: 31,
+            content_hash: "current".to_string(),
+        };
+        map.force_authority_negative(
+            logical_did,
+            Some(rejected),
+            "AuthorityNotCurrent(DifferentDocument)",
+        )
+        .await;
+        let negative = map.authority_negative_snapshot(logical_did).await.unwrap();
+
+        assert!(
+            !map.clear_authority_negative_if_current(
+                logical_did,
+                negative.generation.wrapping_add(1),
+                &current,
+                40,
+            )
+            .await
+        );
+        assert!(map.authority_negative_snapshot(logical_did).await.is_some());
+        assert!(
+            map.clear_authority_negative_if_current(
+                logical_did,
+                negative.generation,
+                &current,
+                41,
+            )
+            .await
+        );
+        assert!(map.authority_negative_snapshot(logical_did).await.is_none());
+        assert!(
+            map.authority_confirmed_revision(logical_did, &current)
+                .await
+        );
+    }
+
+    #[tokio::test]
+    async fn authority_unavailable_does_not_block_snapshot_admission() {
+        let map = RTcpTunnelMap::new();
+        let logical_did = "did:web:authority-unavailable.example";
+        let identity = verified_test_identity(logical_did, 44, "unavailable-document");
+        let ticket = map
+            .begin_authority_confirmation(logical_did, &identity.document_revision, 50, Some(0))
+            .await
+            .unwrap();
+        map.complete_authority_unavailable_if_current(logical_did, &ticket, 51)
+            .await;
+
+        let (candidate, _peer) = test_tunnel(55);
+        assert!(
+            map.complete_authenticated_inbound_with_outcome(
+                "local_did:dev:authority-unavailable",
+                candidate.clone(),
+                Some((identity, CacheWriteOutcome::Inserted)),
+            )
+            .await
+        );
+        assert!(!candidate.is_closed());
+        assert_eq!(map.verified_identity_len(logical_did).await, 1);
+    }
+
+    #[tokio::test]
     async fn inbound_second_logical_name_for_same_canonical_dev_is_rejected() {
         let map = RTcpTunnelMap::new();
         let shared_dev = "did:dev:shared-binding-key";
@@ -7728,13 +8525,29 @@ mod tests {
         );
 
         assert_eq!(
-            map.close_verified_identity(logical, "AuthorityNotCurrent")
-                .await,
+            map.force_authority_negative(
+                logical,
+                Some(DocumentRevision {
+                    iat: 93,
+                    content_hash: "outbound-rejected".to_string(),
+                }),
+                "AuthorityNotCurrent",
+            )
+            .await,
             1
         );
         assert!(outbound.is_closed());
         assert!(map.get_tunnel(key).await.is_none());
         assert_eq!(map.binding_len().await, 0);
+
+        let (reconnect, _reconnect_peer) = test_tunnel(94);
+        assert!(matches!(
+            map.register_outbound_if_absent(key, reconnect.clone(), Some(&binding))
+                .await,
+            Err(OutboundRegisterError::AuthorityNegative(_))
+        ));
+        assert!(map.acquire_outbound(key, Some(&binding)).await.is_err());
+        assert!(map.get_tunnel(key).await.is_none());
     }
 
     #[tokio::test]
@@ -7757,6 +8570,9 @@ mod tests {
             OutboundRegisterError::Existing(existing) => existing,
             OutboundRegisterError::BindingConflict(conflict) => {
                 panic!("unbound outbound race must not report a binding conflict: {conflict}")
+            }
+            OutboundRegisterError::AuthorityNegative(reason) => {
+                panic!("unbound outbound race must not report authority Negative: {reason}")
             }
         };
         assert!(existing.is_same_instance(&first));
@@ -9261,6 +10077,76 @@ mod tests {
             .expect("listener rejection must leave the old tunnel usable");
     }
 
+    #[tokio::test]
+    async fn authority_negative_reconnect_never_calls_application_listener() {
+        let _ = init_name_lib_for_test(&HashMap::new()).await;
+        let (server_config, server_key) = test_device_config("negative-listener-server");
+        let (client_logical_did, _client_dev_did, client_key, client_device_doc_jwt) =
+            test_named_device_identity("negative-listener-client");
+        cache_test_device(&server_config).await;
+
+        let admissions = Arc::new(AtomicUsize::new(0));
+        let server_port = unused_tcp_port();
+        let mut server = RTcp::new(
+            server_config.id.clone(),
+            format!("127.0.0.1:{}", server_port),
+            Some(server_key),
+            None,
+            Arc::new(MockRTcpListener::counting(
+                admissions.clone(),
+                Duration::ZERO,
+            )),
+        );
+        // Without the RTCP Negative gate this setup deliberately permits the
+        // unavailable LocalAndZone verification to fall back to KeyDid and
+        // reach the listener, making the callback assertion meaningful.
+        allow_named_key_fallback(&mut server);
+        let rejected_revision =
+            DocumentRevision::of(&EncodedDocument::Jwt(client_device_doc_jwt.clone()));
+        server
+            .inner
+            .tunnel_map
+            .force_authority_negative(
+                &client_logical_did.to_string(),
+                rejected_revision,
+                "test authority Superseded",
+            )
+            .await;
+        server.start().await.unwrap();
+
+        let mut client = RTcp::new(
+            client_logical_did.clone(),
+            format!("127.0.0.1:{}", unused_tcp_port()),
+            Some(client_key),
+            Some(client_device_doc_jwt),
+            Arc::new(MockRTcpListener::new()),
+        );
+        client.start().await.unwrap();
+
+        let stack_id = format!("{}:{}", server_config.id.to_host_name(), server_port);
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.create_tunnel(Some(&stack_id)),
+        )
+        .await
+        .expect("Negative reconnect did not fail within handshake budget");
+        assert!(result.is_err(), "Negative reconnect must fail closed");
+        assert_eq!(
+            admissions.load(Ordering::SeqCst),
+            0,
+            "application listener must not observe an active Negative identity"
+        );
+        assert_eq!(server.inner.tunnel_map.primary_len().await, 0);
+        assert_eq!(
+            server
+                .inner
+                .tunnel_map
+                .verified_identity_len(&client_logical_did.to_string())
+                .await,
+            0
+        );
+    }
+
     // Mock实现用于测试
     struct MockRTcpListener {
         admissions: Option<Arc<AtomicUsize>>,
@@ -10039,6 +10925,122 @@ mod tests {
                 .find(|state| state.did == *did && state.doc_type == doc_type.as_str())
                 .cloned())
         }
+    }
+
+    #[tokio::test]
+    async fn authority_negative_recovers_only_for_exact_remote_current_document() {
+        let _ = init_name_lib_for_test(&HashMap::new()).await;
+
+        let (owner_signing_key, owner_pkcs8_bytes) = generate_ed25519_key();
+        let owner_jwk = encode_ed25519_sk_to_pk_jwk(&owner_signing_key);
+        let owner_config = DeviceDocument::new_by_jwk(
+            "recovery-owner",
+            serde_json::from_value(owner_jwk).unwrap(),
+        );
+        let owner_private_key = EncodingKey::from_ed_der(&owner_pkcs8_bytes);
+        let logical_did = DID::new("rtcpnegative", "recoverable-device");
+
+        let (old_signing_key, _) = generate_ed25519_key();
+        let old_jwk = encode_ed25519_sk_to_pk_jwk(&old_signing_key);
+        let mut old_document =
+            DeviceDocument::new_by_jwk("old-device", serde_json::from_value(old_jwk).unwrap());
+        old_document.id = logical_did.clone();
+        old_document.owner = owner_config.id.clone();
+        let old_jwt = match old_document.encode(Some(&owner_private_key)).unwrap() {
+            EncodedDocument::Jwt(jwt) => jwt,
+            _ => panic!("old recovery document must be JWT"),
+        };
+
+        let (current_signing_key, _) = generate_ed25519_key();
+        let current_jwk = encode_ed25519_sk_to_pk_jwk(&current_signing_key);
+        let mut current_document = DeviceDocument::new_by_jwk(
+            "current-device",
+            serde_json::from_value(current_jwk).unwrap(),
+        );
+        current_document.id = logical_did.clone();
+        current_document.owner = owner_config.id.clone();
+        let current_jwt = match current_document.encode(Some(&owner_private_key)).unwrap() {
+            EncodedDocument::Jwt(jwt) => jwt,
+            _ => panic!("current recovery document must be JWT"),
+        };
+        let old_revision = DocumentRevision::of(&EncodedDocument::Jwt(old_jwt.clone())).unwrap();
+        let current_revision =
+            DocumentRevision::of(&EncodedDocument::Jwt(current_jwt.clone())).unwrap();
+        assert_ne!(old_revision, current_revision);
+
+        let mut current_state = PublishedState::active(
+            logical_did.clone(),
+            "device".to_string(),
+            EncodedDocument::Jwt(current_jwt.clone()),
+        );
+        current_state.effective_owner = Some(owner_config.id);
+        GLOBAL_NAME_CLIENT
+            .get()
+            .unwrap()
+            .set_method_authority(
+                "rtcpnegative",
+                Box::new(TestAuthorityProvider {
+                    states: vec![current_state],
+                    docs: vec![(
+                        logical_did.clone(),
+                        "device".to_string(),
+                        EncodedDocument::Jwt(current_jwt.clone()),
+                    )],
+                    offline: Arc::new(AtomicBool::new(false)),
+                }),
+            )
+            .await;
+
+        let inner = RTcpInner::new(
+            DID::new("dev", "negative-recovery-test-server"),
+            "127.0.0.1:0".to_string(),
+            None,
+            None,
+            Arc::new(MockRTcpListener::new()),
+        );
+        inner
+            .tunnel_map
+            .force_authority_negative(
+                &logical_did.to_string(),
+                Some(old_revision),
+                "authority reported DifferentDocument",
+            )
+            .await;
+
+        let err = inner
+            .recover_negative_authority_candidate(&logical_did, &old_jwt)
+            .await
+            .expect_err("old snapshot must not clear authority Negative");
+        assert!(
+            err.to_string().contains("Current revision"),
+            "unexpected recovery error: {}",
+            err
+        );
+        assert!(
+            inner
+                .tunnel_map
+                .authority_negative_snapshot(&logical_did.to_string())
+                .await
+                .is_some()
+        );
+
+        inner
+            .recover_negative_authority_candidate(&logical_did, &current_jwt)
+            .await
+            .expect("exact RemoteAuthority Current document must recover identity");
+        assert!(
+            inner
+                .tunnel_map
+                .authority_negative_snapshot(&logical_did.to_string())
+                .await
+                .is_none()
+        );
+        assert!(
+            inner
+                .tunnel_map
+                .authority_confirmed_revision(&logical_did.to_string(), &current_revision)
+                .await
+        );
     }
 
     // 权威锚定成功路径(doc/verify-did-document-jwt.md"RTCP 迁移示例"):
