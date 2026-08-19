@@ -7,14 +7,14 @@ use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::Instant;
 
 use crate::config_loader::GatewayConfigParserRef;
-use crate::{merge, AcmeConfig, AcmeHostConfig, TlsCA};
+use crate::{AcmeConfig, AcmeHostConfig, TlsCA, merge};
 use crate::{
-    GatewayAppProfile, GatewayComposition, GatewayRuntimeCapabilities, GatewayServerRegistry,
-    GatewayServerRuntime, GatewayStackRegistry, GatewayStackRuntime, GatewayTrafficConfigRef,
-    GatewayTrafficService, GatewayTrafficStatFactoryRef, GATEWAY_CONTROL_SERVER_CONFIG,
-    GATEWAY_CONTROL_SERVER_KEY,
+    GATEWAY_CONTROL_SERVER_CONFIG, GATEWAY_CONTROL_SERVER_KEY, GatewayAppProfile,
+    GatewayComposition, GatewayRuntimeCapabilities, GatewayServerRegistry, GatewayServerRuntime,
+    GatewayStackRegistry, GatewayStackRuntime, GatewayTrafficConfigRef, GatewayTrafficService,
+    GatewayTrafficStatFactoryRef,
 };
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use buckyos_kit::*;
 use chrono::Utc;
 use cyfs_acme::{AcmeCertManager, AcmeCertManagerRef, AcmeItem, CertManagerConfig, ChallengeType};
@@ -25,15 +25,16 @@ use kRPC::RPCSessionToken;
 use log::*;
 use name_client::*;
 use name_lib::*;
+use rand::Rng;
 use rand::distr::Alphanumeric;
 use rand::rng;
-use rand::Rng;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 use sfo_js::{JsPkg, JsPkgManager, JsPkgManagerRef, JsString, JsValue, NativeFunction};
 use sha2::Digest;
 use std::future::Future;
 use tokio::fs::create_dir_all;
+use tokio::sync::Mutex as AsyncMutex;
 use url::Url;
 
 fn get_default_saved_gateway_config_path(profile: &GatewayAppProfile) -> PathBuf {
@@ -842,6 +843,7 @@ impl GatewayFactory {
             timer_manager,
             global_collection_manager: RwLock::new(global_collections.clone()),
             traffic_service: Mutex::new(traffic_service),
+            reload_lock: AsyncMutex::new(()),
         });
         let timers = gateway
             .config
@@ -890,6 +892,7 @@ pub struct Gateway {
     timer_manager: TimerManager,
     global_collection_manager: RwLock<GlobalCollectionManagerRef>,
     traffic_service: Mutex<Option<Box<dyn GatewayTrafficService>>>,
+    reload_lock: AsyncMutex<()>,
 }
 
 impl Drop for Gateway {
@@ -914,6 +917,10 @@ struct ParsedRuleId<'a> {
 impl Gateway {
     pub fn tunnel_manager(&self) -> &TunnelManager {
         &self.tunnel_manager
+    }
+
+    pub fn connection_manager(&self) -> ConnectionManagerRef {
+        self.connection_manager.clone()
     }
 
     pub fn global_collection_manager(&self) -> GlobalCollectionManagerRef {
@@ -2492,6 +2499,7 @@ impl Gateway {
     }
 
     pub async fn remove_dispatch(&self, local: &str, protocol: Option<&str>) -> Result<()> {
+        let _reload_guard = self.reload_lock.lock().await;
         let raw_config = { self.config.lock().unwrap().raw_config.clone() };
         let (raw_config, stack_id) =
             Self::remove_dispatch_from_config(raw_config, local, protocol)?;
@@ -2500,7 +2508,9 @@ impl Gateway {
             .parse(raw_config)
             .map_err(|e| anyhow!("parse config failed: {}", e))?;
 
-        self.stack_manager.remove(stack_id.as_str());
+        self.stack_manager
+            .remove_with_shutdown(stack_id.as_str())
+            .await;
 
         let mut guard = self.config.lock().unwrap();
         *guard = gateway_config;
@@ -2696,37 +2706,29 @@ impl Gateway {
     }
 
     pub async fn reload(&self, config: GatewayConfig) -> Result<()> {
+        let _reload_guard = self.reload_lock.lock().await;
+        self.reload_inner(config, true).await
+    }
+
+    async fn reload_inner(&self, config: GatewayConfig, rollback_on_failure: bool) -> Result<()> {
         let traffic_config = config.traffic.clone();
-        let old_device_manager = { self.config.lock().unwrap().device_manager.clone() };
-        if old_device_manager != config.device_manager {
-            if config.device_manager.enabled {
-                let offline_timeout = std::time::Duration::from_secs(
-                    config.device_manager.offline_timeout_seconds.max(1),
-                );
-                let cleanup_interval = std::time::Duration::from_secs(
-                    config.device_manager.cleanup_interval_seconds.max(1),
-                );
-                let device_online_db_path =
-                    get_buckyos_service_data_dir(self.composition.profile().service_data_namespace)
-                        .join("device_online.db");
-                let store = SqliteDeviceOnlineStore::new(device_online_db_path)
-                    .await
-                    .map_err(|e| anyhow!("create sqlite device online store failed: {}", e))?;
-                self.connection_manager.set_device_manager(
-                    DeviceManager::new(Arc::new(store), offline_timeout, cleanup_interval).await,
-                );
-                info!(
-                    "device_manager reloaded: enabled=true offline_timeout={}s cleanup_interval={}s",
-                    offline_timeout.as_secs(),
-                    cleanup_interval.as_secs(),
-                );
-            } else {
-                self.connection_manager.remove_device_manager();
-                info!("device_manager reloaded: enabled=false");
-            }
+        let old_config = { self.config.lock().unwrap().clone() };
+        let device_manager_changed = old_config.device_manager != config.device_manager;
+        // Only prepare the online store up front. The store creation is the sole
+        // fallible device-manager step, and doing it early keeps it out of the
+        // rollback paths. The manager itself is installed below, at the commit
+        // point, so a failed reload never leaves connection_manager switched.
+        let device_online_store = if device_manager_changed && config.device_manager.enabled {
+            let device_online_db_path =
+                get_buckyos_service_data_dir(self.composition.profile().service_data_namespace)
+                    .join("device_online.db");
+            let store = SqliteDeviceOnlineStore::new(device_online_db_path)
+                .await
+                .map_err(|e| anyhow!("create sqlite device online store failed: {}", e))?;
+            Some(Arc::new(store) as DeviceOnlineStoreRef)
         } else {
-            debug!("device_manager config unchanged, keep current manager");
-        }
+            None
+        };
 
         let user_name: Option<String> = match config.raw_config.get("user_name") {
             Some(user_name) => user_name.as_str().map(|value| value.to_string()),
@@ -2886,18 +2888,48 @@ impl Gateway {
             }
         }
 
-        for new_stack in &new_stacks {
-            if let Err(error) = new_stack.start().await {
+        // Remove obsolete stacks before starting newly-created stacks. This
+        // is required when a replacement stack reuses the old bind address.
+        self.stack_manager
+            .retain_with_shutdown(|id| exist_stacks.contains(id))
+            .await;
+
+        for index in 0..new_stacks.len() {
+            let start_result = new_stacks[index].start().await;
+            if let Err(error) = start_result {
+                let failed_stack_id = new_stacks[index].id();
                 for prepared in &changed_stacks {
                     prepared.rollback_update().await;
                 }
-                let msg = format!("Failed to start stack {}: {}", new_stack.id(), error);
+                // Await every new stack's shutdown before restoring the old
+                // instances. Drop only aborts background tasks; it does not
+                // guarantee that their listeners have released the port yet.
+                for stack in &new_stacks {
+                    stack.shutdown().await;
+                }
+                drop(new_stacks);
+
+                // Rebuild the old stack set from the old configuration. The
+                // target runtime above contains the new server/global
+                // resources, so pre-creating old stacks with it would bind
+                // old stacks to the wrong generation during rollback.
+                if rollback_on_failure {
+                    if let Err(rollback_error) =
+                        Box::pin(self.reload_inner(old_config.clone(), false)).await
+                    {
+                        let msg = format!(
+                            "Failed to start stack {} and restore old stack: {}; rollback failed: {}",
+                            failed_stack_id, error, rollback_error
+                        );
+                        log::error!("{}", msg);
+                        return Err(anyhow!(msg));
+                    }
+                }
+                let msg = format!("Failed to start stack {}: {}", failed_stack_id, error);
                 log::error!("{}", msg);
                 return Err(anyhow!(msg));
             }
         }
-
-        self.stack_manager.retain(|id| exist_stacks.contains(id));
 
         for changed_stack in changed_stacks.into_iter() {
             changed_stack.commit_update().await;
@@ -2932,7 +2964,8 @@ impl Gateway {
             })
             .collect::<Vec<_>>();
 
-        self.timer_manager
+        if let Err(error) = self
+            .timer_manager
             .reload(
                 &timer_tasks,
                 Arc::downgrade(&server_manager),
@@ -2940,13 +2973,67 @@ impl Gateway {
                 global_collections.clone(),
                 js_externals,
             )
-            .await?;
+            .await
+        {
+            if rollback_on_failure {
+                if let Err(rollback_error) =
+                    Box::pin(self.reload_inner(old_config.clone(), false)).await
+                {
+                    return Err(anyhow!(
+                        "reload timers failed: {}; rollback failed: {}",
+                        error,
+                        rollback_error
+                    ));
+                }
+            }
+            return Err(anyhow!("reload timers failed: {}", error));
+        }
 
         *self.global_collection_manager.write().unwrap() = global_collections;
         let active_limiter_manager = limiter_manager.clone();
         *self.limiter_manager.lock().unwrap() = limiter_manager;
-        self.restart_traffic_service(traffic_config, active_limiter_manager)
-            .await?;
+        if let Err(error) = self
+            .restart_traffic_service(traffic_config, active_limiter_manager)
+            .await
+        {
+            if rollback_on_failure {
+                if let Err(rollback_error) =
+                    Box::pin(self.reload_inner(old_config.clone(), false)).await
+                {
+                    return Err(anyhow!(
+                        "restart traffic service failed: {}; rollback failed: {}",
+                        error,
+                        rollback_error
+                    ));
+                }
+            }
+            return Err(anyhow!("restart traffic service failed: {}", error));
+        }
+        if device_manager_changed {
+            if config.device_manager.enabled {
+                let offline_timeout = std::time::Duration::from_secs(
+                    config.device_manager.offline_timeout_seconds.max(1),
+                );
+                let cleanup_interval = std::time::Duration::from_secs(
+                    config.device_manager.cleanup_interval_seconds.max(1),
+                );
+                let store = device_online_store
+                    .expect("device online store must be prepared for enabled device_manager");
+                self.connection_manager.set_device_manager(
+                    DeviceManager::new(store, offline_timeout, cleanup_interval).await,
+                );
+                info!(
+                    "device_manager reloaded: enabled=true offline_timeout={}s cleanup_interval={}s",
+                    offline_timeout.as_secs(),
+                    cleanup_interval.as_secs(),
+                );
+            } else {
+                self.connection_manager.remove_device_manager();
+                info!("device_manager reloaded: enabled=false");
+            }
+        } else {
+            debug!("device_manager config unchanged, keep current manager");
+        }
         *self.config.lock().unwrap() = config;
         Ok(())
     }
@@ -2956,17 +3043,15 @@ impl Gateway {
         traffic_config: Option<GatewayTrafficConfigRef>,
         limiter_manager: LimiterManagerRef,
     ) -> Result<()> {
-        let old_service = { self.traffic_service.lock().unwrap().take() };
-        if let Some(service) = old_service {
-            service.stop().await;
-        }
-
         let (Some(adapter), Some(config), Some(stat_factory)) = (
             self.composition.traffic_adapter(),
             traffic_config.as_ref(),
             self.traffic_stat_factory.as_ref(),
         ) else {
-            *self.traffic_service.lock().unwrap() = None;
+            let old_service = { self.traffic_service.lock().unwrap().take() };
+            if let Some(service) = old_service {
+                service.stop().await;
+            }
             return Ok(());
         };
 
@@ -2978,7 +3063,13 @@ impl Gateway {
                 limiter_manager,
             )
             .await?;
-        *self.traffic_service.lock().unwrap() = new_service;
+        let old_service = {
+            let mut service = self.traffic_service.lock().unwrap();
+            std::mem::replace(&mut *service, new_service)
+        };
+        if let Some(service) = old_service {
+            service.stop().await;
+        }
         Ok(())
     }
 }
@@ -4469,9 +4560,11 @@ mod tests {
             .as_object()
             .unwrap();
         assert_eq!(blocks.len(), 2);
-        assert!(blocks
-            .values()
-            .any(|block| block["block"].as_str() == Some("new;")));
+        assert!(
+            blocks
+                .values()
+                .any(|block| block["block"].as_str() == Some("new;"))
+        );
         let updated = Gateway::add_rule_to_config(raw_config.clone(), "stack:s1", "new;").unwrap();
         let chains = updated["stacks"]["s1"]["hook_point"].as_object().unwrap();
         assert_eq!(chains.len(), 2);
@@ -4692,9 +4785,11 @@ mod tests {
             .as_object()
             .unwrap();
         assert_eq!(blocks.len(), 2);
-        assert!(blocks
-            .values()
-            .any(|block| block["block"].as_str() == Some("new;")));
+        assert!(
+            blocks
+                .values()
+                .any(|block| block["block"].as_str() == Some("new;"))
+        );
         let updated =
             Gateway::append_rule_to_config(raw_config.clone(), "stack:s1", "new;").unwrap();
         let chains = updated["stacks"]["s1"]["hook_point"].as_object().unwrap();
@@ -5336,11 +5431,13 @@ mod tests {
         println!("{}", rule);
         assert!(rule.starts_with(r#"match ${REQ.path} "/static/*" && rewrite ${REQ.path} "/static/*" "/*" && call-server"#));
         // dir server created
-        assert!(updated["servers"]
-            .as_object()
-            .unwrap()
-            .keys()
-            .any(|k| k.starts_with("router_dir_")));
+        assert!(
+            updated["servers"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .any(|k| k.starts_with("router_dir_"))
+        );
 
         let (updated, removed_id) =
             Gateway::remove_router_from_config(updated, Some("router_test"), "/static/*", "/www/")

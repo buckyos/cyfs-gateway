@@ -63,6 +63,12 @@ pub trait Stack: Send + Sync + 'static {
     fn stack_protocol(&self) -> StackProtocol;
     fn get_bind_addr(&self) -> String;
     async fn start(&self) -> StackResult<()>;
+    /// Stop runtime-owned tasks and resources before the stack is removed.
+    ///
+    /// Most stacks can rely on their existing Drop implementation, so the
+    /// default is intentionally a no-op. Stacks with asynchronous background
+    /// tasks should override this to provide deterministic shutdown.
+    async fn shutdown(&self) {}
     async fn update_config(&self, config: Arc<dyn StackConfig>) -> StackResult<()> {
         self.prepare_update(config, None).await?;
         self.commit_update().await;
@@ -123,16 +129,31 @@ impl StackManager {
         None
     }
 
-    pub fn retain<F>(&self, f: F)
+    pub async fn retain_with_shutdown<F>(&self, f: F)
     where
         F: Fn(&str) -> bool,
     {
-        let mut stacks = self.stacks.lock().unwrap();
-        stacks.retain(|stack| f(stack.id().as_str()));
+        let removed = {
+            let mut stacks = self.stacks.lock().unwrap();
+            let mut removed = Vec::new();
+            stacks.retain(|stack| {
+                if f(stack.id().as_str()) {
+                    true
+                } else {
+                    removed.push(stack.clone());
+                    false
+                }
+            });
+            removed
+        };
+
+        for stack in removed {
+            stack.shutdown().await;
+        }
     }
 
-    pub fn remove(&self, id: &str) {
-        self.retain(|stack_id| stack_id != id);
+    pub async fn remove_with_shutdown(&self, id: &str) {
+        self.retain_with_shutdown(|stack_id| stack_id != id).await;
     }
 }
 
