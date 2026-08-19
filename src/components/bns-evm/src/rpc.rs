@@ -6,7 +6,7 @@ use serde_json::{json, Value};
 
 use crate::{BnsEvmError, BnsEvmResult};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BlockRange {
     Latest,
     Number(u64),
@@ -215,13 +215,22 @@ impl EthRpcClient {
     }
 
     pub async fn eth_call(&self, to: Address, calldata: &[u8]) -> BnsEvmResult<Bytes> {
+        self.eth_call_at(to, calldata, BlockRange::Latest).await
+    }
+
+    pub async fn eth_call_at(
+        &self,
+        to: Address,
+        calldata: &[u8],
+        block: BlockRange,
+    ) -> BnsEvmResult<Bytes> {
         let value: String = self
             .call(
                 "eth_call",
                 json!([{
                     "to": hex_address(to),
                     "data": format!("0x{}", hex::encode(calldata)),
-                }, "latest"]),
+                }, block.to_rpc_value()]),
             )
             .await?;
         parse_hex_bytes(&value).map(Bytes::from)
@@ -231,7 +240,19 @@ impl EthRpcClient {
     where
         C: SolCall,
     {
-        let output = self.eth_call(to, &call.abi_encode()).await?;
+        self.call_contract_at(to, call, BlockRange::Latest).await
+    }
+
+    pub async fn call_contract_at<C>(
+        &self,
+        to: Address,
+        call: &C,
+        block: BlockRange,
+    ) -> BnsEvmResult<C::Return>
+    where
+        C: SolCall,
+    {
+        let output = self.eth_call_at(to, &call.abi_encode(), block).await?;
         C::abi_decode_returns(&output).map_err(|err| BnsEvmError::Abi(err.to_string()))
     }
 
