@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
@@ -14,6 +14,7 @@ use name_lib::{
 };
 use serde::{Deserialize, Serialize};
 use sfo_io::{LimitStream, StatStream};
+use tokio::task::JoinHandle;
 use url::Url;
 
 use crate::forward::ForwardPlan;
@@ -1206,7 +1207,7 @@ pub struct RtcpStack {
     bind_addr: String,
     device_id: String,
     device_public_key: String,
-    keep_tunnel: Vec<String>,
+    keep_tunnel: Mutex<Vec<String>>,
     liveness: RtcpLivenessConfig,
     security: RtcpSecurityConfig,
     reuse_address: bool,
@@ -1216,12 +1217,63 @@ pub struct RtcpStack {
     tunnel_manager: TunnelManager,
     handler: Arc<RwLock<Arc<RtcpConnectionHandler>>>,
     prepare_handler: Arc<RwLock<Option<Arc<RtcpConnectionHandler>>>>,
+    prepare_keep_tunnel: Mutex<Option<Vec<String>>>,
+    keep_tunnel_update_lock: tokio::sync::Mutex<()>,
+    keep_tunnel_tasks: Mutex<HashMap<String, KeepTunnelTask>>,
+    registered_tunnel_builder: Mutex<Option<Arc<dyn TunnelBuilder>>>,
+}
+
+struct KeepTunnelTask {
+    handle: JoinHandle<()>,
+    tunnel_manager: TunnelManager,
+    tunnel_url: Url,
 }
 
 impl Drop for RtcpStack {
     fn drop(&mut self) {
-        self.tunnel_manager.remove_tunnel_builder("rtcp");
-        self.tunnel_manager.remove_tunnel_builder("rudp");
+        if let Some(builder) = self.registered_tunnel_builder.get_mut().unwrap().take() {
+            self.tunnel_manager
+                .remove_owned_tunnel_builder("rtcp", &self.id, &builder);
+            self.tunnel_manager
+                .remove_owned_tunnel_builder("rudp", &self.id, &builder);
+        }
+        for task in self
+            .keep_tunnel_tasks
+            .get_mut()
+            .unwrap()
+            .drain()
+            .map(|(_, task)| task)
+        {
+            let KeepTunnelTask {
+                handle: task_handle,
+                tunnel_manager,
+                tunnel_url,
+            } = task;
+            task_handle.abort();
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                let cleanup_tunnel_manager = tunnel_manager.clone();
+                let cleanup_tunnel_url = tunnel_url.clone();
+                handle.spawn(async move {
+                    let _ = task_handle.await;
+                    cleanup_tunnel_manager
+                        .unpin_tunnel_url(&cleanup_tunnel_url)
+                        .await;
+                });
+            } else {
+                match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(runtime) => {
+                        runtime.block_on(tunnel_manager.unpin_tunnel_url(&tunnel_url));
+                    }
+                    Err(error) => warn!(
+                        "RTCP keep tunnel {} dropped without a Tokio runtime; URL pin release failed: {}",
+                        tunnel_url, error
+                    ),
+                }
+            }
+        }
     }
 }
 
@@ -1681,9 +1733,10 @@ impl RtcpStack {
         RtcpStackBuilder::new()
     }
 
-    fn start_keep_tunnels(&self) {
-        for tunnel in self.keep_tunnel.iter().cloned() {
-            self.start_keep_tunnel(tunnel);
+    async fn start_keep_tunnels(&self) {
+        let keep_tunnels = self.keep_tunnel.lock().unwrap().clone();
+        for tunnel in keep_tunnels {
+            self.start_keep_tunnel(tunnel).await;
         }
     }
 
@@ -1696,7 +1749,7 @@ impl RtcpStack {
         *missed_pongs >= max_missed
     }
 
-    fn start_keep_tunnel(&self, tunnel: String) {
+    async fn start_keep_tunnel(&self, tunnel: String) {
         let tunnel_url = format!("rtcp://{}", tunnel);
         info!("Will keep tunnel: {}", tunnel_url);
         let tunnel_url = match Url::parse(tunnel_url.as_str()) {
@@ -1719,10 +1772,10 @@ impl RtcpStack {
             }
         };
         let liveness = self.liveness.clone();
-        tokio::task::spawn(async move {
-            // Pin the keep_tunnel URL so its URL history is never evicted
-            // by LRU pressure -- it is a configured, long-lived URL.
-            tunnel_manager.pin_tunnel_url(&tunnel_url).await;
+        tunnel_manager.pin_tunnel_url(&tunnel_url).await;
+        let task_tunnel_manager = tunnel_manager.clone();
+        let task_tunnel_url = tunnel_url.clone();
+        let handle = tokio::task::spawn(async move {
             let mut missed_pongs = 0u32;
             loop {
                 let options = TunnelProbeOptions {
@@ -1730,11 +1783,11 @@ impl RtcpStack {
                     timeout_ms: Some(liveness.pong_timeout_secs.saturating_mul(1000)),
                     ..TunnelProbeOptions::default()
                 };
-                let mut status = match rtcp.probe_url(&tunnel_url, &options).await {
+                let mut status = match rtcp.probe_url(&task_tunnel_url, &options).await {
                     Ok(status) => status,
                     Err(err) => crate::tunnel_url_status::unreachable_status(
-                        &tunnel_url,
-                        &normalize_tunnel_url(&tunnel_url),
+                        &task_tunnel_url,
+                        &normalize_tunnel_url(&task_tunnel_url),
                         crate::tunnel_mgr::now_ms(),
                         TunnelUrlStatusSource::KeepAlive,
                         format!("keep-tunnel probe: {}", err),
@@ -1742,7 +1795,7 @@ impl RtcpStack {
                 };
                 status.source = TunnelUrlStatusSource::KeepAlive;
                 let last_ok = status.state == TunnelUrlState::Reachable;
-                tunnel_manager.record_status_observation(status).await;
+                task_tunnel_manager.record_status_observation(status).await;
 
                 if Self::record_liveness_probe(
                     &mut missed_pongs,
@@ -1751,15 +1804,15 @@ impl RtcpStack {
                 ) {
                     warn!(
                         "RTCP keep tunnel {} missed Pong ({}/{})",
-                        tunnel_url, missed_pongs, liveness.max_missed_pongs
+                        task_tunnel_url, missed_pongs, liveness.max_missed_pongs
                     );
-                    rtcp.close_tunnel_for_url(&tunnel_url, "keep-tunnel liveness exhausted")
+                    rtcp.close_tunnel_for_url(&task_tunnel_url, "keep-tunnel liveness exhausted")
                         .await;
                     missed_pongs = 0;
                 } else if !last_ok {
                     warn!(
                         "RTCP keep tunnel {} missed Pong ({}/{})",
-                        tunnel_url, missed_pongs, liveness.max_missed_pongs
+                        task_tunnel_url, missed_pongs, liveness.max_missed_pongs
                     );
                 }
 
@@ -1767,6 +1820,74 @@ impl RtcpStack {
                     .await;
             }
         });
+        self.keep_tunnel_tasks.lock().unwrap().insert(
+            tunnel,
+            KeepTunnelTask {
+                handle,
+                tunnel_manager,
+                tunnel_url,
+            },
+        );
+    }
+
+    async fn stop_keep_tunnel(&self, tunnel: &str) {
+        let task = self.keep_tunnel_tasks.lock().unwrap().remove(tunnel);
+        if let Some(task) = task {
+            Self::shutdown_keep_tunnel_task(task).await;
+        }
+    }
+
+    async fn shutdown_keep_tunnel_task(task: KeepTunnelTask) {
+        task.handle.abort();
+        let _ = task.handle.await;
+        task.tunnel_manager.unpin_tunnel_url(&task.tunnel_url).await;
+    }
+
+    async fn shutdown_keep_tunnels(&self) {
+        let tasks = self
+            .keep_tunnel_tasks
+            .lock()
+            .unwrap()
+            .drain()
+            .map(|(_, task)| task)
+            .collect::<Vec<_>>();
+        for task in tasks {
+            Self::shutdown_keep_tunnel_task(task).await;
+        }
+    }
+
+    async fn shutdown_runtime(&self) {
+        self.shutdown_keep_tunnels().await;
+        if let Some(builder) = self.registered_tunnel_builder.lock().unwrap().take() {
+            self.tunnel_manager
+                .remove_owned_tunnel_builder("rtcp", &self.id, &builder);
+            self.tunnel_manager
+                .remove_owned_tunnel_builder("rudp", &self.id, &builder);
+        }
+        let rtcp = self.rtcp_ref.lock().unwrap().clone();
+        if let Some(rtcp) = rtcp {
+            rtcp.shutdown().await;
+        }
+        self.rtcp_ref.lock().unwrap().take();
+        self.rtcp.lock().unwrap().take();
+    }
+
+    async fn apply_keep_tunnels(&self, keep_tunnels: Vec<String>) {
+        let _update_guard = self.keep_tunnel_update_lock.lock().await;
+        let old_tunnels = self.keep_tunnel.lock().unwrap().clone();
+        for tunnel in old_tunnels
+            .iter()
+            .filter(|tunnel| !keep_tunnels.contains(tunnel))
+        {
+            self.stop_keep_tunnel(tunnel).await;
+        }
+
+        *self.keep_tunnel.lock().unwrap() = keep_tunnels.clone();
+        for tunnel in keep_tunnels {
+            if !old_tunnels.contains(&tunnel) {
+                self.start_keep_tunnel(tunnel).await;
+            }
+        }
     }
 
     async fn create(mut builder: RtcpStackBuilder) -> StackResult<Self> {
@@ -1807,7 +1928,7 @@ impl RtcpStack {
 
         let id = builder.id.take().unwrap();
         let bind_addr = builder.bind_addr.clone().unwrap();
-        let keep_tunnel = sanitize_keep_tunnels(&builder.keep_tunnel);
+        let keep_tunnel = validate_keep_tunnels(&builder.keep_tunnel)?;
         let device_config = builder.device_config.take().unwrap();
         let device_id = device_config.id.to_string();
         let private_key = builder.private_key.take().unwrap();
@@ -1880,7 +2001,7 @@ impl RtcpStack {
             bind_addr,
             device_id,
             device_public_key,
-            keep_tunnel,
+            keep_tunnel: Mutex::new(keep_tunnel),
             liveness: builder.security.liveness.clone(),
             security: builder.security.clone(),
             reuse_address: builder.reuse_address,
@@ -1890,6 +2011,10 @@ impl RtcpStack {
             tunnel_manager: stack_context.tunnel_manager.clone(),
             handler,
             prepare_handler: Arc::new(Default::default()),
+            prepare_keep_tunnel: Mutex::new(None),
+            keep_tunnel_update_lock: tokio::sync::Mutex::new(()),
+            keep_tunnel_tasks: Mutex::new(HashMap::new()),
+            registered_tunnel_builder: Mutex::new(None),
         })
     }
 }
@@ -1919,12 +2044,17 @@ impl Stack for RtcpStack {
         let rtcp = Arc::new(rtcp);
         let tunnel_builder = Arc::new(RtcpTunnelBuilder::new(rtcp.clone()));
         self.tunnel_manager
-            .register_tunnel_builder("rtcp", tunnel_builder.clone());
+            .register_owned_tunnel_builder("rtcp", &self.id, tunnel_builder.clone());
         self.tunnel_manager
-            .register_tunnel_builder("rudp", tunnel_builder);
+            .register_owned_tunnel_builder("rudp", &self.id, tunnel_builder.clone());
+        *self.registered_tunnel_builder.lock().unwrap() = Some(tunnel_builder);
         *self.rtcp_ref.lock().unwrap() = Some(rtcp);
-        self.start_keep_tunnels();
+        self.start_keep_tunnels().await;
         Ok(())
+    }
+
+    async fn shutdown(&self) {
+        self.shutdown_runtime().await;
     }
 
     async fn prepare_update(
@@ -2013,6 +2143,7 @@ impl Stack for RtcpStack {
         )
         .await
         .map_err(|e| stack_err!(StackErrorCode::InvalidConfig, "{e}"))?;
+        let keep_tunnels = validate_keep_tunnels(&config.keep_tunnel)?;
         let handler = RtcpConnectionHandler::create_with_max_datagram(
             config.hook_point.clone(),
             config.on_new_tunnel_hook_point.clone(),
@@ -2023,6 +2154,7 @@ impl Stack for RtcpStack {
         )
         .await?;
         *self.prepare_handler.write().unwrap() = Some(Arc::new(handler));
+        *self.prepare_keep_tunnel.lock().unwrap() = Some(keep_tunnels);
         Ok(())
     }
 
@@ -2030,10 +2162,15 @@ impl Stack for RtcpStack {
         if let Some(handler) = self.prepare_handler.write().unwrap().take() {
             *self.handler.write().unwrap() = handler;
         }
+        let keep_tunnels = { self.prepare_keep_tunnel.lock().unwrap().take() };
+        if let Some(keep_tunnels) = keep_tunnels {
+            self.apply_keep_tunnels(keep_tunnels).await;
+        }
     }
 
     async fn rollback_update(&self) {
         self.prepare_handler.write().unwrap().take();
+        self.prepare_keep_tunnel.lock().unwrap().take();
     }
 }
 
@@ -2326,12 +2463,27 @@ fn sanitize_keep_tunnels(keep_tunnels: &[String]) -> Vec<String> {
     result
 }
 
+fn validate_keep_tunnels(keep_tunnels: &[String]) -> StackResult<Vec<String>> {
+    let keep_tunnels = sanitize_keep_tunnels(keep_tunnels);
+    for tunnel in &keep_tunnels {
+        Url::parse(&format!("rtcp://{}", tunnel)).map_err(|error| {
+            stack_err!(
+                StackErrorCode::InvalidConfig,
+                "invalid keep_tunnel '{}': {}",
+                tunnel,
+                error
+            )
+        })?;
+    }
+    Ok(keep_tunnels)
+}
+
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::{
         RtcpConnectionHandler, RtcpIdentityManagerConfig, load_rtcp_identity_material,
-        sanitize_keep_tunnels,
+        sanitize_keep_tunnels, validate_keep_tunnels,
     };
     use crate::global_process_chains::GlobalProcessChains;
     use crate::{
@@ -2339,8 +2491,8 @@ mod tests {
         LimiterManagerRef, ProcessChainConfigs, RtcpInboundAdmissionConfig, RtcpLimitsConfig,
         RtcpLivenessConfig, RtcpPeerIdentityConfig, RtcpStack, RtcpStackConfig, RtcpStackContext,
         RtcpStackFactory, Server, ServerManager, ServerManagerRef, ServerResult, Stack,
-        StackContext, StackFactory, StackProtocol, StatManager, StatManagerRef, StreamInfo,
-        StreamServer, TunnelEndpoint, TunnelManager, create_io_dump_stack_config,
+        StackContext, StackFactory, StackManager, StackProtocol, StatManager, StatManagerRef,
+        StreamInfo, StreamServer, TunnelEndpoint, TunnelManager, create_io_dump_stack_config,
         decode_io_dump_frames,
     };
     use buckyos_kit::AsyncStream;
@@ -2479,6 +2631,36 @@ inbound_admission:
             None,
             None,
         ))
+    }
+
+    async fn build_keep_tunnel_stack(
+        id: &str,
+        bind: &str,
+        keep_tunnels: Vec<&str>,
+        tunnel_manager: TunnelManager,
+    ) -> RtcpStack {
+        let (signing_key, pkcs8_bytes) = generate_ed25519_key();
+        let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
+        let device_config = DeviceDocument::new_by_jwk(id, serde_json::from_value(jwk).unwrap());
+        let context = build_stack_context(
+            Arc::new(ServerManager::new()),
+            tunnel_manager,
+            Arc::new(DefaultLimiterManager::new()),
+            StatManager::new(),
+            Some(Arc::new(GlobalProcessChains::new())),
+        );
+
+        RtcpStack::builder()
+            .id(id)
+            .bind(bind.to_string())
+            .keep_tunnel(keep_tunnels.into_iter().map(str::to_string).collect())
+            .device_config(device_config)
+            .private_key(pkcs8_bytes)
+            .hook_point(vec![])
+            .stack_context(context)
+            .build()
+            .await
+            .unwrap()
     }
 
     fn build_rtcp_identity_config(
@@ -6582,6 +6764,266 @@ inbound_admission:
         assert!(ret.is_err());
     }
 
+    #[tokio::test]
+    async fn test_keep_tunnel_shutdown_releases_pin() {
+        let tunnel_manager = TunnelManager::new();
+        let stack = build_keep_tunnel_stack(
+            "keep-tunnel-shutdown",
+            "127.0.0.1:0",
+            vec!["peer.example"],
+            tunnel_manager.clone(),
+        )
+        .await;
+        let url = Url::parse("rtcp://peer.example").unwrap();
+        let normalized = crate::tunnel_url_status::normalize_tunnel_url(&url);
+
+        stack.start().await.unwrap();
+        assert!(
+            tunnel_manager
+                .list_tunnel_url_history()
+                .await
+                .into_iter()
+                .find(|entry| entry.normalized_url == normalized)
+                .unwrap()
+                .pinned
+        );
+
+        tokio::time::timeout(Duration::from_secs(2), stack.shutdown())
+            .await
+            .expect("keep-tunnel shutdown timed out");
+        assert!(stack.keep_tunnel_tasks.lock().unwrap().is_empty());
+        assert!(stack.rtcp_ref.lock().unwrap().is_none());
+        assert!(
+            !tunnel_manager
+                .list_tunnel_url_history()
+                .await
+                .into_iter()
+                .find(|entry| entry.normalized_url == normalized)
+                .unwrap()
+                .pinned
+        );
+    }
+
+    #[tokio::test]
+    async fn test_keep_tunnel_reload_diff_is_idempotent() {
+        let tunnel_manager = TunnelManager::new();
+        let stack = build_keep_tunnel_stack(
+            "keep-tunnel-diff",
+            "127.0.0.1:0",
+            vec!["peer-a"],
+            tunnel_manager.clone(),
+        )
+        .await;
+        stack.start().await.unwrap();
+
+        stack.apply_keep_tunnels(vec!["peer-b".to_string()]).await;
+        {
+            let tasks = stack.keep_tunnel_tasks.lock().unwrap();
+            assert_eq!(tasks.len(), 1);
+            assert!(tasks.contains_key("peer-b"));
+            assert!(!tasks.contains_key("peer-a"));
+        }
+
+        let old_url = Url::parse("rtcp://peer-a").unwrap();
+        let new_url = Url::parse("rtcp://peer-b").unwrap();
+        let history = tunnel_manager.list_tunnel_url_history().await;
+        assert!(
+            !history
+                .iter()
+                .find(|entry| {
+                    entry.normalized_url == crate::tunnel_url_status::normalize_tunnel_url(&old_url)
+                })
+                .unwrap()
+                .pinned
+        );
+        assert!(
+            history
+                .iter()
+                .find(|entry| {
+                    entry.normalized_url == crate::tunnel_url_status::normalize_tunnel_url(&new_url)
+                })
+                .unwrap()
+                .pinned
+        );
+
+        stack
+            .apply_keep_tunnels(vec!["peer-b".to_string(), "peer-c".to_string()])
+            .await;
+        assert_eq!(stack.keep_tunnel_tasks.lock().unwrap().len(), 2);
+
+        // Re-applying the same configuration must not create duplicate
+        // keep-tunnel tasks or extra URL-pin owners.
+        stack
+            .apply_keep_tunnels(vec!["peer-b".to_string(), "peer-c".to_string()])
+            .await;
+        assert_eq!(stack.keep_tunnel_tasks.lock().unwrap().len(), 2);
+        let peer_b_history = tunnel_manager
+            .list_tunnel_url_history()
+            .await
+            .into_iter()
+            .find(|entry| {
+                entry.normalized_url == crate::tunnel_url_status::normalize_tunnel_url(&new_url)
+            })
+            .unwrap();
+        assert!(peer_b_history.pinned);
+
+        stack.shutdown().await;
+        let history = tunnel_manager.list_tunnel_url_history().await;
+        for tunnel in ["rtcp://peer-b", "rtcp://peer-c"] {
+            let url = Url::parse(tunnel).unwrap();
+            assert!(
+                !history
+                    .iter()
+                    .find(|entry| {
+                        entry.normalized_url == crate::tunnel_url_status::normalize_tunnel_url(&url)
+                    })
+                    .unwrap()
+                    .pinned
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_keep_tunnel_updates_do_not_orphan_tasks_or_pins() {
+        let tunnel_manager = TunnelManager::new();
+        let stack = build_keep_tunnel_stack(
+            "keep-tunnel-concurrent-update",
+            "127.0.0.1:0",
+            vec!["peer-old"],
+            tunnel_manager.clone(),
+        )
+        .await;
+        stack.start().await.unwrap();
+
+        let _ = tokio::join!(
+            stack.apply_keep_tunnels(vec!["peer-new".to_string()]),
+            stack.apply_keep_tunnels(vec!["peer-new".to_string()]),
+        );
+
+        assert_eq!(stack.keep_tunnel_tasks.lock().unwrap().len(), 1);
+        assert!(stack
+            .keep_tunnel_tasks
+            .lock()
+            .unwrap()
+            .contains_key("peer-new"));
+
+        stack.shutdown().await;
+        let normalized = crate::tunnel_url_status::normalize_tunnel_url(
+            &Url::parse("rtcp://peer-new").unwrap(),
+        );
+        assert!(!tunnel_manager
+            .list_tunnel_url_history()
+            .await
+            .into_iter()
+            .find(|entry| entry.normalized_url == normalized)
+            .unwrap()
+            .pinned);
+    }
+
+    #[tokio::test]
+    async fn test_keep_tunnel_rollback_preserves_running_tasks() {
+        let tunnel_manager = TunnelManager::new();
+        let stack = build_keep_tunnel_stack(
+            "keep-tunnel-rollback",
+            "127.0.0.1:0",
+            vec!["peer-old"],
+            tunnel_manager.clone(),
+        )
+        .await;
+        stack.start().await.unwrap();
+
+        *stack.prepare_keep_tunnel.lock().unwrap() = Some(vec!["peer-new".to_string()]);
+        stack.rollback_update().await;
+
+        let tasks = stack.keep_tunnel_tasks.lock().unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert!(tasks.contains_key("peer-old"));
+        assert!(!tasks.contains_key("peer-new"));
+        drop(tasks);
+
+        let old_url = Url::parse("rtcp://peer-old").unwrap();
+        let new_url = Url::parse("rtcp://peer-new").unwrap();
+        let history = tunnel_manager.list_tunnel_url_history().await;
+        assert!(
+            history
+                .iter()
+                .find(|entry| {
+                    entry.normalized_url == crate::tunnel_url_status::normalize_tunnel_url(&old_url)
+                })
+                .unwrap()
+                .pinned
+        );
+        assert!(history.iter().all(|entry| {
+            entry.normalized_url != crate::tunnel_url_status::normalize_tunnel_url(&new_url)
+        }));
+
+        stack.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_keep_tunnel_shutdown_releases_bind_for_replacement() {
+        let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let bind = probe.local_addr().unwrap().to_string();
+        drop(probe);
+
+        let tunnel_manager = TunnelManager::new();
+        let old_stack = build_keep_tunnel_stack(
+            "keep-tunnel-old-bind",
+            &bind,
+            vec!["peer-old"],
+            tunnel_manager.clone(),
+        )
+        .await;
+        old_stack.start().await.unwrap();
+        old_stack.shutdown().await;
+
+        let replacement = build_keep_tunnel_stack(
+            "keep-tunnel-new-bind",
+            &bind,
+            vec!["peer-new"],
+            tunnel_manager,
+        )
+        .await;
+        replacement
+            .start()
+            .await
+            .expect("replacement stack must reuse the released bind address");
+        replacement.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_stack_manager_removal_shuts_down_keep_tunnel_stack() {
+        let tunnel_manager = TunnelManager::new();
+        let stack = Arc::new(
+            build_keep_tunnel_stack(
+                "keep-tunnel-manager-removal",
+                "127.0.0.1:0",
+                vec!["peer-removal"],
+                tunnel_manager.clone(),
+            )
+            .await,
+        );
+        let url = Url::parse("rtcp://peer-removal").unwrap();
+        let normalized = crate::tunnel_url_status::normalize_tunnel_url(&url);
+        let manager = StackManager::new();
+        manager.add_stack(stack.clone()).unwrap();
+        manager.start().await.unwrap();
+
+        manager.retain_with_shutdown(|_| false).await;
+        assert!(manager.get_stack("keep-tunnel-manager-removal").is_none());
+        assert!(stack.keep_tunnel_tasks.lock().unwrap().is_empty());
+        assert!(stack.rtcp_ref.lock().unwrap().is_none());
+        assert!(
+            !tunnel_manager
+                .list_tunnel_url_history()
+                .await
+                .into_iter()
+                .find(|entry| entry.normalized_url == normalized)
+                .unwrap()
+                .pinned
+        );
+    }
+
     #[test]
     fn test_sanitize_keep_tunnels() {
         assert_eq!(
@@ -6593,5 +7035,11 @@ inbound_admission:
             ]),
             vec!["did:1".to_string(), "did:2".to_string()]
         );
+    }
+
+    #[test]
+    fn test_validate_keep_tunnels_rejects_invalid_url() {
+        let result = validate_keep_tunnels(&["peer with spaces".to_string()]);
+        assert!(result.is_err());
     }
 }

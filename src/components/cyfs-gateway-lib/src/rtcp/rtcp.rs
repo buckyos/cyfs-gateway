@@ -264,7 +264,7 @@ impl fmt::Display for RtcpIdentityTrust {
 
 pub struct RTcp {
     inner: Arc<RTcpInner>,
-    handle: Option<JoinHandle<()>>,
+    handle: Mutex<Option<JoinHandle<()>>>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -280,9 +280,20 @@ pub struct RTcpSourceDeviceInfo {
 impl Drop for RTcp {
     fn drop(&mut self) {
         log::debug!("RTcp {} drop", self.inner.this_device_did.to_string());
-        if let Some(handle) = self.handle.take() {
+        if let Some(handle) = self.handle.get_mut().take() {
             handle.abort();
         }
+    }
+}
+
+impl RTcp {
+    pub async fn shutdown(&self) {
+        let handle = self.handle.lock().await.take();
+        if let Some(handle) = handle {
+            handle.abort();
+            let _ = handle.await;
+        }
+        self.inner.tunnel_map.close_all("RTCP stack shutdown").await;
     }
 }
 
@@ -302,7 +313,7 @@ impl RTcp {
                 this_device_doc_jwt,
                 listener,
             )),
-            handle: None,
+            handle: Mutex::new(None),
         }
     }
 
@@ -340,7 +351,7 @@ impl RTcp {
     pub async fn start(&mut self) -> TunnelResult<()> {
         let inner = self.inner.clone();
         let handle = inner.start().await?;
-        self.handle = Some(handle);
+        *self.handle.lock().await = Some(handle);
         Ok(())
     }
 
@@ -3362,7 +3373,11 @@ impl RTcpInner {
                     let tunnel = attempt.tunnel;
                     if let Err(err) = self
                         .tunnel_map
-                        .register_outbound_if_absent(&tunnel_key, tunnel.clone(), name_binding.as_ref())
+                        .register_outbound_if_absent(
+                            &tunnel_key,
+                            tunnel.clone(),
+                            name_binding.as_ref(),
+                        )
                         .await
                     {
                         tunnel.close().await;
@@ -5740,6 +5755,36 @@ impl RTcpTunnelMap {
         all_tunnel.tunnels.get(tunnel_key).cloned()
     }
 
+    /// Detach and close every tunnel owned by this RTCP instance. The map is
+    /// cleared while locked, but transport shutdown happens afterwards so a
+    /// tunnel's close path cannot block map users.
+    pub async fn close_all(&self, reason: &str) -> usize {
+        let tunnels = {
+            let mut all_tunnel = self.tunnel_map.lock().await;
+            let tunnels = all_tunnel
+                .tunnels
+                .drain()
+                .map(|(_, tunnel)| tunnel)
+                .collect::<Vec<_>>();
+            all_tunnel.verified_by_logical_did.clear();
+            all_tunnel.binding_by_instance.clear();
+            all_tunnel.binding_by_canonical_dev.clear();
+            tunnels
+        };
+
+        let count = tunnels.len();
+        for tunnel in tunnels {
+            debug!(
+                "close RTCP tunnel {} instance {} after {}",
+                tunnel.remote_stack.did.to_string(),
+                tunnel.instance_id(),
+                reason
+            );
+            tunnel.close().await;
+        }
+        count
+    }
+
     // Outbound reuse with one-to-one arbitration: before reusing (or deciding
     // to build) a canonical tunnel for a named target, verify the canonical
     // DEV DID is not already bound to a different verified logical name. A
@@ -6539,8 +6584,7 @@ mod tests {
         let zone_jwk = serde_json::from_value(encode_ed25519_sk_to_pk_jwk(&zone_signing_key))
             .expect("test zone JWK");
         let remote_zone_did = DID::from_str("did:web:sn.remote-zone.scope.test").unwrap();
-        let remote_zone_document =
-            ZoneDocument::new(remote_zone_did.clone(), owner_did, zone_jwk);
+        let remote_zone_document = ZoneDocument::new(remote_zone_did.clone(), owner_did, zone_jwk);
         let zone_context = inner.address_resolution_for_document(
             &remote_zone_did,
             &ResolvedHandshakeDocument::Zone(remote_zone_document),
@@ -7675,11 +7719,12 @@ mod tests {
         );
         assert!(inbound.is_closed());
         assert!(!outbound.is_closed());
-        assert!(map
-            .get_tunnel(key)
-            .await
-            .unwrap()
-            .is_same_instance(&outbound));
+        assert!(
+            map.get_tunnel(key)
+                .await
+                .unwrap()
+                .is_same_instance(&outbound)
+        );
 
         // A duplicate inbound connection for the same name is also rejected;
         // the already-published outbound instance remains the shared winner.
@@ -9082,13 +9127,15 @@ mod tests {
         // Give the rejected candidate time to execute cleanup. It must not
         // remove or close the first accepted instance.
         tokio::time::sleep(Duration::from_millis(100)).await;
-        assert!(server
-            .inner
-            .tunnel_map
-            .get_tunnel(&server_tunnel_key)
-            .await
-            .unwrap()
-            .is_same_instance(&old_server_tunnel));
+        assert!(
+            server
+                .inner
+                .tunnel_map
+                .get_tunnel(&server_tunnel_key)
+                .await
+                .unwrap()
+                .is_same_instance(&old_server_tunnel)
+        );
     }
 
     #[tokio::test]
@@ -9160,18 +9207,22 @@ mod tests {
         );
         assert_eq!(client.inner.tunnel_map.primary_len().await, 1);
         assert_eq!(server.inner.tunnel_map.primary_len().await, 1);
-        assert!(client
-            .inner
-            .tunnel_map
-            .get_tunnel(&client_key)
-            .await
-            .is_some());
-        assert!(server
-            .inner
-            .tunnel_map
-            .get_tunnel(&server_key)
-            .await
-            .is_some());
+        assert!(
+            client
+                .inner
+                .tunnel_map
+                .get_tunnel(&client_key)
+                .await
+                .is_some()
+        );
+        assert!(
+            server
+                .inner
+                .tunnel_map
+                .get_tunnel(&server_key)
+                .await
+                .is_some()
+        );
     }
 
     #[tokio::test]
@@ -10736,25 +10787,35 @@ mod tests {
         stream_id_prefix: &'static str,
         count: usize,
     ) {
+        // Keep the total stress count high while bounding simultaneous socket
+        // creation. This still exercises concurrent forward/reverse opens
+        // without making the test depend on a 2,000-connection burst.
+        const MAX_IN_FLIGHT: usize = 64;
+        async fn open_one(tunnel: Box<dyn TunnelBox>, prefix: &'static str, i: usize) {
+            let stream_id = format!("{}{}.test:80", prefix, i);
+            let stream =
+                open_stream_with_quota_retries(tunnel.as_ref(), &stream_id, prefix, 500).await;
+            drop(stream);
+        }
+
         let mut streams = FuturesUnordered::new();
-        for i in 0..count {
+        let mut next = 0usize;
+        while next < count && streams.len() < MAX_IN_FLIGHT {
             let tunnel = tunnel.clone();
-            streams.push(async move {
-                let stream_id = format!("{}{}.test:80", stream_id_prefix, i);
-                let stream = open_stream_with_quota_retries(
-                    tunnel.as_ref(),
-                    &stream_id,
-                    stream_id_prefix,
-                    500,
-                )
-                .await;
-                drop(stream);
-            });
+            let i = next;
+            next += 1;
+            streams.push(open_one(tunnel, stream_id_prefix, i));
         }
 
         let mut completed = 0usize;
         while streams.next().await.is_some() {
             completed += 1;
+            if next < count {
+                let tunnel = tunnel.clone();
+                let i = next;
+                next += 1;
+                streams.push(open_one(tunnel, stream_id_prefix, i));
+            }
         }
         assert_eq!(completed, count, "{} streams opened", stream_id_prefix);
     }

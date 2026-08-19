@@ -26,8 +26,10 @@ http-body-util.workspace = true
 hyper = { version = "1.8", features = ["full"] }
 hyper-util.workspace = true
 kRPC.workspace = true
+name-lib.workspace = true
 reqwest.workspace = true
 serde_json.workspace = true
 serde_yaml_ng.workspace = true
 sqlx.workspace = true
 tempfile.workspace = true
+url.workspace = true
