@@ -273,7 +273,9 @@ where
             projection_records.push((record, decoded_call));
         }
 
-        let snapshot = self.load_projection_snapshot(&projection_records).await?;
+        let snapshot = self
+            .load_projection_snapshot(&projection_records, to_block)
+            .await?;
         let mut registry_events_stored = 0;
         for (record, decoded_call) in projection_records {
             let projection =
@@ -440,6 +442,7 @@ where
     async fn load_projection_snapshot(
         &self,
         records: &[(EventLogRecord, Option<BnsCall>)],
+        to_block: u64,
     ) -> BnsRegistryResult<ProjectionSnapshot> {
         let mut seen = HashSet::new();
         let mut reads = Vec::new();
@@ -454,7 +457,10 @@ where
             .iter()
             .map(|read| read.contract_read(self.contract))
             .collect::<Vec<_>>();
-        let outputs = self.chain_client.multicall(&calls).await?;
+        let outputs = self
+            .chain_client
+            .multicall_at(&calls, BlockRange::Number(to_block))
+            .await?;
         if outputs.len() != reads.len() {
             return Err(BnsRegistryError::InvalidConfig(format!(
                 "BNS projection batch returned {} values for {} reads",

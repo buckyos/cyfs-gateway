@@ -17,7 +17,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use alloy_sol_types::{sol, SolCall, SolEvent};
-use bns_evm::{address, Address, Bns, Bytes, B256, MULTICALL3_ADDRESS, U256};
+use bns_evm::{address, Address, Bns, Bytes, EthRpcClient, B256, MULTICALL3_ADDRESS, U256};
 use bns_indexer::{
     sync_bns_contract_once, BnsBlockSyncSourceConfig, BnsContractEventIndexer,
     BnsIndexerSyncConfig, BnsRegistryError, BnsRegistryStore, DocumentStatus, NameStatus,
@@ -53,8 +53,12 @@ struct MockConfig {
     logs_json: Vec<serde_json::Value>,
     // selector(hex, no 0x) -> eth_call 返回 hex（含 0x）。
     eth_call_returns: HashMap<String, String>,
+    // block tag -> selector -> eth_call 返回值，用于区分历史块和 latest 状态。
+    eth_call_returns_by_block: HashMap<String, HashMap<String, String>>,
     // Multicall3 aggregate 返回值（含 0x）；未设置时模拟目标链不支持并触发回退。
     multicall_return: Option<String>,
+    // block tag -> Multicall3 aggregate 返回值。
+    multicall_returns_by_block: HashMap<String, String>,
     // tx hash(lowercase, 含 0x) -> input calldata hex（含 0x），供 decode_bns_call 补全入参。
     txs: HashMap<String, String>,
     // block number -> block hash（含 0x），用于游标 reorg 检测。
@@ -66,6 +70,7 @@ struct MockEthRpc {
     config: Arc<Mutex<MockConfig>>,
     get_logs_calls: Arc<Mutex<u64>>,
     eth_call_calls: Arc<Mutex<u64>>,
+    eth_call_block_tags: Arc<Mutex<Vec<String>>>,
     chain_id_calls: Arc<AtomicUsize>,
     latest_block_calls: Arc<AtomicUsize>,
     transaction_lookup_calls: Arc<AtomicUsize>,
@@ -78,12 +83,14 @@ impl MockEthRpc {
         let config = Arc::new(Mutex::new(config));
         let get_logs_calls = Arc::new(Mutex::new(0u64));
         let eth_call_calls = Arc::new(Mutex::new(0u64));
+        let eth_call_block_tags = Arc::new(Mutex::new(Vec::new()));
         let chain_id_calls = Arc::new(AtomicUsize::new(0));
         let latest_block_calls = Arc::new(AtomicUsize::new(0));
         let transaction_lookup_calls = Arc::new(AtomicUsize::new(0));
         let cfg = config.clone();
         let calls = get_logs_calls.clone();
         let view_calls = eth_call_calls.clone();
+        let view_block_tags = eth_call_block_tags.clone();
         let network_calls = chain_id_calls.clone();
         let head_calls = latest_block_calls.clone();
         let transaction_calls = transaction_lookup_calls.clone();
@@ -96,6 +103,7 @@ impl MockEthRpc {
                 let cfg = cfg.clone();
                 let calls = calls.clone();
                 let view_calls = view_calls.clone();
+                let view_block_tags = view_block_tags.clone();
                 let network_calls = network_calls.clone();
                 let head_calls = head_calls.clone();
                 let transaction_calls = transaction_calls.clone();
@@ -115,6 +123,7 @@ impl MockEthRpc {
                         &cfg,
                         &calls,
                         &view_calls,
+                        &view_block_tags,
                         &network_calls,
                         &head_calls,
                         &transaction_calls,
@@ -137,6 +146,7 @@ impl MockEthRpc {
             config,
             get_logs_calls,
             eth_call_calls,
+            eth_call_block_tags,
             chain_id_calls,
             latest_block_calls,
             transaction_lookup_calls,
@@ -153,6 +163,10 @@ impl MockEthRpc {
 
     fn eth_call_calls(&self) -> u64 {
         *self.eth_call_calls.lock().unwrap()
+    }
+
+    fn eth_call_block_tags(&self) -> Vec<String> {
+        self.eth_call_block_tags.lock().unwrap().clone()
     }
 
     fn chain_id_calls(&self) -> usize {
@@ -174,6 +188,7 @@ fn handle_method(
     cfg: &Arc<Mutex<MockConfig>>,
     calls: &Arc<Mutex<u64>>,
     view_calls: &Arc<Mutex<u64>>,
+    view_block_tags: &Arc<Mutex<Vec<String>>>,
     network_calls: &Arc<AtomicUsize>,
     head_calls: &Arc<AtomicUsize>,
     transaction_calls: &Arc<AtomicUsize>,
@@ -217,18 +232,24 @@ fn handle_method(
         }
         "eth_call" => {
             *view_calls.lock().unwrap() += 1;
+            let block_tag = req["params"][1].as_str().unwrap_or("").to_string();
+            view_block_tags.lock().unwrap().push(block_tag.clone());
             let to = req["params"][0]["to"].as_str().unwrap_or("");
             if to.eq_ignore_ascii_case(&format!("{MULTICALL3_ADDRESS:#x}")) {
                 return cfg
-                    .multicall_return
-                    .clone()
+                    .multicall_returns_by_block
+                    .get(&block_tag)
+                    .cloned()
+                    .or_else(|| cfg.multicall_return.clone())
                     .map(serde_json::Value::String)
                     .unwrap_or_else(|| serde_json::Value::String("0x".to_string()));
             }
             let data = req["params"][0]["data"].as_str().unwrap_or("");
             let selector = data.trim_start_matches("0x").get(0..8).unwrap_or("");
-            cfg.eth_call_returns
-                .get(selector)
+            cfg.eth_call_returns_by_block
+                .get(&block_tag)
+                .and_then(|returns| returns.get(selector))
+                .or_else(|| cfg.eth_call_returns.get(selector))
                 .cloned()
                 .map(serde_json::Value::String)
                 .unwrap_or_else(|| serde_json::Value::String("0x".to_string()))
@@ -414,6 +435,89 @@ fn protocol_event_log(seq: u64, log_root: u8, block_number: u64) -> serde_json::
     )
 }
 
+fn document_published_logs(block_number: u64) -> Vec<serde_json::Value> {
+    vec![
+        protocol_event_log(7, 0x44, block_number),
+        event_log_json(
+            &Bns::DocumentPublished {
+                nameHash: B256::repeat_byte(0x09),
+                name: "alice".to_string(),
+                docType: "dns_txt".to_string(),
+                version: 3,
+                actor: ACTOR,
+                contentHash: B256::repeat_byte(0x22),
+                documentStateHash: B256::repeat_byte(0x33),
+            },
+            block_number,
+        ),
+    ]
+}
+
+fn name_and_document_returns(name_seq: u64, version: u64) -> HashMap<String, String> {
+    HashMap::from([
+        (
+            selector_hex::<Bns::queryNameStateCall>(),
+            format!(
+                "0x{}",
+                hex::encode(Bns::queryNameStateCall::abi_encode_returns(
+                    &evm_name_state("alice", name_seq)
+                ))
+            ),
+        ),
+        (
+            selector_hex::<Bns::getDocumentVersionCall>(),
+            format!(
+                "0x{}",
+                hex::encode(Bns::getDocumentVersionCall::abi_encode_returns(
+                    &evm_document_state("alice", "dns_txt", version)
+                ))
+            ),
+        ),
+    ])
+}
+
+fn name_and_document_multicall_return(block_number: u64, name_seq: u64, version: u64) -> String {
+    format!(
+        "0x{}",
+        hex::encode(TestMulticall3::aggregateCall::abi_encode_returns(
+            &TestMulticall3::aggregateReturn {
+                blockNumber: U256::from(block_number),
+                returnData: vec![
+                    Bytes::from(Bns::queryNameStateCall::abi_encode_returns(
+                        &evm_name_state("alice", name_seq),
+                    )),
+                    Bytes::from(Bns::getDocumentVersionCall::abi_encode_returns(
+                        &evm_document_state("alice", "dns_txt", version),
+                    )),
+                ],
+            },
+        ))
+    )
+}
+
+fn name_registered_logs(
+    seq: u64,
+    name: &str,
+    name_hash: u8,
+    block_number: u64,
+) -> Vec<serde_json::Value> {
+    vec![
+        protocol_event_log(seq, name_hash, block_number),
+        event_log_json(
+            &Bns::NameRegistered {
+                nameHash: B256::repeat_byte(name_hash),
+                name: name.to_string(),
+                assetOwner: OWNER,
+                actor: ACTOR,
+                expireAt: 1_000,
+                lineageEpoch: 0,
+                nameSeq: seq,
+            },
+            block_number,
+        ),
+    ]
+}
+
 fn config_for_chain(chain_id: u64) -> BnsIndexerSyncConfig {
     BnsIndexerSyncConfig::new(BnsBlockSyncSourceConfig {
         network: "anvil-local".to_string(),
@@ -475,6 +579,168 @@ async fn sync_respects_confirmations_rollback() {
     );
     // 游标未建立。
     assert!(outcome.cursor.is_none());
+}
+
+#[tokio::test]
+async fn ordinary_eth_call_still_uses_latest() {
+    let calldata = [0x01, 0x02, 0x03, 0x04];
+    let mock = MockEthRpc::start(MockConfig {
+        eth_call_returns: HashMap::from([("01020304".to_string(), "0xab".to_string())]),
+        ..Default::default()
+    })
+    .await;
+
+    let output = EthRpcClient::new(&mock.endpoint)
+        .eth_call(Address::ZERO, &calldata)
+        .await
+        .unwrap();
+
+    assert_eq!(output.as_ref(), &[0xab]);
+    assert_eq!(mock.eth_call_block_tags(), ["latest"]);
+}
+
+#[tokio::test]
+async fn sync_projection_multicall_uses_confirmed_to_block() {
+    let mut multicall_returns_by_block = HashMap::new();
+    multicall_returns_by_block.insert(
+        "0x5".to_string(),
+        name_and_document_multicall_return(5, 2, 3),
+    );
+    multicall_returns_by_block.insert(
+        "latest".to_string(),
+        name_and_document_multicall_return(10, 9, 7),
+    );
+    let mock = MockEthRpc::start(MockConfig {
+        chain_id: 31_337,
+        block_number: 10,
+        logs_json: document_published_logs(5),
+        multicall_returns_by_block,
+        ..Default::default()
+    })
+    .await;
+    let store = SqliteBnsRegistryStore::open_memory().unwrap();
+    let mut config = config_for_chain(31_337);
+    config.confirmations = 5;
+
+    let outcome = sync_bns_contract_once(&store, with_endpoint(config, &mock.endpoint))
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.to_block, Some(5));
+    assert_eq!(outcome.cursor.as_ref().unwrap().block_number, 5);
+    assert_eq!(mock.eth_call_calls(), 1);
+    assert_eq!(mock.eth_call_block_tags(), ["0x5"]);
+    let (name, document) = store
+        .transact(|tx| {
+            Ok((
+                tx.get_name("alice")?,
+                tx.get_current_document("alice", "dns_txt")?,
+            ))
+        })
+        .unwrap();
+    assert_eq!(name.unwrap().name_seq, 2);
+    assert_eq!(document.unwrap().version, 3);
+}
+
+#[tokio::test]
+async fn sync_projection_fallback_uses_confirmed_to_block() {
+    let eth_call_returns_by_block = HashMap::from([
+        ("0x5".to_string(), name_and_document_returns(2, 3)),
+        ("latest".to_string(), name_and_document_returns(9, 7)),
+    ]);
+    let mock = MockEthRpc::start(MockConfig {
+        chain_id: 31_337,
+        block_number: 10,
+        logs_json: document_published_logs(5),
+        eth_call_returns_by_block,
+        ..Default::default()
+    })
+    .await;
+    let store = SqliteBnsRegistryStore::open_memory().unwrap();
+    let mut config = config_for_chain(31_337);
+    config.confirmations = 5;
+
+    let outcome = sync_bns_contract_once(&store, with_endpoint(config, &mock.endpoint))
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.to_block, Some(5));
+    assert_eq!(mock.eth_call_calls(), 3, "aggregate plus two fallbacks");
+    assert_eq!(mock.eth_call_block_tags(), ["0x5", "0x5", "0x5"]);
+    let (name, document) = store
+        .transact(|tx| {
+            Ok((
+                tx.get_name("alice")?,
+                tx.get_current_document("alice", "dns_txt")?,
+            ))
+        })
+        .unwrap();
+    assert_eq!(name.unwrap().name_seq, 2);
+    assert_eq!(document.unwrap().version, 3);
+}
+
+#[tokio::test]
+async fn sync_projection_uses_each_backlog_batch_to_block() {
+    let eth_call_returns_by_block = HashMap::from([
+        (
+            "0x4".to_string(),
+            HashMap::from([(
+                selector_hex::<Bns::queryNameStateCall>(),
+                format!(
+                    "0x{}",
+                    hex::encode(Bns::queryNameStateCall::abi_encode_returns(
+                        &evm_name_state("alice", 1)
+                    ))
+                ),
+            )]),
+        ),
+        (
+            "0x9".to_string(),
+            HashMap::from([(
+                selector_hex::<Bns::queryNameStateCall>(),
+                format!(
+                    "0x{}",
+                    hex::encode(Bns::queryNameStateCall::abi_encode_returns(
+                        &evm_name_state("bob", 2)
+                    ))
+                ),
+            )]),
+        ),
+    ]);
+    let mock = MockEthRpc::start(MockConfig {
+        chain_id: 31_337,
+        block_number: 12,
+        logs_json: name_registered_logs(1, "alice", 0xA1, 4),
+        eth_call_returns_by_block,
+        ..Default::default()
+    })
+    .await;
+    let store = SqliteBnsRegistryStore::open_memory().unwrap();
+    let mut config = config_for_chain(31_337);
+    config.max_block_span = 5;
+
+    let first = sync_bns_contract_once(&store, with_endpoint(config.clone(), &mock.endpoint))
+        .await
+        .unwrap();
+    assert_eq!(first.to_block, Some(4));
+
+    mock.update(|cfg| {
+        cfg.logs_json = name_registered_logs(2, "bob", 0xB2, 9);
+    });
+    let second = sync_bns_contract_once(&store, with_endpoint(config, &mock.endpoint))
+        .await
+        .unwrap();
+
+    assert_eq!(second.to_block, Some(9));
+    assert_eq!(mock.eth_call_block_tags(), ["0x4", "0x9"]);
+    let names = store.transact(|tx| tx.list_names()).unwrap();
+    assert_eq!(
+        names
+            .iter()
+            .map(|name| name.name.as_str())
+            .collect::<Vec<_>>(),
+        ["alice", "bob"]
+    );
 }
 
 #[tokio::test]

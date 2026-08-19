@@ -8,7 +8,7 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 
 use crate::{
-    BnsEvmError, BnsEvmResult, Eip1559FeeSuggestion, EthBlock, EthLog, EthRpcClient,
+    BlockRange, BnsEvmError, BnsEvmResult, Eip1559FeeSuggestion, EthBlock, EthLog, EthRpcClient,
     EthTransaction, EthTransactionReceipt, RpcLogFilter,
 };
 
@@ -342,6 +342,15 @@ impl BnsChainClient {
         self.rpc.eth_call(to, calldata).await
     }
 
+    pub async fn eth_call_at(
+        &self,
+        to: Address,
+        calldata: &[u8],
+        block: BlockRange,
+    ) -> BnsEvmResult<Bytes> {
+        self.rpc.eth_call_at(to, calldata, block).await
+    }
+
     pub async fn call_contract<C>(&self, to: Address, call: &C) -> BnsEvmResult<C::Return>
     where
         C: SolCall,
@@ -349,13 +358,36 @@ impl BnsChainClient {
         self.rpc.call_contract(to, call).await
     }
 
+    pub async fn call_contract_at<C>(
+        &self,
+        to: Address,
+        call: &C,
+        block: BlockRange,
+    ) -> BnsEvmResult<C::Return>
+    where
+        C: SolCall,
+    {
+        self.rpc.call_contract_at(to, call, block).await
+    }
+
     /// Execute independent latest-state reads through Multicall3.
     ///
     /// A missing or incompatible Multicall3 deployment is transparent to
     /// callers: the original calls are replayed individually in order.
     pub async fn multicall(&self, calls: &[ContractRead]) -> BnsEvmResult<Vec<Bytes>> {
+        self.multicall_at(calls, BlockRange::Latest).await
+    }
+
+    /// Execute independent reads at the same block through Multicall3.
+    ///
+    /// The aggregate call and every individual fallback call use `block`.
+    pub async fn multicall_at(
+        &self,
+        calls: &[ContractRead],
+        block: BlockRange,
+    ) -> BnsEvmResult<Vec<Bytes>> {
         if calls.len() <= 1 {
-            return self.call_individually(calls).await;
+            return self.call_individually_at(calls, block).await;
         }
 
         let aggregate = Multicall3::aggregateCall {
@@ -367,19 +399,31 @@ impl BnsChainClient {
                 })
                 .collect(),
         };
-        if let Ok(result) = self.rpc.call_contract(MULTICALL3_ADDRESS, &aggregate).await {
+        if let Ok(result) = self
+            .rpc
+            .call_contract_at(MULTICALL3_ADDRESS, &aggregate, block)
+            .await
+        {
             if result.returnData.len() == calls.len() {
                 return Ok(result.returnData);
             }
         }
 
-        self.call_individually(calls).await
+        self.call_individually_at(calls, block).await
     }
 
-    async fn call_individually(&self, calls: &[ContractRead]) -> BnsEvmResult<Vec<Bytes>> {
+    async fn call_individually_at(
+        &self,
+        calls: &[ContractRead],
+        block: BlockRange,
+    ) -> BnsEvmResult<Vec<Bytes>> {
         let mut outputs = Vec::with_capacity(calls.len());
         for call in calls {
-            outputs.push(self.rpc.eth_call(call.target, &call.calldata).await?);
+            outputs.push(
+                self.rpc
+                    .eth_call_at(call.target, &call.calldata, block)
+                    .await?,
+            );
         }
         Ok(outputs)
     }
