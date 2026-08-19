@@ -18,6 +18,7 @@ pub(crate) enum CmdType {
     Open = 7,
     OpenResp = 8,
     HelloAckConfirm = 9,
+    TunnelResult = 10,
 }
 
 impl From<u8> for CmdType {
@@ -32,6 +33,7 @@ impl From<u8> for CmdType {
             7 => CmdType::Open,
             8 => CmdType::OpenResp,
             9 => CmdType::HelloAckConfirm,
+            10 => CmdType::TunnelResult,
             _ => CmdType::UnknownProtocol,
         }
     }
@@ -59,13 +61,13 @@ where
 // token whose `aud` is missing or not exactly this string. Bumping the
 // suffix is how RTCP signals an incompatible handshake protocol revision
 // without relying on an out-of-band version negotiation.
-pub(crate) const RTCP_PROTOCOL_VERSION: u8 = 3;
-pub(crate) const RTCP_HELLO_AUD: &str = "buckyos-rtcp-v3-hello";
+pub(crate) const RTCP_PROTOCOL_VERSION: u8 = 4;
+pub(crate) const RTCP_HELLO_AUD: &str = "buckyos-rtcp-v4-hello";
 
 // JWT audience tag for the responder's HelloAck token. Distinct from the
 // Hello tag so that a captured Hello cannot be re-purposed as an ack and
-// vice-versa (a confused-deputy mitigation in the RTCP v3 handshake).
-pub(crate) const RTCP_HELLO_ACK_AUD: &str = "buckyos-rtcp-v3-ack";
+// vice-versa (a confused-deputy mitigation in the RTCP v4 handshake).
+pub(crate) const RTCP_HELLO_ACK_AUD: &str = "buckyos-rtcp-v4-ack";
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub(crate) struct TunnelTokenPayload {
@@ -86,7 +88,7 @@ pub(crate) struct TunnelTokenPayload {
     // Signed copy of Hello.my_port. Receivers reject a mismatch before using
     // the plaintext field as a reconnect target.
     pub listen_port: u16,
-    // Hex-encoded ephemeral X25519 public key. v3 always uses a freshly-
+    // Hex-encoded ephemeral X25519 public key. v4 always uses a freshly-
     // generated ephemeral key here; the key is no longer derived from
     // the device's long-term Ed25519 identity.
     pub xpub: String,
@@ -96,7 +98,7 @@ pub(crate) struct TunnelTokenPayload {
     //
     // Responder keeps a short-lived per-(from_id, nonce) cache and rejects
     // any repeat while the token is still within its validity window. This
-    // closes the replay gap in the v3 handshake: without the
+    // closes the replay gap in the v4 handshake: without the
     // nonce, a captured Hello could be replayed verbatim until the 60s
     // token expiry plus clock leeway elapsed.
     pub nonce: String,
@@ -181,7 +183,7 @@ impl RTcpHelloPackage {
     }
 }
 
-// HelloAck is the responder's plaintext reply in the v3 handshake. It
+// HelloAck is the responder's plaintext reply in the v4 handshake. It
 // publishes the responder's fresh ephemeral X25519 public key (carried
 // inside `ack_token`, signed by the responder's long-term Ed25519 key)
 // plus a fresh challenge. Both sides then derive the session key from
@@ -244,10 +246,9 @@ impl RTcpHelloAckPackage {
     }
 }
 
-// HelloAckConfirm closes the v3 handshake: initiator proves it holds
-// the AEAD key by echoing the responder's challenge. The echo is sent
-// inside an AEAD record, so both confidentiality of the challenge and
-// integrity of the echo are authenticated by the record layer.
+// HelloAckConfirm proves initiator key possession in the v4 handshake by
+// echoing the responder's challenge with the AEAD key. The responder's
+// subsequent TunnelResult closes the handshake after admission.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub(crate) struct RTcpHelloAckConfirmBody {
     pub challenge_echo: String,
@@ -281,6 +282,50 @@ impl RTcpHelloAckConfirmPackage {
             body: body.unwrap(),
         };
         Ok(package)
+    }
+}
+
+// The responder sends TunnelResult only after listener authorization and
+// authoritative tunnel-map arbitration have completed. The initiator must not
+// publish or return a tunnel before it receives an accepted result.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub(crate) struct RTcpTunnelResultBody {
+    pub accepted: bool,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub reason: String,
+}
+pub(crate) type RTcpTunnelResultPackage = RTcpTunnelPackageImpl<RTcpTunnelResultBody>;
+
+impl RTcpTunnelResultPackage {
+    pub fn accepted(seq: u32) -> Self {
+        Self::new(seq, true, String::new())
+    }
+
+    pub fn rejected(seq: u32, reason: impl Into<String>) -> Self {
+        Self::new(seq, false, reason.into())
+    }
+
+    fn new(seq: u32, accepted: bool, reason: String) -> Self {
+        RTcpTunnelResultPackage {
+            len: 0,
+            json_pos: 0,
+            cmd: CmdType::TunnelResult.into(),
+            seq,
+            body: RTcpTunnelResultBody { accepted, reason },
+        }
+    }
+
+    pub fn from_json(seq: u32, json_value: serde_json::Value) -> Result<Self, std::io::Error> {
+        let body = serde_json::from_value::<RTcpTunnelResultBody>(json_value).map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "parse package error")
+        })?;
+        Ok(RTcpTunnelResultPackage {
+            len: 0,
+            json_pos: 0,
+            cmd: CmdType::TunnelResult.into(),
+            seq,
+            body,
+        })
     }
 }
 
@@ -567,6 +612,7 @@ pub(crate) enum RTcpTunnelPackage {
     Hello(RTcpHelloPackage),
     HelloAck(RTcpHelloAckPackage),
     HelloAckConfirm(RTcpHelloAckConfirmPackage),
+    TunnelResult(RTcpTunnelResultPackage),
     Ping(RTcpPingPackage),
     Pong(RTcpPongPackage),
     ROpen(RTcpROpenPackage),
@@ -731,6 +777,10 @@ impl RTcpTunnelPackage {
                 CmdType::HelloAckConfirm => {
                     let result_package = RTcpHelloAckConfirmPackage::from_json(seq, package_value)?;
                     return Ok(RTcpTunnelPackage::HelloAckConfirm(result_package));
+                }
+                CmdType::TunnelResult => {
+                    let result_package = RTcpTunnelResultPackage::from_json(seq, package_value)?;
+                    return Ok(RTcpTunnelPackage::TunnelResult(result_package));
                 }
                 CmdType::Ping => {
                     let result_package: RTcpTunnelPackageImpl<RTcpPingBody> =
@@ -927,7 +977,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn open_wire_format_keeps_string_purpose_and_header_v3_contract() {
+    async fn open_wire_format_keeps_string_purpose_and_header_v4_contract() {
         let package = RTcpOpenPackage::new(
             0x01020304,
             "00112233445566778899aabbccddeeff".to_string(),

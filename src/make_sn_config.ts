@@ -319,7 +319,7 @@ function cloneDeviceDocumentWithDid(
 }
 
 /**
- * RTCP v3 默认按 DID method authority 解析对端 key，普通 DNS TXT 只允许
+ * RTCP v4 默认按 DID method authority 解析对端 key，普通 DNS TXT 只允许
  * 显式开启的 non-authoritative bootstrap。客户端用 sn.<base> 建
  * keep-tunnel 时语义 DID 是 did:web:sn.<base>，因此部署目录必须提供真正的
  * did:web origin 文档，而不能只依赖 BOOT/DEV TXT。
@@ -1162,7 +1162,7 @@ function readDeviceDocJwt(userDir: string, deviceName: string): string {
 }
 
 // 读取（缺失或仍是旧身份布局则先重建）用户 env，取出种子需要的完整
-// DeviceDocument、mini document、boot document 与 owner 公钥。RTCP v3 的
+// DeviceDocument、mini document、boot document 与 owner 公钥。RTCP v4 的
 // authority-current 验证需要完整 DeviceDocument；TXT DEV mini document
 // 只能继续承担 DNS/bootstrap 兼容职责。
 async function loadSeedUserEnv(

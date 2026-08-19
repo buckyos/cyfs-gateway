@@ -1,7 +1,7 @@
-# RTCP v3 协议与实现
+# RTCP v4 协议与实现
 
 RTCP（Reverse TCP）是 `cyfs-gateway` 的私有 tunnel 协议，不是 RFC 中的
-Real-time Transport Control Protocol。本文只描述当前 Beta2.2 实现；历史 v2 设计和
+Real-time Transport Control Protocol。本文只描述当前 Beta2.2 实现；历史 v2/v3 设计和
 review 结论见 [RTCP Authoritative Peer Key Resolution](RTCP-Authoritative-Peer-Key-Resolution-TODO.md)。
 
 实现入口：
@@ -31,10 +31,11 @@ RTCP 使用两类承载：
 
 Tunnel 建立与业务 stream 建立是两个独立成功边界：
 
-- initiator 验证 `HelloAck` 并成功写出 AEAD `HelloAckConfirm` 后，将控制 tunnel 视为
-  本地可用；
-- responder 验证 `HelloAckConfirm` 并通过 listener 准入后，将控制 tunnel 视为本地可用；
-- 协议没有第四条 “tunnel accepted” 回复，initiator 不等待 responder 完成本地发布；
+- responder 验证 `HelloAckConfirm`、通过 listener 准入并完成 tunnel map 仲裁后，发送
+  AEAD `TunnelResult { accepted, reason }`；
+- initiator 只有收到匹配握手 seq 的 `accepted=true` 后，才发布并返回本地 tunnel；
+- listener、verified-cache 或 map 仲裁拒绝通过 `accepted=false` 明确返回，initiator
+  不再把 responder 未接纳的连接误判为成功；
 - tunnel 可用只表示 RTCP 控制通道已经完成 Hello/密钥确认，不承诺后续任意一次
   `Open` / `ROpen` 成功。每次业务流仍要独立经过方向、配额、授权、解析、拨号和
   HelloStream 交接。
@@ -61,7 +62,7 @@ bootstrap transport，不会错误地退回裸 TCP。
 ```
 
 - `len` 包含 2 字节长度字段，最大 65535；
-- v3 固定要求 `len >= 8`、`json_pos == 8`；
+- v4 固定要求 `len >= 8`、`json_pos == 8`；
 - JSON 必须非空、UTF-8 合法并能反序列化为对应包体；
 - 所有偏移都使用 checked arithmetic 和安全切片，畸形输入返回 `InvalidData`；
 - listener 对完整未认证握手使用统一 deadline 和全局 pending-handshake semaphore。
@@ -76,6 +77,7 @@ bootstrap transport，不会错误地退回裸 TCP。
 | 5 / 6 | `ROpen` / `ROpenResp` | 请求对端回连 stream leg |
 | 7 / 8 | `Open` / `OpenResp` | 准备接收本端新建的 stream leg |
 | 9 | `HelloAckConfirm` | AEAD challenge echo |
+| 10 | `TunnelResult` | responder 最终准入/仲裁结果 |
 
 ### 2.2 HelloStream
 
@@ -120,7 +122,7 @@ stream id 在 tunnel 生命周期内唯一；重复值不会覆盖 waiter，而�
 
 未知非零码一律按安全失败处理。
 
-## 3. v3 身份与握手
+## 3. v4 身份与握手
 
 ### 3.1 身份表示
 
@@ -157,8 +159,8 @@ bootstrap: <local-canonical-dev-did>_<remote-canonical-dev-did>|bootstrap=<url>
   bootstrap 名字；zone 目标（ZoneDocument 委托默认 gateway）是 zone 寻址不是第二个
   设备名，不参与设备名绑定；裸 `did:dev` 寻址不算逻辑名字。
 - 入站：具名 from 在文档验证后、HelloAck/listener 授权前有 rejection-only 预检查，
-  发布时在提交序列内做权威仲裁；冲突连接被拒绝，不得替换已存在的合法 tunnel（同
-  canonical key 的 last-accepted-wins 替换只对同名或匿名 key 身份成立）。
+  发布时在提交序列内做权威仲裁；同一 canonical tunnel key 在当前实例存活期间采用
+  first-accepted-wins，重复连接被明确拒绝，只有已关闭实例允许被新连接替换。
 - 同一逻辑名字提交更高 `DocumentRevision` 时，已验证二级索引会关闭严格更旧
   revision / 旧 canonical key 下的 tunnel，并在同一临界区释放旧 canonical DEV DID
   的反向绑定；版本仲裁使用 name-client 的 verified-cache CAS 结果，不由 RTCP 自行
@@ -206,11 +208,11 @@ Hello：
 }
 ```
 
-Hello token v3 payload：
+Hello token v4 payload：
 
 ```json
 {
-  "aud": "buckyos-rtcp-v3-hello",
+  "aud": "buckyos-rtcp-v4-hello",
   "to": "responder.example",
   "canonical_to": "did:dev:<resolved-responder-key>",
   "from": "initiator.example",
@@ -224,7 +226,7 @@ Hello token v3 payload：
 
 接收端要求：
 
-- `aud` 精确等于 v3 audience；v2 在握手阶段失败；
+- `aud` 精确等于 v4 audience；v2/v3 在握手阶段失败；
 - signed `from` 与 `Hello.from_id` 的规范 host form 一致；
 - signed semantic `to` 与 `Hello.to_id` 一致；
 - signed `canonical_to` 等于本 stack 从私钥导出的 canonical `did:dev`；
@@ -236,12 +238,12 @@ nonce cache 以 `(canonical source did:dev, nonce)` 为键，最多 16K **条目
 `exp + leeway`。满载时淘汰最早到期项。它是进程内、单实例的 replay/DoS 纵深防护，
 不是跨集群防重放服务。
 
-HelloAck token 使用 `buckyos-rtcp-v3-ack`，带同样的 `iat`/`exp`/`nonce`，并用
+HelloAck token 使用 `buckyos-rtcp-v4-ack`，带同样的 `iat`/`exp`/`nonce`，并用
 `peer_xpub` 绑定本次 Hello。`HelloAckConfirm` 是第一条 AEAD 记录，echo responder
-challenge。initiator 在成功写出 Confirm 后可以发布本地 tunnel；responder 必须成功
-解密并校验 Confirm、通过 listener 授权后才能注册或替换旧 tunnel。listener 拒绝发生在
-responder 发布前，不会替换已有 tunnel；initiator 通过后续控制读写/liveness 感知对端
-拒绝或断开。
+challenge。responder 成功解密 Confirm 后执行 listener、verified-cache 和 tunnel map
+仲裁，并以 `TunnelResult` 返回最终结果。initiator 必须收到 `accepted=true` 才能发布
+tunnel；`accepted=false` 的 `reason` 作为建链错误返回。最终结果发送失败或发送任务被
+取消时，responder 会条件删除并关闭刚发布的候选实例。
 
 ### 3.4 入站具名准入
 
@@ -266,8 +268,10 @@ responder 发布前，不会替换已有 tunnel；initiator 通过后续控制�
    canonical DEV DID 已绑定到其它已验证逻辑名字时直接拒绝；
 9. 将 trust、canonical DID、owner/zone（只有验证成功时）交给 listener；
 10. 持钥证明、key confirmation、listener 授权都成功后才提交 verified cache 并注册
-    tunnel；注册前在同一提交序列内做权威的一一绑定仲裁与 same-version 冲突门
-    （§3.1），冲突连接被拒绝，不得替换已存在的合法 tunnel。
+    tunnel；注册前在同一提交序列内做权威的一一绑定、first-accepted-wins 与
+    same-version 冲突仲裁（§3.1）；
+11. responder 发送最终 `TunnelResult`。只有结果成功送达并且 `accepted=true`，双方才把
+    本次握手视为 tunnel 建立成功。
 
 同步路径不访问 method authority。self-declared 验证和 observed cache 写入路径不存在。
 验证 unavailable 时，默认 `anonymous: reject`；显式 `anonymous: allow` 只按已证明持有的
@@ -310,9 +314,9 @@ ctx = "|" || initiator_semantic_did
           || "|" || responder_nonce_hex
 
 control_key = HKDF-Expand-SHA256(
-  PRK, "buckyos-rtcp-v3 aes256-key" || ctx, 32)
+  PRK, "buckyos-rtcp-v4 aes256-key" || ctx, 32)
 control_iv = HKDF-Expand-SHA256(
-  PRK, "buckyos-rtcp-v3 iv-salt" || ctx, 16)
+  PRK, "buckyos-rtcp-v4 iv-salt" || ctx, 16)
 ```
 
 `control_key` / `control_iv` 用于 tunnel 控制通道。当前实现不会把 ECDH `PRK` 作为独立
@@ -322,11 +326,11 @@ exporter secret 保留；后续 per-stream KDF 以 `control_key` 作为输入。
 ### 4.2 Per-stream key
 
 业务 stream 不直接使用控制通道 AES key。stream id 必须先解码为 16 字节；version 和
-purpose 都是单字节，其中 `version = 3`、`Stream = 0`、`Datagram = 1`：
+purpose 都是单字节，其中 `version = 4`、`Stream = 0`、`Datagram = 1`：
 
 ```text
 stream_PRK = HKDF-Extract-SHA256(salt = None, IKM = control_key)
-stream_ctx = 0x03 || stream_id_raw_16_bytes || purpose_u8
+stream_ctx = 0x04 || stream_id_raw_16_bytes || purpose_u8
 
 stream_key = HKDF-Expand-SHA256(
   stream_PRK, "buckyos-rtcp stream key|" || stream_ctx, 32)
@@ -373,18 +377,20 @@ key-use 预算：
 
 ## 5. Tunnel 生命周期与 liveness
 
-入站 tunnel 在完整认证后按 canonical key 执行 last-accepted-wins 原子替换：
+入站 tunnel 在完整认证后按 canonical key 执行 first-accepted-wins 仲裁：
 
 - 每个实例有进程内唯一 `instance_id`；
-- 旧实例在 map 临界区内先标记 closed，锁外清 waiter 和 shutdown；
+- 当前实例存活时，新候选收到 `accepted=false` 并关闭；当前实例已关闭时才允许替换，
+  旧实例在 map 临界区内标记 closed，锁外清 waiter 和 shutdown；
 - run loop 退出只执行 `remove_if_current(key, instance)`，并同时清理该实例的
   一一绑定索引；
 - 同逻辑 DID 的更新 revision 通过二级索引关闭旧 revision；
 - 替换资格受 §3.1 一一绑定约束：不同逻辑名字命中同一 canonical key 的连接在注册前
-  被拒绝，last-accepted-wins 只对同名或匿名 key 身份成立。
+  被拒绝。
 
-出站并发建链保持 first-wins，loser 关闭并复用 winner；具名目标复用前先过一一绑定
-仲裁。
+出站 `create_tunnel` 按 canonical tunnel key 执行 single-flight；并发调用等待同一个
+creator，随后复用已发布的 winner，不再各自发起完整握手。最终注册仍保持 first-wins
+兜底，loser 关闭并复用 winner；具名目标复用前先过一一绑定仲裁。
 
 `keep_tunnel` 使用带 seq 的 `ping_rtt()`，只有匹配 Pong 才算成功。配置的连续失败次数达到
 阈值后 close + conditional remove，下一轮重新建链。direct accept、初始 connect 和

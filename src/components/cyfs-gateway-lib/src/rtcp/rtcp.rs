@@ -348,7 +348,7 @@ impl RTcp {
     }
 }
 
-// v3 anti-replay: tunnel_token lifetime. The signed token carries iat/exp;
+// v4 anti-replay: tunnel_token lifetime. The signed token carries iat/exp;
 // the responder applies JWT expiry leeway plus an explicit future-iat bound.
 // A legitimate Hello thus tolerates bounded clock skew while keeping the
 // replay window short.
@@ -613,13 +613,63 @@ struct RTcpInner {
     // framework when the stack id carries a `params@remote` prefix. None means
     // only direct TCP bootstrap is available (backward compatible path).
     tunnel_manager: Option<TunnelManager>,
-    // v3: reject replayed Hello tokens by their embedded nonce.
+    // v4: reject replayed Hello tokens by their embedded nonce.
     nonce_cache: NonceCache,
+    // Coalesces concurrent create_tunnel calls after canonical target
+    // resolution. Waiters re-check tunnel_map after the active creator exits.
+    create_flights: RTcpCreateFlights,
 }
 
 struct DirectTunnelAttempt {
     remote_addr: SocketAddr,
     tunnel: RTcpTunnel,
+}
+
+#[derive(Clone, Default)]
+struct RTcpCreateFlights {
+    active: Arc<std::sync::Mutex<HashSet<String>>>,
+    notify: Arc<Notify>,
+}
+
+struct RTcpCreateFlightPermit {
+    key: String,
+    flights: RTcpCreateFlights,
+}
+
+impl RTcpCreateFlights {
+    async fn acquire(&self, key: String) -> RTcpCreateFlightPermit {
+        loop {
+            // Enable the waiter before checking the set so notify_waiters()
+            // cannot be lost if the active creator exits between the check
+            // and await.
+            let notified = self.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let acquired = self
+                .active
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert(key.clone());
+            if acquired {
+                return RTcpCreateFlightPermit {
+                    key,
+                    flights: self.clone(),
+                };
+            }
+            notified.await;
+        }
+    }
+}
+
+impl Drop for RTcpCreateFlightPermit {
+    fn drop(&mut self) {
+        self.flights
+            .active
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&self.key);
+        self.flights.notify.notify_waiters();
+    }
 }
 
 struct EstablishedInboundTunnel {
@@ -1279,7 +1329,7 @@ impl RTcpInner {
             ));
         }
 
-        // v3 key confirmation: read plaintext HelloAck, verify the
+        // v4 key confirmation: read plaintext HelloAck, verify the
         // responder's signed ack token, derive session keys via HKDF,
         // wrap the stream, then send the AEAD-protected confirm. A
         // direct attempt only wins after this completes.
@@ -1337,7 +1387,7 @@ impl RTcpInner {
         this_device_doc_jwt: Option<String>,
         listener: RTcpListenerRef,
     ) -> RTcpInner {
-        // v3 handshake: the device's long-term Ed25519 key is used only
+        // v4 handshake: the device's long-term Ed25519 key is used only
         // to sign Hello / HelloAck JWTs. ECDH is run between freshly-
         // generated ephemeral X25519 keys on each side, so there is no
         // long-term X25519 secret to keep around any more. Dropping the
@@ -1396,6 +1446,7 @@ impl RTcpInner {
             authority_confirmation_slots: Arc::new(Semaphore::new(16)),
             tunnel_manager: None,
             nonce_cache: NonceCache::new(),
+            create_flights: RTcpCreateFlights::default(),
         };
         return result;
     }
@@ -1468,7 +1519,7 @@ impl RTcpInner {
 
         let (my_secret, my_public_bytes, my_public_hex) = Self::fresh_ephemeral();
 
-        // v3: embed a fresh 16-byte random nonce and use a short exp
+        // v4: embed a fresh 16-byte random nonce and use a short exp
         // (default 60s). The responder keeps a nonce cache for the exp
         // window, so any captured token cannot be replayed as-is to stand
         // up a second tunnel. An attacker that replays an already-used
@@ -1494,7 +1545,7 @@ impl RTcpInner {
             nonce: nonce_hex.clone(),
         };
         debug!(
-            "generated v3 hello token for {} -> {} ({})",
+            "generated v4 hello token for {} -> {} ({})",
             tunnel_token_payload.from, tunnel_token_payload.to, tunnel_token_payload.canonical_to
         );
         let tunnel_token = Self::sign_jwt(ed25519_sk, &tunnel_token_payload)?;
@@ -1547,7 +1598,7 @@ impl RTcpInner {
     fn jwt_validation_for(aud: &str) -> Validation {
         // Explicit leeway pinned to JWT_LEEWAY_SECS so the nonce-cache
         // retention window stays aligned with the signature acceptance
-        // window (see the v3 anti-replay contract).
+        // window (see the v4 anti-replay contract).
         let mut validation = Validation::new(Algorithm::EdDSA);
         validation.leeway = JWT_LEEWAY_SECS;
         validation.set_audience(&[aud]);
@@ -1996,10 +2047,10 @@ impl RTcpInner {
         }
     }
 
-    // v3 session-key derivation. Replaces the old SHA256(shared_secret)
+    // v4 session-key derivation. Replaces the old SHA256(shared_secret)
     // construction with a real HKDF-Extract+Expand and binds the output
     // to the full handshake context, including:
-    //   - protocol identifier ("buckyos-rtcp-v3") for domain separation,
+    //   - protocol identifier ("buckyos-rtcp-v4") for domain separation,
     //     so the same Ed25519/X25519 keys can be safely reused by a future
     //     non-RTCP protocol without producing a colliding key.
     //   - both DIDs, both ephemeral public keys, and both nonces, so
@@ -2048,13 +2099,13 @@ impl RTcpInner {
         .concat();
 
         let mut aes_key = [0u8; 32];
-        let mut aes_info = b"buckyos-rtcp-v3 aes256-key".to_vec();
+        let mut aes_info = b"buckyos-rtcp-v4 aes256-key".to_vec();
         aes_info.extend_from_slice(&info_tail);
         hk.expand(&aes_info, &mut aes_key)
             .expect("HKDF expand for aes256-key must succeed for 32-byte output");
 
         let mut iv = [0u8; 16];
-        let mut iv_info = b"buckyos-rtcp-v3 iv-salt".to_vec();
+        let mut iv_info = b"buckyos-rtcp-v4 iv-salt".to_vec();
         iv_info.extend_from_slice(&info_tail);
         hk.expand(&iv_info, &mut iv)
             .expect("HKDF expand for iv-salt must succeed for 16-byte output");
@@ -2452,7 +2503,7 @@ impl RTcpInner {
             }
         };
 
-        // v3 anti-replay: every Hello token must bind this responder
+        // v4 anti-replay: every Hello token must bind this responder
         // and must not be replayed within its exp window.
         let this_host = self.this_device_did.to_host_name();
         if let Err(e) = Self::validate_hello_target(
@@ -2576,7 +2627,7 @@ impl RTcpInner {
         }
         let remote_stack = remote_stack.unwrap();
 
-        // v3: generate a fresh ephemeral X25519 keypair, sign an
+        // v4: generate a fresh ephemeral X25519 keypair, sign an
         // ack JWT binding it to the initiator's xpub, ship HelloAck in
         // the clear, then derive (aes_key, iv) from ECDH(my_eph,
         // peer_eph) via HKDF and wrap the stream. Only after the AEAD-
@@ -2619,6 +2670,7 @@ impl RTcpInner {
             challenge_hex.clone(),
             hello_payload.to.clone(),
         );
+        let handshake_seq = ack_pkg.seq;
         if let Err(e) = timeout(
             HELLO_HANDSHAKE_TIMEOUT,
             RTcpTunnelPackage::send_package(Pin::new(&mut bearing), ack_pkg),
@@ -2669,10 +2721,20 @@ impl RTcpInner {
             .on_new_tunnel(endpoint.clone(), source_addr, source_device_info)
             .await
         {
+            let reason = format!("listener rejected tunnel: {}", e);
             warn!(
                 "reject rtcp tunnel from {} {}: {}",
                 endpoint.device_id, source_addr, e
             );
+            if let Err(send_err) =
+                responder_send_tunnel_result(&mut encrypted_stream, handshake_seq, false, reason)
+                    .await
+            {
+                debug!(
+                    "send listener rejection to {} {} failed: {}",
+                    endpoint.device_id, source_addr, send_err
+                );
+            }
             return None;
         }
 
@@ -2711,14 +2773,51 @@ impl RTcpInner {
         {
             Ok(registration) => registration,
             Err(err) => {
+                let reason = format!("cannot commit accepted device document: {}", err);
                 warn!(
                     "reject rtcp tunnel from {} {}: cannot commit accepted device document: {}",
                     source_device_id, source_addr, err
                 );
+                if let Err(send_err) = tunnel
+                    .send_tunnel_result(handshake_seq, false, reason)
+                    .await
+                {
+                    debug!(
+                        "send cache-arbitration rejection to {} {} failed: {}",
+                        source_device_id, source_addr, send_err
+                    );
+                }
                 tunnel.mark_closed();
                 return None;
             }
         };
+
+        let accepted = registration.accepted;
+        let result_reason = registration.rejection_reason.clone().unwrap_or_default();
+        let publication_guard = PublishedInboundGuard::new(
+            self.tunnel_map.clone(),
+            tunnel_key.clone(),
+            tunnel.clone(),
+            registration,
+        );
+        if let Err(err) = tunnel
+            .send_tunnel_result(handshake_seq, accepted, result_reason)
+            .await
+        {
+            warn!(
+                "finalize rtcp tunnel from {} {} failed: {}",
+                source_device_id, source_addr, err
+            );
+            return None;
+        }
+        if !accepted {
+            warn!(
+                "reject duplicate rtcp tunnel from {} {} after map arbitration",
+                source_device_id, source_addr
+            );
+            return None;
+        }
+        let registration = publication_guard.disarm();
 
         let authority_confirmation = if matches!(
             identity_trust,
@@ -2734,10 +2833,9 @@ impl RTcpInner {
             None
         };
 
-        // No await may be added after the map publication above. Returning
-        // immediately makes publication the cancellation boundary: timeout
-        // can cancel before registration, or observe this established value,
-        // but cannot leave a published tunnel without handing it to run().
+        // TunnelResult is the last await after publication. The publication
+        // guard removes the candidate if that send is cancelled or fails; once
+        // it succeeds, disarming and returning happen in the same future poll.
         Some(EstablishedInboundTunnel {
             tunnel,
             tunnel_key,
@@ -2994,6 +3092,33 @@ impl RTcpInner {
             }
         }
 
+        // Only one creator per canonical tunnel key may proceed into bootstrap
+        // or Happy-Eyeballs connection establishment. Concurrent callers wait
+        // here, then reuse the winner published by the active creator.
+        let _create_permit = self.create_flights.acquire(tunnel_key.clone()).await;
+        match self
+            .tunnel_map
+            .acquire_outbound(tunnel_key.as_str(), name_binding.as_ref())
+            .await
+        {
+            Ok(Some(tunnel)) => {
+                debug!(
+                    "Reuse tunnel {} after waiting for concurrent creator",
+                    tunnel_key.as_str()
+                );
+                return Ok(Box::new(tunnel));
+            }
+            Ok(None) => {}
+            Err(conflict) => {
+                let msg = format!(
+                    "rtcp target {} rejected by one-to-one name binding: {}",
+                    target_device_id, conflict
+                );
+                warn!("{}", msg);
+                return Err(TunnelError::DocumentError(msg));
+            }
+        }
+
         // `params@remote` bootstrap: build the tunnel's bearing stream through
         // the tunnel framework instead of opening a direct TCP connection.
         if let Some(bootstrap_url) = remote_stack.bootstrap_stream_url.as_ref() {
@@ -3057,7 +3182,7 @@ impl RTcpInner {
                     TunnelError::ConnectError(msg)
                 })?;
 
-            // v3 key confirmation: read plaintext HelloAck off the
+            // v4 key confirmation: read plaintext HelloAck off the
             // bearing, verify the responder's signed ack_token, derive
             // session keys, wrap, and ship the AEAD-protected confirm
             // before the tunnel is registered. A responder that didn't
@@ -3078,7 +3203,7 @@ impl RTcpInner {
             // peer_addr is None for bootstrap-backed tunnels. Instead, we hand
             // the tunnel a bootstrap context so that subsequent Open/ROpen
             // reconnects replay the same nested transport via the tunnel
-            // framework (the RTCP v3 bootstrap transport rule).
+            // framework (the RTCP v4 bootstrap transport rule).
             let bootstrap_ctx = RTcpBootstrapCtx {
                 url: bootstrap_url_parsed,
                 tunnel_manager: tunnel_manager.clone(),
@@ -3480,7 +3605,7 @@ impl fmt::Display for InitiatorKeyConfirmationError {
     }
 }
 
-// v3 initiator-side handshake completion.
+// v4 initiator-side handshake completion.
 //
 // Runs after the initiator has sent the plaintext Hello. Reads HelloAck
 // in the clear off the still-unwrapped bearing stream, verifies the
@@ -3504,7 +3629,7 @@ async fn initiator_complete_handshake(
     .await
     .map_err(|_| {
         InitiatorKeyConfirmationError::Timeout(TunnelError::ReasonError(
-            "HelloAck read timed out; peer did not complete v3 handshake".to_string(),
+            "HelloAck read timed out; peer did not complete v4 handshake".to_string(),
         ))
     })?
     .map_err(|e| {
@@ -3593,10 +3718,74 @@ async fn initiator_complete_handshake(
         )))
     })?;
 
+    let final_result = timeout(
+        HELLO_HANDSHAKE_TIMEOUT,
+        RTcpTunnelPackage::read_package(Pin::new(&mut encrypted_stream), false, "tunnel_result"),
+    )
+    .await
+    .map_err(|_| {
+        InitiatorKeyConfirmationError::Timeout(TunnelError::ReasonError(
+            "TunnelResult read timed out; responder did not finish admission".to_string(),
+        ))
+    })?
+    .map_err(|e| {
+        InitiatorKeyConfirmationError::Failed(TunnelError::ReasonError(format!(
+            "TunnelResult read error: {}",
+            e
+        )))
+    })?;
+
+    let final_result = match final_result {
+        RTcpTunnelPackage::TunnelResult(result) if result.seq == ack.seq => result,
+        RTcpTunnelPackage::TunnelResult(result) => {
+            return Err(InitiatorKeyConfirmationError::Failed(
+                TunnelError::ReasonError(format!(
+                    "TunnelResult seq {} does not match HelloAck seq {}",
+                    result.seq, ack.seq
+                )),
+            ));
+        }
+        other => {
+            return Err(InitiatorKeyConfirmationError::Failed(
+                TunnelError::ReasonError(format!("expected TunnelResult, got {:?}", other)),
+            ));
+        }
+    };
+    if !final_result.body.accepted {
+        let reason = if final_result.body.reason.is_empty() {
+            "responder rejected tunnel".to_string()
+        } else {
+            final_result.body.reason
+        };
+        return Err(InitiatorKeyConfirmationError::Failed(
+            TunnelError::ConnectError(reason),
+        ));
+    }
+
     Ok((encrypted_stream, aes_key))
 }
 
-// v3 responder-side key confirmation, post-key-derivation.
+async fn responder_send_tunnel_result(
+    stream: &mut EncryptedStream<RTcpBearingStream>,
+    seq: u32,
+    accepted: bool,
+    reason: impl Into<String>,
+) -> Result<(), TunnelError> {
+    let package = if accepted {
+        RTcpTunnelResultPackage::accepted(seq)
+    } else {
+        RTcpTunnelResultPackage::rejected(seq, reason)
+    };
+    timeout(
+        HELLO_HANDSHAKE_TIMEOUT,
+        RTcpTunnelPackage::send_package(Pin::new(stream), package),
+    )
+    .await
+    .map_err(|_| TunnelError::ReasonError("TunnelResult send timed out".to_string()))?
+    .map_err(|e| TunnelError::ReasonError(format!("TunnelResult send error: {}", e)))
+}
+
+// v4 responder-side key confirmation, post-key-derivation.
 //
 // Runs after the responder has shipped HelloAck plaintext, derived the
 // session keys, and wrapped the bearing stream. Reads HelloAckConfirm
@@ -3754,7 +3943,7 @@ struct RTcpTunnel {
 
 impl RTcpTunnel {
     // The EncryptedStream wrapping happens in create_tunnel / on_new_tunnel
-    // so the v3 key-confirmation handshake (HelloAck / HelloAckConfirm)
+    // so the v4 key-confirmation handshake (HelloAck / HelloAckConfirm)
     // can run over AEAD records before the tunnel is published to the map.
     // The caller is therefore responsible for picking the correct
     // EncryptionRole when building `encrypted_stream`.
@@ -3896,6 +4085,27 @@ impl RTcpTunnel {
         } else {
             Ok(())
         }
+    }
+
+    async fn send_tunnel_result(
+        &self,
+        seq: u32,
+        accepted: bool,
+        reason: impl Into<String>,
+    ) -> Result<(), TunnelError> {
+        let package = if accepted {
+            RTcpTunnelResultPackage::accepted(seq)
+        } else {
+            RTcpTunnelResultPackage::rejected(seq, reason)
+        };
+        let mut write_stream = self.write_stream.lock().await;
+        timeout(
+            HELLO_HANDSHAKE_TIMEOUT,
+            RTcpTunnelPackage::send_package(Pin::new(&mut *write_stream), package),
+        )
+        .await
+        .map_err(|_| TunnelError::ReasonError("TunnelResult send timed out".to_string()))?
+        .map_err(|e| TunnelError::ReasonError(format!("TunnelResult send error: {}", e)))
     }
 
     fn ensure_accepts_new_streams(&self) -> std::io::Result<()> {
@@ -4144,7 +4354,7 @@ impl RTcpTunnel {
     }
 
     // Builds a fresh stream leg to the remote RTCP listener so the caller can
-    // send a HelloStream on it. This is the single choke point for v3's
+    // send a HelloStream on it. This is the single choke point for v4's
     // "rebind transport semantics after remote nesting": bootstrap-backed
     // tunnels replay their nested transport via the tunnel framework, while
     // direct tunnels keep the classic `TcpStream::connect(peer_addr)` fast
@@ -5212,9 +5422,63 @@ struct CanonicalDevBinding {
 
 struct InboundTunnelRegistration {
     accepted: bool,
+    rejection_reason: Option<String>,
     replaced: Option<RTcpTunnel>,
     superseded: Vec<RTcpTunnel>,
     rejected: Option<RTcpTunnel>,
+}
+
+// Map publication precedes the final encrypted TunnelResult. If the handshake
+// future is cancelled or the send fails in that narrow interval, Drop removes
+// and closes the published candidate so create_tunnel can never observe a
+// server-side entry whose acceptance was not delivered.
+struct PublishedInboundGuard {
+    tunnel_map: RTcpTunnelMap,
+    tunnel_key: String,
+    tunnel: RTcpTunnel,
+    registration: Option<InboundTunnelRegistration>,
+}
+
+impl PublishedInboundGuard {
+    fn new(
+        tunnel_map: RTcpTunnelMap,
+        tunnel_key: String,
+        tunnel: RTcpTunnel,
+        registration: InboundTunnelRegistration,
+    ) -> Self {
+        Self {
+            tunnel_map,
+            tunnel_key,
+            tunnel,
+            registration: Some(registration),
+        }
+    }
+
+    fn disarm(mut self) -> InboundTunnelRegistration {
+        self.registration
+            .take()
+            .expect("published inbound guard must own a registration")
+    }
+}
+
+impl Drop for PublishedInboundGuard {
+    fn drop(&mut self) {
+        let Some(registration) = self.registration.take() else {
+            return;
+        };
+        let accepted = registration.accepted;
+        let tunnel_map = self.tunnel_map.clone();
+        let tunnel_key = self.tunnel_key.clone();
+        let tunnel = self.tunnel.clone();
+        tunnel.mark_closed();
+        task::spawn(async move {
+            tunnel_map.remove_if_current(&tunnel_key, &tunnel).await;
+            RTcpTunnelMap::finish_authenticated_registration(registration).await;
+            if accepted {
+                tunnel.close().await;
+            }
+        });
+    }
 }
 
 // A named outbound target's verified resolution snapshot, used to arbitrate
@@ -5493,11 +5757,10 @@ impl RTcpTunnelMap {
         Ok(())
     }
 
-    // Authenticated inbound tunnels use last-accepted-wins. Each v3 handshake
-    // has fresh ephemeral keys, nonces, and challenge, so a newly admitted
-    // connection owns an independent AEAD key/nonce space. The old instance is
-    // marked closed in the same critical section as the replacement, then
-    // returned so its async shutdown can run after releasing the map lock.
+    // Authenticated inbound tunnels use first-accepted-wins while the indexed
+    // instance is live. This keeps the responder's admission decision aligned
+    // with the initiator's final TunnelResult. A closed indexed instance may be
+    // replaced in the same critical section.
     pub async fn replace_authenticated_inbound(
         &self,
         tunnel_key: &str,
@@ -5513,6 +5776,7 @@ impl RTcpTunnelMap {
             all_tunnel.remove_instance_binding(tunnel.instance_id());
             return InboundTunnelRegistration {
                 accepted: false,
+                rejection_reason: Some("candidate tunnel is already closed".to_string()),
                 replaced: None,
                 superseded: Vec::new(),
                 rejected: Some(tunnel),
@@ -5539,6 +5803,11 @@ impl RTcpTunnelMap {
                 );
                 return InboundTunnelRegistration {
                     accepted: false,
+                    rejection_reason: Some(Self::binding_conflict_message(
+                        &identity.logical_did,
+                        &identity.canonical_dev_did,
+                        &bound_logical,
+                    )),
                     replaced: None,
                     superseded: Vec::new(),
                     rejected: Some(tunnel),
@@ -5573,11 +5842,38 @@ impl RTcpTunnelMap {
                     );
                     return InboundTunnelRegistration {
                         accepted: false,
+                        rejection_reason: Some(format!(
+                            "verified document for {} conflicts at revision {}",
+                            identity.logical_did, identity.document_revision.iat
+                        )),
                         replaced: None,
                         superseded: Vec::new(),
                         rejected: Some(tunnel),
                     };
                 }
+            }
+        }
+
+        if let Some(existing) = all_tunnel.tunnels.get(tunnel_key).cloned() {
+            if !existing.is_closed() {
+                let reason = format!(
+                    "tunnel {} already has active instance {}; first accepted tunnel wins",
+                    tunnel_key,
+                    existing.instance_id()
+                );
+                info!(
+                    "reject duplicate authenticated inbound RTcp tunnel {} instance {}: {}",
+                    tunnel_key,
+                    tunnel.instance_id(),
+                    reason
+                );
+                return InboundTunnelRegistration {
+                    accepted: false,
+                    rejection_reason: Some(reason),
+                    replaced: None,
+                    superseded: Vec::new(),
+                    rejected: Some(tunnel),
+                };
             }
         }
 
@@ -5689,6 +5985,7 @@ impl RTcpTunnelMap {
 
         InboundTunnelRegistration {
             accepted: true,
+            rejection_reason: None,
             replaced: old_tunnel,
             superseded,
             rejected: None,
@@ -5804,6 +6101,10 @@ impl RTcpTunnelMap {
                 self.remove_if_current(tunnel_key, &tunnel).await;
                 return InboundTunnelRegistration {
                     accepted: false,
+                    rejection_reason: Some(format!(
+                        "verified cache arbitration rejected identity {}: {:?}",
+                        identity.logical_did, outcome
+                    )),
                     replaced: None,
                     superseded: Vec::new(),
                     rejected: Some(tunnel),
@@ -6331,7 +6632,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn inbound_tunnel_replace_is_atomic_and_cleanup_is_instance_safe() {
+    async fn inbound_tunnel_registration_keeps_first_live_instance() {
         let map = RTcpTunnelMap::new();
         let key = "local_remote";
         let (old_tunnel, _old_peer) = test_tunnel(1);
@@ -6349,38 +6650,29 @@ mod tests {
                 .is_same_instance(&old_tunnel)
         );
 
-        let replaced = map
+        let duplicate = map
             .replace_authenticated_inbound(key, new_tunnel.clone(), None)
             .await;
-        assert!(replaced.accepted);
-        let replaced = replaced
-            .replaced
-            .expect("second authenticated inbound tunnel must replace the first");
-        assert!(replaced.is_same_instance(&old_tunnel));
-        assert!(old_tunnel.is_closed());
+        assert!(!duplicate.accepted);
+        assert!(duplicate.replaced.is_none());
+        assert!(duplicate.rejection_reason.is_some());
+        assert!(RTcpTunnelMap::finish_authenticated_registration(duplicate).await == false);
+        assert!(new_tunnel.is_closed());
+        assert!(!old_tunnel.is_closed());
         assert!(
             map.get_tunnel(key)
                 .await
                 .unwrap()
-                .is_same_instance(&new_tunnel)
+                .is_same_instance(&old_tunnel)
         );
 
-        assert!(
-            !map.remove_if_current(key, &old_tunnel).await,
-            "superseded tunnel cleanup must not remove its replacement"
-        );
-        assert!(
-            map.get_tunnel(key)
-                .await
-                .unwrap()
-                .is_same_instance(&new_tunnel)
-        );
-        assert!(map.remove_if_current(key, &new_tunnel).await);
+        assert!(!map.remove_if_current(key, &new_tunnel).await);
+        assert!(map.remove_if_current(key, &old_tunnel).await);
         assert!(map.get_tunnel(key).await.is_none());
     }
 
     #[tokio::test]
-    async fn concurrent_authenticated_inbound_replacements_leave_one_current_instance() {
+    async fn concurrent_authenticated_inbound_registrations_keep_first_instance() {
         const TUNNEL_COUNT: usize = 8;
 
         let map = RTcpTunnelMap::new();
@@ -6399,21 +6691,24 @@ mod tests {
             tasks.push(tokio::spawn(async move {
                 barrier.wait().await;
                 tokio::time::sleep(Duration::from_millis(index as u64 * 5)).await;
-                map.replace_authenticated_inbound(key, tunnel, None).await;
+                let registration = map.replace_authenticated_inbound(key, tunnel, None).await;
+                RTcpTunnelMap::finish_authenticated_registration(registration).await
             }));
         }
 
+        let mut accepted = 0;
         for task in tasks {
-            task.await.unwrap();
+            accepted += usize::from(task.await.unwrap());
         }
 
         let current = map.get_tunnel(key).await.unwrap();
-        assert!(current.is_same_instance(tunnels.last().unwrap()));
+        assert_eq!(accepted, 1);
+        assert!(current.is_same_instance(tunnels.first().unwrap()));
         assert_eq!(map.primary_len().await, 1);
-        for tunnel in &tunnels[..TUNNEL_COUNT - 1] {
+        assert!(!tunnels.first().unwrap().is_closed());
+        for tunnel in &tunnels[1..] {
             assert!(tunnel.is_closed());
         }
-        assert!(!tunnels.last().unwrap().is_closed());
     }
 
     #[tokio::test]
@@ -6575,7 +6870,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn same_revision_uses_slot_replacement_without_cross_key_kick() {
+    async fn same_revision_keeps_live_slot_without_cross_key_kick() {
         let map = RTcpTunnelMap::new();
         let logical_did = "did:web:same-revision.example";
         let same_key = "local_did:dev:same-key";
@@ -6594,20 +6889,20 @@ mod tests {
             .await
         );
         assert!(
-            map.complete_authenticated_inbound_with_outcome(
+            !map.complete_authenticated_inbound_with_outcome(
                 same_key,
                 same_slot_new.clone(),
                 Some((identity.clone(), CacheWriteOutcome::AlreadyPresent)),
             )
             .await
         );
-        assert!(first.is_closed());
-        assert!(!same_slot_new.is_closed());
+        assert!(!first.is_closed());
+        assert!(same_slot_new.is_closed());
         assert_eq!(map.verified_identity_len(logical_did).await, 1);
 
-        // A single document normally implies one canonical device key.  If
-        // the impossible-looking cross-key state is observed, log it but do
-        // not invent an ordering or close either same-revision tunnel.
+        // A single document normally implies one canonical device key. If the
+        // impossible-looking cross-key state is observed, log it but do not
+        // invent an ordering or close either same-revision tunnel.
         assert!(
             map.complete_authenticated_inbound_with_outcome(
                 other_key,
@@ -6616,7 +6911,7 @@ mod tests {
             )
             .await
         );
-        assert!(!same_slot_new.is_closed());
+        assert!(!first.is_closed());
         assert!(!other_slot.is_closed());
         assert_eq!(map.verified_identity_len(logical_did).await, 2);
     }
@@ -7072,13 +7367,17 @@ mod tests {
         );
         assert!(inbound.is_closed());
         assert!(!outbound.is_closed());
-        assert!(map.get_tunnel(key).await.unwrap().is_same_instance(&outbound));
+        assert!(map
+            .get_tunnel(key)
+            .await
+            .unwrap()
+            .is_same_instance(&outbound));
 
-        // The same name arriving inbound replaces the outbound tunnel via the
-        // normal last-accepted-wins path and keeps the binding.
+        // A duplicate inbound connection for the same name is also rejected;
+        // the already-published outbound instance remains the shared winner.
         let (inbound_same, _inbound_same_peer) = test_tunnel(90);
         assert!(
-            map.complete_authenticated_inbound_with_outcome(
+            !map.complete_authenticated_inbound_with_outcome(
                 key,
                 inbound_same.clone(),
                 Some((
@@ -7088,12 +7387,13 @@ mod tests {
             )
             .await
         );
-        assert!(outbound.is_closed());
+        assert!(inbound_same.is_closed());
+        assert!(!outbound.is_closed());
         assert!(
             map.get_tunnel(key)
                 .await
                 .unwrap()
-                .is_same_instance(&inbound_same)
+                .is_same_instance(&outbound)
         );
         assert_eq!(
             map.bound_logical_for_dev(dev).await,
@@ -7170,7 +7470,7 @@ mod tests {
         assert_eq!(datagram_err.kind(), std::io::ErrorKind::BrokenPipe);
     }
 
-    // v3 regression: the nonce cache retention window must cover the
+    // v4 regression: the nonce cache retention window must cover the
     // full signature-acceptance window (`exp + JWT_LEEWAY_SECS`), not just
     // `exp`. Before this fix the cache evicted the entry at `exp`, while
     // jsonwebtoken's default leeway kept the token itself signature-valid
@@ -7348,7 +7648,7 @@ mod tests {
     }
 
     #[test]
-    fn test_rtcp_v3_token_time_audience_and_listen_port_contract() {
+    fn test_rtcp_v4_token_time_audience_and_listen_port_contract() {
         let (encoding_key, decoding_key) = ed25519_test_keys();
         let now = buckyos_get_unix_timestamp();
         let base = TunnelTokenPayload {
@@ -7572,7 +7872,7 @@ mod tests {
     fn test_rtcp_struct_creation() {
         // 测试RTcp结构体的创建
         let did = DID::new("test", "device1");
-        let listener = Arc::new(MockRTcpListener {});
+        let listener = Arc::new(MockRTcpListener::new());
 
         let _rtcp = RTcp::new(
             did.clone(),
@@ -8392,7 +8692,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn authenticated_second_connection_replaces_old_inbound_tunnel() {
+    async fn authenticated_second_connection_is_rejected_while_first_is_live() {
         let _ = init_name_lib_for_test(&HashMap::new()).await;
         let (server_config, server_key) = test_device_config("replace-server");
         let (client_logical_did, client_dev_did, client_key, client_device_doc_jwt) =
@@ -8430,7 +8730,7 @@ mod tests {
         client_two.start().await.unwrap();
 
         let server_stack_id = format!("{}:{}", server_config.id.to_host_name(), server_port);
-        let _client_one_tunnel = client_one
+        let client_one_tunnel = client_one
             .create_tunnel(Some(&server_stack_id))
             .await
             .unwrap();
@@ -8442,54 +8742,128 @@ mod tests {
         let old_server_tunnel =
             wait_for_current_tunnel(&server.inner.tunnel_map, &server_tunnel_key, None).await;
 
-        let client_two_tunnel = client_two
-            .create_tunnel(Some(&server_stack_id))
-            .await
-            .unwrap();
-        let new_server_tunnel = wait_for_current_tunnel(
-            &server.inner.tunnel_map,
-            &server_tunnel_key,
-            Some(old_server_tunnel.instance_id()),
-        )
-        .await;
+        let second_error = match client_two.create_tunnel(Some(&server_stack_id)).await {
+            Ok(_) => panic!("duplicate authenticated connection must be rejected"),
+            Err(err) => err,
+        };
+        assert!(
+            second_error
+                .to_string()
+                .contains("first accepted tunnel wins"),
+            "unexpected duplicate error: {}",
+            second_error
+        );
 
-        assert!(old_server_tunnel.is_closed());
-        assert!(!new_server_tunnel.is_closed());
-        let old_open_error = old_server_tunnel
-            .open_stream("superseded.test:80")
-            .await
-            .err()
-            .expect("superseded inbound tunnel must reject new streams");
-        assert_eq!(old_open_error.kind(), std::io::ErrorKind::BrokenPipe);
-
-        new_server_tunnel
+        assert!(!old_server_tunnel.is_closed());
+        old_server_tunnel
             .ping_rtt(Duration::from_secs(2))
             .await
-            .expect("replacement tunnel must answer ping");
+            .expect("first accepted tunnel must remain usable");
         let mut stream = tokio::time::timeout(
             Duration::from_secs(5),
-            client_two_tunnel.open_stream("replacement-echo.test:80"),
+            client_one_tunnel.open_stream("first-winner-echo.test:80"),
         )
         .await
-        .expect("replacement tunnel open timed out")
-        .expect("replacement tunnel open failed");
-        stream.write_all(b"replacement-ok").await.unwrap();
-        let mut response = [0u8; 14];
+        .expect("first tunnel open timed out")
+        .expect("first tunnel open failed");
+        stream.write_all(b"first-winner-ok").await.unwrap();
+        let mut response = [0u8; 15];
         stream.read_exact(&mut response).await.unwrap();
-        assert_eq!(&response, b"replacement-ok");
+        assert_eq!(&response, b"first-winner-ok");
 
-        // Give the old run loop time to execute its delayed cleanup. The map
-        // must still point at the replacement (compare-and-remove).
+        // Give the rejected candidate time to execute cleanup. It must not
+        // remove or close the first accepted instance.
         tokio::time::sleep(Duration::from_millis(100)).await;
-        assert!(
-            server
-                .inner
-                .tunnel_map
-                .get_tunnel(&server_tunnel_key)
-                .await
-                .unwrap()
-                .is_same_instance(&new_server_tunnel)
+        assert!(server
+            .inner
+            .tunnel_map
+            .get_tunnel(&server_tunnel_key)
+            .await
+            .unwrap()
+            .is_same_instance(&old_server_tunnel));
+    }
+
+    #[tokio::test]
+    async fn concurrent_create_tunnel_calls_share_one_accepted_instance() {
+        let _ = init_name_lib_for_test(&HashMap::new()).await;
+        let (server_config, server_key) = test_device_config("single-flight-server");
+        let (client_config, client_key) = test_device_config("single-flight-client");
+        cache_test_device(&server_config).await;
+        cache_test_device(&client_config).await;
+
+        let admissions = Arc::new(AtomicUsize::new(0));
+        let server_port = unused_tcp_port();
+        let mut server = RTcp::new(
+            server_config.id.clone(),
+            format!("127.0.0.1:{}", server_port),
+            Some(server_key),
+            None,
+            Arc::new(MockRTcpListener::counting(
+                admissions.clone(),
+                Duration::from_millis(150),
+            )),
         );
+        server.start().await.unwrap();
+
+        let mut client = RTcp::new(
+            client_config.id.clone(),
+            format!("127.0.0.1:{}", unused_tcp_port()),
+            Some(client_key),
+            None,
+            Arc::new(MockRTcpListener::new()),
+        );
+        client.start().await.unwrap();
+
+        let stack_id = format!("{}:{}", server_config.id.to_host_name(), server_port);
+        let barrier = Arc::new(tokio::sync::Barrier::new(3));
+        let mut tasks = Vec::new();
+        for _ in 0..2 {
+            let inner = client.inner.clone();
+            let stack_id = stack_id.clone();
+            let barrier = barrier.clone();
+            tasks.push(tokio::spawn(async move {
+                barrier.wait().await;
+                let tunnel = inner
+                    .create_tunnel(Some(&stack_id))
+                    .await
+                    .map_err(|err| err.to_string())?;
+                tunnel.ping().await.map_err(|err| err.to_string())
+            }));
+        }
+        barrier.wait().await;
+        for task in tasks {
+            task.await.unwrap().unwrap();
+        }
+
+        assert_eq!(
+            admissions.load(Ordering::SeqCst),
+            1,
+            "single-flight must prevent a second RTCP handshake"
+        );
+        let client_key = format!(
+            "{}_{}",
+            client_config.id.to_string(),
+            server_config.id.to_string()
+        );
+        let server_key = format!(
+            "{}_{}",
+            server_config.id.to_string(),
+            client_config.id.to_string()
+        );
+        assert_eq!(client.inner.tunnel_map.primary_len().await, 1);
+        assert_eq!(server.inner.tunnel_map.primary_len().await, 1);
+        assert!(client
+            .inner
+            .tunnel_map
+            .get_tunnel(&client_key)
+            .await
+            .is_some());
+        assert!(server
+            .inner
+            .tunnel_map
+            .get_tunnel(&server_key)
+            .await
+            .is_some());
     }
 
     #[tokio::test]
@@ -8544,11 +8918,19 @@ mod tests {
         let original =
             wait_for_current_tunnel(&server.inner.tunnel_map, &server_tunnel_key, None).await;
 
-        // The initiator can finish key confirmation before the responder's
-        // application admission result is known. Regardless of that local
-        // return value, the responder must keep its previously admitted map
-        // entry when the listener rejects the second connection.
-        let _ = client_two.create_tunnel(Some(&server_stack_id)).await;
+        // create_tunnel must wait for the responder's final listener result,
+        // not return Ok immediately after sending HelloAckConfirm.
+        let rejection = match client_two.create_tunnel(Some(&server_stack_id)).await {
+            Ok(_) => panic!("listener rejection must be returned to the initiator"),
+            Err(err) => err,
+        };
+        assert!(
+            rejection
+                .to_string()
+                .contains("test listener rejects replacement"),
+            "unexpected listener rejection: {}",
+            rejection
+        );
         tokio::time::timeout(Duration::from_secs(5), async {
             while admissions.load(Ordering::SeqCst) < 2 {
                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -8572,11 +8954,24 @@ mod tests {
     }
 
     // Mock实现用于测试
-    struct MockRTcpListener;
+    struct MockRTcpListener {
+        admissions: Option<Arc<AtomicUsize>>,
+        admission_delay: Duration,
+    }
 
     impl MockRTcpListener {
         fn new() -> Self {
-            MockRTcpListener {}
+            MockRTcpListener {
+                admissions: None,
+                admission_delay: Duration::ZERO,
+            }
+        }
+
+        fn counting(admissions: Arc<AtomicUsize>, admission_delay: Duration) -> Self {
+            MockRTcpListener {
+                admissions: Some(admissions),
+                admission_delay,
+            }
         }
     }
 
@@ -8688,6 +9083,21 @@ mod tests {
 
     #[async_trait::async_trait]
     impl RTcpListener for MockRTcpListener {
+        async fn on_new_tunnel(
+            &self,
+            _endpoint: TunnelEndpoint,
+            _source_addr: SocketAddr,
+            _source_device_info: Option<RTcpSourceDeviceInfo>,
+        ) -> TunnelResult<()> {
+            if let Some(admissions) = self.admissions.as_ref() {
+                admissions.fetch_add(1, Ordering::SeqCst);
+            }
+            if !self.admission_delay.is_zero() {
+                tokio::time::sleep(self.admission_delay).await;
+            }
+            Ok(())
+        }
+
         async fn on_new_stream(
             &self,
             mut stream: Box<dyn AsyncStream>,
@@ -8912,7 +9322,7 @@ mod tests {
         // Hello; no tunnel entry survived on rtcp2 and the peer's TCP
         // reset let rtcp1's stale tunnel get evicted within the 2s wait.
         //
-        // The v3 key-confirmation handshake is synchronous -- the
+        // The v4 key-confirmation handshake is synchronous -- the
         // initiator only returns from create_tunnel after the AEAD
         // challenge-response completes. That removes the race and, with
         // it, the cheap way to force rtcp1's cached tunnel to clear.

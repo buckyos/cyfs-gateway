@@ -1860,7 +1860,7 @@ impl RtcpStack {
         rtcp.set_security_config(builder.security.clone())
             .map_err(|e| stack_err!(StackErrorCode::InvalidConfig, "{}", e))?;
         info!(
-            "RTCP v3 security for stack {}: peer requirement={:?}, DNS TXT bootstrap={}, \
+            "RTCP v4 security for stack {}: peer requirement={:?}, DNS TXT bootstrap={}, \
              inbound anonymous={:?}, named relation={:?}; self-declared fallback is unavailable",
             id,
             builder.security.peer_identity.requirement,
