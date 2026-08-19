@@ -219,6 +219,7 @@ stacks:
     #     handshake_requests_per_second: 16
     #     handshake_request_burst: 32
     #     max_pending_stream_builds_per_tunnel: 64
+    #     max_stream_ids_per_tunnel: 65536 # shared inbound/outbound ID budget; reconnects on exhaustion
     #     max_datagram_bytes: 65507
     #     handshake_timeout_secs: 15
     #     stream_requests_per_second: 32

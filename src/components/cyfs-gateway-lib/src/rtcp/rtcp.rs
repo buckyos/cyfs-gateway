@@ -150,6 +150,13 @@ impl Default for RtcpLivenessConfig {
     }
 }
 
+// A configurable operational limit keeps ordinary tunnels small, while the
+// hard ceiling prevents a configuration mistake from restoring unbounded
+// per-tunnel replay state. Stream IDs remain remembered for the whole key
+// epoch; reaching the limit retires the tunnel instead of evicting history.
+const DEFAULT_MAX_STREAM_IDS_PER_TUNNEL: usize = 1 << 16;
+const MAX_STREAM_IDS_PER_TUNNEL_HARD_LIMIT: usize = 1 << 20;
+
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct RtcpLimitsConfig {
@@ -157,6 +164,7 @@ pub struct RtcpLimitsConfig {
     pub handshake_requests_per_second: u32,
     pub handshake_request_burst: u32,
     pub max_pending_stream_builds_per_tunnel: usize,
+    pub max_stream_ids_per_tunnel: usize,
     pub max_datagram_bytes: usize,
     pub handshake_timeout_secs: u64,
     pub stream_requests_per_second: u32,
@@ -170,6 +178,7 @@ impl Default for RtcpLimitsConfig {
             handshake_requests_per_second: 16,
             handshake_request_burst: 32,
             max_pending_stream_builds_per_tunnel: 64,
+            max_stream_ids_per_tunnel: DEFAULT_MAX_STREAM_IDS_PER_TUNNEL,
             max_datagram_bytes: super::datagram::MAX_RTCP_DATAGRAM_BYTES,
             handshake_timeout_secs: 15,
             stream_requests_per_second: 32,
@@ -203,11 +212,18 @@ impl RtcpSecurityConfig {
             || self.limits.handshake_requests_per_second == 0
             || self.limits.handshake_request_burst == 0
             || self.limits.max_pending_stream_builds_per_tunnel == 0
+            || self.limits.max_stream_ids_per_tunnel == 0
             || self.limits.handshake_timeout_secs == 0
             || self.limits.stream_requests_per_second == 0
             || self.limits.stream_request_burst == 0
         {
             return Err("rtcp limits must be greater than zero".to_string());
+        }
+        if self.limits.max_stream_ids_per_tunnel > MAX_STREAM_IDS_PER_TUNNEL_HARD_LIMIT {
+            return Err(format!(
+                "rtcp max_stream_ids_per_tunnel must be in 1..={}",
+                MAX_STREAM_IDS_PER_TUNNEL_HARD_LIMIT
+            ));
         }
         if self.limits.max_datagram_bytes == 0
             || self.limits.max_datagram_bytes > super::datagram::MAX_RTCP_DATAGRAM_BYTES
@@ -3841,6 +3857,7 @@ const OPEN_RESULT_AUTHORIZATION_REJECTED: u32 = 5;
 const OPEN_RESULT_INVALID_STREAM_ID: u32 = 6;
 const OPEN_RESULT_DUPLICATE_STREAM_ID: u32 = 7;
 const OPEN_RESULT_RATE_LIMITED: u32 = 8;
+const OPEN_RESULT_KEY_EPOCH_EXHAUSTED: u32 = 9;
 const MAX_RTCP_TUNNEL_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 
 struct StreamRequestRateState {
@@ -3930,7 +3947,8 @@ struct RTcpTunnel {
     stream_requests_per_second: u32,
     stream_request_burst: u32,
     max_datagram_bytes: usize,
-    used_stream_ids: Arc<Mutex<HashSet<String>>>,
+    max_stream_ids_per_tunnel: usize,
+    used_stream_ids: Arc<Mutex<HashSet<[u8; 16]>>>,
     created_at: Instant,
 
     // Pong waiters for RTT-aware probes. `ping_rtt` registers a waiter
@@ -3999,6 +4017,7 @@ impl RTcpTunnel {
             stream_requests_per_second: limits.stream_requests_per_second,
             stream_request_burst: limits.stream_request_burst,
             max_datagram_bytes: limits.max_datagram_bytes,
+            max_stream_ids_per_tunnel: limits.max_stream_ids_per_tunnel,
             used_stream_ids: Arc::new(Mutex::new(HashSet::new())),
             created_at: Instant::now(),
             pong_waiters: Arc::new(Mutex::new(HashMap::new())),
@@ -4051,6 +4070,11 @@ impl RTcpTunnel {
     pub async fn close(&self) {
         // Flag and wake the read loop before awaiting any locks or network I/O.
         self.mark_closed();
+
+        // A closed tunnel can never accept another stream ID, so its replay
+        // history is no longer security-sensitive. Clear it explicitly rather
+        // than waiting for every cloned RTcpTunnel handle to be dropped.
+        self.used_stream_ids.lock().await.clear();
 
         // Dropping the senders makes in-flight Open/ROpen/Ping callers fail
         // immediately. Removing this tunnel's HelloStream slots also wakes the
@@ -4199,13 +4223,9 @@ impl RTcpTunnel {
     ) -> Result<tokio::sync::OwnedSemaphorePermit, u32> {
         self.ensure_accepts_new_streams()
             .map_err(|_| OPEN_RESULT_RECONNECT_FAILED)?;
-        Self::validate_stream_id(stream_id).map_err(|_| OPEN_RESULT_INVALID_STREAM_ID)?;
-        if self
-            .used_stream_ids
-            .lock()
-            .await
-            .contains(&stream_id.to_ascii_lowercase())
-        {
+        let stream_id =
+            Self::validate_stream_id(stream_id).map_err(|_| OPEN_RESULT_INVALID_STREAM_ID)?;
+        if self.used_stream_ids.lock().await.contains(&stream_id) {
             return Err(OPEN_RESULT_DUPLICATE_STREAM_ID);
         }
         if !self.consume_stream_request_token().await {
@@ -4220,9 +4240,25 @@ impl RTcpTunnel {
                 TryAcquireError::Closed => OPEN_RESULT_RECONNECT_FAILED,
             })?;
         let mut used = self.used_stream_ids.lock().await;
-        if !used.insert(stream_id.to_ascii_lowercase()) {
+        // Re-check active state under the same lock used for the final insert.
+        // close() marks the tunnel first and then takes this lock to clear the
+        // set, so no reservation can survive a concurrent close.
+        self.ensure_accepts_new_streams()
+            .map_err(|_| OPEN_RESULT_RECONNECT_FAILED)?;
+        if used.contains(&stream_id) {
             return Err(OPEN_RESULT_DUPLICATE_STREAM_ID);
         }
+        if used.len() >= self.max_stream_ids_per_tunnel {
+            warn!(
+                "RTCP tunnel {} instance {} stream ID key epoch exhausted at {} entries",
+                self.remote_stack.did.to_string(),
+                self.instance_id,
+                used.len()
+            );
+            return Err(OPEN_RESULT_KEY_EPOCH_EXHAUSTED);
+        }
+        used.insert(stream_id);
+        self.maybe_log_stream_id_usage(used.len());
         Ok(permit)
     }
 
@@ -4230,15 +4266,47 @@ impl RTcpTunnel {
         self.ensure_accepts_new_streams()?;
         for _ in 0..16 {
             let bytes: [u8; 16] = rand::rng().random();
-            let id = hex::encode(bytes);
-            if self.used_stream_ids.lock().await.insert(id.clone()) {
-                return Ok((id, bytes));
+            let mut used = self.used_stream_ids.lock().await;
+            // See the matching inbound check: close() clears only after
+            // marking closed, and this final re-check prevents a late insert.
+            self.ensure_accepts_new_streams()?;
+            if used.len() >= self.max_stream_ids_per_tunnel {
+                let used_count = used.len();
+                drop(used);
+                warn!(
+                    "RTCP tunnel {} instance {} stream ID key epoch exhausted at {} entries; reconnect required",
+                    self.remote_stack.did.to_string(),
+                    self.instance_id,
+                    used_count
+                );
+                self.close().await;
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionAborted,
+                    "rtcp tunnel stream ID key epoch exhausted; reconnect required",
+                ));
+            }
+            if used.insert(bytes) {
+                self.maybe_log_stream_id_usage(used.len());
+                return Ok((hex::encode(bytes), bytes));
             }
         }
         Err(std::io::Error::new(
             std::io::ErrorKind::AlreadyExists,
             "could not allocate a unique RTCP stream id",
         ))
+    }
+
+    fn maybe_log_stream_id_usage(&self, used: usize) {
+        let warn_at = self.max_stream_ids_per_tunnel.saturating_mul(9) / 10;
+        if used == warn_at.max(1) {
+            warn!(
+                "RTCP tunnel {} instance {} stream ID key epoch is nearing exhaustion: {}/{}",
+                self.remote_stack.did.to_string(),
+                self.instance_id,
+                used,
+                self.max_stream_ids_per_tunnel
+            );
+        }
     }
 
     async fn send_open_result(&self, seq: u32, code: u32) -> Result<(), anyhow::Error> {
@@ -4285,7 +4353,11 @@ impl RTcpTunnel {
                 {
                     Ok(permit) => permit,
                     Err(code) => {
-                        self.send_ropen_result(ropen_package.seq, code).await?;
+                        let send_result = self.send_ropen_result(ropen_package.seq, code).await;
+                        if code == OPEN_RESULT_KEY_EPOCH_EXHAUSTED {
+                            self.close().await;
+                        }
+                        send_result?;
                         return Ok(());
                     }
                 };
@@ -4315,6 +4387,14 @@ impl RTcpTunnel {
                 if let Some(sender) = waiter {
                     let _ = sender.send(ropen_resp_package.body.result);
                 }
+                if ropen_resp_package.body.result == OPEN_RESULT_KEY_EPOCH_EXHAUSTED {
+                    warn!(
+                        "peer reports exhausted RTCP stream ID key epoch for tunnel {} instance {}; reconnect required",
+                        self.remote_stack.did.to_string(),
+                        self.instance_id
+                    );
+                    self.close().await;
+                }
                 Ok(())
             }
             RTcpTunnelPackage::Open(open_package) => self.on_open(open_package).await,
@@ -4333,6 +4413,15 @@ impl RTcpTunnel {
                         "Tunnel open stream waiter not found: seq={}",
                         open_resp_package.seq
                     );
+                }
+
+                if open_resp_package.body.result == OPEN_RESULT_KEY_EPOCH_EXHAUSTED {
+                    warn!(
+                        "peer reports exhausted RTCP stream ID key epoch for tunnel {} instance {}; reconnect required",
+                        self.remote_stack.did.to_string(),
+                        self.instance_id
+                    );
+                    self.close().await;
                 }
 
                 Ok(())
@@ -4773,7 +4862,11 @@ impl RTcpTunnel {
         {
             Ok(permit) => permit,
             Err(code) => {
-                self.send_open_result(open_package.seq, code).await?;
+                let send_result = self.send_open_result(open_package.seq, code).await;
+                if code == OPEN_RESULT_KEY_EPOCH_EXHAUSTED {
+                    self.close().await;
+                }
+                send_result?;
                 return Ok(());
             }
         };
@@ -5079,10 +5172,18 @@ impl RTcpTunnel {
                     real_key.as_str(),
                     result_code
                 );
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::ConnectionRefused,
-                    format!("peer rejected open stream, result={}", result_code),
-                ));
+                let (kind, message) = if result_code == OPEN_RESULT_KEY_EPOCH_EXHAUSTED {
+                    (
+                        std::io::ErrorKind::ConnectionAborted,
+                        "peer exhausted RTCP stream ID key epoch; reconnect required".to_string(),
+                    )
+                } else {
+                    (
+                        std::io::ErrorKind::ConnectionRefused,
+                        format!("peer rejected open stream, result={}", result_code),
+                    )
+                };
+                return Err(std::io::Error::new(kind, message));
             }
 
             // Build a fresh stream leg to the remote RTCP listener. Direct
@@ -5164,9 +5265,21 @@ impl RTcpTunnel {
                                 code
                             );
                             self.remove_wait_stream(&real_key).await;
+                            let (kind, message) = if code == OPEN_RESULT_KEY_EPOCH_EXHAUSTED {
+                                (
+                                    std::io::ErrorKind::ConnectionAborted,
+                                    "peer exhausted RTCP stream ID key epoch; reconnect required"
+                                        .to_string(),
+                                )
+                            } else {
+                                (
+                                    std::io::ErrorKind::ConnectionRefused,
+                                    format!("peer rejected ropen, result={}", code),
+                                )
+                            };
                             return Err(std::io::Error::new(
-                                std::io::ErrorKind::ConnectionRefused,
-                                format!("peer rejected ropen, result={}", code),
+                                kind,
+                                message,
                             ));
                         }
                         Err(_) => {
@@ -6301,6 +6414,13 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt, copy_bidirectional};
 
     fn test_tunnel(seed: u8) -> (RTcpTunnel, tokio::io::DuplexStream) {
+        test_tunnel_with_limits(seed, &RtcpLimitsConfig::default())
+    }
+
+    fn test_tunnel_with_limits(
+        seed: u8,
+        limits: &RtcpLimitsConfig,
+    ) -> (RTcpTunnel, tokio::io::DuplexStream) {
         let (bearing, peer) = tokio::io::duplex(64 * 1024);
         let bearing: RTcpBearingStream = Box::new(bearing);
         let encrypted_stream = EncryptedStream::new(
@@ -6329,7 +6449,7 @@ mod tests {
                 None,
                 None,
                 [seed; 32],
-                &RtcpLimitsConfig::default(),
+                limits,
                 Arc::new(MockRTcpListener::new()),
             ),
             peer,
@@ -6629,6 +6749,194 @@ mod tests {
         );
         drop(permit);
         drop(peer);
+    }
+
+    #[tokio::test]
+    async fn inbound_stream_id_history_stops_at_configured_epoch_limit() {
+        let mut limits = RtcpLimitsConfig::default();
+        limits.max_stream_ids_per_tunnel = 3;
+        limits.stream_requests_per_second = 100_000;
+        limits.stream_request_burst = 1024;
+        let (tunnel, _peer) = test_tunnel_with_limits(93, &limits);
+        let accepted = [
+            "00112233445566778899aabbccddeeff",
+            "10112233445566778899aabbccddeeff",
+            "20112233445566778899aabbccddeeff",
+        ];
+
+        for stream_id in accepted {
+            let permit = tunnel.admit_inbound_stream_build(stream_id).await.unwrap();
+            drop(permit);
+        }
+        assert_eq!(tunnel.used_stream_ids.lock().await.len(), 3);
+
+        // Canonical byte storage rejects an uppercase replay even at the cap.
+        assert_eq!(
+            tunnel
+                .admit_inbound_stream_build("00112233445566778899AABBCCDDEEFF")
+                .await
+                .unwrap_err(),
+            OPEN_RESULT_DUPLICATE_STREAM_ID
+        );
+
+        for value in 10u128..138 {
+            let stream_id = format!("{value:032x}");
+            assert_eq!(
+                tunnel
+                    .admit_inbound_stream_build(&stream_id)
+                    .await
+                    .unwrap_err(),
+                OPEN_RESULT_KEY_EPOCH_EXHAUSTED
+            );
+        }
+        assert_eq!(tunnel.used_stream_ids.lock().await.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn unused_outbound_reservations_consume_limit_and_close_releases_history() {
+        let mut limits = RtcpLimitsConfig::default();
+        limits.max_stream_ids_per_tunnel = 2;
+        let (tunnel, _peer) = test_tunnel_with_limits(94, &limits);
+        let retained_clone = tunnel.clone();
+
+        // Reserving IDs is enough to consume the budget even though no stream
+        // leg is built; failed connection attempts must never make an ID
+        // reusable within this key epoch.
+        tunnel.reserve_outbound_stream_id().await.unwrap();
+        tunnel.reserve_outbound_stream_id().await.unwrap();
+        assert_eq!(tunnel.used_stream_ids.lock().await.len(), 2);
+
+        let error = tunnel.reserve_outbound_stream_id().await.unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::ConnectionAborted);
+        assert!(tunnel.is_closed());
+        assert!(retained_clone.used_stream_ids.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn stream_id_can_be_reused_only_after_tunnel_key_epoch_closes() {
+        let mut limits = RtcpLimitsConfig::default();
+        limits.max_stream_ids_per_tunnel = 1;
+        let stream_id = "00112233445566778899aabbccddeeff";
+        let (old_tunnel, _old_peer) = test_tunnel_with_limits(95, &limits);
+
+        let permit = old_tunnel
+            .admit_inbound_stream_build(stream_id)
+            .await
+            .unwrap();
+        drop(permit);
+        assert_eq!(
+            old_tunnel
+                .admit_inbound_stream_build(stream_id)
+                .await
+                .unwrap_err(),
+            OPEN_RESULT_DUPLICATE_STREAM_ID
+        );
+        old_tunnel.close().await;
+        assert!(old_tunnel.used_stream_ids.lock().await.is_empty());
+
+        let (new_tunnel, _new_peer) = test_tunnel_with_limits(96, &limits);
+        let permit = new_tunnel
+            .admit_inbound_stream_build(stream_id)
+            .await
+            .unwrap();
+        drop(permit);
+    }
+
+    #[tokio::test]
+    async fn inbound_epoch_exhaustion_is_reported_before_tunnel_closes() {
+        let mut limits = RtcpLimitsConfig::default();
+        limits.max_stream_ids_per_tunnel = 1;
+        let (bearing, peer) = tokio::io::duplex(64 * 1024);
+        let encrypted_stream = EncryptedStream::new_control(
+            Box::new(bearing) as RTcpBearingStream,
+            &[97; 32],
+            &[98; 16],
+            EncryptionRole::Initiator,
+        );
+        let mut encrypted_peer =
+            EncryptedStream::new_control(peer, &[97; 32], &[98; 16], EncryptionRole::Responder);
+        let remote_stack = RTcpTargetStackEP {
+            did: DID::new("dev", "rtcp-exhaustion-peer"),
+            stack_port: DEFAULT_RTCP_STACK_PORT,
+            bootstrap_stream_url: None,
+        };
+        let tunnel = RTcpTunnel::new(
+            RTcpStreamBuildHelper::new(),
+            DID::new("dev", "rtcp-exhaustion-local"),
+            &remote_stack,
+            RtcpAddressResolutionContext::without_device_info(
+                remote_stack.did.clone(),
+                ResolveIpTargetKind::Unknown,
+                ResolveIpZoneRelation::Unknown,
+            ),
+            false,
+            encrypted_stream,
+            None,
+            None,
+            [97; 32],
+            &limits,
+            Arc::new(MockRTcpListener::new()),
+        );
+
+        let permit = tunnel
+            .admit_inbound_stream_build("00112233445566778899aabbccddeeff")
+            .await
+            .unwrap();
+        drop(permit);
+        tunnel
+            .process_package(RTcpTunnelPackage::Open(RTcpOpenPackage::new(
+                42,
+                "10112233445566778899aabbccddeeff".to_string(),
+                Some(StreamPurpose::Stream),
+                443,
+                Some("service.example".to_string()),
+            )))
+            .await
+            .unwrap();
+
+        let response = timeout(
+            Duration::from_secs(1),
+            RTcpTunnelPackage::read_package(Pin::new(&mut encrypted_peer), false, "test-peer"),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        match response {
+            RTcpTunnelPackage::OpenResp(response) => {
+                assert_eq!(response.seq, 42);
+                assert_eq!(response.body.result, OPEN_RESULT_KEY_EPOCH_EXHAUSTED);
+            }
+            other => panic!("unexpected exhaustion response: {:?}", other),
+        }
+        assert!(tunnel.is_closed());
+        assert!(tunnel.used_stream_ids.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn peer_epoch_exhaustion_result_closes_local_tunnel_after_waking_waiter() {
+        let (tunnel, _peer) = test_tunnel(99);
+        tunnel.used_stream_ids.lock().await.insert([1; 16]);
+        let (sender, receiver) = oneshot::channel();
+        tunnel.open_resp_waiters.lock().await.insert(7, sender);
+
+        tunnel
+            .process_package(RTcpTunnelPackage::OpenResp(RTcpOpenRespPackage::new(
+                7,
+                OPEN_RESULT_KEY_EPOCH_EXHAUSTED,
+            )))
+            .await
+            .unwrap();
+
+        assert_eq!(receiver.await.unwrap(), OPEN_RESULT_KEY_EPOCH_EXHAUSTED);
+        assert!(tunnel.is_closed());
+        assert!(tunnel.used_stream_ids.lock().await.is_empty());
+    }
+
+    #[test]
+    fn stream_id_epoch_limit_has_a_non_configurable_hard_ceiling() {
+        let mut security = RtcpSecurityConfig::default();
+        security.limits.max_stream_ids_per_tunnel = MAX_STREAM_IDS_PER_TUNNEL_HARD_LIMIT + 1;
+        assert!(security.validate().is_err());
     }
 
     #[tokio::test]

@@ -90,7 +90,9 @@ bootstrap transport，不会错误地退回裸 TCP。
 ```
 
 发送端和接收端都要求 stream id 恰好是规范的 16 字节值的 32 位十六进制编码。
-stream id 在 tunnel 生命周期内唯一；重复值不会覆盖 waiter，而会被明确拒绝。
+stream id 在 tunnel key epoch 内唯一；重复值不会覆盖 waiter，而会被明确拒绝。双方用
+紧凑的 16 字节值保存已经预留的 ID，成功、失败和已关闭 stream 的 ID 都不会在同一
+epoch 内被淘汰。
 
 ### 2.3 Open/ROpen 包体
 
@@ -119,6 +121,7 @@ stream id 在 tunnel 生命周期内唯一；重复值不会覆盖 waiter，而�
 | 6 | invalid stream id |
 | 7 | duplicate stream id |
 | 8 | rate limited |
+| 9 | tunnel key epoch stream ID budget exhausted; reconnect required |
 
 未知非零码一律按安全失败处理。
 
@@ -373,7 +376,9 @@ key-use 预算：
 | business stream | 2^20 | 1 GiB | 24 h |
 
 预算耗尽、年龄耗尽和 seq 溢出返回可区分错误。tunnel 到达 24 小时后不再建立新 stream；
-由后续建链替换旧实例，不实现原地 KeyUpdate。
+同一 key epoch 预留的 stream ID 达到 `max_stream_ids_per_tunnel` 后也不再接受新 stream。
+接收端先返回错误码 9，随后双方关闭旧 tunnel；调用方必须重连，后续建链使用新 key
+epoch。旧 tunnel 关闭后才整体释放 ID 历史，不实现淘汰旧 ID 或原地 KeyUpdate。
 
 ## 5. Tunnel 生命周期与 liveness
 
@@ -475,6 +480,7 @@ stacks:
       handshake_requests_per_second: 16
       handshake_request_burst: 32
       max_pending_stream_builds_per_tunnel: 64
+      max_stream_ids_per_tunnel: 65536
       max_datagram_bytes: 65507
       handshake_timeout_secs: 15
       stream_requests_per_second: 32
@@ -493,6 +499,11 @@ stacks:
 `named_min_relation` 支持 `same_zone`、`known_owner`、`any`。`same_owner` 等未实现枚举值、
 已删除的 `inbound_self_declared_fallback` 和其它未知字段会导致配置反序列化失败，不会
 静默忽略。
+
+`max_stream_ids_per_tunnel` 同时限制入站和出站预留 ID 的总数，默认 65536，硬上限
+1048576。达到上限时不会淘汰历史 ID；当前请求收到“key epoch exhausted”错误，旧
+tunnel 进入关闭流程，下一次请求通过重新建 tunnel 获得新的 key epoch。关闭已建立的
+业务 stream 不会归还 ID 配额。
 
 Identity manager 实际探测：
 

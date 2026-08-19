@@ -439,6 +439,7 @@ stacks:
     limits:
       max_pending_handshakes: 256
       max_pending_stream_builds_per_tunnel: 64
+      max_stream_ids_per_tunnel: 65536
       max_datagram_bytes: 65507
 ```
 
