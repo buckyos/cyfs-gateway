@@ -315,19 +315,19 @@ async fn controller_auto_nonce_signs_and_submits_via_bns_server() {
         .await
         .unwrap();
 
-    // 返回的提交回执：from = 托管私钥地址，nonce = 链上 5，chainId = 31337，tx hash 来自 server。
+    // 返回的提交回执：from = 托管私钥地址，nonce = 链上 5，chainId = 31337。
     assert_eq!(
         submission.from.to_lowercase(),
         format!("{ANVIL_ADDRESS:#x}")
     );
     assert_eq!(submission.nonce, 5);
     assert_eq!(submission.chain_id, 31_337);
-    assert_eq!(submission.tx_hash, SERVER_TX_HASH);
 
     // raw TX 经 server 转发；独立解码后恢复出的 signer == 托管私钥地址（链上 msg.sender 一致）。
     let received = server.received();
     assert_eq!(received.len(), 1);
     let decoded = decode_signed_eip1559(&received[0]).unwrap();
+    assert_eq!(submission.tx_hash, format!("{:#x}", decoded.hash()));
     assert_eq!(decoded.recover_signer().unwrap(), ANVIL_ADDRESS);
     assert_eq!(decoded.tx().nonce, 5);
     assert_eq!(decoded.tx().chain_id, 31_337);
@@ -547,12 +547,14 @@ async fn controller_with_explicit_chain_rpc_submitter_uses_chain() {
         .await
         .unwrap();
     assert_eq!(submission.nonce, 2);
-    assert_eq!(submission.tx_hash, SERVER_TX_HASH);
 
     let sent = eth.sent();
     assert_eq!(sent.len(), 1);
     // 链上收到的 raw 与回执里的 raw 一致。
     assert_eq!(sent[0].to_lowercase(), submission.raw_tx.to_lowercase());
+    let raw = hex::decode(submission.raw_tx.trim_start_matches("0x")).unwrap();
+    let decoded = decode_signed_eip1559(&raw).unwrap();
+    assert_eq!(submission.tx_hash, format!("{:#x}", decoded.hash()));
     let raw_bytes = hex::decode(sent[0].trim_start_matches("0x")).unwrap();
     assert_eq!(
         decode_signed_eip1559(&raw_bytes)

@@ -19,7 +19,7 @@ use bns_evm::{
     PrincipalKind as EvmPrincipalKind, RegisterOptions as EvmRegisterOptions, SignedEip1559Tx,
     SolCall, TxEip1559, TxKind, B256, U256,
 };
-use log::info;
+use log::{info, warn};
 use serde::{Deserialize, Serialize};
 use tokio::time::{sleep, Duration, Instant};
 
@@ -27,7 +27,7 @@ use crate::{
     BnsApplyMutationsReq, BnsBootstrapNameReq, BnsClientError, BnsClientResult, BnsIndexerApi,
     BnsPrepareTxReq, BnsPublishDocumentReq, BnsRegisterNameReq, BnsRevokeDocumentReq,
     BnsSetControllerPolicyReq, BnsSetMinDocumentIatReq, BnsSubmitRawTxReq, BnsSystemInfo,
-    BnsTxExecutionState, BnsUpdateAuthorityKeysReq,
+    BnsTxExecutionState, BnsTxState, BnsUpdateAuthorityKeysReq,
 };
 
 impl From<BnsEvmError> for BnsClientError {
@@ -111,6 +111,37 @@ pub struct BnsEvmTxSubmission {
     pub receipt_block_number: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub receipt_confirmations: Option<u64>,
+}
+
+/// A fully signed EVM transaction that has not necessarily been broadcast.
+/// Its hash is deterministic from `raw_tx`, so callers can persist this value
+/// before handing the transaction to the network.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BnsEvmPreparedTx {
+    pub tx_hash: String,
+    pub raw_tx: String,
+    pub from: String,
+    pub nonce: u64,
+    pub chain_id: u64,
+}
+
+impl BnsEvmPreparedTx {
+    pub fn submission(&self) -> BnsEvmTxSubmission {
+        BnsEvmTxSubmission {
+            tx_hash: self.tx_hash.clone(),
+            raw_tx: self.raw_tx.clone(),
+            from: self.from.clone(),
+            nonce: self.nonce,
+            chain_id: self.chain_id,
+            receipt_status: None,
+            receipt_block_number: None,
+            receipt_confirmations: None,
+        }
+    }
+
+    fn raw_tx_bytes(&self) -> BnsClientResult<Vec<u8>> {
+        BnsSubmitRawTxReq::from_hex(self.raw_tx.clone()).raw_tx_bytes()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -519,6 +550,23 @@ impl BnsEvmControllerClient {
         request: &BnsEvmSignRequest,
         call: &C,
     ) -> BnsClientResult<BnsEvmTxSubmission> {
+        let prepared = self.prepare_with_request(request, call).await?;
+        match self.submit_prepared_tx(&prepared).await {
+            Ok(submission) => Ok(submission),
+            Err(error) => {
+                if let Ok(signer_address) = parse_address(&prepared.from, "prepared.from") {
+                    self.reset_nonce(signer_address);
+                }
+                Err(error)
+            }
+        }
+    }
+
+    pub async fn prepare_with_request<C: SolCall>(
+        &self,
+        request: &BnsEvmSignRequest,
+        call: &C,
+    ) -> BnsClientResult<BnsEvmPreparedTx> {
         let signer_address = self.key_manager.signer_address(request).await?;
         let _submission_guard = self.submission_lock.lock().await;
         let tx = match &self.raw_tx_submitter {
@@ -531,20 +579,17 @@ impl BnsEvmControllerClient {
                     ))
                     .await?;
                 let to = parse_address(&prepared.contract_address, "contract_address")?;
-                let (max_fee_per_gas, max_priority_fee_per_gas) =
-                    if self.zero_fee_override {
-                        (0, 0)
-                    } else {
-                        (
-                            prepared.max_fee_per_gas,
-                            prepared.max_priority_fee_per_gas,
-                        )
-                    };
+                let (max_fee_per_gas, max_priority_fee_per_gas) = if self.zero_fee_override {
+                    (0, 0)
+                } else {
+                    (prepared.max_fee_per_gas, prepared.max_priority_fee_per_gas)
+                };
+                let nonce = self.reserve_nonce(signer_address, prepared.nonce)?;
                 Ok(build_eip1559_contract_tx(
                     call,
                     Eip1559TxParams {
                         chain_id: prepared.chain_id,
-                        nonce: prepared.nonce,
+                        nonce,
                         to,
                         gas_limit: prepared.gas_limit,
                         max_fee_per_gas,
@@ -591,43 +636,127 @@ impl BnsEvmControllerClient {
             )));
         }
 
-        match self.submit_raw_tx(&signed.raw_tx).await {
-            Ok(tx_hash) => {
-                info!(
-                    "bns evm contract transaction submitted: operation={} name={} doc_type={} \
-                     contract_address={} from={} chain_id={} nonce={} tx_hash={}",
-                    request.operation.as_str(),
-                    if request.name.is_empty() {
-                        "-"
-                    } else {
-                        request.name.as_str()
-                    },
-                    request.doc_type.as_deref().unwrap_or("-"),
-                    contract_address,
-                    signed.signer,
-                    signed.chain_id,
-                    signed.nonce,
-                    tx_hash,
+        let prepared = BnsEvmPreparedTx {
+            tx_hash: format!("{:#x}", signed.tx_hash),
+            raw_tx: format!("0x{}", hex::encode(&signed.raw_tx)),
+            from: format!("{:#x}", signed.signer),
+            nonce: signed.nonce,
+            chain_id: signed.chain_id,
+        };
+        info!(
+            "bns evm contract transaction prepared: operation={} name={} doc_type={} \
+             contract_address={} from={} chain_id={} nonce={} tx_hash={}",
+            request.operation.as_str(),
+            if request.name.is_empty() {
+                "-"
+            } else {
+                request.name.as_str()
+            },
+            request.doc_type.as_deref().unwrap_or("-"),
+            contract_address,
+            prepared.from,
+            prepared.chain_id,
+            prepared.nonce,
+            prepared.tx_hash,
+        );
+        Ok(prepared)
+    }
+
+    /// Broadcast an already signed transaction. Callers that persist
+    /// idempotency state must do so before invoking this method.
+    pub async fn submit_prepared_tx(
+        &self,
+        prepared: &BnsEvmPreparedTx,
+    ) -> BnsClientResult<BnsEvmTxSubmission> {
+        let raw_tx = prepared.raw_tx_bytes()?;
+        let submitted_hash = match self.submit_raw_tx(&raw_tx).await {
+            Ok(hash) => hash,
+            Err(submit_error) => {
+                match self
+                    .query_prepared_tx_state(prepared.tx_hash.as_str())
+                    .await
+                {
+                    Ok(state)
+                        if matches!(
+                            state.state,
+                            BnsTxExecutionState::Pending | BnsTxExecutionState::Succeeded
+                        ) =>
+                    {
+                        let mut submission = prepared.submission();
+                        if state.state == BnsTxExecutionState::Succeeded {
+                            submission.receipt_status = Some(1);
+                            submission.receipt_block_number = state.block_number;
+                            submission.receipt_confirmations = Some(state.confirmations);
+                        }
+                        return Ok(submission);
+                    }
+                    _ => return Err(submit_error),
+                }
+            }
+        };
+        if let (Ok(expected_hash), Ok(actual_hash)) = (
+            parse_b256(prepared.tx_hash.as_str(), "prepared.tx_hash"),
+            parse_b256(submitted_hash.as_str(), "submitted.tx_hash"),
+        ) {
+            if actual_hash != expected_hash {
+                warn!(
+                    "EVM submitter returned tx hash {}, using locally computed prepared hash {}",
+                    submitted_hash, prepared.tx_hash
                 );
-                let receipt = match self.receipt_wait {
-                    Some(config) => Some(self.wait_for_receipt(tx_hash.as_str(), config).await?),
-                    None => None,
-                };
-                Ok(BnsEvmTxSubmission {
-                    tx_hash,
-                    raw_tx: format!("0x{}", hex::encode(&signed.raw_tx)),
-                    from: format!("{:#x}", signed.signer),
-                    nonce: signed.nonce,
-                    chain_id: signed.chain_id,
-                    receipt_status: receipt.as_ref().and_then(|receipt| receipt.status),
-                    receipt_block_number: receipt.as_ref().map(|receipt| receipt.block_number),
-                    receipt_confirmations: receipt.as_ref().map(|receipt| receipt.confirmations),
-                })
             }
-            Err(error) => {
-                self.reset_nonce(signer_address);
-                Err(error)
-            }
+        }
+        info!(
+            "bns evm contract transaction submitted: from={} chain_id={} nonce={} tx_hash={}",
+            prepared.from, prepared.chain_id, prepared.nonce, prepared.tx_hash,
+        );
+        let receipt = match self.receipt_wait {
+            Some(config) => Some(
+                self.wait_for_receipt(prepared.tx_hash.as_str(), config)
+                    .await?,
+            ),
+            None => None,
+        };
+        Ok(BnsEvmTxSubmission {
+            tx_hash: prepared.tx_hash.clone(),
+            raw_tx: prepared.raw_tx.clone(),
+            from: prepared.from.clone(),
+            nonce: prepared.nonce,
+            chain_id: prepared.chain_id,
+            receipt_status: receipt.as_ref().and_then(|receipt| receipt.status),
+            receipt_block_number: receipt.as_ref().map(|receipt| receipt.block_number),
+            receipt_confirmations: receipt.as_ref().map(|receipt| receipt.confirmations),
+        })
+    }
+
+    /// Resume a prepared transaction without ever allocating another nonce or
+    /// signing a replacement. Known pending/succeeded transactions are reused;
+    /// transactions not known by the node are rebroadcast byte-for-byte.
+    pub async fn recover_prepared_tx(
+        &self,
+        prepared: &BnsEvmPreparedTx,
+    ) -> BnsClientResult<BnsEvmTxSubmission> {
+        match self
+            .query_prepared_tx_state(prepared.tx_hash.as_str())
+            .await
+        {
+            Ok(state) => match state.state {
+                BnsTxExecutionState::Pending => Ok(prepared.submission()),
+                BnsTxExecutionState::Succeeded => {
+                    let mut submission = prepared.submission();
+                    submission.receipt_status = Some(1);
+                    submission.receipt_block_number = state.block_number;
+                    submission.receipt_confirmations = Some(state.confirmations);
+                    Ok(submission)
+                }
+                BnsTxExecutionState::Reverted => Err(BnsClientError::registry(
+                    "EVM_TX_REVERTED",
+                    format!("BNS EVM tx {} reverted", prepared.tx_hash),
+                )),
+                BnsTxExecutionState::NotFound => self.submit_prepared_tx(prepared).await,
+            },
+            // A backend without transaction lookup can still safely replay the
+            // exact raw transaction. EVM transaction hashes make this idempotent.
+            Err(_) => self.submit_prepared_tx(prepared).await,
         }
     }
 
@@ -726,6 +855,88 @@ impl BnsEvmControllerClient {
                 .await
                 .map(|resp| resp.tx_hash),
         }
+    }
+
+    pub async fn query_prepared_tx_state(&self, tx_hash: &str) -> BnsClientResult<BnsTxState> {
+        if let BnsEvmRawTxSubmitter::BnsServer(server) = &self.raw_tx_submitter {
+            return server.query_tx_state(tx_hash).await;
+        }
+
+        let hash = parse_b256(tx_hash, "tx_hash")?;
+        if let Some(receipt) = self
+            .standard
+            .rpc
+            .transaction_receipt(hash)
+            .await
+            .map_err(BnsClientError::from)?
+        {
+            let confirmations = match receipt.block_number {
+                Some(block_number) => self.receipt_confirmations(block_number).await?,
+                None => 0,
+            };
+            return Ok(BnsTxState {
+                tx_hash: tx_hash.to_string(),
+                state: if receipt.status == Some(0) {
+                    BnsTxExecutionState::Reverted
+                } else {
+                    BnsTxExecutionState::Succeeded
+                },
+                block_number: receipt.block_number,
+                confirmations,
+            });
+        }
+        let transaction = self
+            .standard
+            .rpc
+            .transaction_by_hash(hash)
+            .await
+            .map_err(BnsClientError::from)?;
+        Ok(BnsTxState {
+            tx_hash: tx_hash.to_string(),
+            state: if transaction.is_some() {
+                BnsTxExecutionState::Pending
+            } else {
+                BnsTxExecutionState::NotFound
+            },
+            block_number: None,
+            confirmations: 0,
+        })
+    }
+
+    pub async fn prepare_register_name(
+        &self,
+        req: &BnsRegisterNameReq,
+    ) -> BnsClientResult<BnsEvmPreparedTx> {
+        let request = BnsEvmSignRequest::for_register(BnsEvmWriteOperation::RegisterName, req);
+        self.prepare_with_request(&request, &register_name_call(req)?)
+            .await
+    }
+
+    pub async fn prepare_apply_mutations(
+        &self,
+        req: &BnsApplyMutationsReq,
+    ) -> BnsClientResult<BnsEvmPreparedTx> {
+        let request = BnsEvmSignRequest::new(
+            BnsEvmWriteOperation::ApplyMutations,
+            req.name.clone(),
+            req.authority.clone(),
+        );
+        self.prepare_with_request(&request, &apply_mutations_call(req)?)
+            .await
+    }
+
+    pub async fn prepare_publish_document(
+        &self,
+        req: &BnsPublishDocumentReq,
+    ) -> BnsClientResult<BnsEvmPreparedTx> {
+        let request = BnsEvmSignRequest::for_document(
+            BnsEvmWriteOperation::PublishDocument,
+            &req.name,
+            req.update.doc_type.clone(),
+            req.authority.clone(),
+        );
+        self.prepare_with_request(&request, &publish_document_call(req)?)
+            .await
     }
 
     pub async fn register_name(
@@ -849,6 +1060,20 @@ impl BnsEvmControllerClient {
             .lock()
             .map_err(|_| BnsClientError::Transport("BNS EVM nonce lock poisoned".to_string()))?;
         let nonce = *cached.get(&signer_address).unwrap_or(&chain_nonce);
+        cached.insert(signer_address, nonce + 1);
+        Ok(nonce)
+    }
+
+    fn reserve_nonce(&self, signer_address: Address, suggested_nonce: u64) -> BnsClientResult<u64> {
+        let mut cached = self
+            .next_nonces
+            .lock()
+            .map_err(|_| BnsClientError::Transport("BNS EVM nonce lock poisoned".to_string()))?;
+        let nonce = cached
+            .get(&signer_address)
+            .copied()
+            .unwrap_or(suggested_nonce)
+            .max(suggested_nonce);
         cached.insert(signer_address, nonce + 1);
         Ok(nonce)
     }

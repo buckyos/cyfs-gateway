@@ -8,7 +8,7 @@ use crate::{
 };
 use crate::{
     BnsApplyMutationsReq, BnsClientError, BnsDocumentVersion, BnsEvmControllerClient,
-    BnsEvmReceiptWaitConfig, BnsEvmTxReceipt, BnsEvmTxSubmission, BnsIndexerApi,
+    BnsEvmPreparedTx, BnsEvmReceiptWaitConfig, BnsEvmTxReceipt, BnsEvmTxSubmission, BnsIndexerApi,
     BnsPublishDocumentReq, BnsRegisterNameReq, BnsRpcErrorInfo,
 };
 use async_trait::async_trait;
@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use thiserror::Error;
 
@@ -25,6 +26,17 @@ pub const ZONE_DOC_TYPE: &str = "zone";
 pub const BOOT_DOC_TYPE: &str = "boot";
 pub const DEVICE_MINI_DOC_TYPE: &str = "device_mini_doc";
 pub const RELAY_ASSIGNMENT_DOC_TYPE: &str = "relay_assignment";
+const DEFAULT_IDEMPOTENCY_LEASE_SECS: u64 = 300;
+
+fn next_lease_owner() -> String {
+    static NEXT_LEASE_ID: AtomicU64 = AtomicU64::new(1);
+    format!(
+        "{}:{}:{}",
+        std::process::id(),
+        crate::now_timestamp(),
+        NEXT_LEASE_ID.fetch_add(1, Ordering::Relaxed)
+    )
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -213,6 +225,10 @@ pub struct SnBnsWriteRequestRecord {
     pub error_code: Option<String>,
     pub error_message: Option<String>,
     #[serde(default)]
+    pub lease_owner: Option<String>,
+    #[serde(default)]
+    pub lease_expires_at: Option<u64>,
+    #[serde(default)]
     pub evm_chain_id: Option<u64>,
     #[serde(default)]
     pub evm_nonce: Option<u64>,
@@ -285,10 +301,40 @@ impl From<serde_json::Error> for SnBnsControllerError {
 
 pub type SnBnsControllerResult<T> = Result<T, SnBnsControllerError>;
 
+#[derive(Debug, Clone)]
+pub enum SnBnsTryBeginResult {
+    Acquired,
+    Existing(SnBnsWriteRequestRecord),
+}
+
 pub trait SnBnsWriteRequestStore: Send + Sync {
     fn get(&self, request_id: &str) -> SnBnsControllerResult<Option<SnBnsWriteRequestRecord>>;
 
-    fn put(&self, record: SnBnsWriteRequestRecord) -> SnBnsControllerResult<()>;
+    /// Atomically insert the initial Pending record. Exactly one caller may
+    /// receive [`SnBnsTryBeginResult::Acquired`] for a request id.
+    fn try_begin(
+        &self,
+        record: SnBnsWriteRequestRecord,
+    ) -> SnBnsControllerResult<SnBnsTryBeginResult>;
+
+    /// Persist a fully signed transaction while the request is still Pending.
+    /// Returns false when another state transition has already won.
+    fn save_prepared(&self, record: SnBnsWriteRequestRecord) -> SnBnsControllerResult<bool>;
+
+    /// Atomically take over an expired Pending request. The returned record is
+    /// the only one authorized to recover/finish the prepared transaction.
+    fn try_takeover(
+        &self,
+        request_id: &str,
+        payload_hash: &str,
+        lease_owner: &str,
+        lease_expires_at: u64,
+        now: u64,
+    ) -> SnBnsControllerResult<Option<SnBnsWriteRequestRecord>>;
+
+    /// Finish a Pending request using a compare-and-set transition. The stored
+    /// payload hash and prepared transaction (if any) must still match.
+    fn finish(&self, record: SnBnsWriteRequestRecord) -> SnBnsControllerResult<bool>;
 }
 
 #[derive(Default)]
@@ -311,13 +357,90 @@ impl SnBnsWriteRequestStore for MemorySnBnsWriteRequestStore {
         Ok(records.get(request_id).cloned())
     }
 
-    fn put(&self, record: SnBnsWriteRequestRecord) -> SnBnsControllerResult<()> {
+    fn try_begin(
+        &self,
+        record: SnBnsWriteRequestRecord,
+    ) -> SnBnsControllerResult<SnBnsTryBeginResult> {
+        use std::collections::hash_map::Entry;
+
         let mut records = self
             .records
             .lock()
             .map_err(|_| SnBnsControllerError::Store("memory store lock poisoned".to_string()))?;
-        records.insert(record.request_id.clone(), record);
-        Ok(())
+        match records.entry(record.request_id.clone()) {
+            Entry::Vacant(entry) => {
+                entry.insert(record);
+                Ok(SnBnsTryBeginResult::Acquired)
+            }
+            Entry::Occupied(entry) => Ok(SnBnsTryBeginResult::Existing(entry.get().clone())),
+        }
+    }
+
+    fn save_prepared(&self, mut record: SnBnsWriteRequestRecord) -> SnBnsControllerResult<bool> {
+        let mut records = self
+            .records
+            .lock()
+            .map_err(|_| SnBnsControllerError::Store("memory store lock poisoned".to_string()))?;
+        let Some(current) = records.get_mut(&record.request_id) else {
+            return Ok(false);
+        };
+        if current.state != BnsWriteRequestState::Pending
+            || current.payload_hash != record.payload_hash
+            || current.evm_tx_hash.is_some()
+            || current.lease_owner != record.lease_owner
+        {
+            return Ok(false);
+        }
+        record.created_at = current.created_at;
+        *current = record;
+        Ok(true)
+    }
+
+    fn try_takeover(
+        &self,
+        request_id: &str,
+        payload_hash: &str,
+        lease_owner: &str,
+        lease_expires_at: u64,
+        now: u64,
+    ) -> SnBnsControllerResult<Option<SnBnsWriteRequestRecord>> {
+        let mut records = self
+            .records
+            .lock()
+            .map_err(|_| SnBnsControllerError::Store("memory store lock poisoned".to_string()))?;
+        let Some(record) = records.get_mut(request_id) else {
+            return Ok(None);
+        };
+        if record.state != BnsWriteRequestState::Pending
+            || record.payload_hash != payload_hash
+            || record.lease_expires_at.is_some_and(|expires| expires > now)
+        {
+            return Ok(None);
+        }
+        record.lease_owner = Some(lease_owner.to_string());
+        record.lease_expires_at = Some(lease_expires_at);
+        record.updated_at = now;
+        Ok(Some(record.clone()))
+    }
+
+    fn finish(&self, mut record: SnBnsWriteRequestRecord) -> SnBnsControllerResult<bool> {
+        let mut records = self
+            .records
+            .lock()
+            .map_err(|_| SnBnsControllerError::Store("memory store lock poisoned".to_string()))?;
+        let Some(current) = records.get_mut(&record.request_id) else {
+            return Ok(false);
+        };
+        if current.state != BnsWriteRequestState::Pending
+            || current.payload_hash != record.payload_hash
+            || current.evm_tx_hash != record.evm_tx_hash
+            || current.lease_owner != record.lease_owner
+        {
+            return Ok(false);
+        }
+        record.created_at = current.created_at;
+        *current = record;
+        Ok(true)
     }
 }
 
@@ -328,6 +451,7 @@ pub struct SnBnsControllerConfig {
     pub allowed_controller_doc_types: Vec<String>,
     pub max_inline_document_size: usize,
     pub write_retry_limit: usize,
+    pub idempotency_lease_secs: u64,
 }
 
 impl SnBnsControllerConfig {
@@ -341,6 +465,7 @@ impl SnBnsControllerConfig {
             allowed_controller_doc_types: vec![String::new()],
             max_inline_document_size: crate::MAX_INLINE_DOCUMENT,
             write_retry_limit: 2,
+            idempotency_lease_secs: DEFAULT_IDEMPOTENCY_LEASE_SECS,
         }
     }
 
@@ -402,20 +527,32 @@ impl SnBnsControllerConfig {
 
 #[async_trait]
 pub trait SnBnsEvmSubmitter: Send + Sync {
-    async fn register_name(
+    async fn prepare_register_name(
         &self,
         req: &BnsRegisterNameReq,
-    ) -> crate::BnsClientResult<BnsEvmTxSubmission>;
+    ) -> crate::BnsClientResult<BnsEvmPreparedTx>;
 
-    async fn apply_mutations(
+    async fn prepare_apply_mutations(
         &self,
         req: &BnsApplyMutationsReq,
-    ) -> crate::BnsClientResult<BnsEvmTxSubmission>;
+    ) -> crate::BnsClientResult<BnsEvmPreparedTx>;
 
-    async fn publish_document(
+    async fn prepare_publish_document(
         &self,
         req: &BnsPublishDocumentReq,
+    ) -> crate::BnsClientResult<BnsEvmPreparedTx>;
+
+    async fn submit_prepared(
+        &self,
+        prepared: &BnsEvmPreparedTx,
     ) -> crate::BnsClientResult<BnsEvmTxSubmission>;
+
+    async fn recover_prepared(
+        &self,
+        prepared: &BnsEvmPreparedTx,
+    ) -> crate::BnsClientResult<BnsEvmTxSubmission> {
+        self.submit_prepared(prepared).await
+    }
 
     async fn wait_for_receipt(
         &self,
@@ -431,25 +568,39 @@ pub trait SnBnsEvmSubmitter: Send + Sync {
 
 #[async_trait]
 impl SnBnsEvmSubmitter for BnsEvmControllerClient {
-    async fn register_name(
+    async fn prepare_register_name(
         &self,
         req: &BnsRegisterNameReq,
-    ) -> crate::BnsClientResult<BnsEvmTxSubmission> {
-        BnsEvmControllerClient::register_name(self, req).await
+    ) -> crate::BnsClientResult<BnsEvmPreparedTx> {
+        BnsEvmControllerClient::prepare_register_name(self, req).await
     }
 
-    async fn apply_mutations(
+    async fn prepare_apply_mutations(
         &self,
         req: &BnsApplyMutationsReq,
-    ) -> crate::BnsClientResult<BnsEvmTxSubmission> {
-        BnsEvmControllerClient::apply_mutations(self, req).await
+    ) -> crate::BnsClientResult<BnsEvmPreparedTx> {
+        BnsEvmControllerClient::prepare_apply_mutations(self, req).await
     }
 
-    async fn publish_document(
+    async fn prepare_publish_document(
         &self,
         req: &BnsPublishDocumentReq,
+    ) -> crate::BnsClientResult<BnsEvmPreparedTx> {
+        BnsEvmControllerClient::prepare_publish_document(self, req).await
+    }
+
+    async fn submit_prepared(
+        &self,
+        prepared: &BnsEvmPreparedTx,
     ) -> crate::BnsClientResult<BnsEvmTxSubmission> {
-        BnsEvmControllerClient::publish_document(self, req).await
+        BnsEvmControllerClient::submit_prepared_tx(self, prepared).await
+    }
+
+    async fn recover_prepared(
+        &self,
+        prepared: &BnsEvmPreparedTx,
+    ) -> crate::BnsClientResult<BnsEvmTxSubmission> {
+        BnsEvmControllerClient::recover_prepared_tx(self, prepared).await
     }
 
     async fn wait_for_receipt(
@@ -463,19 +614,29 @@ impl SnBnsEvmSubmitter for BnsEvmControllerClient {
 
 #[async_trait]
 trait SnBnsWriteBackend: Send + Sync {
-    async fn register_name(
+    async fn prepare_register_name(
         &self,
         req: BnsRegisterNameReq,
-    ) -> SnBnsControllerResult<BnsEvmTxSubmission>;
+    ) -> SnBnsControllerResult<BnsEvmPreparedTx>;
 
-    async fn apply_mutations(
+    async fn prepare_apply_mutations(
         &self,
         req: BnsApplyMutationsReq,
-    ) -> SnBnsControllerResult<BnsEvmTxSubmission>;
+    ) -> SnBnsControllerResult<BnsEvmPreparedTx>;
 
-    async fn publish_document(
+    async fn prepare_publish_document(
         &self,
         req: BnsPublishDocumentReq,
+    ) -> SnBnsControllerResult<BnsEvmPreparedTx>;
+
+    async fn submit_prepared(
+        &self,
+        prepared: &BnsEvmPreparedTx,
+    ) -> SnBnsControllerResult<BnsEvmTxSubmission>;
+
+    async fn recover_prepared(
+        &self,
+        prepared: &BnsEvmPreparedTx,
     ) -> SnBnsControllerResult<BnsEvmTxSubmission>;
 
     async fn wait_for_receipt(
@@ -497,29 +658,52 @@ impl EvmSnBnsWriteBackend {
 
 #[async_trait]
 impl SnBnsWriteBackend for EvmSnBnsWriteBackend {
-    async fn register_name(
+    async fn prepare_register_name(
         &self,
         req: BnsRegisterNameReq,
-    ) -> SnBnsControllerResult<BnsEvmTxSubmission> {
-        self.submitter.register_name(&req).await.map_err(Into::into)
-    }
-
-    async fn apply_mutations(
-        &self,
-        req: BnsApplyMutationsReq,
-    ) -> SnBnsControllerResult<BnsEvmTxSubmission> {
+    ) -> SnBnsControllerResult<BnsEvmPreparedTx> {
         self.submitter
-            .apply_mutations(&req)
+            .prepare_register_name(&req)
             .await
             .map_err(Into::into)
     }
 
-    async fn publish_document(
+    async fn prepare_apply_mutations(
+        &self,
+        req: BnsApplyMutationsReq,
+    ) -> SnBnsControllerResult<BnsEvmPreparedTx> {
+        self.submitter
+            .prepare_apply_mutations(&req)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn prepare_publish_document(
         &self,
         req: BnsPublishDocumentReq,
+    ) -> SnBnsControllerResult<BnsEvmPreparedTx> {
+        self.submitter
+            .prepare_publish_document(&req)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn submit_prepared(
+        &self,
+        prepared: &BnsEvmPreparedTx,
     ) -> SnBnsControllerResult<BnsEvmTxSubmission> {
         self.submitter
-            .publish_document(&req)
+            .submit_prepared(prepared)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn recover_prepared(
+        &self,
+        prepared: &BnsEvmPreparedTx,
+    ) -> SnBnsControllerResult<BnsEvmTxSubmission> {
+        self.submitter
+            .recover_prepared(prepared)
             .await
             .map_err(Into::into)
     }
@@ -533,6 +717,59 @@ impl SnBnsWriteBackend for EvmSnBnsWriteBackend {
             .wait_for_receipt(tx_hash, config)
             .await
             .map_err(Into::into)
+    }
+}
+
+#[derive(Clone)]
+struct SnBnsIdempotentExecution {
+    store: Arc<dyn SnBnsWriteRequestStore>,
+    backend: Arc<dyn SnBnsWriteBackend>,
+    pending_record: SnBnsWriteRequestRecord,
+    prepared: Arc<AtomicBool>,
+}
+
+enum SnBnsExistingAction<T> {
+    Return(T),
+    Execute(SnBnsWriteRequestRecord),
+}
+
+impl SnBnsIdempotentExecution {
+    fn new(
+        store: Arc<dyn SnBnsWriteRequestStore>,
+        backend: Arc<dyn SnBnsWriteBackend>,
+        pending_record: SnBnsWriteRequestRecord,
+    ) -> Self {
+        Self {
+            store,
+            backend,
+            pending_record,
+            prepared: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn is_prepared(&self) -> bool {
+        self.prepared.load(Ordering::Acquire)
+    }
+
+    async fn persist_and_submit<T: Serialize + ?Sized>(
+        &self,
+        prepared: &BnsEvmPreparedTx,
+        provisional_result: &T,
+    ) -> SnBnsControllerResult<BnsEvmTxSubmission> {
+        let mut record = self.pending_record.clone();
+        record.result_json = Some(serde_json::to_value(provisional_result)?);
+        record.evm_chain_id = Some(prepared.chain_id);
+        record.evm_nonce = Some(prepared.nonce);
+        record.evm_tx_hash = Some(prepared.tx_hash.clone());
+        record.evm_raw_tx = Some(prepared.raw_tx.clone());
+        record.updated_at = crate::now_timestamp();
+        if !self.store.save_prepared(record)? {
+            return Err(SnBnsControllerError::IdempotencyPending {
+                request_id: self.pending_record.request_id.clone(),
+            });
+        }
+        self.prepared.store(true, Ordering::Release);
+        self.backend.submit_prepared(prepared).await
     }
 }
 
@@ -642,14 +879,16 @@ impl SnBnsController {
             &name,
             None,
             &payload,
-            || async move {
-                let submission = self.write_backend.register_name(req).await?;
-                Ok(self.register_output_from_submission(
+            |execution| async move {
+                let prepared = self.write_backend.prepare_register_name(req).await?;
+                let output = self.register_output_from_submission(
                     &response_request_id,
                     &response_name,
                     &controller_policy_hash,
-                    submission,
-                ))
+                    prepared.submission(),
+                );
+                execution.persist_and_submit(&prepared, &output).await?;
+                Ok(output)
             },
         )
         .await
@@ -660,20 +899,22 @@ impl SnBnsController {
         params: PublishOwnerDocumentParams,
     ) -> SnBnsControllerResult<BnsWriteReceipt> {
         self.ensure_owner_authority(&params.authority, OWNER_DOC_TYPE)?;
+        let execute_params = params.clone();
         self.run_idempotent(
             &params.request_id,
             BnsWriteOperation::PublishDocument,
             &params.name,
             Some(OWNER_DOC_TYPE),
             &params,
-            || async {
+            |execution| async move {
                 self.publish_json_document_once(
-                    &params.request_id,
+                    &execution,
+                    &execute_params.request_id,
                     BnsWriteOperation::PublishDocument,
-                    &params.name,
+                    &execute_params.name,
                     OWNER_DOC_TYPE,
-                    &params.owner_config,
-                    params.authority.clone(),
+                    &execute_params.owner_config,
+                    execute_params.authority.clone(),
                 )
                 .await
             },
@@ -686,20 +927,22 @@ impl SnBnsController {
         params: PublishDocumentParams,
     ) -> SnBnsControllerResult<BnsWriteReceipt> {
         self.ensure_owner_authority(&params.authority, &params.doc_type)?;
+        let execute_params = params.clone();
         self.run_idempotent(
             &params.request_id,
             BnsWriteOperation::PublishDocument,
             &params.name,
             Some(&params.doc_type),
             &params,
-            || async {
+            |execution| async move {
                 self.publish_json_document_once(
-                    &params.request_id,
+                    &execution,
+                    &execute_params.request_id,
                     BnsWriteOperation::PublishDocument,
-                    &params.name,
-                    &params.doc_type,
-                    &params.document,
-                    params.authority.clone(),
+                    &execute_params.name,
+                    &execute_params.doc_type,
+                    &execute_params.document,
+                    execute_params.authority.clone(),
                 )
                 .await
             },
@@ -737,6 +980,7 @@ impl SnBnsController {
             ));
         }
         self.ensure_authority_can_publish(&params.authority, &params.doc_type)?;
+        let execute_params = params.clone();
 
         self.run_idempotent(
             &params.request_id,
@@ -744,23 +988,25 @@ impl SnBnsController {
             &params.name,
             Some(&params.doc_type),
             &params,
-            || async {
+            |execution| async move {
                 let mut attempt = 0;
                 loop {
                     let result = self
                         .publish_inline_document_once(
-                            &params.request_id,
+                            &execution,
+                            &execute_params.request_id,
                             BnsWriteOperation::PublishDocument,
-                            &params.name,
-                            &params.doc_type,
-                            &params.document,
-                            params.authority.clone(),
+                            &execute_params.name,
+                            &execute_params.doc_type,
+                            &execute_params.document,
+                            execute_params.authority.clone(),
                         )
                         .await;
                     match result {
                         Ok(receipt) => return Ok(receipt),
                         Err(error)
                             if error.is_stale_guard()
+                                && !execution.is_prepared()
                                 && attempt < self.config.write_retry_limit =>
                         {
                             attempt += 1;
@@ -790,6 +1036,7 @@ impl SnBnsController {
             ));
         }
         self.ensure_authority_can_publish(&params.authority, OWNER_DOC_TYPE)?;
+        let execute_params = params.clone();
 
         self.run_idempotent(
             &params.request_id,
@@ -797,14 +1044,17 @@ impl SnBnsController {
             &params.name,
             Some(OWNER_DOC_TYPE),
             &params,
-            || async {
+            |execution| async move {
                 let mut attempt = 0;
                 loop {
-                    let result = self.publish_guarded_owner_document_once(&params).await;
+                    let result = self
+                        .publish_guarded_owner_document_once(&execution, &execute_params)
+                        .await;
                     match result {
                         Ok(receipt) => return Ok(receipt),
                         Err(error)
                             if error.is_stale_guard()
+                                && !execution.is_prepared()
                                 && attempt < self.config.write_retry_limit =>
                         {
                             attempt += 1;
@@ -832,55 +1082,57 @@ impl SnBnsController {
                 "boot_config must be a JSON object when present".to_string(),
             ));
         }
+        let execute_params = params.clone();
         self.run_idempotent(
             &params.request_id,
             BnsWriteOperation::BindZoneDocuments,
             &params.name,
             Some(ZONE_DOC_TYPE),
             &params,
-            || async {
-                let name_state = self.required_name_state(&params.name).await?;
+            |execution| async move {
+                let name_state = self.required_name_state(&execute_params.name).await?;
                 let zone_current = self
-                    .current_document_state(&params.name, ZONE_DOC_TYPE)
+                    .current_document_state(&execute_params.name, ZONE_DOC_TYPE)
                     .await?;
                 let zone_expected = zone_current.as_ref().map_or(0, |state| state.version);
                 let mut updates = vec![self.inline_json_update(
                     ZONE_DOC_TYPE,
                     zone_expected,
-                    &params.zone_config,
+                    &execute_params.zone_config,
                 )?];
-                if !params.boot_config.is_null() {
+                if !execute_params.boot_config.is_null() {
                     let boot_current = self
-                        .current_document_state(&params.name, BOOT_DOC_TYPE)
+                        .current_document_state(&execute_params.name, BOOT_DOC_TYPE)
                         .await?;
                     let boot_expected = boot_current.as_ref().map_or(0, |state| state.version);
                     updates.push(self.inline_json_update(
                         BOOT_DOC_TYPE,
                         boot_expected,
-                        &params.boot_config,
+                        &execute_params.boot_config,
                     )?);
                 }
                 let guard = MutationGuard {
                     expected_name_seq: name_state.name_seq,
                     expected_parent_name_seq: 0,
                 };
-                let submission = self
+                let prepared = self
                     .write_backend
-                    .apply_mutations(BnsApplyMutationsReq {
-                        name: params.name.clone(),
+                    .prepare_apply_mutations(BnsApplyMutationsReq {
+                        name: execute_params.name.clone(),
                         authority_key_updates: Vec::new(),
                         documents: updates.clone(),
                         owner_policy: OwnerPolicyUpdate::none(),
-                        authority: params.authority.clone(),
+                        authority: execute_params.authority.clone(),
                         guard,
                     })
                     .await?;
-                let authority_set = self.client.get_authority_set(&params.name).await?;
+                let submission = prepared.submission();
+                let authority_set = self.client.get_authority_set(&execute_params.name).await?;
                 let receipts = updates
                     .iter()
                     .map(|update| {
                         receipt_from_submitted_document(
-                            &params.request_id,
+                            &execute_params.request_id,
                             BnsWriteOperation::BindZoneDocuments,
                             &name_state,
                             update,
@@ -889,9 +1141,9 @@ impl SnBnsController {
                         )
                     })
                     .collect();
-                Ok(BnsMultiWriteReceipt {
-                    request_id: params.request_id.clone(),
-                    name: params.name.clone(),
+                let output = BnsMultiWriteReceipt {
+                    request_id: execute_params.request_id.clone(),
+                    name: execute_params.name.clone(),
                     operation: BnsWriteOperation::BindZoneDocuments,
                     status: BnsWriteReceiptStatus::Submitted,
                     evm_chain_id: Some(submission.chain_id),
@@ -900,7 +1152,9 @@ impl SnBnsController {
                     evm_raw_tx: Some(submission.raw_tx),
                     receipts,
                     created_or_reused: false,
-                })
+                };
+                execution.persist_and_submit(&prepared, &output).await?;
+                Ok(output)
             },
         )
         .await
@@ -913,6 +1167,7 @@ impl SnBnsController {
         self.ensure_owner_authority(&params.authority, DEVICE_MINI_DOC_TYPE)?;
         self.validate_device_name(&params.device_name)?;
         crate::validate_did(&params.did).map_err(SnBnsControllerError::from)?;
+        let execute_params = params.clone();
 
         self.run_idempotent(
             &params.request_id,
@@ -920,9 +1175,9 @@ impl SnBnsController {
             &params.name,
             Some(DEVICE_MINI_DOC_TYPE),
             &params,
-            || async {
+            |execution| async move {
                 let current = self
-                    .current_document_state(&params.name, DEVICE_MINI_DOC_TYPE)
+                    .current_document_state(&execute_params.name, DEVICE_MINI_DOC_TYPE)
                     .await?;
                 let expected_version = current.as_ref().map_or(0, |state| state.version);
                 let mut collection = match current.as_ref() {
@@ -930,19 +1185,24 @@ impl SnBnsController {
                     None => DeviceMiniDocCollection::default(),
                 };
 
-                let entry =
-                    normalize_device_mini_doc_entry(&params.did, params.device_mini_doc.clone())?;
-                collection.devices.insert(params.device_name.clone(), entry);
+                let entry = normalize_device_mini_doc_entry(
+                    &execute_params.did,
+                    execute_params.device_mini_doc.clone(),
+                )?;
+                collection
+                    .devices
+                    .insert(execute_params.device_name.clone(), entry);
                 let document = serde_json::to_value(collection)?;
 
                 self.publish_json_document_with_expected_once(
-                    &params.request_id,
+                    &execution,
+                    &execute_params.request_id,
                     BnsWriteOperation::PublishDeviceMiniDoc,
-                    &params.name,
+                    &execute_params.name,
                     DEVICE_MINI_DOC_TYPE,
                     expected_version,
                     &document,
-                    params.authority.clone(),
+                    execute_params.authority.clone(),
                 )
                 .await
             },
@@ -955,20 +1215,22 @@ impl SnBnsController {
         params: UpsertDnsTxtParams,
     ) -> SnBnsControllerResult<BnsWriteReceipt> {
         self.ensure_authority_can_publish(&params.authority, DNS_TXT_DOC_TYPE)?;
+        let execute_params = params.clone();
         self.run_idempotent(
             &params.request_id,
             BnsWriteOperation::UpsertDnsTxt,
             &params.name,
             Some(DNS_TXT_DOC_TYPE),
             &params,
-            || async {
+            |execution| async move {
                 let mut attempt = 0;
                 loop {
-                    let result = self.upsert_dns_txt_once(&params).await;
+                    let result = self.upsert_dns_txt_once(&execution, &execute_params).await;
                     match result {
                         Ok(receipt) => return Ok(receipt),
                         Err(error)
                             if error.is_stale_guard()
+                                && !execution.is_prepared()
                                 && attempt < self.config.write_retry_limit =>
                         {
                             attempt += 1;
@@ -991,6 +1253,7 @@ impl SnBnsController {
                 "relay_assignment must be a JSON object".to_string(),
             ));
         }
+        let execute_params = params.clone();
 
         self.run_idempotent(
             &params.request_id,
@@ -998,14 +1261,15 @@ impl SnBnsController {
             &params.name,
             Some(RELAY_ASSIGNMENT_DOC_TYPE),
             &params,
-            || async {
+            |execution| async move {
                 self.publish_inline_document_once(
-                    &params.request_id,
+                    &execution,
+                    &execute_params.request_id,
                     BnsWriteOperation::PublishRelayAssignment,
-                    &params.name,
+                    &execute_params.name,
                     RELAY_ASSIGNMENT_DOC_TYPE,
-                    &params.relay_assignment,
-                    params.authority.clone(),
+                    &execute_params.relay_assignment,
+                    execute_params.authority.clone(),
                 )
                 .await
             },
@@ -1015,6 +1279,7 @@ impl SnBnsController {
 
     async fn upsert_dns_txt_once(
         &self,
+        execution: &SnBnsIdempotentExecution,
         params: &UpsertDnsTxtParams,
     ) -> SnBnsControllerResult<BnsWriteReceipt> {
         let current = self
@@ -1051,6 +1316,7 @@ impl SnBnsController {
 
         let update = self.dns_txt_update(expected_version, &records)?;
         self.publish_document_update_once(
+            execution,
             &params.request_id,
             BnsWriteOperation::UpsertDnsTxt,
             &params.name,
@@ -1062,6 +1328,7 @@ impl SnBnsController {
 
     async fn publish_json_document_once(
         &self,
+        execution: &SnBnsIdempotentExecution,
         request_id: &str,
         operation: BnsWriteOperation,
         name: &str,
@@ -1072,6 +1339,7 @@ impl SnBnsController {
         let current = self.current_document_state(name, doc_type).await?;
         let expected_version = current.as_ref().map_or(0, |state| state.version);
         self.publish_json_document_with_expected_once(
+            execution,
             request_id,
             operation,
             name,
@@ -1085,6 +1353,7 @@ impl SnBnsController {
 
     async fn publish_inline_document_once(
         &self,
+        execution: &SnBnsIdempotentExecution,
         request_id: &str,
         operation: BnsWriteOperation,
         name: &str,
@@ -1095,12 +1364,13 @@ impl SnBnsController {
         let current = self.current_document_state(name, doc_type).await?;
         let expected_version = current.as_ref().map_or(0, |state| state.version);
         let update = self.inline_content_update(doc_type, expected_version, document)?;
-        self.publish_document_update_once(request_id, operation, name, update, authority)
+        self.publish_document_update_once(execution, request_id, operation, name, update, authority)
             .await
     }
 
     async fn publish_guarded_owner_document_once(
         &self,
+        execution: &SnBnsIdempotentExecution,
         params: &PublishDocumentParams,
     ) -> SnBnsControllerResult<BnsWriteReceipt> {
         let current = self
@@ -1112,6 +1382,7 @@ impl SnBnsController {
         }
         let expected_version = current.as_ref().map_or(0, |state| state.version);
         self.publish_json_document_with_expected_once(
+            execution,
             &params.request_id,
             BnsWriteOperation::PublishDocument,
             &params.name,
@@ -1125,6 +1396,7 @@ impl SnBnsController {
 
     async fn publish_json_document_with_expected_once(
         &self,
+        execution: &SnBnsIdempotentExecution,
         request_id: &str,
         operation: BnsWriteOperation,
         name: &str,
@@ -1134,12 +1406,13 @@ impl SnBnsController {
         authority: CallAuthority,
     ) -> SnBnsControllerResult<BnsWriteReceipt> {
         let update = self.inline_json_update(doc_type, expected_version, document)?;
-        self.publish_document_update_once(request_id, operation, name, update, authority)
+        self.publish_document_update_once(execution, request_id, operation, name, update, authority)
             .await
     }
 
     async fn publish_document_update_once(
         &self,
+        execution: &SnBnsIdempotentExecution,
         request_id: &str,
         operation: BnsWriteOperation,
         name: &str,
@@ -1151,9 +1424,9 @@ impl SnBnsController {
             expected_name_seq: name_state.name_seq,
             expected_parent_name_seq: 0,
         };
-        let submission = self
+        let prepared = self
             .write_backend
-            .publish_document(BnsPublishDocumentReq {
+            .prepare_publish_document(BnsPublishDocumentReq {
                 name: name.to_string(),
                 update: update.clone(),
                 authority,
@@ -1161,15 +1434,16 @@ impl SnBnsController {
             })
             .await?;
         let authority_set = self.client.get_authority_set(name).await?;
-
-        Ok(receipt_from_submitted_document(
+        let output = receipt_from_submitted_document(
             request_id,
             operation,
             &name_state,
             &update,
             &authority_set,
-            submission,
-        ))
+            prepared.submission(),
+        );
+        execution.persist_and_submit(&prepared, &output).await?;
+        Ok(output)
     }
 
     async fn current_document_state(
@@ -1404,6 +1678,144 @@ impl SnBnsController {
         }
     }
 
+    async fn handle_existing<T>(
+        &self,
+        mut record: SnBnsWriteRequestRecord,
+    ) -> SnBnsControllerResult<SnBnsExistingAction<T>>
+    where
+        T: DeserializeOwned + MarkIdempotentReuse,
+    {
+        match record.state {
+            BnsWriteRequestState::Succeeded => {
+                let value = record.result_json.ok_or_else(|| {
+                    SnBnsControllerError::Store(format!(
+                        "succeeded request `{}` has no result_json",
+                        record.request_id
+                    ))
+                })?;
+                let mut result: T = serde_json::from_value(value)?;
+                result.mark_reused();
+                Ok(SnBnsExistingAction::Return(result))
+            }
+            BnsWriteRequestState::Failed => Err(SnBnsControllerError::IdempotencyPreviousFailure {
+                request_id: record.request_id,
+                message: record
+                    .error_message
+                    .unwrap_or_else(|| "previous request failed".to_string()),
+            }),
+            BnsWriteRequestState::Pending => {
+                let now = crate::now_timestamp();
+                if record.lease_expires_at.is_some_and(|expires| expires > now) {
+                    return Err(SnBnsControllerError::IdempotencyPending {
+                        request_id: record.request_id,
+                    });
+                }
+                // A record created by the lease-aware workflow with no result
+                // and no transaction fields is known to still be before the
+                // persist-before-broadcast boundary. After lease takeover it
+                // is safe to prepare a new transaction. Legacy Pending rows
+                // have no lease metadata and remain fail-closed because an old
+                // process may already have broadcast without persisting raw_tx.
+                let safe_prebroadcast_takeover = record.lease_owner.is_some()
+                    && record.lease_expires_at.is_some()
+                    && record.result_json.is_none()
+                    && record.evm_chain_id.is_none()
+                    && record.evm_nonce.is_none()
+                    && record.evm_tx_hash.is_none()
+                    && record.evm_raw_tx.is_none();
+                let lease_owner = next_lease_owner();
+                let Some(taken_over) = self.idempotency_store.try_takeover(
+                    record.request_id.as_str(),
+                    record.payload_hash.as_str(),
+                    lease_owner.as_str(),
+                    now.saturating_add(self.config.idempotency_lease_secs),
+                    now,
+                )?
+                else {
+                    return Err(SnBnsControllerError::IdempotencyPending {
+                        request_id: record.request_id,
+                    });
+                };
+                record = taken_over;
+                if safe_prebroadcast_takeover {
+                    return Ok(SnBnsExistingAction::Execute(record));
+                }
+                let Some(prepared) = prepared_tx_from_record(&record) else {
+                    return Err(SnBnsControllerError::IdempotencyPending {
+                        request_id: record.request_id,
+                    });
+                };
+                let Some(provisional_result) = record.result_json.clone() else {
+                    return Err(SnBnsControllerError::IdempotencyPending {
+                        request_id: record.request_id,
+                    });
+                };
+
+                match self.write_backend.recover_prepared(&prepared).await {
+                    Ok(_) => {
+                        record.state = BnsWriteRequestState::Succeeded;
+                        record.error_code = None;
+                        record.error_message = None;
+                        record.updated_at = crate::now_timestamp();
+                        if !self.idempotency_store.finish(record.clone())? {
+                            let latest = self
+                                .idempotency_store
+                                .get(record.request_id.as_str())?
+                                .ok_or_else(|| {
+                                    SnBnsControllerError::Store(format!(
+                                        "request `{}` disappeared during recovery",
+                                        record.request_id
+                                    ))
+                                })?;
+                            return match latest.state {
+                                BnsWriteRequestState::Succeeded => {
+                                    let value = latest.result_json.ok_or_else(|| {
+                                        SnBnsControllerError::Store(format!(
+                                            "succeeded request `{}` has no result_json",
+                                            latest.request_id
+                                        ))
+                                    })?;
+                                    let mut result: T = serde_json::from_value(value)?;
+                                    result.mark_reused();
+                                    Ok(SnBnsExistingAction::Return(result))
+                                }
+                                BnsWriteRequestState::Failed => {
+                                    Err(SnBnsControllerError::IdempotencyPreviousFailure {
+                                        request_id: latest.request_id,
+                                        message: latest.error_message.unwrap_or_else(|| {
+                                            "previous request failed".to_string()
+                                        }),
+                                    })
+                                }
+                                BnsWriteRequestState::Pending => {
+                                    Err(SnBnsControllerError::IdempotencyPending {
+                                        request_id: latest.request_id,
+                                    })
+                                }
+                            };
+                        }
+                        let mut result: T = serde_json::from_value(provisional_result)?;
+                        result.mark_reused();
+                        Ok(SnBnsExistingAction::Return(result))
+                    }
+                    Err(error) if error.code() == "EVM_TX_REVERTED" => {
+                        record.state = BnsWriteRequestState::Failed;
+                        record.result_json = None;
+                        record.error_code = Some(error.code().to_string());
+                        record.error_message = Some(error.to_string());
+                        record.updated_at = crate::now_timestamp();
+                        let _ = self.idempotency_store.finish(record)?;
+                        Err(error)
+                    }
+                    // Submission/query failures are ambiguous. Keep the exact
+                    // signed transaction Pending so a later retry can query or
+                    // rebroadcast it without allocating another nonce.
+                    Err(error) => Err(error),
+                }
+            }
+        }
+    }
+
     async fn run_idempotent<T, P, F, Fut>(
         &self,
         request_id: &str,
@@ -1416,7 +1828,7 @@ impl SnBnsController {
     where
         T: Serialize + DeserializeOwned + MarkIdempotentReuse + BnsWriteMetadata,
         P: Serialize + ?Sized,
-        F: FnOnce() -> Fut,
+        F: FnOnce(SnBnsIdempotentExecution) -> Fut,
         Fut: Future<Output = SnBnsControllerResult<T>>,
     {
         if request_id.is_empty() {
@@ -1430,41 +1842,9 @@ impl SnBnsController {
         }
 
         let payload_hash = hash_json(payload).map_err(SnBnsControllerError::from)?;
-        if let Some(record) = self.idempotency_store.get(request_id)? {
-            if record.payload_hash != payload_hash {
-                return Err(SnBnsControllerError::IdempotencyConflict {
-                    request_id: request_id.to_string(),
-                });
-            }
-
-            return match record.state {
-                BnsWriteRequestState::Succeeded => {
-                    let value = record.result_json.ok_or_else(|| {
-                        SnBnsControllerError::Store(format!(
-                            "succeeded request `{}` has no result_json",
-                            request_id
-                        ))
-                    })?;
-                    let mut result: T = serde_json::from_value(value)?;
-                    result.mark_reused();
-                    Ok(result)
-                }
-                BnsWriteRequestState::Pending => Err(SnBnsControllerError::IdempotencyPending {
-                    request_id: request_id.to_string(),
-                }),
-                BnsWriteRequestState::Failed => {
-                    Err(SnBnsControllerError::IdempotencyPreviousFailure {
-                        request_id: request_id.to_string(),
-                        message: record
-                            .error_message
-                            .unwrap_or_else(|| "previous request failed".to_string()),
-                    })
-                }
-            };
-        }
-
         let now = crate::now_timestamp();
-        self.idempotency_store.put(SnBnsWriteRequestRecord {
+        let lease_owner = next_lease_owner();
+        let pending_record = SnBnsWriteRequestRecord {
             request_id: request_id.to_string(),
             operation,
             name: name.to_string(),
@@ -1474,60 +1854,93 @@ impl SnBnsController {
             result_json: None,
             error_code: None,
             error_message: None,
+            lease_owner: Some(lease_owner),
+            lease_expires_at: Some(now.saturating_add(self.config.idempotency_lease_secs)),
             evm_chain_id: None,
             evm_nonce: None,
             evm_tx_hash: None,
             evm_raw_tx: None,
             created_at: now,
             updated_at: now,
-        })?;
+        };
+        let pending_record = match self.idempotency_store.try_begin(pending_record.clone())? {
+            SnBnsTryBeginResult::Acquired => pending_record,
+            SnBnsTryBeginResult::Existing(record) => {
+                if record.payload_hash != payload_hash {
+                    return Err(SnBnsControllerError::IdempotencyConflict {
+                        request_id: request_id.to_string(),
+                    });
+                }
+                match self.handle_existing(record).await? {
+                    SnBnsExistingAction::Return(value) => return Ok(value),
+                    SnBnsExistingAction::Execute(record) => record,
+                }
+            }
+        };
 
-        let result = execute().await;
+        let execution = SnBnsIdempotentExecution::new(
+            self.idempotency_store.clone(),
+            self.write_backend.clone(),
+            pending_record.clone(),
+        );
+        let result = execute(execution.clone()).await;
         match result {
             Ok(value) => {
                 let evm_submission = value.evm_submission();
                 let result_json = serde_json::to_value(&value)?;
-                self.idempotency_store.put(SnBnsWriteRequestRecord {
-                    request_id: request_id.to_string(),
-                    operation,
-                    name: name.to_string(),
-                    doc_type: doc_type.map(str::to_string),
-                    payload_hash,
-                    state: BnsWriteRequestState::Succeeded,
-                    result_json: Some(result_json),
-                    error_code: None,
-                    error_message: None,
-                    evm_chain_id: evm_submission.as_ref().map(|tx| tx.chain_id),
-                    evm_nonce: evm_submission.as_ref().map(|tx| tx.nonce),
-                    evm_tx_hash: evm_submission.as_ref().map(|tx| tx.tx_hash.clone()),
-                    evm_raw_tx: evm_submission.as_ref().map(|tx| tx.raw_tx.clone()),
-                    created_at: now,
-                    updated_at: crate::now_timestamp(),
-                })?;
+                let mut record = pending_record;
+                record.state = BnsWriteRequestState::Succeeded;
+                record.result_json = Some(result_json);
+                record.evm_chain_id = evm_submission.as_ref().map(|tx| tx.chain_id);
+                record.evm_nonce = evm_submission.as_ref().map(|tx| tx.nonce);
+                record.evm_tx_hash = evm_submission.as_ref().map(|tx| tx.tx_hash.clone());
+                record.evm_raw_tx = evm_submission.as_ref().map(|tx| tx.raw_tx.clone());
+                record.updated_at = crate::now_timestamp();
+                if !self.idempotency_store.finish(record.clone())? {
+                    let latest = self.idempotency_store.get(request_id)?.ok_or_else(|| {
+                        SnBnsControllerError::Store(format!(
+                            "request `{request_id}` disappeared before completion"
+                        ))
+                    })?;
+                    if latest.state != BnsWriteRequestState::Succeeded
+                        || latest.payload_hash != record.payload_hash
+                        || latest.evm_tx_hash != record.evm_tx_hash
+                    {
+                        return Err(SnBnsControllerError::Store(format!(
+                            "request `{request_id}` completion lost its compare-and-set"
+                        )));
+                    }
+                }
                 Ok(value)
             }
+            Err(error) if execution.is_prepared() => {
+                // The network may have accepted the transaction even though
+                // the submit call failed. Preserve Pending + raw_tx for safe
+                // recovery instead of recording an irreversible failure.
+                Err(error)
+            }
             Err(error) => {
-                self.idempotency_store.put(SnBnsWriteRequestRecord {
-                    request_id: request_id.to_string(),
-                    operation,
-                    name: name.to_string(),
-                    doc_type: doc_type.map(str::to_string),
-                    payload_hash,
-                    state: BnsWriteRequestState::Failed,
-                    result_json: None,
-                    error_code: Some(error.code().to_string()),
-                    error_message: Some(error.to_string()),
-                    evm_chain_id: None,
-                    evm_nonce: None,
-                    evm_tx_hash: None,
-                    evm_raw_tx: None,
-                    created_at: now,
-                    updated_at: crate::now_timestamp(),
-                })?;
+                let mut record = pending_record;
+                record.state = BnsWriteRequestState::Failed;
+                record.result_json = None;
+                record.error_code = Some(error.code().to_string());
+                record.error_message = Some(error.to_string());
+                record.updated_at = crate::now_timestamp();
+                let _ = self.idempotency_store.finish(record)?;
                 Err(error)
             }
         }
     }
+}
+
+fn prepared_tx_from_record(record: &SnBnsWriteRequestRecord) -> Option<BnsEvmPreparedTx> {
+    Some(BnsEvmPreparedTx {
+        tx_hash: record.evm_tx_hash.clone()?,
+        raw_tx: record.evm_raw_tx.clone()?,
+        from: String::new(),
+        nonce: record.evm_nonce?,
+        chain_id: record.evm_chain_id?,
+    })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

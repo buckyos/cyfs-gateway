@@ -137,8 +137,14 @@ pub(crate) async fn handle_auth(
                     .as_ref()
                     .map_or(true, |documents| documents.is_empty())
             );
-            // 锁覆盖预查、可选 BNS bootstrap 和本地事务，避免同进程并发请求
-            // 在邮箱冲突已知前产生两次外部注册副作用。SQLite UNIQUE 索引仍兜底。
+            // 锁覆盖预查、可选 BNS bootstrap 和本地事务。username 锁阻止
+            // 同名不同邮箱共享默认 request_id 时并发进入链上调用；email 锁
+            // 阻止不同用户名竞争同一邮箱。持久化幂等 store 仍是跨入口兜底。
+            let _username_locker = async_named_locker::Locker::get_locker(format!(
+                "sn_auth_register_username_{}",
+                username
+            ))
+            .await;
             let _email_locker =
                 async_named_locker::Locker::get_locker(format!("sn_auth_register_email_{}", email))
                     .await;

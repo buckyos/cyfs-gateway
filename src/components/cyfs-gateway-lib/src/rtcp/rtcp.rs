@@ -40,7 +40,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::io::{ReadHalf, WriteHalf};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Mutex, Notify, Semaphore, TryAcquireError, oneshot};
+use tokio::sync::{Mutex, Notify, OwnedSemaphorePermit, Semaphore, TryAcquireError, oneshot};
 use tokio::task;
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
@@ -2164,12 +2164,16 @@ impl RTcpInner {
                 };
                 debug!("RTcp stack accept new tcp stream from {}", addr.clone());
 
+                let Some(initial_permit) = this.try_acquire_initial_handshake_permit(addr) else {
+                    continue;
+                };
                 if let Err(e) = Self::configure_tcp_keepalive(&stream) {
                     debug!("cannot configure TCP keepalive for {}: {}", addr, e);
                 }
                 let this = this.clone();
                 task::spawn(async move {
-                    this.serve_connection(stream, addr).await;
+                    this.serve_connection_with_permit(stream, addr, initial_permit)
+                        .await;
                 });
             }
         });
@@ -2178,8 +2182,42 @@ impl RTcpInner {
     }
 
     pub async fn serve_connection(self: &Arc<Self>, stream: TcpStream, addr: SocketAddr) {
+        let Some(initial_permit) = self.try_acquire_initial_handshake_permit(addr) else {
+            return;
+        };
+        self.serve_connection_with_permit(stream, addr, initial_permit)
+            .await;
+    }
+
+    fn try_acquire_initial_handshake_permit(
+        &self,
+        addr: SocketAddr,
+    ) -> Option<OwnedSemaphorePermit> {
+        match self.pending_handshakes.clone().try_acquire_owned() {
+            Ok(permit) => Some(permit),
+            Err(_) => {
+                warn!(
+                    "reject RTcp connection from {}: pending initial-handshake quota exhausted",
+                    addr
+                );
+                None
+            }
+        }
+    }
+
+    async fn serve_connection_with_permit(
+        self: &Arc<Self>,
+        stream: TcpStream,
+        addr: SocketAddr,
+        initial_permit: OwnedSemaphorePermit,
+    ) {
         let deadline = Duration::from_secs(self.security.limits.handshake_timeout_secs);
-        let established = match timeout(deadline, self.establish_connection(stream, addr)).await {
+        let established = match timeout(
+            deadline,
+            self.establish_connection(stream, addr, initial_permit),
+        )
+        .await
+        {
             Ok(established) => established,
             Err(_) => {
                 warn!(
@@ -2201,6 +2239,7 @@ impl RTcpInner {
         self: &Arc<Self>,
         mut stream: TcpStream,
         addr: SocketAddr,
+        initial_permit: OwnedSemaphorePermit,
     ) -> Option<EstablishedInboundTunnel> {
         let source_info = addr.to_string();
         let first_package =
@@ -2228,6 +2267,10 @@ impl RTcpInner {
                     addr,
                     session_key
                 );
+                // HelloStream only needs the shared quota while its first
+                // packet is unclassified. A valid stream must not consume a
+                // tunnel-handshake slot while it is delivered to its waiter.
+                drop(initial_permit);
                 self.on_new_stream(stream, session_key).await;
                 None
             }
@@ -2239,16 +2282,6 @@ impl RTcpInner {
                     );
                     return None;
                 }
-                let _handshake_permit = match self.pending_handshakes.clone().try_acquire_owned() {
-                    Ok(permit) => permit,
-                    Err(_) => {
-                        warn!(
-                            "reject RTcp tunnel handshake from {}: pending quota exhausted",
-                            addr
-                        );
-                        return None;
-                    }
-                };
                 debug!(
                     "RTcp stack {} accept new tunnel: {}, {} -> {}",
                     self.this_device_did.to_string(),
@@ -2257,9 +2290,11 @@ impl RTcpInner {
                     hello_package.body.to_id
                 );
 
-                // The pending-handshake permit is scoped to this future. It is
-                // released as soon as establishment returns, before the
-                // accepted tunnel enters its long-running control read loop.
+                // The initial-read permit becomes the tunnel-handshake permit
+                // and remains scoped to this future. It is released as soon
+                // as establishment returns, before the accepted tunnel enters
+                // its long-running control read loop.
+                let _handshake_permit = initial_permit;
                 self.on_new_tunnel(stream, hello_package).await
             }
             _ => {
@@ -7616,6 +7651,35 @@ mod tests {
             .port()
     }
 
+    async fn wait_for_available_handshake_permits(server: &RTcp, expected: usize) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if server.inner.pending_handshakes.available_permits() == expected {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "timed out waiting for {expected} available handshake permit(s); found {}",
+                server.inner.pending_handshakes.available_permits()
+            )
+        });
+    }
+
+    async fn assert_connection_closed_within(stream: &mut TcpStream, duration: Duration) {
+        let mut byte = [0u8; 1];
+        match tokio::time::timeout(duration, stream.read(&mut byte))
+            .await
+            .expect("RTCP connection was not closed within the expected deadline")
+        {
+            Ok(0) | Err(_) => {}
+            Ok(n) => panic!("server unexpectedly wrote {n} byte(s) before closing connection"),
+        }
+    }
+
     async fn wait_for_current_tunnel(
         tunnel_map: &RTcpTunnelMap,
         tunnel_key: &str,
@@ -8245,6 +8309,86 @@ mod tests {
             Ok(0) | Err(_) => {}
             Ok(n) => panic!("server unexpectedly wrote {n} byte(s) to stalled handshake"),
         }
+    }
+
+    #[tokio::test]
+    async fn initial_packet_reads_are_bounded_and_release_handshake_permits() {
+        let (server_config, server_key) = test_device_config("initial-read-limit-server");
+        let server_port = unused_tcp_port();
+        let mut server = RTcp::new(
+            server_config.id,
+            format!("127.0.0.1:{}", server_port),
+            Some(server_key),
+            None,
+            Arc::new(MockRTcpListener::new()),
+        );
+        let mut security = RtcpSecurityConfig::default();
+        security.limits.max_pending_handshakes = 1;
+        security.limits.handshake_timeout_secs = 2;
+        server.set_security_config(security).unwrap();
+        server.start().await.unwrap();
+
+        // A connection that sends no data consumes the only permit before
+        // the server starts reading its first package.
+        let stalled = TcpStream::connect(("127.0.0.1", server_port))
+            .await
+            .unwrap();
+        wait_for_available_handshake_permits(&server, 0).await;
+
+        // Capacity exhaustion is handled in the accept loop: the next peer is
+        // closed promptly instead of receiving another long-lived read task.
+        let mut rejected = TcpStream::connect(("127.0.0.1", server_port))
+            .await
+            .unwrap();
+        assert_connection_closed_within(&mut rejected, Duration::from_secs(1)).await;
+
+        // EOF releases the permit.
+        drop(stalled);
+        wait_for_available_handshake_permits(&server, 1).await;
+
+        // A partial length field is subject to the same bound.
+        let mut partial = TcpStream::connect(("127.0.0.1", server_port))
+            .await
+            .unwrap();
+        partial.write_all(&[0]).await.unwrap();
+        wait_for_available_handshake_permits(&server, 0).await;
+        let mut rejected_after_partial = TcpStream::connect(("127.0.0.1", server_port))
+            .await
+            .unwrap();
+        assert_connection_closed_within(&mut rejected_after_partial, Duration::from_secs(1)).await;
+        drop(partial);
+        wait_for_available_handshake_permits(&server, 1).await;
+
+        // A malformed first package releases its permit as soon as parsing
+        // fails (length 1 is smaller than the RTCP control header).
+        let mut malformed = TcpStream::connect(("127.0.0.1", server_port))
+            .await
+            .unwrap();
+        wait_for_available_handshake_permits(&server, 0).await;
+        malformed.write_all(&[0, 1]).await.unwrap();
+        wait_for_available_handshake_permits(&server, 1).await;
+        assert_connection_closed_within(&mut malformed, Duration::from_secs(1)).await;
+
+        // Timeout also returns the permit, even with an incomplete length
+        // field still pending.
+        let mut timed_out = TcpStream::connect(("127.0.0.1", server_port))
+            .await
+            .unwrap();
+        timed_out.write_all(&[0]).await.unwrap();
+        wait_for_available_handshake_permits(&server, 0).await;
+        assert_connection_closed_within(&mut timed_out, Duration::from_secs(3)).await;
+        wait_for_available_handshake_permits(&server, 1).await;
+
+        // HelloStream needs the permit only through first-packet
+        // classification and releases it before stream delivery.
+        let mut hello_stream = TcpStream::connect(("127.0.0.1", server_port))
+            .await
+            .unwrap();
+        wait_for_available_handshake_permits(&server, 0).await;
+        let mut hello_stream_package = vec![0, 0];
+        hello_stream_package.extend_from_slice(b"0123456789abcdef0123456789abcdef");
+        hello_stream.write_all(&hello_stream_package).await.unwrap();
+        wait_for_available_handshake_permits(&server, 1).await;
     }
 
     #[tokio::test]

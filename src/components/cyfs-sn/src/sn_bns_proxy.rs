@@ -1009,8 +1009,8 @@ fn now_secs() -> u64 {
 mod tests {
     use super::*;
     use bns_client::{
-        BnsApplyMutationsReq, BnsClientResult, BnsEvmTxSubmission, BnsIndexerApi, BnsIndexerClient,
-        BnsPublishDocumentReq, BnsRegisterNameReq, MemorySnBnsWriteRequestStore,
+        BnsApplyMutationsReq, BnsClientResult, BnsEvmPreparedTx, BnsEvmTxSubmission, BnsIndexerApi,
+        BnsIndexerClient, BnsPublishDocumentReq, BnsRegisterNameReq, MemorySnBnsWriteRequestStore,
         SnBnsControllerConfig, SnBnsEvmSubmitter,
     };
     use bns_indexer::{
@@ -1035,46 +1035,50 @@ mod tests {
             self.registrations.lock().unwrap().clone()
         }
 
-        fn submission(&self) -> BnsEvmTxSubmission {
+        fn prepared(&self) -> BnsEvmPreparedTx {
             let mut next_nonce = self.next_nonce.lock().unwrap();
             let nonce = *next_nonce;
             *next_nonce += 1;
-            BnsEvmTxSubmission {
+            BnsEvmPreparedTx {
                 tx_hash: format!("0x{nonce:064x}"),
                 raw_tx: format!("0x{nonce:02x}"),
                 from: CONTROLLER_A.to_string(),
                 nonce,
                 chain_id: 31_337,
-                receipt_status: None,
-                receipt_block_number: None,
-                receipt_confirmations: None,
             }
         }
     }
 
     #[async_trait]
     impl SnBnsEvmSubmitter for RecordingEvmSubmitter {
-        async fn register_name(
+        async fn prepare_register_name(
             &self,
             req: &BnsRegisterNameReq,
-        ) -> BnsClientResult<BnsEvmTxSubmission> {
+        ) -> BnsClientResult<BnsEvmPreparedTx> {
             self.registrations.lock().unwrap().push(req.clone());
-            Ok(self.submission())
+            Ok(self.prepared())
         }
 
-        async fn apply_mutations(
+        async fn prepare_apply_mutations(
             &self,
             _req: &BnsApplyMutationsReq,
-        ) -> BnsClientResult<BnsEvmTxSubmission> {
-            Ok(self.submission())
+        ) -> BnsClientResult<BnsEvmPreparedTx> {
+            Ok(self.prepared())
         }
 
-        async fn publish_document(
+        async fn prepare_publish_document(
             &self,
             req: &BnsPublishDocumentReq,
-        ) -> BnsClientResult<BnsEvmTxSubmission> {
+        ) -> BnsClientResult<BnsEvmPreparedTx> {
             self.published.lock().unwrap().push(req.clone());
-            Ok(self.submission())
+            Ok(self.prepared())
+        }
+
+        async fn submit_prepared(
+            &self,
+            prepared: &BnsEvmPreparedTx,
+        ) -> BnsClientResult<BnsEvmTxSubmission> {
+            Ok(prepared.submission())
         }
     }
 

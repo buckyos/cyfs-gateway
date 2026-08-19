@@ -2,14 +2,14 @@ use ::kRPC::{RPCErrors, RPCHandler, RPCRequest};
 use async_trait::async_trait;
 use bns_client::{
     publish_document_call, register_name_call, BindZoneDocumentsParams, BnsApplyMutationsReq,
-    BnsClientError, BnsClientResult, BnsEvmClientConfig, BnsEvmKeyManager, BnsEvmSignRequest,
-    BnsEvmStandardClient, BnsEvmTxSubmission, BnsEvmWriteOperation, BnsIndexerApi,
-    BnsIndexerClient, BnsIndexerRpcHandler, BnsPublishDocumentReq, BnsRegisterNameReq,
-    BnsWriteReceiptStatus, BootstrapNameParams, DnsTxtUpdate, MemorySnBnsWriteRequestStore,
-    PublishDeviceMiniDocParams, PublishDocumentParams, PublishRelayAssignmentParams,
-    SnBnsController, SnBnsControllerConfig, SnBnsControllerError, SnBnsEvmSubmitter,
-    StaticBnsEvmKeyManager, UpsertDnsTxtParams, BOOT_DOC_TYPE, DEVICE_MINI_DOC_TYPE,
-    OWNER_DOC_TYPE, RELAY_ASSIGNMENT_DOC_TYPE, ZONE_DOC_TYPE,
+    BnsClientError, BnsClientResult, BnsEvmClientConfig, BnsEvmKeyManager, BnsEvmPreparedTx,
+    BnsEvmSignRequest, BnsEvmStandardClient, BnsEvmTxSubmission, BnsEvmWriteOperation,
+    BnsIndexerApi, BnsIndexerClient, BnsIndexerRpcHandler, BnsPublishDocumentReq,
+    BnsRegisterNameReq, BnsWriteReceiptStatus, BootstrapNameParams, DnsTxtUpdate,
+    MemorySnBnsWriteRequestStore, PublishDeviceMiniDocParams, PublishDocumentParams,
+    PublishRelayAssignmentParams, SnBnsController, SnBnsControllerConfig, SnBnsControllerError,
+    SnBnsEvmSubmitter, SnBnsWriteRequestStore, StaticBnsEvmKeyManager, UpsertDnsTxtParams,
+    BOOT_DOC_TYPE, DEVICE_MINI_DOC_TYPE, OWNER_DOC_TYPE, RELAY_ASSIGNMENT_DOC_TYPE, ZONE_DOC_TYPE,
 };
 use bns_evm::{AuthorityRole as EvmAuthorityRole, PrincipalKind as EvmPrincipalKind, SolCall};
 use bns_indexer::dns_document::{self, DNS_TXT_DOC_TYPE};
@@ -20,7 +20,9 @@ use bns_indexer::{
 };
 use serde_json::json;
 use std::net::{IpAddr, Ipv4Addr};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use tokio::sync::Notify;
 
 const OWNER: &str = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const SN_CONTROLLER: &str = "0xcccccccccccccccccccccccccccccccccccccccc";
@@ -77,44 +79,51 @@ impl RecordingEvmSubmitter {
         self.published.lock().unwrap().clone()
     }
 
-    fn submission(&self) -> BnsEvmTxSubmission {
+    fn prepared(&self) -> BnsEvmPreparedTx {
         let mut next_nonce = self.next_nonce.lock().unwrap();
         let nonce = *next_nonce;
         *next_nonce += 1;
-        BnsEvmTxSubmission {
+        BnsEvmPreparedTx {
             tx_hash: format!("0x{nonce:064x}"),
             raw_tx: format!("0x{nonce:02x}"),
             from: ANVIL_ADDRESS.to_string(),
             nonce,
             chain_id: 31_337,
-            receipt_status: None,
-            receipt_block_number: None,
-            receipt_confirmations: None,
         }
     }
 }
 
 #[async_trait]
 impl SnBnsEvmSubmitter for RecordingEvmSubmitter {
-    async fn register_name(&self, req: &BnsRegisterNameReq) -> BnsClientResult<BnsEvmTxSubmission> {
+    async fn prepare_register_name(
+        &self,
+        req: &BnsRegisterNameReq,
+    ) -> BnsClientResult<BnsEvmPreparedTx> {
         self.registrations.lock().unwrap().push(req.clone());
-        Ok(self.submission())
+        Ok(self.prepared())
     }
 
-    async fn apply_mutations(
+    async fn prepare_apply_mutations(
         &self,
         req: &BnsApplyMutationsReq,
-    ) -> BnsClientResult<BnsEvmTxSubmission> {
+    ) -> BnsClientResult<BnsEvmPreparedTx> {
         self.mutations.lock().unwrap().push(req.clone());
-        Ok(self.submission())
+        Ok(self.prepared())
     }
 
-    async fn publish_document(
+    async fn prepare_publish_document(
         &self,
         req: &BnsPublishDocumentReq,
-    ) -> BnsClientResult<BnsEvmTxSubmission> {
+    ) -> BnsClientResult<BnsEvmPreparedTx> {
         self.published.lock().unwrap().push(req.clone());
-        Ok(self.submission())
+        Ok(self.prepared())
+    }
+
+    async fn submit_prepared(
+        &self,
+        prepared: &BnsEvmPreparedTx,
+    ) -> BnsClientResult<BnsEvmTxSubmission> {
+        Ok(prepared.submission())
     }
 }
 
@@ -131,26 +140,26 @@ impl ApplyingEvmSubmitter {
         }
     }
 
-    fn submission(&self) -> BnsEvmTxSubmission {
+    fn prepared(&self) -> BnsEvmPreparedTx {
         let mut next_nonce = self.next_nonce.lock().unwrap();
         let nonce = *next_nonce;
         *next_nonce += 1;
-        BnsEvmTxSubmission {
+        BnsEvmPreparedTx {
             tx_hash: format!("0x{nonce:064x}"),
             raw_tx: format!("0x{nonce:02x}"),
             from: ANVIL_ADDRESS.to_string(),
             nonce,
             chain_id: 31_337,
-            receipt_status: None,
-            receipt_block_number: None,
-            receipt_confirmations: None,
         }
     }
 }
 
 #[async_trait]
 impl SnBnsEvmSubmitter for ApplyingEvmSubmitter {
-    async fn register_name(&self, req: &BnsRegisterNameReq) -> BnsClientResult<BnsEvmTxSubmission> {
+    async fn prepare_register_name(
+        &self,
+        req: &BnsRegisterNameReq,
+    ) -> BnsClientResult<BnsEvmPreparedTx> {
         if req.authority_key_updates.is_empty()
             && req.semantic_owner_after_authority.is_none()
             && req.controller_policy.is_empty()
@@ -181,13 +190,13 @@ impl SnBnsEvmSubmitter for ApplyingEvmSubmitter {
                 )
                 .map_err(BnsClientError::from)?;
         }
-        Ok(self.submission())
+        Ok(self.prepared())
     }
 
-    async fn apply_mutations(
+    async fn prepare_apply_mutations(
         &self,
         req: &BnsApplyMutationsReq,
-    ) -> BnsClientResult<BnsEvmTxSubmission> {
+    ) -> BnsClientResult<BnsEvmPreparedTx> {
         self.registry
             .apply_mutations(
                 req.name.as_str(),
@@ -198,13 +207,13 @@ impl SnBnsEvmSubmitter for ApplyingEvmSubmitter {
                 req.guard,
             )
             .map_err(BnsClientError::from)?;
-        Ok(self.submission())
+        Ok(self.prepared())
     }
 
-    async fn publish_document(
+    async fn prepare_publish_document(
         &self,
         req: &BnsPublishDocumentReq,
-    ) -> BnsClientResult<BnsEvmTxSubmission> {
+    ) -> BnsClientResult<BnsEvmPreparedTx> {
         self.registry
             .publish_document(
                 req.name.as_str(),
@@ -213,7 +222,184 @@ impl SnBnsEvmSubmitter for ApplyingEvmSubmitter {
                 req.guard,
             )
             .map_err(BnsClientError::from)?;
-        Ok(self.submission())
+        Ok(self.prepared())
+    }
+
+    async fn submit_prepared(
+        &self,
+        prepared: &BnsEvmPreparedTx,
+    ) -> BnsClientResult<BnsEvmTxSubmission> {
+        Ok(prepared.submission())
+    }
+}
+
+#[derive(Default)]
+struct BlockingEvmSubmitter {
+    prepare_count: AtomicUsize,
+    submit_count: AtomicUsize,
+    submit_started: Notify,
+    release_submit: Notify,
+}
+
+impl BlockingEvmSubmitter {
+    fn prepared(&self) -> BnsEvmPreparedTx {
+        self.prepare_count.fetch_add(1, Ordering::SeqCst);
+        BnsEvmPreparedTx {
+            tx_hash: format!("0x{:064x}", 0xabc_u64),
+            raw_tx: "0x02abcd".to_string(),
+            from: ANVIL_ADDRESS.to_string(),
+            nonce: 7,
+            chain_id: 31_337,
+        }
+    }
+}
+
+#[async_trait]
+impl SnBnsEvmSubmitter for BlockingEvmSubmitter {
+    async fn prepare_register_name(
+        &self,
+        _req: &BnsRegisterNameReq,
+    ) -> BnsClientResult<BnsEvmPreparedTx> {
+        Ok(self.prepared())
+    }
+
+    async fn prepare_apply_mutations(
+        &self,
+        _req: &BnsApplyMutationsReq,
+    ) -> BnsClientResult<BnsEvmPreparedTx> {
+        Ok(self.prepared())
+    }
+
+    async fn prepare_publish_document(
+        &self,
+        _req: &BnsPublishDocumentReq,
+    ) -> BnsClientResult<BnsEvmPreparedTx> {
+        Ok(self.prepared())
+    }
+
+    async fn submit_prepared(
+        &self,
+        prepared: &BnsEvmPreparedTx,
+    ) -> BnsClientResult<BnsEvmTxSubmission> {
+        self.submit_count.fetch_add(1, Ordering::SeqCst);
+        self.submit_started.notify_one();
+        self.release_submit.notified().await;
+        Ok(prepared.submission())
+    }
+}
+
+#[derive(Default)]
+struct CrashOnceEvmSubmitter {
+    prepare_count: AtomicUsize,
+    submit_count: AtomicUsize,
+}
+
+#[derive(Default)]
+struct CrashBeforePrepareEvmSubmitter {
+    prepare_count: AtomicUsize,
+    submit_count: AtomicUsize,
+    first_prepare_started: Notify,
+}
+
+#[async_trait]
+impl SnBnsEvmSubmitter for CrashBeforePrepareEvmSubmitter {
+    async fn prepare_register_name(
+        &self,
+        _req: &BnsRegisterNameReq,
+    ) -> BnsClientResult<BnsEvmPreparedTx> {
+        let attempt = self.prepare_count.fetch_add(1, Ordering::SeqCst);
+        if attempt == 0 {
+            self.first_prepare_started.notify_one();
+            return std::future::pending::<BnsClientResult<BnsEvmPreparedTx>>().await;
+        }
+        Ok(BnsEvmPreparedTx {
+            tx_hash: format!("0x{:064x}", 0x123_u64),
+            raw_tx: "0x021230".to_string(),
+            from: ANVIL_ADDRESS.to_string(),
+            nonce: 13,
+            chain_id: 31_337,
+        })
+    }
+
+    async fn prepare_apply_mutations(
+        &self,
+        _req: &BnsApplyMutationsReq,
+    ) -> BnsClientResult<BnsEvmPreparedTx> {
+        unreachable!("not used")
+    }
+
+    async fn prepare_publish_document(
+        &self,
+        _req: &BnsPublishDocumentReq,
+    ) -> BnsClientResult<BnsEvmPreparedTx> {
+        unreachable!("not used")
+    }
+
+    async fn submit_prepared(
+        &self,
+        prepared: &BnsEvmPreparedTx,
+    ) -> BnsClientResult<BnsEvmTxSubmission> {
+        self.submit_count.fetch_add(1, Ordering::SeqCst);
+        Ok(prepared.submission())
+    }
+}
+
+#[async_trait]
+impl SnBnsEvmSubmitter for CrashOnceEvmSubmitter {
+    async fn prepare_register_name(
+        &self,
+        _req: &BnsRegisterNameReq,
+    ) -> BnsClientResult<BnsEvmPreparedTx> {
+        self.prepare_count.fetch_add(1, Ordering::SeqCst);
+        Ok(BnsEvmPreparedTx {
+            tx_hash: format!("0x{:064x}", 0xdef_u64),
+            raw_tx: "0x02def0".to_string(),
+            from: ANVIL_ADDRESS.to_string(),
+            nonce: 11,
+            chain_id: 31_337,
+        })
+    }
+
+    async fn prepare_apply_mutations(
+        &self,
+        _req: &BnsApplyMutationsReq,
+    ) -> BnsClientResult<BnsEvmPreparedTx> {
+        unreachable!("not used")
+    }
+
+    async fn prepare_publish_document(
+        &self,
+        _req: &BnsPublishDocumentReq,
+    ) -> BnsClientResult<BnsEvmPreparedTx> {
+        unreachable!("not used")
+    }
+
+    async fn submit_prepared(
+        &self,
+        prepared: &BnsEvmPreparedTx,
+    ) -> BnsClientResult<BnsEvmTxSubmission> {
+        let attempt = self.submit_count.fetch_add(1, Ordering::SeqCst);
+        if attempt == 0 {
+            return Err(BnsClientError::Transport(
+                "simulated crash after broadcast".to_string(),
+            ));
+        }
+        Ok(prepared.submission())
+    }
+}
+
+fn bootstrap_params(request_id: &str) -> BootstrapNameParams {
+    BootstrapNameParams {
+        request_id: request_id.to_string(),
+        name: "alice".to_string(),
+        asset_owner: OWNER.to_string(),
+        register_options: RegisterOptions::default(),
+        owner_config: json!({"id":"did:bns:alice"}),
+        owner_authority_keys: vec![],
+        semantic_owner_after_authority: None,
+        initial_documents: vec![],
+        authority: CallAuthority::public(),
+        guard: MutationGuard::default(),
     }
 }
 
@@ -432,6 +618,171 @@ async fn sn_controller_register_name_submits_controller_policy() {
     assert_eq!(registrations[0].initial_documents[0].doc_type, "owner");
     assert_eq!(registrations[0].controller_policy.len(), 1);
     assert_eq!(registrations[0].controller_policy[0].doc_type, "");
+}
+
+#[tokio::test]
+async fn concurrent_same_request_id_has_only_one_preparer_and_submitter() {
+    let submitter = Arc::new(BlockingEvmSubmitter::default());
+    let store = Arc::new(MemorySnBnsWriteRequestStore::new());
+    let controller = Arc::new(
+        SnBnsController::new_with_evm_submitter(
+            in_process_client(registry()),
+            store,
+            SnBnsControllerConfig::new(Principal::chain_account(SN_CONTROLLER), ""),
+            submitter.clone(),
+        )
+        .unwrap(),
+    );
+    let params = bootstrap_params("sn:register:alice");
+
+    let first_controller = controller.clone();
+    let first_params = params.clone();
+    let first = tokio::spawn(async move { first_controller.register_name(first_params).await });
+    submitter.submit_started.notified().await;
+
+    let duplicate = controller.register_name(params.clone()).await.unwrap_err();
+    assert!(matches!(
+        duplicate,
+        SnBnsControllerError::IdempotencyPending { .. }
+    ));
+
+    let mut conflicting = params.clone();
+    conflicting.asset_owner = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string();
+    let conflict = controller.register_name(conflicting).await.unwrap_err();
+    assert!(matches!(
+        conflict,
+        SnBnsControllerError::IdempotencyConflict { .. }
+    ));
+
+    submitter.release_submit.notify_one();
+    let first_output = first.await.unwrap().unwrap();
+    assert!(!first_output.receipt.created_or_reused);
+    let replay = controller.register_name(params).await.unwrap();
+    assert!(replay.receipt.created_or_reused);
+    assert_eq!(replay.receipt.evm_tx_hash, first_output.receipt.evm_tx_hash);
+    assert_eq!(submitter.prepare_count.load(Ordering::SeqCst), 1);
+    assert_eq!(submitter.submit_count.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn concurrent_explicit_publish_request_id_submits_only_once() {
+    let registry = registry();
+    registry
+        .register_name(
+            "alice",
+            OWNER,
+            RegisterOptions::default(),
+            vec![],
+            CallAuthority::public(),
+            MutationGuard::default(),
+        )
+        .unwrap();
+    let submitter = Arc::new(BlockingEvmSubmitter::default());
+    let controller = Arc::new(
+        SnBnsController::new_with_evm_submitter(
+            in_process_client(registry),
+            Arc::new(MemorySnBnsWriteRequestStore::new()),
+            SnBnsControllerConfig::new(Principal::chain_account(SN_CONTROLLER), ""),
+            submitter.clone(),
+        )
+        .unwrap(),
+    );
+    let params = PublishDocumentParams {
+        request_id: "publish-zone-explicit-id".to_string(),
+        name: "alice".to_string(),
+        doc_type: ZONE_DOC_TYPE.to_string(),
+        document: json!({"oods":["ood1"]}),
+        authority: owner_authority(),
+    };
+
+    let first_controller = controller.clone();
+    let first_params = params.clone();
+    let first = tokio::spawn(async move { first_controller.publish_document(first_params).await });
+    submitter.submit_started.notified().await;
+    let duplicate = controller.publish_document(params).await.unwrap_err();
+    assert!(matches!(
+        duplicate,
+        SnBnsControllerError::IdempotencyPending { .. }
+    ));
+    submitter.release_submit.notify_one();
+    first.await.unwrap().unwrap();
+
+    assert_eq!(submitter.prepare_count.load(Ordering::SeqCst), 1);
+    assert_eq!(submitter.submit_count.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn pending_prepared_transaction_recovers_without_resigning() {
+    let submitter = Arc::new(CrashOnceEvmSubmitter::default());
+    let store = Arc::new(MemorySnBnsWriteRequestStore::new());
+    let mut config = SnBnsControllerConfig::new(Principal::chain_account(SN_CONTROLLER), "");
+    config.idempotency_lease_secs = 0;
+    let controller = SnBnsController::new_with_evm_submitter(
+        in_process_client(registry()),
+        store.clone(),
+        config,
+        submitter.clone(),
+    )
+    .unwrap();
+    let params = bootstrap_params("sn:register:alice:recover");
+
+    let first_error = controller.register_name(params.clone()).await.unwrap_err();
+    assert!(matches!(first_error, SnBnsControllerError::Bns(_)));
+    let pending = store
+        .get(params.request_id.as_str())
+        .unwrap()
+        .expect("pending request persisted");
+    assert_eq!(pending.state, bns_client::BnsWriteRequestState::Pending);
+    assert_eq!(pending.evm_nonce, Some(11));
+    assert_eq!(pending.evm_raw_tx.as_deref(), Some("0x02def0"));
+    assert!(pending.result_json.is_some());
+
+    let recovered = controller.register_name(params.clone()).await.unwrap();
+    assert!(recovered.receipt.created_or_reused);
+    assert_eq!(recovered.receipt.evm_nonce, Some(11));
+    assert_eq!(recovered.receipt.evm_raw_tx.as_deref(), Some("0x02def0"));
+    assert_eq!(submitter.prepare_count.load(Ordering::SeqCst), 1);
+    assert_eq!(submitter.submit_count.load(Ordering::SeqCst), 2);
+
+    let finished = store.get(params.request_id.as_str()).unwrap().unwrap();
+    assert_eq!(finished.state, bns_client::BnsWriteRequestState::Succeeded);
+}
+
+#[tokio::test]
+async fn expired_prebroadcast_lease_can_be_taken_over_safely() {
+    let submitter = Arc::new(CrashBeforePrepareEvmSubmitter::default());
+    let store = Arc::new(MemorySnBnsWriteRequestStore::new());
+    let mut config = SnBnsControllerConfig::new(Principal::chain_account(SN_CONTROLLER), "");
+    config.idempotency_lease_secs = 0;
+    let controller = Arc::new(
+        SnBnsController::new_with_evm_submitter(
+            in_process_client(registry()),
+            store.clone(),
+            config,
+            submitter.clone(),
+        )
+        .unwrap(),
+    );
+    let params = bootstrap_params("sn:register:alice:prebroadcast-recover");
+
+    let crashed_controller = controller.clone();
+    let crashed_params = params.clone();
+    let crashed =
+        tokio::spawn(async move { crashed_controller.register_name(crashed_params).await });
+    submitter.first_prepare_started.notified().await;
+    crashed.abort();
+    let _ = crashed.await;
+
+    let pending = store.get(params.request_id.as_str()).unwrap().unwrap();
+    assert_eq!(pending.state, bns_client::BnsWriteRequestState::Pending);
+    assert!(pending.lease_owner.is_some());
+    assert!(pending.evm_tx_hash.is_none());
+    assert!(pending.evm_raw_tx.is_none());
+
+    let recovered = controller.register_name(params).await.unwrap();
+    assert_eq!(recovered.receipt.evm_nonce, Some(13));
+    assert_eq!(submitter.prepare_count.load(Ordering::SeqCst), 2);
+    assert_eq!(submitter.submit_count.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]

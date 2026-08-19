@@ -4349,29 +4349,26 @@ users:
             }
         }
 
-        fn submission(&self) -> bns_client::BnsEvmTxSubmission {
+        fn prepared(&self) -> bns_client::BnsEvmPreparedTx {
             let mut next_nonce = self.next_nonce.lock().unwrap();
             let nonce = *next_nonce;
             *next_nonce += 1;
-            bns_client::BnsEvmTxSubmission {
+            bns_client::BnsEvmPreparedTx {
                 tx_hash: format!("0x{nonce:064x}"),
                 raw_tx: format!("0x{nonce:02x}"),
                 from: "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266".to_string(),
                 nonce,
                 chain_id: 31_337,
-                receipt_status: None,
-                receipt_block_number: None,
-                receipt_confirmations: None,
             }
         }
     }
 
     #[async_trait]
     impl bns_client::SnBnsEvmSubmitter for TestApplyingEvmSubmitter {
-        async fn register_name(
+        async fn prepare_register_name(
             &self,
             req: &bns_client::BnsRegisterNameReq,
-        ) -> bns_client::BnsClientResult<bns_client::BnsEvmTxSubmission> {
+        ) -> bns_client::BnsClientResult<bns_client::BnsEvmPreparedTx> {
             if req.authority_key_updates.is_empty()
                 && req.semantic_owner_after_authority.is_none()
                 && req.controller_policy.is_empty()
@@ -4402,13 +4399,13 @@ users:
                     )
                     .map_err(bns_client::BnsClientError::from)?;
             }
-            Ok(self.submission())
+            Ok(self.prepared())
         }
 
-        async fn apply_mutations(
+        async fn prepare_apply_mutations(
             &self,
             req: &bns_client::BnsApplyMutationsReq,
-        ) -> bns_client::BnsClientResult<bns_client::BnsEvmTxSubmission> {
+        ) -> bns_client::BnsClientResult<bns_client::BnsEvmPreparedTx> {
             self.registry
                 .apply_mutations(
                     req.name.as_str(),
@@ -4419,13 +4416,13 @@ users:
                     req.guard,
                 )
                 .map_err(bns_client::BnsClientError::from)?;
-            Ok(self.submission())
+            Ok(self.prepared())
         }
 
-        async fn publish_document(
+        async fn prepare_publish_document(
             &self,
             req: &bns_client::BnsPublishDocumentReq,
-        ) -> bns_client::BnsClientResult<bns_client::BnsEvmTxSubmission> {
+        ) -> bns_client::BnsClientResult<bns_client::BnsEvmPreparedTx> {
             self.registry
                 .publish_document(
                     req.name.as_str(),
@@ -4434,7 +4431,14 @@ users:
                     req.guard,
                 )
                 .map_err(bns_client::BnsClientError::from)?;
-            Ok(self.submission())
+            Ok(self.prepared())
+        }
+
+        async fn submit_prepared(
+            &self,
+            prepared: &bns_client::BnsEvmPreparedTx,
+        ) -> bns_client::BnsClientResult<bns_client::BnsEvmTxSubmission> {
+            Ok(prepared.submission())
         }
 
         async fn wait_for_receipt(
@@ -4882,6 +4886,47 @@ users:
         let auth_url = format!("{}/kapi/sn/auth", base_url);
         let bns_proxy_url = format!("{}/kapi/sn/bns-proxy", base_url);
         let internal_url = format!("{}/", base_url);
+
+        // 同一 username、不同 email、未显式 request_id：两个请求都会生成
+        // `sn:register:<username>`。入口 username 锁与 controller 原子幂等共同
+        // 保证只有一个注册成功，另一个在产生第二笔链上写之前观察到用户已存在。
+        const CONCURRENT_USER: &str = "bnsconcurrentuser";
+        const CONCURRENT_ACTIVE_CODE: &str = "bnsConcurrentCode";
+        sn.auth_db()
+            .insert_activation_code(CONCURRENT_ACTIVE_CODE)
+            .await
+            .unwrap();
+        let concurrent_a = kRPC::new(auth_url.as_str(), None);
+        let concurrent_b = kRPC::new(auth_url.as_str(), None);
+        let (first, second) = tokio::join!(
+            concurrent_a.call(
+                "auth.register",
+                json!({
+                    "name": CONCURRENT_USER,
+                    "email": "bns-concurrent-a@example.com",
+                    "pwd_hash": "12345678",
+                    "active_code": CONCURRENT_ACTIVE_CODE,
+                    "asset_owner": PROXY_USER_OWNER
+                }),
+            ),
+            concurrent_b.call(
+                "auth.register",
+                json!({
+                    "name": CONCURRENT_USER,
+                    "email": "bns-concurrent-b@example.com",
+                    "pwd_hash": "12345678",
+                    "active_code": CONCURRENT_ACTIVE_CODE,
+                    "asset_owner": PROXY_USER_OWNER
+                }),
+            )
+        );
+        assert_eq!(usize::from(first.is_ok()) + usize::from(second.is_ok()), 1);
+        let duplicate_error = first.err().or_else(|| second.err()).unwrap().to_string();
+        assert!(duplicate_error.contains("username_already_exists"));
+        assert!(registry
+            .query_name_state(CONCURRENT_USER)
+            .unwrap()
+            .is_some());
 
         // --- 生产模式：缺 asset_owner 注册失败，且不创建本地用户 ---
         let auth_krpc = kRPC::new(auth_url.as_str(), None);
