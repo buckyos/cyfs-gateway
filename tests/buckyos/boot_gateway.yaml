@@ -93,6 +93,14 @@ servers:
               global THIS_ZONE_HOST=$NODE_INFO.this_zone_host;
               global CONTROL_PANEL_URL="https://sys.${THIS_ZONE_HOST}/";
 
+              # Preserve the external request scheme across the HTTP reverse-proxy hop.
+              # Overwrite any client value so SSO origin checks only trust the gateway.
+              if eq $REQ_target_port "443" then
+                map-add REQ X-Forwarded-Proto "https";
+              else
+                map-add REQ X-Forwarded-Proto "http";
+              end
+
               if eq $REQ.host "public.${THIS_ZONE_HOST}" then
                 return --from chain $(exec forward_to_public);
               end
@@ -123,20 +131,49 @@ servers:
             # host 必须精确匹配 app_id.${THIS_ZONE_HOST} 或 app_id-${THIS_ZONE_HOST} 格式
             priority: 120
             block: |
-              map-create hp;
-              if $REQ.host == $THIS_ZONE_HOST then
-                map-add hp 1 "_";
+              app_lookup_key="";
+              if eq $REQ.host $THIS_ZONE_HOST then
+                app_lookup_key="_";
+              elif ends-with $REQ.host ".${THIS_ZONE_HOST}" then
+                app_lookup_key=$REQ.host;
+                replace $app_lookup_key ".${THIS_ZONE_HOST}" "";
+                local expected_host=$(append $app_lookup_key ".${THIS_ZONE_HOST}");
+                eq $REQ.host $expected_host || return false;
+                map-create hp;
+                match-reg --capture hp $app_lookup_key "^([a-zA-Z0-9_-]+)\$" || return false;
+                eq $hp[1] $app_lookup_key || return false;
+              elif ends-with $REQ.host "-${THIS_ZONE_HOST}" then
+                app_lookup_key=$REQ.host;
+                replace $app_lookup_key "-${THIS_ZONE_HOST}" "";
+                local expected_host=$(append $app_lookup_key "-${THIS_ZONE_HOST}");
+                eq $REQ.host $expected_host || return false;
+                map-create hp;
+                match-reg --capture hp $app_lookup_key "^([a-zA-Z0-9_-]+)\$" || return false;
+                eq $hp[1] $app_lookup_key || return false;
               else
-                match-reg --capture hp $REQ.host "^([a-zA-Z0-9_]+)[-.]" || return false;
+                return false;
               end
-              match-include $APP_INFO $hp[1] || return false;
-              local app_info=$APP_INFO[$hp[1]];
+              match-include $APP_INFO $app_lookup_key || return false;
+              local app_info=$APP_INFO[$app_lookup_key];
               if match-include $app_info "service_id" then
-                #echo "app_info is a service ${app_info.service_id}";
+                eq $app_info.service_id "" && error false;
+                match-include $app_info "app_id" && error false;
+                match-include $app_info "app_instance_id" && error false;
+                match-include $app_info "app_owner_user_id" && error false;
+                map-create service_hp;
+                match-reg --capture service_hp $app_info.service_id "^([a-z0-9-]+)\$" || error false;
+                eq $service_hp[1] $app_info.service_id || error false;
                 global SERVICE_ID=$app_info.service_id;
                 global TARGET_SERVICE_INFO=$app_info;
               else
-                #echo "app_info is an app ${app_info.app_id}";
+                match-include $app_info "app_id" || error false;
+                match-include $app_info "app_instance_id" || error false;
+                match-include $app_info "app_owner_user_id" || error false;
+                eq $app_info.app_id "" && error false;
+                eq $app_info.app_instance_id "" && error false;
+                eq $app_info.app_owner_user_id "" && error false;
+                local expected_app_instance_id="${app_info.app_id}@${app_info.app_owner_user_id}";
+                eq $app_info.app_instance_id $expected_app_instance_id || error false;
                 global APP_ID=$app_info.app_id;
                 global TARGET_APP_INFO=$app_info;
               end
@@ -177,7 +214,16 @@ servers:
 
               capture --value payload --error jwt_error $(verify-jwt $cookies.buckyos_session_token $TRUST_KEY);
               eq $jwt_error false || error false;
+              eq $payload.iss "verify-hub" || error false;
+              eq $payload.principal_kind "user" || error false;
+              eq $payload.token_use "session" || error false;
+              eq $payload.target_kind "app" || error false;
+              if match-include $payload "sudo" then
+                eq $payload.sudo false || error false;
+              end
               eq $payload.appid $APP_ID || error false;
+              eq $payload.app_instance_id $TARGET_APP_INFO.app_instance_id || error false;
+              eq $payload.app_owner_user_id $TARGET_APP_INFO.app_owner_user_id || error false;
               return true;
 
           permit_check:
@@ -233,4 +279,3 @@ servers:
             priority: 110
             block: |
               return true;
-

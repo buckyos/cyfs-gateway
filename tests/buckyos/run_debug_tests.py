@@ -46,7 +46,11 @@ def run_debug(binary: Path, config: Path, req_file: Path, rule_id: str | None = 
         )
 
     out = result.stdout.strip()
-    start = out.find("{")
+    start = out.rfind('\n{\n  "control_result"')
+    if start >= 0:
+        start += 1
+    elif out.startswith('{\n  "control_result"'):
+        start = 0
     if start < 0:
         raise RuntimeError("No JSON object in cyfs_gateway debug output")
     json_str = out[start:].strip()
@@ -133,6 +137,19 @@ def main():
 
             return _check
 
+        def request_header_equals(header_name, expected_value):
+            def _check(result):
+                request = result.get("output", {}).get("REQ", {})
+                actual = request.get(header_name)
+                if actual != expected_value:
+                    return False, (
+                        f"expected request header {header_name}={expected_value!r}, "
+                        f"got {actual!r}"
+                    )
+                return True, ""
+
+            return _check
+
         if name == "req_stack_node_rtcp":
             def check_forward_return(result):
                 ctrl = result.get("control_result", {})
@@ -161,7 +178,10 @@ def main():
             assertions = [control_matches({"return"}, exact_value="server bob_testweb")]
 
         elif name == "req_server_node_gateway":
-            assertions = [control_matches({"return", "exit"}, expected_substring="127.0.0.1:10160")]
+            assertions = [
+                control_matches({"return", "exit"}, expected_substring="127.0.0.1:10160"),
+                request_header_equals("X-Forwarded-Proto", "https"),
+            ]
 
         elif name == "req_service_by_kapi_ok":
             assertions = [control_matches({"return", "exit"}, expected_substring="127.0.0.1:10165")]
