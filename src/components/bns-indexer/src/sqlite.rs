@@ -321,8 +321,32 @@ impl BnsRegistryStoreTx for SqliteStoreTx<'_> {
                 r#"
                 SELECT payload_json
                 FROM bns_documents
+                WHERE name = ?1 AND doc_type = ?2 AND is_current = 1
+                ORDER BY version DESC
+                LIMIT 1
+                "#,
+                params![name, doc_type],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        payload.as_deref().map(from_json).transpose()
+    }
+
+    fn get_latest_document(
+        &mut self,
+        name: &str,
+        doc_type: &str,
+    ) -> BnsRegistryResult<Option<DocumentState>> {
+        let name = canonical_bns_name(name)?;
+        let doc_type = canonical_doc_type(doc_type)?;
+        let payload = self
+            .tx
+            .query_row(
+                r#"
+                SELECT payload_json
+                FROM bns_documents
                 WHERE name = ?1 AND doc_type = ?2
-                ORDER BY is_current DESC, version DESC
+                ORDER BY version DESC
                 LIMIT 1
                 "#,
                 params![name, doc_type],
@@ -572,6 +596,29 @@ impl BnsRegistryStoreTx for SqliteStoreTx<'_> {
                 to_json(state)?
             ],
         )?;
+        Ok(())
+    }
+
+    fn reset_name_lineage(&mut self, name: &str) -> BnsRegistryResult<()> {
+        let name = canonical_bns_name(name)?;
+        self.tx.execute(
+            "UPDATE bns_documents SET is_current = 0 WHERE name = ?1",
+            params![name],
+        )?;
+        self.tx.execute(
+            "DELETE FROM bns_authority_keys WHERE name = ?1",
+            params![name],
+        )?;
+        self.tx.execute(
+            "DELETE FROM bns_authority_sets WHERE name = ?1",
+            params![name],
+        )?;
+        self.tx.execute(
+            "DELETE FROM bns_controller_policies WHERE name = ?1",
+            params![name],
+        )?;
+        self.tx
+            .execute("DELETE FROM bns_aliases WHERE name = ?1", params![name])?;
         Ok(())
     }
 

@@ -211,6 +211,15 @@ BNS-Client 始终使用点号形式的 canonical method；下划线别名只用�
 
 返回 `DocumentState | null`；指定版本不存在时底层结果为 `null`。
 
+名称发生 `Released -> 重新注册` 后，读取接口遵循 lineage 边界：
+
+- `name_seq` 继续单调递增，`lineage_epoch` 加一；
+- `document.resolve`、`authority.get_set`、`authority.get_key` 和 alias 相关当前态只返回新世代数据，不回退到旧世代；
+- 新世代某 `doc_type` 的首个写入使用 `expected_version = 0`，但实际 `version` 继续取该名称历史最大版本加一；
+- `document.get_version` 仍可按显式版本读取旧世代文档。
+
+Indexer 在处理 `name_registered` 时，会在同一事务内清空该名称的当前 authority/controller/alias 投影并取消全部历史文档的 current 标记，然后由同一交易中的后续事件建立新世代当前态。历史文档行和事件日志保留。
+
 ### 3.7 `events.list`
 
 按事件序号顺序读取投影事件日志。

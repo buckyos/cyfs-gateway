@@ -27,6 +27,9 @@ abstract contract BnsCore is IBnsEvents {
     bytes32 internal constant OP_SET_ALIAS = keccak256("set_alias");
     bytes32 internal constant OP_SET_NAMESPACE = keccak256("set_namespace");
 
+    bytes32 internal constant LINEAGE_STATE_DOMAIN = keccak256("bns.lineage.state.v1");
+    bytes32 internal constant LINEAGE_STATE_MARKER = keccak256("bns.lineage.state.marker.v1");
+
     bytes32 internal constant EVENT_NAME_REGISTERED = keccak256("name_registered");
     bytes32 internal constant EVENT_NAME_RENEWED = keccak256("name_renewed");
     bytes32 internal constant EVENT_NAME_TRANSFERRED = keccak256("name_asset_transferred");
@@ -136,7 +139,7 @@ abstract contract BnsCore is IBnsEvents {
         }
 
         uint64 nowTs = _now();
-        uint64 nextSeq = 1;
+        uint64 nextSeq = existing.nameSeq + 1;
         uint64 lineageEpoch = existing.nameSeq == 0 ? 0 : existing.lineageEpoch + 1;
 
         existing.name = name;
@@ -161,6 +164,8 @@ abstract contract BnsCore is IBnsEvents {
         existing.namespacePolicyHash = options.initialNamespacePolicyHash;
         existing.paymentPolicyHash = options.initialPaymentPolicyHash;
         existing.aliasStateHash = bytes32(0);
+
+        _activateLineageState(nameHash, lineageEpoch);
 
         _validateAllOwnerGraphs();
 
@@ -221,12 +226,16 @@ abstract contract BnsCore is IBnsEvents {
         _validatePrincipalCalldata(controller);
         _validatePrincipalCalldata(beneficiary);
 
-        uint64 actualVersion = _currentDocumentVersions[nameHash][docTypeHash];
+        bytes32 stateKey = _lineageStateKey(nameHash);
+        uint64 actualVersion = _currentDocumentVersions[stateKey][docTypeHash];
         if (actualVersion != expectedVersion) {
             revert StaleDocumentVersion(name, docType, expectedVersion, actualVersion);
         }
-        version = actualVersion + 1;
+        version = _currentDocumentVersions[nameHash][docTypeHash] + 1;
         _currentDocumentVersions[nameHash][docTypeHash] = version;
+        if (stateKey != nameHash) {
+            _currentDocumentVersions[stateKey][docTypeHash] = version;
+        }
 
         DocumentState storage document = _documents[nameHash][docTypeHash][version];
         document.name = name;
@@ -273,14 +282,15 @@ abstract contract BnsCore is IBnsEvents {
         bytes32 policyHash,
         bool bumpNameSeq
     ) internal returns (uint64 nameSeq) {
-        delete _controllerPolicies[nameHash];
+        bytes32 stateKey = _lineageStateKey(nameHash);
+        delete _controllerPolicies[stateKey];
         for (uint256 i = 0; i < rules.length; i++) {
             _validateControllerRule(rules[i]);
             if (rules[i].controller.kind == PrincipalKind.BnsName) {
                 _requireActiveAuthoritySetForPrincipal(rules[i].controller);
             }
-            _controllerPolicies[nameHash].push();
-            ControllerRule storage stored = _controllerPolicies[nameHash][i];
+            _controllerPolicies[stateKey].push();
+            ControllerRule storage stored = _controllerPolicies[stateKey][i];
             _copyPrincipal(stored.controller, rules[i].controller);
             stored.docType = rules[i].docType;
             stored.permissions = rules[i].permissions;
@@ -334,6 +344,7 @@ abstract contract BnsCore is IBnsEvents {
         internal
         returns (AuthoritySetState memory set)
     {
+        bytes32 stateKey = _lineageStateKey(nameHash);
         for (uint256 i = 0; i < updates.length; i++) {
             AuthorityKey calldata updateKey = updates[i].key;
             if (updateKey.kid == bytes32(0)) {
@@ -342,12 +353,12 @@ abstract contract BnsCore is IBnsEvents {
             if (updateKey.verificationMethod == bytes32(0)) {
                 revert InvalidKid(updateKey.kid);
             }
-            if (!_knownAuthorityKey[nameHash][updateKey.kid]) {
-                _knownAuthorityKey[nameHash][updateKey.kid] = true;
-                _authorityKeyIds[nameHash].push(updateKey.kid);
+            if (!_knownAuthorityKey[stateKey][updateKey.kid]) {
+                _knownAuthorityKey[stateKey][updateKey.kid] = true;
+                _authorityKeyIds[stateKey].push(updateKey.kid);
             }
 
-            AuthorityKey storage stored = _authorityKeys[nameHash][updateKey.kid];
+            AuthorityKey storage stored = _authorityKeys[stateKey][updateKey.kid];
             stored.kid = updateKey.kid;
             stored.verificationMethod = updateKey.verificationMethod;
             stored.keyData = updateKey.keyData;
@@ -364,7 +375,7 @@ abstract contract BnsCore is IBnsEvents {
         if (set.activeKeyCount == 0 && _nameIsAuthorityOwner(nameHash)) {
             revert NoConcreteSigner();
         }
-        _authoritySets[nameHash] = set;
+        _authoritySets[stateKey] = set;
         _commitEvent(EVENT_AUTHORITY_UPDATED, keccak256(abi.encode(nameHash, set.authoritySeq, set.authorityRoot)));
         emit AuthorityKeysUpdated(nameHash, name, msg.sender, set.authoritySeq, set.authorityRoot);
     }
@@ -374,12 +385,13 @@ abstract contract BnsCore is IBnsEvents {
         view
         returns (AuthoritySetState memory set)
     {
+        bytes32 stateKey = _lineageStateKey(nameHash);
         bytes32 root = bytes32(0);
         uint32 activeCount = 0;
-        bytes32[] storage ids = _authorityKeyIds[nameHash];
+        bytes32[] storage ids = _authorityKeyIds[stateKey];
         uint64 nowTs = _now();
         for (uint256 i = 0; i < ids.length; i++) {
-            AuthorityKey storage key = _authorityKeys[nameHash][ids[i]];
+            AuthorityKey storage key = _authorityKeys[stateKey][ids[i]];
             root = keccak256(
                 abi.encodePacked(
                     root,
@@ -397,7 +409,7 @@ abstract contract BnsCore is IBnsEvents {
                 activeCount += 1;
             }
         }
-        AuthoritySetState storage previous = _authoritySets[nameHash];
+        AuthoritySetState storage previous = _authoritySets[stateKey];
         set = AuthoritySetState({
             name: name, authoritySeq: previous.authoritySeq + 1, authorityRoot: root, activeKeyCount: activeCount
         });
@@ -434,7 +446,7 @@ abstract contract BnsCore is IBnsEvents {
             revert NotEffectiveOwner(name);
         }
 
-        ControllerRule[] storage rules = _controllerPolicies[nameHash];
+        ControllerRule[] storage rules = _controllerPolicies[_lineageStateKey(nameHash)];
         for (uint256 i = 0; i < rules.length; i++) {
             ControllerRule storage rule = rules[i];
             if ((rule.permissions & permission) == 0) {
@@ -503,7 +515,8 @@ abstract contract BnsCore is IBnsEvents {
         view
         returns (bool)
     {
-        AuthorityKey storage key = _authorityKeys[authorityNameHash][kid];
+        bytes32 stateKey = _lineageStateKey(authorityNameHash);
+        AuthorityKey storage key = _authorityKeys[stateKey][kid];
         if (!_isActiveKey(key, KEY_PURPOSE_AUTHENTICATION, _now())) {
             return false;
         }
@@ -523,7 +536,7 @@ abstract contract BnsCore is IBnsEvents {
         if (state.semanticOwner.kind == PrincipalKind.BnsName) {
             string memory ownerName = string(state.semanticOwner.value);
             bytes32 ownerHash = _nameHash(ownerName);
-            AuthoritySetState memory set = _authoritySets[ownerHash];
+            AuthoritySetState memory set = _authoritySets[_lineageStateKey(ownerHash)];
             if (_isActiveName(state)) {
                 if (!_isActiveName(_names[ownerHash]) || set.activeKeyCount == 0) {
                     revert NoConcreteSigner();
@@ -539,7 +552,7 @@ abstract contract BnsCore is IBnsEvents {
 
         string memory parent = _parentName(state.name);
         if (bytes(parent).length == 0) {
-            AuthoritySetState memory set = _authoritySets[nameHash];
+            AuthoritySetState memory set = _authoritySets[_lineageStateKey(nameHash)];
             return OwnerResolution({
                 effectiveOwner: _chainAccountPrincipal(state.assetOwner),
                 source: OwnerSource.AssetOwnerFallback,
@@ -603,7 +616,7 @@ abstract contract BnsCore is IBnsEvents {
                 if (!_isActiveName(_names[ownerHash])) {
                     revert NoConcreteSigner();
                 }
-                AuthoritySetState storage set = _authoritySets[ownerHash];
+                AuthoritySetState storage set = _authoritySets[_lineageStateKey(ownerHash)];
                 if (ownerHash == current) {
                     if (set.activeKeyCount == 0) {
                         revert NoConcreteSigner();
@@ -743,10 +756,37 @@ abstract contract BnsCore is IBnsEvents {
     function _requireActiveAuthoritySetForPrincipal(Principal calldata principal) internal view {
         if (principal.kind == PrincipalKind.BnsName) {
             bytes32 authorityNameHash = keccak256(principal.value);
-            if (!_isActiveName(_names[authorityNameHash]) || _authoritySets[authorityNameHash].activeKeyCount == 0) {
+            if (
+                !_isActiveName(_names[authorityNameHash])
+                    || _authoritySets[_lineageStateKey(authorityNameHash)].activeKeyCount == 0
+            ) {
                 revert NoConcreteSigner();
             }
         }
+    }
+
+    function _lineageStateKey(bytes32 nameHash) internal view returns (bytes32) {
+        uint64 lineageEpoch = _names[nameHash].lineageEpoch;
+        if (lineageEpoch == 0) {
+            return nameHash;
+        }
+
+        bytes32 candidate = keccak256(abi.encode(LINEAGE_STATE_DOMAIN, nameHash, lineageEpoch));
+        // A legacy implementation stored every lineage under nameHash. The marker
+        // lets an upgraded contract keep serving such a live lineage until its
+        // next registration creates an explicitly isolated state key.
+        if (_currentDocumentVersions[candidate][LINEAGE_STATE_MARKER] != lineageEpoch) {
+            return nameHash;
+        }
+        return candidate;
+    }
+
+    function _activateLineageState(bytes32 nameHash, uint64 lineageEpoch) internal {
+        if (lineageEpoch == 0) {
+            return;
+        }
+        bytes32 stateKey = keccak256(abi.encode(LINEAGE_STATE_DOMAIN, nameHash, lineageEpoch));
+        _currentDocumentVersions[stateKey][LINEAGE_STATE_MARKER] = lineageEpoch;
     }
 
     function _requireExistingName(bytes32 nameHash, string memory name) internal view {

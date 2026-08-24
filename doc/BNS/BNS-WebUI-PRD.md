@@ -302,15 +302,12 @@ WebUI 根据用户选择的授权路径构造 `CallAuthority`，但最终身份�
 5. `ReleaseAfterGrace` 调用后立即写入 `Released`；当前重新注册逻辑允许 `Released` 名称再次注册，并不在合约中等待 `graceUntil`。
 6. `publishLogCheckpoint` 当前没有把 `issuer` principal 与 `msg.sender` 做身份绑定，不应出现在普通用户入口。
 7. bns-server 没有同步高度/链 tip/落后区块数接口，无法严格证明某次查询已追到最新链状态。
-8. Released 名称重新注册时，当前 `_registerNameHash` 不会清理旧 authority key、文档版本、
-   controller policy 或 alias 等关联存储。WebUI 不应在普通流程中开放 Released 名称重注册，
-   直至协议明确 lineage 隔离和旧状态清理规则。
-9. `RegisterOptions.initialPaymentTarget` 存在于 ABI，但当前注册逻辑没有读取或保存它。WebUI
+8. `RegisterOptions.initialPaymentTarget` 存在于 ABI，但当前注册逻辑没有读取或保存它。WebUI
    固定传 zero address，不展示为有效注册选项；初始文档的 payment target 不受此问题影响。
-10. Controller rule 的 `namespaceScopeHash`、`constraintHash` 当前只存储、不参与授权判断；
+9. Controller rule 的 `namespaceScopeHash`、`constraintHash` 当前只存储、不参与授权判断；
     authority key 的 `verificationMethod` 也不参与 signer 验证。WebUI 必须把这些字段标为
     “承诺/元数据”，不能描述为已被合约强制执行。
-11. Authority key 的 Recovery 和 Sign Document purpose 当前不会授予链上写权限；实际
+10. Authority key 的 Recovery 和 Sign Document purpose 当前不会授予链上写权限；实际
     `msg.sender` 验证只检查 Authentication bit 和 20 字节地址 key data。
 
 这些缺口不应由 WebUI 用文案掩盖。上线前如协议语义有调整，应先修改合约或 bns-server，再同步更新 PRD。
@@ -739,8 +736,8 @@ registerName(...)
 - 合约不使用 `expectedNameSeq`；
 - 名称在当前投影为 `null` 或 `Released` 时，合约才可能接受注册；
 - WebUI 不把 `Expired` 显示为可抢注，因为当前合约会拒绝已存在的 `Expired` 状态。
-- v1 普通流程只允许投影结果为 `null` 的新名称；Released 名称虽可被当前合约重新注册，
-  但旧 authority/document/policy/alias 状态不会被注册逻辑完整清理，因此暂时阻断并提示协议风险。
+- 投影结果为 `Released` 时可以重新注册。确认页必须显示这是新的 `lineage_epoch`，旧世代的 owner、authority、controller、alias 和当前文档不会继承；旧文档与事件仍可作为历史查询。
+- Released 重新注册时，初始文档仍填写 `expectedVersion = 0`，但 UI 不得假定成功版本为 1；合约会在该名称的历史最大版本之后分配新版本。
 
 #### 二级名称
 
@@ -765,8 +762,10 @@ registerName(...)
 
 - `tx.query_state.state == succeeded`；
 - `name.query_state(name)` 非空；
-- `lineage_epoch` 和 `name_seq` 与本次注册预期一致；
+- 首次注册的 `lineage_epoch = 0`；重新注册的 `lineage_epoch = 注册前值 + 1`；
+- `name_seq` 大于注册前该名称的历史值，不因重新注册回到 1；
 - 可选 initial document 均可通过 `document.resolve` 查询。
+- 重新注册且未提交某类 current 状态时，`document.resolve`、authority、alias 等查询不得出现旧世代当前值。
 
 ---
 
@@ -1298,7 +1297,7 @@ releaseName(...)
 
 - 两种模式都会立即离开 Active；
 - `ReleaseAfterGrace` 实际写入 Released，当前合约允许 Released 名称重新注册，没有强制等待 grace；
-- Released 名称重新注册可能继承旧 authority/document/policy/alias 存储，v1 普通注册流程暂时阻断；
+- Released 名称重新注册会进入新的 `lineage_epoch`；旧 authority/controller/alias 和文档 current 指针被隔离，文档版本号与事件历史继续全局保留；
 - Tombstoned 名称不能重新注册；
 - Tombstone 是不可逆的协议级危险操作。
 
@@ -1602,7 +1601,7 @@ interface BnsRpcEnvelope<T> {
 | Available/null | 未注册或投影未发现 |
 | Active | 活跃 |
 | Expired | 已过期 |
-| Released | 已释放，按当前合约可能可重新注册 |
+| Released | 已释放，可重新注册为新的 lineage |
 | Tombstoned | 永久停用 |
 
 ### 12.2 文档状态

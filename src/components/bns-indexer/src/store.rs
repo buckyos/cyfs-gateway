@@ -32,6 +32,11 @@ pub trait BnsRegistryStoreTx {
         name: &str,
         doc_type: &str,
     ) -> BnsRegistryResult<Option<DocumentState>>;
+    fn get_latest_document(
+        &mut self,
+        name: &str,
+        doc_type: &str,
+    ) -> BnsRegistryResult<Option<DocumentState>>;
     fn put_document(&mut self, state: &DocumentState) -> BnsRegistryResult<()>;
     fn list_document_keys(&mut self, name: Option<&str>) -> BnsRegistryResult<Vec<DocumentKey>>;
 
@@ -55,6 +60,8 @@ pub trait BnsRegistryStoreTx {
 
     fn get_alias(&mut self, name: &str) -> BnsRegistryResult<Option<AliasState>>;
     fn put_alias(&mut self, state: &AliasState) -> BnsRegistryResult<()>;
+
+    fn reset_name_lineage(&mut self, name: &str) -> BnsRegistryResult<()>;
 
     fn append_event(
         &mut self,

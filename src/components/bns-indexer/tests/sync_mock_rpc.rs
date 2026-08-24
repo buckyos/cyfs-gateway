@@ -19,9 +19,11 @@ use std::time::Duration;
 use alloy_sol_types::{sol, SolCall, SolEvent};
 use bns_evm::{address, Address, Bns, Bytes, EthRpcClient, B256, MULTICALL3_ADDRESS, U256};
 use bns_indexer::{
-    sync_bns_contract_once, BnsBlockSyncSourceConfig, BnsContractEventIndexer,
-    BnsIndexerSyncConfig, BnsRegistryError, BnsRegistryStore, DocumentStatus, NameStatus,
-    SqliteBnsRegistryStore,
+    controller_rule, default_document_update, sha256_hex, sync_bns_contract_once, AliasKind,
+    AuthorityKey, AuthorityKeyUpdate, BnsBlockSyncSourceConfig, BnsContractEventIndexer,
+    BnsIndexerSyncConfig, BnsRegistryError, BnsRegistryStore, CallAuthority,
+    CentralizedBnsRegistry, DocumentRef, DocumentStatus, MutationGuard, NameStatus, Principal,
+    RegisterOptions, SqliteBnsRegistryStore, PERMISSION_PUBLISH_DOCUMENT, ZERO_HASH,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -640,6 +642,142 @@ async fn sync_projection_multicall_uses_confirmed_to_block() {
         .unwrap();
     assert_eq!(name.unwrap().name_seq, 2);
     assert_eq!(document.unwrap().version, 3);
+}
+
+#[tokio::test]
+async fn name_registered_atomically_starts_a_fresh_current_projection() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("lineage-reset.sqlite");
+    let old_kid;
+    {
+        let registry = CentralizedBnsRegistry::new_legacy_state_machine(
+            SqliteBnsRegistryStore::open(&db_path).unwrap(),
+        );
+        let old_document =
+            default_document_update("dns_txt", 0, DocumentRef::inline(b"old-lineage")).unwrap();
+        registry
+            .register_name(
+                "alice",
+                "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                RegisterOptions::default(),
+                vec![old_document],
+                CallAuthority::public(),
+                MutationGuard::default(),
+            )
+            .unwrap();
+
+        let old_key = AuthorityKey::authentication_key(
+            sha256_hex(b"old-lineage-key"),
+            b"old-lineage-key".to_vec(),
+        );
+        old_kid = old_key.kid.clone();
+        registry
+            .update_authority_keys(
+                "alice",
+                vec![AuthorityKeyUpdate {
+                    key: old_key,
+                    active: true,
+                }],
+                CallAuthority::owner(
+                    Principal::chain_account("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+                    "",
+                ),
+                MutationGuard {
+                    expected_name_seq: 1,
+                    expected_parent_name_seq: 0,
+                },
+            )
+            .unwrap();
+        registry
+            .set_controller_policy(
+                "alice",
+                vec![controller_rule(
+                    Principal::chain_account("0xcccccccccccccccccccccccccccccccccccccccc"),
+                    "dns_txt",
+                    PERMISSION_PUBLISH_DOCUMENT,
+                )],
+                ZERO_HASH,
+                CallAuthority::owner(
+                    Principal::chain_account("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+                    "",
+                ),
+                MutationGuard {
+                    expected_name_seq: 1,
+                    expected_parent_name_seq: 0,
+                },
+            )
+            .unwrap();
+        registry
+            .set_did_alias(
+                "alice",
+                "did:bns:old-lineage",
+                AliasKind::Alias,
+                ZERO_HASH,
+                CallAuthority::owner(
+                    Principal::chain_account("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+                    "",
+                ),
+                MutationGuard {
+                    expected_name_seq: 2,
+                    expected_parent_name_seq: 0,
+                },
+            )
+            .unwrap();
+    }
+
+    let mut projected_name = evm_name_state("alice", 4);
+    projected_name.lineageEpoch = 1;
+    let eth_call_returns = HashMap::from([(
+        selector_hex::<Bns::queryNameStateCall>(),
+        format!(
+            "0x{}",
+            hex::encode(Bns::queryNameStateCall::abi_encode_returns(&projected_name))
+        ),
+    )]);
+    let logs = vec![
+        protocol_event_log(10, 0x55, 1),
+        event_log_json(
+            &Bns::NameRegistered {
+                nameHash: B256::repeat_byte(0x09),
+                name: "alice".to_string(),
+                assetOwner: OWNER,
+                actor: ACTOR,
+                expireAt: 1_000,
+                lineageEpoch: 1,
+                nameSeq: 4,
+            },
+            1,
+        ),
+    ];
+    let mock = MockEthRpc::start(MockConfig {
+        chain_id: 31_337,
+        block_number: 1,
+        logs_json: logs,
+        eth_call_returns,
+        ..Default::default()
+    })
+    .await;
+    let store = SqliteBnsRegistryStore::open(&db_path).unwrap();
+
+    sync_bns_contract_once(
+        &store,
+        with_endpoint(config_for_chain(31_337), &mock.endpoint),
+    )
+    .await
+    .unwrap();
+
+    store
+        .transact(|tx| {
+            assert_eq!(tx.get_name("alice")?.unwrap().lineage_epoch, 1);
+            assert!(tx.get_current_document("alice", "dns_txt")?.is_none());
+            assert!(tx.get_document("alice", "dns_txt", 1)?.is_some());
+            assert!(tx.get_authority_key("alice", &old_kid)?.is_none());
+            assert!(tx.get_authority_set("alice")?.is_none());
+            assert!(tx.get_controller_policy("alice")?.is_empty());
+            assert!(tx.get_alias("alice")?.is_none());
+            Ok(())
+        })
+        .unwrap();
 }
 
 #[tokio::test]

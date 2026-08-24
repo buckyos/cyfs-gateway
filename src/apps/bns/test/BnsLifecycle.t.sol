@@ -127,6 +127,110 @@ contract BnsLifecycleTest is BnsTestBase {
         assertTrue(bns.queryNameState("alice").assetOwner == BOB, "new owner after re-register");
     }
 
+    function testReRegistrationIsolatesLineageStateAndPreservesDocumentHistory() public {
+        _registerRoot("alice", ALICE);
+
+        DocumentRef memory oldRef = _inlineDoc(bytes("old-lineage"));
+        uint64 s = _seq("alice");
+        vm.prank(ALICE);
+        uint64 oldVersion = _publishDoc(
+            "alice", "dns_txt", 0, oldRef, _ownerAuth(ALICE), _guard(s)
+        );
+        assertEqUint(oldVersion, 1, "first lineage starts at version one");
+
+        s = _seq("alice");
+        _installAuthorityKey("alice", KID, ALICE, ALICE, 0, 0, s);
+
+        ControllerRule[] memory rules = _singleRule(
+            _chain(CTRL), "dns_txt", bns.PERMISSION_PUBLISH_DOCUMENT(), 0, 0
+        );
+        s = _seq("alice");
+        vm.prank(ALICE);
+        bns.setControllerPolicy(
+            "alice", rules, keccak256("old-controller"), _ownerAuth(ALICE), _guard(s)
+        );
+
+        s = _seq("alice");
+        vm.prank(ALICE);
+        bns.setDidAlias(
+            "alice",
+            "did:web:old.example",
+            AliasKind.MigratedTo,
+            keccak256("old-alias"),
+            _ownerAuth(ALICE),
+            _guard(s)
+        );
+
+        s = _seq("alice");
+        vm.prank(ALICE);
+        bns.setPaymentTarget(
+            "alice",
+            "dns_txt",
+            oldVersion,
+            ALICE,
+            _chain(ALICE),
+            keccak256("old-payment"),
+            ZERO,
+            ZERO,
+            ZERO,
+            _ownerAuth(ALICE),
+            _guard(s)
+        );
+
+        s = _seq("alice");
+        vm.prank(ALICE);
+        bns.releaseName(
+            "alice", ReleaseMode.ReleaseAfterGrace, keccak256("done"), _ownerAuth(ALICE), _guard(s)
+        );
+        uint64 releasedSeq = _seq("alice");
+
+        _registerRoot("alice", BOB);
+        NameState memory currentName = bns.queryNameState("alice");
+        assertEqUint(currentName.nameSeq, releasedSeq + 1, "name seq remains globally monotonic");
+        assertEqUint(currentName.lineageEpoch, 1, "new registration advances lineage");
+
+        ResolveResult memory missing = bns.resolveDocument("alice", "dns_txt");
+        assertTrue(missing.status == DocumentStatus.Missing, "old document is not current");
+        vm.expectPartialRevert(DocumentNotFound.selector);
+        bns.getPurchaseContext("alice", "dns_txt");
+
+        AliasState memory aliasState = bns.getAlias("alice");
+        assertTrue(aliasState.kind == AliasKind.None, "old alias is isolated");
+        assertTrue(bytes(aliasState.targetDid).length == 0, "old alias target is isolated");
+        assertEqUint(bns.getAuthoritySet("alice").activeKeyCount, 0, "old authority set is isolated");
+        assertTrue(
+            bns.getAuthorityKey("alice", KID).status == AuthorityKeyStatus.Missing,
+            "old authority key is isolated"
+        );
+
+        DocumentRef memory deniedRef = _inlineDoc(bytes("denied"));
+        s = _seq("alice");
+        vm.prank(CTRL);
+        vm.expectPartialRevert(ControllerScopeDenied.selector);
+        _publishDoc("alice", "dns_txt", 0, deniedRef, _controllerAuth(CTRL), _guard(s));
+
+        DocumentRef memory newRef = _inlineDoc(bytes("new-lineage"));
+        vm.prank(BOB);
+        uint64 newVersion = _publishDoc(
+            "alice", "dns_txt", 0, newRef, _ownerAuth(BOB), _guard(s)
+        );
+        assertEqUint(newVersion, 2, "document history remains globally monotonic");
+        assertEqUint(
+            bns.getDocumentVersion("alice", "dns_txt", newVersion).previousVersion,
+            0,
+            "new lineage does not link trust to old lineage"
+        );
+        assertEqBytes32(
+            bns.getDocumentVersion("alice", "dns_txt", oldVersion).document.contentHash,
+            oldRef.contentHash,
+            "old document remains available by explicit historical version"
+        );
+
+        (, address historicalPaymentTarget,,,,,) =
+            bns.resolvePaymentTarget("alice", "dns_txt", oldVersion);
+        assertTrue(historicalPaymentTarget == ALICE, "explicit historical payment lookup is preserved");
+    }
+
     function testTombstonedNameRejectsWritesAndReRegistration() public {
         _registerRoot("alice", ALICE);
         uint64 s = _seq("alice");

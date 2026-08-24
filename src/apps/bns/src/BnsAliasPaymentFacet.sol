@@ -27,7 +27,7 @@ contract BnsAliasPaymentFacet is BnsCore {
         state.aliasStateHash = proofHash;
         state.updatedAt = _now();
 
-        AliasState storage aliasState = _aliases[nameHash];
+        AliasState storage aliasState = _aliases[_lineageStateKey(nameHash)];
         aliasState.name = name;
         aliasState.kind = kind;
         aliasState.targetDid = targetDid;
@@ -69,7 +69,7 @@ contract BnsAliasPaymentFacet is BnsCore {
             guard
         );
 
-        uint64 current = _currentDocumentVersions[nameHash][docTypeHash];
+        uint64 current = _currentDocumentVersions[_lineageStateKey(nameHash)][docTypeHash];
         if (current != expectedVersion) {
             revert StaleDocumentVersion(name, docType, expectedVersion, current);
         }

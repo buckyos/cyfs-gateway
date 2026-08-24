@@ -38,7 +38,7 @@ contract BnsResolverFacet is BnsCore {
 
     function getAuthoritySet(string calldata name) external view returns (AuthoritySetState memory state) {
         bytes32 nameHash = _validateName(name);
-        state = _authoritySets[nameHash];
+        state = _authoritySets[_lineageStateKey(nameHash)];
         if (bytes(state.name).length == 0) {
             state.name = name;
         }
@@ -46,7 +46,7 @@ contract BnsResolverFacet is BnsCore {
 
     function getAuthorityKey(string calldata name, bytes32 kid) external view returns (AuthorityKey memory) {
         bytes32 nameHash = _validateName(name);
-        return _authorityKeys[nameHash][kid];
+        return _authorityKeys[_lineageStateKey(nameHash)][kid];
     }
 
     function resolveDocument(string calldata name, string calldata docType)
@@ -60,7 +60,7 @@ contract BnsResolverFacet is BnsCore {
 
         result.nameState = _materializeNameState(_names[nameHash]);
         result.owner = _resolveOwner(nameHash, 0);
-        uint64 version = _currentDocumentVersions[nameHash][docTypeHash];
+        uint64 version = _currentDocumentVersions[_lineageStateKey(nameHash)][docTypeHash];
         if (version == 0) {
             result.documentState.name = name;
             result.documentState.docType = docType;
@@ -78,7 +78,7 @@ contract BnsResolverFacet is BnsCore {
         result.status = _effectiveDocumentStatus(
             result.nameState.status, result.documentState.status, result.documentState.expireAt
         );
-        AliasState storage aliasState = _aliases[nameHash];
+        AliasState storage aliasState = _aliases[_lineageStateKey(nameHash)];
         result.aliasKind = aliasState.kind;
         result.aliasTargetDid = aliasState.targetDid;
         result.proofRoot = currentLogRoot;
@@ -102,7 +102,7 @@ contract BnsResolverFacet is BnsCore {
 
     function getAlias(string calldata name) external view returns (AliasState memory state) {
         bytes32 nameHash = _validateName(name);
-        state = _aliases[nameHash];
+        state = _aliases[_lineageStateKey(nameHash)];
         if (bytes(state.name).length == 0) {
             state.name = name;
         }
@@ -115,7 +115,7 @@ contract BnsResolverFacet is BnsCore {
     {
         bytes32 nameHash = _validateName(name);
         bytes32 docTypeHash = _validateDocType(docType);
-        uint64 version = _currentDocumentVersions[nameHash][docTypeHash];
+        uint64 version = _currentDocumentVersions[_lineageStateKey(nameHash)][docTypeHash];
         if (version == 0) {
             revert DocumentNotFound(name, docType);
         }

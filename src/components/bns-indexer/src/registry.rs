@@ -436,6 +436,9 @@ where
                 ));
             }
 
+            if existing.is_some() {
+                tx.reset_name_lineage(&name)?;
+            }
             self.validate_semantic_owner_target(tx, &options.initial_semantic_owner)?;
 
             let lineage_epoch = existing.as_ref().map_or(0, |state| state.lineage_epoch + 1);
@@ -558,6 +561,9 @@ where
                 ));
             }
 
+            if existing.is_some() {
+                tx.reset_name_lineage(&name)?;
+            }
             self.validate_semantic_owner_target(tx, &options.initial_semantic_owner)?;
 
             let lineage_epoch = existing.as_ref().map_or(0, |state| state.lineage_epoch + 1);
@@ -1161,7 +1167,11 @@ where
                 });
             }
 
-            let new_version = actual_version + 1;
+            let latest_version = tx
+                .get_latest_document(&name, &doc_type)?
+                .as_ref()
+                .map_or(0, |state| state.version);
+            let new_version = latest_version + 1;
             let mut document = DocumentState {
                 name: name.clone(),
                 doc_type: doc_type.clone(),
@@ -1518,7 +1528,11 @@ where
             });
         }
 
-        let version = actual_version + 1;
+        let latest_version = tx
+            .get_latest_document(name, &update.doc_type)?
+            .as_ref()
+            .map_or(0, |state| state.version);
+        let version = latest_version + 1;
         let mut document = DocumentState {
             name: name.to_string(),
             doc_type: update.doc_type.clone(),

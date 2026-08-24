@@ -576,8 +576,12 @@ impl ProjectionSnapshot {
     ) -> BnsRegistryResult<ContractProjectionWrite> {
         let mut write = ContractProjectionWrite::default();
         match &record.event {
-            RegistryEvent::NameRegistered { name, .. }
-            | RegistryEvent::NameRenewed { name, .. }
+            RegistryEvent::NameRegistered { name, .. } => {
+                let name = canonical_bns_name(name)?;
+                write.lineage_resets.push(name.clone());
+                self.push_name(&mut write, &name)?;
+            }
+            RegistryEvent::NameRenewed { name, .. }
             | RegistryEvent::NameAssetTransferred { name, .. }
             | RegistryEvent::NameOwnerUpdated { name, .. }
             | RegistryEvent::NameReleased { name, .. }
@@ -833,6 +837,7 @@ where
 
 #[derive(Default)]
 struct ContractProjectionWrite {
+    lineage_resets: Vec<String>,
     names: Vec<NameState>,
     documents: Vec<DocumentState>,
     authority_sets: Vec<AuthoritySetState>,
@@ -844,6 +849,9 @@ struct ContractProjectionWrite {
 
 impl ContractProjectionWrite {
     fn apply(self, tx: &mut dyn BnsRegistryStoreTx) -> BnsRegistryResult<()> {
+        for name in self.lineage_resets {
+            tx.reset_name_lineage(&name)?;
+        }
         for name in self.names {
             tx.put_name(&name)?;
         }
