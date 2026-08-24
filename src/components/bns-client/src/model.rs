@@ -454,6 +454,24 @@ pub struct NameState {
 }
 
 impl NameState {
+    /// Return the effective lifecycle status without mutating the projected
+    /// contract state. Contract events cannot fire merely because wall-clock
+    /// time crossed `expire_at`, so readers must derive this at query time.
+    pub fn effective_status_at(&self, now: u64) -> NameStatus {
+        if self.status == NameStatus::Active && self.expire_at != 0 && now >= self.expire_at {
+            NameStatus::Expired
+        } else {
+            self.status
+        }
+    }
+
+    pub fn materialize_status_at(&mut self, now: u64) {
+        self.status = self.effective_status_at(now);
+        if self.status != NameStatus::Active {
+            self.standard_transfer_enabled = false;
+        }
+    }
+
     pub fn validate(&self) -> BnsRegistryResult<()> {
         canonical_bns_name(&self.name)?;
         if self.asset_owner.is_empty() {
@@ -493,6 +511,21 @@ pub struct DocumentState {
 }
 
 impl DocumentState {
+    pub fn effective_status_at(&self, name_status: NameStatus, now: u64) -> DocumentStatus {
+        if name_status == NameStatus::Tombstoned {
+            return DocumentStatus::Tombstoned;
+        }
+        if self.status != DocumentStatus::Active {
+            return self.status;
+        }
+        if matches!(name_status, NameStatus::Expired | NameStatus::Released)
+            || (self.expire_at != 0 && now >= self.expire_at)
+        {
+            return DocumentStatus::Expired;
+        }
+        DocumentStatus::Active
+    }
+
     pub fn validate(&self) -> BnsRegistryResult<()> {
         canonical_bns_name(&self.name)?;
         canonical_doc_type(&self.doc_type)?;
@@ -676,6 +709,23 @@ pub struct ResolveResult {
     pub alias_kind: AliasKind,
     pub alias_target_did: String,
     pub proof_root: String,
+}
+
+impl ResolveResult {
+    /// Derive the status used for current resolution while preserving the raw
+    /// `document_state.status` for history and audit queries.
+    pub fn effective_status_at(&self, now: u64) -> DocumentStatus {
+        let name_status = self.name_state.effective_status_at(now);
+        if self.status != DocumentStatus::Active {
+            return self.status;
+        }
+        self.document_state.effective_status_at(name_status, now)
+    }
+
+    pub fn materialize_status_at(&mut self, now: u64) {
+        self.status = self.effective_status_at(now);
+        self.name_state.materialize_status_at(now);
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

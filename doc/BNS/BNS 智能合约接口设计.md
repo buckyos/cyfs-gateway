@@ -761,6 +761,8 @@ function queryNameState(string calldata name)
 ```
 
 回答名字是否存在、资产持有人、显式 owner、effective owner、owner 来源及标准 NFT transfer 是否启用。
+当存储状态为 `Active` 且 `block.timestamp >= expireAt` 时，返回状态在读取时派生为
+`Expired`，并关闭 `standardTransferEnabled`；该 view 不写回存储。
 
 ### resolveOwner
 
@@ -770,6 +772,7 @@ function resolveOwner(string calldata name)
 ```
 
 该接口必须返回当前 effective owner 和其 authority root。客户端不应仅通过 `assetOwner` 判断控制权。
+名称或其 owner authority name 已经过期时，该接口按非活跃名称拒绝解析。
 
 ### registerName
 
@@ -914,6 +917,9 @@ function resolveDid(
 ```
 
 `resolveDid` 只负责把 `did:bns:$name` 转换为 canonical name，再调用 `resolveDocument`。
+
+`ResolveResult.status` 是读取时有效状态：名称到期或文档自身到期都会派生为 `Expired`。
+`ResolveResult.documentState.status` 仍保留写入时的原始状态；历史版本接口同样不改写历史状态。
 
 ### getDocumentVersion
 
@@ -1201,6 +1207,8 @@ function getPurchaseContext(
     string calldata docType
 ) external view returns (PurchaseContext memory context);
 ```
+
+`context.status` 与 `resolveDocument.status` 使用相同的读取时有效状态派生规则。
 
 ### resolvePaymentTarget
 

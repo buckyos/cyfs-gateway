@@ -157,9 +157,10 @@ where
 
     pub fn query_name_state(&self, name: &str) -> BnsRegistryResult<Option<NameState>> {
         let name = canonical_bns_name(name)?;
+        let now = now_timestamp();
         self.store.transact(|tx| {
             tx.get_name(&name)?
-                .map(|state| self.materialize_name_state(tx, state))
+                .map(|state| self.materialize_name_state_at(tx, state, now))
                 .transpose()
         })
     }
@@ -197,8 +198,17 @@ where
 
     pub fn resolve_owner(&self, name: &str) -> BnsRegistryResult<OwnerResolution> {
         let name = canonical_bns_name(name)?;
-        self.store
-            .transact(|tx| self.resolve_owner_for_name(tx, &name))
+        let now = now_timestamp();
+        self.store.transact(|tx| {
+            let mut state = tx
+                .get_name(&name)?
+                .ok_or_else(|| BnsRegistryError::NameNotFound { name: name.clone() })?;
+            state.materialize_status_at(now);
+            if state.status != NameStatus::Active {
+                return Err(BnsRegistryError::NameNotFound { name: name.clone() });
+            }
+            self.resolve_owner_from_state_at(tx, &state, now)
+        })
     }
 
     pub fn is_standard_transfer_enabled(&self, name: &str) -> BnsRegistryResult<bool> {
@@ -227,11 +237,13 @@ where
     pub fn resolve_document(&self, name: &str, doc_type: &str) -> BnsRegistryResult<ResolveResult> {
         let name = canonical_bns_name(name)?;
         let doc_type = canonical_doc_type(doc_type)?;
+        let now = now_timestamp();
         self.store.transact(|tx| {
-            let name_state = self
-                .load_materialized_name(tx, &name)?
+            let raw_name_state = tx
+                .get_name(&name)?
                 .ok_or_else(|| BnsRegistryError::NameNotFound { name: name.clone() })?;
-            let owner = self.resolve_owner_for_name(tx, &name)?;
+            let name_state = self.materialize_name_state_at(tx, raw_name_state, now)?;
+            let owner = self.resolve_owner_from_state_at(tx, &name_state, now)?;
             let alias = tx.get_alias(&name)?;
             let proof_root = self.current_proof_root(tx)?;
             let document_state = tx
@@ -253,7 +265,7 @@ where
                 )?;
             }
 
-            Ok(ResolveResult {
+            let mut result = ResolveResult {
                 status: document_state.status,
                 alias_kind: alias.as_ref().map_or(AliasKind::None, |state| state.kind),
                 alias_target_did: alias.map_or_else(String::new, |state| state.target_did),
@@ -262,7 +274,9 @@ where
                 owner,
                 effective_controller,
                 proof_root,
-            })
+            };
+            result.materialize_status_at(now);
+            Ok(result)
         })
     }
 
@@ -306,6 +320,7 @@ where
     ) -> BnsRegistryResult<PurchaseContext> {
         let name = canonical_bns_name(name)?;
         let doc_type = canonical_doc_type(doc_type)?;
+        let now = now_timestamp();
         self.store.transact(|tx| {
             let document = tx.get_current_document(&name, &doc_type)?.ok_or_else(|| {
                 BnsRegistryError::DocumentNotFound {
@@ -315,6 +330,11 @@ where
             })?;
             let owner = self.resolve_owner_for_name(tx, &name)?;
             self.ensure_document_consistent(&name, &doc_type, &document, &owner.effective_owner)?;
+            let name_status = tx
+                .get_name(&name)?
+                .ok_or_else(|| BnsRegistryError::NameNotFound { name: name.clone() })?
+                .effective_status_at(now);
+            let status = document.effective_status_at(name_status, now);
             let proof_root = self.current_proof_root(tx)?;
             Ok(PurchaseContext {
                 name: name.clone(),
@@ -326,7 +346,7 @@ where
                 split_policy_hash: document.split_policy_hash,
                 price_policy_hash: document.price_policy_hash,
                 rights_policy_hash: document.rights_policy_hash,
-                status: document.status,
+                status,
                 proof_root,
             })
         })
@@ -672,6 +692,9 @@ where
                 )));
             }
             let grace_delta = state.grace_until.saturating_sub(state.expire_at);
+            if state.status == NameStatus::Expired {
+                state.status = NameStatus::Active;
+            }
             state.expire_at = state.expire_at.max(now) + duration;
             state.grace_until = state.expire_at + grace_delta;
             state.updated_at = now;
@@ -1740,32 +1763,33 @@ where
     }
 
     fn ensure_active_name(&self, state: &NameState) -> BnsRegistryResult<()> {
-        if state.status == NameStatus::Active {
+        let status = state.effective_status_at(now_timestamp());
+        if status == NameStatus::Active {
             Ok(())
         } else {
             Err(BnsRegistryError::InvalidMutation(format!(
                 "name `{}` is not active: {}",
-                state.name, state.status
+                state.name, status
             )))
         }
-    }
-
-    fn load_materialized_name(
-        &self,
-        tx: &mut dyn BnsRegistryStoreTx,
-        name: &str,
-    ) -> BnsRegistryResult<Option<NameState>> {
-        tx.get_name(name)?
-            .map(|state| self.materialize_name_state(tx, state))
-            .transpose()
     }
 
     fn materialize_name_state(
         &self,
         tx: &mut dyn BnsRegistryStoreTx,
-        mut state: NameState,
+        state: NameState,
     ) -> BnsRegistryResult<NameState> {
-        let owner = self.resolve_owner_from_state(tx, &state)?;
+        self.materialize_name_state_at(tx, state, now_timestamp())
+    }
+
+    fn materialize_name_state_at(
+        &self,
+        tx: &mut dyn BnsRegistryStoreTx,
+        mut state: NameState,
+        now: u64,
+    ) -> BnsRegistryResult<NameState> {
+        state.materialize_status_at(now);
+        let owner = self.resolve_owner_from_state_at(tx, &state, now)?;
         state.effective_owner = owner.effective_owner;
         state.owner_source = owner.source;
         state.standard_transfer_enabled = state.transferable
@@ -1779,22 +1803,25 @@ where
         tx: &mut dyn BnsRegistryStoreTx,
         name: &str,
     ) -> BnsRegistryResult<OwnerResolution> {
-        let state = tx
+        let mut state = tx
             .get_name(name)?
             .ok_or_else(|| BnsRegistryError::NameNotFound {
                 name: name.to_string(),
             })?;
-        self.resolve_owner_from_state(tx, &state)
+        let now = now_timestamp();
+        state.materialize_status_at(now);
+        self.resolve_owner_from_state_at(tx, &state, now)
     }
 
-    fn resolve_owner_from_state(
+    fn resolve_owner_from_state_at(
         &self,
         tx: &mut dyn BnsRegistryStoreTx,
         state: &NameState,
+        now: u64,
     ) -> BnsRegistryResult<OwnerResolution> {
         if state.semantic_owner.kind == PrincipalKind::BnsName {
             let authority = if state.status == NameStatus::Active {
-                self.require_active_authority_set(tx, &state.semantic_owner.value)?
+                self.require_active_authority_set_at(tx, &state.semantic_owner.value, now)?
             } else {
                 self.authority_set(tx, &state.semantic_owner.value)?
             };
@@ -1819,15 +1846,24 @@ where
                 BnsRegistryError::InvalidMutation("second-level name has no parent".to_string())
             })?;
             let mut owner = if state.status == NameStatus::Active {
-                let parent_state = self.load_materialized_name(tx, parent)?.ok_or_else(|| {
-                    BnsRegistryError::NameNotFound {
-                        name: parent.to_string(),
-                    }
-                })?;
-                self.ensure_active_name(&parent_state)?;
-                self.resolve_owner_from_state(tx, &parent_state)?
+                let raw_parent_state =
+                    tx.get_name(parent)?
+                        .ok_or_else(|| BnsRegistryError::NameNotFound {
+                            name: parent.to_string(),
+                        })?;
+                let parent_state = self.materialize_name_state_at(tx, raw_parent_state, now)?;
+                if parent_state.status != NameStatus::Active {
+                    return Err(BnsRegistryError::NoConcreteSigner);
+                }
+                self.resolve_owner_from_state_at(tx, &parent_state, now)?
             } else {
-                self.resolve_owner_for_name(tx, parent)?
+                let mut parent_state =
+                    tx.get_name(parent)?
+                        .ok_or_else(|| BnsRegistryError::NameNotFound {
+                            name: parent.to_string(),
+                        })?;
+                parent_state.materialize_status_at(now);
+                self.resolve_owner_from_state_at(tx, &parent_state, now)?
             };
             owner.source = OwnerSource::ParentInherited;
             Ok(owner)
@@ -1861,12 +1897,21 @@ where
         tx: &mut dyn BnsRegistryStoreTx,
         name: &str,
     ) -> BnsRegistryResult<AuthoritySetState> {
+        self.require_active_authority_set_at(tx, name, now_timestamp())
+    }
+
+    fn require_active_authority_set_at(
+        &self,
+        tx: &mut dyn BnsRegistryStoreTx,
+        name: &str,
+        now: u64,
+    ) -> BnsRegistryResult<AuthoritySetState> {
         let state = tx
             .get_name(name)?
             .ok_or_else(|| BnsRegistryError::NameNotFound {
                 name: name.to_string(),
             })?;
-        if state.status != NameStatus::Active {
+        if state.effective_status_at(now) != NameStatus::Active {
             return Err(BnsRegistryError::NoConcreteSigner);
         }
         let set = self.authority_set(tx, name)?;
@@ -1921,8 +1966,9 @@ where
         tx: &mut dyn BnsRegistryStoreTx,
         authority_name: &str,
     ) -> BnsRegistryResult<bool> {
+        let now = now_timestamp();
         for state in tx.list_names()? {
-            if state.status == NameStatus::Active
+            if state.effective_status_at(now) == NameStatus::Active
                 && state.semantic_owner.kind == PrincipalKind::BnsName
                 && state.semantic_owner.value == authority_name
             {
@@ -1946,9 +1992,10 @@ where
             names.insert(state.name.clone(), state.clone());
         }
 
+        let now = now_timestamp();
         for state in names.values() {
-            if state.status == NameStatus::Active {
-                self.validate_owner_path(tx, &names, &state.name)?;
+            if state.effective_status_at(now) == NameStatus::Active {
+                self.validate_owner_path(tx, &names, &state.name, now)?;
             }
         }
         Ok(())
@@ -1959,6 +2006,7 @@ where
         tx: &mut dyn BnsRegistryStoreTx,
         names: &HashMap<String, NameState>,
         start: &str,
+        now: u64,
     ) -> BnsRegistryResult<()> {
         let mut current = start.to_string();
         let mut visited = HashSet::new();
@@ -1973,12 +2021,18 @@ where
                 .ok_or_else(|| BnsRegistryError::NameNotFound {
                     name: current.clone(),
                 })?;
-            if state.status != NameStatus::Active {
+            if state.effective_status_at(now) != NameStatus::Active {
                 return Err(BnsRegistryError::NoConcreteSigner);
             }
 
             if state.semantic_owner.kind == PrincipalKind::BnsName {
                 let owner_name = state.semantic_owner.value.clone();
+                let owner_state = names
+                    .get(&owner_name)
+                    .ok_or(BnsRegistryError::NoConcreteSigner)?;
+                if owner_state.effective_status_at(now) != NameStatus::Active {
+                    return Err(BnsRegistryError::NoConcreteSigner);
+                }
                 let authority = self.authority_set(tx, &owner_name)?;
                 if owner_name == current {
                     if authority.active_key_count > 0 {

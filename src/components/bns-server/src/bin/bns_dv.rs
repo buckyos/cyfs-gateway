@@ -28,7 +28,7 @@ use bns_client::{
 use bns_dv_cluster::{create_database_parent, merge_cluster_serve_flags};
 use bns_evm::BnsChainClient;
 use bns_indexer::{
-    default_document_update, BnsBlockSyncSourceConfig, BnsContractEventIndexer,
+    default_document_update, now_timestamp, BnsBlockSyncSourceConfig, BnsContractEventIndexer,
     BnsIndexerSyncConfig, CallAuthority, DocumentRef, DocumentStatus, MutationGuard, NameState,
     NameStatus, OwnerPolicyUpdate, Principal, RegisterOptions, SqliteBnsRegistryStore,
 };
@@ -485,10 +485,11 @@ async fn run_register_name_init_tx(
                 )
                 .into());
             }
-            if state.status != NameStatus::Active {
+            let status = state.effective_status_at(now_timestamp());
+            if status != NameStatus::Active {
                 return Err(format!(
                     "on_init_txs[{index}] name `{name}` exists but is {:?}; startup mutation only supports active names",
-                    state.status
+                    status
                 )
                 .into());
             }
@@ -522,10 +523,11 @@ async fn register_authority_and_guard(
         .query_name_state(parent)
         .await?
         .ok_or_else(|| format!("cannot register `{name}`: parent `{parent}` is not projected"))?;
-    if parent_state.status != NameStatus::Active {
+    let parent_status = parent_state.effective_status_at(now_timestamp());
+    if parent_status != NameStatus::Active {
         return Err(format!(
             "cannot register `{name}`: parent `{parent}` is {:?}",
-            parent_state.status
+            parent_status
         )
         .into());
     }
@@ -558,6 +560,7 @@ async fn apply_init_document_mutations(
         let current_version = current.as_ref().map_or(0, |state| state.version);
         if current.as_ref().is_some_and(|state| {
             state.status == DocumentStatus::Active
+                && (state.expire_at == 0 || now_timestamp() < state.expire_at)
                 && state.document.inline_document == doc.inline_document
         }) {
             current_documents.push(ProjectedDocumentInfo {
@@ -691,7 +694,9 @@ async fn wait_for_init_projection(
     let poll = Duration::from_millis(runtime.wait_poll_ms.max(1));
     loop {
         if let Ok(Some(name_state)) = api.query_name_state(name).await {
-            if name_state.status == NameStatus::Active && name_state.name_seq >= min_name_seq {
+            if name_state.effective_status_at(now_timestamp()) == NameStatus::Active
+                && name_state.name_seq >= min_name_seq
+            {
                 let mut projected_docs = Vec::with_capacity(documents.len());
                 let mut all_ready = true;
                 for doc in documents {
@@ -701,7 +706,8 @@ async fn wait_for_init_projection(
                         .map_or(1, |(_, version)| *version);
                     match api.resolve_document(name, &doc.doc_type).await {
                         Ok(result)
-                            if result.document_state.status == DocumentStatus::Active
+                            if result.effective_status_at(now_timestamp())
+                                == DocumentStatus::Active
                                 && result.document_state.version >= min_version
                                 && result.document_state.document.inline_document
                                     == doc.inline_document =>
@@ -927,7 +933,7 @@ async fn smoke(flags: HashMap<String, String>) -> Result<(), DynError> {
     let deadline = Instant::now() + Duration::from_millis(timeout_ms);
     loop {
         if let Ok(Some(state)) = server_api.query_name_state(&name).await {
-            if state.status == NameStatus::Active {
+            if state.effective_status_at(now_timestamp()) == NameStatus::Active {
                 break;
             }
         }
