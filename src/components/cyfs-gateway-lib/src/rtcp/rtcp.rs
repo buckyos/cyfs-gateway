@@ -280,17 +280,24 @@ impl RTcpRuntimeTasks {
         }
     }
 
-    fn spawn<F>(&self, future: F) -> bool
+    fn try_spawn<F>(&self, future: F) -> Result<(), F>
     where
         F: std::future::Future<Output = ()> + Send + 'static,
     {
         let mut tasks = self.tasks.lock().unwrap();
         let Some(tasks) = tasks.as_mut() else {
-            return false;
+            return Err(future);
         };
         while tasks.try_join_next().is_some() {}
         tasks.spawn(future);
-        true
+        Ok(())
+    }
+
+    fn spawn<F>(&self, future: F) -> bool
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        self.try_spawn(future).is_ok()
     }
 
     async fn shutdown(&self) {
@@ -773,22 +780,29 @@ impl Drop for RTcpInner {
 }
 
 impl RTcpInner {
-    fn spawn_runtime_task<F>(&self, future: F) -> bool
+    fn try_spawn_runtime_task<F>(&self, future: F) -> Result<(), F>
     where
         F: std::future::Future<Output = ()> + Send + 'static,
     {
         let task_set = self.runtime_tasks.read().unwrap().upgrade();
         if let Some(task_set) = task_set {
-            if !task_set.spawn(future) {
-                debug!("reject RTCP runtime task after shutdown started");
-                false
-            } else {
-                true
-            }
+            task_set.try_spawn(future)
         } else {
             // Standalone RTcpInner values are used by focused tests. Production
             // RTcp instances always install the owned task set in RTcp::new.
             task::spawn(future);
+            Ok(())
+        }
+    }
+
+    fn spawn_runtime_task<F>(&self, future: F) -> bool
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        if self.try_spawn_runtime_task(future).is_err() {
+            debug!("reject RTCP runtime task after shutdown started");
+            false
+        } else {
             true
         }
     }
@@ -2496,9 +2510,15 @@ impl RTcpInner {
         // Cleanup of replaced instances must not delay the new tunnel's read
         // loop, and cancellation of either cleanup task cannot unpublish the
         // newly accepted instance.
-        self.spawn_runtime_task(async move {
+        let cleanup = async move {
             RTcpTunnelMap::finish_authenticated_registration(registration).await;
-        });
+        };
+        if let Err(cleanup) = self.try_spawn_runtime_task(cleanup) {
+            warn!(
+                "finish replaced RTcp tunnel cleanup inline because runtime shutdown has started"
+            );
+            cleanup.await;
+        }
 
         info!(
             "Tunnel {} accept from {} OK, instance {}, start running",
@@ -7313,6 +7333,54 @@ mod tests {
         ));
         assert!(late_outbound.is_closed());
         assert_eq!(rtcp.inner.tunnel_map.primary_len().await, 0);
+    }
+
+    #[tokio::test]
+    async fn accepted_inbound_cleanup_finishes_inline_after_runtime_shutdown() {
+        let rtcp = RTcp::new(
+            DID::new("dev", "shutdown-cleanup-test-local"),
+            "127.0.0.1:0".to_string(),
+            None,
+            None,
+            Arc::new(MockRTcpListener::new()),
+        );
+        let (accepted, _accepted_peer) = test_tunnel(104);
+        let (replaced, mut replaced_peer) = test_tunnel(105);
+        let (waiter_tx, waiter_rx) = oneshot::channel();
+        replaced.open_resp_waiters.lock().await.insert(1, waiter_tx);
+        replaced.mark_closed();
+        accepted.mark_closed();
+
+        rtcp.shutdown().await;
+        rtcp.inner
+            .run_established_inbound(EstablishedInboundTunnel {
+                tunnel: accepted,
+                tunnel_key: "shutdown-cleanup-test-key".to_string(),
+                source_device_id: "did:dev:shutdown-cleanup-test-peer".to_string(),
+                source_addr: "127.0.0.1:12345".parse().unwrap(),
+                registration: InboundTunnelRegistration {
+                    accepted: true,
+                    rejection_reason: None,
+                    replaced: Some(replaced),
+                    superseded: Vec::new(),
+                    rejected: None,
+                },
+                authority_confirmation: None,
+            })
+            .await;
+
+        timeout(Duration::from_secs(1), waiter_rx)
+            .await
+            .expect("replaced tunnel waiter cleanup was dropped")
+            .expect_err("replaced tunnel waiter should be closed");
+        let mut byte = [0u8; 1];
+        assert_eq!(
+            timeout(Duration::from_secs(1), replaced_peer.read(&mut byte))
+                .await
+                .expect("replaced tunnel transport was not shut down")
+                .unwrap(),
+            0
+        );
     }
 
     #[tokio::test]
