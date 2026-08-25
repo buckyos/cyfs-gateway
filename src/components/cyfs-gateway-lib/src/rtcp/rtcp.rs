@@ -445,6 +445,10 @@ const JWT_LEEWAY_SECS: u64 = 60;
 // handshakes from pinning an (aes_key, nonce_base) slot.
 const HELLO_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 
+// Tunnels are already marked closed and detached before transport cleanup, so
+// shutdown may continue after this whole-batch deadline without reopening work.
+const RTCP_TUNNEL_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
+
 // Happy Eyeballs style stagger between direct RTCP connection attempts. The
 // address order still matters, but a slow first candidate no longer blocks the
 // next one until it fully fails.
@@ -5925,7 +5929,16 @@ impl RTcpTunnelMap {
     }
 
     async fn close_detached(tunnels: Vec<RTcpTunnel>, reason: &str) -> usize {
+        Self::close_detached_with_timeout(tunnels, reason, RTCP_TUNNEL_CLOSE_TIMEOUT).await
+    }
+
+    async fn close_detached_with_timeout(
+        tunnels: Vec<RTcpTunnel>,
+        reason: &str,
+        close_timeout: Duration,
+    ) -> usize {
         let count = tunnels.len();
+        let mut close_futures = FuturesUnordered::new();
         for tunnel in tunnels {
             debug!(
                 "close RTCP tunnel {} instance {} after {}",
@@ -5933,7 +5946,24 @@ impl RTcpTunnelMap {
                 tunnel.instance_id(),
                 reason
             );
-            tunnel.close().await;
+            close_futures.push(async move {
+                tunnel.close().await;
+            });
+        }
+
+        if timeout(close_timeout, async {
+            while close_futures.next().await.is_some() {}
+        })
+        .await
+        .is_err()
+        {
+            warn!(
+                "timed out after {:?}: {} of {} detached RTCP tunnel closes did not finish after {}",
+                close_timeout,
+                close_futures.len(),
+                count,
+                reason
+            );
         }
         count
     }
@@ -7232,6 +7262,39 @@ mod tests {
         ));
         assert!(late_outbound.is_closed());
         assert_eq!(rtcp.inner.tunnel_map.primary_len().await, 0);
+    }
+
+    #[tokio::test]
+    async fn detached_tunnel_close_is_concurrent_and_timeout_bounded() {
+        let (blocked, _blocked_peer) = test_tunnel(104);
+        let (closable, _closable_peer) = test_tunnel(105);
+        let blocked_write_guard = blocked.write_stream.lock().await;
+        let (waiter_tx, waiter_rx) = oneshot::channel();
+        closable.open_resp_waiters.lock().await.insert(1, waiter_tx);
+
+        let closed = timeout(
+            Duration::from_secs(1),
+            RTcpTunnelMap::close_detached_with_timeout(
+                vec![blocked.clone(), closable.clone()],
+                "test shutdown",
+                Duration::from_millis(100),
+            ),
+        )
+        .await
+        .expect("detached tunnel close exceeded its timeout");
+
+        assert_eq!(closed, 2);
+        assert!(blocked.is_closed());
+        assert!(closable.is_closed());
+        timeout(Duration::from_secs(1), waiter_rx)
+            .await
+            .expect("unblocked tunnel was not closed concurrently")
+            .expect_err("closing the unblocked tunnel should drop its waiter");
+
+        drop(blocked_write_guard);
+        timeout(Duration::from_secs(1), blocked.close())
+            .await
+            .expect("blocked tunnel cleanup did not finish after releasing its write lock");
     }
 
     #[tokio::test]
