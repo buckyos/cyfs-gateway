@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use bns_client::{
-    BnsClientError, BnsClientResult, BnsEvmClientConfig, BnsEvmControllerClient,
+    BnsClientError, BnsClientResult, BnsEvmClientConfig, BnsEvmControllerClient, BnsEvmPreparedTx,
     BnsEvmRawTxSubmitter, BnsEvmReceiptWaitConfig, BnsEvmStandardClient, BnsIndexerApi,
     BnsPrepareTxReq, BnsPrepareTxResp, BnsRegisterNameReq, BnsSubmitRawTxReq, BnsSubmitRawTxResp,
     BnsTxExecutionState, BnsTxState,
@@ -555,6 +555,14 @@ async fn controller_with_explicit_chain_rpc_submitter_uses_chain() {
     let raw = hex::decode(submission.raw_tx.trim_start_matches("0x")).unwrap();
     let decoded = decode_signed_eip1559(&raw).unwrap();
     assert_eq!(submission.tx_hash, format!("{:#x}", decoded.hash()));
+    let reconstructed = BnsEvmPreparedTx::from_raw_tx(submission.raw_tx.clone()).unwrap();
+    assert_eq!(reconstructed.tx_hash, submission.tx_hash);
+    assert_eq!(reconstructed.raw_tx, submission.raw_tx);
+    assert!(reconstructed
+        .from
+        .eq_ignore_ascii_case(ANVIL_ADDRESS.to_string().as_str()));
+    assert_eq!(reconstructed.nonce, submission.nonce);
+    assert_eq!(reconstructed.chain_id, submission.chain_id);
     let raw_bytes = hex::decode(sent[0].trim_start_matches("0x")).unwrap();
     assert_eq!(
         decode_signed_eip1559(&raw_bytes)

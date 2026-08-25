@@ -2812,7 +2812,7 @@ impl SnServerFactory {
             )
         })?);
 
-        let mut controllers = Vec::new();
+        let mut controllers: Vec<SnBnsProxyController> = Vec::new();
         for info in signer_vault.controller_infos() {
             let key_manager =
                 BoundControllerKeyManager::new(signer_vault.clone(), info.id.as_str()).map_err(
@@ -2874,6 +2874,42 @@ impl SnServerFactory {
                 weight: info.weight,
                 controller: Arc::new(controller),
             });
+        }
+
+        if let Some(recovery_controller) = controllers.first() {
+            match recovery_controller
+                .controller
+                .recover_inflight_requests()
+                .await
+            {
+                Ok(report) => {
+                    for failure in &report.failures {
+                        error!(
+                            "sn bns startup transaction recovery failed: request_id={} name={} \
+                             tx_hash={} error_code={} error={}",
+                            failure.request_id,
+                            failure.name,
+                            failure.tx_hash.as_deref().unwrap_or("-"),
+                            failure.error_code,
+                            failure.error_message,
+                        );
+                    }
+                    info!(
+                        "sn bns startup transaction recovery completed: scanned={} recovered={} \
+                         failed={}",
+                        report.scanned,
+                        report.recovered,
+                        report.failures.len(),
+                    );
+                }
+                Err(error) => {
+                    error!(
+                        "scan in-flight sn bns transactions during startup failed; \
+                         continuing without blocking SN services: {}",
+                        error
+                    );
+                }
+            }
         }
 
         let binding_store = SqliteSnBnsControllerBindingStore::new_by_path(db_path)
@@ -3179,6 +3215,10 @@ mod tests {
     use super::*;
     use crate::SnAuthDB;
     use base64::Engine as _;
+    use bns_client::{
+        BnsWriteOperation, BnsWriteRequestState, SnBnsWriteRequestRecord,
+        SnBnsWriteRequestStore,
+    };
     use buckyos_kit::init_logging;
     use cyfs_gateway_lib::hyper_serve_http;
     use std::time::SystemTime;
@@ -4239,6 +4279,65 @@ users:
         let binding = proxy.assign_controller_for_user("alice").await.unwrap();
         assert_eq!(binding.controller_id, "default");
         assert_eq!(binding.controller_address, ANVIL_ADDRESS);
+    }
+
+    #[tokio::test]
+    async fn sn_bns_proxy_startup_recovery_failure_does_not_block_proxy_build() {
+        let db = tempfile::NamedTempFile::new().unwrap();
+        let store = SqliteSnBnsWriteRequestStore::open(db.path()).unwrap();
+        assert!(matches!(
+            store
+                .try_begin(SnBnsWriteRequestRecord {
+                    request_id: "startup-corrupt".to_string(),
+                    operation: BnsWriteOperation::RegisterName,
+                    name: "corrupt-user".to_string(),
+                    doc_type: None,
+                    payload_hash: "0xpayload".to_string(),
+                    state: BnsWriteRequestState::Sending,
+                    result_json: Some(json!({"persisted": true})),
+                    error_code: None,
+                    error_message: None,
+                    lease_owner: None,
+                    lease_expires_at: None,
+                    evm_chain_id: Some(31_337),
+                    evm_nonce: Some(7),
+                    evm_tx_hash: Some(format!("0x{:064x}", 7)),
+                    evm_raw_tx: Some("0x02corrupt".to_string()),
+                    created_at: 1,
+                    updated_at: 1,
+                })
+                .unwrap(),
+            bns_client::SnBnsTryBeginResult::Acquired
+        ));
+        drop(store);
+
+        let config: SNServerConfig = serde_json::from_value(json!({
+            "id": "test",
+            "host": "buckyos.ai",
+            "ip": "127.0.0.1",
+            "boot_jwt": "",
+            "owner_pkx": "",
+            "device_jwt": [],
+            "bns_server_url": "http://127.0.0.1:18080",
+            "bns_proxy": {
+                "controllers": [{
+                    "id": "default",
+                    "private_key": ANVIL_PRIVATE_KEY
+                }]
+            }
+        }))
+        .unwrap();
+
+        let proxy = SnServerFactory::build_bns_proxy(
+            &config,
+            db.path().to_str().unwrap(),
+            test_bns_client(),
+            &test_bns_system_info(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(proxy.controller_count(), 1);
     }
 
     #[tokio::test]

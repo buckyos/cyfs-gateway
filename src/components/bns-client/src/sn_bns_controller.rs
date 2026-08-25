@@ -9,7 +9,7 @@ use crate::{
 use crate::{
     BnsApplyMutationsReq, BnsClientError, BnsDocumentVersion, BnsEvmControllerClient,
     BnsEvmPreparedTx, BnsEvmReceiptWaitConfig, BnsEvmTxReceipt, BnsEvmTxSubmission, BnsIndexerApi,
-    BnsPublishDocumentReq, BnsRegisterNameReq, BnsRpcErrorInfo,
+    BnsPublishDocumentReq, BnsRegisterNameReq, BnsRpcErrorInfo, BnsTxExecutionState, BnsTxState,
 };
 use async_trait::async_trait;
 use serde::de::DeserializeOwned;
@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use thiserror::Error;
 
@@ -26,17 +26,7 @@ pub const ZONE_DOC_TYPE: &str = "zone";
 pub const BOOT_DOC_TYPE: &str = "boot";
 pub const DEVICE_MINI_DOC_TYPE: &str = "device_mini_doc";
 pub const RELAY_ASSIGNMENT_DOC_TYPE: &str = "relay_assignment";
-const DEFAULT_IDEMPOTENCY_LEASE_SECS: u64 = 300;
-
-fn next_lease_owner() -> String {
-    static NEXT_LEASE_ID: AtomicU64 = AtomicU64::new(1);
-    format!(
-        "{}:{}:{}",
-        std::process::id(),
-        crate::now_timestamp(),
-        NEXT_LEASE_ID.fetch_add(1, Ordering::Relaxed)
-    )
-}
+pub const EVM_TX_RECOVERY_DATA_INVALID: &str = "EVM_TX_RECOVERY_DATA_INVALID";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -139,28 +129,9 @@ trait MarkIdempotentReuse {
     fn mark_reused(&mut self);
 }
 
-trait BnsWriteMetadata {
-    fn evm_submission(&self) -> Option<BnsEvmTxSubmission>;
-}
-
 impl MarkIdempotentReuse for BnsWriteReceipt {
     fn mark_reused(&mut self) {
         self.created_or_reused = true;
-    }
-}
-
-impl BnsWriteMetadata for BnsWriteReceipt {
-    fn evm_submission(&self) -> Option<BnsEvmTxSubmission> {
-        Some(BnsEvmTxSubmission {
-            tx_hash: self.evm_tx_hash.clone()?,
-            raw_tx: self.evm_raw_tx.clone()?,
-            from: String::new(),
-            nonce: self.evm_nonce?,
-            chain_id: self.evm_chain_id?,
-            receipt_status: None,
-            receipt_block_number: None,
-            receipt_confirmations: None,
-        })
     }
 }
 
@@ -173,43 +144,19 @@ impl MarkIdempotentReuse for BnsMultiWriteReceipt {
     }
 }
 
-impl BnsWriteMetadata for BnsMultiWriteReceipt {
-    fn evm_submission(&self) -> Option<BnsEvmTxSubmission> {
-        self.receipts
-            .iter()
-            .find_map(BnsWriteMetadata::evm_submission)
-            .or_else(|| {
-                Some(BnsEvmTxSubmission {
-                    tx_hash: self.evm_tx_hash.clone()?,
-                    raw_tx: self.evm_raw_tx.clone()?,
-                    from: String::new(),
-                    nonce: self.evm_nonce?,
-                    chain_id: self.evm_chain_id?,
-                    receipt_status: None,
-                    receipt_block_number: None,
-                    receipt_confirmations: None,
-                })
-            })
-    }
-}
-
 impl MarkIdempotentReuse for RegisterNameOutput {
     fn mark_reused(&mut self) {
         self.receipt.mark_reused();
     }
 }
 
-impl BnsWriteMetadata for RegisterNameOutput {
-    fn evm_submission(&self) -> Option<BnsEvmTxSubmission> {
-        self.receipt.evm_submission()
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BnsWriteRequestState {
+    Sending,
     Pending,
     Succeeded,
+    Reverted,
     Failed,
 }
 
@@ -238,6 +185,22 @@ pub struct SnBnsWriteRequestRecord {
     pub evm_raw_tx: Option<String>,
     pub created_at: u64,
     pub updated_at: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnBnsRecoveryFailure {
+    pub request_id: String,
+    pub name: String,
+    pub tx_hash: Option<String>,
+    pub error_code: String,
+    pub error_message: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SnBnsRecoveryReport {
+    pub scanned: usize,
+    pub recovered: usize,
+    pub failures: Vec<SnBnsRecoveryFailure>,
 }
 
 #[derive(Debug, Error)]
@@ -308,38 +271,72 @@ pub enum SnBnsTryBeginResult {
 }
 
 pub trait SnBnsWriteRequestStore: Send + Sync {
+    /// Serialize the prepare -> persist -> broadcast boundary for every
+    /// controller sharing this store. This prevents a losing request-id race
+    /// from reserving an EVM nonce that will never be broadcast.
+    fn execution_lock(&self) -> &tokio::sync::Mutex<()>;
+
     fn get(&self, request_id: &str) -> SnBnsControllerResult<Option<SnBnsWriteRequestRecord>>;
 
-    /// Atomically insert the initial Pending record. Exactly one caller may
-    /// receive [`SnBnsTryBeginResult::Acquired`] for a request id.
+    /// Atomically insert a fully signed Sending record. Exactly one caller may
+    /// receive [`SnBnsTryBeginResult::Acquired`] for a request id. Nothing is
+    /// persisted before the raw transaction is available.
     fn try_begin(
         &self,
         record: SnBnsWriteRequestRecord,
     ) -> SnBnsControllerResult<SnBnsTryBeginResult>;
 
-    /// Persist a fully signed transaction while the request is still Pending.
-    /// Returns false when another state transition has already won.
-    fn save_prepared(&self, record: SnBnsWriteRequestRecord) -> SnBnsControllerResult<bool>;
+    /// Return all records that still need startup or request-triggered recovery.
+    fn list_inflight(&self) -> SnBnsControllerResult<Vec<SnBnsWriteRequestRecord>>;
 
-    /// Atomically take over an expired Pending request. The returned record is
-    /// the only one authorized to recover/finish the prepared transaction.
-    fn try_takeover(
+    /// Compare-and-set a Sending/Pending record to its next chain-derived
+    /// state. The payload hash and prepared transaction must still match.
+    fn update_inflight(&self, record: SnBnsWriteRequestRecord) -> SnBnsControllerResult<bool>;
+
+    /// Repair metadata from a successfully decoded signed raw transaction.
+    /// A conflicting stored hash may only be replaced after the caller has
+    /// established that the old hash is not known by the chain.
+    fn repair_prepared_metadata(
         &self,
         request_id: &str,
         payload_hash: &str,
-        lease_owner: &str,
-        lease_expires_at: u64,
-        now: u64,
-    ) -> SnBnsControllerResult<Option<SnBnsWriteRequestRecord>>;
+        expected_raw_tx: &str,
+        expected_tx_hash: Option<&str>,
+        prepared: &BnsEvmPreparedTx,
+        updated_at: u64,
+    ) -> SnBnsControllerResult<bool>;
 
-    /// Finish a Pending request using a compare-and-set transition. The stored
-    /// payload hash and prepared transaction (if any) must still match.
-    fn finish(&self, record: SnBnsWriteRequestRecord) -> SnBnsControllerResult<bool>;
+    /// Resolve a quarantined recovery failure from a later authoritative chain
+    /// lookup without discarding its audit record.
+    fn resolve_recovery_failed(
+        &self,
+        record: SnBnsWriteRequestRecord,
+    ) -> SnBnsControllerResult<bool>;
+
+    /// Delete only a quarantined recovery failure after a later chain lookup
+    /// again confirms that its transaction hash is not known.
+    fn remove_recovery_failed(
+        &self,
+        request_id: &str,
+        payload_hash: &str,
+        tx_hash: Option<&str>,
+        raw_tx: Option<&str>,
+    ) -> SnBnsControllerResult<bool>;
+
+    /// Remove a legacy pre-broadcast row that has no signed transaction. Such
+    /// rows are safe to retry because the old workflow could not have reached
+    /// its persist-before-broadcast boundary.
+    fn remove_unprepared(
+        &self,
+        request_id: &str,
+        payload_hash: &str,
+    ) -> SnBnsControllerResult<bool>;
 }
 
 #[derive(Default)]
 pub struct MemorySnBnsWriteRequestStore {
     records: Mutex<HashMap<String, SnBnsWriteRequestRecord>>,
+    execution_lock: tokio::sync::Mutex<()>,
 }
 
 impl MemorySnBnsWriteRequestStore {
@@ -349,6 +346,10 @@ impl MemorySnBnsWriteRequestStore {
 }
 
 impl SnBnsWriteRequestStore for MemorySnBnsWriteRequestStore {
+    fn execution_lock(&self) -> &tokio::sync::Mutex<()> {
+        &self.execution_lock
+    }
+
     fn get(&self, request_id: &str) -> SnBnsControllerResult<Option<SnBnsWriteRequestRecord>> {
         let records = self
             .records
@@ -363,6 +364,18 @@ impl SnBnsWriteRequestStore for MemorySnBnsWriteRequestStore {
     ) -> SnBnsControllerResult<SnBnsTryBeginResult> {
         use std::collections::hash_map::Entry;
 
+        if record.state != BnsWriteRequestState::Sending
+            || record.result_json.is_none()
+            || record.evm_chain_id.is_none()
+            || record.evm_nonce.is_none()
+            || record.evm_tx_hash.is_none()
+            || record.evm_raw_tx.is_none()
+        {
+            return Err(SnBnsControllerError::Store(
+                "try_begin requires a fully prepared sending record".to_string(),
+            ));
+        }
+
         let mut records = self
             .records
             .lock()
@@ -376,7 +389,29 @@ impl SnBnsWriteRequestStore for MemorySnBnsWriteRequestStore {
         }
     }
 
-    fn save_prepared(&self, mut record: SnBnsWriteRequestRecord) -> SnBnsControllerResult<bool> {
+    fn list_inflight(&self) -> SnBnsControllerResult<Vec<SnBnsWriteRequestRecord>> {
+        let records = self
+            .records
+            .lock()
+            .map_err(|_| SnBnsControllerError::Store("memory store lock poisoned".to_string()))?;
+        Ok(records
+            .values()
+            .filter(|record| {
+                matches!(
+                    record.state,
+                    BnsWriteRequestState::Sending | BnsWriteRequestState::Pending
+                )
+            })
+            .cloned()
+            .collect())
+    }
+
+    fn update_inflight(&self, mut record: SnBnsWriteRequestRecord) -> SnBnsControllerResult<bool> {
+        if record.state == BnsWriteRequestState::Sending {
+            return Err(SnBnsControllerError::Store(
+                "update_inflight cannot transition back to sending".to_string(),
+            ));
+        }
         let mut records = self
             .records
             .lock()
@@ -384,10 +419,12 @@ impl SnBnsWriteRequestStore for MemorySnBnsWriteRequestStore {
         let Some(current) = records.get_mut(&record.request_id) else {
             return Ok(false);
         };
-        if current.state != BnsWriteRequestState::Pending
-            || current.payload_hash != record.payload_hash
-            || current.evm_tx_hash.is_some()
-            || current.lease_owner != record.lease_owner
+        if !matches!(
+            current.state,
+            BnsWriteRequestState::Sending | BnsWriteRequestState::Pending
+        ) || current.payload_hash != record.payload_hash
+            || current.evm_tx_hash != record.evm_tx_hash
+            || current.evm_raw_tx != record.evm_raw_tx
         {
             return Ok(false);
         }
@@ -396,34 +433,53 @@ impl SnBnsWriteRequestStore for MemorySnBnsWriteRequestStore {
         Ok(true)
     }
 
-    fn try_takeover(
+    fn repair_prepared_metadata(
         &self,
         request_id: &str,
         payload_hash: &str,
-        lease_owner: &str,
-        lease_expires_at: u64,
-        now: u64,
-    ) -> SnBnsControllerResult<Option<SnBnsWriteRequestRecord>> {
+        expected_raw_tx: &str,
+        expected_tx_hash: Option<&str>,
+        prepared: &BnsEvmPreparedTx,
+        updated_at: u64,
+    ) -> SnBnsControllerResult<bool> {
         let mut records = self
             .records
             .lock()
             .map_err(|_| SnBnsControllerError::Store("memory store lock poisoned".to_string()))?;
         let Some(record) = records.get_mut(request_id) else {
-            return Ok(None);
+            return Ok(false);
         };
-        if record.state != BnsWriteRequestState::Pending
-            || record.payload_hash != payload_hash
-            || record.lease_expires_at.is_some_and(|expires| expires > now)
+        if !matches!(
+            record.state,
+            BnsWriteRequestState::Sending | BnsWriteRequestState::Pending
+        ) || record.payload_hash != payload_hash
+            || record.evm_raw_tx.as_deref() != Some(expected_raw_tx)
+            || record.evm_tx_hash.as_deref() != expected_tx_hash
         {
-            return Ok(None);
+            return Ok(false);
         }
-        record.lease_owner = Some(lease_owner.to_string());
-        record.lease_expires_at = Some(lease_expires_at);
-        record.updated_at = now;
-        Ok(Some(record.clone()))
+        record.evm_tx_hash = Some(prepared.tx_hash.clone());
+        record.evm_raw_tx = Some(prepared.raw_tx.clone());
+        record.evm_chain_id = Some(prepared.chain_id);
+        record.evm_nonce = Some(prepared.nonce);
+        record.updated_at = updated_at;
+        Ok(true)
     }
 
-    fn finish(&self, mut record: SnBnsWriteRequestRecord) -> SnBnsControllerResult<bool> {
+    fn resolve_recovery_failed(
+        &self,
+        mut record: SnBnsWriteRequestRecord,
+    ) -> SnBnsControllerResult<bool> {
+        if !matches!(
+            record.state,
+            BnsWriteRequestState::Pending
+                | BnsWriteRequestState::Succeeded
+                | BnsWriteRequestState::Reverted
+        ) {
+            return Err(SnBnsControllerError::Store(
+                "resolve_recovery_failed requires a chain-derived state".to_string(),
+            ));
+        }
         let mut records = self
             .records
             .lock()
@@ -431,16 +487,65 @@ impl SnBnsWriteRequestStore for MemorySnBnsWriteRequestStore {
         let Some(current) = records.get_mut(&record.request_id) else {
             return Ok(false);
         };
-        if current.state != BnsWriteRequestState::Pending
+        if current.state != BnsWriteRequestState::Failed
+            || current.error_code.as_deref() != Some(EVM_TX_RECOVERY_DATA_INVALID)
             || current.payload_hash != record.payload_hash
             || current.evm_tx_hash != record.evm_tx_hash
-            || current.lease_owner != record.lease_owner
+            || current.evm_raw_tx != record.evm_raw_tx
         {
             return Ok(false);
         }
         record.created_at = current.created_at;
         *current = record;
         Ok(true)
+    }
+
+    fn remove_recovery_failed(
+        &self,
+        request_id: &str,
+        payload_hash: &str,
+        tx_hash: Option<&str>,
+        raw_tx: Option<&str>,
+    ) -> SnBnsControllerResult<bool> {
+        let mut records = self
+            .records
+            .lock()
+            .map_err(|_| SnBnsControllerError::Store("memory store lock poisoned".to_string()))?;
+        let removable = records.get(request_id).is_some_and(|record| {
+            record.state == BnsWriteRequestState::Failed
+                && record.error_code.as_deref() == Some(EVM_TX_RECOVERY_DATA_INVALID)
+                && record.payload_hash == payload_hash
+                && record.evm_tx_hash.as_deref() == tx_hash
+                && record.evm_raw_tx.as_deref() == raw_tx
+        });
+        if removable {
+            records.remove(request_id);
+        }
+        Ok(removable)
+    }
+
+    fn remove_unprepared(
+        &self,
+        request_id: &str,
+        payload_hash: &str,
+    ) -> SnBnsControllerResult<bool> {
+        let mut records = self
+            .records
+            .lock()
+            .map_err(|_| SnBnsControllerError::Store("memory store lock poisoned".to_string()))?;
+        let removable = records.get(request_id).is_some_and(|record| {
+            record.payload_hash == payload_hash
+                && matches!(
+                    record.state,
+                    BnsWriteRequestState::Sending | BnsWriteRequestState::Pending
+                )
+                && record.evm_tx_hash.is_none()
+                && record.evm_raw_tx.is_none()
+        });
+        if removable {
+            records.remove(request_id);
+        }
+        Ok(removable)
     }
 }
 
@@ -451,7 +556,6 @@ pub struct SnBnsControllerConfig {
     pub allowed_controller_doc_types: Vec<String>,
     pub max_inline_document_size: usize,
     pub write_retry_limit: usize,
-    pub idempotency_lease_secs: u64,
 }
 
 impl SnBnsControllerConfig {
@@ -465,7 +569,6 @@ impl SnBnsControllerConfig {
             allowed_controller_doc_types: vec![String::new()],
             max_inline_document_size: crate::MAX_INLINE_DOCUMENT,
             write_retry_limit: 2,
-            idempotency_lease_secs: DEFAULT_IDEMPOTENCY_LEASE_SECS,
         }
     }
 
@@ -547,6 +650,17 @@ pub trait SnBnsEvmSubmitter: Send + Sync {
         prepared: &BnsEvmPreparedTx,
     ) -> crate::BnsClientResult<BnsEvmTxSubmission>;
 
+    /// Release any process-local nonce reservation when a prepared
+    /// transaction could not be persisted and therefore must not be sent.
+    fn abandon_prepared(&self, _prepared: &BnsEvmPreparedTx) {}
+
+    async fn query_tx_state(&self, tx_hash: &str) -> crate::BnsClientResult<BnsTxState> {
+        let _ = tx_hash;
+        Err(BnsClientError::unsupported(
+            "EVM transaction lookup is not supported by this submitter",
+        ))
+    }
+
     async fn recover_prepared(
         &self,
         prepared: &BnsEvmPreparedTx,
@@ -596,6 +710,14 @@ impl SnBnsEvmSubmitter for BnsEvmControllerClient {
         BnsEvmControllerClient::submit_prepared_tx(self, prepared).await
     }
 
+    fn abandon_prepared(&self, prepared: &BnsEvmPreparedTx) {
+        BnsEvmControllerClient::abandon_prepared_tx(self, prepared)
+    }
+
+    async fn query_tx_state(&self, tx_hash: &str) -> crate::BnsClientResult<BnsTxState> {
+        BnsEvmControllerClient::query_prepared_tx_state(self, tx_hash).await
+    }
+
     async fn recover_prepared(
         &self,
         prepared: &BnsEvmPreparedTx,
@@ -633,6 +755,10 @@ trait SnBnsWriteBackend: Send + Sync {
         &self,
         prepared: &BnsEvmPreparedTx,
     ) -> SnBnsControllerResult<BnsEvmTxSubmission>;
+
+    fn abandon_prepared(&self, prepared: &BnsEvmPreparedTx);
+
+    async fn query_tx_state(&self, tx_hash: &str) -> SnBnsControllerResult<BnsTxState>;
 
     async fn recover_prepared(
         &self,
@@ -698,6 +824,17 @@ impl SnBnsWriteBackend for EvmSnBnsWriteBackend {
             .map_err(Into::into)
     }
 
+    fn abandon_prepared(&self, prepared: &BnsEvmPreparedTx) {
+        self.submitter.abandon_prepared(prepared)
+    }
+
+    async fn query_tx_state(&self, tx_hash: &str) -> SnBnsControllerResult<BnsTxState> {
+        self.submitter
+            .query_tx_state(tx_hash)
+            .await
+            .map_err(Into::into)
+    }
+
     async fn recover_prepared(
         &self,
         prepared: &BnsEvmPreparedTx,
@@ -724,25 +861,36 @@ impl SnBnsWriteBackend for EvmSnBnsWriteBackend {
 struct SnBnsIdempotentExecution {
     store: Arc<dyn SnBnsWriteRequestStore>,
     backend: Arc<dyn SnBnsWriteBackend>,
-    pending_record: SnBnsWriteRequestRecord,
+    base_record: SnBnsWriteRequestRecord,
     prepared: Arc<AtomicBool>,
 }
 
 enum SnBnsExistingAction<T> {
     Return(T),
-    Execute(SnBnsWriteRequestRecord),
+    Execute,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SnBnsRecoveryMode {
+    Startup,
+    RequestReplay,
+}
+
+enum SnBnsReconcileAction {
+    Record(SnBnsWriteRequestRecord),
+    Execute,
 }
 
 impl SnBnsIdempotentExecution {
     fn new(
         store: Arc<dyn SnBnsWriteRequestStore>,
         backend: Arc<dyn SnBnsWriteBackend>,
-        pending_record: SnBnsWriteRequestRecord,
+        base_record: SnBnsWriteRequestRecord,
     ) -> Self {
         Self {
             store,
             backend,
-            pending_record,
+            base_record,
             prepared: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -756,20 +904,98 @@ impl SnBnsIdempotentExecution {
         prepared: &BnsEvmPreparedTx,
         provisional_result: &T,
     ) -> SnBnsControllerResult<BnsEvmTxSubmission> {
-        let mut record = self.pending_record.clone();
-        record.result_json = Some(serde_json::to_value(provisional_result)?);
+        let mut record = self.base_record.clone();
+        record.state = BnsWriteRequestState::Sending;
+        record.result_json = Some(match serde_json::to_value(provisional_result) {
+            Ok(result) => result,
+            Err(error) => {
+                self.backend.abandon_prepared(prepared);
+                return Err(error.into());
+            }
+        });
         record.evm_chain_id = Some(prepared.chain_id);
         record.evm_nonce = Some(prepared.nonce);
         record.evm_tx_hash = Some(prepared.tx_hash.clone());
         record.evm_raw_tx = Some(prepared.raw_tx.clone());
         record.updated_at = crate::now_timestamp();
-        if !self.store.save_prepared(record)? {
-            return Err(SnBnsControllerError::IdempotencyPending {
-                request_id: self.pending_record.request_id.clone(),
-            });
+        let begin = match self.store.try_begin(record.clone()) {
+            Ok(begin) => begin,
+            Err(error) => {
+                self.backend.abandon_prepared(prepared);
+                return Err(error);
+            }
+        };
+        match begin {
+            SnBnsTryBeginResult::Acquired => {}
+            SnBnsTryBeginResult::Existing(existing) => {
+                self.backend.abandon_prepared(prepared);
+                if existing.payload_hash != record.payload_hash {
+                    return Err(SnBnsControllerError::IdempotencyConflict {
+                        request_id: record.request_id,
+                    });
+                }
+                return Err(SnBnsControllerError::IdempotencyPending {
+                    request_id: record.request_id,
+                });
+            }
         }
         self.prepared.store(true, Ordering::Release);
-        self.backend.submit_prepared(prepared).await
+        match self.backend.submit_prepared(prepared).await {
+            Ok(submission) => {
+                record.state = submission_state(&submission);
+                record.error_code = None;
+                record.error_message = None;
+                record.updated_at = crate::now_timestamp();
+                if !self.store.update_inflight(record.clone())? {
+                    return Err(SnBnsControllerError::Store(format!(
+                        "request `{}` lost its post-broadcast state transition",
+                        record.request_id
+                    )));
+                }
+                if record.state == BnsWriteRequestState::Reverted {
+                    return Err(SnBnsControllerError::Bns(BnsClientError::registry(
+                        "EVM_TX_REVERTED",
+                        format!("BNS EVM tx {} reverted", prepared.tx_hash),
+                    )));
+                }
+                Ok(submission)
+            }
+            Err(error) => {
+                if error.code() == "EVM_TX_REVERTED" {
+                    record.state = BnsWriteRequestState::Reverted;
+                    record.error_code = Some(error.code().to_string());
+                    record.error_message = Some(error.to_string());
+                    record.updated_at = crate::now_timestamp();
+                    if !self.store.update_inflight(record.clone())? {
+                        let latest =
+                            self.store.get(record.request_id.as_str())?.ok_or_else(|| {
+                                SnBnsControllerError::Store(format!(
+                                    "request `{}` disappeared after transaction revert",
+                                    record.request_id
+                                ))
+                            })?;
+                        if latest.state != BnsWriteRequestState::Reverted
+                            || latest.payload_hash != record.payload_hash
+                            || latest.evm_tx_hash != record.evm_tx_hash
+                        {
+                            return Err(SnBnsControllerError::Store(format!(
+                                "request `{}` lost its reverted state transition",
+                                record.request_id
+                            )));
+                        }
+                    }
+                }
+                Err(error)
+            }
+        }
+    }
+}
+
+fn submission_state(submission: &BnsEvmTxSubmission) -> BnsWriteRequestState {
+    match submission.receipt_status {
+        Some(0) => BnsWriteRequestState::Reverted,
+        Some(_) => BnsWriteRequestState::Succeeded,
+        None => BnsWriteRequestState::Pending,
     }
 }
 
@@ -823,7 +1049,52 @@ impl SnBnsController {
         tx_hash: &str,
         config: BnsEvmReceiptWaitConfig,
     ) -> SnBnsControllerResult<BnsEvmTxReceipt> {
-        self.write_backend.wait_for_receipt(tx_hash, config).await
+        let result = self.write_backend.wait_for_receipt(tx_hash, config).await;
+        let next_state = match &result {
+            Ok(receipt) if receipt.status == Some(0) => Some(BnsWriteRequestState::Reverted),
+            Ok(_) => Some(BnsWriteRequestState::Succeeded),
+            Err(error) if error.code() == "EVM_TX_REVERTED" => Some(BnsWriteRequestState::Reverted),
+            Err(_) => None,
+        };
+        if let Some(next_state) = next_state {
+            if let Some(mut record) = self
+                .idempotency_store
+                .list_inflight()?
+                .into_iter()
+                .find(|record| record.evm_tx_hash.as_deref() == Some(tx_hash))
+            {
+                record.state = next_state;
+                record.updated_at = crate::now_timestamp();
+                if next_state == BnsWriteRequestState::Reverted {
+                    record.error_code = Some("EVM_TX_REVERTED".to_string());
+                    record.error_message = Some(format!("BNS EVM tx {tx_hash} reverted"));
+                } else {
+                    record.error_code = None;
+                    record.error_message = None;
+                }
+                if !self.idempotency_store.update_inflight(record.clone())? {
+                    let latest = self
+                        .idempotency_store
+                        .get(record.request_id.as_str())?
+                        .ok_or_else(|| {
+                            SnBnsControllerError::Store(format!(
+                                "request `{}` disappeared after receipt",
+                                record.request_id
+                            ))
+                        })?;
+                    if latest.state != next_state
+                        || latest.payload_hash != record.payload_hash
+                        || latest.evm_tx_hash != record.evm_tx_hash
+                    {
+                        return Err(SnBnsControllerError::Store(format!(
+                            "request `{}` lost its receipt state transition",
+                            record.request_id
+                        )));
+                    }
+                }
+            }
+        }
+        result
     }
 
     pub async fn bootstrap_name(
@@ -1115,6 +1386,7 @@ impl SnBnsController {
                     expected_name_seq: name_state.name_seq,
                     expected_parent_name_seq: 0,
                 };
+                let authority_set = self.client.get_authority_set(&execute_params.name).await?;
                 let prepared = self
                     .write_backend
                     .prepare_apply_mutations(BnsApplyMutationsReq {
@@ -1127,7 +1399,6 @@ impl SnBnsController {
                     })
                     .await?;
                 let submission = prepared.submission();
-                let authority_set = self.client.get_authority_set(&execute_params.name).await?;
                 let receipts = updates
                     .iter()
                     .map(|update| {
@@ -1424,6 +1695,7 @@ impl SnBnsController {
             expected_name_seq: name_state.name_seq,
             expected_parent_name_seq: 0,
         };
+        let authority_set = self.client.get_authority_set(name).await?;
         let prepared = self
             .write_backend
             .prepare_publish_document(BnsPublishDocumentReq {
@@ -1433,7 +1705,6 @@ impl SnBnsController {
                 guard,
             })
             .await?;
-        let authority_set = self.client.get_authority_set(name).await?;
         let output = receipt_from_submitted_document(
             request_id,
             operation,
@@ -1678,6 +1949,325 @@ impl SnBnsController {
         }
     }
 
+    async fn transition_from_chain_state(
+        &self,
+        mut record: SnBnsWriteRequestRecord,
+        state: BnsTxExecutionState,
+        from_recovery_failure: bool,
+    ) -> SnBnsControllerResult<SnBnsWriteRequestRecord> {
+        record.state = match state {
+            BnsTxExecutionState::Pending => BnsWriteRequestState::Pending,
+            BnsTxExecutionState::Succeeded => BnsWriteRequestState::Succeeded,
+            BnsTxExecutionState::Reverted => BnsWriteRequestState::Reverted,
+            BnsTxExecutionState::NotFound => {
+                return Err(SnBnsControllerError::Store(
+                    "cannot transition a request from a NotFound chain state".to_string(),
+                ));
+            }
+        };
+        if record.state == BnsWriteRequestState::Reverted {
+            record.error_code = Some("EVM_TX_REVERTED".to_string());
+            record.error_message = Some(format!(
+                "BNS EVM tx {} reverted",
+                record.evm_tx_hash.as_deref().unwrap_or("<unknown>")
+            ));
+        } else {
+            record.error_code = None;
+            record.error_message = None;
+        }
+        record.updated_at = crate::now_timestamp();
+        let updated = if from_recovery_failure {
+            self.idempotency_store
+                .resolve_recovery_failed(record.clone())?
+        } else {
+            self.idempotency_store.update_inflight(record.clone())?
+        };
+        if updated {
+            return Ok(record);
+        }
+        let latest = self
+            .idempotency_store
+            .get(record.request_id.as_str())?
+            .ok_or_else(|| {
+                SnBnsControllerError::Store(format!(
+                    "request `{}` disappeared during chain-state recovery",
+                    record.request_id
+                ))
+            })?;
+        if latest.state != record.state
+            || latest.payload_hash != record.payload_hash
+            || latest.evm_tx_hash != record.evm_tx_hash
+            || latest.evm_raw_tx != record.evm_raw_tx
+        {
+            return Err(SnBnsControllerError::Store(format!(
+                "request `{}` lost its chain-state recovery transition",
+                record.request_id
+            )));
+        }
+        Ok(latest)
+    }
+
+    fn quarantine_invalid_recovery_record(
+        &self,
+        mut record: SnBnsWriteRequestRecord,
+        reason: &str,
+    ) -> SnBnsControllerResult<SnBnsWriteRequestRecord> {
+        record.state = BnsWriteRequestState::Failed;
+        record.error_code = Some(EVM_TX_RECOVERY_DATA_INVALID.to_string());
+        record.error_message = Some(reason.to_string());
+        record.updated_at = crate::now_timestamp();
+        if self.idempotency_store.update_inflight(record.clone())? {
+            return Ok(record);
+        }
+        let latest = self
+            .idempotency_store
+            .get(record.request_id.as_str())?
+            .ok_or_else(|| {
+                SnBnsControllerError::Store(format!(
+                    "request `{}` disappeared while quarantining invalid recovery data",
+                    record.request_id
+                ))
+            })?;
+        if latest.state != BnsWriteRequestState::Failed
+            || latest.error_code.as_deref() != Some(EVM_TX_RECOVERY_DATA_INVALID)
+            || latest.payload_hash != record.payload_hash
+            || latest.evm_tx_hash != record.evm_tx_hash
+            || latest.evm_raw_tx != record.evm_raw_tx
+        {
+            return Err(SnBnsControllerError::Store(format!(
+                "request `{}` lost its recovery quarantine transition",
+                record.request_id
+            )));
+        }
+        Ok(latest)
+    }
+
+    fn recovery_data_error(
+        record: &SnBnsWriteRequestRecord,
+        reason: impl Into<String>,
+    ) -> SnBnsControllerError {
+        SnBnsControllerError::Bns(BnsClientError::registry(
+            EVM_TX_RECOVERY_DATA_INVALID,
+            format!(
+                "request `{}` cannot recover its stored EVM transaction: {}",
+                record.request_id,
+                reason.into()
+            ),
+        ))
+    }
+
+    async fn reconcile_invalid_record(
+        &self,
+        record: SnBnsWriteRequestRecord,
+        reason: String,
+        mode: SnBnsRecoveryMode,
+    ) -> SnBnsControllerResult<SnBnsReconcileAction> {
+        if let Some(tx_hash) = record.evm_tx_hash.as_deref() {
+            match self.write_backend.query_tx_state(tx_hash).await? {
+                BnsTxState {
+                    state: BnsTxExecutionState::NotFound,
+                    ..
+                } => {
+                    let quarantined = self.quarantine_invalid_recovery_record(record, &reason)?;
+                    if mode == SnBnsRecoveryMode::RequestReplay {
+                        let removed = self.idempotency_store.remove_recovery_failed(
+                            quarantined.request_id.as_str(),
+                            quarantined.payload_hash.as_str(),
+                            quarantined.evm_tx_hash.as_deref(),
+                            quarantined.evm_raw_tx.as_deref(),
+                        )?;
+                        if removed {
+                            return Ok(SnBnsReconcileAction::Execute);
+                        }
+                    }
+                    return Err(Self::recovery_data_error(&quarantined, reason));
+                }
+                state => {
+                    let record = self
+                        .transition_from_chain_state(record, state.state, false)
+                        .await?;
+                    return Ok(SnBnsReconcileAction::Record(record));
+                }
+            }
+        }
+
+        let quarantined = self.quarantine_invalid_recovery_record(record, &reason)?;
+        Err(Self::recovery_data_error(&quarantined, reason))
+    }
+
+    async fn reconcile_inflight_record(
+        &self,
+        mut record: SnBnsWriteRequestRecord,
+        mode: SnBnsRecoveryMode,
+    ) -> SnBnsControllerResult<SnBnsReconcileAction> {
+        if record.evm_tx_hash.is_none() && record.evm_raw_tx.is_none() {
+            if self
+                .idempotency_store
+                .remove_unprepared(record.request_id.as_str(), record.payload_hash.as_str())?
+            {
+                return Ok(SnBnsReconcileAction::Execute);
+            }
+            return Err(SnBnsControllerError::Store(format!(
+                "request `{}` could not remove its legacy pre-broadcast record",
+                record.request_id
+            )));
+        }
+
+        let Some(stored_raw_tx) = record.evm_raw_tx.clone() else {
+            return self
+                .reconcile_invalid_record(
+                    record,
+                    "stored transaction hash has no raw transaction".to_string(),
+                    mode,
+                )
+                .await;
+        };
+
+        if let (Some(tx_hash), Some(nonce), Some(chain_id)) = (
+            record.evm_tx_hash.clone(),
+            record.evm_nonce,
+            record.evm_chain_id,
+        ) {
+            let prepared = BnsEvmPreparedTx {
+                tx_hash,
+                raw_tx: stored_raw_tx,
+                from: String::new(),
+                nonce,
+                chain_id,
+            };
+            return self.recover_prepared_record(record, prepared, mode).await;
+        }
+
+        let decoded = match BnsEvmPreparedTx::from_raw_tx(stored_raw_tx.clone()) {
+            Ok(decoded) => decoded,
+            Err(error) => {
+                return self
+                    .reconcile_invalid_record(
+                        record,
+                        format!("decode stored raw transaction failed: {error}"),
+                        mode,
+                    )
+                    .await;
+            }
+        };
+
+        let stored_hash = record.evm_tx_hash.clone();
+        if let Some(stored_hash) = stored_hash.as_deref() {
+            if !stored_hash.eq_ignore_ascii_case(decoded.tx_hash.as_str()) {
+                let state = self.write_backend.query_tx_state(stored_hash).await?;
+                if state.state != BnsTxExecutionState::NotFound {
+                    let record = self
+                        .transition_from_chain_state(record, state.state, false)
+                        .await?;
+                    return Ok(SnBnsReconcileAction::Record(record));
+                }
+            }
+        }
+
+        let metadata_needs_repair = record.evm_tx_hash.as_deref() != Some(decoded.tx_hash.as_str())
+            || record.evm_raw_tx.as_deref() != Some(decoded.raw_tx.as_str())
+            || record.evm_chain_id != Some(decoded.chain_id)
+            || record.evm_nonce != Some(decoded.nonce);
+        if metadata_needs_repair {
+            if !self.idempotency_store.repair_prepared_metadata(
+                record.request_id.as_str(),
+                record.payload_hash.as_str(),
+                stored_raw_tx.as_str(),
+                stored_hash.as_deref(),
+                &decoded,
+                crate::now_timestamp(),
+            )? {
+                return Err(SnBnsControllerError::Store(format!(
+                    "request `{}` could not repair its prepared transaction metadata",
+                    record.request_id
+                )));
+            }
+            record.evm_chain_id = Some(decoded.chain_id);
+            record.evm_nonce = Some(decoded.nonce);
+            record.evm_tx_hash = Some(decoded.tx_hash.clone());
+            record.evm_raw_tx = Some(decoded.raw_tx.clone());
+        }
+
+        self.recover_prepared_record(record, decoded, mode).await
+    }
+
+    async fn recover_prepared_record(
+        &self,
+        record: SnBnsWriteRequestRecord,
+        prepared: BnsEvmPreparedTx,
+        mode: SnBnsRecoveryMode,
+    ) -> SnBnsControllerResult<SnBnsReconcileAction> {
+        match self.write_backend.recover_prepared(&prepared).await {
+            Ok(submission) => {
+                let state = submission_state(&submission);
+                let state = match state {
+                    BnsWriteRequestState::Pending => BnsTxExecutionState::Pending,
+                    BnsWriteRequestState::Succeeded => BnsTxExecutionState::Succeeded,
+                    BnsWriteRequestState::Reverted => BnsTxExecutionState::Reverted,
+                    BnsWriteRequestState::Sending | BnsWriteRequestState::Failed => {
+                        return Err(SnBnsControllerError::Store(
+                            "recovered submission returned an invalid state".to_string(),
+                        ));
+                    }
+                };
+                let record = self
+                    .transition_from_chain_state(record, state, false)
+                    .await?;
+                Ok(SnBnsReconcileAction::Record(record))
+            }
+            Err(error) if error.code() == "EVM_TX_REVERTED" => {
+                let record = self
+                    .transition_from_chain_state(record, BnsTxExecutionState::Reverted, false)
+                    .await?;
+                Ok(SnBnsReconcileAction::Record(record))
+            }
+            Err(error) if error.code() == "SERIALIZATION_ERROR" => {
+                self.reconcile_invalid_record(record, error.to_string(), mode)
+                    .await
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn retry_recovery_failed_record(
+        &self,
+        record: SnBnsWriteRequestRecord,
+    ) -> SnBnsControllerResult<SnBnsReconcileAction> {
+        let Some(tx_hash) = record.evm_tx_hash.as_deref() else {
+            if self.idempotency_store.remove_recovery_failed(
+                record.request_id.as_str(),
+                record.payload_hash.as_str(),
+                None,
+                record.evm_raw_tx.as_deref(),
+            )? {
+                return Ok(SnBnsReconcileAction::Execute);
+            }
+            return Err(SnBnsControllerError::Store(format!(
+                "request `{}` could not remove its unqueryable recovery failure",
+                record.request_id
+            )));
+        };
+        let state = self.write_backend.query_tx_state(tx_hash).await?;
+        if state.state == BnsTxExecutionState::NotFound {
+            if self.idempotency_store.remove_recovery_failed(
+                record.request_id.as_str(),
+                record.payload_hash.as_str(),
+                record.evm_tx_hash.as_deref(),
+                record.evm_raw_tx.as_deref(),
+            )? {
+                return Ok(SnBnsReconcileAction::Execute);
+            }
+            return Err(SnBnsControllerError::Store(format!(
+                "request `{}` could not remove its retryable recovery failure",
+                record.request_id
+            )));
+        }
+        let record = self
+            .transition_from_chain_state(record, state.state, true)
+            .await?;
+        Ok(SnBnsReconcileAction::Record(record))
+    }
+
     async fn handle_existing<T>(
         &self,
         mut record: SnBnsWriteRequestRecord,
@@ -1685,11 +2275,33 @@ impl SnBnsController {
     where
         T: DeserializeOwned + MarkIdempotentReuse,
     {
+        if record.state == BnsWriteRequestState::Failed
+            && record.error_code.as_deref() == Some(EVM_TX_RECOVERY_DATA_INVALID)
+        {
+            match self.retry_recovery_failed_record(record).await? {
+                SnBnsReconcileAction::Record(next) => record = next,
+                SnBnsReconcileAction::Execute => return Ok(SnBnsExistingAction::Execute),
+            }
+        }
+
+        if matches!(
+            record.state,
+            BnsWriteRequestState::Sending | BnsWriteRequestState::Pending
+        ) {
+            match self
+                .reconcile_inflight_record(record, SnBnsRecoveryMode::RequestReplay)
+                .await?
+            {
+                SnBnsReconcileAction::Record(next) => record = next,
+                SnBnsReconcileAction::Execute => return Ok(SnBnsExistingAction::Execute),
+            }
+        }
+
         match record.state {
-            BnsWriteRequestState::Succeeded => {
+            BnsWriteRequestState::Pending | BnsWriteRequestState::Succeeded => {
                 let value = record.result_json.ok_or_else(|| {
                     SnBnsControllerError::Store(format!(
-                        "succeeded request `{}` has no result_json",
+                        "request `{}` has no provisional result",
                         record.request_id
                     ))
                 })?;
@@ -1697,123 +2309,46 @@ impl SnBnsController {
                 result.mark_reused();
                 Ok(SnBnsExistingAction::Return(result))
             }
-            BnsWriteRequestState::Failed => Err(SnBnsControllerError::IdempotencyPreviousFailure {
+            BnsWriteRequestState::Reverted | BnsWriteRequestState::Failed => {
+                Err(SnBnsControllerError::IdempotencyPreviousFailure {
+                    request_id: record.request_id,
+                    message: record
+                        .error_message
+                        .unwrap_or_else(|| "previous request failed".to_string()),
+                })
+            }
+            BnsWriteRequestState::Sending => Err(SnBnsControllerError::IdempotencyPending {
                 request_id: record.request_id,
-                message: record
-                    .error_message
-                    .unwrap_or_else(|| "previous request failed".to_string()),
             }),
-            BnsWriteRequestState::Pending => {
-                let now = crate::now_timestamp();
-                if record.lease_expires_at.is_some_and(|expires| expires > now) {
-                    return Err(SnBnsControllerError::IdempotencyPending {
-                        request_id: record.request_id,
-                    });
-                }
-                // A record created by the lease-aware workflow with no result
-                // and no transaction fields is known to still be before the
-                // persist-before-broadcast boundary. After lease takeover it
-                // is safe to prepare a new transaction. Legacy Pending rows
-                // have no lease metadata and remain fail-closed because an old
-                // process may already have broadcast without persisting raw_tx.
-                let safe_prebroadcast_takeover = record.lease_owner.is_some()
-                    && record.lease_expires_at.is_some()
-                    && record.result_json.is_none()
-                    && record.evm_chain_id.is_none()
-                    && record.evm_nonce.is_none()
-                    && record.evm_tx_hash.is_none()
-                    && record.evm_raw_tx.is_none();
-                let lease_owner = next_lease_owner();
-                let Some(taken_over) = self.idempotency_store.try_takeover(
-                    record.request_id.as_str(),
-                    record.payload_hash.as_str(),
-                    lease_owner.as_str(),
-                    now.saturating_add(self.config.idempotency_lease_secs),
-                    now,
-                )?
-                else {
-                    return Err(SnBnsControllerError::IdempotencyPending {
-                        request_id: record.request_id,
-                    });
-                };
-                record = taken_over;
-                if safe_prebroadcast_takeover {
-                    return Ok(SnBnsExistingAction::Execute(record));
-                }
-                let Some(prepared) = prepared_tx_from_record(&record) else {
-                    return Err(SnBnsControllerError::IdempotencyPending {
-                        request_id: record.request_id,
-                    });
-                };
-                let Some(provisional_result) = record.result_json.clone() else {
-                    return Err(SnBnsControllerError::IdempotencyPending {
-                        request_id: record.request_id,
-                    });
-                };
+        }
+    }
 
-                match self.write_backend.recover_prepared(&prepared).await {
-                    Ok(_) => {
-                        record.state = BnsWriteRequestState::Succeeded;
-                        record.error_code = None;
-                        record.error_message = None;
-                        record.updated_at = crate::now_timestamp();
-                        if !self.idempotency_store.finish(record.clone())? {
-                            let latest = self
-                                .idempotency_store
-                                .get(record.request_id.as_str())?
-                                .ok_or_else(|| {
-                                    SnBnsControllerError::Store(format!(
-                                        "request `{}` disappeared during recovery",
-                                        record.request_id
-                                    ))
-                                })?;
-                            return match latest.state {
-                                BnsWriteRequestState::Succeeded => {
-                                    let value = latest.result_json.ok_or_else(|| {
-                                        SnBnsControllerError::Store(format!(
-                                            "succeeded request `{}` has no result_json",
-                                            latest.request_id
-                                        ))
-                                    })?;
-                                    let mut result: T = serde_json::from_value(value)?;
-                                    result.mark_reused();
-                                    Ok(SnBnsExistingAction::Return(result))
-                                }
-                                BnsWriteRequestState::Failed => {
-                                    Err(SnBnsControllerError::IdempotencyPreviousFailure {
-                                        request_id: latest.request_id,
-                                        message: latest.error_message.unwrap_or_else(|| {
-                                            "previous request failed".to_string()
-                                        }),
-                                    })
-                                }
-                                BnsWriteRequestState::Pending => {
-                                    Err(SnBnsControllerError::IdempotencyPending {
-                                        request_id: latest.request_id,
-                                    })
-                                }
-                            };
-                        }
-                        let mut result: T = serde_json::from_value(provisional_result)?;
-                        result.mark_reused();
-                        Ok(SnBnsExistingAction::Return(result))
-                    }
-                    Err(error) if error.code() == "EVM_TX_REVERTED" => {
-                        record.state = BnsWriteRequestState::Failed;
-                        record.result_json = None;
-                        record.error_code = Some(error.code().to_string());
-                        record.error_message = Some(error.to_string());
-                        record.updated_at = crate::now_timestamp();
-                        let _ = self.idempotency_store.finish(record)?;
-                        Err(error)
-                    }
-                    // Submission/query failures are ambiguous. Keep the exact
-                    // signed transaction Pending so a later retry can query or
-                    // rebroadcast it without allocating another nonce.
-                    Err(error) => Err(error),
-                }
+    pub async fn recover_inflight_requests(&self) -> SnBnsControllerResult<SnBnsRecoveryReport> {
+        let _write_guard = self.idempotency_store.execution_lock().lock().await;
+        let records = self.idempotency_store.list_inflight()?;
+        let mut report = SnBnsRecoveryReport {
+            scanned: records.len(),
+            ..Default::default()
+        };
+        for record in records {
+            let request_id = record.request_id.clone();
+            let name = record.name.clone();
+            let tx_hash = record.evm_tx_hash.clone();
+            match self
+                .reconcile_inflight_record(record, SnBnsRecoveryMode::Startup)
+                .await
+            {
+                Ok(_) => report.recovered += 1,
+                Err(error) => report.failures.push(SnBnsRecoveryFailure {
+                    request_id,
+                    name,
+                    tx_hash,
+                    error_code: error.code().to_string(),
+                    error_message: error.to_string(),
+                }),
             }
         }
+        Ok(report)
     }
 
     async fn run_idempotent<T, P, F, Fut>(
@@ -1826,11 +2361,12 @@ impl SnBnsController {
         execute: F,
     ) -> SnBnsControllerResult<T>
     where
-        T: Serialize + DeserializeOwned + MarkIdempotentReuse + BnsWriteMetadata,
+        T: Serialize + DeserializeOwned + MarkIdempotentReuse,
         P: Serialize + ?Sized,
         F: FnOnce(SnBnsIdempotentExecution) -> Fut,
         Fut: Future<Output = SnBnsControllerResult<T>>,
     {
+        let _write_guard = self.idempotency_store.execution_lock().lock().await;
         if request_id.is_empty() {
             return Err(SnBnsControllerError::InvalidInput(
                 "request_id is required".to_string(),
@@ -1842,20 +2378,31 @@ impl SnBnsController {
         }
 
         let payload_hash = hash_json(payload).map_err(SnBnsControllerError::from)?;
+        if let Some(record) = self.idempotency_store.get(request_id)? {
+            if record.payload_hash != payload_hash {
+                return Err(SnBnsControllerError::IdempotencyConflict {
+                    request_id: request_id.to_string(),
+                });
+            }
+            match self.handle_existing(record).await? {
+                SnBnsExistingAction::Return(value) => return Ok(value),
+                SnBnsExistingAction::Execute => {}
+            }
+        }
+
         let now = crate::now_timestamp();
-        let lease_owner = next_lease_owner();
-        let pending_record = SnBnsWriteRequestRecord {
+        let base_record = SnBnsWriteRequestRecord {
             request_id: request_id.to_string(),
             operation,
             name: name.to_string(),
             doc_type: doc_type.map(str::to_string),
             payload_hash: payload_hash.clone(),
-            state: BnsWriteRequestState::Pending,
+            state: BnsWriteRequestState::Sending,
             result_json: None,
             error_code: None,
             error_message: None,
-            lease_owner: Some(lease_owner),
-            lease_expires_at: Some(now.saturating_add(self.config.idempotency_lease_secs)),
+            lease_owner: None,
+            lease_expires_at: None,
             evm_chain_id: None,
             evm_nonce: None,
             evm_tx_hash: None,
@@ -1863,84 +2410,24 @@ impl SnBnsController {
             created_at: now,
             updated_at: now,
         };
-        let pending_record = match self.idempotency_store.try_begin(pending_record.clone())? {
-            SnBnsTryBeginResult::Acquired => pending_record,
-            SnBnsTryBeginResult::Existing(record) => {
-                if record.payload_hash != payload_hash {
-                    return Err(SnBnsControllerError::IdempotencyConflict {
-                        request_id: request_id.to_string(),
-                    });
-                }
-                match self.handle_existing(record).await? {
-                    SnBnsExistingAction::Return(value) => return Ok(value),
-                    SnBnsExistingAction::Execute(record) => record,
-                }
-            }
-        };
 
         let execution = SnBnsIdempotentExecution::new(
             self.idempotency_store.clone(),
             self.write_backend.clone(),
-            pending_record.clone(),
+            base_record,
         );
         let result = execute(execution.clone()).await;
         match result {
-            Ok(value) => {
-                let evm_submission = value.evm_submission();
-                let result_json = serde_json::to_value(&value)?;
-                let mut record = pending_record;
-                record.state = BnsWriteRequestState::Succeeded;
-                record.result_json = Some(result_json);
-                record.evm_chain_id = evm_submission.as_ref().map(|tx| tx.chain_id);
-                record.evm_nonce = evm_submission.as_ref().map(|tx| tx.nonce);
-                record.evm_tx_hash = evm_submission.as_ref().map(|tx| tx.tx_hash.clone());
-                record.evm_raw_tx = evm_submission.as_ref().map(|tx| tx.raw_tx.clone());
-                record.updated_at = crate::now_timestamp();
-                if !self.idempotency_store.finish(record.clone())? {
-                    let latest = self.idempotency_store.get(request_id)?.ok_or_else(|| {
-                        SnBnsControllerError::Store(format!(
-                            "request `{request_id}` disappeared before completion"
-                        ))
-                    })?;
-                    if latest.state != BnsWriteRequestState::Succeeded
-                        || latest.payload_hash != record.payload_hash
-                        || latest.evm_tx_hash != record.evm_tx_hash
-                    {
-                        return Err(SnBnsControllerError::Store(format!(
-                            "request `{request_id}` completion lost its compare-and-set"
-                        )));
-                    }
-                }
-                Ok(value)
-            }
+            Ok(value) => Ok(value),
             Err(error) if execution.is_prepared() => {
                 // The network may have accepted the transaction even though
-                // the submit call failed. Preserve Pending + raw_tx for safe
-                // recovery instead of recording an irreversible failure.
+                // the submit call failed. Preserve Sending + raw_tx so startup
+                // or a request-id replay can query/rebroadcast the exact bytes.
                 Err(error)
             }
-            Err(error) => {
-                let mut record = pending_record;
-                record.state = BnsWriteRequestState::Failed;
-                record.result_json = None;
-                record.error_code = Some(error.code().to_string());
-                record.error_message = Some(error.to_string());
-                record.updated_at = crate::now_timestamp();
-                let _ = self.idempotency_store.finish(record)?;
-                Err(error)
-            }
+            Err(error) => Err(error),
         }
     }
-}
-
-fn prepared_tx_from_record(record: &SnBnsWriteRequestRecord) -> Option<BnsEvmPreparedTx> {
-    Some(BnsEvmPreparedTx {
-        tx_hash: record.evm_tx_hash.clone()?,
-        raw_tx: record.evm_raw_tx.clone()?,
-        from: String::new(),
-        nonce: record.evm_nonce?,
-        chain_id: record.evm_chain_id?,
-    })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
