@@ -266,6 +266,7 @@ pub struct RTcp {
     inner: Arc<RTcpInner>,
     handle: Mutex<Option<JoinHandle<()>>>,
     runtime_tasks: Arc<RTcpRuntimeTasks>,
+    cleanup_tasks: Arc<RTcpCleanupTasks>,
     shutdown_lock: Mutex<()>,
 }
 
@@ -310,6 +311,62 @@ impl RTcpRuntimeTasks {
     }
 }
 
+// Cleanup is deliberately owned separately from cancellable runtime work.
+// RTcp::shutdown first aborts and joins every runtime task, allowing their
+// destructors to register cleanup here, and only then closes and drains this
+// set. Every cleanup has its own deadline, so shutdown neither cancels it nor
+// waits forever for a contended lock or transport I/O.
+struct RTcpCleanupTasks {
+    tasks: std::sync::Mutex<Option<JoinSet<()>>>,
+}
+
+impl RTcpCleanupTasks {
+    fn new() -> Self {
+        Self {
+            tasks: std::sync::Mutex::new(Some(JoinSet::new())),
+        }
+    }
+
+    fn spawn<F>(&self, description: &'static str, future: F) -> bool
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let mut tasks = self.tasks.lock().unwrap();
+        let Some(tasks) = tasks.as_mut() else {
+            // This can only happen after all RTCP-owned runtime tasks have
+            // already been joined. A production cleanup producer reaching
+            // this branch would violate shutdown's ownership ordering.
+            error!(
+                "reject RTCP cleanup task after cleanup drain started: {}",
+                description
+            );
+            return false;
+        };
+        while tasks.try_join_next().is_some() {}
+        tasks.spawn(async move {
+            if timeout(RTCP_TUNNEL_CLOSE_TIMEOUT, future).await.is_err() {
+                warn!(
+                    "timed out after {:?} while {}",
+                    RTCP_TUNNEL_CLOSE_TIMEOUT, description
+                );
+            }
+        });
+        true
+    }
+
+    async fn shutdown(&self) {
+        let tasks = self.tasks.lock().unwrap().take();
+        let Some(mut tasks) = tasks else {
+            return;
+        };
+        while let Some(result) = tasks.join_next().await {
+            if let Err(err) = result {
+                warn!("RTCP cleanup task failed while draining: {}", err);
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RTcpSourceDeviceInfo {
     pub device_doc_jwt: Option<String>,
@@ -344,6 +401,7 @@ impl RTcp {
             let _ = handle.await;
         }
         self.runtime_tasks.shutdown().await;
+        self.cleanup_tasks.shutdown().await;
         RTcpTunnelMap::close_detached(tunnels, "RTCP stack shutdown").await;
         self.inner.tunnel_map.finish_shutdown().await;
     }
@@ -366,10 +424,12 @@ impl RTcp {
             listener,
         ));
         *inner.runtime_tasks.write().unwrap() = Arc::downgrade(&runtime_tasks);
+        let cleanup_tasks = inner.cleanup_tasks.clone();
         RTcp {
             inner,
             handle: Mutex::new(None),
             runtime_tasks,
+            cleanup_tasks,
             shutdown_lock: Mutex::new(()),
         }
     }
@@ -710,6 +770,10 @@ struct RTcpInner {
     // RTcp owns the task set. Keeping only a weak reference here avoids a
     // task-set -> task -> RTcpInner ownership cycle for long-lived tunnels.
     runtime_tasks: std::sync::RwLock<std::sync::Weak<RTcpRuntimeTasks>>,
+    // Cleanup has a distinct owner because runtime shutdown aborts business
+    // work. RTcp keeps the same Arc alive until every aborted producer has
+    // dropped and registered its pending cleanup.
+    cleanup_tasks: Arc<RTcpCleanupTasks>,
 }
 
 struct DirectTunnelAttempt {
@@ -805,6 +869,13 @@ impl RTcpInner {
         } else {
             true
         }
+    }
+
+    fn spawn_cleanup_task<F>(&self, description: &'static str, future: F) -> bool
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        self.cleanup_tasks.spawn(description, future)
     }
 }
 
@@ -1570,6 +1641,7 @@ impl RTcpInner {
             nonce_cache: NonceCache::new(),
             create_flights: RTcpCreateFlights::default(),
             runtime_tasks: std::sync::RwLock::new(std::sync::Weak::new()),
+            cleanup_tasks: Arc::new(RTcpCleanupTasks::new()),
         };
         return result;
     }
@@ -2497,27 +2569,23 @@ impl RTcpInner {
             authority_confirmation,
         } = established;
 
-        if !registration.accepted {
-            RTcpTunnelMap::finish_authenticated_registration(registration).await;
+        let accepted = registration.accepted;
+        registration.mark_tunnels_closed();
+        let cleanup_registered =
+            self.spawn_cleanup_task("finishing authenticated inbound registration", async move {
+                RTcpTunnelMap::finish_authenticated_registration(registration).await;
+            });
+        debug_assert!(
+            cleanup_registered,
+            "inbound cleanup must be registered before cleanup drain starts"
+        );
+
+        if !accepted {
             warn!(
                 "reject rtcp tunnel from {} {} after verified-cache arbitration",
                 source_device_id, source_addr
             );
             return;
-        }
-
-        // Publication is the final operation inside the handshake timeout.
-        // Cleanup of replaced instances must not delay the new tunnel's read
-        // loop, and cancellation of either cleanup task cannot unpublish the
-        // newly accepted instance.
-        let cleanup = async move {
-            RTcpTunnelMap::finish_authenticated_registration(registration).await;
-        };
-        if let Err(cleanup) = self.try_spawn_runtime_task(cleanup) {
-            warn!(
-                "finish replaced RTcp tunnel cleanup inline because runtime shutdown has started"
-            );
-            cleanup.await;
         }
 
         info!(
@@ -2935,6 +3003,7 @@ impl RTcpInner {
         let result_reason = registration.rejection_reason.clone().unwrap_or_default();
         let publication_guard = PublishedInboundGuard::new(
             self.tunnel_map.clone(),
+            self.cleanup_tasks.clone(),
             tunnel_key.clone(),
             tunnel.clone(),
             registration,
@@ -5744,12 +5813,27 @@ struct InboundTunnelRegistration {
     rejected: Option<RTcpTunnel>,
 }
 
+impl InboundTunnelRegistration {
+    fn mark_tunnels_closed(&self) {
+        if let Some(rejected) = self.rejected.as_ref() {
+            rejected.mark_closed();
+        }
+        if let Some(replaced) = self.replaced.as_ref() {
+            replaced.mark_closed();
+        }
+        for superseded in &self.superseded {
+            superseded.mark_closed();
+        }
+    }
+}
+
 // Map publication precedes the final encrypted TunnelResult. If the handshake
 // future is cancelled or the send fails in that narrow interval, Drop removes
 // and closes the published candidate so create_tunnel can never observe a
 // server-side entry whose acceptance was not delivered.
 struct PublishedInboundGuard {
     tunnel_map: RTcpTunnelMap,
+    cleanup_tasks: Arc<RTcpCleanupTasks>,
     tunnel_key: String,
     tunnel: RTcpTunnel,
     registration: Option<InboundTunnelRegistration>,
@@ -5758,12 +5842,14 @@ struct PublishedInboundGuard {
 impl PublishedInboundGuard {
     fn new(
         tunnel_map: RTcpTunnelMap,
+        cleanup_tasks: Arc<RTcpCleanupTasks>,
         tunnel_key: String,
         tunnel: RTcpTunnel,
         registration: InboundTunnelRegistration,
     ) -> Self {
         Self {
             tunnel_map,
+            cleanup_tasks,
             tunnel_key,
             tunnel,
             registration: Some(registration),
@@ -5784,16 +5870,24 @@ impl Drop for PublishedInboundGuard {
         };
         let accepted = registration.accepted;
         let tunnel_map = self.tunnel_map.clone();
+        let cleanup_tasks = self.cleanup_tasks.clone();
         let tunnel_key = self.tunnel_key.clone();
         let tunnel = self.tunnel.clone();
         tunnel.mark_closed();
-        task::spawn(async move {
-            tunnel_map.remove_if_current(&tunnel_key, &tunnel).await;
-            RTcpTunnelMap::finish_authenticated_registration(registration).await;
-            if accepted {
-                tunnel.close().await;
-            }
-        });
+        registration.mark_tunnels_closed();
+        let cleanup_registered =
+            cleanup_tasks.spawn("rolling back cancelled inbound publication", async move {
+                tunnel_map.remove_if_current(&tunnel_key, &tunnel).await;
+                RTcpTunnelMap::finish_authenticated_registration(registration).await;
+                if accepted {
+                    tunnel.close().await;
+                }
+            });
+        if !cleanup_registered {
+            error!(
+                "published inbound cleanup reached a closed cleanup set; shutdown ordering is broken"
+            );
+        }
     }
 }
 
@@ -7336,48 +7430,139 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn accepted_inbound_cleanup_finishes_inline_after_runtime_shutdown() {
-        let rtcp = RTcp::new(
+    async fn shutdown_drains_inbound_cleanup_from_aborted_runtime_task() {
+        let rtcp = Arc::new(RTcp::new(
             DID::new("dev", "shutdown-cleanup-test-local"),
             "127.0.0.1:0".to_string(),
             None,
             None,
             Arc::new(MockRTcpListener::new()),
-        );
+        ));
         let (accepted, _accepted_peer) = test_tunnel(104);
         let (replaced, mut replaced_peer) = test_tunnel(105);
+        let replaced_write_guard = replaced.write_stream.lock().await;
+        let replaced_for_cleanup = replaced.clone();
         let (waiter_tx, waiter_rx) = oneshot::channel();
         replaced.open_resp_waiters.lock().await.insert(1, waiter_tx);
         replaced.mark_closed();
-        accepted.mark_closed();
 
-        rtcp.shutdown().await;
-        rtcp.inner
-            .run_established_inbound(EstablishedInboundTunnel {
-                tunnel: accepted,
-                tunnel_key: "shutdown-cleanup-test-key".to_string(),
-                source_device_id: "did:dev:shutdown-cleanup-test-peer".to_string(),
-                source_addr: "127.0.0.1:12345".parse().unwrap(),
-                registration: InboundTunnelRegistration {
-                    accepted: true,
-                    rejection_reason: None,
-                    replaced: Some(replaced),
-                    superseded: Vec::new(),
-                    rejected: None,
-                },
-                authority_confirmation: None,
-            })
-            .await;
+        let task_owner = rtcp.inner.clone();
+        assert!(rtcp.runtime_tasks.spawn(async move {
+            task_owner
+                .run_established_inbound(EstablishedInboundTunnel {
+                    tunnel: accepted,
+                    tunnel_key: "shutdown-cleanup-test-key".to_string(),
+                    source_device_id: "did:dev:shutdown-cleanup-test-peer".to_string(),
+                    source_addr: "127.0.0.1:12345".parse().unwrap(),
+                    registration: InboundTunnelRegistration {
+                        accepted: true,
+                        rejection_reason: None,
+                        replaced: Some(replaced_for_cleanup),
+                        superseded: Vec::new(),
+                        rejected: None,
+                    },
+                    authority_confirmation: None,
+                })
+                .await;
+        }));
 
         timeout(Duration::from_secs(1), waiter_rx)
             .await
-            .expect("replaced tunnel waiter cleanup was dropped")
+            .expect("replacement cleanup did not start")
             .expect_err("replaced tunnel waiter should be closed");
+
+        let shutdown_owner = rtcp.clone();
+        let shutdown = task::spawn(async move {
+            shutdown_owner.shutdown().await;
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !shutdown.is_finished(),
+            "shutdown must drain, not abort, the blocked cleanup"
+        );
+
+        drop(replaced_write_guard);
+        timeout(Duration::from_secs(1), shutdown)
+            .await
+            .expect("shutdown did not finish after cleanup was unblocked")
+            .unwrap();
         let mut byte = [0u8; 1];
         assert_eq!(
             timeout(Duration::from_secs(1), replaced_peer.read(&mut byte))
                 .await
                 .expect("replaced tunnel transport was not shut down")
+                .unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_drains_publication_guard_cleanup_dropped_by_abort() {
+        let rtcp = Arc::new(RTcp::new(
+            DID::new("dev", "shutdown-guard-test-local"),
+            "127.0.0.1:0".to_string(),
+            None,
+            None,
+            Arc::new(MockRTcpListener::new()),
+        ));
+        let key = "shutdown-guard-test-key";
+        let (published, _published_peer) = test_tunnel(106);
+        let registration = rtcp
+            .inner
+            .tunnel_map
+            .replace_authenticated_inbound(key, published.clone(), None)
+            .await;
+        assert!(registration.accepted);
+
+        let (replaced, mut replaced_peer) = test_tunnel(107);
+        let replaced_write_guard = replaced.write_stream.lock().await;
+        let replaced_for_cleanup = replaced.clone();
+        let (waiter_tx, waiter_rx) = oneshot::channel();
+        replaced.open_resp_waiters.lock().await.insert(1, waiter_tx);
+        replaced.mark_closed();
+        let registration = InboundTunnelRegistration {
+            replaced: Some(replaced_for_cleanup),
+            ..registration
+        };
+
+        let (guard_ready_tx, guard_ready_rx) = oneshot::channel();
+        let guard = PublishedInboundGuard::new(
+            rtcp.inner.tunnel_map.clone(),
+            rtcp.cleanup_tasks.clone(),
+            key.to_string(),
+            published,
+            registration,
+        );
+        assert!(rtcp.runtime_tasks.spawn(async move {
+            let _guard = guard;
+            let _ = guard_ready_tx.send(());
+            std::future::pending::<()>().await;
+        }));
+        guard_ready_rx.await.unwrap();
+
+        let shutdown_owner = rtcp.clone();
+        let shutdown = task::spawn(async move {
+            shutdown_owner.shutdown().await;
+        });
+        timeout(Duration::from_secs(1), waiter_rx)
+            .await
+            .expect("publication guard cleanup did not run after parent abort")
+            .expect_err("replaced tunnel waiter should be closed");
+        assert!(
+            !shutdown.is_finished(),
+            "shutdown must wait for publication guard cleanup"
+        );
+
+        drop(replaced_write_guard);
+        timeout(Duration::from_secs(1), shutdown)
+            .await
+            .expect("shutdown did not finish after guard cleanup was unblocked")
+            .unwrap();
+        let mut byte = [0u8; 1];
+        assert_eq!(
+            timeout(Duration::from_secs(1), replaced_peer.read(&mut byte))
+                .await
+                .expect("guard cleanup did not shut down replaced transport")
                 .unwrap(),
             0
         );
