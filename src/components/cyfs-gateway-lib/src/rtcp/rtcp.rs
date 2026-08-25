@@ -42,7 +42,7 @@ use tokio::io::{ReadHalf, WriteHalf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, Notify, OwnedSemaphorePermit, Semaphore, TryAcquireError, oneshot};
 use tokio::task;
-use tokio::task::JoinHandle;
+use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::timeout;
 use url::Url;
 use x25519_dalek::{EphemeralSecret, PublicKey};
@@ -265,6 +265,42 @@ impl fmt::Display for RtcpIdentityTrust {
 pub struct RTcp {
     inner: Arc<RTcpInner>,
     handle: Mutex<Option<JoinHandle<()>>>,
+    runtime_tasks: Arc<RTcpRuntimeTasks>,
+    shutdown_lock: Mutex<()>,
+}
+
+struct RTcpRuntimeTasks {
+    tasks: std::sync::Mutex<Option<JoinSet<()>>>,
+}
+
+impl RTcpRuntimeTasks {
+    fn new() -> Self {
+        Self {
+            tasks: std::sync::Mutex::new(Some(JoinSet::new())),
+        }
+    }
+
+    fn spawn<F>(&self, future: F) -> bool
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let mut tasks = self.tasks.lock().unwrap();
+        let Some(tasks) = tasks.as_mut() else {
+            return false;
+        };
+        while tasks.try_join_next().is_some() {}
+        tasks.spawn(future);
+        true
+    }
+
+    async fn shutdown(&self) {
+        let tasks = self.tasks.lock().unwrap().take();
+        let Some(mut tasks) = tasks else {
+            return;
+        };
+        tasks.abort_all();
+        while tasks.join_next().await.is_some() {}
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -283,17 +319,26 @@ impl Drop for RTcp {
         if let Some(handle) = self.handle.get_mut().take() {
             handle.abort();
         }
+        if let Ok(mut tasks) = self.runtime_tasks.tasks.lock() {
+            if let Some(tasks) = tasks.as_mut() {
+                tasks.abort_all();
+            }
+        }
     }
 }
 
 impl RTcp {
     pub async fn shutdown(&self) {
+        let _shutdown_guard = self.shutdown_lock.lock().await;
+        let tunnels = self.inner.tunnel_map.begin_shutdown().await;
         let handle = self.handle.lock().await.take();
         if let Some(handle) = handle {
             handle.abort();
             let _ = handle.await;
         }
-        self.inner.tunnel_map.close_all("RTCP stack shutdown").await;
+        self.runtime_tasks.shutdown().await;
+        RTcpTunnelMap::close_detached(tunnels, "RTCP stack shutdown").await;
+        self.inner.tunnel_map.finish_shutdown().await;
     }
 }
 
@@ -305,15 +350,20 @@ impl RTcp {
         this_device_doc_jwt: Option<String>,
         listener: RTcpListenerRef,
     ) -> RTcp {
+        let runtime_tasks = Arc::new(RTcpRuntimeTasks::new());
+        let inner = Arc::new(RTcpInner::new(
+            this_device_did,
+            bind_addr,
+            private_key_pkcs8_bytes,
+            this_device_doc_jwt,
+            listener,
+        ));
+        *inner.runtime_tasks.write().unwrap() = Arc::downgrade(&runtime_tasks);
         RTcp {
-            inner: Arc::new(RTcpInner::new(
-                this_device_did,
-                bind_addr,
-                private_key_pkcs8_bytes,
-                this_device_doc_jwt,
-                listener,
-            )),
+            inner,
             handle: Mutex::new(None),
+            runtime_tasks,
+            shutdown_lock: Mutex::new(()),
         }
     }
 
@@ -349,6 +399,7 @@ impl RTcp {
     }
 
     pub async fn start(&mut self) -> TunnelResult<()> {
+        self.inner.tunnel_map.ensure_running().await?;
         let inner = self.inner.clone();
         let handle = inner.start().await?;
         *self.handle.lock().await = Some(handle);
@@ -645,6 +696,9 @@ struct RTcpInner {
     // Coalesces concurrent create_tunnel calls after canonical target
     // resolution. Waiters re-check tunnel_map after the active creator exits.
     create_flights: RTcpCreateFlights,
+    // RTcp owns the task set. Keeping only a weak reference here avoids a
+    // task-set -> task -> RTcpInner ownership cycle for long-lived tunnels.
+    runtime_tasks: std::sync::RwLock<std::sync::Weak<RTcpRuntimeTasks>>,
 }
 
 struct DirectTunnelAttempt {
@@ -711,6 +765,28 @@ struct EstablishedInboundTunnel {
 impl Drop for RTcpInner {
     fn drop(&mut self) {
         log::debug!("RTcpInner {} drop", self.this_device_did.to_string());
+    }
+}
+
+impl RTcpInner {
+    fn spawn_runtime_task<F>(&self, future: F) -> bool
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let task_set = self.runtime_tasks.read().unwrap().upgrade();
+        if let Some(task_set) = task_set {
+            if !task_set.spawn(future) {
+                debug!("reject RTCP runtime task after shutdown started");
+                false
+            } else {
+                true
+            }
+        } else {
+            // Standalone RTcpInner values are used by focused tests. Production
+            // RTcp instances always install the owned task set in RTcp::new.
+            task::spawn(future);
+            true
+        }
     }
 }
 
@@ -1474,6 +1550,7 @@ impl RTcpInner {
             tunnel_manager: None,
             nonce_cache: NonceCache::new(),
             create_flights: RTcpCreateFlights::default(),
+            runtime_tasks: std::sync::RwLock::new(std::sync::Weak::new()),
         };
         return result;
     }
@@ -2249,8 +2326,10 @@ impl RTcpInner {
                     debug!("cannot configure TCP keepalive for {}: {}", addr, e);
                 }
                 let this = this.clone();
-                task::spawn(async move {
-                    this.serve_connection_with_permit(stream, addr, initial_permit)
+                let task_owner = this.clone();
+                this.spawn_runtime_task(async move {
+                    task_owner
+                        .serve_connection_with_permit(stream, addr, initial_permit)
                         .await;
                 });
             }
@@ -2289,6 +2368,13 @@ impl RTcpInner {
         addr: SocketAddr,
         initial_permit: OwnedSemaphorePermit,
     ) {
+        if !self.tunnel_map.is_running().await {
+            debug!(
+                "reject RTCP connection from {} after shutdown started",
+                addr
+            );
+            return;
+        }
         let deadline = Duration::from_secs(self.security.limits.handshake_timeout_secs);
         let established = match timeout(
             deadline,
@@ -2405,7 +2491,7 @@ impl RTcpInner {
         // Cleanup of replaced instances must not delay the new tunnel's read
         // loop, and cancellation of either cleanup task cannot unpublish the
         // newly accepted instance.
-        task::spawn(async move {
+        self.spawn_runtime_task(async move {
             RTcpTunnelMap::finish_authenticated_registration(registration).await;
         });
 
@@ -2418,7 +2504,7 @@ impl RTcpInner {
 
         if let Some((logical_did, candidate_jwt, source_ip)) = authority_confirmation {
             let this = self.clone();
-            task::spawn(async move {
+            self.spawn_runtime_task(async move {
                 this.maybe_spawn_authority_confirmation(logical_did, candidate_jwt, source_ip)
                     .await;
             });
@@ -2915,7 +3001,7 @@ impl RTcpInner {
         }
 
         let this = self.clone();
-        tokio::spawn(async move {
+        self.spawn_runtime_task(async move {
             let permit = match this
                 .authority_confirmation_slots
                 .clone()
@@ -3059,6 +3145,7 @@ impl RTcpInner {
         &self,
         tunnel_stack_id: Option<&str>,
     ) -> TunnelResult<Box<dyn TunnelBox>> {
+        self.tunnel_map.ensure_running().await?;
         // lookup existing tunnel and resue it
         if tunnel_stack_id.is_none() {
             return Err(TunnelError::ReasonError(
@@ -3109,6 +3196,9 @@ impl RTcpInner {
                 return Ok(Box::new(tunnel));
             }
             Ok(None) => {}
+            Err(conflict) if conflict == RTCP_STOPPED_REASON => {
+                return Err(TunnelError::InvalidState(conflict));
+            }
             Err(conflict) => {
                 let msg = format!(
                     "rtcp target {} rejected by one-to-one name binding: {}",
@@ -3136,6 +3226,9 @@ impl RTcpInner {
                 return Ok(Box::new(tunnel));
             }
             Ok(None) => {}
+            Err(conflict) if conflict == RTCP_STOPPED_REASON => {
+                return Err(TunnelError::InvalidState(conflict));
+            }
             Err(conflict) => {
                 let msg = format!(
                     "rtcp target {} rejected by one-to-one name binding: {}",
@@ -3271,6 +3364,9 @@ impl RTcpInner {
                         warn!("{}", msg);
                         return Err(TunnelError::DocumentError(msg));
                     }
+                    OutboundRegisterError::Stopped => {
+                        return Err(TunnelError::InvalidState(RTCP_STOPPED_REASON.to_string()));
+                    }
                 }
             }
             info!(
@@ -3282,15 +3378,25 @@ impl RTcpInner {
 
             let result: TunnelResult<Box<dyn TunnelBox>> = Ok(Box::new(tunnel.clone()));
             let tunnel_map = self.tunnel_map.clone();
-            task::spawn(async move {
+            let run_tunnel = tunnel.clone();
+            let run_tunnel_key = tunnel_key.clone();
+            if !self.spawn_runtime_task(async move {
                 debug!(
                     "RTcp tunnel {} established (bootstrap), tunnel running",
-                    tunnel_key.as_str()
+                    run_tunnel_key.as_str()
                 );
-                tunnel.run().await;
-                tunnel_map.remove_if_current(&tunnel_key, &tunnel).await;
-                info!("RTcp tunnel {} end", tunnel_key.as_str());
-            });
+                run_tunnel.run().await;
+                tunnel_map
+                    .remove_if_current(&run_tunnel_key, &run_tunnel)
+                    .await;
+                info!("RTcp tunnel {} end", run_tunnel_key.as_str());
+            }) {
+                self.tunnel_map
+                    .remove_if_current(&tunnel_key, &tunnel)
+                    .await;
+                tunnel.close().await;
+                return Err(TunnelError::InvalidState(RTCP_STOPPED_REASON.to_string()));
+            }
 
             return result;
         }
@@ -3397,6 +3503,11 @@ impl RTcpInner {
                                 warn!("{}", msg);
                                 return Err(TunnelError::DocumentError(msg));
                             }
+                            OutboundRegisterError::Stopped => {
+                                return Err(TunnelError::InvalidState(
+                                    RTCP_STOPPED_REASON.to_string(),
+                                ));
+                            }
                         }
                     }
                     info!(
@@ -3408,18 +3519,28 @@ impl RTcpInner {
 
                     let result: TunnelResult<Box<dyn TunnelBox>> = Ok(Box::new(tunnel.clone()));
                     let tunnel_map = self.tunnel_map.clone();
-                    task::spawn(async move {
+                    let run_tunnel = tunnel.clone();
+                    let run_tunnel_key = tunnel_key.clone();
+                    if !self.spawn_runtime_task(async move {
                         debug!(
                             "RTcp tunnel {} established, tunnel running",
-                            tunnel_key.as_str()
+                            run_tunnel_key.as_str()
                         );
-                        tunnel.run().await;
+                        run_tunnel.run().await;
 
                         // remove tunnel from manager
-                        tunnel_map.remove_if_current(&tunnel_key, &tunnel).await;
+                        tunnel_map
+                            .remove_if_current(&run_tunnel_key, &run_tunnel)
+                            .await;
 
-                        info!("RTcp tunnel {} end", tunnel_key.as_str());
-                    });
+                        info!("RTcp tunnel {} end", run_tunnel_key.as_str());
+                    }) {
+                        self.tunnel_map
+                            .remove_if_current(&tunnel_key, &tunnel)
+                            .await;
+                        tunnel.close().await;
+                        return Err(TunnelError::InvalidState(RTCP_STOPPED_REASON.to_string()));
+                    }
 
                     return result;
                 }
@@ -5513,6 +5634,7 @@ struct RTcpTunnelMap {
 
 #[derive(Default)]
 struct RTcpTunnelMapState {
+    lifecycle: RTcpLifecycle,
     tunnels: HashMap<String, RTcpTunnel>,
     verified_by_logical_did: HashMap<String, HashMap<u64, VerifiedTunnelIndexEntry>>,
     // Every instance currently holding a logical-name binding. Inbound
@@ -5525,6 +5647,14 @@ struct RTcpTunnelMapState {
     // Addressing the same device directly by its did:dev is not a second
     // logical name and never appears here.
     binding_by_canonical_dev: HashMap<String, CanonicalDevBinding>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum RTcpLifecycle {
+    #[default]
+    Running,
+    Stopping,
+    Stopped,
 }
 
 #[derive(Clone)]
@@ -5625,7 +5755,11 @@ enum OutboundRegisterError {
     // One-to-one arbitration: the canonical DEV DID is bound to another
     // verified logical name. The new tunnel must be closed, not registered.
     BindingConflict(String),
+    // The RTcp lifecycle has crossed its shutdown linearization point.
+    Stopped,
 }
+
+const RTCP_STOPPED_REASON: &str = "RTCP stack is stopping or stopped";
 
 impl RTcpTunnelMapState {
     fn remove_instance_binding(&mut self, instance_id: u64) -> bool {
@@ -5755,23 +5889,42 @@ impl RTcpTunnelMap {
         all_tunnel.tunnels.get(tunnel_key).cloned()
     }
 
-    /// Detach and close every tunnel owned by this RTCP instance. The map is
-    /// cleared while locked, but transport shutdown happens afterwards so a
-    /// tunnel's close path cannot block map users.
-    pub async fn close_all(&self, reason: &str) -> usize {
-        let tunnels = {
-            let mut all_tunnel = self.tunnel_map.lock().await;
-            let tunnels = all_tunnel
-                .tunnels
-                .drain()
-                .map(|(_, tunnel)| tunnel)
-                .collect::<Vec<_>>();
-            all_tunnel.verified_by_logical_did.clear();
-            all_tunnel.binding_by_instance.clear();
-            all_tunnel.binding_by_canonical_dev.clear();
-            tunnels
-        };
+    async fn ensure_running(&self) -> TunnelResult<()> {
+        if self.tunnel_map.lock().await.lifecycle == RTcpLifecycle::Running {
+            Ok(())
+        } else {
+            Err(TunnelError::InvalidState(RTCP_STOPPED_REASON.to_string()))
+        }
+    }
 
+    async fn is_running(&self) -> bool {
+        self.tunnel_map.lock().await.lifecycle == RTcpLifecycle::Running
+    }
+
+    /// Establish the shutdown linearization point and detach every tunnel in
+    /// the same map critical section. A registration is therefore either
+    /// published before this transition and included here, or rejected after
+    /// it; no tunnel can be published behind the drain.
+    async fn begin_shutdown(&self) -> Vec<RTcpTunnel> {
+        let mut all_tunnel = self.tunnel_map.lock().await;
+        if all_tunnel.lifecycle == RTcpLifecycle::Running {
+            all_tunnel.lifecycle = RTcpLifecycle::Stopping;
+        }
+        let tunnels = all_tunnel
+            .tunnels
+            .drain()
+            .map(|(_, tunnel)| tunnel)
+            .collect::<Vec<_>>();
+        for tunnel in &tunnels {
+            tunnel.mark_closed();
+        }
+        all_tunnel.verified_by_logical_did.clear();
+        all_tunnel.binding_by_instance.clear();
+        all_tunnel.binding_by_canonical_dev.clear();
+        tunnels
+    }
+
+    async fn close_detached(tunnels: Vec<RTcpTunnel>, reason: &str) -> usize {
         let count = tunnels.len();
         for tunnel in tunnels {
             debug!(
@@ -5785,6 +5938,12 @@ impl RTcpTunnelMap {
         count
     }
 
+    async fn finish_shutdown(&self) {
+        let mut all_tunnel = self.tunnel_map.lock().await;
+        debug_assert!(all_tunnel.tunnels.is_empty());
+        all_tunnel.lifecycle = RTcpLifecycle::Stopped;
+    }
+
     // Outbound reuse with one-to-one arbitration: before reusing (or deciding
     // to build) a canonical tunnel for a named target, verify the canonical
     // DEV DID is not already bound to a different verified logical name. A
@@ -5796,6 +5955,9 @@ impl RTcpTunnelMap {
         binding: Option<&OutboundNameBinding>,
     ) -> Result<Option<RTcpTunnel>, String> {
         let mut all_tunnel = self.tunnel_map.lock().await;
+        if all_tunnel.lifecycle != RTcpLifecycle::Running {
+            return Err(RTCP_STOPPED_REASON.to_string());
+        }
         if let Some(binding) = binding {
             if let Some(bound_logical) = all_tunnel
                 .conflicting_logical_binding(&binding.logical_did, &binding.canonical_dev_did)
@@ -5865,6 +6027,10 @@ impl RTcpTunnelMap {
         binding: Option<&OutboundNameBinding>,
     ) -> Result<(), OutboundRegisterError> {
         let mut all_tunnel = self.tunnel_map.lock().await;
+        if all_tunnel.lifecycle != RTcpLifecycle::Running {
+            tunnel.mark_closed();
+            return Err(OutboundRegisterError::Stopped);
+        }
         if let Some(binding) = binding {
             if let Some(bound_logical) = all_tunnel
                 .conflicting_logical_binding(&binding.logical_did, &binding.canonical_dev_did)
@@ -5926,6 +6092,16 @@ impl RTcpTunnelMap {
         verified_identity: Option<VerifiedTunnelIdentity>,
     ) -> InboundTunnelRegistration {
         let mut all_tunnel = self.tunnel_map.lock().await;
+        if all_tunnel.lifecycle != RTcpLifecycle::Running {
+            tunnel.mark_closed();
+            return InboundTunnelRegistration {
+                accepted: false,
+                rejection_reason: Some(RTCP_STOPPED_REASON.to_string()),
+                replaced: None,
+                superseded: Vec::new(),
+                rejected: Some(tunnel),
+            };
+        }
         if tunnel.is_closed() {
             // A delayed handshake-completion callback may race with an
             // authority/supersession kick.  It must not republish the closed
@@ -6984,6 +7160,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn shutdown_closes_all_tunnels_aborts_tasks_and_rejects_late_registration() {
+        struct TaskDropFlag(Arc<AtomicBool>);
+
+        impl Drop for TaskDropFlag {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let rtcp = RTcp::new(
+            DID::new("dev", "shutdown-test-local"),
+            "127.0.0.1:0".to_string(),
+            None,
+            None,
+            Arc::new(MockRTcpListener::new()),
+        );
+        let key = "shutdown-test-key";
+        let (existing, _existing_peer) = test_tunnel(101);
+        assert!(
+            rtcp.inner
+                .tunnel_map
+                .register_outbound_if_absent(key, existing.clone(), None)
+                .await
+                .is_ok()
+        );
+
+        let task_dropped = Arc::new(AtomicBool::new(false));
+        let (task_started_tx, task_started_rx) = oneshot::channel();
+        assert!(rtcp.inner.spawn_runtime_task({
+            let task_dropped = task_dropped.clone();
+            async move {
+                let _drop_flag = TaskDropFlag(task_dropped);
+                let _ = task_started_tx.send(());
+                std::future::pending::<()>().await;
+            }
+        }));
+        task_started_rx.await.unwrap();
+
+        rtcp.shutdown().await;
+
+        assert!(existing.is_closed());
+        assert_eq!(rtcp.inner.tunnel_map.primary_len().await, 0);
+        assert!(task_dropped.load(Ordering::SeqCst));
+        assert!(matches!(
+            rtcp.create_tunnel(Some("late-target")).await,
+            Err(TunnelError::InvalidState(reason)) if reason == RTCP_STOPPED_REASON
+        ));
+
+        let (late_inbound, _late_inbound_peer) = test_tunnel(102);
+        let inbound_registration = rtcp
+            .inner
+            .tunnel_map
+            .replace_authenticated_inbound(key, late_inbound.clone(), None)
+            .await;
+        assert!(!inbound_registration.accepted);
+        assert_eq!(
+            inbound_registration.rejection_reason.as_deref(),
+            Some(RTCP_STOPPED_REASON)
+        );
+        assert!(!RTcpTunnelMap::finish_authenticated_registration(inbound_registration).await);
+        assert!(late_inbound.is_closed());
+
+        let (late_outbound, _late_outbound_peer) = test_tunnel(103);
+        assert!(matches!(
+            rtcp.inner
+                .tunnel_map
+                .register_outbound_if_absent(key, late_outbound.clone(), None)
+                .await,
+            Err(OutboundRegisterError::Stopped)
+        ));
+        assert!(late_outbound.is_closed());
+        assert_eq!(rtcp.inner.tunnel_map.primary_len().await, 0);
+    }
+
+    #[tokio::test]
     async fn inbound_tunnel_registration_keeps_first_live_instance() {
         let map = RTcpTunnelMap::new();
         let key = "local_remote";
@@ -7802,6 +8053,9 @@ mod tests {
             OutboundRegisterError::Existing(existing) => existing,
             OutboundRegisterError::BindingConflict(conflict) => {
                 panic!("unbound outbound race must not report a binding conflict: {conflict}")
+            }
+            OutboundRegisterError::Stopped => {
+                panic!("running map must not reject outbound registration as stopped")
             }
         };
         assert!(existing.is_same_instance(&first));
