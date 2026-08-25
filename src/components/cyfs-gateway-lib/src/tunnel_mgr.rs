@@ -573,8 +573,12 @@ impl TunnelManager {
     pub async fn pin_tunnel_url(&self, url: &Url) {
         let normalized = normalize_tunnel_url(url);
         let mut pins = self.inner.tunnel_url_pins.lock().await;
-        *pins.entry(normalized.clone()).or_insert(0) += 1;
         let mut hist = self.inner.tunnel_history.write().await;
+
+        // Do not mutate either side until both locks are held. This keeps the
+        // reference count and history flag consistent if this future is
+        // cancelled while waiting for the history lock.
+        *pins.entry(normalized.clone()).or_insert(0) += 1;
         if let Some(h) = hist.get_mut(&normalized) {
             h.pinned = true;
         } else {
@@ -607,24 +611,24 @@ impl TunnelManager {
     pub async fn unpin_tunnel_url(&self, url: &Url) {
         let normalized = normalize_tunnel_url(url);
         let mut pins = self.inner.tunnel_url_pins.lock().await;
-        let released = match pins.get_mut(&normalized) {
+        let mut hist = self.inner.tunnel_history.write().await;
+
+        // As in pin_tunnel_url, all state changes happen after both awaits so
+        // cancellation cannot leave the two representations out of sync.
+        let pinned = match pins.get_mut(&normalized) {
             Some(count) if *count > 1 => {
                 *count -= 1;
-                false
+                true
             }
             Some(_) => {
                 pins.remove(&normalized);
-                true
+                false
             }
-            None => false,
+            None => return,
         };
-        if !released {
-            return;
-        }
 
-        let mut hist = self.inner.tunnel_history.write().await;
         if let Some(h) = hist.get_mut(&normalized) {
-            h.pinned = false;
+            h.pinned = pinned;
         }
     }
 
@@ -1078,6 +1082,19 @@ mod tests {
     use async_trait::async_trait;
     use std::io;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    async fn wait_until_pin_lock_is_held(mgr: &TunnelManager) {
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if mgr.inner.tunnel_url_pins.try_lock().is_err() {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("pin operation did not acquire the pin lock");
+    }
 
     #[derive(Clone, Default)]
     struct MockTunnel {}
@@ -1540,6 +1557,80 @@ mod tests {
                 .await
                 .into_iter()
                 .find(|entry| entry.normalized_url == normalized)
+                .unwrap()
+                .pinned
+        );
+    }
+
+    #[tokio::test]
+    async fn tunnel_url_pin_is_cancellation_safe() {
+        let mgr = TunnelManager::new();
+        let pin_url = url("tcp://127.0.0.1:18033/");
+        let normalized = normalize_tunnel_url(&pin_url);
+
+        let history_guard = mgr.inner.tunnel_history.write().await;
+        let owner = mgr.clone();
+        let owner_url = pin_url.clone();
+        let handle = tokio::spawn(async move {
+            owner.pin_tunnel_url(&owner_url).await;
+        });
+
+        wait_until_pin_lock_is_held(&mgr).await;
+        handle.abort();
+        assert!(handle.await.unwrap_err().is_cancelled());
+        drop(history_guard);
+
+        assert!(
+            !mgr.inner
+                .tunnel_url_pins
+                .lock()
+                .await
+                .contains_key(&normalized)
+        );
+        assert!(
+            mgr.inner
+                .tunnel_history
+                .read()
+                .await
+                .get(&normalized)
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn last_tunnel_url_unpin_is_cancellation_safe() {
+        let mgr = TunnelManager::new();
+        let pin_url = url("tcp://127.0.0.1:18034/");
+        let normalized = normalize_tunnel_url(&pin_url);
+        mgr.pin_tunnel_url(&pin_url).await;
+
+        let history_guard = mgr.inner.tunnel_history.write().await;
+        let owner = mgr.clone();
+        let owner_url = pin_url.clone();
+        let handle = tokio::spawn(async move {
+            owner.unpin_tunnel_url(&owner_url).await;
+        });
+
+        wait_until_pin_lock_is_held(&mgr).await;
+        handle.abort();
+        assert!(handle.await.unwrap_err().is_cancelled());
+        drop(history_guard);
+
+        assert_eq!(
+            mgr.inner
+                .tunnel_url_pins
+                .lock()
+                .await
+                .get(&normalized)
+                .copied(),
+            Some(1)
+        );
+        assert!(
+            mgr.inner
+                .tunnel_history
+                .read()
+                .await
+                .get(&normalized)
                 .unwrap()
                 .pinned
         );
