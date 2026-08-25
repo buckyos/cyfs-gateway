@@ -1479,6 +1479,7 @@ impl RTcpInner {
             aes_key,
             &self.security.limits,
             self.listener.clone(),
+            self.runtime_tasks.read().unwrap().clone(),
         );
         tunnel.set_identity(&responder_canonical_did, responder_trust);
         Ok(DirectTunnelAttempt {
@@ -2871,6 +2872,7 @@ impl RTcpInner {
             aes_key,
             &self.security.limits,
             self.listener.clone(),
+            self.runtime_tasks.read().unwrap().clone(),
         );
         tunnel.set_identity(&source_dev_did, identity_trust);
         let tunnel_key = self.format_tunnel_key(&source_dev_did, None);
@@ -3344,6 +3346,7 @@ impl RTcpInner {
                 aes_key,
                 &self.security.limits,
                 self.listener.clone(),
+                self.runtime_tasks.read().unwrap().clone(),
             );
             tunnel.set_identity(&responder_canonical_did, responder_trust);
             if let Err(err) = self
@@ -4063,6 +4066,10 @@ struct RTcpTunnel {
 
     next_seq: Arc<AtomicU32>,
     listener: RTcpListenerRef,
+    // Tunnel-level Open/ROpen work belongs to the owning RTcp runtime. A weak
+    // reference avoids a task-set -> task -> tunnel -> task-set ownership
+    // cycle while still letting shutdown reject and await all derived work.
+    runtime_tasks: std::sync::Weak<RTcpRuntimeTasks>,
 
     // Use to deliver the OpenResp result code back to the open stream waiter.
     // The result code (0 = success, non-zero = rejection, e.g. quota
@@ -4117,6 +4124,7 @@ impl RTcpTunnel {
         aes_key: [u8; 32],
         limits: &RtcpLimitsConfig,
         listener: RTcpListenerRef,
+        runtime_tasks: std::sync::Weak<RTcpRuntimeTasks>,
     ) -> Self {
         let (read_stream, write_stream) = tokio::io::split(encrypted_stream);
         //let (read_stream,write_stream) =  tokio::io::split(stream);
@@ -4144,6 +4152,7 @@ impl RTcpTunnel {
             close_notify: Arc::new(Notify::new()),
             next_seq: Arc::new(AtomicU32::new(0)),
             listener,
+            runtime_tasks,
             open_resp_waiters: Arc::new(Mutex::new(HashMap::new())),
             ropen_resp_waiters: Arc::new(Mutex::new(HashMap::new())),
             pending_wait_stream_keys: Arc::new(Mutex::new(HashSet::new())),
@@ -4161,6 +4170,31 @@ impl RTcpTunnel {
             used_stream_ids: Arc::new(Mutex::new(HashSet::new())),
             created_at: Instant::now(),
             pong_waiters: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    fn spawn_runtime_task<F>(&self, future: F) -> bool
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let task_set = self.runtime_tasks.upgrade();
+        if let Some(task_set) = task_set {
+            if !task_set.spawn(future) {
+                debug!(
+                    "reject RTCP tunnel {} instance {} runtime task after shutdown started",
+                    self.remote_stack.did.to_string(),
+                    self.instance_id
+                );
+                false
+            } else {
+                true
+            }
+        } else {
+            // Standalone RTcpTunnel values are used by focused tests.
+            // Production tunnels always inherit the owned task set from
+            // RTcpInner.
+            task::spawn(future);
+            true
         }
     }
 
@@ -4506,7 +4540,7 @@ impl RTcpTunnel {
                 // read loop free so concurrent Open/ROpen responses are not
                 // head-of-line blocked behind that business stream.
                 let this = self.clone();
-                tokio::spawn(async move {
+                self.spawn_runtime_task(async move {
                     let _permit = permit;
                     if let Err(e) = this.on_ropen(ropen_package).await {
                         error!("RTcp on_ropen background task error: {}", e);
@@ -5036,7 +5070,7 @@ impl RTcpTunnel {
         // arriving HelloStream does not stall the tunnel read loop. The
         // permit is dropped when the task exits, releasing the quota slot.
         let this = self.clone();
-        tokio::spawn(async move {
+        self.spawn_runtime_task(async move {
             let _permit = permit;
             if let Err(e) = this.finish_open(open_package, real_key).await {
                 error!("RTcp on_open background task error: {}", e);
@@ -6672,6 +6706,14 @@ mod tests {
         seed: u8,
         limits: &RtcpLimitsConfig,
     ) -> (RTcpTunnel, tokio::io::DuplexStream) {
+        test_tunnel_with_runtime_tasks(seed, limits, std::sync::Weak::new())
+    }
+
+    fn test_tunnel_with_runtime_tasks(
+        seed: u8,
+        limits: &RtcpLimitsConfig,
+        runtime_tasks: std::sync::Weak<RTcpRuntimeTasks>,
+    ) -> (RTcpTunnel, tokio::io::DuplexStream) {
         let (bearing, peer) = tokio::io::duplex(64 * 1024);
         let bearing: RTcpBearingStream = Box::new(bearing);
         let encrypted_stream = EncryptedStream::new(
@@ -6702,6 +6744,7 @@ mod tests {
                 [seed; 32],
                 limits,
                 Arc::new(MockRTcpListener::new()),
+                runtime_tasks,
             ),
             peer,
         )
@@ -6840,6 +6883,7 @@ mod tests {
             [41; 32],
             &RtcpLimitsConfig::default(),
             Arc::new(MockRTcpListener::new()),
+            std::sync::Weak::new(),
         );
 
         assert_eq!(tunnel.address_resolution, initial_context);
@@ -6979,6 +7023,7 @@ mod tests {
             [92; 32],
             &limits,
             Arc::new(MockRTcpListener::new()),
+            std::sync::Weak::new(),
         );
         let first_id = "00112233445566778899aabbccddeeff";
         let second_id = "10112233445566778899aabbccddeeff";
@@ -7126,6 +7171,7 @@ mod tests {
             [97; 32],
             &limits,
             Arc::new(MockRTcpListener::new()),
+            std::sync::Weak::new(),
         );
 
         let permit = tunnel
@@ -7207,7 +7253,11 @@ mod tests {
             Arc::new(MockRTcpListener::new()),
         );
         let key = "shutdown-test-key";
-        let (existing, _existing_peer) = test_tunnel(101);
+        let (existing, _existing_peer) = test_tunnel_with_runtime_tasks(
+            101,
+            &RtcpLimitsConfig::default(),
+            Arc::downgrade(&rtcp.runtime_tasks),
+        );
         assert!(
             rtcp.inner
                 .tunnel_map
@@ -7218,7 +7268,7 @@ mod tests {
 
         let task_dropped = Arc::new(AtomicBool::new(false));
         let (task_started_tx, task_started_rx) = oneshot::channel();
-        assert!(rtcp.inner.spawn_runtime_task({
+        assert!(existing.spawn_runtime_task({
             let task_dropped = task_dropped.clone();
             async move {
                 let _drop_flag = TaskDropFlag(task_dropped);
@@ -7233,6 +7283,7 @@ mod tests {
         assert!(existing.is_closed());
         assert_eq!(rtcp.inner.tunnel_map.primary_len().await, 0);
         assert!(task_dropped.load(Ordering::SeqCst));
+        assert!(!existing.spawn_runtime_task(async {}));
         assert!(matches!(
             rtcp.create_tunnel(Some("late-target")).await,
             Err(TunnelError::InvalidState(reason)) if reason == RTCP_STOPPED_REASON
