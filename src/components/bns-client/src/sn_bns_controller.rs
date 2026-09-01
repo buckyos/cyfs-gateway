@@ -1429,11 +1429,20 @@ impl SnBnsController {
                     });
                 }
 
+                let allow_legacy_implicit_same_name = legacy_implicit_same_name_candidate(
+                    &source_document,
+                    &execute_params.name,
+                    &execute_params.zone_did,
+                ) && self
+                    .current_document_state(&execute_params.name, ZONE_DOC_TYPE)
+                    .await?
+                    .is_some();
                 let mut result_document = source_document;
                 remove_owner_bound_zone(
                     &mut result_document,
                     &execute_params.name,
                     &execute_params.zone_did,
+                    allow_legacy_implicit_same_name,
                 )?;
                 let result_owner_hash =
                     canonical_json_sha256(&result_document).map_err(SnBnsControllerError::from)?;
@@ -2715,6 +2724,7 @@ fn remove_owner_bound_zone(
     document: &mut Value,
     name: &str,
     zone_did: &str,
+    allow_legacy_implicit_same_name: bool,
 ) -> SnBnsControllerResult<()> {
     let object = document.as_object_mut().ok_or_else(|| {
         SnBnsControllerError::InvalidInput("owner document must be a JSON object".to_string())
@@ -2726,6 +2736,7 @@ fn remove_owner_bound_zone(
         )));
     }
 
+    let is_legacy = !object.contains_key("zone_binding_model_version");
     if let Some(value) = object.get("zone_binding_model_version") {
         match value.as_u64() {
             Some(ZONE_BINDING_MODEL_VERSION) => {}
@@ -2758,10 +2769,18 @@ fn remove_owner_bound_zone(
     }
     let previous_len = zones.len();
     zones.retain(|zone| zone.as_str() != Some(zone_did));
-    if zones.len() == previous_len {
+    if zones.len() == previous_len && !allow_legacy_implicit_same_name {
         return Err(SnBnsControllerError::ZoneNotBound {
             zone_did: zone_did.to_string(),
         });
+    }
+    if allow_legacy_implicit_same_name
+        && (!is_legacy || previous_len != 0 || zone_did != expected_owner_did)
+    {
+        return Err(SnBnsControllerError::InvalidInput(
+            "legacy implicit binding bypass is only valid for an empty same-name legacy owner"
+                .to_string(),
+        ));
     }
 
     object.insert(
@@ -2796,6 +2815,20 @@ fn remove_owner_bound_zone(
         object.insert("service".to_string(), Value::Array(services));
     }
     Ok(())
+}
+
+fn legacy_implicit_same_name_candidate(document: &Value, name: &str, zone_did: &str) -> bool {
+    let Some(object) = document.as_object() else {
+        return false;
+    };
+    if object.contains_key("zone_binding_model_version") || zone_did != format!("did:bns:{name}") {
+        return false;
+    }
+    match object.get("binded_zone_list") {
+        None => true,
+        Some(Value::Array(zones)) => zones.is_empty(),
+        Some(_) => false,
+    }
 }
 
 const OWNER_IDENTITY_PATHS: [(&str, &[&str]); 5] = [
@@ -2917,7 +2950,7 @@ mod owner_zone_binding_tests {
     #[test]
     fn removing_default_zone_promotes_next_zone_and_preserves_other_services() {
         let mut document = owner_document();
-        remove_owner_bound_zone(&mut document, "alice", "did:web:zone-a.example").unwrap();
+        remove_owner_bound_zone(&mut document, "alice", "did:web:zone-a.example", false).unwrap();
 
         assert_eq!(document["zone_binding_model_version"], json!(2));
         assert_eq!(
@@ -2938,7 +2971,7 @@ mod owner_zone_binding_tests {
     #[test]
     fn removing_non_default_zone_keeps_default_last_doc() {
         let mut document = owner_document();
-        remove_owner_bound_zone(&mut document, "alice", "did:web:zone-b.example").unwrap();
+        remove_owner_bound_zone(&mut document, "alice", "did:web:zone-b.example", false).unwrap();
 
         assert_eq!(
             document["binded_zone_list"],
@@ -2966,7 +2999,7 @@ mod owner_zone_binding_tests {
                 {"id":"did:bns:alice#profile","type":"Profile","serviceEndpoint":"keep"}
             ]
         });
-        remove_owner_bound_zone(&mut document, "alice", "did:web:zone-a.example").unwrap();
+        remove_owner_bound_zone(&mut document, "alice", "did:web:zone-a.example", false).unwrap();
 
         assert_eq!(document["zone_binding_model_version"], json!(2));
         assert!(document.get("binded_zone_list").is_none());
@@ -2979,13 +3012,14 @@ mod owner_zone_binding_tests {
     #[test]
     fn removal_is_exact_and_rejects_unsupported_or_unbound_state() {
         let mut document = owner_document();
-        let error =
-            remove_owner_bound_zone(&mut document, "alice", "did:web:zone.example").unwrap_err();
+        let error = remove_owner_bound_zone(&mut document, "alice", "did:web:zone.example", false)
+            .unwrap_err();
         assert!(matches!(error, SnBnsControllerError::ZoneNotBound { .. }));
 
         document["zone_binding_model_version"] = json!(3);
         let error =
-            remove_owner_bound_zone(&mut document, "alice", "did:web:zone-a.example").unwrap_err();
+            remove_owner_bound_zone(&mut document, "alice", "did:web:zone-a.example", false)
+                .unwrap_err();
         assert!(matches!(error, SnBnsControllerError::InvalidInput(_)));
         assert!(error
             .to_string()
@@ -2993,8 +3027,49 @@ mod owner_zone_binding_tests {
 
         document["zone_binding_model_version"] = json!("2");
         let error =
-            remove_owner_bound_zone(&mut document, "alice", "did:web:zone-a.example").unwrap_err();
+            remove_owner_bound_zone(&mut document, "alice", "did:web:zone-a.example", false)
+                .unwrap_err();
         assert!(error.to_string().contains("must be an unsigned integer"));
+    }
+
+    #[test]
+    fn legacy_same_name_unlink_requires_explicit_confirmed_candidate() {
+        let mut legacy = json!({
+            "id": "did:bns:alice",
+            "service": [
+                {"id":"did:bns:alice#lastDoc","type":"DIDDoc","serviceEndpoint":"legacy"},
+                {"id":"did:bns:alice#profile","type":"Profile","serviceEndpoint":"keep"}
+            ]
+        });
+        assert!(legacy_implicit_same_name_candidate(
+            &legacy,
+            "alice",
+            "did:bns:alice"
+        ));
+
+        let mut rejected = legacy.clone();
+        assert!(matches!(
+            remove_owner_bound_zone(&mut rejected, "alice", "did:bns:alice", false),
+            Err(SnBnsControllerError::ZoneNotBound { .. })
+        ));
+
+        remove_owner_bound_zone(&mut legacy, "alice", "did:bns:alice", true).unwrap();
+        assert_eq!(legacy["zone_binding_model_version"], json!(2));
+        assert!(legacy.get("binded_zone_list").is_none());
+        assert_eq!(
+            legacy["service"],
+            json!([{"id":"did:bns:alice#profile","type":"Profile","serviceEndpoint":"keep"}])
+        );
+
+        let explicit_unbound = json!({
+            "id": "did:bns:alice",
+            "zone_binding_model_version": 2
+        });
+        assert!(!legacy_implicit_same_name_candidate(
+            &explicit_unbound,
+            "alice",
+            "did:bns:alice"
+        ));
     }
 
     #[test]
