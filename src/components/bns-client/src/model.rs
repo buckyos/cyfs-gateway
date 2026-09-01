@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fmt;
@@ -1130,6 +1131,30 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
 
 pub fn hash_json<T: Serialize + ?Sized>(value: &T) -> BnsRegistryResult<String> {
     Ok(sha256_hex(&serde_json::to_vec(value)?))
+}
+
+/// Hash JSON independently of object insertion order. Arrays retain their
+/// order; object keys are sorted recursively before compact serialization.
+pub fn canonical_json_sha256(value: &Value) -> BnsRegistryResult<String> {
+    fn canonicalize(value: &Value) -> Value {
+        match value {
+            Value::Object(object) => {
+                let mut entries = object.iter().collect::<Vec<_>>();
+                entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+                let mut canonical = serde_json::Map::new();
+                for (key, value) in entries {
+                    canonical.insert(key.clone(), canonicalize(value));
+                }
+                Value::Object(canonical)
+            }
+            Value::Array(values) => Value::Array(values.iter().map(canonicalize).collect()),
+            _ => value.clone(),
+        }
+    }
+
+    let bytes = serde_json::to_vec(&canonicalize(value))?;
+    let digest = Sha256::digest(bytes);
+    Ok(format!("sha256:{}", hex::encode(digest)))
 }
 
 pub fn authority_root(keys: &[AuthorityKey], now: u64) -> BnsRegistryResult<(String, u32)> {

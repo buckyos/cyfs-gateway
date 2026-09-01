@@ -1,10 +1,10 @@
 use crate::dns_document::{self, DnsTxtRecord, DNS_TXT_DOC_TYPE};
 use crate::{
-    canonical_bns_name, canonical_doc_type, controller_rule, default_document_update, hash_json,
-    policy_hash_from_rules, AuthorityKeyUpdate, AuthorityRole, AuthoritySetState, BnsRegistryError,
-    CallAuthority, DocumentRef, DocumentState, DocumentStatus, DocumentUpdate, MutationGuard,
-    NameState, OwnerPolicyUpdate, Principal, PrincipalKind, RegisterOptions,
-    PERMISSION_PUBLISH_DOCUMENT, ZERO_HASH,
+    canonical_bns_name, canonical_doc_type, canonical_json_sha256, controller_rule,
+    default_document_update, hash_json, policy_hash_from_rules, validate_did, AuthorityKeyUpdate,
+    AuthorityRole, AuthoritySetState, BnsRegistryError, CallAuthority, DocumentRef, DocumentState,
+    DocumentStatus, DocumentUpdate, MutationGuard, NameState, OwnerPolicyUpdate, Principal,
+    PrincipalKind, RegisterOptions, PERMISSION_PUBLISH_DOCUMENT, ZERO_HASH,
 };
 use crate::{
     BnsApplyMutationsReq, BnsClientError, BnsDocumentVersion, BnsEvmControllerClient,
@@ -38,6 +38,7 @@ pub enum BnsWriteOperation {
     SetControllerPolicy,
     UpdateAuthorityKeys,
     BindZoneDocuments,
+    RemoveBoundZone,
     PublishDeviceMiniDoc,
     UpsertDnsTxt,
     PublishRelayAssignment,
@@ -53,6 +54,7 @@ impl BnsWriteOperation {
             Self::SetControllerPolicy => "set_controller_policy",
             Self::UpdateAuthorityKeys => "update_authority_keys",
             Self::BindZoneDocuments => "bind_zone_documents",
+            Self::RemoveBoundZone => "remove_bound_zone",
             Self::PublishDeviceMiniDoc => "publish_device_mini_doc",
             Self::UpsertDnsTxt => "upsert_dns_txt",
             Self::PublishRelayAssignment => "publish_relay_assignment",
@@ -125,6 +127,22 @@ pub struct RegisterNameOutput {
 
 pub type BootstrapNameOutput = RegisterNameOutput;
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OwnerDocumentSnapshot {
+    pub document: Value,
+    pub version: u64,
+    pub hash: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemoveBoundZoneOutput {
+    pub receipt: BnsWriteReceipt,
+    pub source_owner_hash: String,
+    pub result_owner_hash: String,
+    pub source_version: u64,
+    pub target_version: u64,
+}
+
 trait MarkIdempotentReuse {
     fn mark_reused(&mut self);
 }
@@ -145,6 +163,12 @@ impl MarkIdempotentReuse for BnsMultiWriteReceipt {
 }
 
 impl MarkIdempotentReuse for RegisterNameOutput {
+    fn mark_reused(&mut self) {
+        self.receipt.mark_reused();
+    }
+}
+
+impl MarkIdempotentReuse for RemoveBoundZoneOutput {
     fn mark_reused(&mut self) {
         self.receipt.mark_reused();
     }
@@ -223,6 +247,12 @@ pub enum SnBnsControllerError {
     #[error("idempotency store error: {0}")]
     Store(String),
 
+    #[error("owner document hash conflict: expected {expected}, actual {actual}")]
+    OwnerDocumentHashConflict { expected: String, actual: String },
+
+    #[error("owner document is not bound to zone `{zone_did}`")]
+    ZoneNotBound { zone_did: String },
+
     #[error("serialization error: {0}")]
     Serialization(String),
 }
@@ -236,6 +266,8 @@ impl SnBnsControllerError {
             Self::IdempotencyPending { .. } => "IDEMPOTENCY_PENDING",
             Self::IdempotencyPreviousFailure { .. } => "IDEMPOTENCY_PREVIOUS_FAILURE",
             Self::Store(_) => "IDEMPOTENCY_STORE_ERROR",
+            Self::OwnerDocumentHashConflict { .. } => "OWNER_DOCUMENT_HASH_CONFLICT",
+            Self::ZoneNotBound { .. } => "ZONE_NOT_BOUND",
             Self::Serialization(_) => "SERIALIZATION_ERROR",
         }
     }
@@ -1333,6 +1365,114 @@ impl SnBnsController {
                         Err(error) => return Err(error),
                     }
                 }
+            },
+        )
+        .await
+    }
+
+    pub async fn resolve_owner_document_snapshot(
+        &self,
+        name: &str,
+    ) -> SnBnsControllerResult<OwnerDocumentSnapshot> {
+        let state = self
+            .current_document_state(name, OWNER_DOC_TYPE)
+            .await?
+            .ok_or_else(|| {
+                SnBnsControllerError::InvalidInput(format!(
+                    "owner document for `{name}` does not exist"
+                ))
+            })?;
+        let document = self.parse_inline_document::<Value>(&state)?;
+        let hash = canonical_json_sha256(&document).map_err(SnBnsControllerError::from)?;
+        Ok(OwnerDocumentSnapshot {
+            document,
+            version: state.version,
+            hash,
+        })
+    }
+
+    /// Remove exactly one Zone DID from the latest OwnerDocument and submit a
+    /// single compare-and-set update. A stale source hash or document version
+    /// is never retried against a newer document.
+    pub async fn remove_bound_zone(
+        &self,
+        params: RemoveBoundZoneParams,
+    ) -> SnBnsControllerResult<RemoveBoundZoneOutput> {
+        self.ensure_authority_can_publish(&params.authority, OWNER_DOC_TYPE)?;
+        validate_did(&params.zone_did).map_err(SnBnsControllerError::from)?;
+        validate_owner_document_hash(&params.expected_owner_hash)?;
+
+        let execute_params = params.clone();
+        self.run_idempotent(
+            &params.request_id,
+            BnsWriteOperation::RemoveBoundZone,
+            &params.name,
+            Some(OWNER_DOC_TYPE),
+            &params,
+            |execution| async move {
+                let current = self
+                    .current_document_state(&execute_params.name, OWNER_DOC_TYPE)
+                    .await?
+                    .ok_or_else(|| {
+                        SnBnsControllerError::InvalidInput(format!(
+                            "owner document for `{}` does not exist",
+                            execute_params.name
+                        ))
+                    })?;
+                let source_document = self.parse_inline_document::<Value>(&current)?;
+                let source_owner_hash =
+                    canonical_json_sha256(&source_document).map_err(SnBnsControllerError::from)?;
+                if source_owner_hash != execute_params.expected_owner_hash {
+                    return Err(SnBnsControllerError::OwnerDocumentHashConflict {
+                        expected: execute_params.expected_owner_hash.clone(),
+                        actual: source_owner_hash,
+                    });
+                }
+
+                let mut result_document = source_document;
+                remove_owner_bound_zone(
+                    &mut result_document,
+                    &execute_params.name,
+                    &execute_params.zone_did,
+                )?;
+                let result_owner_hash =
+                    canonical_json_sha256(&result_document).map_err(SnBnsControllerError::from)?;
+                let update =
+                    self.inline_json_update(OWNER_DOC_TYPE, current.version, &result_document)?;
+                let name_state = self.required_name_state(&execute_params.name).await?;
+                let guard = MutationGuard {
+                    expected_name_seq: name_state.name_seq,
+                    expected_parent_name_seq: 0,
+                };
+                let authority_set = self.client.get_authority_set(&execute_params.name).await?;
+                let prepared = self
+                    .write_backend
+                    .prepare_publish_document(BnsPublishDocumentReq {
+                        name: execute_params.name.clone(),
+                        update: update.clone(),
+                        authority: execute_params.authority.clone(),
+                        guard,
+                    })
+                    .await?;
+                let receipt = receipt_from_submitted_document(
+                    &execute_params.request_id,
+                    BnsWriteOperation::RemoveBoundZone,
+                    &name_state,
+                    &update,
+                    &authority_set,
+                    prepared.submission(),
+                );
+                let output = RemoveBoundZoneOutput {
+                    source_owner_hash: execute_params.expected_owner_hash.clone(),
+                    result_owner_hash,
+                    source_version: current.version,
+                    target_version: receipt
+                        .document_version
+                        .unwrap_or(current.version.saturating_add(1)),
+                    receipt,
+                };
+                execution.persist_and_submit(&prepared, &output).await?;
+                Ok(output)
             },
         )
         .await
@@ -2464,6 +2604,15 @@ pub struct PublishDocumentParams {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemoveBoundZoneParams {
+    pub request_id: String,
+    pub name: String,
+    pub zone_did: String,
+    pub expected_owner_hash: String,
+    pub authority: CallAuthority,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BindZoneDocumentsParams {
     pub request_id: String,
     pub name: String,
@@ -2519,6 +2668,134 @@ impl Default for DeviceMiniDocCollection {
             devices: BTreeMap::new(),
         }
     }
+}
+
+const ZONE_BINDING_MODEL_VERSION: u64 = 2;
+
+fn validate_owner_document_hash(value: &str) -> SnBnsControllerResult<()> {
+    let Some(hex) = value.strip_prefix("sha256:") else {
+        return Err(SnBnsControllerError::InvalidInput(
+            "expected_owner_hash must use the sha256:<64 lowercase hex> format".to_string(),
+        ));
+    };
+    if hex.len() != 64
+        || !hex.bytes().all(|byte| byte.is_ascii_hexdigit())
+        || hex.bytes().any(|byte| byte.is_ascii_uppercase())
+    {
+        return Err(SnBnsControllerError::InvalidInput(
+            "expected_owner_hash must use the sha256:<64 lowercase hex> format".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn zone_did_hostname(zone_did: &str) -> SnBnsControllerResult<String> {
+    let mut parts = zone_did.splitn(3, ':');
+    if parts.next() != Some("did") {
+        return Err(SnBnsControllerError::InvalidInput(format!(
+            "invalid zone DID `{zone_did}`"
+        )));
+    }
+    let method = parts.next().unwrap_or_default();
+    let id = parts.next().unwrap_or_default();
+    let hostname = id.split(':').next().unwrap_or_default();
+    if method.is_empty() || hostname.is_empty() {
+        return Err(SnBnsControllerError::InvalidInput(format!(
+            "invalid zone DID `{zone_did}`"
+        )));
+    }
+    if method == "web" {
+        Ok(hostname.to_string())
+    } else {
+        Ok(format!("{hostname}.{method}.did"))
+    }
+}
+
+fn remove_owner_bound_zone(
+    document: &mut Value,
+    name: &str,
+    zone_did: &str,
+) -> SnBnsControllerResult<()> {
+    let object = document.as_object_mut().ok_or_else(|| {
+        SnBnsControllerError::InvalidInput("owner document must be a JSON object".to_string())
+    })?;
+    let expected_owner_did = format!("did:bns:{name}");
+    if object.get("id").and_then(Value::as_str) != Some(expected_owner_did.as_str()) {
+        return Err(SnBnsControllerError::InvalidInput(format!(
+            "owner document id must be `{expected_owner_did}`"
+        )));
+    }
+
+    if let Some(value) = object.get("zone_binding_model_version") {
+        match value.as_u64() {
+            Some(ZONE_BINDING_MODEL_VERSION) => {}
+            Some(version) => {
+                return Err(SnBnsControllerError::InvalidInput(format!(
+                    "unsupported zone_binding_model_version `{version}`"
+                )));
+            }
+            None => {
+                return Err(SnBnsControllerError::InvalidInput(
+                    "zone_binding_model_version must be an unsigned integer".to_string(),
+                ));
+            }
+        }
+    }
+
+    let mut zones = match object.remove("binded_zone_list") {
+        None => Vec::new(),
+        Some(Value::Array(zones)) => zones,
+        Some(_) => {
+            return Err(SnBnsControllerError::InvalidInput(
+                "binded_zone_list must be an array".to_string(),
+            ));
+        }
+    };
+    if zones.iter().any(|zone| !zone.is_string()) {
+        return Err(SnBnsControllerError::InvalidInput(
+            "binded_zone_list entries must be DID strings".to_string(),
+        ));
+    }
+    let previous_len = zones.len();
+    zones.retain(|zone| zone.as_str() != Some(zone_did));
+    if zones.len() == previous_len {
+        return Err(SnBnsControllerError::ZoneNotBound {
+            zone_did: zone_did.to_string(),
+        });
+    }
+
+    object.insert(
+        "zone_binding_model_version".to_string(),
+        Value::from(ZONE_BINDING_MODEL_VERSION),
+    );
+    if !zones.is_empty() {
+        object.insert("binded_zone_list".to_string(), Value::Array(zones.clone()));
+    }
+
+    let last_doc_id = format!("{expected_owner_did}#lastDoc");
+    let mut services = match object.remove("service") {
+        None => Vec::new(),
+        Some(Value::Array(services)) => services,
+        Some(_) => {
+            return Err(SnBnsControllerError::InvalidInput(
+                "owner document service must be an array".to_string(),
+            ));
+        }
+    };
+    services
+        .retain(|service| service.get("id").and_then(Value::as_str) != Some(last_doc_id.as_str()));
+    if let Some(default_zone_did) = zones.first().and_then(Value::as_str) {
+        let hostname = zone_did_hostname(default_zone_did)?;
+        services.push(serde_json::json!({
+            "id": last_doc_id,
+            "type": "DIDDoc",
+            "serviceEndpoint": format!("https://{hostname}/resolve/{expected_owner_did}"),
+        }));
+    }
+    if !services.is_empty() {
+        object.insert("service".to_string(), Value::Array(services));
+    }
+    Ok(())
 }
 
 const OWNER_IDENTITY_PATHS: [(&str, &[&str]); 5] = [
@@ -2599,6 +2876,138 @@ mod owner_identity_field_tests {
 
         let removed = json!({"verificationMethod":[{"id":"did:bns:alice#default"}]});
         assert!(ensure_owner_identity_fields_unchanged(&current, &removed).is_err());
+    }
+}
+
+#[cfg(test)]
+mod owner_zone_binding_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn owner_document() -> Value {
+        json!({
+            "id": "did:bns:alice",
+            "zone_binding_model_version": 2,
+            "binded_zone_list": ["did:web:zone-a.example", "did:web:zone-b.example"],
+            "service": [
+                {
+                    "id": "did:bns:alice#profile",
+                    "type": "Profile",
+                    "serviceEndpoint": "https://alice.example/profile"
+                },
+                {
+                    "id": "did:bns:alice#lastDoc",
+                    "type": "DIDDoc",
+                    "serviceEndpoint": "https://zone-a.example/resolve/did:bns:alice"
+                }
+            ]
+        })
+    }
+
+    #[test]
+    fn canonical_owner_hash_ignores_object_insertion_order() {
+        let left = json!({"id":"did:bns:alice","nested":{"b":2,"a":1}});
+        let right = json!({"nested":{"a":1,"b":2},"id":"did:bns:alice"});
+        assert_eq!(
+            canonical_json_sha256(&left).unwrap(),
+            canonical_json_sha256(&right).unwrap()
+        );
+    }
+
+    #[test]
+    fn removing_default_zone_promotes_next_zone_and_preserves_other_services() {
+        let mut document = owner_document();
+        remove_owner_bound_zone(&mut document, "alice", "did:web:zone-a.example").unwrap();
+
+        assert_eq!(document["zone_binding_model_version"], json!(2));
+        assert_eq!(
+            document["binded_zone_list"],
+            json!(["did:web:zone-b.example"])
+        );
+        let services = document["service"].as_array().unwrap();
+        assert!(services.iter().any(|service| {
+            service["id"] == "did:bns:alice#profile"
+                && service["serviceEndpoint"] == "https://alice.example/profile"
+        }));
+        assert!(services.iter().any(|service| {
+            service["id"] == "did:bns:alice#lastDoc"
+                && service["serviceEndpoint"] == "https://zone-b.example/resolve/did:bns:alice"
+        }));
+    }
+
+    #[test]
+    fn removing_non_default_zone_keeps_default_last_doc() {
+        let mut document = owner_document();
+        remove_owner_bound_zone(&mut document, "alice", "did:web:zone-b.example").unwrap();
+
+        assert_eq!(
+            document["binded_zone_list"],
+            json!(["did:web:zone-a.example"])
+        );
+        let last_doc = document["service"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|service| service["id"] == "did:bns:alice#lastDoc")
+            .unwrap();
+        assert_eq!(
+            last_doc["serviceEndpoint"],
+            "https://zone-a.example/resolve/did:bns:alice"
+        );
+    }
+
+    #[test]
+    fn removing_last_zone_records_v2_unbound_state() {
+        let mut document = json!({
+            "id": "did:bns:alice",
+            "binded_zone_list": ["did:web:zone-a.example"],
+            "service": [
+                {"id":"did:bns:alice#lastDoc","type":"DIDDoc","serviceEndpoint":"old"},
+                {"id":"did:bns:alice#profile","type":"Profile","serviceEndpoint":"keep"}
+            ]
+        });
+        remove_owner_bound_zone(&mut document, "alice", "did:web:zone-a.example").unwrap();
+
+        assert_eq!(document["zone_binding_model_version"], json!(2));
+        assert!(document.get("binded_zone_list").is_none());
+        assert_eq!(
+            document["service"],
+            json!([{"id":"did:bns:alice#profile","type":"Profile","serviceEndpoint":"keep"}])
+        );
+    }
+
+    #[test]
+    fn removal_is_exact_and_rejects_unsupported_or_unbound_state() {
+        let mut document = owner_document();
+        let error =
+            remove_owner_bound_zone(&mut document, "alice", "did:web:zone.example").unwrap_err();
+        assert!(matches!(error, SnBnsControllerError::ZoneNotBound { .. }));
+
+        document["zone_binding_model_version"] = json!(3);
+        let error =
+            remove_owner_bound_zone(&mut document, "alice", "did:web:zone-a.example").unwrap_err();
+        assert!(matches!(error, SnBnsControllerError::InvalidInput(_)));
+        assert!(error
+            .to_string()
+            .contains("unsupported zone_binding_model_version"));
+
+        document["zone_binding_model_version"] = json!("2");
+        let error =
+            remove_owner_bound_zone(&mut document, "alice", "did:web:zone-a.example").unwrap_err();
+        assert!(error.to_string().contains("must be an unsigned integer"));
+    }
+
+    #[test]
+    fn owner_hash_requires_lowercase_sha256_format() {
+        assert!(validate_owner_document_hash(
+            "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        )
+        .is_ok());
+        assert!(validate_owner_document_hash(
+            "sha256:0123456789ABCDEF0123456789abcdef0123456789abcdef0123456789abcdef"
+        )
+        .is_err());
+        assert!(validate_owner_document_hash("0123").is_err());
     }
 }
 

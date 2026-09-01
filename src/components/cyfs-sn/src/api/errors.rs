@@ -36,6 +36,9 @@ pub(crate) enum SnApiErrorCode {
     BnsControllerUnavailable = 1027,
     InvalidEmail = 1028,
     EmailAlreadyBound = 1029,
+    OwnerDocumentConflict = 1030,
+    OwnerAuthorizationFailed = 1031,
+    ZoneNotBound = 1032,
     InternalError = 1099,
 }
 
@@ -72,6 +75,9 @@ impl SnApiErrorCode {
             Self::BnsControllerUnavailable => "bns_controller_unavailable",
             Self::InvalidEmail => "invalid_email",
             Self::EmailAlreadyBound => "email_already_bound",
+            Self::OwnerDocumentConflict => "owner_document_conflict",
+            Self::OwnerAuthorizationFailed => "owner_authorization_failed",
+            Self::ZoneNotBound => "zone_not_bound",
             Self::InternalError => "internal_error",
         }
     }
@@ -90,6 +96,29 @@ pub(crate) fn reason_error(code: SnApiErrorCode, message: impl AsRef<str>) -> RP
 }
 
 pub(crate) fn bns_write_error(error: SnBnsControllerError) -> RPCErrors {
+    if let SnBnsControllerError::OwnerDocumentHashConflict { expected, actual } = &error {
+        return reason_error(
+            SnApiErrorCode::OwnerDocumentConflict,
+            json!({
+                "bns_code": error.code(),
+                "expected": expected,
+                "actual": actual,
+                "message": error.to_string(),
+            })
+            .to_string(),
+        );
+    }
+    if let SnBnsControllerError::ZoneNotBound { zone_did } = &error {
+        return reason_error(
+            SnApiErrorCode::ZoneNotBound,
+            json!({
+                "bns_code": error.code(),
+                "zone_did": zone_did,
+                "message": error.to_string(),
+            })
+            .to_string(),
+        );
+    }
     let (code, bns_code, expected, actual) = match &error {
         SnBnsControllerError::Bns(BnsClientError::Registry(info)) => {
             let code = match info.code.as_str() {
@@ -133,5 +162,8 @@ pub(crate) fn bns_proxy_error(error: SnBnsProxyError) -> RPCErrors {
             reason_error(SnApiErrorCode::BnsControllerUnavailable, error.to_string())
         }
         SnBnsProxyError::Store(message) => reason_error(SnApiErrorCode::InternalError, message),
+        SnBnsProxyError::OwnerAuthorization(message) => {
+            reason_error(SnApiErrorCode::OwnerAuthorizationFailed, message)
+        }
     }
 }

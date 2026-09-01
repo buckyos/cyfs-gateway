@@ -690,6 +690,19 @@ pub struct SnBnsPublishDocumentReq {
     pub request_id: Option<String>,
 }
 
+/// `/kapi/sn/bns-proxy` `owner.remove_bound_zone` request. The compact JWT is
+/// signed by a current OwnerDocument authentication key and binds every CAS
+/// field in this request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SnOwnerRemoveBoundZoneReq {
+    pub name: String,
+    pub zone_did: String,
+    pub expected_owner_hash: String,
+    pub request_id: String,
+    pub owner_authorization: String,
+}
+
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SnDeviceState {
@@ -1081,6 +1094,17 @@ pub struct SnBnsProxyResp {
     pub outcome: SnBnsProxyTxOutcome,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SnOwnerRemoveBoundZoneResp {
+    pub code: u16,
+    #[serde(flatten)]
+    pub outcome: SnBnsProxyTxOutcome,
+    pub source_owner_hash: String,
+    pub result_owner_hash: String,
+    pub source_version: u64,
+    pub target_version: u64,
+}
+
 impl SnBnsProxyInitialDocuments {
     pub fn is_empty(&self) -> bool {
         self.zone.is_none() && self.boot.is_none() && self.dns_txt.is_none()
@@ -1361,6 +1385,17 @@ impl SnClient {
         self.call_bns_proxy(
             "bns.publish_document",
             to_value(req, "SnBnsPublishDocumentReq")?,
+        )
+        .await
+    }
+
+    pub async fn remove_bound_zone(
+        &self,
+        req: SnOwnerRemoveBoundZoneReq,
+    ) -> Result<SnOwnerRemoveBoundZoneResp, RPCErrors> {
+        self.call_bns_proxy(
+            "owner.remove_bound_zone",
+            to_value(req, "SnOwnerRemoveBoundZoneReq")?,
         )
         .await
     }

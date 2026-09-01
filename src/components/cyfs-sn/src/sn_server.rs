@@ -485,7 +485,9 @@ impl SNServer {
             | "device.list"
             | "deviceinfo.resolve_ood_by_did"
             | "deviceinfo.resolve_ood_by_hostname" => SnRpcPath::DeviceInfo,
-            "bns.publish_dns_txt" | "bns.publish_document" => SnRpcPath::BnsProxy,
+            "bns.publish_dns_txt" | "bns.publish_document" | "owner.remove_bound_zone" => {
+                SnRpcPath::BnsProxy
+            }
             // internal/admin only：不在外部 HTTP 路径开放（QA/loopback 通道可用）。
             "bns.publish_relay_assignment" | "bns.register_name_bootstrap" => {
                 SnRpcPath::InternalRoot
@@ -1317,6 +1319,7 @@ impl SNServer {
                     .to_string();
                 handle_bns_proxy(self, Self::rewrite_rpc_method(req, bare_method.as_str())).await
             }
+            "owner.remove_bound_zone" => handle_bns_proxy(self, req).await,
             "admin.clear_state_by_active_code" => {
                 self.clear_state_by_active_code(Self::rewrite_rpc_method(
                     req,
