@@ -160,13 +160,13 @@ where
 
     async fn query_name_state(&self, name: &str) -> BnsClientResult<Option<NameState>> {
         self.store
-            .transact(|tx| projection_query_name_state(tx, name))
+            .transact(|tx| projection_query_name_state(tx, name, now_timestamp()))
             .map_err(Into::into)
     }
 
     async fn resolve_owner(&self, name: &str) -> BnsClientResult<OwnerResolution> {
         self.store
-            .transact(|tx| projection_resolve_owner(tx, name))
+            .transact(|tx| projection_resolve_owner(tx, name, now_timestamp()))
             .map_err(Into::into)
     }
 
@@ -194,7 +194,7 @@ where
 
     async fn resolve_document(&self, name: &str, doc_type: &str) -> BnsClientResult<ResolveResult> {
         self.store
-            .transact(|tx| projection_resolve_document(tx, name, doc_type))
+            .transact(|tx| projection_resolve_document(tx, name, doc_type, now_timestamp()))
             .map_err(Into::into)
     }
 
@@ -1123,16 +1123,13 @@ fn did_resolver_document_status(result: &ResolveResult, now: u64) -> DocumentSta
             result.name_state.name, result.alias_target_did
         );
     }
-    if matches!(
-        result.name_state.status,
-        NameStatus::Expired | NameStatus::Released
-    ) || (result.document_state.expire_at != 0 && now >= result.document_state.expire_at)
-    {
+    let status = result.effective_status_at(now);
+    if status == DocumentStatus::Expired {
         // Registration lapsed or the document outlived its own validity
         // window. The chain has no timers, so this must be derived at read
         // time; expired stays 200 + last known content and the fallback
         // decision belongs to client policy.
-        return DocumentStatus::Expired;
+        return status;
     }
     DocumentStatus::Active
 }
@@ -1409,42 +1406,49 @@ fn rpc_envelope_response<T: Serialize>(
 fn projection_query_name_state(
     tx: &mut dyn BnsRegistryStoreTx,
     name: &str,
+    now: u64,
 ) -> BnsRegistryResult<Option<NameState>> {
     let name = canonical_bns_name(name)?;
     tx.get_name(&name)?
-        .map(|state| projection_materialize_name_state(tx, state))
+        .map(|state| projection_materialize_name_state(tx, state, now))
         .transpose()
 }
 
 fn projection_resolve_owner(
     tx: &mut dyn BnsRegistryStoreTx,
     name: &str,
+    now: u64,
 ) -> BnsRegistryResult<OwnerResolution> {
     let name = canonical_bns_name(name)?;
-    let state = tx
+    let mut state = tx
         .get_name(&name)?
-        .ok_or_else(|| BnsRegistryError::NameNotFound { name })?;
-    projection_resolve_owner_from_state(tx, &state)
+        .ok_or_else(|| BnsRegistryError::NameNotFound { name: name.clone() })?;
+    state.materialize_status_at(now);
+    if state.status != NameStatus::Active {
+        return Err(BnsRegistryError::NameNotFound { name });
+    }
+    projection_resolve_owner_from_state(tx, &state, now)
 }
 
 fn projection_resolve_document(
     tx: &mut dyn BnsRegistryStoreTx,
     name: &str,
     doc_type: &str,
+    now: u64,
 ) -> BnsRegistryResult<ResolveResult> {
     let name = canonical_bns_name(name)?;
     let doc_type = canonical_doc_type(doc_type)?;
     let raw_name_state = tx
         .get_name(&name)?
         .ok_or_else(|| BnsRegistryError::NameNotFound { name: name.clone() })?;
-    let name_state = projection_materialize_name_state(tx, raw_name_state)?;
+    let name_state = projection_materialize_name_state(tx, raw_name_state, now)?;
     let document_state = tx.get_current_document(&name, &doc_type)?.ok_or_else(|| {
         BnsRegistryError::DocumentNotFound {
             name: name.clone(),
             doc_type: doc_type.clone(),
         }
     })?;
-    let owner = projection_resolve_owner_from_state(tx, &name_state)?;
+    let owner = projection_resolve_owner_from_state(tx, &name_state, now)?;
     let alias = tx.get_alias(&name)?;
     let proof_root = projection_current_proof_root(tx)?;
     let effective_controller = if document_state.controller.is_unset() {
@@ -1453,7 +1457,7 @@ fn projection_resolve_document(
         document_state.controller.clone()
     };
 
-    Ok(ResolveResult {
+    let mut result = ResolveResult {
         status: document_state.status,
         alias_kind: alias.as_ref().map_or(AliasKind::None, |state| state.kind),
         alias_target_did: alias.map_or_else(String::new, |state| state.target_did),
@@ -1462,14 +1466,18 @@ fn projection_resolve_document(
         owner,
         effective_controller,
         proof_root,
-    })
+    };
+    result.materialize_status_at(now);
+    Ok(result)
 }
 
 fn projection_materialize_name_state(
     tx: &mut dyn BnsRegistryStoreTx,
     mut state: NameState,
+    now: u64,
 ) -> BnsRegistryResult<NameState> {
-    let owner = projection_resolve_owner_from_state(tx, &state)?;
+    state.materialize_status_at(now);
+    let owner = projection_resolve_owner_from_state(tx, &state, now)?;
     state.effective_owner = owner.effective_owner;
     state.owner_source = owner.source;
     state.standard_transfer_enabled = state.transferable
@@ -1481,9 +1489,20 @@ fn projection_materialize_name_state(
 fn projection_resolve_owner_from_state(
     tx: &mut dyn BnsRegistryStoreTx,
     state: &NameState,
+    now: u64,
 ) -> BnsRegistryResult<OwnerResolution> {
     if state.semantic_owner.kind == PrincipalKind::BnsName {
         let authority = projection_authority_set(tx, &state.semantic_owner.value)?;
+        if state.status == NameStatus::Active {
+            let owner_state = tx
+                .get_name(&state.semantic_owner.value)?
+                .ok_or(BnsRegistryError::NoConcreteSigner)?;
+            if owner_state.effective_status_at(now) != NameStatus::Active
+                || authority.active_key_count == 0
+            {
+                return Err(BnsRegistryError::NoConcreteSigner);
+            }
+        }
         return Ok(OwnerResolution {
             effective_owner: state.semantic_owner.clone(),
             source: OwnerSource::ExplicitSemanticOwner,
@@ -1505,12 +1524,16 @@ fn projection_resolve_owner_from_state(
     let parent = parent_name(&state.name).ok_or_else(|| {
         BnsRegistryError::InvalidMutation("second-level name has no parent".to_string())
     })?;
-    let parent_state = tx
+    let mut parent_state = tx
         .get_name(parent)?
         .ok_or_else(|| BnsRegistryError::NameNotFound {
             name: parent.to_string(),
         })?;
-    let mut owner = projection_resolve_owner_from_state(tx, &parent_state)?;
+    parent_state.materialize_status_at(now);
+    if state.status == NameStatus::Active && parent_state.status != NameStatus::Active {
+        return Err(BnsRegistryError::NoConcreteSigner);
+    }
+    let mut owner = projection_resolve_owner_from_state(tx, &parent_state, now)?;
     owner.source = OwnerSource::ParentInherited;
     Ok(owner)
 }
@@ -1655,8 +1678,8 @@ mod tests {
                     standard_transfer_enabled: true,
                     status: NameStatus::Active,
                     registered_at: 1,
-                    expire_at: 100,
-                    grace_until: 200,
+                    expire_at: 4_102_444_800,
+                    grace_until: 4_102_531_200,
                     updated_at: 2,
                     name_seq: 1,
                     owner_document_version: 0,
@@ -1879,6 +1902,12 @@ mod tests {
             .transact(|tx| {
                 // alice: active name with several document states.
                 tx.put_name(&resolver_name_state("alice", NameStatus::Active))?;
+                tx.put_authority_set(&AuthoritySetState {
+                    name: "alice".to_string(),
+                    authority_seq: 1,
+                    authority_root: ZERO_HASH.to_string(),
+                    active_key_count: 1,
+                })?;
                 let mut owner_doc = resolver_document_state(
                     "alice",
                     "owner",
@@ -1958,6 +1987,20 @@ mod tests {
                     set_at: 1,
                     name_seq: 1,
                 })?;
+
+                // lapsed: raw projection remains Active, but the name-level
+                // validity window has elapsed and must be derived on reads.
+                let mut lapsed = resolver_name_state("lapsed", NameStatus::Active);
+                lapsed.expire_at = 1;
+                lapsed.grace_until = 2;
+                tx.put_name(&lapsed)?;
+                tx.put_document(&resolver_document_state(
+                    "lapsed",
+                    "zone",
+                    1,
+                    DocumentStatus::Active,
+                    br#"{"id":"did:bns:lapsed"}"#,
+                ))?;
                 Ok(())
             })
             .unwrap();
@@ -2033,7 +2076,7 @@ mod tests {
         assert_eq!(buckyos["docType"], "owner");
         assert_eq!(buckyos["documentStatus"], "active");
         assert_eq!(buckyos["documentVersion"], 3);
-        assert_eq!(buckyos["authoritySeq"], 0);
+        assert_eq!(buckyos["authoritySeq"], 1);
         // Chain-account owners have no DID form yet: the field must be
         // omitted, never serialized as the internal principal JSON.
         assert!(buckyos.get("effectiveOwner").is_none());
@@ -2211,6 +2254,42 @@ mod tests {
         );
         // Expired still returns the last known content for policy fallback.
         assert_eq!(body["didDocument"]["id"], "did:bns:alice");
+    }
+
+    #[tokio::test]
+    async fn contract_projection_derives_name_and_document_expiry() {
+        let handler = BnsContractServerHandler::new(resolver_seeded_store(), "http://127.0.0.1:1");
+
+        let state = handler.query_name_state("lapsed").await.unwrap().unwrap();
+        assert_eq!(state.status, NameStatus::Expired);
+        assert!(!state.standard_transfer_enabled);
+        let owner_error = handler.resolve_owner("lapsed").await.unwrap_err();
+        assert!(owner_error.is_registry_code("NAME_NOT_FOUND"));
+
+        let result = handler.resolve_document("lapsed", "zone").await.unwrap();
+        assert_eq!(result.status, DocumentStatus::Expired);
+        assert_eq!(result.document_state.status, DocumentStatus::Active);
+
+        let document_expired = handler.resolve_document("alice", "old").await.unwrap();
+        assert_eq!(document_expired.status, DocumentStatus::Expired);
+        assert_eq!(
+            document_expired.document_state.status,
+            DocumentStatus::Active
+        );
+    }
+
+    #[tokio::test]
+    async fn did_resolver_reports_expired_name() {
+        let server = resolver_contract_server();
+        let (status, body, _) =
+            resolver_request(&server, Method::GET, "/1.0/identifiers/did:bns:lapsed").await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body["didDocumentMetadata"]["buckyos"]["documentStatus"],
+            "expired"
+        );
+        assert_eq!(body["didDocument"]["id"], "did:bns:lapsed");
     }
 
     #[tokio::test]

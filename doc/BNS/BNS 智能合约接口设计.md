@@ -357,7 +357,14 @@ doc_type = "dns_" + lower_case_dns_rrtype
 - `nameSeq` 在名字的**整个生命周期内单调递增，跨 `Released -> 重新注册` 不重置**。它天然是该名字事件流的连续性指纹。
 - 名字经历 `Released -> 重新注册` 时，`lineageEpoch` 加一，并重新发出 `NameRegistered`（其 `nameSeq` 严格大于该名字此前任何事件）。
 - 跨 `lineageEpoch` 边界的 effective owner 变化属于**信任断点**：客户端、钱包和信用系统不得把新世代的 owner 与旧世代的历史 receipt、签名或信用记录默认视为同一主体。
+- authority set/key、controller policy、alias 和文档 current 指针都按 `(nameHash, lineageEpoch)` 隔离；新世代初始视为没有这些当前状态，只能由本次注册或之后的更新重新建立。
+- 文档实体和版本号仍属于 `(nameHash, docType)` 的全生命周期历史。新世代首个文档以 `expectedVersion = 0` 做并发校验，但分配的 `version` 是历史最大版本加一，且 `previousVersion = 0`，明确切断对旧世代的信任链接。
+- `resolveDocument`、`getPurchaseContext` 和文档写操作只使用当前世代指针；`getDocumentVersion`、带显式 version 的 `resolvePaymentTarget` 仍可读取旧世代历史，用于审计和验证旧 receipt。
 - 对已售出内容或有非平凡历史的高价值名字，建议默认采用 `TombstoneForever` 而非 `ReleaseAfterGrace`，从根本上避免名字被重注册后造成身份混淆。
+
+Solidity 实现不新增或重排可升级合约的存储槽。`lineageEpoch = 0` 继续使用历史 `nameHash` key；后续世代在现有 mapping 内使用带 domain 的派生 key，并用保留 marker 标识已启用隔离的世代。这样，升级前已经存在且 `lineageEpoch > 0` 的活动名字仍可沿用旧 key，只有下一次重新注册才切换到新的隔离 key。
+
+`bns-indexer` / `bns_dv` 收到 `NameRegistered` 时，必须在写入新名称状态前于同一数据库事务中完成当前投影换代：把该名称的全部历史文档标记为非 current，删除 authority set/key、controller policy 和 alias 当前投影，再按同一交易中的后续事件重建新世代状态。文档行和事件日志不得删除。`get_current_document` 必须只读取明确标记为 current 的行，不能在没有 current 行时回退到历史最高版本。
 
 ## 6. 协议级数据类型
 
@@ -761,6 +768,8 @@ function queryNameState(string calldata name)
 ```
 
 回答名字是否存在、资产持有人、显式 owner、effective owner、owner 来源及标准 NFT transfer 是否启用。
+当存储状态为 `Active` 且 `block.timestamp >= expireAt` 时，返回状态在读取时派生为
+`Expired`，并关闭 `standardTransferEnabled`；该 view 不写回存储。
 
 ### resolveOwner
 
@@ -770,6 +779,7 @@ function resolveOwner(string calldata name)
 ```
 
 该接口必须返回当前 effective owner 和其 authority root。客户端不应仅通过 `assetOwner` 判断控制权。
+名称或其 owner authority name 已经过期时，该接口按非活跃名称拒绝解析。
 
 ### registerName
 
@@ -794,6 +804,8 @@ function registerName(
 - 二级名字 `initialSemanticOwner = Unset` 时，继承父 effective owner。
 - `initialSemanticOwner = BnsName(x)` 时，`x` 必须有有效 authority key set，并通过 §3.6 的图检查。
 - 重新注册一个已 `Released` 的名字时，`lineageEpoch` 加一，`nameSeq` 续用该名字的历史最大值继续递增（不重置）。
+- 重新注册先启用新世代隔离，再安装本次 `authorityUpdates`、controller policy 和初始文档；旧世代状态不能参与新世代授权。需要 self-managed owner 时，应保持 `initialSemanticOwner = Unset`，在同一原子注册中先安装新 authority key，再通过 `semanticOwnerAfterAuthority` 切换为自身。
+- 重新注册的初始文档仍要求 `expectedVersion = 0`；返回的实际版本可能大于 1，因为历史版本号不复用。
 - 初始文档不能授权本次注册。
 - exact global name 优先于 delegated subname。
 
@@ -914,6 +926,9 @@ function resolveDid(
 ```
 
 `resolveDid` 只负责把 `did:bns:$name` 转换为 canonical name，再调用 `resolveDocument`。
+
+`ResolveResult.status` 是读取时有效状态：名称到期或文档自身到期都会派生为 `Expired`。
+`ResolveResult.documentState.status` 仍保留写入时的原始状态；历史版本接口同样不改写历史状态。
 
 ### getDocumentVersion
 
@@ -1201,6 +1216,8 @@ function getPurchaseContext(
     string calldata docType
 ) external view returns (PurchaseContext memory context);
 ```
+
+`context.status` 与 `resolveDocument.status` 使用相同的读取时有效状态派生规则。
 
 ### resolvePaymentTarget
 

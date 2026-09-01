@@ -3,13 +3,15 @@ use async_trait::async_trait;
 use bns_client::{
     publish_document_call, register_name_call, BindZoneDocumentsParams, BnsApplyMutationsReq,
     BnsClientError, BnsClientResult, BnsEvmClientConfig, BnsEvmKeyManager, BnsEvmPreparedTx,
-    BnsEvmSignRequest, BnsEvmStandardClient, BnsEvmTxSubmission, BnsEvmWriteOperation,
-    BnsIndexerApi, BnsIndexerClient, BnsIndexerRpcHandler, BnsPublishDocumentReq,
-    BnsRegisterNameReq, BnsWriteReceiptStatus, BootstrapNameParams, DnsTxtUpdate,
+    BnsEvmReceiptWaitConfig, BnsEvmSignRequest, BnsEvmStandardClient, BnsEvmTxReceipt,
+    BnsEvmTxSubmission, BnsEvmWriteOperation, BnsIndexerApi, BnsIndexerClient,
+    BnsIndexerRpcHandler, BnsPublishDocumentReq, BnsRegisterNameReq, BnsTxExecutionState,
+    BnsTxState, BnsWriteReceiptStatus, BootstrapNameParams, DnsTxtUpdate,
     MemorySnBnsWriteRequestStore, PublishDeviceMiniDocParams, PublishDocumentParams,
     PublishRelayAssignmentParams, SnBnsController, SnBnsControllerConfig, SnBnsControllerError,
-    SnBnsEvmSubmitter, SnBnsWriteRequestStore, StaticBnsEvmKeyManager, UpsertDnsTxtParams,
-    BOOT_DOC_TYPE, DEVICE_MINI_DOC_TYPE, OWNER_DOC_TYPE, RELAY_ASSIGNMENT_DOC_TYPE, ZONE_DOC_TYPE,
+    SnBnsEvmSubmitter, SnBnsWriteRequestStore, SqliteSnBnsWriteRequestStore,
+    StaticBnsEvmKeyManager, UpsertDnsTxtParams, BOOT_DOC_TYPE, DEVICE_MINI_DOC_TYPE,
+    EVM_TX_RECOVERY_DATA_INVALID, OWNER_DOC_TYPE, RELAY_ASSIGNMENT_DOC_TYPE, ZONE_DOC_TYPE,
 };
 use bns_evm::{AuthorityRole as EvmAuthorityRole, PrincipalKind as EvmPrincipalKind, SolCall};
 use bns_indexer::dns_document::{self, DNS_TXT_DOC_TYPE};
@@ -18,6 +20,7 @@ use bns_indexer::{
     CentralizedBnsIndexerHandler, CentralizedBnsRegistry, DocumentRef, DocumentStatus,
     MutationGuard, Principal, RegisterOptions, SqliteBnsRegistryStore, PERMISSION_PUBLISH_DOCUMENT,
 };
+use rusqlite::Connection;
 use serde_json::json;
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -124,6 +127,19 @@ impl SnBnsEvmSubmitter for RecordingEvmSubmitter {
         prepared: &BnsEvmPreparedTx,
     ) -> BnsClientResult<BnsEvmTxSubmission> {
         Ok(prepared.submission())
+    }
+
+    async fn wait_for_receipt(
+        &self,
+        tx_hash: &str,
+        _config: BnsEvmReceiptWaitConfig,
+    ) -> BnsClientResult<BnsEvmTxReceipt> {
+        Ok(BnsEvmTxReceipt {
+            tx_hash: tx_hash.to_string(),
+            status: Some(1),
+            block_number: 9,
+            confirmations: 1,
+        })
     }
 }
 
@@ -286,12 +302,94 @@ impl SnBnsEvmSubmitter for BlockingEvmSubmitter {
         self.release_submit.notified().await;
         Ok(prepared.submission())
     }
+
+    async fn recover_prepared(
+        &self,
+        prepared: &BnsEvmPreparedTx,
+    ) -> BnsClientResult<BnsEvmTxSubmission> {
+        Ok(prepared.submission())
+    }
 }
 
 #[derive(Default)]
 struct CrashOnceEvmSubmitter {
     prepare_count: AtomicUsize,
     submit_count: AtomicUsize,
+}
+
+#[derive(Default)]
+struct SelectiveRecoverySubmitter {
+    prepare_count: AtomicUsize,
+}
+
+#[async_trait]
+impl SnBnsEvmSubmitter for SelectiveRecoverySubmitter {
+    async fn prepare_register_name(
+        &self,
+        _req: &BnsRegisterNameReq,
+    ) -> BnsClientResult<BnsEvmPreparedTx> {
+        let nonce = self.prepare_count.fetch_add(1, Ordering::SeqCst) as u64;
+        Ok(BnsEvmPreparedTx {
+            tx_hash: format!("0x{nonce:064x}"),
+            raw_tx: match nonce {
+                0 => "0x02corrupt".to_string(),
+                1 => "0x02recoverable".to_string(),
+                _ => "0x02retry".to_string(),
+            },
+            from: ANVIL_ADDRESS.to_string(),
+            nonce,
+            chain_id: 31_337,
+        })
+    }
+
+    async fn prepare_apply_mutations(
+        &self,
+        _req: &BnsApplyMutationsReq,
+    ) -> BnsClientResult<BnsEvmPreparedTx> {
+        unreachable!("not used")
+    }
+
+    async fn prepare_publish_document(
+        &self,
+        _req: &BnsPublishDocumentReq,
+    ) -> BnsClientResult<BnsEvmPreparedTx> {
+        unreachable!("not used")
+    }
+
+    async fn submit_prepared(
+        &self,
+        prepared: &BnsEvmPreparedTx,
+    ) -> BnsClientResult<BnsEvmTxSubmission> {
+        if prepared.nonce < 2 {
+            return Err(BnsClientError::Transport(
+                "simulated ambiguous initial broadcast".to_string(),
+            ));
+        }
+        Ok(prepared.submission())
+    }
+
+    async fn recover_prepared(
+        &self,
+        prepared: &BnsEvmPreparedTx,
+    ) -> BnsClientResult<BnsEvmTxSubmission> {
+        if prepared.nonce == 0 {
+            return Err(BnsClientError::Serialization(
+                "simulated corrupt raw transaction".to_string(),
+            ));
+        }
+        let mut submission = prepared.submission();
+        submission.receipt_status = Some(1);
+        Ok(submission)
+    }
+
+    async fn query_tx_state(&self, tx_hash: &str) -> BnsClientResult<BnsTxState> {
+        Ok(BnsTxState {
+            tx_hash: tx_hash.to_string(),
+            state: BnsTxExecutionState::NotFound,
+            block_number: None,
+            confirmations: 0,
+        })
+    }
 }
 
 #[derive(Default)]
@@ -385,6 +483,17 @@ impl SnBnsEvmSubmitter for CrashOnceEvmSubmitter {
             ));
         }
         Ok(prepared.submission())
+    }
+
+    async fn recover_prepared(
+        &self,
+        prepared: &BnsEvmPreparedTx,
+    ) -> BnsClientResult<BnsEvmTxSubmission> {
+        let mut submission = self.submit_prepared(prepared).await?;
+        submission.receipt_status = Some(1);
+        submission.receipt_block_number = Some(9);
+        submission.receipt_confirmations = Some(1);
+        Ok(submission)
     }
 }
 
@@ -627,7 +736,16 @@ async fn concurrent_same_request_id_has_only_one_preparer_and_submitter() {
     let controller = Arc::new(
         SnBnsController::new_with_evm_submitter(
             in_process_client(registry()),
-            store,
+            store.clone(),
+            SnBnsControllerConfig::new(Principal::chain_account(SN_CONTROLLER), ""),
+            submitter.clone(),
+        )
+        .unwrap(),
+    );
+    let duplicate_controller = Arc::new(
+        SnBnsController::new_with_evm_submitter(
+            in_process_client(registry()),
+            store.clone(),
             SnBnsControllerConfig::new(Principal::chain_account(SN_CONTROLLER), ""),
             submitter.clone(),
         )
@@ -640,28 +758,76 @@ async fn concurrent_same_request_id_has_only_one_preparer_and_submitter() {
     let first = tokio::spawn(async move { first_controller.register_name(first_params).await });
     submitter.submit_started.notified().await;
 
-    let duplicate = controller.register_name(params.clone()).await.unwrap_err();
-    assert!(matches!(
-        duplicate,
-        SnBnsControllerError::IdempotencyPending { .. }
-    ));
+    let duplicate_params = params.clone();
+    let duplicate =
+        tokio::spawn(async move { duplicate_controller.register_name(duplicate_params).await });
+    tokio::task::yield_now().await;
+    assert_eq!(submitter.prepare_count.load(Ordering::SeqCst), 1);
 
-    let mut conflicting = params.clone();
+    submitter.release_submit.notify_one();
+    let first_output = first.await.unwrap().unwrap();
+    let replay = duplicate.await.unwrap().unwrap();
+    assert!(!first_output.receipt.created_or_reused);
+    assert!(replay.receipt.created_or_reused);
+    assert_eq!(replay.receipt.evm_tx_hash, first_output.receipt.evm_tx_hash);
+    assert_eq!(
+        store
+            .get(params.request_id.as_str())
+            .unwrap()
+            .unwrap()
+            .state,
+        bns_client::BnsWriteRequestState::Pending
+    );
+
+    let mut conflicting = params;
     conflicting.asset_owner = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string();
     let conflict = controller.register_name(conflicting).await.unwrap_err();
     assert!(matches!(
         conflict,
         SnBnsControllerError::IdempotencyConflict { .. }
     ));
-
-    submitter.release_submit.notify_one();
-    let first_output = first.await.unwrap().unwrap();
-    assert!(!first_output.receipt.created_or_reused);
-    let replay = controller.register_name(params).await.unwrap();
-    assert!(replay.receipt.created_or_reused);
-    assert_eq!(replay.receipt.evm_tx_hash, first_output.receipt.evm_tx_hash);
     assert_eq!(submitter.prepare_count.load(Ordering::SeqCst), 1);
     assert_eq!(submitter.submit_count.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn receipt_confirmation_advances_pending_request_to_succeeded() {
+    let submitter = Arc::new(RecordingEvmSubmitter::default());
+    let store = Arc::new(MemorySnBnsWriteRequestStore::new());
+    let controller = SnBnsController::new_with_evm_submitter(
+        in_process_client(registry()),
+        store.clone(),
+        SnBnsControllerConfig::new(Principal::chain_account(SN_CONTROLLER), ""),
+        submitter,
+    )
+    .unwrap();
+    let params = bootstrap_params("sn:register:alice:receipt");
+
+    let output = controller.register_name(params.clone()).await.unwrap();
+    assert_eq!(
+        store
+            .get(params.request_id.as_str())
+            .unwrap()
+            .unwrap()
+            .state,
+        bns_client::BnsWriteRequestState::Pending
+    );
+
+    controller
+        .wait_for_evm_receipt(
+            output.receipt.evm_tx_hash.as_deref().unwrap(),
+            BnsEvmReceiptWaitConfig::included(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .get(params.request_id.as_str())
+            .unwrap()
+            .unwrap()
+            .state,
+        bns_client::BnsWriteRequestState::Succeeded
+    );
 }
 
 #[tokio::test]
@@ -699,13 +865,14 @@ async fn concurrent_explicit_publish_request_id_submits_only_once() {
     let first_params = params.clone();
     let first = tokio::spawn(async move { first_controller.publish_document(first_params).await });
     submitter.submit_started.notified().await;
-    let duplicate = controller.publish_document(params).await.unwrap_err();
-    assert!(matches!(
-        duplicate,
-        SnBnsControllerError::IdempotencyPending { .. }
-    ));
+    let duplicate_controller = controller.clone();
+    let duplicate =
+        tokio::spawn(async move { duplicate_controller.publish_document(params).await });
+    tokio::task::yield_now().await;
+    assert_eq!(submitter.prepare_count.load(Ordering::SeqCst), 1);
     submitter.release_submit.notify_one();
     first.await.unwrap().unwrap();
+    assert!(duplicate.await.unwrap().unwrap().created_or_reused);
 
     assert_eq!(submitter.prepare_count.load(Ordering::SeqCst), 1);
     assert_eq!(submitter.submit_count.load(Ordering::SeqCst), 1);
@@ -715,12 +882,10 @@ async fn concurrent_explicit_publish_request_id_submits_only_once() {
 async fn pending_prepared_transaction_recovers_without_resigning() {
     let submitter = Arc::new(CrashOnceEvmSubmitter::default());
     let store = Arc::new(MemorySnBnsWriteRequestStore::new());
-    let mut config = SnBnsControllerConfig::new(Principal::chain_account(SN_CONTROLLER), "");
-    config.idempotency_lease_secs = 0;
     let controller = SnBnsController::new_with_evm_submitter(
         in_process_client(registry()),
         store.clone(),
-        config,
+        SnBnsControllerConfig::new(Principal::chain_account(SN_CONTROLLER), ""),
         submitter.clone(),
     )
     .unwrap();
@@ -732,7 +897,7 @@ async fn pending_prepared_transaction_recovers_without_resigning() {
         .get(params.request_id.as_str())
         .unwrap()
         .expect("pending request persisted");
-    assert_eq!(pending.state, bns_client::BnsWriteRequestState::Pending);
+    assert_eq!(pending.state, bns_client::BnsWriteRequestState::Sending);
     assert_eq!(pending.evm_nonce, Some(11));
     assert_eq!(pending.evm_raw_tx.as_deref(), Some("0x02def0"));
     assert!(pending.result_json.is_some());
@@ -749,16 +914,164 @@ async fn pending_prepared_transaction_recovers_without_resigning() {
 }
 
 #[tokio::test]
-async fn expired_prebroadcast_lease_can_be_taken_over_safely() {
+async fn startup_recovery_resubmits_sending_before_request_replay() {
+    let submitter = Arc::new(CrashOnceEvmSubmitter::default());
+    let store = Arc::new(MemorySnBnsWriteRequestStore::new());
+    let controller = SnBnsController::new_with_evm_submitter(
+        in_process_client(registry()),
+        store.clone(),
+        SnBnsControllerConfig::new(Principal::chain_account(SN_CONTROLLER), ""),
+        submitter.clone(),
+    )
+    .unwrap();
+    let params = bootstrap_params("sn:register:alice:startup-recover");
+
+    controller.register_name(params.clone()).await.unwrap_err();
+    assert_eq!(
+        store
+            .get(params.request_id.as_str())
+            .unwrap()
+            .unwrap()
+            .state,
+        bns_client::BnsWriteRequestState::Sending
+    );
+
+    let report = controller.recover_inflight_requests().await.unwrap();
+    assert_eq!(report.scanned, 1);
+    assert_eq!(report.recovered, 1);
+    assert!(report.failures.is_empty());
+    assert_eq!(
+        store
+            .get(params.request_id.as_str())
+            .unwrap()
+            .unwrap()
+            .state,
+        bns_client::BnsWriteRequestState::Succeeded
+    );
+
+    let replay = controller.register_name(params).await.unwrap();
+    assert!(replay.receipt.created_or_reused);
+    assert_eq!(submitter.prepare_count.load(Ordering::SeqCst), 1);
+    assert_eq!(submitter.submit_count.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn startup_recovery_isolates_corrupt_record_and_same_request_retries_after_not_found() {
+    let submitter = Arc::new(SelectiveRecoverySubmitter::default());
+    let store = Arc::new(MemorySnBnsWriteRequestStore::new());
+    let controller = SnBnsController::new_with_evm_submitter(
+        in_process_client(registry()),
+        store.clone(),
+        SnBnsControllerConfig::new(Principal::chain_account(SN_CONTROLLER), ""),
+        submitter.clone(),
+    )
+    .unwrap();
+    let corrupt = bootstrap_params("sn:register:alice:corrupt-recovery");
+    let recoverable = bootstrap_params("sn:register:alice:other-user");
+
+    controller.register_name(corrupt.clone()).await.unwrap_err();
+    controller
+        .register_name(recoverable.clone())
+        .await
+        .unwrap_err();
+
+    let report = controller.recover_inflight_requests().await.unwrap();
+    assert_eq!(report.scanned, 2);
+    assert_eq!(report.recovered, 1);
+    assert_eq!(report.failures.len(), 1);
+    assert_eq!(report.failures[0].request_id, corrupt.request_id);
+    assert_eq!(report.failures[0].error_code, EVM_TX_RECOVERY_DATA_INVALID);
+    assert_eq!(
+        store
+            .get(recoverable.request_id.as_str())
+            .unwrap()
+            .unwrap()
+            .state,
+        bns_client::BnsWriteRequestState::Succeeded,
+        "one corrupt user must not prevent another request from recovering"
+    );
+    assert_eq!(
+        store
+            .get(corrupt.request_id.as_str())
+            .unwrap()
+            .unwrap()
+            .state,
+        bns_client::BnsWriteRequestState::Failed
+    );
+
+    let retried = controller.register_name(corrupt.clone()).await.unwrap();
+    assert_eq!(retried.receipt.evm_nonce, Some(2));
+    assert_eq!(submitter.prepare_count.load(Ordering::SeqCst), 3);
+    assert_eq!(
+        store
+            .get(corrupt.request_id.as_str())
+            .unwrap()
+            .unwrap()
+            .state,
+        bns_client::BnsWriteRequestState::Pending
+    );
+}
+
+#[tokio::test]
+async fn same_request_retries_quarantined_corrupt_raw_without_a_tx_hash() {
+    let path = std::env::temp_dir().join(format!(
+        "cyfs-gateway-sn-bns-no-hash-recovery-{}-{}.sqlite",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let submitter = Arc::new(SelectiveRecoverySubmitter::default());
+    let store = Arc::new(SqliteSnBnsWriteRequestStore::open(&path).unwrap());
+    let controller = SnBnsController::new_with_evm_submitter(
+        in_process_client(registry()),
+        store.clone(),
+        SnBnsControllerConfig::new(Principal::chain_account(SN_CONTROLLER), ""),
+        submitter.clone(),
+    )
+    .unwrap();
+    let params = bootstrap_params("sn:register:alice:corrupt-no-hash");
+
+    controller.register_name(params.clone()).await.unwrap_err();
+    let conn = Connection::open(&path).unwrap();
+    conn.execute(
+        "UPDATE sn_bns_write_requests SET evm_tx_hash = NULL WHERE request_id = ?1",
+        [params.request_id.as_str()],
+    )
+    .unwrap();
+    drop(conn);
+
+    let report = controller.recover_inflight_requests().await.unwrap();
+    assert_eq!(report.scanned, 1);
+    assert_eq!(report.recovered, 0);
+    assert_eq!(report.failures.len(), 1);
+    let quarantined = store.get(params.request_id.as_str()).unwrap().unwrap();
+    assert_eq!(quarantined.state, bns_client::BnsWriteRequestState::Failed);
+    assert_eq!(quarantined.evm_tx_hash, None);
+
+    controller.register_name(params.clone()).await.unwrap_err();
+    let retried = store.get(params.request_id.as_str()).unwrap().unwrap();
+    assert_eq!(retried.state, bns_client::BnsWriteRequestState::Sending);
+    assert_eq!(retried.evm_nonce, Some(1));
+    assert_eq!(submitter.prepare_count.load(Ordering::SeqCst), 2);
+    drop(controller);
+    drop(store);
+
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(path.with_extension("sqlite-wal"));
+    let _ = std::fs::remove_file(path.with_extension("sqlite-shm"));
+}
+
+#[tokio::test]
+async fn aborted_prebroadcast_request_leaves_no_persistent_record() {
     let submitter = Arc::new(CrashBeforePrepareEvmSubmitter::default());
     let store = Arc::new(MemorySnBnsWriteRequestStore::new());
-    let mut config = SnBnsControllerConfig::new(Principal::chain_account(SN_CONTROLLER), "");
-    config.idempotency_lease_secs = 0;
     let controller = Arc::new(
         SnBnsController::new_with_evm_submitter(
             in_process_client(registry()),
             store.clone(),
-            config,
+            SnBnsControllerConfig::new(Principal::chain_account(SN_CONTROLLER), ""),
             submitter.clone(),
         )
         .unwrap(),
@@ -773,11 +1086,7 @@ async fn expired_prebroadcast_lease_can_be_taken_over_safely() {
     crashed.abort();
     let _ = crashed.await;
 
-    let pending = store.get(params.request_id.as_str()).unwrap().unwrap();
-    assert_eq!(pending.state, bns_client::BnsWriteRequestState::Pending);
-    assert!(pending.lease_owner.is_some());
-    assert!(pending.evm_tx_hash.is_none());
-    assert!(pending.evm_raw_tx.is_none());
+    assert!(store.get(params.request_id.as_str()).unwrap().is_none());
 
     let recovered = controller.register_name(params).await.unwrap();
     assert_eq!(recovered.receipt.evm_nonce, Some(13));

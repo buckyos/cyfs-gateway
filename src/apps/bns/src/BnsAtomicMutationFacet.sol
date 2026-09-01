@@ -131,7 +131,7 @@ contract BnsAtomicMutationFacet is BnsCore {
             );
         }
 
-        AuthoritySetState memory finalSet = _authoritySets[nameHash];
+        AuthoritySetState memory finalSet = _authoritySets[_lineageStateKey(nameHash)];
         return (state.nameSeq, finalSet.authoritySeq, finalSet.authorityRoot, state.ownerPolicySeq);
     }
 }

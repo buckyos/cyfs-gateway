@@ -218,14 +218,32 @@ contract BnsAccessControlTest is BnsTestBase {
         assertEqUint(version, 1, "delegated authority publishes");
     }
 
+    function testExpiredBnsAuthorityCannotAuthorizeActiveName() public {
+        vm.warp(1000);
+        DocumentUpdate[] memory noDocs = new DocumentUpdate[](0);
+        _registerName("keyholder", ALICE, _options(100, 30, true, true), noDocs, _noneAuth(), _guard(0));
+        uint64 keyholderSeq = bns.queryNameState("keyholder").nameSeq;
+        _installAuthorityKey("keyholder", KID, CAROL, ALICE, 0, 0, keyholderSeq);
+
+        _registerRoot("org", BOB);
+        uint64 orgSeq = bns.queryNameState("org").nameSeq;
+        vm.prank(BOB);
+        bns.setNameOwner("org", _bnsName("keyholder"), _ownerAuth(BOB), _guard(orgSeq));
+        orgSeq = bns.queryNameState("org").nameSeq;
+
+        vm.warp(1100);
+        vm.prank(CAROL);
+        vm.expectPartialRevert(NoConcreteSigner.selector);
+        _publishDoc("org", "owner", 0, ownerRef, _ownerAuthName("keyholder", KID), _guard(orgSeq));
+    }
+
     // --- _authorizeOwner and _authorizeUpdate must agree on effectiveOwner -
 
     function testAuthorizeOwnerAndUpdatePathsAgreeUnderAuthorityKey() public {
         uint64 seq = _selfOwnedWithKey("org", KID, CAROL, ALICE);
 
         // _authorizeOwner path (setControllerPolicy) accepts the key holder.
-        ControllerRule[] memory rules =
-            _singleRule(_chain(CTRL), "dns_txt", bns.PERMISSION_PUBLISH_DOCUMENT(), 0, 0);
+        ControllerRule[] memory rules = _singleRule(_chain(CTRL), "dns_txt", bns.PERMISSION_PUBLISH_DOCUMENT(), 0, 0);
         vm.prank(CAROL);
         bns.setControllerPolicy("org", rules, keccak256("p"), _ownerAuthName("org", KID), _guard(seq));
         seq = bns.queryNameState("org").nameSeq;

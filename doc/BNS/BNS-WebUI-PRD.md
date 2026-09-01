@@ -293,22 +293,21 @@ WebUI 根据用户选择的授权路径构造 `CallAuthority`，但最终身份�
 
 以下是产品必须如实处理的现状：
 
-1. 名称不会仅因当前时间超过 `expireAt` 自动把链上 `status` 改成 `Expired`；WebUI 应同时显示“原始状态”和基于时间计算的“有效期已过”标签。
+1. 名称到期不会写回链上存储槽；`queryNameState` 和 bns-server 投影会在读取时把
+   `Active + now >= expireAt` 派生为 `Expired`。WebUI 应把查询结果作为有效状态，不能因底层
+   存储仍为 `Active` 而继续提供写操作。
 2. `transferable` 当前只影响派生字段 `standard_transfer_enabled`，`transferName` 本身没有检查该 flag。
 3. `allow_delegated_subnames` 当前没有参与 `registerName` 的链上鉴权；二级名称注册仍要求父名称 effective owner 授权。
 4. `registerName` 和 `renewName` 是 `payable`，但当前没有价格校验、收款或退款逻辑。WebUI 必须固定发送 `value = 0`。
 5. `ReleaseAfterGrace` 调用后立即写入 `Released`；当前重新注册逻辑允许 `Released` 名称再次注册，并不在合约中等待 `graceUntil`。
 6. `publishLogCheckpoint` 当前没有把 `issuer` principal 与 `msg.sender` 做身份绑定，不应出现在普通用户入口。
 7. bns-server 没有同步高度/链 tip/落后区块数接口，无法严格证明某次查询已追到最新链状态。
-8. Released 名称重新注册时，当前 `_registerNameHash` 不会清理旧 authority key、文档版本、
-   controller policy 或 alias 等关联存储。WebUI 不应在普通流程中开放 Released 名称重注册，
-   直至协议明确 lineage 隔离和旧状态清理规则。
-9. `RegisterOptions.initialPaymentTarget` 存在于 ABI，但当前注册逻辑没有读取或保存它。WebUI
+8. `RegisterOptions.initialPaymentTarget` 存在于 ABI，但当前注册逻辑没有读取或保存它。WebUI
    固定传 zero address，不展示为有效注册选项；初始文档的 payment target 不受此问题影响。
-10. Controller rule 的 `namespaceScopeHash`、`constraintHash` 当前只存储、不参与授权判断；
+9. Controller rule 的 `namespaceScopeHash`、`constraintHash` 当前只存储、不参与授权判断；
     authority key 的 `verificationMethod` 也不参与 signer 验证。WebUI 必须把这些字段标为
     “承诺/元数据”，不能描述为已被合约强制执行。
-11. Authority key 的 Recovery 和 Sign Document purpose 当前不会授予链上写权限；实际
+10. Authority key 的 Recovery 和 Sign Document purpose 当前不会授予链上写权限；实际
     `msg.sender` 验证只检查 Authentication bit 和 20 字节地址 key data。
 
 这些缺口不应由 WebUI 用文案掩盖。上线前如协议语义有调整，应先修改合约或 bns-server，再同步更新 PRD。
@@ -737,8 +736,8 @@ registerName(...)
 - 合约不使用 `expectedNameSeq`；
 - 名称在当前投影为 `null` 或 `Released` 时，合约才可能接受注册；
 - WebUI 不把 `Expired` 显示为可抢注，因为当前合约会拒绝已存在的 `Expired` 状态。
-- v1 普通流程只允许投影结果为 `null` 的新名称；Released 名称虽可被当前合约重新注册，
-  但旧 authority/document/policy/alias 状态不会被注册逻辑完整清理，因此暂时阻断并提示协议风险。
+- 投影结果为 `Released` 时可以重新注册。确认页必须显示这是新的 `lineage_epoch`，旧世代的 owner、authority、controller、alias 和当前文档不会继承；旧文档与事件仍可作为历史查询。
+- Released 重新注册时，初始文档仍填写 `expectedVersion = 0`，但 UI 不得假定成功版本为 1；合约会在该名称的历史最大版本之后分配新版本。
 
 #### 二级名称
 
@@ -746,7 +745,7 @@ registerName(...)
 - 查询 parent state 和 owner；
 - 使用父名称授权；
 - `guard.expectedParentNameSeq = parent.name_seq`；
-- 当前合约要求父名称 raw status 为 `Active`；
+- 当前合约要求父名称的读取时有效状态为 `Active`；
 - 当前合约未使用 `allow_delegated_subnames` 决定授权，UI 必须明确“仍需父名称 owner 签名”。
 
 #### Self-managed BNS owner
@@ -763,8 +762,10 @@ registerName(...)
 
 - `tx.query_state.state == succeeded`；
 - `name.query_state(name)` 非空；
-- `lineage_epoch` 和 `name_seq` 与本次注册预期一致；
+- 首次注册的 `lineage_epoch = 0`；重新注册的 `lineage_epoch = 注册前值 + 1`；
+- `name_seq` 大于注册前该名称的历史值，不因重新注册回到 1；
 - 可选 initial document 均可通过 `document.resolve` 查询。
+- 重新注册且未提交某类 current 状态时，`document.resolve`、authority、alias 等查询不得出现旧世代当前值。
 
 ---
 
@@ -1296,7 +1297,7 @@ releaseName(...)
 
 - 两种模式都会立即离开 Active；
 - `ReleaseAfterGrace` 实际写入 Released，当前合约允许 Released 名称重新注册，没有强制等待 grace；
-- Released 名称重新注册可能继承旧 authority/document/policy/alias 存储，v1 普通注册流程暂时阻断；
+- Released 名称重新注册会进入新的 `lineage_epoch`；旧 authority/controller/alias 和文档 current 指针被隔离，文档版本号与事件历史继续全局保留；
 - Tombstoned 名称不能重新注册；
 - Tombstone 是不可逆的协议级危险操作。
 
@@ -1414,7 +1415,8 @@ GET /1.0/identifiers/did:bns:{name}?type={doc_type}
 - 非 `did:bns:*` 返回 not applicable，不解释为 BNS 名称缺失；
 - `iat` 历史查询当前返回 501 和 `historicalQuerySupported=false`；
 - Missing、Revoked、Expired、Migrated、Tombstoned 使用不同状态样式；
-- Resolver 对过期状态的派生可能与 `document.resolve` raw status 不同，页面需标明数据口径。
+- `document.resolve.result.status` 是读取时有效状态；嵌套的 `document_state.status` 是原始状态，
+  页面需标明数据口径。
 
 ---
 
@@ -1594,12 +1596,12 @@ interface BnsRpcEnvelope<T> {
 
 ### 12.1 名称状态
 
-| raw status | UI |
+| effective status (`name.query_state`) | UI |
 | --- | --- |
 | Available/null | 未注册或投影未发现 |
-| Active | 活跃；若超过 expireAt，额外显示“有效期已过（raw status 仍为 Active）” |
+| Active | 活跃 |
 | Expired | 已过期 |
-| Released | 已释放，按当前合约可能可重新注册 |
+| Released | 已释放，可重新注册为新的 lineage |
 | Tombstoned | 永久停用 |
 
 ### 12.2 文档状态
@@ -1611,7 +1613,9 @@ interface BnsRpcEnvelope<T> {
 - Migrated
 - Tombstoned
 
-`document.resolve` 返回 raw status；DID Resolver 会结合时间、名称和 alias 派生最终 resolver status。两者不一致时并列展示，不覆盖原始数据。
+`document.resolve.result.status` 已结合名称有效期和文档有效期派生；嵌套的
+`document_state.status` 以及 `document.get_version` 保留写入时的原始状态，供审计与历史查询。
+DID Resolver 还会在此基础上处理 alias。
 
 ### 12.3 常见 Server 错误
 
@@ -1889,7 +1893,7 @@ P2 需要独立治理 PRD，不直接继承普通钱包交互。
 
 - receipt 成功但投影未更新时显示 Indexing，不显示 Completed；
 - `tx.query_state = not_found` 不被显示为确定失败；
-- raw status 与基于时间派生状态同时可见；
+- 文档原始状态与读取时有效状态同时可见；名称查询使用读取时有效状态；
 - bns-server 不可用、chain 不一致、contract 不一致时阻断写入。
 
 ### 18.5 安全

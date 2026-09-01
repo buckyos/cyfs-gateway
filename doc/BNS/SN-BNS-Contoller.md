@@ -158,7 +158,6 @@ SN controller 只用于自动化、低风险、可审计的文档更新，例如
 - `allowed_controller_doc_types`: 允许 SN controller 自动写入的 doc type allowlist。
 - `max_inline_document_size`: 默认跟随 BNS `MAX_INLINE_DOCUMENT = 4 KiB`。
 - `write_retry_limit`: stale version/name seq 的有限重试次数。
-- `idempotency_ttl`: 幂等记录保留时间。
 
 ### BnsWriteIntent
 
@@ -639,6 +638,47 @@ Resolver 依赖：
 - 纯运行态：先本地写，必要时异步发布低频 BNS 文档。
 - 注册：BNS bootstrap 成功后再创建 active 本地账号；失败恢复由幂等记录处理。
 
+### request_id 与 EVM 交易状态
+
+`request_id` 重放必须复用已经持久化的同一份 raw transaction，不重新签名或分配 nonce。
+本地状态机为：
+
+1. 参数校验、读取 guard、构造和签名期间不持久化请求记录；此阶段失败可直接用同一
+   `request_id` 重试。
+2. raw transaction 完整生成后，以 `Sending` 状态原子写入
+   `sn_bns_write_requests`，然后才允许广播。
+3. 节点接受交易，或按本地计算的 tx hash 能查询到交易后，更新为 `Pending`。
+4. 只有查询到链上 receipt 后才能更新为 `Succeeded` 或 `Reverted`；不能把
+   `eth_sendRawTransaction` 成功当作链上成功。
+5. `Sending` / `Pending` 重放时，先按 tx hash 查询；查不到则重发已保存的原始 raw
+   transaction。相同 raw transaction 的 tx hash 不变，不会构造第二笔业务交易。
+
+SN 初始化时在开放业务接口前扫描全部 `Sending` / `Pending`：能查询到的同步状态，查不到
+的重发原 raw transaction。恢复按记录隔离；单条记录查询、解码或重发失败时输出包含
+`request_id`、name、tx hash 和错误码的 error 日志，但不阻止 SN 继续初始化和服务其他
+用户。连扫描列表本身失败也只记录 error，不让恢复子流程成为 SN 的全局启动开关。运行
+期间暂不后台轮询；相同 `request_id` 重放以及显式等待 receipt 是状态继续收敛的触发点。
+
+恢复数据异常按以下顺序处理：
+
+- raw transaction 可解码但 chain id、nonce 或 tx hash 等本地字段缺失时，从已签名 raw
+  transaction 修复元数据，不重新签名；如果旧 tx hash 与 raw 不一致，只有旧 hash 在链上
+  明确为 `NotFound` 时才可改用 raw 推导出的 hash。
+- tx hash 能查询到 `Pending` / `Succeeded` / `Reverted` 时，以链上状态为准，即使其他本地
+  恢复字段损坏也不构造新交易。
+- raw transaction 损坏且 tx hash 为 `NotFound` 时，把记录隔离为 `Failed`，错误码为
+  `EVM_TX_RECOVERY_DATA_INVALID`；相同 `request_id` 再次进入业务时复查链状态，仍为
+  `NotFound` 才删除隔离记录并重新执行。没有 tx hash、因而无法查询链状态的损坏记录，
+  也只在该用户用相同 `request_id` 重试时删除并重新执行。
+- 链查询本身失败时保留原记录，不能把网络或节点故障误判成 `NotFound`。
+- tx hash 和 raw transaction 都没有的旧版广播前记录可直接删除；它不可能越过当前的
+  “完整 raw transaction 落库后才广播”边界。
+
+SQLite 首次启用该状态模型时执行一次兼容迁移：旧实现中“广播成功即成功”的
+`Succeeded`（带完整 raw transaction）回退为 `Pending` 后重新查链；明确的
+`EVM_TX_REVERTED` 迁移为 `Reverted`；没有 raw transaction 的旧 `Pending` 可安全删除并
+允许业务重试。原有 lease 列继续保留但不再使用，避免破坏性表结构迁移。
+
 不得出现的状态：
 
 - 本地账号 active，但 BNS name 未创建，且 API 告诉用户已拥有 BNS owner 权限。
@@ -673,9 +713,9 @@ SN API 响应中建议包含：
 
 ## 当前实现映射
 
-> 与目标设计的差异（迁移期现状）：下面映射的是**当前已落地的中心化状态机路径**——`SnBnsController` 仍通过 `bns-client` 直接调用 `bns-indexer` 的 `CentralizedBnsRegistry` 单事务接口（`registry.rs`），尚未切到“构造并签名 EVM TX → 经 BNS-Server `eth_sendRawTransaction` 提交到 `Bns.sol` 合约”的目标写路径（见 `BNS-签名边界改造-EVM-TX-TODO.md`）。EVM 合约/索引器/raw-TX 提交已部分落地，SN 写路径切换属后续工作；下文的 `registry.rs` 引用应理解为迁移期实现，而非目标权威源。
->
-> 重要现状（割裂事实）：BNS 写入层 `SnBnsController` **已实现，但物理上在 `bns-client` crate**（`src/components/bns-client/src/sn_bns_controller.rs`，约 1151 行），**不在 `cyfs-sn` 里**。`cyfs-sn` 至今只消费**只读侧**——`sn_bns_reader.rs` 的 `BnsIndexerDocumentReader` 接在 resolver 上（`src/components/cyfs-sn/src/sn_server.rs:689`），从不实例化或调用 `SnBnsController`。换言之：写入库本身基本写完并通过自身单测，但**尚未被它所服务的 SN 业务流程采用**；目前 `SnBnsController` 的唯一调用方是 `bns-client` 自己的测试（`src/components/bns-client/tests/rpc_and_controller.rs`）。
+> 当前 SN 写路径已经切换为：`SnBnsController` 构造并签名 EVM transaction，经
+> BNS-Server 广播 raw transaction，再通过 tx hash 查询链上状态。Controller 实现在
+> `bns-client`，由 `cyfs-sn::SnBnsProxy` 实例化并接入注册和代付写接口。
 
 ### 写入层 `SnBnsController`（`bns-client`，已完成）
 
@@ -688,12 +728,16 @@ SN API 响应中建议包含：
 - `upsert_dns_txt`（`:512`）：`add` / `remove` / `replace` + 去重 + stale 有限重试。
 - `publish_owner_document`（`:398`）、`publish_relay_assignment`（`:543`）。
 - version guard：`expected_name_seq` 来自 `NameState`，`expected_version` 来自当前文档状态（`:660-715`）。
-- 幂等逻辑 `run_idempotent`（`:902-1012`）：request_id 必填、payload_hash 冲突拒绝、pending/failed/succeeded 状态机、重放 `mark_reused`。
+- request-id 重放逻辑 `run_idempotent`：request_id 必填、payload_hash 冲突拒绝；raw tx
+  生成后以 `Sending` 落库，广播后为 `Pending`，receipt 决定 `Succeeded/Reverted`；
+  重放只查询或重发同一 raw tx，并对返回结果设置 `mark_reused`。
 
 ### `cyfs-sn`（Beta2.2 当前边界）
 
 - `auth.register` 通过 `SnBnsProxy` 提交 BNS name bootstrap，再创建 AuthDB 账号；receipt
   未确认时不提前创建本地用户。
+- `SnBnsProxy` 构造期间先尝试恢复持久化的 `Sending/Pending` 交易；逐条失败
+  会隔离并记录 error，但不阻塞 SN server 继续开放业务请求。
 - `bns.publish_document` / `bns.publish_dns_txt` 是受 controller policy、operation
   allowlist 和幂等 request_id 约束的代付写入口。
 - `device.register/update` 只写 `SnDeviceInfoDB` 在线态；设备静态身份必须发布为 BNS
@@ -746,7 +790,8 @@ controller。`CONTROLLER_SCOPE_DENIED` / `NOT_EFFECTIVE_OWNER` 等错误会映�
 6. ⬜ 在 `cyfs-sn::api/device.rs::register` 中接入 `publish_device_mini_doc`，并把本地设备记录降级为 runtime cache。
 7. ⬜ 在 ACME / DNS TXT 流程中接入 `upsert_dns_txt`。
 9. ⬜ 增加 admin / repair 命令，用于修复 BNS 已成功但本地 DB 未完成的注册（依赖基于 BNS 状态的恢复路径）。
-10. ⬜ 把幂等存储从 `MemorySnBnsWriteRequestStore`（内存，重启即失）替换为持久化 `sn_bns_write_requests` 表，并实现基于 BNS 状态的恢复。
+10. ✅ 使用持久化 `sn_bns_write_requests` 表保存 request_id、payload hash 和完整 raw tx；
+    SN 初始化时恢复 `Sending/Pending`，运行期由 request-id 重放或 receipt 等待触发状态收敛。
 11. ⬜ 增加 `sn_authority` → `CallAuthority` 桥接，以及在 `cyfs-sn` 侧落地文档错误映射表（BNS error code → SN API code）。
 
 ## 测试要求
@@ -763,6 +808,12 @@ controller。`CONTROLLER_SCOPE_DENIED` / `NOT_EFFECTIVE_OWNER` 等错误会映�
 
 - 同一 `request_id` 重放返回同一 receipt。
 - 同一 `request_id` 不同 payload 返回幂等冲突。
+- 签名完成前失败不留下请求记录；raw tx 落库后的失败保持 `Sending`，重放和启动恢复都不重新签名。
+- 广播成功只进入 `Pending`；只有 receipt 能推进到 `Succeeded/Reverted`。
+- SN 初始化逐条尝试恢复全部 `Sending/Pending`；单条失败不影响其他记录，
+  也不阻塞后续业务服务。
+- 损坏 raw tx 或不完整元数据会被修复或隔离；只有链上明确 `NotFound`（或记录根本
+  没有 tx hash 可供查询）时，同 `request_id` 重试才能清理隔离记录并重新发送。
 - `dns_txt` add/remove 在并发 stale 后能有限重试并保持去重。
 - BNS `CONTROLLER_SCOPE_DENIED` 映射为 SN 权限错误。
 - BNS 成功、本地幂等记录丢失时可以通过查询 BNS state 恢复。

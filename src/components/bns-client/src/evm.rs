@@ -9,8 +9,8 @@ use crate::{
 };
 use async_trait::async_trait;
 use bns_evm::{
-    build_eip1559_contract_tx, sign_eip1559_tx, signer_from_private_key, Address,
-    AuthorityKey as EvmAuthorityKey, AuthorityKeyStatus as EvmAuthorityKeyStatus,
+    build_eip1559_contract_tx, decode_signed_eip1559, sign_eip1559_tx, signer_from_private_key,
+    Address, AuthorityKey as EvmAuthorityKey, AuthorityKeyStatus as EvmAuthorityKeyStatus,
     AuthorityKeyUpdate as EvmAuthorityKeyUpdate, AuthorityRole as EvmAuthorityRole, Bns,
     BnsEvmError, Bytes, CallAuthority as EvmCallAuthority, ControllerRule as EvmControllerRule,
     DocumentRef as EvmDocumentRef, DocumentUpdate as EvmDocumentUpdate, Eip1559TxParams,
@@ -126,6 +126,24 @@ pub struct BnsEvmPreparedTx {
 }
 
 impl BnsEvmPreparedTx {
+    /// Reconstruct the authoritative transaction metadata from signed EIP-1559
+    /// bytes. This is used to repair incomplete local recovery records without
+    /// allocating a nonce or signing a replacement transaction.
+    pub fn from_raw_tx(raw_tx: impl Into<String>) -> BnsClientResult<Self> {
+        let raw_tx = BnsSubmitRawTxReq::from_hex(raw_tx.into()).raw_tx_bytes()?;
+        let signed = decode_signed_eip1559(&raw_tx).map_err(BnsClientError::from)?;
+        let signer = signed
+            .recover_signer()
+            .map_err(|error| BnsClientError::Serialization(error.to_string()))?;
+        Ok(Self {
+            tx_hash: format!("{:#x}", signed.hash()),
+            raw_tx: format!("0x{}", hex::encode(&raw_tx)),
+            from: format!("{signer:#x}"),
+            nonce: signed.tx().nonce,
+            chain_id: signed.tx().chain_id,
+        })
+    }
+
     pub fn submission(&self) -> BnsEvmTxSubmission {
         BnsEvmTxSubmission {
             tx_hash: self.tx_hash.clone(),
@@ -139,8 +157,21 @@ impl BnsEvmPreparedTx {
         }
     }
 
-    fn raw_tx_bytes(&self) -> BnsClientResult<Vec<u8>> {
-        BnsSubmitRawTxReq::from_hex(self.raw_tx.clone()).raw_tx_bytes()
+    fn validated_raw_tx_bytes(&self) -> BnsClientResult<Vec<u8>> {
+        let decoded = Self::from_raw_tx(self.raw_tx.clone())?;
+        if !decoded.tx_hash.eq_ignore_ascii_case(self.tx_hash.as_str()) {
+            return Err(BnsClientError::Serialization(format!(
+                "prepared tx hash {} does not match raw transaction hash {}",
+                self.tx_hash, decoded.tx_hash
+            )));
+        }
+        if decoded.chain_id != self.chain_id || decoded.nonce != self.nonce {
+            return Err(BnsClientError::Serialization(format!(
+                "prepared tx metadata does not match raw transaction: chain_id={}/{}, nonce={}/{}",
+                self.chain_id, decoded.chain_id, self.nonce, decoded.nonce
+            )));
+        }
+        BnsSubmitRawTxReq::from_hex(decoded.raw_tx).raw_tx_bytes()
     }
 }
 
@@ -668,7 +699,7 @@ impl BnsEvmControllerClient {
         &self,
         prepared: &BnsEvmPreparedTx,
     ) -> BnsClientResult<BnsEvmTxSubmission> {
-        let raw_tx = prepared.raw_tx_bytes()?;
+        let raw_tx = prepared.validated_raw_tx_bytes()?;
         let submitted_hash = match self.submit_raw_tx(&raw_tx).await {
             Ok(hash) => hash,
             Err(submit_error) => {
@@ -676,6 +707,12 @@ impl BnsEvmControllerClient {
                     .query_prepared_tx_state(prepared.tx_hash.as_str())
                     .await
                 {
+                    Ok(state) if state.state == BnsTxExecutionState::Reverted => {
+                        return Err(BnsClientError::registry(
+                            "EVM_TX_REVERTED",
+                            format!("BNS EVM tx {} reverted", prepared.tx_hash),
+                        ));
+                    }
                     Ok(state)
                         if matches!(
                             state.state,
@@ -726,6 +763,14 @@ impl BnsEvmControllerClient {
             receipt_block_number: receipt.as_ref().map(|receipt| receipt.block_number),
             receipt_confirmations: receipt.as_ref().map(|receipt| receipt.confirmations),
         })
+    }
+
+    /// Forget a locally reserved nonce when the caller could not persist the
+    /// prepared transaction and therefore will not broadcast it.
+    pub fn abandon_prepared_tx(&self, prepared: &BnsEvmPreparedTx) {
+        if let Ok(signer_address) = parse_address(&prepared.from, "prepared.from") {
+            self.reset_nonce(signer_address);
+        }
     }
 
     /// Resume a prepared transaction without ever allocating another nonce or

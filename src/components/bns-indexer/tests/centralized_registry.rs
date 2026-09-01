@@ -559,6 +559,128 @@ fn released_and_tombstoned_names_reject_state_writes() {
 }
 
 #[test]
+fn re_registration_resets_current_projection_and_preserves_document_history() {
+    let registry = registry();
+    registry
+        .register_name(
+            "alice",
+            OWNER_A,
+            RegisterOptions::default(),
+            vec![doc_update("dns_txt", 0, "old-lineage")],
+            CallAuthority::public(),
+            MutationGuard::default(),
+        )
+        .unwrap();
+
+    let old_key = key(b"old-lineage-key");
+    registry
+        .update_authority_keys(
+            "alice",
+            vec![AuthorityKeyUpdate {
+                key: old_key.clone(),
+                active: true,
+            }],
+            chain_owner(1, OWNER_A).0,
+            guard(1),
+        )
+        .unwrap();
+    registry
+        .set_controller_policy(
+            "alice",
+            vec![controller_rule(
+                Principal::chain_account(CONTROLLER),
+                "dns_txt",
+                PERMISSION_PUBLISH_DOCUMENT,
+            )],
+            ZERO_HASH,
+            chain_owner(1, OWNER_A).0,
+            guard(1),
+        )
+        .unwrap();
+    registry
+        .set_did_alias(
+            "alice",
+            "did:bns:old-lineage",
+            AliasKind::Alias,
+            ZERO_HASH,
+            chain_owner(2, OWNER_A).0,
+            guard(2),
+        )
+        .unwrap();
+    let released_seq = registry
+        .release_name(
+            "alice",
+            ReleaseMode::ReleaseAfterGrace,
+            ZERO_HASH,
+            chain_owner(3, OWNER_A).0,
+            guard(3),
+        )
+        .unwrap();
+
+    let new_seq = registry
+        .register_name(
+            "alice",
+            OWNER_B,
+            RegisterOptions::default(),
+            vec![doc_update("dns_txt", 0, "new-lineage")],
+            CallAuthority::public(),
+            MutationGuard::default(),
+        )
+        .unwrap();
+    assert_eq!(new_seq, released_seq + 1);
+
+    let state = registry.query_name_state("alice").unwrap().unwrap();
+    assert_eq!(state.lineage_epoch, 1);
+    assert_eq!(
+        registry
+            .resolve_document("alice", "dns_txt")
+            .unwrap()
+            .document_state
+            .version,
+        2
+    );
+    assert_eq!(
+        registry
+            .get_document_version("alice", "dns_txt", 1)
+            .unwrap()
+            .unwrap()
+            .document
+            .inline_document,
+        b"old-lineage"
+    );
+    assert_eq!(
+        registry
+            .get_document_version("alice", "dns_txt", 2)
+            .unwrap()
+            .unwrap()
+            .previous_version,
+        0
+    );
+    assert!(registry.get_alias("alice").unwrap().is_none());
+    assert!(registry
+        .get_authority_key("alice", &old_key.kid)
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        registry
+            .get_authority_set("alice")
+            .unwrap()
+            .active_key_count,
+        0
+    );
+
+    let err = registry
+        .publish_document(
+            "alice",
+            doc_update("dns_txt", 2, "old-controller-write"),
+            CallAuthority::controller(Principal::chain_account(CONTROLLER), ""),
+            guard(new_seq),
+        )
+        .unwrap_err();
+    assert_eq!(err.code(), "CONTROLLER_SCOPE_DENIED");
+}
+
+#[test]
 fn release_name_rejects_breaking_active_semantic_owner_graph() {
     let registry = registry();
     registry

@@ -283,17 +283,28 @@ candidate key 降级为 `KeyDid`，不携带 owner/zone，不写授权缓存。
 可信 Host/Zone snapshot 接纳后，可触发每逻辑身份 singleflight 的后台
 `RemoteAuthority` 确认。任务有全局并发额度、超时与结果缓存：
 
-- authority current：写 verified cache，并把该 DID 的 tunnel 单向升级为
-  `MethodAuthorityCurrent`；
+- authority current：写 verified cache，并只把同一 `DocumentRevision` 的 tunnel
+  单向升级为 `MethodAuthorityCurrent`；不同 revision 不复用该确认结果；
 - authority 证明候选文档是 `DifferentDocument` 或 `Superseded`，或验证返回
-  definite rejection：写 RTCP 负结果状态，并通过逻辑 DID 二级索引关闭该身份的
-  tunnel；
+  definite rejection：在具名 tunnel 提交锁内写 RTCP `Negative` 状态，并通过逻辑
+  DID 二级索引关闭该身份的 inbound/outbound tunnel；状态写入与现存实例摘除是同一
+  线性化动作；
 - authority 对未发布设备文档返回 `NegativeStatus(Missing/Expired/Migrated)`：保留
   Host/Zone snapshot trust，但不升级为 `MethodAuthorityCurrent`；
 - unavailable/timeout：保留原 snapshot trust，不踢 tunnel。
 
-`authority_reconfirm_max_age: unlimited` 表示每进程生命周期只确认一次；有限秒数使用懒
-检查，不启动后台定时吊销扫描。
+`Negative` 是后续具名准入的硬门禁：已存在该状态时，在 `LocalAndZone` 验证和
+application listener 之前拒绝旧候选；最终 verified-cache/tunnel 提交在同一提交锁内再次
+检查，因而与后台否定并发时，否定先发生则不发布，提交先发生则随后被否定路径摘除。
+Negative 不因 `authority_reconfirm_max_age` 或 name-client cache TTL 自动失效。恢复时仅对
+该候选同步执行 `RemoteAuthority` 查询；返回 Anchored Current 且其完整
+`DocumentRevision(iat + content hash)` 与候选一致时，才能在提交锁内把 Negative 替换为
+Confirmed。DifferentDocument、unavailable、timeout、Missing、Expired、Migrated 均保持
+fail closed，且不会调用 application listener。
+
+`authority_reconfirm_max_age: unlimited` 表示同一逻辑 DID 的同一 document revision 在每
+进程生命周期只确认一次；不同 revision 必须重新确认。有限秒数使用懒检查，不启动后台
+定时吊销扫描。
 
 ## 4. 密钥派生与记录层
 
