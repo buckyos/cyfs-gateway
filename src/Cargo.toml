@@ -91,9 +91,9 @@ kRPC = { git = "https://github.com/buckyos/buckyos-base.git", rev = "70e67dfa0c6
 buckyos-http-server = { git = "https://github.com/buckyos/buckyos-base.git", rev = "70e67dfa0c62a6304f871153d0eff8c3e33bb44d", package = "buckyos-http-server" }
 name-client = { git = "https://github.com/buckyos/buckyos-base.git", rev = "70e67dfa0c62a6304f871153d0eff8c3e33bb44d", package = "name-client" }
 name-lib = { git = "https://github.com/buckyos/buckyos-base.git", rev = "70e67dfa0c62a6304f871153d0eff8c3e33bb44d", package = "name-lib" }
-ndn-lib = { git = "https://github.com/buckyos/cyfs-ndn.git", branch = "main", package = "ndn-lib" }
-named_store = { git = "https://github.com/buckyos/cyfs-ndn.git", branch = "main", package = "named_store" }
-ndn-toolkit = { git = "https://github.com/buckyos/cyfs-ndn.git", branch = "main", package = "ndn-toolkit" }
+ndn-lib = { git = "https://github.com/buckyos/cyfs-ndn.git", rev = "c1abac83c8186caa49749ff6b272edd8aa9d526e", package = "ndn-lib" }
+named_store = { git = "https://github.com/buckyos/cyfs-ndn.git", rev = "c1abac83c8186caa49749ff6b272edd8aa9d526e", package = "named_store" }
+ndn-toolkit = { git = "https://github.com/buckyos/cyfs-ndn.git", rev = "c1abac83c8186caa49749ff6b272edd8aa9d526e", package = "ndn-toolkit" }
 cyfs-gateway-api = { path = "components/cyfs-gateway-api" }
 
 [profile.test]
