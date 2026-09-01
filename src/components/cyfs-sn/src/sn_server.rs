@@ -4682,6 +4682,144 @@ users:
         (sn, registry)
     }
 
+    #[tokio::test]
+    async fn owner_remove_bound_zone_rpc_verifies_jwt_cas_and_replay() {
+        init_logging("sn", false);
+        const USER: &str = "zoneunlinkrpcuser";
+        const ZONE_A: &str = "did:web:zone-a.example";
+        const ZONE_B: &str = "did:web:zone-b.example";
+        const REQUEST_ID: &str = "remove-zone-a-through-rpc";
+
+        let db = tempfile::NamedTempFile::with_suffix(".db").unwrap();
+        let auth_dir = tempfile::tempdir().unwrap();
+        let (sn, registry) =
+            build_sn_with_bns_proxy(db.path().to_str().unwrap(), auth_dir.path(), true, false)
+                .await;
+        let http_server: Arc<dyn HttpServer> = sn;
+        let http_addr = spawn_test_http_server(http_server).await;
+        let auth_url = format!("http://{http_addr}/kapi/sn/auth");
+        let bns_proxy_url = format!("http://{http_addr}/kapi/sn/bns-proxy");
+
+        let registration = kRPC::new(auth_url.as_str(), None)
+            .call(
+                "auth.register",
+                json!({
+                    "name": USER,
+                    "email": "zone-unlink-rpc@example.com",
+                    "pwd_hash": "12345678",
+                    "active_code": CLEAR_STATE_ACTIVE_CODE,
+                    "asset_owner": PROXY_USER_OWNER
+                }),
+            )
+            .await
+            .unwrap();
+        let access_token = registration["access_token"].as_str().unwrap().to_string();
+
+        let (owner_signing_key, owner_pkcs8) = generate_ed25519_key();
+        let owner_jwk = encode_ed25519_sk_to_pk_jwk(&owner_signing_key);
+        let owner_did = format!("did:bns:{USER}");
+        let owner_document = json!({
+            "id": owner_did,
+            "verificationMethod": [{
+                "id": format!("did:bns:{USER}#owner-key"),
+                "type": "JsonWebKey2020",
+                "controller": format!("did:bns:{USER}"),
+                "publicKeyJwk": owner_jwk
+            }],
+            "authentication": ["#owner-key"],
+            "zone_binding_model_version": 2,
+            "binded_zone_list": [ZONE_A, ZONE_B],
+            "service": [{
+                "id": format!("did:bns:{USER}#lastDoc"),
+                "type": "DIDDoc",
+                "serviceEndpoint": format!("https://zone-a.example/resolve/did:bns:{USER}")
+            }]
+        });
+        kRPC::new(bns_proxy_url.as_str(), Some(access_token))
+            .call(
+                "bns.publish_document",
+                json!({
+                    "request_id": "publish-owner-before-zone-unlink",
+                    "name": USER,
+                    "doc_type": "owner",
+                    "document": owner_document
+                }),
+            )
+            .await
+            .unwrap();
+
+        let source = registry.resolve_document(USER, "owner").unwrap();
+        let source_document: Value =
+            serde_json::from_slice(&source.document_state.document.inline_document).unwrap();
+        let source_hash = bns_client::canonical_json_sha256(&source_document).unwrap();
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::EdDSA);
+        header.kid = Some("#owner-key".to_string());
+        let owner_authorization = jsonwebtoken::encode(
+            &header,
+            &json!({
+                "sub": format!("did:bns:{USER}"),
+                "aud": "sn-bns-proxy",
+                "operation": "owner.remove_bound_zone",
+                "name": USER,
+                "zone_did": ZONE_A,
+                "expected_owner_hash": source_hash,
+                "request_id": REQUEST_ID,
+                "iat": now,
+                "exp": now + 300
+            }),
+            &jsonwebtoken::EncodingKey::from_ed_der(owner_pkcs8.as_slice()),
+        )
+        .unwrap();
+        let request = json!({
+            "name": USER,
+            "zone_did": ZONE_A,
+            "expected_owner_hash": source_hash,
+            "request_id": REQUEST_ID,
+            "owner_authorization": owner_authorization
+        });
+
+        let rpc = kRPC::new(bns_proxy_url.as_str(), None);
+        let first = rpc
+            .call("owner.remove_bound_zone", request.clone())
+            .await
+            .unwrap();
+        assert_eq!(first["code"], 0);
+        assert_eq!(first["operation"], "owner.remove_bound_zone");
+        assert_eq!(first["source_owner_hash"], source_hash);
+        assert_eq!(first["source_version"], source.document_state.version);
+        assert_eq!(first["target_version"], source.document_state.version + 1);
+        assert_eq!(first["reused"], false);
+
+        let result = registry.resolve_document(USER, "owner").unwrap();
+        let result_document: Value =
+            serde_json::from_slice(&result.document_state.document.inline_document).unwrap();
+        assert_eq!(result_document["binded_zone_list"], json!([ZONE_B]));
+        assert_eq!(
+            result_document["service"][0]["serviceEndpoint"],
+            format!("https://zone-b.example/resolve/did:bns:{USER}")
+        );
+        assert_eq!(
+            first["result_owner_hash"],
+            bns_client::canonical_json_sha256(&result_document).unwrap()
+        );
+
+        let replay = rpc.call("owner.remove_bound_zone", request).await.unwrap();
+        assert_eq!(replay["reused"], true);
+        assert_eq!(replay["result_owner_hash"], first["result_owner_hash"]);
+        assert_eq!(
+            registry
+                .resolve_document(USER, "owner")
+                .unwrap()
+                .document_state
+                .version,
+            result.document_state.version
+        );
+    }
+
     fn test_region_probe_config(version: &str, include_eu: bool) -> Value {
         let now = chrono::Utc::now();
         let mut regions = vec![json!({
