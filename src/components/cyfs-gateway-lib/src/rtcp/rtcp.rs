@@ -2732,8 +2732,13 @@ impl RTcpInner {
         {
             let this = self.clone();
             self.spawn_runtime_task(async move {
-                this.maybe_spawn_authority_confirmation(logical_did, candidate_jwt, source_ip)
-                    .await;
+                this.maybe_spawn_authority_confirmation(
+                    logical_did,
+                    candidate_jwt,
+                    source_ip,
+                    document_revision,
+                )
+                .await;
             });
         }
 
@@ -3698,6 +3703,7 @@ impl RTcpInner {
                     }
                     OutboundRegisterError::Stopped => {
                         return Err(TunnelError::InvalidState(RTCP_STOPPED_REASON.to_string()));
+                    }
                     OutboundRegisterError::AuthorityNegative(reason) => {
                         let msg = format!(
                             "rtcp target {} rejected by authority admission: {}",
@@ -3846,6 +3852,7 @@ impl RTcpInner {
                                 return Err(TunnelError::InvalidState(
                                     RTCP_STOPPED_REASON.to_string(),
                                 ));
+                            }
                             OutboundRegisterError::AuthorityNegative(reason) => {
                                 let msg = format!(
                                     "rtcp target {} rejected by authority admission: {}",
@@ -9225,6 +9232,7 @@ mod tests {
             }
             OutboundRegisterError::Stopped => {
                 panic!("running map must not reject outbound registration as stopped")
+            }
             OutboundRegisterError::AuthorityNegative(reason) => {
                 panic!("unbound outbound race must not report authority Negative: {reason}")
             }
