@@ -7623,6 +7623,44 @@ users:
             "{}",
             err
         );
+
+        // A fresh OOD install has a new device DID. The authenticated account
+        // may replace its own same-name registration. An old device token
+        // may still verify against a stale BNS projection, but cannot reclaim
+        // the name through the strict device.update path.
+        let (replacement_signing_key, _) = generate_ed25519_key();
+        let replacement_jwk = encode_ed25519_sk_to_pk_jwk(&replacement_signing_key);
+        let replacement_config =
+            DeviceDocument::new_by_jwk("ood1", serde_json::from_value(replacement_jwk).unwrap());
+        let replacement_info = DeviceInfo::from_device_doc(&replacement_config);
+        let replacement_did = replacement_config.id.to_string();
+        let result = account_krpc
+            .call(
+                "device.register",
+                json!({
+                    "device_name": "ood1",
+                    "device_did": replacement_did,
+                    "device_ip": "127.0.0.2",
+                    "device_info": serde_json::to_string(&replacement_info).unwrap(),
+                    "ttl": 600
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["did"].as_str().unwrap(), replacement_did);
+
+        let devices = account_krpc.call("device.list", json!({})).await.unwrap();
+        let items = devices["items"].as_array().unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["did"].as_str().unwrap(), replacement_did);
+
+        let err = device_token_krpc
+            .call("device.update", update_params)
+            .await
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(err.contains("already bound"), "{}", err);
     }
 
     #[tokio::test]
