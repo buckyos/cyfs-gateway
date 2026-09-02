@@ -33,6 +33,10 @@ impl ReportIdentity {
         }
     }
 
+    fn is_account(&self) -> bool {
+        matches!(self, Self::Account { .. })
+    }
+
     /// 设备凭证时校验请求参数没有越出凭证边界（设备名/DID 必须一致），
     /// 并返回强制使用的上报 DID；账号凭证不做设备级约束，返回 None。
     fn enforce_reported_device(
@@ -102,6 +106,15 @@ pub(crate) async fn handle_device(
                     Some(params.device_did.as_str()),
                 )?
                 .unwrap_or_else(|| params.device_did.clone());
+            if identity.is_account() {
+                replace_account_device_name_binding(
+                    server,
+                    identity.username(),
+                    params.device_name.as_str(),
+                    device_did.as_str(),
+                )
+                .await?;
+            }
             let view = report_device_online_state(
                 server,
                 identity.username(),
@@ -229,6 +242,37 @@ pub(crate) async fn handle_device(
         }
         _ => Err(RPCErrors::UnknownMethod(req.method)),
     }
+}
+
+async fn replace_account_device_name_binding(
+    server: &SNServer,
+    username: &str,
+    device_name: &str,
+    device_did: &str,
+) -> RpcCallResult<()> {
+    if device_did.trim().is_empty() {
+        return Err(parse_error(
+            SnApiErrorCode::InvalidDeviceDid,
+            "device_did is required for device registration",
+        ));
+    }
+    let Some(existing) = server
+        .device_info_db()
+        .get_device_state_by_name(username, device_name)
+        .await
+        .into_rpc()?
+    else {
+        return Ok(());
+    };
+    if existing.did == device_did {
+        return Ok(());
+    }
+
+    server
+        .device_info_db()
+        .remove_device_index(existing.did.as_str())
+        .await
+        .into_rpc()
 }
 
 #[derive(Deserialize)]

@@ -19,8 +19,8 @@ use async_trait::async_trait;
 use bns_client::dns_document::{DnsTxtRecord, DNS_TXT_DOC_TYPE};
 use bns_client::{
     canonical_doc_type, hash_json, BnsEvmReceiptWaitConfig, DnsTxtUpdate, PublishDocumentParams,
-    RegisterNameParams, SnBnsController, SnBnsControllerError, UpsertDnsTxtParams, OWNER_DOC_TYPE,
-    RELAY_ASSIGNMENT_DOC_TYPE,
+    RegisterNameParams, RemoveBoundZoneOutput, RemoveBoundZoneParams, SnBnsController,
+    SnBnsControllerError, UpsertDnsTxtParams, OWNER_DOC_TYPE, RELAY_ASSIGNMENT_DOC_TYPE,
 };
 use bns_client::{
     default_document_update, CallAuthority, DocumentRef, DocumentUpdate, MutationGuard, Principal,
@@ -29,6 +29,8 @@ use bns_client::{
 pub use cyfs_gateway_api::{
     SnBnsDnsTxtRecord, SnBnsProxyInitialDocuments, SnBnsProxyStatus, SnBnsProxyTxOutcome,
 };
+use jsonwebtoken::jwk::Jwk;
+use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
 use log::{info, warn};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -386,6 +388,7 @@ pub enum SnBnsProxyError {
     Store(String),
     /// BNS 写链路失败（构造/签名/投递）。
     Write(SnBnsControllerError),
+    OwnerAuthorization(String),
 }
 
 impl fmt::Display for SnBnsProxyError {
@@ -405,6 +408,9 @@ impl fmt::Display for SnBnsProxyError {
             ),
             SnBnsProxyError::Store(message) => write!(f, "binding store error: {}", message),
             SnBnsProxyError::Write(error) => write!(f, "{}", error),
+            SnBnsProxyError::OwnerAuthorization(message) => {
+                write!(f, "owner authorization failed: {message}")
+            }
         }
     }
 }
@@ -871,6 +877,67 @@ impl SnBnsProxy {
         Ok(outcome)
     }
 
+    /// Owner-authorized atomic removal of a single Zone DID from the current
+    /// OwnerDocument. The source hash is checked again by the controller.
+    pub async fn remove_bound_zone(
+        &self,
+        username: &str,
+        request_id: String,
+        zone_did: String,
+        expected_owner_hash: String,
+        owner_authorization: String,
+    ) -> SnBnsProxyResult<(SnBnsProxyTxOutcome, RemoveBoundZoneOutput)> {
+        self.ensure_operation(SnBnsProxyOperation::PublishDocument)?;
+        let binding = self.assign_controller_for_user(username).await?;
+        let entry = self.controller_entry(&binding)?;
+        let snapshot = entry
+            .controller
+            .resolve_owner_document_snapshot(username)
+            .await
+            .map_err(SnBnsProxyError::Write)?;
+        verify_remove_bound_zone_authorization(
+            &snapshot.document,
+            owner_authorization.as_str(),
+            username,
+            zone_did.as_str(),
+            expected_owner_hash.as_str(),
+            request_id.as_str(),
+        )?;
+
+        let params = RemoveBoundZoneParams {
+            request_id: request_id.clone(),
+            name: username.to_string(),
+            zone_did,
+            expected_owner_hash,
+            authority: entry.controller.sn_controller_authority(),
+        };
+        let payload_hash = hash_json(&params).unwrap_or_default();
+        let output = entry
+            .controller
+            .remove_bound_zone(params)
+            .await
+            .map_err(SnBnsProxyError::Write)?;
+        let receipt = &output.receipt;
+        let outcome = SnBnsProxyTxOutcome {
+            request_id,
+            operation: "owner.remove_bound_zone".to_string(),
+            name: username.to_string(),
+            controller_id: entry.id.clone(),
+            controller_address: entry.address.clone(),
+            asset_owner: None,
+            doc_type: receipt.doc_type.clone(),
+            document_version: receipt.document_version,
+            chain_id: receipt.evm_chain_id,
+            nonce: receipt.evm_nonce,
+            tx_hash: receipt.evm_tx_hash.clone(),
+            raw_tx: receipt.evm_raw_tx.clone(),
+            status: SnBnsProxyStatus::Submitted,
+            reused: receipt.created_or_reused,
+        };
+        self.audit(&outcome, payload_hash.as_str());
+        Ok((outcome, output))
+    }
+
     /// SN 内部发布 relay assignment（internal/admin only，由路由层限制）。
     pub async fn publish_relay_assignment(
         &self,
@@ -941,6 +1008,156 @@ impl SnBnsProxy {
     }
 }
 
+const OWNER_REMOVE_BOUND_ZONE_AUD: &str = "sn-bns-proxy";
+const OWNER_AUTHORIZATION_MAX_TTL_SECS: u64 = 5 * 60;
+const OWNER_AUTHORIZATION_LEEWAY_SECS: u64 = 30;
+
+#[derive(Debug, Serialize, Deserialize)]
+struct RemoveBoundZoneAuthorizationClaims {
+    sub: String,
+    aud: String,
+    operation: String,
+    name: String,
+    zone_did: String,
+    expected_owner_hash: String,
+    request_id: String,
+    iat: u64,
+    exp: u64,
+}
+
+fn owner_authentication_keys(
+    owner_document: &Value,
+    requested_kid: Option<&str>,
+) -> SnBnsProxyResult<Vec<DecodingKey>> {
+    let owner = owner_document.as_object().ok_or_else(|| {
+        SnBnsProxyError::OwnerAuthorization("owner document must be a JSON object".to_string())
+    })?;
+    let owner_did = owner.get("id").and_then(Value::as_str).ok_or_else(|| {
+        SnBnsProxyError::OwnerAuthorization("owner document id is missing".to_string())
+    })?;
+    let authentication = owner
+        .get("authentication")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            SnBnsProxyError::OwnerAuthorization(
+                "owner document authentication methods are missing".to_string(),
+            )
+        })?;
+    let verification_methods = owner
+        .get("verificationMethod")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            SnBnsProxyError::OwnerAuthorization(
+                "owner document verification methods are missing".to_string(),
+            )
+        })?;
+
+    let equivalent = |left: &str, right: &str| {
+        left == right
+            || left
+                .strip_prefix(owner_did)
+                .is_some_and(|suffix| suffix == right)
+            || right
+                .strip_prefix(owner_did)
+                .is_some_and(|suffix| suffix == left)
+    };
+    let mut keys = Vec::new();
+    for method in verification_methods {
+        let Some(method_id) = method.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        if !authentication
+            .iter()
+            .filter_map(Value::as_str)
+            .any(|reference| equivalent(reference, method_id))
+        {
+            continue;
+        }
+        if requested_kid.is_some_and(|kid| !equivalent(kid, method_id)) {
+            continue;
+        }
+        let Some(jwk_value) = method.get("publicKeyJwk") else {
+            continue;
+        };
+        let Ok(jwk) = serde_json::from_value::<Jwk>(jwk_value.clone()) else {
+            continue;
+        };
+        if let Ok(key) = DecodingKey::from_jwk(&jwk) {
+            keys.push(key);
+        }
+    }
+    if keys.is_empty() {
+        return Err(SnBnsProxyError::OwnerAuthorization(
+            "no usable current owner authentication key matched the JWT kid".to_string(),
+        ));
+    }
+    Ok(keys)
+}
+
+fn verify_remove_bound_zone_authorization(
+    owner_document: &Value,
+    token: &str,
+    expected_name: &str,
+    expected_zone_did: &str,
+    expected_owner_hash: &str,
+    expected_request_id: &str,
+) -> SnBnsProxyResult<()> {
+    let expected_sub = format!("did:bns:{expected_name}");
+    if owner_document.get("id").and_then(Value::as_str) != Some(expected_sub.as_str()) {
+        return Err(SnBnsProxyError::OwnerAuthorization(format!(
+            "owner document id does not match `{expected_sub}`"
+        )));
+    }
+    let header = decode_header(token).map_err(|error| {
+        SnBnsProxyError::OwnerAuthorization(format!("invalid JWT header: {error}"))
+    })?;
+    if header.alg != Algorithm::EdDSA {
+        return Err(SnBnsProxyError::OwnerAuthorization(
+            "owner authorization must use EdDSA".to_string(),
+        ));
+    }
+    let keys = owner_authentication_keys(owner_document, header.kid.as_deref())?;
+    let mut validation = Validation::new(Algorithm::EdDSA);
+    validation.leeway = OWNER_AUTHORIZATION_LEEWAY_SECS;
+    validation.set_audience(&[OWNER_REMOVE_BOUND_ZONE_AUD]);
+    validation.set_required_spec_claims(&["sub", "aud", "iat", "exp"]);
+
+    let claims = keys
+        .iter()
+        .find_map(|key| {
+            decode::<RemoveBoundZoneAuthorizationClaims>(token, key, &validation)
+                .ok()
+                .map(|data| data.claims)
+        })
+        .ok_or_else(|| {
+            SnBnsProxyError::OwnerAuthorization(
+                "signature does not match a current owner authentication key".to_string(),
+            )
+        })?;
+    let now = now_secs();
+    if claims.exp < claims.iat
+        || claims.exp.saturating_sub(claims.iat) > OWNER_AUTHORIZATION_MAX_TTL_SECS
+        || claims.iat > now.saturating_add(OWNER_AUTHORIZATION_LEEWAY_SECS)
+    {
+        return Err(SnBnsProxyError::OwnerAuthorization(
+            "owner authorization time window is invalid".to_string(),
+        ));
+    }
+    if claims.sub != expected_sub
+        || claims.aud != OWNER_REMOVE_BOUND_ZONE_AUD
+        || claims.operation != "owner.remove_bound_zone"
+        || claims.name != expected_name
+        || claims.zone_did != expected_zone_did
+        || claims.expected_owner_hash != expected_owner_hash
+        || claims.request_id != expected_request_id
+    {
+        return Err(SnBnsProxyError::OwnerAuthorization(
+            "owner authorization claims do not match the request".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 fn build_initial_documents(
     initial: &SnBnsProxyInitialDocuments,
 ) -> SnBnsProxyResult<Vec<DocumentUpdate>> {
@@ -1008,6 +1225,8 @@ fn now_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine as _;
     use bns_client::{
         BnsApplyMutationsReq, BnsClientResult, BnsEvmPreparedTx, BnsEvmTxSubmission, BnsIndexerApi,
         BnsIndexerClient, BnsPublishDocumentReq, BnsRegisterNameReq, MemorySnBnsWriteRequestStore,
@@ -1022,6 +1241,127 @@ mod tests {
     const CONTROLLER_A: &str = "0xcccccccccccccccccccccccccccccccccccccc01";
     const CONTROLLER_B: &str = "0xcccccccccccccccccccccccccccccccccccccc02";
     const USER_OWNER: &str = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    fn owner_authorization_fixture() -> (Value, jsonwebtoken::EncodingKey) {
+        use ring::signature::KeyPair as _;
+
+        let seed = [7_u8; 32];
+        let pair = ring::signature::Ed25519KeyPair::from_seed_unchecked(&seed).unwrap();
+        let public_key = URL_SAFE_NO_PAD.encode(pair.public_key().as_ref());
+        let mut pkcs8 = vec![
+            0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x04, 0x22,
+            0x04, 0x20,
+        ];
+        pkcs8.extend_from_slice(&seed);
+        let document = json!({
+            "id": "did:bns:alice",
+            "verificationMethod": [{
+                "id": "did:bns:alice#owner-key",
+                "type": "JsonWebKey2020",
+                "controller": "did:bns:alice",
+                "publicKeyJwk": {
+                    "kty": "OKP",
+                    "crv": "Ed25519",
+                    "x": public_key
+                }
+            }],
+            "authentication": ["#owner-key"]
+        });
+        (document, jsonwebtoken::EncodingKey::from_ed_der(&pkcs8))
+    }
+
+    fn owner_authorization_token(key: &jsonwebtoken::EncodingKey, ttl_secs: u64) -> String {
+        let now = now_secs();
+        let claims = RemoveBoundZoneAuthorizationClaims {
+            sub: "did:bns:alice".to_string(),
+            aud: OWNER_REMOVE_BOUND_ZONE_AUD.to_string(),
+            operation: "owner.remove_bound_zone".to_string(),
+            name: "alice".to_string(),
+            zone_did: "did:web:zone-a.example".to_string(),
+            expected_owner_hash:
+                "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                    .to_string(),
+            request_id: "remove-zone-1".to_string(),
+            iat: now,
+            exp: now + ttl_secs,
+        };
+        let mut header = jsonwebtoken::Header::new(Algorithm::EdDSA);
+        header.kid = Some("#owner-key".to_string());
+        jsonwebtoken::encode(&header, &claims, key).unwrap()
+    }
+
+    #[test]
+    fn owner_authorization_binds_signature_and_all_cas_fields() {
+        let (document, key) = owner_authorization_fixture();
+        let token = owner_authorization_token(&key, 60);
+        let hash = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+        verify_remove_bound_zone_authorization(
+            &document,
+            &token,
+            "alice",
+            "did:web:zone-a.example",
+            hash,
+            "remove-zone-1",
+        )
+        .unwrap();
+
+        assert!(verify_remove_bound_zone_authorization(
+            &document,
+            &token,
+            "alice",
+            "did:web:zone-b.example",
+            hash,
+            "remove-zone-1",
+        )
+        .is_err());
+        assert!(verify_remove_bound_zone_authorization(
+            &document,
+            &token,
+            "alice",
+            "did:web:zone-a.example",
+            "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+            "remove-zone-1",
+        )
+        .is_err());
+        assert!(verify_remove_bound_zone_authorization(
+            &document,
+            &token,
+            "alice",
+            "did:web:zone-a.example",
+            hash,
+            "remove-zone-2",
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn owner_authorization_rejects_non_authentication_key_and_long_ttl() {
+        let (mut document, key) = owner_authorization_fixture();
+        let token = owner_authorization_token(&key, 60);
+        document["authentication"] = json!(["#another-key"]);
+        assert!(verify_remove_bound_zone_authorization(
+            &document,
+            &token,
+            "alice",
+            "did:web:zone-a.example",
+            "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "remove-zone-1",
+        )
+        .is_err());
+
+        let (document, key) = owner_authorization_fixture();
+        let token = owner_authorization_token(&key, OWNER_AUTHORIZATION_MAX_TTL_SECS + 1);
+        assert!(verify_remove_bound_zone_authorization(
+            &document,
+            &token,
+            "alice",
+            "did:web:zone-a.example",
+            "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "remove-zone-1",
+        )
+        .is_err());
+    }
 
     #[derive(Default)]
     struct RecordingEvmSubmitter {

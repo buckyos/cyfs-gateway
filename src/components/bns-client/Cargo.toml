@@ -7,6 +7,7 @@ authors = ["BuckyOS DAO", "@waterflier", "@lurenpluto", "@wugren"]
 [dependencies]
 async-trait.workspace = true
 bns-evm = { path = "../bns-evm" }
+buckyos-kit.workspace = true
 hex.workspace = true
 kRPC.workspace = true
 log.workspace = true

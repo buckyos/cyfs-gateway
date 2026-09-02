@@ -1,15 +1,15 @@
 use ::kRPC::{RPCErrors, RPCHandler, RPCRequest};
 use async_trait::async_trait;
 use bns_client::{
-    publish_document_call, register_name_call, BindZoneDocumentsParams, BnsApplyMutationsReq,
-    BnsClientError, BnsClientResult, BnsEvmClientConfig, BnsEvmKeyManager, BnsEvmPreparedTx,
-    BnsEvmReceiptWaitConfig, BnsEvmSignRequest, BnsEvmStandardClient, BnsEvmTxReceipt,
-    BnsEvmTxSubmission, BnsEvmWriteOperation, BnsIndexerApi, BnsIndexerClient,
+    canonical_json_sha256, publish_document_call, register_name_call, BindZoneDocumentsParams,
+    BnsApplyMutationsReq, BnsClientError, BnsClientResult, BnsEvmClientConfig, BnsEvmKeyManager,
+    BnsEvmPreparedTx, BnsEvmReceiptWaitConfig, BnsEvmSignRequest, BnsEvmStandardClient,
+    BnsEvmTxReceipt, BnsEvmTxSubmission, BnsEvmWriteOperation, BnsIndexerApi, BnsIndexerClient,
     BnsIndexerRpcHandler, BnsPublishDocumentReq, BnsRegisterNameReq, BnsTxExecutionState,
     BnsTxState, BnsWriteReceiptStatus, BootstrapNameParams, DnsTxtUpdate,
     MemorySnBnsWriteRequestStore, PublishDeviceMiniDocParams, PublishDocumentParams,
-    PublishRelayAssignmentParams, SnBnsController, SnBnsControllerConfig, SnBnsControllerError,
-    SnBnsEvmSubmitter, SnBnsWriteRequestStore, SqliteSnBnsWriteRequestStore,
+    PublishRelayAssignmentParams, RemoveBoundZoneParams, SnBnsController, SnBnsControllerConfig,
+    SnBnsControllerError, SnBnsEvmSubmitter, SnBnsWriteRequestStore, SqliteSnBnsWriteRequestStore,
     StaticBnsEvmKeyManager, UpsertDnsTxtParams, BOOT_DOC_TYPE, DEVICE_MINI_DOC_TYPE,
     EVM_TX_RECOVERY_DATA_INVALID, OWNER_DOC_TYPE, RELAY_ASSIGNMENT_DOC_TYPE, ZONE_DOC_TYPE,
 };
@@ -1577,6 +1577,230 @@ async fn bns_client_preserves_stale_guard_error_codes() {
         }
         other => panic!("unexpected error: {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn remove_bound_zone_applies_cas_once_and_replays_idempotently() {
+    let registry = registry();
+    registry
+        .register_name(
+            "alice",
+            OWNER,
+            RegisterOptions::default(),
+            vec![],
+            CallAuthority::public(),
+            MutationGuard::default(),
+        )
+        .unwrap();
+    let rules = vec![controller_rule(
+        Principal::chain_account(SN_CONTROLLER),
+        OWNER_DOC_TYPE,
+        PERMISSION_PUBLISH_DOCUMENT,
+    )];
+    let policy_hash = policy_hash_from_rules(&rules).unwrap();
+    registry
+        .set_controller_policy("alice", rules, &policy_hash, owner_authority(), guard(1))
+        .unwrap();
+
+    let owner_document = json!({
+        "id": "did:bns:alice",
+        "zone_binding_model_version": 2,
+        "binded_zone_list": ["did:web:zone-a.example", "did:web:zone-b.example"],
+        "service": [
+            {
+                "id": "did:bns:alice#profile",
+                "type": "Profile",
+                "serviceEndpoint": "https://alice.example/profile"
+            },
+            {
+                "id": "did:bns:alice#lastDoc",
+                "type": "DIDDoc",
+                "serviceEndpoint": "https://zone-a.example/resolve/did:bns:alice"
+            }
+        ]
+    });
+    registry
+        .publish_document(
+            "alice",
+            inline_update(
+                OWNER_DOC_TYPE,
+                0,
+                &serde_json::to_string(&owner_document).unwrap(),
+            ),
+            owner_authority(),
+            guard(2),
+        )
+        .unwrap();
+
+    let controller = sn_controller_with_applying_submitter(registry);
+    let source = controller
+        .resolve_owner_document_snapshot("alice")
+        .await
+        .unwrap();
+    assert_eq!(source.version, 1);
+    assert_eq!(source.hash, canonical_json_sha256(&owner_document).unwrap());
+
+    let params = RemoveBoundZoneParams {
+        request_id: "remove-zone-a".to_string(),
+        name: "alice".to_string(),
+        zone_did: "did:web:zone-a.example".to_string(),
+        expected_owner_hash: source.hash.clone(),
+        authority: sn_controller_authority(),
+    };
+    let first = controller.remove_bound_zone(params.clone()).await.unwrap();
+    assert!(!first.receipt.created_or_reused);
+    assert_eq!(first.source_version, 1);
+    assert_eq!(first.target_version, 2);
+    assert_eq!(first.source_owner_hash, source.hash);
+
+    let result = controller
+        .resolve_owner_document_snapshot("alice")
+        .await
+        .unwrap();
+    assert_eq!(result.version, 2);
+    assert_eq!(result.hash, first.result_owner_hash);
+    assert_eq!(
+        result.document["binded_zone_list"],
+        json!(["did:web:zone-b.example"])
+    );
+    assert_eq!(
+        result.document["service"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|service| service["id"] == "did:bns:alice#lastDoc")
+            .unwrap()["serviceEndpoint"],
+        "https://zone-b.example/resolve/did:bns:alice"
+    );
+
+    let replay = controller.remove_bound_zone(params).await.unwrap();
+    assert!(replay.receipt.created_or_reused);
+    assert_eq!(replay.result_owner_hash, result.hash);
+    assert_eq!(
+        controller
+            .resolve_owner_document_snapshot("alice")
+            .await
+            .unwrap()
+            .version,
+        2
+    );
+
+    let stale = controller
+        .remove_bound_zone(RemoveBoundZoneParams {
+            request_id: "remove-zone-b-with-stale-hash".to_string(),
+            name: "alice".to_string(),
+            zone_did: "did:web:zone-b.example".to_string(),
+            expected_owner_hash: first.source_owner_hash,
+            authority: sn_controller_authority(),
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        stale,
+        SnBnsControllerError::OwnerDocumentHashConflict { .. }
+    ));
+}
+
+#[tokio::test]
+async fn legacy_same_name_unlink_requires_zone_history_and_stays_v2_unbound() {
+    let registry = registry();
+    registry
+        .register_name(
+            "alice",
+            OWNER,
+            RegisterOptions::default(),
+            vec![],
+            CallAuthority::public(),
+            MutationGuard::default(),
+        )
+        .unwrap();
+    let rules = vec![controller_rule(
+        Principal::chain_account(SN_CONTROLLER),
+        OWNER_DOC_TYPE,
+        PERMISSION_PUBLISH_DOCUMENT,
+    )];
+    let policy_hash = policy_hash_from_rules(&rules).unwrap();
+    registry
+        .set_controller_policy("alice", rules, &policy_hash, owner_authority(), guard(1))
+        .unwrap();
+    let legacy_owner = json!({
+        "id": "did:bns:alice",
+        "service": [
+            {
+                "id": "did:bns:alice#lastDoc",
+                "type": "DIDDoc",
+                "serviceEndpoint": "legacy"
+            },
+            {
+                "id": "did:bns:alice#profile",
+                "type": "Profile",
+                "serviceEndpoint": "keep"
+            }
+        ]
+    });
+    registry
+        .publish_document(
+            "alice",
+            inline_update(
+                OWNER_DOC_TYPE,
+                0,
+                &serde_json::to_string(&legacy_owner).unwrap(),
+            ),
+            owner_authority(),
+            guard(2),
+        )
+        .unwrap();
+    registry
+        .publish_document(
+            "alice",
+            inline_update(ZONE_DOC_TYPE, 0, r#"{"oods":["ood1"]}"#),
+            owner_authority(),
+            guard(3),
+        )
+        .unwrap();
+
+    let controller = sn_controller_with_applying_submitter(registry);
+    let source = controller
+        .resolve_owner_document_snapshot("alice")
+        .await
+        .unwrap();
+    let removed = controller
+        .remove_bound_zone(RemoveBoundZoneParams {
+            request_id: "remove-legacy-same-name".to_string(),
+            name: "alice".to_string(),
+            zone_did: "did:bns:alice".to_string(),
+            expected_owner_hash: source.hash,
+            authority: sn_controller_authority(),
+        })
+        .await
+        .unwrap();
+    let unbound = controller
+        .resolve_owner_document_snapshot("alice")
+        .await
+        .unwrap();
+    assert_eq!(unbound.hash, removed.result_owner_hash);
+    assert_eq!(unbound.document["zone_binding_model_version"], json!(2));
+    assert!(unbound.document.get("binded_zone_list").is_none());
+    assert_eq!(
+        unbound.document["service"],
+        json!([{
+            "id": "did:bns:alice#profile",
+            "type": "Profile",
+            "serviceEndpoint": "keep"
+        }])
+    );
+
+    let error = controller
+        .remove_bound_zone(RemoveBoundZoneParams {
+            request_id: "must-not-reinfer-legacy-binding".to_string(),
+            name: "alice".to_string(),
+            zone_did: "did:bns:alice".to_string(),
+            expected_owner_hash: unbound.hash,
+            authority: sn_controller_authority(),
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(error, SnBnsControllerError::ZoneNotBound { .. }));
 }
 
 #[tokio::test]

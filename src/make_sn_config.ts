@@ -242,9 +242,15 @@ function readJson(file: string): Record<string, unknown> {
 // 带 scheme 会让 RTCP DID hostname 校验失败。https 信任由部署侧安装
 // dev CA 解决（web3-gateway/start.py install_dev_ca）。
 // 部署侧由 web3-gateway/start.py 装载到 {BUCKYOS_ROOT}/etc/machine.json。
-function writeMachineConfig(targetDir: string, snBaseHost: string): void {
+// `bns_host` selects the authoritative DID resolver. `web3_bridge.bns`
+// independently controls did:bns-to-hostname mapping, so generate both.
+export function writeMachineConfig(
+  targetDir: string,
+  snBaseHost: string,
+): void {
   const machineConfigPath = path.join(targetDir, "machine.json");
   writeJson(machineConfigPath, {
+    bns_host: `web3.${snBaseHost}`,
     web3_bridge: { bns: `web3.${snBaseHost}` },
     force_https: false,
     trust_did: [
@@ -253,7 +259,7 @@ function writeMachineConfig(targetDir: string, snBaseHost: string): void {
       "did:web:buckyos.io",
     ],
   });
-  console.log(`  machine.json bns bridge -> web3.${snBaseHost}`);
+  console.log(`  machine.json bns resolver/bridge -> web3.${snBaseHost}`);
 }
 
 function rewriteDidController(
