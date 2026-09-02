@@ -1543,6 +1543,10 @@ impl SNServer {
             .unwrap_or_else(|_| did.to_string())
     }
 
+    fn scoped_device_hostname(zone_name: &str, device_name: &str) -> String {
+        Self::did_hostname(format!("did:bns:{device_name}.{zone_name}").as_str())
+    }
+
     fn device_state_to_ood_state(state: SnDeviceState) -> SnOodState {
         match state {
             SnDeviceState::Online => SnOodState::Active,
@@ -1554,9 +1558,10 @@ impl SNServer {
     pub(crate) async fn query_device_by_hostname(&self, req_host: &str) -> Option<OODInfo> {
         match self.resolver.resolve_gateway_by_hostname(req_host).await {
             Ok(gateway) => {
-                let did_hostname = DID::from_str(gateway.gateway_did.as_str())
-                    .map(|did| did.to_host_name())
-                    .unwrap_or_else(|_| gateway.gateway_did.clone());
+                let did_hostname = Self::scoped_device_hostname(
+                    gateway.zone_name.as_str(),
+                    gateway.gateway_device_name.as_str(),
+                );
                 let state = gateway
                     .online
                     .as_ref()
@@ -3304,6 +3309,20 @@ mod tests {
         )
         .unwrap();
         (roots, public)
+    }
+
+    #[test]
+    fn scoped_device_hostname_uses_bns_alias_for_address_resolution() {
+        let scoped_did = DID::from_str("did:bns:ood1.alice").unwrap();
+
+        assert_eq!(
+            SNServer::scoped_device_hostname("alice", "ood1"),
+            scoped_did.to_host_name()
+        );
+        assert_ne!(
+            SNServer::scoped_device_hostname("alice", "ood1"),
+            DID::from_str("did:dev:device-key").unwrap().to_host_name()
+        );
     }
 
     /// AuthDB provider 准入是严格同版比较：旧 contract/schema（如 v2）在流量
