@@ -13,7 +13,24 @@ import {
   materializeSnDidWebDocuments,
   omitSnSelfBootstrapParams,
   patchLocalDnsBnsRecord,
+  writeMachineConfig,
 } from "./make_sn_config.ts";
+
+Deno.test("machine config sets independent BNS resolver and bridge hosts", async () => {
+  const root = await Deno.makeTempDir();
+  try {
+    writeMachineConfig(root, "devtests.org");
+    const config = JSON.parse(await Deno.readTextFile(`${root}/machine.json`));
+    if (config.bns_host !== "web3.devtests.org") {
+      throw new Error("BNS resolver host was not generated");
+    }
+    if (config.web3_bridge?.bns !== "web3.devtests.org") {
+      throw new Error("BNS bridge host was not generated");
+    }
+  } finally {
+    await Deno.remove(root, { recursive: true });
+  }
+});
 
 Deno.test("generated params omit optional SN self-DNS bootstrap material", () => {
   const params: Record<string, unknown> = {

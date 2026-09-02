@@ -12,6 +12,7 @@ use crate::{
     BnsPublishDocumentReq, BnsRegisterNameReq, BnsRpcErrorInfo, BnsTxExecutionState, BnsTxState,
 };
 use async_trait::async_trait;
+use buckyos_kit::BuckyOSMachineConfig;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -2698,7 +2699,10 @@ fn validate_owner_document_hash(value: &str) -> SnBnsControllerResult<()> {
     Ok(())
 }
 
-fn zone_did_hostname(zone_did: &str) -> SnBnsControllerResult<String> {
+fn zone_did_hostname_with_bridges(
+    zone_did: &str,
+    web3_bridges: &HashMap<String, String>,
+) -> SnBnsControllerResult<String> {
     let mut parts = zone_did.splitn(3, ':');
     if parts.next() != Some("did") {
         return Err(SnBnsControllerError::InvalidInput(format!(
@@ -2715,9 +2719,20 @@ fn zone_did_hostname(zone_did: &str) -> SnBnsControllerResult<String> {
     }
     if method == "web" {
         Ok(hostname.to_string())
+    } else if let Some(bridge) = web3_bridges
+        .get(method)
+        .map(|value| value.trim().trim_matches('.'))
+        .filter(|value| !value.is_empty())
+    {
+        Ok(format!("{hostname}.{bridge}"))
     } else {
         Ok(format!("{hostname}.{method}.did"))
     }
+}
+
+fn zone_did_hostname(zone_did: &str) -> SnBnsControllerResult<String> {
+    let machine_config = BuckyOSMachineConfig::load_machine_config().unwrap_or_default();
+    zone_did_hostname_with_bridges(zone_did, &machine_config.web3_bridge)
 }
 
 fn remove_owner_bound_zone(
@@ -2944,6 +2959,24 @@ mod owner_zone_binding_tests {
         assert_eq!(
             canonical_json_sha256(&left).unwrap(),
             canonical_json_sha256(&right).unwrap()
+        );
+    }
+
+    #[test]
+    fn zone_hostname_uses_configured_web3_bridge() {
+        let bridges = HashMap::from([("bns".to_string(), "web3.devtests.org".to_string())]);
+
+        assert_eq!(
+            zone_did_hostname_with_bridges("did:bns:alice", &bridges).unwrap(),
+            "alice.web3.devtests.org"
+        );
+        assert_eq!(
+            zone_did_hostname_with_bridges("did:web:zone.example", &bridges).unwrap(),
+            "zone.example"
+        );
+        assert_eq!(
+            zone_did_hostname_with_bridges("did:dev:device-key", &bridges).unwrap(),
+            "device-key.dev.did"
         );
     }
 
