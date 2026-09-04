@@ -1,18 +1,22 @@
-name: Build CYFS Gateway for Windows
-on: 
-    workflow_call:
-        inputs:
-            arch:
-                required: true
-                type: string
-            enable_tests:
-                required: false
-                type: boolean
-                default: false
+name: Build CYFS Gateway Windows Staged Artifact
+
+on:
+  workflow_call:
+    inputs:
+      arch:
+        required: true
+        type: string
+      enable_tests:
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
 
 jobs:
   build:
-    name: build
+    name: Windows ${{ inputs.arch }}
     runs-on: ${{ inputs.arch == 'aarch64' && 'windows-11-arm' || 'windows-2025' }}
     steps:
     - name: Checkout
@@ -20,7 +24,7 @@ jobs:
     - name: Setup pnpm
       uses: pnpm/action-setup@v4
       with:
-        version: "latest"
+        version: "10.13.1"
     - name: Setup Node.js
       uses: actions/setup-node@v4
       with:
@@ -37,23 +41,60 @@ jobs:
         python-version: '3.11' 
     - name: cargo test
       working-directory: ./src
-      if: ${{inputs.enable_tests == true}}
+      if: ${{ inputs.enable_tests }}
       run: cargo test -- --test-threads=1
-    - name: install buckyos devkit
+    - name: Install BuckyOS devkit
       run: pip install "buckyos-devkit @ git+https://github.com/buckyos/buckyos-devkit.git"
-    - name: build buckyos
+    - name: Build CYFS Gateway
       working-directory: ./src
-      run: buckyos-build
+      run: buckyos-build --app=cyfs-gateway --target=${{ inputs.arch }}-pc-windows-msvc
       env:
         PYTHONIOENCODING: 'utf-8'
         PYTHONLEGACYWINDOWSSTDIO: "utf-8"
-    - name: Tar Rootfs
-      run:
-        cd .\src\rootfs && tar -czvf ../../gateway-windows-${{inputs.arch == 'x86_64' && 'amd64' || 'aarch64'}}.tar.gz .
-    - name: Upload
-      id: upload
+    - name: Install staged payload
+      working-directory: ./src
+      shell: pwsh
+      run: |
+        $stageRoot = Join-Path $env:RUNNER_TEMP 'staged'
+        $payloadRoot = Join-Path $stageRoot 'buckyos'
+        if (Test-Path $stageRoot) {
+          Remove-Item -Recurse -Force $stageRoot
+        }
+        New-Item -ItemType Directory -Force -Path $payloadRoot | Out-Null
+        buckyos-install --app=cyfs-gateway --all "--target-rootfs=$payloadRoot"
+        if ($LASTEXITCODE -ne 0) {
+          throw "buckyos-install failed with exit code $LASTEXITCODE"
+        }
+        if (-not (Get-ChildItem -Force $payloadRoot | Select-Object -First 1)) {
+          throw "staged CYFS Gateway payload is empty: $payloadRoot"
+        }
+    - name: Get staged CYFS Gateway version
+      id: version
+      shell: pwsh
+      run: |
+        $binary = Join-Path $env:RUNNER_TEMP 'staged\buckyos\bin\cyfs-gateway\cyfs_gateway.exe'
+        $versionOutput = (& $binary --version) -join "`n"
+        if ($LASTEXITCODE -ne 0) {
+          throw "cyfs_gateway --version failed with exit code $LASTEXITCODE"
+        }
+        $versionMatch = [regex]::Match($versionOutput, '\d+(?:\.\d+)*\+build\d+')
+        if (-not $versionMatch.Success) {
+          throw "Unable to parse CYFS Gateway version from: $versionOutput"
+        }
+        Add-Content -Path $env:GITHUB_OUTPUT -Value "value=$($versionMatch.Value)"
+    - name: Archive staged payload
+      shell: pwsh
+      run: |
+        $stageRoot = Join-Path $env:RUNNER_TEMP 'staged'
+        $archivePath = Join-Path $env:RUNNER_TEMP "cyfs-gateway-windows-${{ inputs.arch == 'x86_64' && 'amd64' || 'aarch64' }}-${{ steps.version.outputs.value }}.tar.gz"
+        tar -czf $archivePath -C $stageRoot .
+        if ($LASTEXITCODE -ne 0) {
+          throw "tar failed with exit code $LASTEXITCODE"
+        }
+    - name: Upload staged artifact
       uses: actions/upload-artifact@v4
       with:
-        name: gateway-windows-${{inputs.arch == 'x86_64' && 'amd64' || 'aarch64'}}
-        path: gateway-windows-${{inputs.arch == 'x86_64' && 'amd64' || 'aarch64'}}.tar.gz
+        name: cyfs-gateway-windows-${{ inputs.arch == 'x86_64' && 'amd64' || 'aarch64' }}-${{ steps.version.outputs.value }}
+        path: ${{ runner.temp }}/cyfs-gateway-windows-${{ inputs.arch == 'x86_64' && 'amd64' || 'aarch64' }}-${{ steps.version.outputs.value }}.tar.gz
         if-no-files-found: error
+        compression-level: 0

@@ -1,18 +1,22 @@
-name: Build CYFS Gateway for MacOS
-on: 
-    workflow_call:
-        inputs:
-            arch:
-                required: true
-                type: string
-            enable_tests:
-                required: false
-                type: boolean
-                default: false
+name: Build CYFS Gateway macOS Staged Artifact
+
+on:
+  workflow_call:
+    inputs:
+      arch:
+        required: true
+        type: string
+      enable_tests:
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
 
 jobs:
   build:
-    name: build
+    name: macOS ${{ inputs.arch }}
     runs-on: ${{ inputs.arch == 'aarch64' && 'macos-15' || 'macos-15-intel' }}
     steps:
     - name: Checkout
@@ -20,7 +24,7 @@ jobs:
     - name: Setup pnpm
       uses: pnpm/action-setup@v4
       with:
-        version: "latest"
+        version: "10.13.1"
     - name: Setup Node.js
       uses: actions/setup-node@v4
       with:
@@ -32,20 +36,45 @@ jobs:
         targets: ${{inputs.arch}}-apple-darwin
     - name: cargo test
       working-directory: ./src
-      if: ${{inputs.enable_tests == 'true'}}
-      run: sudo cargo test -- --test-threads=1
-    - name: install buckyos devkit
+      if: ${{ inputs.enable_tests }}
+      run: cargo test -- --test-threads=1
+    - name: Install BuckyOS devkit
       run: pip install "buckyos-devkit @ git+https://github.com/buckyos/buckyos-devkit.git"
-    - name: build buckyos
+    - name: Build CYFS Gateway
       working-directory: ./src
-      run: sudo buckyos-build
-    - name: Tar Rootfs
-      run: 
-        cd ./src/rootfs && tar -czvf ../../gateway-apple-${{inputs.arch == 'x86_64' && 'amd64' || 'aarch64'}}.tar.gz .
-    - name: Upload
-      id: upload
+      run: buckyos-build --app=cyfs-gateway --target=${{ inputs.arch }}-apple-darwin
+    - name: Install staged payload
+      working-directory: ./src
+      env:
+        STAGE_ROOT: ${{ runner.temp }}/staged
+      run: |
+        set -euxo pipefail
+        rm -rf "$STAGE_ROOT"
+        mkdir -p "$STAGE_ROOT/buckyos"
+        buckyos-install --app=cyfs-gateway --all --target-rootfs="$STAGE_ROOT/buckyos"
+        test -n "$(find "$STAGE_ROOT/buckyos" -mindepth 1 -print -quit)"
+    - name: Get staged CYFS Gateway version
+      id: version
+      env:
+        STAGE_ROOT: ${{ runner.temp }}/staged
+      run: |
+        set -euo pipefail
+        version_output="$("$STAGE_ROOT/buckyos/bin/cyfs-gateway/cyfs_gateway" --version)"
+        version_pattern='[0-9]+(\.[0-9]+)*\+build[0-9]+'
+        if [[ ! "$version_output" =~ $version_pattern ]]; then
+          echo "Unable to parse CYFS Gateway version from: $version_output" >&2
+          exit 1
+        fi
+        echo "value=${BASH_REMATCH[0]}" >> "$GITHUB_OUTPUT"
+    - name: Archive staged payload
+      env:
+        STAGE_ROOT: ${{ runner.temp }}/staged
+        ARCHIVE_PATH: ${{ runner.temp }}/cyfs-gateway-apple-${{ inputs.arch == 'x86_64' && 'amd64' || 'aarch64' }}-${{ steps.version.outputs.value }}.tar.gz
+      run: tar -czf "$ARCHIVE_PATH" -C "$STAGE_ROOT" .
+    - name: Upload staged artifact
       uses: actions/upload-artifact@v4
       with:
-        name: gateway-apple-${{inputs.arch == 'x86_64' && 'amd64' || 'aarch64'}}
-        path: gateway-apple-${{inputs.arch == 'x86_64' && 'amd64' || 'aarch64'}}.tar.gz
+        name: cyfs-gateway-apple-${{ inputs.arch == 'x86_64' && 'amd64' || 'aarch64' }}-${{ steps.version.outputs.value }}
+        path: ${{ runner.temp }}/cyfs-gateway-apple-${{ inputs.arch == 'x86_64' && 'amd64' || 'aarch64' }}-${{ steps.version.outputs.value }}.tar.gz
         if-no-files-found: error
+        compression-level: 0

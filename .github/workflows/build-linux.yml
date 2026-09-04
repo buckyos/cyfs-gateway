@@ -1,17 +1,22 @@
-name: Build CYFS Gateway for Linux
-on: 
-    workflow_call:
-        inputs:
-            arch:
-                required: true
-                type: string
-            enable_tests:
-                required: false
-                type: boolean
-                default: false
+name: Build CYFS Gateway Linux Staged Artifact
+
+on:
+  workflow_call:
+    inputs:
+      arch:
+        required: true
+        type: string
+      enable_tests:
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
 jobs:
   build:
-    name: build
+    name: Linux ${{ inputs.arch }}
     runs-on: ${{ inputs.arch == 'aarch64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
     steps:
     - name: Checkout
@@ -19,7 +24,7 @@ jobs:
     - name: Setup pnpm
       uses: pnpm/action-setup@v4
       with:
-        version: "latest"
+        version: "10.13.1"
     - name: Setup Node.js
       uses: actions/setup-node@v4
       with:
@@ -29,45 +34,85 @@ jobs:
       with:
         toolchain: stable
         targets: ${{inputs.arch}}-unknown-linux-${{inputs.arch == 'aarch64' && 'gnu' || 'musl'}}
-    - name: Setup Needed Packages
+    - name: Cache musl toolchain
       if: ${{ inputs.arch == 'x86_64' }}
+      id: musl-toolchain-cache
+      uses: actions/cache@v5
+      with:
+        path: ${{ runner.temp }}/x86_64-linux-musl-cross
+        key: musl-cc-v0.0.1-x86_64-linux-musl-cross-52abd1a56e670952116e35d1a62e048a9b6160471d988e16fa0e1611923dd108a581d2e00874af5eb04e4968b1ba32e0eb449a1f15c3e4d5240ebe09caf5a9f3
+    - name: Install full musl C/C++ toolchain
+      if: ${{ inputs.arch == 'x86_64' && steps.musl-toolchain-cache.outputs.cache-hit != 'true' }}
+      env:
+        MUSL_TOOLCHAIN_URL: https://github.com/musl-cc/musl.cc/releases/download/v0.0.1/x86_64-linux-musl-cross.tgz
+        MUSL_TOOLCHAIN_SHA512: 52abd1a56e670952116e35d1a62e048a9b6160471d988e16fa0e1611923dd108a581d2e00874af5eb04e4968b1ba32e0eb449a1f15c3e4d5240ebe09caf5a9f3
       run: |
-          sudo apt update
-          sudo apt install -y musl-tools g++ binutils
-          sudo ln -sf "$(command -v g++)" /usr/local/bin/musl-g++
-          sudo ln -sf "$(command -v ar)" /usr/local/bin/musl-ar
-          sudo ln -sf "$(command -v ranlib)" /usr/local/bin/musl-ranlib
-          sudo ln -sf /usr/local/bin/musl-g++ /usr/local/bin/x86_64-linux-musl-g++
-          sudo ln -sf /usr/local/bin/musl-ar /usr/local/bin/x86_64-linux-musl-ar
-          sudo ln -sf /usr/local/bin/musl-ranlib /usr/local/bin/x86_64-linux-musl-ranlib
+        set -euxo pipefail
+        archive="$RUNNER_TEMP/x86_64-linux-musl-cross.tgz"
+        curl --fail --location --retry 3 --output "$archive" "$MUSL_TOOLCHAIN_URL"
+        printf '%s  %s\n' "$MUSL_TOOLCHAIN_SHA512" "$archive" | sha512sum --check --strict
+        tar --extract --gzip --file="$archive" --directory="$RUNNER_TEMP" --no-same-owner
+    - name: Verify full musl C/C++ toolchain
+      if: ${{ inputs.arch == 'x86_64' }}
+      env:
+        MUSL_TOOLCHAIN_ROOT: ${{ runner.temp }}/x86_64-linux-musl-cross
+      run: |
+        set -euxo pipefail
+        echo "$MUSL_TOOLCHAIN_ROOT/bin" >> "$GITHUB_PATH"
+        export PATH="$MUSL_TOOLCHAIN_ROOT/bin:$PATH"
+
+        command -v x86_64-linux-musl-gcc
+        command -v x86_64-linux-musl-g++
+        command -v x86_64-linux-musl-ar
+        command -v x86_64-linux-musl-ranlib
+        test "$(x86_64-linux-musl-g++ -dumpmachine)" = "x86_64-linux-musl"
+
+        source="$RUNNER_TEMP/musl-cxx-smoke.cpp"
+        binary="$RUNNER_TEMP/musl-cxx-smoke"
+        printf '%s\n' '#include <iostream>' 'int main() { std::cout << "musl-cxx-ok"; }' > "$source"
+        x86_64-linux-musl-g++ -static "$source" -o "$binary"
+        test "$("$binary")" = "musl-cxx-ok"
     - name: cargo test
       working-directory: ./src
-      if: ${{inputs.enable_tests == 'true'}}
+      if: ${{ inputs.enable_tests }}
       run: cargo test -- --test-threads=1
-    - name: install buckyos devkit
+    - name: Install BuckyOS devkit
       run: pip install "buckyos-devkit @ git+https://github.com/buckyos/buckyos-devkit.git"
-    - name: build buckyos
+    - name: Build CYFS Gateway
       working-directory: ./src
-      run: buckyos-build
-    - name: Tar Rootfs
-      run:
-        cd ./src/rootfs && tar -czvf ../../gateway-linux-${{inputs.arch == 'x86_64' && 'amd64' || 'aarch64'}}.tar.gz .
-    - name: Package Web3 Gateway
-      if: ${{ inputs.arch == 'x86_64' }}
+      run: buckyos-build --app=cyfs-gateway --target=${{ inputs.arch }}-unknown-linux-${{ inputs.arch == 'aarch64' && 'gnu' || 'musl' }}
+    - name: Install staged payload
+      working-directory: ./src
+      env:
+        STAGE_ROOT: ${{ runner.temp }}/staged
       run: |
-            tar -czvf web3-gateway-amd64.tar.gz -C ./src web3-gateway
-    - name: Upload
+        set -euxo pipefail
+        rm -rf "$STAGE_ROOT"
+        mkdir -p "$STAGE_ROOT/buckyos"
+        buckyos-install --app=cyfs-gateway --all --target-rootfs="$STAGE_ROOT/buckyos"
+        test -n "$(find "$STAGE_ROOT/buckyos" -mindepth 1 -print -quit)"
+    - name: Get staged CYFS Gateway version
+      id: version
+      env:
+        STAGE_ROOT: ${{ runner.temp }}/staged
+      run: |
+        set -euo pipefail
+        version_output="$("$STAGE_ROOT/buckyos/bin/cyfs-gateway/cyfs_gateway" --version)"
+        version_pattern='[0-9]+(\.[0-9]+)*\+build[0-9]+'
+        if [[ ! "$version_output" =~ $version_pattern ]]; then
+          echo "Unable to parse CYFS Gateway version from: $version_output" >&2
+          exit 1
+        fi
+        echo "value=${BASH_REMATCH[0]}" >> "$GITHUB_OUTPUT"
+    - name: Archive staged payload
+      env:
+        STAGE_ROOT: ${{ runner.temp }}/staged
+        ARCHIVE_PATH: ${{ runner.temp }}/cyfs-gateway-linux-${{ inputs.arch == 'x86_64' && 'amd64' || 'aarch64' }}-${{ steps.version.outputs.value }}.tar.gz
+      run: tar -czf "$ARCHIVE_PATH" -C "$STAGE_ROOT" .
+    - name: Upload staged artifact
       uses: actions/upload-artifact@v4
-      id: upload
       with:
-        name: gateway-linux-${{inputs.arch == 'x86_64' && 'amd64' || 'aarch64'}}
-        path: gateway-linux-${{inputs.arch == 'x86_64' && 'amd64' || 'aarch64'}}.tar.gz
+        name: cyfs-gateway-linux-${{ inputs.arch == 'x86_64' && 'amd64' || 'aarch64' }}-${{ steps.version.outputs.value }}
+        path: ${{ runner.temp }}/cyfs-gateway-linux-${{ inputs.arch == 'x86_64' && 'amd64' || 'aarch64' }}-${{ steps.version.outputs.value }}.tar.gz
         if-no-files-found: error
-    - name: Upload Web3 Gateway Artifact
-      if: ${{ inputs.arch == 'x86_64' }}
-      uses: actions/upload-artifact@v4
-      id: upload_web3
-      with:
-        name: web3-gateway-amd64
-        path: web3-gateway-amd64.tar.gz
-        if-no-files-found: error
+        compression-level: 0
