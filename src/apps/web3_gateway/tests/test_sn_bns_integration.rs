@@ -141,6 +141,7 @@ fn seed_bns_registry(db_path: &Path) {
                             (BNS_GATEWAY_DEVICE): {
                                 "id": BNS_GATEWAY_DID,
                                 "device_name": BNS_GATEWAY_DEVICE,
+                                "net_id": "wan",
                                 "addresses": ["203.0.113.12"],
                                 "mini_config_jwt": "bns-mini-config-jwt"
                             }
@@ -312,7 +313,7 @@ servers:
 
     let device: serde_json::Value = http_client
         .get(format!(
-            "{}/did:bns:{}.{}?type=doc",
+            "{}/did:bns:{}.{}?type=device_mini_doc",
             did_endpoint, BNS_GATEWAY_DEVICE, BNS_NAME
         ))
         .send()
