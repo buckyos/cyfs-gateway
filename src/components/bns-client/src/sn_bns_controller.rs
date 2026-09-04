@@ -2963,6 +2963,34 @@ mod owner_zone_binding_tests {
     }
 
     #[test]
+    fn canonical_owner_hash_matches_javascript_number_formatting() {
+        let number_fixture = json!({
+            "numbers": [333333333.33333329_f64, 1e30_f64, 4.50_f64, 2e-3_f64, 1e-27_f64]
+        });
+        assert_eq!(
+            canonical_json_sha256(&number_fixture).unwrap(),
+            "sha256:7c892d3452ad85ad65857a43e8dcac93b79475d2334fc3e85bac5c599142c158"
+        );
+
+        let threshold_fixture = json!({"small": 0.000001_f64, "large": 1e20_f64});
+        assert_eq!(
+            canonical_json_sha256(&threshold_fixture).unwrap(),
+            "sha256:ce6cb4ba83bb705700ff9761d727f1f32126cbe558abb6ac4ecd2597234b628a"
+        );
+    }
+
+    #[test]
+    fn canonical_owner_hash_rejects_inexact_integer_values() {
+        for unsafe_integer in [
+            json!({"value": 9_007_199_254_740_993_u64}),
+            json!({"value": i64::MAX}),
+            json!({"value": u64::MAX}),
+        ] {
+            assert!(canonical_json_sha256(&unsafe_integer).is_err());
+        }
+    }
+
+    #[test]
     fn zone_hostname_uses_configured_web3_bridge() {
         let bridges = HashMap::from([("bns".to_string(), "web3.devtests.org".to_string())]);
 
