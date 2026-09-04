@@ -1133,26 +1133,46 @@ pub fn hash_json<T: Serialize + ?Sized>(value: &T) -> BnsRegistryResult<String> 
     Ok(sha256_hex(&serde_json::to_vec(value)?))
 }
 
-/// Hash JSON independently of object insertion order. Arrays retain their
-/// order; object keys are sorted recursively before compact serialization.
+/// Hash JSON using RFC 8785 JCS so Rust and JavaScript produce identical
+/// bytes for object key ordering and IEEE-754 number formatting.
 pub fn canonical_json_sha256(value: &Value) -> BnsRegistryResult<String> {
-    fn canonicalize(value: &Value) -> Value {
+    fn validate_numbers(value: &Value) -> BnsRegistryResult<()> {
         match value {
             Value::Object(object) => {
-                let mut entries = object.iter().collect::<Vec<_>>();
-                entries.sort_by(|(left, _), (right, _)| left.cmp(right));
-                let mut canonical = serde_json::Map::new();
-                for (key, value) in entries {
-                    canonical.insert(key.clone(), canonicalize(value));
+                for child in object.values() {
+                    validate_numbers(child)?;
                 }
-                Value::Object(canonical)
             }
-            Value::Array(values) => Value::Array(values.iter().map(canonicalize).collect()),
-            _ => value.clone(),
+            Value::Array(values) => {
+                for child in values {
+                    validate_numbers(child)?;
+                }
+            }
+            Value::Number(number) => {
+                let exactly_representable = if let Some(number) = number.as_i64() {
+                    (number as f64) as i128 == i128::from(number)
+                } else if let Some(number) = number.as_u64() {
+                    (number as f64) as i128 == i128::from(number)
+                } else {
+                    number.as_f64().is_some_and(|number| {
+                        number.is_finite() && !(number == 0.0 && number.is_sign_negative())
+                    })
+                };
+                if !exactly_representable {
+                    return Err(BnsRegistryError::InvalidMutation(format!(
+                        "JSON number `{number}` is not an exact non-negative-zero IEEE-754 value"
+                    )));
+                }
+            }
+            _ => {}
         }
+        Ok(())
     }
 
-    let bytes = serde_json::to_vec(&canonicalize(value))?;
+    validate_numbers(value)?;
+    let bytes = serde_jcs::to_vec(value).map_err(|error| {
+        BnsRegistryError::InvalidMutation(format!("invalid RFC 8785 JSON: {error}"))
+    })?;
     let digest = Sha256::digest(bytes);
     Ok(format!("sha256:{}", hex::encode(digest)))
 }

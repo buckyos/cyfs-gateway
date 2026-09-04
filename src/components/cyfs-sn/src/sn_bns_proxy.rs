@@ -18,9 +18,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use bns_client::dns_document::{DnsTxtRecord, DNS_TXT_DOC_TYPE};
 use bns_client::{
-    canonical_doc_type, hash_json, BnsEvmReceiptWaitConfig, DnsTxtUpdate, PublishDocumentParams,
-    RegisterNameParams, RemoveBoundZoneOutput, RemoveBoundZoneParams, SnBnsController,
-    SnBnsControllerError, UpsertDnsTxtParams, OWNER_DOC_TYPE, RELAY_ASSIGNMENT_DOC_TYPE,
+    canonical_bns_name, canonical_doc_type, canonical_json_sha256, hash_json,
+    BnsEvmReceiptWaitConfig, DnsTxtUpdate, PublishDocumentParams, RegisterNameParams,
+    RemoveBoundZoneOutput, RemoveBoundZoneParams, SnBnsController, SnBnsControllerError,
+    UpsertDnsTxtParams, OWNER_DOC_TYPE, RELAY_ASSIGNMENT_DOC_TYPE,
 };
 use bns_client::{
     default_document_update, CallAuthority, DocumentRef, DocumentUpdate, MutationGuard, Principal,
@@ -591,29 +592,47 @@ impl SnBnsProxy {
         Ok(entry)
     }
 
+    /// Resolve an existing binding or choose a deterministic candidate
+    /// without mutating the binding store.
+    async fn controller_candidate_for_user(
+        &self,
+        username: &str,
+    ) -> SnBnsProxyResult<SnBnsControllerBinding> {
+        let username = canonical_bns_name(username)
+            .map_err(|error| SnBnsProxyError::InvalidInput(error.to_string()))?;
+        if let Some(existing) = self.bindings.get_binding(username.as_str()).await? {
+            self.controller_entry(&existing)?;
+            return Ok(existing);
+        }
+        let picked = self.stable_pick(username.as_str())?;
+        let now = now_secs();
+        Ok(SnBnsControllerBinding {
+            username,
+            controller_id: picked.id.clone(),
+            controller_address: picked.address.clone(),
+            created_at: now,
+            updated_at: now,
+        })
+    }
+
+    async fn persist_controller_binding(
+        &self,
+        binding: &SnBnsControllerBinding,
+    ) -> SnBnsProxyResult<SnBnsControllerBinding> {
+        // 并发注册时以先写入者为准（try_insert 返回既有行）。
+        let stored = self.bindings.try_insert_binding(binding).await?;
+        self.controller_entry(&stored)?;
+        Ok(stored)
+    }
+
     /// 取该用户绑定的 controller；无绑定时按稳定策略分配并持久化。
     /// 既有绑定永不静默覆盖；绑定指向的 controller 不在配置中 → 显式报错。
     pub async fn assign_controller_for_user(
         &self,
         username: &str,
     ) -> SnBnsProxyResult<SnBnsControllerBinding> {
-        if let Some(existing) = self.bindings.get_binding(username).await? {
-            self.controller_entry(&existing)?;
-            return Ok(existing);
-        }
-        let picked = self.stable_pick(username)?;
-        let now = now_secs();
-        let binding = SnBnsControllerBinding {
-            username: username.to_string(),
-            controller_id: picked.id.clone(),
-            controller_address: picked.address.clone(),
-            created_at: now,
-            updated_at: now,
-        };
-        // 并发注册时以先写入者为准（try_insert 返回既有行）。
-        let stored = self.bindings.try_insert_binding(&binding).await?;
-        self.controller_entry(&stored)?;
-        Ok(stored)
+        let candidate = self.controller_candidate_for_user(username).await?;
+        self.persist_controller_binding(&candidate).await
     }
 
     /// 只读查询绑定（不触发分配）。
@@ -631,7 +650,7 @@ impl SnBnsProxy {
                 "asset_owner is required".to_string(),
             ));
         }
-        let binding = self.assign_controller_for_user(username).await?;
+        let binding = self.controller_candidate_for_user(username).await?;
         Ok(binding.controller_address)
     }
 
@@ -642,6 +661,8 @@ impl SnBnsProxy {
         params: SnBnsProxyRegisterParams,
     ) -> SnBnsProxyResult<SnBnsProxyTxOutcome> {
         self.ensure_operation(SnBnsProxyOperation::RegisterNameBootstrap)?;
+        canonical_bns_name(params.name.as_str())
+            .map_err(|error| SnBnsProxyError::InvalidInput(error.to_string()))?;
         let asset_owner = normalize_evm_address(params.asset_owner.as_str()).ok_or_else(|| {
             SnBnsProxyError::InvalidInput(
                 "asset_owner must be a 0x-prefixed EVM address".to_string(),
@@ -653,11 +674,12 @@ impl SnBnsProxy {
             ));
         }
 
-        let binding = self
-            .assign_controller_for_user(params.name.as_str())
-            .await?;
-        let entry = self.controller_entry(&binding)?;
         let initial_documents = build_initial_documents(&params.initial_documents)?;
+        let candidate = self
+            .controller_candidate_for_user(params.name.as_str())
+            .await?;
+        let binding = self.persist_controller_binding(&candidate).await?;
+        let entry = self.controller_entry(&binding)?;
 
         let register_params = RegisterNameParams {
             request_id: params.request_id.clone(),
@@ -888,9 +910,9 @@ impl SnBnsProxy {
         owner_authorization: String,
     ) -> SnBnsProxyResult<(SnBnsProxyTxOutcome, RemoveBoundZoneOutput)> {
         self.ensure_operation(SnBnsProxyOperation::PublishDocument)?;
-        let binding = self.assign_controller_for_user(username).await?;
-        let entry = self.controller_entry(&binding)?;
-        let snapshot = entry
+        let candidate = self.controller_candidate_for_user(username).await?;
+        let candidate_entry = self.controller_entry(&candidate)?;
+        let snapshot = candidate_entry
             .controller
             .resolve_owner_document_snapshot(username)
             .await
@@ -903,6 +925,15 @@ impl SnBnsProxy {
             expected_owner_hash.as_str(),
             request_id.as_str(),
         )?;
+        let actual_owner_hash = canonical_json_sha256(&snapshot.document)
+            .map_err(|error| SnBnsProxyError::InvalidInput(error.to_string()))?;
+        if actual_owner_hash != expected_owner_hash {
+            return Err(SnBnsProxyError::OwnerAuthorization(
+                "expected_owner_hash does not match the current owner document".to_string(),
+            ));
+        }
+        let binding = self.persist_controller_binding(&candidate).await?;
+        let entry = self.controller_entry(&binding)?;
 
         let params = RemoveBoundZoneParams {
             request_id: request_id.clone(),
@@ -1505,6 +1536,19 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn controller_assignment_rejects_non_canonical_names_without_writing() {
+        let bindings: SnBnsControllerBindingStoreRef =
+            Arc::new(MemorySnBnsControllerBindingStore::new());
+        let (proxy, _) = two_controller_proxy(bindings.clone());
+
+        let error = proxy.assign_controller_for_user("Alice").await.unwrap_err();
+
+        assert!(matches!(error, SnBnsProxyError::InvalidInput(_)));
+        assert!(bindings.get_binding("Alice").await.unwrap().is_none());
+        assert!(bindings.get_binding("alice").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
     async fn different_users_can_map_to_different_controllers() {
         let bindings: SnBnsControllerBindingStoreRef =
             Arc::new(MemorySnBnsControllerBindingStore::new());
@@ -1640,7 +1684,7 @@ mod tests {
     async fn register_bootstrap_rejects_invalid_asset_owner() {
         let bindings: SnBnsControllerBindingStoreRef =
             Arc::new(MemorySnBnsControllerBindingStore::new());
-        let (proxy, submitter) = two_controller_proxy(bindings);
+        let (proxy, submitter) = two_controller_proxy(bindings.clone());
         let error = proxy
             .register_bootstrap(SnBnsProxyRegisterParams {
                 request_id: "sn:register:alice".to_string(),
@@ -1653,6 +1697,54 @@ mod tests {
             .unwrap_err();
         assert!(matches!(error, SnBnsProxyError::InvalidInput(_)));
         assert!(submitter.registrations().is_empty());
+        assert!(bindings.get_binding("alice").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn register_bootstrap_validates_documents_before_writing_binding() {
+        let bindings: SnBnsControllerBindingStoreRef =
+            Arc::new(MemorySnBnsControllerBindingStore::new());
+        let (proxy, submitter) = two_controller_proxy(bindings.clone());
+
+        let error = proxy
+            .register_bootstrap(SnBnsProxyRegisterParams {
+                request_id: "sn:register:alice".to_string(),
+                name: "alice".to_string(),
+                asset_owner: USER_OWNER.to_string(),
+                owner_config: json!({}),
+                initial_documents: SnBnsProxyInitialDocuments {
+                    zone: Some(json!("not-an-object")),
+                    boot: None,
+                    dns_txt: None,
+                },
+            })
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, SnBnsProxyError::InvalidInput(_)));
+        assert!(submitter.registrations().is_empty());
+        assert!(bindings.get_binding("alice").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn remove_bound_zone_resolves_before_writing_binding() {
+        let bindings: SnBnsControllerBindingStoreRef =
+            Arc::new(MemorySnBnsControllerBindingStore::new());
+        let (proxy, _) = two_controller_proxy(bindings.clone());
+
+        let error = proxy
+            .remove_bound_zone(
+                "alice",
+                "owner-unbind:test".to_string(),
+                "did:bns:alice".to_string(),
+                format!("sha256:{}", "0".repeat(64)),
+                "not-a-jwt".to_string(),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, SnBnsProxyError::Write(_)));
+        assert!(bindings.get_binding("alice").await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -1663,9 +1755,11 @@ mod tests {
         assert!(strict.default_asset_owner_for_user("alice").await.is_err());
 
         let submitter = Arc::new(RecordingEvmSubmitter::default());
+        let devtest_bindings: SnBnsControllerBindingStoreRef =
+            Arc::new(MemorySnBnsControllerBindingStore::new());
         let devtest = SnBnsProxy::new(
             vec![controller_entry("controller-a", CONTROLLER_A, 1, submitter)],
-            Arc::new(MemorySnBnsControllerBindingStore::new()),
+            devtest_bindings.clone(),
             SnBnsProxyOperation::all().into_iter().collect(),
             false,
         )
@@ -1674,6 +1768,11 @@ mod tests {
             devtest.default_asset_owner_for_user("alice").await.unwrap(),
             CONTROLLER_A
         );
+        assert!(devtest_bindings
+            .get_binding("alice")
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]
