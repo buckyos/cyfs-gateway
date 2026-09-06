@@ -100,8 +100,3 @@ cyfs-gateway-api = { path = "components/cyfs-gateway-api" }
 debug = 0
 split-debuginfo = "off"
 
-# Develop the dispatch protocol and its Gateway consumer together.
-[patch."https://github.com/buckyos/cyfs-ndn.git"]
-ndn-lib = { path = "../../cyfs-ndn/src/ndn-lib" }
-named_store = { path = "../../cyfs-ndn/src/named_store" }
-ndn-toolkit = { path = "../../cyfs-ndn/src/ndn-toolkit" }
