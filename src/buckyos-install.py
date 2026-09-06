@@ -7,7 +7,7 @@ import sys
 from pathlib import Path
 
 
-DEVKIT_SPEC = "buckyos-devkit @ git+https://github.com/buckyos/buckyos-devkit.git"
+DEVKIT_SPEC = "buckyos-devkit @ git+https://github.com/buckyos/buckyos-devkit.git@main"
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_CONFIG = SCRIPT_DIR / "bucky_project.yaml"
 

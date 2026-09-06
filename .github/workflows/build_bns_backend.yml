@@ -33,7 +33,7 @@ jobs:
           sudo ln -sf /usr/local/bin/musl-ranlib /usr/local/bin/x86_64-linux-musl-ranlib
 
       - name: Install BuckyOS devkit
-        run: pip install "buckyos-devkit @ git+https://github.com/buckyos/buckyos-devkit.git"
+        run: pip install "buckyos-devkit @ git+https://github.com/buckyos/buckyos-devkit.git@main"
 
       - name: Read project version
         id: project
