@@ -288,6 +288,14 @@ pub(crate) fn register_core_gateway_servers(
         },
     ))?;
     builder.register(GatewayServerRegistration::new(
+        "named-inbox-cache",
+        "cyfs-gateway-app-lib::named-inbox-cache",
+        Arc::new(crate::NamedInboxCacheServerConfigParser),
+        Arc::new(cyfs_gateway_lib::NamedInboxCacheServerFactory),
+        Contextless,
+        |_runtime: &GatewayServerRuntime| Ok(None),
+    ))?;
+    builder.register(GatewayServerRegistration::new(
         "control_server",
         "cyfs-gateway-app-lib::control_server",
         Arc::new(GatewayControlServerConfigParser::new()),
@@ -624,7 +632,15 @@ mod tests {
         let registry = builder.build().unwrap();
         assert_eq!(
             registry.registered_server_types(),
-            ["acme_response", "control_server", "cyfs-dir", "dir", "http"].map(str::to_string)
+            [
+                "acme_response",
+                "control_server",
+                "cyfs-dir",
+                "dir",
+                "http",
+                "named-inbox-cache"
+            ]
+            .map(str::to_string)
         );
 
         let expected_modes = [
@@ -633,6 +649,7 @@ mod tests {
             ("cyfs-dir", GatewayServerContextMode::Required),
             ("dir", GatewayServerContextMode::Contextless),
             ("http", GatewayServerContextMode::Required),
+            ("named-inbox-cache", GatewayServerContextMode::Contextless),
         ];
         for (server_type, expected_mode) in expected_modes {
             let registration = registry.registration(server_type).unwrap();
@@ -640,5 +657,44 @@ mod tests {
             assert!(!registration.source().is_empty());
             assert_eq!(registration.context_mode(), expected_mode);
         }
+    }
+
+    #[test]
+    fn named_inbox_config_registration_and_validation() {
+        let mut builder = GatewayServerRegistryBuilder::new();
+        register_core_gateway_servers(&mut builder).unwrap();
+        let registry = builder.build().unwrap();
+        let value = json!({
+            "id":"alice-inbox", "type":"named-inbox-cache", "target_zone":"alice.example",
+            "accepted_paths":["/messages/inbox"], "cache_path":"/tmp/alice-inbox",
+            "upstream":"http://127.0.0.1:18080", "upstream_timeout":"3s", "cache_ttl":"24h",
+            "poll_interval":"5s", "retry_backoff":["5s","30s","2m","10m"], "concurrency":2,
+            "max_object_bytes":65536, "max_entries":10000, "max_bytes":268435456,
+            "per_principal_quota":{"max_entries":1000,"max_bytes":16777216}
+        });
+        let config = registry.parse_server_config(value.clone()).unwrap();
+        assert_eq!(config.server_type(), "named-inbox-cache");
+        let serialized = config.get_config_json();
+        assert!(
+            registry
+                .parse_server_config(serde_json::from_str(&serialized).unwrap())
+                .is_ok()
+        );
+        for (field, bad) in [
+            ("concurrency", json!(0)),
+            ("max_object_bytes", json!(0)),
+            ("accepted_paths", json!(["/inbox/@/field"])),
+            ("retry_backoff", json!([])),
+            ("upstream", json!("http://localhost/recursive/cache")),
+            ("upstream_timeout", json!("0s")),
+        ] {
+            let mut invalid = value.clone();
+            invalid[field] = bad;
+            assert!(registry.parse_server_config(invalid).is_err(), "{field}");
+        }
+        let mut invalid = value;
+        invalid.as_object_mut().unwrap().remove("upstream");
+        invalid["drain_enabled"] = json!(true);
+        assert!(registry.parse_server_config(invalid).is_err());
     }
 }

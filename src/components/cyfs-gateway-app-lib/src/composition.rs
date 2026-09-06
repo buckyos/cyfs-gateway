@@ -536,7 +536,14 @@ mod tests {
         assert_eq!(composition.manifest().modules, vec!["core"]);
         assert_eq!(
             composition.manifest().servers,
-            vec!["acme_response", "control_server", "cyfs-dir", "dir", "http"]
+            vec![
+                "acme_response",
+                "control_server",
+                "cyfs-dir",
+                "dir",
+                "http",
+                "named-inbox-cache"
+            ]
         );
         assert_eq!(
             composition.manifest().stacks,

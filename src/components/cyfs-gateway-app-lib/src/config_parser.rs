@@ -449,6 +449,27 @@ impl<D: for<'de> Deserializer<'de> + Clone> ServerConfigParser<D> for HttpServer
 
 pub struct CyfsDirServerConfigParser {}
 
+pub struct NamedInboxCacheServerConfigParser;
+
+impl<D: for<'de> Deserializer<'de> + Clone> ServerConfigParser<D>
+    for NamedInboxCacheServerConfigParser
+{
+    fn parse(&self, de: D) -> ConfigResult<Arc<dyn ServerConfig>> {
+        let config =
+            cyfs_gateway_lib::NamedInboxCacheServerConfig::deserialize(de).map_err(|e| {
+                config_err!(
+                    ConfigErrorCode::InvalidConfig,
+                    "invalid named-inbox-cache config: {}",
+                    e
+                )
+            })?;
+        config
+            .validate()
+            .map_err(|e| config_err!(ConfigErrorCode::InvalidConfig, "{}", e))?;
+        Ok(Arc::new(config))
+    }
+}
+
 impl CyfsDirServerConfigParser {
     pub fn new() -> Self {
         Self {}

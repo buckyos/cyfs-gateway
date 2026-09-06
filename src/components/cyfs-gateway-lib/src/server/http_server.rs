@@ -1,3 +1,4 @@
+use super::dispatch::*;
 use super::http_compression::{
     CompressionRequestInfo, HttpCompressionSettings, apply_request_decompression,
     apply_response_compression,
@@ -1735,6 +1736,23 @@ impl HttpServer for ProcessChainHttpServer {
         req: http::Request<BoxBody<Bytes, ServerError>>,
         info: StreamInfo,
     ) -> ServerResult<http::Response<BoxBody<Bytes, ServerError>>> {
+        let dispatch = is_dispatch(&req);
+        let dispatch_target = dispatch_target(&req).unwrap_or_default();
+        let dispatch_credentials: Vec<_> = req
+            .headers()
+            .iter()
+            .filter(|(key, _)| replay_header(key.as_str()))
+            .filter_map(|(key, value)| {
+                value
+                    .to_str()
+                    .ok()
+                    .map(|v| (key.to_string(), v.to_string()))
+            })
+            .collect();
+        let received_at_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
         let req_info = CompressionRequestInfo::from_request(&req);
         let sources = self.resolve_request_sources(&info, req.headers());
         let mut req = match apply_request_decompression(req, &self.compression) {
@@ -1844,13 +1862,43 @@ impl HttpServer for ProcessChainHttpServer {
             .await
             .map_err(|e| server_err!(ServerErrorCode::ProcessChainError, "{}", e))?;
 
-        let ret = executor
-            .execute_lib()
+        let auth_env = global_env.clone();
+        let ret = executor.execute_lib().await;
+        let verified_principal = auth_env
+            .get("AUTH_principal")
             .await
-            .map_err(|e| server_err!(ServerErrorCode::ProcessChainError, "{}", e))?;
+            .ok()
+            .flatten()
+            .and_then(|v| v.try_as_str().ok().map(str::to_string));
+        drop(auth_env);
+        let ret = match ret {
+            Ok(ret) => ret,
+            Err(_) if dispatch => {
+                return Ok(dispatch_rejected(
+                    StatusCode::BAD_GATEWAY,
+                    &dispatch_target,
+                    "routing-failed",
+                ));
+            }
+            Err(e) => return Err(server_err!(ServerErrorCode::ProcessChainError, "{}", e)),
+        };
 
         if ret.is_control() {
             if ret.is_drop() {
+                if dispatch {
+                    return self
+                        .apply_post_chain_result(
+                            Ok(dispatch_rejected(
+                                StatusCode::FORBIDDEN,
+                                &dispatch_target,
+                                "dropped",
+                            )),
+                            &req_info,
+                            Some(&info),
+                            Some(&sources),
+                        )
+                        .await;
+                }
                 debug!("Request dropped by the process chain");
                 let response = http::Response::new(
                     Full::new(Bytes::from("Request dropped"))
@@ -1861,6 +1909,20 @@ impl HttpServer for ProcessChainHttpServer {
                     .apply_post_chain_result(Ok(response), &req_info, Some(&info), Some(&sources))
                     .await;
             } else if ret.is_reject() {
+                if dispatch {
+                    return self
+                        .apply_post_chain_result(
+                            Ok(dispatch_rejected(
+                                StatusCode::FORBIDDEN,
+                                &dispatch_target,
+                                "policy-denied",
+                            )),
+                            &req_info,
+                            Some(&info),
+                            Some(&sources),
+                        )
+                        .await;
+                }
                 debug!(
                     "process_chain_reject server={} remote={} method={} host={} uri={}",
                     self.id, req_remote, req_method, req_host, req_uri,
@@ -1873,6 +1935,20 @@ impl HttpServer for ProcessChainHttpServer {
                     .await;
             }
             if let Some(CommandControl::Error(ret)) = ret.as_control() {
+                if dispatch {
+                    return self
+                        .apply_post_chain_result(
+                            Ok(dispatch_rejected(
+                                StatusCode::BAD_GATEWAY,
+                                &dispatch_target,
+                                "routing-failed",
+                            )),
+                            &req_info,
+                            Some(&info),
+                            Some(&sources),
+                        )
+                        .await;
+                }
                 debug!(
                     "process_chain_error server={} remote={} method={} host={} uri={} message={}",
                     self.id, req_remote, req_method, req_host, req_uri, ret.value,
@@ -1936,9 +2012,18 @@ impl HttpServer for ProcessChainHttpServer {
                             }
 
                             let server_id = list[1].as_str();
-                            let post_req = req_map.into_request().map_err(|e| {
+                            let mut post_req = req_map.into_request().map_err(|e| {
                                 server_err!(ServerErrorCode::ProcessChainError, "{}", e)
                             })?;
+                            if let Some(principal) = verified_principal {
+                                post_req.extensions_mut().insert(VerifiedDispatchContext {
+                                    principal,
+                                    target: dispatch_target.clone(),
+                                    credentials: dispatch_credentials,
+                                    received_at_ms,
+                                    ingress: self.id.clone(),
+                                });
+                            }
 
                             if let Some(server_mgr) = self.server_mgr.upgrade() {
                                 if let Some(service) = server_mgr.get_http_server(server_id) {
@@ -2044,7 +2129,15 @@ impl HttpServer for ProcessChainHttpServer {
                             }
                             let status = Self::parse_error_status_code(list[1].as_str())?;
                             let message = list.get(2).map(|v| v.as_str());
-                            let resp = self.build_error_response(status, message)?;
+                            let resp = if dispatch {
+                                dispatch_rejected(
+                                    status,
+                                    &dispatch_target,
+                                    message.unwrap_or("request-rejected"),
+                                )
+                            } else {
+                                self.build_error_response(status, message)?
+                            };
                             return self
                                 .apply_post_chain_result(
                                     Ok(resp),
@@ -2072,6 +2165,9 @@ impl HttpServer for ProcessChainHttpServer {
         let mut response =
             http::Response::new(Full::new(Bytes::new()).map_err(|e| match e {}).boxed());
         *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+        if dispatch {
+            response = dispatch_rejected(StatusCode::NOT_FOUND, &dispatch_target, "no-handler");
+        }
         self.apply_post_chain_result(Ok(response), &req_info, Some(&info), Some(&sources))
             .await
     }
