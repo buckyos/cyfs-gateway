@@ -91,7 +91,7 @@ pub(crate) fn validate_rtcp_hostname_form_did(
         ));
     }
 
-    let host = did.to_host_name();
+    let host = did.to_raw_host_name();
     if host.is_empty() || host.contains('/') || host.contains('?') || host.contains('#') {
         return Err(format!(
             "{} {} resolves to invalid RTCP DID hostname '{}'",

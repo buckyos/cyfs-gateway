@@ -140,6 +140,11 @@ RTCP 同时保留：
 canonical DID 用于 tunnel key 和持钥证明；semantic DID 与 canonical DID 一起进入
 session HKDF。trust 不会在 canonical 化后丢失，并暴露给 process-chain。
 
+握手中 semantic DID 的 hostname 表示统一使用 `DID::to_raw_host_name()`：例如
+`did:bns:ood1.alice` 固定为 `ood1.alice.bns.did`。Hello/HelloAck token 的 `from`、`to`
+以及 HKDF 的 semantic identity 输入都使用该表示，不受进程的 web3 bridge 配置影响。
+需要实际寻址、访问时才使用带 bridge 映射的 `to_host_name()`。
+
 当前 tunnel 复用键只使用 canonical device identity 和承载路径：
 
 ```text
@@ -230,8 +235,8 @@ Hello token v4 payload：
 接收端要求：
 
 - `aud` 精确等于 v4 audience；v2/v3 在握手阶段失败；
-- signed `from` 与 `Hello.from_id` 的规范 host form 一致；
-- signed semantic `to` 与 `Hello.to_id` 一致；
+- signed `from` 等于 `DID::from_str(Hello.from_id).to_raw_host_name()`；
+- signed `to` 等于 `DID::from_str(Hello.to_id).to_raw_host_name()`；
 - signed `canonical_to` 等于本 stack 从私钥导出的 canonical `did:dev`；
 - signed `listen_port == Hello.my_port`；
 - `exp >= iat`、寿命不超过 60 秒、`iat` 不超过当前时间加 60 秒 clock skew；
@@ -242,7 +247,8 @@ nonce cache 以 `(canonical source did:dev, nonce)` 为键，最多 16K **条目
 不是跨集群防重放服务。
 
 HelloAck token 使用 `buckyos-rtcp-v4-ack`，带同样的 `iat`/`exp`/`nonce`，并用
-`peer_xpub` 绑定本次 Hello。`HelloAckConfirm` 是第一条 AEAD 记录，echo responder
+`peer_xpub` 绑定本次 Hello。其 `from`、`to` 分别原样回显 Hello token 的 `to`、`from`，
+`HelloAck.responder_id` 同样使用 Hello token 的 `to`。`HelloAckConfirm` 是第一条 AEAD 记录，echo responder
 challenge。responder 成功解密 Confirm 后执行 listener、verified-cache 和 tunnel map
 仲裁，并以 `TunnelResult` 返回最终结果。initiator 必须收到 `accepted=true` 才能发布
 tunnel；`accepted=false` 的 `reason` 作为建链错误返回。最终结果发送失败或发送任务被
@@ -311,7 +317,8 @@ fail closed，且不会调用 application listener。
 ### 4.1 Tunnel session key
 
 双方各生成一次性 X25519 key。以下 `||` 表示原始字节串拼接，字符串使用签名 claim 中
-双方实际校验过的 UTF-8 字节；canonical DID 使用 `DID::to_string()` 的结果，xpub 和
+双方实际校验过的 UTF-8 字节；semantic DID 使用 `DID::to_raw_host_name()` 的结果，
+canonical DID 使用 `DID::to_string()` 的结果，xpub 和
 nonce 使用 token 中双方共同看到的十六进制字符串：
 
 ```text

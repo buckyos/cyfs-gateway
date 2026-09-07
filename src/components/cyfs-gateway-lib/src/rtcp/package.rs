@@ -77,13 +77,15 @@ pub(crate) struct TunnelTokenPayload {
     // replayed against a future BuckyOS protocol that happens to share
     // the same Ed25519 signing key.
     pub aud: String,
-    // Semantic identity requested by the caller (for example a did:web
-    // alias). It is retained in the HKDF context and echoed by HelloAck.
+    // Semantic identity requested by the caller, encoded with
+    // DID::to_raw_host_name() independently of web3 bridge configuration.
+    // It is retained in the HKDF context and echoed by HelloAck.
     pub to: String,
     // Canonical did:dev derived from the responder key selected by the
     // resolver. This lets the receiver prove that a semantic alias was
     // actually resolved to its own long-term key.
     pub canonical_to: String,
+    // Initiator's semantic identity in the same raw hostname form as `to`.
     pub from: String,
     // Signed copy of Hello.my_port. Receivers reject a mismatch before using
     // the plaintext field as a reconnect target.
@@ -115,6 +117,7 @@ pub(crate) struct TunnelTokenPayload {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub(crate) struct TunnelAckTokenPayload {
     pub aud: String,
+    // Echo Hello's signed raw hostnames with the source/target reversed.
     pub to: String,
     pub from: String,
     // Hex-encoded ephemeral X25519 public key for this side (responder).

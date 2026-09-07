@@ -1382,15 +1382,16 @@ impl RTcpInner {
         _this_host: &str,
         this_dev_did: &DID,
     ) -> Result<(), String> {
-        // Signed identity bindings must compare semantic DIDs, not their
-        // bridge hostnames. `to_host_name()` depends on the process-local
-        // web3 bridge config, so the same did:bns value may map to different
-        // hosts on an OOD and its SN.
-        let token_to_did = DID::from_str(token_to)
-            .map_err(|e| format!("token.to {} is not a valid DID: {}", token_to, e))?;
+        // Handshake identities use raw hostnames: they are not addresses to
+        // visit and must not depend on either peer's web3 bridge config.
         let hello_to_did = DID::from_str(hello_to_id)
             .map_err(|e| format!("Hello.to_id {} is not a valid DID: {}", hello_to_id, e))?;
-        if token_to_did != hello_to_did {
+        // Raw hostnames omit DID paths, which RTCP does not support. Reject
+        // them before conversion so an altered Hello target cannot collapse
+        // to the same signed hostname.
+        validate_rtcp_hostname_form_did(&hello_to_did, "Hello.to_id")?;
+        let hello_to_host = hello_to_did.to_raw_host_name();
+        if token_to != hello_to_host {
             return Err(format!(
                 "signed token.to {} does not match Hello.to_id {}",
                 token_to, hello_to_id
@@ -1421,11 +1422,10 @@ impl RTcpInner {
         claims: &TunnelTokenPayload,
         hello: &RTcpHelloBody,
     ) -> Result<(), String> {
-        let claims_from = DID::from_str(&claims.from)
-            .map_err(|e| format!("invalid token.from {}: {}", claims.from, e))?;
         let hello_from = DID::from_str(&hello.from_id)
-            .map_err(|e| format!("invalid Hello.from_id {}: {}", hello.from_id, e))?;
-        if claims_from != hello_from {
+            .map_err(|e| format!("invalid Hello.from_id {}: {}", hello.from_id, e))?
+            .to_raw_host_name();
+        if claims.from != hello_from {
             return Err(format!(
                 "token.from {} does not match Hello.from_id {}",
                 claims.from, hello.from_id
@@ -1508,7 +1508,7 @@ impl RTcpInner {
         let responder_trust = state.responder_trust;
         let responder_canonical_did = DID::from_str(&state.responder_canonical_did)
             .map_err(|e| format!("invalid canonical responder DID: {}", e))?;
-        let initiator_did = self.this_device_did.to_string();
+        let initiator_did = self.this_device_did.to_raw_host_name();
 
         let addr: SocketAddr = self.bind_addr.parse().unwrap();
         let hello_package = RTcpHelloPackage::new(
@@ -1720,7 +1720,7 @@ impl RTcpInner {
         let ed25519_sk = self.this_device_ed25519_sk.as_ref().ok_or_else(|| {
             TunnelError::DocumentError("this device ed25519 sk is none".to_string())
         })?;
-        let responder_did = responder_identity.semantic_did.to_string();
+        let responder_did = responder_identity.semantic_did.to_raw_host_name();
         let responder_ed25519_pk_der = responder_identity.ed25519_pk_der.to_vec();
         let responder_canonical_did = responder_identity.canonical_dev_did.to_string();
         let responder_trust = responder_identity.trust;
@@ -1745,7 +1745,7 @@ impl RTcpInner {
             aud: RTCP_HELLO_AUD.to_string(),
             to: responder_did.clone(),
             canonical_to: responder_canonical_did.clone(),
-            from: self.this_device_did.to_string(),
+            from: self.this_device_did.to_raw_host_name(),
             listen_port,
             xpub: my_public_hex.clone(),
             iat: now,
@@ -2845,7 +2845,7 @@ impl RTcpInner {
 
         // v4 anti-replay: every Hello token must bind this responder
         // and must not be replayed within its exp window.
-        let this_host = self.this_device_did.to_host_name();
+        let this_host = self.this_device_did.to_raw_host_name();
         if let Err(e) = Self::validate_hello_target(
             &hello_payload.to,
             &hello_payload.canonical_to,
@@ -3002,9 +3002,9 @@ impl RTcpInner {
         // peer_eph) via HKDF and wrap the stream. Only after the AEAD-
         // protected HelloAckConfirm is verified do we admit the tunnel.
         //
-        // hello_payload.from is the JWT-verified semantic DID. Keep the
-        // ack token bound to that canonical wire identity instead of an
-        // environment-dependent bridge hostname.
+        // hello_payload.from is the JWT-verified raw hostname. Echo the
+        // signed raw hostnames in HelloAck and use the same bytes in HKDF,
+        // independently of either peer's web3 bridge config.
         let initiator_hostname = hello_payload.from.clone();
         let ack_state = match self
             .generate_ack_token(
@@ -3607,7 +3607,7 @@ impl RTcpInner {
                 DID::from_str(&state.responder_canonical_did).map_err(|e| {
                     TunnelError::DocumentError(format!("invalid canonical responder DID: {}", e))
                 })?;
-            let initiator_did = self.this_device_did.to_string();
+            let initiator_did = self.this_device_did.to_raw_host_name();
 
             let addr: SocketAddr = self.bind_addr.parse().unwrap();
             let hello_package = RTcpHelloPackage::new(
@@ -9350,9 +9350,9 @@ mod tests {
 
         assert_eq!(
             claims.get("to").and_then(|v| v.as_str()),
-            Some("did:web:sn.devtests.org")
+            Some("sn.devtests.org")
         );
-        assert_eq!(state.responder_did, "did:web:sn.devtests.org");
+        assert_eq!(state.responder_did, "sn.devtests.org");
         assert_eq!(state.responder_canonical_did, server_id.to_string());
         assert_eq!(state.responder_trust, RtcpIdentityTrust::DnsTxtBootstrap);
         RTcpInner::validate_hello_target(
@@ -9363,6 +9363,147 @@ mod tests {
             &server_id,
         )
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_rtcp_raw_hostname_handshake_ignores_bridge_config() {
+        const BRIDGE_ENV: &str = "RTCP_RAW_HOSTNAME_TEST_BRIDGE";
+        let Ok(bridge) = std::env::var(BRIDGE_ENV) else {
+            // Bridge configuration is process-global and write-once. Run each
+            // configuration in a child so other tests cannot set it first.
+            for bridge in ["ood-bridge.example", "sn-bridge.example"] {
+                let output = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        concat!(
+                            module_path!(),
+                            "::test_rtcp_raw_hostname_handshake_ignores_bridge_config"
+                        )
+                        .strip_prefix("cyfs_gateway_lib::")
+                        .unwrap(),
+                        "--nocapture",
+                    ])
+                    .env(BRIDGE_ENV, bridge)
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "bridge {bridge}:\n{}\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            }
+            return;
+        };
+        KNOWN_WEB3_BRIDGE_CONFIG
+            .set(HashMap::from([("bns".to_string(), bridge.clone())]))
+            .unwrap();
+
+        let (client_config, client_key) = test_device_config("raw-client");
+        let (server_config, server_key) = test_device_config("raw-server");
+        let client_did = DID::new("bns", "ood1.alice");
+        let server_did = DID::new("bns", "ood1.bob");
+        assert_eq!(client_did.to_host_name(), format!("ood1.alice.{bridge}"));
+        assert_eq!(server_did.to_host_name(), format!("ood1.bob.{bridge}"));
+        let client = RTcpInner::new(
+            client_did.clone(),
+            "127.0.0.1:2980".to_string(),
+            Some(client_key),
+            None,
+            Arc::new(MockRTcpListener::new()),
+        );
+        let server = RTcpInner::new(
+            server_did.clone(),
+            "127.0.0.1:2981".to_string(),
+            Some(server_key),
+            None,
+            Arc::new(MockRTcpListener::new()),
+        );
+        // Resolve the key DID locally, then supply the semantic BNS target;
+        // this exercises the handshake without depending on a live resolver.
+        let mut identity = server
+            .resolve_handshake_identity(&server_config.id)
+            .await
+            .unwrap();
+        identity.semantic_did = server_did.clone();
+        let state = client.generate_tunnel_token_for_identity(identity).unwrap();
+        let client_pk = jwk_to_ed25519_pk(&client_config.get_default_key().unwrap()).unwrap();
+        let (client_xpub, claims) = RTcpInner::verify_hello_token(
+            &state.token,
+            &DecodingKey::from_ed_der(&client_pk),
+            Some("ood1.alice.bns.did"),
+        )
+        .unwrap();
+        assert_eq!(claims.to, "ood1.bob.bns.did");
+        assert_eq!(claims.canonical_to, server_config.id.to_string());
+        let hello = RTcpHelloBody {
+            from_id: client_did.to_string(),
+            to_id: server_did.to_string(),
+            my_port: claims.listen_port,
+            tunnel_token: Some(state.token.clone()),
+            device_doc_jwt: None,
+        };
+        RTcpInner::validate_hello_signed_bindings(&claims, &hello).unwrap();
+        RTcpInner::validate_hello_target(
+            &claims.to,
+            &claims.canonical_to,
+            &hello.to_id,
+            &server_did.to_raw_host_name(),
+            &server_config.id,
+        )
+        .unwrap();
+        let mut bridge_claims = claims.clone();
+        bridge_claims.from = client_did.to_host_name();
+        assert!(RTcpInner::validate_hello_signed_bindings(&bridge_claims, &hello).is_err());
+        assert!(
+            RTcpInner::validate_hello_target(
+                &server_did.to_host_name(),
+                &claims.canonical_to,
+                &hello.to_id,
+                &server_did.to_raw_host_name(),
+                &server_config.id,
+            )
+            .is_err()
+        );
+
+        let (ack, server_secret, _, _) = server
+            .generate_ack_token(&claims.from, &claims.xpub, &claims.to)
+            .await
+            .unwrap();
+        let (server_xpub, ack_claims) = RTcpInner::verify_ack_token(
+            &ack,
+            &DecodingKey::from_ed_der(&state.responder_ed25519_pk_der),
+            &state.responder_did,
+            &client_did.to_raw_host_name(),
+            &state.my_xpub_hex,
+        )
+        .unwrap();
+        let client_keys = RTcpInner::derive_session_secrets(
+            state.my_secret,
+            server_xpub,
+            &client_did.to_raw_host_name(),
+            &state.responder_did,
+            &state.initiator_canonical_did,
+            &state.responder_canonical_did,
+            &state.my_xpub_hex,
+            &ack_claims.xpub,
+            &state.my_nonce_hex,
+            &ack_claims.nonce,
+        );
+        let server_keys = RTcpInner::derive_session_secrets(
+            server_secret,
+            client_xpub,
+            &claims.from,
+            &claims.to,
+            &client_config.id.to_string(),
+            &server_config.id.to_string(),
+            &claims.xpub,
+            &ack_claims.xpub,
+            &claims.nonce,
+            &ack_claims.nonce,
+        );
+        assert_eq!(client_keys, server_keys);
     }
 
     fn ed25519_test_keys() -> (EncodingKey, DecodingKey) {
@@ -9384,9 +9525,9 @@ mod tests {
         let now = buckyos_get_unix_timestamp();
         let payload = TunnelTokenPayload {
             aud: RTCP_HELLO_AUD.to_string(),
-            to: "did:web:responder.example.com".to_string(),
+            to: "responder.example.com".to_string(),
             canonical_to: DID::new("dev", "responder-key").to_string(),
-            from: "did:web:initiator.example.com".to_string(),
+            from: "initiator.example.com".to_string(),
             listen_port: 2981,
             xpub: hex::encode([1u8; 32]),
             iat: now,
@@ -9395,15 +9536,12 @@ mod tests {
         };
         let token = RTcpInner::sign_jwt(&encoding_key, &payload).unwrap();
 
-        RTcpInner::verify_hello_token(&token, &decoding_key, Some("did:web:initiator.example.com"))
+        RTcpInner::verify_hello_token(&token, &decoding_key, Some("initiator.example.com"))
             .unwrap();
 
-        let err = RTcpInner::verify_hello_token(
-            &token,
-            &decoding_key,
-            Some("did:web:attacker.example.com"),
-        )
-        .unwrap_err();
+        let err =
+            RTcpInner::verify_hello_token(&token, &decoding_key, Some("attacker.example.com"))
+                .unwrap_err();
         assert!(
             err.to_string().contains("not match expected"),
             "unexpected error: {}",
@@ -9416,7 +9554,7 @@ mod tests {
         let err = RTcpInner::verify_hello_token(
             &bad_xpub_token,
             &decoding_key,
-            Some("did:web:initiator.example.com"),
+            Some("initiator.example.com"),
         )
         .unwrap_err();
         assert!(
@@ -9432,9 +9570,9 @@ mod tests {
         let now = buckyos_get_unix_timestamp();
         let base = TunnelTokenPayload {
             aud: RTCP_HELLO_AUD.to_string(),
-            to: "did:web:responder.example".to_string(),
+            to: "responder.example".to_string(),
             canonical_to: DID::new("dev", "responder-key").to_string(),
-            from: "did:web:initiator.example".to_string(),
+            from: "initiator.example".to_string(),
             listen_port: 2980,
             xpub: hex::encode([11u8; 32]),
             iat: now,
@@ -9446,11 +9584,7 @@ mod tests {
         old_audience.aud = "buckyos-rtcp-v2-hello".to_string();
         let token = RTcpInner::sign_jwt(&encoding_key, &old_audience).unwrap();
         assert!(
-            RTcpInner::verify_hello_token(
-                &token,
-                &decoding_key,
-                Some("did:web:initiator.example"),
-            )
+            RTcpInner::verify_hello_token(&token, &decoding_key, Some("initiator.example"),)
                 .is_err()
         );
 
@@ -9459,11 +9593,7 @@ mod tests {
         future.exp = future.iat + TUNNEL_TOKEN_EXP_SECS;
         let token = RTcpInner::sign_jwt(&encoding_key, &future).unwrap();
         assert!(
-            RTcpInner::verify_hello_token(
-                &token,
-                &decoding_key,
-                Some("did:web:initiator.example"),
-            )
+            RTcpInner::verify_hello_token(&token, &decoding_key, Some("initiator.example"),)
                 .unwrap_err()
                 .to_string()
                 .contains("future")
@@ -9473,11 +9603,7 @@ mod tests {
         reversed.exp = reversed.iat - 1;
         let token = RTcpInner::sign_jwt(&encoding_key, &reversed).unwrap();
         assert!(
-            RTcpInner::verify_hello_token(
-                &token,
-                &decoding_key,
-                Some("did:web:initiator.example"),
-            )
+            RTcpInner::verify_hello_token(&token, &decoding_key, Some("initiator.example"),)
                 .is_err()
         );
 
@@ -9485,11 +9611,7 @@ mod tests {
         overlong.exp = overlong.iat + TUNNEL_TOKEN_EXP_SECS + 1;
         let token = RTcpInner::sign_jwt(&encoding_key, &overlong).unwrap();
         assert!(
-            RTcpInner::verify_hello_token(
-                &token,
-                &decoding_key,
-                Some("did:web:initiator.example"),
-            )
+            RTcpInner::verify_hello_token(&token, &decoding_key, Some("initiator.example"),)
                 .unwrap_err()
                 .to_string()
                 .contains("lifetime")
@@ -9499,11 +9621,7 @@ mod tests {
         missing_iat.as_object_mut().unwrap().remove("iat");
         let token = RTcpInner::sign_jwt(&encoding_key, &missing_iat).unwrap();
         assert!(
-            RTcpInner::verify_hello_token(
-                &token,
-                &decoding_key,
-                Some("did:web:initiator.example"),
-            )
+            RTcpInner::verify_hello_token(&token, &decoding_key, Some("initiator.example"),)
                 .is_err()
         );
 
@@ -9523,7 +9641,7 @@ mod tests {
         );
 
         let mut bns_claims = base.clone();
-        bns_claims.from = "did:bns:ood1.issue39".to_string();
+        bns_claims.from = "ood1.issue39.bns.did".to_string();
         let bns_hello = RTcpHelloBody {
             from_id: "did:bns:ood1.issue39".to_string(),
             to_id: "did:web:sn.devtests.org".to_string(),
@@ -9533,7 +9651,7 @@ mod tests {
         };
         RTcpInner::validate_hello_signed_bindings(&bns_claims, &bns_hello).unwrap();
 
-        bns_claims.from = "did:bns:ood1.other-zone".to_string();
+        bns_claims.from = "ood1.other-zone.bns.did".to_string();
         assert!(
             RTcpInner::validate_hello_signed_bindings(&bns_claims, &bns_hello)
                 .unwrap_err()
@@ -9544,8 +9662,8 @@ mod tests {
     #[test]
     fn test_rtcp_verify_ack_token_rejects_identity_and_peer_xpub_mismatch() {
         let (encoding_key, decoding_key) = ed25519_test_keys();
-        let expected_from = "did:web:responder.example.com";
-        let expected_to = "did:web:initiator.example.com";
+        let expected_from = "responder.example.com";
+        let expected_to = "initiator.example.com";
         let expected_peer_xpub = hex::encode([7u8; 32]);
         let now = buckyos_get_unix_timestamp();
         let payload = TunnelAckTokenPayload {
@@ -9570,7 +9688,7 @@ mod tests {
         .unwrap();
 
         let mut wrong_from = payload.clone();
-        wrong_from.from = "did:web:other-responder.example.com".to_string();
+        wrong_from.from = "other-responder.example.com".to_string();
         let token = RTcpInner::sign_jwt(&encoding_key, &wrong_from).unwrap();
         assert!(
             RTcpInner::verify_ack_token(
@@ -9586,7 +9704,7 @@ mod tests {
         );
 
         let mut wrong_to = payload.clone();
-        wrong_to.to = "did:web:other-initiator.example.com".to_string();
+        wrong_to.to = "other-initiator.example.com".to_string();
         let token = RTcpInner::sign_jwt(&encoding_key, &wrong_to).unwrap();
         assert!(
             RTcpInner::verify_ack_token(
@@ -9632,6 +9750,16 @@ mod tests {
         .unwrap();
 
         let err = RTcpInner::validate_hello_target(
+            this_host,
+            this_dev_did.to_string().as_str(),
+            "did:web:this.example.com:other-device",
+            this_host,
+            &this_dev_did,
+        )
+        .unwrap_err();
+        assert!(err.contains("DID URL/path forms"), "unexpected error: {}", err);
+
+        let err = RTcpInner::validate_hello_target(
             "other.test.did",
             DID::new("dev", "different-key").to_string().as_str(),
             "did:test:other",
@@ -9648,14 +9776,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_rtcp_validate_hello_target_accepts_this_dev_did_forms() {
-        // token.to 固定使用 DID 的 host-name 规范形式；Hello.to_id 可保留
+        // token.to 固定使用 DID 的 raw hostname 形式；Hello.to_id 可保留
         // did:dev 字符串形式。
         let (device_config, _pkcs8_bytes) = test_device_config("hello-target-dev");
         let this_dev_did = device_config.id.clone();
         let this_host = "sn.devtests.org";
 
         RTcpInner::validate_hello_target(
-            this_dev_did.to_host_name().as_str(),
+            this_dev_did.to_raw_host_name().as_str(),
             this_dev_did.to_string().as_str(),
             this_dev_did.to_string().as_str(),
             this_host,
@@ -9675,7 +9803,7 @@ mod tests {
         // 其它设备的 did:dev 仍然拒绝。
         let (other_config, _other_pkcs8_bytes) = test_device_config("hello-target-other");
         let err = RTcpInner::validate_hello_target(
-            other_config.id.to_host_name().as_str(),
+            other_config.id.to_raw_host_name().as_str(),
             other_config.id.to_string().as_str(),
             other_config.id.to_string().as_str(),
             this_host,
@@ -11468,7 +11596,7 @@ mod tests {
         RTcpInner::verify_hello_token(
             &state.token,
             &DecodingKey::from_ed_der(&candidate_key),
-            Some(client_id.to_string().as_str()),
+            Some(client_id.to_raw_host_name().as_str()),
         )
         .unwrap();
     }
