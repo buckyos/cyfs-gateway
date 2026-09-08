@@ -197,6 +197,92 @@ BNS-Client 始终使用点号形式的 canonical method；下划线别名只用�
 返回 `ResolveResult`。名称不存在时返回 `NAME_NOT_FOUND`；从未发布过该类型文档时返回
 `DOCUMENT_NOT_FOUND`。
 
+
+### 3.5.1 Device DID 的 HTTP 权威解析
+
+document.resolve 仍按精确 (name, doc_type) 查询，不做父名字回退。
+仅 HTTP DID resolver 的当前态 type=zone 查询支持 Node Active 的设备槽布局：
+
+- 请求 did:bns:{device}.{parent}，先检查完整子名字。只要存在名字状态记录，
+  包括 active、expired、released、tombstoned，就查询子名字自己的 zone 槽；
+  子名字 Missing、撤销或替换不能由父名字覆盖。
+- 只有子名字从未注册时，才读取 ({parent}, {device})。保留该槽原始
+  DeviceDocument JWT、版本、内容 hash 和状态，不从内嵌设备重建 JWT。
+- 设备必须出现在当前、有效且由 owner 签名的父 Zone 的 devices 中。
+  id、name、owner、zone_did 必须绑定请求 DID 和父 BNS DID。
+  父 owner 槽必须是同名 OwnerDocument；使用其当前/历史公钥验证 JWT，
+  遵循 owner valid_iat 和 registry min_document_iat；设备认证公钥必须为
+  由设备自身控制、在 authentication 中授权的 Ed25519 key（校验 Relay 实际选择的 key）。
+- Zone membership 确认设备身份；设备当前公钥来自独立设备槽。
+  因此设备换钥不要求旧的内嵌设备快照与当前设备文档逐字相同。
+- zone/owner/boot/info/doc/profile 等保留槽名不作设备映射。
+  非 BNS method、非 zone 类型和历史查询不使用此规则。
+- 父名字迁移不会隐式迁移设备。父名字的 alias target 是 Zone 的目标，
+  设备查询因此返回 Missing、无正文、无 migrationTarget；独立注册的子名字仍按自身状态解析。
+- Owner valid_iat（含阈值）和 min_document_iat（不含阈值）作废的设备/Zone 返回
+  Revoked；Owner/Device/Zone 文档自身 exp 到期返回 Expired。这些确定的判断不返回 502，
+  使 NameClient 清理旧 positive cache。来源槽的原始发布状态仍保留在 sourceDocumentStatus。
+- 父 Zone/Owner 的负状态或过期会阻止映射。查询期间 checkpoint 改变或子名字
+  被注册时拒绝这次回答；返回前还需重读并比较 Device/Zone/Owner 三份完整投影，
+  不依赖 checkpoint 随每次更新变化。调用方重试。无效身份/签名/hash 返回 resolver 错误。
+- HTTP metadata 的 sourceName/sourceDocType/sourceContentHash 指向实际投影槽。
+  sourceDocumentStatus 保留来源槽的发布状态；父 Zone/Owner 导致拒绝时返回该依赖槽的
+  来源元数据且不返回其文档正文。原始 compact JWT 同时返回 docHash（去掉 registry 的 0x 前缀的 SHA-256）；
+  JSON 重序列化或 JSON string 包装不伪装为相同的原始内容 hash。
+
+BNS 父 Zone 内嵌设备不能写入 NameClient 的独立设备身份缓存；权威 Missing/Expired
+删除该 DID 旧的 positive cache。RemoteAuthority 始终重新查询权威源。
+Relay 的 Anchored / MethodAuthorityCurrent 要求不变。
+
+自有 did:web Zone 使用域名 canonical HTTPS endpoint（以及 WebProvider 定义的父域
+resolver），不能通过上述 BNS 槽映射证明其权威状态。Node Active 在持久化完成前必须
+使用和 Relay 相同的 RemoteAuthority 策略读回原始 DeviceDocument JWT。自有域名的 HTTPS
+若经本节点 RTCP 转发，会与首次握手形成循环，单纯提前启动节点无法打破这个循环。
+
+Node Active 的自有域名流程先生成签名文档并导出设备 JWT，再由用户在独立静态站点发布到
+https://ood1.<自有域名>/.well-known/did.json，使用 application/jwt，保持原文字节。
+此 HTTPS 身份文档路径在节点离线时也必须可用，不能依赖其尚未建立的中继隧道。
+独立发布入口必须同时保留设备域名原有的 RTCP 地址/端口路由；不能简单把设备 DNS 改到
+只提供静态 HTTP 的站点，否则 NameClient 的设备地址解析可能指向错误的 RTCP 服务。
+可以在独立入口按 HTTPS 路径和 TCP 端口分流。Root Zone 域名继续使用既有网关配置，
+不把 BNS 的权威身份规则套用于 did:web。
+签名材料仅保留在当前激活页面内存，导出文件只含公开的签名设备文档。
+
+提交和重试复用已导出的同一组签名文档；域名、Owner、设备公钥、网关配置变化后必须重新
+生成并更新外部发布。后端在任何 SN/BNS 写入前先校验 did:web 的权威发布，BNS 投影完成后
+再次校验设备权威，再完成激活。JSON 重建、旧 JWT、错误身份、过期或 Missing 都不能完成激活。
+密钥轮换/撤销时，独立静态发布面也必须同步更新或撤下，不能指望 BNS 槽更新自动改变 did:web。
+
+跨仓库回归入口（五个仓库为同级目录，已有 Cargo/Python 3.11+ 环境）：
+
+    python3 src/components/bns-server/tests/node_active_authority.py
+
+该入口调用 node-daemon 的真实 prepare/sign 流程，装载其发布布局到临时 SQLite 投影，
+启动真实 BNS HTTP server，再调用 Relay 的 resolve_handshake_identity，断言
+MethodAuthorityCurrent 和设备公钥。通过临时 Cargo patch 使用同级 buckyos-base 源码；
+不修改依赖声明，不提交链上交易，不部署、不重启服务，退出时清理临时 fixture。
+常规 bns-server 单元测试另覆盖多设备、换钥、错误绑定/签名、独立子名字/负状态、
+父名字迁移、撤销阈值、文档 exp 和负缓存后的重新发布恢复。
+node-daemon 测试使用独立本地 HTTP 静态站点验证 WebProvider 的 canonical 路径和提交校验；
+测试使用 HTTP 和临时端口，生产仍使用 HTTPS，不验证真实 DNS/CA 证书部署。
+Node Active 前端运行 npm test 验证导出到提交/重试不重新签名，pnpm exec tsc --noEmit
+验证类型；以上测试不执行真实 commit_active 持久化或链上发布。
+
+### 3.5.2 已有激活文档恢复
+
+Issue buckyos/buckyos#608 的存量恢复必须先检查精确设备槽和父 Zone 内容。
+若设备槽有效且所有绑定成立，解析端升级即可恢复设备 DID 权威查询。
+若 Zone owner 为 did:undefined:undefined，不能放宽 resolver 校验：
+
+1. 由原 owner 使用既有密钥重新签发修正 owner、提高 iat 的 Zone JWT，保留
+   Zone DID、设备 DID、devices 和其他有效配置。
+2. 通过已有受权发布流程更新同一名字的 zone 槽，等待链上成功与 Indexer 投影；
+   无须删除名字、用户或重新激活，已有正确的设备槽无需重写。
+3. 验证设备 DID 的 RemoteAuthority 结果、原始设备 hash/revision 和 Relay
+   MethodAuthorityCurrent，再分别验证 Hello/HelloAck、Ping/Pong、公网 HTTPS。
+4. token.from / Hello.from_id 语义比较的构建版本需要独立核实，不能以 BNS 查询
+   修复推断所有 HelloAck EOF 已消失。
+
 ### 3.6 `document.get_version`
 
 读取文档的指定历史版本。

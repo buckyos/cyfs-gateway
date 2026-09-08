@@ -9313,6 +9313,43 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires the Node Active fixture BNS HTTP server"]
+    async fn relay_node_active_bns_authority_current() {
+        let path = std::env::var("BUCKYOS_ACTIVE_FIXTURE").expect("fixture path");
+        let fixture: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let url = std::fs::read_to_string(format!("{path}.url")).unwrap();
+        let client = name_client::NameClient::new(name_client::NameClientConfig {
+            cache_backend: name_client::CacheBackend::Memory,
+            enable_zone_resolver: false,
+            ..Default::default()
+        });
+        client
+            .set_method_authority("bns", Box::new(name_client::BaseHttpProvider::new(&url)))
+            .await;
+        assert!(name_client::GLOBAL_NAME_CLIENT.set(client).is_ok());
+        let (signing_key, pkcs8) = generate_ed25519_key();
+        let local = DeviceDocument::new_by_jwk(
+            "relay",
+            serde_json::from_value(encode_ed25519_sk_to_pk_jwk(&signing_key)).unwrap(),
+        );
+        let relay = RTcpInner::new(
+            local.id,
+            "127.0.0.1:0".into(),
+            Some(pkcs8),
+            None,
+            Arc::new(MockRTcpListener::new()),
+        );
+        let device: DeviceDocument = serde_json::from_value(fixture["device"].clone()).unwrap();
+        let identity = relay.resolve_handshake_identity(&device.id).await.unwrap();
+        assert_eq!(identity.trust, RtcpIdentityTrust::MethodAuthorityCurrent);
+        assert_eq!(identity.semantic_did, device.id);
+        assert!(identity.binds_logical_name);
+        let key = name_lib::jwk_to_ed25519_pk(&device.get_default_key().unwrap()).unwrap();
+        assert_eq!(identity.ed25519_pk_der, key);
+    }
+
+    #[tokio::test]
     async fn web_target_token_uses_resolved_dev_identity() {
         let _ = init_name_lib_for_test(&HashMap::new()).await;
 
