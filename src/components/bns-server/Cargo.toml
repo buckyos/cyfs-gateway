@@ -15,6 +15,7 @@ http.workspace = true
 http-body-util.workspace = true
 kRPC.workspace = true
 log.workspace = true
+name-lib.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde_yaml_ng.workspace = true
@@ -22,5 +23,4 @@ tokio.workspace = true
 
 [dev-dependencies]
 name-client.workspace = true
-name-lib.workspace = true
 tempfile.workspace = true

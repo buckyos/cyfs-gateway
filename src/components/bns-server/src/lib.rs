@@ -42,6 +42,7 @@ use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full};
 use kRPC::{RPCErrors, RPCHandler, RPCRequest, RPCResponse, RPCResult};
 use log::warn;
+use name_lib::{DIDDocumentTrait, DeviceDocument, EncodedDocument, OwnerDocument, ZoneDocument, DID};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use serde_json::{json, Map, Value};
@@ -1030,7 +1031,7 @@ async fn serve_did_resolver_request<T: BnsIndexerApi>(
         );
     }
 
-    match api.resolve_document(&name, &doc_type).await {
+    match resolve_bns_identity(api, &name, &doc_type).await {
         Ok(result) => {
             let status = did_resolver_document_status(&result, now_timestamp());
             did_resolution_state_response(&doc_type, status, Some(&result))
@@ -1063,6 +1064,207 @@ async fn serve_did_resolver_request<T: BnsIndexerApi>(
         // 5xx — never as Missing/Revoked (protocol §5).
         Err(error) => did_resolution_failure_response(did, &doc_type, &error),
     }
+}
+
+async fn resolve_bns_identity<T: BnsIndexerApi>(
+    api: &T,
+    name: &str,
+    doc_type: &str,
+) -> BnsClientResult<ResolveResult> {
+    if doc_type != DID_RESOLVER_DEFAULT_DOC_TYPE || !name.contains('.') {
+        return api.resolve_document(name, doc_type).await;
+    }
+    let checkpoint = api.latest_checkpoint().await?;
+    if api.query_name_state(name).await?.is_some() {
+        return api.resolve_document(name, doc_type).await;
+    }
+    let (device_name, parent) = name.split_once('.').unwrap();
+    if matches!(
+        device_name,
+        "zone" | "owner" | "boot" | "info" | "doc" | "profile"
+    ) {
+        return api.resolve_document(name, doc_type).await;
+    }
+    let result = api.resolve_document(parent, device_name).await?;
+    match did_resolver_document_status(&result, now_timestamp()) {
+        DocumentStatus::Active => {}
+        DocumentStatus::Migrated => {
+            return Ok(denied_device_resolution(&result, DocumentStatus::Missing));
+        }
+        _ => return Ok(result),
+    }
+    let zone_result = api.resolve_document(parent, "zone").await?;
+    let owner_result = api.resolve_document(parent, "owner").await?;
+    for dependency in [&zone_result, &owner_result] {
+        if did_resolver_document_status(dependency, now_timestamp()) != DocumentStatus::Active {
+            let status = match did_resolver_document_status(dependency, now_timestamp()) {
+                DocumentStatus::Migrated => DocumentStatus::Missing,
+                status => status,
+            };
+            return Ok(denied_device_resolution(dependency, status));
+        }
+    }
+    let denied = validate_device_slot(
+        name,
+        device_name,
+        parent,
+        &result,
+        &zone_result,
+        &owner_result,
+    )
+    .map_err(BnsClientError::Transport)?;
+    if api.resolve_document(parent, device_name).await? != result
+        || api.resolve_document(parent, "zone").await? != zone_result
+        || api.resolve_document(parent, "owner").await? != owner_result
+        || api.query_name_state(name).await?.is_some()
+        || api.latest_checkpoint().await? != checkpoint
+    {
+        return Err(BnsClientError::Transport(
+            "BNS projection changed during device resolution".into(),
+        ));
+    }
+    Ok(match denied {
+        Some((status, source)) => denied_device_resolution(source, status),
+        None => result,
+    })
+}
+
+fn denied_device_resolution(source: &ResolveResult, status: DocumentStatus) -> ResolveResult {
+    let mut result = source.clone();
+    result.document_state.document.inline_document.clear();
+    result.status = status;
+    result.alias_kind = AliasKind::None;
+    result.alias_target_did.clear();
+    result
+}
+
+fn projected_document(result: &ResolveResult) -> Result<EncodedDocument, String> {
+    if bns_client::sha256_hex(&result.document_state.document.inline_document)
+        != result.document_state.document.content_hash
+    {
+        return Err("BNS inline content does not match its published hash".into());
+    }
+    match decode_inline_document(&result.document_state.document.inline_document).0 {
+        Some(Value::String(jwt)) => Ok(EncodedDocument::Jwt(jwt)),
+        Some(value) => Ok(EncodedDocument::JsonLd(value)),
+        None => Err("BNS document has no inline content".into()),
+    }
+}
+
+fn decode_owner_signed<D: DIDDocumentTrait>(
+    encoded: &EncodedDocument,
+    owner: &OwnerDocument,
+) -> Result<D, String> {
+    let mut kids = vec![None];
+    let historical = owner.get_historical_keys();
+    kids.extend(historical.iter().map(|(kid, _)| Some(kid.as_str())));
+    for kid in kids {
+        if let Some((key, _)) = owner.get_auth_key(kid) {
+            if let Ok(document) = D::decode(encoded, Some(&key)) {
+                return Ok(document);
+            }
+        }
+    }
+    Err("BNS document signature does not match current owner keys".into())
+}
+
+fn validate_device_slot<'a>(
+    name: &str,
+    device_name: &str,
+    parent: &str,
+    device_result: &'a ResolveResult,
+    zone_result: &'a ResolveResult,
+    owner_result: &'a ResolveResult,
+) -> Result<Option<(DocumentStatus, &'a ResolveResult)>, String> {
+    let parent_did = DID::new("bns", parent);
+    let requested = DID::new("bns", name);
+    let owner = OwnerDocument::decode(&projected_document(owner_result)?, None)
+        .map_err(|e| e.to_string())?;
+    if owner.id != parent_did || owner.name != parent {
+        return Err("BNS device owner identity mismatch".into());
+    }
+    owner
+        .get_auth_key(None)
+        .ok_or("BNS owner authentication key missing")?;
+    let device_encoded = projected_document(device_result)?;
+    let zone_encoded = projected_document(zone_result)?;
+    if !matches!(device_encoded, EncodedDocument::Jwt(_))
+        || !matches!(zone_encoded, EncodedDocument::Jwt(_))
+    {
+        return Err("BNS device mapping requires signed Device and Zone JWTs".into());
+    }
+    let device = DeviceDocument::decode(&device_encoded, None).map_err(|e| e.to_string())?;
+    let zone = ZoneDocument::decode(&zone_encoded, None).map_err(|e| e.to_string())?;
+    if device.id != requested
+        || device.name != device_name
+        || device.owner != parent_did
+        || device.zone_did.as_ref() != Some(&parent_did)
+        || zone.id != parent_did
+        || zone.owner != parent_did
+    {
+        return Err("BNS device/zone identity or owner mismatch".into());
+    }
+    if owner.valid_iat.is_some_and(|cutoff| device.iat <= cutoff || zone.iat <= cutoff) {
+        return Ok(Some((DocumentStatus::Revoked, owner_result)));
+    }
+    if device.iat < device_result.name_state.min_document_iat {
+        return Ok(Some((DocumentStatus::Revoked, device_result)));
+    }
+    if zone.iat < zone_result.name_state.min_document_iat {
+        return Ok(Some((DocumentStatus::Revoked, zone_result)));
+    }
+    for (exp, source) in [
+        (owner.exp, owner_result),
+        (device.exp, device_result),
+        (zone.exp, zone_result),
+    ] {
+        if exp <= now_timestamp() {
+            return Ok(Some((DocumentStatus::Expired, source)));
+        }
+    }
+    if device.iat > now_timestamp() + 300 || zone.iat > now_timestamp() + 300 {
+        return Err("BNS device/zone issuance time is in the future".into());
+    }
+    decode_owner_signed::<DeviceDocument>(&device_encoded, &owner)?;
+    decode_owner_signed::<ZoneDocument>(&zone_encoded, &owner)?;
+    let member = zone
+        .devices
+        .get(device_name)
+        .ok_or("Device is not a member of the published Zone")?;
+    if member.id != requested
+        || member.name != device_name
+        || member.owner != parent_did
+        || member.zone_did.as_ref() != Some(&parent_did)
+        || device
+            .get_exchange_key(None)
+            .and_then(|(_, key)| name_lib::jwk_to_ed25519_pk(&key).ok())
+            .is_none()
+    {
+        return Err("BNS Zone membership or device authentication key mismatch".into());
+    }
+    let value = serde_json::to_value(&device).map_err(|e| e.to_string())?;
+    let selected_key = value["verificationMethod"][0]["id"]
+        .as_str().ok_or("Device exchange key id missing")?;
+    let absolute_key = if selected_key.starts_with('#') {
+        format!("{}{selected_key}", requested.to_string())
+    } else {
+        selected_key.to_string()
+    };
+    if !value["authentication"].as_array().is_some_and(|refs| {
+        refs.iter().any(|key| key.as_str() == Some(selected_key)
+            || key.as_str() == Some(absolute_key.as_str()))
+    }) {
+        return Err("Device exchange key is not authorized for authentication".into());
+    }
+    for method in value["verificationMethod"]
+        .as_array()
+        .ok_or("Device verificationMethod missing")?
+    {
+        if method["controller"].as_str() != Some(requested.to_string().as_str()) {
+            return Err("Device key controller does not match its DID".into());
+        }
+    }
+    Ok(None)
 }
 
 fn did_resolution_failure_response(
@@ -1171,6 +1373,15 @@ fn did_resolution_state_response(
     buckyos.insert("docType".to_string(), json!(doc_type));
     buckyos.insert("documentStatus".to_string(), json!(status.as_str()));
     if let Some(result) = result {
+        buckyos.insert("sourceName".to_string(), json!(result.document_state.name));
+        buckyos.insert("sourceDocType".to_string(), json!(result.document_state.doc_type));
+        buckyos.insert("sourceContentHash".to_string(), json!(result.document_state.document.content_hash));
+        buckyos.insert("sourceDocumentStatus".to_string(), json!(result.document_state.status.as_str()));
+        if let Some(Value::String(jwt)) = &did_document {
+            if jwt.as_bytes() == result.document_state.document.inline_document.as_slice() {
+                buckyos.insert("docHash".to_string(), json!(result.document_state.document.content_hash.trim_start_matches("0x")));
+            }
+        }
         // Version 0 is the "never published" placeholder, not a real version.
         if result.document_state.version != 0 {
             buckyos.insert(
@@ -1193,11 +1404,6 @@ fn did_resolution_state_response(
                 json!(result.alias_target_did),
             );
         }
-        // `docHash` is deliberately not emitted: the store anchors the raw
-        // stored bytes while protocol §6 anchors the encoded document string
-        // clients re-serialize from `didDocument`; for re-encoded JSON bodies
-        // the two disagree and a wrong anchor would make clients discard
-        // valid documents. Inline answers need no anchor.
     }
 
     let mut metadata = Map::new();
@@ -2093,6 +2299,533 @@ mod tests {
         for legacy in ["nextVersionId", "canonicalId", "equivalentId"] {
             assert!(metadata.get(legacy).is_none(), "legacy field {legacy}");
         }
+    }
+
+    #[tokio::test]
+    #[ignore = "cross-repository Node Active/Relay integration server"]
+    async fn serve_node_active_authority_fixture() {
+        let path = std::env::var("BUCKYOS_ACTIVE_FIXTURE").expect("fixture path");
+        let fixture: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let store = resolver_seeded_store();
+        store
+            .transact(|tx| {
+                for (slot, bytes) in [
+                    ("owner", serde_json::to_vec(&fixture["owner"]).unwrap()),
+                    (
+                        "zone",
+                        fixture["zone_jwt"].as_str().unwrap().as_bytes().to_vec(),
+                    ),
+                    (
+                        "ood1",
+                        fixture["device_jwt"].as_str().unwrap().as_bytes().to_vec(),
+                    ),
+                ] {
+                    tx.put_document(&resolver_document_state(
+                        "alice",
+                        slot,
+                        10,
+                        DocumentStatus::Active,
+                        &bytes,
+                    ))?;
+                }
+                Ok(())
+            })
+            .unwrap();
+        let registry = Arc::new(CentralizedBnsRegistry::new(store));
+        let server = Arc::new(SqliteBnsIndexerHttpServer::from_registry(registry));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let handle = spawn_listener(listener, server).unwrap();
+        std::fs::write(
+            format!("{path}.url"),
+            format!("http://{}", handle.local_addr()),
+        )
+        .unwrap();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(120);
+        while !std::path::Path::new(&format!("{path}.stop")).exists() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "integration client did not finish"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        handle.shutdown().await;
+    }
+
+
+    #[tokio::test]
+    async fn did_resolver_parent_migration_does_not_redirect_device_identity() {
+        use name_client::{BaseHttpProvider, CacheBackend, NameClient, NameClientConfig, ResolvePolicy, ResolveSourcePolicy};
+        let store = resolver_seeded_store();
+        store.transact(|tx| tx.put_document(&resolver_document_state(
+            "moved", "ood1", 1, DocumentStatus::Active, br#"{"id":"did:bns:ood1.moved"}"#,
+        ))).unwrap();
+        let registry = Arc::new(CentralizedBnsRegistry::new(store));
+        let server = Arc::new(SqliteBnsIndexerHttpServer::from_registry(registry.clone()));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let handle = spawn_listener(listener, server.clone()).unwrap();
+        let client = NameClient::new(NameClientConfig {
+            cache_backend: CacheBackend::Memory, enable_zone_resolver: false, ..Default::default()
+        });
+        client.set_method_authority("bns", Box::new(BaseHttpProvider::new(&format!("http://{}", handle.local_addr())))).await;
+        let did = DID::new("bns", "ood1.moved");
+        let remote = ResolvePolicy::default().with_source(ResolveSourcePolicy::RemoteAuthority);
+        let (status, body, _) = resolver_request(server.as_ref(), Method::GET, "/1.0/identifiers/did:bns:ood1.moved").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(body["didDocument"].is_null());
+        assert_eq!(body["didDocumentMetadata"]["buckyos"]["documentStatus"], "missing");
+        assert!(body["didDocumentMetadata"]["buckyos"].get("migrationTarget").is_none());
+        assert!(client.resolve_did_ex(&did, None, remote.clone()).await.is_err());
+        registry.store().transact(|tx| {
+            tx.put_name(&resolver_name_state("ood1.moved", NameStatus::Active))?;
+            tx.put_document(&resolver_document_state("ood1.moved", "zone", 1, DocumentStatus::Active, br#"{"id":"did:bns:ood1.moved"}"#))
+        }).unwrap();
+        let answer = client.resolve_did_ex(&did, None, remote).await.unwrap();
+        assert_eq!(answer.document.to_json_value().unwrap()["id"], did.to_string());
+        let (_, body, _) = resolver_request(server.as_ref(), Method::GET, "/1.0/identifiers/did:bns:moved").await;
+        assert_eq!(body["didDocumentMetadata"]["buckyos"]["migrationTarget"], "did:bns:alice");
+        handle.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn did_resolver_owner_policy_and_payload_expiry_invalidate_device_cache() {
+        use name_client::{BaseHttpProvider, CacheBackend, NameClient, NameClientConfig, ResolvePolicy, ResolveSourcePolicy};
+        use name_lib::*;
+        for cause in ["owner_cutoff", "iat_floor", "owner_expiry", "device_expiry", "zone_expiry"] {
+            let (pem, public) = generate_ed25519_key_pair();
+            let keyfile = tempfile::NamedTempFile::new().unwrap();
+            std::fs::write(keyfile.path(), pem).unwrap();
+            let key = load_private_key(keyfile.path()).unwrap();
+            let did = DID::new("bns", "ood1.alice");
+            let parent = DID::new("bns", "alice");
+            let mut owner = OwnerDocument::new(parent.clone(), "alice".into(), "Alice".into(), serde_json::from_value(public).unwrap());
+            let mut value = serde_json::to_value(DeviceDocument::new_by_jwk("ood1", owner.get_default_key().unwrap())).unwrap();
+            value["id"] = json!(did.to_string());
+            value["owner"] = json!(parent.to_string());
+            value["zone_did"] = json!(parent.to_string());
+            value["verificationMethod"][0]["controller"] = json!(did.to_string());
+            let mut device: DeviceDocument = serde_json::from_value(value).unwrap();
+            let mut zone = ZoneDocument::new(parent.clone(), parent, owner.get_default_key().unwrap());
+            let now = now_timestamp();
+            device.iat = now - 400;
+            zone.iat = now - 399;
+            zone.devices.insert("ood1".into(), device.clone());
+            let store = resolver_seeded_store();
+            store.transact(|tx| {
+                for (slot, bytes) in [
+                    ("owner", serde_json::to_vec(&owner).unwrap()),
+                    ("zone", zone.encode(Some(&key)).unwrap().to_string().into_bytes()),
+                    ("ood1", device.encode(Some(&key)).unwrap().to_string().into_bytes()),
+                ] { tx.put_document(&resolver_document_state("alice", slot, 10, DocumentStatus::Active, &bytes))?; }
+                Ok(())
+            }).unwrap();
+            let registry = Arc::new(CentralizedBnsRegistry::new(store));
+            let server = Arc::new(SqliteBnsIndexerHttpServer::from_registry(registry.clone()));
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let handle = spawn_listener(listener, server.clone()).unwrap();
+            let client = NameClient::new(NameClientConfig {
+                cache_backend: CacheBackend::Memory, enable_zone_resolver: false, ..Default::default()
+            });
+            client.set_method_authority("bns", Box::new(BaseHttpProvider::new(&format!("http://{}", handle.local_addr())))).await;
+            let remote = ResolvePolicy::default().with_source(ResolveSourcePolicy::RemoteAuthority);
+            let local = ResolvePolicy::default().with_source(ResolveSourcePolicy::LocalOnly);
+            client.resolve_did_ex(&did, None, remote.clone()).await.unwrap();
+            let (status, source) = match cause {
+                "owner_cutoff" => { owner.valid_iat = Some(now - 300); (DocumentStatus::Revoked, "owner") }
+                "iat_floor" => (DocumentStatus::Revoked, "ood1"),
+                "owner_expiry" => { owner.exp = now - 120; (DocumentStatus::Expired, "owner") }
+                "device_expiry" => { device.exp = now - 120; (DocumentStatus::Expired, "ood1") }
+                "zone_expiry" => { zone.exp = now - 120; (DocumentStatus::Expired, "zone") }
+                _ => unreachable!(),
+            };
+            registry.store().transact(|tx| {
+                if cause == "iat_floor" {
+                    let mut state = tx.get_name("alice")?.unwrap();
+                    state.min_document_iat = now - 300;
+                    state.owner_policy_seq += 1;
+                    tx.put_name(&state)?;
+                }
+                for (slot, bytes) in [
+                    ("owner", serde_json::to_vec(&owner).unwrap()),
+                    ("zone", zone.encode(Some(&key)).unwrap().to_string().into_bytes()),
+                    ("ood1", device.encode(Some(&key)).unwrap().to_string().into_bytes()),
+                ] { tx.put_document(&resolver_document_state("alice", slot, 11, DocumentStatus::Active, &bytes))?; }
+                Ok(())
+            }).unwrap();
+            let (http, body, _) = resolver_request(server.as_ref(), Method::GET, "/1.0/identifiers/did:bns:ood1.alice").await;
+            assert_eq!(http, if status == DocumentStatus::Revoked { StatusCode::GONE } else { StatusCode::OK }, "{cause}");
+            assert!(body["didDocument"].is_null(), "{cause}");
+            assert_eq!(body["didDocumentMetadata"]["buckyos"]["documentStatus"], status.as_str(), "{cause}");
+            assert_eq!(body["didDocumentMetadata"]["buckyos"]["sourceDocType"], source, "{cause}");
+            assert_eq!(body["didDocumentMetadata"]["buckyos"]["sourceDocumentStatus"], "active", "{cause}");
+            assert!(client.resolve_did_ex(&did, None, remote.clone()).await.is_err(), "{cause}");
+            assert!(client.resolve_did_ex(&did, None, local.clone()).await.is_err(), "{cause}");
+            owner.exp = FAR_FUTURE;
+            device.exp = FAR_FUTURE;
+            zone.exp = FAR_FUTURE;
+            device.iat = now;
+            zone.iat = now + 1;
+            let (_, rotated_key) = generate_ed25519_key_pair();
+            let mut value = serde_json::to_value(&device).unwrap();
+            value["verificationMethod"][0]["publicKeyJwk"] = rotated_key;
+            device = serde_json::from_value(value).unwrap();
+            zone.devices.insert("ood1".into(), device.clone());
+            let recovered = device.encode(Some(&key)).unwrap();
+            registry.store().transact(|tx| {
+                for (slot, bytes) in [
+                    ("owner", serde_json::to_vec(&owner).unwrap()),
+                    ("zone", zone.encode(Some(&key)).unwrap().to_string().into_bytes()),
+                    ("ood1", recovered.to_string().into_bytes()),
+                ] { tx.put_document(&resolver_document_state("alice", slot, 12, DocumentStatus::Active, &bytes))?; }
+                Ok(())
+            }).unwrap();
+            assert_eq!(client.resolve_did_ex(&did, None, remote).await.unwrap().document, recovered, "{cause}");
+            assert_eq!(client.resolve_did_ex(&did, None, local).await.unwrap().document, recovered, "{cause}");
+            handle.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn did_resolver_node_active_device_slots() {
+        use name_client::{
+            BaseHttpProvider, BodyEvidence, CacheBackend, NameClient, NameClientConfig, ResolvePolicy,
+            ResolveSourcePolicy,
+        };
+        use name_lib::*;
+        let (pem, public) = generate_ed25519_key_pair();
+        let keyfile = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(keyfile.path(), pem).unwrap();
+        let key = load_private_key(keyfile.path()).unwrap();
+        let jwk = serde_json::from_value(public).unwrap();
+        let owner_did = DID::new("bns", "alice");
+        let owner = OwnerDocument::new(owner_did.clone(), "alice".into(), "Alice".into(), jwk);
+        let mut zone = ZoneDocument::new(
+            owner_did.clone(),
+            owner_did.clone(),
+            owner.get_default_key().unwrap(),
+        );
+        let store = resolver_seeded_store();
+        let mut devices = Vec::new();
+        for short in ["ood1", "ood2"] {
+            let (_, public) = generate_ed25519_key_pair();
+            let mut value = serde_json::to_value(DeviceDocument::new_by_jwk(
+                short,
+                serde_json::from_value(public).unwrap(),
+            ))
+            .unwrap();
+            let did = format!("did:bns:{short}.alice");
+            value["id"] = json!(did);
+            value["owner"] = json!("did:bns:alice");
+            value["zone_did"] = json!("did:bns:alice");
+            for method in value["verificationMethod"].as_array_mut().unwrap() {
+                method["controller"] = json!(did);
+            }
+            let device: DeviceDocument = serde_json::from_value(value).unwrap();
+            zone.devices.insert(short.into(), device.clone());
+            let EncodedDocument::Jwt(jwt) = device.encode(Some(&key)).unwrap() else {
+                panic!()
+            };
+            devices.push((device, jwt));
+        }
+        let EncodedDocument::Jwt(zone_jwt) = zone.encode(Some(&key)).unwrap() else {
+            panic!()
+        };
+        store
+            .transact(|tx| {
+                tx.put_document(&resolver_document_state(
+                    "alice",
+                    "owner",
+                    4,
+                    DocumentStatus::Active,
+                    &serde_json::to_vec(&owner).unwrap(),
+                ))?;
+                tx.put_document(&resolver_document_state(
+                    "alice",
+                    "zone",
+                    8,
+                    DocumentStatus::Active,
+                    zone_jwt.as_bytes(),
+                ))?;
+                for (device, jwt) in &devices {
+                    tx.put_document(&resolver_document_state(
+                        "alice",
+                        &device.name,
+                        1,
+                        DocumentStatus::Active,
+                        jwt.as_bytes(),
+                    ))?;
+                }
+                Ok(())
+            })
+            .unwrap();
+        let registry = Arc::new(CentralizedBnsRegistry::new(store));
+        let server = Arc::new(SqliteBnsIndexerHttpServer::from_registry(registry.clone()));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let handle = spawn_listener(listener, server.clone()).unwrap();
+        let client = NameClient::new(NameClientConfig {
+            cache_backend: CacheBackend::Memory,
+            enable_zone_resolver: false,
+            ..Default::default()
+        });
+        client
+            .set_method_authority(
+                "bns",
+                Box::new(BaseHttpProvider::new(&format!(
+                    "http://{}",
+                    handle.local_addr()
+                ))),
+            )
+            .await;
+        let mut policy = ResolvePolicy::default();
+        policy.source = ResolveSourcePolicy::RemoteAuthority;
+        policy.allow_self_signed_when_missing = false;
+        policy.allow_stale_cache = false;
+        policy.allow_unverified_cache_when_unavailable = false;
+        for (device, jwt) in &devices {
+            let answer = client
+                .resolve_did_ex(&device.id, None, policy.clone())
+                .await
+                .unwrap();
+            assert_eq!(
+                answer.resolution_metadata.evidence,
+                Some(BodyEvidence::Anchored)
+            );
+            assert_eq!(answer.document, EncodedDocument::Jwt(jwt.clone()));
+            assert!(DeviceDocument::decode(&answer.document, None)
+                .unwrap()
+                .get_auth_key(None)
+                .is_some());
+            let (_, envelope, _) = resolver_request(
+                server.as_ref(),
+                Method::GET,
+                &format!("/1.0/identifiers/{}", device.id.to_string()),
+            )
+            .await;
+            assert_eq!(
+                envelope["didDocumentMetadata"]["buckyos"]["sourceName"],
+                "alice"
+            );
+            assert_eq!(
+                envelope["didDocumentMetadata"]["buckyos"]["sourceDocType"],
+                device.name
+            );
+            assert_eq!(envelope["didDocumentMetadata"]["versionId"], "1");
+        }
+        let (device, _) = &devices[0];
+        let mut rotated = device.clone();
+        rotated.iat += 1;
+        let (_, public) = generate_ed25519_key_pair();
+        let mut value = serde_json::to_value(&rotated).unwrap();
+        value["verificationMethod"][0]["publicKeyJwk"] = public;
+        rotated = serde_json::from_value(value).unwrap();
+        let EncodedDocument::Jwt(rotated_jwt) = rotated.encode(Some(&key)).unwrap() else {
+            panic!()
+        };
+        registry
+            .store()
+            .transact(|tx| {
+                tx.put_document(&resolver_document_state(
+                    "alice",
+                    "ood1",
+                    2,
+                    DocumentStatus::Active,
+                    rotated_jwt.as_bytes(),
+                ))
+            })
+            .unwrap();
+        let answer = client
+            .resolve_did_ex(&device.id, None, policy.clone())
+            .await
+            .unwrap();
+        assert_eq!(answer.document, EncodedDocument::Jwt(rotated_jwt.clone()));
+
+        for (slot, content) in [
+            ("zone", zone_jwt.as_bytes().to_vec()),
+            ("owner", serde_json::to_vec(&owner).unwrap()),
+        ] {
+            registry.store().transact(|tx| {
+                tx.put_document(&resolver_document_state("alice", slot, 20, DocumentStatus::Revoked, &content))
+            }).unwrap();
+            let (status, denied, _) = resolver_request(
+                server.as_ref(), Method::GET, "/1.0/identifiers/did:bns:ood1.alice"
+            ).await;
+            assert_eq!(status, StatusCode::GONE);
+            assert_eq!(denied["didDocumentMetadata"]["buckyos"]["sourceDocType"], slot);
+            assert_eq!(denied["didDocumentMetadata"]["buckyos"]["sourceDocumentStatus"], "revoked");
+            assert!(denied["didDocument"].is_null());
+            registry.store().transact(|tx| {
+                tx.put_document(&resolver_document_state("alice", slot, 21, DocumentStatus::Active, &content))
+            }).unwrap();
+        }
+
+        registry.store().transact(|tx| {
+            tx.put_name(&resolver_name_state("ood1.alice", NameStatus::Active))?;
+            tx.put_document(&resolver_document_state("ood1.alice", "zone", 1, DocumentStatus::Active, rotated_jwt.as_bytes()))
+        }).unwrap();
+        let (_, independent, _) = resolver_request(
+            server.as_ref(), Method::GET, "/1.0/identifiers/did:bns:ood1.alice"
+        ).await;
+        assert_eq!(independent["didDocumentMetadata"]["buckyos"]["sourceName"], "ood1.alice");
+        assert_eq!(independent["didDocument"], rotated_jwt);
+        registry.store().transact(|tx| {
+            tx.put_document(&resolver_document_state("ood1.alice", "zone", 2, DocumentStatus::Missing, rotated_jwt.as_bytes()))
+        }).unwrap();
+
+        for status in [
+            NameStatus::Active,
+            NameStatus::Expired,
+            NameStatus::Released,
+            NameStatus::Tombstoned,
+        ] {
+            registry
+                .store()
+                .transact(|tx| tx.put_name(&resolver_name_state("ood1.alice", status)))
+                .unwrap();
+            assert!(client
+                .resolve_did_ex(&device.id, None, policy.clone())
+                .await
+                .is_err());
+        }
+        for status in [
+            DocumentStatus::Expired,
+            DocumentStatus::Revoked,
+            DocumentStatus::Missing,
+        ] {
+            registry
+                .store()
+                .transact(|tx| {
+                    tx.put_document(&resolver_document_state(
+                        "alice",
+                        "ood2",
+                        2,
+                        status,
+                        devices[1].1.as_bytes(),
+                    ))
+                })
+                .unwrap();
+            assert!(client
+                .resolve_did_ex(&devices[1].0.id, None, policy.clone())
+                .await
+                .is_err());
+        }
+        handle.shutdown().await;
+    }
+
+    #[test]
+    fn did_resolver_rejects_device_identity_and_signature_mismatch() {
+        use name_lib::*;
+        let (pem, public) = generate_ed25519_key_pair();
+        let keyfile = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(keyfile.path(), pem).unwrap();
+        let key = load_private_key(keyfile.path()).unwrap();
+        let did = DID::new("bns", "alice");
+        let owner = OwnerDocument::new(
+            did.clone(),
+            "alice".into(),
+            "Alice".into(),
+            serde_json::from_value(public).unwrap(),
+        );
+        let mut value = serde_json::to_value(DeviceDocument::new_by_jwk(
+            "ood1",
+            owner.get_default_key().unwrap(),
+        ))
+        .unwrap();
+        value["id"] = json!("did:bns:ood1.alice");
+        value["owner"] = json!("did:bns:alice");
+        value["zone_did"] = json!("did:bns:alice");
+        value["verificationMethod"][0]["controller"] = json!("did:bns:ood1.alice");
+        let device: DeviceDocument = serde_json::from_value(value.clone()).unwrap();
+        let mut zone = ZoneDocument::new(did.clone(), did, owner.get_default_key().unwrap());
+        zone.devices.insert("ood1".into(), device.clone());
+        let EncodedDocument::Jwt(zone_jwt) = zone.encode(Some(&key)).unwrap() else {
+            panic!()
+        };
+        let store = resolver_seeded_store();
+        store
+            .transact(|tx| {
+                tx.put_document(&resolver_document_state(
+                    "alice",
+                    "owner",
+                    4,
+                    DocumentStatus::Active,
+                    &serde_json::to_vec(&owner).unwrap(),
+                ))?;
+                tx.put_document(&resolver_document_state(
+                    "alice",
+                    "zone",
+                    8,
+                    DocumentStatus::Active,
+                    zone_jwt.as_bytes(),
+                ))?;
+                Ok(())
+            })
+            .unwrap();
+        let registry = CentralizedBnsRegistry::new(store);
+        let zone_result = registry.resolve_document("alice", "zone").unwrap();
+        let owner_result = registry.resolve_document("alice", "owner").unwrap();
+        for field in ["id", "name", "owner", "zone_did"] {
+            let mut bad = value.clone();
+            bad[field] = if field == "name" {
+                json!("ood2")
+            } else {
+                json!("did:bns:mallory")
+            };
+            let bad: DeviceDocument = serde_json::from_value(bad).unwrap();
+            let EncodedDocument::Jwt(jwt) = bad.encode(Some(&key)).unwrap() else {
+                panic!()
+            };
+            registry
+                .store()
+                .transact(|tx| {
+                    tx.put_document(&resolver_document_state(
+                        "alice",
+                        "ood1",
+                        1,
+                        DocumentStatus::Active,
+                        jwt.as_bytes(),
+                    ))
+                })
+                .unwrap();
+            let result = registry.resolve_document("alice", "ood1").unwrap();
+            assert!(
+                validate_device_slot(
+                    "ood1.alice",
+                    "ood1",
+                    "alice",
+                    &result,
+                    &zone_result,
+                    &owner_result
+                )
+                .is_err(),
+                "{field}"
+            );
+        }
+        let (other_pem, _) = generate_ed25519_key_pair();
+        std::fs::write(keyfile.path(), other_pem).unwrap();
+        let other_key = load_private_key(keyfile.path()).unwrap();
+        let EncodedDocument::Jwt(jwt) = device.encode(Some(&other_key)).unwrap() else {
+            panic!()
+        };
+        registry
+            .store()
+            .transact(|tx| {
+                tx.put_document(&resolver_document_state(
+                    "alice",
+                    "ood1",
+                    1,
+                    DocumentStatus::Active,
+                    jwt.as_bytes(),
+                ))
+            })
+            .unwrap();
+        assert!(validate_device_slot(
+            "ood1.alice",
+            "ood1",
+            "alice",
+            &registry.resolve_document("alice", "ood1").unwrap(),
+            &zone_result,
+            &owner_result
+        )
+        .is_err());
     }
 
     #[tokio::test]
