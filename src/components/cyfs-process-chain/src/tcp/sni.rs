@@ -76,26 +76,42 @@ impl HttpsSniProbe {
         if pos + 2 <= buffer.len() {
             let extensions_len = ((buffer[pos] as usize) << 8) | (buffer[pos + 1] as usize);
             pos += 2;
-            let extensions_end = pos + extensions_len;
+            // A single stream read may contain only part of the ClientHello.
+            // Never trust the declared length beyond the bytes actually read.
+            let extensions_end = (pos + extensions_len).min(buffer.len());
 
             while pos + 4 <= extensions_end {
                 let ext_type = ((buffer[pos] as u16) << 8) | (buffer[pos + 1] as u16);
                 let ext_len = ((buffer[pos + 2] as usize) << 8) | (buffer[pos + 3] as usize);
                 pos += 4;
 
-                // SNI extension type is 0
-                if ext_type == 0 && pos + ext_len <= buffer.len() {
-                    // Parse SNI content
-                    if ext_len > 5 {
-                        let sni_len =
-                            ((buffer[pos + 3] as usize) << 8) | (buffer[pos + 4] as usize);
-                        if pos + 5 + sni_len <= buffer.len() {
-                            return String::from_utf8(buffer[pos + 5..pos + 5 + sni_len].to_vec())
-                                .ok();
-                        }
-                    }
+                let extension_end = pos + ext_len;
+                if extension_end > extensions_end {
+                    return None;
                 }
-                pos += ext_len;
+
+                // SNI extension type is 0
+                if ext_type == 0 {
+                    let extension = &buffer[pos..extension_end];
+                    if extension.len() <= 5 {
+                        return None;
+                    }
+
+                    // Only host_name (type 0) is supported. Its list and hostname
+                    // must fit inside this extension, not merely inside the buffer.
+                    let names_len = ((extension[0] as usize) << 8) | extension[1] as usize;
+                    let sni_len = ((extension[3] as usize) << 8) | extension[4] as usize;
+                    if names_len + 2 != ext_len
+                        || extension[2] != 0
+                        || sni_len == 0
+                        || sni_len + 3 != names_len
+                    {
+                        return None;
+                    }
+
+                    return String::from_utf8(extension[5..].to_vec()).ok();
+                }
+                pos = extension_end;
             }
         }
         None
@@ -258,6 +274,178 @@ impl ExternalCommand for HttpsSniProbeCommand {
         match ret.sni {
             Some(sni) => Ok(CommandResult::success_with_string(sni)),
             None => Ok(CommandResult::error()),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    fn client_hello(extensions: &[u8]) -> Vec<u8> {
+        let mut hello = vec![0x03, 0x03];
+        hello.extend_from_slice(&[0; 32]); // Random
+        hello.push(0); // Session ID length
+        hello.extend_from_slice(&[0, 2, 0x13, 0x01]); // Cipher suites
+        hello.extend_from_slice(&[1, 0]); // Compression methods
+        hello.extend_from_slice(&(extensions.len() as u16).to_be_bytes());
+        hello.extend_from_slice(extensions);
+
+        let mut record = vec![0x16, 0x03, 0x01];
+        record.extend_from_slice(&((hello.len() + 4) as u16).to_be_bytes());
+        record.push(1); // ClientHello
+        record.extend_from_slice(&(hello.len() as u32).to_be_bytes()[1..]);
+        record.extend_from_slice(&hello);
+        record
+    }
+
+    fn sni_extension(host: &[u8]) -> Vec<u8> {
+        let mut extension = vec![0, 0]; // server_name
+        extension.extend_from_slice(&((host.len() + 5) as u16).to_be_bytes());
+        extension.extend_from_slice(&((host.len() + 3) as u16).to_be_bytes());
+        extension.push(0); // host_name
+        extension.extend_from_slice(&(host.len() as u16).to_be_bytes());
+        extension.extend_from_slice(host);
+        extension
+    }
+
+    fn issue_35_truncated_client_hello() -> Vec<u8> {
+        let mut extensions = vec![0; 1610];
+        // Skipping this incomplete extension used to read buffer[1657].
+        extensions[..4].copy_from_slice(&[0, 10, 0x06, 0x41]);
+        let mut hello = client_hello(&extensions);
+        hello.truncate(1340);
+        hello
+    }
+
+    #[test]
+    fn test_extract_sni_valid_client_hello() {
+        let mut extensions = vec![0, 10, 0, 2, 0, 0];
+        extensions.extend_from_slice(&sni_extension(b"buckyos.com"));
+        let hello = client_hello(&extensions);
+        assert_eq!(
+            HttpsSniProbe::extract_sni(&hello).as_deref(),
+            Some("buckyos.com")
+        );
+    }
+
+    #[test]
+    fn test_extract_sni_before_truncated_later_extension() {
+        let mut extensions = sni_extension(b"buckyos.com");
+        extensions.extend_from_slice(&[0, 10, 0, 2, 0, 0]);
+        let mut hello = client_hello(&extensions);
+        hello.truncate(hello.len() - 1);
+        assert_eq!(
+            HttpsSniProbe::extract_sni(&hello).as_deref(),
+            Some("buckyos.com")
+        );
+    }
+
+    #[test]
+    fn test_extract_sni_issue_35_truncated_extension() {
+        assert_eq!(
+            HttpsSniProbe::extract_sni(&issue_35_truncated_client_hello()),
+            None
+        );
+    }
+
+    #[test]
+    fn test_extract_sni_all_truncated_prefixes() {
+        let mut extensions = vec![0, 10, 0, 2, 0, 0];
+        extensions.extend_from_slice(&sni_extension(b"buckyos.com"));
+        let hello = client_hello(&extensions);
+        for end in 0..hello.len() {
+            assert_eq!(
+                HttpsSniProbe::extract_sni(&hello[..end]),
+                None,
+                "prefix length {end}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_extract_sni_truncated_extension_header() {
+        let extensions_start = client_hello(&[]).len();
+        for header_len in 0..4 {
+            let mut hello = client_hello(&[0, 10, 0, 0]);
+            hello.truncate(extensions_start + header_len);
+            assert_eq!(HttpsSniProbe::extract_sni(&hello), None);
+        }
+    }
+
+    #[test]
+    fn test_extract_sni_respects_extensions_length() {
+        let mut hello = client_hello(&sni_extension(b"buckyos.com"));
+        let extensions_start = client_hello(&[]).len();
+        // Bytes after the declared extension list must not become the hostname.
+        hello[extensions_start - 2..extensions_start].copy_from_slice(&4u16.to_be_bytes());
+        assert_eq!(HttpsSniProbe::extract_sni(&hello), None);
+    }
+
+    #[test]
+    fn test_extract_sni_respects_sni_extension_length() {
+        let mut extension = sni_extension(b"buckyos.com");
+        // The hostname extends beyond this extension into subsequent bytes.
+        extension[2..4].copy_from_slice(&6u16.to_be_bytes());
+        assert_eq!(HttpsSniProbe::extract_sni(&client_hello(&extension)), None);
+    }
+
+    #[test]
+    fn test_extract_sni_rejects_invalid_server_name_lengths() {
+        for list_len in [0u16, 2, 13, 15, u16::MAX] {
+            let mut extension = sni_extension(b"buckyos.com");
+            extension[4..6].copy_from_slice(&list_len.to_be_bytes());
+            assert_eq!(HttpsSniProbe::extract_sni(&client_hello(&extension)), None);
+        }
+        for host_len in [0u16, 10, 12, u16::MAX] {
+            let mut extension = sni_extension(b"buckyos.com");
+            extension[7..9].copy_from_slice(&host_len.to_be_bytes());
+            assert_eq!(HttpsSniProbe::extract_sni(&client_hello(&extension)), None);
+        }
+    }
+
+    #[test]
+    fn test_extract_sni_rejects_invalid_server_name() {
+        let mut extension = sni_extension(b"buckyos.com");
+        extension[6] = 1; // Unsupported name type
+        assert_eq!(HttpsSniProbe::extract_sni(&client_hello(&extension)), None);
+        for host in [b"".as_slice(), b"\xff".as_slice()] {
+            assert_eq!(
+                HttpsSniProbe::extract_sni(&client_hello(&sni_extension(host))),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn test_extract_sni_without_sni() {
+        for hello in [
+            Vec::new(),
+            b"GET / HTTP/1.1\r\n\r\n".to_vec(),
+            client_hello(&[]),
+            client_hello(&[0, 10, 0, 0]),
+        ] {
+            assert_eq!(HttpsSniProbe::extract_sni(&hello), None);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_process_stream_preserves_bytes() {
+        for (hello, expected_sni) in [
+            (
+                client_hello(&sni_extension(b"buckyos.com")),
+                Some("buckyos.com"),
+            ),
+            (issue_35_truncated_client_hello(), None),
+        ] {
+            let mut result = HttpsSniProbe::process_stream(Box::new(Cursor::new(hello.clone())))
+                .await
+                .unwrap();
+            assert_eq!(result.sni.as_deref(), expected_sni);
+            let mut replayed = Vec::new();
+            result.stream.read_to_end(&mut replayed).await.unwrap();
+            assert_eq!(replayed, hello);
         }
     }
 }
