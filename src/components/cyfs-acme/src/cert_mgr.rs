@@ -1,4 +1,6 @@
-use crate::acme_client::{AcmeAccount, AcmeChallengeResponderRef, AcmeClient, AcmeOrderSession};
+use crate::acme_client::{
+    AcmeAccount, AcmeChallengeResponderRef, AcmeClient, AcmeHttpError, AcmeOrderSession,
+};
 use crate::default_challenge_responder::DefaultChallengeResponder;
 use crate::{Challenge, ChallengeData, ChallengeType};
 use anyhow::Result;
@@ -57,12 +59,29 @@ enum CertState {
     None,
     Ready(CertInfo),
     Renewing(CertInfo),
-    Expired(CertInfo),
 }
 
 struct CertMutPart {
     state: CertState,
-    order: Option<AcmeOrderSession>,
+}
+
+lazy_static::lazy_static! {
+    // Configuration reloads create separate managers. Their per-stub task handles
+    // cannot prevent simultaneous orders for the same domain.
+    static ref CERT_ORDER_LOCKS: Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>> =
+        Mutex::new(HashMap::new());
+}
+
+fn cert_order_lock(domain: &str) -> Arc<tokio::sync::Mutex<()>> {
+    let mut locks = CERT_ORDER_LOCKS.lock().unwrap();
+    locks.retain(|_, lock| lock.strong_count() > 0);
+    let domain = domain.trim_end_matches('.').to_ascii_lowercase();
+    if let Some(lock) = locks.get(&domain).and_then(Weak::upgrade) {
+        return lock;
+    }
+    let lock = Arc::new(tokio::sync::Mutex::new(()));
+    locks.insert(domain, Arc::downgrade(&lock));
+    lock
 }
 
 struct CertStubInner {
@@ -72,6 +91,7 @@ struct CertStubInner {
     acme_client: AcmeClient,
     responder: AcmeChallengeResponderRef,
     renew_before_expiry: chrono::Duration,
+    order_lock: Arc<tokio::sync::Mutex<()>>,
     mut_part: Mutex<CertMutPart>,
     handle: Mutex<Option<JoinHandle<()>>>,
 }
@@ -115,6 +135,7 @@ impl CertStub {
     ) -> Self {
         Self {
             inner: Arc::new(CertStubInner {
+                order_lock: cert_order_lock(&acme_item.domain),
                 acme_item,
                 work_dir,
                 identity_roots,
@@ -123,7 +144,6 @@ impl CertStub {
                 renew_before_expiry,
                 mut_part: Mutex::new(CertMutPart {
                     state: CertState::None,
-                    order: None,
                 }),
                 handle: Mutex::new(None),
             }),
@@ -174,10 +194,12 @@ impl CertStub {
     pub fn get_cert(&self) -> Option<Arc<CertifiedKey>> {
         let mut_part = self.inner.mut_part.lock().unwrap();
         match &mut_part.state {
-            CertState::Ready(info) => Some(info.key.clone()),
-            CertState::Renewing(info) => Some(info.key.clone()),
-            CertState::Expired(_) => None,
-            CertState::None => None,
+            CertState::Ready(info) | CertState::Renewing(info)
+                if chrono::Utc::now() < info.expires =>
+            {
+                Some(info.key.clone())
+            }
+            _ => None,
         }
     }
 
@@ -189,13 +211,15 @@ impl CertStub {
 
         let stub = self.clone();
         handle.replace(task::spawn(async move {
-            if let Err(e) = stub.load_cert_inner().await {
+            if let Err(e) = stub.start_order().await {
                 error!("load cert failed, stub: {}, {}", stub, e);
             }
         }));
     }
 
-    async fn load_cert_inner(&self) -> Result<()> {
+    // Returns true when a new order is needed. Re-read under order_lock before
+    // ordering: another manager may have installed a certificate while we waited.
+    fn refresh_cert(&self) -> Result<bool> {
         if let Some(info) = self.load_identity_cert_info()? {
             let should_renew = Self::cert_needs_renewal(&info, self.inner.renew_before_expiry);
             {
@@ -206,77 +230,11 @@ impl CertStub {
                     CertState::Ready(info)
                 };
             }
-            if should_renew {
-                info!(
-                    "identity cert is inside renewal window, start ordering new cert, stub: {}",
-                    self
-                );
-                self.start_order().await?;
-            }
-            return Ok(());
+            return Ok(should_renew);
         }
 
-        info!(
-            "no valid identity cert found, start ordering new cert, stub: {}",
-            self
-        );
-        self.start_order().await?;
-        Ok(())
-    }
-
-    fn check_cert(&self, renew_before_expiry: chrono::Duration) -> Result<()> {
-        if let Some(info) = self.load_identity_cert_info()? {
-            let should_renew = Self::cert_needs_renewal(&info, renew_before_expiry);
-            let mut mut_part = self.inner.mut_part.lock().unwrap();
-            mut_part.state = if should_renew {
-                CertState::Renewing(info)
-            } else {
-                CertState::Ready(info)
-            };
-            if !should_renew {
-                return Ok(());
-            }
-        } else {
-            let mut mut_part = self.inner.mut_part.lock().unwrap();
-            mut_part.state = CertState::None;
-        }
-
-        let should_order = {
-            {
-                let handle = self.inner.handle.lock().unwrap();
-                if handle.is_some() && !handle.as_ref().unwrap().is_finished() {
-                    return Ok(());
-                }
-            }
-
-            let mut mut_part = self.inner.mut_part.lock().unwrap();
-            match &mut_part.state {
-                CertState::None => true,
-                CertState::Ready(info) => {
-                    let now = chrono::Utc::now();
-                    if now >= info.expires {
-                        mut_part.state = CertState::Expired(info.clone());
-                        true
-                    } else {
-                        let renew_time = info.expires - renew_before_expiry;
-                        if now >= renew_time {
-                            mut_part.state = CertState::Renewing(info.clone());
-                            true
-                        } else {
-                            false
-                        }
-                    }
-                }
-                CertState::Renewing(_) => true,
-                CertState::Expired(_) => true,
-            }
-        };
-
-        if should_order {
-            self.renew_cert();
-        }
-
-        Ok(())
+        self.inner.mut_part.lock().unwrap().state = CertState::None;
+        Ok(true)
     }
 
     fn load_identity_cert_info(&self) -> Result<Option<CertInfo>> {
@@ -414,26 +372,31 @@ impl CertStub {
         now >= info.expires || now >= info.expires - renew_before_expiry
     }
 
-    async fn order_inner(&self) -> Result<()> {
-        let mut order = AcmeOrderSession::new(
-            self.inner.acme_item.domain.clone(),
-            self.inner.acme_client.clone(),
-            self.inner.responder.clone(),
-        );
-        let (cert_data, key_data) = order.start().await?;
+    async fn order_inner(&self, issued_cert: &mut Option<(Vec<u8>, Vec<u8>)>) -> Result<()> {
+        if issued_cert.is_none() {
+            let mut order = AcmeOrderSession::new(
+                self.inner.acme_item.domain.clone(),
+                self.inner.acme_client.clone(),
+                self.inner.responder.clone(),
+            );
+            *issued_cert = Some(order.start().await?);
+        }
+        // An installation failure must retry the downloaded certificate, not
+        // consume another issuance for the same identifiers.
+        let (cert_data, key_data) = issued_cert.as_ref().unwrap();
 
         install_identity_certificate(
             &self.inner.identity_roots,
             self.inner.acme_item.identity(),
             &self.inner.acme_item.domain,
             &self.inner.work_dir,
-            &cert_data,
-            &key_data,
+            cert_data,
+            key_data,
             self.inner.renew_before_expiry,
         )?;
 
-        let certified_key = Self::create_certified_key(&cert_data, &key_data)?;
-        let expires = Self::get_cert_expiry(&cert_data)?;
+        let certified_key = Self::create_certified_key(cert_data, key_data)?;
+        let expires = Self::get_cert_expiry(cert_data)?;
 
         info!(
             "install identity cert success, stub: {}, identity: {}, expires: {}",
@@ -454,38 +417,67 @@ impl CertStub {
     }
 
     async fn start_order(&self) -> Result<()> {
+        // Make an existing certificate available even while another manager is
+        // renewing it and holds the order lock.
+        if !self.refresh_cert()? {
+            return Ok(());
+        }
+        let _order_guard = self.inner.order_lock.lock().await;
         let mut interval = 15;
+        let mut issued_cert = None;
         loop {
-            let result = self.order_inner().await;
+            if !self.refresh_cert()? {
+                return Ok(());
+            }
+            let result = self.order_inner(&mut issued_cert).await;
 
             match result {
                 Ok(()) => {
                     break Ok(());
                 }
                 Err(e) => {
-                    error!("order cert failed, stub: {}, {}", self, e);
                     interval *= 2;
                     if interval > 600 {
                         interval = 600;
                     }
-                    tokio::time::sleep(Duration::from_secs(interval)).await;
+                    let retry_delay = e
+                        .downcast_ref::<AcmeHttpError>()
+                        .and_then(|error| error.retry_after)
+                        .unwrap_or_default()
+                        .max(Duration::from_secs(interval));
+                    error!(
+                        "order cert failed, stub: {}, {:#}; retry in {:?}",
+                        self, e, retry_delay
+                    );
+                    if self.wait_for_retry(retry_delay).await? {
+                        return Ok(());
+                    }
                 }
             }
         }
     }
 
-    fn renew_cert(&self) {
-        let mut handle = self.inner.handle.lock().unwrap();
-        if handle.is_some() && !handle.as_ref().unwrap().is_finished() {
-            return;
-        }
-
-        let stub = self.clone();
-        handle.replace(tokio::spawn(async move {
-            if let Err(e) = stub.start_order().await {
-                error!("renew cert failed, stub: {}, {}", stub, e);
+    // Return true if an externally installed certificate ends the retry loop.
+    async fn wait_for_retry(&self, retry_delay: Duration) -> Result<bool> {
+        let retry_at = tokio::time::Instant::now() + retry_delay;
+        loop {
+            tokio::time::sleep_until(
+                retry_at.min(tokio::time::Instant::now() + Duration::from_secs(60)),
+            )
+            .await;
+            if !self.refresh_cert()? {
+                return Ok(true);
             }
-        }));
+            if tokio::time::Instant::now() >= retry_at {
+                return Ok(false);
+            }
+        }
+    }
+
+    fn cancel_load(&self) {
+        if let Some(handle) = self.inner.handle.lock().unwrap().take() {
+            handle.abort();
+        }
     }
 }
 
@@ -1162,6 +1154,11 @@ impl Drop for AcmeCertManager {
         if let Some(handler) = check_handler.take() {
             handler.abort();
         }
+        // Workers own a CertStub clone, so CertStubInner::drop alone cannot
+        // cancel a retry loop when this manager is replaced during a reload.
+        for cert in self.certs.read().unwrap().values() {
+            cert.cancel_load();
+        }
     }
 }
 
@@ -1387,9 +1384,7 @@ impl AcmeCertManager {
             .collect::<Vec<_>>();
 
         for cert in certs {
-            if let Err(e) = cert.check_cert(self.config.renew_before_expiry) {
-                error!("check cert failed, stub: {}, error: {}", cert, e);
-            }
+            cert.load_cert();
         }
         Ok(())
     }
@@ -1610,10 +1605,234 @@ fn sanitize_path_component(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_acme::MockAcme;
     use openssl::asn1::Asn1Time;
     use openssl::bn::BigNum;
     use openssl::x509::extension::SubjectAlternativeName;
     use openssl::x509::{X509Builder, X509NameBuilder};
+
+    fn test_config(temp: &Path, server: &MockAcme) -> CertManagerConfig {
+        CertManagerConfig {
+            account: Some("test@example.com".to_string()),
+            acme_server: format!("{}/directory", server.url),
+            keystore_path: temp.join("acme").to_string_lossy().into_owned(),
+            identity_manager: Some(AcmeIdentityConfig {
+                public_root_path: Some(temp.join("identity").to_string_lossy().into_owned()),
+                security_root_path: Some(temp.join("security").to_string_lossy().into_owned()),
+            }),
+            ..CertManagerConfig::default()
+        }
+    }
+
+    fn test_stub(manager: &AcmeCertManagerRef, domain: &str) -> CertStub {
+        let item = AcmeItem::new(domain.to_string(), ChallengeType::Http01, None);
+        CertStub::new(
+            item.clone(),
+            Path::new(&manager.config.keystore_path).join(sanitize_path_component(domain)),
+            item.identity_roots(&manager.config.identity_manager)
+                .unwrap(),
+            manager.acme_client.clone(),
+            manager.responder.lock().unwrap().clone().unwrap(),
+            manager.config.renew_before_expiry,
+        )
+    }
+
+    fn install_test_cert(stub: &CertStub, valid_days: u32) {
+        let domain = &stub.inner.acme_item.domain;
+        let (cert, key) = generate_test_cert(domain, valid_days);
+        install_identity_certificate(
+            &stub.inner.identity_roots,
+            stub.inner.acme_item.identity(),
+            domain,
+            &stub.inner.work_dir,
+            &cert,
+            &key,
+            stub.inner.renew_before_expiry,
+        )
+        .unwrap();
+    }
+
+    async fn wait_until(mut condition: impl FnMut() -> bool) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !condition() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("ACME test condition timed out");
+    }
+
+    #[tokio::test]
+    async fn concurrent_managers_issue_once_per_domain() {
+        let temp = tempfile::tempdir().unwrap();
+        let server = MockAcme::new().await;
+        let config = test_config(temp.path(), &server);
+        let first = AcmeCertManager::create(config.clone()).await.unwrap();
+        let second = AcmeCertManager::create(config).await.unwrap();
+        let domains = ["example.com", "*.example.com"];
+        for manager in [&first, &second] {
+            for domain in domains {
+                // Repeated registration and periodic checks must share the
+                // same work, including across a configuration reload.
+                for _ in 0..3 {
+                    manager
+                        .add_acme_item(AcmeItem::new(
+                            domain.to_string(),
+                            ChallengeType::Http01,
+                            None,
+                        ))
+                        .unwrap();
+                }
+            }
+            manager.check_all_certs().unwrap();
+        }
+        wait_until(|| server.orders() >= 2).await;
+        server.order_gate.add_permits(100);
+        wait_until(|| {
+            [&first, &second].iter().all(|manager| {
+                domains.iter().all(|domain| {
+                    manager
+                        .get_cert_by_host(domain)
+                        .unwrap()
+                        .get_cert()
+                        .is_some()
+                })
+            })
+        })
+        .await;
+        assert_eq!(
+            server.orders(),
+            2,
+            "one order for the apex and one for the wildcard"
+        );
+        for domain in domains {
+            let first_cert = first.get_cert_by_host(domain).unwrap().get_cert().unwrap();
+            let second_cert = second.get_cert_by_host(domain).unwrap().get_cert().unwrap();
+            assert_eq!(first_cert.cert, second_cert.cert);
+        }
+    }
+
+    #[tokio::test]
+    async fn start_order_reuses_installed_cert_and_renews_only_inside_window() {
+        let temp = tempfile::tempdir().unwrap();
+        let server = MockAcme::new().await;
+        server.order_gate.add_permits(100);
+        let manager = AcmeCertManager::create(test_config(temp.path(), &server))
+            .await
+            .unwrap();
+        let stub = test_stub(&manager, "example.com");
+        install_test_cert(&stub, 90);
+        stub.start_order().await.unwrap();
+        assert!(stub.get_cert().is_some());
+        assert_eq!(server.orders(), 0);
+
+        install_test_cert(&stub, 3);
+        stub.start_order().await.unwrap();
+        assert_eq!(server.orders(), 1);
+        // A later check must load the renewal instead of ordering again.
+        stub.start_order().await.unwrap();
+        assert_eq!(server.orders(), 1);
+    }
+
+    #[tokio::test]
+    async fn installation_retry_reuses_downloaded_certificate() {
+        let temp = tempfile::tempdir().unwrap();
+        let server = MockAcme::new().await;
+        server.order_gate.add_permits(100);
+        let manager = AcmeCertManager::create(test_config(temp.path(), &server))
+            .await
+            .unwrap();
+        let stub = test_stub(&manager, "example.com");
+        // A file where the state directory belongs forces installation to fail
+        // after the ACME server has already issued and returned the certificate.
+        std::fs::write(&stub.inner.work_dir, "blocked").unwrap();
+        let mut issued_cert = None;
+        assert!(stub.order_inner(&mut issued_cert).await.is_err());
+        assert!(issued_cert.is_some());
+        assert_eq!(server.orders(), 1);
+        std::fs::remove_file(&stub.inner.work_dir).unwrap();
+        stub.order_inner(&mut issued_cert).await.unwrap();
+        assert_eq!(server.orders(), 1);
+        assert!(stub.get_cert().is_some());
+        assert!(stub.load_identity_cert_info().unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn waiting_renewal_serves_existing_certificate_only_until_expiry() {
+        let temp = tempfile::tempdir().unwrap();
+        let server = MockAcme::new().await;
+        let manager = AcmeCertManager::create(test_config(temp.path(), &server))
+            .await
+            .unwrap();
+        let stub = test_stub(&manager, "example.com");
+        install_test_cert(&stub, 3);
+        let _guard = stub.inner.order_lock.lock().await;
+        stub.load_cert();
+        wait_until(|| stub.get_cert().is_some()).await;
+        {
+            let mut state = stub.inner.mut_part.lock().unwrap();
+            let CertState::Renewing(info) = &mut state.state else {
+                panic!("expected renewal")
+            };
+            info.expires = chrono::Utc::now() - chrono::Duration::seconds(1);
+        }
+        assert!(stub.get_cert().is_none());
+        assert_eq!(server.orders(), 0);
+        stub.cancel_load();
+    }
+
+    #[tokio::test]
+    async fn dropping_manager_cancels_inflight_order() {
+        let temp = tempfile::tempdir().unwrap();
+        let server = MockAcme::new().await;
+        let manager = AcmeCertManager::create(test_config(temp.path(), &server))
+            .await
+            .unwrap();
+        manager
+            .add_acme_item(AcmeItem::new(
+                "example.com".to_string(),
+                ChallengeType::Http01,
+                None,
+            ))
+            .unwrap();
+        let stub = manager.get_cert_by_host("example.com").unwrap();
+        let weak_stub = Arc::downgrade(&stub.inner);
+        wait_until(|| server.orders() == 1).await;
+        drop(stub);
+        drop(manager);
+        wait_until(|| weak_stub.upgrade().is_none()).await;
+        // Cancellation must also release the shared lock for the next manager.
+        let lock = cert_order_lock("example.com");
+        assert!(lock.try_lock().is_ok());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retry_wait_honors_deadline_and_observes_external_certificate() {
+        let temp = tempfile::tempdir().unwrap();
+        let server = MockAcme::new().await;
+        let manager = AcmeCertManager::create(test_config(temp.path(), &server))
+            .await
+            .unwrap();
+        let stub = test_stub(&manager, "example.com");
+        let start = tokio::time::Instant::now();
+        assert!(
+            !stub
+                .wait_for_retry(Duration::from_secs(3600))
+                .await
+                .unwrap()
+        );
+        assert!(start.elapsed() >= Duration::from_secs(3600));
+
+        let start = tokio::time::Instant::now();
+        let (loaded, ()) = tokio::join!(stub.wait_for_retry(Duration::from_secs(3600)), async {
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            install_test_cert(&stub, 90);
+        });
+        assert!(loaded.unwrap());
+        assert!(start.elapsed() < Duration::from_secs(3600));
+        assert!(stub.get_cert().is_some());
+        assert_eq!(server.orders(), 0);
+    }
 
     #[test]
     fn install_identity_certificate_writes_active_files() {

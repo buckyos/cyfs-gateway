@@ -5,7 +5,7 @@ use base64::Engine;
 use openssl::{
     pkey::{PKey, Private},
     rsa::Rsa,
-    x509::{extension::SubjectAlternativeName, X509NameBuilder, X509ReqBuilder},
+    x509::{X509NameBuilder, X509ReqBuilder, extension::SubjectAlternativeName},
 };
 use rcgen::{KeyPair, PKCS_ECDSA_P256_SHA256};
 use reqwest;
@@ -222,6 +222,34 @@ struct AcmeError {
     detail: Option<String>,
     #[serde(default)]
     status: Option<u16>,
+}
+
+#[derive(Debug)]
+pub(crate) struct AcmeHttpError {
+    status: reqwest::StatusCode,
+    body: String,
+    pub(crate) retry_after: Option<Duration>,
+}
+
+impl Display for AcmeHttpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "HTTP error: {} - {}", self.status, self.body)
+    }
+}
+
+impl std::error::Error for AcmeHttpError {}
+
+fn parse_retry_after(value: &str, now: chrono::DateTime<chrono::Utc>) -> Option<Duration> {
+    let value = value.trim();
+    if let Ok(seconds) = value.parse::<u64>() {
+        return Some(Duration::from_secs(seconds));
+    }
+    let retry_at = chrono::DateTime::parse_from_rfc2822(value).ok()?;
+    Some(
+        (retry_at.with_timezone(&chrono::Utc) - now)
+            .to_std()
+            .unwrap_or_default(),
+    )
 }
 
 fn default_acme_problem_type() -> String {
@@ -631,12 +659,10 @@ impl AcmeClient {
                         "get acme challenge failed, client: {}, auth_url: {}, {}",
                         self, auth_url, e
                     );
-                    anyhow::anyhow!(
-                        "get acme challenge failed, client: {}, auth_url: {}, {}",
-                        self,
-                        auth_url,
-                        e
-                    )
+                    e.context(format!(
+                        "get acme challenge failed, client: {}, auth_url: {}",
+                        self, auth_url
+                    ))
                 })?;
 
         let mut challengs = vec![];
@@ -752,9 +778,7 @@ impl AcmeClient {
         // 检查状态码
         let status = response.status();
         if !status.is_success() {
-            let body = response.text().await?;
-            error!("acme response error, status: {}, body: {}", status, body);
-            return Err(anyhow::anyhow!("HTTP error: {} - {}", status, body));
+            return Err(Self::response_error(response).await);
         }
 
         Ok(())
@@ -772,12 +796,10 @@ impl AcmeClient {
                     "verify acme challenge failed, client: {}, challenge_url: {}, {}",
                     self, challenge_url, e
                 );
-                anyhow::anyhow!(
-                    "verify acme challenge failed, client: {}, challenge_url: {}, {}",
-                    self,
-                    challenge_url,
-                    e
-                )
+                e.context(format!(
+                    "verify acme challenge failed, client: {}, challenge_url: {}",
+                    self, challenge_url
+                ))
             })
     }
 
@@ -799,12 +821,10 @@ impl AcmeClient {
                     "poll acme authorization failed, client: {}, auth_url: {}, {}",
                     self, auth_url, e
                 );
-                anyhow::anyhow!(
-                    "poll acme authorization failed, client: {}, auth_url: {}, {}",
-                    self,
-                    auth_url,
-                    e
-                )
+                e.context(format!(
+                    "poll acme authorization failed, client: {}, auth_url: {}",
+                    self, auth_url
+                ))
             })?;
 
             match authz.status.as_str() {
@@ -889,13 +909,12 @@ impl AcmeClient {
                         csr.len(),
                         e
                     );
-                    anyhow::anyhow!(
-                        "finalize acme order failed, client: {}, url: {}, csr: {}, {}",
+                    e.context(format!(
+                        "finalize acme order failed, client: {}, url: {}, csr: {}",
                         self,
                         url,
-                        csr.len(),
-                        e
-                    )
+                        csr.len()
+                    ))
                 })?;
 
         info!(
@@ -928,7 +947,7 @@ impl AcmeClient {
                     "download acme certificate failed, client: {}, url: {}, {}",
                     self, url, e
                 );
-                anyhow::anyhow!("download acme certificate failed: {}", e)
+                e.context("download acme certificate failed")
             })?;
 
         info!(
@@ -971,12 +990,11 @@ impl AcmeClient {
                     domains.join(","),
                     e
                 );
-                anyhow::anyhow!(
-                    "create acme order failed, client: {}, domains: {}, {}",
+                e.context(format!(
+                    "create acme order failed, client: {}, domains: {}",
                     self,
-                    domains.join(","),
-                    e
-                )
+                    domains.join(",")
+                ))
             })?;
 
         info!(
@@ -1085,9 +1103,7 @@ impl AcmeClient {
 
         let status = response.status();
         if !status.is_success() {
-            let body = response.text().await?;
-            error!("acme response error, status: {}, body: {}", status, body);
-            return Err(anyhow::anyhow!("HTTP error: {} - {}", status, body));
+            return Err(Self::response_error(response).await);
         }
 
         Ok(response.bytes().await?.to_vec())
@@ -1131,6 +1147,23 @@ impl AcmeClient {
         Ok(nonce)
     }
 
+    async fn response_error(response: reqwest::Response) -> anyhow::Error {
+        let status = response.status();
+        let retry_after = response
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| parse_retry_after(value, chrono::Utc::now()));
+        let body = response.text().await.unwrap_or_else(|e| e.to_string());
+        error!("acme response error, status: {}, body: {}", status, body);
+        AcmeHttpError {
+            status,
+            body,
+            retry_after,
+        }
+        .into()
+    }
+
     /// 处理ACME响应
     async fn handle_response<R>(&self, response: reqwest::Response) -> Result<R>
     where
@@ -1146,9 +1179,7 @@ impl AcmeClient {
         // 检查状态码
         let status = response.status();
         if !status.is_success() {
-            let body = response.text().await?;
-            error!("acme response error, status: {}, body: {}", status, body);
-            return Err(anyhow::anyhow!("HTTP error: {}", status));
+            return Err(Self::response_error(response).await);
         }
 
         // 解析响应体
@@ -1336,6 +1367,51 @@ struct AccountResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retry_after_accepts_seconds_and_http_dates() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-09-11T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        assert_eq!(
+            parse_retry_after("3600", now),
+            Some(Duration::from_secs(3600))
+        );
+        assert_eq!(
+            parse_retry_after("Sat, 12 Sep 2026 00:00:00 GMT", now),
+            Some(Duration::from_secs(86400))
+        );
+        assert_eq!(
+            parse_retry_after("Thu, 10 Sep 2026 00:00:00 GMT", now),
+            Some(Duration::ZERO)
+        );
+        assert_eq!(parse_retry_after("invalid", now), None);
+    }
+
+    #[tokio::test]
+    async fn create_order_preserves_rate_limit_detail_and_retry_after() {
+        let server = crate::test_acme::MockAcme::new().await;
+        server
+            .state
+            .fail_orders
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        server.order_gate.add_permits(1);
+        let client = AcmeClient::new(
+            AcmeAccount::new("test@example.com".to_string()),
+            format!("{}/directory", server.url),
+        )
+        .await
+        .unwrap();
+        let directory = client.get_directory().await.unwrap();
+        let error = client
+            .create_order(&["example.com".to_string()], directory)
+            .await
+            .unwrap_err();
+        let http_error = error.downcast_ref::<AcmeHttpError>().unwrap();
+        assert_eq!(http_error.status, reqwest::StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(http_error.retry_after, Some(Duration::from_secs(3600)));
+        assert!(format!("{error:#}").contains("test issuance limit"));
+    }
 
     #[test]
     fn authz_response_parses_challenge_error() {
