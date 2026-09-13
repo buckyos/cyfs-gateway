@@ -1,6 +1,6 @@
 /**
  * DID Resolver 的四种回答必须落到不同的 kind 上。
- * 报文全部取自线上 bns-server 的真实回包。
+ * 状态机使用线上历史回包；版本语义使用当前协议构造的报文。
  */
 
 import { describe, expect, it } from 'vitest'
@@ -8,6 +8,8 @@ import { describe, expect, it } from 'vitest'
 import { parseDidResolution } from '../services/did_resolver'
 import { didResolverEndpoint, encodeDidPathSegment, resolveConfig } from '../config'
 import { didFixture, fixtures } from './fixtures'
+import { createDemoFetch } from '../../demo/server'
+import { DemoWorld } from '../../demo/world'
 
 function parse(key: string) {
   const { httpStatus, body } = didFixture(key)
@@ -16,14 +18,26 @@ function parse(key: string) {
 
 describe('DID Resolver 状态机', () => {
   it('200：权威答案，带 buckyos 扩展块', () => {
-    const answer = parse('answer')
+    const answer = parseDidResolution(200, {
+      didResolutionMetadata: { contentType: 'application/did+ld+json', error: null },
+      didDocument: { id: 'did:bns:alice', iat: 1751500000 },
+      didDocumentMetadata: {
+        versionId: '1751500000',
+        deactivated: false,
+        buckyos: {
+          docType: 'owner', documentStatus: 'active',
+          documentVersion: 1751500000, registryVersion: 3, authoritySeq: 0,
+        },
+      },
+    })
     expect(answer.kind).toBe('answer')
     expect(answer.httpStatus).toBe(200)
     expect(answer.documentStatus).toBe('active')
     expect(answer.docType).toBe('owner')
-    expect(answer.documentVersion).toBe(1n)
+    expect(answer.documentVersion).toBe(1751500000n)
+    expect(answer.registryVersion).toBe(3n)
     expect(answer.authoritySeq).toBe(0n)
-    expect(answer.versionId).toBe('1')
+    expect(answer.versionId).toBe('1751500000')
     expect(answer.deactivated).toBe(false)
     expect(answer.contentType).toBe('application/did+ld+json')
     expect(answer.didDocument).not.toBeNull()
@@ -81,6 +95,27 @@ describe('DID Resolver 状态机', () => {
 
   it('原始 envelope 完整保留，供高级视图展示', () => {
     expect(parse('answer').raw).toEqual(didFixture('answer').body)
+  })
+
+  it('旧响应没有 registryVersion 时不从 documentVersion 推断登记版本', () => {
+    expect(parse('answer').registryVersion).toBeNull()
+  })
+
+  it('demo 将文档 iat 与登记版本分开，缺 iat 时省略文档版本', async () => {
+    const fetchDemo = createDemoFetch(new DemoWorld())
+    const zoneResponse = await fetchDemo('http://demo.local/1.0/identifiers/did:bns:alice?type=zone')
+    const zone = parseDidResolution(zoneResponse.status, await zoneResponse.json())
+    const iat = (zone.didDocument as { iat: number }).iat
+    expect(zone.documentVersion).toBe(BigInt(iat))
+    expect(zone.versionId).toBe(String(iat))
+    expect(zone.registryVersion).toBe(2n)
+
+    const response = await fetchDemo('http://demo.local/1.0/identifiers/did:bns:alice?type=payment')
+    const raw = await response.json()
+    const payment = parseDidResolution(response.status, raw)
+    expect(payment.registryVersion).toBe(1n)
+    expect(raw.didDocumentMetadata.buckyos).not.toHaveProperty('documentVersion')
+    expect(raw.didDocumentMetadata).not.toHaveProperty('versionId')
   })
 })
 

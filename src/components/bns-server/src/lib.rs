@@ -42,6 +42,7 @@ use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full};
 use kRPC::{RPCErrors, RPCHandler, RPCRequest, RPCResponse, RPCResult};
 use log::warn;
+use name_client::document_iat;
 use name_lib::{DIDDocumentTrait, DeviceDocument, EncodedDocument, OwnerDocument, ZoneDocument, DID};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -1354,6 +1355,9 @@ fn did_resolution_state_response(
         DocumentStatus::Revoked | DocumentStatus::Tombstoned => StatusCode::GONE,
     };
     let deactivated = matches!(status, DocumentStatus::Revoked | DocumentStatus::Tombstoned);
+    let document_version = result
+        .and_then(|result| projected_document(result).ok())
+        .and_then(|document| document_iat(&document));
 
     // Only readable states expose the document content; revoked/tombstoned
     // answers keep `didDocument` null so stale content cannot outlive a 410.
@@ -1372,6 +1376,9 @@ fn did_resolution_state_response(
     let mut buckyos = Map::new();
     buckyos.insert("docType".to_string(), json!(doc_type));
     buckyos.insert("documentStatus".to_string(), json!(status.as_str()));
+    if let Some(iat) = document_version {
+        buckyos.insert("documentVersion".to_string(), json!(iat));
+    }
     if let Some(result) = result {
         buckyos.insert("sourceName".to_string(), json!(result.document_state.name));
         buckyos.insert("sourceDocType".to_string(), json!(result.document_state.doc_type));
@@ -1385,7 +1392,7 @@ fn did_resolution_state_response(
         // Version 0 is the "never published" placeholder, not a real version.
         if result.document_state.version != 0 {
             buckyos.insert(
-                "documentVersion".to_string(),
+                "registryVersion".to_string(),
                 json!(result.document_state.version),
             );
         }
@@ -1407,13 +1414,8 @@ fn did_resolution_state_response(
     }
 
     let mut metadata = Map::new();
-    if let Some(result) = result {
-        if result.document_state.version != 0 {
-            metadata.insert(
-                "versionId".to_string(),
-                json!(result.document_state.version.to_string()),
-            );
-        }
+    if let Some(iat) = document_version {
+        metadata.insert("versionId".to_string(), json!(iat.to_string()));
     }
     metadata.insert("deactivated".to_string(), json!(deactivated));
     metadata.insert("buckyos".to_string(), Value::Object(buckyos));
@@ -2119,7 +2121,7 @@ mod tests {
                     "owner",
                     3,
                     DocumentStatus::Active,
-                    br#"{"id":"did:bns:alice"}"#,
+                    br#"{"id":"did:bns:alice","iat":1751500000}"#,
                 );
                 owner_doc.previous_version = 2;
                 tx.put_document(&owner_doc)?;
@@ -2128,7 +2130,7 @@ mod tests {
                     "zone",
                     7,
                     DocumentStatus::Active,
-                    br#"{"id":"did:bns:alice","oods":["ood1"]}"#,
+                    br#"{"id":"did:bns:alice","iat":1751500100,"oods":["ood1"]}"#,
                 ))?;
                 tx.put_document(&resolver_document_state(
                     "alice",
@@ -2276,12 +2278,14 @@ mod tests {
         );
         assert_eq!(body["didDocument"]["id"], "did:bns:alice");
         let metadata = &body["didDocumentMetadata"];
-        assert_eq!(metadata["versionId"], "3");
+        let iat = body["didDocument"]["iat"].as_u64().unwrap();
+        assert_eq!(metadata["versionId"], iat.to_string());
         assert_eq!(metadata["deactivated"], false);
         let buckyos = &metadata["buckyos"];
         assert_eq!(buckyos["docType"], "owner");
         assert_eq!(buckyos["documentStatus"], "active");
-        assert_eq!(buckyos["documentVersion"], 3);
+        assert_eq!(buckyos["documentVersion"], iat);
+        assert_eq!(buckyos["registryVersion"], 3);
         assert_eq!(buckyos["authoritySeq"], 1);
         // Chain-account owners have no DID form yet: the field must be
         // omitted, never serialized as the internal principal JSON.
@@ -2608,7 +2612,15 @@ mod tests {
                 envelope["didDocumentMetadata"]["buckyos"]["sourceDocType"],
                 device.name
             );
-            assert_eq!(envelope["didDocumentMetadata"]["versionId"], "1");
+            assert_eq!(
+                envelope["didDocumentMetadata"]["versionId"],
+                device.iat.to_string()
+            );
+            assert_eq!(
+                envelope["didDocumentMetadata"]["buckyos"]["documentVersion"],
+                device.iat
+            );
+            assert_eq!(envelope["didDocumentMetadata"]["buckyos"]["registryVersion"], 1);
         }
         let (device, _) = &devices[0];
         let mut rotated = device.clone();
@@ -2837,8 +2849,55 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         let buckyos = &body["didDocumentMetadata"]["buckyos"];
         assert_eq!(buckyos["docType"], "zone");
-        assert_eq!(buckyos["documentVersion"], 7);
+        let iat = body["didDocument"]["iat"].as_u64().unwrap();
+        assert_eq!(buckyos["documentVersion"], iat);
+        assert_eq!(body["didDocumentMetadata"]["versionId"], iat.to_string());
+        assert_eq!(buckyos["registryVersion"], 7);
         assert_eq!(body["didDocument"]["oods"][0], "ood1");
+    }
+
+    #[tokio::test]
+    async fn did_resolver_versions_do_not_fall_back_to_registry_counter() {
+        let registry = CentralizedBnsRegistry::new(resolver_seeded_store());
+        let mut result = registry.resolve_document("alice", "owner").unwrap();
+        for (content, iat, registry_version) in [
+            (json!({"iat": 1751500000}), Some(1751500000u64), 3),
+            (
+                json!({"exp": 1751500000 + name_lib::DEFAULT_EXPIRE_TIME}),
+                Some(1751500000),
+                3,
+            ),
+            (json!({"id": "did:bns:alice"}), None, 3),
+            (json!("invalid-jwt"), None, 3),
+            (json!({}), None, 0),
+            (json!({"iat": 0}), Some(0), 3),
+        ] {
+            result.document_state.document =
+                DocumentRef::inline(serde_json::to_vec(&content).unwrap());
+            result.document_state.version = registry_version;
+            for status in [DocumentStatus::Active, DocumentStatus::Revoked] {
+                let response = did_resolution_state_response("owner", status, Some(&result)).unwrap();
+                let bytes = response.into_body().collect().await.unwrap().to_bytes();
+                let body: Value = serde_json::from_slice(&bytes).unwrap();
+                let metadata = &body["didDocumentMetadata"];
+                let buckyos = &metadata["buckyos"];
+                if let Some(iat) = iat {
+                    assert_eq!(buckyos["documentVersion"], iat);
+                    assert_eq!(metadata["versionId"], iat.to_string());
+                } else {
+                    assert!(buckyos.get("documentVersion").is_none());
+                    assert!(metadata.get("versionId").is_none());
+                }
+                if registry_version != 0 {
+                    assert_eq!(buckyos["registryVersion"], registry_version);
+                } else {
+                    assert!(buckyos.get("registryVersion").is_none());
+                }
+                if status == DocumentStatus::Revoked {
+                    assert!(body["didDocument"].is_null());
+                }
+            }
+        }
     }
 
     #[tokio::test]

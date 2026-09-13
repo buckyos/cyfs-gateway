@@ -31,6 +31,7 @@ export interface DidResolution {
   documentStatus: DocumentStatus | null
   docType: string | null
   documentVersion: bigint | null
+  registryVersion: bigint | null
   authoritySeq: bigint | null
   effectiveOwner: string | null
   migrationTarget: string | null
@@ -124,6 +125,7 @@ export function parseDidResolution(httpStatus: number, raw: unknown): DidResolut
     documentStatus,
     docType: typeof buckyos.docType === 'string' ? buckyos.docType : null,
     documentVersion: u64FromWireOptional(buckyos.documentVersion ?? null, 'buckyos.documentVersion'),
+    registryVersion: u64FromWireOptional(buckyos.registryVersion ?? null, 'buckyos.registryVersion'),
     authoritySeq: u64FromWireOptional(buckyos.authoritySeq ?? null, 'buckyos.authoritySeq'),
     effectiveOwner: typeof buckyos.effectiveOwner === 'string' ? buckyos.effectiveOwner : null,
     migrationTarget: typeof buckyos.migrationTarget === 'string' ? buckyos.migrationTarget : null,

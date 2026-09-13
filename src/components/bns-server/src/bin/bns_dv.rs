@@ -1015,7 +1015,7 @@ mod tests {
 
     use bns_evm::{Address, EthRpcClient};
     use name_client::{
-        BnsProvider, DidDocType, DocumentStatus as ResolverDocumentStatus, NsProvider,
+        document_iat, BnsProvider, DidDocType, DocumentStatus as ResolverDocumentStatus, NsProvider,
     };
     use name_lib::DID;
     use serde_json::json;
@@ -1179,7 +1179,7 @@ mod tests {
             .collect()
     }
 
-    async fn resolve_json_doc(provider: &BnsProvider, did: &DID, doc_type: &str) -> (u64, Value) {
+    async fn resolve_json_doc(provider: &BnsProvider, did: &DID, doc_type: &str) -> Value {
         let doc_type = DidDocType::from(doc_type);
         let state = provider
             .resolve_published_state(did, &doc_type)
@@ -1187,13 +1187,12 @@ mod tests {
             .unwrap()
             .expect("published state");
         assert_eq!(state.document_status, ResolverDocumentStatus::Active);
-        let version = state.document_version.expect("document version");
         let document = state
             .document_ref
             .and_then(|doc| doc.inline_document)
             .expect("inline document");
-        let value = document.to_json_value().unwrap();
-        (version, value)
+        assert_eq!(state.document_version, document_iat(&document));
+        document.to_json_value().unwrap()
     }
 
     #[tokio::test]
@@ -1220,6 +1219,7 @@ mod tests {
             serde_json::to_vec(&json!({
                 "id": "did:bns:alice",
                 "gateway_device_name": "ood1",
+                "iat": 1751500000,
                 "marker": "zone-from-on-init"
             }))
             .unwrap(),
@@ -1230,6 +1230,7 @@ mod tests {
             serde_json::to_vec(&json!({
                 "id": "did:bns:alice",
                 "oods": ["ood1"],
+                "iat": 1751500100,
                 "marker": "boot-from-on-init"
             }))
             .unwrap(),
@@ -1240,6 +1241,7 @@ mod tests {
         // 3,000,000 gas limit and guards the devtest seed path against regression.
         let device_document = serde_json::to_vec(&json!({
             "id": "did:bns:alice",
+            "iat": 1751500200,
             "devices": {
                 "ood1": {
                     "id": "did:dev:ood1",
@@ -1306,23 +1308,21 @@ on_init_txs:
         .unwrap();
         let did = DID::new("bns", "alice");
 
-        let (zone_version, zone) = resolve_json_doc(&provider, &did, "zone").await;
-        assert_eq!(zone_version, 1);
+        let zone = resolve_json_doc(&provider, &did, "zone").await;
         assert_eq!(
             zone,
             json!({
                 "id": "did:bns:alice",
                 "gateway_device_name": "ood1",
+                "iat": 1751500000,
                 "marker": "zone-from-on-init"
             })
         );
 
-        let (boot_version, boot) = resolve_json_doc(&provider, &did, "boot").await;
-        assert_eq!(boot_version, 1);
+        let boot = resolve_json_doc(&provider, &did, "boot").await;
         assert_eq!(boot["marker"], "boot-from-on-init");
 
-        let (device_version, device) = resolve_json_doc(&provider, &did, "device_mini_doc").await;
-        assert_eq!(device_version, 1);
+        let device = resolve_json_doc(&provider, &did, "device_mini_doc").await;
         assert_eq!(device["devices"]["ood1"]["marker"], "device-from-on-init");
 
         server_task.abort();

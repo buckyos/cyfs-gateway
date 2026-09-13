@@ -382,9 +382,9 @@ function DidResolutionView({ resolution }: { resolution: DidResolution }) {
       </div>
       {resolution.kind === 'answer' ? (
         <dl className="kv kv--tight">
-          <dt>doc type / 版本</dt>
+          <dt>doc type / 登记版本</dt>
           <dd className="mono">
-            {resolution.docType ?? '—'} / {resolution.documentVersion?.toString() ?? '—'}
+            {resolution.docType ?? '—'} / {resolution.registryVersion?.toString() ?? '—'}
           </dd>
           <dt>Effective Owner</dt>
           <dd className="mono">{resolution.effectiveOwner || '—'}</dd>

@@ -295,6 +295,14 @@ function handleDidResolve(world: DemoWorld, url: URL): Response {
   }
 
   const gone = derivedStatus === 'revoked' || derivedStatus === 'tombstoned'
+  const payload = didDocument as Record<string, unknown> | null
+  const isTimestamp = (value: unknown): value is number =>
+    typeof value === 'number' && Number.isSafeInteger(value) && value >= 0
+  const documentVersion = isTimestamp(payload?.iat)
+    ? payload.iat
+    : isTimestamp(payload?.exp)
+      ? Math.max(0, payload.exp - 3600 * 24 * 365 * 5)
+      : undefined
   return json(
     {
       ...resolutionBase,
@@ -303,12 +311,13 @@ function handleDidResolve(world: DemoWorld, url: URL): Response {
         ? { error: 'gone', errorMessage: `document status: ${derivedStatus}` }
         : { contentType: 'application/json' },
       didDocumentMetadata: {
-        versionId: String(doc.version),
+        versionId: documentVersion?.toString(),
         deactivated: gone,
         buckyos: {
           documentStatus: derivedStatus,
           docType,
-          documentVersion: doc.version,
+          documentVersion,
+          registryVersion: doc.version === 0 ? undefined : doc.version,
           authoritySeq: owner?.authority_seq ?? 0,
           effectiveOwner: owner ? principalLabel(owner.effective_owner) : '',
           historicalQuerySupported: false,

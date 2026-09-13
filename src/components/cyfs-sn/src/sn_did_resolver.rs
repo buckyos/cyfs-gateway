@@ -1573,6 +1573,47 @@ mod tests {
         );
     }
 
+    #[test]
+    fn resolver_profile_preserves_bns_registry_version() {
+        let resolver = resolver_with_users(Vec::new());
+        for profile in [
+            SnDidResolverProfile::InternalZoneResolver,
+            SnDidResolverProfile::PublicSupplement,
+        ] {
+            let request = SnDidResolveRequest::new(
+                DID::from_str("did:bns:alice").unwrap(),
+                Some("owner".to_string()),
+                None,
+                profile,
+            );
+            let mut response = SnDidResolveResponse {
+                did: request.did.to_string(),
+                doc_type: "owner".to_string(),
+                document: EncodedDocument::JsonLd(json!({"id": "did:bns:alice", "iat": 1751500000})),
+                source: SnDidDocumentSource::BnsDocument,
+                profile,
+                document_status: Some(SnDidDocumentStatus::Active),
+                metadata: json!({}),
+            };
+            resolver.apply_profile(
+                &request,
+                &mut response,
+                Some(json!({"registryVersion": 3, "documentVersion": 1751500000})),
+            );
+            let body: Value = serde_json::from_str(
+                &response.body_for_accept(Some("application/did-resolution+json")),
+            )
+            .unwrap();
+            let buckyos = &body["didDocumentMetadata"]["buckyos"];
+            assert_eq!(buckyos["registryVersion"], 3);
+            if profile == SnDidResolverProfile::InternalZoneResolver {
+                assert_eq!(buckyos["documentVersion"], 1751500000u64);
+            } else {
+                assert!(buckyos.get("documentVersion").is_none());
+            }
+        }
+    }
+
     #[tokio::test]
     async fn internal_zone_resolver_projects_active_auth_db_owner_with_revision_metadata() {
         let resolver = resolver_with_users(vec![auth_user(

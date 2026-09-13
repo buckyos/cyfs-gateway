@@ -914,11 +914,13 @@ function seedWorld(world: DemoWorld): void {
   ])
   world.publishDocument(alice, docUpdate('owner', {
     did: 'did:bns:alice',
+    iat: now - 400 * DAY,
     display_name: 'Alice',
     profile: '演示账号：一级名称即账号',
   }))
   world.publishDocument(alice, docUpdate('zone', {
     did: 'did:bns:alice',
+    iat: now - 400 * DAY,
     oods: ['ood1.alice'],
     sn: 'sn.buckyos.io',
     version: 1,
@@ -926,6 +928,7 @@ function seedWorld(world: DemoWorld): void {
   // zone 文档发布过第二版：历史版本演示。
   world.publishDocument(alice, docUpdate('zone', {
     did: 'did:bns:alice',
+    iat: now - DAY,
     oods: ['ood1.alice', 'ood2.alice'],
     sn: 'sn.buckyos.io',
     version: 2,
