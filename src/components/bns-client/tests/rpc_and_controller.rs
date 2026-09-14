@@ -1604,6 +1604,7 @@ async fn remove_bound_zone_applies_cas_once_and_replays_idempotently() {
 
     let owner_document = json!({
         "id": "did:bns:alice",
+        "iat": buckyos_kit::buckyos_get_unix_timestamp() + 60,
         "zone_binding_model_version": 2,
         "binded_zone_list": ["did:web:zone-a.example", "did:web:zone-b.example"],
         "service": [
@@ -1660,6 +1661,10 @@ async fn remove_bound_zone_applies_cas_once_and_replays_idempotently() {
     assert_eq!(result.version, 2);
     assert_eq!(result.hash, first.result_owner_hash);
     assert_eq!(
+        result.document["iat"].as_u64().unwrap(),
+        owner_document["iat"].as_u64().unwrap() + 1
+    );
+    assert_eq!(
         result.document["binded_zone_list"],
         json!(["did:web:zone-b.example"])
     );
@@ -1699,6 +1704,27 @@ async fn remove_bound_zone_applies_cas_once_and_replays_idempotently() {
         stale,
         SnBnsControllerError::OwnerDocumentHashConflict { .. }
     ));
+
+    let second = controller
+        .remove_bound_zone(RemoveBoundZoneParams {
+            request_id: "remove-zone-b".to_string(),
+            name: "alice".to_string(),
+            zone_did: "did:web:zone-b.example".to_string(),
+            expected_owner_hash: result.hash,
+            authority: sn_controller_authority(),
+        })
+        .await
+        .unwrap();
+    let unbound = controller
+        .resolve_owner_document_snapshot("alice")
+        .await
+        .unwrap();
+    assert_eq!(unbound.hash, second.result_owner_hash);
+    assert_eq!(
+        unbound.document["iat"].as_u64().unwrap(),
+        result.document["iat"].as_u64().unwrap() + 1
+    );
+    assert!(unbound.document.get("binded_zone_list").is_none());
 }
 
 #[tokio::test]
@@ -1725,6 +1751,7 @@ async fn legacy_same_name_unlink_requires_zone_history_and_stays_v2_unbound() {
         .unwrap();
     let legacy_owner = json!({
         "id": "did:bns:alice",
+        "iat": 1,
         "service": [
             {
                 "id": "did:bns:alice#lastDoc",
@@ -1779,6 +1806,7 @@ async fn legacy_same_name_unlink_requires_zone_history_and_stays_v2_unbound() {
         .await
         .unwrap();
     assert_eq!(unbound.hash, removed.result_owner_hash);
+    assert!(unbound.document["iat"].as_u64().unwrap() > 1);
     assert_eq!(unbound.document["zone_binding_model_version"], json!(2));
     assert!(unbound.document.get("binded_zone_list").is_none());
     assert_eq!(

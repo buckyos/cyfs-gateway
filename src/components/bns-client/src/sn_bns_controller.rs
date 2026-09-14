@@ -1445,6 +1445,16 @@ impl SnBnsController {
                     &execute_params.zone_did,
                     allow_legacy_implicit_same_name,
                 )?;
+                let previous_iat = result_document
+                    .get("iat")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| SnBnsControllerError::InvalidInput(
+                        "owner document iat must be an unsigned integer".to_string(),
+                    ))?;
+                let next_iat = previous_iat.checked_add(1).ok_or_else(|| {
+                    SnBnsControllerError::InvalidInput("owner document iat overflow".to_string())
+                })?;
+                result_document["iat"] = Value::from(crate::now_timestamp().max(next_iat));
                 let result_owner_hash =
                     canonical_json_sha256(&result_document).map_err(SnBnsControllerError::from)?;
                 let update =
