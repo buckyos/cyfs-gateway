@@ -1,12 +1,12 @@
 use std::io::Error;
 use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use buckyos_kit::AsyncStream;
 use percent_encoding::percent_decode;
 use tokio::io::AsyncWriteExt;
-
-use std::sync::Arc;
 
 use crate::ip::TcpUrlProber;
 use crate::tunnel_url_status::TunnelUrlProberRef;
@@ -25,6 +25,7 @@ impl ProxyTcpTunnel {
     async fn open_stream_by_target(
         &self,
         target: &str,
+        connect_timeout: Duration,
     ) -> Result<Box<dyn AsyncStream>, std::io::Error> {
         let stream = percent_decode(target.as_bytes())
             .decode_utf8()
@@ -39,7 +40,20 @@ impl ProxyTcpTunnel {
             ));
         }
 
-        let mut tcp = tokio::net::TcpStream::connect(stream.as_str()).await?;
+        let mut tcp = tokio::time::timeout(
+            connect_timeout,
+            tokio::net::TcpStream::connect(stream.as_str()),
+        )
+        .await
+        .map_err(|_| {
+            Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!(
+                    "tcp connect to {} timed out after {:?}",
+                    stream, connect_timeout
+                ),
+            )
+        })??;
         let dest_addr = tcp.peer_addr()?;
         let header = build_proxy_v1_header(self.source_addr, dest_addr);
         tcp.write_all(header.as_bytes()).await?;
@@ -71,10 +85,11 @@ impl Tunnel for ProxyTcpTunnel {
         Ok(())
     }
 
-    async fn open_stream_by_dest(
+    async fn open_stream_by_dest_with_timeout(
         &self,
         _dest_port: u16,
         _dest_host: Option<String>,
+        _connect_timeout: Duration,
     ) -> Result<Box<dyn AsyncStream>, std::io::Error> {
         Err(Error::new(
             std::io::ErrorKind::Unsupported,
@@ -82,14 +97,19 @@ impl Tunnel for ProxyTcpTunnel {
         ))
     }
 
-    async fn open_stream(&self, stream_id: &str) -> Result<Box<dyn AsyncStream>, std::io::Error> {
-        self.open_stream_by_target(stream_id).await
+    async fn open_stream_with_timeout(
+        &self,
+        stream_id: &str,
+        connect_timeout: Duration,
+    ) -> Result<Box<dyn AsyncStream>, std::io::Error> {
+        self.open_stream_by_target(stream_id, connect_timeout).await
     }
 
-    async fn create_datagram_client_by_dest(
+    async fn create_datagram_client_by_dest_with_timeout(
         &self,
         _dest_port: u16,
         _dest_host: Option<String>,
+        _connect_timeout: Duration,
     ) -> Result<Box<dyn DatagramClientBox>, std::io::Error> {
         Err(Error::new(
             std::io::ErrorKind::Unsupported,
@@ -97,9 +117,10 @@ impl Tunnel for ProxyTcpTunnel {
         ))
     }
 
-    async fn create_datagram_client(
+    async fn create_datagram_client_with_timeout(
         &self,
         _session_id: &str,
+        _connect_timeout: Duration,
     ) -> Result<Box<dyn DatagramClientBox>, std::io::Error> {
         Err(Error::new(
             std::io::ErrorKind::Unsupported,

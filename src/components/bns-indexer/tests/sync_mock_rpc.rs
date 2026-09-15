@@ -1086,13 +1086,17 @@ async fn polling_loop_runs_sync_once_repeatedly() {
     .unwrap();
     let outcomes = Arc::new(AtomicUsize::new(0));
     let observed = outcomes.clone();
+    let (second_outcome_tx, mut second_outcome_rx) = tokio::sync::mpsc::unbounded_channel();
 
     tokio::select! {
         _ = indexer.run_polling_loop(Duration::from_millis(1), move |outcome| {
             outcome.unwrap();
-            observed.fetch_add(1, Ordering::SeqCst);
+            let n = observed.fetch_add(1, Ordering::SeqCst) + 1;
+            let _ = second_outcome_tx.send(n);
         }) => panic!("polling loop should not return"),
-        _ = tokio::time::sleep(Duration::from_millis(20)) => {}
+        _ = tokio::time::timeout(Duration::from_secs(10), async {
+            while second_outcome_rx.recv().await.map_or(0, |n| n) < 2 {}
+        }) => {}
     }
 
     assert!(

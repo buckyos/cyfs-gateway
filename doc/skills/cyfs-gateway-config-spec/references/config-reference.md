@@ -356,6 +356,22 @@ hook_point:
 - `brotli_types`
 - `brotli_min_length`
 - `brotli_comp_level`
+- `dns_timeout?`
+- `connect_timeout?`
+- `tls_handshake_timeout?`
+- `http_handshake_timeout?`
+- `tunnel_open_timeout?`
+- `response_timeout?`
+- `request_body_idle_timeout?`
+
+超时字段说明：
+
+- 每个字段既可写毫秒整数，也可写时长字符串（`500ms`、`5s`、`2m`）；写 `0` 表示关闭该阶段的超时。
+- 默认值：`dns_timeout = 5s`、`connect_timeout = 800ms`、`tls_handshake_timeout = 5s`、`http_handshake_timeout = 5s`、`tunnel_open_timeout = 0`（沿用 `tunnel_mgr` 的 `connect_timeout`）、`response_timeout = 60s`、`request_body_idle_timeout = 60s`。
+- 覆盖的阶段依次是：解析上游域名、单次 TCP 连接尝试、https 上游 TLS 握手、HTTP 客户端连接握手（直连 / TLS / tunnel）、tunnel 流打开的底层 connect 预算、等待上游响应头、请求体读取。
+- 所有超时都作用在底层第三方调用（tokio socket、TLS / HTTP / QUIC 握手等）上，`tunnel_open_timeout` 也是作为本次 tunnel open 下发给底层 connect 的预算；任何超时都不会用 `timeout` 包裹网关自身接口（tunnel 打开、请求处理入口等），因此不存在"单请求总预算"配置项。
+- process chain（`hook_point` / `post_hook_point` 链）的执行不设超时，因此没有对应的超时配置项。
+- 请求体相关语义说明（重要）：`request_body_idle_timeout` 是**空闲**超时，只限制"相邻两次收到请求体数据之间的间隔"，请求体大小与合法上传耗时都不设总时长上限；`response_timeout` 的起算点是**请求体发送完成**（无请求体时是请求发出），因此大文件慢速上传不会被判成上游超时。若把 `request_body_idle_timeout` 设为 `0`，则退化为从请求发出起算 `response_timeout`。
 
 ### `dir`
 

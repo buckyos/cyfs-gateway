@@ -1,11 +1,11 @@
 mod acme_http_challenge_server;
 mod cyfs_dir_server;
-mod dispatch;
-mod named_inbox_cache_server;
 mod dir_server;
+mod dispatch;
 mod dns_server;
 mod http_compression;
 mod http_server;
+mod named_inbox_cache_server;
 
 mod qa_server;
 mod server;
@@ -24,11 +24,11 @@ pub use buckyos_http_server::{
     server_err,
 };
 pub use cyfs_dir_server::*;
-pub use dispatch::VerifiedDispatchContext;
-pub use named_inbox_cache_server::*;
 pub use dir_server::*;
+pub use dispatch::VerifiedDispatchContext;
 pub use dns_server::*;
 pub use http_server::*;
+pub use named_inbox_cache_server::*;
 
 pub use qa_server::*;
 pub use server::*;

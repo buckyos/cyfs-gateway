@@ -36,6 +36,7 @@ impl IPTunnel {
         &self,
         dest_port: u16,
         dest_host: Option<String>,
+        connect_timeout: Duration,
     ) -> Result<Box<dyn AsyncStream>, std::io::Error> {
         let dest_addr = match dest_host {
             Some(host) => format!("{}:{}", host, dest_port),
@@ -51,7 +52,20 @@ impl IPTunnel {
         let stream;
         if self.ip_stack_id.is_none() {
             debug!("use any tcp client addr for open_stream : {}", dest_addr);
-            stream = tokio::net::TcpStream::connect(dest_addr).await?;
+            stream = tokio::time::timeout(
+                connect_timeout,
+                tokio::net::TcpStream::connect(dest_addr.as_str()),
+            )
+            .await
+            .map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!(
+                        "tcp connect to {} timed out after {:?}",
+                        dest_addr, connect_timeout
+                    ),
+                )
+            })??;
         } else {
             let bind_addr = self.ip_stack_id.as_ref().unwrap();
             let is_ipv4 = is_ipv4_addr_str(bind_addr)?;
@@ -72,7 +86,17 @@ impl IPTunnel {
             let dest_addr: SocketAddr = dest_addr
                 .parse()
                 .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "invalid dest addr"))?;
-            stream = socket.connect(dest_addr).await?;
+            stream = tokio::time::timeout(connect_timeout, socket.connect(dest_addr))
+                .await
+                .map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        format!(
+                            "tcp connect to {} timed out after {:?}",
+                            dest_addr, connect_timeout
+                        ),
+                    )
+                })??;
         }
 
         Ok(Box::new(stream))
@@ -82,6 +106,7 @@ impl IPTunnel {
         &self,
         dest_port: u16,
         dest_host: Option<String>,
+        connect_timeout: Duration,
     ) -> Result<Box<dyn AsyncStream>, std::io::Error> {
         if dest_host.is_none() {
             return Err(std::io::Error::new(
@@ -99,7 +124,20 @@ impl IPTunnel {
         let stream;
         if self.ip_stack_id.is_none() {
             debug!("use any tcp client addr for open_stream : {}", dest_addr);
-            stream = tokio::net::TcpStream::connect(dest_addr).await?;
+            stream = tokio::time::timeout(
+                connect_timeout,
+                tokio::net::TcpStream::connect(dest_addr.as_str()),
+            )
+            .await
+            .map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!(
+                        "tcp connect to {} timed out after {:?}",
+                        dest_addr, connect_timeout
+                    ),
+                )
+            })??;
         } else {
             let bind_addr = self.ip_stack_id.as_ref().unwrap();
             let is_ipv4 = is_ipv4_addr_str(bind_addr)?;
@@ -120,7 +158,17 @@ impl IPTunnel {
             let dest_addr: SocketAddr = dest_addr
                 .parse()
                 .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "invalid dest addr"))?;
-            stream = socket.connect(dest_addr).await?;
+            stream = tokio::time::timeout(connect_timeout, socket.connect(dest_addr))
+                .await
+                .map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        format!(
+                            "tcp connect to {} timed out after {:?}",
+                            dest_addr, connect_timeout
+                        ),
+                    )
+                })??;
         }
 
         // Configure TLS
@@ -156,15 +204,21 @@ impl Tunnel for IPTunnel {
         Ok(())
     }
 
-    async fn open_stream_by_dest(
+    async fn open_stream_by_dest_with_timeout(
         &self,
         dest_port: u16,
         dest_host: Option<String>,
+        connect_timeout: Duration,
     ) -> Result<Box<dyn AsyncStream>, Error> {
-        self.open_tcp_stream_by_dest(dest_port, dest_host).await
+        self.open_tcp_stream_by_dest(dest_port, dest_host, connect_timeout)
+            .await
     }
 
-    async fn open_stream(&self, stream_id: &str) -> Result<Box<dyn AsyncStream>, std::io::Error> {
+    async fn open_stream_with_timeout(
+        &self,
+        stream_id: &str,
+        connect_timeout: Duration,
+    ) -> Result<Box<dyn AsyncStream>, std::io::Error> {
         let stream_id = percent_decode(stream_id.as_bytes())
             .decode_utf8()
             .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "invalid stream id"))?
@@ -174,7 +228,8 @@ impl Tunnel for IPTunnel {
         // 检测stream_id中是否有协议头
         if !has_scheme(stream_id) {
             let (dest_host, dest_port) = get_dest_info_from_url_path(stream_id)?;
-            self.open_tcp_stream_by_dest(dest_port, dest_host).await
+            self.open_tcp_stream_by_dest(dest_port, dest_host, connect_timeout)
+                .await
         } else {
             match Url::parse(&stream_id) {
                 Ok(url) => {
@@ -188,12 +243,14 @@ impl Tunnel for IPTunnel {
                         self.open_tcp_stream_by_dest(
                             url.port().unwrap(),
                             url.host().map(|h| h.to_string()),
+                            connect_timeout,
                         )
                         .await
                     } else if url.scheme() == "tls" {
                         self.open_tls_stream_by_dest(
                             url.port().unwrap(),
                             url.host().map(|h| h.to_string()),
+                            connect_timeout,
                         )
                         .await
                     } else {
@@ -211,10 +268,11 @@ impl Tunnel for IPTunnel {
         }
     }
 
-    async fn create_datagram_client_by_dest(
+    async fn create_datagram_client_by_dest_with_timeout(
         &self,
         dest_port: u16,
         dest_host: Option<String>,
+        _connect_timeout: Duration,
     ) -> Result<Box<dyn DatagramClientBox>, Error> {
         let real_dest_host;
         if dest_host.is_none() {
@@ -231,13 +289,18 @@ impl Tunnel for IPTunnel {
         Ok(Box::new(client))
     }
 
-    async fn create_datagram_client(
+    async fn create_datagram_client_with_timeout(
         &self,
         session_id: &str,
+        connect_timeout: Duration,
     ) -> Result<Box<dyn DatagramClientBox>, std::io::Error> {
         let (dest_host, dest_port) = get_dest_info_from_url_path(session_id)?;
-        self.create_datagram_client_by_dest(dest_port, dest_host)
-            .await
+        self.create_datagram_client_by_dest_with_timeout(
+            dest_port,
+            dest_host,
+            connect_timeout,
+        )
+        .await
     }
 }
 

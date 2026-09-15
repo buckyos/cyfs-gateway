@@ -51,7 +51,22 @@ use crate::forward::{
 use crate::{DatagramClientBox, TunnelManager};
 pub use sfo_result::err as stack_err;
 pub use sfo_result::into_err as into_stack_err;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+use tokio::sync::Notify;
+use tokio::time::{Instant, sleep_until};
 use url::Url;
+
+pub const DEFAULT_STREAM_IDLE_TIMEOUT_SECS: u64 = 600;
+pub const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 60;
+
+pub fn stream_idle_timeout_from_secs(timeout_secs: Option<u64>) -> Duration {
+    Duration::from_secs(timeout_secs.unwrap_or(DEFAULT_STREAM_IDLE_TIMEOUT_SECS))
+}
+
+pub fn connect_timeout_from_secs(timeout_secs: Option<u64>) -> Duration {
+    Duration::from_secs(timeout_secs.unwrap_or(DEFAULT_CONNECT_TIMEOUT_SECS))
+}
 
 /// Best-effort dual-stack support for wildcard IPv6 listeners.
 ///
@@ -153,6 +168,8 @@ pub async fn stream_forward(
     target: &str,
     tunnel_manager: &TunnelManager,
     info: Option<&crate::StreamInfo>,
+    idle_timeout: Duration,
+    connect_timeout: Duration,
 ) -> StackResult<()> {
     let url = Url::parse(target).map_err(into_stack_err!(
         StackErrorCode::InvalidConfig,
@@ -165,8 +182,12 @@ pub async fn stream_forward(
         .query_pairs()
         .any(|(k, v)| k == "proxy_protocol" && v.eq_ignore_ascii_case("v2"));
 
+    // The connect budget is handed to the tunnel manager, which forwards it
+    // to the tunnel implementation's low-level connect. The open is never
+    // wrapped in a timeout here: a caller-side cut would cancel the manager's
+    // failure-history bookkeeping.
     let mut forward_stream = tunnel_manager
-        .open_stream_by_url(&url)
+        .open_stream_by_url_with_timeout(&url, connect_timeout)
         .await
         .map_err(into_stack_err!(StackErrorCode::TunnelError))?;
 
@@ -180,7 +201,7 @@ pub async fn stream_forward(
         }
     }
 
-    tokio::io::copy_bidirectional(&mut stream, forward_stream.as_mut())
+    sfo_io::copy_bidirectional_with_timeout(&mut stream, forward_stream.as_mut(), idle_timeout)
         .await
         .map_err(into_stack_err!(
             StackErrorCode::StreamError,
@@ -197,13 +218,16 @@ pub async fn stream_forward(
 /// as a wall-clock budget that caps the total cost of all candidate
 /// attempts (§6.3 "next_upstream_tries 和 next_upstream_timeout 必须限
 /// 制单次请求的最大尝试成本"). The timer starts before the first
-/// attempt and any remaining slice is passed to `tokio::time::timeout`
-/// per attempt, so a slow candidate cannot blow past the budget.
+/// attempt and the remaining slice is passed down as the per-attempt connect
+/// budget of `open_stream_by_url_with_timeout`, so a slow candidate cannot
+/// blow past the budget. The data phase is bounded by `idle_timeout`.
 pub async fn stream_forward_group(
     stream: Box<dyn AsyncStream>,
     plan: &ForwardPlan,
     tunnel_manager: &TunnelManager,
     info: Option<&crate::StreamInfo>,
+    idle_timeout: Duration,
+    connect_timeout: Duration,
 ) -> StackResult<()> {
     // Stage 4: re-order plan candidates by RTT before iterating when
     // the plan asked for least-time selection. Best-effort: any failure
@@ -276,31 +300,25 @@ pub async fn stream_forward_group(
             .query_pairs()
             .any(|(k, v)| k == "proxy_protocol" && v.eq_ignore_ascii_case("v2"));
 
-        let attempt = tunnel_manager.open_stream_by_url(&url);
-        let (result, cond) = match deadline {
+        // The per-attempt budget (the remaining `next_upstream` budget when
+        // the plan set one, else the configured connect timeout) is handed to
+        // the tunnel manager, which forwards it to the tunnel's low-level
+        // connect. The open is never wrapped in a timeout here: a caller-side
+        // cut would cancel the manager's failure-history bookkeeping.
+        let budget = match deadline {
             Some(d) => {
                 let remaining = d.saturating_duration_since(std::time::Instant::now());
-                match tokio::time::timeout(remaining, attempt).await {
-                    Ok(r) => (
-                        r.map_err(|e| crate::TunnelError::ConnectError(e.to_string())),
-                        NextUpstreamCondition::Error,
-                    ),
-                    Err(_) => (
-                        Err(crate::TunnelError::ConnectError(format!(
-                            "next_upstream timeout exceeded ({}ms budget) on {}",
-                            policy.timeout.unwrap_or_default().as_millis(),
-                            candidate.url,
-                        ))),
-                        NextUpstreamCondition::Timeout,
-                    ),
-                }
+                remaining.min(connect_timeout)
             }
-            None => (
-                attempt
-                    .await
-                    .map_err(|e| crate::TunnelError::ConnectError(e.to_string())),
-                NextUpstreamCondition::Error,
-            ),
+            None => connect_timeout,
+        };
+        let result = tunnel_manager
+            .open_stream_by_url_with_timeout(&url, budget)
+            .await;
+        let cond = if matches!(result, Err(crate::TunnelError::ConnectTimeout(_))) {
+            NextUpstreamCondition::Timeout
+        } else {
+            NextUpstreamCondition::Error
         };
 
         match result {
@@ -369,7 +387,7 @@ pub async fn stream_forward_group(
         }
     }
 
-    tokio::io::copy_bidirectional(&mut stream, forward_stream.as_mut())
+    sfo_io::copy_bidirectional_with_timeout(&mut stream, forward_stream.as_mut(), idle_timeout)
         .await
         .map_err(into_stack_err!(
             StackErrorCode::StreamError,
@@ -384,6 +402,8 @@ pub async fn datagram_forward(
     datagram: Box<dyn DatagramClientBox>,
     target: &str,
     tunnel_manager: &TunnelManager,
+    idle_timeout: Duration,
+    connect_timeout: Duration,
 ) -> StackResult<()> {
     let url = Url::parse(&target).map_err(into_stack_err!(
         StackErrorCode::InvalidConfig,
@@ -391,11 +411,11 @@ pub async fn datagram_forward(
         target
     ))?;
     let forward_datagram = tunnel_manager
-        .create_datagram_client_by_url(&url)
+        .create_datagram_client_by_url_with_timeout(&url, connect_timeout)
         .await
         .map_err(into_stack_err!(StackErrorCode::TunnelError))?;
 
-    copy_datagram_bidirectional(datagram, forward_datagram)
+    copy_datagram_bidirectional(datagram, forward_datagram, idle_timeout)
         .await
         .map_err(into_stack_err!(StackErrorCode::TunnelError))?;
     Ok(())
@@ -405,11 +425,15 @@ pub async fn datagram_forward(
 /// Connection-stage retry only: once a datagram client has been created, a
 /// failure inside `copy_datagram_bidirectional` is propagated, never retried
 /// transparently. Implements §6.5. Honors `policy.timeout` as a wall-clock
-/// budget (see `stream_forward_group`).
+/// budget (see `stream_forward_group`). Each candidate open receives
+/// `remaining.min(connect_timeout)` as its low-level connect budget; the
+/// data phase is bounded by `idle_timeout`.
 pub async fn datagram_forward_group(
     datagram: Box<dyn DatagramClientBox>,
     plan: &ForwardPlan,
     tunnel_manager: &TunnelManager,
+    idle_timeout: Duration,
+    connect_timeout: Duration,
 ) -> StackResult<()> {
     let mut plan_local;
     let plan: &ForwardPlan = if matches!(plan.balance, crate::forward::BalanceMethod::LeastTime) {
@@ -467,31 +491,22 @@ pub async fn datagram_forward_group(
                 continue;
             }
         };
-        let attempt = tunnel_manager.create_datagram_client_by_url(&url);
-        let (result, cond) = match deadline {
+        // See `stream_forward_group`: the per-attempt budget is passed down to
+        // the tunnel manager instead of wrapping the open in a timeout.
+        let budget = match deadline {
             Some(d) => {
                 let remaining = d.saturating_duration_since(std::time::Instant::now());
-                match tokio::time::timeout(remaining, attempt).await {
-                    Ok(r) => (
-                        r.map_err(|e| crate::TunnelError::ConnectError(e.to_string())),
-                        NextUpstreamCondition::Error,
-                    ),
-                    Err(_) => (
-                        Err(crate::TunnelError::ConnectError(format!(
-                            "next_upstream timeout exceeded ({}ms budget) on {}",
-                            policy.timeout.unwrap_or_default().as_millis(),
-                            candidate.url,
-                        ))),
-                        NextUpstreamCondition::Timeout,
-                    ),
-                }
+                remaining.min(connect_timeout)
             }
-            None => (
-                attempt
-                    .await
-                    .map_err(|e| crate::TunnelError::ConnectError(e.to_string())),
-                NextUpstreamCondition::Error,
-            ),
+            None => connect_timeout,
+        };
+        let result = tunnel_manager
+            .create_datagram_client_by_url_with_timeout(&url, budget)
+            .await;
+        let cond = if matches!(result, Err(crate::TunnelError::ConnectTimeout(_))) {
+            NextUpstreamCondition::Timeout
+        } else {
+            NextUpstreamCondition::Error
         };
         match result {
             Ok(client) => {
@@ -540,7 +555,7 @@ pub async fn datagram_forward_group(
         }
     };
 
-    copy_datagram_bidirectional(datagram, forward_datagram)
+    copy_datagram_bidirectional(datagram, forward_datagram, idle_timeout)
         .await
         .map_err(into_stack_err!(StackErrorCode::TunnelError))?;
     Ok(())
@@ -573,36 +588,95 @@ fn should_continue(
     attempted_idx + 1 < max_attempts
 }
 
-#[allow(unreachable_code)]
 pub async fn copy_datagram_bidirectional(
     a: Box<dyn DatagramClientBox>,
     b: Box<dyn DatagramClientBox>,
+    idle_timeout: Duration,
 ) -> Result<(), std::io::Error> {
-    let recv = {
-        let a = a.clone();
-        let b = b.clone();
-        async move {
-            loop {
-                let mut buf = [0u8; 4096];
-                let n = a.recv_datagram(&mut buf).await?;
-                b.send_datagram(&buf[..n]).await?;
-            }
-            Ok::<(), std::io::Error>(())
-        }
-    };
-
-    let send = async move {
-        let mut buf = [0u8; 4096];
+    async fn copy_datagram_one_way(
+        recv: Box<dyn DatagramClientBox>,
+        send: Box<dyn DatagramClientBox>,
+        last_active: Arc<Mutex<Instant>>,
+        active_notify: Arc<Notify>,
+    ) -> Result<(), std::io::Error> {
         loop {
-            let n = b.recv_datagram(&mut buf).await?;
-            a.send_datagram(&buf[..n]).await?;
-        }
-        Ok::<(), std::io::Error>(())
-    };
+            let mut buf = [0u8; 4096];
+            let n = recv.recv_datagram(&mut buf).await?;
+            send.send_datagram(&buf[..n]).await?;
 
-    let ret = tokio::try_join!(recv, send);
+            *last_active.lock().unwrap() = Instant::now();
+            active_notify.notify_waiters();
+        }
+    }
+
+    async fn idle_timeout_guard(
+        idle_timeout: Duration,
+        last_active: Arc<Mutex<Instant>>,
+        active_notify: Arc<Notify>,
+    ) -> Result<(), std::io::Error> {
+        loop {
+            let deadline = *last_active.lock().unwrap() + idle_timeout;
+            tokio::select! {
+                _ = sleep_until(deadline) => {
+                    if last_active.lock().unwrap().elapsed() >= idle_timeout {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "datagram copy idle timeout",
+                        ));
+                    }
+                }
+                _ = active_notify.notified() => {}
+            }
+        }
+    }
+
+    let last_active = Arc::new(Mutex::new(Instant::now()));
+    let active_notify = Arc::new(Notify::new());
+
+    let recv = copy_datagram_one_way(
+        a.clone(),
+        b.clone(),
+        last_active.clone(),
+        active_notify.clone(),
+    );
+    let send = copy_datagram_one_way(b, a, last_active.clone(), active_notify.clone());
+    let timeout = idle_timeout_guard(idle_timeout, last_active, active_notify);
+
+    let ret = tokio::try_join!(recv, send, timeout);
     ret?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Clone)]
+    struct PendingDatagram;
+
+    #[async_trait::async_trait]
+    impl crate::DatagramClient for PendingDatagram {
+        async fn recv_datagram(&self, _buffer: &mut [u8]) -> Result<usize, std::io::Error> {
+            std::future::pending::<Result<usize, std::io::Error>>().await
+        }
+
+        async fn send_datagram(&self, buffer: &[u8]) -> Result<usize, std::io::Error> {
+            Ok(buffer.len())
+        }
+    }
+
+    #[tokio::test]
+    async fn copy_datagram_bidirectional_times_out_when_idle() {
+        let err = copy_datagram_bidirectional(
+            Box::new(PendingDatagram),
+            Box::new(PendingDatagram),
+            Duration::from_millis(10),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+    }
 }
 
 #[cfg(target_os = "linux")]

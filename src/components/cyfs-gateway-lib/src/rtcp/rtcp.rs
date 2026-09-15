@@ -5836,16 +5836,21 @@ impl Tunnel for RTcpTunnel {
             })
     }
 
-    async fn open_stream_by_dest(
+    async fn open_stream_by_dest_with_timeout(
         &self,
         dest_port: u16,
         dest_host: Option<String>,
+        _connect_timeout: Duration,
     ) -> Result<Box<dyn AsyncStream>, std::io::Error> {
         self.request_open_stream(Some(StreamPurpose::Stream), dest_port, dest_host)
             .await
     }
 
-    async fn open_stream(&self, stream_id: &str) -> Result<Box<dyn AsyncStream>, std::io::Error> {
+    async fn open_stream_with_timeout(
+        &self,
+        stream_id: &str,
+        connect_timeout: Duration,
+    ) -> Result<Box<dyn AsyncStream>, std::io::Error> {
         //TODO: support stream_id is a tunnel url like rtcp://sn.buckyos.ai/google.com:443/
         let real_stream_id = percent_decode_str(stream_id.trim_start_matches('/')).decode_utf8();
         if real_stream_id.is_ok() {
@@ -5855,20 +5860,26 @@ impl Tunnel for RTcpTunnel {
                 if stream_url.is_ok() {
                     debug!("will request open stream by url: {}", real_stream_id);
                     return self
-                        .open_stream_by_dest(0, Some(real_stream_id.to_string()))
+                        .open_stream_by_dest_with_timeout(
+                            0,
+                            Some(real_stream_id.to_string()),
+                            connect_timeout,
+                        )
                         .await;
                 }
             }
         }
         debug!("will rquest open stream by dest: {}", stream_id);
         let (dest_host, dest_port) = get_dest_info_from_url_path(stream_id)?;
-        self.open_stream_by_dest(dest_port, dest_host).await
+        self.open_stream_by_dest_with_timeout(dest_port, dest_host, connect_timeout)
+            .await
     }
 
-    async fn create_datagram_client_by_dest(
+    async fn create_datagram_client_by_dest_with_timeout(
         &self,
         dest_port: u16,
         dest_host: Option<String>,
+        _connect_timeout: Duration,
     ) -> Result<Box<dyn DatagramClientBox>, std::io::Error> {
         //todo 是否可以支持配置成udp session,而不是强制使用tcp stream
         let stream = self
@@ -5878,9 +5889,10 @@ impl Tunnel for RTcpTunnel {
         Ok(Box::new(client) as Box<dyn DatagramClientBox>)
     }
 
-    async fn create_datagram_client(
+    async fn create_datagram_client_with_timeout(
         &self,
         session_id: &str,
+        connect_timeout: Duration,
     ) -> Result<Box<dyn DatagramClientBox>, std::io::Error> {
         let real_stream_id = percent_decode_str(session_id.trim_start_matches('/')).decode_utf8();
         if real_stream_id.is_ok() {
@@ -5890,13 +5902,17 @@ impl Tunnel for RTcpTunnel {
                 if stream_url.is_ok() {
                     debug!("will request open stream by url: {}", real_stream_id);
                     return self
-                        .create_datagram_client_by_dest(0, Some(real_stream_id.to_string()))
+                        .create_datagram_client_by_dest_with_timeout(
+                            0,
+                            Some(real_stream_id.to_string()),
+                            connect_timeout,
+                        )
                         .await;
                 }
             }
         }
         let (dest_host, dest_port) = get_dest_info_from_url_path(session_id)?;
-        self.create_datagram_client_by_dest(dest_port, dest_host)
+        self.create_datagram_client_by_dest_with_timeout(dest_port, dest_host, connect_timeout)
             .await
     }
 }
@@ -9236,13 +9252,13 @@ mod tests {
         let ping_err = first.ping().await.unwrap_err();
         assert_eq!(ping_err.kind(), std::io::ErrorKind::BrokenPipe);
         let open_err = first
-            .open_stream("closed-tunnel.test:80")
+            .open_stream_with_timeout("closed-tunnel.test:80", Duration::from_secs(60))
             .await
             .err()
             .expect("open on a closed tunnel must fail");
         assert_eq!(open_err.kind(), std::io::ErrorKind::BrokenPipe);
         let datagram_err = first
-            .create_datagram_client("closed-tunnel.test:80")
+            .create_datagram_client_with_timeout("closed-tunnel.test:80", Duration::from_secs(60))
             .await
             .err()
             .expect("datagram creation on a closed tunnel must fail");
@@ -9794,7 +9810,11 @@ mod tests {
             &this_dev_did,
         )
         .unwrap_err();
-        assert!(err.contains("DID URL/path forms"), "unexpected error: {}", err);
+        assert!(
+            err.contains("DID URL/path forms"),
+            "unexpected error: {}",
+            err
+        );
 
         let err = RTcpInner::validate_hello_target(
             "other.test.did",
@@ -10553,7 +10573,7 @@ mod tests {
 
         let mut stream = tokio::time::timeout(
             Duration::from_secs(5),
-            client_one_tunnel.open_stream("handshake-lifetime.test:80"),
+            client_one_tunnel.open_stream_with_timeout("handshake-lifetime.test:80", Duration::from_secs(60)),
         )
         .await
         .expect("open_stream timed out after handshake deadline")
@@ -10743,7 +10763,7 @@ mod tests {
             .expect("first accepted tunnel must remain usable");
         let mut stream = tokio::time::timeout(
             Duration::from_secs(5),
-            client_one_tunnel.open_stream("first-winner-echo.test:80"),
+            client_one_tunnel.open_stream_with_timeout("first-winner-echo.test:80", Duration::from_secs(60)),
         )
         .await
         .expect("first tunnel open timed out")
@@ -11076,10 +11096,11 @@ mod tests {
             Ok(())
         }
 
-        async fn open_stream_by_dest(
+        async fn open_stream_by_dest_with_timeout(
             &self,
             _dest_port: u16,
             _dest_host: Option<String>,
+            _connect_timeout: Duration,
         ) -> Result<Box<dyn AsyncStream>, std::io::Error> {
             self.open_count.fetch_add(1, Ordering::SeqCst);
             Err(std::io::Error::new(
@@ -11088,9 +11109,10 @@ mod tests {
             ))
         }
 
-        async fn open_stream(
+        async fn open_stream_with_timeout(
             &self,
             _stream_id: &str,
+            _connect_timeout: Duration,
         ) -> Result<Box<dyn AsyncStream>, std::io::Error> {
             self.open_count.fetch_add(1, Ordering::SeqCst);
             Err(std::io::Error::new(
@@ -11099,10 +11121,11 @@ mod tests {
             ))
         }
 
-        async fn create_datagram_client_by_dest(
+        async fn create_datagram_client_by_dest_with_timeout(
             &self,
             _dest_port: u16,
             _dest_host: Option<String>,
+            _connect_timeout: Duration,
         ) -> Result<Box<dyn DatagramClientBox>, std::io::Error> {
             Err(std::io::Error::new(
                 std::io::ErrorKind::Unsupported,
@@ -11110,9 +11133,10 @@ mod tests {
             ))
         }
 
-        async fn create_datagram_client(
+        async fn create_datagram_client_with_timeout(
             &self,
             _session_id: &str,
+            _connect_timeout: Duration,
         ) -> Result<Box<dyn DatagramClientBox>, std::io::Error> {
             Err(std::io::Error::new(
                 std::io::ErrorKind::Unsupported,
@@ -12294,7 +12318,10 @@ mod tests {
                 .create_tunnel(Some(format!("{}:{port2}", id2.to_host_name()).as_str()))
                 .await
                 .unwrap();
-            let mut stream = tunnel.open_stream("www.baidu.com:80").await.unwrap();
+            let mut stream = tunnel
+                .open_stream_with_timeout("www.baidu.com:80", Duration::from_secs(60))
+                .await
+                .unwrap();
             stream.write_all(b"test").await.unwrap();
             let mut buf = [0u8; 1024];
             let ret = stream.read(&mut buf).await;
@@ -12309,7 +12336,10 @@ mod tests {
                 .create_tunnel(Some(format!("{}:{port1}", id1.to_host_name()).as_str()))
                 .await
                 .unwrap();
-            let mut stream = tunnel.open_stream("www.baidu.com:80").await.unwrap();
+            let mut stream = tunnel
+                .open_stream_with_timeout("www.baidu.com:80", Duration::from_secs(60))
+                .await
+                .unwrap();
             stream.write_all(b"test").await.unwrap();
             let mut buf = [0u8; 1024];
             let ret = stream.read(&mut buf).await;
@@ -12577,7 +12607,11 @@ mod tests {
     ) -> Box<dyn AsyncStream> {
         let open_attempts = open_attempts.max(1);
         for attempt in 1..=open_attempts {
-            match tokio::time::timeout(Duration::from_secs(30), tunnel.open_stream(stream_id)).await
+            match tokio::time::timeout(
+                Duration::from_secs(30),
+                tunnel.open_stream_with_timeout(stream_id, Duration::from_secs(60)),
+            )
+            .await
             {
                 Ok(Ok(stream)) => return stream,
                 Ok(Err(e)) => {
@@ -12823,7 +12857,7 @@ mod tests {
                 .await
                 .unwrap();
             let stream = tunnel
-                .create_datagram_client("www.baidu.com:80")
+                .create_datagram_client_with_timeout("www.baidu.com:80", Duration::from_secs(60))
                 .await
                 .unwrap();
             stream.send_datagram(b"test").await.unwrap();
@@ -12843,7 +12877,7 @@ mod tests {
                 .await
                 .unwrap();
             let stream = tunnel
-                .create_datagram_client("www.baidu.com:80")
+                .create_datagram_client_with_timeout("www.baidu.com:80", Duration::from_secs(60))
                 .await
                 .unwrap();
             stream.send_datagram(b"test").await.unwrap();

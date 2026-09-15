@@ -1488,6 +1488,35 @@ impl SnBnsController {
         .await
     }
 
+    /// 幂等重放查询：`request_id` 已经完成同一 payload 的 `remove_bound_zone` 时
+    /// 返回既有结果（receipt 标记为 reused），既不读取当前 OwnerDocument，也不
+    /// 提交新的链上交易。返回 `None` 表示该 request_id 还没有可复用的结果，
+    /// 调用方必须走正常 CAS 校验流程。
+    pub async fn replay_remove_bound_zone(
+        &self,
+        params: RemoveBoundZoneParams,
+    ) -> SnBnsControllerResult<Option<RemoveBoundZoneOutput>> {
+        if params.request_id.is_empty() {
+            return Err(SnBnsControllerError::InvalidInput(
+                "request_id is required".to_string(),
+            ));
+        }
+        let payload_hash = hash_json(&params).map_err(SnBnsControllerError::from)?;
+        let _write_guard = self.idempotency_store.execution_lock().lock().await;
+        let Some(record) = self.idempotency_store.get(params.request_id.as_str())? else {
+            return Ok(None);
+        };
+        if record.payload_hash != payload_hash {
+            return Err(SnBnsControllerError::IdempotencyConflict {
+                request_id: params.request_id,
+            });
+        }
+        match self.handle_existing(record).await? {
+            SnBnsExistingAction::Return(output) => Ok(Some(output)),
+            SnBnsExistingAction::Execute => Ok(None),
+        }
+    }
+
     pub async fn bind_zone_documents(
         &self,
         params: BindZoneDocumentsParams,

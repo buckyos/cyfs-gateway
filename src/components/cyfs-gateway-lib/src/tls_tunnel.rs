@@ -34,10 +34,11 @@ impl Tunnel for TlsTunnel {
         Ok(())
     }
 
-    async fn open_stream_by_dest(
+    async fn open_stream_by_dest_with_timeout(
         &self,
         dest_port: u16,
         dest_host: Option<String>,
+        connect_timeout: Duration,
     ) -> Result<Box<dyn AsyncStream>, Error> {
         if dest_host.is_none() {
             return Err(Error::new(std::io::ErrorKind::Other, "dest_host is None"));
@@ -49,9 +50,21 @@ impl Tunnel for TlsTunnel {
             .map_err(|e| Error::new(std::io::ErrorKind::Other, e))?;
 
         // Create TCP connection
-        let tcp_stream = TcpStream::connect(format!("{}:{}", ip, dest_port))
-            .await
-            .map_err(|e| Error::new(std::io::ErrorKind::Other, e))?;
+        let tcp_stream = tokio::time::timeout(
+            connect_timeout,
+            TcpStream::connect(format!("{}:{}", ip, dest_port)),
+        )
+        .await
+        .map_err(|_| {
+            Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!(
+                    "tcp connect to {}:{} timed out after {:?}",
+                    ip, dest_port, connect_timeout
+                ),
+            )
+        })?
+        .map_err(|e| Error::new(std::io::ErrorKind::Other, e))?;
 
         // Configure TLS
         let mut config =
@@ -78,22 +91,29 @@ impl Tunnel for TlsTunnel {
         Ok(Box::new(tls_stream))
     }
 
-    async fn open_stream(&self, stream_id: &str) -> Result<Box<dyn AsyncStream>, Error> {
+    async fn open_stream_with_timeout(
+        &self,
+        stream_id: &str,
+        connect_timeout: Duration,
+    ) -> Result<Box<dyn AsyncStream>, Error> {
         let (dest_host, dest_port) = get_dest_info_from_url_path(stream_id)?;
-        self.open_stream_by_dest(dest_port, dest_host).await
+        self.open_stream_by_dest_with_timeout(dest_port, dest_host, connect_timeout)
+            .await
     }
 
-    async fn create_datagram_client_by_dest(
+    async fn create_datagram_client_by_dest_with_timeout(
         &self,
         _dest_port: u16,
         _dest_host: Option<String>,
+        _connect_timeout: Duration,
     ) -> Result<Box<dyn DatagramClientBox>, Error> {
         unreachable!()
     }
 
-    async fn create_datagram_client(
+    async fn create_datagram_client_with_timeout(
         &self,
         _session_id: &str,
+        _connect_timeout: Duration,
     ) -> Result<Box<dyn DatagramClientBox>, Error> {
         unreachable!()
     }

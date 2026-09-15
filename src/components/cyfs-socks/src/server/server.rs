@@ -4,7 +4,8 @@ use crate::{
 };
 use buckyos_kit::AsyncStream;
 use cyfs_gateway_lib::{
-    server_err, GlobalCollectionManagerRef, GlobalProcessChainsRef, JsExternalsManagerRef, Server,
+    connect_timeout_from_secs, server_err, stream_idle_timeout_from_secs,
+    GlobalCollectionManagerRef, GlobalProcessChainsRef, JsExternalsManagerRef, Server,
     ServerConfig, ServerContext, ServerContextRef, ServerErrorCode, ServerFactory, ServerResult,
     StreamInfo, StreamServer,
 };
@@ -152,6 +153,8 @@ impl ServerFactory for SocksServerFactory {
             auth,
             rule_config: config.rule_config.clone(),
             rule_engine: None,
+            stream_idle_timeout: stream_idle_timeout_from_secs(config.stream_idle_timeout),
+            connect_timeout: connect_timeout_from_secs(config.connect_timeout),
         };
 
         let socks_server = Socks5Proxy::new(proxy_config, hook_point.clone());
@@ -266,6 +269,8 @@ mod tests {
             target: Url::parse("socks5://127.0.0.1:1080").unwrap(),
             enable_tunnel: None,
             rule_config: None,
+            stream_idle_timeout: None,
+            connect_timeout: None,
             hook_point: vec![ProcessChainConfig {
                 id: "main".to_string(),
                 priority: 1,

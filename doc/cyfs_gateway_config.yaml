@@ -169,6 +169,15 @@ servers:
     # trusted_upstreams:          # 可选：可信上一跳 IP/CIDR 列表。仅当直接上一跳命中时，
     #   - 127.0.0.1               # 其 X-Forwarded-For / X-Real-IP 才会被还原为
     #   - 10.0.0.0/8              # real_source_*（默认不信任任何转发头）
+    # 各阶段超时（可选；可写毫秒整数或时长字符串 500ms / 5s / 2m，0 表示关闭该阶段超时）：
+    # dns_timeout: 5s              # 默认 5s：解析上游域名
+    # connect_timeout: 800ms       # 默认 800ms：单次 TCP 连接尝试
+    # tls_handshake_timeout: 5s    # 默认 5s：https 上游 TLS 握手
+    # http_handshake_timeout: 5s   # 默认 5s：HTTP 客户端连接握手（直连 / TLS / tunnel）
+    # tunnel_open_timeout: 0       # 默认 0：沿用 tunnel_mgr 的 connect_timeout；
+    #                              # 非 0 时作为本次 tunnel open 下发给底层 connect 的预算
+    # response_timeout: 60s        # 默认 60s：请求体发完后等待上游响应头
+    # request_body_idle_timeout: 60s  # 默认 60s：请求体相邻两次数据之间的空闲上限
     hook_point:
       main:
         priority: 1

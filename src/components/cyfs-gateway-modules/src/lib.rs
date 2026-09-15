@@ -604,6 +604,7 @@ mod tests {
                 "dns",
                 "http",
                 "local_dns",
+                "named-inbox-cache",
                 "sn",
                 "socks",
             ]
