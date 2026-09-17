@@ -117,6 +117,13 @@ forward https://api.example.com/base/
 - 这里的 `forward` 目标更像“上游基地址”
 - 如果你想保留原始 URI，通常只写 host[:port] 或 base path 前缀，不要在 target 里重复完整业务路径
 
+WebSocket / 协议升级：
+
+- 带 `Connection: upgrade` + `Upgrade: websocket` 的请求会原样转发给上游；上游回 101 后，网关把客户端连接和上游连接对接成裸字节流，直到任一侧关闭
+- `wss://` 就是 TLS stack 终止 TLS 之后的这种升级请求，所以已有的 `forward http://...`、`forward https://...`、tunnel scheme 以及 `forward-group` 规则都不需要为 WebSocket 做额外配置
+- 升级请求只走连接阶段重试，不会进入 HTTP 状态码重试与请求体缓冲；升级后的字节流也不再经过 `post_hook_point` 和压缩
+- 入口 stack 需要走 HTTP/1.1（`alpn_protocols` 含 `http/1.1`）；浏览器建 WebSocket 时会单独开一条 HTTP/1.1 连接
+
 ### B. stream stack 中的 `forward`
 
 当 `forward` 结果被 TCP / TLS / RTCP 这类 stream 入口消费时，运行时调用的是 `stream_forward(...)`，目标 URL 会交给 tunnel manager 按 scheme 选择 tunnel builder。

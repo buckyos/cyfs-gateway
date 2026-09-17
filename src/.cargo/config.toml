@@ -1,0 +1,9 @@
+# TEMPORARY (session 2026-09-17): build against local buckyos-base with the
+# with_upgrades() change until buckyos-base is pushed and Cargo.lock updated.
+[patch."https://github.com/buckyos/buckyos-base.git"]
+buckyos-http-server = { path = "/home/lzc/project/buckyos-base/src/buckyos-http-server" }
+buckyos-kit = { path = "/home/lzc/project/buckyos-base/src/buckyos-kit" }
+kRPC = { path = "/home/lzc/project/buckyos-base/src/kRPC" }
+name-client = { path = "/home/lzc/project/buckyos-base/src/name-client" }
+name-lib = { path = "/home/lzc/project/buckyos-base/src/name-lib" }
+rbac = { path = "/home/lzc/project/buckyos-base/src/rbac" }
