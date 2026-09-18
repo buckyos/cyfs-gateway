@@ -795,6 +795,7 @@ impl GatewayFactory {
             global_collection_manager: Some(global_collections.clone()),
             js_externals: Some(js_externals.clone()),
             self_cert_manager: self_cert_manager.clone(),
+            stack_manager: Arc::downgrade(&stack_manager),
         };
         for stack_config in config.stacks.iter() {
             let stack = self
@@ -2840,6 +2841,7 @@ impl Gateway {
             global_collection_manager: Some(global_collections.clone()),
             js_externals: Some(js_externals.clone()),
             self_cert_manager: self_cert_manager.clone(),
+            stack_manager: Arc::downgrade(&self.stack_manager),
         };
         let mut exist_stacks = HashSet::new();
         let mut new_stacks: Vec<StackRef> = Vec::new();

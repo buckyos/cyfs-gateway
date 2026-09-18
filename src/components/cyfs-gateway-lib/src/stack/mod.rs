@@ -41,6 +41,9 @@ pub enum StackErrorCode {
     ListenFailed,
     AlreadyExists,
     BindUnmatched,
+    StackNotFound,
+    IncompatibleStack,
+    StackHandoffCycle,
 }
 pub type StackResult<T> = sfo_result::Result<T, StackErrorCode>;
 pub type StackError = sfo_result::Error<StackErrorCode>;
