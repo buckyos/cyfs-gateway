@@ -140,7 +140,7 @@ impl StackStreamContext {
 
         macro_rules! refresh_string {
             ($key:literal, $field:ident) => {
-                if let Some(CollectionValue::String(value)) = req.get($key).await.map_err(|e| {
+                self.$field = match req.get($key).await.map_err(|e| {
                     stack_err!(
                         StackErrorCode::ProcessChainError,
                         "read REQ.{} for stack handoff failed: {}",
@@ -148,14 +148,15 @@ impl StackStreamContext {
                         e
                     )
                 })? {
-                    self.$field = Some(value);
-                }
+                    Some(CollectionValue::String(value)) => Some(value),
+                    _ => None,
+                };
             };
         }
 
         macro_rules! refresh_addr {
             ($key:literal, $field:ident) => {
-                if let Some(CollectionValue::String(value)) = req.get($key).await.map_err(|e| {
+                self.$field = match req.get($key).await.map_err(|e| {
                     stack_err!(
                         StackErrorCode::ProcessChainError,
                         "read REQ.{} for stack handoff failed: {}",
@@ -163,7 +164,7 @@ impl StackStreamContext {
                         e
                     )
                 })? {
-                    self.$field = Some(value.parse().map_err(|e| {
+                    Some(CollectionValue::String(value)) => Some(value.parse().map_err(|e| {
                         stack_err!(
                             StackErrorCode::ProcessChainError,
                             "invalid REQ.{} address {}: {}",
@@ -171,8 +172,9 @@ impl StackStreamContext {
                             value,
                             e
                         )
-                    })?);
-                }
+                    })?),
+                    _ => None,
+                };
             };
         }
 

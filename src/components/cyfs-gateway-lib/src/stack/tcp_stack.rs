@@ -1479,6 +1479,108 @@ mod tests {
         assert_eq!(target_stat.get_write_sum_size(), 4);
     }
 
+    #[tokio::test]
+    async fn test_stack_handoff_does_not_restore_deleted_identity_field() {
+        let target_chains: ProcessChainConfigs = serde_yaml_ng::from_str(
+            r#"
+- id: main
+  priority: 1
+  blocks:
+    - id: main
+      block: |
+        eq ${REQ.source_user_id} "" && set-stat target-clean;
+        !eq ${REQ.source_user_id} "" && set-stat target-leak;
+        return "server handoff-target";
+"#,
+        )
+        .unwrap();
+        let source_chains: ProcessChainConfigs = serde_yaml_ng::from_str(
+            r#"
+- id: main
+  priority: 1
+  blocks:
+    - id: main
+      block: |
+        delete REQ.source_user_id;
+        call-stack target;
+"#,
+        )
+        .unwrap();
+
+        let manager = StackManager::new();
+        let servers = Arc::new(ServerManager::new());
+        servers
+            .add_server(Server::Stream(Arc::new(MockServer::new(
+                "handoff-target".to_string(),
+            ))))
+            .unwrap();
+        let target_stat_manager = StatManager::new();
+        let build_context = |stat_manager| {
+            Arc::new(
+                TcpStackContext::new(
+                    servers.clone(),
+                    TunnelManager::new(),
+                    Arc::new(DefaultLimiterManager::new()),
+                    stat_manager,
+                    Some(Arc::new(GlobalProcessChains::new())),
+                    None,
+                    None,
+                )
+                .with_stack_manager(Arc::downgrade(&manager)),
+            )
+        };
+        let source = Arc::new(
+            TcpStack::builder()
+                .id("source")
+                .bind("127.0.0.1:0")
+                .hook_point(source_chains)
+                .stack_context(build_context(StatManager::new()))
+                .build()
+                .await
+                .unwrap(),
+        );
+        let target = Arc::new(
+            TcpStack::builder()
+                .id("target")
+                .bind("127.0.0.1:0")
+                .hook_point(target_chains)
+                .stack_context(build_context(target_stat_manager.clone()))
+                .build()
+                .await
+                .unwrap(),
+        );
+        manager.add_stack(source.clone()).unwrap();
+        manager.add_stack(target).unwrap();
+
+        let (mut client, handed_off) = tokio::io::duplex(64);
+        let (context_stream, _) = tokio::io::duplex(1);
+        let mut request =
+            StreamRequest::new(Box::new(context_stream), "192.0.2.10:443".parse().unwrap());
+        request.source_addr = Some("198.51.100.20:50000".parse().unwrap());
+        request.conn_source_addr = Some("198.51.100.20:50000".parse().unwrap());
+        request.source_user_id = Some("alice".to_string());
+        let context = StackStreamContext::from_request("source", &request);
+
+        let serve = source.serve_stream(Box::new(handed_off), context);
+        let client_io = async move {
+            client.write_all(b"test").await.unwrap();
+            let mut response = [0u8; 4];
+            client.read_exact(&mut response).await.unwrap();
+            assert_eq!(&response, b"recv");
+        };
+        let (serve_result, ()) = tokio::join!(serve, client_io);
+        serve_result.unwrap();
+
+        assert!(
+            target_stat_manager.get_speed_stat("target-clean").is_some(),
+            "target stack must observe the deleted source_user_id as empty"
+        );
+        assert!(
+            target_stat_manager.get_speed_stat("target-leak").is_none(),
+            "deleted source_user_id must not be restored during handoff"
+        );
+    }
+
     impl MockServer {
         pub fn new(id: String) -> Self {
             Self { id }
