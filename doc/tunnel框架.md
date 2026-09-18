@@ -719,7 +719,7 @@ any://target-host/...
 
 ### SOCKS 接入
 
-`src/apps/cyfs_gateway/src/socks.rs` 的典型方式是：
+`src/components/cyfs-gateway-modules/src/lib.rs` 中 `SocksGatewayModule` 的典型方式是：
 
 - 先基于 `proxy_target` 获取 tunnel
 - 再根据客户端请求目标调用 `open_stream_by_dest()`

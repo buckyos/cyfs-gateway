@@ -1,24 +1,24 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, Weak};
 
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use buckyos_kit::{
-    AsyncStream, apply_params_to_json, get_buckyos_service_data_dir, get_buckyos_system_etc_dir,
+    apply_params_to_json, get_buckyos_service_data_dir, get_buckyos_system_etc_dir, AsyncStream,
 };
 use cyfs_gateway_lib::{
-    GlobalCollectionManager, GlobalCollectionManagerRef, GlobalProcessChains,
-    GlobalProcessChainsRef, JsExternalsManager, JsExternalsManagerRef, ProcessChainConfig,
-    ProcessChainConfigs, create_process_chain_executor, get_external_commands,
-    normalize_all_path_value_config, normalize_config_file_path,
+    create_process_chain_executor, get_external_commands, normalize_all_path_value_config,
+    normalize_config_file_path, GlobalCollectionManager, GlobalCollectionManagerRef,
+    GlobalProcessChains, GlobalProcessChainsRef, JsExternalsManager, JsExternalsManagerRef,
+    ProcessChainConfig, ProcessChainConfigs,
 };
 use cyfs_process_chain::{
     CollectionValue, CommandControl, CommandResult, MemoryMapCollection, MemorySetCollection,
 };
 use serde::Deserialize;
-use serde_json::{Map, Value, json};
+use serde_json::{json, Map, Value};
 
 use crate::{
-    ConfigMerger, GATEWAY_CONTROL_SERVER_CONFIG, merge, parse_collections_from_raw_config,
+    merge, parse_collections_from_raw_config, ConfigMerger, GATEWAY_CONTROL_SERVER_CONFIG,
 };
 
 async fn build_js_externals_from_raw_config(
@@ -395,10 +395,13 @@ fn merge_debug_chains(
     merged
 }
 
-fn resolve_debug_config_file_path(config_file: Option<&str>) -> PathBuf {
+fn resolve_debug_config_file_path(
+    profile: &crate::GatewayAppProfile,
+    config_file: Option<&str>,
+) -> PathBuf {
     let requested_path = config_file
         .map(PathBuf::from)
-        .unwrap_or_else(get_default_config_path);
+        .unwrap_or_else(|| get_default_config_path(profile));
     let base_dir = std::env::current_dir().unwrap_or(PathBuf::new());
     let resolved_path = if requested_path.is_relative() {
         base_dir.join(requested_path)
@@ -409,27 +412,33 @@ fn resolve_debug_config_file_path(config_file: Option<&str>) -> PathBuf {
     real_config_file
 }
 
-fn get_default_config_path() -> PathBuf {
-    let mut default_config = get_buckyos_system_etc_dir().join("cyfs_gateway.yaml");
+fn get_default_config_path(profile: &crate::GatewayAppProfile) -> PathBuf {
+    let mut default_config =
+        get_buckyos_system_etc_dir().join(format!("{}.yaml", profile.config_basename));
     if !default_config.exists() {
-        default_config = get_buckyos_system_etc_dir().join("cyfs_gateway.json");
+        default_config =
+            get_buckyos_system_etc_dir().join(format!("{}.json", profile.config_basename));
     }
     default_config.canonicalize().unwrap_or(default_config)
 }
 
-async fn get_gateway_remote_config_cache_path() -> PathBuf {
-    let cache_dir = get_buckyos_service_data_dir("cyfs_gateway").join("config_cache");
+async fn get_gateway_remote_config_cache_path(profile: &crate::GatewayAppProfile) -> PathBuf {
+    let cache_dir =
+        get_buckyos_service_data_dir(profile.service_data_namespace).join("config_cache");
     if !cache_dir.exists() {
         let _ = tokio::fs::create_dir_all(cache_dir.clone()).await;
     }
     cache_dir
 }
 
-async fn load_debug_config_from_file(config_file: &Path) -> Result<Value> {
+async fn load_debug_config_from_file(
+    profile: &crate::GatewayAppProfile,
+    config_file: &Path,
+) -> Result<Value> {
     let config_dir = config_file
         .parent()
         .ok_or_else(|| anyhow!("cannot get config dir: {:?}", config_file))?;
-    let cache_dir = get_gateway_remote_config_cache_path().await;
+    let cache_dir = get_gateway_remote_config_cache_path(profile).await;
     let config_json = ConfigMerger::load_dir_with_root(config_dir, config_file, None, &cache_dir)
         .await
         .map_err(|e| {
@@ -685,6 +694,7 @@ async fn execute_debug_once(
 }
 
 async fn build_debug_result(
+    profile: &crate::GatewayAppProfile,
     req_file: &str,
     config_file: Option<&str>,
     id: Option<&str>,
@@ -704,10 +714,11 @@ async fn build_debug_result(
         .ok_or_else(|| anyhow!("id is required, provide --id or req_file.id"))?;
 
     let req_base_dir = resolve_req_file_base_dir(req_file);
-    let config_file = resolve_debug_config_file_path(config_file);
-    let config_json = load_debug_config_from_file(config_file.as_path()).await?;
+    let config_file = resolve_debug_config_file_path(profile, config_file);
+    let config_json = load_debug_config_from_file(profile, config_file.as_path()).await?;
 
-    let collections = parse_collections_from_raw_config(&config_json)?;
+    let collections =
+        parse_collections_from_raw_config(&config_json, profile.service_data_namespace)?;
     let global_process_chain_configs = parse_global_process_chains_from_raw_config(&config_json)?;
     let global_collections: GlobalCollectionManagerRef =
         GlobalCollectionManager::create(collections).await?;
@@ -759,12 +770,13 @@ async fn build_debug_result(
 }
 
 pub async fn run_debug_command(
+    profile: &crate::GatewayAppProfile,
     req_file: &str,
     config_file: Option<&str>,
     id: Option<&str>,
     repeat: usize,
 ) -> Result<()> {
-    let result = build_debug_result(req_file, config_file, id, repeat).await?;
+    let result = build_debug_result(profile, req_file, config_file, id, repeat).await?;
     if repeat == 1 {
         if let Some(stdout) = result.get("stdout").and_then(|value| value.as_str()) {
             if !stdout.is_empty() {
@@ -791,9 +803,39 @@ mod tests {
     use serde_json::json;
     use tokio::io::AsyncReadExt;
 
-    use super::{
-        build_debug_result, json_to_collection_value, resolve_req_file_base_dir, run_debug_command,
-    };
+    use super::{json_to_collection_value, resolve_req_file_base_dir};
+
+    async fn run_debug_command(
+        req_file: &str,
+        config_file: Option<&str>,
+        id: Option<&str>,
+        repeat: usize,
+    ) -> anyhow::Result<()> {
+        super::run_debug_command(
+            &crate::GatewayAppProfile::cyfs_gateway(),
+            req_file,
+            config_file,
+            id,
+            repeat,
+        )
+        .await
+    }
+
+    async fn build_debug_result(
+        req_file: &str,
+        config_file: Option<&str>,
+        id: Option<&str>,
+        repeat: usize,
+    ) -> anyhow::Result<serde_json::Value> {
+        super::build_debug_result(
+            &crate::GatewayAppProfile::cyfs_gateway(),
+            req_file,
+            config_file,
+            id,
+            repeat,
+        )
+        .await
+    }
 
     fn write_json_temp(value: &serde_json::Value) -> tempfile::NamedTempFile {
         let mut file = tempfile::NamedTempFile::new().unwrap();

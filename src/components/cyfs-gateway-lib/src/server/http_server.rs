@@ -1,3 +1,4 @@
+use super::dispatch::*;
 use super::http_compression::{
     CompressionRequestInfo, HttpCompressionSettings, apply_request_decompression,
     apply_response_compression,
@@ -783,7 +784,7 @@ impl ProcessChainHttpServer {
                         .await;
                 }
                 tokio::spawn(async move {
-                    if let Err(e) = conn.await {
+                    if let Err(e) = conn.with_upgrades().await {
                         debug!("http upstream connection closed with error: {}", e);
                     }
                 });
@@ -793,9 +794,10 @@ impl ProcessChainHttpServer {
                 // Connection up — taking the body now is the
                 // commitment point. Any subsequent failure is
                 // post-body and non-retryable.
-                let req = req_slot
+                let mut req = req_slot
                     .take()
                     .expect("forward_to_candidate: req_slot drained mid-flight");
+                let client_upgrade = take_client_upgrade(&mut req);
                 let body = req
                     .into_body()
                     .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
@@ -813,7 +815,7 @@ impl ProcessChainHttpServer {
                     })?;
                 *upstream_req.headers_mut() = std::mem::take(&mut header);
 
-                let resp = sender.send_request(upstream_req).await.map_err(|e| {
+                let mut resp = sender.send_request(upstream_req).await.map_err(|e| {
                     server_err!(
                         ServerErrorCode::InvalidConfig,
                         "Failed to request upstream {}: {}",
@@ -821,6 +823,7 @@ impl ProcessChainHttpServer {
                         e
                     )
                 })?;
+                spawn_upgrade_relay_if_switching(&mut resp, client_upgrade, target_url);
                 let resp = resp.map(|body| {
                     body.map_err(|e| {
                         ServerError::new(ServerErrorCode::StreamError, format!("{:?}", e))
@@ -952,15 +955,16 @@ impl ProcessChainHttpServer {
                         .await;
                 }
                 tokio::spawn(async move {
-                    if let Err(e) = conn.await {
+                    if let Err(e) = conn.with_upgrades().await {
                         debug!("https upstream connection closed with error: {}", e);
                     }
                 });
 
                 let _ = host_header;
-                let req = req_slot
+                let mut req = req_slot
                     .take()
                     .expect("forward_to_candidate: req_slot drained mid-flight");
+                let client_upgrade = take_client_upgrade(&mut req);
                 let body = req
                     .into_body()
                     .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
@@ -979,7 +983,7 @@ impl ProcessChainHttpServer {
                     })?;
                 *upstream_req.headers_mut() = std::mem::take(&mut header);
 
-                let resp = sender.send_request(upstream_req).await.map_err(|e| {
+                let mut resp = sender.send_request(upstream_req).await.map_err(|e| {
                     server_err!(
                         ServerErrorCode::InvalidConfig,
                         "Failed to request https upstream {} via {}: {}",
@@ -988,6 +992,7 @@ impl ProcessChainHttpServer {
                         e
                     )
                 })?;
+                spawn_upgrade_relay_if_switching(&mut resp, client_upgrade, target_url);
                 let resp = resp.map(|body| {
                     body.map_err(|e| {
                         ServerError::new(ServerErrorCode::StreamError, format!("{:?}", e))
@@ -1037,15 +1042,16 @@ impl ProcessChainHttpServer {
                     }
                 };
                 tokio::spawn(async move {
-                    if let Err(e) = conn.await {
+                    if let Err(e) = conn.with_upgrades().await {
                         debug!("tunnel upstream connection closed with error: {}", e);
                     }
                 });
 
                 let _ = version;
-                let req = req_slot
+                let mut req = req_slot
                     .take()
                     .expect("forward_to_candidate: req_slot drained mid-flight");
+                let client_upgrade = take_client_upgrade(&mut req);
                 let body = req
                     .into_body()
                     .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
@@ -1063,7 +1069,7 @@ impl ProcessChainHttpServer {
                     })?;
                 *upstream_req.headers_mut() = std::mem::take(&mut header);
 
-                let resp = sender.send_request(upstream_req).await.map_err(|e| {
+                let mut resp = sender.send_request(upstream_req).await.map_err(|e| {
                     server_err!(
                         ServerErrorCode::TunnelError,
                         "Failed to request upstream {}: {}",
@@ -1071,6 +1077,7 @@ impl ProcessChainHttpServer {
                         e
                     )
                 })?;
+                spawn_upgrade_relay_if_switching(&mut resp, client_upgrade, target_url);
                 let resp = resp.map(|body| {
                     body.map_err(|e| {
                         ServerError::new(ServerErrorCode::StreamError, format!("{:?}", e))
@@ -1125,10 +1132,15 @@ impl ProcessChainHttpServer {
         //   - max_body_buffer_bytes > 0.
         let method_class = HttpMethodClass::classify(req.method().as_str());
         let method_replay_allowed = method_class.is_idempotent() || policy.allow_non_idempotent();
+        // Upgrade requests (WebSocket) must keep their `OnUpgrade`
+        // extension, which the status-retry path drops when it clones the
+        // request parts. They also have no replayable body, so route them
+        // through connect-only retry.
         let http_status_retry_armed = policy.is_enabled()
             && policy.any_http_status()
             && method_replay_allowed
-            && policy.max_body_buffer_bytes > 0;
+            && policy.max_body_buffer_bytes > 0
+            && !is_upgrade_request(req.headers());
 
         if http_status_retry_armed {
             return self
@@ -1728,6 +1740,97 @@ impl ProcessChainHttpServer {
     }
 }
 
+/// True when the request asks for an HTTP/1.1 protocol upgrade
+/// (`Connection: upgrade` plus an `Upgrade:` header), e.g. a WebSocket
+/// handshake. `wss://` is exactly this after TLS termination.
+fn is_upgrade_request(headers: &http::HeaderMap) -> bool {
+    let wants_upgrade = headers
+        .get_all(http::header::CONNECTION)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .any(|token| token.trim().eq_ignore_ascii_case("upgrade"));
+    wants_upgrade && headers.contains_key(http::header::UPGRADE)
+}
+
+/// Take the client-side `OnUpgrade` handle off an upgrade request. hyper
+/// stores it in the request extensions when the inbound connection was
+/// served with upgrades enabled; the handle resolves once our 101 has been
+/// written back to the client. Returns `None` for ordinary requests.
+fn take_client_upgrade(
+    req: &mut http::Request<BoxBody<Bytes, ServerError>>,
+) -> Option<hyper::upgrade::OnUpgrade> {
+    if !is_upgrade_request(req.headers()) {
+        return None;
+    }
+    req.extensions_mut().remove::<hyper::upgrade::OnUpgrade>()
+}
+
+/// Bridge the client's upgraded connection with the upstream's upgraded
+/// connection until either side closes.
+async fn relay_upgraded_connection(
+    client: hyper::upgrade::OnUpgrade,
+    upstream: hyper::upgrade::OnUpgrade,
+    target: String,
+) {
+    let (client, upstream) = tokio::join!(client, upstream);
+    let mut client = match client {
+        Ok(io) => TokioIo::new(io),
+        Err(e) => {
+            log::warn!("client upgrade failed while relaying to {}: {}", target, e);
+            return;
+        }
+    };
+    let mut upstream = match upstream {
+        Ok(io) => TokioIo::new(io),
+        Err(e) => {
+            log::warn!("upstream upgrade failed for {}: {}", target, e);
+            return;
+        }
+    };
+    match tokio::io::copy_bidirectional(&mut client, &mut upstream).await {
+        Ok((to_upstream, to_client)) => log::debug!(
+            "upgraded connection to {} closed: {} bytes to upstream, {} bytes to client",
+            target,
+            to_upstream,
+            to_client
+        ),
+        Err(e) => log::debug!("upgraded connection to {} ended with error: {}", target, e),
+    }
+}
+
+/// When the upstream answered 101 Switching Protocols, detach both upgraded
+/// connections and spawn the relay. The 101 itself is still returned to the
+/// client as a normal response; hyper completes the client upgrade once it
+/// has been written.
+fn spawn_upgrade_relay_if_switching(
+    resp: &mut http::Response<hyper::body::Incoming>,
+    client_upgrade: Option<hyper::upgrade::OnUpgrade>,
+    target: &str,
+) {
+    if resp.status() != StatusCode::SWITCHING_PROTOCOLS {
+        return;
+    }
+    match client_upgrade {
+        Some(client_upgrade) => {
+            let upstream_upgrade = hyper::upgrade::on(resp);
+            log::debug!(
+                "upstream {} switching protocols, relaying upgraded connection",
+                target
+            );
+            tokio::spawn(relay_upgraded_connection(
+                client_upgrade,
+                upstream_upgrade,
+                target.to_string(),
+            ));
+        }
+        None => log::warn!(
+            "upstream {} answered 101 but the client did not request an upgrade",
+            target
+        ),
+    }
+}
+
 #[async_trait::async_trait]
 impl HttpServer for ProcessChainHttpServer {
     async fn serve_request(
@@ -1735,6 +1838,23 @@ impl HttpServer for ProcessChainHttpServer {
         req: http::Request<BoxBody<Bytes, ServerError>>,
         info: StreamInfo,
     ) -> ServerResult<http::Response<BoxBody<Bytes, ServerError>>> {
+        let dispatch = is_dispatch(&req);
+        let dispatch_target = dispatch_target(&req).unwrap_or_default();
+        let dispatch_credentials: Vec<_> = req
+            .headers()
+            .iter()
+            .filter(|(key, _)| replay_header(key.as_str()))
+            .filter_map(|(key, value)| {
+                value
+                    .to_str()
+                    .ok()
+                    .map(|v| (key.to_string(), v.to_string()))
+            })
+            .collect();
+        let received_at_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
         let req_info = CompressionRequestInfo::from_request(&req);
         let sources = self.resolve_request_sources(&info, req.headers());
         let mut req = match apply_request_decompression(req, &self.compression) {
@@ -1844,13 +1964,43 @@ impl HttpServer for ProcessChainHttpServer {
             .await
             .map_err(|e| server_err!(ServerErrorCode::ProcessChainError, "{}", e))?;
 
-        let ret = executor
-            .execute_lib()
+        let auth_env = global_env.clone();
+        let ret = executor.execute_lib().await;
+        let verified_principal = auth_env
+            .get("AUTH_principal")
             .await
-            .map_err(|e| server_err!(ServerErrorCode::ProcessChainError, "{}", e))?;
+            .ok()
+            .flatten()
+            .and_then(|v| v.try_as_str().ok().map(str::to_string));
+        drop(auth_env);
+        let ret = match ret {
+            Ok(ret) => ret,
+            Err(_) if dispatch => {
+                return Ok(dispatch_rejected(
+                    StatusCode::BAD_GATEWAY,
+                    &dispatch_target,
+                    "routing-failed",
+                ));
+            }
+            Err(e) => return Err(server_err!(ServerErrorCode::ProcessChainError, "{}", e)),
+        };
 
         if ret.is_control() {
             if ret.is_drop() {
+                if dispatch {
+                    return self
+                        .apply_post_chain_result(
+                            Ok(dispatch_rejected(
+                                StatusCode::FORBIDDEN,
+                                &dispatch_target,
+                                "dropped",
+                            )),
+                            &req_info,
+                            Some(&info),
+                            Some(&sources),
+                        )
+                        .await;
+                }
                 debug!("Request dropped by the process chain");
                 let response = http::Response::new(
                     Full::new(Bytes::from("Request dropped"))
@@ -1861,6 +2011,20 @@ impl HttpServer for ProcessChainHttpServer {
                     .apply_post_chain_result(Ok(response), &req_info, Some(&info), Some(&sources))
                     .await;
             } else if ret.is_reject() {
+                if dispatch {
+                    return self
+                        .apply_post_chain_result(
+                            Ok(dispatch_rejected(
+                                StatusCode::FORBIDDEN,
+                                &dispatch_target,
+                                "policy-denied",
+                            )),
+                            &req_info,
+                            Some(&info),
+                            Some(&sources),
+                        )
+                        .await;
+                }
                 debug!(
                     "process_chain_reject server={} remote={} method={} host={} uri={}",
                     self.id, req_remote, req_method, req_host, req_uri,
@@ -1873,6 +2037,20 @@ impl HttpServer for ProcessChainHttpServer {
                     .await;
             }
             if let Some(CommandControl::Error(ret)) = ret.as_control() {
+                if dispatch {
+                    return self
+                        .apply_post_chain_result(
+                            Ok(dispatch_rejected(
+                                StatusCode::BAD_GATEWAY,
+                                &dispatch_target,
+                                "routing-failed",
+                            )),
+                            &req_info,
+                            Some(&info),
+                            Some(&sources),
+                        )
+                        .await;
+                }
                 debug!(
                     "process_chain_error server={} remote={} method={} host={} uri={} message={}",
                     self.id, req_remote, req_method, req_host, req_uri, ret.value,
@@ -1936,9 +2114,18 @@ impl HttpServer for ProcessChainHttpServer {
                             }
 
                             let server_id = list[1].as_str();
-                            let post_req = req_map.into_request().map_err(|e| {
+                            let mut post_req = req_map.into_request().map_err(|e| {
                                 server_err!(ServerErrorCode::ProcessChainError, "{}", e)
                             })?;
+                            if let Some(principal) = verified_principal {
+                                post_req.extensions_mut().insert(VerifiedDispatchContext {
+                                    principal,
+                                    target: dispatch_target.clone(),
+                                    credentials: dispatch_credentials,
+                                    received_at_ms,
+                                    ingress: self.id.clone(),
+                                });
+                            }
 
                             if let Some(server_mgr) = self.server_mgr.upgrade() {
                                 if let Some(service) = server_mgr.get_http_server(server_id) {
@@ -2044,7 +2231,15 @@ impl HttpServer for ProcessChainHttpServer {
                             }
                             let status = Self::parse_error_status_code(list[1].as_str())?;
                             let message = list.get(2).map(|v| v.as_str());
-                            let resp = self.build_error_response(status, message)?;
+                            let resp = if dispatch {
+                                dispatch_rejected(
+                                    status,
+                                    &dispatch_target,
+                                    message.unwrap_or("request-rejected"),
+                                )
+                            } else {
+                                self.build_error_response(status, message)?
+                            };
                             return self
                                 .apply_post_chain_result(
                                     Ok(resp),
@@ -2072,6 +2267,9 @@ impl HttpServer for ProcessChainHttpServer {
         let mut response =
             http::Response::new(Full::new(Bytes::new()).map_err(|e| match e {}).boxed());
         *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+        if dispatch {
+            response = dispatch_rejected(StatusCode::NOT_FOUND, &dispatch_target, "no-handler");
+        }
         self.apply_post_chain_result(Ok(response), &req_info, Some(&info), Some(&sources))
             .await
     }
@@ -3834,6 +4032,135 @@ mod tests {
 
         let body = resp.collect().await.unwrap().to_bytes();
         assert_eq!(body, Bytes::from("forward success"));
+    }
+
+    /// A `wss://` handshake, after TLS termination, is a plain HTTP/1.1
+    /// `Upgrade: websocket` request. The gateway must forward the 101 and
+    /// then relay raw bytes in both directions on the upgraded connection.
+    async fn run_websocket_forward_test(rule: impl Fn(SocketAddr) -> String) {
+        use http_body_util::BodyExt;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = upstream_listener.accept().await.unwrap();
+            let service = hyper::service::service_fn(
+                |mut req: http::Request<hyper::body::Incoming>| async move {
+                    assert_eq!(req.uri().to_string(), "/ws?room=1");
+                    assert_eq!(req.headers().get("upgrade").unwrap(), "websocket");
+                    let on_upgrade = hyper::upgrade::on(&mut req);
+                    tokio::spawn(async move {
+                        let mut io = TokioIo::new(on_upgrade.await.unwrap());
+                        let mut buf = [0u8; 64];
+                        loop {
+                            let n = io.read(&mut buf).await.unwrap();
+                            if n == 0 {
+                                break;
+                            }
+                            io.write_all(b"echo:").await.unwrap();
+                            io.write_all(&buf[..n]).await.unwrap();
+                        }
+                    });
+                    Ok::<_, ServerError>(
+                        http::Response::builder()
+                            .status(StatusCode::SWITCHING_PROTOCOLS)
+                            .header("upgrade", "websocket")
+                            .header("connection", "Upgrade")
+                            .header("sec-websocket-accept", "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=")
+                            .body(Full::new(Bytes::new()).map_err(|e| match e {}).boxed())
+                            .unwrap(),
+                    )
+                },
+            );
+            let _ = hyper::server::conn::http1::Builder::new()
+                .serve_connection(TokioIo::new(stream), service)
+                .with_upgrades()
+                .await;
+        });
+
+        let mock_server_mgr = Arc::new(ServerManager::new());
+        let chains = format!(
+            r#"
+- id: main
+  priority: 1
+  blocks:
+    - id: main
+      block: |
+        {}
+        "#,
+            rule(upstream_addr)
+        );
+        let chains: ProcessChainConfigs = serde_yaml_ng::from_str(&chains).unwrap();
+        let http_server = Arc::new(
+            ProcessChainHttpServer::builder()
+                .id("test_forward_websocket")
+                .version("HTTP/1.1".to_string())
+                .hook_point(chains)
+                .server_mgr(Arc::downgrade(&mock_server_mgr))
+                .tunnel_manager(TunnelManager::new())
+                .build()
+                .await
+                .unwrap(),
+        );
+
+        let (client, server) = tokio::io::duplex(1024);
+        tokio::spawn(async move {
+            let _ = hyper_serve_http(Box::new(server), http_server, StreamInfo::default()).await;
+        });
+
+        let request = http::Request::builder()
+            .method("GET")
+            .uri("/ws?room=1")
+            .header("host", "ws.example.com")
+            .header("connection", "Upgrade")
+            .header("upgrade", "websocket")
+            .header("sec-websocket-version", "13")
+            .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
+            .body(Full::new(Bytes::new()).map_err(|e| match e {}).boxed())
+            .unwrap();
+
+        let (mut sender, conn) = hyper::client::conn::http1::Builder::new()
+            .handshake(TokioIo::new(client))
+            .await
+            .unwrap();
+        tokio::spawn(async move {
+            let _ = conn.with_upgrades().await;
+        });
+
+        let mut resp = sender.send_request(request).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::SWITCHING_PROTOCOLS);
+        assert_eq!(resp.headers().get("upgrade").unwrap(), "websocket");
+        assert_eq!(
+            resp.headers().get("sec-websocket-accept").unwrap(),
+            "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="
+        );
+
+        let mut io = TokioIo::new(hyper::upgrade::on(&mut resp).await.unwrap());
+        let mut buf = vec![0u8; 9];
+        io.write_all(b"ping").await.unwrap();
+        io.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"echo:ping");
+        io.write_all(b"pong").await.unwrap();
+        io.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"echo:pong");
+    }
+
+    #[tokio::test]
+    async fn test_process_chain_http_server_forward_http_relays_websocket_upgrade() {
+        run_websocket_forward_test(|addr| format!("forward http://{};", addr)).await;
+    }
+
+    #[tokio::test]
+    async fn test_process_chain_http_server_forward_group_relays_websocket_upgrade() {
+        run_websocket_forward_test(|addr| {
+            format!(
+                "forward round_robin --next-upstream \"error,timeout,http_502\" --tries 2 http://{};",
+                addr
+            )
+        })
+        .await;
     }
 
     #[tokio::test]

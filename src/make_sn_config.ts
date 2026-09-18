@@ -34,7 +34,10 @@
 // Output layout:
 //   <rootfs>/sn_device_config.json    SN server device config
 //   <rootfs>/sn_private_key.pem       device private key (rtcp stack)
-//   <rootfs>/params.json              SN service parameters (incl. sn_ip)
+//   <rootfs>/sn_did_web/.well-known/  authoritative did:web documents for
+//                                    RTCP authority-current peer resolution
+//   <rootfs>/params.json              SN service parameters (incl. sn_ip; no
+//                                    SN self-DNS bootstrap material)
 //   <rootfs>/sn.sqlite3               SN sqlite database runtime path (created by cyfs-sn)
 //   <rootfs>/sn_token_key/            server JWT signing key directory
 //   <rootfs>/fullchain.cert/.pem      TLS cert+key for sn.$base, bns.$base,
@@ -58,7 +61,13 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
 import { Buffer } from "node:buffer";
-import { createHash, createPrivateKey, createPublicKey } from "node:crypto";
+import {
+  createHash,
+  createPrivateKey,
+  createPublicKey,
+  sign as cryptoSign,
+  verify as cryptoVerify,
+} from "node:crypto";
 import { parseArgs } from "node:util";
 import {
   assertProvisionRuntime,
@@ -168,6 +177,7 @@ const DEFAULT_CA_NAME = "buckyos_test_ca";
 const PROVISION_SN_DB_FILE = "sn_db.sqlite3";
 const SN_DB_FILE = "sn.sqlite3";
 const SN_AUTH_DATA_DIR = "sn_token_key";
+const SN_DID_WEB_ROOT_DIR = "sn_did_web";
 const WEB3_GATEWAY_CONFIG_FILE = "web3_gateway.yaml";
 // web3_gateway.yaml 的独立部署拆分（DNS / 流量转发 / SN API）。每个文件都有
 // 自己的 web3_sn server 块，provision 阶段的文本补丁（sn.sqlite3 db 路径、
@@ -182,6 +192,11 @@ const WEB3_GATEWAY_ALL_CONFIG_FILES = [
 const LOCAL_DNS_CONFIG_FILE = "local_dns.toml";
 const BNS_LOCAL_DNS_BEGIN = "# BEGIN make_sn_config:bns";
 const BNS_LOCAL_DNS_END = "# END make_sn_config:bns";
+const SN_SELF_BOOTSTRAP_PARAM_KEYS = [
+  "sn_boot_jwt",
+  "sn_owner_pk",
+  "sn_device_jwt",
+] as const;
 
 function printUsage(log: (message?: unknown) => void = console.error): void {
   log(
@@ -227,9 +242,15 @@ function readJson(file: string): Record<string, unknown> {
 // 带 scheme 会让 RTCP DID hostname 校验失败。https 信任由部署侧安装
 // dev CA 解决（web3-gateway/start.py install_dev_ca）。
 // 部署侧由 web3-gateway/start.py 装载到 {BUCKYOS_ROOT}/etc/machine.json。
-function writeMachineConfig(targetDir: string, snBaseHost: string): void {
+// `bns_host` selects the authoritative DID resolver. `web3_bridge.bns`
+// independently controls did:bns-to-hostname mapping, so generate both.
+export function writeMachineConfig(
+  targetDir: string,
+  snBaseHost: string,
+): void {
   const machineConfigPath = path.join(targetDir, "machine.json");
   writeJson(machineConfigPath, {
+    bns_host: `web3.${snBaseHost}`,
     web3_bridge: { bns: `web3.${snBaseHost}` },
     force_https: false,
     trust_did: [
@@ -238,7 +259,142 @@ function writeMachineConfig(targetDir: string, snBaseHost: string): void {
       "did:web:buckyos.io",
     ],
   });
-  console.log(`  machine.json bns bridge -> web3.${snBaseHost}`);
+  console.log(`  machine.json bns resolver/bridge -> web3.${snBaseHost}`);
+}
+
+function rewriteDidController(
+  value: unknown,
+  previousDid: string,
+  authoritativeDid: string,
+): unknown {
+  if (typeof value !== "string") {
+    return value;
+  }
+  if (value === previousDid) {
+    return authoritativeDid;
+  }
+  if (value.startsWith(`${previousDid}#`)) {
+    return `${authoritativeDid}${value.slice(previousDid.length)}`;
+  }
+  return value;
+}
+
+function cloneDeviceDocumentWithDid(
+  source: Record<string, unknown>,
+  previousDid: string,
+  targetDid: string,
+  zoneDid: string,
+): Record<string, unknown> {
+  const document: Record<string, unknown> = {
+    ...source,
+    id: targetDid,
+    zone_did: zoneDid,
+  };
+  if (Array.isArray(source.verificationMethod)) {
+    document.verificationMethod = source.verificationMethod.map((entry) => {
+      if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+        return entry;
+      }
+      const method = { ...entry } as Record<string, unknown>;
+      method.id = rewriteDidController(method.id, previousDid, targetDid);
+      method.controller = rewriteDidController(
+        method.controller,
+        previousDid,
+        targetDid,
+      );
+      return method;
+    });
+  }
+  for (
+    const field of [
+      "authentication",
+      "assertionMethod",
+      "assertion_method",
+      "capabilityInvocation",
+      "capabilityDelegation",
+    ]
+  ) {
+    const value = source[field];
+    if (Array.isArray(value)) {
+      document[field] = value.map((entry) =>
+        rewriteDidController(entry, previousDid, targetDid)
+      );
+    }
+  }
+  return document;
+}
+
+/**
+ * RTCP v4 默认按 DID method authority 解析对端 key，普通 DNS TXT 只允许
+ * 显式开启的 non-authoritative bootstrap。客户端用 sn.<base> 建
+ * keep-tunnel 时语义 DID 是 did:web:sn.<base>，因此部署目录必须提供真正的
+ * did:web origin 文档，而不能只依赖 BOOT/DEV TXT。
+ *
+ * 当前 provision 仍可能生成逻辑 did:web 身份、但不生成 owner-signed
+ * device_doc_jwt；新版 RTCP 会拒绝用它启动。因此这里从同一 device key：
+ *   1. 发布 did:web authority 文档；
+ *   2. 将本地 stack 配置规范化为 did:dev key identity。
+ */
+export function materializeSnDidWebDocuments(
+  targetDir: string,
+  snBaseHost: string,
+): string {
+  const deviceConfigPath = path.join(targetDir, "sn_device_config.json");
+  if (!fs.existsSync(deviceConfigPath)) {
+    throw new Error(
+      `cannot publish SN did:web identity: missing ${deviceConfigPath}`,
+    );
+  }
+
+  const source = readJson(deviceConfigPath);
+  const previousDid = String(source.id ?? "");
+  if (!previousDid) {
+    throw new Error(
+      `cannot publish SN did:web identity: ${deviceConfigPath} misses id`,
+    );
+  }
+  const verificationMethods = source.verificationMethod;
+  const deviceKeyX = Array.isArray(verificationMethods)
+    ? (verificationMethods[0] as Record<string, unknown> | undefined)
+      ?.publicKeyJwk
+    : undefined;
+  const publicKeyX = deviceKeyX && typeof deviceKeyX === "object"
+    ? String((deviceKeyX as Record<string, unknown>).x ?? "")
+    : "";
+  if (!publicKeyX) {
+    throw new Error(
+      `cannot publish SN did:web identity: ${deviceConfigPath} misses verificationMethod[0].publicKeyJwk.x`,
+    );
+  }
+
+  const authoritativeDid = `did:web:sn.${snBaseHost}`;
+  const document = cloneDeviceDocumentWithDid(
+    source,
+    previousDid,
+    authoritativeDid,
+    authoritativeDid,
+  );
+
+  const wellKnownDir = ensureDir(
+    path.join(targetDir, SN_DID_WEB_ROOT_DIR, ".well-known"),
+  );
+  const didDocumentPath = path.join(wellKnownDir, "did.json");
+  writeJson(didDocumentPath, document);
+  // Explicit DeviceDocument lookup uses the same authority material.
+  writeJson(path.join(wellKnownDir, "device.json"), document);
+
+  const canonicalDeviceDid = `did:dev:${publicKeyX}`;
+  const stackDocument = cloneDeviceDocumentWithDid(
+    source,
+    previousDid,
+    canonicalDeviceDid,
+    authoritativeDid,
+  );
+  writeJson(deviceConfigPath, stackDocument);
+  console.log(
+    `  SN RTCP identity: ${canonicalDeviceDid}; authority alias: ${authoritativeDid} -> ${didDocumentPath}`,
+  );
+  return didDocumentPath;
 }
 
 function isProvisionSnDbFile(name: string): boolean {
@@ -272,6 +428,14 @@ function readStagedParams(targetDir: string): Record<string, unknown> {
   }
 }
 
+export function omitSnSelfBootstrapParams(
+  params: Record<string, unknown>,
+): void {
+  for (const key of SN_SELF_BOOTSTRAP_PARAM_KEYS) {
+    delete params[key];
+  }
+}
+
 function updateParamsJson(
   targetDir: string,
   snDbPath: string,
@@ -292,6 +456,10 @@ function updateParamsJson(
       params[key] = value;
     }
   }
+  // provision still creates the RTCP identity and may expose legacy parameters
+  // derived from it. They are unrelated to the stack identity and are no longer
+  // consumed by the SN server template.
+  omitSnSelfBootstrapParams(params);
   params.sn_db_path = snDbPath;
   delete params.sn_v2_auth_data_dir;
   params.sn_auth_data_dir = authDataDir;
@@ -326,7 +494,6 @@ function patchWeb3GatewayConfigText(text: string): string | null {
   }
 
   const childIndent = indent + 2;
-  const nestedIndent = childIndent + 2;
   const block = lines.slice(start + 1, end);
   const filtered: string[] = [];
   for (let i = 0; i < block.length; i++) {
@@ -337,17 +504,8 @@ function patchWeb3GatewayConfigText(text: string): string | null {
       lineIndent === childIndent &&
       (trim.startsWith("v2_auth_data_dir:") ||
         trim.startsWith("auth_data_dir:") ||
-        trim.startsWith("db_type:") ||
         trim.startsWith("db_path:"))
     ) {
-      continue;
-    }
-    if (lineIndent === childIndent && trim === "db_params:") {
-      i++;
-      while (i < block.length && leadingSpaces(block[i]) > childIndent) {
-        i++;
-      }
-      i--;
       continue;
     }
     filtered.push(line);
@@ -355,9 +513,7 @@ function patchWeb3GatewayConfigText(text: string): string | null {
 
   const insertLines = [
     `${" ".repeat(childIndent)}auth_data_dir: "{{sn_auth_data_dir}}"`,
-    `${" ".repeat(childIndent)}db_type: sqlite`,
-    `${" ".repeat(childIndent)}db_params:`,
-    `${" ".repeat(nestedIndent)}db_path: "{{sn_db_path}}"`,
+    `${" ".repeat(childIndent)}db_path: "{{sn_db_path}}"`,
   ];
   const ipLine = filtered.findIndex((line) =>
     leadingSpaces(line) === childIndent && line.trim().startsWith("ip:")
@@ -407,7 +563,13 @@ function patchWeb3GatewayConfig(targetDir: string): void {
 /**
  * local_dns.toml is loaded directly by LocalConfigDnsProvider and therefore is
  * not rendered through params.json. Keep the staged template portable and
- * materialize the deployment-specific bns.<sn_host> -> sn_ip record here.
+ * materialize the deployment-specific infrastructure records here.
+ *
+ * The marker names retain their historical `bns` suffix so an existing
+ * generated block is replaced in place. `sn.<sn_host>` must also be explicit:
+ * cyfs-sn's authoritative DNS surface intentionally manages only `*.web3` and
+ * user-domain zones, so its internal self-host resolver is not reachable via
+ * the public DNS adapter.
  */
 export function patchLocalDnsBnsRecord(
   targetDir: string,
@@ -423,6 +585,7 @@ export function patchLocalDnsBnsRecord(
   }
 
   const bnsHostname = `bns.${snBaseHost}`;
+  const snHostname = `sn.${snBaseHost}`;
   const original = fs.readFileSync(configPath, "utf8");
   const lines = original.split(/\r?\n/);
   let start = lines.findIndex((line) => line.trim() === BNS_LOCAL_DNS_BEGIN);
@@ -459,6 +622,10 @@ export function patchLocalDnsBnsRecord(
     `[${JSON.stringify(bnsHostname)}]`,
     "ttl = 60",
     `address = [${JSON.stringify(snIp)}]`,
+    "",
+    `[${JSON.stringify(snHostname)}]`,
+    "ttl = 60",
+    `address = [${JSON.stringify(snIp)}]`,
     BNS_LOCAL_DNS_END,
   ];
   lines.splice(start, end - start, ...managedBlock);
@@ -467,7 +634,7 @@ export function patchLocalDnsBnsRecord(
   }
   fs.writeFileSync(configPath, `${lines.join("\n")}\n`);
   console.log(
-    `Patched ${configPath}: ${bnsHostname} -> ${snIp}`,
+    `Patched ${configPath}: ${bnsHostname}, ${snHostname} -> ${snIp}`,
   );
 }
 
@@ -512,6 +679,7 @@ async function makeSnConfigs(
   }
 
   discardProvisionSnDb(targetDir);
+  materializeSnDidWebDocuments(targetDir, snBaseHost);
   ensureDir(path.join(targetDir, SN_AUTH_DATA_DIR));
   // params.json 会随部署目录整体复制到另一台机器，运行态路径必须相对于
   // web3_gateway 的工作目录，不能泄漏 provision 时的宿主机输出路径。
@@ -580,7 +748,7 @@ async function makeSnConfigs(
 // 3. cyfs-sn web3_sn server【已实现】启动时从 sn_seed.yaml 幂等导入 C 类
 //    种子（激活码、sn_user 账号、user_domain 绑定），格式真值
 //    cyfs-sn/src/sn_seed.rs；schema 完全归 SN 所有。
-// 4. web3_gateway.yaml【已实现】bns_rpc_url 参数化为 {{bns_rpc_url}}，
+// 4. web3_gateway.yaml【已实现】bns_server_url 参数化为 {{bns_server_url}}，
 //    由 params.json 提供（alignBnsRuntimeParams 与 dv-env.json 对齐）。
 //
 // 验证入口：scripts/sn-dev-up.sh + sn-dev-smoke.sh（本机三件套）与
@@ -781,36 +949,404 @@ function decodeJwtPayload(jwt: string): Record<string, unknown> {
 interface SeedUserEnvView {
   bootConfigJwt: string;
   deviceMiniDocJwt: string;
+  deviceDocJwt: string;
+  deviceDoc: Record<string, unknown>;
   pkx: string;
   zoneBootJson: Record<string, unknown>;
+  sourceZoneDocument: Record<string, unknown>;
+  ownerDocument: Record<string, unknown>;
+  ownerDocumentJwt: string;
+  ownerPrivateKeyPem: string;
+  zoneDocument: Record<string, unknown>;
+  zoneDocumentJwt: string;
 }
 
-// 读取（缺失则先构建）用户 env，取出种子需要的签名 JWT 与公钥。
+interface SeedOwnerIdentity {
+  document: Record<string, unknown>;
+  privateKeyPem: string;
+  publicKeyX: string;
+}
+
+function jwtSegment(value: unknown): string {
+  return Buffer.from(JSON.stringify(value), "utf8").toString("base64url");
+}
+
+// Mirrors name-lib/websdk signJwtEdDSA: compact JWS, Ed25519, no `typ`.
+// Ed25519 signatures are deterministic, keeping regenerated seed products stable.
+function signDidDocumentJwt(
+  document: Record<string, unknown>,
+  privateKeyPem: string,
+): string {
+  const signingInput = `${jwtSegment({ alg: "EdDSA" })}.${
+    jwtSegment(document)
+  }`;
+  const signature = cryptoSign(
+    null,
+    Buffer.from(signingInput, "utf8"),
+    createPrivateKey(privateKeyPem),
+  );
+  return `${signingInput}.${signature.toString("base64url")}`;
+}
+
+function verifyDidDocumentJwt(
+  jwt: string,
+  publicKeyX: string,
+  source: string,
+): Record<string, unknown> {
+  const parts = jwt.trim().split(".");
+  if (parts.length !== 3) {
+    throw new Error(`${source} is not a compact JWT`);
+  }
+  const header = JSON.parse(
+    Buffer.from(parts[0], "base64url").toString("utf8"),
+  ) as Record<string, unknown>;
+  if (header.alg !== "EdDSA") {
+    throw new Error(`${source} does not use EdDSA`);
+  }
+  const valid = cryptoVerify(
+    null,
+    Buffer.from(`${parts[0]}.${parts[1]}`, "utf8"),
+    createPublicKey({
+      key: { kty: "OKP", crv: "Ed25519", x: publicKeyX },
+      format: "jwk",
+    }),
+    Buffer.from(parts[2], "base64url"),
+  );
+  if (!valid) {
+    throw new Error(`${source} signature does not match OwnerDocument key`);
+  }
+  return JSON.parse(
+    Buffer.from(parts[1], "base64url").toString("utf8"),
+  ) as Record<string, unknown>;
+}
+
+function ownerDocumentKeyX(
+  document: Record<string, unknown>,
+  source: string,
+): string {
+  const methods = document.verificationMethod;
+  if (!Array.isArray(methods) || methods.length === 0) {
+    throw new Error(`${source} misses verificationMethod`);
+  }
+  const method = methods[0];
+  if (!method || typeof method !== "object" || Array.isArray(method)) {
+    throw new Error(`${source} has invalid default verificationMethod`);
+  }
+  const jwk = (method as Record<string, unknown>).publicKeyJwk;
+  if (!jwk || typeof jwk !== "object" || Array.isArray(jwk)) {
+    throw new Error(`${source} default verificationMethod misses publicKeyJwk`);
+  }
+  const x = (jwk as Record<string, unknown>).x;
+  if (typeof x !== "string" || !x) {
+    throw new Error(`${source} default verificationMethod misses Ed25519 x`);
+  }
+  const keyId = (method as Record<string, unknown>).id;
+  const controller = (method as Record<string, unknown>).controller;
+  if (keyId !== "#main_key" || controller !== document.id) {
+    throw new Error(
+      `${source} default verificationMethod must be #main_key controlled by ${
+        String(document.id)
+      }`,
+    );
+  }
+  if (
+    (jwk as Record<string, unknown>).kty !== "OKP" ||
+    (jwk as Record<string, unknown>).crv !== "Ed25519"
+  ) {
+    throw new Error(`${source} default verificationMethod is not Ed25519`);
+  }
+  return x;
+}
+
+function loadSeedOwnerIdentity(
+  userDir: string,
+  username: string,
+): SeedOwnerIdentity {
+  const ownerPath = path.join(userDir, "user_config.json");
+  const privateKeyPath = path.join(userDir, "user_private_key.pem");
+  if (!fs.existsSync(ownerPath) || !fs.existsSync(privateKeyPath)) {
+    throw new Error("missing user_config.json/user_private_key.pem");
+  }
+
+  const document = readJson(ownerPath);
+  const expectedDid = `did:bns:${username}`;
+  if (document.id !== expectedDid) {
+    throw new Error(
+      `OwnerDocument id ${String(document.id)} does not match ${expectedDid}`,
+    );
+  }
+  if (
+    !Array.isArray(document["@context"]) ||
+    !document["@context"].includes("https://www.w3.org/ns/did/v1")
+  ) {
+    throw new Error("OwnerDocument misses DID v1 @context");
+  }
+  if (
+    !Array.isArray(document.authentication) ||
+    !document.authentication.includes("#main_key")
+  ) {
+    throw new Error("OwnerDocument authentication misses #main_key");
+  }
+  for (const field of ["iat", "exp", "version_seq"] as const) {
+    if (
+      typeof document[field] !== "number" ||
+      !Number.isFinite(document[field])
+    ) {
+      throw new Error(`OwnerDocument misses numeric ${field}`);
+    }
+  }
+  if ((document.iat as number) > (document.exp as number)) {
+    throw new Error("OwnerDocument iat is after exp");
+  }
+  for (const field of ["name", "display_name"] as const) {
+    if (typeof document[field] !== "string" || !document[field]) {
+      throw new Error(`OwnerDocument misses ${field}`);
+    }
+  }
+
+  const privateKeyPem = fs.readFileSync(privateKeyPath, "utf8");
+  const privatePublicJwk = createPublicKey(createPrivateKey(privateKeyPem))
+    .export({ format: "jwk" }) as { x?: string };
+  const documentPublicKeyX = ownerDocumentKeyX(document, ownerPath);
+  if (
+    !privatePublicJwk.x ||
+    privatePublicJwk.x !== documentPublicKeyX
+  ) {
+    throw new Error(
+      "OwnerDocument default key does not match user_private_key.pem",
+    );
+  }
+
+  return {
+    document,
+    privateKeyPem,
+    publicKeyX: documentPublicKeyX,
+  };
+}
+
+function findFilesNamed(root: string, fileName: string): string[] {
+  if (!fs.existsSync(root)) {
+    return [];
+  }
+  const result: string[] = [];
+  for (const entry of fs.readdirSync(root, { withFileTypes: true })) {
+    const entryPath = path.join(root, entry.name);
+    if (entry.isDirectory()) {
+      result.push(...findFilesNamed(entryPath, fileName));
+    } else if (entry.isFile() && entry.name === fileName) {
+      result.push(entryPath);
+    }
+  }
+  return result;
+}
+
+function readDeviceDocJwt(userDir: string, deviceName: string): string {
+  const nodeDir = path.join(userDir, deviceName);
+  const nodeIdentityPath = path.join(nodeDir, "node_identity.json");
+  if (fs.existsSync(nodeIdentityPath)) {
+    const nodeIdentity = readJson(nodeIdentityPath);
+    if (
+      typeof nodeIdentity.device_doc_jwt === "string" &&
+      nodeIdentity.device_doc_jwt.trim()
+    ) {
+      return nodeIdentity.device_doc_jwt.trim();
+    }
+  }
+
+  const matches = findFilesNamed(
+    path.join(nodeDir, "local", "identity"),
+    "device_doc.jwt",
+  );
+  if (matches.length > 1) {
+    throw new Error(
+      `user env ${userDir} has ambiguous device_doc.jwt files for ${deviceName}: ${
+        matches.join(", ")
+      }`,
+    );
+  }
+  return matches.length === 1 ? fs.readFileSync(matches[0], "utf8").trim() : "";
+}
+
+// 读取（缺失或仍是旧身份布局则先重建）用户 env，取出种子需要的完整
+// DeviceDocument、mini document、boot document 与 owner 公钥。RTCP v4 的
+// authority-current 验证需要完整 DeviceDocument；TXT DEV mini document
+// 只能继续承担 DNS/bootstrap 兼容职责。
 async function loadSeedUserEnv(
   envRoot: string,
   user: SnSeedUserSpec,
 ): Promise<SeedUserEnvView> {
   const params = getParamsFromGroupName(user.groupName);
   const userDir = path.join(envRoot, params.zone_id);
-  if (
-    !fs.existsSync(path.join(userDir, params.node_name, "node_identity.json"))
-  ) {
-    console.log(`user env missing, generate: ${userDir}`);
+  const nodeIdentityPath = path.join(
+    userDir,
+    params.node_name,
+    "node_identity.json",
+  );
+  const expectedDeviceDid = user.userDomain
+    ? `did:web:${params.node_name}.${user.userDomain}`
+    : `did:bns:${params.node_name}.${user.username}`;
+  const expectedOwnerDid = `did:bns:${user.username}`;
+  const expectedZoneDid = user.userDomain
+    ? `did:web:${user.userDomain}`
+    : expectedOwnerDid;
+  let deviceDocJwt = readDeviceDocJwt(userDir, params.node_name);
+  let deviceDoc: Record<string, unknown> | undefined;
+  let ownerIdentity: SeedOwnerIdentity | undefined;
+  const refreshReasons: string[] = [];
+  if (!fs.existsSync(nodeIdentityPath)) {
+    refreshReasons.push("missing node_identity.json");
+  } else if (!deviceDocJwt) {
+    refreshReasons.push("missing device_doc.jwt");
+  } else {
+    try {
+      deviceDoc = decodeJwtPayload(deviceDocJwt);
+      if (deviceDoc.id !== expectedDeviceDid) {
+        refreshReasons.push(
+          `device_doc.jwt id ${
+            String(deviceDoc.id)
+          } does not match ${expectedDeviceDid}`,
+        );
+      } else if (
+        deviceDoc.owner !== expectedOwnerDid ||
+        deviceDoc.zone_did !== expectedZoneDid ||
+        deviceDoc.name !== params.node_name
+      ) {
+        refreshReasons.push(
+          "device_doc.jwt owner/zone/name does not match the seed user",
+        );
+      }
+    } catch (err) {
+      refreshReasons.push(
+        `invalid device_doc.jwt: ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    }
+  }
+
+  try {
+    ownerIdentity = loadSeedOwnerIdentity(userDir, user.username);
+  } catch (err) {
+    refreshReasons.push(
+      `invalid owner identity: ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    );
+  }
+  const sourceZoneDocumentPath = path.join(userDir, "zone_config.json");
+  if (!fs.existsSync(sourceZoneDocumentPath)) {
+    refreshReasons.push("missing zone_config.json");
+  }
+
+  if (refreshReasons.length > 0) {
+    console.log(
+      `user env requires DID identity refresh (${
+        refreshReasons.join("; ")
+      }), generate: ${userDir}`,
+    );
     await buildUserEnv(params, envRoot);
+    deviceDocJwt = readDeviceDocJwt(userDir, params.node_name);
+    deviceDoc = undefined;
+    ownerIdentity = undefined;
   }
   const zoneRecord = readJson(path.join(userDir, "zone_txt_record.json"));
   const bootConfigJwt = String(zoneRecord.boot_config_jwt ?? "");
   const deviceMiniDocJwt = String(zoneRecord.device_mini_doc_jwt ?? "");
   const pkx = String(zoneRecord.pkx ?? "");
-  if (!bootConfigJwt || !deviceMiniDocJwt || !pkx) {
+  if (!bootConfigJwt || !deviceMiniDocJwt || !deviceDocJwt || !pkx) {
     throw new Error(
-      `user env ${userDir} zone_txt_record.json misses boot_config_jwt/device_mini_doc_jwt/pkx`,
+      `user env ${userDir} misses boot_config_jwt/device_mini_doc_jwt/device_doc.jwt/pkx`,
+    );
+  }
+  deviceDoc ??= decodeJwtPayload(deviceDocJwt);
+  if (deviceDoc.id !== expectedDeviceDid) {
+    throw new Error(
+      `user env ${userDir} device_doc.jwt id ${
+        String(deviceDoc.id)
+      } does not match ${expectedDeviceDid}`,
+    );
+  }
+  if (
+    deviceDoc.owner !== expectedOwnerDid ||
+    deviceDoc.zone_did !== expectedZoneDid ||
+    deviceDoc.name !== params.node_name
+  ) {
+    throw new Error(
+      `user env ${userDir} DeviceDocument owner/zone/name does not match ${expectedOwnerDid}/${expectedZoneDid}/${params.node_name}`,
+    );
+  }
+  ownerIdentity ??= loadSeedOwnerIdentity(userDir, user.username);
+  if (ownerIdentity.publicKeyX !== pkx) {
+    throw new Error(
+      `user env ${userDir} OwnerDocument key does not match zone TXT PKX`,
+    );
+  }
+  const verifiedDeviceDocument = verifyDidDocumentJwt(
+    deviceDocJwt,
+    ownerIdentity.publicKeyX,
+    `${userDir} device_doc.jwt`,
+  );
+  if (
+    JSON.stringify(verifiedDeviceDocument) !== JSON.stringify(deviceDoc)
+  ) {
+    throw new Error(
+      `user env ${userDir} decoded DeviceDocument changed during signature verification`,
+    );
+  }
+  const bootDocument = verifyDidDocumentJwt(
+    bootConfigJwt,
+    ownerIdentity.publicKeyX,
+    `${userDir} boot_config_jwt`,
+  );
+  if (bootDocument.id !== expectedZoneDid) {
+    throw new Error(
+      `user env ${userDir} boot_config_jwt id ${
+        String(bootDocument.id)
+      } does not match ${expectedZoneDid}`,
+    );
+  }
+  const deviceMiniDocument = verifyDidDocumentJwt(
+    deviceMiniDocJwt,
+    ownerIdentity.publicKeyX,
+    `${userDir} device_mini_doc_jwt`,
+  );
+  if (deviceMiniDocument.n !== params.node_name) {
+    throw new Error(
+      `user env ${userDir} device_mini_doc_jwt name ${
+        String(deviceMiniDocument.n)
+      } does not match ${params.node_name}`,
     );
   }
   const zoneBootJson = readJson(
     path.join(userDir, `${params.zone_id}.zone.json`),
   );
-  return { bootConfigJwt, deviceMiniDocJwt, pkx, zoneBootJson };
+  const sourceZoneDocument = readJson(sourceZoneDocumentPath);
+  const material = {
+    bootConfigJwt,
+    deviceMiniDocJwt,
+    deviceDocJwt,
+    deviceDoc,
+    pkx,
+    zoneBootJson,
+    sourceZoneDocument,
+    ownerDocument: ownerIdentity.document,
+    ownerPrivateKeyPem: ownerIdentity.privateKeyPem,
+  };
+  const ownerDocumentJwt = signDidDocumentJwt(
+    ownerIdentity.document,
+    ownerIdentity.privateKeyPem,
+  );
+  const zoneDocument = toZoneDocumentJson(user, material);
+  const zoneDocumentJwt = signDidDocumentJwt(
+    zoneDocument,
+    ownerIdentity.privateKeyPem,
+  );
+  return {
+    ...material,
+    ownerDocumentJwt,
+    zoneDocument,
+    zoneDocumentJwt,
+  };
 }
 
 function yamlQuote(value: string): string {
@@ -827,33 +1363,84 @@ function yamlQuote(value: string): string {
 const SEED_ZONE_DOC_IAT = 1735689600; // 2025-01-01T00:00:00Z，devtest 确定性时间戳
 
 function toZoneDocumentJson(
-  username: string,
-  env: SeedUserEnvView,
+  user: SnSeedUserSpec,
+  env: Omit<
+    SeedUserEnvView,
+    "ownerDocumentJwt" | "zoneDocument" | "zoneDocumentJwt"
+  >,
 ): Record<string, unknown> {
-  const zone: Record<string, unknown> = { ...env.zoneBootJson };
-  const zoneDid = `did:bns:${username}`;
+  const zone: Record<string, unknown> = { ...env.sourceZoneDocument };
+  const ownerDid = `did:bns:${user.username}`;
+  const zoneDid = user.userDomain ? `did:web:${user.userDomain}` : ownerDid;
+  const hostname = user.userDomain ?? `${user.username}.bns.did`;
+  const deviceName = String(env.deviceDoc.name ?? "");
+  if (!deviceName) {
+    throw new Error(`DeviceDocument for ${user.username} misses name`);
+  }
+  zone["@context"] = [
+    "https://www.w3.org/ns/did/v1",
+    "https://buckyos.org/ns/zone/v1",
+  ];
   zone.id = zoneDid;
-  zone.owner = zoneDid;
+  zone.owner = ownerDid;
   zone.verificationMethod = [
     {
       type: "Ed25519VerificationKey2020",
-      id: "#owner",
-      controller: zoneDid,
+      id: "#main_key",
+      controller: ownerDid,
       publicKeyJwk: { kty: "OKP", crv: "Ed25519", x: env.pkx },
     },
   ];
-  zone.authentication = ["#owner"];
-  zone.boot_jwt = env.bootConfigJwt;
-  if (zone.hostname === undefined) {
-    // devtest zone 的 web 主机名：sn 字段形如 sn.<base>，zone host 挂在
-    // <user>.web3.<base>；没有 sn 字段时退回 DID 规范 host。
-    const sn = typeof zone.sn === "string" ? zone.sn : "";
-    zone.hostname = sn.startsWith("sn.")
-      ? `${username}.web3.${sn.slice("sn.".length)}`
-      : `${username}.bns.did`;
+  zone.authentication = ["#main_key"];
+  zone.assertionMethod = ["#main_key"];
+  zone.capabilityInvocation = ["#main_key"];
+  zone.service = [{
+    id: `${zoneDid}#lastDoc`,
+    type: "DIDDoc",
+    serviceEndpoint: `https://${hostname}/resolve/this_zone`,
+  }];
+  zone.hostname = hostname;
+  const oods = env.zoneBootJson.oods ?? zone.oods;
+  if (!Array.isArray(oods) || oods.length === 0) {
+    throw new Error(`ZoneDocument for ${user.username} misses oods`);
   }
-  if (zone.iat === undefined) {
+  zone.oods = oods;
+  zone.boot_jwt = env.bootConfigJwt;
+  const existingDevices = zone.devices &&
+      typeof zone.devices === "object" &&
+      !Array.isArray(zone.devices)
+    ? zone.devices as Record<string, unknown>
+    : {};
+  zone.devices = {
+    ...existingDevices,
+    [deviceName]: env.deviceDoc,
+  };
+  const existingMiniDeviceJwts = zone.mini_device_jwts &&
+      typeof zone.mini_device_jwts === "object" &&
+      !Array.isArray(zone.mini_device_jwts)
+    ? zone.mini_device_jwts as Record<string, unknown>
+    : {};
+  zone.mini_device_jwts = {
+    ...existingMiniDeviceJwts,
+    [deviceName]: env.deviceMiniDocJwt,
+  };
+  if (env.zoneBootJson.sn !== undefined) {
+    zone.sn = env.zoneBootJson.sn;
+  }
+  if (env.zoneBootJson.exp !== undefined) {
+    zone.exp = env.zoneBootJson.exp;
+  }
+  if (typeof zone.exp !== "number" || !Number.isFinite(zone.exp)) {
+    throw new Error(`ZoneDocument for ${user.username} misses numeric exp`);
+  }
+  if (typeof zone.iat !== "number" || !Number.isFinite(zone.iat)) {
     zone.iat = SEED_ZONE_DOC_IAT;
+  }
+  if ((zone.iat as number) > (zone.exp as number)) {
+    throw new Error(`ZoneDocument for ${user.username} has iat after exp`);
+  }
+  if (zone.version_seq === undefined) {
+    zone.version_seq = 0;
   }
   return zone;
 }
@@ -862,19 +1449,23 @@ function toZoneDocumentJson(
  * 产出 bns_dv 的启动种子配置，让种子用户的 BNS 权威文档真正上链：
  *   <targetDir>/bns_dv_seed.yaml             BnsDvSeedConfig
  *   <targetDir>/bns_seed_docs/<user>/*       每用户 owner/zone/boot/device_mini_doc
- * 文档内容取自 <envRoot> 用户 env（owner key 已签好的 JWT），多文档随
+ * 文档内容取自 <envRoot> 用户 env，以用户 owner key 生成签名 JWT，多文档随
  * register_name 一次提交（多文档原子写优先用合约批量接口）。种子经 bns_dv
  * 托管 key 代发（等价 Web2 代注册），asset_owner 锚定用户 EVM 地址。
  * 这是 resolver A 类路径（indexer lazy 解析）在测试环境有数据可测的前提，
  * 补 SN-测试计划 §7 的端到端缺口。消费方：start.py（组件侧需求 2）。
  *
  * 文档形状与 resolver 消费面对齐（test_sn_bns_integration 同款）：
- *   owner            {"id":"did:bns:<u>","x":<pkx>}          PKX TXT / resolve_owner
- *   zone             env zone.json 补全 ZoneDocument 必填字段  见 toZoneDocumentJson
+ *   owner            完整 OwnerDocument 的 owner 自签 JWT；BNS 是权威存储
+ *   zone             完整 ZoneDocument JSON（含 boot/device），并生成 owner 签名 JWT
  *   boot             签名 boot JWT 原文（inline_text_file）    原子文档；BOOT= TXT 取 jwt
- *   device_mini_doc  {"devices":{"<ood>":{payload+jwt}}}      设备解析 + DEV= TXT
- * did:web 用户（userDomain）只上链 owner——其 ZoneDocument 权威在 SN 的
- * user_domain 机制（见 makeSnAuthSeedConfig），不在 BNS。
+ *   device_mini_doc  {"devices":{"<ood>":<完整 DeviceDocument>},
+ *                     "mini_device_jwts":{...},
+ *                     "device_document_jwts":{...}}
+ *                    完整文档供 RTCP authority-current；mini JWT 只供 DEV= TXT
+ * did:web 用户（userDomain）的 ZoneDocument 权威仍在 SN user_domain 机制，
+ * 但其 canonical BNS zone 也必须发布完整设备文档，供 SN 的 did:web upper
+ * resolver 在客户端首次 keep-tunnel（OOD 尚未在线）时回答。
  */
 export async function makeBnsDvSeedConfig(
   targetDir: string,
@@ -891,25 +1482,39 @@ export async function makeBnsDvSeedConfig(
     const userDocsDir = ensureDir(path.join(docsRoot, user.username));
     const docLines: string[] = [];
 
-    const ownerRel = `${docsRootName}/${user.username}/owner.json`;
-    writeJson(path.join(userDocsDir, "owner.json"), {
-      id: `did:bns:${user.username}`,
-      x: env.pkx,
-    });
+    writeJson(
+      path.join(userDocsDir, "owner.json"),
+      env.ownerDocument,
+    );
+    const ownerJwtRel = `${docsRootName}/${user.username}/owner.jwt`;
+    fs.writeFileSync(
+      path.join(userDocsDir, "owner.jwt"),
+      `${env.ownerDocumentJwt}\n`,
+    );
+    console.log(`# Write file: ${path.join(userDocsDir, "owner.jwt")}`);
     docLines.push(
       `      - doc_type: owner`,
-      `        inline_json_file: ${yamlQuote(ownerRel)}`,
+      `        inline_text_file: ${yamlQuote(ownerJwtRel)}`,
     );
 
     if (!user.userDomain) {
-      const zoneRel = `${docsRootName}/${user.username}/zone.json`;
+      const zoneJsonRel = `${docsRootName}/${user.username}/zone.json`;
       writeJson(
         path.join(userDocsDir, "zone.json"),
-        toZoneDocumentJson(user.username, env),
+        env.zoneDocument,
       );
+      const zoneJwtRel = `${docsRootName}/${user.username}/zone.jwt`;
+      fs.writeFileSync(
+        path.join(userDocsDir, "zone.jwt"),
+        `${env.zoneDocumentJwt}\n`,
+      );
+      console.log(`# Write file: ${path.join(userDocsDir, "zone.jwt")}`);
       docLines.push(
         `      - doc_type: zone`,
-        `        inline_json_file: ${yamlQuote(zoneRel)}`,
+        // Public did:bns:<name> resolution historically returns JSON for the
+        // default zone document. Keep that wire shape while retaining the
+        // owner-signed JWT as a sibling artifact for signed consumers.
+        `        inline_json_file: ${yamlQuote(zoneJsonRel)}`,
       );
 
       const bootRel = `${docsRootName}/${user.username}/boot.jwt`;
@@ -922,23 +1527,28 @@ export async function makeBnsDvSeedConfig(
         `      - doc_type: boot`,
         `        inline_text_file: ${yamlQuote(bootRel)}`,
       );
-
-      const params = getParamsFromGroupName(user.groupName);
-      const miniPayload = decodeJwtPayload(env.deviceMiniDocJwt);
-      const miniRel = `${docsRootName}/${user.username}/device_mini_doc.json`;
-      writeJson(path.join(userDocsDir, "device_mini_doc.json"), {
-        devices: {
-          [params.node_name]: {
-            ...miniPayload,
-            mini_config_jwt: env.deviceMiniDocJwt,
-          },
-        },
-      });
-      docLines.push(
-        `      - doc_type: device_mini_doc`,
-        `        inline_json_file: ${yamlQuote(miniRel)}`,
-      );
     }
+
+    const params = getParamsFromGroupName(user.groupName);
+    const miniRel = `${docsRootName}/${user.username}/device_mini_doc.json`;
+    writeJson(path.join(userDocsDir, "device_mini_doc.json"), {
+      // Keep the authoritative document body byte-for-byte equivalent at the
+      // JSON payload level to the JWT sent in RTCP Hello. Compatibility JWTs
+      // live in sibling maps so they do not alter the DeviceDocument revision.
+      devices: {
+        [params.node_name]: env.deviceDoc,
+      },
+      mini_device_jwts: {
+        [params.node_name]: env.deviceMiniDocJwt,
+      },
+      device_document_jwts: {
+        [params.node_name]: env.deviceDocJwt,
+      },
+    });
+    docLines.push(
+      `      - doc_type: device_mini_doc`,
+      `        inline_json_file: ${yamlQuote(miniRel)}`,
+    );
 
     txs.push(
       [
@@ -1019,7 +1629,7 @@ export async function makeSnAuthSeedConfig(
         domain: user.userDomain,
         owner: user.username,
         pkx: env.pkx,
-        zone_document_jwt: env.bootConfigJwt,
+        zone_document_jwt: env.zoneDocumentJwt,
       });
     }
   }
@@ -1109,11 +1719,11 @@ export function applyBindParams(targetDir: string, devLocal: boolean): void {
 
 /**
  * 把 BNS 运行参数收敛进 params.json，消除三处各自写死：start.py 的 RPC/合约
- * 常量、web3_gateway.yaml 写死的 bns_rpc_url、dv 环境实际产出的
+ * 常量、web3_gateway.yaml 写死的 bns_server_url、dv 环境实际产出的
  * dv-env.json（rpc_endpoint/chain_id/contract_address/server_url/
- * server_rpc_path）。存在 dv-env.json 时以其为准写入 bns_rpc_url /
- * bns_server_url 等 key；无 dv-env.json 时写 start.py 内置拓扑的缺省值
- * （web3_gateway.yaml 的 {{bns_rpc_url}} 必须始终有值）。
+ * server_rpc_path）。存在 dv-env.json 时以其为准写入 bns_server_url；
+ * 无 dv-env.json 时写 start.py 内置拓扑的缺省值
+ * （web3_gateway.yaml 的 {{bns_server_url}} 必须始终有值）。
  */
 export function alignBnsRuntimeParams(targetDir: string): void {
   const paramsPath = path.join(targetDir, "params.json");
@@ -1145,7 +1755,6 @@ export function alignBnsRuntimeParams(targetDir: string): void {
     console.log(`# params.json: BNS runtime params taken from ${dvEnvPath}`);
   }
 
-  params.bns_rpc_url = serverUrl;
   params.bns_server_url = serverUrl;
   json.params = params;
   writeJson(paramsPath, json);
@@ -1173,10 +1782,11 @@ function injectDevBnsProxy(
     ]),
   ].join("\n");
   const baseProxyBlock = [
-    "    bns_evm:",
-    "      controller_private_key_env: BNS_SN_CONTROLLER_PRIVATE_KEY",
     "    bns_proxy:",
     "      require_user_asset_owner: true",
+    "      controllers:",
+    "        - id: default",
+    "          private_key_env: BNS_SN_CONTROLLER_PRIVATE_KEY",
   ].join("\n");
 
   let injected = false;
@@ -1230,8 +1840,7 @@ const SEED_V2_P1_TODO = "TODO(seed-v2 P1): not implemented";
 
 /**
  * P1：Web2 托管代发路径的 SN controller 身份种子。
- * 生成/复用托管 EVM key，写 params.json 的 sn_controller_principal /
- * sn_controller_kid / allowed_controller_doc_types / bns_evm，并在种子 tx 里
+ * 生成/复用托管 EVM key，写入 bns_proxy.controllers，并在种子 tx 里
  * 为相关 name 设置受限 controller policy（依赖组件侧需求 1 的 tx type 扩展）。
  * 对应 devenv 注释 add_dns_txt_record "代发 tx" 能力与 SN-测试计划 §7 的
  * controller policy 端到端缺口。
@@ -1250,7 +1859,8 @@ export function makeDevtestLocalDns(targetDir: string): void {
 }
 
 /**
- * seed-v2 目标编排。SN 自身身份/TLS/params 闭环仍由 makeSnConfigs 负责，
+ * seed-v2 目标编排。RTCP stack 身份、TLS 和通用 params 仍由 makeSnConfigs
+ * 负责；SN 自身 TXT bootstrap 参数不再生成到最终 params.json。
  * 此处只补各组件的种子配置产物。
  */
 export async function makeSnSeedV2(
@@ -1370,6 +1980,11 @@ async function main(): Promise<void> {
   console.log(`  SN database: ${snDbPath}`);
   console.log(
     `  SN token key dir: ${path.join(targetDir, SN_AUTH_DATA_DIR)}`,
+  );
+  console.log(
+    `  SN did:web authority: ${
+      path.join(targetDir, SN_DID_WEB_ROOT_DIR, ".well-known", "did.json")
+    }`,
   );
   console.log("Template/operator files that should be present:");
   console.log(`  - ${path.join(targetDir, WEB3_GATEWAY_CONFIG_FILE)}`);

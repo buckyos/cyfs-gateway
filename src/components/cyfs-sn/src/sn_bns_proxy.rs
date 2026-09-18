@@ -18,9 +18,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use bns_client::dns_document::{DnsTxtRecord, DNS_TXT_DOC_TYPE};
 use bns_client::{
-    canonical_doc_type, hash_json, BnsEvmReceiptWaitConfig, DnsTxtUpdate, PublishDocumentParams,
-    RegisterNameParams, SnBnsController, SnBnsControllerError, UpsertDnsTxtParams, OWNER_DOC_TYPE,
-    RELAY_ASSIGNMENT_DOC_TYPE,
+    canonical_bns_name, canonical_doc_type, canonical_json_sha256, hash_json,
+    BnsEvmReceiptWaitConfig, DnsTxtUpdate, PublishDocumentParams, RegisterNameParams,
+    RemoveBoundZoneOutput, RemoveBoundZoneParams, SnBnsController, SnBnsControllerError,
+    UpsertDnsTxtParams, OWNER_DOC_TYPE, RELAY_ASSIGNMENT_DOC_TYPE,
 };
 use bns_client::{
     default_document_update, CallAuthority, DocumentRef, DocumentUpdate, MutationGuard, Principal,
@@ -29,6 +30,8 @@ use bns_client::{
 pub use cyfs_gateway_api::{
     SnBnsDnsTxtRecord, SnBnsProxyInitialDocuments, SnBnsProxyStatus, SnBnsProxyTxOutcome,
 };
+use jsonwebtoken::jwk::Jwk;
+use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
 use log::{info, warn};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -45,10 +48,8 @@ use crate::{sn_err, SnErrorCode, SnResult};
 
 /// `SNServerConfig.bns_proxy` 配置块。
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SNBnsProxyConfig {
-    /// 显式关闭 proxy（保留 bns 读路径）。缺省 = true。
-    #[serde(default = "default_enabled")]
-    pub enabled: bool,
     /// 生产模式要求注册必须携带用户 `asset_owner`。缺省 = true；仅 devtest
     /// 场景可显式设为 false（此时回落为该用户绑定 controller 的地址）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -60,10 +61,11 @@ pub struct SNBnsProxyConfig {
     /// publish_document）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allowed_operations: Option<Vec<String>>,
-}
-
-fn default_enabled() -> bool {
-    true
+    /// EIP-1559 fee source. `dynamic` uses the BNS server `tx.prepare`
+    /// suggestion; `zero` keeps its nonce/gas estimate but signs with zero fee
+    /// caps for chains that explicitly accept fee-free transactions.
+    #[serde(default)]
+    pub tx_fee_mode: SnBnsTxFeeMode,
 }
 
 impl SNBnsProxyConfig {
@@ -96,8 +98,17 @@ impl SNBnsProxyConfig {
     }
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SnBnsTxFeeMode {
+    #[default]
+    Dynamic,
+    Zero,
+}
+
 /// 一把 controller key 的配置。私钥来源三选一：env / file / inline。
 #[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SNBnsProxyControllerKeyConfig {
     pub id: String,
     /// 可选的地址声明；与私钥推导地址不一致时启动失败（防错配）。
@@ -131,7 +142,7 @@ impl fmt::Debug for SNBnsProxyControllerKeyConfig {
 }
 
 impl SNBnsProxyControllerKeyConfig {
-    /// 解析私钥明文（env > file > inline，与旧 `bns_evm.controller_private_key*` 同序）。
+    /// 解析私钥明文（env > file > inline）。
     pub fn load_private_key(&self) -> SnResult<String> {
         if let Some(env_name) = self.private_key_env.as_deref() {
             let value = std::env::var(env_name).map_err(|e| {
@@ -378,6 +389,7 @@ pub enum SnBnsProxyError {
     Store(String),
     /// BNS 写链路失败（构造/签名/投递）。
     Write(SnBnsControllerError),
+    OwnerAuthorization(String),
 }
 
 impl fmt::Display for SnBnsProxyError {
@@ -397,6 +409,9 @@ impl fmt::Display for SnBnsProxyError {
             ),
             SnBnsProxyError::Store(message) => write!(f, "binding store error: {}", message),
             SnBnsProxyError::Write(error) => write!(f, "{}", error),
+            SnBnsProxyError::OwnerAuthorization(message) => {
+                write!(f, "owner authorization failed: {message}")
+            }
         }
     }
 }
@@ -577,29 +592,47 @@ impl SnBnsProxy {
         Ok(entry)
     }
 
+    /// Resolve an existing binding or choose a deterministic candidate
+    /// without mutating the binding store.
+    async fn controller_candidate_for_user(
+        &self,
+        username: &str,
+    ) -> SnBnsProxyResult<SnBnsControllerBinding> {
+        let username = canonical_bns_name(username)
+            .map_err(|error| SnBnsProxyError::InvalidInput(error.to_string()))?;
+        if let Some(existing) = self.bindings.get_binding(username.as_str()).await? {
+            self.controller_entry(&existing)?;
+            return Ok(existing);
+        }
+        let picked = self.stable_pick(username.as_str())?;
+        let now = now_secs();
+        Ok(SnBnsControllerBinding {
+            username,
+            controller_id: picked.id.clone(),
+            controller_address: picked.address.clone(),
+            created_at: now,
+            updated_at: now,
+        })
+    }
+
+    async fn persist_controller_binding(
+        &self,
+        binding: &SnBnsControllerBinding,
+    ) -> SnBnsProxyResult<SnBnsControllerBinding> {
+        // 并发注册时以先写入者为准（try_insert 返回既有行）。
+        let stored = self.bindings.try_insert_binding(binding).await?;
+        self.controller_entry(&stored)?;
+        Ok(stored)
+    }
+
     /// 取该用户绑定的 controller；无绑定时按稳定策略分配并持久化。
     /// 既有绑定永不静默覆盖；绑定指向的 controller 不在配置中 → 显式报错。
     pub async fn assign_controller_for_user(
         &self,
         username: &str,
     ) -> SnBnsProxyResult<SnBnsControllerBinding> {
-        if let Some(existing) = self.bindings.get_binding(username).await? {
-            self.controller_entry(&existing)?;
-            return Ok(existing);
-        }
-        let picked = self.stable_pick(username)?;
-        let now = now_secs();
-        let binding = SnBnsControllerBinding {
-            username: username.to_string(),
-            controller_id: picked.id.clone(),
-            controller_address: picked.address.clone(),
-            created_at: now,
-            updated_at: now,
-        };
-        // 并发注册时以先写入者为准（try_insert 返回既有行）。
-        let stored = self.bindings.try_insert_binding(&binding).await?;
-        self.controller_entry(&stored)?;
-        Ok(stored)
+        let candidate = self.controller_candidate_for_user(username).await?;
+        self.persist_controller_binding(&candidate).await
     }
 
     /// 只读查询绑定（不触发分配）。
@@ -617,7 +650,7 @@ impl SnBnsProxy {
                 "asset_owner is required".to_string(),
             ));
         }
-        let binding = self.assign_controller_for_user(username).await?;
+        let binding = self.controller_candidate_for_user(username).await?;
         Ok(binding.controller_address)
     }
 
@@ -628,6 +661,8 @@ impl SnBnsProxy {
         params: SnBnsProxyRegisterParams,
     ) -> SnBnsProxyResult<SnBnsProxyTxOutcome> {
         self.ensure_operation(SnBnsProxyOperation::RegisterNameBootstrap)?;
+        canonical_bns_name(params.name.as_str())
+            .map_err(|error| SnBnsProxyError::InvalidInput(error.to_string()))?;
         let asset_owner = normalize_evm_address(params.asset_owner.as_str()).ok_or_else(|| {
             SnBnsProxyError::InvalidInput(
                 "asset_owner must be a 0x-prefixed EVM address".to_string(),
@@ -639,11 +674,12 @@ impl SnBnsProxy {
             ));
         }
 
-        let binding = self
-            .assign_controller_for_user(params.name.as_str())
-            .await?;
-        let entry = self.controller_entry(&binding)?;
         let initial_documents = build_initial_documents(&params.initial_documents)?;
+        let candidate = self
+            .controller_candidate_for_user(params.name.as_str())
+            .await?;
+        let binding = self.persist_controller_binding(&candidate).await?;
+        let entry = self.controller_entry(&binding)?;
 
         let register_params = RegisterNameParams {
             request_id: params.request_id.clone(),
@@ -863,6 +899,76 @@ impl SnBnsProxy {
         Ok(outcome)
     }
 
+    /// Owner-authorized atomic removal of a single Zone DID from the current
+    /// OwnerDocument. The source hash is checked again by the controller.
+    pub async fn remove_bound_zone(
+        &self,
+        username: &str,
+        request_id: String,
+        zone_did: String,
+        expected_owner_hash: String,
+        owner_authorization: String,
+    ) -> SnBnsProxyResult<(SnBnsProxyTxOutcome, RemoveBoundZoneOutput)> {
+        self.ensure_operation(SnBnsProxyOperation::PublishDocument)?;
+        let candidate = self.controller_candidate_for_user(username).await?;
+        let candidate_entry = self.controller_entry(&candidate)?;
+        let snapshot = candidate_entry
+            .controller
+            .resolve_owner_document_snapshot(username)
+            .await
+            .map_err(SnBnsProxyError::Write)?;
+        verify_remove_bound_zone_authorization(
+            &snapshot.document,
+            owner_authorization.as_str(),
+            username,
+            zone_did.as_str(),
+            expected_owner_hash.as_str(),
+            request_id.as_str(),
+        )?;
+        let actual_owner_hash = canonical_json_sha256(&snapshot.document)
+            .map_err(|error| SnBnsProxyError::InvalidInput(error.to_string()))?;
+        if actual_owner_hash != expected_owner_hash {
+            return Err(SnBnsProxyError::OwnerAuthorization(
+                "expected_owner_hash does not match the current owner document".to_string(),
+            ));
+        }
+        let binding = self.persist_controller_binding(&candidate).await?;
+        let entry = self.controller_entry(&binding)?;
+
+        let params = RemoveBoundZoneParams {
+            request_id: request_id.clone(),
+            name: username.to_string(),
+            zone_did,
+            expected_owner_hash,
+            authority: entry.controller.sn_controller_authority(),
+        };
+        let payload_hash = hash_json(&params).unwrap_or_default();
+        let output = entry
+            .controller
+            .remove_bound_zone(params)
+            .await
+            .map_err(SnBnsProxyError::Write)?;
+        let receipt = &output.receipt;
+        let outcome = SnBnsProxyTxOutcome {
+            request_id,
+            operation: "owner.remove_bound_zone".to_string(),
+            name: username.to_string(),
+            controller_id: entry.id.clone(),
+            controller_address: entry.address.clone(),
+            asset_owner: None,
+            doc_type: receipt.doc_type.clone(),
+            document_version: receipt.document_version,
+            chain_id: receipt.evm_chain_id,
+            nonce: receipt.evm_nonce,
+            tx_hash: receipt.evm_tx_hash.clone(),
+            raw_tx: receipt.evm_raw_tx.clone(),
+            status: SnBnsProxyStatus::Submitted,
+            reused: receipt.created_or_reused,
+        };
+        self.audit(&outcome, payload_hash.as_str());
+        Ok((outcome, output))
+    }
+
     /// SN 内部发布 relay assignment（internal/admin only，由路由层限制）。
     pub async fn publish_relay_assignment(
         &self,
@@ -933,6 +1039,156 @@ impl SnBnsProxy {
     }
 }
 
+const OWNER_REMOVE_BOUND_ZONE_AUD: &str = "sn-bns-proxy";
+const OWNER_AUTHORIZATION_MAX_TTL_SECS: u64 = 5 * 60;
+const OWNER_AUTHORIZATION_LEEWAY_SECS: u64 = 30;
+
+#[derive(Debug, Serialize, Deserialize)]
+struct RemoveBoundZoneAuthorizationClaims {
+    sub: String,
+    aud: String,
+    operation: String,
+    name: String,
+    zone_did: String,
+    expected_owner_hash: String,
+    request_id: String,
+    iat: u64,
+    exp: u64,
+}
+
+fn owner_authentication_keys(
+    owner_document: &Value,
+    requested_kid: Option<&str>,
+) -> SnBnsProxyResult<Vec<DecodingKey>> {
+    let owner = owner_document.as_object().ok_or_else(|| {
+        SnBnsProxyError::OwnerAuthorization("owner document must be a JSON object".to_string())
+    })?;
+    let owner_did = owner.get("id").and_then(Value::as_str).ok_or_else(|| {
+        SnBnsProxyError::OwnerAuthorization("owner document id is missing".to_string())
+    })?;
+    let authentication = owner
+        .get("authentication")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            SnBnsProxyError::OwnerAuthorization(
+                "owner document authentication methods are missing".to_string(),
+            )
+        })?;
+    let verification_methods = owner
+        .get("verificationMethod")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            SnBnsProxyError::OwnerAuthorization(
+                "owner document verification methods are missing".to_string(),
+            )
+        })?;
+
+    let equivalent = |left: &str, right: &str| {
+        left == right
+            || left
+                .strip_prefix(owner_did)
+                .is_some_and(|suffix| suffix == right)
+            || right
+                .strip_prefix(owner_did)
+                .is_some_and(|suffix| suffix == left)
+    };
+    let mut keys = Vec::new();
+    for method in verification_methods {
+        let Some(method_id) = method.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        if !authentication
+            .iter()
+            .filter_map(Value::as_str)
+            .any(|reference| equivalent(reference, method_id))
+        {
+            continue;
+        }
+        if requested_kid.is_some_and(|kid| !equivalent(kid, method_id)) {
+            continue;
+        }
+        let Some(jwk_value) = method.get("publicKeyJwk") else {
+            continue;
+        };
+        let Ok(jwk) = serde_json::from_value::<Jwk>(jwk_value.clone()) else {
+            continue;
+        };
+        if let Ok(key) = DecodingKey::from_jwk(&jwk) {
+            keys.push(key);
+        }
+    }
+    if keys.is_empty() {
+        return Err(SnBnsProxyError::OwnerAuthorization(
+            "no usable current owner authentication key matched the JWT kid".to_string(),
+        ));
+    }
+    Ok(keys)
+}
+
+fn verify_remove_bound_zone_authorization(
+    owner_document: &Value,
+    token: &str,
+    expected_name: &str,
+    expected_zone_did: &str,
+    expected_owner_hash: &str,
+    expected_request_id: &str,
+) -> SnBnsProxyResult<()> {
+    let expected_sub = format!("did:bns:{expected_name}");
+    if owner_document.get("id").and_then(Value::as_str) != Some(expected_sub.as_str()) {
+        return Err(SnBnsProxyError::OwnerAuthorization(format!(
+            "owner document id does not match `{expected_sub}`"
+        )));
+    }
+    let header = decode_header(token).map_err(|error| {
+        SnBnsProxyError::OwnerAuthorization(format!("invalid JWT header: {error}"))
+    })?;
+    if header.alg != Algorithm::EdDSA {
+        return Err(SnBnsProxyError::OwnerAuthorization(
+            "owner authorization must use EdDSA".to_string(),
+        ));
+    }
+    let keys = owner_authentication_keys(owner_document, header.kid.as_deref())?;
+    let mut validation = Validation::new(Algorithm::EdDSA);
+    validation.leeway = OWNER_AUTHORIZATION_LEEWAY_SECS;
+    validation.set_audience(&[OWNER_REMOVE_BOUND_ZONE_AUD]);
+    validation.set_required_spec_claims(&["sub", "aud", "iat", "exp"]);
+
+    let claims = keys
+        .iter()
+        .find_map(|key| {
+            decode::<RemoveBoundZoneAuthorizationClaims>(token, key, &validation)
+                .ok()
+                .map(|data| data.claims)
+        })
+        .ok_or_else(|| {
+            SnBnsProxyError::OwnerAuthorization(
+                "signature does not match a current owner authentication key".to_string(),
+            )
+        })?;
+    let now = now_secs();
+    if claims.exp < claims.iat
+        || claims.exp.saturating_sub(claims.iat) > OWNER_AUTHORIZATION_MAX_TTL_SECS
+        || claims.iat > now.saturating_add(OWNER_AUTHORIZATION_LEEWAY_SECS)
+    {
+        return Err(SnBnsProxyError::OwnerAuthorization(
+            "owner authorization time window is invalid".to_string(),
+        ));
+    }
+    if claims.sub != expected_sub
+        || claims.aud != OWNER_REMOVE_BOUND_ZONE_AUD
+        || claims.operation != "owner.remove_bound_zone"
+        || claims.name != expected_name
+        || claims.zone_did != expected_zone_did
+        || claims.expected_owner_hash != expected_owner_hash
+        || claims.request_id != expected_request_id
+    {
+        return Err(SnBnsProxyError::OwnerAuthorization(
+            "owner authorization claims do not match the request".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 fn build_initial_documents(
     initial: &SnBnsProxyInitialDocuments,
 ) -> SnBnsProxyResult<Vec<DocumentUpdate>> {
@@ -1000,9 +1256,11 @@ fn now_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine as _;
     use bns_client::{
-        BnsApplyMutationsReq, BnsClientResult, BnsEvmTxSubmission, BnsIndexerApi, BnsIndexerClient,
-        BnsPublishDocumentReq, BnsRegisterNameReq, MemorySnBnsWriteRequestStore,
+        BnsApplyMutationsReq, BnsClientResult, BnsEvmPreparedTx, BnsEvmTxSubmission, BnsIndexerApi,
+        BnsIndexerClient, BnsPublishDocumentReq, BnsRegisterNameReq, MemorySnBnsWriteRequestStore,
         SnBnsControllerConfig, SnBnsEvmSubmitter,
     };
     use bns_indexer::{
@@ -1014,6 +1272,127 @@ mod tests {
     const CONTROLLER_A: &str = "0xcccccccccccccccccccccccccccccccccccccc01";
     const CONTROLLER_B: &str = "0xcccccccccccccccccccccccccccccccccccccc02";
     const USER_OWNER: &str = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    fn owner_authorization_fixture() -> (Value, jsonwebtoken::EncodingKey) {
+        use ring::signature::KeyPair as _;
+
+        let seed = [7_u8; 32];
+        let pair = ring::signature::Ed25519KeyPair::from_seed_unchecked(&seed).unwrap();
+        let public_key = URL_SAFE_NO_PAD.encode(pair.public_key().as_ref());
+        let mut pkcs8 = vec![
+            0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x04, 0x22,
+            0x04, 0x20,
+        ];
+        pkcs8.extend_from_slice(&seed);
+        let document = json!({
+            "id": "did:bns:alice",
+            "verificationMethod": [{
+                "id": "did:bns:alice#owner-key",
+                "type": "JsonWebKey2020",
+                "controller": "did:bns:alice",
+                "publicKeyJwk": {
+                    "kty": "OKP",
+                    "crv": "Ed25519",
+                    "x": public_key
+                }
+            }],
+            "authentication": ["#owner-key"]
+        });
+        (document, jsonwebtoken::EncodingKey::from_ed_der(&pkcs8))
+    }
+
+    fn owner_authorization_token(key: &jsonwebtoken::EncodingKey, ttl_secs: u64) -> String {
+        let now = now_secs();
+        let claims = RemoveBoundZoneAuthorizationClaims {
+            sub: "did:bns:alice".to_string(),
+            aud: OWNER_REMOVE_BOUND_ZONE_AUD.to_string(),
+            operation: "owner.remove_bound_zone".to_string(),
+            name: "alice".to_string(),
+            zone_did: "did:web:zone-a.example".to_string(),
+            expected_owner_hash:
+                "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                    .to_string(),
+            request_id: "remove-zone-1".to_string(),
+            iat: now,
+            exp: now + ttl_secs,
+        };
+        let mut header = jsonwebtoken::Header::new(Algorithm::EdDSA);
+        header.kid = Some("#owner-key".to_string());
+        jsonwebtoken::encode(&header, &claims, key).unwrap()
+    }
+
+    #[test]
+    fn owner_authorization_binds_signature_and_all_cas_fields() {
+        let (document, key) = owner_authorization_fixture();
+        let token = owner_authorization_token(&key, 60);
+        let hash = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+        verify_remove_bound_zone_authorization(
+            &document,
+            &token,
+            "alice",
+            "did:web:zone-a.example",
+            hash,
+            "remove-zone-1",
+        )
+        .unwrap();
+
+        assert!(verify_remove_bound_zone_authorization(
+            &document,
+            &token,
+            "alice",
+            "did:web:zone-b.example",
+            hash,
+            "remove-zone-1",
+        )
+        .is_err());
+        assert!(verify_remove_bound_zone_authorization(
+            &document,
+            &token,
+            "alice",
+            "did:web:zone-a.example",
+            "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+            "remove-zone-1",
+        )
+        .is_err());
+        assert!(verify_remove_bound_zone_authorization(
+            &document,
+            &token,
+            "alice",
+            "did:web:zone-a.example",
+            hash,
+            "remove-zone-2",
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn owner_authorization_rejects_non_authentication_key_and_long_ttl() {
+        let (mut document, key) = owner_authorization_fixture();
+        let token = owner_authorization_token(&key, 60);
+        document["authentication"] = json!(["#another-key"]);
+        assert!(verify_remove_bound_zone_authorization(
+            &document,
+            &token,
+            "alice",
+            "did:web:zone-a.example",
+            "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "remove-zone-1",
+        )
+        .is_err());
+
+        let (document, key) = owner_authorization_fixture();
+        let token = owner_authorization_token(&key, OWNER_AUTHORIZATION_MAX_TTL_SECS + 1);
+        assert!(verify_remove_bound_zone_authorization(
+            &document,
+            &token,
+            "alice",
+            "did:web:zone-a.example",
+            "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "remove-zone-1",
+        )
+        .is_err());
+    }
 
     #[derive(Default)]
     struct RecordingEvmSubmitter {
@@ -1027,46 +1406,50 @@ mod tests {
             self.registrations.lock().unwrap().clone()
         }
 
-        fn submission(&self) -> BnsEvmTxSubmission {
+        fn prepared(&self) -> BnsEvmPreparedTx {
             let mut next_nonce = self.next_nonce.lock().unwrap();
             let nonce = *next_nonce;
             *next_nonce += 1;
-            BnsEvmTxSubmission {
+            BnsEvmPreparedTx {
                 tx_hash: format!("0x{nonce:064x}"),
                 raw_tx: format!("0x{nonce:02x}"),
                 from: CONTROLLER_A.to_string(),
                 nonce,
                 chain_id: 31_337,
-                receipt_status: None,
-                receipt_block_number: None,
-                receipt_confirmations: None,
             }
         }
     }
 
     #[async_trait]
     impl SnBnsEvmSubmitter for RecordingEvmSubmitter {
-        async fn register_name(
+        async fn prepare_register_name(
             &self,
             req: &BnsRegisterNameReq,
-        ) -> BnsClientResult<BnsEvmTxSubmission> {
+        ) -> BnsClientResult<BnsEvmPreparedTx> {
             self.registrations.lock().unwrap().push(req.clone());
-            Ok(self.submission())
+            Ok(self.prepared())
         }
 
-        async fn apply_mutations(
+        async fn prepare_apply_mutations(
             &self,
             _req: &BnsApplyMutationsReq,
-        ) -> BnsClientResult<BnsEvmTxSubmission> {
-            Ok(self.submission())
+        ) -> BnsClientResult<BnsEvmPreparedTx> {
+            Ok(self.prepared())
         }
 
-        async fn publish_document(
+        async fn prepare_publish_document(
             &self,
             req: &BnsPublishDocumentReq,
-        ) -> BnsClientResult<BnsEvmTxSubmission> {
+        ) -> BnsClientResult<BnsEvmPreparedTx> {
             self.published.lock().unwrap().push(req.clone());
-            Ok(self.submission())
+            Ok(self.prepared())
+        }
+
+        async fn submit_prepared(
+            &self,
+            prepared: &BnsEvmPreparedTx,
+        ) -> BnsClientResult<BnsEvmTxSubmission> {
+            Ok(prepared.submission())
         }
     }
 
@@ -1150,6 +1533,19 @@ mod tests {
         let (fresh, _) = two_controller_proxy(fresh_bindings);
         let recomputed = fresh.assign_controller_for_user("alice").await.unwrap();
         assert_eq!(recomputed.controller_id, first.controller_id);
+    }
+
+    #[tokio::test]
+    async fn controller_assignment_rejects_non_canonical_names_without_writing() {
+        let bindings: SnBnsControllerBindingStoreRef =
+            Arc::new(MemorySnBnsControllerBindingStore::new());
+        let (proxy, _) = two_controller_proxy(bindings.clone());
+
+        let error = proxy.assign_controller_for_user("Alice").await.unwrap_err();
+
+        assert!(matches!(error, SnBnsProxyError::InvalidInput(_)));
+        assert!(bindings.get_binding("Alice").await.unwrap().is_none());
+        assert!(bindings.get_binding("alice").await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -1288,7 +1684,7 @@ mod tests {
     async fn register_bootstrap_rejects_invalid_asset_owner() {
         let bindings: SnBnsControllerBindingStoreRef =
             Arc::new(MemorySnBnsControllerBindingStore::new());
-        let (proxy, submitter) = two_controller_proxy(bindings);
+        let (proxy, submitter) = two_controller_proxy(bindings.clone());
         let error = proxy
             .register_bootstrap(SnBnsProxyRegisterParams {
                 request_id: "sn:register:alice".to_string(),
@@ -1301,6 +1697,54 @@ mod tests {
             .unwrap_err();
         assert!(matches!(error, SnBnsProxyError::InvalidInput(_)));
         assert!(submitter.registrations().is_empty());
+        assert!(bindings.get_binding("alice").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn register_bootstrap_validates_documents_before_writing_binding() {
+        let bindings: SnBnsControllerBindingStoreRef =
+            Arc::new(MemorySnBnsControllerBindingStore::new());
+        let (proxy, submitter) = two_controller_proxy(bindings.clone());
+
+        let error = proxy
+            .register_bootstrap(SnBnsProxyRegisterParams {
+                request_id: "sn:register:alice".to_string(),
+                name: "alice".to_string(),
+                asset_owner: USER_OWNER.to_string(),
+                owner_config: json!({}),
+                initial_documents: SnBnsProxyInitialDocuments {
+                    zone: Some(json!("not-an-object")),
+                    boot: None,
+                    dns_txt: None,
+                },
+            })
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, SnBnsProxyError::InvalidInput(_)));
+        assert!(submitter.registrations().is_empty());
+        assert!(bindings.get_binding("alice").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn remove_bound_zone_resolves_before_writing_binding() {
+        let bindings: SnBnsControllerBindingStoreRef =
+            Arc::new(MemorySnBnsControllerBindingStore::new());
+        let (proxy, _) = two_controller_proxy(bindings.clone());
+
+        let error = proxy
+            .remove_bound_zone(
+                "alice",
+                "owner-unbind:test".to_string(),
+                "did:bns:alice".to_string(),
+                format!("sha256:{}", "0".repeat(64)),
+                "not-a-jwt".to_string(),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, SnBnsProxyError::Write(_)));
+        assert!(bindings.get_binding("alice").await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -1311,9 +1755,11 @@ mod tests {
         assert!(strict.default_asset_owner_for_user("alice").await.is_err());
 
         let submitter = Arc::new(RecordingEvmSubmitter::default());
+        let devtest_bindings: SnBnsControllerBindingStoreRef =
+            Arc::new(MemorySnBnsControllerBindingStore::new());
         let devtest = SnBnsProxy::new(
             vec![controller_entry("controller-a", CONTROLLER_A, 1, submitter)],
-            Arc::new(MemorySnBnsControllerBindingStore::new()),
+            devtest_bindings.clone(),
             SnBnsProxyOperation::all().into_iter().collect(),
             false,
         )
@@ -1322,6 +1768,11 @@ mod tests {
             devtest.default_asset_owner_for_user("alice").await.unwrap(),
             CONTROLLER_A
         );
+        assert!(devtest_bindings
+            .get_binding("alice")
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]

@@ -1,0 +1,16 @@
+stacks:
+  web_https:
+    bind: 0.0.0.0:443
+    protocol: tls
+    hosts:
+      - host: "YOUR_DOMAIN"
+        cert_path: "/PATH/TO/FULLCHAIN.PEM"
+        key_path: "/PATH/TO/PRIVATE_KEY.PEM"
+    hook_point:
+      main:
+        priority: 1
+        blocks:
+          default:
+            priority: 1
+            block: |
+              return "forward tcp:///127.0.0.1:80";

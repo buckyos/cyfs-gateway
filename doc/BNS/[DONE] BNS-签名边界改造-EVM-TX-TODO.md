@@ -137,7 +137,7 @@ BNS(合约) <-> BNS-Indexer <-> BNS-Server <-> BNS-Client <-> BNS-Controller
 - [x] **Standard Client**（= BNS-Client 薄封装，无私钥）：入参为**已签名 raw TX 字节**，`eth_sendRawTransaction` 提交；另提供 `build_calldata`/`build_unsigned_tx` helper 给外部签名方。读走索引器。
 - [x] **Controller Client**（= BNS-Controller，托管私钥，自动签名）：持 secp256k1 私钥，自动查 nonce → 填 chainId/to/gas → ABI 编码 → 签名 → 提交。仅在 Client 判断持有对应 control 公钥时走此路径。
   - [x] 迁移 `sn_bns_controller.rs`：通过 EVM write backend 构造合约 op → Controller Client 自动签名提交；旧 `CallAuthority` RPC 写 backend 已删除（仅剩 `EvmSnBnsWriteBackend`）。
-  - [x] 幂等元数据：`SnBnsWriteRequestStore` 增加 `evm_chain_id` / `evm_nonce` / `evm_tx_hash` / `evm_raw_tx` 字段，避免后续迁移时重复提交信息丢失。
+  - [x] request-id 交易恢复：签名前不落库；完整 raw TX 以 `Sending` 持久化后再广播，节点接受后转 `Pending`，receipt 决定 `Succeeded/Reverted`。SN 开放业务前逐条恢复全部 `Sending/Pending`，重放只查询或重发相同 raw TX；单条恢复失败隔离并记录 error，不阻塞 SN 启动或其他用户。损坏/不完整历史记录优先从 raw TX 修复；无法修复时隔离，同 `request_id` 重试经链上 `NotFound` 确认后才清理并重走业务。
   - [x] nonce 管理基础：Controller Client 本地缓存 pending nonce。
   - [x] nonce 管理增强：签名/提交失败回退重查、Controller Client 内串行化提交避免并发 nonce 冲突、可选等待 `eth_getTransactionReceipt` 确认上链与确认数。
 

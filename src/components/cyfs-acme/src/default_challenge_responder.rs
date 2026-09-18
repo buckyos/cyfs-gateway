@@ -26,6 +26,13 @@ impl AcmeChallengeResponder for DefaultChallengeResponder {
         }
     }
 
+    fn propagation_delay(&self, challenge: &Challenge) -> std::time::Duration {
+        self.cert_mgr
+            .upgrade()
+            .map(|cert_mgr| cert_mgr.challenge_propagation_delay(challenge))
+            .unwrap_or(std::time::Duration::ZERO)
+    }
+
     fn revert_challenge(&self, challenge: &Challenge) {
         if let Some(cert_mgr) = self.cert_mgr.upgrade() {
             cert_mgr.revert_challenge(challenge);

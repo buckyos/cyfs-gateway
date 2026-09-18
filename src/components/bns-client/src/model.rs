@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fmt;
@@ -454,6 +455,24 @@ pub struct NameState {
 }
 
 impl NameState {
+    /// Return the effective lifecycle status without mutating the projected
+    /// contract state. Contract events cannot fire merely because wall-clock
+    /// time crossed `expire_at`, so readers must derive this at query time.
+    pub fn effective_status_at(&self, now: u64) -> NameStatus {
+        if self.status == NameStatus::Active && self.expire_at != 0 && now >= self.expire_at {
+            NameStatus::Expired
+        } else {
+            self.status
+        }
+    }
+
+    pub fn materialize_status_at(&mut self, now: u64) {
+        self.status = self.effective_status_at(now);
+        if self.status != NameStatus::Active {
+            self.standard_transfer_enabled = false;
+        }
+    }
+
     pub fn validate(&self) -> BnsRegistryResult<()> {
         canonical_bns_name(&self.name)?;
         if self.asset_owner.is_empty() {
@@ -493,6 +512,21 @@ pub struct DocumentState {
 }
 
 impl DocumentState {
+    pub fn effective_status_at(&self, name_status: NameStatus, now: u64) -> DocumentStatus {
+        if name_status == NameStatus::Tombstoned {
+            return DocumentStatus::Tombstoned;
+        }
+        if self.status != DocumentStatus::Active {
+            return self.status;
+        }
+        if matches!(name_status, NameStatus::Expired | NameStatus::Released)
+            || (self.expire_at != 0 && now >= self.expire_at)
+        {
+            return DocumentStatus::Expired;
+        }
+        DocumentStatus::Active
+    }
+
     pub fn validate(&self) -> BnsRegistryResult<()> {
         canonical_bns_name(&self.name)?;
         canonical_doc_type(&self.doc_type)?;
@@ -676,6 +710,23 @@ pub struct ResolveResult {
     pub alias_kind: AliasKind,
     pub alias_target_did: String,
     pub proof_root: String,
+}
+
+impl ResolveResult {
+    /// Derive the status used for current resolution while preserving the raw
+    /// `document_state.status` for history and audit queries.
+    pub fn effective_status_at(&self, now: u64) -> DocumentStatus {
+        let name_status = self.name_state.effective_status_at(now);
+        if self.status != DocumentStatus::Active {
+            return self.status;
+        }
+        self.document_state.effective_status_at(name_status, now)
+    }
+
+    pub fn materialize_status_at(&mut self, now: u64) {
+        self.status = self.effective_status_at(now);
+        self.name_state.materialize_status_at(now);
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1080,6 +1131,50 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
 
 pub fn hash_json<T: Serialize + ?Sized>(value: &T) -> BnsRegistryResult<String> {
     Ok(sha256_hex(&serde_json::to_vec(value)?))
+}
+
+/// Hash JSON using RFC 8785 JCS so Rust and JavaScript produce identical
+/// bytes for object key ordering and IEEE-754 number formatting.
+pub fn canonical_json_sha256(value: &Value) -> BnsRegistryResult<String> {
+    fn validate_numbers(value: &Value) -> BnsRegistryResult<()> {
+        match value {
+            Value::Object(object) => {
+                for child in object.values() {
+                    validate_numbers(child)?;
+                }
+            }
+            Value::Array(values) => {
+                for child in values {
+                    validate_numbers(child)?;
+                }
+            }
+            Value::Number(number) => {
+                let exactly_representable = if let Some(number) = number.as_i64() {
+                    (number as f64) as i128 == i128::from(number)
+                } else if let Some(number) = number.as_u64() {
+                    (number as f64) as i128 == i128::from(number)
+                } else {
+                    number.as_f64().is_some_and(|number| {
+                        number.is_finite() && !(number == 0.0 && number.is_sign_negative())
+                    })
+                };
+                if !exactly_representable {
+                    return Err(BnsRegistryError::InvalidMutation(format!(
+                        "JSON number `{number}` is not an exact non-negative-zero IEEE-754 value"
+                    )));
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    validate_numbers(value)?;
+    let bytes = serde_jcs::to_vec(value).map_err(|error| {
+        BnsRegistryError::InvalidMutation(format!("invalid RFC 8785 JSON: {error}"))
+    })?;
+    let digest = Sha256::digest(bytes);
+    Ok(format!("sha256:{}", hex::encode(digest)))
 }
 
 pub fn authority_root(keys: &[AuthorityKey], now: u64) -> BnsRegistryResult<(String, u32)> {

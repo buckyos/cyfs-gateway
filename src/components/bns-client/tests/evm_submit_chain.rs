@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use bns_client::{
-    BnsClientError, BnsClientResult, BnsEvmClientConfig, BnsEvmControllerClient,
+    BnsClientError, BnsClientResult, BnsEvmClientConfig, BnsEvmControllerClient, BnsEvmPreparedTx,
     BnsEvmRawTxSubmitter, BnsEvmReceiptWaitConfig, BnsEvmStandardClient, BnsIndexerApi,
     BnsPrepareTxReq, BnsPrepareTxResp, BnsRegisterNameReq, BnsSubmitRawTxReq, BnsSubmitRawTxResp,
     BnsTxExecutionState, BnsTxState,
@@ -315,24 +315,52 @@ async fn controller_auto_nonce_signs_and_submits_via_bns_server() {
         .await
         .unwrap();
 
-    // 返回的提交回执：from = 托管私钥地址，nonce = 链上 5，chainId = 31337，tx hash 来自 server。
+    // 返回的提交回执：from = 托管私钥地址，nonce = 链上 5，chainId = 31337。
     assert_eq!(
         submission.from.to_lowercase(),
         format!("{ANVIL_ADDRESS:#x}")
     );
     assert_eq!(submission.nonce, 5);
     assert_eq!(submission.chain_id, 31_337);
-    assert_eq!(submission.tx_hash, SERVER_TX_HASH);
 
     // raw TX 经 server 转发；独立解码后恢复出的 signer == 托管私钥地址（链上 msg.sender 一致）。
     let received = server.received();
     assert_eq!(received.len(), 1);
     let decoded = decode_signed_eip1559(&received[0]).unwrap();
+    assert_eq!(submission.tx_hash, format!("{:#x}", decoded.hash()));
     assert_eq!(decoded.recover_signer().unwrap(), ANVIL_ADDRESS);
     assert_eq!(decoded.tx().nonce, 5);
     assert_eq!(decoded.tx().chain_id, 31_337);
+    assert_eq!(decoded.tx().gas_limit, 120_000);
+    assert_eq!(decoded.tx().max_fee_per_gas, 3_000_000_000);
+    assert_eq!(decoded.tx().max_priority_fee_per_gas, 1_000_000_000);
     // 没有走 eth_sendRawTransaction（提交目标是 server，不是链 RPC）。
     assert!(eth.sent().is_empty());
+}
+
+#[tokio::test]
+async fn controller_can_override_bns_server_suggestion_with_zero_fees() {
+    let eth = MockEthRpc::start(5).await;
+    let server = Arc::new(CapturingBnsServer::new());
+    let controller = BnsEvmControllerClient::new_with_bns_server_submitter(
+        config(&eth.endpoint),
+        Arc::new(bns_client::StaticBnsEvmKeyManager::new(ANVIL_PRIVATE_KEY).unwrap()),
+        server.clone(),
+    )
+    .with_zero_fee_override(true);
+
+    let submission = controller
+        .register_name(&register_req("alice"))
+        .await
+        .unwrap();
+
+    assert_eq!(submission.nonce, 5);
+    let received = server.received();
+    assert_eq!(received.len(), 1);
+    let decoded = decode_signed_eip1559(&received[0]).unwrap();
+    assert_eq!(decoded.tx().gas_limit, 120_000);
+    assert_eq!(decoded.tx().max_fee_per_gas, 0);
+    assert_eq!(decoded.tx().max_priority_fee_per_gas, 0);
 }
 
 #[tokio::test]
@@ -519,12 +547,22 @@ async fn controller_with_explicit_chain_rpc_submitter_uses_chain() {
         .await
         .unwrap();
     assert_eq!(submission.nonce, 2);
-    assert_eq!(submission.tx_hash, SERVER_TX_HASH);
 
     let sent = eth.sent();
     assert_eq!(sent.len(), 1);
     // 链上收到的 raw 与回执里的 raw 一致。
     assert_eq!(sent[0].to_lowercase(), submission.raw_tx.to_lowercase());
+    let raw = hex::decode(submission.raw_tx.trim_start_matches("0x")).unwrap();
+    let decoded = decode_signed_eip1559(&raw).unwrap();
+    assert_eq!(submission.tx_hash, format!("{:#x}", decoded.hash()));
+    let reconstructed = BnsEvmPreparedTx::from_raw_tx(submission.raw_tx.clone()).unwrap();
+    assert_eq!(reconstructed.tx_hash, submission.tx_hash);
+    assert_eq!(reconstructed.raw_tx, submission.raw_tx);
+    assert!(reconstructed
+        .from
+        .eq_ignore_ascii_case(ANVIL_ADDRESS.to_string().as_str()));
+    assert_eq!(reconstructed.nonce, submission.nonce);
+    assert_eq!(reconstructed.chain_id, submission.chain_id);
     let raw_bytes = hex::decode(sent[0].trim_start_matches("0x")).unwrap();
     assert_eq!(
         decode_signed_eip1559(&raw_bytes)

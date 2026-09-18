@@ -41,6 +41,8 @@ impl StreamListener for TcpStreamListener {
             TunnelEndpoint {
                 device_id: addr.ip().to_string(),
                 port: addr.port(),
+                canonical_device_id: None,
+                identity_trust: None,
             },
         ))
     }

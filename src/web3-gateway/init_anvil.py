@@ -469,7 +469,6 @@ def configure_sn_bns_proxy(current_dir: Path, contract: str) -> None:
             "bns_chain_id": str(BNS_CHAIN_ID),
             "bns_contract_address": contract,
             "bns_server_url": BNS_SERVER_URL,
-            "bns_rpc_url": BNS_SERVER_URL,
         }
     )
     temporary_path = params_path.with_suffix(".json.tmp")
@@ -481,7 +480,7 @@ def configure_sn_bns_proxy(current_dir: Path, contract: str) -> None:
         raise RuntimeError(
             f"cannot configure SN BNS proxy: gateway config not found at {gateway_path}"
         )
-    print(f"Configured SN BNS RPC runtime value in {params_path}")
+    print(f"Configured SN BNS server runtime value in {params_path}")
 
 
 def main() -> int:

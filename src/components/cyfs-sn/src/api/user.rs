@@ -70,17 +70,6 @@ async fn ensure_owned_runtime_device(
         ));
     }
 
-    if let Some(device) = server
-        .compat_store()
-        .query_device_by_did(device_did)
-        .await
-        .into_rpc()?
-    {
-        if device.owner == username {
-            return Ok(());
-        }
-    }
-
     Err(parse_error(
         SnApiErrorCode::DevicePermissionDenied,
         "device has no permission",

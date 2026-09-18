@@ -70,7 +70,7 @@ contract BnsRegistrationFacet is BnsCore {
         }
 
         NameState storage latest = _names[nameHash];
-        AuthoritySetState memory finalSet = _authoritySets[nameHash];
+        AuthoritySetState memory finalSet = _authoritySets[_lineageStateKey(nameHash)];
         return (latest.nameSeq, finalSet.authoritySeq, finalSet.authorityRoot);
     }
 }

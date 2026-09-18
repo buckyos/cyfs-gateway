@@ -10,6 +10,7 @@ pub mod dns_document;
 mod error;
 mod evm;
 pub mod model;
+mod read_cache;
 mod rpc;
 mod sn_bns_controller;
 mod sn_bns_store;

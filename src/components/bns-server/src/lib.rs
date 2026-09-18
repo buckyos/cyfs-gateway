@@ -23,7 +23,7 @@ use bns_client::{
     METHOD_QUERY_TX_STATE, METHOD_RESOLVE_DOCUMENT, METHOD_RESOLVE_OWNER, METHOD_SUBMIT_RAW_TX,
     METHOD_SYSTEM_INFO,
 };
-use bns_evm::{Address, EthRpcClient, B256};
+use bns_evm::{Address, BnsChainClient, EthRpcClient, TransactionLookup, B256};
 use bns_indexer::{
     canonical_bns_name, canonical_doc_type, did_bns_from_name, is_top_level_name,
     name_from_did_bns, now_timestamp, parent_name, AliasKind, AuthorityKey, AuthoritySetState,
@@ -42,6 +42,8 @@ use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full};
 use kRPC::{RPCErrors, RPCHandler, RPCRequest, RPCResponse, RPCResult};
 use log::warn;
+use name_client::document_iat;
+use name_lib::{DIDDocumentTrait, DeviceDocument, EncodedDocument, OwnerDocument, ZoneDocument, DID};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use serde_json::{json, Map, Value};
@@ -59,7 +61,7 @@ where
     S: BnsRegistryStore,
 {
     store: S,
-    eth_rpc: EthRpcClient,
+    chain_client: Arc<BnsChainClient>,
     contract_address: Option<String>,
     expected_chain_id: Option<u64>,
 }
@@ -71,7 +73,7 @@ where
     pub fn new(store: S, evm_rpc_endpoint: impl Into<String>) -> Self {
         Self {
             store,
-            eth_rpc: EthRpcClient::new(evm_rpc_endpoint),
+            chain_client: Arc::new(BnsChainClient::new(evm_rpc_endpoint)),
             contract_address: None,
             expected_chain_id: None,
         }
@@ -85,7 +87,21 @@ where
     ) -> Self {
         Self {
             store,
-            eth_rpc: EthRpcClient::new(evm_rpc_endpoint),
+            chain_client: Arc::new(BnsChainClient::new(evm_rpc_endpoint)),
+            contract_address: Some(contract_address.into()),
+            expected_chain_id: Some(chain_id),
+        }
+    }
+
+    pub fn new_with_chain_client(
+        store: S,
+        chain_client: Arc<BnsChainClient>,
+        contract_address: impl Into<String>,
+        chain_id: u64,
+    ) -> Self {
+        Self {
+            store,
+            chain_client,
             contract_address: Some(contract_address.into()),
             expected_chain_id: Some(chain_id),
         }
@@ -96,7 +112,11 @@ where
     }
 
     pub fn evm_rpc(&self) -> &EthRpcClient {
-        &self.eth_rpc
+        self.chain_client.rpc()
+    }
+
+    pub fn chain_client(&self) -> &Arc<BnsChainClient> {
+        &self.chain_client
     }
 }
 
@@ -112,11 +132,14 @@ where
         let contract = self.contract_address.as_deref().ok_or_else(|| {
             BnsClientError::unsupported("BNS server contract_address is not configured")
         })?;
-        let contract = Address::from_str(contract).map_err(|error| {
-            BnsClientError::Serialization(format!("invalid BNS contract_address: {error}"))
-        })?;
+        let contract = match self.chain_client.contract_address() {
+            Some(contract) => contract,
+            None => Address::from_str(contract).map_err(|error| {
+                BnsClientError::Serialization(format!("invalid BNS contract_address: {error}"))
+            })?,
+        };
         let actual_chain_id = self
-            .eth_rpc
+            .chain_client
             .chain_id()
             .await
             .map_err(BnsClientError::from)?;
@@ -139,13 +162,13 @@ where
 
     async fn query_name_state(&self, name: &str) -> BnsClientResult<Option<NameState>> {
         self.store
-            .transact(|tx| projection_query_name_state(tx, name))
+            .transact(|tx| projection_query_name_state(tx, name, now_timestamp()))
             .map_err(Into::into)
     }
 
     async fn resolve_owner(&self, name: &str) -> BnsClientResult<OwnerResolution> {
         self.store
-            .transact(|tx| projection_resolve_owner(tx, name))
+            .transact(|tx| projection_resolve_owner(tx, name, now_timestamp()))
             .map_err(Into::into)
     }
 
@@ -173,7 +196,7 @@ where
 
     async fn resolve_document(&self, name: &str, doc_type: &str) -> BnsClientResult<ResolveResult> {
         self.store
-            .transact(|tx| projection_resolve_document(tx, name, doc_type))
+            .transact(|tx| projection_resolve_document(tx, name, doc_type, now_timestamp()))
             .map_err(Into::into)
     }
 
@@ -235,58 +258,60 @@ where
             BnsClientError::Serialization(format!("invalid tx_hash `{tx_hash}`: {error}"))
         })?;
         let canonical_hash = format!("{hash:#x}");
-        if let Some(receipt) = self
-            .eth_rpc
-            .transaction_receipt(hash)
+        let lookup = self
+            .chain_client
+            .transaction_lookup(hash)
             .await
-            .map_err(BnsClientError::from)?
-        {
-            let block_number = receipt.block_number;
-            let confirmations = match block_number {
-                Some(block_number) => self
-                    .eth_rpc
-                    .block_number()
-                    .await
-                    .map_err(BnsClientError::from)?
-                    .checked_sub(block_number)
-                    .map_or(0, |depth| depth.saturating_add(1)),
-                None => 0,
-            };
-            return Ok(BnsTxState {
+            .map_err(BnsClientError::from)?;
+        match lookup {
+            TransactionLookup::Mined(receipt) => {
+                let block_number = receipt.block_number;
+                let confirmations = match block_number {
+                    Some(block_number) => {
+                        let latest_block = match self.chain_client.cached_latest_block() {
+                            Some(head) => head.number.unwrap_or(0),
+                            None => self
+                                .chain_client
+                                .block_number()
+                                .await
+                                .map_err(BnsClientError::from)?,
+                        };
+                        latest_block
+                            .checked_sub(block_number)
+                            .map_or(0, |depth| depth.saturating_add(1))
+                    }
+                    None => 0,
+                };
+                Ok(BnsTxState {
+                    tx_hash: canonical_hash,
+                    state: if receipt.status == Some(0) {
+                        BnsTxExecutionState::Reverted
+                    } else {
+                        BnsTxExecutionState::Succeeded
+                    },
+                    block_number,
+                    confirmations,
+                })
+            }
+            TransactionLookup::Pending => Ok(BnsTxState {
                 tx_hash: canonical_hash,
-                state: if receipt.status == Some(0) {
-                    BnsTxExecutionState::Reverted
-                } else {
-                    BnsTxExecutionState::Succeeded
-                },
-                block_number,
-                confirmations,
-            });
+                state: BnsTxExecutionState::Pending,
+                block_number: None,
+                confirmations: 0,
+            }),
+            TransactionLookup::NotFound => Ok(BnsTxState {
+                tx_hash: canonical_hash,
+                state: BnsTxExecutionState::NotFound,
+                block_number: None,
+                confirmations: 0,
+            }),
         }
-
-        let state = if self
-            .eth_rpc
-            .transaction_by_hash(hash)
-            .await
-            .map_err(BnsClientError::from)?
-            .is_some()
-        {
-            BnsTxExecutionState::Pending
-        } else {
-            BnsTxExecutionState::NotFound
-        };
-        Ok(BnsTxState {
-            tx_hash: canonical_hash,
-            state,
-            block_number: None,
-            confirmations: 0,
-        })
     }
 
     async fn submit_raw_tx(&self, req: BnsSubmitRawTxReq) -> BnsClientResult<BnsSubmitRawTxResp> {
         let raw_tx = req.raw_tx_bytes()?;
         let tx_hash = self
-            .eth_rpc
+            .chain_client
             .send_raw_transaction(&raw_tx)
             .await
             .map_err(BnsClientError::from)?;
@@ -305,18 +330,18 @@ where
         })?;
         let calldata = req.calldata_bytes()?;
         let nonce = self
-            .eth_rpc
+            .chain_client
             .transaction_count(from)
             .await
             .map_err(BnsClientError::from)?;
         let estimated_gas = self
-            .eth_rpc
+            .chain_client
             .estimate_gas(from, contract, calldata.as_slice())
             .await
             .map_err(BnsClientError::from)?;
         let gas_buffer = estimated_gas / 5 + u64::from(estimated_gas % 5 != 0);
         let fees = self
-            .eth_rpc
+            .chain_client
             .suggest_eip1559_fees()
             .await
             .map_err(BnsClientError::from)?;
@@ -619,6 +644,23 @@ where
             BnsContractServerHandler::new_with_chain_config(
                 store,
                 evm_rpc_endpoint,
+                contract_address,
+                chain_id,
+            ),
+            BnsIndexerHttpServerConfig::default().with_rpc_path(BNS_SERVER_RPC_PATH),
+        )
+    }
+
+    pub fn from_contract_store_with_chain_client(
+        store: S,
+        chain_client: Arc<BnsChainClient>,
+        contract_address: impl Into<String>,
+        chain_id: u64,
+    ) -> Self {
+        Self::with_config(
+            BnsContractServerHandler::new_with_chain_client(
+                store,
+                chain_client,
                 contract_address,
                 chain_id,
             ),
@@ -990,7 +1032,7 @@ async fn serve_did_resolver_request<T: BnsIndexerApi>(
         );
     }
 
-    match api.resolve_document(&name, &doc_type).await {
+    match resolve_bns_identity(api, &name, &doc_type).await {
         Ok(result) => {
             let status = did_resolver_document_status(&result, now_timestamp());
             did_resolution_state_response(&doc_type, status, Some(&result))
@@ -1023,6 +1065,207 @@ async fn serve_did_resolver_request<T: BnsIndexerApi>(
         // 5xx — never as Missing/Revoked (protocol §5).
         Err(error) => did_resolution_failure_response(did, &doc_type, &error),
     }
+}
+
+async fn resolve_bns_identity<T: BnsIndexerApi>(
+    api: &T,
+    name: &str,
+    doc_type: &str,
+) -> BnsClientResult<ResolveResult> {
+    if doc_type != DID_RESOLVER_DEFAULT_DOC_TYPE || !name.contains('.') {
+        return api.resolve_document(name, doc_type).await;
+    }
+    let checkpoint = api.latest_checkpoint().await?;
+    if api.query_name_state(name).await?.is_some() {
+        return api.resolve_document(name, doc_type).await;
+    }
+    let (device_name, parent) = name.split_once('.').unwrap();
+    if matches!(
+        device_name,
+        "zone" | "owner" | "boot" | "info" | "doc" | "profile"
+    ) {
+        return api.resolve_document(name, doc_type).await;
+    }
+    let result = api.resolve_document(parent, device_name).await?;
+    match did_resolver_document_status(&result, now_timestamp()) {
+        DocumentStatus::Active => {}
+        DocumentStatus::Migrated => {
+            return Ok(denied_device_resolution(&result, DocumentStatus::Missing));
+        }
+        _ => return Ok(result),
+    }
+    let zone_result = api.resolve_document(parent, "zone").await?;
+    let owner_result = api.resolve_document(parent, "owner").await?;
+    for dependency in [&zone_result, &owner_result] {
+        if did_resolver_document_status(dependency, now_timestamp()) != DocumentStatus::Active {
+            let status = match did_resolver_document_status(dependency, now_timestamp()) {
+                DocumentStatus::Migrated => DocumentStatus::Missing,
+                status => status,
+            };
+            return Ok(denied_device_resolution(dependency, status));
+        }
+    }
+    let denied = validate_device_slot(
+        name,
+        device_name,
+        parent,
+        &result,
+        &zone_result,
+        &owner_result,
+    )
+    .map_err(BnsClientError::Transport)?;
+    if api.resolve_document(parent, device_name).await? != result
+        || api.resolve_document(parent, "zone").await? != zone_result
+        || api.resolve_document(parent, "owner").await? != owner_result
+        || api.query_name_state(name).await?.is_some()
+        || api.latest_checkpoint().await? != checkpoint
+    {
+        return Err(BnsClientError::Transport(
+            "BNS projection changed during device resolution".into(),
+        ));
+    }
+    Ok(match denied {
+        Some((status, source)) => denied_device_resolution(source, status),
+        None => result,
+    })
+}
+
+fn denied_device_resolution(source: &ResolveResult, status: DocumentStatus) -> ResolveResult {
+    let mut result = source.clone();
+    result.document_state.document.inline_document.clear();
+    result.status = status;
+    result.alias_kind = AliasKind::None;
+    result.alias_target_did.clear();
+    result
+}
+
+fn projected_document(result: &ResolveResult) -> Result<EncodedDocument, String> {
+    if bns_client::sha256_hex(&result.document_state.document.inline_document)
+        != result.document_state.document.content_hash
+    {
+        return Err("BNS inline content does not match its published hash".into());
+    }
+    match decode_inline_document(&result.document_state.document.inline_document).0 {
+        Some(Value::String(jwt)) => Ok(EncodedDocument::Jwt(jwt)),
+        Some(value) => Ok(EncodedDocument::JsonLd(value)),
+        None => Err("BNS document has no inline content".into()),
+    }
+}
+
+fn decode_owner_signed<D: DIDDocumentTrait>(
+    encoded: &EncodedDocument,
+    owner: &OwnerDocument,
+) -> Result<D, String> {
+    let mut kids = vec![None];
+    let historical = owner.get_historical_keys();
+    kids.extend(historical.iter().map(|(kid, _)| Some(kid.as_str())));
+    for kid in kids {
+        if let Some((key, _)) = owner.get_auth_key(kid) {
+            if let Ok(document) = D::decode(encoded, Some(&key)) {
+                return Ok(document);
+            }
+        }
+    }
+    Err("BNS document signature does not match current owner keys".into())
+}
+
+fn validate_device_slot<'a>(
+    name: &str,
+    device_name: &str,
+    parent: &str,
+    device_result: &'a ResolveResult,
+    zone_result: &'a ResolveResult,
+    owner_result: &'a ResolveResult,
+) -> Result<Option<(DocumentStatus, &'a ResolveResult)>, String> {
+    let parent_did = DID::new("bns", parent);
+    let requested = DID::new("bns", name);
+    let owner = OwnerDocument::decode(&projected_document(owner_result)?, None)
+        .map_err(|e| e.to_string())?;
+    if owner.id != parent_did || owner.name != parent {
+        return Err("BNS device owner identity mismatch".into());
+    }
+    owner
+        .get_auth_key(None)
+        .ok_or("BNS owner authentication key missing")?;
+    let device_encoded = projected_document(device_result)?;
+    let zone_encoded = projected_document(zone_result)?;
+    if !matches!(device_encoded, EncodedDocument::Jwt(_))
+        || !matches!(zone_encoded, EncodedDocument::Jwt(_))
+    {
+        return Err("BNS device mapping requires signed Device and Zone JWTs".into());
+    }
+    let device = DeviceDocument::decode(&device_encoded, None).map_err(|e| e.to_string())?;
+    let zone = ZoneDocument::decode(&zone_encoded, None).map_err(|e| e.to_string())?;
+    if device.id != requested
+        || device.name != device_name
+        || device.owner != parent_did
+        || device.zone_did.as_ref() != Some(&parent_did)
+        || zone.id != parent_did
+        || zone.owner != parent_did
+    {
+        return Err("BNS device/zone identity or owner mismatch".into());
+    }
+    if owner.valid_iat.is_some_and(|cutoff| device.iat <= cutoff || zone.iat <= cutoff) {
+        return Ok(Some((DocumentStatus::Revoked, owner_result)));
+    }
+    if device.iat < device_result.name_state.min_document_iat {
+        return Ok(Some((DocumentStatus::Revoked, device_result)));
+    }
+    if zone.iat < zone_result.name_state.min_document_iat {
+        return Ok(Some((DocumentStatus::Revoked, zone_result)));
+    }
+    for (exp, source) in [
+        (owner.exp, owner_result),
+        (device.exp, device_result),
+        (zone.exp, zone_result),
+    ] {
+        if exp <= now_timestamp() {
+            return Ok(Some((DocumentStatus::Expired, source)));
+        }
+    }
+    if device.iat > now_timestamp() + 300 || zone.iat > now_timestamp() + 300 {
+        return Err("BNS device/zone issuance time is in the future".into());
+    }
+    decode_owner_signed::<DeviceDocument>(&device_encoded, &owner)?;
+    decode_owner_signed::<ZoneDocument>(&zone_encoded, &owner)?;
+    let member = zone
+        .devices
+        .get(device_name)
+        .ok_or("Device is not a member of the published Zone")?;
+    if member.id != requested
+        || member.name != device_name
+        || member.owner != parent_did
+        || member.zone_did.as_ref() != Some(&parent_did)
+        || device
+            .get_exchange_key(None)
+            .and_then(|(_, key)| name_lib::jwk_to_ed25519_pk(&key).ok())
+            .is_none()
+    {
+        return Err("BNS Zone membership or device authentication key mismatch".into());
+    }
+    let value = serde_json::to_value(&device).map_err(|e| e.to_string())?;
+    let selected_key = value["verificationMethod"][0]["id"]
+        .as_str().ok_or("Device exchange key id missing")?;
+    let absolute_key = if selected_key.starts_with('#') {
+        format!("{}{selected_key}", requested.to_string())
+    } else {
+        selected_key.to_string()
+    };
+    if !value["authentication"].as_array().is_some_and(|refs| {
+        refs.iter().any(|key| key.as_str() == Some(selected_key)
+            || key.as_str() == Some(absolute_key.as_str()))
+    }) {
+        return Err("Device exchange key is not authorized for authentication".into());
+    }
+    for method in value["verificationMethod"]
+        .as_array()
+        .ok_or("Device verificationMethod missing")?
+    {
+        if method["controller"].as_str() != Some(requested.to_string().as_str()) {
+            return Err("Device key controller does not match its DID".into());
+        }
+    }
+    Ok(None)
 }
 
 fn did_resolution_failure_response(
@@ -1083,16 +1326,13 @@ fn did_resolver_document_status(result: &ResolveResult, now: u64) -> DocumentSta
             result.name_state.name, result.alias_target_did
         );
     }
-    if matches!(
-        result.name_state.status,
-        NameStatus::Expired | NameStatus::Released
-    ) || (result.document_state.expire_at != 0 && now >= result.document_state.expire_at)
-    {
+    let status = result.effective_status_at(now);
+    if status == DocumentStatus::Expired {
         // Registration lapsed or the document outlived its own validity
         // window. The chain has no timers, so this must be derived at read
         // time; expired stays 200 + last known content and the fallback
         // decision belongs to client policy.
-        return DocumentStatus::Expired;
+        return status;
     }
     DocumentStatus::Active
 }
@@ -1115,6 +1355,9 @@ fn did_resolution_state_response(
         DocumentStatus::Revoked | DocumentStatus::Tombstoned => StatusCode::GONE,
     };
     let deactivated = matches!(status, DocumentStatus::Revoked | DocumentStatus::Tombstoned);
+    let document_version = result
+        .and_then(|result| projected_document(result).ok())
+        .and_then(|document| document_iat(&document));
 
     // Only readable states expose the document content; revoked/tombstoned
     // answers keep `didDocument` null so stale content cannot outlive a 410.
@@ -1133,11 +1376,23 @@ fn did_resolution_state_response(
     let mut buckyos = Map::new();
     buckyos.insert("docType".to_string(), json!(doc_type));
     buckyos.insert("documentStatus".to_string(), json!(status.as_str()));
+    if let Some(iat) = document_version {
+        buckyos.insert("documentVersion".to_string(), json!(iat));
+    }
     if let Some(result) = result {
+        buckyos.insert("sourceName".to_string(), json!(result.document_state.name));
+        buckyos.insert("sourceDocType".to_string(), json!(result.document_state.doc_type));
+        buckyos.insert("sourceContentHash".to_string(), json!(result.document_state.document.content_hash));
+        buckyos.insert("sourceDocumentStatus".to_string(), json!(result.document_state.status.as_str()));
+        if let Some(Value::String(jwt)) = &did_document {
+            if jwt.as_bytes() == result.document_state.document.inline_document.as_slice() {
+                buckyos.insert("docHash".to_string(), json!(result.document_state.document.content_hash.trim_start_matches("0x")));
+            }
+        }
         // Version 0 is the "never published" placeholder, not a real version.
         if result.document_state.version != 0 {
             buckyos.insert(
-                "documentVersion".to_string(),
+                "registryVersion".to_string(),
                 json!(result.document_state.version),
             );
         }
@@ -1156,21 +1411,11 @@ fn did_resolution_state_response(
                 json!(result.alias_target_did),
             );
         }
-        // `docHash` is deliberately not emitted: the store anchors the raw
-        // stored bytes while protocol §6 anchors the encoded document string
-        // clients re-serialize from `didDocument`; for re-encoded JSON bodies
-        // the two disagree and a wrong anchor would make clients discard
-        // valid documents. Inline answers need no anchor.
     }
 
     let mut metadata = Map::new();
-    if let Some(result) = result {
-        if result.document_state.version != 0 {
-            metadata.insert(
-                "versionId".to_string(),
-                json!(result.document_state.version.to_string()),
-            );
-        }
+    if let Some(iat) = document_version {
+        metadata.insert("versionId".to_string(), json!(iat.to_string()));
     }
     metadata.insert("deactivated".to_string(), json!(deactivated));
     metadata.insert("buckyos".to_string(), Value::Object(buckyos));
@@ -1369,42 +1614,49 @@ fn rpc_envelope_response<T: Serialize>(
 fn projection_query_name_state(
     tx: &mut dyn BnsRegistryStoreTx,
     name: &str,
+    now: u64,
 ) -> BnsRegistryResult<Option<NameState>> {
     let name = canonical_bns_name(name)?;
     tx.get_name(&name)?
-        .map(|state| projection_materialize_name_state(tx, state))
+        .map(|state| projection_materialize_name_state(tx, state, now))
         .transpose()
 }
 
 fn projection_resolve_owner(
     tx: &mut dyn BnsRegistryStoreTx,
     name: &str,
+    now: u64,
 ) -> BnsRegistryResult<OwnerResolution> {
     let name = canonical_bns_name(name)?;
-    let state = tx
+    let mut state = tx
         .get_name(&name)?
-        .ok_or_else(|| BnsRegistryError::NameNotFound { name })?;
-    projection_resolve_owner_from_state(tx, &state)
+        .ok_or_else(|| BnsRegistryError::NameNotFound { name: name.clone() })?;
+    state.materialize_status_at(now);
+    if state.status != NameStatus::Active {
+        return Err(BnsRegistryError::NameNotFound { name });
+    }
+    projection_resolve_owner_from_state(tx, &state, now)
 }
 
 fn projection_resolve_document(
     tx: &mut dyn BnsRegistryStoreTx,
     name: &str,
     doc_type: &str,
+    now: u64,
 ) -> BnsRegistryResult<ResolveResult> {
     let name = canonical_bns_name(name)?;
     let doc_type = canonical_doc_type(doc_type)?;
     let raw_name_state = tx
         .get_name(&name)?
         .ok_or_else(|| BnsRegistryError::NameNotFound { name: name.clone() })?;
-    let name_state = projection_materialize_name_state(tx, raw_name_state)?;
+    let name_state = projection_materialize_name_state(tx, raw_name_state, now)?;
     let document_state = tx.get_current_document(&name, &doc_type)?.ok_or_else(|| {
         BnsRegistryError::DocumentNotFound {
             name: name.clone(),
             doc_type: doc_type.clone(),
         }
     })?;
-    let owner = projection_resolve_owner_from_state(tx, &name_state)?;
+    let owner = projection_resolve_owner_from_state(tx, &name_state, now)?;
     let alias = tx.get_alias(&name)?;
     let proof_root = projection_current_proof_root(tx)?;
     let effective_controller = if document_state.controller.is_unset() {
@@ -1413,7 +1665,7 @@ fn projection_resolve_document(
         document_state.controller.clone()
     };
 
-    Ok(ResolveResult {
+    let mut result = ResolveResult {
         status: document_state.status,
         alias_kind: alias.as_ref().map_or(AliasKind::None, |state| state.kind),
         alias_target_did: alias.map_or_else(String::new, |state| state.target_did),
@@ -1422,14 +1674,18 @@ fn projection_resolve_document(
         owner,
         effective_controller,
         proof_root,
-    })
+    };
+    result.materialize_status_at(now);
+    Ok(result)
 }
 
 fn projection_materialize_name_state(
     tx: &mut dyn BnsRegistryStoreTx,
     mut state: NameState,
+    now: u64,
 ) -> BnsRegistryResult<NameState> {
-    let owner = projection_resolve_owner_from_state(tx, &state)?;
+    state.materialize_status_at(now);
+    let owner = projection_resolve_owner_from_state(tx, &state, now)?;
     state.effective_owner = owner.effective_owner;
     state.owner_source = owner.source;
     state.standard_transfer_enabled = state.transferable
@@ -1441,9 +1697,20 @@ fn projection_materialize_name_state(
 fn projection_resolve_owner_from_state(
     tx: &mut dyn BnsRegistryStoreTx,
     state: &NameState,
+    now: u64,
 ) -> BnsRegistryResult<OwnerResolution> {
     if state.semantic_owner.kind == PrincipalKind::BnsName {
         let authority = projection_authority_set(tx, &state.semantic_owner.value)?;
+        if state.status == NameStatus::Active {
+            let owner_state = tx
+                .get_name(&state.semantic_owner.value)?
+                .ok_or(BnsRegistryError::NoConcreteSigner)?;
+            if owner_state.effective_status_at(now) != NameStatus::Active
+                || authority.active_key_count == 0
+            {
+                return Err(BnsRegistryError::NoConcreteSigner);
+            }
+        }
         return Ok(OwnerResolution {
             effective_owner: state.semantic_owner.clone(),
             source: OwnerSource::ExplicitSemanticOwner,
@@ -1465,12 +1732,16 @@ fn projection_resolve_owner_from_state(
     let parent = parent_name(&state.name).ok_or_else(|| {
         BnsRegistryError::InvalidMutation("second-level name has no parent".to_string())
     })?;
-    let parent_state = tx
+    let mut parent_state = tx
         .get_name(parent)?
         .ok_or_else(|| BnsRegistryError::NameNotFound {
             name: parent.to_string(),
         })?;
-    let mut owner = projection_resolve_owner_from_state(tx, &parent_state)?;
+    parent_state.materialize_status_at(now);
+    if state.status == NameStatus::Active && parent_state.status != NameStatus::Active {
+        return Err(BnsRegistryError::NoConcreteSigner);
+    }
+    let mut owner = projection_resolve_owner_from_state(tx, &parent_state, now)?;
     owner.source = OwnerSource::ParentInherited;
     Ok(owner)
 }
@@ -1615,8 +1886,8 @@ mod tests {
                     standard_transfer_enabled: true,
                     status: NameStatus::Active,
                     registered_at: 1,
-                    expire_at: 100,
-                    grace_until: 200,
+                    expire_at: 4_102_444_800,
+                    grace_until: 4_102_531_200,
                     updated_at: 2,
                     name_seq: 1,
                     owner_document_version: 0,
@@ -1839,12 +2110,18 @@ mod tests {
             .transact(|tx| {
                 // alice: active name with several document states.
                 tx.put_name(&resolver_name_state("alice", NameStatus::Active))?;
+                tx.put_authority_set(&AuthoritySetState {
+                    name: "alice".to_string(),
+                    authority_seq: 1,
+                    authority_root: ZERO_HASH.to_string(),
+                    active_key_count: 1,
+                })?;
                 let mut owner_doc = resolver_document_state(
                     "alice",
                     "owner",
                     3,
                     DocumentStatus::Active,
-                    br#"{"id":"did:bns:alice"}"#,
+                    br#"{"id":"did:bns:alice","iat":1751500000}"#,
                 );
                 owner_doc.previous_version = 2;
                 tx.put_document(&owner_doc)?;
@@ -1853,7 +2130,7 @@ mod tests {
                     "zone",
                     7,
                     DocumentStatus::Active,
-                    br#"{"id":"did:bns:alice","oods":["ood1"]}"#,
+                    br#"{"id":"did:bns:alice","iat":1751500100,"oods":["ood1"]}"#,
                 ))?;
                 tx.put_document(&resolver_document_state(
                     "alice",
@@ -1918,6 +2195,20 @@ mod tests {
                     set_at: 1,
                     name_seq: 1,
                 })?;
+
+                // lapsed: raw projection remains Active, but the name-level
+                // validity window has elapsed and must be derived on reads.
+                let mut lapsed = resolver_name_state("lapsed", NameStatus::Active);
+                lapsed.expire_at = 1;
+                lapsed.grace_until = 2;
+                tx.put_name(&lapsed)?;
+                tx.put_document(&resolver_document_state(
+                    "lapsed",
+                    "zone",
+                    1,
+                    DocumentStatus::Active,
+                    br#"{"id":"did:bns:lapsed"}"#,
+                ))?;
                 Ok(())
             })
             .unwrap();
@@ -1987,13 +2278,15 @@ mod tests {
         );
         assert_eq!(body["didDocument"]["id"], "did:bns:alice");
         let metadata = &body["didDocumentMetadata"];
-        assert_eq!(metadata["versionId"], "3");
+        let iat = body["didDocument"]["iat"].as_u64().unwrap();
+        assert_eq!(metadata["versionId"], iat.to_string());
         assert_eq!(metadata["deactivated"], false);
         let buckyos = &metadata["buckyos"];
         assert_eq!(buckyos["docType"], "owner");
         assert_eq!(buckyos["documentStatus"], "active");
-        assert_eq!(buckyos["documentVersion"], 3);
-        assert_eq!(buckyos["authoritySeq"], 0);
+        assert_eq!(buckyos["documentVersion"], iat);
+        assert_eq!(buckyos["registryVersion"], 3);
+        assert_eq!(buckyos["authoritySeq"], 1);
         // Chain-account owners have no DID form yet: the field must be
         // omitted, never serialized as the internal principal JSON.
         assert!(buckyos.get("effectiveOwner").is_none());
@@ -2013,6 +2306,541 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "cross-repository Node Active/Relay integration server"]
+    async fn serve_node_active_authority_fixture() {
+        let path = std::env::var("BUCKYOS_ACTIVE_FIXTURE").expect("fixture path");
+        let fixture: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let store = resolver_seeded_store();
+        store
+            .transact(|tx| {
+                for (slot, bytes) in [
+                    ("owner", serde_json::to_vec(&fixture["owner"]).unwrap()),
+                    (
+                        "zone",
+                        fixture["zone_jwt"].as_str().unwrap().as_bytes().to_vec(),
+                    ),
+                    (
+                        "ood1",
+                        fixture["device_jwt"].as_str().unwrap().as_bytes().to_vec(),
+                    ),
+                ] {
+                    tx.put_document(&resolver_document_state(
+                        "alice",
+                        slot,
+                        10,
+                        DocumentStatus::Active,
+                        &bytes,
+                    ))?;
+                }
+                Ok(())
+            })
+            .unwrap();
+        let registry = Arc::new(CentralizedBnsRegistry::new(store));
+        let server = Arc::new(SqliteBnsIndexerHttpServer::from_registry(registry));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let handle = spawn_listener(listener, server).unwrap();
+        std::fs::write(
+            format!("{path}.url"),
+            format!("http://{}", handle.local_addr()),
+        )
+        .unwrap();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(120);
+        while !std::path::Path::new(&format!("{path}.stop")).exists() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "integration client did not finish"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        handle.shutdown().await;
+    }
+
+
+    #[tokio::test]
+    async fn did_resolver_parent_migration_does_not_redirect_device_identity() {
+        use name_client::{BaseHttpProvider, CacheBackend, NameClient, NameClientConfig, ResolvePolicy, ResolveSourcePolicy};
+        let store = resolver_seeded_store();
+        store.transact(|tx| tx.put_document(&resolver_document_state(
+            "moved", "ood1", 1, DocumentStatus::Active, br#"{"id":"did:bns:ood1.moved"}"#,
+        ))).unwrap();
+        let registry = Arc::new(CentralizedBnsRegistry::new(store));
+        let server = Arc::new(SqliteBnsIndexerHttpServer::from_registry(registry.clone()));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let handle = spawn_listener(listener, server.clone()).unwrap();
+        let client = NameClient::new(NameClientConfig {
+            cache_backend: CacheBackend::Memory, enable_zone_resolver: false, ..Default::default()
+        });
+        client.set_method_authority("bns", Box::new(BaseHttpProvider::new(&format!("http://{}", handle.local_addr())))).await;
+        let did = DID::new("bns", "ood1.moved");
+        let remote = ResolvePolicy::default().with_source(ResolveSourcePolicy::RemoteAuthority);
+        let (status, body, _) = resolver_request(server.as_ref(), Method::GET, "/1.0/identifiers/did:bns:ood1.moved").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(body["didDocument"].is_null());
+        assert_eq!(body["didDocumentMetadata"]["buckyos"]["documentStatus"], "missing");
+        assert!(body["didDocumentMetadata"]["buckyos"].get("migrationTarget").is_none());
+        assert!(client.resolve_did_ex(&did, None, remote.clone()).await.is_err());
+        registry.store().transact(|tx| {
+            tx.put_name(&resolver_name_state("ood1.moved", NameStatus::Active))?;
+            tx.put_document(&resolver_document_state("ood1.moved", "zone", 1, DocumentStatus::Active, br#"{"id":"did:bns:ood1.moved"}"#))
+        }).unwrap();
+        let answer = client.resolve_did_ex(&did, None, remote).await.unwrap();
+        assert_eq!(answer.document.to_json_value().unwrap()["id"], did.to_string());
+        let (_, body, _) = resolver_request(server.as_ref(), Method::GET, "/1.0/identifiers/did:bns:moved").await;
+        assert_eq!(body["didDocumentMetadata"]["buckyos"]["migrationTarget"], "did:bns:alice");
+        handle.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn did_resolver_owner_policy_and_payload_expiry_invalidate_device_cache() {
+        use name_client::{BaseHttpProvider, CacheBackend, NameClient, NameClientConfig, ResolvePolicy, ResolveSourcePolicy};
+        use name_lib::*;
+        for cause in ["owner_cutoff", "iat_floor", "owner_expiry", "device_expiry", "zone_expiry"] {
+            let (pem, public) = generate_ed25519_key_pair();
+            let keyfile = tempfile::NamedTempFile::new().unwrap();
+            std::fs::write(keyfile.path(), pem).unwrap();
+            let key = load_private_key(keyfile.path()).unwrap();
+            let did = DID::new("bns", "ood1.alice");
+            let parent = DID::new("bns", "alice");
+            let mut owner = OwnerDocument::new(parent.clone(), "alice".into(), "Alice".into(), serde_json::from_value(public).unwrap());
+            let mut value = serde_json::to_value(DeviceDocument::new_by_jwk("ood1", owner.get_default_key().unwrap())).unwrap();
+            value["id"] = json!(did.to_string());
+            value["owner"] = json!(parent.to_string());
+            value["zone_did"] = json!(parent.to_string());
+            value["verificationMethod"][0]["controller"] = json!(did.to_string());
+            let mut device: DeviceDocument = serde_json::from_value(value).unwrap();
+            let mut zone = ZoneDocument::new(parent.clone(), parent, owner.get_default_key().unwrap());
+            let now = now_timestamp();
+            device.iat = now - 400;
+            zone.iat = now - 399;
+            zone.devices.insert("ood1".into(), device.clone());
+            let store = resolver_seeded_store();
+            store.transact(|tx| {
+                for (slot, bytes) in [
+                    ("owner", serde_json::to_vec(&owner).unwrap()),
+                    ("zone", zone.encode(Some(&key)).unwrap().to_string().into_bytes()),
+                    ("ood1", device.encode(Some(&key)).unwrap().to_string().into_bytes()),
+                ] { tx.put_document(&resolver_document_state("alice", slot, 10, DocumentStatus::Active, &bytes))?; }
+                Ok(())
+            }).unwrap();
+            let registry = Arc::new(CentralizedBnsRegistry::new(store));
+            let server = Arc::new(SqliteBnsIndexerHttpServer::from_registry(registry.clone()));
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let handle = spawn_listener(listener, server.clone()).unwrap();
+            let client = NameClient::new(NameClientConfig {
+                cache_backend: CacheBackend::Memory, enable_zone_resolver: false, ..Default::default()
+            });
+            client.set_method_authority("bns", Box::new(BaseHttpProvider::new(&format!("http://{}", handle.local_addr())))).await;
+            let remote = ResolvePolicy::default().with_source(ResolveSourcePolicy::RemoteAuthority);
+            let local = ResolvePolicy::default().with_source(ResolveSourcePolicy::LocalOnly);
+            client.resolve_did_ex(&did, None, remote.clone()).await.unwrap();
+            let (status, source) = match cause {
+                "owner_cutoff" => { owner.valid_iat = Some(now - 300); (DocumentStatus::Revoked, "owner") }
+                "iat_floor" => (DocumentStatus::Revoked, "ood1"),
+                "owner_expiry" => { owner.exp = now - 120; (DocumentStatus::Expired, "owner") }
+                "device_expiry" => { device.exp = now - 120; (DocumentStatus::Expired, "ood1") }
+                "zone_expiry" => { zone.exp = now - 120; (DocumentStatus::Expired, "zone") }
+                _ => unreachable!(),
+            };
+            registry.store().transact(|tx| {
+                if cause == "iat_floor" {
+                    let mut state = tx.get_name("alice")?.unwrap();
+                    state.min_document_iat = now - 300;
+                    state.owner_policy_seq += 1;
+                    tx.put_name(&state)?;
+                }
+                for (slot, bytes) in [
+                    ("owner", serde_json::to_vec(&owner).unwrap()),
+                    ("zone", zone.encode(Some(&key)).unwrap().to_string().into_bytes()),
+                    ("ood1", device.encode(Some(&key)).unwrap().to_string().into_bytes()),
+                ] { tx.put_document(&resolver_document_state("alice", slot, 11, DocumentStatus::Active, &bytes))?; }
+                Ok(())
+            }).unwrap();
+            let (http, body, _) = resolver_request(server.as_ref(), Method::GET, "/1.0/identifiers/did:bns:ood1.alice").await;
+            assert_eq!(http, if status == DocumentStatus::Revoked { StatusCode::GONE } else { StatusCode::OK }, "{cause}");
+            assert!(body["didDocument"].is_null(), "{cause}");
+            assert_eq!(body["didDocumentMetadata"]["buckyos"]["documentStatus"], status.as_str(), "{cause}");
+            assert_eq!(body["didDocumentMetadata"]["buckyos"]["sourceDocType"], source, "{cause}");
+            assert_eq!(body["didDocumentMetadata"]["buckyos"]["sourceDocumentStatus"], "active", "{cause}");
+            assert!(client.resolve_did_ex(&did, None, remote.clone()).await.is_err(), "{cause}");
+            assert!(client.resolve_did_ex(&did, None, local.clone()).await.is_err(), "{cause}");
+            owner.exp = FAR_FUTURE;
+            device.exp = FAR_FUTURE;
+            zone.exp = FAR_FUTURE;
+            device.iat = now;
+            zone.iat = now + 1;
+            let (_, rotated_key) = generate_ed25519_key_pair();
+            let mut value = serde_json::to_value(&device).unwrap();
+            value["verificationMethod"][0]["publicKeyJwk"] = rotated_key;
+            device = serde_json::from_value(value).unwrap();
+            zone.devices.insert("ood1".into(), device.clone());
+            let recovered = device.encode(Some(&key)).unwrap();
+            registry.store().transact(|tx| {
+                for (slot, bytes) in [
+                    ("owner", serde_json::to_vec(&owner).unwrap()),
+                    ("zone", zone.encode(Some(&key)).unwrap().to_string().into_bytes()),
+                    ("ood1", recovered.to_string().into_bytes()),
+                ] { tx.put_document(&resolver_document_state("alice", slot, 12, DocumentStatus::Active, &bytes))?; }
+                Ok(())
+            }).unwrap();
+            assert_eq!(client.resolve_did_ex(&did, None, remote).await.unwrap().document, recovered, "{cause}");
+            assert_eq!(client.resolve_did_ex(&did, None, local).await.unwrap().document, recovered, "{cause}");
+            handle.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn did_resolver_node_active_device_slots() {
+        use name_client::{
+            BaseHttpProvider, BodyEvidence, CacheBackend, NameClient, NameClientConfig, ResolvePolicy,
+            ResolveSourcePolicy,
+        };
+        use name_lib::*;
+        let (pem, public) = generate_ed25519_key_pair();
+        let keyfile = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(keyfile.path(), pem).unwrap();
+        let key = load_private_key(keyfile.path()).unwrap();
+        let jwk = serde_json::from_value(public).unwrap();
+        let owner_did = DID::new("bns", "alice");
+        let owner = OwnerDocument::new(owner_did.clone(), "alice".into(), "Alice".into(), jwk);
+        let mut zone = ZoneDocument::new(
+            owner_did.clone(),
+            owner_did.clone(),
+            owner.get_default_key().unwrap(),
+        );
+        let store = resolver_seeded_store();
+        let mut devices = Vec::new();
+        for short in ["ood1", "ood2"] {
+            let (_, public) = generate_ed25519_key_pair();
+            let mut value = serde_json::to_value(DeviceDocument::new_by_jwk(
+                short,
+                serde_json::from_value(public).unwrap(),
+            ))
+            .unwrap();
+            let did = format!("did:bns:{short}.alice");
+            value["id"] = json!(did);
+            value["owner"] = json!("did:bns:alice");
+            value["zone_did"] = json!("did:bns:alice");
+            for method in value["verificationMethod"].as_array_mut().unwrap() {
+                method["controller"] = json!(did);
+            }
+            let device: DeviceDocument = serde_json::from_value(value).unwrap();
+            zone.devices.insert(short.into(), device.clone());
+            let EncodedDocument::Jwt(jwt) = device.encode(Some(&key)).unwrap() else {
+                panic!()
+            };
+            devices.push((device, jwt));
+        }
+        let EncodedDocument::Jwt(zone_jwt) = zone.encode(Some(&key)).unwrap() else {
+            panic!()
+        };
+        store
+            .transact(|tx| {
+                tx.put_document(&resolver_document_state(
+                    "alice",
+                    "owner",
+                    4,
+                    DocumentStatus::Active,
+                    &serde_json::to_vec(&owner).unwrap(),
+                ))?;
+                tx.put_document(&resolver_document_state(
+                    "alice",
+                    "zone",
+                    8,
+                    DocumentStatus::Active,
+                    zone_jwt.as_bytes(),
+                ))?;
+                for (device, jwt) in &devices {
+                    tx.put_document(&resolver_document_state(
+                        "alice",
+                        &device.name,
+                        1,
+                        DocumentStatus::Active,
+                        jwt.as_bytes(),
+                    ))?;
+                }
+                Ok(())
+            })
+            .unwrap();
+        let registry = Arc::new(CentralizedBnsRegistry::new(store));
+        let server = Arc::new(SqliteBnsIndexerHttpServer::from_registry(registry.clone()));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let handle = spawn_listener(listener, server.clone()).unwrap();
+        let client = NameClient::new(NameClientConfig {
+            cache_backend: CacheBackend::Memory,
+            enable_zone_resolver: false,
+            ..Default::default()
+        });
+        client
+            .set_method_authority(
+                "bns",
+                Box::new(BaseHttpProvider::new(&format!(
+                    "http://{}",
+                    handle.local_addr()
+                ))),
+            )
+            .await;
+        let mut policy = ResolvePolicy::default();
+        policy.source = ResolveSourcePolicy::RemoteAuthority;
+        policy.allow_self_signed_when_missing = false;
+        policy.allow_stale_cache = false;
+        policy.allow_unverified_cache_when_unavailable = false;
+        for (device, jwt) in &devices {
+            let answer = client
+                .resolve_did_ex(&device.id, None, policy.clone())
+                .await
+                .unwrap();
+            assert_eq!(
+                answer.resolution_metadata.evidence,
+                Some(BodyEvidence::Anchored)
+            );
+            assert_eq!(answer.document, EncodedDocument::Jwt(jwt.clone()));
+            assert!(DeviceDocument::decode(&answer.document, None)
+                .unwrap()
+                .get_auth_key(None)
+                .is_some());
+            let (_, envelope, _) = resolver_request(
+                server.as_ref(),
+                Method::GET,
+                &format!("/1.0/identifiers/{}", device.id.to_string()),
+            )
+            .await;
+            assert_eq!(
+                envelope["didDocumentMetadata"]["buckyos"]["sourceName"],
+                "alice"
+            );
+            assert_eq!(
+                envelope["didDocumentMetadata"]["buckyos"]["sourceDocType"],
+                device.name
+            );
+            assert_eq!(
+                envelope["didDocumentMetadata"]["versionId"],
+                device.iat.to_string()
+            );
+            assert_eq!(
+                envelope["didDocumentMetadata"]["buckyos"]["documentVersion"],
+                device.iat
+            );
+            assert_eq!(envelope["didDocumentMetadata"]["buckyos"]["registryVersion"], 1);
+        }
+        let (device, _) = &devices[0];
+        let mut rotated = device.clone();
+        rotated.iat += 1;
+        let (_, public) = generate_ed25519_key_pair();
+        let mut value = serde_json::to_value(&rotated).unwrap();
+        value["verificationMethod"][0]["publicKeyJwk"] = public;
+        rotated = serde_json::from_value(value).unwrap();
+        let EncodedDocument::Jwt(rotated_jwt) = rotated.encode(Some(&key)).unwrap() else {
+            panic!()
+        };
+        registry
+            .store()
+            .transact(|tx| {
+                tx.put_document(&resolver_document_state(
+                    "alice",
+                    "ood1",
+                    2,
+                    DocumentStatus::Active,
+                    rotated_jwt.as_bytes(),
+                ))
+            })
+            .unwrap();
+        let answer = client
+            .resolve_did_ex(&device.id, None, policy.clone())
+            .await
+            .unwrap();
+        assert_eq!(answer.document, EncodedDocument::Jwt(rotated_jwt.clone()));
+
+        for (slot, content) in [
+            ("zone", zone_jwt.as_bytes().to_vec()),
+            ("owner", serde_json::to_vec(&owner).unwrap()),
+        ] {
+            registry.store().transact(|tx| {
+                tx.put_document(&resolver_document_state("alice", slot, 20, DocumentStatus::Revoked, &content))
+            }).unwrap();
+            let (status, denied, _) = resolver_request(
+                server.as_ref(), Method::GET, "/1.0/identifiers/did:bns:ood1.alice"
+            ).await;
+            assert_eq!(status, StatusCode::GONE);
+            assert_eq!(denied["didDocumentMetadata"]["buckyos"]["sourceDocType"], slot);
+            assert_eq!(denied["didDocumentMetadata"]["buckyos"]["sourceDocumentStatus"], "revoked");
+            assert!(denied["didDocument"].is_null());
+            registry.store().transact(|tx| {
+                tx.put_document(&resolver_document_state("alice", slot, 21, DocumentStatus::Active, &content))
+            }).unwrap();
+        }
+
+        registry.store().transact(|tx| {
+            tx.put_name(&resolver_name_state("ood1.alice", NameStatus::Active))?;
+            tx.put_document(&resolver_document_state("ood1.alice", "zone", 1, DocumentStatus::Active, rotated_jwt.as_bytes()))
+        }).unwrap();
+        let (_, independent, _) = resolver_request(
+            server.as_ref(), Method::GET, "/1.0/identifiers/did:bns:ood1.alice"
+        ).await;
+        assert_eq!(independent["didDocumentMetadata"]["buckyos"]["sourceName"], "ood1.alice");
+        assert_eq!(independent["didDocument"], rotated_jwt);
+        registry.store().transact(|tx| {
+            tx.put_document(&resolver_document_state("ood1.alice", "zone", 2, DocumentStatus::Missing, rotated_jwt.as_bytes()))
+        }).unwrap();
+
+        for status in [
+            NameStatus::Active,
+            NameStatus::Expired,
+            NameStatus::Released,
+            NameStatus::Tombstoned,
+        ] {
+            registry
+                .store()
+                .transact(|tx| tx.put_name(&resolver_name_state("ood1.alice", status)))
+                .unwrap();
+            assert!(client
+                .resolve_did_ex(&device.id, None, policy.clone())
+                .await
+                .is_err());
+        }
+        for status in [
+            DocumentStatus::Expired,
+            DocumentStatus::Revoked,
+            DocumentStatus::Missing,
+        ] {
+            registry
+                .store()
+                .transact(|tx| {
+                    tx.put_document(&resolver_document_state(
+                        "alice",
+                        "ood2",
+                        2,
+                        status,
+                        devices[1].1.as_bytes(),
+                    ))
+                })
+                .unwrap();
+            assert!(client
+                .resolve_did_ex(&devices[1].0.id, None, policy.clone())
+                .await
+                .is_err());
+        }
+        handle.shutdown().await;
+    }
+
+    #[test]
+    fn did_resolver_rejects_device_identity_and_signature_mismatch() {
+        use name_lib::*;
+        let (pem, public) = generate_ed25519_key_pair();
+        let keyfile = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(keyfile.path(), pem).unwrap();
+        let key = load_private_key(keyfile.path()).unwrap();
+        let did = DID::new("bns", "alice");
+        let owner = OwnerDocument::new(
+            did.clone(),
+            "alice".into(),
+            "Alice".into(),
+            serde_json::from_value(public).unwrap(),
+        );
+        let mut value = serde_json::to_value(DeviceDocument::new_by_jwk(
+            "ood1",
+            owner.get_default_key().unwrap(),
+        ))
+        .unwrap();
+        value["id"] = json!("did:bns:ood1.alice");
+        value["owner"] = json!("did:bns:alice");
+        value["zone_did"] = json!("did:bns:alice");
+        value["verificationMethod"][0]["controller"] = json!("did:bns:ood1.alice");
+        let device: DeviceDocument = serde_json::from_value(value.clone()).unwrap();
+        let mut zone = ZoneDocument::new(did.clone(), did, owner.get_default_key().unwrap());
+        zone.devices.insert("ood1".into(), device.clone());
+        let EncodedDocument::Jwt(zone_jwt) = zone.encode(Some(&key)).unwrap() else {
+            panic!()
+        };
+        let store = resolver_seeded_store();
+        store
+            .transact(|tx| {
+                tx.put_document(&resolver_document_state(
+                    "alice",
+                    "owner",
+                    4,
+                    DocumentStatus::Active,
+                    &serde_json::to_vec(&owner).unwrap(),
+                ))?;
+                tx.put_document(&resolver_document_state(
+                    "alice",
+                    "zone",
+                    8,
+                    DocumentStatus::Active,
+                    zone_jwt.as_bytes(),
+                ))?;
+                Ok(())
+            })
+            .unwrap();
+        let registry = CentralizedBnsRegistry::new(store);
+        let zone_result = registry.resolve_document("alice", "zone").unwrap();
+        let owner_result = registry.resolve_document("alice", "owner").unwrap();
+        for field in ["id", "name", "owner", "zone_did"] {
+            let mut bad = value.clone();
+            bad[field] = if field == "name" {
+                json!("ood2")
+            } else {
+                json!("did:bns:mallory")
+            };
+            let bad: DeviceDocument = serde_json::from_value(bad).unwrap();
+            let EncodedDocument::Jwt(jwt) = bad.encode(Some(&key)).unwrap() else {
+                panic!()
+            };
+            registry
+                .store()
+                .transact(|tx| {
+                    tx.put_document(&resolver_document_state(
+                        "alice",
+                        "ood1",
+                        1,
+                        DocumentStatus::Active,
+                        jwt.as_bytes(),
+                    ))
+                })
+                .unwrap();
+            let result = registry.resolve_document("alice", "ood1").unwrap();
+            assert!(
+                validate_device_slot(
+                    "ood1.alice",
+                    "ood1",
+                    "alice",
+                    &result,
+                    &zone_result,
+                    &owner_result
+                )
+                .is_err(),
+                "{field}"
+            );
+        }
+        let (other_pem, _) = generate_ed25519_key_pair();
+        std::fs::write(keyfile.path(), other_pem).unwrap();
+        let other_key = load_private_key(keyfile.path()).unwrap();
+        let EncodedDocument::Jwt(jwt) = device.encode(Some(&other_key)).unwrap() else {
+            panic!()
+        };
+        registry
+            .store()
+            .transact(|tx| {
+                tx.put_document(&resolver_document_state(
+                    "alice",
+                    "ood1",
+                    1,
+                    DocumentStatus::Active,
+                    jwt.as_bytes(),
+                ))
+            })
+            .unwrap();
+        assert!(validate_device_slot(
+            "ood1.alice",
+            "ood1",
+            "alice",
+            &registry.resolve_document("alice", "ood1").unwrap(),
+            &zone_result,
+            &owner_result
+        )
+        .is_err());
+    }
+
+    #[tokio::test]
     async fn did_resolver_defaults_to_zone_doc_type() {
         let server = resolver_contract_server();
         let (status, body, _) =
@@ -2021,8 +2849,55 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         let buckyos = &body["didDocumentMetadata"]["buckyos"];
         assert_eq!(buckyos["docType"], "zone");
-        assert_eq!(buckyos["documentVersion"], 7);
+        let iat = body["didDocument"]["iat"].as_u64().unwrap();
+        assert_eq!(buckyos["documentVersion"], iat);
+        assert_eq!(body["didDocumentMetadata"]["versionId"], iat.to_string());
+        assert_eq!(buckyos["registryVersion"], 7);
         assert_eq!(body["didDocument"]["oods"][0], "ood1");
+    }
+
+    #[tokio::test]
+    async fn did_resolver_versions_do_not_fall_back_to_registry_counter() {
+        let registry = CentralizedBnsRegistry::new(resolver_seeded_store());
+        let mut result = registry.resolve_document("alice", "owner").unwrap();
+        for (content, iat, registry_version) in [
+            (json!({"iat": 1751500000}), Some(1751500000u64), 3),
+            (
+                json!({"exp": 1751500000 + name_lib::DEFAULT_EXPIRE_TIME}),
+                Some(1751500000),
+                3,
+            ),
+            (json!({"id": "did:bns:alice"}), None, 3),
+            (json!("invalid-jwt"), None, 3),
+            (json!({}), None, 0),
+            (json!({"iat": 0}), Some(0), 3),
+        ] {
+            result.document_state.document =
+                DocumentRef::inline(serde_json::to_vec(&content).unwrap());
+            result.document_state.version = registry_version;
+            for status in [DocumentStatus::Active, DocumentStatus::Revoked] {
+                let response = did_resolution_state_response("owner", status, Some(&result)).unwrap();
+                let bytes = response.into_body().collect().await.unwrap().to_bytes();
+                let body: Value = serde_json::from_slice(&bytes).unwrap();
+                let metadata = &body["didDocumentMetadata"];
+                let buckyos = &metadata["buckyos"];
+                if let Some(iat) = iat {
+                    assert_eq!(buckyos["documentVersion"], iat);
+                    assert_eq!(metadata["versionId"], iat.to_string());
+                } else {
+                    assert!(buckyos.get("documentVersion").is_none());
+                    assert!(metadata.get("versionId").is_none());
+                }
+                if registry_version != 0 {
+                    assert_eq!(buckyos["registryVersion"], registry_version);
+                } else {
+                    assert!(buckyos.get("registryVersion").is_none());
+                }
+                if status == DocumentStatus::Revoked {
+                    assert!(body["didDocument"].is_null());
+                }
+            }
+        }
     }
 
     #[tokio::test]
@@ -2171,6 +3046,42 @@ mod tests {
         );
         // Expired still returns the last known content for policy fallback.
         assert_eq!(body["didDocument"]["id"], "did:bns:alice");
+    }
+
+    #[tokio::test]
+    async fn contract_projection_derives_name_and_document_expiry() {
+        let handler = BnsContractServerHandler::new(resolver_seeded_store(), "http://127.0.0.1:1");
+
+        let state = handler.query_name_state("lapsed").await.unwrap().unwrap();
+        assert_eq!(state.status, NameStatus::Expired);
+        assert!(!state.standard_transfer_enabled);
+        let owner_error = handler.resolve_owner("lapsed").await.unwrap_err();
+        assert!(owner_error.is_registry_code("NAME_NOT_FOUND"));
+
+        let result = handler.resolve_document("lapsed", "zone").await.unwrap();
+        assert_eq!(result.status, DocumentStatus::Expired);
+        assert_eq!(result.document_state.status, DocumentStatus::Active);
+
+        let document_expired = handler.resolve_document("alice", "old").await.unwrap();
+        assert_eq!(document_expired.status, DocumentStatus::Expired);
+        assert_eq!(
+            document_expired.document_state.status,
+            DocumentStatus::Active
+        );
+    }
+
+    #[tokio::test]
+    async fn did_resolver_reports_expired_name() {
+        let server = resolver_contract_server();
+        let (status, body, _) =
+            resolver_request(&server, Method::GET, "/1.0/identifiers/did:bns:lapsed").await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body["didDocumentMetadata"]["buckyos"]["documentStatus"],
+            "expired"
+        );
+        assert_eq!(body["didDocument"]["id"], "did:bns:lapsed");
     }
 
     #[tokio::test]

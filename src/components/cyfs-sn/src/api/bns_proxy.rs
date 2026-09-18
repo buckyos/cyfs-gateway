@@ -13,13 +13,13 @@ use super::common::{
     normalize_evm_address, normalize_username, ok_response, parse_params,
     resolve_self_scoped_username, RpcCallResult,
 };
-use super::errors::{bns_proxy_error, parse_error, SnApiErrorCode};
+use super::errors::{bns_proxy_error, parse_error, reason_error, SnApiErrorCode};
 use crate::sn_bns_proxy::{SnBnsProxy, SnBnsProxyInitialDocuments, SnBnsProxyRegisterParams};
 use crate::SNServer;
 use ::kRPC::{RPCErrors, RPCRequest, RPCResponse};
 use bns_client::dns_document::DnsTxtRecord;
 use bns_client::DnsTxtUpdate;
-use cyfs_gateway_api::SnBnsProxyResp;
+use cyfs_gateway_api::{SnBnsProxyResp, SnOwnerRemoveBoundZoneReq, SnOwnerRemoveBoundZoneResp};
 use rand::RngCore;
 use serde::Deserialize;
 use serde_json::Value;
@@ -85,7 +85,12 @@ struct RegisterNameBootstrapReq {
 }
 
 fn require_bns_proxy(server: &SNServer) -> RpcCallResult<Arc<SnBnsProxy>> {
-    Ok(server.bns_proxy())
+    server.bns_proxy().ok_or_else(|| {
+        reason_error(
+            SnApiErrorCode::BnsProxyUnavailable,
+            "BNS proxy is not configured",
+        )
+    })
 }
 
 /// request_id 是幂等键：客户端未提供时生成随机 id（每次调用视为新意图）。
@@ -211,6 +216,39 @@ pub(crate) async fn handle_bns_proxy(
                 .map_err(bns_proxy_error)?;
             server.invalidate_bns_name_dns_cache(username.as_str());
             ok_response(&req, SnBnsProxyResp { code: 0, outcome })
+        }
+        "owner.remove_bound_zone" => {
+            let params: SnOwnerRemoveBoundZoneReq = parse_params(&req)?;
+            let name = normalize_username(params.name.as_str())?;
+            if params.request_id.trim().is_empty() {
+                return Err(parse_error(
+                    SnApiErrorCode::InvalidParams,
+                    "request_id is required",
+                ));
+            }
+            let proxy = require_bns_proxy(server)?;
+            let (outcome, result) = proxy
+                .remove_bound_zone(
+                    name.as_str(),
+                    params.request_id,
+                    params.zone_did,
+                    params.expected_owner_hash,
+                    params.owner_authorization,
+                )
+                .await
+                .map_err(bns_proxy_error)?;
+            server.invalidate_bns_name_dns_cache(name.as_str());
+            ok_response(
+                &req,
+                SnOwnerRemoveBoundZoneResp {
+                    code: 0,
+                    outcome,
+                    source_owner_hash: result.source_owner_hash,
+                    result_owner_hash: result.result_owner_hash,
+                    source_version: result.source_version,
+                    target_version: result.target_version,
+                },
+            )
         }
         "publish_relay_assignment" => {
             let params: PublishRelayAssignmentReq = parse_params(&req)?;

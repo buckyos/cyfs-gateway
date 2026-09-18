@@ -7,11 +7,14 @@ authors = ["BuckyOS DAO", "@waterflier", "@lurenpluto", "@wugren"]
 [dependencies]
 async-trait.workspace = true
 bns-evm = { path = "../bns-evm" }
+buckyos-kit.workspace = true
 hex.workspace = true
 kRPC.workspace = true
+log.workspace = true
 rusqlite = { version = "0.32.1", features = ["bundled"] }
 serde.workspace = true
 serde_json.workspace = true
+serde_jcs = "0.2.0"
 sha2.workspace = true
 thiserror.workspace = true
 tokio.workspace = true

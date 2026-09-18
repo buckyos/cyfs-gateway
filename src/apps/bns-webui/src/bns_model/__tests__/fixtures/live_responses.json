@@ -1,0 +1,629 @@
+{
+  "_note": "captured from https://bns.buckyos.ai — 真实响应，请勿手工编辑；用 scripts/capture-fixtures.mjs 重新抓取",
+  "name": "test-iobns-20260715-01",
+  "address": "0x90f79bf6eb2c4f870365e785982e1f101e93b906",
+  "krpc": {
+    "systemInfo": {
+      "result": {
+        "error": null,
+        "ok": true,
+        "result": {
+          "chain_id": 31337,
+          "contract_address": "0x700b6a60ce7eaaea56f065753d8dcb9653dbad35",
+          "ready": true
+        }
+      },
+      "sys": [
+        1
+      ]
+    },
+    "queryNameState": {
+      "result": {
+        "error": null,
+        "ok": true,
+        "result": {
+          "alias_state_hash": "0x0000000000000000000000000000000000000000000000000000000000000000",
+          "allow_delegated_subnames": false,
+          "asset_owner": "0x90f79bf6eb2c4f870365e785982e1f101e93b906",
+          "effective_owner": {
+            "kind": "chain_account",
+            "value": "0x90f79bf6eb2c4f870365e785982e1f101e93b906"
+          },
+          "expire_at": 1815646660,
+          "grace_until": 1818238660,
+          "lineage_epoch": 0,
+          "min_document_iat": 0,
+          "name": "test-iobns-20260715-01",
+          "name_seq": 1,
+          "namespace_policy_hash": "0x0000000000000000000000000000000000000000000000000000000000000000",
+          "owner_document_version": 1,
+          "owner_policy_seq": 0,
+          "owner_source": "asset_owner_fallback",
+          "payment_policy_hash": "0x0000000000000000000000000000000000000000000000000000000000000000",
+          "registered_at": 1784110660,
+          "renewable": true,
+          "semantic_owner": {
+            "kind": "unset",
+            "value": ""
+          },
+          "standard_transfer_enabled": true,
+          "status": "active",
+          "transferable": true,
+          "updated_at": 1784110660
+        }
+      },
+      "sys": [
+        2
+      ]
+    },
+    "queryNameStateMissing": {
+      "result": {
+        "error": null,
+        "ok": true,
+        "result": null
+      },
+      "sys": [
+        3
+      ]
+    },
+    "queryNameStateInvalid": {
+      "result": {
+        "error": {
+          "actual": null,
+          "code": "INVALID_NAME",
+          "doc_type": null,
+          "expected": null,
+          "message": "invalid BNS name `BadName`: only lower-case ASCII letters, digits, '-' and '.' are supported",
+          "name": "BadName"
+        },
+        "ok": false,
+        "result": null
+      },
+      "sys": [
+        4
+      ]
+    },
+    "resolveOwner": {
+      "result": {
+        "error": null,
+        "ok": true,
+        "result": {
+          "authority_root": "0x0000000000000000000000000000000000000000000000000000000000000000",
+          "authority_seq": 0,
+          "effective_owner": {
+            "kind": "chain_account",
+            "value": "0x90f79bf6eb2c4f870365e785982e1f101e93b906"
+          },
+          "source": "asset_owner_fallback"
+        }
+      },
+      "sys": [
+        5
+      ]
+    },
+    "resolveOwnerMissing": {
+      "result": {
+        "error": {
+          "actual": null,
+          "code": "NAME_NOT_FOUND",
+          "doc_type": null,
+          "expected": null,
+          "message": "name `definitely-not-registered-xyz` was not found",
+          "name": "definitely-not-registered-xyz"
+        },
+        "ok": false,
+        "result": null
+      },
+      "sys": [
+        6
+      ]
+    },
+    "getAuthoritySet": {
+      "result": {
+        "error": null,
+        "ok": true,
+        "result": {
+          "active_key_count": 0,
+          "authority_root": "0x0000000000000000000000000000000000000000000000000000000000000000",
+          "authority_seq": 0,
+          "name": "test-iobns-20260715-01"
+        }
+      },
+      "sys": [
+        7
+      ]
+    },
+    "resolveDocument": {
+      "result": {
+        "error": null,
+        "ok": true,
+        "result": {
+          "alias_kind": "none",
+          "alias_target_did": "",
+          "document_state": {
+            "beneficiary": {
+              "kind": "unset",
+              "value": ""
+            },
+            "controller": {
+              "kind": "unset",
+              "value": ""
+            },
+            "controller_policy_hash": "0x0000000000000000000000000000000000000000000000000000000000000000",
+            "doc_type": "owner",
+            "document": {
+              "codec": "0x0000000000000000000000000000000000000000000000000000000000000000",
+              "content_hash": "0x376e070bb47087e6abd0254c6429ae7618a9ac26d1facaa03fe06577dd5fd6ca",
+              "extra_hash": "0x0000000000000000000000000000000000000000000000000000000000000000",
+              "inline_document": [
+                123,
+                34,
+                99,
+                114,
+                101,
+                97,
+                116,
+                101,
+                100,
+                95,
+                97,
+                116,
+                34,
+                58,
+                49,
+                55,
+                56,
+                52,
+                49,
+                49,
+                48,
+                54,
+                54,
+                48,
+                44,
+                34,
+                99,
+                114,
+                101,
+                97,
+                116,
+                101,
+                100,
+                95,
+                98,
+                121,
+                34,
+                58,
+                34,
+                99,
+                121,
+                102,
+                115,
+                45,
+                115,
+                110,
+                34,
+                44,
+                34,
+                110,
+                97,
+                109,
+                101,
+                34,
+                58,
+                34,
+                116,
+                101,
+                115,
+                116,
+                45,
+                105,
+                111,
+                98,
+                110,
+                115,
+                45,
+                50,
+                48,
+                50,
+                54,
+                48,
+                55,
+                49,
+                53,
+                45,
+                48,
+                49,
+                34,
+                125
+              ],
+              "schema": "0x0000000000000000000000000000000000000000000000000000000000000000",
+              "storage_type": "inline",
+              "uri": ""
+            },
+            "document_state_hash": "0x4253d3a4094c2ac5175e26699b88779d80db368476e5208490a83fd47b1549fe",
+            "expire_at": 0,
+            "name": "test-iobns-20260715-01",
+            "payment_policy_hash": "0x0000000000000000000000000000000000000000000000000000000000000000",
+            "payment_target": "",
+            "previous_version": 0,
+            "price_policy_hash": "0x0000000000000000000000000000000000000000000000000000000000000000",
+            "revoked_at": 0,
+            "rights_policy_hash": "0x0000000000000000000000000000000000000000000000000000000000000000",
+            "split_policy_hash": "0x0000000000000000000000000000000000000000000000000000000000000000",
+            "status": "active",
+            "valid_from": 1784110660,
+            "version": 1
+          },
+          "effective_controller": {
+            "kind": "chain_account",
+            "value": "0x90f79bf6eb2c4f870365e785982e1f101e93b906"
+          },
+          "name_state": {
+            "alias_state_hash": "0x0000000000000000000000000000000000000000000000000000000000000000",
+            "allow_delegated_subnames": false,
+            "asset_owner": "0x90f79bf6eb2c4f870365e785982e1f101e93b906",
+            "effective_owner": {
+              "kind": "chain_account",
+              "value": "0x90f79bf6eb2c4f870365e785982e1f101e93b906"
+            },
+            "expire_at": 1815646660,
+            "grace_until": 1818238660,
+            "lineage_epoch": 0,
+            "min_document_iat": 0,
+            "name": "test-iobns-20260715-01",
+            "name_seq": 1,
+            "namespace_policy_hash": "0x0000000000000000000000000000000000000000000000000000000000000000",
+            "owner_document_version": 1,
+            "owner_policy_seq": 0,
+            "owner_source": "asset_owner_fallback",
+            "payment_policy_hash": "0x0000000000000000000000000000000000000000000000000000000000000000",
+            "registered_at": 1784110660,
+            "renewable": true,
+            "semantic_owner": {
+              "kind": "unset",
+              "value": ""
+            },
+            "standard_transfer_enabled": true,
+            "status": "active",
+            "transferable": true,
+            "updated_at": 1784110660
+          },
+          "owner": {
+            "authority_root": "0x0000000000000000000000000000000000000000000000000000000000000000",
+            "authority_seq": 0,
+            "effective_owner": {
+              "kind": "chain_account",
+              "value": "0x90f79bf6eb2c4f870365e785982e1f101e93b906"
+            },
+            "source": "asset_owner_fallback"
+          },
+          "proof_root": "0xb04af39f765ea2889665b1d8a5b4f91b403e177e0b46353847ea9ed8d1bf08fa",
+          "status": "active"
+        }
+      },
+      "sys": [
+        8
+      ]
+    },
+    "resolveDocumentMissing": {
+      "result": {
+        "error": {
+          "actual": null,
+          "code": "DOCUMENT_NOT_FOUND",
+          "doc_type": "nonexistent",
+          "expected": null,
+          "message": "document `test-iobns-20260715-01/nonexistent` was not found",
+          "name": "test-iobns-20260715-01"
+        },
+        "ok": false,
+        "result": null
+      },
+      "sys": [
+        9
+      ]
+    },
+    "getDocumentVersionMissing": {
+      "result": {
+        "error": null,
+        "ok": true,
+        "result": null
+      },
+      "sys": [
+        10
+      ]
+    },
+    "queryByAddr": {
+      "result": {
+        "error": null,
+        "ok": true,
+        "result": {
+          "names": [
+            "test-iobns-20260715-01",
+            "test-iobns-20260715-02"
+          ],
+          "next_cursor": null
+        }
+      },
+      "sys": [
+        11
+      ]
+    },
+    "queryByAddrBadLimit": {
+      "result": {
+        "error": {
+          "actual": null,
+          "code": "INVALID_LIMIT",
+          "doc_type": null,
+          "expected": null,
+          "message": "invalid page limit 5000; expected 1..=1000",
+          "name": null
+        },
+        "ok": false,
+        "result": null
+      },
+      "sys": [
+        12
+      ]
+    },
+    "queryTxStateNotFound": {
+      "result": {
+        "error": null,
+        "ok": true,
+        "result": {
+          "block_number": null,
+          "confirmations": 0,
+          "state": "not_found",
+          "tx_hash": "0x0000000000000000000000000000000000000000000000000000000000000001"
+        }
+      },
+      "sys": [
+        13
+      ]
+    },
+    "listEvents": {
+      "result": {
+        "error": null,
+        "ok": true,
+        "result": [
+          {
+            "event": {
+              "data": {
+                "asset_owner": "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266",
+                "expire_at": 1815547647,
+                "lineage_epoch": 0,
+                "name": "smoke-20260714064727",
+                "name_seq": 1
+              },
+              "type": "name_registered"
+            },
+            "event_hash": "0x7181ead3f81d149d94df2599a816082c7b7357de2bddf896621d9784a8aa2481",
+            "event_type": "name_registered",
+            "log_root": "0xbf725abef1da76ca362be5882fee1e7bc2ca164031b54ae790e0f4a7316f4fe4",
+            "observed_at": 1784011648,
+            "previous_log_root": "0x0000000000000000000000000000000000000000000000000000000000000000",
+            "seq": 1
+          },
+          {
+            "event": {
+              "data": {
+                "content_hash": "0x4d1c2c8ec7af262318984b74289b6d7982c7f5746c8d8d2c51404d53d629639a",
+                "doc_type": "owner",
+                "document_state_hash": "0x53785d9ec5b87e25b4f14a850a072a751423484e077988facd583295e31043e9",
+                "name": "smoke-20260714064727",
+                "version": 1
+              },
+              "type": "document_published"
+            },
+            "event_hash": "0x6a587ecc7c188a6b78e6cbf2c05a0939bf74b9df84866fe3533eafd384ae81e0",
+            "event_type": "document_published",
+            "log_root": "0xf207c5ce577581c4c1ce2d4318a5a7428fd451e9a68f3f7187cb21175a45a3b6",
+            "observed_at": 1784011648,
+            "previous_log_root": "0xbf725abef1da76ca362be5882fee1e7bc2ca164031b54ae790e0f4a7316f4fe4",
+            "seq": 2
+          },
+          {
+            "event": {
+              "data": {
+                "asset_owner": "0x90f79bf6eb2c4f870365e785982e1f101e93b906",
+                "expire_at": 1815646660,
+                "lineage_epoch": 0,
+                "name": "test-iobns-20260715-01",
+                "name_seq": 1
+              },
+              "type": "name_registered"
+            },
+            "event_hash": "0x5c7b82ddbc85ee0b2ed3412793f12502cd7a23a2d906fab7a4d09935f9d30e4d",
+            "event_type": "name_registered",
+            "log_root": "0x648189bb2b74608cd0a0fe8127654db116a8078f2dcff0dd81efba2f4c6cdd1d",
+            "observed_at": 1784110661,
+            "previous_log_root": "0xf207c5ce577581c4c1ce2d4318a5a7428fd451e9a68f3f7187cb21175a45a3b6",
+            "seq": 3
+          },
+          {
+            "event": {
+              "data": {
+                "content_hash": "0x376e070bb47087e6abd0254c6429ae7618a9ac26d1facaa03fe06577dd5fd6ca",
+                "doc_type": "owner",
+                "document_state_hash": "0x4253d3a4094c2ac5175e26699b88779d80db368476e5208490a83fd47b1549fe",
+                "name": "test-iobns-20260715-01",
+                "version": 1
+              },
+              "type": "document_published"
+            },
+            "event_hash": "0x1e2c2772dbd96276b1c1914049c639653f3dd9e00fcfb11c05b72d1337514b63",
+            "event_type": "document_published",
+            "log_root": "0x3bef0a27c61bb3c8a4612bd721467c181ef1b5920cde0f1fadab6106629fa6ae",
+            "observed_at": 1784110661,
+            "previous_log_root": "0x648189bb2b74608cd0a0fe8127654db116a8078f2dcff0dd81efba2f4c6cdd1d",
+            "seq": 4
+          },
+          {
+            "event": {
+              "data": {
+                "content_hash": "0x9056abdde7f91e6a51742745c09ac657975b11634bbf9a7387bb0809d8ee51e8",
+                "doc_type": "dns_txt",
+                "document_state_hash": "0xfeeccb5e6ec098e46308381a6cf7b72aec53f29145480466a184e537a8c7aed7",
+                "name": "test-iobns-20260715-01",
+                "version": 1
+              },
+              "type": "document_published"
+            },
+            "event_hash": "0xd4c61e08b975002741e5f2a0856ec37ea78b191595f9e475d7013cf6421fab51",
+            "event_type": "document_published",
+            "log_root": "0xb70cf71800b8b9bb365e175bbb9ee5cae72c69ca8abd2ccd2ea7b102f96478ab",
+            "observed_at": 1784110661,
+            "previous_log_root": "0x3bef0a27c61bb3c8a4612bd721467c181ef1b5920cde0f1fadab6106629fa6ae",
+            "seq": 5
+          },
+          {
+            "event": {
+              "data": {
+                "name": "test-iobns-20260715-01",
+                "name_seq": 1,
+                "policy_hash": "0xb202d5f2097d5599d1e29fb476e522ba5f189636203aa1afb966ec4106367aa7"
+              },
+              "type": "controller_policy_updated"
+            },
+            "event_hash": "0xd468320d4cd556fb4350148febf00019cdbc1f7242442ac4c7efd07bfc64fffa",
+            "event_type": "controller_policy_updated",
+            "log_root": "0x192cb1be1dbd87a7213b4e3bd55bdf5c247a3980b5e458af40a11769d18d1bb2",
+            "observed_at": 1784110661,
+            "previous_log_root": "0xb70cf71800b8b9bb365e175bbb9ee5cae72c69ca8abd2ccd2ea7b102f96478ab",
+            "seq": 6
+          },
+          {
+            "event": {
+              "data": {
+                "asset_owner": "0x90f79bf6eb2c4f870365e785982e1f101e93b906",
+                "expire_at": 1815647982,
+                "lineage_epoch": 0,
+                "name": "test-iobns-20260715-02",
+                "name_seq": 1
+              },
+              "type": "name_registered"
+            },
+            "event_hash": "0x620e396c74a63feb53875e2c7b6d3a144cce2da28dcd1ce43cc1a237872f4467",
+            "event_type": "name_registered",
+            "log_root": "0xc33d4d5b035f065a40430e3073e3de36d8559b33887835100922a051dd1cb511",
+            "observed_at": 1784111982,
+            "previous_log_root": "0x192cb1be1dbd87a7213b4e3bd55bdf5c247a3980b5e458af40a11769d18d1bb2",
+            "seq": 7
+          },
+          {
+            "event": {
+              "data": {
+                "content_hash": "0xe22bd3b38cf010cddfceb7a039144f2caa66616313f12a45e83be82aa9402aff",
+                "doc_type": "owner",
+                "document_state_hash": "0x77309902cd5e915e962e2c053f4ea300751b527e7434f2d987032a9415cd80c7",
+                "name": "test-iobns-20260715-02",
+                "version": 1
+              },
+              "type": "document_published"
+            },
+            "event_hash": "0xb886a4c73f7780ff5b4c7326875ae4008257a9ac3847279701f5b61121bfe066",
+            "event_type": "document_published",
+            "log_root": "0x8e48391b2018d138ef3379c4aa111e527762b252b9b42e93d75d940bd0ac3652",
+            "observed_at": 1784111982,
+            "previous_log_root": "0xc33d4d5b035f065a40430e3073e3de36d8559b33887835100922a051dd1cb511",
+            "seq": 8
+          }
+        ]
+      },
+      "sys": [
+        14
+      ]
+    },
+    "latestCheckpointEmpty": {
+      "result": {
+        "error": null,
+        "ok": true,
+        "result": null
+      },
+      "sys": [
+        15
+      ]
+    },
+    "unknownMethod": {
+      "error": "Unknown method: no.such_method",
+      "sys": [
+        16
+      ]
+    },
+    "badParams": {
+      "error": "Parse Request Error: Failed to parse BnsNameReq: missing field `name`",
+      "sys": [
+        17
+      ]
+    }
+  },
+  "didResolver": {
+    "answer": {
+      "httpStatus": 200,
+      "body": {
+        "didDocument": {
+          "created_at": 1784110660,
+          "created_by": "cyfs-sn",
+          "name": "test-iobns-20260715-01"
+        },
+        "didDocumentMetadata": {
+          "buckyos": {
+            "authoritySeq": 0,
+            "docType": "owner",
+            "documentStatus": "active",
+            "documentVersion": 1
+          },
+          "deactivated": false,
+          "versionId": "1"
+        },
+        "didResolutionMetadata": {
+          "contentType": "application/did+ld+json",
+          "error": null
+        }
+      }
+    },
+    "missing": {
+      "httpStatus": 404,
+      "body": {
+        "didDocument": null,
+        "didDocumentMetadata": {
+          "buckyos": {
+            "docType": "nonexistent",
+            "documentStatus": "missing"
+          },
+          "deactivated": false
+        },
+        "didResolutionMetadata": {
+          "contentType": null,
+          "error": "notFound"
+        }
+      }
+    },
+    "notApplicable": {
+      "httpStatus": 404,
+      "body": {
+        "didDocument": null,
+        "didDocumentMetadata": {},
+        "didResolutionMetadata": {
+          "contentType": null,
+          "error": "notApplicable"
+        }
+      }
+    },
+    "historical": {
+      "httpStatus": 501,
+      "body": {
+        "didDocument": null,
+        "didDocumentMetadata": {
+          "buckyos": {
+            "historicalQuerySupported": false
+          }
+        },
+        "didResolutionMetadata": {
+          "contentType": null,
+          "error": "historicalQueryNotSupported"
+        }
+      }
+    }
+  }
+}

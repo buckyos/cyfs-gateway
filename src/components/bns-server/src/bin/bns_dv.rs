@@ -12,6 +12,9 @@
 //!
 //! 这是开发/调试用工具（被 scripts/dv-up.sh / dv-smoke.sh 调用），不是生产服务。
 
+#[path = "bns_dv/cluster.rs"]
+mod bns_dv_cluster;
+
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -22,8 +25,10 @@ use bns_client::{
     BnsEvmTxSubmission, BnsIndexerApi, BnsIndexerClient, BnsPublishDocumentReq, BnsRegisterNameReq,
     StaticBnsEvmKeyManager,
 };
+use bns_dv_cluster::{create_database_parent, merge_cluster_serve_flags};
+use bns_evm::BnsChainClient;
 use bns_indexer::{
-    default_document_update, BnsBlockSyncSourceConfig, BnsContractEventIndexer,
+    default_document_update, now_timestamp, BnsBlockSyncSourceConfig, BnsContractEventIndexer,
     BnsIndexerSyncConfig, CallAuthority, DocumentRef, DocumentStatus, MutationGuard, NameState,
     NameStatus, OwnerPolicyUpdate, Principal, RegisterOptions, SqliteBnsRegistryStore,
 };
@@ -164,14 +169,18 @@ async fn main() {
 async fn run() -> Result<(), DynError> {
     let mut args = std::env::args().skip(1);
     let command = args.next().unwrap_or_default();
-    let flags = parse_flags(args.collect());
+    let mut flags = parse_flags(args.collect());
+    if command == "serve" && flags.contains_key("cluster") {
+        flags = merge_cluster_serve_flags(flags)?;
+    }
     match command.as_str() {
         "serve" => serve(flags).await,
         "smoke" => smoke(flags).await,
         other => Err(format!(
             "unknown subcommand `{other}`; expected `serve` or `smoke`\n\
              usage:\n  \
-             bns-dv serve --rpc <url> --contract <addr> --chain-id <n> --db <path> --listen <addr> [--start-block n] [--confirmations n] [--interval-ms n] [--config seed.yaml] [--seed-key 0x..]\n  \
+             bns-dv serve --cluster [--rpc <url>] [--contract <addr>] [--chain-id <n>] [--db <path>] [--listen <addr>] [--start-block n] [--confirmations n] [--interval-ms n] [--max-block-span n]\n  \
+             bns-dv serve --rpc <url> --contract <addr> --chain-id <n> --db <path> --listen <addr> [--start-block n] [--confirmations n] [--interval-ms n] [--max-block-span n] [--config seed.yaml] [--seed-key 0x..]\n  \
              bns-dv smoke --server <url> --rpc <url> --contract <addr> --chain-id <n> --key <0x..> [--name alice] [--timeout-ms n]"
         )
         .into()),
@@ -188,22 +197,47 @@ async fn serve(flags: HashMap<String, String>) -> Result<(), DynError> {
     let listen = require(&flags, "listen")?;
     let start_block: u64 = flags.get("start-block").map_or(Ok(0), |v| v.parse())?;
     let confirmations: u64 = flags.get("confirmations").map_or(Ok(0), |v| v.parse())?;
-    let interval_ms: u64 = flags.get("interval-ms").map_or(Ok(1000), |v| v.parse())?;
+    let interval_ms: u64 = flags.get("interval-ms").map_or(Ok(15_000), |v| v.parse())?;
+    let max_block_span: u64 = flags.get("max-block-span").map_or(Ok(500), |v| v.parse())?;
+
+    if flags.contains_key("cluster") {
+        create_database_parent(&db)?;
+    }
 
     let mut source = BnsBlockSyncSourceConfig::anvil(rpc.clone(), contract.clone(), start_block);
     source.chain_id = chain_id;
     let mut sync_config = BnsIndexerSyncConfig::new(source.clone());
     sync_config.confirmations = confirmations;
+    sync_config.max_block_span = max_block_span;
     sync_config.validate()?;
     let source_id = source.source_id()?;
 
     // server 与 indexer 各开一条到同一 SQLite 文件的连接（WAL 并发）。
     let server_store = SqliteBnsRegistryStore::open(&db)?;
     let indexer_store = SqliteBnsRegistryStore::open(&db)?;
+    let chain_client = Arc::new(BnsChainClient::new_with_chain_config(
+        rpc.clone(),
+        source.contract_address()?,
+        chain_id,
+    ));
+    loop {
+        match chain_client.validate_chain().await {
+            Ok(()) => break,
+            Err(err) => {
+                eprintln!("[chain] startup validation failed: {err}; retrying in 30 seconds");
+                tokio::time::sleep(Duration::from_secs(30)).await;
+            }
+        }
+    }
 
     // indexer 轮询循环。
+    let indexer_chain_client = chain_client.clone();
     tokio::spawn(async move {
-        let indexer = match BnsContractEventIndexer::new(&indexer_store, sync_config.clone()) {
+        let indexer = match BnsContractEventIndexer::new_with_chain_client(
+            &indexer_store,
+            sync_config.clone(),
+            indexer_chain_client,
+        ) {
             Ok(indexer) => indexer,
             Err(err) => {
                 eprintln!("[indexer] config error: {err}");
@@ -234,9 +268,9 @@ async fn serve(flags: HashMap<String, String>) -> Result<(), DynError> {
     run_on_init_txs(&flags, &rpc, &contract, chain_id, &db).await?;
 
     let server: Arc<dyn HttpServer> = Arc::new(
-        BnsContractHttpServer::from_contract_store_with_chain_config(
+        BnsContractHttpServer::from_contract_store_with_chain_client(
             server_store,
-            rpc.clone(),
+            chain_client,
             contract.clone(),
             chain_id,
         ),
@@ -244,7 +278,8 @@ async fn serve(flags: HashMap<String, String>) -> Result<(), DynError> {
 
     eprintln!(
         "[serve] bns-dv ready\n  rpc={rpc}\n  contract={contract}\n  chain_id={chain_id}\n  \
-         source={source_id}\n  db={db}\n  listen=http://{listen}  (rpc_path={})",
+         source={source_id}\n  db={db}\n  interval_ms={interval_ms}\n  \
+         max_block_span={max_block_span}\n  listen=http://{listen}  (rpc_path={})",
         server_rpc_path()
     );
 
@@ -289,6 +324,7 @@ async fn run_on_init_txs(
     }
     let evm_config = BnsEvmClientConfig::anvil(rpc, contract, chain_id);
     let controller = BnsEvmControllerClient::new(evm_config.clone(), &runtime.private_key)?
+        .with_dynamic_tx_params(true)
         .with_receipt_wait(Some(runtime.receipt_wait));
     let api: Arc<dyn BnsIndexerApi> = Arc::new(BnsContractServerHandler::new(
         SqliteBnsRegistryStore::open(db)?,
@@ -449,10 +485,11 @@ async fn run_register_name_init_tx(
                 )
                 .into());
             }
-            if state.status != NameStatus::Active {
+            let status = state.effective_status_at(now_timestamp());
+            if status != NameStatus::Active {
                 return Err(format!(
                     "on_init_txs[{index}] name `{name}` exists but is {:?}; startup mutation only supports active names",
-                    state.status
+                    status
                 )
                 .into());
             }
@@ -486,10 +523,11 @@ async fn register_authority_and_guard(
         .query_name_state(parent)
         .await?
         .ok_or_else(|| format!("cannot register `{name}`: parent `{parent}` is not projected"))?;
-    if parent_state.status != NameStatus::Active {
+    let parent_status = parent_state.effective_status_at(now_timestamp());
+    if parent_status != NameStatus::Active {
         return Err(format!(
             "cannot register `{name}`: parent `{parent}` is {:?}",
-            parent_state.status
+            parent_status
         )
         .into());
     }
@@ -522,6 +560,7 @@ async fn apply_init_document_mutations(
         let current_version = current.as_ref().map_or(0, |state| state.version);
         if current.as_ref().is_some_and(|state| {
             state.status == DocumentStatus::Active
+                && (state.expire_at == 0 || now_timestamp() < state.expire_at)
                 && state.document.inline_document == doc.inline_document
         }) {
             current_documents.push(ProjectedDocumentInfo {
@@ -621,6 +660,7 @@ fn resolve_mutation_signer(
         .into());
     }
     let owner_controller = BnsEvmControllerClient::new(evm_config.clone(), owner_key)?
+        .with_dynamic_tx_params(true)
         .with_receipt_wait(Some(runtime.receipt_wait));
     Ok((Some(owner_controller), owner_signer))
 }
@@ -654,7 +694,9 @@ async fn wait_for_init_projection(
     let poll = Duration::from_millis(runtime.wait_poll_ms.max(1));
     loop {
         if let Ok(Some(name_state)) = api.query_name_state(name).await {
-            if name_state.status == NameStatus::Active && name_state.name_seq >= min_name_seq {
+            if name_state.effective_status_at(now_timestamp()) == NameStatus::Active
+                && name_state.name_seq >= min_name_seq
+            {
                 let mut projected_docs = Vec::with_capacity(documents.len());
                 let mut all_ready = true;
                 for doc in documents {
@@ -664,7 +706,8 @@ async fn wait_for_init_projection(
                         .map_or(1, |(_, version)| *version);
                     match api.resolve_document(name, &doc.doc_type).await {
                         Ok(result)
-                            if result.document_state.status == DocumentStatus::Active
+                            if result.effective_status_at(now_timestamp())
+                                == DocumentStatus::Active
                                 && result.document_state.version >= min_version
                                 && result.document_state.document.inline_document
                                     == doc.inline_document =>
@@ -890,7 +933,7 @@ async fn smoke(flags: HashMap<String, String>) -> Result<(), DynError> {
     let deadline = Instant::now() + Duration::from_millis(timeout_ms);
     loop {
         if let Ok(Some(state)) = server_api.query_name_state(&name).await {
-            if state.status == NameStatus::Active {
+            if state.effective_status_at(now_timestamp()) == NameStatus::Active {
                 break;
             }
         }
@@ -936,7 +979,7 @@ async fn smoke(flags: HashMap<String, String>) -> Result<(), DynError> {
     Ok(())
 }
 
-// ===== 简易 --flag value 解析 =====
+// ===== cluster 配置和简易 --flag value 解析 =====
 
 fn parse_flags(args: Vec<String>) -> HashMap<String, String> {
     let mut flags = HashMap::new();
@@ -945,6 +988,8 @@ fn parse_flags(args: Vec<String>) -> HashMap<String, String> {
         if let Some(name) = arg.strip_prefix("--") {
             if let Some((k, v)) = name.split_once('=') {
                 flags.insert(k.to_string(), v.to_string());
+            } else if name == "cluster" {
+                flags.insert(name.to_string(), "true".to_string());
             } else {
                 let value = iter.next().unwrap_or_default();
                 flags.insert(name.to_string(), value);
@@ -970,7 +1015,7 @@ mod tests {
 
     use bns_evm::{Address, EthRpcClient};
     use name_client::{
-        BnsProvider, DidDocType, DocumentStatus as ResolverDocumentStatus, NsProvider,
+        document_iat, BnsProvider, DidDocType, DocumentStatus as ResolverDocumentStatus, NsProvider,
     };
     use name_lib::DID;
     use serde_json::json;
@@ -980,6 +1025,20 @@ mod tests {
 
     const CHAIN_ID: u64 = 31_337;
     const DEPLOYER_KEY: &str = "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d";
+
+    #[test]
+    fn cluster_flag_does_not_consume_the_next_option() {
+        let parsed = parse_flags(vec![
+            "--cluster".to_string(),
+            "--rpc".to_string(),
+            "http://override:8545".to_string(),
+        ]);
+        assert_eq!(parsed.get("cluster").map(String::as_str), Some("true"));
+        assert_eq!(
+            parsed.get("rpc").map(String::as_str),
+            Some("http://override:8545")
+        );
+    }
 
     fn e2e_tools_available() -> bool {
         fn has(bin: &str) -> bool {
@@ -1120,7 +1179,7 @@ mod tests {
             .collect()
     }
 
-    async fn resolve_json_doc(provider: &BnsProvider, did: &DID, doc_type: &str) -> (u64, Value) {
+    async fn resolve_json_doc(provider: &BnsProvider, did: &DID, doc_type: &str) -> Value {
         let doc_type = DidDocType::from(doc_type);
         let state = provider
             .resolve_published_state(did, &doc_type)
@@ -1128,13 +1187,12 @@ mod tests {
             .unwrap()
             .expect("published state");
         assert_eq!(state.document_status, ResolverDocumentStatus::Active);
-        let version = state.document_version.expect("document version");
         let document = state
             .document_ref
             .and_then(|doc| doc.inline_document)
             .expect("inline document");
-        let value = document.to_json_value().unwrap();
-        (version, value)
+        assert_eq!(state.document_version, document_iat(&document));
+        document.to_json_value().unwrap()
     }
 
     #[tokio::test]
@@ -1161,6 +1219,7 @@ mod tests {
             serde_json::to_vec(&json!({
                 "id": "did:bns:alice",
                 "gateway_device_name": "ood1",
+                "iat": 1751500000,
                 "marker": "zone-from-on-init"
             }))
             .unwrap(),
@@ -1171,26 +1230,31 @@ mod tests {
             serde_json::to_vec(&json!({
                 "id": "did:bns:alice",
                 "oods": ["ood1"],
+                "iat": 1751500100,
                 "marker": "boot-from-on-init"
             }))
             .unwrap(),
         )
         .unwrap();
-        std::fs::write(
-            &device_file,
-            serde_json::to_vec(&json!({
-                "id": "did:bns:alice",
-                "devices": {
-                    "ood1": {
-                        "id": "did:dev:ood1",
-                        "device_name": "ood1",
-                        "marker": "device-from-on-init"
-                    }
+        // Keep this close to the contract's 4 KiB inline-document limit. Together
+        // with the other initial documents it needs more than the old fixed
+        // 3,000,000 gas limit and guards the devtest seed path against regression.
+        let device_document = serde_json::to_vec(&json!({
+            "id": "did:bns:alice",
+            "iat": 1751500200,
+            "devices": {
+                "ood1": {
+                    "id": "did:dev:ood1",
+                    "device_name": "ood1",
+                    "marker": "device-from-on-init",
+                    "padding": "x".repeat(3_600)
                 }
-            }))
-            .unwrap(),
-        )
+            }
+        }))
         .unwrap();
+        assert!(device_document.len() > 3_500);
+        assert!(device_document.len() <= 4 * 1024);
+        std::fs::write(&device_file, device_document).unwrap();
 
         let config_file = temp.path().join("seed.yaml");
         std::fs::write(
@@ -1244,23 +1308,21 @@ on_init_txs:
         .unwrap();
         let did = DID::new("bns", "alice");
 
-        let (zone_version, zone) = resolve_json_doc(&provider, &did, "zone").await;
-        assert_eq!(zone_version, 1);
+        let zone = resolve_json_doc(&provider, &did, "zone").await;
         assert_eq!(
             zone,
             json!({
                 "id": "did:bns:alice",
                 "gateway_device_name": "ood1",
+                "iat": 1751500000,
                 "marker": "zone-from-on-init"
             })
         );
 
-        let (boot_version, boot) = resolve_json_doc(&provider, &did, "boot").await;
-        assert_eq!(boot_version, 1);
+        let boot = resolve_json_doc(&provider, &did, "boot").await;
         assert_eq!(boot["marker"], "boot-from-on-init");
 
-        let (device_version, device) = resolve_json_doc(&provider, &did, "device_mini_doc").await;
-        assert_eq!(device_version, 1);
+        let device = resolve_json_doc(&provider, &did, "device_mini_doc").await;
         assert_eq!(device["devices"]["ood1"]["marker"], "device-from-on-init");
 
         server_task.abort();
@@ -1382,7 +1444,18 @@ on_init_txs:
         )
         .await
         .unwrap();
-        let doc = server_api.resolve_document("alice", "zone").await.unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let doc = loop {
+            let doc = server_api.resolve_document("alice", "zone").await.unwrap();
+            if doc.document_state.version >= 2 {
+                break doc;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "indexer did not project the replayed document"
+            );
+            sleep(Duration::from_millis(50)).await;
+        };
         assert_eq!(doc.document_state.version, 2);
         let value: Value =
             serde_json::from_slice(&doc.document_state.document.inline_document).unwrap();

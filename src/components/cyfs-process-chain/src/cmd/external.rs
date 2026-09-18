@@ -9,6 +9,11 @@ use std::sync::{Arc, Mutex};
 
 #[async_trait::async_trait]
 pub trait ExternalCommand: Send + Sync {
+    /// Opt in to a host-specific form of an otherwise built-in command.
+    fn overrides_builtin(&self, _args: &CommandArgs) -> bool {
+        false
+    }
+
     fn help(&self, name: &str, _help_type: CommandHelpType) -> String {
         format!("Usage: {}", name)
     }

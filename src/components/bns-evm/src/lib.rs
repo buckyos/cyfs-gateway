@@ -1,5 +1,6 @@
 //! EVM ABI, transaction signing, JSON-RPC, and event helpers for the BNS contract.
 
+mod chain_client;
 mod rpc;
 mod tx;
 
@@ -20,9 +21,12 @@ pub use bindings::{
     OwnerPolicyUpdate, OwnerResolution, OwnerSource, Principal, PrincipalKind, PurchaseContext,
     RegisterOptions, ReleaseMode, ResolveResult,
 };
+pub use chain_client::{
+    decode_contract_return, BnsChainClient, ContractRead, TransactionLookup, MULTICALL3_ADDRESS,
+};
 pub use rpc::{
-    BlockRange, Eip1559FeeSuggestion, EthLog, EthRpcClient, EthTransaction, EthTransactionReceipt,
-    RpcLogFilter,
+    BlockRange, Eip1559FeeSuggestion, EthBlock, EthLog, EthRpcClient, EthTransaction,
+    EthTransactionReceipt, RpcLogFilter,
 };
 pub use tx::{
     build_eip1559_contract_tx, decode_signed_eip1559, encode_call, sign_eip1559_tx,

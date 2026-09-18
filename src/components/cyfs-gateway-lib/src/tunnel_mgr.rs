@@ -61,7 +61,10 @@ pub struct TunnelManager {
 
 struct TunnelManagerInner {
     tunnel_builder_manager: StdMutex<HashMap<String, Arc<dyn TunnelBuilder>>>,
+    owned_tunnel_builder_manager:
+        StdMutex<HashMap<String, HashMap<String, Arc<dyn TunnelBuilder>>>>,
     tunnel_history: RwLock<HashMap<String, TunnelUrlHistory>>,
+    tunnel_url_pins: AsyncMutex<HashMap<String, usize>>,
     in_flight_probes: AsyncMutex<HashMap<String, SharedProbeFuture>>,
     probe_limiter: Arc<Semaphore>,
     config: StdMutex<TunnelStatusStoreConfig>,
@@ -83,7 +86,9 @@ impl TunnelManager {
         let limiter = Arc::new(Semaphore::new(config.probe_concurrency.max(1)));
         let inner = TunnelManagerInner {
             tunnel_builder_manager: StdMutex::new(HashMap::new()),
+            owned_tunnel_builder_manager: StdMutex::new(HashMap::new()),
             tunnel_history: RwLock::new(HashMap::new()),
+            tunnel_url_pins: AsyncMutex::new(HashMap::new()),
             in_flight_probes: AsyncMutex::new(HashMap::new()),
             probe_limiter: limiter,
             config: StdMutex::new(config),
@@ -194,6 +199,9 @@ impl TunnelManager {
             // decide via TTL whether to reuse them. We mark `cached` so
             // the next query treats this as a hint, not fresh.
             entry.current.cached = true;
+            // Pinning is runtime ownership, not persisted state. A gateway
+            // restart must not inherit pins from tasks that no longer exist.
+            entry.pinned = false;
             entry.persisted_at_ms = Some(entry.updated_at_ms);
             hist.insert(entry.normalized_url.clone(), entry);
         }
@@ -237,6 +245,65 @@ impl TunnelManager {
             .lock()
             .unwrap()
             .remove(protocol);
+    }
+
+    /// Register a builder owned by one runtime instance. Removing one owner
+    /// must not remove another instance's builder for the same protocol.
+    pub fn register_owned_tunnel_builder(
+        &self,
+        protocol: &str,
+        owner: &str,
+        builder: Arc<dyn TunnelBuilder>,
+    ) {
+        self.inner
+            .owned_tunnel_builder_manager
+            .lock()
+            .unwrap()
+            .entry(protocol.to_owned())
+            .or_default()
+            .insert(owner.to_owned(), builder.clone());
+        self.inner
+            .tunnel_builder_manager
+            .lock()
+            .unwrap()
+            .insert(protocol.to_owned(), builder);
+    }
+
+    /// Remove an owned builder only when it is still the active builder. If
+    /// another owner remains, promote that builder so the protocol stays
+    /// usable for the remaining runtime instance.
+    pub fn remove_owned_tunnel_builder(
+        &self,
+        protocol: &str,
+        owner: &str,
+        builder: &Arc<dyn TunnelBuilder>,
+    ) {
+        let remaining = {
+            let mut owned = self.inner.owned_tunnel_builder_manager.lock().unwrap();
+            let Some(by_owner) = owned.get_mut(protocol) else {
+                return;
+            };
+            by_owner.remove(owner);
+            let remaining = by_owner.values().next().cloned();
+            let empty = by_owner.is_empty();
+            if empty {
+                owned.remove(protocol);
+            }
+            remaining
+        };
+
+        let mut active = self.inner.tunnel_builder_manager.lock().unwrap();
+        let is_active = active
+            .get(protocol)
+            .map(|current| Arc::ptr_eq(current, builder))
+            .unwrap_or(false);
+        if is_active {
+            if let Some(builder) = remaining {
+                active.insert(protocol.to_owned(), builder);
+            } else {
+                active.remove(protocol);
+            }
+        }
     }
 
     pub fn config(&self) -> TunnelStatusStoreConfig {
@@ -505,7 +572,13 @@ impl TunnelManager {
     /// Pin a URL so that LRU eviction will not drop its history.
     pub async fn pin_tunnel_url(&self, url: &Url) {
         let normalized = normalize_tunnel_url(url);
+        let mut pins = self.inner.tunnel_url_pins.lock().await;
         let mut hist = self.inner.tunnel_history.write().await;
+
+        // Do not mutate either side until both locks are held. This keeps the
+        // reference count and history flag consistent if this future is
+        // cancelled while waiting for the history lock.
+        *pins.entry(normalized.clone()).or_insert(0) += 1;
         if let Some(h) = hist.get_mut(&normalized) {
             h.pinned = true;
         } else {
@@ -532,6 +605,33 @@ impl TunnelManager {
         }
     }
 
+    /// Release one owner of a pinned URL. The history remains pinned until
+    /// the last owner releases it, so independent keep-tunnel tasks cannot
+    /// evict one another's status history.
+    pub async fn unpin_tunnel_url(&self, url: &Url) {
+        let normalized = normalize_tunnel_url(url);
+        let mut pins = self.inner.tunnel_url_pins.lock().await;
+        let mut hist = self.inner.tunnel_history.write().await;
+
+        // As in pin_tunnel_url, all state changes happen after both awaits so
+        // cancellation cannot leave the two representations out of sync.
+        let pinned = match pins.get_mut(&normalized) {
+            Some(count) if *count > 1 => {
+                *count -= 1;
+                true
+            }
+            Some(_) => {
+                pins.remove(&normalized);
+                false
+            }
+            None => return,
+        };
+
+        if let Some(h) = hist.get_mut(&normalized) {
+            h.pinned = pinned;
+        }
+    }
+
     /// Snapshot the current in-memory history (for diagnostics/persistence).
     pub async fn list_tunnel_url_history(&self) -> Vec<TunnelUrlHistory> {
         self.inner
@@ -546,8 +646,10 @@ impl TunnelManager {
     /// Apply an external observation (e.g. from `keep_tunnel`, business
     /// connect feedback, or a direct attempt) to URL history.
     pub async fn record_status_observation(&self, status: TunnelUrlStatus) {
+        let pins = self.inner.tunnel_url_pins.lock().await;
+        let pinned = pins.get(&status.normalized_url).copied().unwrap_or(0) > 0;
         let mut hist = self.inner.tunnel_history.write().await;
-        Self::merge_into_history(&mut hist, status);
+        Self::merge_into_history(&mut hist, status, pinned);
         let limit = self.inner.config.lock().unwrap().max_memory_history_entries;
         Self::evict_if_needed(&mut hist, limit);
     }
@@ -829,10 +931,15 @@ impl TunnelManager {
         map.remove(normalized);
     }
 
-    fn merge_into_history(hist: &mut HashMap<String, TunnelUrlHistory>, status: TunnelUrlStatus) {
+    fn merge_into_history(
+        hist: &mut HashMap<String, TunnelUrlHistory>,
+        status: TunnelUrlStatus,
+        pinned: bool,
+    ) {
         let key = status.normalized_url.clone();
         if let Some(entry) = hist.get_mut(&key) {
             entry.merge(status);
+            entry.pinned |= pinned;
         } else {
             let now = status.observed_at_ms;
             let scheme = status.scheme.clone();
@@ -865,7 +972,7 @@ impl TunnelManager {
                 },
                 updated_at_ms: now,
                 persisted_at_ms: None,
-                pinned: false,
+                pinned,
                 runtime_tunnel_key: status.runtime_tunnel_key.clone(),
             };
             hist.insert(key, entry);
@@ -975,6 +1082,19 @@ mod tests {
     use async_trait::async_trait;
     use std::io;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    async fn wait_until_pin_lock_is_held(mgr: &TunnelManager) {
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if mgr.inner.tunnel_url_pins.try_lock().is_err() {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("pin operation did not acquire the pin lock");
+    }
 
     #[derive(Clone, Default)]
     struct MockTunnel {}
@@ -1370,6 +1490,149 @@ mod tests {
             entries
                 .iter()
                 .any(|h| h.normalized_url == normalize_tunnel_url(&pin_url))
+        );
+    }
+
+    #[tokio::test]
+    async fn tunnel_url_pin_ownership_is_reference_counted() {
+        let mgr = TunnelManager::new();
+        let pin_url = url("tcp://127.0.0.1:18031/");
+        let normalized = normalize_tunnel_url(&pin_url);
+
+        mgr.pin_tunnel_url(&pin_url).await;
+        mgr.pin_tunnel_url(&pin_url).await;
+        assert!(
+            mgr.list_tunnel_url_history()
+                .await
+                .into_iter()
+                .find(|entry| entry.normalized_url == normalized)
+                .unwrap()
+                .pinned
+        );
+
+        mgr.unpin_tunnel_url(&pin_url).await;
+        assert!(
+            mgr.list_tunnel_url_history()
+                .await
+                .into_iter()
+                .find(|entry| entry.normalized_url == normalized)
+                .unwrap()
+                .pinned
+        );
+
+        mgr.unpin_tunnel_url(&pin_url).await;
+        assert!(
+            !mgr.list_tunnel_url_history()
+                .await
+                .into_iter()
+                .find(|entry| entry.normalized_url == normalized)
+                .unwrap()
+                .pinned
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_pin_owners_release_without_stale_pin() {
+        let mgr = TunnelManager::new();
+        let pin_url = url("tcp://127.0.0.1:18032/");
+        let normalized = normalize_tunnel_url(&pin_url);
+
+        mgr.pin_tunnel_url(&pin_url).await;
+        let mut owners = Vec::new();
+        for _ in 0..32 {
+            let owner = mgr.clone();
+            let owner_url = pin_url.clone();
+            owners.push(tokio::spawn(async move {
+                owner.pin_tunnel_url(&owner_url).await;
+                owner.unpin_tunnel_url(&owner_url).await;
+            }));
+        }
+        for owner in owners {
+            owner.await.unwrap();
+        }
+        mgr.unpin_tunnel_url(&pin_url).await;
+
+        assert!(
+            !mgr.list_tunnel_url_history()
+                .await
+                .into_iter()
+                .find(|entry| entry.normalized_url == normalized)
+                .unwrap()
+                .pinned
+        );
+    }
+
+    #[tokio::test]
+    async fn tunnel_url_pin_is_cancellation_safe() {
+        let mgr = TunnelManager::new();
+        let pin_url = url("tcp://127.0.0.1:18033/");
+        let normalized = normalize_tunnel_url(&pin_url);
+
+        let history_guard = mgr.inner.tunnel_history.write().await;
+        let owner = mgr.clone();
+        let owner_url = pin_url.clone();
+        let handle = tokio::spawn(async move {
+            owner.pin_tunnel_url(&owner_url).await;
+        });
+
+        wait_until_pin_lock_is_held(&mgr).await;
+        handle.abort();
+        assert!(handle.await.unwrap_err().is_cancelled());
+        drop(history_guard);
+
+        assert!(
+            !mgr.inner
+                .tunnel_url_pins
+                .lock()
+                .await
+                .contains_key(&normalized)
+        );
+        assert!(
+            mgr.inner
+                .tunnel_history
+                .read()
+                .await
+                .get(&normalized)
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn last_tunnel_url_unpin_is_cancellation_safe() {
+        let mgr = TunnelManager::new();
+        let pin_url = url("tcp://127.0.0.1:18034/");
+        let normalized = normalize_tunnel_url(&pin_url);
+        mgr.pin_tunnel_url(&pin_url).await;
+
+        let history_guard = mgr.inner.tunnel_history.write().await;
+        let owner = mgr.clone();
+        let owner_url = pin_url.clone();
+        let handle = tokio::spawn(async move {
+            owner.unpin_tunnel_url(&owner_url).await;
+        });
+
+        wait_until_pin_lock_is_held(&mgr).await;
+        handle.abort();
+        assert!(handle.await.unwrap_err().is_cancelled());
+        drop(history_guard);
+
+        assert_eq!(
+            mgr.inner
+                .tunnel_url_pins
+                .lock()
+                .await
+                .get(&normalized)
+                .copied(),
+            Some(1)
+        );
+        assert!(
+            mgr.inner
+                .tunnel_history
+                .read()
+                .await
+                .get(&normalized)
+                .unwrap()
+                .pinned
         );
     }
 

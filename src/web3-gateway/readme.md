@@ -13,7 +13,7 @@
   - web3_dns.yaml 只做 53 端口权威 DNS（local_dns + web3_sn 兜底解析）
   - web3_relay.yaml 是对外 TCP 入口（443 SNI / 80 / 2980 rtcp / 3443 *.web3 TLS 终止），设备流量走 rtcp 隧道转发，sn./bns./web3. 流量原样转给 api 实例（params 的 sn_api_addr / api_tls_port / api_http_port，默认 127.0.0.1 同机直连）
   - web3_sn_api.yaml 提供 SN RPC / DID resolver / BNS 网关，只绑高位端口（api_http_bind / api_tls_bind，默认 3080/3444），C 类种子只在这个实例导入
-  - 三个实例各自内嵌 web3_sn server（qa/resolve 只支持进程内引用），设备/账号数据必须共享：同机部署共享 sn.sqlite3（make_sn_config.ts 会给存在的拆分文件打同样的 db 补丁）；跨机部署需给各 web3_sn 配 db: {type: postgres, provider_base_url: ...} 指向共享 provider，且 api 实例要移除 seed_path
+  - 三个实例各自内嵌 web3_sn server（qa/resolve 只支持进程内引用），设备/账号数据必须共享：同机部署共享 sn.sqlite3；跨机部署需给各 web3_sn 分别配置 auth_db / device_info_db 指向共享 provider，且 auth_db 为 remote 时 api 实例要移除 seed_path
   - 启动方式与合并版相同：web3_gateway --config_file <拆分文件>；建议先起 web3_sn_api（导种子）再起 dns/relay
 - website.yaml 被web3_gatweay引用，提供https://sn.$sn_base 的常规网页需求。这个根据运维手工填写。默认为 {}
 - fullchain.cert,fullchain.pem 包含 sn.$sn_base、bns.$sn_base、web3.$sn_base、*.web3.$sn_base 的证书和对应的密钥。如果做全自拥有证书的逻辑就没有 *.web3的证书

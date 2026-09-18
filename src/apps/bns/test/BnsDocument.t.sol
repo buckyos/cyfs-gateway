@@ -79,14 +79,8 @@ contract BnsDocumentTest is BnsTestBase {
     function testMissingToRevokedCreatesV1() public {
         uint64 s = _seq();
         vm.prank(ALICE);
-        (uint64 version, uint64 nameSeq) = bns.revokeDocument(
-            "alice",
-            "dns_txt",
-            0,
-            keccak256("lost-before-publish"),
-            _ownerAuth(ALICE),
-            _guard(s)
-        );
+        (uint64 version, uint64 nameSeq) =
+            bns.revokeDocument("alice", "dns_txt", 0, keccak256("lost-before-publish"), _ownerAuth(ALICE), _guard(s));
 
         assertEqUint(version, 1, "missing revoke creates v1");
         assertEqUint(nameSeq, s + 1, "name seq bumped");
@@ -96,8 +90,7 @@ contract BnsDocumentTest is BnsTestBase {
         assertEqUint(resolved.documentState.previousVersion, 0, "no previous version");
         assertTrue(resolved.status == DocumentStatus.Revoked, "current is revoked");
         assertTrue(
-            bns.getDocumentVersion("alice", "dns_txt", 1).status == DocumentStatus.Revoked,
-            "v1 stored as revoked"
+            bns.getDocumentVersion("alice", "dns_txt", 1).status == DocumentStatus.Revoked, "v1 stored as revoked"
         );
     }
 
@@ -110,9 +103,8 @@ contract BnsDocumentTest is BnsTestBase {
 
         s = _seq();
         vm.prank(ALICE);
-        (uint64 version, uint64 nameSeq) = bns.revokeDocument(
-            "alice", "dns_txt", 1, keccak256("bad"), _ownerAuth(ALICE), _guard(s)
-        );
+        (uint64 version, uint64 nameSeq) =
+            bns.revokeDocument("alice", "dns_txt", 1, keccak256("bad"), _ownerAuth(ALICE), _guard(s));
 
         assertEqUint(version, 2, "revoke creates v2");
         assertEqUint(nameSeq, s + 1, "name seq bumped");
@@ -141,17 +133,13 @@ contract BnsDocumentTest is BnsTestBase {
         s = _seq();
         vm.prank(ALICE);
         vm.expectPartialRevert(StaleDocumentVersion.selector);
-        bns.revokeDocument(
-            "alice", "dns_txt", 0, keccak256("stale"), _ownerAuth(ALICE), _guard(s)
-        );
+        bns.revokeDocument("alice", "dns_txt", 0, keccak256("stale"), _ownerAuth(ALICE), _guard(s));
     }
 
     function testRevokedCanBeRepublishedActive() public {
         uint64 s = _seq();
         vm.prank(ALICE);
-        bns.revokeDocument(
-            "alice", "dns_txt", 0, keccak256("lost"), _ownerAuth(ALICE), _guard(s)
-        ); // v1
+        bns.revokeDocument("alice", "dns_txt", 0, keccak256("lost"), _ownerAuth(ALICE), _guard(s)); // v1
 
         DocumentRef memory r = _inlineDoc(bytes("[{\"v\":2}]"));
         s = _seq();
@@ -169,6 +157,46 @@ contract BnsDocumentTest is BnsTestBase {
         );
     }
 
+    function testDocumentExpiryIsDerivedWithoutChangingStoredStatus() public {
+        vm.warp(1000);
+        DocumentRef memory document = _inlineDoc(bytes("[{\"v\":1}]"));
+        uint64 s = _seq();
+        vm.prank(ALICE);
+        bns.publishDocument(
+            "alice",
+            "dns_txt",
+            0,
+            document,
+            _unset(),
+            _unset(),
+            address(0),
+            1100,
+            ZERO,
+            ZERO,
+            ZERO,
+            ZERO,
+            ZERO,
+            _ownerAuth(ALICE),
+            _guard(s)
+        );
+
+        assertTrue(
+            bns.resolveDocument("alice", "dns_txt").status == DocumentStatus.Active, "document active before expiry"
+        );
+        vm.warp(1100);
+        ResolveResult memory expired = bns.resolveDocument("alice", "dns_txt");
+        assertTrue(expired.status == DocumentStatus.Expired, "document expiry derived at boundary");
+        assertTrue(
+            bns.getPurchaseContext("alice", "dns_txt").status == DocumentStatus.Expired,
+            "purchase context uses effective document status"
+        );
+        assertTrue(expired.documentState.status == DocumentStatus.Active, "stored document status unchanged");
+        assertTrue(
+            bns.getDocumentVersion("alice", "dns_txt", 1).status == DocumentStatus.Active,
+            "historical version remains raw"
+        );
+    }
+
     function testResolveRevokedDoesNotFallBackToPreviousActive() public {
         DocumentRef memory r1 = _inlineDoc(bytes("[{\"v\":1}]"));
         uint64 s = _seq();
@@ -177,9 +205,7 @@ contract BnsDocumentTest is BnsTestBase {
 
         s = _seq();
         vm.prank(ALICE);
-        bns.revokeDocument(
-            "alice", "dns_txt", 1, keccak256("bad"), _ownerAuth(ALICE), _guard(s)
-        ); // v2
+        bns.revokeDocument("alice", "dns_txt", 1, keccak256("bad"), _ownerAuth(ALICE), _guard(s)); // v2
 
         ResolveResult memory resolved = bns.resolveDocument("alice", "dns_txt");
         assertEqUint(resolved.documentState.version, 2, "current pointer is revoked v2");
@@ -191,8 +217,7 @@ contract BnsDocumentTest is BnsTestBase {
     }
 
     function testExactChildRevokedDoesNotFallBackToParentDeviceDocument() public {
-        DocumentRef memory parentDevice =
-            _inlineDoc(bytes("{\"id\":\"did:bns:alice\",\"devices\":[\"laptop\"]}"));
+        DocumentRef memory parentDevice = _inlineDoc(bytes("{\"id\":\"did:bns:alice\",\"devices\":[\"laptop\"]}"));
         uint64 s = _seq();
         vm.prank(ALICE);
         _publishDoc("alice", "device", 0, parentDevice, _ownerAuth(ALICE), _guard(s)); // parent v1
@@ -200,32 +225,17 @@ contract BnsDocumentTest is BnsTestBase {
         DocumentUpdate[] memory noDocs = new DocumentUpdate[](0);
         s = _seq();
         vm.prank(ALICE);
-        _registerName(
-            "laptop.alice",
-            ALICE,
-            _defaultOptions(_unset()),
-            noDocs,
-            _ownerAuth(ALICE),
-            _guard(0, s)
-        );
+        _registerName("laptop.alice", ALICE, _defaultOptions(_unset()), noDocs, _ownerAuth(ALICE), _guard(0, s));
 
         s = bns.queryNameState("laptop.alice").nameSeq;
         vm.prank(ALICE);
-        bns.revokeDocument(
-            "laptop.alice",
-            "device",
-            0,
-            keccak256("lost-laptop"),
-            _ownerAuth(ALICE),
-            _guard(s)
-        );
+        bns.revokeDocument("laptop.alice", "device", 0, keccak256("lost-laptop"), _ownerAuth(ALICE), _guard(s));
 
         ResolveResult memory resolved = bns.resolveDocument("laptop.alice", "device");
         assertEqUint(resolved.documentState.version, 1, "child current is its own v1");
         assertTrue(resolved.status == DocumentStatus.Revoked, "exact child remains revoked");
         assertTrue(
-            bns.resolveDocument("alice", "device").status == DocumentStatus.Active,
-            "parent aggregate remains active"
+            bns.resolveDocument("alice", "device").status == DocumentStatus.Active, "parent aggregate remains active"
         );
     }
 }

@@ -4,6 +4,7 @@ use futures::ready;
 use sha2::{Digest, Sha256};
 use std::pin::Pin;
 use std::task::{Context, Poll};
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 // RTCP tunnel / stream record layer built on AES-256-GCM (AEAD).
@@ -30,6 +31,26 @@ const LEN_FIELD: usize = 2;
 pub const MAX_PLAINTEXT: usize = 16 * 1024;
 const NONCE_LEN: usize = 12;
 
+#[derive(Copy, Clone, Debug)]
+pub(crate) struct AeadUsageBudget {
+    pub max_records_per_direction: u64,
+    pub max_plaintext_bytes_per_direction: u64,
+    pub max_age: Duration,
+}
+
+impl AeadUsageBudget {
+    pub(crate) const CONTROL: Self = Self {
+        max_records_per_direction: 1 << 24,
+        max_plaintext_bytes_per_direction: 4 * 1024 * 1024 * 1024,
+        max_age: Duration::from_secs(24 * 60 * 60),
+    };
+    pub(crate) const STREAM: Self = Self {
+        max_records_per_direction: 1 << 20,
+        max_plaintext_bytes_per_direction: 1024 * 1024 * 1024,
+        max_age: Duration::from_secs(24 * 60 * 60),
+    };
+}
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum EncryptionRole {
     // The side that initiated the underlying transport (TCP connector, or the
@@ -52,6 +73,10 @@ pub struct EncryptedStream<S> {
     read_nonce_base: [u8; NONCE_LEN],
     write_seq: u64,
     read_seq: u64,
+    write_plaintext_bytes: u64,
+    read_plaintext_bytes: u64,
+    budget: AeadUsageBudget,
+    created_at: Instant,
 
     // Write buffer: holds an encrypted record that is being flushed to `inner`.
     write_buf: Vec<u8>,
@@ -77,6 +102,25 @@ pub struct EncryptedStream<S> {
 
 impl<S> EncryptedStream<S> {
     pub fn new(inner: S, key: &[u8; 32], iv: &[u8; 16], role: EncryptionRole) -> Self {
+        Self::new_with_budget(inner, key, iv, role, AeadUsageBudget::STREAM)
+    }
+
+    pub(crate) fn new_control(
+        inner: S,
+        key: &[u8; 32],
+        iv: &[u8; 16],
+        role: EncryptionRole,
+    ) -> Self {
+        Self::new_with_budget(inner, key, iv, role, AeadUsageBudget::CONTROL)
+    }
+
+    pub(crate) fn new_with_budget(
+        inner: S,
+        key: &[u8; 32],
+        iv: &[u8; 16],
+        role: EncryptionRole,
+        budget: AeadUsageBudget,
+    ) -> Self {
         let (nonce_a, nonce_b) = derive_nonce_bases(iv);
         let (write_nonce_base, read_nonce_base) = match role {
             EncryptionRole::Initiator => (nonce_a, nonce_b),
@@ -90,6 +134,10 @@ impl<S> EncryptedStream<S> {
             read_nonce_base,
             write_seq: 0,
             read_seq: 0,
+            write_plaintext_bytes: 0,
+            read_plaintext_bytes: 0,
+            budget,
+            created_at: Instant::now(),
             write_buf: Vec::new(),
             write_pos: 0,
             shutdown_started: false,
@@ -104,6 +152,10 @@ impl<S> EncryptedStream<S> {
             read_eof: false,
             first_record_received: false,
         }
+    }
+
+    fn budget_age_exhausted(&self) -> bool {
+        self.created_at.elapsed() >= self.budget.max_age
     }
 }
 
@@ -158,6 +210,12 @@ impl<S: AsyncRead + Unpin> AsyncRead for EncryptedStream<S> {
 
             if this.read_eof {
                 return Poll::Ready(Ok(()));
+            }
+            if this.budget_age_exhausted() {
+                return Poll::Ready(Err(io_err(
+                    std::io::ErrorKind::Other,
+                    "AEAD key-use age budget exhausted",
+                )));
             }
 
             match this.read_phase {
@@ -228,6 +286,24 @@ impl<S: AsyncRead + Unpin> AsyncRead for EncryptedStream<S> {
                             }
                             this.body_filled += bytes_read;
                             if this.body_filled == this.body_needed {
+                                if this.read_seq >= this.budget.max_records_per_direction {
+                                    return Poll::Ready(Err(io_err(
+                                        std::io::ErrorKind::Other,
+                                        "AEAD read record budget exhausted",
+                                    )));
+                                }
+                                let plaintext_len = this.body_needed.saturating_sub(TAG_LEN) as u64;
+                                let next_bytes =
+                                    this.read_plaintext_bytes.checked_add(plaintext_len);
+                                if next_bytes.is_none()
+                                    || next_bytes.unwrap()
+                                        > this.budget.max_plaintext_bytes_per_direction
+                                {
+                                    return Poll::Ready(Err(io_err(
+                                        std::io::ErrorKind::Other,
+                                        "AEAD read byte budget exhausted",
+                                    )));
+                                }
                                 let nonce = make_nonce(&this.read_nonce_base, this.read_seq);
                                 match this.read_seq.checked_add(1) {
                                     Some(v) => this.read_seq = v,
@@ -243,6 +319,7 @@ impl<S: AsyncRead + Unpin> AsyncRead for EncryptedStream<S> {
                                     .decrypt(Nonce::from_slice(&nonce), this.body_buf.as_slice())
                                 {
                                     Ok(pt) => {
+                                        this.read_plaintext_bytes = next_bytes.unwrap();
                                         this.plaintext = pt;
                                         this.plaintext_pos = 0;
                                         this.first_record_received = true;
@@ -311,6 +388,12 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for EncryptedStream<S> {
                 "encrypted stream already shut down",
             )));
         }
+        if this.budget_age_exhausted() {
+            return Poll::Ready(Err(io_err(
+                std::io::ErrorKind::Other,
+                "AEAD key-use age budget exhausted",
+            )));
+        }
 
         // 1. Finish any in-flight record before accepting new bytes.
         ready!(Self::drain_pending(this, cx))?;
@@ -321,6 +404,21 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for EncryptedStream<S> {
 
         // 2. Build one record from (up to) MAX_PLAINTEXT bytes of input.
         let accept = buf.len().min(MAX_PLAINTEXT);
+        if this.write_seq >= this.budget.max_records_per_direction {
+            return Poll::Ready(Err(io_err(
+                std::io::ErrorKind::Other,
+                "AEAD write record budget exhausted",
+            )));
+        }
+        let next_bytes = this.write_plaintext_bytes.checked_add(accept as u64);
+        if next_bytes.is_none()
+            || next_bytes.unwrap() > this.budget.max_plaintext_bytes_per_direction
+        {
+            return Poll::Ready(Err(io_err(
+                std::io::ErrorKind::Other,
+                "AEAD write byte budget exhausted",
+            )));
+        }
         let nonce = make_nonce(&this.write_nonce_base, this.write_seq);
         match this.write_seq.checked_add(1) {
             Some(v) => this.write_seq = v,
@@ -353,6 +451,7 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for EncryptedStream<S> {
 
         this.write_buf = record;
         this.write_pos = 0;
+        this.write_plaintext_bytes = next_bytes.unwrap();
 
         // 3. Opportunistically drain. A partial drain is fine; the remainder
         //    is flushed by the next poll_write / poll_flush / poll_shutdown.
@@ -532,5 +631,47 @@ mod tests {
         let iv = iv();
         let (a, b) = derive_nonce_bases(&iv);
         assert_ne!(a, b);
+    }
+
+    #[tokio::test]
+    async fn write_record_and_byte_budgets_are_enforced() {
+        let (a, _b) = duplex(64 * 1024);
+        let budget = AeadUsageBudget {
+            max_records_per_direction: 1,
+            max_plaintext_bytes_per_direction: 4,
+            max_age: Duration::from_secs(60),
+        };
+        let mut stream =
+            EncryptedStream::new_with_budget(a, &key(), &iv(), EncryptionRole::Initiator, budget);
+        stream.write_all(b"1234").await.unwrap();
+        stream.flush().await.unwrap();
+        let err = stream.write_all(b"5").await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::Other);
+        assert!(err.to_string().contains("record budget exhausted"));
+
+        let (a, _b) = duplex(64 * 1024);
+        let budget = AeadUsageBudget {
+            max_records_per_direction: 2,
+            max_plaintext_bytes_per_direction: 3,
+            max_age: Duration::from_secs(60),
+        };
+        let mut stream =
+            EncryptedStream::new_with_budget(a, &key(), &iv(), EncryptionRole::Initiator, budget);
+        let err = stream.write_all(b"1234").await.unwrap_err();
+        assert!(err.to_string().contains("byte budget exhausted"));
+    }
+
+    #[tokio::test]
+    async fn key_use_age_budget_is_enforced() {
+        let (a, _b) = duplex(64 * 1024);
+        let budget = AeadUsageBudget {
+            max_records_per_direction: 1,
+            max_plaintext_bytes_per_direction: 16,
+            max_age: Duration::ZERO,
+        };
+        let mut stream =
+            EncryptedStream::new_with_budget(a, &key(), &iv(), EncryptionRole::Initiator, budget);
+        let err = stream.write_all(b"x").await.unwrap_err();
+        assert!(err.to_string().contains("age budget exhausted"));
     }
 }

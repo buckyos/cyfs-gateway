@@ -162,6 +162,13 @@ impl BlockCommandLinker {
     fn link_command(&self, cmd: &mut CommandItem) -> Result<(), String> {
         // debug!("Linking command: {:?}", cmd.command);
         let mut parser = self.parser.get_parser(&cmd.command.name);
+        if self
+            .context
+            .get_external_command(&cmd.command.name)
+            .is_some_and(|external| external.overrides_builtin(&cmd.command.args))
+        {
+            parser = None;
+        }
         if parser.is_none() {
             // Check if it's a external command
             if self

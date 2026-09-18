@@ -35,9 +35,15 @@ RPC method 必须使用 `namespace.method` 形式。当前实现不再做 legacy
 | `/kapi/sn/auth` | 公网 | 账号、会话、user/zone profile、user_domain、user DNS record | `auth.*`、`user.*`、`zone.*`、`domain.*` |
 | `/kapi/sn/deviceinfo` | 公网 | 设备在线态上报、在线态查询、OOD 连接信息解析 | `device.*`、`deviceinfo.*` |
 | `/kapi/sn/bns-proxy` | 公网 | SN 代付 gas 的受限 BNS 写代理 | `bns.publish_dns_txt`、`bns.publish_document` |
-| `/` | 内网/管理面 | 运维管理、bns-proxy 内部/恢复方法 | `admin.clear_state_by_active_code`、`bns.publish_relay_assignment`、`bns.register_name_bootstrap` |
+| `/kapi/sn/region-probe-config.json` | 公网匿名 | 发布 Region 探测 schema v1 JSON | `GET`，非 kRPC |
+| `/` | 本机管理面（仅 loopback） | 运维管理、bns-proxy 内部/恢复方法 | `admin.clear_state_by_active_code`、`bns.publish_relay_assignment`、`bns.register_name_bootstrap` |
 
-路径是强约束。方法发到非首选路径会返回 unknown method，例如 `auth.check_username` 不能再发到 `/kapi/sn`；`bns.publish_relay_assignment` / `bns.register_name_bootstrap` 不能发到 `/kapi/sn/bns-proxy`，只能发到内网 `/`。
+路径是强约束。方法发到非首选路径会返回 unknown method，例如 `auth.check_username` 不能再发到 `/kapi/sn`；`bns.publish_relay_assignment` / `bns.register_name_bootstrap` 不能发到 `/kapi/sn/bns-proxy`，只能由本机 loopback 客户端发到 `/`。非 loopback 来源访问 `/` 统一返回 HTTP 404。
+
+Region 探测配置由 `SNServerConfig.region_probe_config_path` 指向的外部 JSON 文件提供，支持
+`ETag` / `If-None-Match` 和 `Cache-Control: public, max-age=300`。未配置返回 404；路径已配置
+但文件缺失、过期或校验失败返回 503，且不影响 `auth.register`。完整 schema 与客户端降级
+语义见《BuckyOS 边缘 Region 的探测需求》。
 
 ## 3. 认证规则
 
@@ -47,7 +53,7 @@ RPC method 必须使用 `namespace.method` 形式。当前实现不再做 legacy
 - `zone.get_info` 接受账号 access token 或 `aud=sn-device` 的短期设备 token；服务端必须从已验证 token 推导 zone，不能接受客户端指定任意 zone。
 - `deviceinfo.resolve_ood_by_did`、`deviceinfo.resolve_ood_by_hostname` 是匿名只读接口。
 - 带用户作用域的接口只允许访问 token 所属用户；即使参数里带 `name`，也必须等于当前登录用户。`bns.publish_dns_txt`、`bns.publish_document` 同样受此约束。
-- `bns.publish_relay_assignment`、`bns.register_name_bootstrap`、`admin.clear_state_by_active_code` 只在内网管理路径 `/` 可用，不做 SN access token 校验，靠网络边界隔离外部访问。
+- `bns.publish_relay_assignment`、`bns.register_name_bootstrap`、`admin.clear_state_by_active_code` 只在本机管理路径 `/` 可用，不做 SN access token 校验；服务端仅允许 loopback 来源，拒绝公网和私网远程来源。
 
 `auth.register` 和 `auth.login` 返回 access/refresh token。access token 放在 kRPC request 的 `token` 字段中。
 
@@ -84,12 +90,12 @@ RPC method 必须使用 `namespace.method` 形式。当前实现不再做 legacy
 - source IP 只取 HTTP/连接上下文中的可信 real remote IP。RPC params 没有 `source_ip` 或 relay node 字段；即使客户端发送同名未知字段也不会进入调度请求。
 - relay 分配在本地账号创建后执行。成功时 `relay_assignments` 与 `zone_info.relay_sn` 同步完成，注册返回后可立即调用 `zone.get_info`；失败时记录 `relay_allocation_pending`，`relay_sn` 保持 `null`，注册仍正常返回。
 
-`auth.register` 的 BNS 行为取决于 SN 是否启用了 bns-proxy（`bns_write_enabled`/`bns_indexer_url` + `bns_evm`，可选 `bns_proxy` 多 controller 配置块；完整配置见 `doc/SN/sn-bns-proxy-todo.md`）：
+`auth.register` 依赖可选的 `bns_proxy` 写能力：
 
-- 未启用：只创建 SN 本地账号，`need_bind_owner_key = true`，响应没有 `bns` 字段。
+- 未配置：返回稳定的 `bns_proxy_unavailable`（`BNS proxy is not configured`），不创建本地账号。
 - 已启用：注册前先原子性执行 BNS `registerName`（`assetOwner` = 用户地址、`controllerPolicy.actor` = 该用户分配到的 SN controller、`initialDocuments` = 固定的 `owner` document + 请求携带的 `zone`/`boot`/`dns_txt`）；BNS 写入失败则不创建本地账号（用户名可重试注册），成功后才建本地账号，`need_bind_owner_key = false`。
-  - 生产多 controller 配置（`bns_proxy.controllers` 非空）下 `require_user_asset_owner` 缺省 `true`：`asset_owner` 必填，缺失返回 `invalid_params`。
-  - 仅旧版单 controller 配置（`bns_evm.controller_private_key*`，未配置 `bns_proxy.controllers`）下缺省 `false`：`asset_owner` 缺省回落为该用户绑定 controller 的地址（devtest 语义）。
+  - `bns_proxy.controllers` 必须非空；单 controller 与多 controller 使用同一模型。
+  - `require_user_asset_owner` 缺省 `true`：`asset_owner` 必填，缺失返回 `invalid_params`；仅 dev/test 可显式设为 `false`，此时缺省回落为该用户绑定 controller 的地址。
   - `request_id` 缺省为 `sn:register:<username>`；同 `request_id` 重放幂等，返回同一笔已提交的 TX。
 
 响应里的 `bns` 字段结构与 bns-proxy 写操作的返回结构一致（见 6.2），例如：
@@ -117,20 +123,38 @@ RPC method 必须使用 `namespace.method` 形式。当前实现不再做 legacy
 |--------|--------|--------|------|
 | `user.get_profile` | `{}` | `code`, `name`, `owner_key_bound`, `user_domain`, `self_cert`, `sn_ips`, `zone_config` | 返回当前用户 profile。 |
 | `user.set_self_cert` | `self_cert: bool`, `device_did?` | `code` | 开启 `self_cert` 时必须提供属于当前用户的在线设备 DID。关闭时不需要 DID。 |
-| `user.add_dns_record` | `device_did`, `domain`, `record_type`, `record`, `ttl?`, `has_cert?` | `code`, `device_name` | 管理当前用户 `user_domain` 或 SN 提供的 `<username>.web3.<server_host>` 范围内的本地 DNS 记录。 |
-| `user.remove_dns_record` | `device_did`, `domain`, `record_type`, `record?`, `has_cert?` | `code` | 删除上述范围内的本地 DNS 记录；device token 调用时 `record` 必填并精确删除。 |
-| `user.list_dns_records` | `{}` | `code`, `items[]` | 列出当前用户本地 DNS 记录。 |
+| `user.add_dns_record` | `device_did`, `domain`, `record_type`, `record`, `ttl?`, `has_cert?` | `code`, `device_name`, `revision`, `changed` | 向当前用户的 AuthDB RRset 加入一个 value。 |
+| `user.remove_dns_record` | `device_did`, `domain`, `record_type`, `record?`, `has_cert?` | `code`, `revision`, `changed` | 精确删除 value；账号省略 `record` 时删除整个 RRset，device token 必须精确删除。 |
+| `user.list_dns_records` | `{}` | `code`, `items[]` | 按 name/type/value 稳定排序列出结构化 RRset。 |
 
 `user.add_dns_record` / `user.remove_dns_record` 要求 `device_did` 属于当前用户，并允许管理以下两个范围：
 
 - 已完成 active PKX 绑定的传统 `user_domain` 及其子域；
 - 当前账号自己的 `<username>.web3.<server_host>` 及其子域，例如 `_acme-challenge.alice.web3.<server_host>`。不能写入其他账号的 web3 bridge 域名。
 
-`record_type` 主要面向 `A`、`AAAA`、`TXT`。这两个范围的记录都保存在 SN compatibility store，由 SN DNS NameServer 优先解析；调用不会发布 BNS `dns_txt`、不会发起链上交易，也不会产生 gas 成本。因此 ACME 可以通过同一 API 创建和删除短期 challenge TXT 记录，而不必为临时状态上链。
+`record_type` 只允许 `A`、`AAAA`、`TXT`。name、A/AAAA rdata 会在授权前规范化；TTL
+范围是 `30..=86400`，缺省 600。记录存入 AuthDB 的 name/RRset/rdata 模型，由 SN DNS
+NameServer 优先解析；调用不会发布 BNS `dns_txt`、不会发起链上交易，也不会产生 gas 成本。
+
+`items[]` 的结构为：
+
+```json
+{
+  "name": "_acme-challenge.alice.web3.example.com",
+  "record_type": "TXT",
+  "ttl": 600,
+  "values": ["root-order", "wildcard-order"],
+  "revision": 42
+}
+```
+
+TXT value 始终是独立字符串，逗号属于值本身，不是多值分隔符。重复写入是 no-op，
+`changed=false` 且不分配新 revision。
 
 账号 access token 保持上述管理能力。`aud=sn-device` 的短期设备 token 只允许所属 zone 范围内的 `_acme-challenge.*` TXT；SN 使用已验证 token 得到的 zone/device/DID，忽略请求中的身份声明。TXT 使用多值 RRset 语义，重复添加同一 value 幂等，删除必须指定本次 challenge value，因此并发的根域和 wildcard order 不会互相覆盖或误删。`has_cert` 仅作为兼容字段解析，DNS mutation 不据此更新证书状态。
 
-> **过渡设计：** `<username>.web3.<server_host>` 的本地写入是 web3 bridge 仍承担 `did:bns:<username>` 到传统 DNS 名称转换期间的兼容措施。未来如果用户不再通过 web3 bridge 解析 `did:bns:xxx`，或者已有足够多 DNS 解析服务原生支持 `did:bns:xxx`，应移除这个本地例外，让 BNS 名称的 `add_dns_record` 重新回归 BNS 链上发布。传统 `user_domain` 的本地记录不受这一迁移方向影响。
+> `<username>.web3.<server_host>` 仍是 AuthDB 管理的 bridge namespace，用于避免 ACME
+> 短期状态上链；它不是旧 compat store fallback。
 
 `items[]` 结构：
 
@@ -276,7 +300,7 @@ SN 代付 gas 的受限 BNS 写代理：用户不需要持有 gas，就能通过
 
 不要与已下线的 `/kapi/sn/bns` 混淆（见第 10 节）：旧路径曾承载通用文档读写代理，已完全移除；bns-proxy 只覆盖下面四个受控操作。`publish_document` 虽允许内容型 doc_type 通用化，但 authority、controller 和 TX 都由服务端构造，不能提交任意 calldata。
 
-只有 SN 配置了 BNS 写链路（`bns_write_enabled`/`bns_indexer_url` + `bns_evm`）时才启用；配置了 `bns_proxy` 块时还可以显式 `bns_proxy.enabled: false` 关闭。未启用时所有 `bns.*` 调用返回 `bns_proxy_unavailable`（1026），`auth.register` 回落为纯本地注册（不带 `bns` 字段）。
+只有 SN 配置了 `bns_proxy` 块时才启用写能力；块缺失即为 BNS 只读模式。未配置时所有 `bns.*` 写调用和 `auth.register` 都返回 `bns_proxy_unavailable`（1026），message 为 `BNS proxy is not configured`。
 
 ### 6.1 方法
 
@@ -284,8 +308,8 @@ SN 代付 gas 的受限 BNS 写代理：用户不需要持有 gas，就能通过
 |--------|----------|--------|------|
 | `bns.publish_dns_txt` | `/kapi/sn/bns-proxy`（需 SN access token） | `name`, `mode`, `request_id?`, `ttl?`, `value?`, `records?` | 通过当前用户绑定的 controller 更新 `dns_txt` document。`name` 必须等于 token 所属用户。 |
 | `bns.publish_document` | `/kapi/sn/bns-proxy`（需 SN access token） | `name`, `doc_type`, `document`, `request_id?` | 注册后独立发布 JSON object 或 compact JWT string document；`name` 必须等于 token 所属用户。`relay_assignment` 禁止，`owner` 受身份字段保护。 |
-| `bns.publish_relay_assignment` | 仅内网 `/` | `name`, `relay_assignment`, `request_id?` | SN 内部发布 relay assignment，不经外部 HTTP 路径。 |
-| `bns.register_name_bootstrap` | 仅内网 `/` | `name`, `asset_owner`, `request_id?`, `owner_config?`, `initial_documents?` | 注册阶段以外的恢复/重放入口，不创建本地 SN 账号。 |
+| `bns.publish_relay_assignment` | 仅本机 loopback `/` | `name`, `relay_assignment`, `request_id?` | SN 内部发布 relay assignment，不经外部 HTTP 路径。 |
+| `bns.register_name_bootstrap` | 仅本机 loopback `/` | `name`, `asset_owner`, `request_id?`, `owner_config?`, `initial_documents?` | 注册阶段以外的恢复/重放入口，不创建本地 SN 账号。 |
 
 所有参数结构 `deny_unknown_fields`：客户端不能塞 `controller_address` / `authority` 之类字段来影响服务端的 controller 选择。服务端按 `name`（即 BNS name / 用户名本身）经稳定分配（带权重 rendezvous hashing）取绑定 controller；分配结果持久化在本地 sqlite（`sn_bns_controller_bindings`），一旦写入不会静默改分配——绑定指向的 controller 从配置中消失时，写操作返回 `bns_controller_unavailable`（1027），需要人工迁移。
 
@@ -299,7 +323,7 @@ SN 代付 gas 的受限 BNS 写代理：用户不需要持有 gas，就能通过
 
 `bns.publish_document` 的 `document` 必须是 JSON object 或非空 compact JWT string；其它 JSON scalar 和 array 均拒绝。JSON object 按其 JSON bytes 发布，JWT string 按 UTF-8 原文发布，不会额外包裹 JSON 引号。单个 inline document 上限 4KB。SN 会从当前投影读取版本并自动填写 `expected_version`；客户端不传版本号。成功响应的 `status=submitted` 只表示 TX 已投递，调用方必须等待 bns-indexer 投影并读回相同原文后才能把业务标记为完成。除下面两个保留类型外，`zone`、`boot`、`device_mini_doc` 和自定义 doc_type 均不做产品级 schema 限制：
 
-- `relay_assignment`：返回 `invalid_params`，必须改走内网 `bns.publish_relay_assignment`。
+- `relay_assignment`：返回 `invalid_params`，必须由本机改走 `bns.publish_relay_assignment`。
 - `owner`：只接受 JSON object，不接受 JWT string；允许首次补齐身份字段，也允许更新其它内容；但当前 owner 文档里已经存在的 `public_key`、`owner_key`、`default_key`、`key`、`verificationMethod[0].publicKeyJwk` 不得改值或删除，否则返回 `invalid_params`，且不会构造/投递 TX。
 
 ### 6.2 返回结构
@@ -350,20 +374,27 @@ SN 代付 gas 的受限 BNS 写代理：用户不需要持有 gas，就能通过
 ### 6.4 权限与白名单
 
 - 私钥只存在于 SN 内部签名组件（`SnBnsTxSigner`）；RPC handler、日志、DB、错误信息都不会出现明文私钥或原始 calldata。
-- 每个部署可配置多把 controller key（`bns_proxy.controllers`，带 `weight`；`weight: 0` 表示排水，不接新用户但已绑定用户不受影响）；不配置 `bns_proxy.controllers` 时回落旧版单 controller（`bns_evm.controller_private_key*`，id 固定为 `default`）。
+- 每个启用写能力的部署必须在 `bns_proxy.controllers` 配置至少一把 controller key（带 `weight`；`weight: 0` 表示排水，不接新用户但已绑定用户不受影响）。
 - `bns_proxy.allowed_operations` 是服务端白名单（缺省 = 全部四个操作）；命中白名单外操作同样返回 `bns_proxy_unavailable`。`dns_txt` 和 `relay_assignment` 仍映射到各自专属 operation，其余 doc_type 映射到 `publish_document`。签名组件另有一层独立白名单（chain id / contract / method selector / operation×doc_type / gas 上限），未知一律拒签，双重防护。
 - 新注册用户的 controller policy 使用空 doc_type 通配规则，以承载注册后新增的内容型 document；SN 应用层继续硬隔离 relay 专用入口，并通过受保护的 owner 路径锁定已经存在的身份字段。存量用户的链上 policy 不会自动升级。
-- `bns_proxy.require_user_asset_owner`：配置了 `bns_proxy.controllers`（生产多 controller 模式）缺省 `true`；仅旧版单 controller 配置缺省 `false`（devtest，`asset_owner` 缺省回落为该用户绑定 controller 的地址）。
+- `bns_proxy.require_user_asset_owner` 缺省 `true`；仅 dev/test 可显式设为 `false`（`asset_owner` 缺省回落为该用户绑定 controller 的地址）。
 
-## 7. 内网管理 RPC
+## 7. 本机管理 RPC
 
-`admin.clear_state_by_active_code` 只允许发到内网管理根路径 `/`，不允许出现在 `/kapi/sn/auth`、`/kapi/sn/deviceinfo`、`/kapi/sn/bns-proxy` 或 `/kapi/sn`。
+`admin.clear_state_by_active_code` 只允许由 loopback 客户端发到本机管理根路径 `/`，不允许出现在 `/kapi/sn/auth`、`/kapi/sn/deviceinfo`、`/kapi/sn/bns-proxy` 或 `/kapi/sn`。
 
 | Method | Params | Result | 说明 |
 |--------|--------|--------|------|
-| `admin.clear_state_by_active_code` | `{}` | `code`, `deleted_users`, `deleted_devices`, `deleted_domain_records`, `deleted_did_documents`, `activation_code_reset` | 清理内置激活码关联的测试/运维状态。请求参数中不允许带 `active_code`。 |
+| `admin.clear_state_by_active_code` | `{}` | `code`, `deleted_users`, `activation_code_reset` | 清理内置激活码关联的测试/运维业务状态。请求参数中不允许带 `active_code`，响应不暴露表级删除计数。 |
 
-`/` 同时还承载 bns-proxy 的内部/恢复方法 `bns.publish_relay_assignment`、`bns.register_name_bootstrap`（参数与返回见 6.1、6.2）：同一机制，只允许出现在 `/`，不出现在任何公网路径。
+`/` 同时还承载 bns-proxy 的内部/恢复方法 `bns.publish_relay_assignment`、`bns.register_name_bootstrap`（参数与返回见 6.1、6.2）：同一机制，只允许 loopback 来源，不出现在任何公网路径。非 loopback 请求在解析 RPC body 前返回 HTTP 404。
+
+公网 relay 到 SN API 的来源恢复必须满足以下边界：
+
+- TCP/TLS 栈默认不解析 PROXY v1/v2；只有 direct peer 匹配 stack 的 `trusted_upstreams` IP/CIDR 时才解析，公网客户端直连时携带的伪造 PROXY 头不会被解析或剥离。
+- split `web3_relay` 的 `sn.`、`bns.`、`web3.`、apex、`www.` TLS 路由统一发送 PROXY v2。
+- split relay 的明文 HTTP 通过 `X-Forwarded-For` 传递来源，HTTPS 通过 PROXY v2 传递；`web3_sn_api` 两层都只信任 `sn_relay_trusted_upstream`。
+- `sn_relay_trusted_upstream` 默认是同机 `127.0.0.1/32`。跨机部署必须覆盖为 relay 的私网 IP 或尽可能小的私网 CIDR，不能配置公网全网段。
 
 ## 8. 非 RPC 解析接口
 
@@ -372,7 +403,7 @@ SN 仍然提供两个标准解析面，但它们不是 SN RPC：
 | 接口 | 形式 | 说明 |
 |------|------|------|
 | W3C DID Resolver | `GET /1.0/identifiers/{did}?type={doc_type}` | 支持 `did:bns`、`did:dev`、`did:web`，返回 `application/json` 或 `application/jwt`。 |
-| DNS NameServer | DNS `A` / `AAAA` / `TXT` 查询 | 解析 SN 自身、user_domain、本地 DNS 记录、BNS 文档和设备在线态。 |
+| DNS NameServer | DNS `A` / `AAAA` / `TXT` 查询 | 解析 SN 自身、AuthDB user DNS、user_domain、BNS 静态文档和 DeviceInfo 在线态。 |
 
 需要解析 DID 或域名时优先使用这两个标准接口，不再通过 kRPC `query.resolve_*`。
 

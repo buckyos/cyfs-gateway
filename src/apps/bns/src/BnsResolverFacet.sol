@@ -2,7 +2,7 @@
 pragma solidity ^0.8.24;
 
 import "./BnsTypes.sol";
-import { BnsCore } from "./BnsCore.sol";
+import {BnsCore} from "./BnsCore.sol";
 
 contract BnsResolverFacet is BnsCore {
     function chainAccountPrincipal(address account) external pure returns (Principal memory) {
@@ -11,7 +11,7 @@ contract BnsResolverFacet is BnsCore {
 
     function bnsNamePrincipal(string calldata name) external pure returns (Principal memory) {
         _validateName(name);
-        return Principal({ kind: PrincipalKind.BnsName, value: bytes(name) });
+        return Principal({kind: PrincipalKind.BnsName, value: bytes(name)});
     }
 
     function queryNameState(string calldata name) external view returns (NameState memory state) {
@@ -26,7 +26,7 @@ contract BnsResolverFacet is BnsCore {
 
     function resolveOwner(string calldata name) external view returns (OwnerResolution memory) {
         bytes32 nameHash = _validateName(name);
-        _requireExistingName(nameHash, name);
+        _requireActiveName(nameHash, name);
         return _resolveOwner(nameHash, 0);
     }
 
@@ -36,25 +36,17 @@ contract BnsResolverFacet is BnsCore {
         return _materializeNameState(_names[nameHash]).standardTransferEnabled;
     }
 
-    function getAuthoritySet(string calldata name)
-        external
-        view
-        returns (AuthoritySetState memory state)
-    {
+    function getAuthoritySet(string calldata name) external view returns (AuthoritySetState memory state) {
         bytes32 nameHash = _validateName(name);
-        state = _authoritySets[nameHash];
+        state = _authoritySets[_lineageStateKey(nameHash)];
         if (bytes(state.name).length == 0) {
             state.name = name;
         }
     }
 
-    function getAuthorityKey(string calldata name, bytes32 kid)
-        external
-        view
-        returns (AuthorityKey memory)
-    {
+    function getAuthorityKey(string calldata name, bytes32 kid) external view returns (AuthorityKey memory) {
         bytes32 nameHash = _validateName(name);
-        return _authorityKeys[nameHash][kid];
+        return _authorityKeys[_lineageStateKey(nameHash)][kid];
     }
 
     function resolveDocument(string calldata name, string calldata docType)
@@ -68,7 +60,7 @@ contract BnsResolverFacet is BnsCore {
 
         result.nameState = _materializeNameState(_names[nameHash]);
         result.owner = _resolveOwner(nameHash, 0);
-        uint64 version = _currentDocumentVersions[nameHash][docTypeHash];
+        uint64 version = _currentDocumentVersions[_lineageStateKey(nameHash)][docTypeHash];
         if (version == 0) {
             result.documentState.name = name;
             result.documentState.docType = docType;
@@ -83,8 +75,10 @@ contract BnsResolverFacet is BnsCore {
         result.effectiveController = result.documentState.controller.kind == PrincipalKind.Unset
             ? result.owner.effectiveOwner
             : result.documentState.controller;
-        result.status = result.documentState.status;
-        AliasState storage aliasState = _aliases[nameHash];
+        result.status = _effectiveDocumentStatus(
+            result.nameState.status, result.documentState.status, result.documentState.expireAt
+        );
+        AliasState storage aliasState = _aliases[_lineageStateKey(nameHash)];
         result.aliasKind = aliasState.kind;
         result.aliasTargetDid = aliasState.targetDid;
         result.proofRoot = currentLogRoot;
@@ -108,7 +102,7 @@ contract BnsResolverFacet is BnsCore {
 
     function getAlias(string calldata name) external view returns (AliasState memory state) {
         bytes32 nameHash = _validateName(name);
-        state = _aliases[nameHash];
+        state = _aliases[_lineageStateKey(nameHash)];
         if (bytes(state.name).length == 0) {
             state.name = name;
         }
@@ -121,7 +115,7 @@ contract BnsResolverFacet is BnsCore {
     {
         bytes32 nameHash = _validateName(name);
         bytes32 docTypeHash = _validateDocType(docType);
-        uint64 version = _currentDocumentVersions[nameHash][docTypeHash];
+        uint64 version = _currentDocumentVersions[_lineageStateKey(nameHash)][docTypeHash];
         if (version == 0) {
             revert DocumentNotFound(name, docType);
         }
@@ -136,7 +130,9 @@ contract BnsResolverFacet is BnsCore {
             splitPolicyHash: document.splitPolicyHash,
             pricePolicyHash: document.pricePolicyHash,
             rightsPolicyHash: document.rightsPolicyHash,
-            status: document.status,
+            status: _effectiveDocumentStatus(
+                _effectiveNameStatus(_names[nameHash]), document.status, document.expireAt
+            ),
             proofRoot: currentLogRoot
         });
     }

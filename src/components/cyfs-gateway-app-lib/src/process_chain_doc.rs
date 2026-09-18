@@ -1,7 +1,6 @@
 use buckyos_kit::get_buckyos_service_data_dir;
-use cyfs_dns::CmdResolve;
-use cyfs_gateway_lib::{ServerManager, get_external_commands};
-use cyfs_process_chain::{COMMAND_PARSER_FACTORY, CommandHelpType, HookPointEnv};
+use cyfs_gateway_lib::{get_external_commands, ServerManager};
+use cyfs_process_chain::{CommandHelpType, HookPointEnv, COMMAND_PARSER_FACTORY};
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -10,10 +9,15 @@ pub struct GatewayProcessChainDoc {
 }
 
 impl GatewayProcessChainDoc {
-    pub fn new() -> Result<Self, String> {
-        let data_dir = get_buckyos_service_data_dir("cyfs_gateway").join("process_chain_doc");
+    pub fn new(
+        profile: &crate::GatewayAppProfile,
+        composition: &crate::GatewayComposition,
+    ) -> Result<Self, String> {
+        let data_dir =
+            get_buckyos_service_data_dir(profile.service_data_namespace).join("process_chain_doc");
         let env = HookPointEnv::new("gateway-process-chain-doc", data_dir);
-        Self::register_gateway_external_commands(&env)?;
+        let server_manager = Self::register_gateway_external_commands(&env)?;
+        composition.install_process_chain_doc_extensions(&env, Arc::downgrade(&server_manager))?;
 
         Ok(Self { env })
     }
@@ -99,7 +103,9 @@ impl GatewayProcessChainDoc {
         doc
     }
 
-    fn register_gateway_external_commands(env: &HookPointEnv) -> Result<(), String> {
+    fn register_gateway_external_commands(
+        env: &HookPointEnv,
+    ) -> Result<Arc<ServerManager>, String> {
         let server_manager = Arc::new(ServerManager::new());
         let mut registered = HashSet::new();
         for (name, cmd) in get_external_commands(Arc::downgrade(&server_manager)) {
@@ -108,10 +114,6 @@ impl GatewayProcessChainDoc {
             }
             env.register_external_command(&name, cmd)?;
         }
-        let resolve_cmd = CmdResolve::new(Arc::downgrade(&server_manager));
-        let resolve_name = resolve_cmd.name().to_string();
-        env.register_external_command(resolve_name.as_str(), Arc::new(Box::new(resolve_cmd)))?;
-
-        Ok(())
+        Ok(server_manager)
     }
 }

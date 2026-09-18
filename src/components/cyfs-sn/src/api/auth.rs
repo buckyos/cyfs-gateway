@@ -6,7 +6,7 @@ use super::common::{
 use super::errors::{bns_proxy_error, parse_error, reason_error, SnApiErrorCode};
 use crate::sn_auth_manager::{hash_password, verify_password, PASSWORD_ALGO};
 use crate::sn_bns_proxy::SnBnsProxyRegisterParams;
-use crate::{AllocateZoneRelayReq, SNServer};
+use crate::{RegisterUserWithRelayAllocationReq, RegistrationRelayAllocation, SNServer};
 use ::kRPC::{RPCErrors, RPCRequest, RPCResponse};
 use cyfs_gateway_api::{
     SnAuthRefreshResp, SnAuthSessionResp, SnBnsProxyTxOutcome, SnCheckUsernameReason,
@@ -137,22 +137,24 @@ pub(crate) async fn handle_auth(
                     .as_ref()
                     .map_or(true, |documents| documents.is_empty())
             );
-            // 锁覆盖预查、可选 BNS bootstrap 和本地事务，避免同进程并发请求
-            // 在邮箱冲突已知前产生两次外部注册副作用。SQLite UNIQUE 索引仍兜底。
+            // 锁覆盖预查、可选 BNS bootstrap 和本地事务。username 锁阻止
+            // 同名不同邮箱共享默认 request_id 时并发进入链上调用；email 锁
+            // 阻止不同用户名竞争同一邮箱。持久化幂等 store 仍是跨入口兜底。
+            let _username_locker = async_named_locker::Locker::get_locker(format!(
+                "sn_auth_register_username_{}",
+                username
+            ))
+            .await;
             let _email_locker =
                 async_named_locker::Locker::get_locker(format!("sn_auth_register_email_{}", email))
                     .await;
+            // 用户名占用只看 `users`：注册原子写入 `users + user_auth`，
+            // 不存在 orphan auth/user 状态，无需再预查 `get_auth`。
             if server
                 .auth_db()
                 .is_user_exist(username.as_str())
                 .await
                 .into_rpc()?
-                || server
-                    .auth_db()
-                    .get_auth(username.as_str())
-                    .await
-                    .into_rpc()?
-                    .is_some()
             {
                 return Err(parse_error(
                     SnApiErrorCode::UsernameAlreadyExists,
@@ -191,7 +193,12 @@ pub(crate) async fn handle_auth(
             // BNS bootstrap 在本地建号之前执行：失败则不创建本地用户，避免
             // 本地账号与 BNS name 不一致（同 request_id 重试幂等）。
             let bns_info = {
-                let proxy = server.bns_proxy();
+                let proxy = server.bns_proxy().ok_or_else(|| {
+                    reason_error(
+                        SnApiErrorCode::BnsProxyUnavailable,
+                        "BNS proxy is not configured",
+                    )
+                })?;
                 let asset_owner = match params.asset_owner.as_deref() {
                     Some(value) => normalize_evm_address(value, "asset_owner")?,
                     None if proxy.require_user_asset_owner() => {
@@ -233,16 +240,19 @@ pub(crate) async fn handle_auth(
                 );
                 Some(outcome)
             };
-            let ok = server
+            let registration = server
                 .auth_db()
-                .register_user(
-                    params.active_code.as_str(),
-                    username.as_str(),
-                    email.as_str(),
-                    password_hash.as_str(),
-                    password_salt.as_str(),
-                    PASSWORD_ALGO,
-                )
+                .register_user_with_relay_allocation(RegisterUserWithRelayAllocationReq {
+                    active_code: params.active_code,
+                    username: username.clone(),
+                    email,
+                    password_hash,
+                    password_salt,
+                    password_algo: PASSWORD_ALGO.to_string(),
+                    preferred_region: params.region,
+                    source_ip,
+                    source_version: None,
+                })
                 .await
                 .map_err(|error| {
                     if error.code() == crate::SnErrorCode::Conflict
@@ -256,7 +266,7 @@ pub(crate) async fn handle_auth(
                         reason_error(SnApiErrorCode::InternalError, error.to_string())
                     }
                 })?;
-            if !ok {
+            if !registration.registered {
                 return Err(parse_error(
                     SnApiErrorCode::InvalidActiveCode,
                     "register failed, invalid activation code",
@@ -266,30 +276,22 @@ pub(crate) async fn handle_auth(
                 "sn auth register local account created: username={} request_id={}",
                 username, request_id
             );
-            // BNS 和本地账号创建都可能已产生不可回滚状态。Relay 暂不可用、
-            // GeoIP 失败或调度存储失败时只记录 pending，不让注册失败。
-            match server
-                .relay_manager()
-                .allocate_zone_relay(AllocateZoneRelayReq {
-                    zone: username.clone(),
-                    preferred_region: params.region,
-                    source_ip,
-                    reason: "register".to_string(),
-                    source_version: None,
-                })
-                .await
-            {
-                Ok(assignment) => info!(
+            match registration.relay {
+                Some(RegistrationRelayAllocation::Assigned { assignment }) => info!(
                     "sn auth register relay assigned: username={} request_id={} relay_id={} generation={}",
                     username, request_id, assignment.relay_id, assignment.generation
                 ),
-                Err(error) => warn!(
+                Some(RegistrationRelayAllocation::Pending {
+                    error_code,
+                    message,
+                }) => warn!(
                     "sn auth register relay assignment pending: username={} request_id={} error_code={:?} error={}",
                     username,
                     request_id,
-                    error.code(),
-                    error.msg()
+                    error_code,
+                    message
                 ),
+                None => {}
             }
             let response = build_auth_success_response(
                 server,

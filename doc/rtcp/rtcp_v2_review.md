@@ -3,9 +3,11 @@
 
 **总评**:v2 协议设计本身是扎实的——前向安全的临时密钥交换、key-confirmation、aud 域隔离、绑定完整握手上下文的 HKDF、方向分离的 AEAD 记录层、认证/授权分层(§5.3.1),这套推理链完整且大部分与代码一致。文档质量在项目内也是高的(有历史演进、有兼容性声明、有威胁分析)。但有两类问题:**①一个设计决策(拒绝重复 Hello)的安全理由在 v2 下已失效,且与"无保活"叠加会造成真实的重连锁死;②文档停在 7-01 13:04,其后代码改了 1100+ 行,认证一节(§5.3)已与实现漂移,另有多处把"应然"写成了"已然"。**
 
+> 2026-07-24 跟进：下述问题 1 已在当前工作区修复。实现改为“完整认证和准入后的新入站 tunnel 原子替换旧 tunnel”，增加 tunnel `instance_id`、compare-and-remove、关闭唤醒和 waiter 快速清理；map 竞态、双 RTCP 实例重连、名字 DID → canonical `did:dev` 替换、listener 拒绝和客户端名字/DEV 复用测试均通过。随后又补充 verified 逻辑 DID 二级索引和 `DocumentRevision`/`CacheWriteOutcome` 仲裁，使设备文档换钥后即使 canonical key 改变，也会关闭同一逻辑身份的旧 revision tunnel；KeyOnly/未验证声明不进入索引。TCP keepalive/idle 探测仍是独立的可用性增强项，不属于本次替换语义修复。
+
 ## 一、设计层面的问题(按优先级)
 
-**1.【高】"拒绝重复 Hello"的理由在 v2 失效,并造成僵尸 tunnel 锁死。** §14.1 的理由是"新旧 tunnel 在同一把 (aes_key, iv) 上各自从 0 计数"——这是 v1(responder 静态 X25519)的事实。v2 每次握手双方都现场生成 ephemeral,重复 Hello 必然派生全新 (key, iv),该风险已不存在,但 [rtcp.rs:1635-1641](src/components/cyfs-gateway-lib/src/rtcp/rtcp.rs:1635) 的注释和行为仍沿用旧理由。叠加三个事实——`run()` 读循环无 idle 超时、全 rtcp 未设 TCP keepalive、`remove_tunnel` 只在 `run()` 退出后执行——后果是:NAT 半开或对端崩溃后,接受侧 tunnel 永久僵死在 map 里;对端重连的新 Hello 完整走完 v2 握手后被当 duplicate 拒掉,keep_tunnel 每 15s 重试、每次都被拒,恢复遥遥无期。**建议:v2 语义下改为"key-confirmation 通过后新替旧、close 旧 tunnel"(自愈且无密码学代价),并补 TCP keepalive 或读 idle 探测。**
+**1.【高，已修复】"拒绝重复 Hello"的理由在 v2 失效,并造成僵尸 tunnel 锁死。** §14.1 的理由是"新旧 tunnel 在同一把 (aes_key, iv) 上各自从 0 计数"——这是 v1(responder 静态 X25519)的事实。v2 每次握手双方都现场生成 ephemeral,重复 Hello 必然派生全新 (key, iv),该风险已不存在。当前实现已经改为：身份验证、anti-replay、key-confirmation、listener 准入和设备文档提交全部成功后，新入站 tunnel 按 canonical key 原子替换旧 tunnel；旧实例在 map 临界区内先标记 closed，锁外完成异步关闭，退出时通过 `instance_id` compare-and-remove，不能删除新实例。未认证连接和 listener 拒绝仍发生在 map 仲裁前，不能踢掉合法 tunnel。无 idle timeout/TCP keepalive 仍可作为独立的半开检测优化，但不再阻塞合法重连。
 
 **2.【中高】inbound ROpen 没有配额。** Open 有 64 槽 semaphore([rtcp.rs:2276](src/components/cyfs-gateway-lib/src/rtcp/rtcp.rs:2276)),但每条 inbound ROpen 都会触发一次出站 TCP 竞速拨号 + HelloStream,无并发上限、无速率限制,`on_ropen` 也不检查方向(接受侧收到 ROpen 同样会拨号)。恶意对端可把本端当出站连接放大器。§14.3 记录的"对端持续发送请求"问题只修了 Open 一半。
 

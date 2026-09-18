@@ -1,0 +1,19 @@
+{
+  "nodeModulesDir": "auto",
+  "imports": {
+    "acme-client": "npm:acme-client@5.4.0"
+  },
+  "tasks": {
+    "start": "deno run --allow-env --allow-net --allow-read --allow-write main.ts",
+    "check": "deno check main.ts && deno lint && deno fmt --check",
+    "test": "deno test"
+  },
+  "fmt": {
+    "lineWidth": 100
+  },
+  "lint": {
+    "rules": {
+      "tags": ["recommended"]
+    }
+  }
+}

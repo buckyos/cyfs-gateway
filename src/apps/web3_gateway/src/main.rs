@@ -1,4 +1,4 @@
 #[tokio::main]
-async fn main() {
-    web3_gateway::web3_gateway_main().await;
+async fn main() -> anyhow::Result<()> {
+    web3_gateway::app()?.run().await
 }

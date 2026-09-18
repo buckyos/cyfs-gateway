@@ -57,6 +57,12 @@ Examples:
 
 #[async_trait::async_trait]
 impl ExternalCommand for ErrorResponse {
+    fn overrides_builtin(&self, args: &CommandArgs) -> bool {
+        args.as_str_list()
+            .get(1)
+            .is_some_and(|value| Self::parse_status_code(value).is_ok())
+    }
+
     fn help(&self, name: &str, help_type: CommandHelpType) -> String {
         assert_eq!(self.cmd.get_name(), name);
         command_help(help_type, &self.cmd)
@@ -87,15 +93,7 @@ impl ExternalCommand for ErrorResponse {
         args: &[CollectionValue],
         _origin_args: &CommandArgs,
     ) -> Result<CommandResult, String> {
-        let mut str_args = Vec::with_capacity(args.len());
-        for arg in args.iter() {
-            if !arg.is_string() {
-                let msg = format!("Invalid argument type: expected string, got {:?}", arg);
-                error!("{}", msg);
-                return Err(msg);
-            }
-            str_args.push(arg.as_str().unwrap());
-        }
+        let str_args: Vec<_> = args.iter().map(ToString::to_string).collect();
 
         let matches = self
             .cmd
@@ -114,7 +112,11 @@ impl ExternalCommand for ErrorResponse {
         let message = matches.get_one::<String>("message").map(|s| s.to_string());
 
         let command = match message {
-            Some(message) => format!(r#"error {} "{}""#, status, message),
+            Some(message) => format!(
+                "error {} {}",
+                status,
+                shlex::try_quote(&message).map_err(|e| e.to_string())?
+            ),
             None => format!("error {}", status),
         };
 

@@ -1,0 +1,222 @@
+# RTCP on_new_tunnel 入站身份验证 —— 正确流程（伪代码，基于 name-lib 上游 API）
+#
+# 范围：具名 from（逻辑 DID + device_document_jwt）。
+#       did:dev 匿名路径、包解析/资源边界（TODO §F）不在本文，另见
+#       RTCP-Authoritative-Peer-Key-Resolution-TODO.md。
+#
+# 三条不变量（review 实现时按这三条验收）：
+#   I1. 匿名/任意构造的输入：零外网 I/O（最多消耗一次本地 ed25519 验签）。
+#   I2. 外联只可能由"信任库内 owner 真实签名过的文档"触发，且有预算
+#       （singleflight + 限速 + 负缓存 + 并发上限 + 超时）。
+#   I3. rtcp 只拥有两块逻辑：持钥证明（协议签名）+ 策略映射（档位/时机）。
+#       文档的真伪、owner 锚定、valid_iat 防回滚、时效三态，全部由
+#       name-lib 判定，rtcp 一律不重复实现。
+#
+# 已定决策：
+#   D1. 不做后台定时器重验吊销（吊销概率低）。吊销传播依赖两条路：
+#       a) 新文档随新握手到达 → 第⑪步按逻辑 DID 踢旧 revision；
+#       b) 第⑨步每身份一次的后台权威确认。
+#       Accepted risk：吊销后，合法设备若不再连接本节点，本节点上
+#       已建立的旧 tunnel 不会被发现。这是显式接受的风险，实现时
+#       不要隐式"顺手修复"。
+#   D2. 关系档位实现 same_zone | known_owner | any；known_owner 只接受
+#       name-client 已验证的可授权 owner 与 OwnerDocument evidence。
+#       same_owner / unknown_owner_escalation=budgeted 仍为预留枚举值，
+#       配置了未实现值必须启动报错，不得静默接受。
+#   D3. 没有自声明（self-declared）回落路径。离线/首次组网的可用性来自
+#       预置信任材料（set_local_authority_override / 预置 verified cache），
+#       不来自验证放松。
+
+配置 SecurityConfig:
+    anonymous: allow | reject          # 具名验证不可用时，能否降级为 key 身份准入
+    named_min_relation: same_zone | known_owner | any
+    authority_reconfirm_max_age: 无限   # 权威确认复用期；懒检查，无后台定时器（D1）
+
+本地锚 LocalAnchor（启动时装好，全部是本地事实）:
+    my_owner_did, my_zone_did
+    # 本 zone 的 owner/zone 文档经 set_local_authority_override()
+    # 或预置 verified cache 进入本地（D3）
+
+# 全流程唯一一份准入解析策略，任何地方不得另配
+admission_policy = ResolvePolicy(
+    source = LocalAndZone,        # 本机 cache + zone resolver；不碰 method authority
+    allow_stale_cache = True,     # 离线容错；terminal 负状态仍然硬拒
+    allow_unverified_cache_when_unavailable = False,  # observed 证据不进信任判断
+    allow_self_signed_when_missing = False,
+)
+
+# =====================================================================
+# 握手期（同步路径，保证零外网）
+# =====================================================================
+
+过程 验证新建RTCPTunnel(hello, tunnel_token, cfg, anchor):
+    # 除特别注明外，任一步失败即终止并返回 身份验证失败。
+
+    如果 hello.device_document_jwt 不存在:
+        返回 失败        # 具名 from 必须带文档；did:dev 走另一条路径
+    from_did = DID.parse(hello.from_id)
+
+    # ① parse-only 解码：只为取得"声明"与候选 key，不产生任何信任
+    claim = DeviceDocument.decode(hello.device_document_jwt, verify_key = 无)
+
+    # ② 协议字段绑定：声明的 from 必须就是文档主体（canonical DID 串比较）
+    如果 claim.id != hello.from_id:
+        返回 失败
+
+    # ③ 声明预过滤：纯字符串比较，最便宜，放最前。
+    #    只用于"拒"，永远不用于"信"（信任判断只看第⑤步的输出）
+    如果 cfg.named_min_relation == same_zone 且 claim.owner != anchor.my_owner_did:
+        返回 失败(原因 = 非本zone声明)
+
+    # ④ 持钥证明 —— rtcp 唯一的自研"验证"（RTCP 协议签名；
+    #    含 aud / nonce 防重放 / iat-exp 窗口，见 TODO §F/§J）
+    candidate_key = claim.get_default_key()
+    如果 verify_tunnel_token(tunnel_token, candidate_key) 失败:
+        返回 失败
+    canonical_dev = did_dev(candidate_key)
+
+    # ⑤ 上游组合动词：resolve + verify。LocalAndZone ⇒ 结构上零外网（I1）。
+    #    owner 签名、owner 锚定（expected_owner 绝不来自 payload 自声明）、
+    #    valid_iat 防回滚、terminal 负状态，全部在这一次调用里完成（I3）。
+    result = resolve_and_verify_device_document_jwt(
+                 from_did, hello.device_document_jwt,
+                 ResolveVerifyOptions(purpose = AuthSubject,
+                                      policy  = admission_policy))
+
+    如果 result 是 成功(device_doc, verified):
+        返回 具名准入(device_doc, verified)
+
+    如果 is_definite(result.err):
+        返回 失败        # 候选被证明有问题，或被权威/负状态明确否定
+
+    否则:
+        # MissingDependency / Resolve 不可达：本地评估不了 ≠ 假。
+        # 没有自声明回落（D3），也绝不因此联网（I1）。
+        # same_zone 栈走到这里，通常 = 设备不在本 zone 的信任材料里。
+        如果 cfg.anonymous == allow:
+            返回 成功(Key身份(canonical_dev,
+                              未验证声明 = hello.from_id))
+            # 未验证声明不填 owner/zone、不进任何授权判断，仅供观测/日志
+        否则:
+            返回 失败
+
+
+过程 具名准入(device_doc, verified):
+    # ⑥ freshness：只拒"确证回归"。容忍无基线/无权威证据（权威判断在⑨）。
+    #    不能用 NotOlderThanLocalLatest（基线 Unknown 会误杀离线/首见），
+    #    也不能用 AnyValid（连权威否定都不看）。
+    #    已向上游提议收编为 FreshnessRequirement.NotProvenRegressed，
+    #    落地后本段匹配整体删除。
+    如果 verified.freshness.local ∈ { OlderThanLatestKnown, ConflictAtSameRevision }:
+        返回 失败
+    如果 verified.freshness.authority 是 NotCurrent(DifferentDocument | Superseded):
+        返回 失败
+
+    # ⑦ 关系档位：只消费上游锚定的输出（authz_owner），不看 claim
+    owner = verified.authz_owner        # purpose=AuthSubject 成功时必为 Some
+    如果 cfg.named_min_relation == same_zone:
+        如果 owner != anchor.my_owner_did: 返回 失败
+        如果 device_doc.zone_did != anchor.my_zone_did: 返回 失败
+        # zone_did 取自验签通过的文档 ⇒ owner 背书；zone 只随 owner
+    如果 cfg.named_min_relation == known_owner:
+        如果 verified.usable_as_authz_subject != true: 返回 失败
+        如果 owner 为空: 返回 失败
+        如果 verified.validity.owner_document_source 为空: 返回 失败
+        # 只消费 name-client 的验证证据，不使用 claim.owner
+
+    # ⑧ 准入。tunnel 槽位/原子替换仍按 canonical_dev（736a7178 行为不变）。
+    #    trust 档位必须随 tunnel 记录，供 process-chain / on_new_tunnel 授权用。
+    tunnel = 准入(具名身份(
+                 did           = verified.subject_did,
+                 owner         = owner,
+                 canonical_dev = canonical_dev,
+                 doc_revision  = verified.document_metadata.revision,
+                 trust         = 按证据映射(verified)))   # 如 TrustedZoneSnapshot
+
+    # ⑨ 后台一次性权威确认（懒触发，无后台定时器，D1）
+    如果 IdentityState[verified.subject_did].authority_confirmed_at 缺失
+       或 距今 > cfg.authority_reconfirm_max_age:
+        提交后台任务 confirm_authority_binding(tunnel, from_did, hello.device_document_jwt)
+
+    # ⑩⑪ 注册握手完成回调（key-confirmation + listener 授权全部成功后才执行）
+    注册回调 handshake_committed(tunnel, verified)
+    返回 成功(tunnel)
+
+
+函数 is_definite(err):
+    # Definite = 候选本身被证明有问题，或被权威源明确否定 ⇒ 拒绝握手。
+    # 其余（MissingDependency / Resolve 不可达）= 本地评估不了 ⇒ 降级，不拒绝。
+    返回 err 是 Verify 类 且 属于 {
+        InvalidDocument, DocumentIdMismatch, OwnerMismatch,
+        DetachedOwnerRejected, SignatureRejected,
+        RevokedByOwnerPolicy, RejectedByNegativeState }
+    # 注：OwnerBindingUnavailable 的归类待与上游确认 —— 其注释语义是
+    # "权威已回答的确定性缺失"，应属 Definite；确认前按现状归入降级类。
+
+# =====================================================================
+# 握手全链成功后（本地，零网络）
+# =====================================================================
+
+过程 handshake_committed(tunnel, verified):
+    # ⑩ 延迟缓存提交：verify 从不隐式写缓存；只有持钥证明、key-confirmation、
+    #    listener 授权全部成功的文档才落盘（这正是上游对 add_verified_cache
+    #    的契约）。攻击者不能只靠提交一份文档推进 high-water。
+    #    这也是第⑥步本地基线、第⑨步结果复用的数据来源。
+    add_verified_cache(verified.subject_did, DidDocType.Device, verified.document)
+
+    # ⑪ 按逻辑 DID 踢旧 revision ——"新 tunnel 踢旧 tunnel"作为吊销手段（D1.a）
+    #    的必要补丁：key 轮换后新 key ⇒ 新 canonical_dev ⇒ 不同槽位，
+    #    槽位替换永远踢不掉持旧 key 的 tunnel。
+    #    零网络、无定时器，搭新文档随握手到达的便车。
+    对 每个活跃 tunnel t:
+        如果 t.did == verified.subject_did 且 t.doc_revision 旧于 verified.doc_revision:
+            t.kick(原因 = superseded_document)
+
+# =====================================================================
+# 后台一次性权威确认 —— 全流程唯一可能外联外网的地方（I2）
+# =====================================================================
+
+过程 confirm_authority_binding(tunnel, from_did, jwt):
+    # 闸门：能进入本过程的文档必然已通过第⑤步（带信任库 owner 的真实签名），
+    # 攻击者无法伪造触发 ⇒ 外联集合被"owner 实际签发过的文档"界定，
+    # 与握手频率、攻击流量无关（I2）。
+
+    如果 singleflight 占用中(from_did): 返回
+    如果 负缓存命中(from_did): 返回
+    限速(from_did, tunnel.source_ip); 取全局并发额度; 设超时预算
+
+    # RemoteAuthority 会同时重新锚定 owner 材料与 device 文档：
+    # owner_document 型吊销（owner 换 key / bump valid_iat）和
+    # device_document 型吊销（新版 / tombstone）都在这一次调用里暴露。
+    # —— 这就是不手写 resolve_device_document 的原因：手写只会想到设备文档，
+    #    漏掉 owner 文档这半边吊销面。
+    result = resolve_and_verify_device_document_jwt(
+                 from_did, jwt,
+                 ResolveVerifyOptions(purpose = AuthSubject,
+                     policy = admission_policy 改 source = RemoteAuthority))
+
+    如果 result 是 成功(_, verified2)
+       且 evaluate_freshness(verified2, RequireAuthorityCurrent) 通过:
+        IdentityState[from_did].authority_confirmed_at = 现在
+        tunnel.升级档位(MethodAuthorityCurrent)
+        add_verified_cache(verified2.subject_did, DidDocType.Device, verified2.document)
+        # 权威当前结果落盘后，该身份后续握手在第⑤步直接本地命中最高档
+        返回
+
+    如果 evaluate_freshness 报 AuthorityNotCurrent 或 is_definite(result.err):
+        tunnel.kick(原因 = 权威否定)
+        负缓存记录(from_did)
+        返回
+
+    否则:   # AuthorityUnavailable / 超时 / Resolve 不可达
+        有限次退避重试后放弃；tunnel 档位保持快照级不变（不可达 ≠ 否定）
+
+# =====================================================================
+# 网络 I/O 盘点（review 时对照 I1/I2 验收）
+# =====================================================================
+# 握手同步路径：零外网。第⑤步 LocalAndZone 里的 zone-resolver 是 zone 内
+#   基础设施（有界目的地、可限速），不构成对外放大。
+# 后台：仅 confirm_authority_binding，每身份一次（singleflight + 负缓存去重），
+#   且只能由 owner 真签名的文档触发。
+# 总外网读 ≤ 活跃具名身份数（same_zone 栈 ≈ zone 设备数），与握手频率、
+#   攻击流量无关。

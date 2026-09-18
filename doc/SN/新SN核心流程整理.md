@@ -209,13 +209,14 @@ BNS 中的 `device_mini_doc` 是设备身份和基础配置的权威文档；`sn
 请求目标是 BNS 域名：
 
 - `TXT`: 从 `bns-indexer` 读取 `zone`、`boot`、`dns_txt`，合并成多条 TXT 记录。
-- `A/AAAA`: 优先使用 BNS `zone` 文档中的 `gateway_ips`；如果没有，则根据 `zone`/`boot` 中的 gateway device 配置查询 `sn_device_info`，返回当前可达 IP。
+- `A`: 返回单一明确 IPv4；优先取 BNS `zone.gateway_ips` 中第一个 IPv4，否则取当前 assignment 对应 relay node 的第一个 IPv4，不读取 `sn_device_info` 上报地址。
+- `AAAA`: 暂时保持原逻辑，优先使用 `gateway_ips`，否则根据 gateway device 配置和 `sn_device_info` 返回 IPv6 地址。
 
 请求目标是非 BNS 域名：
 
 - 先由 `sn_auth` 根据 `user_domain` 找到对应 `sn_user`。
 - `TXT`: 合并该用户 BNS `zone`、`boot`、`dns_txt`，再叠加必要的 user_domain TXT 记录。
-- `A/AAAA`: 如果 user_domain 记录里有显式 A/AAAA，则直接返回；否则通过 `sn_resolver` 找到该 zone 的 gateway device，再查询 `sn_device_info` 返回当前可达 IP。
+- `A/AAAA`: 如果 user_domain 记录里有显式记录则优先返回（A 只取第一个有效 IPv4）；否则 A 走单 IPv4 的 `gateway_ips`/relay 规则，AAAA 仍通过 gateway device 和 `sn_device_info` 返回 IPv6 地址。
 
 注意：
 
@@ -224,30 +225,33 @@ BNS 中的 `device_mini_doc` 是设备身份和基础配置的权威文档；`sn
 
 ### 返回 IP 地址的构成（结合现有实现）
 
-A/AAAA 查询返回的 IP 不是单一来源，而是 `sn_resolver` 按优先级从多个来源合成、再做协议与可导出过滤后得到的列表。对应实现主要在 `sn_resolver::resolve_dns` 和 `resolve_gateway_addresses`。
+A 查询返回一个确定 IPv4；AAAA 和自有客户端的 gateway 地址发现仍可返回多地址。对应实现主要在 `sn_resolver::resolve_standard_dns_ipv4`、`resolve_dns` 和 `resolve_gateway_addresses`。
 
 按优先级，命中即返回：
 
 1. **SN 自身域名**：查询目标是 SN 自己的 hostname 时，直接返回 `config.server_ip`。
-2. **user_domain 显式记录**：非 BNS 域名若在兼容存储里配置了显式 A/AAAA，直接返回该记录，不再走后续合成。
-3. **zone 文档 `gateway_ips`**：BNS `zone` 文档显式声明了 `gateway_ips` 时，直接返回这些 IP（即用户自有 public gateway 的地址），`source = BnsDocument`。
-4. **gateway device 在线态合成**：以上都没有时，才根据 `zone`/`boot` 指定的 gateway device（缺省回退到 `legacy_gateway_device_name`，即旧的 `ood1`），从 `sn_device_info` 在线态合成地址，`source = DeviceOnlineInfo`。
+2. **user_domain 显式记录**：非 BNS 域名若配置了显式 A/AAAA，直接返回且不走后续合成；A 只取第一个有效 IPv4，AAAA 暂时保持原行为。
+3. **zone 文档 `gateway_ips`**：A 只返回其中第一个可导出的 IPv4；AAAA 暂时仍返回匹配的 IPv6 地址，`source = BnsDocument`。
+4. **无显式公网 IPv4**：A 不再查询 gateway device 或在线态，只返回 assignment 对应 relay node 按 slot 顺序的第一个 IPv4。
+5. **AAAA / 自有客户端地址发现**：仍可根据 `zone`/`boot` 指定的 gateway device，从 `sn_device_info` 和 device document 合成多地址。
 
-第 4 步的地址合成顺序（全部叠加，不是互斥），核心区别在于设备是否公网可达：
+第 5 步只用于 AAAA 和自有客户端地址发现，其地址合成顺序如下：
 
 - 先并入 `zone` 文档里的 `gateway_ips`。
-- **设备签名文档的 `net_id` 不以 `wan` 开头，或文档未声明 `net_id` 且在线态 `is_wan_device == false` 时**：注入 SN relay 出口地址——优先用该 zone 分配的 `zone_info.sn_ips`（`get_user_sn_ips`），若为空则回退到 `config.server_ip`。签名的 `net_id` 优先于公网 IP 形状推断，避免 NAT OOD 因上报宿主机全局 IPv6 而被误判为 WAN。这是"NAT 后设备默认把流量引到 SN 兜底中转"的关键。
-- **设备签名文档的 `net_id` 以 `wan` 开头，或文档未声明 `net_id` 且在线态判定为 WAN 时**：跳过 SN 注入，直接用设备自己的公网地址。
+- **设备签名文档的 `net_id` 不以 `wan` 开头，缺失、为空或无法识别时**：追加当前 assignment 对应 relay node 的地址。即使设备上报了公网形状的地址，也不能据此取消 relay；该地址可能只是 NAT 出口或宿主机/VM 地址。这是“NAT 后设备默认保留 relay 外网入口”的关键。
+- **只有设备签名文档的 `net_id` 明确以 `wan` 开头时**：跳过 relay 注入，直接使用设备自己的公网地址。
 - 再依次并入设备上报的 `public_ips`、`private_ips`、`active_endpoints` 中的 host，以及兼容设备文档和 `device_mini_doc` 内 `ip`/`ips`/`all_ip`/`addresses` 字段里的地址。
 
-当签名 device document 没有 `net_id` 时，WAN/公网回退判定来自 `update_ood_info` 上报时保存的在线态：`sn_device_info` 把设备 `reported_ip`、`reported_ips` 和 SN 实际观测到的 `from_ip`（请求真实来源 IP）一起做公网/私网分类，只要其中存在一个公网 IP，就置 `wan_ip` 并令 `is_wan_device = true`。这个启发式结果只在权威文档未声明拓扑时使用。
+`sn_device_info` 仍会把设备 `reported_ip`、`reported_ips` 和 SN 观测到的 `from_ip` 做公网/私网分类并生成 `is_wan_device`，但这个启发式结果只描述在线地址形状，不再用于取消 DNS relay 地址。
+
+标准 A 查询不依赖 gateway device mini document；需要设备 DID 的 gateway 解析接口仍保持严格，文档缺失时返回 `DeviceNotFound`。
 
 最后所有候选地址都经过过滤再返回：
 
-- 按记录类型过滤：A 只保留 IPv4，AAAA 只保留 IPv6。
+- 按记录类型过滤：A 最多保留一个 IPv4，AAAA 只保留 IPv6。
 - 丢弃不可导出地址：loopback、Docker 网桥地址（`172.16.0.0/12`）会被剔除，并去重。
 
-因此返回 IP 的"构成"可概括为：用户有自有公网入口时返回其声明地址或 user_domain 显式记录；gateway device 公网直达时返回设备自身公网 IP；设备在 NAT 后时返回 SN 的中转地址（zone 分配的 `sn_ips` 或 `server_ip`），同时附带设备 LAN 地址作为同网段可达补充。这与 SN 作为 fallback relay 的定位一致——能直连就给真实地址，不能直连才把流量兜到 SN。
+因此标准 A 的规则可概括为：显式 user-domain A 或 `gateway_ips` 只选一个 IPv4，否则只选一个已分配 relay IPv4；不再把 device 上报的公网、私网或 endpoint 地址混入浏览器使用的 A RRset。自有客户端仍可通过 gateway 地址发现取得多地址并自主排序。
 
 ## 注册管理
 

@@ -1,10 +1,15 @@
+use async_trait::async_trait;
+use bns_client::{
+    AuthorityKey, AuthoritySetState, BnsClientResult, BnsIndexerApi, BnsSystemInfo, DocumentState,
+    EventLogRecord, LogCheckpoint, NameState, OwnerResolution, ResolveResult,
+};
+use bns_indexer::CentralizedBnsIndexerHandler;
 use bns_indexer::{
     default_document_update, CallAuthority, CentralizedBnsRegistry, DocumentRef, MutationGuard,
     RegisterOptions, SqliteBnsRegistryStore,
 };
-use bns_server::{open_sqlite_registry, spawn_listener, BnsIndexerHttpServer};
+use bns_server::{open_sqlite_registry, spawn_listener, BnsContractHttpServer};
 use buckyos_kit::init_logging;
-use web3_gateway::{gateway_service_main, GatewayParams};
 use cyfs_sn::SqliteSnAuthDB;
 use hickory_resolver::config::{NameServerConfig, Protocol, ResolverConfig, ResolverOpts};
 use hickory_resolver::TokioAsyncResolver;
@@ -15,13 +20,78 @@ use std::path::Path;
 use std::str::FromStr;
 use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
+use web3_gateway::{gateway_service_main, GatewayParams};
 
+const SN_HOST: &str = "sn.local.test";
 const BNS_NAME: &str = "bnsalice";
 const BNS_ASSET_OWNER: &str = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const BNS_GATEWAY_DEVICE: &str = "gateway1";
 const BNS_GATEWAY_DID: &str = "did:dev:bnsdevice1";
 const BNS_GATEWAY_IP: &str = "203.0.113.11";
 const BNS_TXT_RECORD: &str = "bns-txt=ok";
+
+struct TestBnsRpc {
+    projection: CentralizedBnsIndexerHandler<SqliteBnsRegistryStore>,
+}
+
+#[async_trait]
+impl BnsIndexerApi for TestBnsRpc {
+    async fn system_info(&self) -> BnsClientResult<BnsSystemInfo> {
+        self.projection.latest_checkpoint().await?;
+        Ok(BnsSystemInfo {
+            ready: true,
+            chain_id: 31_337,
+            contract_address: "0x2222222222222222222222222222222222222222".to_string(),
+        })
+    }
+
+    async fn query_name_state(&self, name: &str) -> BnsClientResult<Option<NameState>> {
+        self.projection.query_name_state(name).await
+    }
+
+    async fn resolve_owner(&self, name: &str) -> BnsClientResult<OwnerResolution> {
+        self.projection.resolve_owner(name).await
+    }
+
+    async fn get_authority_set(&self, name: &str) -> BnsClientResult<AuthoritySetState> {
+        self.projection.get_authority_set(name).await
+    }
+
+    async fn get_authority_key(
+        &self,
+        name: &str,
+        kid: &str,
+    ) -> BnsClientResult<Option<AuthorityKey>> {
+        self.projection.get_authority_key(name, kid).await
+    }
+
+    async fn resolve_document(&self, name: &str, doc_type: &str) -> BnsClientResult<ResolveResult> {
+        self.projection.resolve_document(name, doc_type).await
+    }
+
+    async fn get_document_version(
+        &self,
+        name: &str,
+        doc_type: &str,
+        version: u64,
+    ) -> BnsClientResult<Option<DocumentState>> {
+        self.projection
+            .get_document_version(name, doc_type, version)
+            .await
+    }
+
+    async fn list_events(
+        &self,
+        from_seq: u64,
+        limit: usize,
+    ) -> BnsClientResult<Vec<EventLogRecord>> {
+        self.projection.list_events(from_seq, limit).await
+    }
+
+    async fn latest_checkpoint(&self) -> BnsClientResult<Option<LogCheckpoint>> {
+        self.projection.latest_checkpoint().await
+    }
+}
 
 fn inline_json_doc(doc_type: &str, value: Value) -> bns_indexer::DocumentUpdate {
     default_document_update(
@@ -71,6 +141,7 @@ fn seed_bns_registry(db_path: &Path) {
                             (BNS_GATEWAY_DEVICE): {
                                 "id": BNS_GATEWAY_DID,
                                 "device_name": BNS_GATEWAY_DEVICE,
+                                "net_id": "wan",
                                 "addresses": ["203.0.113.12"],
                                 "mini_config_jwt": "bns-mini-config-jwt"
                             }
@@ -122,7 +193,9 @@ async fn gateway_sn_resolves_bns_documents_through_sn_only() {
     let bns_db = tempfile::NamedTempFile::with_suffix(".bns.sqlite").unwrap();
     seed_bns_registry(bns_db.path());
     let registry = open_sqlite_registry(bns_db.path()).unwrap();
-    let bns_http = BnsIndexerHttpServer::from_registry(registry.clone());
+    let bns_http = BnsContractHttpServer::new(TestBnsRpc {
+        projection: CentralizedBnsIndexerHandler::new(registry.clone()),
+    });
     let bns_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let bns_addr = bns_listener.local_addr().unwrap();
     let bns_server = spawn_listener(bns_listener, Arc::new(bns_http)).unwrap();
@@ -199,11 +272,9 @@ servers:
     boot_jwt: ""
     owner_pkx: ""
     device_jwt: []
-    db_type: sqlite
     db_path: {}
     auth_data_dir: {}
-    bns_indexer_url: http://{}
-    bns_write_enabled: false
+    bns_server_url: http://{}
 "#,
         sn_db.path().to_string_lossy(),
         auth_dir.path().to_string_lossy(),
@@ -242,7 +313,7 @@ servers:
 
     let device: serde_json::Value = http_client
         .get(format!(
-            "{}/did:bns:{}.{}?type=doc",
+            "{}/did:bns:{}.{}?type=device_mini_doc",
             did_endpoint, BNS_GATEWAY_DEVICE, BNS_NAME
         ))
         .send()
@@ -273,8 +344,11 @@ servers:
     let resolver_config = ResolverConfig::from_parts(None, vec![], name_server_configs);
     let resolver = TokioAsyncResolver::tokio(resolver_config, ResolverOpts::default());
 
+    // 权威 DNS 语义：SN 只应答托管 zone（web3.<server_host> 与 active
+    // user_domain）内的名字，BNS name 以 <name>.web3.<server_host> 查询。
+    let bns_fqdn = format!("{}.web3.{}.", BNS_NAME, SN_HOST);
     let ips = resolver
-        .lookup_ip(format!("{}.", BNS_NAME))
+        .lookup_ip(bns_fqdn.as_str())
         .await
         .unwrap()
         .iter()
@@ -282,7 +356,7 @@ servers:
     assert_eq!(ips, vec![IpAddr::from_str(BNS_GATEWAY_IP).unwrap()]);
 
     let txt = resolver
-        .txt_lookup(format!("{}.", BNS_NAME))
+        .txt_lookup(bns_fqdn.as_str())
         .await
         .unwrap()
         .iter()

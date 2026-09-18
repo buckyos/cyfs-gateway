@@ -1,0 +1,4 @@
+node_modules/
+certs/
+*.pem
+state.json

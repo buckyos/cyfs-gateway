@@ -67,7 +67,7 @@ pub(crate) async fn require_sn_user(
 /// `sub` 是 `did:dev:<x>`（公钥内嵌，签名自证持有设备私钥），`iss` 是设备的
 /// zone 域名层级 DID（如 `did:bns:ood1.alice`）。信任链闭环在服务端完成：
 /// `iss` 解析出 (zone, device_name) 后，从 zone 权威侧登记的设备身份文档
-/// （BNS device_mini_doc / zone doc / 兼容设备表，owner 授权发布）取出该
+/// （BNS device_mini_doc / zone doc，owner 授权发布）取出该
 /// 设备名下的公钥，与 `sub` 中的公钥比对，防止任意 key 冒名 zone 内设备。
 pub(crate) async fn require_sn_device(
     server: &SNServer,

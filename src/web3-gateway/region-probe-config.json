@@ -1,0 +1,51 @@
+{
+  "schema_version": 1,
+  "config_version": "test-2026-08-02.1",
+  "generated_at": "2026-08-02T12:00:00Z",
+  "expires_at": "2036-08-02T12:00:00Z",
+  "policy": {
+    "probe_method": "tcp_connect",
+    "samples_per_url": 2,
+    "connect_timeout_ms": 1500,
+    "round_timeout_ms": 3000,
+    "max_concurrency": 8,
+    "ip_family": "ipv4",
+    "minimum_valid_urls": 2,
+    "confident_ratio": 0.75,
+    "cache_ttl_sec": 21600
+  },
+  "regions": [
+    {
+      "region_id": "jp",
+      "priority": 100,
+      "probe_urls": [
+        {
+          "id": "jp-aws-tokyo",
+          "url": "https://ec2.ap-northeast-1.amazonaws.com/",
+          "provider": "aws"
+        },
+        {
+          "id": "jp-oracle-tokyo",
+          "url": "https://objectstorage.ap-tokyo-1.oraclecloud.com/",
+          "provider": "oracle-cloud"
+        }
+      ]
+    },
+    {
+      "region_id": "us",
+      "priority": 100,
+      "probe_urls": [
+        {
+          "id": "us-aws-oregon",
+          "url": "https://ec2.us-west-2.amazonaws.com/",
+          "provider": "aws"
+        },
+        {
+          "id": "us-oracle-phoenix",
+          "url": "https://objectstorage.us-phoenix-1.oraclecloud.com/",
+          "provider": "oracle-cloud"
+        }
+      ]
+    }
+  ]
+}

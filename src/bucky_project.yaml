@@ -1,5 +1,5 @@
 name: cyfs-gateway
-version: 0.6.0
+version: 0.7.0
 base_dir: .
 modules:
   cyfs_gateway:
@@ -22,6 +22,7 @@ apps:
     modules:
       cyfs_gateway: bin/cyfs-gateway/
       test_server: bin/test-server/
+      etc/cyfs_gateway/: etc/cyfs_gateway/
     data_paths: []
     clean_paths: []
   web3-gateway:
@@ -39,6 +40,7 @@ apps:
       - website.yaml
       - params.json
       - local_dns.toml
+      - region-probe-config.json
     clean_paths: []
 rust_env:
   OPENSSL_STATIC: "1"

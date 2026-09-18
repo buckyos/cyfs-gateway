@@ -20,6 +20,10 @@ fn sync_source_id_includes_network_chain_and_contract() {
         testnet.source_id().unwrap(),
         production.source_id().unwrap()
     );
+    assert_eq!(
+        BnsIndexerSyncConfig::new(testnet.clone()).max_block_span,
+        500
+    );
 
     testnet.network.clear();
     assert!(BnsIndexerSyncConfig::new(testnet).validate().is_err());

@@ -6,13 +6,17 @@
     "app_info": {
         "publicview" : {
             "app_id":"publicview",
+            "app_instance_id":"publicview@bob",
+            "app_owner_user_id":"bob",
             "sdk_version":10,
-            "access_mode":"private",
+            "access_mode":"public",
             "node_id":"ood1",
             "port": 10161
         },
         "filebrowser" : {
             "app_id":"filebrowser",
+            "app_instance_id":"filebrowser@alice",
+            "app_owner_user_id":"alice",
             "sdk_version":10,
             "access_mode":"private",
             "node_id":"ood1",
@@ -21,6 +25,8 @@
         },
         "test": {
             "app_id":"bob_testweb",
+            "app_instance_id":"bob_testweb@bob",
+            "app_owner_user_id":"bob",
             "sdk_version":10,
             "access_mode":"public",
             "dir_pkg_id":"bob_testweb"
@@ -99,6 +105,7 @@
         "ood3" : "rtcp://ood3.test.buckyos.io/"
     },
     "trust_key": {
+        "verify-hub": "gubVIszw-u_d5PVTh-oc8CKAhM9C-ne5G_yUK5BDaXc",
         "issuer-main": "Wo0udCICmiQtnLwzpfulTbFEDvtT5UHNP-MZvnQ3dns",
         "issuer-backup": "s9j6X2zwk1DPjFt60z65LeBJN1DCTsqgeh15iF6Zmd4"
     }

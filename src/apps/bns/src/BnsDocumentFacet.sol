@@ -92,14 +92,18 @@ contract BnsDocumentFacet is BnsCore {
             guard
         );
 
-        uint64 current = _currentDocumentVersions[nameHash][docTypeHash];
+        bytes32 stateKey = _lineageStateKey(nameHash);
+        uint64 current = _currentDocumentVersions[stateKey][docTypeHash];
         if (current != expectedVersion) {
             revert StaleDocumentVersion(name, docType, expectedVersion, current);
         }
 
         uint64 nowTs = _now();
-        newVersion = current + 1;
+        newVersion = _currentDocumentVersions[nameHash][docTypeHash] + 1;
         _currentDocumentVersions[nameHash][docTypeHash] = newVersion;
+        if (stateKey != nameHash) {
+            _currentDocumentVersions[stateKey][docTypeHash] = newVersion;
+        }
 
         DocumentState storage document = _documents[nameHash][docTypeHash][newVersion];
         document.name = name;

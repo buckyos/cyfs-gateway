@@ -167,8 +167,8 @@ impl SnDevEnv {
         ));
         let mut opts = ResolverOpts::default();
         opts.recursion_desired = false;
-        // TXT 应答（BOOT/DEV JWT）超过 512 字节，必须带 EDNS0 声明大缓冲，
-        // 否则服务端置 TC 位、hickory 回退 TCP——dev DNS 栈只监听 UDP。
+        // TXT 应答（BOOT/DEV JWT）超过 512 字节，优先带 EDNS0 声明大缓冲；
+        // 不支持 EDNS0 的系统 resolver 会在 TC 后回退到同端口的 TCP listener。
         opts.edns0 = true;
         let resolver = TokioAsyncResolver::tokio(config, opts);
         match resolver.lookup(name, record_type).await {

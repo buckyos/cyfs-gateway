@@ -2,9 +2,6 @@ name: build Web3 Gateway
 on:
     workflow_dispatch:
 
-permissions:
-    contents: write
-
 jobs:
     build:
         runs-on: ubuntu-latest
@@ -37,28 +34,13 @@ jobs:
             sudo ln -sf /usr/local/bin/musl-ar /usr/local/bin/x86_64-linux-musl-ar
             sudo ln -sf /usr/local/bin/musl-ranlib /usr/local/bin/x86_64-linux-musl-ranlib
         - name: install buckyos devkit
-          run: pip install "buckyos-devkit @ git+https://github.com/buckyos/buckyos-devkit.git"
+          run: pip install "buckyos-devkit @ git+https://github.com/buckyos/buckyos-devkit.git@main"
         - name: Build
           working-directory: ./src
           run: buckyos-build --app=web3-gateway
-        - name: Build metadata
-          id: build_meta
-          run: |
-            echo "tag=$(date -u +%Y%m%d%H%M%S)" >> $GITHUB_OUTPUT
-        - name: Package
-          run: |
-            tar -czf web3-gateway-${{ steps.build_meta.outputs.tag }}.tar.gz -C ./src web3-gateway
         - name: Upload Artifact
           uses: actions/upload-artifact@v4
           with:
             name: web3-gateway-build${{ steps.short_time.outputs.last6 }}
             path: ./src/web3-gateway
             if-no-files-found: error
-        - name: Upload Release Asset
-          uses: softprops/action-gh-release@v2
-          with:
-            tag_name: web3-gateway-${{ steps.build_meta.outputs.tag }}
-            name: web3-gateway-${{ steps.build_meta.outputs.tag }}
-            files: web3-gateway-${{ steps.build_meta.outputs.tag }}.tar.gz
-          env:
-            GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

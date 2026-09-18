@@ -203,7 +203,7 @@ cd src/web3-gateway && scripts/sn-dev-down.sh --purge
 ## 7. 当前缺口
 
 - TODO（本版本）：SN Auth 尚无注册邮箱字段、邮箱唯一绑定、存量账号迁移和密码找回测试；实现时需要同时补 DB、RPC、并发和端到端覆盖。
-- SN 服务层尚缺一个“`bns_write_enabled=true` + 真 BNS EVM/indexer/server”的完整业务端到端测试，用来覆盖 `auth.register`、`zone.bind_config`、`did.set_document` 通过 BNS Controller 写链后，再由 SN Resolver 读回的闭环。
+- SN 服务层尚缺一个“配置 `bns_proxy.controllers` + 真 BNS EVM/indexer/server”的完整业务端到端测试，用来覆盖 `auth.register`、`zone.bind_config`、`did.set_document` 通过 BNS Controller 写链后，再由 SN Resolver 读回的闭环。
 - 真链 reorg 场景目前主要由 mock RPC 覆盖；如果未来要支持生产级 reorg 回滚策略，需要增加更接近真实节点行为的集成验证。
 - SN Auth DB 的 remote S2S 适配已有接口，但缺少像 DeviceInfo 一样的 local/remote 同批用例一致性测试。
 - 新增 BNS docType、写操作、RPC 方法或 resolver 数据源时，需要同时更新快速测试和至少一个跨层验证点，避免只测本地缓存或只测链上单边行为。

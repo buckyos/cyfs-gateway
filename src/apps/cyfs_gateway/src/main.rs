@@ -1,4 +1,4 @@
 #[tokio::main]
-async fn main() {
-    cyfs_gateway::cyfs_gateway_main().await;
+async fn main() -> anyhow::Result<()> {
+    cyfs_gateway::app()?.run().await
 }

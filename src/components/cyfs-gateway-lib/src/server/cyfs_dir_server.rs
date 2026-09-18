@@ -221,6 +221,8 @@ impl CyfsDirServer {
         req: Request<BoxBody<Bytes, ServerError>>,
         info: &StreamInfo,
     ) -> ServerResult<ChainOutcome> {
+        let dispatch = super::dispatch::is_dispatch(&req);
+        let dispatch_target = super::dispatch::dispatch_target(&req).unwrap_or_default();
         let executor = match self.executor.as_ref() {
             Some(e) => e,
             None => return Ok(ChainOutcome::PassThrough(req)),
@@ -247,12 +249,26 @@ impl CyfsDirServer {
         if ret.is_control() {
             if ret.is_drop() {
                 debug!("cyfs-dir-server {}: chain dropped request", self.id);
-                return Ok(ChainOutcome::Response(empty_response(StatusCode::OK)));
+                return Ok(ChainOutcome::Response(if dispatch {
+                    super::dispatch::dispatch_rejected(
+                        StatusCode::FORBIDDEN,
+                        &dispatch_target,
+                        "dropped",
+                    )
+                } else {
+                    empty_response(StatusCode::OK)
+                }));
             }
             if ret.is_reject() {
-                return Ok(ChainOutcome::Response(empty_response(
-                    StatusCode::FORBIDDEN,
-                )));
+                return Ok(ChainOutcome::Response(if dispatch {
+                    super::dispatch::dispatch_rejected(
+                        StatusCode::FORBIDDEN,
+                        &dispatch_target,
+                        "policy-denied",
+                    )
+                } else {
+                    empty_response(StatusCode::FORBIDDEN)
+                }));
             }
             if let Some(CommandControl::Error(e)) = ret.as_control() {
                 let msg = e.value.to_string();
