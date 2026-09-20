@@ -6,9 +6,9 @@ use cyfs_gateway_lib::{
     stack_err, ConnectionManagerRef, GlobalCollectionManagerRef, GlobalProcessChainsRef,
     JsExternalsManagerRef, LimiterManagerRef, QuicStackContext, QuicStackFactory, RtcpStackContext,
     RtcpStackFactory, SelfCertMgrRef, ServerManagerRef, StackConfig, StackContext, StackErrorCode,
-    StackFactory, StackProtocol, StackRef, StackResult, StatManagerRef, TcpStackContext,
-    TcpStackFactory, TlsStackContext, TlsStackFactory, TunnelManager, UdpStackContext,
-    UdpStackFactory,
+    StackFactory, StackManagerWeakRef, StackProtocol, StackRef, StackResult, StatManagerRef,
+    TcpStackContext, TcpStackFactory, TlsStackContext, TlsStackFactory, TunnelManager,
+    UdpStackContext, UdpStackFactory,
 };
 use serde::Deserialize;
 
@@ -33,6 +33,9 @@ pub struct GatewayStackRuntime {
     pub global_collection_manager: Option<GlobalCollectionManagerRef>,
     pub js_externals: Option<JsExternalsManagerRef>,
     pub self_cert_manager: SelfCertMgrRef,
+    /// Weak handle to the live stack manager so stacks can hand off streams to
+    /// sibling stacks (call-stack).
+    pub stack_manager: StackManagerWeakRef,
 }
 
 pub trait GatewayStackFactoryBuilder: Send + Sync {
@@ -274,15 +277,18 @@ pub(crate) fn register_core_gateway_stacks(
             )
         },
         |runtime: &GatewayStackRuntime| {
-            Ok(Arc::new(TcpStackContext::new(
-                runtime.server_manager.clone(),
-                runtime.tunnel_manager.clone(),
-                runtime.limiter_manager.clone(),
-                runtime.stat_manager.clone(),
-                runtime.global_process_chains.clone(),
-                runtime.global_collection_manager.clone(),
-                runtime.js_externals.clone(),
-            )) as Arc<dyn StackContext>)
+            Ok(Arc::new(
+                TcpStackContext::new(
+                    runtime.server_manager.clone(),
+                    runtime.tunnel_manager.clone(),
+                    runtime.limiter_manager.clone(),
+                    runtime.stat_manager.clone(),
+                    runtime.global_process_chains.clone(),
+                    runtime.global_collection_manager.clone(),
+                    runtime.js_externals.clone(),
+                )
+                .with_stack_manager(runtime.stack_manager.clone()),
+            ) as Arc<dyn StackContext>)
         },
     ))?;
     builder.register(GatewayStackRegistration::new(
@@ -340,16 +346,19 @@ pub(crate) fn register_core_gateway_stacks(
             )
         },
         |runtime: &GatewayStackRuntime| {
-            Ok(Arc::new(TlsStackContext::new(
-                runtime.server_manager.clone(),
-                runtime.tunnel_manager.clone(),
-                runtime.limiter_manager.clone(),
-                runtime.stat_manager.clone(),
-                runtime.self_cert_manager.clone(),
-                runtime.global_process_chains.clone(),
-                runtime.global_collection_manager.clone(),
-                runtime.js_externals.clone(),
-            )) as Arc<dyn StackContext>)
+            Ok(Arc::new(
+                TlsStackContext::new(
+                    runtime.server_manager.clone(),
+                    runtime.tunnel_manager.clone(),
+                    runtime.limiter_manager.clone(),
+                    runtime.stat_manager.clone(),
+                    runtime.self_cert_manager.clone(),
+                    runtime.global_process_chains.clone(),
+                    runtime.global_collection_manager.clone(),
+                    runtime.js_externals.clone(),
+                )
+                .with_stack_manager(runtime.stack_manager.clone()),
+            ) as Arc<dyn StackContext>)
         },
     ))?;
     builder.register(GatewayStackRegistration::new(
@@ -494,6 +503,7 @@ mod tests {
             global_collection_manager: None,
             js_externals: None,
             self_cert_manager,
+            stack_manager: StackManagerWeakRef::new(),
         }
     }
 
