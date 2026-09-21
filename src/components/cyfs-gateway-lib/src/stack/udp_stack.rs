@@ -33,6 +33,25 @@ use tokio::sync::{Notify, Semaphore};
 use tokio::task::JoinHandle;
 use url::Url;
 
+const DEFAULT_UDP_CONCURRENCY: u32 = 0;
+const DEFAULT_UDP_MAX_SESSIONS: u32 = 0;
+
+fn normalize_concurrency(concurrency: u32) -> u32 {
+    if concurrency == 0 {
+        u32::MAX
+    } else {
+        concurrency
+    }
+}
+
+fn normalize_max_sessions(max_sessions: u32) -> usize {
+    if max_sessions == 0 {
+        usize::MAX
+    } else {
+        max_sessions as usize
+    }
+}
+
 #[derive(Clone)]
 pub struct UdpStackContext {
     pub servers: ServerManagerRef,
@@ -1137,6 +1156,7 @@ struct UdpStackInner {
     id: String,
     bind_addr: String,
     concurrency: u32,
+    max_sessions: usize,
     session_idle_time: Duration,
     all_client_session: DatagramClientSessionMap,
     connection_manager: Option<ConnectionManagerRef>,
@@ -1169,6 +1189,7 @@ impl UdpStackInner {
             id: builder.id.unwrap(),
             bind_addr: builder.bind.unwrap(),
             concurrency: builder.concurrency,
+            max_sessions: normalize_max_sessions(builder.max_sessions),
             session_idle_time: builder.session_idle_time,
             all_client_session: Arc::new(Mutex::new(BTreeMap::new())),
             connection_manager: builder.connection_manager,
@@ -1221,6 +1242,15 @@ impl UdpStackInner {
             let mut all_sessions = self.all_client_session.lock().unwrap();
             let client_session = all_sessions.get(&session_key);
             if client_session.is_none() {
+                if all_sessions.len() >= self.max_sessions {
+                    log::warn!(
+                        "udp session limit reached: max_sessions={}, drop {} -> {}",
+                        self.max_sessions,
+                        src_addr,
+                        dest_addr
+                    );
+                    return Ok(());
+                }
                 let client_session = Arc::new(tokio::sync::Mutex::new(None));
                 all_sessions.insert(session_key, client_session.clone());
             }
@@ -1464,9 +1494,17 @@ impl UdpStackInner {
         let this = self.clone();
         let concurrency = self.concurrency;
         let handle = tokio::spawn(async move {
-            let semaphore = Arc::new(Semaphore::new(concurrency as usize));
+            let semaphore = Arc::new(Semaphore::new(
+                (concurrency as usize).min(Semaphore::MAX_PERMITS),
+            ));
             loop {
-                let permit = semaphore.clone().acquire_owned().await.unwrap();
+                let permit = match semaphore.clone().acquire_owned().await {
+                    Ok(permit) => permit,
+                    Err(e) => {
+                        log::error!("udp accept semaphore closed: {e}, stop accepting");
+                        break;
+                    }
+                };
                 let mut buffer = vec![0u8; 1024 * 2];
                 #[cfg(target_os = "linux")]
                 let (len, src_addr, dest_addr) = if this.transparent {
@@ -1793,6 +1831,7 @@ pub struct UdpStackBuilder {
     id: Option<String>,
     bind: Option<String>,
     concurrency: u32,
+    max_sessions: u32,
     session_idle_time: Duration,
     hook_point: Option<ProcessChainConfigs>,
     connection_manager: Option<ConnectionManagerRef>,
@@ -1807,7 +1846,8 @@ impl UdpStackBuilder {
         Self {
             id: None,
             bind: None,
-            concurrency: 200,
+            concurrency: normalize_concurrency(DEFAULT_UDP_CONCURRENCY),
+            max_sessions: DEFAULT_UDP_MAX_SESSIONS,
             session_idle_time: Duration::from_secs(120),
             hook_point: None,
             connection_manager: None,
@@ -1833,7 +1873,12 @@ impl UdpStackBuilder {
     }
 
     pub fn concurrency(mut self, concurrency: u32) -> Self {
-        self.concurrency = concurrency;
+        self.concurrency = normalize_concurrency(concurrency);
+        self
+    }
+
+    pub fn max_sessions(mut self, max_sessions: u32) -> Self {
+        self.max_sessions = max_sessions;
         self
     }
 
@@ -1879,6 +1924,8 @@ pub struct UdpStackConfig {
     pub bind: SocketAddr,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub concurrency: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_sessions: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_idle_time: Option<u64>,
     pub hook_point: Vec<ProcessChainConfig>,
@@ -1959,7 +2006,8 @@ impl StackFactory for UdpStackFactory {
             .bind(config.bind.to_string())
             .connection_manager(self.connection_manager.clone())
             .hook_point(config.hook_point.clone())
-            .concurrency(config.concurrency.unwrap_or(200))
+            .concurrency(config.concurrency.unwrap_or(DEFAULT_UDP_CONCURRENCY))
+            .max_sessions(config.max_sessions.unwrap_or(DEFAULT_UDP_MAX_SESSIONS))
             .session_idle_time(Duration::from_secs(config.session_idle_time.unwrap_or(120)))
             .transparent(config.transparent.unwrap_or(false))
             .stack_context(stack_context.clone())
@@ -2575,6 +2623,7 @@ mod tests {
             protocol: StackProtocol::Udp,
             bind: "127.0.0.1:334".parse().unwrap(),
             concurrency: None,
+            max_sessions: None,
             session_idle_time: None,
             hook_point: vec![],
             transparent: None,

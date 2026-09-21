@@ -31,7 +31,10 @@ use std::os::fd::{FromRawFd, IntoRawFd};
 use std::os::windows::io::{FromRawSocket, IntoRawSocket};
 use std::sync::{Arc, Mutex, RwLock};
 use tokio::net::TcpStream;
+use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
+
+const DEFAULT_TCP_CONCURRENCY: u32 = 0;
 
 #[derive(Clone)]
 pub struct TcpStackContext {
@@ -466,6 +469,7 @@ fn get_dest_addr(stream: &TcpStream) -> StackResult<SocketAddr> {
 pub struct TcpStack {
     id: String,
     bind_addr: String,
+    concurrency: u32,
     connection_manager: Option<ConnectionManagerRef>,
     handler: Arc<RwLock<Arc<TcpConnectionHandler>>>,
     prepare_handler: Arc<RwLock<Option<Arc<TcpConnectionHandler>>>>,
@@ -485,6 +489,7 @@ impl TcpStack {
             transparent: false,
             io_dump: None,
             reuse_address: false,
+            concurrency: normalize_concurrency(DEFAULT_TCP_CONCURRENCY),
             trusted_upstreams: Vec::new(),
         }
     }
@@ -528,6 +533,7 @@ impl TcpStack {
         Ok(Self {
             id,
             bind_addr,
+            concurrency: config.concurrency,
             connection_manager: config.connection_manager,
             handler: Arc::new(RwLock::new(Arc::new(handler))),
             prepare_handler: Arc::new(Default::default()),
@@ -617,8 +623,18 @@ impl TcpStack {
             .map_err(into_stack_err!(StackErrorCode::BindFailed))?;
         let handler = self.handler.clone();
         let connection_manager = self.connection_manager.clone();
+        let semaphore = Arc::new(Semaphore::new(
+            (self.concurrency as usize).min(Semaphore::MAX_PERMITS),
+        ));
         let handle = tokio::spawn(async move {
             loop {
+                let permit = match semaphore.clone().acquire_owned().await {
+                    Ok(permit) => permit,
+                    Err(e) => {
+                        log::error!("tcp accept semaphore closed: {e}, stop accepting");
+                        break;
+                    }
+                };
                 let (stream, remote_addr) = match listener.accept().await {
                     Ok(s) => s,
                     Err(e) => {
@@ -643,6 +659,7 @@ impl TcpStack {
                     handler.clone()
                 };
                 let handle = tokio::spawn(async move {
+                    let _permit = permit;
                     if let Err(e) = handler_snapshot
                         .handle_connect(stat_stream, dest_addr, compose_stat)
                         .await
@@ -719,6 +736,15 @@ impl Stack for TcpStack {
 
         if config.bind.to_string() != self.bind_addr {
             return Err(stack_err!(StackErrorCode::BindUnmatched, "bind unmatch"));
+        }
+
+        if normalize_concurrency(config.concurrency.unwrap_or(DEFAULT_TCP_CONCURRENCY))
+            != self.concurrency
+        {
+            return Err(stack_err!(
+                StackErrorCode::InvalidConfig,
+                "concurrency unmatch"
+            ));
         }
 
         if config.transparent.unwrap_or(false) != self.transparent {
@@ -810,6 +836,7 @@ pub struct TcpStackBuilder {
     transparent: bool,
     io_dump: Option<IoDumpStackConfig>,
     reuse_address: bool,
+    concurrency: u32,
     trusted_upstreams: Vec<String>,
 }
 
@@ -844,6 +871,11 @@ impl TcpStackBuilder {
         self
     }
 
+    pub fn concurrency(mut self, concurrency: u32) -> Self {
+        self.concurrency = normalize_concurrency(concurrency);
+        self
+    }
+
     pub fn trusted_upstreams(mut self, trusted_upstreams: Vec<String>) -> Self {
         self.trusted_upstreams = trusted_upstreams;
         self
@@ -873,6 +905,8 @@ pub struct TcpStackConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub transparent: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub concurrency: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub io_dump_file: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub io_dump_rotate_size: Option<String>,
@@ -899,6 +933,14 @@ impl StackConfig for TcpStackConfig {
 
     fn get_config_json(&self) -> String {
         serde_json::to_string(self).unwrap()
+    }
+}
+
+fn normalize_concurrency(concurrency: u32) -> u32 {
+    if concurrency == 0 {
+        u32::MAX
+    } else {
+        concurrency
     }
 }
 
@@ -952,6 +994,7 @@ impl StackFactory for TcpStackFactory {
             .connection_manager(self.connection_manager.clone())
             .transparent(config.transparent.unwrap_or(false))
             .reuse_address(config.reuse_address.unwrap_or(false))
+            .concurrency(config.concurrency.unwrap_or(DEFAULT_TCP_CONCURRENCY))
             .trusted_upstreams(config.trusted_upstreams.clone())
             .hook_point(config.hook_point.clone())
             .stack_context(handler_env)
@@ -2215,6 +2258,7 @@ mod tests {
             protocol: StackProtocol::Tcp,
             bind: "127.0.0.1:3345".parse().unwrap(),
             transparent: None,
+            concurrency: None,
             io_dump_file: None,
             io_dump_rotate_size: None,
             io_dump_rotate_max_files: None,

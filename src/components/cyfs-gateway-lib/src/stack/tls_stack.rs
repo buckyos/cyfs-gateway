@@ -37,10 +37,12 @@ use std::os::windows::io::{FromRawSocket, IntoRawSocket};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 use tokio::net::TcpStream;
+use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 use tokio_rustls::TlsAcceptor;
 
 const DEFAULT_IDENTITY_CERT_REFRESH_INTERVAL_SECS: u64 = 60;
+const DEFAULT_TLS_CONCURRENCY: u32 = 0;
 
 pub async fn load_certs(path: &str) -> StackResult<Vec<CertificateDer<'static>>> {
     let certs = CertificateDer::pem_file_iter(path)
@@ -590,6 +592,7 @@ impl TlsConnectionHandler {
 pub struct TlsStack {
     id: String,
     bind_addr: String,
+    concurrency: u32,
     connection_manager: Option<ConnectionManagerRef>,
     handler: Arc<RwLock<Arc<TlsConnectionHandler>>>,
     prepare_handler: Arc<RwLock<Option<Arc<TlsConnectionHandler>>>>,
@@ -652,6 +655,7 @@ impl TlsStack {
         Ok(Self {
             id,
             bind_addr,
+            concurrency: config.concurrency,
             connection_manager: config.connection_manager,
             handler: Arc::new(RwLock::new(Arc::new(handler))),
             prepare_handler: Arc::new(Default::default()),
@@ -711,8 +715,18 @@ impl TlsStack {
             .map_err(into_stack_err!(StackErrorCode::BindFailed))?;
         let handler = self.handler.clone();
         let connection_manager = self.connection_manager.clone();
+        let semaphore = Arc::new(Semaphore::new(
+            (self.concurrency as usize).min(Semaphore::MAX_PERMITS),
+        ));
         let handle = tokio::spawn(async move {
             loop {
+                let permit = match semaphore.clone().acquire_owned().await {
+                    Ok(permit) => permit,
+                    Err(e) => {
+                        log::error!("tls accept semaphore closed: {e}, stop accepting");
+                        break;
+                    }
+                };
                 let (stream, remote_addr) = match listener.accept().await {
                     Ok(s) => s,
                     Err(e) => {
@@ -738,6 +752,7 @@ impl TlsStack {
                     handler.clone()
                 };
                 let handle = tokio::spawn(async move {
+                    let _permit = permit;
                     if let Err(e) = handler_snapshot
                         .handle_connect(stat_stream, local_addr, compose_stat)
                         .await
@@ -805,6 +820,15 @@ impl Stack for TlsStack {
         }
         if config.bind.to_string() != self.bind_addr {
             return Err(stack_err!(StackErrorCode::BindUnmatched, "bind unmatch"));
+        }
+
+        if normalize_concurrency(config.concurrency.unwrap_or(DEFAULT_TLS_CONCURRENCY))
+            != self.concurrency
+        {
+            return Err(stack_err!(
+                StackErrorCode::InvalidConfig,
+                "concurrency unmatch"
+            ));
         }
 
         if config.reuse_address.unwrap_or(false) != self.reuse_address {
@@ -1045,6 +1069,14 @@ impl crate::StackConfig for TlsStackConfig {
     }
 }
 
+fn normalize_concurrency(concurrency: u32) -> u32 {
+    if concurrency == 0 {
+        u32::MAX
+    } else {
+        concurrency
+    }
+}
+
 pub(crate) fn build_identity_cert_config(
     hosts: &[String],
     identity_manager: Option<&TlsIdentityManagerConfig>,
@@ -1160,7 +1192,7 @@ impl crate::StackFactory for TlsStackFactory {
             .hook_point(config.hook_point.clone())
             .add_certs(cert_list)
             .identity_certs(identity_certs)
-            .concurrency(config.concurrency.unwrap_or(0))
+            .concurrency(config.concurrency.unwrap_or(DEFAULT_TLS_CONCURRENCY))
             .alpn_protocols(
                 config
                     .alpn_protocols
@@ -1203,7 +1235,7 @@ impl TlsStackBuilder {
             hook_point: None,
             certs: vec![],
             identity_certs: None,
-            concurrency: 0,
+            concurrency: normalize_concurrency(DEFAULT_TLS_CONCURRENCY),
             connection_manager: None,
             alpn_protocols: vec![],
             stack_context: None,
@@ -1249,11 +1281,7 @@ impl TlsStackBuilder {
     }
 
     pub fn concurrency(mut self, concurrency: u32) -> Self {
-        if concurrency == 0 {
-            self.concurrency = u32::MAX;
-        } else {
-            self.concurrency = concurrency;
-        }
+        self.concurrency = normalize_concurrency(concurrency);
         self
     }
 
