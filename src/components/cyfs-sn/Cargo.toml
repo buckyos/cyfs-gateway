@@ -47,5 +47,6 @@ sfo-ip = "0.1"
 #buckyos-api = { path = "../../kernel/buckyos-api" }
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
 tempfile = "3"
 bns-indexer = { path = "../bns-indexer" }

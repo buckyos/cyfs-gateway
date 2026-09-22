@@ -1710,7 +1710,7 @@ impl NameServer for SNServer {
         let req_real_name = Self::normalize_query_name(name);
         let user_dns_revision = self
             .resolver
-            .synchronize_user_dns_changes()
+            .poll_user_dns_changes()
             .await
             .map_err(|error| error.to_server_error())?;
         let previous_revision = self
