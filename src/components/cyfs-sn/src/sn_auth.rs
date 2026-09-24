@@ -4611,6 +4611,18 @@ mod tests {
             .await?;
         assert!(initial.changed && added.changed && removed.changed);
         assert!(initial.revision < added.revision && added.revision < removed.revision);
+        assert_eq!(
+            removed.rrset.as_ref().unwrap().values,
+            vec!["192.0.2.2".to_string()]
+        );
+        assert_eq!(
+            auth.get_user_dns_rrset(name, UserDnsRecordType::A)
+                .await?
+                .rrset
+                .unwrap()
+                .values,
+            vec!["192.0.2.2".to_string()]
+        );
         // Delete the first change after the resolver's cursor, regardless of
         // revisions consumed by account setup. The remaining change must now
         // be separated by a real gap and force a cache reset.
@@ -4621,6 +4633,10 @@ mod tests {
             .map_err(|e| SqliteSnAuthDB::db_err("simulate DNS retention gap failed", e))?;
         let page = auth.list_user_dns_changes(initial.revision, 10).await?;
         assert_eq!(page.earliest_available_revision, removed.revision);
+        assert_eq!(
+            resolver.synchronize_user_dns_changes().await.unwrap(),
+            removed.revision
+        );
         assert_eq!(
             resolver
                 .resolve_dns_cached(name, RecordType::A)
