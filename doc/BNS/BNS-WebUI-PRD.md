@@ -279,8 +279,9 @@ WebUI 根据用户选择的授权路径构造 `CallAuthority`，但最终身份�
 - `registerName` 和 `applyMutations` 最多包含 32 个
   authority/document/owner-policy item；
 - 上述两个方法中 inline 文档总量最多 64 KiB，doc type 不得重复；
-- `transferName` 和 `updateAuthorityKeys` 当前没有同样的显式数量上限。WebUI 仍应使用 32 项
-  产品上限，避免不可估算的 calldata 和 gas。
+- `updateAuthorityKeys` 的独立入口同样最多 32 项；此限制不是累计历史 KID 上限。
+- `transferName` 当前没有同样的显式数量上限。WebUI 仍应使用 32 项产品上限，避免
+  不可估算的 calldata 和 gas。
 
 ### 6.3 时间与数值
 
@@ -1079,7 +1080,10 @@ updateAuthorityKeys(...)
 安全约束：
 
 - kid 和 verification method 不得为 zero；
-- 若某 BNS name 被其他名称作为 authority owner，不能撤销它的最后一个 active authentication key；
+- 同一 lineage 已保存的 `active_key_count` 一旦大于零，后续更新必须留下至少一个
+  当前有效的 authentication key，无论是否有其它名称引用；轮换应在同一批次内
+  撤销旧 key 并添加有效新 key。自然过期不会重置这条更新约束；
+- `active_key_count` 是上次更新的快照，不能单凭它认定目前仍有可用认证 key；
 - WebUI 无法仅凭 `active_key_count` 知道所有 key 的详情，批量替换前必须要求用户确认；
 - 更新后用 `authority.get_set` 验证 seq/root/count，已知 kid 再逐个查询。
 

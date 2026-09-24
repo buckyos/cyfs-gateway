@@ -29,7 +29,7 @@ contract BnsAtomicMutationFacet is BnsCore {
         _copyPrincipal(state.semanticOwner, newSemanticOwner);
         state.nameSeq += 1;
         state.updatedAt = _now();
-        _validateAllOwnerGraphs();
+        _validateOwnerPath(nameHash);
 
         NameState memory materialized = _materializeNameState(state);
         _commitEvent(
