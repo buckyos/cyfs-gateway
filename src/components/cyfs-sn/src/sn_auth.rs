@@ -4580,7 +4580,8 @@ mod tests {
                 .await?
         );
         let name = "host.alice.web3.example";
-        db.put_user_dns_value("alice", name, UserDnsRecordType::A, "192.0.2.1", 600)
+        let initial = db
+            .put_user_dns_value("alice", name, UserDnsRecordType::A, "192.0.2.1", 600)
             .await?;
         let db = Arc::new(db);
         let auth: SnAuthDBRef = db.clone();
@@ -4602,14 +4603,24 @@ mod tests {
                 .addresses,
             vec!["192.0.2.1".parse::<std::net::IpAddr>().unwrap()]
         );
-        auth.put_user_dns_value("alice", name, UserDnsRecordType::A, "192.0.2.2", 600)
+        let added = auth
+            .put_user_dns_value("alice", name, UserDnsRecordType::A, "192.0.2.2", 600)
             .await?;
-        auth.remove_user_dns_value("alice", name, UserDnsRecordType::A, "192.0.2.1")
+        let removed = auth
+            .remove_user_dns_value("alice", name, UserDnsRecordType::A, "192.0.2.1")
             .await?;
-        sqlx::query("DELETE FROM user_dns_changes WHERE revision <= 2")
+        assert!(initial.changed && added.changed && removed.changed);
+        assert!(initial.revision < added.revision && added.revision < removed.revision);
+        // Delete the first change after the resolver's cursor, regardless of
+        // revisions consumed by account setup. The remaining change must now
+        // be separated by a real gap and force a cache reset.
+        sqlx::query("DELETE FROM user_dns_changes WHERE revision <= ?1")
+            .bind(added.revision as i64)
             .execute(&db.pool)
             .await
             .map_err(|e| SqliteSnAuthDB::db_err("simulate DNS retention gap failed", e))?;
+        let page = auth.list_user_dns_changes(initial.revision, 10).await?;
+        assert_eq!(page.earliest_available_revision, removed.revision);
         assert_eq!(
             resolver
                 .resolve_dns_cached(name, RecordType::A)
