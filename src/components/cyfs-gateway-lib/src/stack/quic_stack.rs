@@ -62,9 +62,11 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, ReadBuf, Take};
 use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::sync::Notify;
+use tokio::sync::{Notify, Semaphore};
 use tokio::task::JoinHandle;
 use tokio_util::io::ReaderStream;
+
+const DEFAULT_QUIC_CONCURRENCY: u32 = 0;
 
 #[derive(Clone)]
 pub struct QuicStackContext {
@@ -135,6 +137,7 @@ struct QuicConnectionHandler {
     executor: ProcessChainLibExecutor,
     connection_manager: Option<ConnectionManagerRef>,
     io_dump: Option<IoDumpStackConfig>,
+    stream_semaphore: Arc<Semaphore>,
 }
 
 impl QuicConnectionHandler {
@@ -143,6 +146,7 @@ impl QuicConnectionHandler {
         env: Arc<QuicStackContext>,
         connection_manager: Option<ConnectionManagerRef>,
         io_dump: Option<IoDumpStackConfig>,
+        stream_semaphore: Arc<Semaphore>,
     ) -> StackResult<Self> {
         let (executor, _) = create_process_chain_executor(
             &hook_point,
@@ -158,6 +162,7 @@ impl QuicConnectionHandler {
             executor,
             connection_manager,
             io_dump,
+            stream_semaphore,
         })
     }
 
@@ -391,6 +396,16 @@ impl QuicConnectionHandler {
                                     .accept_bi()
                                     .await
                                     .map_err(into_stack_err!(StackErrorCode::QuicError))?;
+                                let permit =
+                                    match self.stream_semaphore.clone().acquire_owned().await {
+                                        Ok(permit) => permit,
+                                        Err(e) => {
+                                            log::error!(
+                                                "quic stream semaphore closed: {e}, stop accepting"
+                                            );
+                                            break;
+                                        }
+                                    };
                                 log::debug!("quic accept bi: {} -> {}", remote_addr, local_addr);
                                 let stream = sfo_split::Splittable::new(recv, send);
                                 let stream: Box<dyn AsyncStream> =
@@ -443,6 +458,7 @@ impl QuicConnectionHandler {
                                 let tunnel_manager = self.env.tunnel_manager.clone();
                                 let forward_info = stream_info.clone();
                                 let handle = tokio::spawn(async move {
+                                    let _permit = permit;
                                     let result = match target_or_plan {
                                         Ok(target) => {
                                             stream_forward(
@@ -531,12 +547,27 @@ impl QuicConnectionHandler {
                                             if resolver.is_none() {
                                                 break;
                                             }
+                                            let permit = match self
+                                                .stream_semaphore
+                                                .clone()
+                                                .acquire_owned()
+                                                .await
+                                            {
+                                                Ok(permit) => permit,
+                                                Err(e) => {
+                                                    log::error!(
+                                                        "quic stream semaphore closed: {e}, stop accepting"
+                                                    );
+                                                    break;
+                                                }
+                                            };
                                             let speed = speed_stat.clone();
                                             let limiter = limiter.clone();
                                             let server = server.clone();
                                             let speed_stat = speed_stat.clone();
                                             let device_info = device_info.clone();
                                             let handle = tokio::spawn(async move {
+                                                let _permit = permit;
                                                 let ret: StackResult<()> = async move {
                                                     let (req, stream) = resolver.unwrap().resolve_request().await
                                                         .map_err(into_stack_err!(StackErrorCode::QuicError, "h3 resolve request error"))?;
@@ -633,6 +664,20 @@ impl QuicConnectionHandler {
                                             .accept_bi()
                                             .await
                                             .map_err(into_stack_err!(StackErrorCode::QuicError))?;
+                                        let permit = match self
+                                            .stream_semaphore
+                                            .clone()
+                                            .acquire_owned()
+                                            .await
+                                        {
+                                            Ok(permit) => permit,
+                                            Err(e) => {
+                                                log::error!(
+                                                    "quic stream semaphore closed: {e}, stop accepting"
+                                                );
+                                                break;
+                                            }
+                                        };
                                         log::debug!(
                                             "quic accept bi: {} -> {}",
                                             remote_addr,
@@ -672,6 +717,7 @@ impl QuicConnectionHandler {
                                         };
                                         let device_info = device_info.clone();
                                         let handle = tokio::spawn(async move {
+                                            let _permit = permit;
                                             let info = StreamInfo::with_addrs(
                                                 Some(remote_addr.to_string()),
                                                 proxy_source_addr.map(|a| a.to_string()),
@@ -1442,6 +1488,7 @@ struct QuicStackInner {
     alpn_protocols: Vec<Vec<u8>>,
     reuse_address: bool,
     connection_manager: Option<ConnectionManagerRef>,
+    stream_semaphore: Arc<Semaphore>,
     handler: Arc<RwLock<Arc<QuicConnectionHandler>>>,
 }
 
@@ -1592,11 +1639,15 @@ impl QuicStack {
 
         let stack_context = builder.stack_context.unwrap();
 
+        let stream_semaphore = Arc::new(Semaphore::new(
+            (builder.concurrency as usize).min(Semaphore::MAX_PERMITS),
+        ));
         let handler = QuicConnectionHandler::create(
             builder.hook_point.take().unwrap(),
             stack_context.clone(),
             builder.connection_manager.clone(),
             builder.io_dump,
+            stream_semaphore.clone(),
         )
         .await?;
         let handler = Arc::new(RwLock::new(Arc::new(handler)));
@@ -1615,6 +1666,7 @@ impl QuicStack {
                 alpn_protocols: builder.alpn_protocols,
                 reuse_address: builder.reuse_address,
                 connection_manager: builder.connection_manager.clone(),
+                stream_semaphore,
                 handler,
             }),
             prepare_handler: Arc::new(Default::default()),
@@ -1670,6 +1722,15 @@ impl Stack for QuicStack {
             return Err(stack_err!(StackErrorCode::BindUnmatched, "bind unmatch"));
         }
 
+        if normalize_concurrency(config.concurrency.unwrap_or(DEFAULT_QUIC_CONCURRENCY))
+            != self.inner.concurrency
+        {
+            return Err(stack_err!(
+                StackErrorCode::InvalidConfig,
+                "concurrency unmatch"
+            ));
+        }
+
         if config.reuse_address.unwrap_or(false) != self.inner.reuse_address {
             return Err(stack_err!(
                 StackErrorCode::InvalidConfig,
@@ -1706,6 +1767,7 @@ impl Stack for QuicStack {
             )
             .await
             .map_err(|e| stack_err!(StackErrorCode::InvalidConfig, "{e}"))?,
+            self.inner.stream_semaphore.clone(),
         )
         .await?;
         *self.prepare_handler.write().unwrap() = Some(Arc::new(new_handler));
@@ -1745,7 +1807,7 @@ impl QuicStackBuilder {
             hook_point: None,
             certs: vec![],
             identity_certs: None,
-            concurrency: 1024,
+            concurrency: normalize_concurrency(DEFAULT_QUIC_CONCURRENCY),
             alpn_protocols: vec![],
             reuse_address: false,
             connection_manager: None,
@@ -1779,11 +1841,7 @@ impl QuicStackBuilder {
     }
 
     pub fn concurrency(mut self, concurrency: u32) -> Self {
-        if concurrency == 0 {
-            self.concurrency = u32::MAX;
-        } else {
-            self.concurrency = concurrency;
-        }
+        self.concurrency = normalize_concurrency(concurrency);
         self
     }
 
@@ -1859,6 +1917,14 @@ impl StackConfig for QuicStackConfig {
     }
 }
 
+fn normalize_concurrency(concurrency: u32) -> u32 {
+    if concurrency == 0 {
+        u32::MAX
+    } else {
+        concurrency
+    }
+}
+
 pub struct QuicStackFactory {
     connection_manager: ConnectionManagerRef,
 }
@@ -1921,7 +1987,7 @@ impl StackFactory for QuicStackFactory {
                     .map(|s| s.as_bytes().to_vec())
                     .collect(),
             )
-            .concurrency(config.concurrency.unwrap_or(1024))
+            .concurrency(config.concurrency.unwrap_or(DEFAULT_QUIC_CONCURRENCY))
             .stack_context(stack_context.clone())
             .io_dump(io_dump)
             .reuse_address(config.reuse_address.unwrap_or(false))
@@ -2065,6 +2131,151 @@ mod tests {
             .build()
             .await;
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_quic_update_shares_stream_limit() {
+        let context = build_quic_context(
+            Arc::new(ServerManager::new()),
+            TunnelManager::new(),
+            Arc::new(DefaultLimiterManager::new()),
+            StatManager::new(),
+            SelfCertMgr::create(SelfCertConfig::default())
+                .await
+                .unwrap(),
+            None,
+            None,
+        );
+        let stack = QuicStack::builder()
+            .id("test")
+            .bind("127.0.0.1:20001")
+            .hook_point(vec![])
+            .concurrency(1)
+            .stack_context(context)
+            .build()
+            .await
+            .unwrap();
+        let old_handler = stack.inner.handler.read().unwrap().clone();
+        let permit = old_handler
+            .stream_semaphore
+            .clone()
+            .acquire_owned()
+            .await
+            .unwrap();
+        let config: QuicStackConfig = serde_yaml_ng::from_str(
+            "id: test\nprotocol: quic\nbind: 127.0.0.1:20001\nconcurrency: 1\nhook_point: []\n",
+        )
+        .unwrap();
+        stack.prepare_update(Arc::new(config), None).await.unwrap();
+        stack.commit_update().await;
+        let new_handler = stack.inner.handler.read().unwrap().clone();
+        assert!(Arc::ptr_eq(
+            &old_handler.stream_semaphore,
+            &new_handler.stream_semaphore
+        ));
+        assert!(new_handler.stream_semaphore.try_acquire().is_err());
+        drop(permit);
+        assert!(new_handler.stream_semaphore.try_acquire().is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_idle_quic_connection_does_not_hold_stream_permit() {
+        struct BarrierServer(Arc<tokio::sync::Barrier>);
+
+        #[async_trait::async_trait]
+        impl StreamServer for BarrierServer {
+            async fn serve_connection(
+                &self,
+                mut stream: Box<dyn AsyncStream>,
+                _info: StreamInfo,
+            ) -> ServerResult<()> {
+                let mut request = [0u8; 1];
+                stream.read_exact(&mut request).await.unwrap();
+                self.0.wait().await;
+                stream.write_all(&request).await.unwrap();
+                Ok(())
+            }
+
+            fn id(&self) -> String {
+                "barrier".to_string()
+            }
+        }
+
+        let cert_key = generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let servers = Arc::new(ServerManager::new());
+        servers
+            .add_server(Server::Stream(Arc::new(BarrierServer(Arc::new(
+                tokio::sync::Barrier::new(2),
+            )))))
+            .unwrap();
+        let context = build_quic_context(
+            servers,
+            TunnelManager::new(),
+            Arc::new(DefaultLimiterManager::new()),
+            StatManager::new(),
+            SelfCertMgr::create(SelfCertConfig::default())
+                .await
+                .unwrap(),
+            None,
+            None,
+        );
+        let reserved = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let bind = reserved.local_addr().unwrap();
+        drop(reserved);
+        let chains: ProcessChainConfigs = serde_yaml_ng::from_str(
+            "- id: main\n  priority: 1\n  blocks:\n    - id: main\n      block: |\n        return \"server barrier\";\n",
+        )
+        .unwrap();
+        let stack = QuicStack::builder()
+            .id("test")
+            .bind(&bind.to_string())
+            .hook_point(chains)
+            .concurrency(2)
+            .add_certs(vec![QuicDomainConfig {
+                domain: "localhost".to_string(),
+                certs: Some(vec![cert_key.cert.der().clone()]),
+                key: Some(PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
+                    cert_key.signing_key.serialize_der(),
+                ))),
+            }])
+            .stack_context(context)
+            .build()
+            .await
+            .unwrap();
+        stack.start().await.unwrap();
+
+        let config =
+            ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+                .with_protocol_versions(rustls::DEFAULT_VERSIONS)
+                .unwrap()
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(NoVerifier))
+                .with_no_client_auth();
+        let mut endpoint = Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        endpoint.set_default_client_config(quinn::ClientConfig::new(Arc::new(
+            QuicClientConfig::try_from(config).unwrap(),
+        )));
+        let idle = endpoint.connect(bind, "localhost").unwrap().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let active = endpoint.connect(bind, "localhost").unwrap().await.unwrap();
+        let (mut send1, mut recv1) = active.open_bi().await.unwrap();
+        let (mut send2, mut recv2) = active.open_bi().await.unwrap();
+        send1.write_all(b"a").await.unwrap();
+        send2.write_all(b"b").await.unwrap();
+        let mut response1 = [0u8; 1];
+        let mut response2 = [0u8; 1];
+        tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::try_join!(
+                recv1.read_exact(&mut response1),
+                recv2.read_exact(&mut response2)
+            )
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(response1, *b"a");
+        assert_eq!(response2, *b"b");
+        drop(idle);
     }
 
     #[tokio::test]
