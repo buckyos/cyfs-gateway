@@ -13,6 +13,7 @@ use name_client::resolve_ip;
 use rustls::{ClientConfig, pki_types::ServerName};
 use rustls_platform_verifier::BuilderVerifierExt;
 use std::io::Error;
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
@@ -43,28 +44,32 @@ impl Tunnel for TlsTunnel {
         if dest_host.is_none() {
             return Err(Error::new(std::io::ErrorKind::Other, "dest_host is None"));
         }
+        let deadline = tokio::time::Instant::now() + connect_timeout;
+        let timed_out = || {
+            Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("tls connection timed out after {:?}", connect_timeout),
+            )
+        };
 
         // Resolve IP address
-        let ip = resolve_ip(dest_host.as_ref().unwrap().as_str())
-            .await
-            .map_err(|e| Error::new(std::io::ErrorKind::Other, e))?;
+        let host = dest_host.as_ref().unwrap();
+        let ip = match host.parse::<IpAddr>() {
+            Ok(ip) => ip,
+            Err(_) => tokio::time::timeout_at(deadline, resolve_ip(host.as_str()))
+                .await
+                .map_err(|_| timed_out())?
+                .map_err(|e| Error::new(std::io::ErrorKind::Other, e))?,
+        };
 
         // Create TCP connection
-        let tcp_stream = tokio::time::timeout(
-            connect_timeout,
+        let tcp_stream = tokio::time::timeout_at(
+            deadline,
             TcpStream::connect(format!("{}:{}", ip, dest_port)),
         )
         .await
-        .map_err(|_| {
-            Error::new(
-                std::io::ErrorKind::TimedOut,
-                format!(
-                    "tcp connect to {}:{} timed out after {:?}",
-                    ip, dest_port, connect_timeout
-                ),
-            )
-        })?
-        .map_err(|e| Error::new(std::io::ErrorKind::Other, e))?;
+        .map_err(|_| timed_out())?
+        .map_err(|e| Error::new(e.kind(), e))?;
 
         // Configure TLS
         let mut config =
@@ -83,10 +88,10 @@ impl Tunnel for TlsTunnel {
             .map_err(|e| Error::new(std::io::ErrorKind::Other, e))?;
 
         // Establish TLS connection
-        let tls_stream = connector
-            .connect(domain, tcp_stream)
+        let tls_stream = tokio::time::timeout_at(deadline, connector.connect(domain, tcp_stream))
             .await
-            .map_err(|e| Error::new(std::io::ErrorKind::Other, e))?;
+            .map_err(|_| timed_out())?
+            .map_err(|e| Error::new(e.kind(), e))?;
 
         Ok(Box::new(tls_stream))
     }
@@ -218,5 +223,54 @@ impl TunnelUrlProber for TlsUrlProber {
                 "tls_handshake_timeout".to_string(),
             )),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ip::IPTunnel;
+
+    #[tokio::test]
+    async fn tls_handshake_consumes_connect_budget() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let peer = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            drop(stream);
+        });
+
+        let started = Instant::now();
+        let error = TlsTunnel::new()
+            .open_stream_by_dest_with_timeout(
+                addr.port(),
+                Some("127.0.0.1".to_string()),
+                Duration::from_millis(50),
+            )
+            .await
+            .err()
+            .expect("silent TLS peer must time out");
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert!(started.elapsed() < Duration::from_millis(500));
+        peer.abort();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let peer = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            drop(stream);
+        });
+        let error = IPTunnel::new(None)
+            .open_stream_with_timeout(
+                &format!("tls://127.0.0.1:{}/", addr.port()),
+                Duration::from_millis(50),
+            )
+            .await
+            .err()
+            .expect("IP tunnel TLS path must time out");
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        peer.abort();
     }
 }

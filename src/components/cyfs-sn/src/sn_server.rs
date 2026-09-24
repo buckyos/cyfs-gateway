@@ -4739,6 +4739,7 @@ users:
         let owner_did = format!("did:bns:{USER}");
         let owner_document = json!({
             "id": owner_did,
+            "iat": buckyos_kit::buckyos_get_unix_timestamp() + 60,
             "verificationMethod": [{
                 "id": format!("did:bns:{USER}#owner-key"),
                 "type": "JsonWebKey2020",

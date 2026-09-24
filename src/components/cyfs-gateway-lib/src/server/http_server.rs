@@ -1,28 +1,28 @@
 use super::dispatch::*;
 use super::http_compression::{
-    apply_request_decompression, apply_response_compression, CompressionRequestInfo,
-    HttpCompressionSettings,
+    CompressionRequestInfo, HttpCompressionSettings, apply_request_decompression,
+    apply_response_compression,
 };
 use super::{into_server_err, server_err};
 use crate::forward::{
-    apply_least_time_via_tunnel_mgr, BalanceMethod, ForwardFailureRegistry, ForwardPlan,
-    HttpMethodClass, NextUpstreamCondition,
+    BalanceMethod, ForwardFailureRegistry, ForwardPlan, HttpMethodClass, NextUpstreamCondition,
+    apply_least_time_via_tunnel_mgr,
 };
-use crate::global_process_chains::{create_process_chain_executor, GlobalProcessChainsRef};
+use crate::global_process_chains::{GlobalProcessChainsRef, create_process_chain_executor};
 use crate::tunnel_url_status::TunnelFailureReason;
 use crate::{
-    get_external_commands, GlobalCollectionManagerRef, HttpRequestHeaderMap,
-    HttpRequestProcessChainVars, HttpResponseHeaderMap, HttpServer, JsExternalsManagerRef,
-    ProcessChainConfigs, RequestSourceInfo, Server, ServerConfig, ServerContext, ServerContextRef,
-    ServerError, ServerErrorCode, ServerFactory, ServerManagerWeakRef, ServerResult, StreamInfo,
-    TunnelManager,
+    GlobalCollectionManagerRef, HttpRequestHeaderMap, HttpRequestProcessChainVars,
+    HttpResponseHeaderMap, HttpServer, JsExternalsManagerRef, ProcessChainConfigs,
+    RequestSourceInfo, Server, ServerConfig, ServerContext, ServerContextRef, ServerError,
+    ServerErrorCode, ServerFactory, ServerManagerWeakRef, ServerResult, StreamInfo, TunnelManager,
+    get_external_commands,
 };
 use cyfs_process_chain::{CollectionValue, CommandControl, EnvRef, ProcessChainLibExecutor};
 use http::Version;
 use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full};
 use hyper::body::Bytes;
-use hyper::{http, Request, StatusCode};
+use hyper::{Request, StatusCode, http};
 use hyper_util::rt::TokioIo;
 use regex::Regex;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
@@ -32,8 +32,9 @@ use serde::{Deserialize, Serialize};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
-use tokio::net::{lookup_host, TcpStream};
-use tokio::time::{timeout, Duration};
+use tokio::net::{TcpStream, lookup_host};
+use tokio::sync::Notify;
+use tokio::time::{Duration, timeout};
 use tokio_rustls::TlsConnector;
 use url::Url;
 
@@ -369,6 +370,7 @@ enum HeadWaitFailure {
 #[derive(Debug)]
 struct BodyProgress {
     state: Mutex<BodyProgressState>,
+    changed: Notify,
 }
 
 #[derive(Debug, Default)]
@@ -390,6 +392,7 @@ impl BodyProgress {
         };
         Self {
             state: Mutex::new(state),
+            changed: Notify::new(),
         }
     }
 
@@ -398,14 +401,19 @@ impl BodyProgress {
         if let Ok(mut state) = self.state.lock() {
             state.last_activity = Some(now);
         }
+        self.changed.notify_one();
     }
 
     fn mark_finished(&self) {
         let now = Instant::now();
         if let Ok(mut state) = self.state.lock() {
+            if state.finished_at.is_some() {
+                return;
+            }
             state.last_activity = Some(now);
             state.finished_at = Some(now);
         }
+        self.changed.notify_one();
     }
 
     fn snapshot(&self) -> (Option<Instant>, Option<Instant>) {
@@ -764,11 +772,12 @@ impl ProcessChainHttpServer {
     async fn connect_upstream_candidates(
         candidates: Vec<SocketAddr>,
         connect_timeout: Duration,
-    ) -> Result<(TcpStream, SocketAddr), (TunnelFailureReason, String)> {
+    ) -> Result<(TcpStream, SocketAddr), (TunnelFailureReason, String, bool)> {
         if candidates.is_empty() {
             return Err((
                 TunnelFailureReason::PreConnectDns,
                 "No upstream socket addresses resolved".to_string(),
+                false,
             ));
         }
 
@@ -776,7 +785,11 @@ impl ProcessChainHttpServer {
         for addr in candidates {
             match HttpServerTimeouts::guard(connect_timeout, TcpStream::connect(addr)).await {
                 Ok(Ok(stream)) => return Ok((stream, addr)),
-                Ok(Err(err)) => errors.push((addr.to_string(), err.to_string(), false)),
+                Ok(Err(err)) => errors.push((
+                    addr.to_string(),
+                    err.to_string(),
+                    err.kind() == std::io::ErrorKind::TimedOut,
+                )),
                 Err(()) => {
                     errors.push((
                         addr.to_string(),
@@ -793,7 +806,8 @@ impl ProcessChainHttpServer {
             .map(|(a, m, _)| format!("{} ({})", a, m))
             .collect::<Vec<_>>()
             .join(", ");
-        Err((reason, msg))
+        let timed_out = reason == TunnelFailureReason::ConnectTimeout;
+        Err((reason, msg, timed_out))
     }
 
     async fn connect_upstream_with_fallback(
@@ -801,16 +815,18 @@ impl ProcessChainHttpServer {
         connect_port: u16,
         dns_timeout: Duration,
         connect_timeout: Duration,
-    ) -> Result<(TcpStream, SocketAddr), (TunnelFailureReason, String)> {
+    ) -> Result<(TcpStream, SocketAddr), (TunnelFailureReason, String, bool)> {
         let candidates: Vec<SocketAddr> =
             match HttpServerTimeouts::guard(dns_timeout, lookup_host((connect_host, connect_port)))
                 .await
             {
                 Ok(Ok(it)) => it.collect(),
                 Ok(Err(e)) => {
+                    let is_timeout = e.kind() == std::io::ErrorKind::TimedOut;
                     return Err((
                         TunnelFailureReason::PreConnectDns,
                         format!("resolve {}:{} failed: {}", connect_host, connect_port, e),
+                        is_timeout,
                     ));
                 }
                 Err(()) => {
@@ -822,6 +838,7 @@ impl ProcessChainHttpServer {
                             connect_port,
                             dns_timeout.as_millis()
                         ),
+                        true,
                     ));
                 }
             };
@@ -834,7 +851,7 @@ impl ProcessChainHttpServer {
         &self,
         connect_host: &str,
         connect_port: u16,
-    ) -> Result<(TcpStream, SocketAddr), (TunnelFailureReason, String)> {
+    ) -> Result<(TcpStream, SocketAddr), (TunnelFailureReason, String, bool)> {
         Self::connect_upstream_with_fallback(
             connect_host,
             connect_port,
@@ -885,8 +902,16 @@ impl ProcessChainHttpServer {
         let started = Instant::now();
         let mut response = Box::pin(sender.send_request(req));
         let outcome = loop {
+            // Register before reading progress so a body completion between
+            // the snapshot and select cannot leave the old deadline in force.
+            let changed = progress.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
             match progress.next_deadline(started, body_idle_budget, head_budget) {
-                None => break Ok(response.await),
+                None => tokio::select! {
+                    resp = &mut response => break Ok(resp),
+                    _ = &mut changed => continue,
+                },
                 Some((deadline, failure)) => {
                     if Instant::now() >= deadline {
                         break Err(failure);
@@ -895,6 +920,7 @@ impl ProcessChainHttpServer {
                     tokio::pin!(sleep);
                     tokio::select! {
                         resp = &mut response => break Ok(resp),
+                        _ = &mut changed => continue,
                         _ = &mut sleep => continue,
                     }
                 }
@@ -1115,7 +1141,9 @@ impl ProcessChainHttpServer {
         info: &StreamInfo,
     ) -> ServerResult<http::Response<BoxBody<Bytes, ServerError>>> {
         let mut slot = Some(req);
-        self.forward_to_candidate(&mut slot, target_url, info).await
+        let mut timed_out = false;
+        self.forward_to_candidate(&mut slot, target_url, info, &mut timed_out)
+            .await
     }
 
     /// Forward the request held by `req_slot` to `target_url`.
@@ -1135,6 +1163,7 @@ impl ProcessChainHttpServer {
         req_slot: &mut Option<http::Request<BoxBody<Bytes, ServerError>>>,
         target_url: &str,
         info: &StreamInfo,
+        timed_out: &mut bool,
     ) -> ServerResult<http::Response<BoxBody<Bytes, ServerError>>> {
         let (org_url, mut header, method, version, host_header) = {
             let req_ref = req_slot
@@ -1210,12 +1239,13 @@ impl ProcessChainHttpServer {
                     .await
                 {
                     Ok(v) => v,
-                    Err((reason, msg)) => {
+                    Err((reason, msg, is_timeout)) => {
                         if let Some(key) = history_key.as_ref() {
                             self.tunnel_manager
                                 .record_business_failure(key, reason, Some(&msg))
                                 .await;
                         }
+                        *timed_out = is_timeout;
                         return Err(server_err!(
                             ServerErrorCode::InvalidConfig,
                             "Failed to connect upstream candidates: {}",
@@ -1251,6 +1281,7 @@ impl ProcessChainHttpServer {
                         ));
                     }
                     Err(()) => {
+                        *timed_out = true;
                         let detail = format!(
                             "http handshake timeout after {}ms",
                             handshake_budget.as_millis()
@@ -1363,12 +1394,13 @@ impl ProcessChainHttpServer {
                     .await
                 {
                     Ok(v) => v,
-                    Err((reason, msg)) => {
+                    Err((reason, msg, is_timeout)) => {
                         if let Some(key) = history_key.as_ref() {
                             self.tunnel_manager
                                 .record_business_failure(key, reason, Some(&msg))
                                 .await;
                         }
+                        *timed_out = is_timeout;
                         return Err(server_err!(
                             ServerErrorCode::InvalidConfig,
                             "Failed to connect upstream candidates: {}",
@@ -1424,6 +1456,7 @@ impl ProcessChainHttpServer {
                         ));
                     }
                     Err(()) => {
+                        *timed_out = true;
                         let detail =
                             format!("tls handshake timeout after {}ms", tls_budget.as_millis());
                         if let Some(key) = history_key.as_ref() {
@@ -1471,6 +1504,7 @@ impl ProcessChainHttpServer {
                         ));
                     }
                     Err(()) => {
+                        *timed_out = true;
                         let detail = format!(
                             "http handshake timeout after {}ms",
                             handshake_budget.as_millis()
@@ -1582,6 +1616,7 @@ impl ProcessChainHttpServer {
                 let stream = match tunnel_open {
                     Ok(s) => s,
                     Err(e) => {
+                        *timed_out = matches!(e, crate::TunnelError::ConnectTimeout(_));
                         if !tunnel_open_timeout.is_zero() {
                             warn!(
                                 "open tunnel {} failed within {}ms budget server={}: {}",
@@ -1619,6 +1654,7 @@ impl ProcessChainHttpServer {
                         ));
                     }
                     Err(()) => {
+                        *timed_out = true;
                         return Err(server_err!(
                             ServerErrorCode::StreamError,
                             "Failed to build tunnel client connection to {}: http handshake timeout after {}ms",
@@ -1791,12 +1827,25 @@ impl ProcessChainHttpServer {
                 }
             }
 
-            let attempt_fut = self.forward_to_candidate(&mut req_slot, &candidate.url, info);
+            let mut stage_timed_out = false;
+            let attempt_fut = self.forward_to_candidate(
+                &mut req_slot,
+                &candidate.url,
+                info,
+                &mut stage_timed_out,
+            );
             let (attempt_res, attempt_cond) = match deadline {
                 Some(d) => {
                     let remaining = d.saturating_duration_since(std::time::Instant::now());
                     match timeout(remaining, attempt_fut).await {
-                        Ok(r) => (r, NextUpstreamCondition::Error),
+                        Ok(r) => (
+                            r,
+                            if stage_timed_out {
+                                NextUpstreamCondition::Timeout
+                            } else {
+                                NextUpstreamCondition::Error
+                            },
+                        ),
                         Err(_) => (
                             Err(server_err!(
                                 ServerErrorCode::TunnelError,
@@ -1809,7 +1858,17 @@ impl ProcessChainHttpServer {
                         ),
                     }
                 }
-                None => (attempt_fut.await, NextUpstreamCondition::Error),
+                None => {
+                    let result = attempt_fut.await;
+                    (
+                        result,
+                        if stage_timed_out {
+                            NextUpstreamCondition::Timeout
+                        } else {
+                            NextUpstreamCondition::Error
+                        },
+                    )
+                }
             };
             match attempt_res {
                 Ok(resp) => {
@@ -1940,12 +1999,25 @@ impl ProcessChainHttpServer {
             Self::set_content_length(&mut attempt_req);
             let mut req_slot = Some(attempt_req);
 
-            let attempt_fut = self.forward_to_candidate(&mut req_slot, &candidate.url, info);
+            let mut stage_timed_out = false;
+            let attempt_fut = self.forward_to_candidate(
+                &mut req_slot,
+                &candidate.url,
+                info,
+                &mut stage_timed_out,
+            );
             let (attempt_res, attempt_cond) = match deadline {
                 Some(d) => {
                     let remaining = d.saturating_duration_since(std::time::Instant::now());
                     match timeout(remaining, attempt_fut).await {
-                        Ok(r) => (r, NextUpstreamCondition::Error),
+                        Ok(r) => (
+                            r,
+                            if stage_timed_out {
+                                NextUpstreamCondition::Timeout
+                            } else {
+                                NextUpstreamCondition::Error
+                            },
+                        ),
                         Err(_) => (
                             Err(server_err!(
                                 ServerErrorCode::TunnelError,
@@ -1958,7 +2030,17 @@ impl ProcessChainHttpServer {
                         ),
                     }
                 }
-                None => (attempt_fut.await, NextUpstreamCondition::Error),
+                None => {
+                    let result = attempt_fut.await;
+                    (
+                        result,
+                        if stage_timed_out {
+                            NextUpstreamCondition::Timeout
+                        } else {
+                            NextUpstreamCondition::Error
+                        },
+                    )
+                }
             };
             match attempt_res {
                 Ok(r) => {
@@ -3205,8 +3287,8 @@ impl ServerFactory for ProcessChainHttpServerFactory {
 mod tests {
     use super::*;
     use crate::{
-        hyper_serve_http, hyper_serve_http1, GlobalCollectionManager, GlobalProcessChains,
-        JsExternalsManager, ServerManager, StreamInfo,
+        GlobalCollectionManager, GlobalProcessChains, JsExternalsManager, ServerManager,
+        StreamInfo, hyper_serve_http, hyper_serve_http1,
     };
     use async_compression::tokio::bufread::{BrotliDecoder, GzipDecoder, GzipEncoder};
     use buckyos_kit::init_logging;
@@ -5381,7 +5463,7 @@ mod tests {
         let unreachable_v6: SocketAddr = "[2001:db8::1]:443".parse().unwrap();
         let closed_v4: SocketAddr = "127.0.0.1:9".parse().unwrap();
 
-        let (_reason, msg) = ProcessChainHttpServer::connect_upstream_candidates(
+        let (_reason, msg, _timed_out) = ProcessChainHttpServer::connect_upstream_candidates(
             vec![unreachable_v6, closed_v4],
             Duration::from_millis(200),
         )
@@ -5578,6 +5660,144 @@ request_body_idle_timeout: 10s
             "response timeout was not enforced, elapsed {:?}",
             elapsed
         );
+    }
+
+    #[tokio::test]
+    async fn test_response_deadline_starts_when_upload_finishes() {
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let service = hyper::service::service_fn(
+                |req: http::Request<hyper::body::Incoming>| async move {
+                    let _ = req.into_body().collect().await;
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                    Ok::<_, ServerError>(http::Response::new(
+                        Full::new(Bytes::from_static(b"late"))
+                            .map_err(|e| match e {})
+                            .boxed(),
+                    ))
+                },
+            );
+            let _ = hyper::server::conn::http1::Builder::new()
+                .serve_connection(TokioIo::new(stream), service)
+                .await;
+        });
+        let server = build_forward_server(
+            "test_upload_head_deadline",
+            addr,
+            HttpServerTimeouts {
+                response: Duration::from_millis(50),
+                request_body_idle: Duration::from_secs(2),
+                ..HttpServerTimeouts::default()
+            },
+        )
+        .await;
+        let body = TimedBody::new(
+            vec![Bytes::from_static(b"payload")],
+            Duration::from_millis(10),
+            false,
+        )
+        .boxed();
+        let request = http::Request::builder()
+            .method("POST")
+            .uri("/upload")
+            .body(body)
+            .unwrap();
+        let started = Instant::now();
+        let error = server
+            .serve_request(request, StreamInfo::default())
+            .await
+            .unwrap_err();
+        assert!(error.msg().contains("response head timeout"), "{error}");
+        assert!(started.elapsed() < Duration::from_millis(250));
+    }
+
+    #[tokio::test]
+    async fn test_tls_stage_timeout_retries_by_timeout_condition() {
+        use crate::forward::ForwardTarget;
+        use tokio::net::TcpListener;
+
+        let silent = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let silent_addr = silent.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = silent.accept().await {
+                held.push(stream);
+            }
+        });
+        let healthy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let healthy_addr = healthy.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = healthy.accept().await {
+                let service = hyper::service::service_fn(
+                    |_req: http::Request<hyper::body::Incoming>| async move {
+                        Ok::<_, ServerError>(http::Response::new(
+                            Full::new(Bytes::from_static(b"healthy"))
+                                .map_err(|e| match e {})
+                                .boxed(),
+                        ))
+                    },
+                );
+                tokio::spawn(async move {
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(TokioIo::new(stream), service)
+                        .await;
+                });
+            }
+        });
+        let server = build_forward_server(
+            "test_tls_timeout_retry",
+            healthy_addr,
+            HttpServerTimeouts {
+                tls_handshake: Duration::from_millis(50),
+                ..HttpServerTimeouts::default()
+            },
+        )
+        .await;
+
+        for status_retry in [false, true] {
+            let mut plan = ForwardPlan::single_url(format!("https://{silent_addr}/"));
+            plan.candidates
+                .push(ForwardTarget::new(format!("http://{healthy_addr}/")));
+            plan.next_upstream.conditions = vec![NextUpstreamCondition::Timeout];
+            plan.next_upstream.tries = 2;
+            if status_retry {
+                plan.next_upstream
+                    .conditions
+                    .push(NextUpstreamCondition::Http502);
+                plan.next_upstream.max_body_buffer_bytes = 1024;
+            }
+            let response = server
+                .handle_forward_group_upstream(
+                    simple_get_request("/retry"),
+                    &plan,
+                    &StreamInfo::default(),
+                )
+                .await
+                .expect("TLS timeout should select the healthy candidate");
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                response.into_body().collect().await.unwrap().to_bytes(),
+                Bytes::from_static(b"healthy")
+            );
+
+            let closed = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let closed_addr = closed.local_addr().unwrap();
+            drop(closed);
+            plan.candidates[0] = ForwardTarget::new(format!("http://{closed_addr}/"));
+            let error = server
+                .handle_forward_group_upstream(
+                    simple_get_request("/no-retry"),
+                    &plan,
+                    &StreamInfo::default(),
+                )
+                .await
+                .expect_err("a refused connection must not match timeout-only retry");
+            assert!(error.msg().contains("Failed to connect upstream"));
+        }
     }
 
     /// Test body that delivers one chunk per `gap` and then either ends or

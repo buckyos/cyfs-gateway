@@ -14,7 +14,7 @@ use rustls::ClientConfig;
 use rustls::pki_types::ServerName;
 use rustls_platform_verifier::BuilderVerifierExt;
 use std::io::Error;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio_rustls::TlsConnector;
@@ -114,30 +114,34 @@ impl IPTunnel {
                 "invalid dest host",
             ));
         }
+        let deadline = tokio::time::Instant::now() + connect_timeout;
+        let timed_out = || {
+            Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("tls connection timed out after {:?}", connect_timeout),
+            )
+        };
 
         // Resolve IP address
-        let ip = resolve_ip(dest_host.as_ref().unwrap().as_str())
-            .await
-            .map_err(|e| Error::new(std::io::ErrorKind::Other, e))?;
+        let host = dest_host.as_ref().unwrap();
+        let ip = match host.parse::<IpAddr>() {
+            Ok(ip) => ip,
+            Err(_) => tokio::time::timeout_at(deadline, resolve_ip(host.as_str()))
+                .await
+                .map_err(|_| timed_out())?
+                .map_err(|e| Error::new(std::io::ErrorKind::Other, e))?,
+        };
 
         let dest_addr = format!("{}:{}", ip, dest_port);
         let stream;
         if self.ip_stack_id.is_none() {
             debug!("use any tcp client addr for open_stream : {}", dest_addr);
-            stream = tokio::time::timeout(
-                connect_timeout,
+            stream = tokio::time::timeout_at(
+                deadline,
                 tokio::net::TcpStream::connect(dest_addr.as_str()),
             )
             .await
-            .map_err(|_| {
-                std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    format!(
-                        "tcp connect to {} timed out after {:?}",
-                        dest_addr, connect_timeout
-                    ),
-                )
-            })??;
+            .map_err(|_| timed_out())??;
         } else {
             let bind_addr = self.ip_stack_id.as_ref().unwrap();
             let is_ipv4 = is_ipv4_addr_str(bind_addr)?;
@@ -158,17 +162,9 @@ impl IPTunnel {
             let dest_addr: SocketAddr = dest_addr
                 .parse()
                 .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "invalid dest addr"))?;
-            stream = tokio::time::timeout(connect_timeout, socket.connect(dest_addr))
+            stream = tokio::time::timeout_at(deadline, socket.connect(dest_addr))
                 .await
-                .map_err(|_| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        format!(
-                            "tcp connect to {} timed out after {:?}",
-                            dest_addr, connect_timeout
-                        ),
-                    )
-                })??;
+                .map_err(|_| timed_out())??;
         }
 
         // Configure TLS
@@ -188,10 +184,10 @@ impl IPTunnel {
             .map_err(|e| Error::new(std::io::ErrorKind::Other, e))?;
 
         // Establish TLS connection
-        let tls_stream = connector
-            .connect(domain, stream)
+        let tls_stream = tokio::time::timeout_at(deadline, connector.connect(domain, stream))
             .await
-            .map_err(|e| Error::new(std::io::ErrorKind::Other, e))?;
+            .map_err(|_| timed_out())?
+            .map_err(|e| Error::new(e.kind(), e))?;
 
         Ok(Box::new(tls_stream))
     }
@@ -295,12 +291,8 @@ impl Tunnel for IPTunnel {
         connect_timeout: Duration,
     ) -> Result<Box<dyn DatagramClientBox>, std::io::Error> {
         let (dest_host, dest_port) = get_dest_info_from_url_path(session_id)?;
-        self.create_datagram_client_by_dest_with_timeout(
-            dest_port,
-            dest_host,
-            connect_timeout,
-        )
-        .await
+        self.create_datagram_client_by_dest_with_timeout(dest_port, dest_host, connect_timeout)
+            .await
     }
 }
 
