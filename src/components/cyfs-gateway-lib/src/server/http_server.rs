@@ -31,7 +31,9 @@ use rustls::{ClientConfig, DigitallySignedStruct, Error as TlsError, SignatureSc
 use serde::{Deserialize, Serialize};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 use tokio::net::{TcpStream, lookup_host};
+use tokio::sync::Notify;
 use tokio::time::{Duration, timeout};
 use tokio_rustls::TlsConnector;
 use url::Url;
@@ -178,6 +180,334 @@ fn resolve_trusted_forwarded_source(
     Some(ip.to_string())
 }
 
+/// Built-in defaults for the per-stage timeouts described by
+/// [`HttpServerTimeouts`]. Every value can be overridden (or disabled with
+/// `0`) from the HTTP server config.
+pub const DEFAULT_HTTP_DNS_TIMEOUT_MS: u64 = 5_000;
+pub const DEFAULT_HTTP_CONNECT_TIMEOUT_MS: u64 = 800;
+pub const DEFAULT_HTTP_TLS_HANDSHAKE_TIMEOUT_MS: u64 = 5_000;
+pub const DEFAULT_HTTP_HANDSHAKE_TIMEOUT_MS: u64 = 5_000;
+pub const DEFAULT_HTTP_TUNNEL_OPEN_TIMEOUT_MS: u64 = 0;
+pub const DEFAULT_HTTP_RESPONSE_TIMEOUT_MS: u64 = 60_000;
+pub const DEFAULT_HTTP_REQUEST_BODY_IDLE_TIMEOUT_MS: u64 = 60_000;
+
+fn default_dns_timeout() -> Duration {
+    Duration::from_millis(DEFAULT_HTTP_DNS_TIMEOUT_MS)
+}
+
+fn default_connect_timeout() -> Duration {
+    Duration::from_millis(DEFAULT_HTTP_CONNECT_TIMEOUT_MS)
+}
+
+fn default_tls_handshake_timeout() -> Duration {
+    Duration::from_millis(DEFAULT_HTTP_TLS_HANDSHAKE_TIMEOUT_MS)
+}
+
+fn default_http_handshake_timeout() -> Duration {
+    Duration::from_millis(DEFAULT_HTTP_HANDSHAKE_TIMEOUT_MS)
+}
+
+fn default_tunnel_open_timeout() -> Duration {
+    // `0` means the tunnel manager's own connect timeout is used.
+    Duration::from_millis(DEFAULT_HTTP_TUNNEL_OPEN_TIMEOUT_MS)
+}
+
+fn default_response_timeout() -> Duration {
+    Duration::from_millis(DEFAULT_HTTP_RESPONSE_TIMEOUT_MS)
+}
+
+fn default_request_body_idle_timeout() -> Duration {
+    Duration::from_millis(DEFAULT_HTTP_REQUEST_BODY_IDLE_TIMEOUT_MS)
+}
+
+/// Serde adapter for the per-stage timeouts. Accepts either a bare
+/// integer (milliseconds) or a duration string such as `"800ms"`, `"5s"` or
+/// `"2m"`. `0` means "no bound at this layer"; an absent field uses its
+/// built-in default.
+mod timeout_duration {
+    use serde::{Deserialize, Deserializer, Serializer};
+    use std::time::Duration;
+
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum RawValue {
+        Millis(u64),
+        Text(String),
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Duration, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        match RawValue::deserialize(deserializer)? {
+            RawValue::Millis(millis) => Ok(Duration::from_millis(millis)),
+            RawValue::Text(text) => {
+                crate::forward::parse_duration_str(&text).map_err(serde::de::Error::custom)
+            }
+        }
+    }
+
+    /// Serialize as milliseconds; a disabled bound becomes `0`.
+    pub fn serialize<S>(value: &Duration, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_u64(value.as_millis() as u64)
+    }
+}
+
+/// Per-stage timeouts applied while serving one HTTP request.
+///
+/// Every stage of the request that can block on an external peer starts under
+/// one of these budgets. A zero duration means "no bound at this layer";
+/// for `tunnel_open`, zero delegates to the tunnel manager's own connect
+/// timeout.
+///
+/// Running a process chain (`hook_point` / `post_hook_point`) is deliberately
+/// not covered here: chain execution stays unbounded, because a chain command
+/// can legitimately block on work whose duration is not predictable at this
+/// layer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HttpServerTimeouts {
+    /// Name resolution of the upstream host (`http` / `https` forward).
+    pub dns: Duration,
+    /// One single TCP connect attempt against one resolved upstream address.
+    pub connect: Duration,
+    /// TLS handshake with the upstream.
+    pub tls_handshake: Duration,
+    /// HTTP/1 client connection handshake over an established byte stream
+    /// (direct socket, TLS socket or tunnel stream).
+    pub http_handshake: Duration,
+    /// Opening the tunnel stream on the tunnel forwarding path. Zero means
+    /// the bound comes from `tunnel_mgr`'s own `connect_timeout`.
+    pub tunnel_open: Duration,
+    /// Waiting for the upstream response head after the request was sent.
+    /// The response body streams after this point and is bounded by the
+    /// stream idle timeout of the stack, not by this value.
+    ///
+    /// The clock starts when the outbound request body has been fully
+    /// written (for a body-less request: when the request was handed to the
+    /// connection), so a slow upload is never charged against it.
+    pub response: Duration,
+    /// Gap allowed between two successive inbound request body chunks, both
+    /// while the body is streamed upstream and while the forward-group
+    /// status-retry path buffers it.
+    ///
+    /// This is an *idle* bound, not a total budget: a request body has no
+    /// predictable size or duration, so a healthy but large or slow upload
+    /// may take arbitrarily long as long as it keeps making progress. Only a
+    /// client that stops sending is cut off.
+    pub request_body_idle: Duration,
+}
+
+impl Default for HttpServerTimeouts {
+    fn default() -> Self {
+        Self {
+            dns: default_dns_timeout(),
+            connect: default_connect_timeout(),
+            tls_handshake: default_tls_handshake_timeout(),
+            http_handshake: default_http_handshake_timeout(),
+            tunnel_open: default_tunnel_open_timeout(),
+            response: default_response_timeout(),
+            request_body_idle: default_request_body_idle_timeout(),
+        }
+    }
+}
+
+impl HttpServerTimeouts {
+    /// Runtime table for one server instance. Absent config fields already
+    /// carry the built-in defaults, `0` means the bound is disabled.
+    pub fn from_config(config: &ProcessChainHttpServerConfig) -> Self {
+        Self {
+            dns: config.dns_timeout,
+            connect: config.connect_timeout,
+            tls_handshake: config.tls_handshake_timeout,
+            http_handshake: config.http_handshake_timeout,
+            tunnel_open: config.tunnel_open_timeout,
+            response: config.response_timeout,
+            request_body_idle: config.request_body_idle_timeout,
+        }
+    }
+
+    /// Run `fut` under `budget`. Zero keeps the stage unbounded, `Ok(())`
+    /// from the caller's point of view means "finished inside the budget".
+    async fn guard<F, T>(budget: Duration, fut: F) -> Result<T, ()>
+    where
+        F: std::future::Future<Output = T>,
+    {
+        if budget.is_zero() {
+            Ok(fut.await)
+        } else {
+            match timeout(budget, fut).await {
+                Ok(value) => Ok(value),
+                Err(_) => Err(()),
+            }
+        }
+    }
+}
+
+/// Which budget ended the wait for the upstream response head.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HeadWaitFailure {
+    /// The client stopped sending the request body.
+    BodyIdle,
+    /// The request was (fully) handed over, but the upstream did not answer.
+    ResponseHead,
+}
+
+/// Progress of the outbound request body.
+///
+/// A request body has no predictable size and no predictable transfer time,
+/// so a single "the whole send + response-head exchange must finish within X"
+/// budget would cut off healthy large or slow uploads. The wait is therefore
+/// bounded per phase instead:
+///
+/// - while the body is still being written, only an idle gap longer than the
+///   request body idle budget fails the attempt;
+/// - the upstream response-head budget is counted from the moment the body
+///   finished (for a body-less request: from when the request was handed to
+///   the connection).
+#[derive(Debug)]
+struct BodyProgress {
+    state: Mutex<BodyProgressState>,
+    changed: Notify,
+}
+
+#[derive(Debug, Default)]
+struct BodyProgressState {
+    last_activity: Option<Instant>,
+    finished_at: Option<Instant>,
+}
+
+impl BodyProgress {
+    fn new(body_already_done: bool) -> Self {
+        let now = Instant::now();
+        let state = if body_already_done {
+            BodyProgressState {
+                last_activity: Some(now),
+                finished_at: Some(now),
+            }
+        } else {
+            BodyProgressState::default()
+        };
+        Self {
+            state: Mutex::new(state),
+            changed: Notify::new(),
+        }
+    }
+
+    fn mark_activity(&self) {
+        let now = Instant::now();
+        if let Ok(mut state) = self.state.lock() {
+            state.last_activity = Some(now);
+        }
+        self.changed.notify_one();
+    }
+
+    fn mark_finished(&self) {
+        let now = Instant::now();
+        if let Ok(mut state) = self.state.lock() {
+            if state.finished_at.is_some() {
+                return;
+            }
+            state.last_activity = Some(now);
+            state.finished_at = Some(now);
+        }
+        self.changed.notify_one();
+    }
+
+    fn snapshot(&self) -> (Option<Instant>, Option<Instant>) {
+        match self.state.lock() {
+            Ok(state) => (state.last_activity, state.finished_at),
+            Err(_) => (None, None),
+        }
+    }
+
+    /// Next instant at which waiting is no longer justified, together with
+    /// the budget it belongs to. `None` means the wait is unbounded.
+    fn next_deadline(
+        &self,
+        started: Instant,
+        body_idle_budget: Duration,
+        head_budget: Duration,
+    ) -> Option<(Instant, HeadWaitFailure)> {
+        let (last_activity, finished_at) = self.snapshot();
+        if let Some(finished_at) = finished_at {
+            if head_budget.is_zero() {
+                return None;
+            }
+            return finished_at
+                .checked_add(head_budget)
+                .map(|deadline| (deadline, HeadWaitFailure::ResponseHead));
+        }
+        if !body_idle_budget.is_zero() {
+            let base = last_activity.unwrap_or(started);
+            return base
+                .checked_add(body_idle_budget)
+                .map(|deadline| (deadline, HeadWaitFailure::BodyIdle));
+        }
+        // Body idle bound disabled: fall back to the head budget counted from
+        // the moment the request was handed to the connection.
+        if head_budget.is_zero() {
+            return None;
+        }
+        started
+            .checked_add(head_budget)
+            .map(|deadline| (deadline, HeadWaitFailure::ResponseHead))
+    }
+}
+
+/// Wraps the outbound request body so [`BodyProgress`] observes every chunk
+/// the client body actually delivers, including the end of the stream.
+struct ProgressTrackedBody<B> {
+    inner: B,
+    progress: Arc<BodyProgress>,
+}
+
+impl<B> hyper::body::Body for ProgressTrackedBody<B>
+where
+    B: hyper::body::Body<Data = Bytes> + Unpin,
+{
+    type Data = Bytes;
+    type Error = B::Error;
+
+    fn poll_frame(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<hyper::body::Frame<Bytes>, Self::Error>>> {
+        let this = self.get_mut();
+        match std::pin::Pin::new(&mut this.inner).poll_frame(cx) {
+            std::task::Poll::Ready(Some(Ok(frame))) => {
+                this.progress.mark_activity();
+                std::task::Poll::Ready(Some(Ok(frame)))
+            }
+            std::task::Poll::Ready(Some(Err(e))) => {
+                this.progress.mark_finished();
+                std::task::Poll::Ready(Some(Err(e)))
+            }
+            std::task::Poll::Ready(None) => {
+                this.progress.mark_finished();
+                std::task::Poll::Ready(None)
+            }
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        // Some bodies (a `Full` body, an empty request body) report their end
+        // through `size_hint`/`is_end_stream` without ever being polled again.
+        let done = self.inner.is_end_stream();
+        if done {
+            self.progress.mark_finished();
+        }
+        done
+    }
+
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        self.inner.size_hint()
+    }
+}
+
 pub struct ProcessChainHttpServerBuilder {
     id: Option<String>,
     version: Option<String>,
@@ -191,6 +521,7 @@ pub struct ProcessChainHttpServerBuilder {
     global_collection_manager: Option<GlobalCollectionManagerRef>,
     compression: HttpCompressionSettings,
     trusted_upstreams: Vec<String>,
+    timeouts: HttpServerTimeouts,
 }
 
 // Add setter methods for HttpServerBuilder
@@ -261,6 +592,14 @@ impl ProcessChainHttpServerBuilder {
         self
     }
 
+    /// Per-stage timeouts for upstream work started by this server
+    /// (DNS / connect / TLS / HTTP handshake / tunnel open / response head /
+    /// request body). Process-chain execution is not bounded here.
+    pub fn timeouts(mut self, timeouts: HttpServerTimeouts) -> Self {
+        self.timeouts = timeouts;
+        self
+    }
+
     pub async fn build(self) -> ServerResult<ProcessChainHttpServer> {
         ProcessChainHttpServer::create_server(self).await
     }
@@ -307,6 +646,7 @@ pub struct ProcessChainHttpServer {
     tunnel_manager: TunnelManager,
     compression: HttpCompressionSettings,
     trusted_upstreams: Vec<TrustedUpstreamMatcher>,
+    timeouts: HttpServerTimeouts,
 }
 
 #[derive(Debug)]
@@ -368,8 +708,6 @@ impl Drop for ProcessChainHttpServer {
 }
 
 impl ProcessChainHttpServer {
-    const HTTPS_UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_millis(800);
-
     fn request_header_value<'a>(
         req: &'a http::Request<BoxBody<Bytes, ServerError>>,
         name: &str,
@@ -433,25 +771,32 @@ impl ProcessChainHttpServer {
 
     async fn connect_upstream_candidates(
         candidates: Vec<SocketAddr>,
-    ) -> Result<(TcpStream, SocketAddr), (TunnelFailureReason, String)> {
+        connect_timeout: Duration,
+    ) -> Result<(TcpStream, SocketAddr), (TunnelFailureReason, String, bool)> {
         if candidates.is_empty() {
             return Err((
                 TunnelFailureReason::PreConnectDns,
                 "No upstream socket addresses resolved".to_string(),
+                false,
             ));
         }
 
         let mut errors: Vec<(String, String, bool)> = Vec::new();
         for addr in candidates {
-            match timeout(
-                Self::HTTPS_UPSTREAM_CONNECT_TIMEOUT,
-                TcpStream::connect(addr),
-            )
-            .await
-            {
+            match HttpServerTimeouts::guard(connect_timeout, TcpStream::connect(addr)).await {
                 Ok(Ok(stream)) => return Ok((stream, addr)),
-                Ok(Err(err)) => errors.push((addr.to_string(), err.to_string(), false)),
-                Err(_) => errors.push((addr.to_string(), "connect timeout".to_string(), true)),
+                Ok(Err(err)) => errors.push((
+                    addr.to_string(),
+                    err.to_string(),
+                    err.kind() == std::io::ErrorKind::TimedOut,
+                )),
+                Err(()) => {
+                    errors.push((
+                        addr.to_string(),
+                        format!("connect timeout after {}ms", connect_timeout.as_millis()),
+                        true,
+                    ));
+                }
             }
         }
 
@@ -461,23 +806,169 @@ impl ProcessChainHttpServer {
             .map(|(a, m, _)| format!("{} ({})", a, m))
             .collect::<Vec<_>>()
             .join(", ");
-        Err((reason, msg))
+        let timed_out = reason == TunnelFailureReason::ConnectTimeout;
+        Err((reason, msg, timed_out))
     }
 
     async fn connect_upstream_with_fallback(
         connect_host: &str,
         connect_port: u16,
-    ) -> Result<(TcpStream, SocketAddr), (TunnelFailureReason, String)> {
-        let candidates: Vec<SocketAddr> = match lookup_host((connect_host, connect_port)).await {
-            Ok(it) => it.collect(),
-            Err(e) => {
-                return Err((
-                    TunnelFailureReason::PreConnectDns,
-                    format!("resolve {}:{} failed: {}", connect_host, connect_port, e),
+        dns_timeout: Duration,
+        connect_timeout: Duration,
+    ) -> Result<(TcpStream, SocketAddr), (TunnelFailureReason, String, bool)> {
+        let candidates: Vec<SocketAddr> =
+            match HttpServerTimeouts::guard(dns_timeout, lookup_host((connect_host, connect_port)))
+                .await
+            {
+                Ok(Ok(it)) => it.collect(),
+                Ok(Err(e)) => {
+                    let is_timeout = e.kind() == std::io::ErrorKind::TimedOut;
+                    return Err((
+                        TunnelFailureReason::PreConnectDns,
+                        format!("resolve {}:{} failed: {}", connect_host, connect_port, e),
+                        is_timeout,
+                    ));
+                }
+                Err(()) => {
+                    return Err((
+                        TunnelFailureReason::PreConnectDns,
+                        format!(
+                            "resolve {}:{} timed out after {}ms",
+                            connect_host,
+                            connect_port,
+                            dns_timeout.as_millis()
+                        ),
+                        true,
+                    ));
+                }
+            };
+        Self::connect_upstream_candidates(candidates, connect_timeout).await
+    }
+
+    /// Resolve the upstream host and connect to the first address that
+    /// answers, using the timeouts configured for this server instance.
+    async fn connect_upstream_with_configured_timeouts(
+        &self,
+        connect_host: &str,
+        connect_port: u16,
+    ) -> Result<(TcpStream, SocketAddr), (TunnelFailureReason, String, bool)> {
+        Self::connect_upstream_with_fallback(
+            connect_host,
+            connect_port,
+            self.timeouts.dns,
+            self.timeouts.connect,
+        )
+        .await
+    }
+
+    /// Send one upstream request and wait for its response head.
+    ///
+    /// The wait is phase-aware, because a request body has no predictable
+    /// size and no predictable transfer time:
+    /// - while the body is still streaming, the attempt only fails when the
+    ///   client is idle for longer than `body_idle_budget`;
+    /// - `head_budget` is counted from the moment the body finished, so a
+    ///   long but healthy upload is never charged against the upstream.
+    ///
+    /// The response body keeps streaming after this call returns. A timeout
+    /// here means "the upstream accepted the request but did not answer",
+    /// which §6.7.2 classifies as upstream application health, not URL
+    /// reachability — it is deliberately not written back to `tunnel_mgr`.
+    async fn send_upstream_request<B>(
+        sender: &mut hyper::client::conn::http1::SendRequest<ProgressTrackedBody<B>>,
+        req: http::Request<B>,
+        upstream: &str,
+        head_budget: Duration,
+        body_idle_budget: Duration,
+        client_upgrade: Option<hyper::upgrade::OnUpgrade>,
+    ) -> ServerResult<http::Response<BoxBody<Bytes, ServerError>>>
+    where
+        B: hyper::body::Body<Data = Bytes> + Send + Sync + Unpin + 'static,
+        B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+    {
+        let body_done = req.body().is_end_stream();
+        let progress = Arc::new(BodyProgress::new(body_done));
+        let (parts, body) = req.into_parts();
+        // The connection is typed by the body it writes, so the wrapper is
+        // built here and the sender is parameterized by `ProgressTrackedBody`.
+        let req = http::Request::from_parts(
+            parts,
+            ProgressTrackedBody {
+                inner: body,
+                progress: progress.clone(),
+            },
+        );
+
+        let started = Instant::now();
+        let mut response = Box::pin(sender.send_request(req));
+        let outcome = loop {
+            // Register before reading progress so a body completion between
+            // the snapshot and select cannot leave the old deadline in force.
+            let changed = progress.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            match progress.next_deadline(started, body_idle_budget, head_budget) {
+                None => tokio::select! {
+                    resp = &mut response => break Ok(resp),
+                    _ = &mut changed => continue,
+                },
+                Some((deadline, failure)) => {
+                    if Instant::now() >= deadline {
+                        break Err(failure);
+                    }
+                    let sleep = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline));
+                    tokio::pin!(sleep);
+                    tokio::select! {
+                        resp = &mut response => break Ok(resp),
+                        _ = &mut changed => continue,
+                        _ = &mut sleep => continue,
+                    }
+                }
+            }
+        };
+        let resp = match outcome {
+            Ok(Ok(resp)) => resp,
+            Ok(Err(e)) => {
+                return Err(server_err!(
+                    ServerErrorCode::TunnelError,
+                    "Failed to request upstream {}: {}",
+                    upstream,
+                    e
+                ));
+            }
+            Err(HeadWaitFailure::BodyIdle) => {
+                warn!(
+                    "upstream request to {} aborted: request body idle for {}ms",
+                    upstream,
+                    body_idle_budget.as_millis()
+                );
+                return Err(server_err!(
+                    ServerErrorCode::StreamError,
+                    "Failed to request upstream {}: request body idle for {}ms",
+                    upstream,
+                    body_idle_budget.as_millis()
+                ));
+            }
+            Err(HeadWaitFailure::ResponseHead) => {
+                warn!(
+                    "upstream {} did not send a response head within {}ms of the request body",
+                    upstream,
+                    head_budget.as_millis()
+                );
+                return Err(server_err!(
+                    ServerErrorCode::TunnelError,
+                    "Failed to request upstream {}: response head timeout after {}ms",
+                    upstream,
+                    head_budget.as_millis()
                 ));
             }
         };
-        Self::connect_upstream_candidates(candidates).await
+        let mut resp = resp;
+        spawn_upgrade_relay_if_switching(&mut resp, client_upgrade, upstream);
+        Ok(resp.map(|body| {
+            body.map_err(|e| ServerError::new(ServerErrorCode::StreamError, format!("{:?}", e)))
+                .boxed()
+        }))
     }
 
     /// Best-effort: parse a candidate URL string into a `Url` suitable
@@ -522,6 +1013,7 @@ impl ProcessChainHttpServer {
             global_collection_manager: None,
             compression: HttpCompressionSettings::default(),
             trusted_upstreams: Vec::new(),
+            timeouts: HttpServerTimeouts::default(),
         }
     }
 
@@ -609,6 +1101,7 @@ impl ProcessChainHttpServer {
             tunnel_manager: builder.tunnel_manager.unwrap(),
             compression: builder.compression,
             trusted_upstreams,
+            timeouts: builder.timeouts,
         })
     }
 
@@ -648,7 +1141,9 @@ impl ProcessChainHttpServer {
         info: &StreamInfo,
     ) -> ServerResult<http::Response<BoxBody<Bytes, ServerError>>> {
         let mut slot = Some(req);
-        self.forward_to_candidate(&mut slot, target_url, info).await
+        let mut timed_out = false;
+        self.forward_to_candidate(&mut slot, target_url, info, &mut timed_out)
+            .await
     }
 
     /// Forward the request held by `req_slot` to `target_url`.
@@ -668,6 +1163,7 @@ impl ProcessChainHttpServer {
         req_slot: &mut Option<http::Request<BoxBody<Bytes, ServerError>>>,
         target_url: &str,
         info: &StreamInfo,
+        timed_out: &mut bool,
     ) -> ServerResult<http::Response<BoxBody<Bytes, ServerError>>> {
         let (org_url, mut header, method, version, host_header) = {
             let req_ref = req_slot
@@ -738,45 +1234,75 @@ impl ProcessChainHttpServer {
                 // intact so the caller can retry on another candidate
                 // per §6.3.
                 let started = std::time::Instant::now();
-                let (tcp_stream, connected_addr) =
-                    match Self::connect_upstream_with_fallback(connect_host, connect_port).await {
-                        Ok(v) => v,
-                        Err((reason, msg)) => {
-                            if let Some(key) = history_key.as_ref() {
-                                self.tunnel_manager
-                                    .record_business_failure(key, reason, Some(&msg))
-                                    .await;
-                            }
-                            return Err(server_err!(
-                                ServerErrorCode::InvalidConfig,
-                                "Failed to connect upstream candidates: {}",
-                                msg
-                            ));
+                let (tcp_stream, connected_addr) = match self
+                    .connect_upstream_with_configured_timeouts(connect_host, connect_port)
+                    .await
+                {
+                    Ok(v) => v,
+                    Err((reason, msg, is_timeout)) => {
+                        if let Some(key) = history_key.as_ref() {
+                            self.tunnel_manager
+                                .record_business_failure(key, reason, Some(&msg))
+                                .await;
                         }
-                    };
+                        *timed_out = is_timeout;
+                        return Err(server_err!(
+                            ServerErrorCode::InvalidConfig,
+                            "Failed to connect upstream candidates: {}",
+                            msg
+                        ));
+                    }
+                };
 
-                let (mut sender, conn) =
-                    match hyper::client::conn::http1::handshake(TokioIo::new(tcp_stream)).await {
-                        Ok(v) => v,
-                        Err(e) => {
-                            if let Some(key) = history_key.as_ref() {
-                                let detail = e.to_string();
-                                self.tunnel_manager
-                                    .record_business_failure(
-                                        key,
-                                        TunnelFailureReason::TunnelOpen,
-                                        Some(&detail),
-                                    )
-                                    .await;
-                            }
-                            return Err(server_err!(
-                                ServerErrorCode::StreamError,
-                                "Failed to build http client connection to {}: {}",
-                                connected_addr,
-                                e
-                            ));
+                let handshake_budget = self.timeouts.http_handshake;
+                let handshake = HttpServerTimeouts::guard(
+                    handshake_budget,
+                    hyper::client::conn::http1::handshake(TokioIo::new(tcp_stream)),
+                )
+                .await;
+                let (mut sender, conn) = match handshake {
+                    Ok(Ok(v)) => v,
+                    Ok(Err(e)) => {
+                        if let Some(key) = history_key.as_ref() {
+                            let detail = e.to_string();
+                            self.tunnel_manager
+                                .record_business_failure(
+                                    key,
+                                    TunnelFailureReason::TunnelOpen,
+                                    Some(&detail),
+                                )
+                                .await;
                         }
-                    };
+                        return Err(server_err!(
+                            ServerErrorCode::StreamError,
+                            "Failed to build http client connection to {}: {}",
+                            connected_addr,
+                            e
+                        ));
+                    }
+                    Err(()) => {
+                        *timed_out = true;
+                        let detail = format!(
+                            "http handshake timeout after {}ms",
+                            handshake_budget.as_millis()
+                        );
+                        if let Some(key) = history_key.as_ref() {
+                            self.tunnel_manager
+                                .record_business_failure(
+                                    key,
+                                    TunnelFailureReason::TunnelOpen,
+                                    Some(&detail),
+                                )
+                                .await;
+                        }
+                        return Err(server_err!(
+                            ServerErrorCode::StreamError,
+                            "Failed to build http client connection to {}: {}",
+                            connected_addr,
+                            detail
+                        ));
+                    }
+                };
 
                 if let Some(key) = history_key.as_ref() {
                     self.tunnel_manager
@@ -815,15 +1341,15 @@ impl ProcessChainHttpServer {
                     })?;
                 *upstream_req.headers_mut() = std::mem::take(&mut header);
 
-                let mut resp = sender.send_request(upstream_req).await.map_err(|e| {
-                    server_err!(
-                        ServerErrorCode::InvalidConfig,
-                        "Failed to request upstream {}: {}",
-                        request_url,
-                        e
-                    )
-                })?;
-                spawn_upgrade_relay_if_switching(&mut resp, client_upgrade, target_url);
+                let resp = Self::send_upstream_request(
+                    &mut sender,
+                    upstream_req,
+                    request_url.as_str(),
+                    self.timeouts.response,
+                    self.timeouts.request_body_idle,
+                    client_upgrade,
+                )
+                .await?;
                 let resp = resp.map(|body| {
                     body.map_err(|e| {
                         ServerError::new(ServerErrorCode::StreamError, format!("{:?}", e))
@@ -863,22 +1389,25 @@ impl ProcessChainHttpServer {
                 // reflects path quality, not application latency.
                 let started = std::time::Instant::now();
 
-                let (tcp_stream, connected_addr) =
-                    match Self::connect_upstream_with_fallback(connect_host, connect_port).await {
-                        Ok(v) => v,
-                        Err((reason, msg)) => {
-                            if let Some(key) = history_key.as_ref() {
-                                self.tunnel_manager
-                                    .record_business_failure(key, reason, Some(&msg))
-                                    .await;
-                            }
-                            return Err(server_err!(
-                                ServerErrorCode::InvalidConfig,
-                                "Failed to connect upstream candidates: {}",
-                                msg
-                            ));
+                let (tcp_stream, connected_addr) = match self
+                    .connect_upstream_with_configured_timeouts(connect_host, connect_port)
+                    .await
+                {
+                    Ok(v) => v,
+                    Err((reason, msg, is_timeout)) => {
+                        if let Some(key) = history_key.as_ref() {
+                            self.tunnel_manager
+                                .record_business_failure(key, reason, Some(&msg))
+                                .await;
                         }
-                    };
+                        *timed_out = is_timeout;
+                        return Err(server_err!(
+                            ServerErrorCode::InvalidConfig,
+                            "Failed to connect upstream candidates: {}",
+                            msg
+                        ));
+                    }
+                };
 
                 let tls_config = ClientConfig::builder_with_provider(Arc::new(
                     rustls::crypto::ring::default_provider(),
@@ -899,9 +1428,15 @@ impl ProcessChainHttpServer {
                         e
                     )
                 })?;
-                let tls_stream = match tls_connector.connect(server_name, tcp_stream).await {
-                    Ok(s) => s,
-                    Err(e) => {
+                let tls_budget = self.timeouts.tls_handshake;
+                let tls_handshake = HttpServerTimeouts::guard(
+                    tls_budget,
+                    tls_connector.connect(server_name, tcp_stream),
+                )
+                .await;
+                let tls_stream = match tls_handshake {
+                    Ok(Ok(s)) => s,
+                    Ok(Err(e)) => {
                         if let Some(key) = history_key.as_ref() {
                             let detail = e.to_string();
                             self.tunnel_manager
@@ -920,29 +1455,76 @@ impl ProcessChainHttpServer {
                             e
                         ));
                     }
+                    Err(()) => {
+                        *timed_out = true;
+                        let detail =
+                            format!("tls handshake timeout after {}ms", tls_budget.as_millis());
+                        if let Some(key) = history_key.as_ref() {
+                            self.tunnel_manager
+                                .record_business_failure(
+                                    key,
+                                    TunnelFailureReason::TlsHandshake,
+                                    Some(&detail),
+                                )
+                                .await;
+                        }
+                        return Err(server_err!(
+                            ServerErrorCode::InvalidConfig,
+                            "Failed tls handshake with upstream {} via {}: {}",
+                            sni_host,
+                            connected_addr,
+                            detail
+                        ));
+                    }
                 };
 
-                let (mut sender, conn) =
-                    match hyper::client::conn::http1::handshake(TokioIo::new(tls_stream)).await {
-                        Ok(v) => v,
-                        Err(e) => {
-                            if let Some(key) = history_key.as_ref() {
-                                let detail = e.to_string();
-                                self.tunnel_manager
-                                    .record_business_failure(
-                                        key,
-                                        TunnelFailureReason::TunnelOpen,
-                                        Some(&detail),
-                                    )
-                                    .await;
-                            }
-                            return Err(server_err!(
-                                ServerErrorCode::StreamError,
-                                "Failed to build https client connection: {}",
-                                e
-                            ));
+                let handshake_budget = self.timeouts.http_handshake;
+                let handshake = HttpServerTimeouts::guard(
+                    handshake_budget,
+                    hyper::client::conn::http1::handshake(TokioIo::new(tls_stream)),
+                )
+                .await;
+                let (mut sender, conn) = match handshake {
+                    Ok(Ok(v)) => v,
+                    Ok(Err(e)) => {
+                        if let Some(key) = history_key.as_ref() {
+                            let detail = e.to_string();
+                            self.tunnel_manager
+                                .record_business_failure(
+                                    key,
+                                    TunnelFailureReason::TunnelOpen,
+                                    Some(&detail),
+                                )
+                                .await;
                         }
-                    };
+                        return Err(server_err!(
+                            ServerErrorCode::StreamError,
+                            "Failed to build https client connection: {}",
+                            e
+                        ));
+                    }
+                    Err(()) => {
+                        *timed_out = true;
+                        let detail = format!(
+                            "http handshake timeout after {}ms",
+                            handshake_budget.as_millis()
+                        );
+                        if let Some(key) = history_key.as_ref() {
+                            self.tunnel_manager
+                                .record_business_failure(
+                                    key,
+                                    TunnelFailureReason::TunnelOpen,
+                                    Some(&detail),
+                                )
+                                .await;
+                        }
+                        return Err(server_err!(
+                            ServerErrorCode::StreamError,
+                            "Failed to build https client connection: {}",
+                            detail
+                        ));
+                    }
+                };
 
                 // Connection establishment succeeded — record reachable
                 // with the elapsed RTT before we even attempt the
@@ -983,16 +1565,16 @@ impl ProcessChainHttpServer {
                     })?;
                 *upstream_req.headers_mut() = std::mem::take(&mut header);
 
-                let mut resp = sender.send_request(upstream_req).await.map_err(|e| {
-                    server_err!(
-                        ServerErrorCode::InvalidConfig,
-                        "Failed to request https upstream {} via {}: {}",
-                        sni_host,
-                        connected_addr,
-                        e
-                    )
-                })?;
-                spawn_upgrade_relay_if_switching(&mut resp, client_upgrade, target_url);
+                let upstream_label = format!("https://{} via {}", sni_host, connected_addr);
+                let resp = Self::send_upstream_request(
+                    &mut sender,
+                    upstream_req,
+                    &upstream_label,
+                    self.timeouts.response,
+                    self.timeouts.request_body_idle,
+                    client_upgrade,
+                )
+                .await?;
                 let resp = resp.map(|body| {
                     body.map_err(|e| {
                         ServerError::new(ServerErrorCode::StreamError, format!("{:?}", e))
@@ -1014,9 +1596,36 @@ impl ProcessChainHttpServer {
                         e
                     )
                 })?;
-                let stream = match self.tunnel_manager.open_stream_by_url(&tunnel_url).await {
+                // `tunnel_open_timeout`, when configured, is handed to the
+                // tunnel manager as this open's connect budget so the bound
+                // lands on the tunnel's low-level connect. The open itself is
+                // never wrapped in a timeout: the manager owns the
+                // failure-history writeback and a caller-side cut would race
+                // it. Without an override the manager's own connect timeout
+                // stays the only bound.
+                let tunnel_open_timeout = self.timeouts.tunnel_open;
+                let tunnel_open = if tunnel_open_timeout.is_zero() {
+                    self.tunnel_manager.open_stream_by_url(&tunnel_url).await
+                } else {
+                    {
+                        self.tunnel_manager
+                            .open_stream_by_url_with_timeout(&tunnel_url, tunnel_open_timeout)
+                            .await
+                    }
+                };
+                let stream = match tunnel_open {
                     Ok(s) => s,
                     Err(e) => {
+                        *timed_out = matches!(e, crate::TunnelError::ConnectTimeout(_));
+                        if !tunnel_open_timeout.is_zero() {
+                            warn!(
+                                "open tunnel {} failed within {}ms budget server={}: {}",
+                                target_url,
+                                tunnel_open_timeout.as_millis(),
+                                self.id,
+                                e
+                            );
+                        }
                         return Err(server_err!(
                             ServerErrorCode::TunnelError,
                             "Failed to open tunnel to {}: {}",
@@ -1026,18 +1635,31 @@ impl ProcessChainHttpServer {
                     }
                 };
 
-                let (mut sender, conn) = match hyper::client::conn::http1::handshake(TokioIo::new(
-                    crate::tunnel_connector::TunnelStreamConnection::new(stream),
-                ))
-                .await
-                {
-                    Ok(v) => v,
-                    Err(e) => {
+                let handshake_budget = self.timeouts.http_handshake;
+                let handshake = HttpServerTimeouts::guard(
+                    handshake_budget,
+                    hyper::client::conn::http1::handshake(TokioIo::new(
+                        crate::tunnel_connector::TunnelStreamConnection::new(stream),
+                    )),
+                )
+                .await;
+                let (mut sender, conn) = match handshake {
+                    Ok(Ok(v)) => v,
+                    Ok(Err(e)) => {
                         return Err(server_err!(
                             ServerErrorCode::StreamError,
                             "Failed to build tunnel client connection to {}: {}",
                             target_url,
                             e
+                        ));
+                    }
+                    Err(()) => {
+                        *timed_out = true;
+                        return Err(server_err!(
+                            ServerErrorCode::StreamError,
+                            "Failed to build tunnel client connection to {}: http handshake timeout after {}ms",
+                            target_url,
+                            handshake_budget.as_millis()
                         ));
                     }
                 };
@@ -1069,15 +1691,15 @@ impl ProcessChainHttpServer {
                     })?;
                 *upstream_req.headers_mut() = std::mem::take(&mut header);
 
-                let mut resp = sender.send_request(upstream_req).await.map_err(|e| {
-                    server_err!(
-                        ServerErrorCode::TunnelError,
-                        "Failed to request upstream {}: {}",
-                        target_url,
-                        e
-                    )
-                })?;
-                spawn_upgrade_relay_if_switching(&mut resp, client_upgrade, target_url);
+                let resp = Self::send_upstream_request(
+                    &mut sender,
+                    upstream_req,
+                    target_url,
+                    self.timeouts.response,
+                    self.timeouts.request_body_idle,
+                    client_upgrade,
+                )
+                .await?;
                 let resp = resp.map(|body| {
                     body.map_err(|e| {
                         ServerError::new(ServerErrorCode::StreamError, format!("{:?}", e))
@@ -1205,12 +1827,25 @@ impl ProcessChainHttpServer {
                 }
             }
 
-            let attempt_fut = self.forward_to_candidate(&mut req_slot, &candidate.url, info);
+            let mut stage_timed_out = false;
+            let attempt_fut = self.forward_to_candidate(
+                &mut req_slot,
+                &candidate.url,
+                info,
+                &mut stage_timed_out,
+            );
             let (attempt_res, attempt_cond) = match deadline {
                 Some(d) => {
                     let remaining = d.saturating_duration_since(std::time::Instant::now());
                     match timeout(remaining, attempt_fut).await {
-                        Ok(r) => (r, NextUpstreamCondition::Error),
+                        Ok(r) => (
+                            r,
+                            if stage_timed_out {
+                                NextUpstreamCondition::Timeout
+                            } else {
+                                NextUpstreamCondition::Error
+                            },
+                        ),
                         Err(_) => (
                             Err(server_err!(
                                 ServerErrorCode::TunnelError,
@@ -1223,7 +1858,17 @@ impl ProcessChainHttpServer {
                         ),
                     }
                 }
-                None => (attempt_fut.await, NextUpstreamCondition::Error),
+                None => {
+                    let result = attempt_fut.await;
+                    (
+                        result,
+                        if stage_timed_out {
+                            NextUpstreamCondition::Timeout
+                        } else {
+                            NextUpstreamCondition::Error
+                        },
+                    )
+                }
             };
             match attempt_res {
                 Ok(resp) => {
@@ -1299,7 +1944,13 @@ impl ProcessChainHttpServer {
         };
 
         let (req_parts, body) = req.into_parts();
-        let buffered_body = match Self::buffer_body(body, policy.max_body_buffer_bytes).await? {
+        let buffered_body = match Self::buffer_body(
+            body,
+            policy.max_body_buffer_bytes,
+            self.timeouts.request_body_idle,
+        )
+        .await?
+        {
             Some(b) => b,
             None => {
                 // Body exceeded the configured cap. We can no longer
@@ -1348,12 +1999,25 @@ impl ProcessChainHttpServer {
             Self::set_content_length(&mut attempt_req);
             let mut req_slot = Some(attempt_req);
 
-            let attempt_fut = self.forward_to_candidate(&mut req_slot, &candidate.url, info);
+            let mut stage_timed_out = false;
+            let attempt_fut = self.forward_to_candidate(
+                &mut req_slot,
+                &candidate.url,
+                info,
+                &mut stage_timed_out,
+            );
             let (attempt_res, attempt_cond) = match deadline {
                 Some(d) => {
                     let remaining = d.saturating_duration_since(std::time::Instant::now());
                     match timeout(remaining, attempt_fut).await {
-                        Ok(r) => (r, NextUpstreamCondition::Error),
+                        Ok(r) => (
+                            r,
+                            if stage_timed_out {
+                                NextUpstreamCondition::Timeout
+                            } else {
+                                NextUpstreamCondition::Error
+                            },
+                        ),
                         Err(_) => (
                             Err(server_err!(
                                 ServerErrorCode::TunnelError,
@@ -1366,7 +2030,17 @@ impl ProcessChainHttpServer {
                         ),
                     }
                 }
-                None => (attempt_fut.await, NextUpstreamCondition::Error),
+                None => {
+                    let result = attempt_fut.await;
+                    (
+                        result,
+                        if stage_timed_out {
+                            NextUpstreamCondition::Timeout
+                        } else {
+                            NextUpstreamCondition::Error
+                        },
+                    )
+                }
             };
             match attempt_res {
                 Ok(r) => {
@@ -1435,23 +2109,62 @@ impl ProcessChainHttpServer {
     /// `Ok(Some(bytes))` if the body fit within the cap, `Ok(None)`
     /// if it exceeded the cap (in which case retry is no longer safe
     /// for this request).
+    ///
+    /// `idle_budget` bounds the gap *between two successive body chunks*
+    /// rather than the whole read: the size of a request body and the time a
+    /// healthy upload needs are both unknown, so only a client that stops
+    /// sending is cut off. Bytes beyond `cap` are still drained (so the
+    /// connection stays usable for the error response) but not kept.
     async fn buffer_body(
-        body: BoxBody<Bytes, ServerError>,
+        mut body: BoxBody<Bytes, ServerError>,
         cap: u64,
+        idle_budget: Duration,
     ) -> ServerResult<Option<Bytes>> {
         let cap = cap as usize;
-        let collected = body.collect().await.map_err(|e| {
-            server_err!(
-                ServerErrorCode::StreamError,
-                "buffering request body failed: {:?}",
-                e
-            )
-        })?;
-        let bytes = collected.to_bytes();
-        if bytes.len() > cap {
+        let mut buffered: Vec<u8> = Vec::new();
+        let mut exceeded = false;
+        loop {
+            match HttpServerTimeouts::guard(idle_budget, body.frame()).await {
+                Ok(None) => break,
+                Ok(Some(Ok(frame))) => {
+                    let Ok(data) = frame.into_data() else {
+                        // Trailer frames are not part of the payload.
+                        continue;
+                    };
+                    if exceeded {
+                        continue;
+                    }
+                    if buffered.len() + data.len() > cap {
+                        exceeded = true;
+                        buffered = Vec::new();
+                    } else {
+                        buffered.extend_from_slice(&data);
+                    }
+                }
+                Ok(Some(Err(e))) => {
+                    return Err(server_err!(
+                        ServerErrorCode::StreamError,
+                        "buffering request body failed: {:?}",
+                        e
+                    ));
+                }
+                Err(()) => {
+                    warn!(
+                        "request body idle for {}ms while buffering",
+                        idle_budget.as_millis()
+                    );
+                    return Err(server_err!(
+                        ServerErrorCode::StreamError,
+                        "buffering request body failed: no data for {}ms",
+                        idle_budget.as_millis()
+                    ));
+                }
+            }
+        }
+        if exceeded {
             return Ok(None);
         }
-        Ok(Some(bytes))
+        Ok(Some(Bytes::from(buffered)))
     }
 
     fn full_body(bytes: Bytes) -> BoxBody<Bytes, ServerError> {
@@ -1705,6 +2418,8 @@ impl ProcessChainHttpServer {
             .await
             .map_err(|e| server_err!(ServerErrorCode::ProcessChainError, "{}", e))?;
 
+        // Process-chain execution is intentionally unbounded; see
+        // `HttpServerTimeouts`.
         let ret = post_executor
             .execute_lib()
             .await
@@ -1831,9 +2546,11 @@ fn spawn_upgrade_relay_if_switching(
     }
 }
 
-#[async_trait::async_trait]
-impl HttpServer for ProcessChainHttpServer {
-    async fn serve_request(
+impl ProcessChainHttpServer {
+    /// Everything one request does. Every per-stage budget inside is applied
+    /// to a third-party socket/handshake call; nothing wraps this entry point
+    /// in a timeout.
+    async fn serve_request_inner(
         &self,
         req: http::Request<BoxBody<Bytes, ServerError>>,
         info: StreamInfo,
@@ -1965,6 +2682,8 @@ impl HttpServer for ProcessChainHttpServer {
             .map_err(|e| server_err!(ServerErrorCode::ProcessChainError, "{}", e))?;
 
         let auth_env = global_env.clone();
+        // Process-chain execution is intentionally unbounded; see
+        // `HttpServerTimeouts`.
         let ret = executor.execute_lib().await;
         let verified_principal = auth_env
             .get("AUTH_principal")
@@ -1982,7 +2701,9 @@ impl HttpServer for ProcessChainHttpServer {
                     "routing-failed",
                 ));
             }
-            Err(e) => return Err(server_err!(ServerErrorCode::ProcessChainError, "{}", e)),
+            Err(e) => {
+                return Err(server_err!(ServerErrorCode::ProcessChainError, "{}", e));
+            }
         };
 
         if ret.is_control() {
@@ -2273,6 +2994,23 @@ impl HttpServer for ProcessChainHttpServer {
         self.apply_post_chain_result(Ok(response), &req_info, Some(&info), Some(&sources))
             .await
     }
+}
+
+#[async_trait::async_trait]
+impl HttpServer for ProcessChainHttpServer {
+    /// Entry point of one request. The per-stage budgets (DNS / connect /
+    /// TLS / HTTP handshake / tunnel open / response head / request body)
+    /// are enforced in `serve_request_inner`, each on the third-party
+    /// socket/handshake call it bounds. Process-chain execution and the
+    /// request as a whole stay unbounded: this crate never wraps one of its
+    /// own entry points in a timeout.
+    async fn serve_request(
+        &self,
+        req: http::Request<BoxBody<Bytes, ServerError>>,
+        info: StreamInfo,
+    ) -> ServerResult<http::Response<BoxBody<Bytes, ServerError>>> {
+        self.serve_request_inner(req, info).await
+    }
 
     fn id(&self) -> String {
         self.id.clone()
@@ -2378,6 +3116,63 @@ pub struct ProcessChainHttpServerConfig {
     pub brotli_min_length: u64,
     #[serde(default = "default_brotli_comp_level")]
     pub brotli_comp_level: u32,
+    /// Bound on resolving the upstream host name. Accepts a millisecond
+    /// integer or a duration string (`"5s"`); `0` disables the bound.
+    #[serde(
+        default = "default_dns_timeout",
+        deserialize_with = "timeout_duration::deserialize",
+        serialize_with = "timeout_duration::serialize"
+    )]
+    pub dns_timeout: Duration,
+    /// Bound on one single TCP connect attempt to an upstream address.
+    #[serde(
+        default = "default_connect_timeout",
+        deserialize_with = "timeout_duration::deserialize",
+        serialize_with = "timeout_duration::serialize"
+    )]
+    pub connect_timeout: Duration,
+    /// Bound on the TLS handshake with the upstream (`https` forward).
+    #[serde(
+        default = "default_tls_handshake_timeout",
+        deserialize_with = "timeout_duration::deserialize",
+        serialize_with = "timeout_duration::serialize"
+    )]
+    pub tls_handshake_timeout: Duration,
+    /// Bound on the HTTP/1 client connection handshake that starts the
+    /// upstream request over a direct, TLS or tunnel byte stream.
+    #[serde(
+        default = "default_http_handshake_timeout",
+        deserialize_with = "timeout_duration::deserialize",
+        serialize_with = "timeout_duration::serialize"
+    )]
+    pub http_handshake_timeout: Duration,
+    /// Bound on opening the tunnel stream on the tunnel forwarding path.
+    /// `0` (default) keeps `tunnel_mgr`'s own `connect_timeout` as the only
+    /// bound for that stage.
+    #[serde(
+        default = "default_tunnel_open_timeout",
+        deserialize_with = "timeout_duration::deserialize",
+        serialize_with = "timeout_duration::serialize"
+    )]
+    pub tunnel_open_timeout: Duration,
+    /// Bound on waiting for the upstream response head after the request
+    /// head (and buffered body) was written.
+    #[serde(
+        default = "default_response_timeout",
+        deserialize_with = "timeout_duration::deserialize",
+        serialize_with = "timeout_duration::serialize"
+    )]
+    pub response_timeout: Duration,
+    /// Idle bound between two successive inbound request body chunks. The
+    /// body size and the time a legitimate upload needs are both unknown, so
+    /// this is a progress bound rather than a total budget: it only fails a
+    /// client that stops sending (`0` disables it).
+    #[serde(
+        default = "default_request_body_idle_timeout",
+        deserialize_with = "timeout_duration::deserialize",
+        serialize_with = "timeout_duration::serialize"
+    )]
+    pub request_body_idle_timeout: Duration,
 }
 
 impl ServerConfig for ProcessChainHttpServerConfig {
@@ -2470,7 +3265,8 @@ impl ServerFactory for ProcessChainHttpServerFactory {
             .global_process_chains(context.global_process_chains.clone())
             .js_externals(context.js_externals.clone())
             .global_collection_manager(context.global_collection_manager.clone())
-            .trusted_upstreams(config.trusted_upstreams.clone());
+            .trusted_upstreams(config.trusted_upstreams.clone())
+            .timeouts(HttpServerTimeouts::from_config(config));
         let compression = ProcessChainHttpServerBuilder::build_compression_settings(config)?;
         builder = builder.compression(compression);
         if config.h3_port.is_some() {
@@ -4651,10 +5447,12 @@ mod tests {
         });
 
         let unreachable_v6: SocketAddr = "[2001:db8::1]:443".parse().unwrap();
-        let (stream, connected_addr) =
-            ProcessChainHttpServer::connect_upstream_candidates(vec![unreachable_v6, listen_addr])
-                .await
-                .unwrap();
+        let (stream, connected_addr) = ProcessChainHttpServer::connect_upstream_candidates(
+            vec![unreachable_v6, listen_addr],
+            Duration::from_millis(200),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(connected_addr, listen_addr);
         assert_eq!(stream.peer_addr().unwrap(), listen_addr);
@@ -4665,13 +5463,527 @@ mod tests {
         let unreachable_v6: SocketAddr = "[2001:db8::1]:443".parse().unwrap();
         let closed_v4: SocketAddr = "127.0.0.1:9".parse().unwrap();
 
-        let (_reason, msg) =
-            ProcessChainHttpServer::connect_upstream_candidates(vec![unreachable_v6, closed_v4])
-                .await
-                .unwrap_err();
+        let (_reason, msg, _timed_out) = ProcessChainHttpServer::connect_upstream_candidates(
+            vec![unreachable_v6, closed_v4],
+            Duration::from_millis(200),
+        )
+        .await
+        .unwrap_err();
 
         assert!(msg.contains("2001:db8::1"));
         assert!(msg.contains("127.0.0.1:9"));
+    }
+
+    fn timeout_config_from_yaml(yaml: &str) -> ProcessChainHttpServerConfig {
+        let yaml = format!(
+            r#"
+id: http_timeout_test
+type: http
+hook_point:
+  - id: main
+    priority: 1
+    blocks:
+      - id: main
+        block: |
+          return "error 200";
+{}
+"#,
+            yaml
+        );
+        serde_yaml_ng::from_str(&yaml).unwrap()
+    }
+
+    #[test]
+    fn test_http_server_timeout_config_defaults() {
+        let config = timeout_config_from_yaml("");
+        let timeouts = HttpServerTimeouts::from_config(&config);
+
+        assert_eq!(
+            timeouts.dns,
+            Duration::from_millis(DEFAULT_HTTP_DNS_TIMEOUT_MS)
+        );
+        // 800ms keeps the legacy hard-coded upstream connect budget.
+        assert_eq!(
+            timeouts.connect,
+            Duration::from_millis(DEFAULT_HTTP_CONNECT_TIMEOUT_MS)
+        );
+        assert_eq!(
+            timeouts.tls_handshake,
+            Duration::from_millis(DEFAULT_HTTP_TLS_HANDSHAKE_TIMEOUT_MS)
+        );
+        assert_eq!(
+            timeouts.http_handshake,
+            Duration::from_millis(DEFAULT_HTTP_HANDSHAKE_TIMEOUT_MS)
+        );
+        // Tunnel open defers to tunnel_mgr's own connect timeout by default.
+        assert_eq!(timeouts.tunnel_open, Duration::ZERO);
+        assert_eq!(
+            timeouts.response,
+            Duration::from_millis(DEFAULT_HTTP_RESPONSE_TIMEOUT_MS)
+        );
+        assert_eq!(
+            timeouts.request_body_idle,
+            Duration::from_millis(DEFAULT_HTTP_REQUEST_BODY_IDLE_TIMEOUT_MS)
+        );
+    }
+
+    #[test]
+    fn test_http_server_timeout_config_overrides() {
+        let yaml = r#"
+dns_timeout: 1500
+connect_timeout: 250ms
+tls_handshake_timeout: "2s"
+http_handshake_timeout: 3s
+tunnel_open_timeout: 4s
+response_timeout: 45000
+request_body_idle_timeout: 10s
+"#;
+        let config = timeout_config_from_yaml(yaml);
+        let timeouts = HttpServerTimeouts::from_config(&config);
+
+        assert_eq!(timeouts.dns, Duration::from_millis(1500));
+        assert_eq!(timeouts.connect, Duration::from_millis(250));
+        assert_eq!(timeouts.tls_handshake, Duration::from_secs(2));
+        assert_eq!(timeouts.http_handshake, Duration::from_secs(3));
+        assert_eq!(timeouts.tunnel_open, Duration::from_secs(4));
+        assert_eq!(timeouts.response, Duration::from_millis(45000));
+        assert_eq!(timeouts.request_body_idle, Duration::from_secs(10));
+    }
+
+    #[test]
+    fn test_http_server_timeout_config_zero_disables() {
+        let config = timeout_config_from_yaml("response_timeout: 0");
+        let timeouts = HttpServerTimeouts::from_config(&config);
+
+        assert_eq!(timeouts.response, Duration::ZERO);
+        assert_eq!(
+            timeouts.connect,
+            Duration::from_millis(DEFAULT_HTTP_CONNECT_TIMEOUT_MS)
+        );
+    }
+
+    #[test]
+    fn test_http_server_timeout_config_roundtrip_via_json() {
+        let config = timeout_config_from_yaml("response_timeout: 6s");
+        let encoded = config.get_config_json();
+        let decoded: ProcessChainHttpServerConfig = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded.response_timeout, Duration::from_secs(6));
+        // Fields left absent keep their built-in default across a round trip.
+        assert_eq!(
+            decoded.connect_timeout,
+            Duration::from_millis(DEFAULT_HTTP_CONNECT_TIMEOUT_MS)
+        );
+    }
+
+    /// TCP listener that accepts connections and never answers, used to make
+    /// the request / response budgets fire deterministically.
+    async fn spawn_silent_upstream() -> SocketAddr {
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                held.push(stream);
+            }
+        });
+        addr
+    }
+
+    async fn build_forward_server(
+        id: &str,
+        target: SocketAddr,
+        timeouts: HttpServerTimeouts,
+    ) -> ProcessChainHttpServer {
+        let mock_server_mgr = Arc::new(ServerManager::new());
+        let chains = format!(
+            r#"
+- id: main
+  priority: 1
+  blocks:
+    - id: main
+      block: |
+        return "forward http://{}/";
+"#,
+            target
+        );
+        let chains: ProcessChainConfigs = serde_yaml_ng::from_str(&chains).unwrap();
+
+        ProcessChainHttpServer::builder()
+            .id(id)
+            .version("HTTP/1.1".to_string())
+            .hook_point(chains)
+            .server_mgr(Arc::downgrade(&mock_server_mgr))
+            .tunnel_manager(TunnelManager::new())
+            .timeouts(timeouts)
+            .build()
+            .await
+            .unwrap()
+    }
+
+    fn simple_get_request(uri: &str) -> http::Request<BoxBody<Bytes, ServerError>> {
+        http::Request::builder()
+            .method("GET")
+            .uri(uri)
+            .body(Full::new(Bytes::new()).map_err(|e| match e {}).boxed())
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_forward_to_silent_upstream_hits_response_timeout() {
+        let silent = spawn_silent_upstream().await;
+        let server = build_forward_server(
+            "test_forward_response_timeout",
+            silent,
+            HttpServerTimeouts {
+                response: Duration::from_millis(200),
+                ..HttpServerTimeouts::default()
+            },
+        )
+        .await;
+
+        let started = std::time::Instant::now();
+        let err = server
+            .serve_request(simple_get_request("/slow"), StreamInfo::default())
+            .await
+            .expect_err("a silent upstream must not produce a response");
+        let elapsed = started.elapsed();
+
+        assert!(
+            err.msg().contains("response head timeout"),
+            "unexpected error: {}",
+            err.msg()
+        );
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "response timeout was not enforced, elapsed {:?}",
+            elapsed
+        );
+    }
+
+    #[tokio::test]
+    async fn test_response_deadline_starts_when_upload_finishes() {
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let service = hyper::service::service_fn(
+                |req: http::Request<hyper::body::Incoming>| async move {
+                    let _ = req.into_body().collect().await;
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                    Ok::<_, ServerError>(http::Response::new(
+                        Full::new(Bytes::from_static(b"late"))
+                            .map_err(|e| match e {})
+                            .boxed(),
+                    ))
+                },
+            );
+            let _ = hyper::server::conn::http1::Builder::new()
+                .serve_connection(TokioIo::new(stream), service)
+                .await;
+        });
+        let server = build_forward_server(
+            "test_upload_head_deadline",
+            addr,
+            HttpServerTimeouts {
+                response: Duration::from_millis(50),
+                request_body_idle: Duration::from_secs(2),
+                ..HttpServerTimeouts::default()
+            },
+        )
+        .await;
+        let body = TimedBody::new(
+            vec![Bytes::from_static(b"payload")],
+            Duration::from_millis(10),
+            false,
+        )
+        .boxed();
+        let request = http::Request::builder()
+            .method("POST")
+            .uri("/upload")
+            .body(body)
+            .unwrap();
+        let started = Instant::now();
+        let error = server
+            .serve_request(request, StreamInfo::default())
+            .await
+            .unwrap_err();
+        assert!(error.msg().contains("response head timeout"), "{error}");
+        assert!(started.elapsed() < Duration::from_millis(250));
+    }
+
+    #[tokio::test]
+    async fn test_tls_stage_timeout_retries_by_timeout_condition() {
+        use crate::forward::ForwardTarget;
+        use tokio::net::TcpListener;
+
+        let silent = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let silent_addr = silent.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = silent.accept().await {
+                held.push(stream);
+            }
+        });
+        let healthy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let healthy_addr = healthy.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = healthy.accept().await {
+                let service = hyper::service::service_fn(
+                    |_req: http::Request<hyper::body::Incoming>| async move {
+                        Ok::<_, ServerError>(http::Response::new(
+                            Full::new(Bytes::from_static(b"healthy"))
+                                .map_err(|e| match e {})
+                                .boxed(),
+                        ))
+                    },
+                );
+                tokio::spawn(async move {
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(TokioIo::new(stream), service)
+                        .await;
+                });
+            }
+        });
+        let server = build_forward_server(
+            "test_tls_timeout_retry",
+            healthy_addr,
+            HttpServerTimeouts {
+                tls_handshake: Duration::from_millis(50),
+                ..HttpServerTimeouts::default()
+            },
+        )
+        .await;
+
+        for status_retry in [false, true] {
+            let mut plan = ForwardPlan::single_url(format!("https://{silent_addr}/"));
+            plan.candidates
+                .push(ForwardTarget::new(format!("http://{healthy_addr}/")));
+            plan.next_upstream.conditions = vec![NextUpstreamCondition::Timeout];
+            plan.next_upstream.tries = 2;
+            if status_retry {
+                plan.next_upstream
+                    .conditions
+                    .push(NextUpstreamCondition::Http502);
+                plan.next_upstream.max_body_buffer_bytes = 1024;
+            }
+            let response = server
+                .handle_forward_group_upstream(
+                    simple_get_request("/retry"),
+                    &plan,
+                    &StreamInfo::default(),
+                )
+                .await
+                .expect("TLS timeout should select the healthy candidate");
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                response.into_body().collect().await.unwrap().to_bytes(),
+                Bytes::from_static(b"healthy")
+            );
+
+            let closed = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let closed_addr = closed.local_addr().unwrap();
+            drop(closed);
+            plan.candidates[0] = ForwardTarget::new(format!("http://{closed_addr}/"));
+            let error = server
+                .handle_forward_group_upstream(
+                    simple_get_request("/no-retry"),
+                    &plan,
+                    &StreamInfo::default(),
+                )
+                .await
+                .expect_err("a refused connection must not match timeout-only retry");
+            assert!(error.msg().contains("Failed to connect upstream"));
+        }
+    }
+
+    /// Test body that delivers one chunk per `gap` and then either ends or
+    /// stalls forever, so the body budgets can be checked against a client
+    /// whose size and speed are both unknown.
+    struct TimedBody {
+        chunks: std::collections::VecDeque<Bytes>,
+        gap: Duration,
+        sleep: Option<std::pin::Pin<Box<tokio::time::Sleep>>>,
+        stall_at_end: bool,
+    }
+
+    impl TimedBody {
+        fn new(chunks: Vec<Bytes>, gap: Duration, stall_at_end: bool) -> Self {
+            Self {
+                chunks: chunks.into_iter().collect(),
+                gap,
+                sleep: None,
+                stall_at_end,
+            }
+        }
+    }
+
+    impl hyper::body::Body for TimedBody {
+        type Data = Bytes;
+        type Error = ServerError;
+
+        fn poll_frame(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Result<hyper::body::Frame<Bytes>, Self::Error>>> {
+            let this = self.get_mut();
+            if let Some(sleep) = this.sleep.as_mut() {
+                match std::future::Future::poll(sleep.as_mut(), cx) {
+                    std::task::Poll::Ready(()) => this.sleep = None,
+                    std::task::Poll::Pending => return std::task::Poll::Pending,
+                }
+            }
+            if let Some(chunk) = this.chunks.pop_front() {
+                this.sleep = Some(Box::pin(tokio::time::sleep(this.gap)));
+                return std::task::Poll::Ready(Some(Ok(hyper::body::Frame::data(chunk))));
+            }
+            if this.stall_at_end {
+                // The client stopped sending: no further frame ever arrives.
+                return std::task::Poll::Pending;
+            }
+            std::task::Poll::Ready(None)
+        }
+    }
+
+    #[tokio::test]
+    async fn test_buffer_body_is_idle_bounded_not_total_bounded() {
+        let chunks: Vec<Bytes> = (0..4)
+            .map(|i| Bytes::from(format!("chunk-{}", i)))
+            .collect();
+        let body = TimedBody::new(chunks, Duration::from_millis(60), false).boxed();
+
+        let started = Instant::now();
+        let buffered = ProcessChainHttpServer::buffer_body(body, 1024, Duration::from_millis(100))
+            .await
+            .unwrap();
+        let elapsed = started.elapsed();
+
+        assert_eq!(buffered.unwrap().len(), 4 * 7);
+        assert!(
+            elapsed > Duration::from_millis(100),
+            "a slow upload must survive its total time exceeding the idle budget, elapsed {:?}",
+            elapsed
+        );
+    }
+
+    #[tokio::test]
+    async fn test_buffer_body_cuts_client_that_stops_sending() {
+        let body = TimedBody::new(
+            vec![Bytes::from_static(b"partial")],
+            Duration::from_millis(50),
+            true,
+        )
+        .boxed();
+
+        let started = Instant::now();
+        let err = ProcessChainHttpServer::buffer_body(body, 1024, Duration::from_millis(100))
+            .await
+            .unwrap_err();
+
+        assert!(
+            err.msg().contains("no data for 100ms"),
+            "unexpected error: {}",
+            err.msg()
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "an idle client must be cut promptly, elapsed {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_buffer_body_over_cap_is_reported_not_truncated() {
+        let body = TimedBody::new(
+            vec![Bytes::from_static(b"0123456789")],
+            Duration::from_millis(10),
+            false,
+        )
+        .boxed();
+
+        let buffered = ProcessChainHttpServer::buffer_body(body, 4, Duration::from_secs(1))
+            .await
+            .unwrap();
+
+        assert!(
+            buffered.is_none(),
+            "an over-cap body must be reported, never replayed truncated"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_slow_upload_is_not_charged_against_response_head_budget() {
+        use tokio::net::TcpListener;
+
+        // Upstream that waits for the whole body before answering, like a
+        // typical upload endpoint.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let service = hyper::service::service_fn(
+                    |req: http::Request<hyper::body::Incoming>| async move {
+                        let _ = req.into_body().collect().await;
+                        Ok::<_, ServerError>(
+                            http::Response::builder()
+                                .status(StatusCode::OK)
+                                .body(
+                                    Full::new(Bytes::from("uploaded"))
+                                        .map_err(|e| match e {})
+                                        .boxed(),
+                                )
+                                .unwrap(),
+                        )
+                    },
+                );
+                tokio::spawn(async move {
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(TokioIo::new(stream), service)
+                        .await;
+                });
+            }
+        });
+
+        let server = build_forward_server(
+            "test_slow_upload",
+            upstream_addr,
+            HttpServerTimeouts {
+                // Would fire at 120ms if the head budget were counted from the
+                // moment the request left the gateway.
+                response: Duration::from_millis(120),
+                request_body_idle: Duration::from_secs(5),
+                ..HttpServerTimeouts::default()
+            },
+        )
+        .await;
+
+        let chunks: Vec<Bytes> = (0..4).map(|i| Bytes::from(format!("part-{}", i))).collect();
+        let body = TimedBody::new(chunks, Duration::from_millis(60), false).boxed();
+        let request = http::Request::builder()
+            .method("POST")
+            .uri("/upload")
+            .body(body)
+            .unwrap();
+
+        let started = Instant::now();
+        let resp = server
+            .serve_request(request, StreamInfo::default())
+            .await
+            .expect("a slow but progressing upload must not be cut by the head budget");
+        let elapsed = started.elapsed();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(
+            elapsed > Duration::from_millis(200),
+            "the upload should have outlived the head budget, elapsed {:?}",
+            elapsed
+        );
     }
 
     #[tokio::test]
@@ -5028,6 +6340,13 @@ mod tests {
             brotli_types: Vec::new(),
             brotli_min_length: default_brotli_min_length(),
             brotli_comp_level: default_brotli_comp_level(),
+            dns_timeout: default_dns_timeout(),
+            connect_timeout: default_connect_timeout(),
+            tls_handshake_timeout: default_tls_handshake_timeout(),
+            http_handshake_timeout: default_http_handshake_timeout(),
+            tunnel_open_timeout: default_tunnel_open_timeout(),
+            response_timeout: default_response_timeout(),
+            request_body_idle_timeout: default_request_body_idle_timeout(),
         };
         let server_mgr = Arc::new(ServerManager::new());
         let context = HttpServerContext::new(

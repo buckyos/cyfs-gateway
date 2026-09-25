@@ -57,8 +57,9 @@ impl SocksDataTunnelProvider for SocksTunnelBuilder {
             TargetAddr::Domain(domain, _) => domain.clone(),
         };
 
+        let connect_timeout = self.tunnel_manager.connect_timeout();
         let target_stream = target_tunnel
-            .open_stream_by_dest(target_port, Some(target_host))
+            .open_stream_by_dest_with_timeout(target_port, Some(target_host), connect_timeout)
             .await
             .map_err(|e| {
                 let msg = format!("Open target stream failed: {}, {:?}", request_target, e);

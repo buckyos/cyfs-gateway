@@ -4966,26 +4966,54 @@ impl RTcpTunnel {
     async fn build_reconnect_stream(
         &self,
         stream_id: &str,
+        deadline: Option<tokio::time::Instant>,
     ) -> Result<(Box<dyn AsyncStream>, SocketAddr, SocketAddr), std::io::Error> {
         self.ensure_active()?;
         if let Some(bootstrap) = self.bootstrap.as_ref() {
-            let mut stream = bootstrap
-                .tunnel_manager
-                .open_stream_by_url(&bootstrap.url)
-                .await
-                .map_err(|e| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::ConnectionRefused,
-                        format!(
-                            "open bootstrap stream '{}' for rtcp reconnect failed: {}",
-                            bootstrap.url, e
-                        ),
-                    )
-                })?;
+            let opened = match deadline {
+                Some(deadline) => {
+                    bootstrap
+                        .tunnel_manager
+                        .open_stream_by_url_with_timeout(
+                            &bootstrap.url,
+                            deadline.saturating_duration_since(tokio::time::Instant::now()),
+                        )
+                        .await
+                }
+                None => {
+                    bootstrap
+                        .tunnel_manager
+                        .open_stream_by_url(&bootstrap.url)
+                        .await
+                }
+            };
+            let mut stream = opened.map_err(|e| {
+                let kind = if matches!(e, TunnelError::ConnectTimeout(_)) {
+                    ErrorKind::TimedOut
+                } else {
+                    ErrorKind::ConnectionRefused
+                };
+                std::io::Error::new(
+                    kind,
+                    format!(
+                        "open bootstrap stream '{}' for rtcp reconnect failed: {}",
+                        bootstrap.url, e
+                    ),
+                )
+            })?;
             self.ensure_active()?;
-            RTcpTunnelPackage::send_hello_stream(stream.as_mut(), stream_id)
-                .await
-                .map_err(|err| std::io::Error::new(ErrorKind::Other, err.to_string()))?;
+            let hello = RTcpTunnelPackage::send_hello_stream(stream.as_mut(), stream_id);
+            match deadline {
+                Some(deadline) => tokio::time::timeout_at(deadline, hello)
+                    .await
+                    .map_err(|_| {
+                        std::io::Error::new(ErrorKind::TimedOut, "RTCP hello stream timed out")
+                    })?
+                    .map_err(|err| std::io::Error::new(ErrorKind::Other, err.to_string()))?,
+                None => hello
+                    .await
+                    .map_err(|err| std::io::Error::new(ErrorKind::Other, err.to_string()))?,
+            };
             // No meaningful TCP peer/local addrs exist for a nested-transport
             // stream; upstream uses these only for logging and endpoint tags.
             let placeholder = SocketAddr::from(([0, 0, 0, 0], 0));
@@ -5228,7 +5256,7 @@ impl RTcpTunnel {
         // failure is reported back as ROpenResp(result=2) so the initiator
         // releases its wait-HelloStream slot immediately.
         let (rtcp_stream, remote_addr, local_addr) = match self
-            .build_reconnect_stream(&ropen_package.body.stream_id)
+            .build_reconnect_stream(&ropen_package.body.stream_id, None)
             .await
         {
             Ok(triple) => triple,
@@ -5609,7 +5637,11 @@ impl RTcpTunnel {
         purpose: Option<StreamPurpose>,
         dest_port: u16,
         dest_host: Option<String>,
+        connect_timeout: Duration,
     ) -> Result<Box<dyn AsyncStream>, std::io::Error> {
+        let deadline = tokio::time::Instant::now() + connect_timeout;
+        let timeout_error =
+            || std::io::Error::new(ErrorKind::TimedOut, "RTCP open stream timed out");
         self.ensure_accepts_new_streams()?;
         // Tunnels carried neither by a direct TCP socket nor by a bootstrap
         // transport cannot fulfil either the Open or ROpen path (both need a
@@ -5646,19 +5678,31 @@ impl RTcpTunnel {
             }
 
             // Send open to remote stack to build a direct stream
-            if let Err(e) = self
-                .post_open(seq, purpose, dest_port, dest_host, session_key.as_str())
-                .await
+            match tokio::time::timeout_at(
+                deadline,
+                self.post_open(seq, purpose, dest_port, dest_host, session_key.as_str()),
+            )
+            .await
             {
-                self.open_resp_waiters.lock().await.remove(&seq);
-                return Err(e);
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    self.open_resp_waiters.lock().await.remove(&seq);
+                    return Err(e);
+                }
+                Err(_) => {
+                    self.open_resp_waiters.lock().await.remove(&seq);
+                    // send_package uses write_all; cancellation may leave a
+                    // partial control frame, so this tunnel cannot be reused.
+                    self.mark_closed();
+                    return Err(timeout_error());
+                }
             }
 
             // Wait for OpenResp with the result code. Fail fast on a
             // non-zero code so we don't optimistically connect + send a
             // HelloStream that the peer has already refused (which would
             // show up on the peer as a "late or unknown HelloStream").
-            let wait_result = timeout(Duration::from_secs(60), rx).await;
+            let wait_result = tokio::time::timeout_at(deadline, rx).await;
             let result_code = match wait_result {
                 Ok(Ok(code)) => code,
                 Ok(Err(_)) => {
@@ -5675,7 +5719,7 @@ impl RTcpTunnel {
                         "Timeout: open stream {} was not found within the time limit.",
                         real_key.as_str()
                     );
-                    return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "Timeout"));
+                    return Err(timeout_error());
                 }
             };
 
@@ -5702,17 +5746,27 @@ impl RTcpTunnel {
             // Build a fresh stream leg to the remote RTCP listener. Direct
             // tunnels open TCP to peer_addr; bootstrap-backed tunnels replay
             // the nested transport via the tunnel framework.
-            let (stream, _remote_addr, _local_addr) = self
-                .build_reconnect_stream(session_key.as_str())
+            let reconnect = if self.bootstrap.is_some() {
+                // Let the nested manager own its connect timeout so it can
+                // record the failure before this attempt returns.
+                self.build_reconnect_stream(session_key.as_str(), Some(deadline))
+                    .await
+            } else {
+                tokio::time::timeout_at(
+                    deadline,
+                    self.build_reconnect_stream(session_key.as_str(), Some(deadline)),
+                )
                 .await
-                .map_err(|e| {
-                    error!(
-                        "RTcp tunnel open stream to {} error: {}",
-                        self.remote_stack.did.to_string(),
-                        e
-                    );
+                .map_err(|_| timeout_error())?
+            };
+            let (stream, _remote_addr, _local_addr) = reconnect.map_err(|e| {
+                error!(
+                    "RTcp tunnel open stream to {} error: {}",
+                    self.remote_stack.did.to_string(),
                     e
-                })?;
+                );
+                e
+            })?;
 
             // Direct-open path: this side opened the reconnect stream and sent
             // HelloStream, so it is the stream-layer initiator. The transport
@@ -5742,16 +5796,27 @@ impl RTcpTunnel {
             }
 
             //info!("insert session_key {} to wait ropen stream map",real_key.as_str());
-            if let Err(e) = self
-                .post_ropen(seq, purpose, dest_port, dest_host, session_key.as_str())
-                .await
+            match tokio::time::timeout_at(
+                deadline,
+                self.post_ropen(seq, purpose, dest_port, dest_host, session_key.as_str()),
+            )
+            .await
             {
-                // Send failed: no HelloStream will ever arrive for this key,
-                // so the waiting slot must be reclaimed now rather than
-                // relying on the 30s timeout path.
-                self.ropen_resp_waiters.lock().await.remove(&seq);
-                self.remove_wait_stream(&real_key).await;
-                return Err(e);
+                Ok(Ok(())) => {}
+                result => {
+                    // No completed open can use this waiter or HelloStream slot.
+                    self.ropen_resp_waiters.lock().await.remove(&seq);
+                    self.remove_wait_stream(&real_key).await;
+                    return Err(match result {
+                        Ok(Err(e)) => e,
+                        Err(_) => {
+                            // A cancelled write may have left a partial frame.
+                            self.mark_closed();
+                            timeout_error()
+                        }
+                        Ok(Ok(())) => unreachable!(),
+                    });
+                }
             }
 
             // Race the HelloStream wait against ROpenResp. Either:
@@ -5760,16 +5825,17 @@ impl RTcpTunnel {
             //    and keep waiting for HelloStream.
             //  - ROpenResp(non-zero) arrives -> peer rejected, abort now.
             // (wait_ropen_stream reclaims its own slot on timeout internally.)
-            let stream = tokio::select! {
+            let stream_result = tokio::time::timeout_at(deadline, async {
+                tokio::select! {
                 res = self.wait_ropen_stream(&session_key.as_str()) => {
                     self.ropen_resp_waiters.lock().await.remove(&seq);
-                    res?
+                    res
                 }
                 resp = resp_rx => {
                     match resp {
                         Ok(0) => {
                             // Accepted; HelloStream is en route.
-                            self.wait_ropen_stream(&session_key.as_str()).await?
+                            self.wait_ropen_stream(&session_key.as_str()).await
                         }
                         Ok(code) => {
                             warn!(
@@ -5805,6 +5871,17 @@ impl RTcpTunnel {
                         }
                     }
                 }
+                }
+            })
+            .await;
+            let stream = match stream_result {
+                Ok(Ok(stream)) => stream,
+                Ok(Err(e)) => return Err(e),
+                Err(_) => {
+                    self.ropen_resp_waiters.lock().await.remove(&seq);
+                    self.remove_wait_stream(&real_key).await;
+                    return Err(timeout_error());
+                }
             };
             self.ensure_active()?;
             // ROpen path: this side sent ROpen and the peer connected back
@@ -5836,16 +5913,26 @@ impl Tunnel for RTcpTunnel {
             })
     }
 
-    async fn open_stream_by_dest(
+    async fn open_stream_by_dest_with_timeout(
         &self,
         dest_port: u16,
         dest_host: Option<String>,
+        connect_timeout: Duration,
     ) -> Result<Box<dyn AsyncStream>, std::io::Error> {
-        self.request_open_stream(Some(StreamPurpose::Stream), dest_port, dest_host)
-            .await
+        self.request_open_stream(
+            Some(StreamPurpose::Stream),
+            dest_port,
+            dest_host,
+            connect_timeout,
+        )
+        .await
     }
 
-    async fn open_stream(&self, stream_id: &str) -> Result<Box<dyn AsyncStream>, std::io::Error> {
+    async fn open_stream_with_timeout(
+        &self,
+        stream_id: &str,
+        connect_timeout: Duration,
+    ) -> Result<Box<dyn AsyncStream>, std::io::Error> {
         //TODO: support stream_id is a tunnel url like rtcp://sn.buckyos.ai/google.com:443/
         let real_stream_id = percent_decode_str(stream_id.trim_start_matches('/')).decode_utf8();
         if real_stream_id.is_ok() {
@@ -5855,32 +5942,44 @@ impl Tunnel for RTcpTunnel {
                 if stream_url.is_ok() {
                     debug!("will request open stream by url: {}", real_stream_id);
                     return self
-                        .open_stream_by_dest(0, Some(real_stream_id.to_string()))
+                        .open_stream_by_dest_with_timeout(
+                            0,
+                            Some(real_stream_id.to_string()),
+                            connect_timeout,
+                        )
                         .await;
                 }
             }
         }
         debug!("will rquest open stream by dest: {}", stream_id);
         let (dest_host, dest_port) = get_dest_info_from_url_path(stream_id)?;
-        self.open_stream_by_dest(dest_port, dest_host).await
+        self.open_stream_by_dest_with_timeout(dest_port, dest_host, connect_timeout)
+            .await
     }
 
-    async fn create_datagram_client_by_dest(
+    async fn create_datagram_client_by_dest_with_timeout(
         &self,
         dest_port: u16,
         dest_host: Option<String>,
+        connect_timeout: Duration,
     ) -> Result<Box<dyn DatagramClientBox>, std::io::Error> {
         //todo 是否可以支持配置成udp session,而不是强制使用tcp stream
         let stream = self
-            .request_open_stream(Some(StreamPurpose::Datagram), dest_port, dest_host)
+            .request_open_stream(
+                Some(StreamPurpose::Datagram),
+                dest_port,
+                dest_host,
+                connect_timeout,
+            )
             .await?;
         let client = RTcpTunnelDatagramClient::new_with_limit(stream, self.max_datagram_bytes);
         Ok(Box::new(client) as Box<dyn DatagramClientBox>)
     }
 
-    async fn create_datagram_client(
+    async fn create_datagram_client_with_timeout(
         &self,
         session_id: &str,
+        connect_timeout: Duration,
     ) -> Result<Box<dyn DatagramClientBox>, std::io::Error> {
         let real_stream_id = percent_decode_str(session_id.trim_start_matches('/')).decode_utf8();
         if real_stream_id.is_ok() {
@@ -5890,13 +5989,17 @@ impl Tunnel for RTcpTunnel {
                 if stream_url.is_ok() {
                     debug!("will request open stream by url: {}", real_stream_id);
                     return self
-                        .create_datagram_client_by_dest(0, Some(real_stream_id.to_string()))
+                        .create_datagram_client_by_dest_with_timeout(
+                            0,
+                            Some(real_stream_id.to_string()),
+                            connect_timeout,
+                        )
                         .await;
                 }
             }
         }
         let (dest_host, dest_port) = get_dest_info_from_url_path(session_id)?;
-        self.create_datagram_client_by_dest(dest_port, dest_host)
+        self.create_datagram_client_by_dest_with_timeout(dest_port, dest_host, connect_timeout)
             .await
     }
 }
@@ -7408,6 +7511,42 @@ mod tests {
 
     fn test_tunnel(seed: u8) -> (RTcpTunnel, tokio::io::DuplexStream) {
         test_tunnel_with_limits(seed, &RtcpLimitsConfig::default())
+    }
+
+    #[tokio::test]
+    async fn open_stream_budget_expires_without_open_response_and_cleans_waiter() {
+        let (mut tunnel, _peer) = test_tunnel(124);
+        tunnel.can_direct = true;
+        tunnel.peer_addr = Some(Arc::new(std::sync::Mutex::new(
+            "127.0.0.1:9".parse().unwrap(),
+        )));
+
+        let started = Instant::now();
+        let error = tunnel
+            .open_stream_by_dest_with_timeout(443, None, Duration::from_millis(50))
+            .await
+            .err()
+            .expect("silent peer must not open a stream");
+        assert_eq!(error.kind(), ErrorKind::TimedOut);
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(tunnel.open_resp_waiters.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn datagram_budget_expires_without_ropen_response_and_cleans_slot() {
+        let (mut tunnel, _peer) = test_tunnel(125);
+        tunnel.peer_addr = Some(Arc::new(std::sync::Mutex::new(
+            "127.0.0.1:9".parse().unwrap(),
+        )));
+
+        let error = tunnel
+            .create_datagram_client_by_dest_with_timeout(53, None, Duration::from_millis(50))
+            .await
+            .err()
+            .expect("silent peer must not open a datagram stream");
+        assert_eq!(error.kind(), ErrorKind::TimedOut);
+        assert!(tunnel.ropen_resp_waiters.lock().await.is_empty());
+        assert!(tunnel.pending_wait_stream_keys.lock().await.is_empty());
     }
 
     fn test_tunnel_with_limits(
@@ -9236,13 +9375,13 @@ mod tests {
         let ping_err = first.ping().await.unwrap_err();
         assert_eq!(ping_err.kind(), std::io::ErrorKind::BrokenPipe);
         let open_err = first
-            .open_stream("closed-tunnel.test:80")
+            .open_stream_with_timeout("closed-tunnel.test:80", Duration::from_secs(60))
             .await
             .err()
             .expect("open on a closed tunnel must fail");
         assert_eq!(open_err.kind(), std::io::ErrorKind::BrokenPipe);
         let datagram_err = first
-            .create_datagram_client("closed-tunnel.test:80")
+            .create_datagram_client_with_timeout("closed-tunnel.test:80", Duration::from_secs(60))
             .await
             .err()
             .expect("datagram creation on a closed tunnel must fail");
@@ -9794,7 +9933,11 @@ mod tests {
             &this_dev_did,
         )
         .unwrap_err();
-        assert!(err.contains("DID URL/path forms"), "unexpected error: {}", err);
+        assert!(
+            err.contains("DID URL/path forms"),
+            "unexpected error: {}",
+            err
+        );
 
         let err = RTcpInner::validate_hello_target(
             "other.test.did",
@@ -10553,7 +10696,8 @@ mod tests {
 
         let mut stream = tokio::time::timeout(
             Duration::from_secs(5),
-            client_one_tunnel.open_stream("handshake-lifetime.test:80"),
+            client_one_tunnel
+                .open_stream_with_timeout("handshake-lifetime.test:80", Duration::from_secs(60)),
         )
         .await
         .expect("open_stream timed out after handshake deadline")
@@ -10743,7 +10887,8 @@ mod tests {
             .expect("first accepted tunnel must remain usable");
         let mut stream = tokio::time::timeout(
             Duration::from_secs(5),
-            client_one_tunnel.open_stream("first-winner-echo.test:80"),
+            client_one_tunnel
+                .open_stream_with_timeout("first-winner-echo.test:80", Duration::from_secs(60)),
         )
         .await
         .expect("first tunnel open timed out")
@@ -11076,10 +11221,11 @@ mod tests {
             Ok(())
         }
 
-        async fn open_stream_by_dest(
+        async fn open_stream_by_dest_with_timeout(
             &self,
             _dest_port: u16,
             _dest_host: Option<String>,
+            _connect_timeout: Duration,
         ) -> Result<Box<dyn AsyncStream>, std::io::Error> {
             self.open_count.fetch_add(1, Ordering::SeqCst);
             Err(std::io::Error::new(
@@ -11088,9 +11234,10 @@ mod tests {
             ))
         }
 
-        async fn open_stream(
+        async fn open_stream_with_timeout(
             &self,
             _stream_id: &str,
+            _connect_timeout: Duration,
         ) -> Result<Box<dyn AsyncStream>, std::io::Error> {
             self.open_count.fetch_add(1, Ordering::SeqCst);
             Err(std::io::Error::new(
@@ -11099,10 +11246,11 @@ mod tests {
             ))
         }
 
-        async fn create_datagram_client_by_dest(
+        async fn create_datagram_client_by_dest_with_timeout(
             &self,
             _dest_port: u16,
             _dest_host: Option<String>,
+            _connect_timeout: Duration,
         ) -> Result<Box<dyn DatagramClientBox>, std::io::Error> {
             Err(std::io::Error::new(
                 std::io::ErrorKind::Unsupported,
@@ -11110,9 +11258,10 @@ mod tests {
             ))
         }
 
-        async fn create_datagram_client(
+        async fn create_datagram_client_with_timeout(
             &self,
             _session_id: &str,
+            _connect_timeout: Duration,
         ) -> Result<Box<dyn DatagramClientBox>, std::io::Error> {
             Err(std::io::Error::new(
                 std::io::ErrorKind::Unsupported,
@@ -12294,7 +12443,10 @@ mod tests {
                 .create_tunnel(Some(format!("{}:{port2}", id2.to_host_name()).as_str()))
                 .await
                 .unwrap();
-            let mut stream = tunnel.open_stream("www.baidu.com:80").await.unwrap();
+            let mut stream = tunnel
+                .open_stream_with_timeout("www.baidu.com:80", Duration::from_secs(60))
+                .await
+                .unwrap();
             stream.write_all(b"test").await.unwrap();
             let mut buf = [0u8; 1024];
             let ret = stream.read(&mut buf).await;
@@ -12309,7 +12461,10 @@ mod tests {
                 .create_tunnel(Some(format!("{}:{port1}", id1.to_host_name()).as_str()))
                 .await
                 .unwrap();
-            let mut stream = tunnel.open_stream("www.baidu.com:80").await.unwrap();
+            let mut stream = tunnel
+                .open_stream_with_timeout("www.baidu.com:80", Duration::from_secs(60))
+                .await
+                .unwrap();
             stream.write_all(b"test").await.unwrap();
             let mut buf = [0u8; 1024];
             let ret = stream.read(&mut buf).await;
@@ -12577,7 +12732,11 @@ mod tests {
     ) -> Box<dyn AsyncStream> {
         let open_attempts = open_attempts.max(1);
         for attempt in 1..=open_attempts {
-            match tokio::time::timeout(Duration::from_secs(30), tunnel.open_stream(stream_id)).await
+            match tokio::time::timeout(
+                Duration::from_secs(30),
+                tunnel.open_stream_with_timeout(stream_id, Duration::from_secs(60)),
+            )
+            .await
             {
                 Ok(Ok(stream)) => return stream,
                 Ok(Err(e)) => {
@@ -12823,7 +12982,7 @@ mod tests {
                 .await
                 .unwrap();
             let stream = tunnel
-                .create_datagram_client("www.baidu.com:80")
+                .create_datagram_client_with_timeout("www.baidu.com:80", Duration::from_secs(60))
                 .await
                 .unwrap();
             stream.send_datagram(b"test").await.unwrap();
@@ -12843,7 +13002,7 @@ mod tests {
                 .await
                 .unwrap();
             let stream = tunnel
-                .create_datagram_client("www.baidu.com:80")
+                .create_datagram_client_with_timeout("www.baidu.com:80", Duration::from_secs(60))
                 .await
                 .unwrap();
             stream.send_datagram(b"test").await.unwrap();

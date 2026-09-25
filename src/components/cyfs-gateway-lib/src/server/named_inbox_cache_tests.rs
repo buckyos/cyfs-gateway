@@ -474,6 +474,11 @@ async fn named_inbox_full_cache_still_allows_synchronous_acceptance() {
     let upstream = Upstream::new(0).await;
     cfg.upstream = Some(upstream.url.clone());
     cfg.drain_enabled = Some(false);
+    // The shared test config uses an 80ms upstream timeout to exercise the
+    // timeout path in named_inbox_fallback_write_failure_preserves_unknown_outcome.
+    // Here the local mock must answer within the window even under CI load,
+    // otherwise the full cache turns a timed-out-but-sent delivery into 504.
+    cfg.upstream_timeout = "2s".into();
     let server = NamedInboxCacheServer::new(cfg).await.unwrap();
     assert_status(
         &call(&server, br#"{"n":1}"#, "/second").await,

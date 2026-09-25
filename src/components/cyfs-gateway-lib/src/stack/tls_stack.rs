@@ -11,6 +11,7 @@ use crate::stack::{
     StackManagerWeakRef, StackStreamContext, StreamStack, TlsCertResolver, get_limit_info,
     get_source_addr_from_req_env, parse_proxy_protocol_trusted_upstreams,
     probe_proxy_protocol_stream_from_trusted_upstream, stream_forward, stream_forward_group,
+    stream_idle_timeout_from_secs,
 };
 use crate::{
     ConnectionInfo, ConnectionManagerRef, DumpStream, GlobalCollectionManagerRef,
@@ -135,6 +136,7 @@ struct TlsConnectionHandler {
     server_config: Arc<ServerConfig>,
     io_dump: Option<IoDumpStackConfig>,
     trusted_upstreams: Vec<TrustedUpstreamMatcher>,
+    stream_idle_timeout: std::time::Duration,
 }
 
 impl TlsConnectionHandler {
@@ -148,6 +150,7 @@ impl TlsConnectionHandler {
         connection_manager: Option<ConnectionManagerRef>,
         io_dump: Option<IoDumpStackConfig>,
         trusted_upstreams: Vec<String>,
+        stream_idle_timeout: std::time::Duration,
     ) -> StackResult<Self> {
         let (executor, _) = create_process_chain_executor(
             &hook_point,
@@ -170,6 +173,7 @@ impl TlsConnectionHandler {
             server_config,
             io_dump,
             trusted_upstreams: parse_proxy_protocol_trusted_upstreams(&trusted_upstreams)?,
+            stream_idle_timeout,
         })
     }
 
@@ -193,6 +197,7 @@ impl TlsConnectionHandler {
             server_config: self.server_config.clone(),
             io_dump: self.io_dump.clone(),
             trusted_upstreams: self.trusted_upstreams.clone(),
+            stream_idle_timeout: self.stream_idle_timeout,
         })
     }
 
@@ -467,6 +472,8 @@ impl TlsConnectionHandler {
                                 target,
                                 &self.env.tunnel_manager,
                                 Some(&stream_info),
+                                self.stream_idle_timeout,
+                                self.env.tunnel_manager.connect_timeout(),
                             )
                             .await?;
                         }
@@ -498,6 +505,8 @@ impl TlsConnectionHandler {
                                 &plan,
                                 &self.env.tunnel_manager,
                                 Some(&stream_info),
+                                self.stream_idle_timeout,
+                                self.env.tunnel_manager.connect_timeout(),
                             )
                             .await?;
                         }
@@ -646,6 +655,7 @@ impl TlsStack {
             config.connection_manager.clone(),
             config.io_dump,
             config.trusted_upstreams,
+            config.stream_idle_timeout,
         )
         .await?;
 
@@ -857,6 +867,7 @@ impl Stack for TlsStack {
             .await
             .map_err(|e| stack_err!(StackErrorCode::InvalidConfig, "{e}"))?,
             config.trusted_upstreams.clone(),
+            stream_idle_timeout_from_secs(config.stream_idle_timeout),
         )
         .await?;
 
@@ -989,6 +1000,8 @@ pub struct TlsStackConfig {
     pub reuse_address: Option<bool>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub trusted_upstreams: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stream_idle_timeout: Option<u64>,
 }
 
 async fn build_tls_domain_configs(config: &TlsStackConfig) -> StackResult<Vec<TlsDomainConfig>> {
@@ -1172,6 +1185,7 @@ impl crate::StackFactory for TlsStackFactory {
             )
             .reuse_address(config.reuse_address.unwrap_or(false))
             .trusted_upstreams(config.trusted_upstreams.clone())
+            .stream_idle_timeout(stream_idle_timeout_from_secs(config.stream_idle_timeout))
             .stack_context(stack_context)
             .io_dump(io_dump)
             .build()
@@ -1193,6 +1207,7 @@ pub struct TlsStackBuilder {
     io_dump: Option<IoDumpStackConfig>,
     reuse_address: bool,
     trusted_upstreams: Vec<String>,
+    stream_idle_timeout: std::time::Duration,
 }
 
 impl TlsStackBuilder {
@@ -1210,6 +1225,7 @@ impl TlsStackBuilder {
             io_dump: None,
             reuse_address: false,
             trusted_upstreams: Vec::new(),
+            stream_idle_timeout: stream_idle_timeout_from_secs(None),
         }
     }
 
@@ -1277,6 +1293,11 @@ impl TlsStackBuilder {
         self
     }
 
+    pub fn stream_idle_timeout(mut self, stream_idle_timeout: std::time::Duration) -> Self {
+        self.stream_idle_timeout = stream_idle_timeout;
+        self
+    }
+
     pub async fn build(self) -> StackResult<TlsStack> {
         let stack = TlsStack::create(self).await?;
         Ok(stack)
@@ -1289,6 +1310,7 @@ mod tests {
     use super::{
         TlsConnectionHandler, TlsHostConfig, TlsIdentityManagerConfig, build_identity_cert_config,
         build_tls_domain_configs, build_tls_identity_cert_config, load_certs, load_key,
+        stream_idle_timeout_from_secs,
     };
     use crate::global_process_chains::GlobalProcessChains;
     use crate::self_cert_mgr::{SelfCertConfig, SelfCertMgr, SelfCertMgrRef};
@@ -2021,6 +2043,7 @@ mod tests {
             None,
             None,
             Vec::new(),
+            stream_idle_timeout_from_secs(None),
         )
         .await
         .unwrap();
@@ -3007,6 +3030,7 @@ mod tests {
             io_dump_max_download_bytes_per_conn: None,
             reuse_address: None,
             trusted_upstreams: Vec::new(),
+            stream_idle_timeout: None,
         };
         let stack_context: Arc<dyn StackContext> = Arc::new(TlsStackContext::new(
             server_manager,

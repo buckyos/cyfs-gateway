@@ -12,6 +12,7 @@ use hyper_util::rt::{TokioExecutor, TokioIo};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::TcpListener;
+use tokio::sync::oneshot;
 
 const PROCESS_CHAIN: &str = r#"
 <root>
@@ -167,7 +168,7 @@ async fn handle(
     process_request(req).await
 }
 
-async fn server_main() {
+async fn server_main(addr_tx: oneshot::Sender<SocketAddr>) {
     let hook_manager = HttpHookManager::create(PROCESS_CHAIN).await.unwrap();
     let hook_manager = Arc::new(hook_manager);
 
@@ -177,10 +178,21 @@ async fn server_main() {
         .await
         .unwrap();
 
-    let addr: SocketAddr = ([127, 0, 0, 1], 3000).into();
-
-    let listener = TcpListener::bind(&addr).await.unwrap();
+    // Bind to an ephemeral port so the test never clashes with another
+    // listener (e.g. a Windows-side process surfaced into WSL via localhost
+    // forwarding, or a parallel test run).
+    let bind_addr: SocketAddr = ([127, 0, 0, 1], 0).into();
+    let listener = TcpListener::bind(&bind_addr).await.unwrap();
+    let addr = listener.local_addr().unwrap();
     log::info!("Listening on http://{}", addr);
+
+    // Report the actual port to the test. If the receiver is already gone the
+    // test has finished/aborted, so stop the server.
+    if addr_tx.send(addr).is_err() {
+        log::info!("Test no longer waiting for the server address, shutting down");
+        return;
+    }
+
     loop {
         let (stream, _) = listener.accept().await.unwrap();
         let io = TokioIo::new(stream);
@@ -199,12 +211,12 @@ async fn server_main() {
     }
 }
 
-async fn client_main() {
+async fn client_main(addr: SocketAddr) {
     let client: Client<_, Full<Bytes>> = Client::builder(TokioExecutor::new()).build_http();
     let req = Request::builder()
         .method(Method::GET)
         .header("content-type", "text/html")
-        .uri("http://127.0.0.1:3000/index.html")
+        .uri(format!("http://{}/index.html", addr))
         .body(Full::new(Bytes::new()))
         .unwrap();
 
@@ -230,12 +242,14 @@ async fn test_main() {
         let _ = SimpleLogger::init(LevelFilter::Info, Config::default());
     });
 
-    tokio::spawn(async {
-        server_main().await;
+    let (addr_tx, addr_rx) = oneshot::channel();
+    tokio::spawn(async move {
+        server_main(addr_tx).await;
     });
 
-    // Give the server a moment to start
-    tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+    // Wait until the server has actually bound its port. This also propagates a
+    // startup failure (e.g. a bind error) instead of hanging forever.
+    let addr = addr_rx.await.expect("http test server failed to start");
 
-    client_main().await;
+    client_main(addr).await;
 }

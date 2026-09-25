@@ -2,6 +2,7 @@ use super::{
     Stack, StackManagerWeakRef, StackStreamContext, StreamStack, get_limit_info,
     get_source_addr_from_req_env, parse_proxy_protocol_trusted_upstreams,
     probe_proxy_protocol_stream_from_trusted_upstream, stream_forward, stream_forward_group,
+    stream_idle_timeout_from_secs,
 };
 use crate::forward::ForwardPlan;
 
@@ -86,6 +87,7 @@ struct TcpConnectionHandler {
     connection_manager: Option<ConnectionManagerRef>,
     io_dump: Option<IoDumpStackConfig>,
     trusted_upstreams: Vec<TrustedUpstreamMatcher>,
+    stream_idle_timeout: std::time::Duration,
 }
 
 impl TcpConnectionHandler {
@@ -96,6 +98,7 @@ impl TcpConnectionHandler {
         connection_manager: Option<ConnectionManagerRef>,
         io_dump: Option<IoDumpStackConfig>,
         trusted_upstreams: Vec<String>,
+        stream_idle_timeout: std::time::Duration,
     ) -> StackResult<Self> {
         let (executor, _) = create_process_chain_executor(
             &hook_point,
@@ -113,6 +116,7 @@ impl TcpConnectionHandler {
             connection_manager,
             io_dump,
             trusted_upstreams: parse_proxy_protocol_trusted_upstreams(&trusted_upstreams)?,
+            stream_idle_timeout,
         })
     }
 
@@ -137,6 +141,7 @@ impl TcpConnectionHandler {
             connection_manager: self.connection_manager.clone(),
             io_dump,
             trusted_upstreams: self.trusted_upstreams.clone(),
+            stream_idle_timeout: self.stream_idle_timeout,
         })
     }
 
@@ -316,6 +321,8 @@ impl TcpConnectionHandler {
                                 target,
                                 &self.env.tunnel_manager,
                                 Some(&stream_info),
+                                self.stream_idle_timeout,
+                                self.env.tunnel_manager.connect_timeout(),
                             )
                             .await?;
                         }
@@ -347,6 +354,8 @@ impl TcpConnectionHandler {
                                 &plan,
                                 &self.env.tunnel_manager,
                                 Some(&stream_info),
+                                self.stream_idle_timeout,
+                                self.env.tunnel_manager.connect_timeout(),
                             )
                             .await?;
                         }
@@ -486,6 +495,7 @@ impl TcpStack {
             io_dump: None,
             reuse_address: false,
             trusted_upstreams: Vec::new(),
+            stream_idle_timeout: stream_idle_timeout_from_secs(None),
         }
     }
 
@@ -522,6 +532,7 @@ impl TcpStack {
             config.connection_manager.clone(),
             config.io_dump,
             config.trusted_upstreams,
+            config.stream_idle_timeout,
         )
         .await?;
 
@@ -767,6 +778,7 @@ impl Stack for TcpStack {
             self.connection_manager.clone(),
             io_dump,
             config.trusted_upstreams.clone(),
+            stream_idle_timeout_from_secs(config.stream_idle_timeout),
         )
         .await?;
 
@@ -811,6 +823,7 @@ pub struct TcpStackBuilder {
     io_dump: Option<IoDumpStackConfig>,
     reuse_address: bool,
     trusted_upstreams: Vec<String>,
+    stream_idle_timeout: std::time::Duration,
 }
 
 impl TcpStackBuilder {
@@ -846,6 +859,11 @@ impl TcpStackBuilder {
 
     pub fn trusted_upstreams(mut self, trusted_upstreams: Vec<String>) -> Self {
         self.trusted_upstreams = trusted_upstreams;
+        self
+    }
+
+    pub fn stream_idle_timeout(mut self, stream_idle_timeout: std::time::Duration) -> Self {
+        self.stream_idle_timeout = stream_idle_timeout;
         self
     }
 
@@ -885,6 +903,8 @@ pub struct TcpStackConfig {
     pub reuse_address: Option<bool>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub trusted_upstreams: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stream_idle_timeout: Option<u64>,
     pub hook_point: Vec<ProcessChainConfig>,
 }
 
@@ -953,6 +973,7 @@ impl StackFactory for TcpStackFactory {
             .transparent(config.transparent.unwrap_or(false))
             .reuse_address(config.reuse_address.unwrap_or(false))
             .trusted_upstreams(config.trusted_upstreams.clone())
+            .stream_idle_timeout(stream_idle_timeout_from_secs(config.stream_idle_timeout))
             .hook_point(config.hook_point.clone())
             .stack_context(handler_env)
             .io_dump(io_dump)
@@ -1146,9 +1167,13 @@ mod tests {
             StatManager::new(),
             Some(Arc::new(GlobalProcessChains::new())),
         );
+        let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = probe.local_addr().unwrap();
+        drop(probe);
+
         let result = TcpStack::builder()
             .id("test")
-            .bind("127.0.0.1:8081")
+            .bind(addr.to_string().as_str())
             .hook_point(chains)
             .stack_context(handler_env)
             .build()
@@ -1158,7 +1183,7 @@ mod tests {
         let result = stack.start().await;
         assert!(result.is_ok());
 
-        let mut stream = TcpStream::connect("127.0.0.1:8081").await.unwrap();
+        let mut stream = TcpStream::connect(addr).await.unwrap();
         let result = stream
             .write_all(b"GET / HTTP/1.1\r\nHost: httpbin.org\r\n\r\n")
             .await;
@@ -2222,6 +2247,7 @@ mod tests {
             io_dump_max_download_bytes_per_conn: None,
             reuse_address: None,
             trusted_upstreams: Vec::new(),
+            stream_idle_timeout: None,
             hook_point: vec![],
         };
 
