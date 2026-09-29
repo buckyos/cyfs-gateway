@@ -6,7 +6,7 @@
 ## 校验范围
 
 - 源码仓库：`cyfs-gateway`
-- 校验日期：2026-07-20
+- 校验日期：2026-07-20；traffic 模块移除于 2026-09-29 复核
 - 校验基线：Gateway 公共宿主与静态模块化改造后的工作区
 
 ## 已校验的当前实现事实
@@ -45,7 +45,9 @@
 每个 registration 同时包含 config parser、runtime factory 和 context builder；`dir` 与
 `sn` 显式标记为 contextless。`cyfs_gateway` 和 `web3_gateway` 当前都显式安装
 `CoreGatewayModule`、`DnsGatewayModule`、`SocksGatewayModule`、`TunGatewayModule`、
-`SnGatewayModule`、`TrafficGatewayModule`，因此 manifest 具有相同的 9 项 Server 能力。
+`SnClientGatewayModule`、`SnGatewayModule`，因此 manifest 具有相同的 9 项 Server 能力。
+
+当前两个应用均未安装 traffic adapter；若配置包含 `traffic` 段，解析时会提示缺少对应模块。
 
 结论：skill 可以把这 9 个 server 类型列为两个当前应用编译安装的能力；没有安装相应
 模块的其它应用会在 parse 阶段拒绝该类型，并列出已安装能力。

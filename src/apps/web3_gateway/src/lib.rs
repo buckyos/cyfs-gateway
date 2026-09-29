@@ -13,7 +13,6 @@ pub fn build_gateway_composition() -> anyhow::Result<GatewayComposition> {
     builder.install(TunGatewayModule::new())?;
     builder.install(SnClientGatewayModule::new())?;
     builder.install(SnGatewayModule::new())?;
-    builder.install(TrafficGatewayModule::new())?;
     builder.build()
 }
 

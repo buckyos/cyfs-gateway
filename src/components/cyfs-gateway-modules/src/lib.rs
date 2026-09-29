@@ -10,21 +10,14 @@ use cyfs_dns::{
 use cyfs_gateway_app_lib::{
     hook_point_value_map_to_vector, GatewayCompositionBuilder, GatewayModule,
     GatewayServerContextMode, GatewayServerRegistration, GatewayServerRuntime,
-    GatewayStackRegistration, GatewayStackRuntime, GatewayTrafficAdapter, GatewayTrafficConfig,
-    GatewayTrafficConfigRef, GatewayTrafficService, GatewayTrafficStatFactory,
-    GatewayTrafficStatFactoryRef, ServerConfigParser, StackConfigParser,
+    GatewayStackRegistration, GatewayStackRuntime, ServerConfigParser, StackConfigParser,
 };
 use cyfs_gateway_lib::{
-    config_err, server_err, ConfigErrorCode, ConfigResult, LimiterManager, LimiterManagerRef,
-    ServerConfig, ServerContextRef, ServerErrorCode, StackConfig, StackContext, StackFactory,
-    StatFactoryRef, StatManagerRef,
+    config_err, server_err, ConfigErrorCode, ConfigResult, ServerConfig, ServerContextRef,
+    ServerErrorCode, StackConfig, StackContext, StackFactory,
 };
 use cyfs_sn::{SNServerConfig, SnServerFactory};
 use cyfs_socks::{SocksServerConfig, SocksServerContext, SocksServerFactory, SocksTunnelBuilder};
-use cyfs_traffic::{
-    TrafficConfig, TrafficQuotaService, TrafficServiceHandle, TrafficStatFactory,
-    TrafficStatFactoryRef, TrafficUserLimiterFactory,
-};
 use cyfs_tun::{TunStackConfig, TunStackContext, TunStackFactory};
 use serde::Deserialize;
 
@@ -419,161 +412,6 @@ impl GatewayModule for SnGatewayModule {
     }
 }
 
-/// Traffic remains a separate explicit capability even though its host lifecycle is shared.
-pub struct TrafficGatewayModule;
-
-impl TrafficGatewayModule {
-    pub fn new() -> Self {
-        Self
-    }
-}
-
-impl Default for TrafficGatewayModule {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl GatewayModule for TrafficGatewayModule {
-    fn id(&self) -> &'static str {
-        "traffic"
-    }
-
-    fn install(&self, builder: &mut GatewayCompositionBuilder) -> Result<()> {
-        builder.register_traffic_adapter(Arc::new(TrafficAdapter))?;
-        Ok(())
-    }
-}
-
-struct TrafficConfigAdapter(TrafficConfig);
-
-impl GatewayTrafficConfig for TrafficConfigAdapter {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
-    fn enabled(&self) -> bool {
-        self.0.enabled
-    }
-}
-
-struct TrafficStatFactoryAdapter(TrafficStatFactoryRef);
-
-impl GatewayTrafficStatFactory for TrafficStatFactoryAdapter {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
-    fn as_stat_factory(&self) -> StatFactoryRef {
-        self.0.clone()
-    }
-}
-
-struct TrafficServiceAdapter(TrafficServiceHandle);
-
-#[async_trait::async_trait]
-impl GatewayTrafficService for TrafficServiceAdapter {
-    async fn stop(self: Box<Self>) {
-        self.0.stop().await;
-    }
-
-    fn shutdown_now(self: Box<Self>) {
-        self.0.shutdown_now();
-    }
-}
-
-struct TrafficAdapter;
-
-impl TrafficAdapter {
-    fn config(config: &GatewayTrafficConfigRef) -> Result<&TrafficConfig> {
-        config
-            .as_any()
-            .downcast_ref::<TrafficConfigAdapter>()
-            .map(|config| &config.0)
-            .ok_or_else(|| anyhow::anyhow!("traffic module received an incompatible config"))
-    }
-
-    fn stat_factory(stat_factory: &GatewayTrafficStatFactoryRef) -> Result<&TrafficStatFactoryRef> {
-        stat_factory
-            .as_any()
-            .downcast_ref::<TrafficStatFactoryAdapter>()
-            .map(|adapter| &adapter.0)
-            .ok_or_else(|| anyhow::anyhow!("traffic module received an incompatible stat factory"))
-    }
-}
-
-#[async_trait::async_trait]
-impl GatewayTrafficAdapter for TrafficAdapter {
-    fn parse_config(
-        &self,
-        value: Option<&serde_json::Value>,
-    ) -> ConfigResult<GatewayTrafficConfigRef> {
-        let config = value
-            .map(|value| {
-                serde_json::from_value::<TrafficConfig>(value.clone()).map_err(|e| {
-                    config_err!(
-                        ConfigErrorCode::InvalidConfig,
-                        "invalid traffic config: {}\n{}",
-                        e,
-                        serde_json::to_string_pretty(value).unwrap_or_default()
-                    )
-                })
-            })
-            .transpose()?
-            .unwrap_or_default();
-        Ok(Arc::new(TrafficConfigAdapter(config)))
-    }
-
-    fn create_stat_factory(
-        &self,
-        config: &GatewayTrafficConfigRef,
-    ) -> Result<GatewayTrafficStatFactoryRef> {
-        let config = Self::config(config)?;
-        Ok(Arc::new(TrafficStatFactoryAdapter(
-            TrafficStatFactory::new(config.stat_prefix.clone()),
-        )))
-    }
-
-    fn configure_limiter_factory(
-        &self,
-        config: &GatewayTrafficConfigRef,
-        stat_factory: &GatewayTrafficStatFactoryRef,
-        limiter_manager: &mut dyn LimiterManager,
-    ) -> Result<()> {
-        let config = Self::config(config)?;
-        if config.enabled {
-            limiter_manager.set_limiter_factory(Some(Arc::new(
-                TrafficUserLimiterFactory::new_http(
-                    config.clone(),
-                    Self::stat_factory(stat_factory)?.clone(),
-                )?,
-            )));
-        } else {
-            limiter_manager.set_limiter_factory(None);
-        }
-        Ok(())
-    }
-
-    async fn start_service(
-        &self,
-        config: &GatewayTrafficConfigRef,
-        stat_manager: StatManagerRef,
-        stat_factory: &GatewayTrafficStatFactoryRef,
-        limiter_manager: LimiterManagerRef,
-    ) -> Result<Option<Box<dyn GatewayTrafficService>>> {
-        let service = TrafficQuotaService::start_http(
-            Self::config(config)?.clone(),
-            stat_manager,
-            Self::stat_factory(stat_factory)?.clone(),
-            limiter_manager,
-        )
-        .await?;
-        Ok(service.map(|service| {
-            Box::new(TrafficServiceAdapter(service)) as Box<dyn GatewayTrafficService>
-        }))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -587,7 +425,6 @@ mod tests {
         builder.install(TunGatewayModule::new()).unwrap();
         builder.install(SnClientGatewayModule::new()).unwrap();
         builder.install(SnGatewayModule::new()).unwrap();
-        builder.install(TrafficGatewayModule::new()).unwrap();
         builder.build().unwrap()
     }
 
@@ -654,12 +491,6 @@ mod tests {
         assert_eq!(sn.manifest().modules, vec!["sn"]);
         assert_eq!(sn.manifest().servers, vec!["sn"]);
         assert!(sn.manifest().acme_dns_providers.is_empty());
-
-        let mut traffic = GatewayCompositionBuilder::new(profile);
-        traffic.install(TrafficGatewayModule::new()).unwrap();
-        let traffic = traffic.build().unwrap();
-        assert_eq!(traffic.manifest().modules, vec!["traffic"]);
-        assert!(traffic.traffic_adapter().is_some());
     }
 
     #[test]

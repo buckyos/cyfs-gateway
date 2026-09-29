@@ -14,7 +14,6 @@ cyfs-gateway-app-lib = { path = "../cyfs-gateway-app-lib" }
 cyfs-gateway-lib = { path = "../cyfs-gateway-lib" }
 cyfs-sn = { path = "../cyfs-sn" }
 cyfs-socks = { path = "../cyfs-socks" }
-cyfs-traffic = { path = "../cyfs-traffic" }
 cyfs-tun = { path = "../cyfs-tun" }
 jsonwebtoken.workspace = true
 kRPC.workspace = true
