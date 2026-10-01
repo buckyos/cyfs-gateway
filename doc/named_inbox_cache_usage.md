@@ -23,7 +23,7 @@ servers:
               ne $REQ.host "alice.example" && reject;
               ne $REQ.path "/messages/inbox" && error 404 "no-handler";
               ne $REQ.method "PUT" && error 405 "method-not-allowed";
-              ne $REQ_content_type "application/cyfs-named-object+json" && error 415 "unsupported-content-type";
+              ne $REQ_content_type "application/cyfs-named-object+json" && ne $REQ_content_type "application/cyfs-named-object+jwt" && error 415 "unsupported-content-type";
               call-server alice_inbox_cache;
 
   alice_inbox_cache:
@@ -53,7 +53,8 @@ servers:
 
 ## 对象、认证与存储
 
-- 请求正文必须是原始 canonical JSON 对象。普通 JSON 未带 `cyfs-obj-id` 时使用 `jobj`；MsgObject 等类型化对象必须带其实际 ObjectId，服务端核对类型与正文哈希。拒绝非 canonical JSON、重复 JSON key、超限流式正文以及 Chunk。
+- 请求正文是原始 canonical JSON 对象（`application/cyfs-named-object+json`），或以该对象为 claims 的 JWT compact 字符串（`application/cyfs-named-object+jwt`）。普通对象未带 `cyfs-obj-id` 时使用 `jobj`；MsgObject 等类型化对象必须带其实际 ObjectId，服务端核对类型与哈希：JSON 形式核对正文，JWT 形式按 claims 计算，不验证签名。拒绝非 canonical JSON、重复 JSON key、格式错误的 JWT、超限流式正文以及 Chunk。
+- 缓存按原 Content-Type 保存并转投。同一 ObjectId 先后以 JSON 与 JWT 形式到达时，保留 JWT 形式（放得下时），避免丢掉签名。
 - Zone 转小写并移除末尾点；path 解码 unreserved 字符、统一百分号转义大小写。拒绝点路径、重复或尾随斜杠、编码分隔符和 inner_path；路径本身大小写敏感。去重身份为规范化 target 和 ObjectId，同对象不同路径分别计额。
 - HTTP 宿主通过进程内 `VerifiedDispatchContext` 传递主体、原目标、接收时间和可信入口。只保存并重放必要的原始 `authorization`、`cyfs-proofs`、`cyfs-cascades`、`cyfs-access-code`；这些原始凭据在规则执行前取得。凭据总量限制为 16 KiB，避免 header 元数据无界增长。匿名网络 header 不会创建可信上下文。
 - 本版在 `cache_path` 中为每份投递保存独立完整 JSON 记录，通过临时文件写入、flush 和 rename 完成写入。Unix 记录文件权限为 0600。不使用 OOD 存储，不抓取附件，不删除 NamedDataMgr 的共享对象。

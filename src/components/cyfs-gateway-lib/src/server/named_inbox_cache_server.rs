@@ -169,11 +169,18 @@ fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
+fn default_entry_encoding() -> CyfsNamedObjectEncoding {
+    CyfsNamedObjectEncoding::Json
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 struct CacheEntry {
     instance: String,
     target: String,
     obj_id: ObjId,
+    /// Body encoding from the original Content-Type; replay uses the same one.
+    #[serde(default = "default_entry_encoding")]
+    encoding: CyfsNamedObjectEncoding,
     body: String,
     context: VerifiedDispatchContext,
     expires_at_ms: Option<u64>,
@@ -400,8 +407,12 @@ impl InboxInner {
         {
             return Err("incomplete, expired or foreign cache entry".into());
         }
-        validate_cyfs_dispatch_object(entry.body.as_bytes(), Some(&entry.obj_id.to_string()))
-            .map_err(|e| e.to_string())?;
+        validate_cyfs_dispatch_body(
+            entry.encoding,
+            entry.body.as_bytes(),
+            Some(&entry.obj_id.to_string()),
+        )
+        .map_err(|e| e.to_string())?;
         Ok(entry)
     }
 
@@ -528,6 +539,23 @@ impl InboxInner {
                 if existing.context.principal != entry.context.principal {
                     return Err("principal-conflict");
                 }
+                // Same ObjectId: keep the cached body, except that a JWT form
+                // replaces a JSON form (when it fits) so the signature is kept.
+                if existing.encoding == CyfsNamedObjectEncoding::Json
+                    && entry.encoding == CyfsNamedObjectEncoding::Jwt
+                {
+                    let mut signed = existing.clone();
+                    signed.encoding = entry.encoding;
+                    signed.body = entry.body.clone();
+                    let indexed = state.entries.get(&key).cloned();
+                    state.remove(&key);
+                    if self.fits(&state, &signed) {
+                        existing = signed;
+                    }
+                    if let Some(indexed) = indexed {
+                        state.insert(key.clone(), indexed);
+                    }
+                }
                 existing.context = entry.context;
                 if let Err(e) = self.persist(&key, &existing).await {
                     log::warn!(
@@ -537,7 +565,7 @@ impl InboxInner {
                     );
                     return Err("cache-write-failed");
                 }
-                state.entries.insert(key, existing.clone());
+                state.insert(key, existing.clone());
                 return Ok(existing);
             }
             state.remove(&key);
@@ -563,7 +591,7 @@ impl InboxInner {
                 .client
                 .put(url)
                 .header("host", target.host_str().unwrap())
-                .header("content-type", CYFS_CONTENT_TYPE_NAMED_OBJECT_JSON)
+                .header("content-type", entry.encoding.content_type())
                 .header(CYFS_HEADER_OBJ_ID, entry.obj_id.to_string())
                 .header(CYFS_HEADER_ORIGINAL_USER, &entry.context.principal)
                 .body(entry.body.clone());
@@ -727,19 +755,21 @@ impl InboxInner {
         if req.uri().query().is_some() {
             return dispatch_rejected(StatusCode::BAD_REQUEST, &target, "invalid-query");
         }
-        if !req
+        let encoding = match req
             .headers()
             .get("content-type")
             .and_then(|v| v.to_str().ok())
-            .is_some_and(is_cyfs_named_object_content_type)
-            || req.headers().contains_key("content-encoding")
+            .and_then(CyfsNamedObjectEncoding::from_content_type)
         {
-            return dispatch_rejected(
-                StatusCode::UNSUPPORTED_MEDIA_TYPE,
-                &target,
-                "unsupported-content-type",
-            );
-        }
+            Some(encoding) if !req.headers().contains_key("content-encoding") => encoding,
+            _ => {
+                return dispatch_rejected(
+                    StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                    &target,
+                    "unsupported-content-type",
+                );
+            }
+        };
         let context = match req.extensions().get::<VerifiedDispatchContext>() {
             Some(context) if context.validate() && context.target == target => context.clone(),
             _ => return dispatch_rejected(StatusCode::UNAUTHORIZED, &target, "unauthenticated"),
@@ -786,7 +816,7 @@ impl InboxInner {
                 }
             }
         }
-        let obj_id = match validate_cyfs_dispatch_object(&body, claimed.as_deref()) {
+        let obj_id = match validate_cyfs_dispatch_body(encoding, &body, claimed.as_deref()) {
             Ok(id) => id,
             Err(_) => return dispatch_rejected(StatusCode::BAD_REQUEST, &target, "invalid-object"),
         };
@@ -794,6 +824,7 @@ impl InboxInner {
             instance: self.config.id.clone(),
             target: target.clone(),
             obj_id: obj_id.clone(),
+            encoding,
             body: String::from_utf8(body).unwrap(),
             context,
             expires_at_ms: self
