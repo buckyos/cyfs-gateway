@@ -265,33 +265,66 @@ impl Socks5Proxy {
     ) -> SocksResult<()> {
         // Connect to target directly
         let mut stream = match &target {
-            TargetAddr::Ip(ip) => TcpStream::connect(ip).await.map_err(|e| {
-                let msg = format!("Error connecting to target with ip: {}, {}", ip, e);
-                error!("{}", msg);
-                SocksError::IoError(msg)
-            })?,
+            TargetAddr::Ip(ip) => {
+                match tokio::time::timeout(self.config.connect_timeout, TcpStream::connect(ip))
+                    .await
+                {
+                    Ok(Ok(stream)) => stream,
+                    Ok(Err(e)) => {
+                        let msg = format!("Error connecting to target with ip: {}, {}", ip, e);
+                        error!("{}", msg);
+                        return Err(SocksError::IoError(msg));
+                    }
+                    Err(_) => {
+                        let msg = format!(
+                            "Error connecting to target with ip: {}, timeout after {:?}",
+                            ip, self.config.connect_timeout
+                        );
+                        error!("{}", msg);
+                        return Err(SocksError::IoError(msg));
+                    }
+                }
+            }
             TargetAddr::Domain(domain, port) => {
                 // Resolve domain
 
                 let addr = format!("{}:{}", domain, port);
-                TcpStream::connect(&addr).await.map_err(|e| {
-                    let msg = format!("Error connecting to target with domain: {}, {}", addr, e);
-                    error!("{}", msg);
-                    SocksError::IoError(msg)
-                })?
+                match tokio::time::timeout(self.config.connect_timeout, TcpStream::connect(&addr))
+                    .await
+                {
+                    Ok(Ok(stream)) => stream,
+                    Ok(Err(e)) => {
+                        let msg =
+                            format!("Error connecting to target with domain: {}, {}", addr, e);
+                        error!("{}", msg);
+                        return Err(SocksError::IoError(msg));
+                    }
+                    Err(_) => {
+                        let msg = format!(
+                            "Error connecting to target with domain: {}, timeout after {:?}",
+                            addr, self.config.connect_timeout
+                        );
+                        error!("{}", msg);
+                        return Err(SocksError::IoError(msg));
+                    }
+                }
             }
         };
 
         // Reply success after connected
         Socks5Util::reply_error(&mut socket, fast_socks5::ReplyError::Succeeded).await?;
 
-        let (read, write) = tokio::io::copy_bidirectional(&mut stream, &mut socket)
-            .await
-            .map_err(|e| {
-                let msg = format!("Error copying data on socks connection: {}, {}", target, e);
-                error!("{}", msg);
-                SocksError::IoError(msg)
-            })?;
+        let (read, write) = sfo_io::copy_bidirectional_with_timeout(
+            &mut stream,
+            &mut socket,
+            self.config.stream_idle_timeout,
+        )
+        .await
+        .map_err(|e| {
+            let msg = format!("Error copying data on socks connection: {}, {}", target, e);
+            error!("{}", msg);
+            SocksError::IoError(msg)
+        })?;
 
         info!(
             "socks5 connection to {} closed, {} bytes read, {} bytes written",
@@ -323,13 +356,17 @@ impl Socks5Proxy {
             }
         };
 
-        let (read, write) = tokio::io::copy_bidirectional(&mut tunnel, &mut socket)
-            .await
-            .map_err(|e| {
-                let msg = format!("Error copying data on socks connection: {}, {}", target, e);
-                error!("{}", msg);
-                SocksError::IoError(msg)
-            })?;
+        let (read, write) = sfo_io::copy_bidirectional_with_timeout(
+            &mut tunnel,
+            &mut socket,
+            self.config.stream_idle_timeout,
+        )
+        .await
+        .map_err(|e| {
+            let msg = format!("Error copying data on socks connection: {}, {}", target, e);
+            error!("{}", msg);
+            SocksError::IoError(msg)
+        })?;
 
         info!(
             "socks5 connection to {} closed, {} bytes read, {} bytes written",

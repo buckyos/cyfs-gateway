@@ -18,6 +18,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, Weak};
+use std::time::Duration;
 use tokio::sync::{Mutex as AsyncMutex, RwLock, Semaphore};
 use url::Url;
 
@@ -69,6 +70,7 @@ struct TunnelManagerInner {
     probe_limiter: Arc<Semaphore>,
     config: StdMutex<TunnelStatusStoreConfig>,
     flush_task_running: AtomicBool,
+    connect_timeout: StdMutex<Duration>,
 }
 
 impl Default for TunnelManager {
@@ -93,6 +95,7 @@ impl TunnelManager {
             probe_limiter: limiter,
             config: StdMutex::new(config),
             flush_task_running: AtomicBool::new(false),
+            connect_timeout: StdMutex::new(crate::connect_timeout_from_secs(None)),
         };
         let this = Self {
             inner: Arc::new(inner),
@@ -112,6 +115,18 @@ impl TunnelManager {
         // affect business behavior (§8.1).
         this.bootstrap_persistence();
         this
+    }
+
+    /// Default connect timeout used when a tunnel opens a stream. Callers
+    /// can override the per-open budget by passing a timeout explicitly to
+    /// the tunnel methods; this value is used by `open_stream_by_url` and
+    /// `create_datagram_client_by_url`.
+    pub fn connect_timeout(&self) -> Duration {
+        *self.inner.connect_timeout.lock().unwrap()
+    }
+
+    pub fn set_connect_timeout(&self, connect_timeout: Duration) {
+        *self.inner.connect_timeout.lock().unwrap() = connect_timeout;
     }
 
     fn bootstrap_persistence(&self) {
@@ -353,6 +368,22 @@ impl TunnelManager {
 
     //$tunnel_schema://$tunnel_stack_id/$target_stream_id
     pub async fn open_stream_by_url(&self, url: &Url) -> TunnelResult<Box<dyn AsyncStream>> {
+        self.open_stream_by_url_with_timeout(url, self.connect_timeout())
+            .await
+    }
+
+    /// `open_stream_by_url` with an explicit per-open connect budget.
+    ///
+    /// The budget is handed to the tunnel implementation, which applies it to
+    /// its own low-level connect (`TcpSocket::connect`, QUIC handshake, ...).
+    /// It is deliberately not enforced by wrapping this call in a timeout:
+    /// a caller-side cut would cancel the failure-history writeback below and
+    /// leave the manager's bookkeeping inconsistent.
+    pub async fn open_stream_by_url_with_timeout(
+        &self,
+        url: &Url,
+        connect_timeout: Duration,
+    ) -> TunnelResult<Box<dyn AsyncStream>> {
         // Per §6.7 we record an outcome on every failure branch
         // (including pre-connect) so dashboards reflect the same view
         // an active prober would. RTT is measured wall-clock from here
@@ -390,7 +421,7 @@ impl TunnelManager {
         };
         let path = url.path();
         debug!("Open stream by url.path: {}", path);
-        match tunnel.open_stream(path).await {
+        match tunnel.open_stream_with_timeout(path, connect_timeout).await {
             Ok(stream) => {
                 self.record_business_success(url, Some(started.elapsed()))
                     .await;
@@ -401,10 +432,10 @@ impl TunnelManager {
                 self.record_business_failure(url, TunnelFailureReason::TunnelOpen, Some(&detail))
                     .await;
                 error!("Open stream by url {} failed: {}", url, e);
-                Err(TunnelError::ConnectError(format!(
-                    "Open stream by url failed: {}",
-                    e
-                )))
+                Err(tunnel_open_error(
+                    format!("Open stream by url failed: {}", e),
+                    &e,
+                ))
             }
         }
     }
@@ -412,6 +443,18 @@ impl TunnelManager {
     pub async fn create_datagram_client_by_url(
         &self,
         url: &Url,
+    ) -> TunnelResult<Box<dyn DatagramClientBox>> {
+        self.create_datagram_client_by_url_with_timeout(url, self.connect_timeout())
+            .await
+    }
+
+    /// `create_datagram_client_by_url` with an explicit connect budget; see
+    /// `open_stream_by_url_with_timeout` for why the budget is passed down
+    /// instead of being wrapped around this call.
+    pub async fn create_datagram_client_by_url_with_timeout(
+        &self,
+        url: &Url,
+        connect_timeout: Duration,
     ) -> TunnelResult<Box<dyn DatagramClientBox>> {
         let started = std::time::Instant::now();
 
@@ -444,7 +487,10 @@ impl TunnelManager {
                 return Err(e);
             }
         };
-        match tunnel.create_datagram_client(url.path()).await {
+        match tunnel
+            .create_datagram_client_with_timeout(url.path(), connect_timeout)
+            .await
+        {
             Ok(client) => {
                 self.record_business_success(url, Some(started.elapsed()))
                     .await;
@@ -455,10 +501,10 @@ impl TunnelManager {
                 self.record_business_failure(url, TunnelFailureReason::TunnelOpen, Some(&detail))
                     .await;
                 error!("Create datagram client by url failed: {}", e);
-                Err(TunnelError::ConnectError(format!(
-                    "Create datagram client by url failed: {}",
-                    e
-                )))
+                Err(tunnel_open_error(
+                    format!("Create datagram client by url failed: {}", e),
+                    &e,
+                ))
             }
         }
     }
@@ -1015,6 +1061,17 @@ pub(crate) fn now_ms() -> u64 {
 /// finished bringing the tunnel up". Refinement should happen by having
 /// individual `TunnelBuilder` impls surface a typed error rather than by
 /// growing this list of substring matches.
+/// Map a tunnel-level open failure into `TunnelError`. The timeout case stays
+/// distinguishable so `next_upstream` retry policies can classify it as a
+/// timeout instead of a generic error when the budget is passed down.
+fn tunnel_open_error(message: String, err: &std::io::Error) -> TunnelError {
+    if err.kind() == std::io::ErrorKind::TimedOut {
+        TunnelError::ConnectTimeout(message)
+    } else {
+        TunnelError::ConnectError(message)
+    }
+}
+
 pub(crate) fn classify_create_tunnel_error(err: &TunnelError) -> TunnelFailureReason {
     let msg = err.to_string().to_ascii_lowercase();
     if msg.contains("timed out") || msg.contains("timeout") {
@@ -1105,10 +1162,11 @@ mod tests {
             Ok(())
         }
 
-        async fn open_stream_by_dest(
+        async fn open_stream_by_dest_with_timeout(
             &self,
             _dest_port: u16,
             _dest_host: Option<String>,
+            _connect_timeout: Duration,
         ) -> Result<Box<dyn AsyncStream>, io::Error> {
             Err(io::Error::new(
                 io::ErrorKind::Unsupported,
@@ -1116,17 +1174,22 @@ mod tests {
             ))
         }
 
-        async fn open_stream(&self, _stream_id: &str) -> Result<Box<dyn AsyncStream>, io::Error> {
+        async fn open_stream_with_timeout(
+            &self,
+            _stream_id: &str,
+            _connect_timeout: Duration,
+        ) -> Result<Box<dyn AsyncStream>, io::Error> {
             Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "not used in test",
             ))
         }
 
-        async fn create_datagram_client_by_dest(
+        async fn create_datagram_client_by_dest_with_timeout(
             &self,
             _dest_port: u16,
             _dest_host: Option<String>,
+            _connect_timeout: Duration,
         ) -> Result<Box<dyn crate::DatagramClientBox>, io::Error> {
             Err(io::Error::new(
                 io::ErrorKind::Unsupported,
@@ -1134,9 +1197,10 @@ mod tests {
             ))
         }
 
-        async fn create_datagram_client(
+        async fn create_datagram_client_with_timeout(
             &self,
             _session_id: &str,
+            _connect_timeout: Duration,
         ) -> Result<Box<dyn crate::DatagramClientBox>, io::Error> {
             Err(io::Error::new(
                 io::ErrorKind::Unsupported,

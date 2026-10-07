@@ -4,6 +4,7 @@ use async_trait::async_trait;
 use buckyos_kit::AsyncStream;
 use std::net::IpAddr;
 use std::net::SocketAddr;
+use std::time::Duration;
 
 #[derive(Hash, Eq, PartialEq, Debug, Clone)]
 pub struct TunnelEndpoint {
@@ -42,28 +43,78 @@ impl Clone for Box<dyn DatagramClientBox> {
     }
 }
 
+/// Default connect timeout used when a tunnel opens a stream via the
+/// convenience methods (the ones without an explicit timeout argument).
+pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(60);
+
 // one Tunnel to device
 #[async_trait]
 pub trait Tunnel: Send + Sync {
     async fn ping(&self) -> Result<(), std::io::Error>;
+
+    async fn open_stream_by_dest_with_timeout(
+        &self,
+        dest_port: u16,
+        dest_host: Option<String>,
+        connect_timeout: Duration,
+    ) -> Result<Box<dyn AsyncStream>, std::io::Error>;
+
     async fn open_stream_by_dest(
         &self,
         dest_port: u16,
         dest_host: Option<String>,
+    ) -> Result<Box<dyn AsyncStream>, std::io::Error> {
+        self.open_stream_by_dest_with_timeout(dest_port, dest_host, DEFAULT_CONNECT_TIMEOUT)
+            .await
+    }
+
+    async fn open_stream_with_timeout(
+        &self,
+        stream_id: &str,
+        connect_timeout: Duration,
     ) -> Result<Box<dyn AsyncStream>, std::io::Error>;
 
-    async fn open_stream(&self, stream_id: &str) -> Result<Box<dyn AsyncStream>, std::io::Error>;
+    async fn open_stream(
+        &self,
+        stream_id: &str,
+    ) -> Result<Box<dyn AsyncStream>, std::io::Error> {
+        self.open_stream_with_timeout(stream_id, DEFAULT_CONNECT_TIMEOUT)
+            .await
+    }
+
+    async fn create_datagram_client_by_dest_with_timeout(
+        &self,
+        dest_port: u16,
+        dest_host: Option<String>,
+        connect_timeout: Duration,
+    ) -> Result<Box<dyn DatagramClientBox>, std::io::Error>;
 
     async fn create_datagram_client_by_dest(
         &self,
         dest_port: u16,
         dest_host: Option<String>,
+    ) -> Result<Box<dyn DatagramClientBox>, std::io::Error> {
+        self.create_datagram_client_by_dest_with_timeout(
+            dest_port,
+            dest_host,
+            DEFAULT_CONNECT_TIMEOUT,
+        )
+        .await
+    }
+
+    async fn create_datagram_client_with_timeout(
+        &self,
+        session_id: &str,
+        connect_timeout: Duration,
     ) -> Result<Box<dyn DatagramClientBox>, std::io::Error>;
 
     async fn create_datagram_client(
         &self,
         session_id: &str,
-    ) -> Result<Box<dyn DatagramClientBox>, std::io::Error>;
+    ) -> Result<Box<dyn DatagramClientBox>, std::io::Error> {
+        self.create_datagram_client_with_timeout(session_id, DEFAULT_CONNECT_TIMEOUT)
+            .await
+    }
 }
 
 pub trait TunnelBox: Tunnel {

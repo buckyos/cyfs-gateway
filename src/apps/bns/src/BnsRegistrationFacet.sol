@@ -38,7 +38,7 @@ contract BnsRegistrationFacet is BnsCore {
             NameState storage state = _names[nameHash];
             _copyPrincipal(state.semanticOwner, semanticOwnerAfterAuthority);
             state.updatedAt = _now();
-            _validateAllOwnerGraphs();
+            _validateOwnerPath(nameHash);
             NameState memory materialized = _materializeNameState(state);
             _commitEvent(
                 EVENT_NAME_OWNER_UPDATED,

@@ -199,21 +199,33 @@ Document 内部声明
 
 ### 3.6 owner 图不变量与防 brick
 
-由于显式 `semanticOwner` 一旦生效，对应名字的 `assetOwner` 权限**立即彻底失效**（见 §3.2），`semanticOwner = BnsName(x)` 会把若干名字串成一张有向图。如果不加约束，这张图可能出现环或不可达，导致名字被永久锁死且无任何恢复路径。
+显式 `semanticOwner` 一旦生效，对应名字的 `assetOwner` 权限立即失效（见 §3.2）。
+当前 EVM 实现中，`BnsName(x)` 直接选择 `x` 的 authority set 作为认证终点，
+**不会继续解析 `x.semanticOwner`，也不会回落到 `x.assetOwner`**。因此 self-owned
+名字以及双方各有 authority key 的相互引用都是合法的，不代表递归 owner 环。
+只有 `semanticOwner = Unset` 的二级名字需要继承父名字的 effective owner。
 
-第一版强制以下不变量：
+`registerName`（包括安装 authority 后设置 owner）、`setNameOwner` 和 `transferName`
+按各接口既定规则授权（owner 更新使用更新前的 owner，二级注册使用父 owner），
+并在写入后校验本名字的 owner 路径，失败时整笔交易回滚：
 
-- **有界深度。** 解析任意名字的 effective 控制方时，沿 `semanticOwner = BnsName` 边的跳数不得超过 `MAX_OWNER_REF_DEPTH = 8`。超过即视为非法状态。
-- **无环。** `semanticOwner` 形成的有向图必须无环。
-- **可达具体签名者。** 任意 Active 名字必须能在 `MAX_OWNER_REF_DEPTH` 跳内解析到至少一个具体可用签名者，即某个 `AssetOwnerFallback` 链账户，或某个拥有至少一个当前有效认证 key 的 authority name。
+- 路径中的名字必须 Active；显式 BNS authority 终点必须 Active 且已保存的
+  `activeKeyCount > 0`，否则拒绝为 `NO_CONCRETE_SIGNER`。
+- 一级名字的 fallback 必须是非零链账户；二级名字继承父 owner。
+- 保留 `MAX_OWNER_REF_DEPTH = 8` 和路径重复检查，分别拒绝为
+  `OWNER_GRAPH_TOO_DEEP`、`OWNER_GRAPH_CYCLE`。当前最多两级名称，且 BNS authority
+  是终点，正常状态不会形成递归路径环。
 
-任何会把 `semanticOwner` 设为 `BnsName` 的写操作（`setNameOwner`、`transferName`、带 `initialSemanticOwner` 的 `registerName`）在提交前必须基于更新前状态做一次图检查：
+Issue #185 后不再扫描全局名称。修改父名字时，其继承型子名字自然使用新的父 owner；
+引用该名字 authority 的其它名字仍然使用同一 authority set。结合 §7 的非零认证
+密钥计数保护，这些更新无需检查全部子名字或反向引用。无关名字的 authority 或父名字
+过期、释放，不应阻止其它用户注册或更新名称。
 
-- 若新边会构成环，拒绝，错误码 `OWNER_GRAPH_CYCLE`。
-- 若新状态会使本名字（或图中任何受其影响的名字）失去可达的具体签名者，拒绝，错误码 `NO_CONCRETE_SIGNER`。
-- 若解析深度会超过 `MAX_OWNER_REF_DEPTH`，拒绝，错误码 `OWNER_GRAPH_TOO_DEEP`。
-
-完整的 social recovery 状态机仍属于第一版暂不解决的范围（见 §17），但上述检查是**现在就必须存在**的最小兜底，确保任何单步合法操作都不会把名字变成不可恢复的死状态。`assetOwner` 在显式 semantic owner 模式下不再拥有日常权限，但实现**可以**保留一条受时间锁保护、仅用于「图已无可用签名者」这一极端情形的 recovery-only 通道；该通道的具体设计留待 recovery 状态机一并定义。
+`activeKeyCount` 是最近一次 authority 更新时的快照，不会随时间自动刷新；真正签名
+授权仍逐次检查所选 key 的状态、用途、有效期和签名账户。上述局部校验不保证名字
+永远可操作：最后一个 key 自然过期、authority name 过期或释放仍可能使依赖者无法
+授权。调用方必须及时轮换及续期；完整 social recovery 仍不在本次实现范围内。
+显式 owner 模式下不会因 key 失效而恢复 `assetOwner` 的日常权限。
 
 ## 4. NFT 转让语义
 
@@ -733,7 +745,19 @@ function updateAuthorityKeys(
 - 新增 key 不能授权其自身所在的本次调用。
 - 删除或撤销 key 后，之后的调用立即不能再使用该 key。
 - authority key 变化会影响所有把该 name 作为 semantic owner 或 controller 的名字。
-- 当一个 authority name 正在控制其它名字时，实现应阻止无恢复路径地删除最后一个有效认证 key，或者要求在同一原子操作中迁移 owner。
+- 每次 authority 更新最多 32 项，独立 `updateAuthorityKeys`、原子注册和
+  `applyMutations` 均执行该限制；原子入口还受其合计批量大小限制。
+- 同一 lineage 中，若最近一次成功更新保存的 `activeKeyCount > 0`，本次更新的
+  最终状态必须至少保留一个当前有效认证 key，否则返回 `NO_CONCRETE_SIGNER`。
+  即使没有其它名字引用它，也不允许清空；撤销、改变用途、改变状态或有效期均适用。
+  轮换应在同一批次中撤销旧 key 并安装有效的新 key，检查的是批次最终状态。
+- 上述判断使用已保存的旧计数，不能先按当前时间重算旧计数，否则自然过期会绕过
+  保护。key 已经过期时，下一次更新仍须留下有效认证 key。始终为零的集合可以
+  维护 recovery/sign-document-only key；释放后重新注册的新 lineage 独立计算。
+- 本次不设置历史 KID 总数上限。`authorityRoot` 继续按插入顺序覆盖当前 lineage
+  所有已记录 KID（包括已撤销 key），一次更新的重算成本仍为 O(K)。32 项批量限制
+  不限制累计历史量。待目标链明确后，根据该链交易/区块 Gas 限制及边界实测决定
+  历史量限制；不能把本次修复视为已消除历史 KID 持续增长的 Gas 风险。
 
 ### rotateAuthorityAndOwnerDocument
 
@@ -875,7 +899,7 @@ function setNameOwner(
 - 设置显式 semantic owner 后，asset owner 权限立即失效，标准 NFT transfer 立即禁用。
 - 清回 `Unset` 后，按一级/二级 fallback 规则重新计算 effective owner。
 - 若新 owner 是本 name 自身，应先写入至少一个有效 authority key，再切换 owner，避免名字被锁死。
-- 设置 `semanticOwner = BnsName` 前必须通过 §3.6 的图检查（无环、可达具体签名者、深度不超限），否则按对应错误码拒绝。
+- 更新后必须通过 §3.6 的局部 owner 路径校验；BNS authority 是认证终点，不递归追踪其 semantic owner。失败则回滚并按对应错误码拒绝。
 
 ### releaseName
 

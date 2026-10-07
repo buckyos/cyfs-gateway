@@ -39,6 +39,14 @@ pub const DEFAULT_AUTH_SOA_EXPIRE: i32 = 86_400;
 pub const DEFAULT_AUTH_SOA_MINIMUM: u32 = 60;
 pub const SN_SERVER_IP_NOT_CONFIGURED: &str = "SN server ip is not configured";
 
+const USER_DNS_SYNC_INTERVAL: Duration = Duration::from_secs(1);
+const USER_DNS_SYNC_TIMEOUT: Duration = Duration::from_secs(5);
+const USER_DNS_SYNC_MAX_BACKOFF: Duration = Duration::from_secs(30);
+
+#[cfg(test)]
+#[path = "sn_resolver_sync_tests.rs"]
+mod sync_tests;
+
 pub type SnResolverRef = Arc<SnResolver>;
 pub type SnResolverResult<T> = std::result::Result<T, SnResolverError>;
 pub type SnAuthReaderRef = Arc<dyn SnAuthReader>;
@@ -986,6 +994,14 @@ struct ManagedDnsZone {
     authority: DnsAuthority,
 }
 
+#[derive(Default)]
+struct UserDnsSyncState {
+    revision: u64,
+    next_attempt: Option<tokio::time::Instant>,
+    failures: u32,
+    last_error: Option<SnResolverError>,
+}
+
 pub struct SnResolver {
     config: SnResolverConfig,
     auth: SnAuthReaderRef,
@@ -993,7 +1009,7 @@ pub struct SnResolver {
     device_online: DeviceOnlineReaderRef,
     relay_reader: RelayAssignmentReaderRef,
     cache: Arc<SnResolverCache>,
-    user_dns_revision: tokio::sync::Mutex<u64>,
+    user_dns_sync: tokio::sync::Mutex<UserDnsSyncState>,
 }
 
 impl SnResolver {
@@ -1013,7 +1029,7 @@ impl SnResolver {
             device_online: Arc::new(EmptyDeviceOnlineReader),
             relay_reader: Arc::new(EmptyRelayAssignmentReader),
             cache: Arc::new(SnResolverCache::new()),
-            user_dns_revision: tokio::sync::Mutex::new(0),
+            user_dns_sync: tokio::sync::Mutex::new(UserDnsSyncState::default()),
         }
     }
 
@@ -1087,8 +1103,63 @@ impl SnResolver {
             || self.config.aliases.iter().any(|alias| alias == &hostname)
     }
 
+    /// 显式写后刷新绕过成功轮询间隔；后端失败期间仍遵守重试退避。
     pub async fn synchronize_user_dns_changes(&self) -> SnResolverResult<u64> {
-        let mut cursor = self.user_dns_revision.lock().await;
+        self.sync_user_dns_changes(true).await
+    }
+
+    /// 查询路径使用有界轮询，锁内复核期限使并发请求共享一次同步结果。
+    pub async fn poll_user_dns_changes(&self) -> SnResolverResult<u64> {
+        self.sync_user_dns_changes(false).await
+    }
+
+    async fn sync_user_dns_changes(&self, force: bool) -> SnResolverResult<u64> {
+        let mut state = self.user_dns_sync.lock().await;
+        let now = tokio::time::Instant::now();
+        if state.next_attempt.is_some_and(|next| now < next)
+            && (!force || state.last_error.is_some())
+        {
+            return match &state.last_error {
+                Some(error) => Err(error.clone()),
+                None => Ok(state.revision),
+            };
+        }
+
+        // 取消中的调用也不能让等待者误以为同步成功，或立即重启一轮 RPC。
+        state.last_error = Some(SnResolverError::backend("user DNS synchronization interrupted"));
+        state.next_attempt = Some(now + USER_DNS_SYNC_TIMEOUT + USER_DNS_SYNC_INTERVAL);
+        let result = tokio::time::timeout(
+            USER_DNS_SYNC_TIMEOUT,
+            self.drain_user_dns_changes(&mut state.revision),
+        )
+        .await
+        .unwrap_or_else(|_| Err(SnResolverError::backend("user DNS synchronization timed out")));
+        match result {
+            Ok(revision) => {
+                if state.failures > 0 {
+                    log::info!("user DNS synchronization recovered at revision {}", revision);
+                }
+                state.failures = 0;
+                state.last_error = None;
+                state.next_attempt = Some(tokio::time::Instant::now() + USER_DNS_SYNC_INTERVAL);
+                Ok(revision)
+            }
+            Err(error) => {
+                state.failures = state.failures.saturating_add(1);
+                let delay = Duration::from_secs(1u64 << (state.failures - 1).min(5))
+                    .min(USER_DNS_SYNC_MAX_BACKOFF);
+                state.next_attempt = Some(tokio::time::Instant::now() + delay);
+                state.last_error = Some(error.clone());
+                log::warn!(
+                    "user DNS synchronization failed at revision {}; retry in {:?}: {}",
+                    state.revision, delay, error,
+                );
+                Err(error)
+            }
+        }
+    }
+
+    async fn drain_user_dns_changes(&self, cursor: &mut u64) -> SnResolverResult<u64> {
         loop {
             let page = self.auth.list_user_dns_changes(*cursor, 256).await?;
             if *cursor < page.current_revision
@@ -1134,7 +1205,7 @@ impl SnResolver {
             ));
         }
 
-        self.synchronize_user_dns_changes().await?;
+        self.poll_user_dns_changes().await?;
         let bypass_cache = is_user_dns_control_name(hostname.as_str());
         if !bypass_cache {
             if let Some(result) = self
@@ -1358,7 +1429,7 @@ impl SnResolver {
             ));
         }
 
-        self.synchronize_user_dns_changes().await?;
+        self.poll_user_dns_changes().await?;
         let bypass_cache = is_user_dns_control_name(normalized.as_str());
         match (!bypass_cache)
             .then(|| self.cache.query_dns(normalized.as_str(), record_type))

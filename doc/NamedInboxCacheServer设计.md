@@ -12,7 +12,7 @@ NamedInboxCacheServer 先有界读取完整小对象，再尝试自身配置的 
 
 缓存是尽力而为的，cached 之后对象仍可能丢失。发送方继续保存原对象并负责重试，只有 upstream 的 accepted 才能结束投递。本版不要求缓存持久队列、租约协议、终态回执保留或断电不丢；本地存储可以复用 NamedDataMgr 提高可用性，但不因此升级 cached 的承诺。
 
-NamedInboxCacheServer 与 `cyfs-dir` 同属通用 CYFS 标准协议支持组件，可在没有 BuckyOS 的 gateway 宿主中使用。它处理 canonical JSON NamedObject、目标语义路径和认证上下文，不理解联系人、Session、群成员、Agent 或消息正文中的业务字段。
+NamedInboxCacheServer 与 `cyfs-dir` 同属通用 CYFS 标准协议支持组件，可在没有 BuckyOS 的 gateway 宿主中使用。它处理 canonical JSON 或 JWT 形式的 NamedObject、目标语义路径和认证上下文，不理解联系人、Session、群成员、Agent 或消息正文中的业务字段。
 
 职责分开，允许同进程组合：
 
@@ -32,6 +32,9 @@ NamedInboxCacheServer 与 `cyfs-dir` 同属通用 CYFS 标准协议支持组件�
 PUT cyfs://<zone>/<semantic_path>
 Content-Type: application/cyfs-named-object+json
 body = canonical JSON NamedObject
+
+Content-Type: application/cyfs-named-object+jwt
+body = JWT compact 字符串，claims 为 NamedObject；ObjectId 按 claims 计算，与签名无关
 ```
 
 缓存服务成功写入返回 `202 + cyfs-dispatch-status: cached`；upstream 持久接收返回 `200/201 + accepted`；明确拒绝携带 `reason/retryable`。无响应属于调用方无法确认的结果，没有可伪造为成功的 HTTP 状态。
@@ -80,7 +83,7 @@ process-chain 的 drop/reject 结果必须映射为失败或真实的连接丢�
 
 | 记录 | 必需内容 |
 | --- | --- |
-| 对象正文 | 经校验的 ObjectId、原始 canonical JSON、字节数、缓存引用 |
+| 对象正文 | 经校验的 ObjectId、原始正文（canonical JSON 或 JWT）及其编码、字节数、缓存引用。转投使用原 Content-Type；同一 ObjectId 的 JWT 形式替换已缓存的 JSON 形式 |
 | 投递身份 | 目标 Zone、规范化 semantic path、ObjectId；同对象不同接收点分别记账 |
 | 来源上下文 | 经验证的请求主体、必要的原始 proofs/cascades、接收时间、可信入口信息 |
 | 路由信息 | 所属缓存实例及其配置的 upstream 逻辑接收点；物理地址变化可以重新解析，逻辑接收点不得改变 |
@@ -175,7 +178,7 @@ servers:
               ne $REQ.host "alice.example" && reject;
               ne $REQ.path "/messages/inbox" && error 404 "no-handler";
               ne $REQ.method "PUT" && error 405 "method-not-allowed";
-              ne $REQ_content_type "application/cyfs-named-object+json" && error 415 "unsupported-content-type";
+              ne $REQ_content_type "application/cyfs-named-object+json" && ne $REQ_content_type "application/cyfs-named-object+jwt" && error 415 "unsupported-content-type";
 
               call-server alice_inbox_cache;
 
@@ -206,7 +209,7 @@ servers:
 
 `upstream_timeout: 3s` 是每次同步投递或后台转投的总预算，覆盖连接、发送、等待响应及确认协议结果；到期后按超时处理。完整对象在发送前就已保留，因此即使 upstream 已经消费请求但响应丢失，仍可缓存同一对象；重复业务副作用由 upstream 的事务去重避免。有界读取用于本次请求的重放，不算缓存成功，也不使请求提前进入缓存队列。
 
-NamedInboxCacheServer 在首次投递或纯暂存前检查规范化 Zone/path、method、content-type，禁止 inner_path，校验 canonical JSON、实际 body 大小和可信来源上下文；目标必须在自身允许范围内。入口和缓存 server 都不读取 `M` 的业务字段，upstream 仍独立执行应用 ACL。本例只展示 PUT；可选 GET 查询须另配 HTTP 规则并调用同一缓存 server 的查询处理，校验查询参数与查询权限，不执行写缓存动作。
+NamedInboxCacheServer 在首次投递或纯暂存前检查规范化 Zone/path、method、content-type，禁止 inner_path，按 Content-Type 校验 canonical JSON 或 JWT 形式（JWT 只核对 claims 的 ObjectId，不验签）、实际 body 大小和可信来源上下文；目标必须在自身允许范围内。入口和缓存 server 都不读取 `M` 的业务字段，upstream 仍独立执行应用 ACL。本例只展示 PUT；可选 GET 查询须另配 HTTP 规则并调用同一缓存 server 的查询处理，校验查询参数与查询权限，不执行写缓存动作。
 
 脚本中的 `error` / `reject` 是现有 HTTP 控制动作；它们目前不会自动生成完整 dispatch 状态体。HTTP 入口已补齐这类请求的协议错误映射，例如 `error 404 "no-handler"` 对应 `404 + rejected`、`reason=no-handler`、`retryable=false`，并按第 2 节构造 header 和 JSON 状态体。进入 NamedInboxCacheServer 后，由它构造或验证相应协议响应；入口放行或生成 call-server 动作本身不表示 upstream 已 accepted。
 

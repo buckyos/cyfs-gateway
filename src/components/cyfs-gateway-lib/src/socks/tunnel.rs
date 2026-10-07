@@ -92,10 +92,11 @@ impl Tunnel for SocksTunnel {
         Ok(())
     }
 
-    async fn open_stream_by_dest(
+    async fn open_stream_by_dest_with_timeout(
         &self,
         dest_port: u16,
         dest_host: Option<String>,
+        connect_timeout: Duration,
     ) -> Result<Box<dyn AsyncStream>, std::io::Error> {
         debug!(
             "socks_tunnel open_stream_by_dest: {:?}:{}",
@@ -110,24 +111,50 @@ impl Tunnel for SocksTunnel {
                 // Establish a SOCKS5 tunnel with optional username and password
                 let ret = match socks_server.auth {
                     SocksAuth::UsernamePassword(ref username, ref password) => {
-                        Socks5Stream::connect_with_password(
-                            (socks_server.host.as_str(), socks_server.port),
-                            (dest_host.as_str(), dest_port),
-                            &username,
-                            &password,
-                        )
+                        tokio::time::timeout(connect_timeout, async {
+                            Socks5Stream::connect_with_password(
+                                (socks_server.host.as_str(), socks_server.port),
+                                (dest_host.as_str(), dest_port),
+                                &username,
+                                &password,
+                            )
+                            .await
+                            .map_err(|e| {
+                                std::io::Error::new(std::io::ErrorKind::Other, e.to_string())
+                            })
+                        })
                         .await
+                        .map_err(|_| {
+                            std::io::Error::new(
+                                std::io::ErrorKind::TimedOut,
+                                format!(
+                                    "socks5 connect to {}:{} timed out after {:?}",
+                                    dest_host, dest_port, connect_timeout
+                                ),
+                            )
+                        })?
                     }
-                    SocksAuth::None => {
+                    SocksAuth::None => tokio::time::timeout(connect_timeout, async {
                         Socks5Stream::connect(
                             (socks_server.host.as_str(), socks_server.port),
                             (dest_host.as_str(), dest_port),
                         )
                         .await
-                    }
+                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
+                    })
+                    .await
+                    .map_err(|_| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            format!(
+                                "socks5 connect to {}:{} timed out after {:?}",
+                                dest_host, dest_port, connect_timeout
+                            ),
+                        )
+                    })?,
                 };
 
-                ret.as_ref().map_err(|e| {
+                let stream = ret.map_err(|e| {
                     let msg = format!(
                         "Failed to establish SOCKS5 tunnel: {:?}, {}",
                         socks_server.server(),
@@ -137,34 +164,50 @@ impl Tunnel for SocksTunnel {
                     std::io::Error::new(std::io::ErrorKind::Other, msg)
                 })?;
 
-                let stream = ret.unwrap();
                 Ok(Box::new(stream))
             }
             None => {
                 let dest_addr = format!("{}:{}", dest_host, dest_port);
-                let stream = tokio::net::TcpStream::connect(&dest_addr)
-                    .await
-                    .map_err(|e| {
-                        let msg = format!("Failed to connect to target: {}, {}", dest_addr, e);
-                        error!("{}", msg);
-                        std::io::Error::new(std::io::ErrorKind::Other, msg)
-                    })?;
+                let stream = tokio::time::timeout(
+                    connect_timeout,
+                    tokio::net::TcpStream::connect(&dest_addr),
+                )
+                .await
+                .map_err(|_| {
+                    let msg = format!(
+                        "Failed to connect to target: {}, timed out after {:?}",
+                        dest_addr, connect_timeout
+                    );
+                    error!("{}", msg);
+                    std::io::Error::new(std::io::ErrorKind::TimedOut, msg)
+                })?
+                .map_err(|e| {
+                    let msg = format!("Failed to connect to target: {}, {}", dest_addr, e);
+                    error!("{}", msg);
+                    std::io::Error::new(std::io::ErrorKind::Other, msg)
+                })?;
 
                 Ok(Box::new(stream))
             }
         }
     }
 
-    async fn open_stream(&self, stream_id: &str) -> Result<Box<dyn AsyncStream>, std::io::Error> {
+    async fn open_stream_with_timeout(
+        &self,
+        stream_id: &str,
+        connect_timeout: Duration,
+    ) -> Result<Box<dyn AsyncStream>, std::io::Error> {
         debug!("socks_tunnel open_stream: {}", stream_id);
         let (dest_host, dest_port) = get_dest_info_from_url_path(stream_id)?;
-        self.open_stream_by_dest(dest_port, dest_host).await
+        self.open_stream_by_dest_with_timeout(dest_port, dest_host, connect_timeout)
+            .await
     }
 
-    async fn create_datagram_client_by_dest(
+    async fn create_datagram_client_by_dest_with_timeout(
         &self,
         dest_port: u16,
         dest_host: Option<String>,
+        _connect_timeout: Duration,
     ) -> Result<Box<dyn DatagramClientBox>, std::io::Error> {
         // FIXME what should we do if dest_host is None or the port is 0?
         let dest_host = dest_host.unwrap_or("0.0.0.0".to_string());
@@ -216,12 +259,13 @@ impl Tunnel for SocksTunnel {
         }
     }
 
-    async fn create_datagram_client(
+    async fn create_datagram_client_with_timeout(
         &self,
         session_id: &str,
+        connect_timeout: Duration,
     ) -> Result<Box<dyn DatagramClientBox>, std::io::Error> {
         let (dest_host, dest_port) = get_dest_info_from_url_path(session_id)?;
-        self.create_datagram_client_by_dest(dest_port, dest_host)
+        self.create_datagram_client_by_dest_with_timeout(dest_port, dest_host, connect_timeout)
             .await
     }
 }

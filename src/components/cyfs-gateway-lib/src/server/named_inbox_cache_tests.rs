@@ -16,11 +16,20 @@ fn config(dir: &TempDir) -> NamedInboxCacheServerConfig {
 }
 
 fn request(body: &'static [u8], path: &str, principal: Option<&str>) -> Request<DispatchBody> {
+    typed_request(CyfsNamedObjectEncoding::Json, body, path, principal)
+}
+
+fn typed_request(
+    encoding: CyfsNamedObjectEncoding,
+    body: &'static [u8],
+    path: &str,
+    principal: Option<&str>,
+) -> Request<DispatchBody> {
     let mut request = Request::builder()
         .method("PUT")
         .uri(path)
         .header("host", "alice.example")
-        .header("content-type", CYFS_CONTENT_TYPE_NAMED_OBJECT_JSON)
+        .header("content-type", encoding.content_type())
         .header("cyfs-original-user", "did:bns:forged")
         .body(
             Full::new(Bytes::from_static(body))
@@ -67,6 +76,7 @@ struct Upstream {
     url: String,
     mode: Arc<AtomicUsize>,
     calls: Arc<AtomicUsize>,
+    content_types: Arc<StdMutex<Vec<String>>>,
     task: JoinHandle<()>,
 }
 
@@ -82,20 +92,30 @@ impl Upstream {
         let url = format!("http://{}", listener.local_addr().unwrap());
         let mode = Arc::new(AtomicUsize::new(mode));
         let calls = Arc::new(AtomicUsize::new(0));
+        let content_types = Arc::new(StdMutex::new(Vec::new()));
         let task_mode = mode.clone();
         let task_calls = calls.clone();
+        let task_content_types = content_types.clone();
         let task = tokio::spawn(async move {
             loop {
                 let (socket, _) = listener.accept().await.unwrap();
                 let mode = task_mode.clone();
                 let calls = task_calls.clone();
+                let content_types = task_content_types.clone();
                 tokio::spawn(async move {
                     let service =
                         hyper::service::service_fn(move |req: Request<hyper::body::Incoming>| {
                             let mode = mode.clone();
                             let calls = calls.clone();
+                            let content_types = content_types.clone();
                             async move {
                                 calls.fetch_add(1, Ordering::SeqCst);
+                                let content_type =
+                                    req.headers()["content-type"].to_str().unwrap().to_string();
+                                content_types.lock().unwrap().push(content_type.clone());
+                                let encoding =
+                                    CyfsNamedObjectEncoding::from_content_type(&content_type)
+                                        .unwrap();
                                 assert_eq!(req.headers()["host"], "alice.example");
                                 assert_eq!(req.headers()["cyfs-original-user"], "did:bns:bob");
                                 assert_eq!(req.headers()["cyfs-proofs"], "original-proof");
@@ -106,7 +126,8 @@ impl Upstream {
                                     .to_string();
                                 let body = req.into_body().collect().await.unwrap().to_bytes();
                                 let id =
-                                    validate_cyfs_dispatch_object(&body, Some(&claimed)).unwrap();
+                                    validate_cyfs_dispatch_body(encoding, &body, Some(&claimed))
+                                        .unwrap();
                                 let target =
                                     normalize_cyfs_dispatch_target("alice.example", &path).unwrap();
                                 let mode = mode.load(Ordering::SeqCst);
@@ -152,6 +173,7 @@ impl Upstream {
             url,
             mode,
             calls,
+            content_types,
             task,
         }
     }
@@ -474,6 +496,11 @@ async fn named_inbox_full_cache_still_allows_synchronous_acceptance() {
     let upstream = Upstream::new(0).await;
     cfg.upstream = Some(upstream.url.clone());
     cfg.drain_enabled = Some(false);
+    // The shared test config uses an 80ms upstream timeout to exercise the
+    // timeout path in named_inbox_fallback_write_failure_preserves_unknown_outcome.
+    // Here the local mock must answer within the window even under CI load,
+    // otherwise the full cache turns a timed-out-but-sent delivery into 504.
+    cfg.upstream_timeout = "2s".into();
     let server = NamedInboxCacheServer::new(cfg).await.unwrap();
     assert_status(
         &call(&server, br#"{"n":1}"#, "/second").await,
@@ -605,4 +632,82 @@ async fn named_inbox_cancelled_client_does_not_leave_unaccounted_writes() {
     .await
     .unwrap();
     assert_status(&call(&server, b"{}", "/second").await, 503, "rejected");
+}
+
+/// `{"alg":"EdDSA"}` . `{"n":1}` . fake signature: dispatch does not verify
+/// signatures, it only derives the ObjectId from the claims.
+const JWT_BODY: &[u8] = b"eyJhbGciOiJFZERTQSJ9.eyJuIjoxfQ.c2ln";
+
+#[tokio::test]
+async fn named_inbox_caches_and_replays_jwt_form_with_original_content_type() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let unavailable = format!("http://{}", listener.local_addr().unwrap());
+    drop(listener);
+    let dir = TempDir::new().unwrap();
+    let mut config = config(&dir);
+    config.upstream = Some(unavailable);
+    config.drain_enabled = Some(false);
+    let server = NamedInboxCacheServer::new(config.clone()).await.unwrap();
+
+    // JSON and JWT forms of `{"n":1}` share one ObjectId.
+    let json_id = validate_cyfs_dispatch_object(br#"{"n":1}"#, None).unwrap();
+    assert_eq!(
+        validate_cyfs_dispatch_object_jwt(JWT_BODY, None).unwrap(),
+        json_id
+    );
+    assert_status(&call(&server, br#"{"n":1}"#, "/inbox").await, 202, "cached");
+    let resp = server
+        .inner
+        .handle(typed_request(
+            CyfsNamedObjectEncoding::Jwt,
+            JWT_BODY,
+            "/inbox",
+            Some("did:bns:bob"),
+        ))
+        .await;
+    assert_status(&resp, 202, "cached");
+    {
+        let state = server.inner.store.state.lock().await;
+        assert_eq!(state.entries.len(), 1);
+        let entry = state.entries.values().next().unwrap();
+        assert_eq!(entry.encoding, CyfsNamedObjectEncoding::Jwt, "JWT replaces JSON");
+        assert_eq!(state.bytes, JWT_BODY.len() as u64);
+    }
+    // A later JSON copy does not drop the signed form.
+    assert_status(&call(&server, br#"{"n":1}"#, "/inbox").await, 202, "cached");
+    assert_eq!(
+        server.inner.store.state.lock().await.entries.values().next().unwrap().encoding,
+        CyfsNamedObjectEncoding::Jwt
+    );
+    // A malformed JWT is rejected before storage.
+    let resp = server
+        .inner
+        .handle(typed_request(
+            CyfsNamedObjectEncoding::Jwt,
+            b"not-a-jwt",
+            "/inbox",
+            Some("did:bns:bob"),
+        ))
+        .await;
+    assert_status(&resp, 400, "rejected");
+    drop(server);
+
+    let upstream = Upstream::new(0).await;
+    config.upstream = Some(upstream.url.clone());
+    config.drain_enabled = None;
+    let server = NamedInboxCacheServer::new(config).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if server.inner.store.state.lock().await.entries.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        *upstream.content_types.lock().unwrap(),
+        vec![CYFS_CONTENT_TYPE_NAMED_OBJECT_JWT.to_string()]
+    );
 }

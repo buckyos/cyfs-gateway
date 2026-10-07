@@ -34,63 +34,86 @@ impl Tunnel for QuicTunnel {
         Ok(())
     }
 
-    async fn open_stream_by_dest(
+    async fn open_stream_by_dest_with_timeout(
         &self,
         dest_port: u16,
         dest_host: Option<String>,
+        connect_timeout: Duration,
     ) -> Result<Box<dyn AsyncStream>, Error> {
         if dest_host.is_none() {
             return Err(Error::new(std::io::ErrorKind::Other, "dest_host is None"));
         }
-        let mut config =
-            ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
-                .with_safe_default_protocol_versions()
-                .unwrap()
-                .with_platform_verifier()
-                .unwrap()
-                .with_no_client_auth();
-        config.enable_early_data = true;
-        let client_config =
-            quinn::ClientConfig::new(Arc::new(QuicClientConfig::try_from(config).unwrap()));
+        let dest_host = dest_host.as_ref().unwrap();
+        let open = async {
+            let mut config = ClientConfig::builder_with_provider(Arc::new(
+                rustls::crypto::ring::default_provider(),
+            ))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_platform_verifier()
+            .unwrap()
+            .with_no_client_auth();
+            config.enable_early_data = true;
+            let client_config =
+                quinn::ClientConfig::new(Arc::new(QuicClientConfig::try_from(config).unwrap()));
 
-        let ip = resolve_ip(dest_host.as_ref().unwrap().as_str())
+            let ip = resolve_ip(dest_host)
+                .await
+                .map_err(|e| Error::new(std::io::ErrorKind::Other, e))?;
+            let mut endpoint = quinn::Endpoint::client("0.0.0.0:0".parse().unwrap())
+                .map_err(|e| Error::new(std::io::ErrorKind::Other, e))?;
+            endpoint.set_default_client_config(client_config);
+            let connecting = endpoint
+                .connect(
+                    format!("{}:{}", ip.to_string(), dest_port).parse().unwrap(),
+                    dest_host,
+                )
+                .map_err(|e| Error::new(std::io::ErrorKind::Other, e))?;
+            let connection = connecting
+                .await
+                .map_err(|e| Error::new(std::io::ErrorKind::Other, e))?;
+            let (send, recv) = connection
+                .open_bi()
+                .await
+                .map_err(|e| Error::new(std::io::ErrorKind::Other, e))?;
+            Ok::<Box<dyn AsyncStream>, Error>(Box::new(Splittable::new(recv, send)))
+        };
+        tokio::time::timeout(connect_timeout, open)
             .await
-            .map_err(|e| Error::new(std::io::ErrorKind::Other, e))?;
-        let mut endpoint = quinn::Endpoint::client("0.0.0.0:0".parse().unwrap())
-            .map_err(|e| Error::new(std::io::ErrorKind::Other, e))?;
-        endpoint.set_default_client_config(client_config);
-        let connecting = endpoint
-            .connect(
-                format!("{}:{}", ip.to_string(), dest_port).parse().unwrap(),
-                dest_host.as_ref().unwrap().as_str(),
-            )
-            .map_err(|e| Error::new(std::io::ErrorKind::Other, e))?;
-        let connection = connecting
-            .await
-            .map_err(|e| Error::new(std::io::ErrorKind::Other, e))?;
-        let (send, recv) = connection
-            .open_bi()
-            .await
-            .map_err(|e| Error::new(std::io::ErrorKind::Other, e))?;
-        Ok(Box::new(Splittable::new(recv, send)))
+            .map_err(|_| {
+                Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!(
+                        "quic connect to {}:{} timed out after {:?}",
+                        dest_host, dest_port, connect_timeout
+                    ),
+                )
+            })?
     }
 
-    async fn open_stream(&self, stream_id: &str) -> Result<Box<dyn AsyncStream>, Error> {
+    async fn open_stream_with_timeout(
+        &self,
+        stream_id: &str,
+        connect_timeout: Duration,
+    ) -> Result<Box<dyn AsyncStream>, Error> {
         let (dest_host, dest_port) = get_dest_info_from_url_path(stream_id)?;
-        self.open_stream_by_dest(dest_port, dest_host).await
+        self.open_stream_by_dest_with_timeout(dest_port, dest_host, connect_timeout)
+            .await
     }
 
-    async fn create_datagram_client_by_dest(
+    async fn create_datagram_client_by_dest_with_timeout(
         &self,
         _dest_port: u16,
         _dest_host: Option<String>,
+        _connect_timeout: Duration,
     ) -> Result<Box<dyn DatagramClientBox>, Error> {
         unreachable!()
     }
 
-    async fn create_datagram_client(
+    async fn create_datagram_client_with_timeout(
         &self,
         _session_id: &str,
+        _connect_timeout: Duration,
     ) -> Result<Box<dyn DatagramClientBox>, Error> {
         unreachable!()
     }

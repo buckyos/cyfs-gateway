@@ -76,7 +76,6 @@ pub fn app() -> anyhow::Result<GatewayApp> {
         .install(SocksGatewayModule::new())?
         .install(TunGatewayModule::new())?
         .install(SnGatewayModule::new())?
-        .install(TrafficGatewayModule::new())?
         .build()
 }
 
@@ -170,7 +169,6 @@ cyfs-gateway-module-dns     -> cyfs-gateway-app-lib + cyfs-dns
 cyfs-gateway-module-socks   -> cyfs-gateway-app-lib + cyfs-socks
 cyfs-gateway-module-tun     -> cyfs-gateway-app-lib + cyfs-tun
 cyfs-gateway-module-sn      -> cyfs-gateway-app-lib + cyfs-sn + cyfs-gateway-api
-cyfs-gateway-module-traffic -> cyfs-gateway-app-lib + cyfs-traffic
 ```
 
 核心 TCP/UDP/RTCP/TLS/QUIC、HTTP、dir、cyfs-dir、control server 等只依赖
@@ -302,8 +300,6 @@ Server/Stack module 的 runtime 对象必须引用本轮构建的服务。为移
 - [x] `SocksGatewayModule`：`socks` parser/factory/context；
 - [x] `TunGatewayModule`：`tun` parser/factory/context；
 - [x] `SnGatewayModule`：`sn` parser/factory，并提供 SN ACME DNS provider；
-- [x] `TrafficGatewayModule`：traffic config、limiter factory、quota service 的
-  create/reload/shutdown；
 - [x] 每个 module 至少有 capability snapshot 和最小构建测试；
 - [x] 缺少某模块时，其配置应在 parse 阶段明确失败，而不是链接错误或运行时 panic。
 
@@ -358,7 +354,6 @@ Server/Stack module 的 runtime 对象必须引用本轮构建的服务。为移
 - [x] 将两份完全相同的 `config_loader.rs` 移入 `cyfs-gateway-app-lib`；
 - [x] `GatewayConfigParser` 由 `GatewayComposition` 提供 Server/Stack registries；
 - [x] 保持 includes、params、路径归一化、saved config patch 和 control config 合并行为；
-- [x] `TrafficConfig` 若已模块化，从 `GatewayConfig` 固定字段迁入 typed module config；
 - [x] 模块 config 的初次 parse 与 reload parse 使用同一 parser/registration；
 - [x] 删除两个 app 中的 `config_loader.rs`。
 

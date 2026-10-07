@@ -66,6 +66,34 @@ not need to know the Backend layout. Hardhat artifacts, cache, and generated loc
 bindings remain ignored build outputs. `bns-evm` does not consume a JSON ABI, so no
 `Bns.json` copy is maintained.
 
+## Owner validation and authority limits (#185)
+
+Registration and owner/asset transfers validate only the changed name's owner
+path. `BnsName(x)` terminates at x's authority set; it does not recurse into x's
+semantic owner. These writes and authority updates no longer scan all names, so
+an unrelated expired/released authority cannot block another user's writes.
+
+Once a lineage has a persisted nonzero authentication-key count, every successful
+authority update must leave at least one currently active authentication key.
+This applies even without dependants. Rotate keys in one batch, revoking the old
+key and installing the replacement together. The previous persisted count is
+used even after keys expire; it is a snapshot, not a live count. Natural key
+expiry and authority-name expiry/release can still disable dependants. This rule
+does not add a recovery path. Recovery/document-only sets that have always had a
+zero authentication count remain supported, and a fresh lineage starts afresh.
+
+Each authority-update array is limited to 32 entries, including the standalone
+`updateAuthorityKeys` entrypoint. Historical KIDs are **not capped**: authority-root
+recomputation still costs O(K) in the current lineage's recorded KIDs, including
+revoked keys. Before this history becomes large, measure the worst-case mutation
+against the selected chain's transaction/block gas limits and revisit the cap.
+
+The #185 changes preserve storage layout, ABI, events, and authority-root encoding.
+They are intended for the next fresh test-chain deployment; no mainnet deployment
+or migration is part of this change. Existing clients and bns_dv need no protocol
+changes. A new chain/proxy still requires the usual backend/SN network-address
+configuration and fresh indexer state.
+
 ## Upgradeability
 
 The public deployment uses the OpenZeppelin UUPS pattern:

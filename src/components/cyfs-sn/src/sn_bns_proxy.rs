@@ -900,7 +900,10 @@ impl SnBnsProxy {
     }
 
     /// Owner-authorized atomic removal of a single Zone DID from the current
-    /// OwnerDocument. The source hash is checked again by the controller.
+    /// OwnerDocument. The source hash is checked again by the controller; a
+    /// replayed request_id carrying the original (now stale) source hash is
+    /// answered from the controller's idempotency record instead of failing
+    /// the CAS check.
     pub async fn remove_bound_zone(
         &self,
         username: &str,
@@ -928,6 +931,31 @@ impl SnBnsProxy {
         let actual_owner_hash = canonical_json_sha256(&snapshot.document)
             .map_err(|error| SnBnsProxyError::InvalidInput(error.to_string()))?;
         if actual_owner_hash != expected_owner_hash {
+            // 重放请求携带的是原始 source hash，文档推进后 CAS 必然失配；
+            // 只有控制器已有同一 request_id/payload 的完成记录时才是合法重放。
+            let replay_params = RemoveBoundZoneParams {
+                request_id: request_id.clone(),
+                name: username.to_string(),
+                zone_did: zone_did.clone(),
+                expected_owner_hash: expected_owner_hash.clone(),
+                authority: candidate_entry.controller.sn_controller_authority(),
+            };
+            let replay = candidate_entry
+                .controller
+                .replay_remove_bound_zone(replay_params.clone())
+                .await
+                .map_err(SnBnsProxyError::Write)?;
+            if let Some(output) = replay {
+                let payload_hash = hash_json(&replay_params).unwrap_or_default();
+                let outcome = remove_bound_zone_outcome(
+                    candidate_entry,
+                    request_id.as_str(),
+                    username,
+                    &output,
+                );
+                self.audit(&outcome, payload_hash.as_str());
+                return Ok((outcome, output));
+            }
             return Err(SnBnsProxyError::OwnerAuthorization(
                 "expected_owner_hash does not match the current owner document".to_string(),
             ));
@@ -948,23 +976,7 @@ impl SnBnsProxy {
             .remove_bound_zone(params)
             .await
             .map_err(SnBnsProxyError::Write)?;
-        let receipt = &output.receipt;
-        let outcome = SnBnsProxyTxOutcome {
-            request_id,
-            operation: "owner.remove_bound_zone".to_string(),
-            name: username.to_string(),
-            controller_id: entry.id.clone(),
-            controller_address: entry.address.clone(),
-            asset_owner: None,
-            doc_type: receipt.doc_type.clone(),
-            document_version: receipt.document_version,
-            chain_id: receipt.evm_chain_id,
-            nonce: receipt.evm_nonce,
-            tx_hash: receipt.evm_tx_hash.clone(),
-            raw_tx: receipt.evm_raw_tx.clone(),
-            status: SnBnsProxyStatus::Submitted,
-            reused: receipt.created_or_reused,
-        };
+        let outcome = remove_bound_zone_outcome(entry, request_id.as_str(), username, &output);
         self.audit(&outcome, payload_hash.as_str());
         Ok((outcome, output))
     }
@@ -1187,6 +1199,31 @@ fn verify_remove_bound_zone_authorization(
         ));
     }
     Ok(())
+}
+
+fn remove_bound_zone_outcome(
+    entry: &SnBnsProxyController,
+    request_id: &str,
+    username: &str,
+    output: &RemoveBoundZoneOutput,
+) -> SnBnsProxyTxOutcome {
+    let receipt = &output.receipt;
+    SnBnsProxyTxOutcome {
+        request_id: request_id.to_string(),
+        operation: "owner.remove_bound_zone".to_string(),
+        name: username.to_string(),
+        controller_id: entry.id.clone(),
+        controller_address: entry.address.clone(),
+        asset_owner: None,
+        doc_type: receipt.doc_type.clone(),
+        document_version: receipt.document_version,
+        chain_id: receipt.evm_chain_id,
+        nonce: receipt.evm_nonce,
+        tx_hash: receipt.evm_tx_hash.clone(),
+        raw_tx: receipt.evm_raw_tx.clone(),
+        status: SnBnsProxyStatus::Submitted,
+        reused: receipt.created_or_reused,
+    }
 }
 
 fn build_initial_documents(

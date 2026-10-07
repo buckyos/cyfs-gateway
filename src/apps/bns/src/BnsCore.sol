@@ -167,7 +167,7 @@ abstract contract BnsCore is IBnsEvents {
 
         _activateLineageState(nameHash, lineageEpoch);
 
-        _validateAllOwnerGraphs();
+        _validateOwnerPath(nameHash);
 
         _commitEvent(
             EVENT_NAME_REGISTERED, keccak256(abi.encode(nameHash, assetOwner, existing.expireAt, lineageEpoch, nextSeq))
@@ -344,6 +344,9 @@ abstract contract BnsCore is IBnsEvents {
         internal
         returns (AuthoritySetState memory set)
     {
+        if (updates.length > MAX_MUTATION_BATCH_ITEMS) {
+            revert InvalidMutation(ERR_MUTATION_BATCH_TOO_LARGE);
+        }
         bytes32 stateKey = _lineageStateKey(nameHash);
         for (uint256 i = 0; i < updates.length; i++) {
             AuthorityKey calldata updateKey = updates[i].key;
@@ -372,7 +375,11 @@ abstract contract BnsCore is IBnsEvents {
         }
 
         set = _recomputeAuthoritySet(nameHash, name);
-        if (set.activeKeyCount == 0 && _nameIsAuthorityOwner(nameHash)) {
+        // Keep the last persisted nonzero count as the safety latch, even if
+        // those keys have since expired. Recounting the old keys at the current
+        // timestamp would let expiry bypass this check. Rotations must leave a
+        // currently active authentication key in the final batch state.
+        if (set.activeKeyCount == 0 && _authoritySets[stateKey].activeKeyCount > 0) {
             revert NoConcreteSigner();
         }
         _authoritySets[stateKey] = set;
@@ -586,15 +593,9 @@ abstract contract BnsCore is IBnsEvents {
         }
     }
 
-    function _validateAllOwnerGraphs() internal view {
-        for (uint256 i = 0; i < _nameHashes.length; i++) {
-            NameState storage state = _names[_nameHashes[i]];
-            if (_isActiveName(state)) {
-                _validateOwnerPath(_nameHashes[i]);
-            }
-        }
-    }
-
+    // Validate only the changed name. BnsName selects an authority set directly,
+    // not the target's semantic owner; only Unset subnames inherit a parent path.
+    // Unrelated names must not affect this operation's validity or gas cost.
     function _validateOwnerPath(bytes32 startHash) internal view {
         bytes32 current = startHash;
         bytes32[9] memory visited;
@@ -617,16 +618,10 @@ abstract contract BnsCore is IBnsEvents {
                     revert NoConcreteSigner();
                 }
                 AuthoritySetState storage set = _authoritySets[_lineageStateKey(ownerHash)];
-                if (ownerHash == current) {
-                    if (set.activeKeyCount == 0) {
-                        revert NoConcreteSigner();
-                    }
-                    return;
+                if (set.activeKeyCount == 0) {
+                    revert NoConcreteSigner();
                 }
-                if (set.activeKeyCount > 0) {
-                    return;
-                }
-                current = ownerHash;
+                return;
             } else {
                 string memory parent = _parentName(state.name);
                 if (bytes(parent).length == 0) {
@@ -642,19 +637,6 @@ abstract contract BnsCore is IBnsEvents {
                 revert OwnerGraphTooDeep(MAX_OWNER_REF_DEPTH);
             }
         }
-    }
-
-    function _nameIsAuthorityOwner(bytes32 authorityNameHash) internal view returns (bool) {
-        for (uint256 i = 0; i < _nameHashes.length; i++) {
-            NameState storage state = _names[_nameHashes[i]];
-            if (
-                _isActiveName(state) && state.semanticOwner.kind == PrincipalKind.BnsName
-                    && keccak256(state.semanticOwner.value) == authorityNameHash
-            ) {
-                return true;
-            }
-        }
-        return false;
     }
 
     function _validateBatchBounds(uint256 authorityUpdateCount, DocumentUpdate[] calldata documents) internal pure {

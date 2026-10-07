@@ -1678,7 +1678,7 @@ async fn remove_bound_zone_applies_cas_once_and_replays_idempotently() {
         "https://zone-b.example/resolve/did:bns:alice"
     );
 
-    let replay = controller.remove_bound_zone(params).await.unwrap();
+    let replay = controller.remove_bound_zone(params.clone()).await.unwrap();
     assert!(replay.receipt.created_or_reused);
     assert_eq!(replay.result_owner_hash, result.hash);
     assert_eq!(
@@ -1689,6 +1689,42 @@ async fn remove_bound_zone_applies_cas_once_and_replays_idempotently() {
             .version,
         2
     );
+
+    // SN RPC 层用 replay 查询回答“同一 request_id 携带原始 source hash 的重放”：
+    // 这里必须能直接取回既有结果，且不读取当前文档。
+    let replayed = controller
+        .replay_remove_bound_zone(params.clone())
+        .await
+        .unwrap()
+        .expect("completed request must be replayable");
+    assert!(replayed.receipt.created_or_reused);
+    assert_eq!(replayed.source_owner_hash, first.source_owner_hash);
+    assert_eq!(replayed.result_owner_hash, first.result_owner_hash);
+    assert_eq!(replayed.source_version, 1);
+    assert_eq!(replayed.target_version, 2);
+
+    // 没有完成记录的 request_id 不产生重放结果（仍走正常 CAS 校验）。
+    assert!(controller
+        .replay_remove_bound_zone(RemoveBoundZoneParams {
+            request_id: "never-submitted-request".to_string(),
+            ..params.clone()
+        })
+        .await
+        .unwrap()
+        .is_none());
+
+    // 同 request_id 但 payload 不同 → 重放冲突，不能返回既有结果。
+    let conflicting = controller
+        .replay_remove_bound_zone(RemoveBoundZoneParams {
+            zone_did: "did:web:zone-b.example".to_string(),
+            ..params
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        conflicting,
+        SnBnsControllerError::IdempotencyConflict { .. }
+    ));
 
     let stale = controller
         .remove_bound_zone(RemoveBoundZoneParams {
