@@ -469,11 +469,22 @@ async fn named_inbox_call_server_trust_and_dispatch_control_mapping() {
 #[tokio::test]
 async fn named_inbox_reload_shares_atomic_capacity_and_stops_worker() {
     let dir = TempDir::new().unwrap();
-    let config = config(&dir);
+    let mut config = config(&dir);
+    config.cache_path = dir.path().join("nested/cache");
     let first = NamedInboxCacheServer::new(config.clone()).await.unwrap();
+    assert!(!config.cache_path.exists());
     assert_status(&call(&first, b"{}", "/inbox").await, 202, "cached");
     let second = NamedInboxCacheServer::new(config.clone()).await.unwrap();
+    assert_eq!(first.inner.config.cache_path, second.inner.config.cache_path);
     assert!(Arc::ptr_eq(&first.inner.store, &second.inner.store));
+    let (a, b) = tokio::join!(
+        call(&first, br#"{"n":1}"#, "/inbox"),
+        call(&second, br#"{"n":2}"#, "/inbox")
+    );
+    let mut codes = [a.status().as_u16(), b.status().as_u16()];
+    codes.sort();
+    assert_eq!(codes, [202, 503]);
+    assert_eq!(first.inner.store.state.lock().await.entries.len(), 2);
     let upstream = Upstream::new(1).await;
     let mut config = config;
     config.upstream = Some(upstream.url.clone());

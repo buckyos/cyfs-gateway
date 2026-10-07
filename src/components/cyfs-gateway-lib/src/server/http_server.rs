@@ -5752,6 +5752,9 @@ request_body_idle_timeout: 10s
             "test_tls_timeout_retry",
             healthy_addr,
             HttpServerTimeouts {
+                // Windows can take about two seconds to report loopback
+                // connection refusal. Keep it distinct from a TCP timeout.
+                connect: Duration::from_secs(5),
                 tls_handshake: Duration::from_millis(50),
                 ..HttpServerTimeouts::default()
             },
