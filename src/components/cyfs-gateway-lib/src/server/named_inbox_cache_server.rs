@@ -248,6 +248,24 @@ struct SharedStore {
 static STORES: once_cell::sync::Lazy<StdMutex<HashMap<PathBuf, Weak<SharedStore>>>> =
     once_cell::sync::Lazy::new(|| StdMutex::new(HashMap::new()));
 
+fn normalize_cache_path(path: &Path) -> std::io::Result<PathBuf> {
+    let absolute = super::normalize_path(&std::path::absolute(path)?);
+    let mut ancestor = absolute.as_path();
+    loop {
+        // Resolve an existing ancestor even before the cache directory is
+        // created, so Windows verbatim prefixes and parent symlinks stay
+        // consistent when a later instance resolves the full directory.
+        if let Ok(mut canonical) = std::fs::canonicalize(ancestor) {
+            canonical.extend(absolute.strip_prefix(ancestor).unwrap().components());
+            return Ok(canonical);
+        }
+        let Some(parent) = ancestor.parent() else {
+            return Ok(absolute);
+        };
+        ancestor = parent;
+    }
+}
+
 struct InboxInner {
     config: NamedInboxCacheServerConfig,
     targets: Vec<String>,
@@ -276,13 +294,8 @@ impl NamedInboxCacheServer {
         config
             .validate()
             .map_err(|e| server_err!(ServerErrorCode::InvalidConfig, "{}", e))?;
-        config.cache_path = super::normalize_path(
-            &std::path::absolute(&config.cache_path)
-                .map_err(|e| server_err!(ServerErrorCode::InvalidConfig, "{}", e))?,
-        );
-        if let Ok(canonical) = std::fs::canonicalize(&config.cache_path) {
-            config.cache_path = canonical;
-        }
+        config.cache_path = normalize_cache_path(&config.cache_path)
+            .map_err(|e| server_err!(ServerErrorCode::InvalidConfig, "{}", e))?;
         let targets: Vec<_> = config
             .accepted_paths
             .iter()
