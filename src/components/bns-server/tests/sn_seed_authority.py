@@ -8,6 +8,8 @@ import time
 import urllib.error
 import urllib.request
 
+from cargo_lockfile import ensure_cargo_lockfile
+
 root = Path(__file__).resolve().parents[4]
 gateway = root / "src"
 
@@ -26,8 +28,11 @@ with tempfile.TemporaryDirectory(prefix="bns-sn-seed-") as temp:
     assert slots["ood1"] == expected["device_jwt"]
     assert slots["zone"] == expected["zone_jwt"]
 
+    ensure_cargo_lockfile(gateway, env)
+    profile = env.get("BUCKYOS_SN_SEED_CARGO_PROFILE", "release")
     output = subprocess.run(
-        ["cargo", "test", "--locked", "--release", "--no-run", "--message-format=json",
+        ["cargo", "test", "--locked", "--profile", profile,
+         "--no-run", "--message-format=json",
          "-p", "bns-server", "-p", "cyfs-gateway-lib", "--lib"],
         cwd=gateway, env=env, check=True, stdout=subprocess.PIPE, text=True)
     binaries = {}
