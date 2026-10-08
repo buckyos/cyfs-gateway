@@ -365,6 +365,7 @@ Deno.test("BNS seed publishes full device documents separately from TXT mini JWT
     iat: 1_735_689_600,
     exp: 2_058_838_939,
     verificationMethod: [{
+      type: "Ed25519VerificationKey2020",
       id: "#main_key",
       controller: "did:bns:ood1.alice",
       publicKeyJwk: { kty: "OKP", crv: "Ed25519", x: TEST_OWNER_PUBLIC_KEY_X },

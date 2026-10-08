@@ -5,6 +5,7 @@ from pathlib import Path
 import subprocess
 import tempfile
 import time
+import urllib.error
 import urllib.request
 
 root = Path(__file__).resolve().parents[4]
@@ -64,6 +65,9 @@ with tempfile.TemporaryDirectory(prefix="bns-sn-seed-") as temp:
                 [binaries["cyfs_gateway_lib"], "relay_node_active_bns_authority_current",
                  "--ignored", "--nocapture"],
                 env=env, check=True, timeout=30)
+        except urllib.error.HTTPError as error:
+            print("BNS HTTP error body:", error.read().decode(), flush=True)
+            raise
         finally:
             Path(str(fixture) + ".stop").touch()
             try:
