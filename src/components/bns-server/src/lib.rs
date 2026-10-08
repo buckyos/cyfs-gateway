@@ -2313,20 +2313,37 @@ mod tests {
         let store = resolver_seeded_store();
         store
             .transact(|tx| {
-                for (slot, bytes) in [
-                    ("owner", serde_json::to_vec(&fixture["owner"]).unwrap()),
-                    (
-                        "zone",
-                        fixture["zone_jwt"].as_str().unwrap().as_bytes().to_vec(),
-                    ),
-                    (
-                        "ood1",
-                        fixture["device_jwt"].as_str().unwrap().as_bytes().to_vec(),
-                    ),
-                ] {
+                let documents = if let Some(documents) = fixture["documents"].as_array() {
+                    documents
+                        .iter()
+                        .map(|document| {
+                            (
+                                document["name"].as_str().unwrap().to_string(),
+                                document["doc_type"].as_str().unwrap().to_string(),
+                                document["content"].as_str().unwrap().as_bytes().to_vec(),
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                } else {
+                    [
+                        ("owner", serde_json::to_vec(&fixture["owner"]).unwrap()),
+                        (
+                            "zone",
+                            fixture["zone_jwt"].as_str().unwrap().as_bytes().to_vec(),
+                        ),
+                        (
+                            "ood1",
+                            fixture["device_jwt"].as_str().unwrap().as_bytes().to_vec(),
+                        ),
+                    ]
+                    .into_iter()
+                    .map(|(slot, bytes)| ("alice".to_string(), slot.to_string(), bytes))
+                    .collect()
+                };
+                for (name, slot, bytes) in documents {
                     tx.put_document(&resolver_document_state(
-                        "alice",
-                        slot,
+                        &name,
+                        &slot,
                         10,
                         DocumentStatus::Active,
                         &bytes,

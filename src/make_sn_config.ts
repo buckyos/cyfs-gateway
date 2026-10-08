@@ -1457,12 +1457,10 @@ function toZoneDocumentJson(
  *
  * 文档形状与 resolver 消费面对齐（test_sn_bns_integration 同款）：
  *   owner            完整 OwnerDocument 的 owner 自签 JWT；BNS 是权威存储
- *   zone             完整 ZoneDocument JSON（含 boot/device），并生成 owner 签名 JWT
  *   boot             签名 boot JWT 原文（inline_text_file）    原子文档；BOOT= TXT 取 jwt
  *   device_mini_doc  {"devices":{"<ood>":<完整 DeviceDocument>},
  *                     "mini_device_jwts":{...},
  *                     "device_document_jwts":{...}}
- *                    完整文档供 RTCP authority-current；mini JWT 只供 DEV= TXT
  * did:web 用户（userDomain）的 ZoneDocument 权威仍在 SN user_domain 机制，
  * 但其 canonical BNS zone 也必须发布完整设备文档，供 SN 的 did:web upper
  * resolver 在客户端首次 keep-tunnel（OOD 尚未在线）时回答。
@@ -1498,7 +1496,6 @@ export async function makeBnsDvSeedConfig(
     );
 
     if (!user.userDomain) {
-      const zoneJsonRel = `${docsRootName}/${user.username}/zone.json`;
       writeJson(
         path.join(userDocsDir, "zone.json"),
         env.zoneDocument,
@@ -1511,10 +1508,7 @@ export async function makeBnsDvSeedConfig(
       console.log(`# Write file: ${path.join(userDocsDir, "zone.jwt")}`);
       docLines.push(
         `      - doc_type: zone`,
-        // Public did:bns:<name> resolution historically returns JSON for the
-        // default zone document. Keep that wire shape while retaining the
-        // owner-signed JWT as a sibling artifact for signed consumers.
-        `        inline_json_file: ${yamlQuote(zoneJsonRel)}`,
+        `        inline_text_file: ${yamlQuote(zoneJwtRel)}`,
       );
 
       const bootRel = `${docsRootName}/${user.username}/boot.jwt`;
@@ -1530,6 +1524,15 @@ export async function makeBnsDvSeedConfig(
     }
 
     const params = getParamsFromGroupName(user.groupName);
+    const deviceRel = `${docsRootName}/${user.username}/${params.node_name}.jwt`;
+    fs.writeFileSync(
+      path.join(userDocsDir, `${params.node_name}.jwt`),
+      `${env.deviceDocJwt}\n`,
+    );
+    docLines.push(
+      `      - doc_type: ${yamlQuote(params.node_name)}`,
+      `        inline_text_file: ${yamlQuote(deviceRel)}`,
+    );
     const miniRel = `${docsRootName}/${user.username}/device_mini_doc.json`;
     writeJson(path.join(userDocsDir, "device_mini_doc.json"), {
       // Keep the authoritative document body byte-for-byte equivalent at the
