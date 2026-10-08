@@ -274,6 +274,7 @@ async function writeUserDidSeedMaterial(
   userDir: string,
   username: string,
   zoneDid: string,
+  issuedAt = 1_901_158_939,
 ): Promise<void> {
   const ownerDid = `did:bns:${username}`;
   await Deno.writeTextFile(
@@ -306,7 +307,7 @@ async function writeUserDidSeedMaterial(
       assertionMethod: ["#main_key"],
       capabilityInvocation: ["#main_key"],
       exp: 2_058_838_939,
-      iat: 1_901_158_939,
+      iat: issuedAt,
       version_seq: 0,
       hostname: zoneDid.startsWith("did:web:")
         ? zoneDid.slice("did:web:".length)
@@ -364,9 +365,10 @@ Deno.test("BNS seed publishes full device documents separately from TXT mini JWT
     iat: 1_735_689_600,
     exp: 2_058_838_939,
     verificationMethod: [{
+      type: "Ed25519VerificationKey2020",
       id: "#main_key",
       controller: "did:bns:ood1.alice",
-      publicKeyJwk: { kty: "OKP", crv: "Ed25519", x: "device-x" },
+      publicKeyJwk: { kty: "OKP", crv: "Ed25519", x: TEST_OWNER_PUBLIC_KEY_X },
     }],
     authentication: ["#main_key"],
   };
@@ -388,7 +390,7 @@ Deno.test("BNS seed publishes full device documents separately from TXT mini JWT
   const miniJwt = signedJwt(
     {
       n: "ood1",
-      x: "device-x",
+      x: TEST_OWNER_PUBLIC_KEY_X,
       exp: 2_058_838_939,
     },
     TEST_OWNER_PRIVATE_KEY_PEM,
@@ -418,6 +420,7 @@ Deno.test("BNS seed publishes full device documents separately from TXT mini JWT
       userDir,
       "alice",
       "did:bns:alice",
+      1_735_689_600,
     );
     await writeUserDidSeedMaterial(
       webUserDir,
@@ -520,10 +523,25 @@ Deno.test("BNS seed publishes full device documents separately from TXT mini JWT
     }
     if (
       !seedYaml.includes(
-        'inline_json_file: "bns_seed_docs/alice/zone.json"',
+        'inline_text_file: "bns_seed_docs/alice/zone.jwt"',
       )
     ) {
-      throw new Error("BNS seed does not publish the complete ZoneDocument");
+      throw new Error("BNS seed does not publish the signed ZoneDocument");
+    }
+    for (const [username, expectedJwt] of [
+      ["alice", deviceDocJwt],
+      ["charlie", webDeviceDocJwt],
+    ]) {
+      const reference = `bns_seed_docs/${username}/ood1.jwt`;
+      if (!seedYaml.includes(
+        `      - doc_type: "ood1"\n        inline_text_file: "${reference}"`,
+      )) {
+        throw new Error(`BNS seed misses the independent device slot for ${username}`);
+      }
+      const stored = await Deno.readTextFile(`${outputRoot}/${reference}`);
+      if (stored.trim() !== expectedJwt) {
+        throw new Error(`BNS device slot changed the original JWT for ${username}`);
+      }
     }
 
     const storedOwner = JSON.parse(
@@ -563,7 +581,7 @@ Deno.test("BNS seed publishes full device documents separately from TXT mini JWT
       JSON.stringify(storedZone) !== JSON.stringify(signedZone) ||
       signedZone.id !== "did:bns:alice" ||
       signedZone.owner !== "did:bns:alice" ||
-      signedZone.iat !== 1_901_158_939 ||
+      signedZone.iat !== 1_735_689_600 ||
       (signedZone.devices as Record<string, unknown>).ood1 === undefined
     ) {
       throw new Error("BNS zone document is not complete or owner-signed");
@@ -622,6 +640,35 @@ Deno.test("BNS seed publishes full device documents separately from TXT mini JWT
       throw new Error(
         "did:web device document was not seeded via canonical BNS",
       );
+    }
+    const fixturePath = Deno.env.get("BUCKYOS_SN_SEED_FIXTURE");
+    if (fixturePath) {
+      const documents = [];
+      for (const block of seedYaml.split("  - type: register_name\n").slice(1)) {
+        const nameMatch = block.match(/^    name: (".*")$/m);
+        if (!nameMatch) {
+          throw new Error("Generated BNS seed registration misses a name");
+        }
+        const name = JSON.parse(nameMatch[1]);
+        for (const match of block.matchAll(
+          /^      - doc_type: (.+)\n        inline_(text|json)_file: (".*")$/gm,
+        )) {
+          const docType = match[1].startsWith('"')
+            ? JSON.parse(match[1]) : match[1];
+          const reference = JSON.parse(match[3]);
+          const text = await Deno.readTextFile(`${outputRoot}/${reference}`);
+          const content = match[2] === "json"
+            ? JSON.stringify(JSON.parse(text)) : text.trim();
+          documents.push({ name, doc_type: docType, content });
+        }
+      }
+      await Deno.writeTextFile(fixturePath, JSON.stringify({
+        owner: ownerDocument("alice"),
+        zone_jwt: storedZoneJwt.trim(),
+        device_jwt: deviceDocJwt,
+        device: deviceDoc,
+        documents,
+      }));
     }
   } finally {
     await Deno.remove(root, { recursive: true });

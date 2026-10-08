@@ -16,6 +16,25 @@ jobs:
 
     steps:
     - uses: actions/checkout@v4
+    - uses: denoland/setup-deno@v2
+      with:
+        deno-version: v2.9.2
+    - name: Prepare regression scratch directory
+      run: mkdir -p "$GITHUB_WORKSPACE/.work/tmp"
+    - name: Test Cargo lockfile bootstrap
+      env:
+        TMPDIR: ${{ github.workspace }}/.work/tmp
+      run: python3 -m unittest discover -s src/components/bns-server/tests -p test_cargo_lockfile.py -v
+    - name: Test SN seed generator
+      working-directory: src
+      env:
+        TMPDIR: ${{ github.workspace }}/.work/tmp
+      run: deno test -A make_sn_config_test.ts
+    - name: Test generated SN seed authority
+      env:
+        TMPDIR: ${{ github.workspace }}/.work/tmp
+        BUCKYOS_SN_SEED_CARGO_PROFILE: test
+      run: python3 src/components/bns-server/tests/sn_seed_authority.py
     - name: Build
       run: cd src && cargo build --verbose
     - name: Run tests
