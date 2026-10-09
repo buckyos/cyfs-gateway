@@ -49,13 +49,6 @@
 //   <rootfs>/web3_relay.yaml          与 web3_gateway.yaml 打同样的 web3_sn
 //   <rootfs>/web3_sn_api.yaml         文本补丁（db 路径、dev bns_proxy 注入）
 // Still created manually/by app template: website.yaml, local_dns.toml.
-//
-// Seed users: alice.ood1 / bob.ood1 / charlie.ood1 / dave.ood1 dev zones are
-// materialized as bns_dv_seed.yaml and sn_seed.yaml. Their user envs are reused
-// from <env_root> when present (so JWTs match rootfs built by make_config.ts)
-// and generated there otherwise (DEV_TEST_KEYS are deterministic, so devices
-// still verify). cyfs-sn imports sn_seed.yaml at startup; this script no longer
-// writes SN-private user/device tables.
 
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -65,21 +58,22 @@ import {
   createHash,
   createPrivateKey,
   createPublicKey,
-  sign as cryptoSign,
   verify as cryptoVerify,
 } from "node:crypto";
 import { parseArgs } from "node:util";
+import { pathToFileURL } from "node:url";
 import {
   assertProvisionRuntime,
   createCertFromCa,
   createSnConfigs,
   ensureCa,
+  deviceIdentityPathsForRoots,
+  IdentityRoots,
+  loadLocalNodeIdentityConfig,
 } from "buckyos/provision";
-import { createNodeConfigs, createUserEnv } from "buckyos/provision";
 import {
   ENV_ROOT_DIR,
   getParamsFromGroupName,
-  type OODGroupParams,
 } from "./devenv_config.ts";
 
 // ---------------------------------------------------------------------------
@@ -93,83 +87,6 @@ import {
 export function ensureDir(dirPath: string): string {
   fs.mkdirSync(dirPath, { recursive: true });
   return dirPath;
-}
-
-interface DevEd25519KeyPair {
-  privateKeyPem: string;
-  publicKeyX: string;
-}
-
-// websdk DEV_TEST_KEYS 之外的种子用户（如纯 Web3 位 dave）没有预置密钥，
-// createNodeConfigs 查不到 `<user>.<device>` 会直接 throw。这里用固定标签
-// sha256 出 32 字节种子做 ed25519 私钥（PKCS8 头 + seed），公钥 x 由
-// node:crypto 导出——确定性与 DEV_TEST_KEYS 预置键等价，仅限 devtest。
-function deriveDevEd25519KeyPair(label: string): DevEd25519KeyPair {
-  const seed = createHash("sha256")
-    .update(`buckyos-devtest-ed25519:${label}`)
-    .digest();
-  const pkcs8 = Buffer.concat([
-    Buffer.from("302e020100300506032b657004220420", "hex"),
-    seed,
-  ]);
-  const privateKeyPem = `-----BEGIN PRIVATE KEY-----\n${
-    pkcs8.toString("base64")
-  }\n-----END PRIVATE KEY-----`;
-  const jwk = createPublicKey(createPrivateKey(privateKeyPem)).export({
-    format: "jwk",
-  }) as { x?: string };
-  if (!jwk.x) {
-    throw new Error(`derive ed25519 key pair failed for ${label}`);
-  }
-  return { privateKeyPem, publicKeyX: jwk.x };
-}
-
-// 需要本地派生密钥的种子用户（不在 buckyos websdk DEV_TEST_KEYS 预置表里）。
-const DERIVED_KEY_SEED_USERS = new Set(["dave"]);
-
-function seedKeyOverrides(
-  username: string,
-  deviceName: string,
-): { ownerKeyPair?: DevEd25519KeyPair; deviceKeyPair?: DevEd25519KeyPair } {
-  if (!DERIVED_KEY_SEED_USERS.has(username)) {
-    return {};
-  }
-  return {
-    ownerKeyPair: deriveDevEd25519KeyPair(`${username}.owner`),
-    deviceKeyPair: deriveDevEd25519KeyPair(`${username}.${deviceName}`),
-  };
-}
-
-// Build (or rebuild) the user env dir <envRoot>/<zone_id> with provision.
-// websdk createUserEnv + createNodeConfigs 的组合薄封装（与 buckyos
-// make_config.ts 的 buildUserEnv 同语义），另支持 DEV_TEST_KEYS 之外用户的
-// 确定性派生密钥。
-export async function buildUserEnv(
-  params: OODGroupParams,
-  envRoot: string,
-): Promise<string> {
-  const userDir = ensureDir(path.join(envRoot, params.zone_id));
-  const oodNameForZone = params.netid !== "lan"
-    ? `${params.node_name}@${params.netid}`
-    : params.node_name;
-  const keyOverrides = seedKeyOverrides(params.username, params.node_name);
-
-  await createUserEnv({
-    username: params.username,
-    hostname: params.zone_id,
-    oodName: oodNameForZone,
-    snBaseHost: params.sn_base_host,
-    rtcpPort: params.rtcp_port,
-    outputDir: userDir,
-    ...keyOverrides,
-  });
-  await createNodeConfigs({
-    deviceName: params.node_name,
-    netId: params.netid,
-    envDir: userDir,
-    ...keyOverrides,
-  });
-  return userDir;
 }
 
 const DEFAULT_SN_BASE_HOST = "devtests.org";
@@ -934,29 +851,14 @@ export function deriveUserEvmAccount(
   return account;
 }
 
-function decodeJwtPayload(jwt: string): Record<string, unknown> {
-  const parts = jwt.split(".");
-  if (parts.length !== 3) {
-    throw new Error("invalid JWT: expected 3 segments");
-  }
-  const payload = Buffer.from(
-    parts[1].replaceAll("-", "+").replaceAll("_", "/"),
-    "base64",
-  ).toString("utf8");
-  return JSON.parse(payload);
-}
-
 interface SeedUserEnvView {
   bootConfigJwt: string;
   deviceMiniDocJwt: string;
   deviceDocJwt: string;
   deviceDoc: Record<string, unknown>;
   pkx: string;
-  zoneBootJson: Record<string, unknown>;
-  sourceZoneDocument: Record<string, unknown>;
   ownerDocument: Record<string, unknown>;
   ownerDocumentJwt: string;
-  ownerPrivateKeyPem: string;
   zoneDocument: Record<string, unknown>;
   zoneDocumentJwt: string;
 }
@@ -965,27 +867,6 @@ interface SeedOwnerIdentity {
   document: Record<string, unknown>;
   privateKeyPem: string;
   publicKeyX: string;
-}
-
-function jwtSegment(value: unknown): string {
-  return Buffer.from(JSON.stringify(value), "utf8").toString("base64url");
-}
-
-// Mirrors name-lib/websdk signJwtEdDSA: compact JWS, Ed25519, no `typ`.
-// Ed25519 signatures are deterministic, keeping regenerated seed products stable.
-function signDidDocumentJwt(
-  document: Record<string, unknown>,
-  privateKeyPem: string,
-): string {
-  const signingInput = `${jwtSegment({ alg: "EdDSA" })}.${
-    jwtSegment(document)
-  }`;
-  const signature = cryptoSign(
-    null,
-    Buffer.from(signingInput, "utf8"),
-    createPrivateKey(privateKeyPem),
-  );
-  return `${signingInput}.${signature.toString("base64url")}`;
 }
 
 function verifyDidDocumentJwt(
@@ -1124,326 +1005,176 @@ function loadSeedOwnerIdentity(
   };
 }
 
-function findFilesNamed(root: string, fileName: string): string[] {
-  if (!fs.existsSync(root)) {
-    return [];
-  }
-  const result: string[] = [];
-  for (const entry of fs.readdirSync(root, { withFileTypes: true })) {
-    const entryPath = path.join(root, entry.name);
-    if (entry.isDirectory()) {
-      result.push(...findFilesNamed(entryPath, fileName));
-    } else if (entry.isFile() && entry.name === fileName) {
-      result.push(entryPath);
-    }
-  }
-  return result;
-}
-
-function readDeviceDocJwt(userDir: string, deviceName: string): string {
-  const nodeDir = path.join(userDir, deviceName);
-  const nodeIdentityPath = path.join(nodeDir, "node_identity.json");
-  if (fs.existsSync(nodeIdentityPath)) {
-    const nodeIdentity = readJson(nodeIdentityPath);
-    if (
-      typeof nodeIdentity.device_doc_jwt === "string" &&
-      nodeIdentity.device_doc_jwt.trim()
-    ) {
-      return nodeIdentity.device_doc_jwt.trim();
-    }
-  }
-
-  const matches = findFilesNamed(
-    path.join(nodeDir, "local", "identity"),
-    "device_doc.jwt",
-  );
-  if (matches.length > 1) {
-    throw new Error(
-      `user env ${userDir} has ambiguous device_doc.jwt files for ${deviceName}: ${
-        matches.join(", ")
-      }`,
-    );
-  }
-  return matches.length === 1 ? fs.readFileSync(matches[0], "utf8").trim() : "";
-}
-
-// 读取（缺失或仍是旧身份布局则先重建）用户 env，取出种子需要的完整
-// DeviceDocument、mini document、boot document 与 owner 公钥。RTCP v4 的
-// authority-current 验证需要完整 DeviceDocument；TXT DEV mini document
-// 只能继续承担 DNS/bootstrap 兼容职责。
 async function loadSeedUserEnv(
   envRoot: string,
   user: SnSeedUserSpec,
 ): Promise<SeedUserEnvView> {
   const params = getParamsFromGroupName(user.groupName);
   const userDir = path.join(envRoot, params.zone_id);
-  const nodeIdentityPath = path.join(
-    userDir,
-    params.node_name,
-    "node_identity.json",
+  const nodeDir = path.join(userDir, params.node_name);
+  const bundlePath = path.join(nodeDir, "sn_seed_identity.json");
+  if (!fs.existsSync(bundlePath)) {
+    throw new Error(
+      `missing finalized OOD identity: ${bundlePath}; run buckyos make_config.ts ${user.groupName} with the same --env_root before generating SN seeds`,
+    );
+  }
+  const bundle = readJson(bundlePath);
+  if (bundle.schema !== "buckyos.sn_seed_identity.v1") {
+    throw new Error(`${bundlePath} has invalid schema`);
+  }
+  const nodeIdentity = loadLocalNodeIdentityConfig(path.join(nodeDir, "node_identity.json"));
+  const sourcePaths = deviceIdentityPathsForRoots(
+    new IdentityRoots(path.join(nodeDir, "local", "identity"), path.join(nodeDir, "security")),
+    nodeIdentity.device_did,
   );
-  const expectedDeviceDid = user.userDomain
+  const sourceFiles = [
+    path.join(userDir, "user_config.json"),
+    path.join(userDir, "zone_config.json"),
+    path.join(userDir, `${params.zone_id}.zone.json`),
+    path.join(nodeDir, "node_identity.json"),
+    sourcePaths.didJson,
+  ];
+  const sourceHash = createHash("sha256")
+    .update(JSON.stringify(sourceFiles.map((file) => fs.readFileSync(file, "utf8"))))
+    .digest("hex");
+  if (bundle.source_sha256 !== sourceHash) {
+    throw new Error(`${bundlePath} is stale; regenerate OOD configuration for ${user.groupName}`);
+  }
+
+  const ownerIdentity = loadSeedOwnerIdentity(userDir, user.username);
+  const pkx = ownerIdentity.publicKeyX;
+  const documents: Record<string, Record<string, unknown>> = {};
+  const tokens: Record<string, string> = {};
+  for (const field of [
+    "owner_document_jwt",
+    "zone_document_jwt",
+    "boot_config_jwt",
+    "device_doc_jwt",
+    "device_mini_doc_jwt",
+  ]) {
+    const token = bundle[field];
+    if (typeof token !== "string" || !token.trim()) {
+      throw new Error(`${bundlePath} misses ${field}`);
+    }
+    tokens[field] = token.trim();
+    documents[field] = verifyDidDocumentJwt(token, pkx, `${bundlePath} ${field}`);
+  }
+  const ownerDocument = documents.owner_document_jwt;
+  const deviceDoc = documents.device_doc_jwt;
+  const zoneDocument = documents.zone_document_jwt;
+  const bootDocument = documents.boot_config_jwt;
+  const miniDocument = documents.device_mini_doc_jwt;
+  const ownerDid = `did:bns:${user.username}`;
+  const zoneDid = user.userDomain ? `did:web:${user.userDomain}` : ownerDid;
+  const deviceDid = user.userDomain
     ? `did:web:${params.node_name}.${user.userDomain}`
     : `did:bns:${params.node_name}.${user.username}`;
-  const expectedOwnerDid = `did:bns:${user.username}`;
-  const expectedZoneDid = user.userDomain
-    ? `did:web:${user.userDomain}`
-    : expectedOwnerDid;
-  let deviceDocJwt = readDeviceDocJwt(userDir, params.node_name);
-  let deviceDoc: Record<string, unknown> | undefined;
-  let ownerIdentity: SeedOwnerIdentity | undefined;
-  const refreshReasons: string[] = [];
-  if (!fs.existsSync(nodeIdentityPath)) {
-    refreshReasons.push("missing node_identity.json");
-  } else if (!deviceDocJwt) {
-    refreshReasons.push("missing device_doc.jwt");
-  } else {
-    try {
-      deviceDoc = decodeJwtPayload(deviceDocJwt);
-      if (deviceDoc.id !== expectedDeviceDid) {
-        refreshReasons.push(
-          `device_doc.jwt id ${
-            String(deviceDoc.id)
-          } does not match ${expectedDeviceDid}`,
-        );
-      } else if (
-        deviceDoc.owner !== expectedOwnerDid ||
-        deviceDoc.zone_did !== expectedZoneDid ||
-        deviceDoc.name !== params.node_name
-      ) {
-        refreshReasons.push(
-          "device_doc.jwt owner/zone/name does not match the seed user",
-        );
-      }
-    } catch (err) {
-      refreshReasons.push(
-        `invalid device_doc.jwt: ${
-          err instanceof Error ? err.message : String(err)
-        }`,
-      );
+  if (
+    ownerDocument.id !== ownerDid ||
+    ownerDocumentKeyX(ownerDocument, bundlePath) !== pkx ||
+    deviceDoc.id !== deviceDid ||
+    deviceDoc.id !== nodeIdentity.device_did ||
+    deviceDoc.owner !== ownerDid ||
+    deviceDoc.zone_did !== zoneDid ||
+    deviceDoc.name !== params.node_name ||
+    zoneDocument.id !== zoneDid ||
+    zoneDocument.owner !== ownerDid ||
+    bootDocument.id !== zoneDid ||
+    miniDocument.n !== params.node_name
+  ) {
+    throw new Error(`${bundlePath} identity binding does not match the seed user`);
+  }
+  const devices = zoneDocument.devices as Record<string, unknown> | undefined;
+  const miniJwts = zoneDocument.mini_device_jwts as Record<string, unknown> | undefined;
+  const methods = deviceDoc.verificationMethod as { publicKeyJwk?: { x?: unknown } }[] | undefined;
+  const sourceDevice = readJson(sourcePaths.didJson);
+  const sourceMethods = sourceDevice.verificationMethod as { publicKeyJwk?: { x?: unknown } }[] | undefined;
+  if (
+    JSON.stringify(devices?.[params.node_name]) !== JSON.stringify(deviceDoc) ||
+    zoneDocument.boot_jwt !== tokens.boot_config_jwt ||
+    miniJwts?.[params.node_name] !== tokens.device_mini_doc_jwt ||
+    !Array.isArray(bootDocument.oods) || bootDocument.oods.length === 0 ||
+    JSON.stringify(zoneDocument.oods) !== JSON.stringify(bootDocument.oods) ||
+    !methods?.[0]?.publicKeyJwk?.x ||
+    methods[0].publicKeyJwk.x !== sourceMethods?.[0]?.publicKeyJwk?.x ||
+    miniDocument.x !== methods[0].publicKeyJwk.x ||
+    miniDocument.p !== deviceDoc.rtcp_port ||
+    miniDocument.iat !== deviceDoc.iat ||
+    miniDocument.exp !== deviceDoc.exp ||
+    zoneDocument.iat !== deviceDoc.iat ||
+    zoneDocument.exp !== deviceDoc.exp ||
+    bootDocument.exp !== deviceDoc.exp
+  ) {
+    throw new Error(`${bundlePath} contains inconsistent signed documents`);
+  }
+  const now = Math.floor(Date.now() / 1000);
+  for (const document of [ownerDocument, zoneDocument, deviceDoc, miniDocument]) {
+    if (
+      typeof document.iat !== "number" || !Number.isFinite(document.iat) ||
+      typeof document.exp !== "number" || !Number.isFinite(document.exp) ||
+      document.iat > now || document.exp <= now || document.iat > document.exp
+    ) {
+      throw new Error(`${bundlePath} has invalid document validity times`);
     }
   }
-
-  try {
-    ownerIdentity = loadSeedOwnerIdentity(userDir, user.username);
-  } catch (err) {
-    refreshReasons.push(
-      `invalid owner identity: ${
-        err instanceof Error ? err.message : String(err)
-      }`,
-    );
-  }
-  const sourceZoneDocumentPath = path.join(userDir, "zone_config.json");
-  if (!fs.existsSync(sourceZoneDocumentPath)) {
-    refreshReasons.push("missing zone_config.json");
-  }
-
-  if (refreshReasons.length > 0) {
-    console.log(
-      `user env requires DID identity refresh (${
-        refreshReasons.join("; ")
-      }), generate: ${userDir}`,
-    );
-    await buildUserEnv(params, envRoot);
-    deviceDocJwt = readDeviceDocJwt(userDir, params.node_name);
-    deviceDoc = undefined;
-    ownerIdentity = undefined;
-  }
-  const zoneRecord = readJson(path.join(userDir, "zone_txt_record.json"));
-  const bootConfigJwt = String(zoneRecord.boot_config_jwt ?? "");
-  const deviceMiniDocJwt = String(zoneRecord.device_mini_doc_jwt ?? "");
-  const pkx = String(zoneRecord.pkx ?? "");
-  if (!bootConfigJwt || !deviceMiniDocJwt || !deviceDocJwt || !pkx) {
-    throw new Error(
-      `user env ${userDir} misses boot_config_jwt/device_mini_doc_jwt/device_doc.jwt/pkx`,
-    );
-  }
-  deviceDoc ??= decodeJwtPayload(deviceDocJwt);
-  if (deviceDoc.id !== expectedDeviceDid) {
-    throw new Error(
-      `user env ${userDir} device_doc.jwt id ${
-        String(deviceDoc.id)
-      } does not match ${expectedDeviceDid}`,
-    );
-  }
+  const usesSnRelay = params.netid !== "wan";
+  const snHost = `sn.${params.sn_base_host.trim()}`;
+  const snApiUrl = `${params.force_https ? "https" : "http"}://${snHost}/kapi/sn`;
   if (
-    deviceDoc.owner !== expectedOwnerDid ||
-    deviceDoc.zone_did !== expectedZoneDid ||
-    deviceDoc.name !== params.node_name
+    deviceDoc.net_id !== (params.netid === "lan" ? "nat" : params.netid) ||
+    deviceDoc.rtcp_port !== params.rtcp_port ||
+    deviceDoc.ddns_sn_url !== (usesSnRelay ? snApiUrl : undefined) ||
+    bootDocument.sn !== (usesSnRelay ? snHost : undefined) ||
+    zoneDocument.sn !== (usesSnRelay ? snHost : undefined)
   ) {
-    throw new Error(
-      `user env ${userDir} DeviceDocument owner/zone/name does not match ${expectedOwnerDid}/${expectedZoneDid}/${params.node_name}`,
-    );
+    throw new Error(`${bundlePath} network parameters do not match ${user.groupName}`);
   }
-  ownerIdentity ??= loadSeedOwnerIdentity(userDir, user.username);
-  if (ownerIdentity.publicKeyX !== pkx) {
-    throw new Error(
-      `user env ${userDir} OwnerDocument key does not match zone TXT PKX`,
-    );
-  }
-  const verifiedDeviceDocument = verifyDidDocumentJwt(
-    deviceDocJwt,
-    ownerIdentity.publicKeyX,
-    `${userDir} device_doc.jwt`,
-  );
-  if (
-    JSON.stringify(verifiedDeviceDocument) !== JSON.stringify(deviceDoc)
-  ) {
-    throw new Error(
-      `user env ${userDir} decoded DeviceDocument changed during signature verification`,
-    );
-  }
-  const bootDocument = verifyDidDocumentJwt(
-    bootConfigJwt,
-    ownerIdentity.publicKeyX,
-    `${userDir} boot_config_jwt`,
-  );
-  if (bootDocument.id !== expectedZoneDid) {
-    throw new Error(
-      `user env ${userDir} boot_config_jwt id ${
-        String(bootDocument.id)
-      } does not match ${expectedZoneDid}`,
-    );
-  }
-  const deviceMiniDocument = verifyDidDocumentJwt(
-    deviceMiniDocJwt,
-    ownerIdentity.publicKeyX,
-    `${userDir} device_mini_doc_jwt`,
-  );
-  if (deviceMiniDocument.n !== params.node_name) {
-    throw new Error(
-      `user env ${userDir} device_mini_doc_jwt name ${
-        String(deviceMiniDocument.n)
-      } does not match ${params.node_name}`,
-    );
-  }
-  const zoneBootJson = readJson(
-    path.join(userDir, `${params.zone_id}.zone.json`),
-  );
-  const sourceZoneDocument = readJson(sourceZoneDocumentPath);
-  const material = {
-    bootConfigJwt,
-    deviceMiniDocJwt,
-    deviceDocJwt,
+  return {
+    bootConfigJwt: tokens.boot_config_jwt,
+    deviceMiniDocJwt: tokens.device_mini_doc_jwt,
+    deviceDocJwt: tokens.device_doc_jwt,
     deviceDoc,
     pkx,
-    zoneBootJson,
-    sourceZoneDocument,
-    ownerDocument: ownerIdentity.document,
-    ownerPrivateKeyPem: ownerIdentity.privateKeyPem,
-  };
-  const ownerDocumentJwt = signDidDocumentJwt(
-    ownerIdentity.document,
-    ownerIdentity.privateKeyPem,
-  );
-  const zoneDocument = toZoneDocumentJson(user, material);
-  const zoneDocumentJwt = signDidDocumentJwt(
+    ownerDocument,
+    ownerDocumentJwt: tokens.owner_document_jwt,
     zoneDocument,
-    ownerIdentity.privateKeyPem,
-  );
-  return {
-    ...material,
-    ownerDocumentJwt,
-    zoneDocument,
-    zoneDocumentJwt,
+    zoneDocumentJwt: tokens.zone_document_jwt,
   };
+}
+
+export async function prepareSeedIdentities(
+  envRoot: string,
+  users: SnSeedUserSpec[] = getSeedUserSpecs(),
+): Promise<void> {
+  const missing = users.filter((user) => {
+    const params = getParamsFromGroupName(user.groupName);
+    return !fs.existsSync(path.join(envRoot, params.zone_id, params.node_name, "sn_seed_identity.json"));
+  });
+  for (const user of users.filter((user) => !missing.includes(user))) {
+    await loadSeedUserEnv(envRoot, user);
+  }
+  if (missing.length > 0) {
+    const source = Deno.env.get("BUCKYOS_OOD_CONFIG_SOURCE");
+    const sourceUrl = source
+      ? pathToFileURL(path.resolve(source)).href
+      : new URL("../../buckyos/src/make_config.ts", import.meta.url).href;
+    const producer = await import(sourceUrl);
+    if (typeof producer.prepareSeedIdentity !== "function") {
+      throw new Error("BuckyOS main must provide prepareSeedIdentity; no raw SDK fallback is allowed");
+    }
+    for (const user of missing) {
+      await producer.prepareSeedIdentity(user.groupName, envRoot);
+    }
+  }
+  for (const user of users) {
+    await loadSeedUserEnv(envRoot, user);
+  }
 }
 
 function yamlQuote(value: string): string {
   return JSON.stringify(value);
 }
 
-// 链上 zone 文档必须满足 name-lib ZoneDocument 的 schema（id /
-// verificationMethod / authentication / iat 必填）：SN 对 RTCP keep-tunnel
-// 来源设备验证的回落路径用 resolve_auth_key(owner) 解析 owner DID，name-lib
-// 按 oods 字段识别为 ZoneDocument 后从 verificationMethod[0] 取 owner 公钥
-// 验 device_doc_jwt 签名。env 的 <zone>.zone.json 只有 oods/sn/exp（BuckyOS
-// boot 面形状），直接上链会让 SN 侧 parse 失败并拒绝 keep-tunnel。BuckyOS
-// 侧 boot/zone 消费面对新增字段宽容，补全无影响。
-const SEED_ZONE_DOC_IAT = 1735689600; // 2025-01-01T00:00:00Z，devtest 确定性时间戳
-
-function toZoneDocumentJson(
-  user: SnSeedUserSpec,
-  env: Omit<
-    SeedUserEnvView,
-    "ownerDocumentJwt" | "zoneDocument" | "zoneDocumentJwt"
-  >,
-): Record<string, unknown> {
-  const zone: Record<string, unknown> = { ...env.sourceZoneDocument };
-  const ownerDid = `did:bns:${user.username}`;
-  const zoneDid = user.userDomain ? `did:web:${user.userDomain}` : ownerDid;
-  const hostname = user.userDomain ?? `${user.username}.bns.did`;
-  const deviceName = String(env.deviceDoc.name ?? "");
-  if (!deviceName) {
-    throw new Error(`DeviceDocument for ${user.username} misses name`);
-  }
-  zone["@context"] = [
-    "https://www.w3.org/ns/did/v1",
-    "https://buckyos.org/ns/zone/v1",
-  ];
-  zone.id = zoneDid;
-  zone.owner = ownerDid;
-  zone.verificationMethod = [
-    {
-      type: "Ed25519VerificationKey2020",
-      id: "#main_key",
-      controller: ownerDid,
-      publicKeyJwk: { kty: "OKP", crv: "Ed25519", x: env.pkx },
-    },
-  ];
-  zone.authentication = ["#main_key"];
-  zone.assertionMethod = ["#main_key"];
-  zone.capabilityInvocation = ["#main_key"];
-  zone.service = [{
-    id: `${zoneDid}#lastDoc`,
-    type: "DIDDoc",
-    serviceEndpoint: `https://${hostname}/resolve/this_zone`,
-  }];
-  zone.hostname = hostname;
-  const oods = env.zoneBootJson.oods ?? zone.oods;
-  if (!Array.isArray(oods) || oods.length === 0) {
-    throw new Error(`ZoneDocument for ${user.username} misses oods`);
-  }
-  zone.oods = oods;
-  zone.boot_jwt = env.bootConfigJwt;
-  const existingDevices = zone.devices &&
-      typeof zone.devices === "object" &&
-      !Array.isArray(zone.devices)
-    ? zone.devices as Record<string, unknown>
-    : {};
-  zone.devices = {
-    ...existingDevices,
-    [deviceName]: env.deviceDoc,
-  };
-  const existingMiniDeviceJwts = zone.mini_device_jwts &&
-      typeof zone.mini_device_jwts === "object" &&
-      !Array.isArray(zone.mini_device_jwts)
-    ? zone.mini_device_jwts as Record<string, unknown>
-    : {};
-  zone.mini_device_jwts = {
-    ...existingMiniDeviceJwts,
-    [deviceName]: env.deviceMiniDocJwt,
-  };
-  if (env.zoneBootJson.sn !== undefined) {
-    zone.sn = env.zoneBootJson.sn;
-  }
-  if (env.zoneBootJson.exp !== undefined) {
-    zone.exp = env.zoneBootJson.exp;
-  }
-  if (typeof zone.exp !== "number" || !Number.isFinite(zone.exp)) {
-    throw new Error(`ZoneDocument for ${user.username} misses numeric exp`);
-  }
-  if (typeof zone.iat !== "number" || !Number.isFinite(zone.iat)) {
-    zone.iat = SEED_ZONE_DOC_IAT;
-  }
-  if ((zone.iat as number) > (zone.exp as number)) {
-    throw new Error(`ZoneDocument for ${user.username} has iat after exp`);
-  }
-  if (zone.version_seq === undefined) {
-    zone.version_seq = 0;
-  }
-  return zone;
-}
 
 /**
  * 产出 bns_dv 的启动种子配置，让种子用户的 BNS 权威文档真正上链：
@@ -1966,7 +1697,8 @@ async function main(): Promise<void> {
   const snIp = values.sn_ip ??
     (devLocal ? "127.0.0.1" : Deno.env.get("BUCKYOS_SN_IP") ?? getLocalIp());
   const envRoot = values.env_root ?? ENV_ROOT_DIR;
-  const caDir = values.ca ?? ensureDir(path.join(ENV_ROOT_DIR, "ca"));
+  await prepareSeedIdentities(envRoot);
+  const caDir = values.ca ?? ensureDir(path.join(envRoot, "ca"));
 
   await makeSnConfigs(targetDir, snBaseHost, snIp, caDir, DEFAULT_CA_NAME);
   const snDbPath = path.join(targetDir, SN_DB_FILE);
