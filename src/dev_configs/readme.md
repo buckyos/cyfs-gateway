@@ -44,6 +44,21 @@ VM 框架里，而应按以下方式接入：
 这样同一套 VM 可以跑 `sn-dev-smoke`、手写 curl/dig 检查、后续新的 SN DV Test，
 以及需要真实 Linux/特权端口的测试。
 
+## OOD 与 SN 的身份生成顺序
+
+SN 与 OOD staging 可以任意顺序，但必须共享同一个环境目录（默认
+`~/buckycli`）和 dev CA。SN CLI 在交接文件缺失时调用同级 BuckyOS main
+的 `prepareSeedIdentity`，建立最终签名身份；之后生成 OOD rootfs 复用
+这一轮身份，不刷新时间或文档修订。已存在的交接文件无效时直接失败，
+不重新初始化、不使用旧 SDK 文档兜底，也不覆盖 SN staging 配置。
+
+如需变更身份输入或网络参数，使用新的环境目录并匹配重建 OOD 与 SN
+配置，不把新身份与旧链、旧 seed 混装。代码生成不会修改运行中的链或 VM。
+生产方默认来自同级 BuckyOS checkout，也可设置
+`BUCKYOS_OOD_CONFIG_SOURCE` 指定上游 main 生成器。
+具体契约、隔离生成命令和跨仓库合入顺序见
+[SN Seed Config](../../doc/SN/SN-Seed-Config.md#ood-最终身份交接)。
+
 ## 一次完整初始化
 
 ```bash

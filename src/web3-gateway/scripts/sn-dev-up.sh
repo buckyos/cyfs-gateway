@@ -64,6 +64,12 @@ for arg in "$@"; do
   esac
 done
 
+OOD_CONFIG_SOURCE="${BUCKYOS_OOD_CONFIG_SOURCE:-$SRC_DIR/../../buckyos/src/make_config.ts}"
+if [ "$MODE" = "fresh" ] && [ ! -f "$OOD_CONFIG_SOURCE" ]; then
+  echo "missing OOD config generator: $OOD_CONFIG_SOURCE; use buckyos main or set BUCKYOS_OOD_CONFIG_SOURCE" >&2
+  exit 1
+fi
+
 for bin in anvil node npm cargo deno curl dig; do
   command -v "$bin" >/dev/null 2>&1 || { echo "missing required tool: $bin" >&2; exit 1; }
 done
@@ -142,6 +148,16 @@ else
   [ -f "$DEPLOY_JSON" ] || { echo "no deployment to resume ($DEPLOY_JSON); run --fresh" >&2; exit 1; }
 fi
 mkdir -p "$ROOTFS" "$ENV_ROOT" "$VAR/buckyos_root"
+
+if [ "$MODE" = "fresh" ]; then
+  for group in alice.ood1 bob.ood1 charlie.ood1 dave.ood1; do
+    echo "[sn-dev-up] generating finalized OOD identity for $group"
+    deno run -A --config "$SRC_DIR/deno.json" "$OOD_CONFIG_SOURCE" "$group" \
+      --rootfs "$VAR/buckyos_root/$group" --env_root "$ENV_ROOT" --ca "$ENV_ROOT/ca" \
+      >>"$VAR/make_ood_config.log" 2>&1 \
+      || { echo "OOD config generation failed; see $VAR/make_ood_config.log" >&2; exit 1; }
+  done
+fi
 
 # --- 2) 编译合约并同步 ABI（fresh）---
 if [ "$MODE" = "fresh" ]; then
