@@ -16,7 +16,7 @@ use jsonwebtoken::{
 };
 use log::{debug, info, warn};
 use name_client::{NameInfo, RecordType};
-use name_lib::{EncodedDocument, DID};
+use name_lib::{DeviceNodeType, EncodedDocument, OODDescriptionString, DID};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
@@ -2876,12 +2876,16 @@ fn find_gateway_device_name(value: &Value) -> Option<String> {
         if let Some(array) = find_array_path(value, path) {
             for item in array {
                 if let Some(name) = item.as_str() {
-                    return Some(short_device_name(name));
+                    if let Some(name) = short_device_name(name) {
+                        return Some(name);
+                    }
                 }
                 if let Some(name) = find_string_path(item, &["device_name"])
                     .or_else(|| find_string_path(item, &["name"]))
                 {
-                    return Some(short_device_name(name.as_str()));
+                    if let Some(name) = short_device_name(name.as_str()) {
+                        return Some(name);
+                    }
                 }
             }
         }
@@ -2921,8 +2925,12 @@ fn find_mini_device_jwts(value: &Value) -> HashMap<String, String> {
         .unwrap_or_default()
 }
 
-fn short_device_name(value: &str) -> String {
-    value.split('.').next().unwrap_or(value).to_string()
+fn short_device_name(value: &str) -> Option<String> {
+    let description = value.parse::<OODDescriptionString>().ok()?;
+    if description.node_type == DeviceNodeType::OODOnly {
+        return None;
+    }
+    Some(description.name.split('.').next()?.to_string())
 }
 
 fn find_gateway_ips(value: &Value) -> Vec<IpAddr> {
@@ -4020,6 +4028,59 @@ mod tests {
 
         let value = json!({ "oods": ["ood2.testuser"] });
         assert_eq!(find_gateway_device_name(&value).as_deref(), Some("ood2"));
+    }
+
+    #[test]
+    fn gateway_device_names_exclude_ood_network_annotations() {
+        for description in [
+            "ood1@wan_dyn",
+            "ood1:192.0.2.20@wan",
+            "ood1:2001:db8::20@wan",
+            "ood1.bob@wan_dyn",
+            "#ood1@wan_dyn",
+        ] {
+            let zone = json!({ "oods": [description] });
+            assert_eq!(find_gateway_device_name(&zone).as_deref(), Some("ood1"));
+            let zone = json!({ "gateway_devices": [{"name": description}] });
+            assert_eq!(find_gateway_device_name(&zone).as_deref(), Some("ood1"));
+        }
+        let zone = json!({ "oods": ["$archive@lan", "ood1@wan_dyn"] });
+        assert_eq!(find_gateway_device_name(&zone).as_deref(), Some("ood1"));
+        assert!(find_gateway_device_name(&json!({"oods": ["$archive@lan"]})).is_none());
+    }
+
+    #[tokio::test]
+    async fn resolves_gateway_from_network_annotated_ood_description() {
+        let mut bns = StaticBnsReader::default();
+        bns.owners.insert(
+            "bob".to_string(),
+            BnsOwner {
+                name: "bob".to_string(),
+                effective_owner: None,
+                owner_config: None,
+            },
+        );
+        bns.documents.insert(("bob".to_string(), BNS_DOC_ZONE.to_string()),
+            BnsDocument::json("bob", BNS_DOC_ZONE, json!({
+                "oods": ["ood1@wan_dyn"],
+                "mini_device_jwts": {"ood1": compact_test_jwt(&json!({"n": "ood1", "x": "bob-key"}))}
+            })));
+        let resolver = test_resolver_with_bns(bns).with_relay_reader(
+            Arc::new(StaticRelayReader {
+                assignment: test_relay_assignment("bob"),
+                ips: Some([
+                    "192.0.2.10".parse::<IpAddr>().unwrap(),
+                    "198.51.100.20".parse::<IpAddr>().unwrap(),
+                ]),
+            }),
+        );
+        let gateway = resolver
+            .resolve_gateway_by_hostname("bob.web3.buckyos.test")
+            .await
+            .unwrap();
+        assert_eq!(gateway.gateway_device_name, "ood1");
+        assert_eq!(gateway.device_doc.device_name, "ood1");
+        assert_eq!(gateway.gateway_did, "did:dev:bob-key");
     }
 
     #[test]
