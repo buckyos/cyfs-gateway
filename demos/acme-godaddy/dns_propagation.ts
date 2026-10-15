@@ -2,12 +2,20 @@ export interface DnsPropagationOptions {
   zone: string;
   timeoutMs: number;
   intervalMs: number;
+  delayMs?: number;
   log?: (message: string) => void;
 }
 
 interface AuthoritativeServer {
   name: string;
   address: string;
+}
+
+interface PropagationRuntime {
+  now: () => number;
+  sleep: (milliseconds: number) => Promise<void>;
+  resolveServers: typeof resolveAuthoritativeServers;
+  hasTxt: typeof hasTxtValue;
 }
 
 /**
@@ -19,42 +27,74 @@ export async function waitForAuthoritativeTxt(
   fqdn: string,
   expectedValue: string,
   options: DnsPropagationOptions,
+  runtime: Partial<PropagationRuntime> = {},
 ): Promise<void> {
-  const servers = await resolveAuthoritativeServers(options.zone);
+  const delayMs = options.delayMs ?? 0;
+  if (
+    !Number.isFinite(options.timeoutMs) || options.timeoutMs <= 0 ||
+    !Number.isFinite(options.intervalMs) || options.intervalMs <= 0 ||
+    !Number.isFinite(delayMs) || delayMs < 0 || delayMs >= options.timeoutMs
+  ) {
+    throw new Error(
+      "DNS timeout and interval must be positive; delay must be nonnegative and less than timeout",
+    );
+  }
+  const now = runtime.now ?? Date.now;
+  const sleep = runtime.sleep ?? delay;
+  const hasTxt = runtime.hasTxt ?? hasTxtValue;
+  const deadline = now() + options.timeoutMs;
+  const servers = await (runtime.resolveServers ?? resolveAuthoritativeServers)(options.zone);
   options.log?.(
     `authoritative DNS: ${
       servers.map((server) => `${server.name} (${server.address})`).join(", ")
     }`,
   );
 
-  const deadline = Date.now() + options.timeoutMs;
   let lastPending = servers.map((server) => server.name);
+  let visibleSince: number | undefined;
 
-  while (Date.now() <= deadline) {
+  while (now() <= deadline) {
     const checks = await Promise.all(
       servers.map(async (server) => ({
         server,
-        visible: await hasTxtValue(fqdn, expectedValue, server.address),
+        visible: await hasTxt(fqdn, expectedValue, server.address),
       })),
     );
     lastPending = checks.filter((check) => !check.visible).map((check) => check.server.name);
+    const checkedAt = now();
+    if (checkedAt > deadline) break;
     if (lastPending.length === 0) {
-      options.log?.(`TXT ${fqdn} is visible on all authoritative nameservers`);
-      return;
+      if (visibleSince === undefined) {
+        visibleSince = checkedAt;
+        options.log?.(`TXT ${fqdn} is visible on all authoritative nameservers`);
+        if (delayMs > 0) {
+          options.log?.(`holding TXT ${fqdn} for ${delayMs / 1000}s before ACME validation`);
+        }
+      }
+      if (checkedAt - visibleSince >= delayMs) return;
+    } else {
+      visibleSince = undefined;
+      options.log?.(`waiting for TXT ${fqdn}; not visible on: ${lastPending.join(", ")}`);
     }
 
-    options.log?.(`waiting for TXT ${fqdn}; not visible on: ${lastPending.join(", ")}`);
-    const remaining = deadline - Date.now();
+    const remaining = deadline - checkedAt;
     if (remaining <= 0) {
       break;
     }
-    await delay(Math.min(options.intervalMs, remaining));
+    const remainingDelay = visibleSince === undefined
+      ? options.intervalMs
+      : delayMs - (checkedAt - visibleSince);
+    await sleep(Math.min(options.intervalMs, remaining, remainingDelay));
   }
 
   throw new Error(
-    `DNS propagation timed out for ${fqdn}; TXT value was not visible on: ${
-      lastPending.join(", ")
-    }`,
+    lastPending.length > 0
+      ? `DNS propagation timed out for ${fqdn}; TXT value was not visible on: ${
+        lastPending.join(", ")
+      }`
+      : `DNS propagation timed out for ${fqdn}; the ${
+        delayMs / 1000
+      }s propagation delay did not complete`,
   );
 }
 

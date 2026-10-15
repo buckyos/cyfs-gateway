@@ -6,7 +6,7 @@
   "tasks": {
     "start": "deno run --allow-env --allow-net --allow-read --allow-write main.ts",
     "check": "deno check main.ts && deno lint && deno fmt --check",
-    "test": "deno test"
+    "test": "deno test --allow-env --allow-read --allow-write"
   },
   "fmt": {
     "lineWidth": 100

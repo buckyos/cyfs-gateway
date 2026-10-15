@@ -1,4 +1,5 @@
 import * as path from "node:path";
+import { createPrivateKey, X509Certificate } from "node:crypto";
 import acme from "acme-client";
 
 import {
@@ -7,18 +8,23 @@ import {
   type Dns01RecordHandle,
   dns01RecordName,
 } from "./dns_provider.ts";
+import {
+  identityPaths,
+  type IdentityStorage,
+  orderStateDirectory,
+  sha256,
+  validateIdentityStorage,
+} from "./identity.ts";
 
 const STATE_FILE = "state.json";
-const FULLCHAIN_FILE = "fullchain.pem";
 
 interface CertificateState {
-  schemaVersion: 1;
+  schemaVersion: 2;
   directoryUrl: string;
   domains: string[];
   issuedAt: string;
   notAfter: string;
-  privateKeySha256: string;
-  fullchainSha256: string;
+  artifacts: Record<string, string>;
 }
 
 export interface RenewalDecision {
@@ -31,7 +37,8 @@ export interface ObtainCertificateOptions {
   directoryUrl: string;
   domains: string[];
   email: string;
-  outputDir: string;
+  storage: IdentityStorage;
+  renewBeforeDays: number;
   provider: Dns01Provider;
   waitForPropagation: (fqdn: string, value: string) => Promise<void>;
   log?: (message: string) => void;
@@ -43,18 +50,14 @@ export interface ObtainCertificateResult {
 }
 
 export async function inspectExistingCertificate(
-  outputDir: string,
+  storage: IdentityStorage,
   domains: string[],
   directoryUrl: string,
   renewBeforeDays: number,
 ): Promise<RenewalDecision> {
-  const stateText = await readTextIfExists(path.join(outputDir, STATE_FILE));
-  const certificate = await readTextIfExists(path.join(outputDir, FULLCHAIN_FILE));
-  const privateKey = await readTextIfExists(path.join(outputDir, "privkey.pem"));
-  if (!stateText || !certificate || !privateKey) {
-    return { renew: true, reason: "certificate, private key, or state file does not exist" };
-  }
-
+  const stateDir = await orderStateDirectory(storage, domains, directoryUrl);
+  const stateText = await readTextIfExists(path.join(stateDir, STATE_FILE));
+  if (!stateText) return { renew: true, reason: "certificate state file does not exist" };
   let state: CertificateState;
   try {
     const parsed = JSON.parse(stateText) as unknown;
@@ -65,58 +68,63 @@ export async function inspectExistingCertificate(
   } catch {
     return { renew: true, reason: "state file is invalid" };
   }
-
-  if (state.directoryUrl !== directoryUrl) {
-    return { renew: true, reason: "ACME directory changed" };
-  }
-
   const expectedDomains = sortedUnique(domains);
-  if (!sameStrings(sortedUnique(state.domains), expectedDomains)) {
-    return { renew: true, reason: "requested domain set changed" };
+  if (state.directoryUrl !== directoryUrl || !sameStrings(state.domains, expectedDomains)) {
+    return { renew: true, reason: "ACME directory or requested domains changed" };
   }
-  if (
-    state.fullchainSha256 !== await sha256(certificate) ||
-    state.privateKeySha256 !== await sha256(privateKey)
-  ) {
-    return { renew: true, reason: "certificate files do not match the last completed write" };
-  }
-
-  try {
-    const info = acme.crypto.readCertificateInfo(certificate);
-    const certificateDomains = sortedUnique([
-      info.domains.commonName,
-      ...info.domains.altNames,
-    ].filter(Boolean));
-    if (!sameStrings(certificateDomains, expectedDomains)) {
-      return { renew: true, reason: "certificate SANs do not match the requested domains" };
+  let notAfter: Date | undefined;
+  for (const domain of expectedDomains) {
+    const files = identityPaths(storage, domain);
+    const contents: Record<string, string> = {};
+    for (
+      const file of [files.cert, files.chain, files.fullchain, files.metadata, files.privateKey]
+    ) {
+      const text = await readTextIfExists(file);
+      if (text === undefined || state.artifacts[file] !== sha256(text)) {
+        return { renew: true, reason: `identity files missing or changed for ${domain}` };
+      }
+      contents[file] = text;
     }
-
-    const remainingMs = info.notAfter.getTime() - Date.now();
-    const renewBeforeMs = renewBeforeDays * 24 * 60 * 60 * 1000;
-    if (remainingMs <= renewBeforeMs) {
-      return {
-        renew: true,
-        reason: `certificate expires within ${renewBeforeDays} days`,
-        notAfter: info.notAfter,
-      };
+    try {
+      const validated = validateCertificate(
+        contents[files.fullchain],
+        contents[files.privateKey],
+        expectedDomains,
+      );
+      notAfter = validated.notAfter;
+      if (notAfter.toISOString() !== state.notAfter) {
+        return { renew: true, reason: "certificate expiry does not match state" };
+      }
+      if (notAfter.getTime() - Date.now() <= renewBeforeDays * 86_400_000) {
+        return {
+          renew: true,
+          reason: `certificate expires within ${renewBeforeDays} days`,
+          notAfter,
+        };
+      }
+    } catch (error) {
+      return { renew: true, reason: `invalid identity certificate: ${errorMessage(error)}` };
     }
-    return { renew: false, reason: "certificate is still valid", notAfter: info.notAfter };
-  } catch {
-    return { renew: true, reason: "existing certificate cannot be parsed" };
   }
+  return { renew: false, reason: "all identity certificates are still valid", notAfter };
 }
 
 export async function obtainCertificate(
   options: ObtainCertificateOptions,
 ): Promise<ObtainCertificateResult> {
-  await Deno.mkdir(options.outputDir, { recursive: true, mode: 0o700 });
-
-  const accountKeyPath = path.join(options.outputDir, "account.key.pem");
+  validateIdentityStorage(options.storage);
+  const stateDir = await orderStateDirectory(
+    options.storage,
+    options.domains,
+    options.directoryUrl,
+  );
+  await Deno.mkdir(stateDir, { recursive: true, mode: 0o700 });
+  const accountKeyPath = path.join(stateDir, "account.key.pem");
   let accountKey = await readTextIfExists(accountKeyPath);
   if (!accountKey) {
     options.log?.("generating a new ACME account key");
     accountKey = (await acme.crypto.createPrivateEcdsaKey("P-256")).toString();
-    await atomicWriteText(accountKeyPath, accountKey, 0o600);
+    await writeStagedFiles([{ filePath: accountKeyPath, contents: accountKey, mode: 0o600 }]);
   }
 
   const certificateKey = await acme.crypto.createPrivateEcdsaKey("P-256");
@@ -186,70 +194,191 @@ export async function obtainCertificate(
     }
   }
 
-  const chain = acme.crypto.splitPemChain(certificate);
-  if (chain.length === 0) {
-    throw new Error("ACME server returned an empty certificate chain");
-  }
-  const certificateInfo = acme.crypto.readCertificateInfo(chain[0]);
-  const privateKeyText = certificateKey.toString();
-  const fullchainText = ensureTrailingNewline(certificate);
-  const state: CertificateState = {
-    schemaVersion: 1,
-    directoryUrl: options.directoryUrl,
-    domains: sortedUnique(options.domains),
-    issuedAt: new Date().toISOString(),
-    notAfter: certificateInfo.notAfter.toISOString(),
-    privateKeySha256: await sha256(privateKeyText),
-    fullchainSha256: await sha256(fullchainText),
-  };
-
-  // Write state last. If the process stops while replacing one of the four
-  // artifacts, the old state hashes force a fresh issuance on the next run
-  // instead of accepting a mismatched certificate/private-key pair.
-  await Promise.all([
-    atomicWriteText(path.join(options.outputDir, "privkey.pem"), privateKeyText, 0o600),
-    atomicWriteText(
-      path.join(options.outputDir, "cert.pem"),
-      ensureTrailingNewline(chain[0]),
-      0o644,
-    ),
-    atomicWriteText(
-      path.join(options.outputDir, "chain.pem"),
-      ensureTrailingNewline(chain.slice(1).join("\n")),
-      0o644,
-    ),
-    atomicWriteText(
-      path.join(options.outputDir, FULLCHAIN_FILE),
-      fullchainText,
-      0o644,
-    ),
-  ]);
-  await atomicWriteText(
-    path.join(options.outputDir, STATE_FILE),
-    `${JSON.stringify(state, null, 2)}\n`,
-    0o600,
+  const notAfter = await installCertificate(
+    options.storage,
+    options.domains,
+    options.directoryUrl,
+    options.renewBeforeDays,
+    certificate,
+    certificateKey.toString(),
   );
-
-  return { notAfter: certificateInfo.notAfter, cleanupWarnings };
+  return { notAfter, cleanupWarnings };
 }
 
-async function atomicWriteText(filePath: string, contents: string, mode: number): Promise<void> {
-  const temporaryPath = path.join(
-    path.dirname(filePath),
-    `.${path.basename(filePath)}.${crypto.randomUUID()}.tmp`,
+/** Validate everything before replacing any active identity material. */
+export async function installCertificate(
+  storage: IdentityStorage,
+  domains: string[],
+  directoryUrl: string,
+  renewBeforeDays: number,
+  certificate: string,
+  privateKey: string,
+): Promise<Date> {
+  const expectedDomains = sortedUnique(domains);
+  if (expectedDomains.length === 0) throw new Error("at least one DNS identity is required");
+  const { leaf, chain, notBefore, notAfter } = validateCertificate(
+    certificate,
+    privateKey,
+    expectedDomains,
   );
-  try {
-    await Deno.writeTextFile(temporaryPath, contents, { mode });
-    await Deno.rename(temporaryPath, filePath);
-    await setModeIfSupported(filePath, mode);
-  } catch (error) {
+  const stateDir = await orderStateDirectory(storage, expectedDomains, directoryUrl);
+  const issuedAt = new Date().toISOString();
+  const fullchain = chain.map(ensureTrailingNewline).join("");
+  const cert = ensureTrailingNewline(chain[0]);
+  const intermediates = chain.slice(1).map(ensureTrailingNewline).join("");
+  const certFingerprint = `sha256:${sha256(leaf.raw)}`;
+  const publicKeyFingerprint = `sha256:${
+    sha256(
+      leaf.publicKey.export({ type: "spki", format: "der" }),
+    )
+  }`;
+  const writes: PendingWrite[] = [];
+  for (const domain of expectedDomains) {
+    const files = identityPaths(storage, domain);
+    const metadata = {
+      schema: "buckyos.identity.x509.metadata.v1",
+      did: `did:web:${files.dirName}`,
+      raw_host_uri: files.dirName,
+      dir_name: files.dirName,
+      usage: "server",
+      match: domain.startsWith("*.")
+        ? { type: "wildcard", host_pattern: domain }
+        : { type: "exact", host: domain },
+      certificate: {
+        serial_number: leaf.serialNumber,
+        issuer: leaf.issuer,
+        subject: leaf.subject,
+        not_before: notBefore.toISOString(),
+        not_after: notAfter.toISOString(),
+        fingerprint_sha256: certFingerprint,
+        public_key_fingerprint: publicKeyFingerprint,
+      },
+      san: { dns: expectedDomains, uri: [] },
+      paths: {
+        cert: "server.cert.pem",
+        chain: "server.chain.pem",
+        fullchain: "server.fullchain.pem",
+        ca: null,
+        key_ref: null,
+      },
+      did_binding: domain.startsWith("*.") ? null : {
+        type: "did-web-domain",
+        did: `did:web:${domain}`,
+        web_origin: `https://${domain}`,
+        did_document_url: `https://${domain}/.well-known/did.json`,
+      },
+      renewal: {
+        manager: "acme",
+        renew_before: `PT${renewBeforeDays * 86400}S`,
+        last_renewed_at: issuedAt,
+        state_ref: stateDir,
+      },
+      updated_at: issuedAt,
+      generation: `${issuedAt}-${certFingerprint}`,
+    };
+    writes.push(
+      { filePath: files.cert, contents: cert, mode: 0o644 },
+      { filePath: files.chain, contents: intermediates, mode: 0o644 },
+      { filePath: files.fullchain, contents: fullchain, mode: 0o644 },
+      { filePath: files.metadata, contents: `${JSON.stringify(metadata, null, 2)}\n`, mode: 0o644 },
+      { filePath: files.privateKey, contents: privateKey, mode: 0o600 },
+    );
+  }
+  const state: CertificateState = {
+    schemaVersion: 2,
+    directoryUrl,
+    domains: expectedDomains,
+    issuedAt,
+    notAfter: notAfter.toISOString(),
+    artifacts: Object.fromEntries(writes.map((write) => [write.filePath, sha256(write.contents)])),
+  };
+  // Stage the entire generation before the first rename. Commit state last so an
+  // interrupted multi-file install is detected by the next renewal inspection.
+  writes.push({
+    filePath: path.join(stateDir, STATE_FILE),
+    contents: `${JSON.stringify(state, null, 2)}\n`,
+    mode: 0o600,
+  });
+  await writeStagedFiles(writes);
+  for (const domain of expectedDomains) {
     try {
-      await Deno.remove(temporaryPath);
-    } catch {
-      // Preserve the original write/rename error; the random .tmp name is safe
-      // to remove manually if filesystem cleanup also failed.
+      await Deno.remove(identityPaths(storage, domain).keyref);
+    } catch (error) {
+      if (!(error instanceof Deno.errors.NotFound)) throw error;
     }
-    throw error;
+  }
+  return notAfter;
+}
+
+function validateCertificate(certificate: string, privateKey: string, domains: string[]) {
+  const chain = acme.crypto.splitPemChain(certificate);
+  if (chain.length === 0) throw new Error("ACME server returned an empty certificate chain");
+  const leaf = new X509Certificate(chain[0]);
+  // Parse every intermediate too; none of the active files should contain malformed PEM.
+  for (const intermediate of chain.slice(1)) new X509Certificate(intermediate);
+  const notBefore = new Date(leaf.validFrom);
+  const notAfter = new Date(leaf.validTo);
+  const now = Date.now();
+  if (
+    !Number.isFinite(notBefore.getTime()) || !Number.isFinite(notAfter.getTime()) ||
+    now < notBefore.getTime() || now >= notAfter.getTime()
+  ) {
+    throw new Error("certificate is not currently valid");
+  }
+  const info = acme.crypto.readCertificateInfo(chain[0]);
+  // SAN is mandatory; a commonName alone cannot authorize an identity directory.
+  if (!sameStrings(sortedUnique(info.domains.altNames), domains)) {
+    throw new Error("certificate DNS SANs do not match the requested domains");
+  }
+  if (!leaf.checkPrivateKey(createPrivateKey(privateKey))) {
+    throw new Error("certificate does not match its private key");
+  }
+  return { leaf, chain, notBefore, notAfter };
+}
+
+interface PendingWrite {
+  filePath: string;
+  contents: string;
+  mode: number;
+}
+
+async function writeStagedFiles(writes: PendingWrite[]): Promise<void> {
+  const staged: { temporaryPath: string; filePath: string }[] = [];
+  try {
+    for (const { filePath, contents, mode } of writes) {
+      await Deno.mkdir(path.dirname(filePath), {
+        recursive: true,
+        mode: mode === 0o600 ? 0o700 : 0o755,
+      });
+      const temporaryPath = path.join(
+        path.dirname(filePath),
+        `.${path.basename(filePath)}.${crypto.randomUUID()}.tmp`,
+      );
+      staged.push({ temporaryPath, filePath });
+      const file = await Deno.open(temporaryPath, { write: true, createNew: true, mode });
+      try {
+        const bytes = new TextEncoder().encode(contents);
+        let written = 0;
+        while (written < bytes.length) written += await file.write(bytes.subarray(written));
+        await file.sync();
+      } finally {
+        file.close();
+      }
+      await setModeIfSupported(temporaryPath, mode);
+    }
+    for (const { temporaryPath, filePath } of staged) await Deno.rename(temporaryPath, filePath);
+  } finally {
+    for (const { temporaryPath } of staged) {
+      try {
+        await Deno.remove(temporaryPath);
+      } catch (error) {
+        if (!(error instanceof Deno.errors.NotFound)) {
+          console.warn(
+            `could not remove staged identity file ${temporaryPath}: ${errorMessage(error)}`,
+          );
+        }
+      }
+    }
   }
 }
 
@@ -257,9 +386,7 @@ async function setModeIfSupported(filePath: string, mode: number): Promise<void>
   try {
     await Deno.chmod(filePath, mode);
   } catch (error) {
-    if (!(error instanceof Deno.errors.NotSupported)) {
-      throw error;
-    }
+    if (!(error instanceof Deno.errors.NotSupported)) throw error;
   }
 }
 
@@ -267,18 +394,13 @@ async function readTextIfExists(filePath: string): Promise<string | undefined> {
   try {
     return await Deno.readTextFile(filePath);
   } catch (error) {
-    if (error instanceof Deno.errors.NotFound) {
-      return undefined;
-    }
+    if (error instanceof Deno.errors.NotFound) return undefined;
     throw error;
   }
 }
 
 function ensureTrailingNewline(value: string): string {
-  if (!value) {
-    return value;
-  }
-  return value.endsWith("\n") ? value : `${value}\n`;
+  return !value || value.endsWith("\n") ? value : `${value}\n`;
 }
 
 function sortedUnique(values: string[]): string[] {
@@ -290,25 +412,16 @@ function sameStrings(left: string[], right: string[]): boolean {
 }
 
 function isCertificateState(value: unknown): value is CertificateState {
-  if (!value || typeof value !== "object") {
-    return false;
-  }
+  if (!value || typeof value !== "object") return false;
   const state = value as Partial<CertificateState>;
-  return state.schemaVersion === 1 &&
-    typeof state.directoryUrl === "string" &&
-    Array.isArray(state.domains) &&
+  return state.schemaVersion === 2 && typeof state.directoryUrl === "string" &&
+    Array.isArray(state.domains) && state.domains.length > 0 &&
     state.domains.every((domain) => typeof domain === "string") &&
-    typeof state.issuedAt === "string" &&
-    typeof state.notAfter === "string" &&
-    typeof state.privateKeySha256 === "string" &&
-    typeof state.fullchainSha256 === "string";
+    typeof state.issuedAt === "string" && typeof state.notAfter === "string" &&
+    !!state.artifacts && typeof state.artifacts === "object" &&
+    Object.values(state.artifacts).every((digest) => typeof digest === "string");
 }
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
-}
-
-async function sha256(value: string): Promise<string> {
-  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
-  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
 }

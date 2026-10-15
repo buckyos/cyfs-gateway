@@ -1,6 +1,5 @@
 #!/usr/bin/env -S deno run --allow-env --allow-net --allow-read --allow-write
 
-import * as path from "node:path";
 import { parseArgs } from "node:util";
 import { domainToASCII } from "node:url";
 import acme from "acme-client";
@@ -8,34 +7,42 @@ import acme from "acme-client";
 import { inspectExistingCertificate, obtainCertificate } from "./certificate.ts";
 import { waitForAuthoritativeTxt } from "./dns_propagation.ts";
 import { GoDaddyDnsProvider } from "./godaddy_provider.ts";
+import { identityPaths, type IdentityStorageOptions, resolveIdentityStorage } from "./identity.ts";
 
 interface CliOptions {
   zone: string;
   domains: string[];
   email: string;
-  outputDir: string;
+  storageOptions: IdentityStorageOptions;
   directoryUrl: string;
   acceptTerms: boolean;
   force: boolean;
   renewBeforeDays: number;
   propagationTimeoutMs: number;
   propagationIntervalMs: number;
+  propagationDelayMs: number;
   verbose: boolean;
 }
 
 export async function run(args: string[]): Promise<void> {
   const options = parseCli(args);
   const log = (message: string) => console.log(`[acme] ${message}`);
+  const storage = await resolveIdentityStorage(options.storageOptions, options.directoryUrl);
+  log(`证书目录：${storage.publicRoot}`);
+  log(`私钥目录：${storage.securityRoot}`);
+  if (options.directoryUrl !== acme.directory.letsencrypt.production) {
+    log("非生产 CA：使用隔离目录，证书不会安装到正式 identity 目录");
+  }
 
   const decision = await inspectExistingCertificate(
-    options.outputDir,
+    storage,
     options.domains,
     options.directoryUrl,
     options.renewBeforeDays,
   );
   if (!options.force && !decision.renew) {
     log(
-      `无需续期：${decision.reason}（到期时间 ${decision.notAfter?.toISOString()}，证书目录 ${options.outputDir}）`,
+      `无需续期：${decision.reason}（到期时间 ${decision.notAfter?.toISOString()}）`,
     );
     return;
   }
@@ -58,26 +65,31 @@ export async function run(args: string[]): Promise<void> {
     directoryUrl: options.directoryUrl,
     domains: options.domains,
     email: options.email,
-    outputDir: options.outputDir,
+    storage,
+    renewBeforeDays: options.renewBeforeDays,
     provider,
     waitForPropagation: (fqdn, value) =>
       waitForAuthoritativeTxt(fqdn, value, {
         zone: options.zone,
         timeoutMs: options.propagationTimeoutMs,
         intervalMs: options.propagationIntervalMs,
+        delayMs: options.propagationDelayMs,
         log,
       }),
     log,
   });
 
   log(`证书签发成功，到期时间 ${result.notAfter.toISOString()}`);
-  log(`证书已写入 ${options.outputDir}`);
+  for (const domain of options.domains) {
+    const installed = identityPaths(storage, domain);
+    log(`${domain} 证书：${installed.fullchain}；私钥：${installed.privateKey}`);
+  }
   for (const warning of result.cleanupWarnings) {
     console.warn(`[acme] 警告：${warning}`);
   }
 }
 
-function parseCli(args: string[]): CliOptions {
+export function parseCli(args: string[]): CliOptions {
   const parsed = parseArgs({
     args,
     strict: true,
@@ -86,7 +98,10 @@ function parseCli(args: string[]): CliOptions {
       zone: { type: "string", short: "z" },
       domain: { type: "string", short: "d", multiple: true },
       email: { type: "string", short: "e" },
-      output: { type: "string", short: "o", default: "./certs" },
+      "buckyos-root": { type: "string" },
+      "identity-root": { type: "string" },
+      "security-root": { type: "string" },
+      "state-root": { type: "string" },
       production: { type: "boolean", default: false },
       "directory-url": { type: "string" },
       "accept-terms": { type: "boolean", default: false },
@@ -94,6 +109,7 @@ function parseCli(args: string[]): CliOptions {
       "renew-before-days": { type: "string", default: "30" },
       "propagation-timeout": { type: "string", default: "300" },
       "propagation-interval": { type: "string", default: "5" },
+      "propagation-delay": { type: "string", default: "0" },
       verbose: { type: "boolean", short: "v", default: false },
       help: { type: "boolean", short: "h", default: false },
     },
@@ -131,23 +147,39 @@ function parseCli(args: string[]): CliOptions {
   );
   validateHttpsUrl(directoryUrl, "--directory-url");
 
+  const propagationTimeoutMs = positiveNumber(
+    parsed.values["propagation-timeout"],
+    "--propagation-timeout",
+  ) * 1000;
+  const propagationDelay = Number(parsed.values["propagation-delay"]);
+  if (!Number.isFinite(propagationDelay) || propagationDelay < 0) {
+    throw new Error("--propagation-delay 必须是大于等于 0 的数字");
+  }
+  const propagationDelayMs = propagationDelay * 1000;
+  if (propagationDelayMs >= propagationTimeoutMs) {
+    throw new Error("--propagation-timeout 必须大于 --propagation-delay");
+  }
+
   return {
     zone,
     domains: [...new Set(domains)],
     email,
-    outputDir: path.resolve(parsed.values.output),
+    storageOptions: {
+      buckyosRoot: parsed.values["buckyos-root"],
+      identityRoot: parsed.values["identity-root"],
+      securityRoot: parsed.values["security-root"],
+      stateRoot: parsed.values["state-root"],
+    },
     directoryUrl,
     acceptTerms: parsed.values["accept-terms"],
     force: parsed.values.force,
     renewBeforeDays: positiveNumber(parsed.values["renew-before-days"], "--renew-before-days"),
-    propagationTimeoutMs: positiveNumber(
-      parsed.values["propagation-timeout"],
-      "--propagation-timeout",
-    ) * 1000,
+    propagationTimeoutMs,
     propagationIntervalMs: positiveNumber(
       parsed.values["propagation-interval"],
       "--propagation-interval",
     ) * 1000,
+    propagationDelayMs,
     verbose: parsed.values.verbose,
   };
 }
@@ -217,17 +249,23 @@ function printHelp(): void {
       --accept-terms                接受 ACME CA 的服务条款
 
 选项：
-  -o, --output <dir>                输出目录（默认 ./certs）
+      --buckyos-root <dir>          BuckyOS 根目录（环境变量 BUCKYOS_ROOT 或 /opt/buckyos）
+      --identity-root <dir>         公开身份根目录（BUCKYOS_IDENTITY_ROOT 或 <root>/local/identity）
+      --security-root <dir>         私钥根目录（BUCKYOS_SECURITY_ROOT 或 <root>/security）
+      --state-root <dir>            ACME 状态目录（默认 <root>/var/identity/state/acme/acme-godaddy）
       --production                  使用 Let's Encrypt 生产环境（默认 staging）
       --directory-url <url>         自定义 ACME directory URL
       --renew-before-days <days>    提前续期天数（默认 30）
       --propagation-timeout <sec>   DNS 传播超时（默认 300）
       --propagation-interval <sec>  DNS 检查间隔（默认 5）
+      --propagation-delay <sec>     全部权威 DNS 可见后持续检查等待（默认 0，须小于 timeout）
       --force                       忽略现有证书并重新签发
   -v, --verbose                     输出 acme-client 调试日志
   -h, --help                        显示帮助
 
-凭据只从环境变量 GODADDY_PAT 读取。`);
+每个 --domain 都会安装到对应 identity 目录，*.example.com 映射为 _.example.com。
+staging / 自定义 CA 使用状态目录下的隔离 identity 与 security 目录。
+凭据只从环境变量 GODADDY_PAT 读取；systemd 服务通过 EnvironmentFile 注入。`);
 }
 
 if (import.meta.main) {
