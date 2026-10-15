@@ -8,6 +8,7 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  BUCKYOS_OOD_CONFIG_SOURCE: ${{ github.workspace }}/.work/buckyos-source/src/make_config.ts
 
 jobs:
   build:
@@ -16,6 +17,12 @@ jobs:
 
     steps:
     - uses: actions/checkout@v4
+    - name: Checkout main OOD config producer
+      uses: actions/checkout@v4
+      with:
+        repository: buckyos/buckyos
+        ref: main
+        path: .work/buckyos-source
     - uses: denoland/setup-deno@v2
       with:
         deno-version: v2.9.2

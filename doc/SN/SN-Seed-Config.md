@@ -91,3 +91,62 @@ cd src && cargo test -p cyfs-sn sn_seed -- --test-threads=1
 
 覆盖：全新导入 / 同 seed 二次导入零变更 / 同名不同内容跳过告警 /
 文件缺失正常启动、格式坏启动报错 / 存量用户补 user_domain 绑定。
+
+## OOD 最终身份交接
+
+devtest 的身份生产方是 BuckyOS 的 `src/make_config.ts`。它在完成 OOD
+本地身份规范化后，将与目标 rootfs 相同的五份签名 JWT 导出到
+`<env_root>/<zone_id>/<node_name>/sn_seed_identity.json`：
+
+- `schema: buckyos.sn_seed_identity.v1`
+- `owner_document_jwt`、`zone_document_jwt`、`boot_config_jwt`
+- `device_doc_jwt`、`device_mini_doc_jwt`
+- `source_sha256`：按顺序读取 owner、zone、boot、node identity、device JSON
+  的 UTF-8 原文，序列化为 JSON 字符串数组后计算 SHA-256，用于拒绝过期交接包。
+
+交接文件不包含私钥或登录配置。SN 生成器验证源文件摘要、owner 签名、
+用户/Zone/设备绑定、签发与过期时间、文档之间的引用及网络参数，然后原样发布
+JWT；不再读取 SDK 初始设备 JWT、不独立重签 Zone，也不降级到聚合文档。
+底层种子导出函数只消费交接文件。SN CLI 遇到缺失的交接文件时，调用同级
+BuckyOS main 的 `prepareSeedIdentity` 初始化最终身份，不生成 OOD rootfs 或启动服务。
+已存在的交接文件先全部验证，任何无效身份都会阻止本轮初始化与 SN 输出更新，
+不会通过重新签名或使用旧 SDK 文档绕过。
+
+BuckyOS 开发生成器使用同次生成的 OwnerDocument 签发时间作为 Zone/Device
+签发时间，避免把固定 boot 到期时间减去 SDK 有效期后得到未来时间。此规则不修改
+共享 SDK，也不放宽 BNS 的时间有效性校验。
+
+从五个仓库共同的父目录执行一个隔离的生成流程：
+
+```bash
+mkdir -p .work/sn-seed/ood
+for group in alice.ood1 bob.ood1 charlie.ood1 dave.ood1; do
+  deno run -A --config buckyos/src/deno.json buckyos/src/make_config.ts "$group" \
+    --rootfs ".work/sn-seed/ood/$group" --env_root .work/sn-seed/env --ca .work/sn-seed/ca
+done
+deno run -A --config cyfs-gateway/src/deno.json cyfs-gateway/src/make_sn_config.ts \
+  --rootfs .work/sn-seed/sn --env_root .work/sn-seed/env --ca .work/sn-seed/ca
+```
+
+SN 和 OOD 可以任意顺序生成，但必须使用同一个 `--env_root`（VM staging
+默认 `~/buckycli`）和同一个 dev CA。首次初始化建立最终身份；后续 OOD
+生成从原始源文件确定性重现并核对已有交接 JWT，不重建用户环境、不刷新
+`iat`，重复 SN 生成也保持相同文档修订。已有 SDK 环境但没有交接文件时，
+由 OOD 生产方重新初始化并规范化，绝不把旧 SDK JWT 当作最终文档发布。
+
+源文件、网络参数、密钥或交接内容改变，以及身份过期时，生成失败，不能
+自动刷新已发布的身份。需要新测试身份时使用新的 `--env_root`，重新生成
+并匹配安装 OOD 与 SN；运行中的链和数据库不会被配置生成器更新。
+初始化使用每个用户的排他文件锁；并发生成冲突会失败，需等待另一个生成完成
+再重试，进程异常遗留的锁也不会自动抢占。
+
+独立本机 `sn-dev-up.sh --fresh` 仍提前生成完整 OOD rootfs，`--resume`
+不重新生成任何身份。SN CLI、脚本和回归测试默认查找同级 BuckyOS checkout，
+也可通过 `BUCKYOS_OOD_CONFIG_SOURCE` 指定生成器文件；必须使用上游 main。
+只有缺少最终交接文件时，SN CLI 才需要调用生产方；已有完整有效交接文件可直接消费。
+回归覆盖 OOD-first、SN-first、部分 OOD 已生成和跨秒重复生成的字节级一致性。
+
+这是一项跨仓库 devtest 生成契约：先合入 BuckyOS 生产方，再合入 cyfs-gateway
+消费方，其 CI 从 BuckyOS main 调用真实生成器，不再使用手工构造的替代 JWT。
+正式 SN Cluster 的 `security_asset_req.ts -> make_asset.ts -> security-update`
+不消费这个交接文件；正式密钥、BNS 内容、数据库与运行时校验均不因此改变。
