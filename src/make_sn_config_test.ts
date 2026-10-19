@@ -1,4 +1,5 @@
 import { Buffer } from "node:buffer";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import {
   createPrivateKey,
   createPublicKey,
@@ -8,11 +9,13 @@ import {
 
 import {
   enableDevVmBnsProxy,
+  getSeedUserSpecs,
   makeBnsDvSeedConfig,
   makeSnAuthSeedConfig,
   materializeSnDidWebDocuments,
   omitSnSelfBootstrapParams,
   patchLocalDnsBnsRecord,
+  prepareSeedIdentities,
   writeMachineConfig,
 } from "./make_sn_config.ts";
 
@@ -207,17 +210,6 @@ Deno.test("SN did:web authority and canonical stack identity reuse one key", asy
   }
 });
 
-function unsignedJwt(payload: Record<string, unknown>): string {
-  const base64url = (value: string) =>
-    btoa(value)
-      .replaceAll("+", "-")
-      .replaceAll("/", "_")
-      .replaceAll("=", "");
-  return `${base64url('{"alg":"EdDSA"}')}.${
-    base64url(JSON.stringify(payload))
-  }.signature`;
-}
-
 function signedJwt(
   payload: Record<string, unknown>,
   privateKeyPem: string,
@@ -235,438 +227,171 @@ function signedJwt(
   return `${signingInput}.${signature.toString("base64url")}`;
 }
 
-const TEST_OWNER_PRIVATE_KEY_PEM = `-----BEGIN PRIVATE KEY-----
-MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
------END PRIVATE KEY-----
-`;
-const TEST_OWNER_PUBLIC_KEY_X = "T4Quc1L6Ogu4N2tTKOvneV1yYnBcmhP89B_RsuFsJZ8";
-
-function ownerDocument(username: string): Record<string, unknown> {
-  const ownerDid = `did:bns:${username}`;
-  return {
-    "@context": [
-      "https://www.w3.org/ns/did/v1",
-      "https://buckyos.org/ns/owner/v1",
-    ],
-    id: ownerDid,
-    verificationMethod: [{
-      type: "Ed25519VerificationKey2020",
-      id: "#main_key",
-      controller: ownerDid,
-      publicKeyJwk: {
-        kty: "OKP",
-        crv: "Ed25519",
-        x: TEST_OWNER_PUBLIC_KEY_X,
-      },
-    }],
-    authentication: ["#main_key"],
-    assertion_method: ["#main_key"],
-    capabilityInvocation: ["#main_key"],
-    exp: 2_058_838_939,
-    iat: 1_735_689_600,
-    version_seq: 0,
-    name: username,
-    display_name: username,
-  };
-}
-
-async function writeUserDidSeedMaterial(
-  userDir: string,
-  username: string,
-  zoneDid: string,
-  issuedAt = 1_901_158_939,
-): Promise<void> {
-  const ownerDid = `did:bns:${username}`;
-  await Deno.writeTextFile(
-    `${userDir}/user_config.json`,
-    JSON.stringify(ownerDocument(username)),
-  );
-  await Deno.writeTextFile(
-    `${userDir}/user_private_key.pem`,
-    TEST_OWNER_PRIVATE_KEY_PEM,
-  );
-  await Deno.writeTextFile(
-    `${userDir}/zone_config.json`,
-    JSON.stringify({
-      "@context": [
-        "https://www.w3.org/ns/did/v1",
-        "https://buckyos.org/ns/zone/v1",
-      ],
-      id: zoneDid,
-      verificationMethod: [{
-        type: "Ed25519VerificationKey2020",
-        id: "#main_key",
-        controller: ownerDid,
-        publicKeyJwk: {
-          kty: "OKP",
-          crv: "Ed25519",
-          x: TEST_OWNER_PUBLIC_KEY_X,
-        },
-      }],
-      authentication: ["#main_key"],
-      assertionMethod: ["#main_key"],
-      capabilityInvocation: ["#main_key"],
-      exp: 2_058_838_939,
-      iat: issuedAt,
-      version_seq: 0,
-      hostname: zoneDid.startsWith("did:web:")
-        ? zoneDid.slice("did:web:".length)
-        : `${username}.bns.did`,
-      owner: ownerDid,
-      oods: ["ood1"],
-      boot_jwt: "",
-    }),
-  );
-}
-
-function decodeAndVerifyJwt(
-  jwt: string,
-  publicKeyX: string,
-): Record<string, unknown> {
+function decodeAndVerifyJwt(jwt: string, publicKeyX: string): Record<string, unknown> {
   const parts = jwt.trim().split(".");
-  if (parts.length !== 3) {
-    throw new Error("signed DID document is not a compact JWT");
-  }
-  const header = JSON.parse(
-    Buffer.from(parts[0], "base64url").toString("utf8"),
-  );
-  if (header.alg !== "EdDSA" || header.typ !== undefined) {
-    throw new Error(`unexpected owner JWT header: ${JSON.stringify(header)}`);
-  }
-  const verified = cryptoVerify(
+  const header = JSON.parse(Buffer.from(parts[0], "base64url").toString("utf8"));
+  if (header.alg !== "EdDSA" || header.typ !== undefined || !cryptoVerify(
     null,
-    Buffer.from(`${parts[0]}.${parts[1]}`, "utf8"),
-    createPublicKey({
-      key: { kty: "OKP", crv: "Ed25519", x: publicKeyX },
-      format: "jwk",
-    }),
+    Buffer.from(`${parts[0]}.${parts[1]}`),
+    createPublicKey({ key: { kty: "OKP", crv: "Ed25519", x: publicKeyX }, format: "jwk" }),
     Buffer.from(parts[2], "base64url"),
-  );
-  if (!verified) {
-    throw new Error("DID document JWT signature is invalid");
+  )) {
+    throw new Error("invalid owner-signed JWT");
   }
   return JSON.parse(Buffer.from(parts[1], "base64url").toString("utf8"));
 }
 
+async function generateOodFixture(root: string, group: string) {
+  const source = Deno.env.get("BUCKYOS_OOD_CONFIG_SOURCE");
+  const sourceUrl = source
+    ? pathToFileURL(source).href
+    : new URL("../../buckyos/src/make_config.ts", import.meta.url).href;
+  const { makeConfigByGroupName } = await import(sourceUrl);
+  const rootfs = `${root}/${group}`;
+  await makeConfigByGroupName(group, rootfs, `${root}/ca`, `${root}/env`);
+  const start = JSON.parse(await Deno.readTextFile(`${rootfs}/etc/start_config.json`));
+  return { rootfs, start };
+}
+
+async function runSnCli(root: string) {
+  return await new Deno.Command(Deno.execPath(), {
+    args: [
+      "run", "-A", "--config", fileURLToPath(new URL("./deno.json", import.meta.url)),
+      new URL("./make_sn_config.ts", import.meta.url).href,
+      "--rootfs", `${root}/out`, "--env_root", `${root}/env`,
+      "--ca", `${root}/ca`, "--sn_ip", "127.0.0.1",
+    ],
+    stdout: "piped",
+    stderr: "piped",
+  }).output();
+}
+
+async function expectSeedFailure(root: string, fragment: string) {
+  try {
+    await makeBnsDvSeedConfig(`${root}/out`, `${root}/env`, getSeedUserSpecs().slice(0, 1));
+  } catch (error) {
+    if (error instanceof Error && error.message.includes(fragment)) {
+      return;
+    }
+    throw error;
+  }
+  throw new Error(`expected seed generation to reject: ${fragment}`);
+}
+
 Deno.test("BNS seed publishes full device documents separately from TXT mini JWTs", async () => {
   const root = await Deno.makeTempDir();
-  const envRoot = `${root}/env`;
   const outputRoot = `${root}/out`;
-  const userDir = `${envRoot}/alice.bns.did`;
-  const identityDir = `${userDir}/ood1/local/identity/ood1.alice.bns.did`;
-  const webUserDir = `${envRoot}/charlie.me`;
-  const webIdentityDir = `${webUserDir}/ood1/local/identity/ood1.charlie.me`;
-  const deviceDoc = {
-    id: "did:bns:ood1.alice",
-    owner: "did:bns:alice",
-    zone_did: "did:bns:alice",
-    device_type: "ood",
-    name: "ood1",
-    iat: 1_735_689_600,
-    exp: 2_058_838_939,
-    verificationMethod: [{
-      type: "Ed25519VerificationKey2020",
-      id: "#main_key",
-      controller: "did:bns:ood1.alice",
-      publicKeyJwk: { kty: "OKP", crv: "Ed25519", x: TEST_OWNER_PUBLIC_KEY_X },
-    }],
-    authentication: ["#main_key"],
-  };
-  const deviceDocJwt = signedJwt(deviceDoc, TEST_OWNER_PRIVATE_KEY_PEM);
-  const webDeviceDoc = {
-    ...deviceDoc,
-    id: "did:web:ood1.charlie.me",
-    owner: "did:bns:charlie",
-    zone_did: "did:web:charlie.me",
-    verificationMethod: [{
-      ...deviceDoc.verificationMethod[0],
-      controller: "did:web:ood1.charlie.me",
-    }],
-  };
-  const webDeviceDocJwt = signedJwt(
-    webDeviceDoc,
-    TEST_OWNER_PRIVATE_KEY_PEM,
-  );
-  const miniJwt = signedJwt(
-    {
-      n: "ood1",
-      x: TEST_OWNER_PUBLIC_KEY_X,
-      exp: 2_058_838_939,
-    },
-    TEST_OWNER_PRIVATE_KEY_PEM,
-  );
-  const bootJwt = signedJwt(
-    {
-      id: "did:bns:alice",
-      oods: ["ood1"],
-      exp: 2_058_838_939,
-    },
-    TEST_OWNER_PRIVATE_KEY_PEM,
-  );
-  const webBootJwt = signedJwt(
-    {
-      id: "did:web:charlie.me",
-      oods: ["ood1@portmap"],
-      exp: 2_058_838_939,
-    },
-    TEST_OWNER_PRIVATE_KEY_PEM,
-  );
-
   try {
-    await Deno.mkdir(identityDir, { recursive: true });
-    await Deno.mkdir(webIdentityDir, { recursive: true });
+    const users = getSeedUserSpecs();
+    const fixtures = new Map<string, Awaited<ReturnType<typeof generateOodFixture>>>();
+    for (const user of users) {
+      fixtures.set(user.username, await generateOodFixture(root, user.groupName));
+    }
     await Deno.mkdir(outputRoot, { recursive: true });
-    await writeUserDidSeedMaterial(
-      userDir,
-      "alice",
-      "did:bns:alice",
-      1_735_689_600,
-    );
-    await writeUserDidSeedMaterial(
-      webUserDir,
-      "charlie",
-      "did:web:charlie.me",
-    );
-    await Deno.writeTextFile(
-      `${userDir}/ood1/node_identity.json`,
-      JSON.stringify({
-        schema: "buckyos.node_identity.v2",
-        device_did: "did:bns:ood1.alice",
-      }),
-    );
-    await Deno.writeTextFile(
-      `${identityDir}/device_doc.jwt`,
-      deviceDocJwt,
-    );
-    await Deno.writeTextFile(
-      `${webUserDir}/ood1/node_identity.json`,
-      JSON.stringify({
-        schema: "buckyos.node_identity.v2",
-        device_did: "did:web:ood1.charlie.me",
-      }),
-    );
-    await Deno.writeTextFile(
-      `${webIdentityDir}/device_doc.jwt`,
-      webDeviceDocJwt,
-    );
-    await Deno.writeTextFile(
-      `${userDir}/zone_txt_record.json`,
-      JSON.stringify({
-        boot_config_jwt: bootJwt,
-        device_mini_doc_jwt: miniJwt,
-        pkx: TEST_OWNER_PUBLIC_KEY_X,
-      }),
-    );
-    await Deno.writeTextFile(
-      `${userDir}/alice.bns.did.zone.json`,
-      JSON.stringify({
-        oods: ["ood1"],
-        sn: "sn.devtests.org",
-        exp: 2_058_838_939,
-      }),
-    );
-    await Deno.writeTextFile(
-      `${webUserDir}/zone_txt_record.json`,
-      JSON.stringify({
-        boot_config_jwt: webBootJwt,
-        device_mini_doc_jwt: miniJwt,
-        pkx: TEST_OWNER_PUBLIC_KEY_X,
-      }),
-    );
-    await Deno.writeTextFile(
-      `${webUserDir}/charlie.me.zone.json`,
-      JSON.stringify({
-        oods: ["ood1@portmap"],
-        sn: "sn.devtests.org",
-        exp: 2_058_838_939,
-      }),
-    );
-
-    await makeBnsDvSeedConfig(outputRoot, envRoot, [
-      {
-        groupName: "alice.ood1",
-        username: "alice",
-        email: "alice@buckyos.org",
-        zoneId: "alice.bns.did",
-        snAccount: true,
-      },
-      {
-        groupName: "charlie.ood1",
-        username: "charlie",
-        email: "charlie@buckyos.org",
-        zoneId: "charlie.me",
-        userDomain: "charlie.me",
-        snAccount: true,
-      },
-    ]);
-    await makeSnAuthSeedConfig(outputRoot, envRoot, [{
-      groupName: "charlie.ood1",
-      username: "charlie",
-      email: "charlie@buckyos.org",
-      zoneId: "charlie.me",
-      userDomain: "charlie.me",
-      snAccount: true,
-    }]);
-
-    const seedYaml = await Deno.readTextFile(
-      `${outputRoot}/bns_dv_seed.yaml`,
-    );
-    for (
-      const reference of [
-        "bns_seed_docs/alice/owner.jwt",
-        "bns_seed_docs/charlie/owner.jwt",
-      ]
-    ) {
-      if (!seedYaml.includes(`inline_text_file: "${reference}"`)) {
-        throw new Error(`BNS seed does not publish signed ${reference}`);
-      }
+    const cli = await new Deno.Command(Deno.execPath(), {
+      args: [
+        "run", "-A", "--config", fileURLToPath(new URL("./deno.json", import.meta.url)),
+        new URL("./make_sn_config.ts", import.meta.url).href,
+        "--rootfs", outputRoot, "--env_root", `${root}/env`, "--ca", `${root}/ca`,
+        "--sn_ip", "127.0.0.1",
+      ],
+      stdout: "piped",
+      stderr: "piped",
+    }).output();
+    if (!cli.success) {
+      throw new Error(`SN CLI failed: ${new TextDecoder().decode(cli.stderr)}`);
     }
-    if (
-      !seedYaml.includes(
-        'inline_text_file: "bns_seed_docs/alice/zone.jwt"',
-      )
-    ) {
-      throw new Error("BNS seed does not publish the signed ZoneDocument");
-    }
-    for (const [username, expectedJwt] of [
-      ["alice", deviceDocJwt],
-      ["charlie", webDeviceDocJwt],
-    ]) {
-      const reference = `bns_seed_docs/${username}/ood1.jwt`;
-      if (!seedYaml.includes(
-        `      - doc_type: "ood1"\n        inline_text_file: "${reference}"`,
-      )) {
-        throw new Error(`BNS seed misses the independent device slot for ${username}`);
-      }
-      const stored = await Deno.readTextFile(`${outputRoot}/${reference}`);
-      if (stored.trim() !== expectedJwt) {
-        throw new Error(`BNS device slot changed the original JWT for ${username}`);
-      }
-    }
-
-    const storedOwner = JSON.parse(
-      await Deno.readTextFile(
-        `${outputRoot}/bns_seed_docs/alice/owner.json`,
-      ),
-    );
-    const storedOwnerJwt = await Deno.readTextFile(
-      `${outputRoot}/bns_seed_docs/alice/owner.jwt`,
-    );
-    const signedOwner = decodeAndVerifyJwt(
-      storedOwnerJwt,
-      TEST_OWNER_PUBLIC_KEY_X,
-    );
-    if (
-      JSON.stringify(storedOwner) !== JSON.stringify(signedOwner) ||
-      signedOwner.id !== "did:bns:alice" ||
-      !Array.isArray(signedOwner.verificationMethod) ||
-      !Array.isArray(signedOwner.authentication)
-    ) {
-      throw new Error("BNS owner document is not the complete signed document");
-    }
-
-    const storedZone = JSON.parse(
-      await Deno.readTextFile(
-        `${outputRoot}/bns_seed_docs/alice/zone.json`,
-      ),
-    );
-    const storedZoneJwt = await Deno.readTextFile(
-      `${outputRoot}/bns_seed_docs/alice/zone.jwt`,
-    );
-    const signedZone = decodeAndVerifyJwt(
-      storedZoneJwt,
-      TEST_OWNER_PUBLIC_KEY_X,
-    );
-    if (
-      JSON.stringify(storedZone) !== JSON.stringify(signedZone) ||
-      signedZone.id !== "did:bns:alice" ||
-      signedZone.owner !== "did:bns:alice" ||
-      signedZone.iat !== 1_735_689_600 ||
-      (signedZone.devices as Record<string, unknown>).ood1 === undefined
-    ) {
-      throw new Error("BNS zone document is not complete or owner-signed");
-    }
-
+    await makeBnsDvSeedConfig(outputRoot, `${root}/env`, users);
+    await makeSnAuthSeedConfig(outputRoot, `${root}/env`, users);
+    const seedYaml = await Deno.readTextFile(`${outputRoot}/bns_dv_seed.yaml`);
     const snSeed = await Deno.readTextFile(`${outputRoot}/sn_seed.yaml`);
-    const userDomainJwtLine = snSeed.split("\n").find((line) =>
-      line.trimStart().startsWith("zone_document_jwt:")
-    );
-    if (!userDomainJwtLine) {
-      throw new Error("SN user-domain seed misses ZoneDocument JWT");
-    }
-    const userDomainJwt = JSON.parse(
-      userDomainJwtLine.slice(userDomainJwtLine.indexOf(":") + 1).trim(),
-    );
-    const userDomainZone = decodeAndVerifyJwt(
-      userDomainJwt,
-      TEST_OWNER_PUBLIC_KEY_X,
-    );
-    if (
-      userDomainZone.id !== "did:web:charlie.me" ||
-      userDomainZone.owner !== "did:bns:charlie" ||
-      (userDomainZone.devices as Record<string, unknown>).ood1 === undefined
-    ) {
-      throw new Error(
-        "SN user-domain seed does not contain a signed ZoneDocument",
+    for (const user of users) {
+      const { rootfs, start } = fixtures.get(user.username)!;
+      const device = JSON.parse(Buffer.from(start.device_doc_jwt.split(".")[1], "base64url").toString("utf8"));
+      const nodeIdentity = JSON.parse(await Deno.readTextFile(`${rootfs}/etc/node_identity.json`));
+      const host = nodeIdentity.device_did.replace(/^did:(bns|web):/, "") +
+        (nodeIdentity.device_did.startsWith("did:bns:") ? ".bns.did" : "");
+      const installedJwt = (await Deno.readTextFile(`${rootfs}/local/identity/${host}/device_doc.jwt`)).trim();
+      const seedJwt = (await Deno.readTextFile(`${outputRoot}/bns_seed_docs/${user.username}/ood1.jwt`)).trim();
+      const owner = start.owner_document;
+      const pkx = owner.verificationMethod[0].publicKeyJwk.x;
+      decodeAndVerifyJwt(seedJwt, pkx);
+      if (installedJwt !== seedJwt || start.device_doc_jwt !== seedJwt) {
+        throw new Error(`installed and seeded JWT revisions differ for ${user.username}`);
+      }
+      if (!seedYaml.includes(`      - doc_type: "ood1"\n        inline_text_file: "bns_seed_docs/${user.username}/ood1.jwt"`)) {
+        throw new Error(`missing independent device slot for ${user.username}`);
+      }
+      const originalJwt = (await Deno.readTextFile(
+        `${root}/env/${user.zoneId}/ood1/local/identity/${host}/device_doc.jwt`,
+      )).trim();
+      if (originalJwt === seedJwt) {
+        throw new Error("fixture failed to exercise OOD normalization");
+      }
+      const aggregate = JSON.parse(await Deno.readTextFile(
+        `${outputRoot}/bns_seed_docs/${user.username}/device_mini_doc.json`,
+      ));
+      if (aggregate.device_document_jwts.ood1 !== seedJwt ||
+        aggregate.mini_device_jwts.ood1 !== start.device_mini_doc_jwt ||
+        JSON.stringify(aggregate.devices.ood1) !== JSON.stringify(device)) {
+        throw new Error("aggregate seed differs from installed identity");
+      }
+      const ownerJwt = (await Deno.readTextFile(
+        `${outputRoot}/bns_seed_docs/${user.username}/owner.jwt`,
+      )).trim();
+      if (JSON.stringify(decodeAndVerifyJwt(ownerJwt, pkx)) !== JSON.stringify(owner)) {
+        throw new Error("owner seed differs from OOD OwnerDocument");
+      }
+      if (!user.userDomain) {
+        for (const [name, expected] of [
+          ["zone", start.zone_document_jwt], ["boot", start.boot_config_jwt],
+        ]) {
+          const token = (await Deno.readTextFile(
+            `${outputRoot}/bns_seed_docs/${user.username}/${name}.jwt`,
+          )).trim();
+          if (token !== expected) {
+            throw new Error(`${name} seed differs from installed identity`);
+          }
+          decodeAndVerifyJwt(token, pkx);
+        }
+      } else if (!snSeed.includes(JSON.stringify(start.zone_document_jwt))) {
+        throw new Error("SN did:web authority differs from installed ZoneDocument");
+      }
+      const bundle = await Deno.readTextFile(
+        `${root}/env/${user.zoneId}/ood1/sn_seed_identity.json`,
       );
+      if (bundle.includes("PRIVATE KEY") || bundle.includes("admin_password")) {
+        throw new Error("public identity handoff leaked a secret");
+      }
     }
-
-    const aggregate = JSON.parse(
-      await Deno.readTextFile(
-        `${outputRoot}/bns_seed_docs/alice/device_mini_doc.json`,
-      ),
-    );
-    if (JSON.stringify(aggregate.devices.ood1) !== JSON.stringify(deviceDoc)) {
-      throw new Error(
-        "authority device payload differs from Hello JWT payload",
-      );
-    }
-    if (aggregate.mini_device_jwts.ood1 !== miniJwt) {
-      throw new Error("mini JWT compatibility map is missing");
-    }
-    if (aggregate.device_document_jwts.ood1 !== deviceDocJwt) {
-      throw new Error("full device JWT archive map is missing");
-    }
-    const webAggregate = JSON.parse(
-      await Deno.readTextFile(
-        `${outputRoot}/bns_seed_docs/charlie/device_mini_doc.json`,
-      ),
-    );
-    if (
-      JSON.stringify(webAggregate.devices.ood1) !==
-        JSON.stringify(webDeviceDoc) ||
-      webAggregate.device_document_jwts.ood1 !== webDeviceDocJwt
-    ) {
-      throw new Error(
-        "did:web device document was not seeded via canonical BNS",
-      );
+    const snapshot = seedYaml;
+    await makeBnsDvSeedConfig(outputRoot, `${root}/env`, users);
+    if ((await Deno.readTextFile(`${outputRoot}/bns_dv_seed.yaml`)) !== snapshot) {
+      throw new Error("seed regeneration changed finalized identities");
     }
     const fixturePath = Deno.env.get("BUCKYOS_SN_SEED_FIXTURE");
     if (fixturePath) {
       const documents = [];
       for (const block of seedYaml.split("  - type: register_name\n").slice(1)) {
-        const nameMatch = block.match(/^    name: (".*")$/m);
-        if (!nameMatch) {
-          throw new Error("Generated BNS seed registration misses a name");
-        }
-        const name = JSON.parse(nameMatch[1]);
+        const name = JSON.parse(block.match(/^    name: (".*")$/m)![1]);
         for (const match of block.matchAll(
           /^      - doc_type: (.+)\n        inline_(text|json)_file: (".*")$/gm,
         )) {
-          const docType = match[1].startsWith('"')
-            ? JSON.parse(match[1]) : match[1];
-          const reference = JSON.parse(match[3]);
-          const text = await Deno.readTextFile(`${outputRoot}/${reference}`);
-          const content = match[2] === "json"
-            ? JSON.stringify(JSON.parse(text)) : text.trim();
-          documents.push({ name, doc_type: docType, content });
+          const docType = match[1].startsWith('"') ? JSON.parse(match[1]) : match[1];
+          const text = await Deno.readTextFile(`${outputRoot}/${JSON.parse(match[3])}`);
+          documents.push({
+            name,
+            doc_type: docType,
+            content: match[2] === "json" ? JSON.stringify(JSON.parse(text)) : text.trim(),
+          });
         }
       }
+      const { start } = fixtures.get("alice")!;
       await Deno.writeTextFile(fixturePath, JSON.stringify({
-        owner: ownerDocument("alice"),
-        zone_jwt: storedZoneJwt.trim(),
-        device_jwt: deviceDocJwt,
-        device: deviceDoc,
+        owner: start.owner_document,
+        zone_jwt: start.zone_document_jwt,
+        device_jwt: start.device_doc_jwt,
+        device: JSON.parse(Buffer.from(start.device_doc_jwt.split(".")[1], "base64url").toString("utf8")),
         documents,
       }));
     }
@@ -675,42 +400,203 @@ Deno.test("BNS seed publishes full device documents separately from TXT mini JWT
   }
 });
 
-Deno.test("BNS seed refreshes legacy did:dev user environments", async () => {
+Deno.test("low-level SN seed export does not initialize missing identities", async () => {
   const root = await Deno.makeTempDir();
-  const envRoot = `${root}/env`;
-  const outputRoot = `${root}/out`;
-  const nodeDir = `${envRoot}/bob.bns.did/ood1`;
-
   try {
-    await Deno.mkdir(nodeDir, { recursive: true });
-    await Deno.mkdir(outputRoot, { recursive: true });
-    await Deno.writeTextFile(
-      `${nodeDir}/node_identity.json`,
-      JSON.stringify({
-        device_doc_jwt: unsignedJwt({
-          id: "did:dev:legacy-bob-device",
-        }),
-      }),
-    );
-
-    await makeBnsDvSeedConfig(outputRoot, envRoot, [{
-      groupName: "bob.ood1",
-      username: "bob",
-      email: "bob@buckyos.org",
-      zoneId: "bob.bns.did",
-      snAccount: true,
-    }]);
-
-    const aggregate = JSON.parse(
-      await Deno.readTextFile(
-        `${outputRoot}/bns_seed_docs/bob/device_mini_doc.json`,
-      ),
-    );
-    if (aggregate.devices.ood1.id !== "did:bns:ood1.bob") {
-      throw new Error(
-        `legacy device identity was not refreshed: ${aggregate.devices.ood1.id}`,
-      );
+    await expectSeedFailure(root, "missing finalized OOD identity");
+    try {
+      await Deno.stat(`${root}/env`);
+    } catch (error) {
+      if (error instanceof Deno.errors.NotFound) {
+        return;
+      }
+      throw error;
     }
+    throw new Error("seed export unexpectedly rebuilt the OOD environment");
+  } finally {
+    await Deno.remove(root, { recursive: true });
+  }
+});
+
+for (const initialOodCount of [0, 1]) {
+  Deno.test(`SN-first and mixed generation preserve final identities (initial OODs: ${initialOodCount})`, async () => {
+    const root = await Deno.makeTempDir();
+    try {
+      const users = getSeedUserSpecs();
+      let existingBundle: string | undefined;
+      if (initialOodCount) {
+        await generateOodFixture(root, users[0].groupName);
+        existingBundle = await Deno.readTextFile(`${root}/env/${users[0].zoneId}/ood1/sn_seed_identity.json`);
+      }
+      const cli = await runSnCli(root);
+      if (!cli.success) {
+        throw new Error(`SN-first CLI failed: ${new TextDecoder().decode(cli.stderr)}`);
+      }
+      const bundles = new Map<string, string>();
+      for (const user of users) {
+        const text = await Deno.readTextFile(`${root}/env/${user.zoneId}/ood1/sn_seed_identity.json`);
+        if (user === users[0] && existingBundle && text !== existingBundle) {
+          throw new Error("SN preparation replaced an existing finalized identity");
+        }
+        bundles.set(user.username, text);
+      }
+      await new Promise((resolve) => setTimeout(resolve, 1200));
+      for (const user of users) {
+        for (let generation = 0; generation < 2; generation++) {
+          const { start } = await generateOodFixture(root, user.groupName);
+          const bundleText = bundles.get(user.username)!;
+          const bundle = JSON.parse(bundleText);
+          for (const field of [
+            "zone_document_jwt", "boot_config_jwt", "device_doc_jwt", "device_mini_doc_jwt",
+          ]) {
+            if (start[field] !== bundle[field]) {
+              throw new Error(`OOD regeneration revised ${user.username} ${field}`);
+            }
+          }
+          const seeded = (await Deno.readTextFile(`${root}/out/bns_seed_docs/${user.username}/ood1.jwt`)).trim();
+          if (seeded !== start.device_doc_jwt ||
+              await Deno.readTextFile(`${root}/env/${user.zoneId}/ood1/sn_seed_identity.json`) !== bundleText) {
+            throw new Error("SN-first seed no longer matches subsequent installed OOD identity");
+          }
+        }
+      }
+      const repeated = await runSnCli(root);
+      if (!repeated.success) {
+        throw new Error(`repeated SN CLI failed: ${new TextDecoder().decode(repeated.stderr)}`);
+      }
+      for (const user of users) {
+        if ((await Deno.readTextFile(`${root}/out/bns_seed_docs/${user.username}/ood1.jwt`)).trim() !==
+            JSON.parse(bundles.get(user.username)!).device_doc_jwt) {
+          throw new Error("repeated SN CLI changed the seeded revision");
+        }
+      }
+    } finally {
+      await Deno.remove(root, { recursive: true });
+    }
+  });
+}
+
+Deno.test("SN-first preparation normalizes a pre-existing raw SDK environment", async () => {
+  const root = await Deno.makeTempDir();
+  try {
+    const source = Deno.env.get("BUCKYOS_OOD_CONFIG_SOURCE");
+    const sourceUrl = source
+      ? pathToFileURL(source).href
+      : new URL("../../buckyos/src/make_config.ts", import.meta.url).href;
+    const { buildUserEnv } = await import(sourceUrl);
+    const { getParamsFromGroupName } = await import(new URL("./devenv_config.ts", import.meta.url).href);
+    const userDir = await buildUserEnv(getParamsFromGroupName("alice.ood1"), `${root}/env`);
+    const rawJwt = (await Deno.readTextFile(`${userDir}/ood1/local/identity/ood1.alice.bns.did/device_doc.jwt`)).trim();
+    await prepareSeedIdentities(`${root}/env`, getSeedUserSpecs().slice(0, 1));
+    const bundle = JSON.parse(await Deno.readTextFile(`${userDir}/ood1/sn_seed_identity.json`));
+    if (bundle.device_doc_jwt === rawJwt) {
+      throw new Error("SN-first preparation reused the raw SDK JWT");
+    }
+    await makeBnsDvSeedConfig(`${root}/out`, `${root}/env`, getSeedUserSpecs().slice(0, 1));
+    await new Promise((resolve) => setTimeout(resolve, 1200));
+    const { start } = await generateOodFixture(root, "alice.ood1");
+    if (start.device_doc_jwt !== bundle.device_doc_jwt ||
+        (await Deno.readTextFile(`${root}/out/bns_seed_docs/alice/ood1.jwt`)).trim() !== start.device_doc_jwt) {
+      throw new Error("later OOD generation changed the SN-first normalized identity");
+    }
+  } finally {
+    await Deno.remove(root, { recursive: true });
+  }
+});
+
+Deno.test("SN preparation fails before output or other users change when finalized identity is invalid", async () => {
+  const root = await Deno.makeTempDir();
+  try {
+    await generateOodFixture(root, "alice.ood1");
+    const bundlePath = `${root}/env/alice.bns.did/ood1/sn_seed_identity.json`;
+    const text = await Deno.readTextFile(bundlePath);
+    const bundle = JSON.parse(text);
+    bundle.device_doc_jwt = "invalid";
+    await Deno.writeTextFile(bundlePath, JSON.stringify(bundle));
+    await Deno.mkdir(`${root}/out`);
+    const paramsPath = `${root}/out/params.json`;
+    await Deno.writeTextFile(paramsPath, "preserve existing config");
+    const cli = await runSnCli(root);
+    if (cli.success || await Deno.readTextFile(paramsPath) !== "preserve existing config") {
+      throw new Error("SN CLI changed staged config before validating final identities");
+    }
+    if (await Deno.readTextFile(bundlePath) !== JSON.stringify(bundle)) {
+      throw new Error("SN CLI repaired invalid identity instead of rejecting it");
+    }
+    try {
+      await Deno.stat(`${root}/env/bob.bns.did`);
+    } catch (error) {
+      if (error instanceof Deno.errors.NotFound) {
+        return;
+      }
+      throw error;
+    }
+    throw new Error("SN CLI initialized other users before rejecting invalid existing identity");
+  } finally {
+    await Deno.remove(root, { recursive: true });
+  }
+});
+
+Deno.test("SN seed rejects stale, tampered and inconsistent final identities", async () => {
+  const root = await Deno.makeTempDir();
+  try {
+    const { start } = await generateOodFixture(root, "alice.ood1");
+    const bundlePath = `${root}/env/alice.bns.did/ood1/sn_seed_identity.json`;
+    const bundle = JSON.parse(await Deno.readTextFile(bundlePath));
+    const badSignature = structuredClone(bundle);
+    const parts = start.device_doc_jwt.split(".");
+    parts[2] = (parts[2][0] === "A" ? "B" : "A") + parts[2].slice(1);
+    badSignature.device_doc_jwt = parts.join(".");
+    await Deno.writeTextFile(bundlePath, JSON.stringify(badSignature));
+    await expectSeedFailure(root, "signature does not match");
+
+    const ownerKey = await Deno.readTextFile(`${root}/env/alice.bns.did/user_private_key.pem`);
+    const wrongDevice = JSON.parse(Buffer.from(parts[1], "base64url").toString("utf8"));
+    wrongDevice.name = "ood2";
+    await Deno.writeTextFile(bundlePath, JSON.stringify({
+      ...bundle, device_doc_jwt: signedJwt(wrongDevice, ownerKey),
+    }));
+    await expectSeedFailure(root, "identity binding");
+
+    const wrongMini = JSON.parse(Buffer.from(start.device_mini_doc_jwt.split(".")[1], "base64url").toString("utf8"));
+    wrongMini.p = 9999;
+    await Deno.writeTextFile(bundlePath, JSON.stringify({
+      ...bundle, device_mini_doc_jwt: signedJwt(wrongMini, ownerKey),
+    }));
+    await expectSeedFailure(root, "inconsistent signed documents");
+
+    const rewriteDevice = (device: Record<string, unknown>) => {
+      const mini = JSON.parse(Buffer.from(start.device_mini_doc_jwt.split(".")[1], "base64url").toString("utf8"));
+      mini.p = device.rtcp_port;
+      mini.iat = device.iat;
+      const miniJwt = signedJwt(mini, ownerKey);
+      const zone = JSON.parse(Buffer.from(start.zone_document_jwt.split(".")[1], "base64url").toString("utf8"));
+      zone.devices.ood1 = device;
+      zone.iat = device.iat;
+      zone.mini_device_jwts.ood1 = miniJwt;
+      return {
+        ...bundle,
+        device_doc_jwt: signedJwt(device, ownerKey),
+        device_mini_doc_jwt: miniJwt,
+        zone_document_jwt: signedJwt(zone, ownerKey),
+      };
+    };
+    const originalDevice = JSON.parse(Buffer.from(start.device_doc_jwt.split(".")[1], "base64url").toString("utf8"));
+    await Deno.writeTextFile(bundlePath, JSON.stringify(rewriteDevice({
+      ...originalDevice, iat: Math.floor(Date.now() / 1000) + 3600,
+    })));
+    await expectSeedFailure(root, "invalid document validity times");
+    await Deno.writeTextFile(bundlePath, JSON.stringify(rewriteDevice({
+      ...originalDevice, rtcp_port: 9999,
+    })));
+    await expectSeedFailure(root, "network parameters");
+
+    await Deno.writeTextFile(bundlePath, JSON.stringify(bundle));
+    const zonePath = `${root}/env/alice.bns.did/zone_config.json`;
+    const zone = JSON.parse(await Deno.readTextFile(zonePath));
+    zone.iat += 1;
+    await Deno.writeTextFile(zonePath, JSON.stringify(zone));
+    await expectSeedFailure(root, "is stale");
   } finally {
     await Deno.remove(root, { recursive: true });
   }
