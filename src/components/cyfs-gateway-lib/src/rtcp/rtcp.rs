@@ -690,7 +690,25 @@ struct VerifiedTunnelIdentity {
     // It is the subject of the one-to-one binding arbitration: at any moment
     // a canonical DEV DID may belong to at most one verified logical name.
     canonical_dev_did: String,
-    document_revision: DocumentRevision,
+    document_revision: DocRevision,
+}
+
+/// Outcome of handing a verified identity to the tunnel index.  Document
+/// arbitration (same-iat conflict, older-than-best) already happened inside
+/// name-client's `verify_document`; the index only orders revisions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum VerifiedCommitOutcome {
+    Accepted,
+    /// name-client rejected the body (same-iat conflict); only produced by
+    /// tests of the map arbitration.
+    #[allow(dead_code)]
+    Rejected,
+}
+
+impl VerifiedCommitOutcome {
+    fn stored(&self) -> bool {
+        matches!(self, VerifiedCommitOutcome::Accepted)
+    }
 }
 
 #[derive(Clone)]
@@ -715,7 +733,7 @@ struct VerifiedSourceDevice {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct AuthorityConfirmationTicket {
     generation: u64,
-    document_revision: DocumentRevision,
+    document_revision: DocRevision,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -723,7 +741,7 @@ struct AuthorityNegativeState {
     completed_at: u64,
     generation: u64,
     reason: String,
-    rejected_revision: Option<DocumentRevision>,
+    rejected_revision: Option<DocRevision>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -731,12 +749,12 @@ enum AuthorityConfirmationState {
     InFlight(AuthorityConfirmationTicket),
     Confirmed {
         completed_at: u64,
-        document_revision: DocumentRevision,
+        document_revision: DocRevision,
     },
     Negative(AuthorityNegativeState),
     Unavailable {
         completed_at: u64,
-        document_revision: DocumentRevision,
+        document_revision: DocRevision,
     },
 }
 
@@ -853,7 +871,7 @@ struct EstablishedInboundTunnel {
     source_device_id: String,
     source_addr: SocketAddr,
     registration: InboundTunnelRegistration,
-    authority_confirmation: Option<(DID, String, std::net::IpAddr, DocumentRevision)>,
+    authority_confirmation: Option<(DID, String, std::net::IpAddr, DocRevision)>,
 }
 
 impl Drop for RTcpInner {
@@ -1070,15 +1088,14 @@ impl RTcpInner {
     // document kind. The parsed document is also used to derive the address
     // resolution scope without consulting DeviceInfo.
     fn exchange_key_from_resolved_document(
-        resolved: &ResolvedDocument,
+        document: &EncodedDocument,
     ) -> Result<([u8; 32], ResolvedHandshakeDocument), String> {
-        let document_value = resolved
-            .document
+        let document_value = document
             .clone()
             .to_json_value()
             .map_err(|e| format!("decode resolved DID document failed: {}", e))?;
         let (exchange_key, target_document) = if document_value.get("device_type").is_some() {
-            let device_document = DeviceDocument::decode(&resolved.document, None)
+            let device_document = DeviceDocument::decode(document, None)
                 .map_err(|e| format!("decode resolved DeviceDocument failed: {}", e))?;
             let exchange_key = device_document.get_exchange_key(None);
             (
@@ -1086,7 +1103,7 @@ impl RTcpInner {
                 ResolvedHandshakeDocument::Device(device_document),
             )
         } else if document_value.get("hostname").is_some() {
-            let zone_document = ZoneDocument::decode(&resolved.document, None)
+            let zone_document = ZoneDocument::decode(document, None)
                 .map_err(|e| format!("decode resolved ZoneDocument failed: {}", e))?;
             let exchange_key = zone_document
                 .get_default_zone_gateway()
@@ -1172,10 +1189,7 @@ impl RTcpInner {
     fn authority_error_allows_txt_bootstrap(err: &NSError) -> bool {
         matches!(
             err,
-            NSError::Failed(_)
-                | NSError::InvalidState(_)
-                | NSError::VerifyAndPromoteUnavailable(_)
-                | NSError::DNSProtoError(_)
+            NSError::Failed(_) | NSError::InvalidState(_) | NSError::DNSProtoError(_)
         )
     }
 
@@ -1206,65 +1220,10 @@ impl RTcpInner {
             });
         }
 
-        let mut policy = ResolvePolicy::default();
-        policy.allow_self_signed_when_missing = false;
-        policy.allow_unverified_cache_when_unavailable = false;
-        policy.allow_stale_cache = false;
-        policy.source = match self.security.peer_identity.requirement {
-            RtcpPeerIdentityRequirement::AuthorityCurrent => ResolveSourcePolicy::RemoteAuthority,
-            RtcpPeerIdentityRequirement::TrustedSnapshot => ResolveSourcePolicy::LocalAndZone,
-        };
-
-        match resolve_did_ex(remote_did, None, policy).await {
-            Ok(resolved) => {
-                let metadata = &resolved.resolution_metadata;
-                let trust = match self.security.peer_identity.requirement {
-                    RtcpPeerIdentityRequirement::AuthorityCurrent => {
-                        if metadata.evidence != Some(BodyEvidence::Anchored) {
-                            return Err(format!(
-                                "authority_current resolve for {} returned non-anchored evidence {:?}",
-                                remote_did.to_string(),
-                                metadata.evidence
-                            ));
-                        }
-                        RtcpIdentityTrust::MethodAuthorityCurrent
-                    }
-                    RtcpPeerIdentityRequirement::TrustedSnapshot => {
-                        if matches!(
-                            metadata.cache_status,
-                            Some(CacheStatus::Fallback | CacheStatus::ObservedFallback)
-                        ) {
-                            return Err(format!(
-                                "trusted_snapshot resolve for {} returned stale/observed cache status {:?}",
-                                remote_did.to_string(),
-                                metadata.cache_status
-                            ));
-                        }
-                        match metadata.evidence {
-                            Some(BodyEvidence::Anchored) => {}
-                            Some(BodyEvidence::NeedProof)
-                                if metadata.verification_status
-                                    == Some(VerificationStatus::Passed) => {}
-                            other => {
-                                return Err(format!(
-                                    "trusted_snapshot resolve for {} returned untrusted evidence {:?}/{:?}",
-                                    remote_did.to_string(),
-                                    other,
-                                    metadata.verification_status
-                                ));
-                            }
-                        }
-                        if metadata.cache_status == Some(CacheStatus::ZoneHit)
-                            || metadata.source == Some(UpdateSource::ZoneResolver)
-                        {
-                            RtcpIdentityTrust::TrustedZoneSnapshot
-                        } else {
-                            RtcpIdentityTrust::TrustedHostSnapshot
-                        }
-                    }
-                };
+        match self.resolve_handshake_document(remote_did).await {
+            Ok((document, trust, resolver_id)) => {
                 let (exchange_key, target_document) =
-                    Self::exchange_key_from_resolved_document(&resolved)?;
+                    Self::exchange_key_from_resolved_document(&document)?;
                 let canonical_dev_did = canonical_dev_did_from_ed25519_pk(&exchange_key);
                 let address_resolution =
                     self.address_resolution_for_document(remote_did, &target_document);
@@ -1275,14 +1234,14 @@ impl RTcpInner {
                     remote_did.to_string(),
                     canonical_dev_did.to_string(),
                     trust,
-                    metadata.resolver_id
+                    resolver_id
                 );
                 Ok(ResolvedHandshakeIdentity {
                     semantic_did: remote_did.clone(),
                     canonical_dev_did,
                     ed25519_pk_der: exchange_key,
                     trust,
-                    resolver_id: metadata.resolver_id.clone(),
+                    resolver_id,
                     address_resolution,
                     binds_logical_name,
                 })
@@ -1325,6 +1284,105 @@ impl RTcpInner {
                 Err(primary_err_str)
             }
         }
+    }
+
+    /// AuthorityCurrent:只允许 authority 联网、关闭两种 locker、要求本轮真实权威回答。
+    /// TrustedSnapshot:不发普通 provider 请求,只用本机 / Zone locker 与已验证缓存。
+    // TODO(cyfs-gateway#207): with_transport_policy(IndependentControlPlane) once sources declare it.
+    fn handshake_resolve_opts(&self, requirement: RtcpPeerIdentityRequirement) -> ResolveOpts {
+        let budget = Duration::from_secs(self.security.limits.handshake_timeout_secs.max(1));
+        let opts = match requirement {
+            RtcpPeerIdentityRequirement::AuthorityCurrent => ResolveOpts::default()
+                .authority_only()
+                .without_local_lock()
+                .without_zone_lock()
+                .with_force_authority_query(),
+            RtcpPeerIdentityRequirement::TrustedSnapshot => ResolveOpts::default().not_allow_request(),
+        };
+        opts.with_timeout(budget).normalize(budget)
+    }
+
+    fn authority_current_opts(&self) -> ResolveOpts {
+        self.handshake_resolve_opts(RtcpPeerIdentityRequirement::AuthorityCurrent)
+    }
+
+    // Resolve the peer's identity document under the configured requirement.
+    // RTCP peers are DeviceDocuments; a ZoneDocument (gateway device) is still
+    // accepted when no device document exists for the name.
+    async fn resolve_handshake_document(
+        &self,
+        remote_did: &DID,
+    ) -> Result<(EncodedDocument, RtcpIdentityTrust, Option<String>), NSError> {
+        let requirement = self.security.peer_identity.requirement;
+        let opts = self.handshake_resolve_opts(requirement);
+        let mut last_reason: Option<String> = None;
+        for doc_type in [DidDocType::Device, DidDocType::Zone] {
+            let result =
+                resolve_did_ex(remote_did, Some(doc_type.clone()), Revision::current(), opts.clone())
+                    .await?;
+            if result.is_disabled() {
+                return Err(NSError::Disabled(result.reason()));
+            }
+            let choice = match requirement {
+                RtcpPeerIdentityRequirement::AuthorityCurrent => {
+                    select_authority_current(&result, opts.receipts())
+                }
+                RtcpPeerIdentityRequirement::TrustedSnapshot => {
+                    result.select(&Revision::current()).cloned()
+                }
+            };
+            match choice {
+                Some(choice) if choice.is_valid() => {
+                    let trust = match requirement {
+                        RtcpPeerIdentityRequirement::AuthorityCurrent => {
+                            RtcpIdentityTrust::MethodAuthorityCurrent
+                        }
+                        RtcpPeerIdentityRequirement::TrustedSnapshot => {
+                            if Self::choice_from_zone_locker(&choice) {
+                                RtcpIdentityTrust::TrustedZoneSnapshot
+                            } else {
+                                RtcpIdentityTrust::TrustedHostSnapshot
+                            }
+                        }
+                    };
+                    return Ok((choice.doc.clone(), trust, Some(choice.source.id.clone())));
+                }
+                _ => {
+                    if result.is_not_exist() {
+                        last_reason = Some(format!(
+                            "{}#{} is not published: {}",
+                            remote_did.to_string(),
+                            doc_type,
+                            result.reason()
+                        ));
+                        // A definite "no such document" is not a transport failure.
+                        return Err(NSError::NotFound(last_reason.unwrap_or_default()));
+                    }
+                    last_reason = Some(format!(
+                        "{}#{} has no {} document: {}",
+                        remote_did.to_string(),
+                        doc_type,
+                        match requirement {
+                            RtcpPeerIdentityRequirement::AuthorityCurrent => "authority-current",
+                            RtcpPeerIdentityRequirement::TrustedSnapshot => "trusted-snapshot",
+                        },
+                        result.reason()
+                    ));
+                }
+            }
+        }
+        Err(NSError::Failed(last_reason.unwrap_or_else(|| {
+            format!("resolve {} returned no document", remote_did.to_string())
+        })))
+    }
+
+    fn choice_from_zone_locker(choice: &Choice) -> bool {
+        choice.source.is_zone_locker()
+            || choice
+                .report
+                .publish_evidence
+                .as_ref()
+                .map_or(false, |evidence| evidence.source.starts_with("zone-locker"))
     }
 
     async fn resolve_remote_tunnel_identity(
@@ -1901,94 +1959,71 @@ impl RTcpInner {
     }
 
     // A definite verification rejection may never degrade to anonymous
-    // KeyDid admission. Only resolver/dependency unavailability is eligible,
-    // and only when inbound_admission.anonymous is explicitly Allow.
-    fn is_definite_verify_rejection(err: &ResolveVerifyError) -> bool {
-        match err {
-            ResolveVerifyError::Resolve(_) => false,
-            ResolveVerifyError::Verify(err) => matches!(
-                err,
-                VerifyError::InvalidDocument { .. }
-                    | VerifyError::DocumentIdMismatch { .. }
-                    | VerifyError::OwnerMismatch { .. }
-                    | VerifyError::DetachedOwnerRejected { .. }
-                    | VerifyError::SignatureRejected { .. }
-                    | VerifyError::RevokedByOwnerPolicy { .. }
-                    | VerifyError::RejectedByNegativeState { .. }
-            ),
-        }
+    // KeyDid admission. Only resolver/dependency unavailability (validity
+    // unknown) is eligible, and only when inbound_admission.anonymous is
+    // explicitly Allow.
+    fn is_definite_verify_rejection(report: &VerifyResult) -> bool {
+        report.validity == Validity::Invalid
     }
 
-    // RTCP owns anti-rollback admission policy.  A successfully verified
-    // document can still be unusable when it is older than this Host/Zone's
-    // accepted high-water mark, conflicts at the same iat, or a fresh authority
-    // receipt identifies another current document.  Missing/Expired/Migrated
-    // authority status remains eligible for the bootstrap/offline behavior used
-    // by unpublished logical DeviceDocuments.
-    fn freshness_rejection(verified: &VerifiedDidDocument) -> Option<String> {
-        match &verified.freshness.local {
-            LocalFreshness::OlderThanLatestKnown {
-                scope,
-                candidate,
-                latest,
-            } => {
-                return Some(format!(
-                    "candidate {:?} is older than {:?} in {} scope",
-                    candidate, latest, scope
-                ));
-            }
-            LocalFreshness::ConflictAtSameRevision {
-                scope,
-                expected,
-                candidate,
-            } => {
-                return Some(format!(
-                    "candidate {:?} conflicts with {:?} in {} scope",
-                    candidate, expected, scope
-                ));
-            }
-            _ => {}
+    // RTCP owns anti-rollback admission policy.  A valid document is still
+    // unusable when it is older than this Host/Zone's accepted best, conflicts
+    // at the same iat (`conflict`), or a fresh authority receipt identifies
+    // another current document.  Missing/Invalid authority status remains
+    // eligible for the bootstrap/offline behavior used by unpublished logical
+    // DeviceDocuments: a valid signed candidate becomes best without being
+    // published.
+    fn freshness_rejection(report: &VerifyResult) -> Option<String> {
+        if let Some(conflict) = report.conflict.as_ref() {
+            return Some(format!(
+                "candidate {:?} conflicts with verified {:?} at the same iat",
+                report.revision, conflict
+            ));
         }
-
-        match &verified.freshness.authority {
-            AuthorityFreshness::NotCurrent {
-                reason:
-                    AuthorityNotCurrentReason::DifferentDocument | AuthorityNotCurrentReason::Superseded,
-                current_document_iat,
-                ..
-            } => Some(format!(
-                "authority rejected candidate as current (current document iat {:?})",
-                current_document_iat
-            )),
-            _ => None,
+        if !report.is_valid() {
+            return None;
         }
+        if !report.success(&Revision::current()) {
+            return Some(format!(
+                "candidate {:?} is older than the accepted best document",
+                report.revision
+            ));
+        }
+        None
     }
 
-    // A remote authority lookup for an unpublished logical DeviceDocument
-    // reports NotCurrent(NegativeStatus(Missing)).  That is not a revocation:
-    // the OwnerDocument can still authenticate the candidate and the trusted
-    // Host/Zone snapshot remains the admission evidence.  Only an authority
-    // receipt proving that another document is current is a definite reason to
-    // tear down tunnels here.  Terminal negative states are returned as
-    // VerifyError::RejectedByNegativeState and handled by the error branch in
-    // maybe_spawn_authority_confirmation.
-    fn authority_confirmation_rejects_snapshot(authority: &AuthorityFreshness) -> bool {
-        matches!(
-            authority,
-            AuthorityFreshness::NotCurrent {
-                reason: AuthorityNotCurrentReason::DifferentDocument
-                    | AuthorityNotCurrentReason::Superseded
-                    | AuthorityNotCurrentReason::NegativeStatus(
-                        DocumentStatus::Revoked | DocumentStatus::Tombstoned,
-                    ),
-                ..
+    // Authority receipts gathered during a verification round.  `latest` is the
+    // revision the authority currently publishes (None when the authority did
+    // not answer); `negative` is a terminal authority state.
+    fn authority_receipt_summary(
+        opts: &ResolveOpts,
+        did: &DID,
+    ) -> (Option<DocRevision>, bool, bool) {
+        let receipts = opts.receipts().authority_receipts(did, &DidDocType::Device);
+        let mut latest = None;
+        let mut negative = false;
+        let mut answered = false;
+        for receipt in receipts {
+            let Some(info) = receipt.answer.publish_info.as_ref() else {
+                continue;
+            };
+            if info.simulated {
+                continue;
             }
-        )
+            answered = true;
+            if info.is_disabled() {
+                negative = true;
+            }
+            if let Some(revision) = info.latest_revision() {
+                latest = Some(revision);
+            }
+        }
+        (latest, negative, answered)
     }
 
     // A remembered authority Negative is fail-closed. Recovery is deliberately
     // synchronous and exceptional: only a fresh RemoteAuthority answer whose
-    // exact DocumentRevision matches the presented candidate may clear it.
+    // exact DocRevision matches the presented candidate may clear it.
     // The normal LocalAndZone path is not allowed to clear or age out this
     // state, even if name-client's surrounding cache state changes.
     async fn recover_negative_authority_candidate(
@@ -2006,7 +2041,7 @@ impl RTcpInner {
         };
 
         let candidate_document = EncodedDocument::Jwt(candidate_jwt.to_string());
-        let candidate_revision = DocumentRevision::of(&candidate_document).ok_or_else(|| {
+        let candidate_revision = DocRevision::of(&candidate_document).ok_or_else(|| {
             TunnelError::DocumentError(format!(
                 "authority Negative recovery candidate {} has no document revision",
                 identity_key
@@ -2029,23 +2064,14 @@ impl RTcpInner {
                 ))
             })?;
         let _permit = permit;
-        let mut policy = ResolvePolicy::default();
-        policy.source = ResolveSourcePolicy::RemoteAuthority;
-        policy.allow_stale_cache = false;
-        policy.allow_unverified_cache_when_unavailable = false;
-        policy.allow_self_signed_when_missing = false;
-        let budget = Duration::from_secs(self.security.limits.handshake_timeout_secs.max(1));
-        let resolved = timeout(
-            budget,
-            resolve_did_ex(logical_did, Some(DidDocType::Device), policy),
+        let opts = self.authority_current_opts();
+        let result = resolve_did_ex(
+            logical_did,
+            Some(DidDocType::Device),
+            Revision::current(),
+            opts.clone(),
         )
         .await
-        .map_err(|_| {
-            TunnelError::DocumentError(format!(
-                "authority recovery for {} timed out after {:?}; Negative remains active",
-                identity_key, budget
-            ))
-        })?
         .map_err(|err| {
             TunnelError::DocumentError(format!(
                 "authority recovery for {} failed: {}; Negative remains active",
@@ -2053,18 +2079,14 @@ impl RTcpInner {
             ))
         })?;
 
-        if resolved.resolution_metadata.evidence != Some(BodyEvidence::Anchored) {
+        let Some(current) = select_authority_current(&result, opts.receipts()) else {
             return Err(TunnelError::DocumentError(format!(
-                "authority recovery for {} returned non-anchored evidence {:?}",
-                identity_key, resolved.resolution_metadata.evidence
+                "authority recovery for {} returned no authority-current document: {}",
+                identity_key,
+                result.reason()
             )));
-        }
-        let authority_revision = DocumentRevision::of(&resolved.document).ok_or_else(|| {
-            TunnelError::DocumentError(format!(
-                "authority Current document for {} has no document revision",
-                identity_key
-            ))
-        })?;
+        };
+        let authority_revision = current.revision.clone();
         if authority_revision != candidate_revision {
             return Err(TunnelError::DocumentError(format!(
                 "authority Negative rejects {} candidate revision {:?}; Current revision is {:?}",
@@ -2090,18 +2112,15 @@ impl RTcpInner {
         Ok(())
     }
 
+    // verify_document already promoted the admitted document to name-client's
+    // best; this step only hands the verified identity to the tunnel index.
     fn commit_verified_cache_entry(
         entry: Option<PendingVerifiedCacheEntry>,
-    ) -> NSResult<Option<(VerifiedTunnelIdentity, CacheWriteOutcome)>> {
+    ) -> NSResult<Option<(VerifiedTunnelIdentity, VerifiedCommitOutcome)>> {
         let Some(entry) = entry else {
             return Ok(None);
         };
-        let client = GLOBAL_NAME_CLIENT
-            .get()
-            .ok_or_else(|| NSError::InvalidState("name client not initialized".to_string()))?;
-        let outcome =
-            client.add_verified_cache(entry.did, Some(DidDocType::Device), entry.document)?;
-        Ok(Some((entry.identity, outcome)))
+        Ok(Some((entry.identity, VerifiedCommitOutcome::Accepted)))
     }
 
     fn parse_source_candidate(
@@ -2175,34 +2194,80 @@ impl RTcpInner {
         Ok((from_did, key, None))
     }
 
-    fn trust_from_verified(verified: &VerifiedDidDocument) -> RtcpIdentityTrust {
-        if matches!(
-            verified.freshness.authority,
-            AuthorityFreshness::Current { .. }
-        ) {
+    fn trust_from_verified(report: &VerifyResult) -> RtcpIdentityTrust {
+        let authority_current = report.authority_receipt.is_some()
+            && report.is_published
+            && report
+                .publish_evidence
+                .as_ref()
+                .map_or(false, |evidence| !evidence.simulated);
+        if authority_current {
             return RtcpIdentityTrust::MethodAuthorityCurrent;
         }
-        match verified.validity.scope {
-            LocalTrustScope::Zone => RtcpIdentityTrust::TrustedZoneSnapshot,
-            _ => RtcpIdentityTrust::TrustedHostSnapshot,
+        let from_zone = report
+            .publish_evidence
+            .as_ref()
+            .map_or(false, |evidence| evidence.source.starts_with("zone-locker"))
+            || report
+                .source_id
+                .as_deref()
+                .map_or(false, |id| id.starts_with("zone-locker"));
+        if from_zone {
+            RtcpIdentityTrust::TrustedZoneSnapshot
+        } else {
+            RtcpIdentityTrust::TrustedHostSnapshot
         }
+    }
+
+    // The owner this verification actually relied on: the current OwnerDocument
+    // dependency for signed candidates, or the document's declared owner when
+    // an authority/trust source anchored the body.  Never the bare payload.
+    fn verified_owner(device_document: &DeviceDocument, report: &VerifyResult) -> Option<DID> {
+        if let Some(dependency) = report
+            .dependencies
+            .iter()
+            .find(|dependency| dependency.role == DependencyRole::CurrentOwner)
+        {
+            return Some(dependency.did.clone());
+        }
+        if !report.is_valid() {
+            return None;
+        }
+        // name-client 给出的可信绑定(权威 owner 绑定或名字结构 owner)。
+        if let Some(binding) = report.owner_binding.as_ref() {
+            return Some(binding.clone());
+        }
+        // 权威当前发布记录精确锚定了输入(未走 owner 递归),或 authority / trust
+        // 来源免签放行:owner 由该已锚定文档声明。
+        let authority_anchored = report.is_published
+            && report
+                .publish_evidence
+                .as_ref()
+                .map_or(false, |evidence| !evidence.simulated);
+        if authority_anchored
+            || matches!(
+                report.source_tier,
+                Some(SourceTier::Authority) | Some(SourceTier::Trust)
+            )
+        {
+            return Some(device_document.owner.clone());
+        }
+        None
     }
 
     fn validate_named_relation(
         &self,
         device_document: &DeviceDocument,
-        verified: &VerifiedDidDocument,
+        report: &VerifyResult,
     ) -> Result<(), TunnelError> {
+        let subject = device_document.id.to_string();
         match self.security.inbound_admission.named_min_relation {
             RtcpNamedMinRelation::Any => Ok(()),
             RtcpNamedMinRelation::KnownOwner => {
-                if !verified.usable_as_authz_subject
-                    || verified.authz_owner.is_none()
-                    || verified.validity.owner_document_source.is_none()
-                {
+                if Self::verified_owner(device_document, report).is_none() {
                     return Err(TunnelError::DocumentError(format!(
                         "verified identity {} has no trusted owner evidence",
-                        verified.subject_did.to_string()
+                        subject
                     )));
                 }
                 Ok(())
@@ -2218,14 +2283,12 @@ impl RTcpInner {
                         "same_zone admission requires a local zone anchor".to_string(),
                     )
                 })?;
-                if !verified.usable_as_authz_subject
-                    || verified.validity.owner_document_source.is_none()
-                    || verified.authz_owner.as_ref() != Some(expected_owner)
+                if Self::verified_owner(device_document, report).as_ref() != Some(expected_owner)
                     || device_document.zone_did.as_ref() != Some(expected_zone)
                 {
                     return Err(TunnelError::DocumentError(format!(
                         "verified identity {} is outside local owner/zone",
-                        verified.subject_did.to_string()
+                        subject
                     )));
                 }
                 Ok(())
@@ -2254,119 +2317,163 @@ impl RTcpInner {
             });
         };
 
-        let mut policy = ResolvePolicy::default();
-        policy.source = ResolveSourcePolicy::LocalAndZone;
-        policy.allow_stale_cache = true;
-        policy.allow_unverified_cache_when_unavailable = false;
-        policy.allow_self_signed_when_missing = false;
-        let options = ResolveVerifyOptions {
-            purpose: VerifyPurpose::AuthSubject,
-            policy,
-        };
-        match resolve_and_verify_device_document_jwt(from_did, device_doc_jwt, &options).await {
-            Ok((device_doc, verified)) => {
-                if verified.subject_did.to_string() != hello_body.from_id {
-                    return Err(TunnelError::DocumentError(format!(
-                        "hello from_id {} not match verified device document id {}",
-                        hello_body.from_id,
-                        verified.subject_did.to_string()
-                    )));
-                }
-                if let Some(reason) = Self::freshness_rejection(&verified) {
-                    return Err(TunnelError::DocumentError(format!(
-                        "device_doc_jwt for {} rejected by freshness policy: {}",
-                        hello_body.from_id, reason
-                    )));
-                }
-                let verified_key = device_doc
-                    .get_default_key()
-                    .ok_or_else(|| {
-                        TunnelError::DocumentError(
-                            "verified device document missing default key".to_string(),
-                        )
-                    })
-                    .and_then(|jwk| {
-                        jwk_to_ed25519_pk(&jwk).map_err(|e| {
-                            TunnelError::DocumentError(format!(
-                                "decode verified device public key failed: {}",
-                                e
-                            ))
-                        })
-                    })?;
-                if verified_key != candidate_key {
-                    return Err(TunnelError::DocumentError(
-                        "verified device key differs from possession key".to_string(),
-                    ));
-                }
-
-                self.validate_named_relation(&device_doc, &verified)?;
-
-                let mut identity_trust = Self::trust_from_verified(&verified);
-                if self
-                    .tunnel_map
-                    .authority_confirmed_revision(
-                        &verified.subject_did.to_string(),
-                        &verified.revision,
-                    )
-                    .await
-                {
-                    identity_trust = RtcpIdentityTrust::MethodAuthorityCurrent;
-                }
-                let verified_cache_entry = Some(PendingVerifiedCacheEntry {
-                    did: verified.subject_did.clone(),
-                    document: verified.document.clone(),
-                    identity: VerifiedTunnelIdentity {
-                        logical_did: verified.subject_did.to_string(),
-                        canonical_dev_did: canonical_dev_did.to_string(),
-                        document_revision: verified.revision.clone(),
-                    },
-                });
-                Ok(VerifiedSourceDevice {
-                    source_device_id: verified.subject_did.to_string(),
-                    canonical_dev_did: canonical_dev_did.clone(),
-                    source_device_info: Some(RTcpSourceDeviceInfo {
-                        device_doc_jwt: Some(device_doc_jwt.clone()),
-                        name: Some(device_doc.name.clone()),
-                        owner: verified.authz_owner.map(|did| did.to_string()),
-                        zone_did: device_doc.zone_did.map(|did| did.to_string()),
-                        identity_trust: Some(identity_trust),
-                        canonical_device_id: Some(canonical_dev_did.to_string()),
-                    }),
-                    public_key: from_public_key,
-                    identity_trust,
-                    verified_cache_entry,
-                })
-            }
-            Err(err) if Self::is_definite_verify_rejection(&err) => {
-                Err(TunnelError::DocumentError(format!(
-                    "verify device_doc_jwt for {} rejected: {}",
-                    hello_body.from_id, err
-                )))
-            }
-            Err(err)
-                if self.security.inbound_admission.anonymous == RtcpAnonymousAdmission::Allow =>
-            {
-                info!(
-                    "RTCP named identity {} verification unavailable; admit only canonical key {} with KeyDid trust: {}",
-                    hello_body.from_id,
-                    canonical_dev_did.to_string(),
-                    err
-                );
-                let _ = candidate_document;
-                Ok(VerifiedSourceDevice {
-                    source_device_id: canonical_dev_did.to_string(),
+        // Inbound hello is attacker-triggerable: never fan out provider requests
+        // from here (TODO D3).  Zone locker and verified cache remain allowed.
+        let budget = Duration::from_secs(self.security.limits.handshake_timeout_secs.max(1));
+        let opts = ResolveOpts::default()
+            .not_allow_request()
+            .with_timeout(budget);
+        let candidate = EncodedDocument::Jwt(device_doc_jwt.clone());
+        let report = match verify_document(
+            from_did,
+            Some(DidDocType::Device),
+            &candidate,
+            Revision::current(),
+            opts,
+        )
+        .await
+        {
+            Ok(report) => report,
+            Err(err) => {
+                return self.admit_without_named_identity(
+                    hello_body,
                     canonical_dev_did,
-                    source_device_info: None,
-                    public_key: from_public_key,
-                    identity_trust: RtcpIdentityTrust::KeyDid,
-                    verified_cache_entry: None,
-                })
+                    from_public_key,
+                    candidate_document,
+                    format!("verify_document failed: {}", err),
+                );
             }
-            Err(err) => Err(TunnelError::DocumentError(format!(
-                "verify device_doc_jwt for {} unavailable and anonymous admission is rejected: {}",
-                hello_body.from_id, err
-            ))),
+        };
+        if Self::is_definite_verify_rejection(&report) {
+            return Err(TunnelError::DocumentError(format!(
+                "verify device_doc_jwt for {} rejected: {}",
+                hello_body.from_id,
+                report.reason()
+            )));
         }
+        if !report.is_valid() {
+            return self.admit_without_named_identity(
+                hello_body,
+                canonical_dev_did,
+                from_public_key,
+                candidate_document,
+                report.reason(),
+            );
+        }
+        if let Some(reason) = Self::freshness_rejection(&report) {
+            return Err(TunnelError::DocumentError(format!(
+                "device_doc_jwt for {} rejected by freshness policy: {}",
+                hello_body.from_id, reason
+            )));
+        }
+        let device_doc = DeviceDocument::decode(&candidate, None).map_err(|e| {
+            TunnelError::DocumentError(format!(
+                "verified device_doc_jwt for {} is not a DeviceDocument: {}",
+                hello_body.from_id, e
+            ))
+        })?;
+        if device_doc.id.to_string() != hello_body.from_id || device_doc.id != *from_did {
+            return Err(TunnelError::DocumentError(format!(
+                "hello from_id {} not match verified device document id {}",
+                hello_body.from_id,
+                device_doc.id.to_string()
+            )));
+        }
+        let document_revision = report.revision.clone().ok_or_else(|| {
+            TunnelError::DocumentError(format!(
+                "verified device document {} has no revision",
+                hello_body.from_id
+            ))
+        })?;
+        let verified_key = device_doc
+            .get_default_key()
+            .ok_or_else(|| {
+                TunnelError::DocumentError(
+                    "verified device document missing default key".to_string(),
+                )
+            })
+            .and_then(|jwk| {
+                jwk_to_ed25519_pk(&jwk).map_err(|e| {
+                    TunnelError::DocumentError(format!(
+                        "decode verified device public key failed: {}",
+                        e
+                    ))
+                })
+            })?;
+        if verified_key != candidate_key {
+            return Err(TunnelError::DocumentError(
+                "verified device key differs from possession key".to_string(),
+            ));
+        }
+
+        self.validate_named_relation(&device_doc, &report)?;
+
+        let mut identity_trust = Self::trust_from_verified(&report);
+        if self
+            .tunnel_map
+            .authority_confirmed_revision(&hello_body.from_id, &document_revision)
+            .await
+        {
+            identity_trust = RtcpIdentityTrust::MethodAuthorityCurrent;
+        }
+        let verified_owner = Self::verified_owner(&device_doc, &report);
+        let verified_cache_entry = Some(PendingVerifiedCacheEntry {
+            did: device_doc.id.clone(),
+            document: candidate,
+            identity: VerifiedTunnelIdentity {
+                logical_did: device_doc.id.to_string(),
+                canonical_dev_did: canonical_dev_did.to_string(),
+                document_revision,
+            },
+        });
+        Ok(VerifiedSourceDevice {
+            source_device_id: device_doc.id.to_string(),
+            canonical_dev_did: canonical_dev_did.clone(),
+            source_device_info: Some(RTcpSourceDeviceInfo {
+                device_doc_jwt: Some(device_doc_jwt.clone()),
+                name: Some(device_doc.name.clone()),
+                owner: verified_owner.map(|did| did.to_string()),
+                zone_did: device_doc.zone_did.map(|did| did.to_string()),
+                identity_trust: Some(identity_trust),
+                canonical_device_id: Some(canonical_dev_did.to_string()),
+            }),
+            public_key: from_public_key,
+            identity_trust,
+            verified_cache_entry,
+        })
+    }
+
+    // Verification unavailable (not a definite rejection): admit only the
+    // canonical key with KeyDid trust when anonymous admission is allowed.
+    fn admit_without_named_identity(
+        &self,
+        hello_body: &RTcpHelloBody,
+        canonical_dev_did: DID,
+        from_public_key: DecodingKey,
+        candidate_document: Option<&DeviceDocument>,
+        reason: String,
+    ) -> Result<VerifiedSourceDevice, TunnelError> {
+        if self.security.inbound_admission.anonymous == RtcpAnonymousAdmission::Allow {
+            info!(
+                "RTCP named identity {} verification unavailable; admit only canonical key {} with KeyDid trust: {}",
+                hello_body.from_id,
+                canonical_dev_did.to_string(),
+                reason
+            );
+            let _ = candidate_document;
+            return Ok(VerifiedSourceDevice {
+                source_device_id: canonical_dev_did.to_string(),
+                canonical_dev_did,
+                source_device_info: None,
+                public_key: from_public_key,
+                identity_trust: RtcpIdentityTrust::KeyDid,
+                verified_cache_entry: None,
+            });
+        }
+        Err(TunnelError::DocumentError(format!(
+            "verify device_doc_jwt for {} unavailable and anonymous admission is rejected: {}",
+            hello_body.from_id, reason
+        )))
     }
 
     // v4 session-key derivation. Replaces the old SHA256(shared_secret)
@@ -3130,7 +3237,7 @@ impl RTcpInner {
         // of its device key, completed key confirmation, and passed the
         // application listener's authorization.  Commit it now as RTCP's
         // high-water/CAS step.  A concurrent newer or conflicting acceptance
-        // wins in name-client's DocumentRevision merge.  RTcpTunnelMap holds
+        // wins in name-client's DocRevision merge.  RTcpTunnelMap holds
         // a dedicated commit guard across this cache CAS and the subsequent
         // map/index publication, closing the gap where an old successful CAS
         // could otherwise resume after a newer tunnel's index scan.
@@ -3229,7 +3336,7 @@ impl RTcpInner {
         logical_did: DID,
         candidate_jwt: String,
         source_ip: std::net::IpAddr,
-        document_revision: DocumentRevision,
+        document_revision: DocRevision,
     ) {
         let now = buckyos_get_unix_timestamp();
         let max_age = match self
@@ -3278,35 +3385,57 @@ impl RTcpInner {
                 }
             };
             let _permit = permit;
-            let mut policy = ResolvePolicy::default();
-            policy.source = ResolveSourcePolicy::RemoteAuthority;
-            policy.allow_stale_cache = false;
-            policy.allow_unverified_cache_when_unavailable = false;
-            policy.allow_self_signed_when_missing = false;
-            let options = ResolveVerifyOptions {
-                purpose: VerifyPurpose::AuthSubject,
-                policy,
-            };
+            let opts = this.authority_current_opts();
             let budget = Duration::from_secs(this.security.limits.handshake_timeout_secs.max(1));
-            let confirmation = timeout(
-                budget,
-                resolve_and_verify_device_document_jwt(&logical_did, &candidate_jwt, &options),
+            let confirmation = verify_document(
+                &logical_did,
+                Some(DidDocType::Device),
+                &EncodedDocument::Jwt(candidate_jwt.clone()),
+                Revision::current(),
+                opts.clone(),
             )
             .await;
 
             let completed_at = buckyos_get_unix_timestamp();
             match confirmation {
-                Ok(Ok((_document, verified)))
-                    if matches!(
-                        &verified.freshness.authority,
-                        AuthorityFreshness::Current { .. }
-                    ) =>
-                {
-                    if verified.revision != ticket.document_revision {
-                        let reason = format!(
-                            "authority Current revision {:?} differs from admitted revision {:?}",
-                            verified.revision, ticket.document_revision
+                Ok(report) => {
+                    let (authority_latest, authority_negative, authority_answered) =
+                        RTcpInner::authority_receipt_summary(&opts, &logical_did);
+                    let current_matches_ticket =
+                        authority_latest.as_ref() == Some(&ticket.document_revision);
+                    if report.success(&Revision::current())
+                        && current_matches_ticket
+                        && report.revision.as_ref() == Some(&ticket.document_revision)
+                    {
+                        let upgraded = this
+                            .tunnel_map
+                            .complete_authority_confirmed_if_current(
+                                &identity_key,
+                                &ticket,
+                                completed_at,
+                            )
+                            .await;
+                        info!(
+                            "RTCP authority confirmation passed for {} from {}; upgraded {} tunnel(s)",
+                            identity_key, source_ip, upgraded
                         );
+                    } else if authority_negative
+                        || report.is_revoked
+                        || report.is_disabled
+                        || (authority_latest.is_some() && !current_matches_ticket)
+                    {
+                        let reason = if let Some(latest) = authority_latest.as_ref() {
+                            if !current_matches_ticket {
+                                format!(
+                                    "authority Current revision {:?} differs from admitted revision {:?}",
+                                    latest, ticket.document_revision
+                                )
+                            } else {
+                                format!("AuthorityNotCurrent: {}", report.reason())
+                            }
+                        } else {
+                            format!("AuthorityNotCurrent: {}", report.reason())
+                        };
                         warn!(
                             "RTCP authority confirmation rejected {} from {}: {}",
                             identity_key, source_ip, reason
@@ -3319,75 +3448,14 @@ impl RTcpInner {
                                 &reason,
                             )
                             .await;
-                        return;
-                    }
-                    let cache_result = GLOBAL_NAME_CLIENT
-                        .get()
-                        .ok_or_else(|| {
-                            NSError::InvalidState("name client not initialized".to_string())
-                        })
-                        .and_then(|client| {
-                            client.add_verified_cache(
-                                verified.subject_did.clone(),
-                                Some(DidDocType::Device),
-                                verified.document.clone(),
-                            )
-                        });
-                    match cache_result {
-                        Ok(outcome) if outcome.stored() => {
-                            let upgraded = this
-                                .tunnel_map
-                                .complete_authority_confirmed_if_current(
-                                    &identity_key,
-                                    &ticket,
-                                    completed_at,
-                                )
-                                .await;
-                            info!(
-                                "RTCP authority confirmation passed for {} from {}; upgraded {} tunnel(s), cache={:?}",
-                                identity_key, source_ip, upgraded, outcome
-                            );
-                        }
-                        Ok(outcome) => {
-                            let reason =
-                                format!("authority cache arbitration rejected: {:?}", outcome);
-                            warn!(
-                                "RTCP authority confirmation cache arbitration rejected {} from {}: {:?}",
-                                identity_key, source_ip, outcome
-                            );
-                            this.tunnel_map
-                                .complete_authority_negative_if_current(
-                                    &identity_key,
-                                    &ticket,
-                                    completed_at,
-                                    &reason,
-                                )
-                                .await;
-                        }
-                        Err(err) => {
-                            warn!(
-                                "RTCP authority confirmation for {} passed but cache commit failed: {}",
-                                identity_key, err
-                            );
-                            this.tunnel_map
-                                .complete_authority_unavailable_if_current(
-                                    &identity_key,
-                                    &ticket,
-                                    completed_at,
-                                )
-                                .await;
-                        }
-                    }
-                }
-                Ok(Ok((_document, verified))) => {
-                    if Self::authority_confirmation_rejects_snapshot(&verified.freshness.authority)
-                    {
+                    } else if RTcpInner::is_definite_verify_rejection(&report) {
                         warn!(
-                            "RTCP authority confirmation denied {} from {}: {:?}",
-                            identity_key, source_ip, verified.freshness.authority
+                            "RTCP authority confirmation definitively rejected {} from {}: {}",
+                            identity_key,
+                            source_ip,
+                            report.reason()
                         );
-                        let reason =
-                            format!("AuthorityNotCurrent: {:?}", verified.freshness.authority);
+                        let reason = format!("definite authority rejection: {}", report.reason());
                         this.tunnel_map
                             .complete_authority_negative_if_current(
                                 &identity_key,
@@ -3396,26 +3464,22 @@ impl RTcpInner {
                                 &reason,
                             )
                             .await;
-                    } else if matches!(
-                        &verified.freshness.authority,
-                        AuthorityFreshness::NotCurrent { .. }
-                    ) {
-                        info!(
-                            "RTCP authority confirmation did not establish a current published device document for {} from {}; retaining snapshot trust: {:?}",
-                            identity_key, source_ip, verified.freshness.authority
-                        );
-                        this.tunnel_map
-                            .complete_authority_unavailable_if_current(
-                                &identity_key,
-                                &ticket,
-                                completed_at,
-                            )
-                            .await;
                     } else {
-                        warn!(
-                            "RTCP authority confirmation for {} returned no current receipt",
-                            identity_key
-                        );
+                        if authority_answered {
+                            info!(
+                                "RTCP authority confirmation did not establish a current published device document for {} from {}; retaining snapshot trust: {}",
+                                identity_key,
+                                source_ip,
+                                report.reason()
+                            );
+                        } else {
+                            warn!(
+                                "RTCP authority confirmation unavailable for {} from {}: {}",
+                                identity_key,
+                                source_ip,
+                                report.reason()
+                            );
+                        }
                         this.tunnel_map
                             .complete_authority_unavailable_if_current(
                                 &identity_key,
@@ -3425,38 +3489,10 @@ impl RTcpInner {
                             .await;
                     }
                 }
-                Ok(Err(err)) if Self::is_definite_verify_rejection(&err) => {
+                Err(err) => {
                     warn!(
-                        "RTCP authority confirmation definitively rejected {} from {}: {}",
-                        identity_key, source_ip, err
-                    );
-                    let reason = format!("definite authority rejection: {}", err);
-                    this.tunnel_map
-                        .complete_authority_negative_if_current(
-                            &identity_key,
-                            &ticket,
-                            completed_at,
-                            &reason,
-                        )
-                        .await;
-                }
-                Ok(Err(err)) => {
-                    warn!(
-                        "RTCP authority confirmation unavailable for {} from {}: {}",
-                        identity_key, source_ip, err
-                    );
-                    this.tunnel_map
-                        .complete_authority_unavailable_if_current(
-                            &identity_key,
-                            &ticket,
-                            completed_at,
-                        )
-                        .await;
-                }
-                Err(_) => {
-                    warn!(
-                        "RTCP authority confirmation for {} from {} timed out after {:?}",
-                        identity_key, source_ip, budget
+                        "RTCP authority confirmation for {} from {} did not complete within {:?}: {}",
+                        identity_key, source_ip, budget, err
                     );
                     this.tunnel_map
                         .complete_authority_unavailable_if_current(
@@ -6146,7 +6182,7 @@ enum RTcpLifecycle {
 struct VerifiedTunnelIndexEntry {
     instance_id: u64,
     canonical_key: String,
-    document_revision: DocumentRevision,
+    document_revision: DocRevision,
     tunnel: RTcpTunnel,
 }
 
@@ -6378,13 +6414,13 @@ impl RTcpTunnelMapState {
     }
 }
 
-// DocumentRevision deliberately exposes no total ordering: iat orders
+// DocRevision deliberately exposes no total ordering: iat orders
 // revisions, while the content hash distinguishes identity from a same-iat
 // conflict.  "Strictly older" therefore follows name-client's own documented
 // semantics and never uses the hash as a tie-breaker.
 fn document_revision_is_strictly_older(
-    candidate: &DocumentRevision,
-    current: &DocumentRevision,
+    candidate: &DocRevision,
+    current: &DocRevision,
 ) -> bool {
     candidate.iat < current.iat
 }
@@ -6402,7 +6438,7 @@ impl RTcpTunnelMap {
     async fn begin_authority_confirmation(
         &self,
         logical_did: &str,
-        document_revision: &DocumentRevision,
+        document_revision: &DocRevision,
         now: u64,
         max_age: Option<u64>,
     ) -> Option<AuthorityConfirmationTicket> {
@@ -6455,7 +6491,7 @@ impl RTcpTunnelMap {
     async fn authority_confirmed_revision(
         &self,
         logical_did: &str,
-        document_revision: &DocumentRevision,
+        document_revision: &DocRevision,
     ) -> bool {
         matches!(
             self.authority_confirmations.lock().await.get(logical_did),
@@ -6470,7 +6506,7 @@ impl RTcpTunnelMap {
         &self,
         logical_did: &str,
         negative_generation: u64,
-        document_revision: &DocumentRevision,
+        document_revision: &DocRevision,
         completed_at: u64,
     ) -> bool {
         let _commit_guard = self.authenticated_commit_lock.lock().await;
@@ -7120,19 +7156,8 @@ impl RTcpTunnelMap {
                 });
             }
 
-            let mut verified_commit = RTcpInner::commit_verified_cache_entry(Some(entry))?;
-            if authority_confirmed {
-                if let Some((_, outcome)) = verified_commit.as_mut() {
-                    // Recovery first stores the exact Current document with
-                    // Published evidence. The later handshake commit carries
-                    // lower Verified evidence and is therefore IgnoredOlder;
-                    // the matching authority revision proves the content is
-                    // already present at a stronger evidence level.
-                    if *outcome == CacheWriteOutcome::IgnoredOlder {
-                        *outcome = CacheWriteOutcome::AlreadyPresent;
-                    }
-                }
-            }
+            let verified_commit = RTcpInner::commit_verified_cache_entry(Some(entry))?;
+            let _ = authority_confirmed;
             if let Some((identity, outcome)) = verified_commit.as_ref() {
                 debug!(
                     "verified-cache arbitration for accepted device document {}: {:?}",
@@ -7154,7 +7179,7 @@ impl RTcpTunnelMap {
         &self,
         tunnel_key: &str,
         tunnel: RTcpTunnel,
-        verified_commit: Option<(VerifiedTunnelIdentity, CacheWriteOutcome)>,
+        verified_commit: Option<(VerifiedTunnelIdentity, VerifiedCommitOutcome)>,
     ) -> bool {
         let registration = if verified_commit.is_some() {
             let _commit_guard = self.authenticated_commit_lock.lock().await;
@@ -7202,7 +7227,7 @@ impl RTcpTunnelMap {
         &self,
         tunnel_key: &str,
         tunnel: RTcpTunnel,
-        verified_commit: Option<(VerifiedTunnelIdentity, CacheWriteOutcome)>,
+        verified_commit: Option<(VerifiedTunnelIdentity, VerifiedCommitOutcome)>,
     ) -> InboundTunnelRegistration {
         let verified_identity = match verified_commit {
             Some((identity, outcome)) if outcome.stored() => {
@@ -7372,7 +7397,7 @@ impl RTcpTunnelMap {
     async fn force_authority_negative(
         &self,
         logical_did: &str,
-        rejected_revision: Option<DocumentRevision>,
+        rejected_revision: Option<DocRevision>,
         reason: &str,
     ) -> usize {
         let commit_guard = self.authenticated_commit_lock.lock().await;
@@ -7418,7 +7443,7 @@ impl RTcpTunnelMap {
     async fn upgrade_verified_identity_revision_trust(
         &self,
         logical_did: &str,
-        document_revision: &DocumentRevision,
+        document_revision: &DocRevision,
         trust: RtcpIdentityTrust,
     ) -> usize {
         let tunnels: Vec<RTcpTunnel> = self
@@ -7758,52 +7783,42 @@ mod tests {
         VerifiedTunnelIdentity {
             logical_did: logical_did.to_string(),
             canonical_dev_did: canonical_dev_did.to_string(),
-            document_revision: DocumentRevision {
+            document_revision: DocRevision {
                 iat,
-                content_hash: hash.to_string(),
+                hash: hash.to_string(),
             },
         }
     }
 
-    fn authority_not_current(reason: AuthorityNotCurrentReason) -> AuthorityFreshness {
-        AuthorityFreshness::NotCurrent {
-            reason,
-            authority_seq: None,
-            current_document_iat: None,
-            checked_at: 1,
-            source: "test-authority".to_string(),
-        }
+    fn test_report(validity: Validity, is_best: bool) -> VerifyResult {
+        let mut report = VerifyResult::new(0);
+        report.validity = validity;
+        report.doc_type = Some(DidDocType::Device);
+        report.revision = Some(DocRevision::new(7, "doc"));
+        report.is_best = is_best;
+        report
     }
 
     #[test]
-    fn authority_confirmation_keeps_unpublished_device_snapshot() {
-        for status in [
-            DocumentStatus::Missing,
-            DocumentStatus::Expired,
-            DocumentStatus::Migrated,
-        ] {
-            let authority =
-                authority_not_current(AuthorityNotCurrentReason::NegativeStatus(status));
-            assert!(
-                !RTcpInner::authority_confirmation_rejects_snapshot(&authority),
-                "non-terminal authority status must retain trusted snapshot: {:?}",
-                authority
-            );
-        }
+    fn freshness_rejection_follows_verify_result() {
+        // valid + best: admitted.  Unknown (no material) is not a freshness
+        // decision: the caller falls back to the unavailable branch.
+        assert!(RTcpInner::freshness_rejection(&test_report(Validity::Valid, true)).is_none());
+        assert!(RTcpInner::freshness_rejection(&test_report(Validity::Unknown, false)).is_none());
+        assert!(!RTcpInner::is_definite_verify_rejection(&test_report(Validity::Unknown, false)));
 
-        for reason in [
-            AuthorityNotCurrentReason::DifferentDocument,
-            AuthorityNotCurrentReason::Superseded,
-            AuthorityNotCurrentReason::NegativeStatus(DocumentStatus::Revoked),
-            AuthorityNotCurrentReason::NegativeStatus(DocumentStatus::Tombstoned),
-        ] {
-            let authority = authority_not_current(reason);
-            assert!(
-                RTcpInner::authority_confirmation_rejects_snapshot(&authority),
-                "a conflicting, superseded, or terminal document must reject the snapshot: {:?}",
-                authority
-            );
-        }
+        // valid but older than the accepted best: anti-rollback rejection.
+        let older = RTcpInner::freshness_rejection(&test_report(Validity::Valid, false))
+            .expect("older valid document must be rejected");
+        assert!(older.contains("older"));
+
+        // same-iat different-content conflict is reported even when verify
+        // already marked the report invalid.
+        let mut conflict = test_report(Validity::Invalid, false);
+        conflict.conflict = Some(DocRevision::new(7, "other"));
+        let reason = RTcpInner::freshness_rejection(&conflict).expect("conflict must be rejected");
+        assert!(reason.contains("conflicts with"));
+        assert!(RTcpInner::is_definite_verify_rejection(&conflict));
     }
 
     #[test]
@@ -8429,7 +8444,7 @@ mod tests {
                 old_tunnel.clone(),
                 Some((
                     verified_test_identity(logical_did, 1, "rev-1"),
-                    CacheWriteOutcome::Inserted,
+                    VerifiedCommitOutcome::Accepted,
                 )),
             )
             .await
@@ -8440,7 +8455,7 @@ mod tests {
                 new_tunnel.clone(),
                 Some((
                     verified_test_identity(logical_did, 2, "rev-2"),
-                    CacheWriteOutcome::ReplacedOlder,
+                    VerifiedCommitOutcome::Accepted,
                 )),
             )
             .await
@@ -8497,7 +8512,7 @@ mod tests {
                 new_tunnel.clone(),
                 Some((
                     verified_test_identity(logical_did, 2, "rev-2"),
-                    CacheWriteOutcome::Inserted,
+                    VerifiedCommitOutcome::Accepted,
                 )),
             )
             .await
@@ -8508,7 +8523,7 @@ mod tests {
                 late_old_tunnel.clone(),
                 Some((
                     verified_test_identity(logical_did, 1, "rev-1"),
-                    CacheWriteOutcome::IgnoredOlder,
+                    VerifiedCommitOutcome::Rejected,
                 )),
             )
             .await
@@ -8545,7 +8560,7 @@ mod tests {
                 verified_key_did_tunnel.clone(),
                 Some((
                     verified_test_identity("did:dev:verified-key-only", 2, "key-revision"),
-                    CacheWriteOutcome::AlreadyPresent,
+                    VerifiedCommitOutcome::Accepted,
                 )),
             )
             .await
@@ -8556,7 +8571,7 @@ mod tests {
                 named_tunnel.clone(),
                 Some((
                     verified_test_identity(logical_did, 2, "rev-2"),
-                    CacheWriteOutcome::Inserted,
+                    VerifiedCommitOutcome::Accepted,
                 )),
             )
             .await
@@ -8587,7 +8602,7 @@ mod tests {
             map.complete_authenticated_inbound_with_outcome(
                 same_key,
                 first.clone(),
-                Some((identity.clone(), CacheWriteOutcome::Inserted)),
+                Some((identity.clone(), VerifiedCommitOutcome::Accepted)),
             )
             .await
         );
@@ -8595,7 +8610,7 @@ mod tests {
             !map.complete_authenticated_inbound_with_outcome(
                 same_key,
                 same_slot_new.clone(),
-                Some((identity.clone(), CacheWriteOutcome::AlreadyPresent)),
+                Some((identity.clone(), VerifiedCommitOutcome::Accepted)),
             )
             .await
         );
@@ -8610,7 +8625,7 @@ mod tests {
             map.complete_authenticated_inbound_with_outcome(
                 other_key,
                 other_slot.clone(),
-                Some((identity, CacheWriteOutcome::AlreadyPresent)),
+                Some((identity, VerifiedCommitOutcome::Accepted)),
             )
             .await
         );
@@ -8633,7 +8648,7 @@ mod tests {
             map.complete_authenticated_inbound_with_outcome(
                 first_key,
                 normal.clone(),
-                Some((identity.clone(), CacheWriteOutcome::Inserted)),
+                Some((identity.clone(), VerifiedCommitOutcome::Accepted)),
             )
             .await
         );
@@ -8641,7 +8656,7 @@ mod tests {
             map.complete_authenticated_inbound_with_outcome(
                 second_key,
                 abnormal.clone(),
-                Some((identity, CacheWriteOutcome::AlreadyPresent)),
+                Some((identity, VerifiedCommitOutcome::Accepted)),
             )
             .await
         );
@@ -8668,7 +8683,7 @@ mod tests {
             map.complete_authenticated_inbound_with_outcome(
                 "local_did:dev:authority-1",
                 first.clone(),
-                Some((identity.clone(), CacheWriteOutcome::Inserted)),
+                Some((identity.clone(), VerifiedCommitOutcome::Accepted)),
             )
             .await
         );
@@ -8676,7 +8691,7 @@ mod tests {
             map.complete_authenticated_inbound_with_outcome(
                 "local_did:dev:authority-2",
                 second.clone(),
-                Some((identity, CacheWriteOutcome::AlreadyPresent)),
+                Some((identity, VerifiedCommitOutcome::Accepted)),
             )
             .await
         );
@@ -8706,14 +8721,14 @@ mod tests {
     async fn authority_negative_rejects_reconnect_without_publication() {
         let map = RTcpTunnelMap::new();
         let logical_did = "did:web:authority-reconnect.example";
-        let revision = DocumentRevision {
+        let revision = DocRevision {
             iat: 12,
-            content_hash: "rejected-document".to_string(),
+            hash: "rejected-document".to_string(),
         };
         let identity = verified_test_identity_bound(
             logical_did,
             revision.iat,
-            &revision.content_hash,
+            &revision.hash,
             "did:dev:authority-reconnect",
         );
         let (initial, _initial_peer) = test_tunnel(54);
@@ -8721,7 +8736,7 @@ mod tests {
             map.complete_authenticated_inbound_with_outcome(
                 "local_did:dev:authority-reconnect",
                 initial.clone(),
-                Some((identity.clone(), CacheWriteOutcome::Inserted)),
+                Some((identity.clone(), VerifiedCommitOutcome::Accepted)),
             )
             .await
         );
@@ -8742,7 +8757,7 @@ mod tests {
             !map.complete_authenticated_inbound_with_outcome(
                 "local_did:dev:authority-reconnect",
                 candidate.clone(),
-                Some((identity, CacheWriteOutcome::AlreadyPresent)),
+                Some((identity, VerifiedCommitOutcome::Accepted)),
             )
             .await
         );
@@ -8764,14 +8779,14 @@ mod tests {
             let logical_did = format!("did:web:authority-race-{}.example", round);
             let canonical_dev_did = format!("did:dev:authority-race-{}", round);
             let tunnel_key = format!("local_{}", canonical_dev_did);
-            let revision = DocumentRevision {
+            let revision = DocRevision {
                 iat: u64::from(round) + 20,
-                content_hash: format!("race-document-{}", round),
+                hash: format!("race-document-{}", round),
             };
             let identity = verified_test_identity_bound(
                 &logical_did,
                 revision.iat,
-                &revision.content_hash,
+                &revision.hash,
                 &canonical_dev_did,
             );
             let (candidate, peer) = test_tunnel(100u8.wrapping_add(round));
@@ -8787,7 +8802,7 @@ mod tests {
                     .complete_authenticated_inbound_with_outcome(
                         &commit_key,
                         commit_tunnel,
-                        Some((identity, CacheWriteOutcome::Inserted)),
+                        Some((identity, VerifiedCommitOutcome::Accepted)),
                     )
                     .await
             });
@@ -8827,13 +8842,13 @@ mod tests {
     async fn authority_negative_clears_only_for_matching_current_generation() {
         let map = RTcpTunnelMap::new();
         let logical_did = "did:web:authority-recovery.example";
-        let rejected = DocumentRevision {
+        let rejected = DocRevision {
             iat: 30,
-            content_hash: "rejected".to_string(),
+            hash: "rejected".to_string(),
         };
-        let current = DocumentRevision {
+        let current = DocRevision {
             iat: 31,
-            content_hash: "current".to_string(),
+            hash: "current".to_string(),
         };
         map.force_authority_negative(
             logical_did,
@@ -8886,7 +8901,7 @@ mod tests {
             map.complete_authenticated_inbound_with_outcome(
                 "local_did:dev:authority-unavailable",
                 candidate.clone(),
-                Some((identity, CacheWriteOutcome::Inserted)),
+                Some((identity, VerifiedCommitOutcome::Accepted)),
             )
             .await
         );
@@ -8908,7 +8923,7 @@ mod tests {
                 first.clone(),
                 Some((
                     verified_test_identity_bound("did:web:name-a.example", 5, "doc-a", shared_dev),
-                    CacheWriteOutcome::Inserted,
+                    VerifiedCommitOutcome::Accepted,
                 )),
             )
             .await
@@ -8927,7 +8942,7 @@ mod tests {
                 second.clone(),
                 Some((
                     verified_test_identity_bound("did:web:name-b.example", 6, "doc-b", shared_dev),
-                    CacheWriteOutcome::Inserted,
+                    VerifiedCommitOutcome::Accepted,
                 )),
             )
             .await
@@ -8980,7 +8995,7 @@ mod tests {
                             &format!("doc-{}", i),
                             shared_dev,
                         ),
-                        CacheWriteOutcome::Inserted,
+                        VerifiedCommitOutcome::Accepted,
                     )),
                 )
                 .await
@@ -9029,7 +9044,7 @@ mod tests {
                 first.clone(),
                 Some((
                     verified_test_identity(logical_did, 7, "content-a"),
-                    CacheWriteOutcome::Inserted,
+                    VerifiedCommitOutcome::Accepted,
                 )),
             )
             .await
@@ -9043,7 +9058,7 @@ mod tests {
                 second.clone(),
                 Some((
                     verified_test_identity(logical_did, 7, "content-b"),
-                    CacheWriteOutcome::RejectedConflict,
+                    VerifiedCommitOutcome::Rejected,
                 )),
             )
             .await
@@ -9061,7 +9076,7 @@ mod tests {
                 third.clone(),
                 Some((
                     verified_test_identity(logical_did, 7, "content-c"),
-                    CacheWriteOutcome::ReplacedOlder,
+                    VerifiedCommitOutcome::Accepted,
                 )),
             )
             .await
@@ -9199,7 +9214,7 @@ mod tests {
                 first.clone(),
                 Some((
                     verified_test_identity_bound("did:web:stale-a.example", 3, "doc-a", shared_dev),
-                    CacheWriteOutcome::Inserted,
+                    VerifiedCommitOutcome::Accepted,
                 )),
             )
             .await
@@ -9214,7 +9229,7 @@ mod tests {
                 second.clone(),
                 Some((
                     verified_test_identity_bound("did:web:stale-b.example", 4, "doc-b", shared_dev),
-                    CacheWriteOutcome::Inserted,
+                    VerifiedCommitOutcome::Accepted,
                 )),
             )
             .await
@@ -9255,7 +9270,7 @@ mod tests {
                 inbound.clone(),
                 Some((
                     verified_test_identity_bound("did:web:cross-in.example", 9, "doc-in", dev),
-                    CacheWriteOutcome::Inserted,
+                    VerifiedCommitOutcome::Accepted,
                 )),
             )
             .await
@@ -9278,7 +9293,7 @@ mod tests {
                 inbound_same.clone(),
                 Some((
                     verified_test_identity_bound("did:web:cross-out.example", 9, "doc-out", dev),
-                    CacheWriteOutcome::Inserted,
+                    VerifiedCommitOutcome::Accepted,
                 )),
             )
             .await
@@ -9318,9 +9333,9 @@ mod tests {
         assert_eq!(
             map.force_authority_negative(
                 logical,
-                Some(DocumentRevision {
+                Some(DocRevision {
                     iat: 93,
-                    content_hash: "outbound-rejected".to_string(),
+                    hash: "outbound-rejected".to_string(),
                 }),
                 "AuthorityNotCurrent",
             )
@@ -9460,12 +9475,10 @@ mod tests {
         let url = std::fs::read_to_string(format!("{path}.url")).unwrap();
         let client = name_client::NameClient::new(name_client::NameClientConfig {
             cache_backend: name_client::CacheBackend::Memory,
-            enable_zone_resolver: false,
+            enable_zone_locker: false,
             ..Default::default()
         });
-        client
-            .set_method_authority("bns", Box::new(name_client::BaseHttpProvider::new(&url)))
-            .await;
+        client.set_method_authority("bns", Arc::new(name_client::BaseHttpProvider::new(&url)));
         assert!(name_client::GLOBAL_NAME_CLIENT.set(client).is_ok());
         let (signing_key, pkcs8) = generate_ed25519_key();
         let local = DeviceDocument::new_by_jwk(
@@ -10056,7 +10069,14 @@ mod tests {
     async fn cache_test_device(device_config: &DeviceDocument) {
         let did_doc_value = serde_json::to_value(device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        add_observed_cache(device_config.id.clone(), None, encoded_doc, None).unwrap();
+        commit_candidate_doc(
+            &device_config.id,
+            Some(DidDocType::Device),
+            &encoded_doc,
+            SourceRef::normal("test"),
+        )
+        .await
+        .unwrap();
         add_nameinfo_cache(
             device_config.id.to_string().as_str(),
             NameInfo::from_address(
@@ -11111,7 +11131,7 @@ mod tests {
         // reach the listener, making the callback assertion meaningful.
         allow_named_key_fallback(&mut server);
         let rejected_revision =
-            DocumentRevision::of(&EncodedDocument::Jwt(client_device_doc_jwt.clone()));
+            DocRevision::of(&EncodedDocument::Jwt(client_device_doc_jwt.clone()));
         server
             .inner
             .tunnel_map
@@ -11474,7 +11494,14 @@ mod tests {
         let _id1 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        add_observed_cache(device_config.id.clone(), None, encoded_doc, None).unwrap();
+        commit_candidate_doc(
+            &device_config.id,
+            Some(DidDocType::Device),
+            &encoded_doc,
+            SourceRef::normal("test"),
+        )
+        .await
+        .unwrap();
         add_nameinfo_cache(
             device_config.id.to_string().as_str(),
             NameInfo::from_address(
@@ -11501,7 +11528,14 @@ mod tests {
         let id2 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        add_observed_cache(device_config.id.clone(), None, encoded_doc, None).unwrap();
+        commit_candidate_doc(
+            &device_config.id,
+            Some(DidDocType::Device),
+            &encoded_doc,
+            SourceRef::normal("test"),
+        )
+        .await
+        .unwrap();
         add_nameinfo_cache(
             device_config.id.to_string().as_str(),
             NameInfo::from_address(
@@ -11556,7 +11590,14 @@ mod tests {
         let _id1 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        add_observed_cache(device_config.id.clone(), None, encoded_doc, None).unwrap();
+        commit_candidate_doc(
+            &device_config.id,
+            Some(DidDocType::Device),
+            &encoded_doc,
+            SourceRef::normal("test"),
+        )
+        .await
+        .unwrap();
         add_nameinfo_cache(
             device_config.id.to_string().as_str(),
             NameInfo::from_address(
@@ -11583,7 +11624,14 @@ mod tests {
         let id2 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        add_observed_cache(device_config.id.clone(), None, encoded_doc, None).unwrap();
+        commit_candidate_doc(
+            &device_config.id,
+            Some(DidDocType::Device),
+            &encoded_doc,
+            SourceRef::normal("test"),
+        )
+        .await
+        .unwrap();
         add_nameinfo_cache(
             device_config.id.to_string().as_str(),
             NameInfo::from_address(
@@ -11632,7 +11680,14 @@ mod tests {
         let _id1 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        add_observed_cache(device_config.id.clone(), None, encoded_doc, None).unwrap();
+        commit_candidate_doc(
+            &device_config.id,
+            Some(DidDocType::Device),
+            &encoded_doc,
+            SourceRef::normal("test"),
+        )
+        .await
+        .unwrap();
         add_nameinfo_cache(
             device_config.id.to_string().as_str(),
             NameInfo::from_address(
@@ -11659,7 +11714,14 @@ mod tests {
         let id2 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        add_observed_cache(device_config.id.clone(), None, encoded_doc, None).unwrap();
+        commit_candidate_doc(
+            &device_config.id,
+            Some(DidDocType::Device),
+            &encoded_doc,
+            SourceRef::normal("test"),
+        )
+        .await
+        .unwrap();
         add_nameinfo_cache(
             device_config.id.to_string().as_str(),
             NameInfo::from_address(
@@ -11873,7 +11935,8 @@ mod tests {
         };
         assert!(
             err.to_string().contains("could not be evaluated")
-                || err.to_string().contains("failed"),
+                || err.to_string().contains("failed")
+                || err.to_string().contains("unavailable"),
             "unexpected error: {}",
             err
         );
@@ -11884,59 +11947,212 @@ mod tests {
         );
     }
 
-    // 测试用权威 provider:按 (did, doc_type) 返回预注册的发布状态与文档本体;
-    // offline 置位后所有查询报传输错误,模拟权威源断网。
+    // 统计来源调用次数的权威来源(永远回答 missing)。
+    struct CountingAuthority {
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl Source for CountingAuthority {
+        fn id(&self) -> String {
+            "rtcp-counting-authority".to_string()
+        }
+
+        async fn get_document(
+            &self,
+            did: &DID,
+            doc_type: &DidDocType,
+            revision: &Revision,
+            _opts: &ResolveOpts,
+        ) -> SourceAnswer {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let sref = SourceRef::provider(self.id(), SourceTier::Authority);
+            SourceAnswer::new(sref).with_publish_info(
+                PublishInfo::new(did.clone(), doc_type.clone(), revision.clone())
+                    .with_status(&DocumentStatus::Missing, None, None),
+            )
+        }
+    }
+
+    // TODO D3 零网络断言:入站 hello 的 device_doc_jwt 验证使用 not_allow_request,
+    // 即使该 method 注册了 authority(以及 owner 递归)也不得发出任何来源请求。
+    #[tokio::test]
+    async fn inbound_hello_verification_never_queries_sources() {
+        let _ = init_name_lib_for_test(&HashMap::new()).await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        GLOBAL_NAME_CLIENT.get().unwrap().set_method_authority(
+            "rtcpzeronet",
+            Arc::new(CountingAuthority {
+                calls: calls.clone(),
+            }),
+        );
+
+        let (owner_signing_key, owner_pkcs8_bytes) = generate_ed25519_key();
+        let owner_jwk = encode_ed25519_sk_to_pk_jwk(&owner_signing_key);
+        let owner_did = DID::new("rtcpzeronet", "owner");
+        let owner_private_key = EncodingKey::from_ed_der(&owner_pkcs8_bytes);
+        let _owner_doc = OwnerDocument::new(
+            owner_did.clone(),
+            "owner".to_string(),
+            "owner@zeronet".to_string(),
+            serde_json::from_value(owner_jwk).unwrap(),
+        );
+        let (device_signing_key, _) = generate_ed25519_key();
+        let device_jwk = encode_ed25519_sk_to_pk_jwk(&device_signing_key);
+        let mut device_config =
+            DeviceDocument::new_by_jwk("dev1", serde_json::from_value(device_jwk).unwrap());
+        let device_did = DID::new("rtcpzeronet", "dev1.owner");
+        device_config.id = device_did.clone();
+        device_config.owner = owner_did.clone();
+        let device_doc_jwt = match device_config.encode(Some(&owner_private_key)).unwrap() {
+            EncodedDocument::Jwt(jwt) => jwt,
+            _ => panic!("device config encode should return jwt"),
+        };
+
+        let mut inner = RTcpInner::new(
+            DID::new("dev", "zero-network-server"),
+            "127.0.0.1:0".to_string(),
+            None,
+            None,
+            Arc::new(MockRTcpListener::new()),
+        );
+        inner.security.inbound_admission.named_min_relation = RtcpNamedMinRelation::Any;
+        let hello_body = RTcpHelloBody {
+            from_id: device_did.to_string(),
+            to_id: "did:dev:zero-network-server".to_string(),
+            my_port: 19070,
+            tunnel_token: Some("unused".to_string()),
+            device_doc_jwt: Some(device_doc_jwt),
+        };
+        let (parsed_from, candidate_key, candidate_document) =
+            inner.parse_source_candidate(&hello_body).unwrap();
+        let outcome = inner
+            .resolve_source_device_info(
+                &hello_body,
+                &parsed_from,
+                candidate_key,
+                candidate_document.as_ref(),
+            )
+            .await;
+        // 没有本地材料:要么按策略拒绝,要么只以 KeyDid 准入;绝不能联网补材料。
+        if let Ok(admitted) = outcome {
+            assert_eq!(admitted.identity_trust, RtcpIdentityTrust::KeyDid);
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "inbound verification must not query any source"
+        );
+    }
+
+    // 测试用权威来源:按 (did, doc_type) 返回预注册的文档本体(当前发布版本)、
+    // 负状态与 owner 绑定;offline 置位后所有查询报传输错误,模拟权威源断网。
+    // 支持 current / exact / closest 三种查询(单版本)。
     struct TestAuthorityProvider {
-        states: Vec<PublishedState>,
         docs: Vec<(DID, String, EncodedDocument)>,
+        negatives: Vec<(DID, String, DocumentStatus)>,
+        owner_bindings: Vec<(DID, DID)>,
         offline: Arc<AtomicBool>,
     }
 
     #[async_trait]
-    impl NsProvider for TestAuthorityProvider {
-        fn get_id(&self) -> String {
+    impl Source for TestAuthorityProvider {
+        fn id(&self) -> String {
             "rtcp-test-authority".to_string()
         }
 
-        async fn query(
-            &self,
-            _name: &str,
-            _record_type: Option<RecordType>,
-            _from_ip: Option<std::net::IpAddr>,
-        ) -> NSResult<NameInfo> {
-            Err(NSError::NotFound("not implemented".to_string()))
+        fn supports_publish_info(&self) -> bool {
+            true
         }
 
-        async fn query_did(
-            &self,
-            did: &DID,
-            doc_type: Option<DidDocType>,
-            _from_ip: Option<std::net::IpAddr>,
-        ) -> NSResult<EncodedDocument> {
-            if self.offline.load(Ordering::SeqCst) {
-                return Err(NSError::Failed("authority offline (test)".to_string()));
-            }
-            let wanted = doc_type.unwrap_or_default();
-            self.docs
-                .iter()
-                .find(|(candidate, doc_type, _)| candidate == did && doc_type == wanted.as_str())
-                .map(|(_, _, doc)| doc.clone())
-                .ok_or_else(|| NSError::NotFound("no matching doc".to_string()))
-        }
-
-        async fn resolve_published_state(
+        async fn get_document(
             &self,
             did: &DID,
             doc_type: &DidDocType,
-        ) -> NSResult<Option<PublishedState>> {
+            revision: &Revision,
+            _opts: &ResolveOpts,
+        ) -> SourceAnswer {
+            let sref = SourceRef::provider(self.id(), SourceTier::Authority);
             if self.offline.load(Ordering::SeqCst) {
-                return Err(NSError::Failed("authority offline (test)".to_string()));
+                return SourceAnswer::failure(sref, "authority offline (test)");
             }
-            Ok(self
-                .states
+            let mut info = PublishInfo::new(did.clone(), doc_type.clone(), revision.clone())
+                .with_source(self.id());
+            info.owner_binding = self
+                .owner_bindings
                 .iter()
-                .find(|state| state.did == *did && state.doc_type == doc_type.as_str())
-                .cloned())
+                .find(|(d, _)| d == did)
+                .map(|(_, owner)| owner.clone());
+            if let Some((_, _, status)) = self
+                .negatives
+                .iter()
+                .find(|(d, t, _)| d == did && t == doc_type.as_str())
+            {
+                return SourceAnswer::new(sref)
+                    .with_publish_info(info.with_status(status, None, None));
+            }
+            let Some((_, _, doc)) = self
+                .docs
+                .iter()
+                .find(|(d, t, _)| d == did && t == doc_type.as_str())
+            else {
+                return SourceAnswer::new(sref)
+                    .with_publish_info(info.with_status(&DocumentStatus::Missing, None, None));
+            };
+            let doc_revision = DocRevision::of(doc).expect("test documents carry iat");
+            info = info.with_status(&DocumentStatus::Active, None, None);
+            info.latest_iat = Some(doc_revision.iat);
+            match revision {
+                Revision::Current => {
+                    info = info.with_record(PublishRecord::published(
+                        doc_revision.iat,
+                        &doc_revision.hash,
+                        true,
+                    ));
+                    SourceAnswer::new(sref)
+                        .with_body(doc.clone(), Carrier::Inline)
+                        .with_publish_info(info)
+                }
+                Revision::Exact { iat, .. } => {
+                    if *iat == doc_revision.iat {
+                        info = info.with_record(PublishRecord::published(
+                            doc_revision.iat,
+                            &doc_revision.hash,
+                            true,
+                        ));
+                        SourceAnswer::new(sref)
+                            .with_body(doc.clone(), Carrier::Inline)
+                            .with_publish_info(info)
+                    } else {
+                        info.records.push(PublishRecord::not_published(*iat));
+                        SourceAnswer::new(sref).with_publish_info(info)
+                    }
+                }
+                Revision::Closest { before_iat } => {
+                    if doc_revision.iat < *before_iat {
+                        info = info.with_record(PublishRecord::published(
+                            doc_revision.iat,
+                            &doc_revision.hash,
+                            true,
+                        ));
+                        info.boundary = Some(Boundary {
+                            query_iat: *before_iat,
+                            selected: Some(doc_revision),
+                            confirmed: true,
+                        });
+                        SourceAnswer::new(sref)
+                            .with_body(doc.clone(), Carrier::Inline)
+                            .with_publish_info(info)
+                    } else {
+                        info.boundary = Some(Boundary {
+                            query_iat: *before_iat,
+                            selected: None,
+                            confirmed: true,
+                        });
+                        SourceAnswer::new(sref).with_publish_info(info)
+                    }
+                }
+            }
         }
     }
 
@@ -11976,33 +12192,24 @@ mod tests {
             EncodedDocument::Jwt(jwt) => jwt,
             _ => panic!("current recovery document must be JWT"),
         };
-        let old_revision = DocumentRevision::of(&EncodedDocument::Jwt(old_jwt.clone())).unwrap();
+        let old_revision = DocRevision::of(&EncodedDocument::Jwt(old_jwt.clone())).unwrap();
         let current_revision =
-            DocumentRevision::of(&EncodedDocument::Jwt(current_jwt.clone())).unwrap();
+            DocRevision::of(&EncodedDocument::Jwt(current_jwt.clone())).unwrap();
         assert_ne!(old_revision, current_revision);
 
-        let mut current_state = PublishedState::active(
-            logical_did.clone(),
-            "device".to_string(),
-            EncodedDocument::Jwt(current_jwt.clone()),
+        GLOBAL_NAME_CLIENT.get().unwrap().set_method_authority(
+            "rtcpnegative",
+            Arc::new(TestAuthorityProvider {
+                docs: vec![(
+                    logical_did.clone(),
+                    "device".to_string(),
+                    EncodedDocument::Jwt(current_jwt.clone()),
+                )],
+                negatives: Vec::new(),
+                owner_bindings: vec![(logical_did.clone(), owner_config.id)],
+                offline: Arc::new(AtomicBool::new(false)),
+            }),
         );
-        current_state.effective_owner = Some(owner_config.id);
-        GLOBAL_NAME_CLIENT
-            .get()
-            .unwrap()
-            .set_method_authority(
-                "rtcpnegative",
-                Box::new(TestAuthorityProvider {
-                    states: vec![current_state],
-                    docs: vec![(
-                        logical_did.clone(),
-                        "device".to_string(),
-                        EncodedDocument::Jwt(current_jwt.clone()),
-                    )],
-                    offline: Arc::new(AtomicBool::new(false)),
-                }),
-            )
-            .await;
 
         let inner = RTcpInner::new(
             DID::new("dev", "negative-recovery-test-server"),
@@ -12141,35 +12348,10 @@ mod tests {
             _ => panic!("device config encode should return jwt"),
         };
 
-        // 权威源:owner 文档锚定发布;device 文档 Active + effective_owner 绑定
-        // + 内联 body(外部候选与当前发布集合一致 → membership 成立 → Published)。
-        let mut device_state = PublishedState::active(
-            device_did.clone(),
-            "device".to_string(),
-            EncodedDocument::Jwt(device_doc_jwt.clone()),
-        );
-        device_state.effective_owner = Some(owner_did.clone());
-        let mut rogue_device_state = PublishedState::active(
-            rogue_device_did.clone(),
-            "device".to_string(),
-            EncodedDocument::Jwt(rogue_device_doc_jwt.clone()),
-        );
-        rogue_device_state.effective_owner = Some(owner_did.clone());
-        let mut revoked_device_state =
-            PublishedState::missing(revoked_device_did.clone(), "device".to_string());
-        revoked_device_state.document_status = DocumentStatus::Revoked;
-        revoked_device_state.effective_owner = Some(owner_did.clone());
+        // 权威源:owner 文档与 device 文档当前发布(authority 回答带 owner 绑定);
+        // revoked1 是类型级 revoked;dev2 未发布但 owner 绑定为 owner1,
+        // 越权候选自报 did:dev owner,必须按 owner 不匹配拒绝且不回落。
         let provider = TestAuthorityProvider {
-            states: vec![
-                PublishedState::active(
-                    owner_did.clone(),
-                    "owner".to_string(),
-                    owner_doc_encoded.clone(),
-                ),
-                device_state,
-                rogue_device_state,
-                revoked_device_state,
-            ],
             docs: vec![
                 (
                     owner_did.clone(),
@@ -12182,65 +12364,58 @@ mod tests {
                     EncodedDocument::Jwt(device_doc_jwt.clone()),
                 ),
             ],
+            negatives: vec![(
+                revoked_device_did.clone(),
+                "device".to_string(),
+                DocumentStatus::Revoked,
+            )],
+            owner_bindings: vec![
+                (device_did.clone(), owner_did.clone()),
+                (rogue_device_did.clone(), owner_did.clone()),
+                (revoked_device_did.clone(), owner_did.clone()),
+            ],
             offline: Arc::new(AtomicBool::new(false)),
         };
         let offline = provider.offline.clone();
         GLOBAL_NAME_CLIENT
             .get()
             .unwrap()
-            .set_method_authority("rtcpauth", Box::new(provider))
-            .await;
-        let mut authority_policy = ResolvePolicy::default();
-        authority_policy.source = ResolveSourcePolicy::RemoteAuthority;
-        authority_policy.allow_stale_cache = false;
+            .set_method_authority("rtcpauth", Arc::new(provider));
+        let authority_opts = ResolveOpts::default()
+            .authority_only()
+            .without_local_lock()
+            .without_zone_lock()
+            .with_force_authority_query();
         let resolved_owner = resolve_did_ex(
             &owner_did,
             Some(DidDocType::Owner),
-            authority_policy.clone(),
+            Revision::current(),
+            authority_opts.clone(),
         )
         .await
         .unwrap();
-        GLOBAL_NAME_CLIENT
-            .get()
-            .unwrap()
-            .add_verified_cache(
-                owner_did.clone(),
-                Some(DidDocType::Owner),
-                resolved_owner.document,
-            )
-            .unwrap();
-        let authority_options = ResolveVerifyOptions {
-            purpose: VerifyPurpose::AuthSubject,
-            policy: authority_policy,
-        };
-        let (_, authority_verified) = resolve_and_verify_device_document_jwt(
+        assert!(resolved_owner.select(&Revision::current()).is_some());
+        let verified = verify_document(
             &device_did,
-            &device_doc_jwt,
-            &authority_options,
+            Some(DidDocType::Device),
+            &EncodedDocument::Jwt(device_doc_jwt.clone()),
+            Revision::current(),
+            authority_opts.clone(),
         )
         .await
         .unwrap();
-        GLOBAL_NAME_CLIENT
-            .get()
-            .unwrap()
-            .add_verified_cache(
-                device_did.clone(),
-                Some(DidDocType::Device),
-                authority_verified.document.clone(),
-            )
-            .unwrap();
-        let (device_doc, verified) = resolve_and_verify_device_document_jwt(
-            &device_did,
-            &device_doc_jwt,
-            &authority_options,
-        )
-        .await
-        .unwrap();
-        assert_eq!(verified.subject_did, device_did);
-        assert_eq!(verified.authz_owner, Some(owner_did.clone()));
         assert!(
-            verified.validity.owner_document_source.is_some(),
-            "known_owner requires trusted OwnerDocument evidence"
+            verified.success(&Revision::current()),
+            "authority-anchored device document must verify: {}",
+            verified.reason()
+        );
+        assert!(verified.is_published && verified.authority_receipt.is_some());
+        let device_doc =
+            DeviceDocument::decode(&EncodedDocument::Jwt(device_doc_jwt.clone()), None).unwrap();
+        assert_eq!(
+            RTcpInner::verified_owner(&device_doc, &verified),
+            Some(owner_did.clone()),
+            "known_owner requires trusted owner evidence"
         );
         let mut known_owner_inner = RTcpInner::new(
             DID::new("dev", "known-owner-admission-server"),
@@ -12257,10 +12432,14 @@ mod tests {
             .validate_named_relation(&device_doc, &verified)
             .expect("owner-backed AuthSubject must pass known_owner admission");
 
+        // 既无 owner 递归依赖、也无权威锚定(模拟 trust 免签之外的"只有签名"情况)。
         let mut ownerless_verified = verified.clone();
-        ownerless_verified.authz_owner = None;
-        ownerless_verified.usable_as_authz_subject = false;
-        ownerless_verified.validity.owner_document_source = None;
+        ownerless_verified.dependencies.clear();
+        ownerless_verified.source_tier = Some(SourceTier::Normal);
+        ownerless_verified.is_published = false;
+        ownerless_verified.publish_evidence = None;
+        ownerless_verified.authority_receipt = None;
+        ownerless_verified.owner_binding = None;
         let err = known_owner_inner
             .validate_named_relation(&device_doc, &ownerless_verified)
             .expect_err("identity without trusted owner evidence must fail known_owner admission");
@@ -12275,102 +12454,87 @@ mod tests {
             device_dev_did
         );
         let verified_cache_entry = Some(PendingVerifiedCacheEntry {
-            did: verified.subject_did.clone(),
-            document: verified.document.clone(),
+            did: device_did.clone(),
+            document: EncodedDocument::Jwt(device_doc_jwt.clone()),
             identity: VerifiedTunnelIdentity {
-                logical_did: verified.subject_did.to_string(),
+                logical_did: device_did.to_string(),
                 canonical_dev_did: canonical_dev_did_from_ed25519_pk(&verified_key).to_string(),
-                document_revision: verified.revision.clone(),
+                document_revision: verified.revision.clone().unwrap(),
             },
         });
 
         // Validity and freshness are separate: this candidate has the right
-        // owner signature but the fresh authority receipt binds another body.
-        // RTCP's policy must reject it before the self-declared fallback.
-        let superseded_hello_body = RTcpHelloBody {
-            from_id: device_did.to_string(),
-            to_id: "did:web:server.devtests.org".to_string(),
-            my_port: 19067,
-            tunnel_token: Some("unused".to_string()),
-            device_doc_jwt: Some(superseded_device_doc_jwt),
-        };
-        let (_, superseded_verified) = resolve_and_verify_device_document_jwt(
+        // owner signature but the authority's current body is another document
+        // at the same iat.  RTCP's policy must reject it before the self-declared fallback.
+        let superseded_verified = verify_document(
             &device_did,
-            superseded_hello_body.device_doc_jwt.as_deref().unwrap(),
-            &authority_options,
+            Some(DidDocType::Device),
+            &EncodedDocument::Jwt(superseded_device_doc_jwt.clone()),
+            Revision::current(),
+            authority_opts.clone(),
         )
         .await
         .unwrap();
-        let err = RTcpInner::freshness_rejection(&superseded_verified)
-            .expect("authority-current body mismatch must be rejected");
+        assert!(!superseded_verified.success(&Revision::current()));
+        // 同 iat 的发布记录 hash 与输入不符是确定性 invalid(权威锚定了另一份
+        // body);inbound 路径先按 definite 拒绝,不进入自报回落。
         assert!(
-            err.contains("authority rejected candidate") || err.contains("conflicts with"),
-            "unexpected error: {}",
-            err
+            RTcpInner::is_definite_verify_rejection(&superseded_verified)
+                || RTcpInner::freshness_rejection(&superseded_verified).is_some(),
+            "authority-current body mismatch must be rejected: {}",
+            superseded_verified.reason()
+        );
+        assert!(
+            superseded_verified.reason().contains("hash")
+                || superseded_verified.reason().contains("conflict"),
+            "unexpected reason: {}",
+            superseded_verified.reason()
         );
 
-        // Revoked/Tombstoned are typed terminal VerifyError values.  They are
-        // definite rejection and may never enter self-declared verification.
-        let revoked_hello_body = RTcpHelloBody {
-            from_id: revoked_device_did.to_string(),
-            to_id: "did:web:server.devtests.org".to_string(),
-            my_port: 19067,
-            tunnel_token: Some("unused".to_string()),
-            device_doc_jwt: Some(revoked_device_doc_jwt),
-        };
-        let err = match resolve_and_verify_device_document_jwt(
+        // Revoked/Tombstoned are terminal authority states: definite rejection
+        // that may never enter self-declared verification or anonymous fallback.
+        let revoked_verified = verify_document(
             &revoked_device_did,
-            revoked_hello_body.device_doc_jwt.as_deref().unwrap(),
-            &authority_options,
+            Some(DidDocType::Device),
+            &EncodedDocument::Jwt(revoked_device_doc_jwt.clone()),
+            Revision::current(),
+            authority_opts.clone(),
         )
         .await
-        {
-            Ok(_) => panic!("terminal authority state must be rejected"),
-            Err(e) => e,
-        };
+        .unwrap();
         assert!(
-            RTcpInner::is_definite_verify_rejection(&err),
-            "unexpected error: {}",
-            err
+            RTcpInner::is_definite_verify_rejection(&revoked_verified)
+                && revoked_verified.is_revoked,
+            "unexpected report: {}",
+            revoked_verified.reason()
         );
 
-        // 越权候选被 Definite 拒绝,不回落:若错误来自回落路径,消息会是
-        // "resolve owner auth key ... failed"(甚至因 did:dev owner 可本地验签
-        // 而放行),而不是带稳定错误码的 rejected。
-        let rogue_hello_body = RTcpHelloBody {
-            from_id: rogue_device_did.to_string(),
-            to_id: "did:web:server.devtests.org".to_string(),
-            my_port: 19067,
-            tunnel_token: Some("unused".to_string()),
-            device_doc_jwt: Some(rogue_device_doc_jwt),
-        };
-        let err = match resolve_and_verify_device_document_jwt(
+        // 越权候选被 Definite 拒绝,不回落:authority 绑定的 owner 是 owner1,
+        // 文档自报的 did:dev owner 与之不符。
+        let rogue_verified = verify_document(
             &rogue_device_did,
-            rogue_hello_body.device_doc_jwt.as_deref().unwrap(),
-            &authority_options,
+            Some(DidDocType::Device),
+            &EncodedDocument::Jwt(rogue_device_doc_jwt.clone()),
+            Revision::current(),
+            authority_opts.clone(),
         )
         .await
-        {
-            Ok(_) => panic!("declared owner mismatching authority binding must be rejected"),
-            Err(e) => e,
-        };
+        .unwrap();
         assert!(
-            RTcpInner::is_definite_verify_rejection(&err)
-                && err.to_string().contains("does not match expected owner"),
-            "unexpected error: {}",
-            err
+            RTcpInner::is_definite_verify_rejection(&rogue_verified)
+                && rogue_verified.reason().contains("owner"),
+            "unexpected report: {}",
+            rogue_verified.reason()
         );
 
-        // resolve/verify 到这里都没有隐式写入。模拟完整握手已完成持钥证明与
-        // listener 授权,显式提交 verified cache;结构化 outcome 同时充当
-        // high-water 的并发合并结果。
+        // verify_document 已把有效输入推进为 best;握手完成后只把身份交给隧道索引。
         let (_, cache_outcome) = RTcpInner::commit_verified_cache_entry(verified_cache_entry)
             .unwrap()
-            .expect("authoritatively verified document should be staged for cache");
+            .expect("authoritatively verified document should be staged for the index");
         assert!(cache_outcome.stored());
 
-        // 受控缓存写入在权威源断网后仍可被 strict resolve_did 命中,与上一个
-        // 测试的 Observed/Unverified(strict 下等同 miss)形成对照。
+        // 已验证的 best 在权威源断网后仍可被 resolve_did 命中,与上一个测试的
+        // 自报候选(不能成为 best)形成对照。
         offline.store(true, Ordering::SeqCst);
         let resolved = resolve_did(&device_did, Some(DidDocType::Device))
             .await
@@ -12390,7 +12554,14 @@ mod tests {
         let id1 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        add_observed_cache(device_config.id.clone(), None, encoded_doc, None).unwrap();
+        commit_candidate_doc(
+            &device_config.id,
+            Some(DidDocType::Device),
+            &encoded_doc,
+            SourceRef::normal("test"),
+        )
+        .await
+        .unwrap();
         add_nameinfo_cache(
             device_config.id.to_string().as_str(),
             NameInfo::from_address(
@@ -12417,7 +12588,14 @@ mod tests {
         let id2 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        add_observed_cache(device_config.id.clone(), None, encoded_doc, None).unwrap();
+        commit_candidate_doc(
+            &device_config.id,
+            Some(DidDocType::Device),
+            &encoded_doc,
+            SourceRef::normal("test"),
+        )
+        .await
+        .unwrap();
         add_nameinfo_cache(
             device_config.id.to_string().as_str(),
             NameInfo::from_address(
@@ -12519,7 +12697,14 @@ mod tests {
         let id_a = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        add_observed_cache(device_config.id.clone(), None, encoded_doc, None).unwrap();
+        commit_candidate_doc(
+            &device_config.id,
+            Some(DidDocType::Device),
+            &encoded_doc,
+            SourceRef::normal("test"),
+        )
+        .await
+        .unwrap();
         add_nameinfo_cache(
             device_config.id.to_string().as_str(),
             NameInfo::from_address(
@@ -12559,7 +12744,14 @@ mod tests {
         let id_b = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        add_observed_cache(device_config.id.clone(), None, encoded_doc, None).unwrap();
+        commit_candidate_doc(
+            &device_config.id,
+            Some(DidDocType::Device),
+            &encoded_doc,
+            SourceRef::normal("test"),
+        )
+        .await
+        .unwrap();
         add_nameinfo_cache(
             device_config.id.to_string().as_str(),
             NameInfo::from_address(
@@ -12589,7 +12781,14 @@ mod tests {
         let id_c = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        add_observed_cache(device_config.id.clone(), None, encoded_doc, None).unwrap();
+        commit_candidate_doc(
+            &device_config.id,
+            Some(DidDocType::Device),
+            &encoded_doc,
+            SourceRef::normal("test"),
+        )
+        .await
+        .unwrap();
         add_nameinfo_cache(
             device_config.id.to_string().as_str(),
             NameInfo::from_address(
@@ -12928,7 +13127,14 @@ mod tests {
         let id1 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        add_observed_cache(device_config.id.clone(), None, encoded_doc, None).unwrap();
+        commit_candidate_doc(
+            &device_config.id,
+            Some(DidDocType::Device),
+            &encoded_doc,
+            SourceRef::normal("test"),
+        )
+        .await
+        .unwrap();
         add_nameinfo_cache(
             device_config.id.to_string().as_str(),
             NameInfo::from_address(
@@ -12955,7 +13161,14 @@ mod tests {
         let id2 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        add_observed_cache(device_config.id.clone(), None, encoded_doc, None).unwrap();
+        commit_candidate_doc(
+            &device_config.id,
+            Some(DidDocType::Device),
+            &encoded_doc,
+            SourceRef::normal("test"),
+        )
+        .await
+        .unwrap();
         add_nameinfo_cache(
             device_config.id.to_string().as_str(),
             NameInfo::from_address(

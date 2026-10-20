@@ -3402,18 +3402,19 @@ impl GatewayCmdHandler {
             "scheme": scheme,
         }))
         .map_err(|e| cmd_err!(ControlErrorCode::InvalidParams, "{}", e))?;
-        let provider_id = provider.get_id();
-        let effective_trust_level = trust_level.unwrap_or(DEFAULT_PROVIDER_TRUST_LEVEL);
-        client
-            .add_provider(Box::new(provider), Some(effective_trust_level))
-            .await;
+        let provider_id = provider.id();
+        // 动态加入的 HTTP resolver 是 normal 来源:只贡献候选,按 owner 链验签。
+        // 旧 trust_level 不再参与解析决策,只在回包里回显。
+        let provider: Arc<dyn Source> = Arc::new(provider);
+        client.add_method_normal("web", provider.clone());
+        client.add_method_normal("bns", provider);
 
         Ok(json!({
             "provider": provider_id,
             "url": provider_url,
             "resolver_host": resolver_host,
             "scheme": scheme,
-            "trust_level": effective_trust_level,
+            "trust_level": trust_level,
         }))
     }
 }

@@ -2548,7 +2548,7 @@ mod tests {
     use jsonwebtoken::EncodingKey;
     use name_client::{
         DidDocType, IdentityMaterial, IdentityRoots, IdentityUsage, NameInfo, add_nameinfo_cache,
-        add_observed_cache, init_name_lib_for_test,
+        commit_candidate_doc, init_name_lib_for_test, SourceRef,
     };
     use name_lib::{
         DID, DIDDocumentTrait, DeviceDocument, EncodedDocument, encode_ed25519_sk_to_pk_jwk,
@@ -3157,7 +3157,14 @@ inbound_admission:
         let id1 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        add_observed_cache(device_config.id.clone(), None, encoded_doc, None).unwrap();
+        commit_candidate_doc(
+            &device_config.id,
+            Some(DidDocType::Device),
+            &encoded_doc,
+            SourceRef::normal("test"),
+        )
+        .await
+        .unwrap();
         add_nameinfo_cache(
             device_config.id.to_string().as_str(),
             NameInfo::from_address(
@@ -3213,7 +3220,14 @@ inbound_admission:
         let _id2 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        add_observed_cache(device_config.id.clone(), None, encoded_doc, None).unwrap();
+        commit_candidate_doc(
+            &device_config.id,
+            Some(DidDocType::Device),
+            &encoded_doc,
+            SourceRef::normal("test"),
+        )
+        .await
+        .unwrap();
         add_nameinfo_cache(
             device_config.id.to_string().as_str(),
             NameInfo::from_address(
@@ -3290,7 +3304,14 @@ inbound_admission:
         let id1 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        add_observed_cache(device_config.id.clone(), None, encoded_doc, None).unwrap();
+        commit_candidate_doc(
+            &device_config.id,
+            Some(DidDocType::Device),
+            &encoded_doc,
+            SourceRef::normal("test"),
+        )
+        .await
+        .unwrap();
         add_nameinfo_cache(
             device_config.id.to_string().as_str(),
             NameInfo::from_address(
@@ -3344,7 +3365,14 @@ inbound_admission:
         let _id2 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        add_observed_cache(device_config.id.clone(), None, encoded_doc, None).unwrap();
+        commit_candidate_doc(
+            &device_config.id,
+            Some(DidDocType::Device),
+            &encoded_doc,
+            SourceRef::normal("test"),
+        )
+        .await
+        .unwrap();
         add_nameinfo_cache(
             device_config.id.to_string().as_str(),
             NameInfo::from_address(
@@ -3421,7 +3449,14 @@ inbound_admission:
         let id1 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        add_observed_cache(device_config.id.clone(), None, encoded_doc, None).unwrap();
+        commit_candidate_doc(
+            &device_config.id,
+            Some(DidDocType::Device),
+            &encoded_doc,
+            SourceRef::normal("test"),
+        )
+        .await
+        .unwrap();
         add_nameinfo_cache(
             device_config.id.to_string().as_str(),
             NameInfo::from_address(
@@ -3475,7 +3510,14 @@ inbound_admission:
         let _id2 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        add_observed_cache(device_config.id.clone(), None, encoded_doc, None).unwrap();
+        commit_candidate_doc(
+            &device_config.id,
+            Some(DidDocType::Device),
+            &encoded_doc,
+            SourceRef::normal("test"),
+        )
+        .await
+        .unwrap();
         add_nameinfo_cache(
             device_config.id.to_string().as_str(),
             NameInfo::from_address(
@@ -3565,7 +3607,14 @@ inbound_admission:
         let id1 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        add_observed_cache(device_config.id.clone(), None, encoded_doc, None).unwrap();
+        commit_candidate_doc(
+            &device_config.id,
+            Some(DidDocType::Device),
+            &encoded_doc,
+            SourceRef::normal("test"),
+        )
+        .await
+        .unwrap();
         add_nameinfo_cache(
             device_config.id.to_string().as_str(),
             NameInfo::from_address(
@@ -3619,7 +3668,14 @@ inbound_admission:
         let _id2 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        add_observed_cache(device_config.id.clone(), None, encoded_doc, None).unwrap();
+        commit_candidate_doc(
+            &device_config.id,
+            Some(DidDocType::Device),
+            &encoded_doc,
+            SourceRef::normal("test"),
+        )
+        .await
+        .unwrap();
         add_nameinfo_cache(
             device_config.id.to_string().as_str(),
             NameInfo::from_address(
@@ -3723,7 +3779,14 @@ inbound_admission:
         let id1 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        add_observed_cache(device_config.id.clone(), None, encoded_doc, None).unwrap();
+        commit_candidate_doc(
+            &device_config.id,
+            Some(DidDocType::Device),
+            &encoded_doc,
+            SourceRef::normal("test"),
+        )
+        .await
+        .unwrap();
         add_nameinfo_cache(
             device_config.id.to_string().as_str(),
             NameInfo::from_address(
@@ -3783,7 +3846,14 @@ inbound_admission:
         let _id2 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        add_observed_cache(device_config.id.clone(), None, encoded_doc, None).unwrap();
+        commit_candidate_doc(
+            &device_config.id,
+            Some(DidDocType::Device),
+            &encoded_doc,
+            SourceRef::normal("test"),
+        )
+        .await
+        .unwrap();
         add_nameinfo_cache(
             device_config.id.to_string().as_str(),
             NameInfo::from_address(
@@ -3861,12 +3931,13 @@ inbound_admission:
             serde_json::from_value(encode_ed25519_sk_to_pk_jwk(&s1)).unwrap(),
         );
         let id1 = d1.id.clone();
-        add_observed_cache(
-            d1.id.clone(),
-            None,
-            EncodedDocument::JsonLd(serde_json::to_value(&d1).unwrap()),
-            None,
+        commit_candidate_doc(
+            &d1.id,
+            Some(DidDocType::Device),
+            &EncodedDocument::JsonLd(serde_json::to_value(&d1).unwrap()),
+            SourceRef::normal("test"),
         )
+        .await
         .unwrap();
         add_nameinfo_cache(
             d1.id.to_string().as_str(),
@@ -3924,12 +3995,13 @@ inbound_admission:
             "test2",
             serde_json::from_value(encode_ed25519_sk_to_pk_jwk(&s2)).unwrap(),
         );
-        add_observed_cache(
-            d2.id.clone(),
-            None,
-            EncodedDocument::JsonLd(serde_json::to_value(&d2).unwrap()),
-            None,
+        commit_candidate_doc(
+            &d2.id,
+            Some(DidDocType::Device),
+            &EncodedDocument::JsonLd(serde_json::to_value(&d2).unwrap()),
+            SourceRef::normal("test"),
         )
+        .await
         .unwrap();
         add_nameinfo_cache(
             d2.id.to_string().as_str(),
@@ -3986,12 +4058,13 @@ inbound_admission:
             serde_json::from_value(encode_ed25519_sk_to_pk_jwk(&s1)).unwrap(),
         );
         let id1 = d1.id.clone();
-        add_observed_cache(
-            d1.id.clone(),
-            None,
-            EncodedDocument::JsonLd(serde_json::to_value(&d1).unwrap()),
-            None,
+        commit_candidate_doc(
+            &d1.id,
+            Some(DidDocType::Device),
+            &EncodedDocument::JsonLd(serde_json::to_value(&d1).unwrap()),
+            SourceRef::normal("test"),
         )
+        .await
         .unwrap();
         add_nameinfo_cache(
             d1.id.to_string().as_str(),
@@ -4049,12 +4122,13 @@ inbound_admission:
             "test2",
             serde_json::from_value(encode_ed25519_sk_to_pk_jwk(&s2)).unwrap(),
         );
-        add_observed_cache(
-            d2.id.clone(),
-            None,
-            EncodedDocument::JsonLd(serde_json::to_value(&d2).unwrap()),
-            None,
+        commit_candidate_doc(
+            &d2.id,
+            Some(DidDocType::Device),
+            &EncodedDocument::JsonLd(serde_json::to_value(&d2).unwrap()),
+            SourceRef::normal("test"),
         )
+        .await
         .unwrap();
         add_nameinfo_cache(
             d2.id.to_string().as_str(),
@@ -4151,12 +4225,13 @@ inbound_admission:
             serde_json::from_value(encode_ed25519_sk_to_pk_jwk(&s1)).unwrap(),
         );
         let id1 = d1.id.clone();
-        add_observed_cache(
-            d1.id.clone(),
-            None,
-            EncodedDocument::JsonLd(serde_json::to_value(&d1).unwrap()),
-            None,
+        commit_candidate_doc(
+            &d1.id,
+            Some(DidDocType::Device),
+            &EncodedDocument::JsonLd(serde_json::to_value(&d1).unwrap()),
+            SourceRef::normal("test"),
         )
+        .await
         .unwrap();
         add_nameinfo_cache(
             d1.id.to_string().as_str(),
@@ -4213,12 +4288,13 @@ inbound_admission:
             "test2",
             serde_json::from_value(encode_ed25519_sk_to_pk_jwk(&s2)).unwrap(),
         );
-        add_observed_cache(
-            d2.id.clone(),
-            None,
-            EncodedDocument::JsonLd(serde_json::to_value(&d2).unwrap()),
-            None,
+        commit_candidate_doc(
+            &d2.id,
+            Some(DidDocType::Device),
+            &EncodedDocument::JsonLd(serde_json::to_value(&d2).unwrap()),
+            SourceRef::normal("test"),
         )
+        .await
         .unwrap();
         add_nameinfo_cache(
             d2.id.to_string().as_str(),
@@ -4288,12 +4364,13 @@ inbound_admission:
             serde_json::from_value(encode_ed25519_sk_to_pk_jwk(&s1)).unwrap(),
         );
         let id1 = d1.id.clone();
-        add_observed_cache(
-            d1.id.clone(),
-            None,
-            EncodedDocument::JsonLd(serde_json::to_value(&d1).unwrap()),
-            None,
+        commit_candidate_doc(
+            &d1.id,
+            Some(DidDocType::Device),
+            &EncodedDocument::JsonLd(serde_json::to_value(&d1).unwrap()),
+            SourceRef::normal("test"),
         )
+        .await
         .unwrap();
         add_nameinfo_cache(
             d1.id.to_string().as_str(),
@@ -4350,12 +4427,13 @@ inbound_admission:
             "test2",
             serde_json::from_value(encode_ed25519_sk_to_pk_jwk(&s2)).unwrap(),
         );
-        add_observed_cache(
-            d2.id.clone(),
-            None,
-            EncodedDocument::JsonLd(serde_json::to_value(&d2).unwrap()),
-            None,
+        commit_candidate_doc(
+            &d2.id,
+            Some(DidDocType::Device),
+            &EncodedDocument::JsonLd(serde_json::to_value(&d2).unwrap()),
+            SourceRef::normal("test"),
         )
+        .await
         .unwrap();
         add_nameinfo_cache(
             d2.id.to_string().as_str(),
@@ -4414,7 +4492,14 @@ inbound_admission:
         let id1 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        add_observed_cache(device_config.id.clone(), None, encoded_doc, None).unwrap();
+        commit_candidate_doc(
+            &device_config.id,
+            Some(DidDocType::Device),
+            &encoded_doc,
+            SourceRef::normal("test"),
+        )
+        .await
+        .unwrap();
         add_nameinfo_cache(
             device_config.id.to_string().as_str(),
             NameInfo::from_address(
@@ -4469,7 +4554,14 @@ inbound_admission:
         let _id2 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        add_observed_cache(device_config.id.clone(), None, encoded_doc, None).unwrap();
+        commit_candidate_doc(
+            &device_config.id,
+            Some(DidDocType::Device),
+            &encoded_doc,
+            SourceRef::normal("test"),
+        )
+        .await
+        .unwrap();
         add_nameinfo_cache(
             device_config.id.to_string().as_str(),
             NameInfo::from_address(
@@ -4544,7 +4636,14 @@ inbound_admission:
         let id1 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        add_observed_cache(device_config.id.clone(), None, encoded_doc, None).unwrap();
+        commit_candidate_doc(
+            &device_config.id,
+            Some(DidDocType::Device),
+            &encoded_doc,
+            SourceRef::normal("test"),
+        )
+        .await
+        .unwrap();
         add_nameinfo_cache(
             device_config.id.to_string().as_str(),
             NameInfo::from_address(
@@ -4599,7 +4698,14 @@ inbound_admission:
         let _id2 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        add_observed_cache(device_config.id.clone(), None, encoded_doc, None).unwrap();
+        commit_candidate_doc(
+            &device_config.id,
+            Some(DidDocType::Device),
+            &encoded_doc,
+            SourceRef::normal("test"),
+        )
+        .await
+        .unwrap();
         add_nameinfo_cache(
             device_config.id.to_string().as_str(),
             NameInfo::from_address(
@@ -4674,7 +4780,14 @@ inbound_admission:
         let id1 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        add_observed_cache(device_config.id.clone(), None, encoded_doc, None).unwrap();
+        commit_candidate_doc(
+            &device_config.id,
+            Some(DidDocType::Device),
+            &encoded_doc,
+            SourceRef::normal("test"),
+        )
+        .await
+        .unwrap();
         add_nameinfo_cache(
             device_config.id.to_string().as_str(),
             NameInfo::from_address(
@@ -4729,7 +4842,14 @@ inbound_admission:
         let _id2 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        add_observed_cache(device_config.id.clone(), None, encoded_doc, None).unwrap();
+        commit_candidate_doc(
+            &device_config.id,
+            Some(DidDocType::Device),
+            &encoded_doc,
+            SourceRef::normal("test"),
+        )
+        .await
+        .unwrap();
         add_nameinfo_cache(
             device_config.id.to_string().as_str(),
             NameInfo::from_address(
@@ -4818,7 +4938,14 @@ inbound_admission:
         let id1 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        add_observed_cache(device_config.id.clone(), None, encoded_doc, None).unwrap();
+        commit_candidate_doc(
+            &device_config.id,
+            Some(DidDocType::Device),
+            &encoded_doc,
+            SourceRef::normal("test"),
+        )
+        .await
+        .unwrap();
         add_nameinfo_cache(
             device_config.id.to_string().as_str(),
             NameInfo::from_address(
@@ -4873,7 +5000,14 @@ inbound_admission:
         let _id2 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        add_observed_cache(device_config.id.clone(), None, encoded_doc, None).unwrap();
+        commit_candidate_doc(
+            &device_config.id,
+            Some(DidDocType::Device),
+            &encoded_doc,
+            SourceRef::normal("test"),
+        )
+        .await
+        .unwrap();
         add_nameinfo_cache(
             device_config.id.to_string().as_str(),
             NameInfo::from_address(
@@ -4949,7 +5083,14 @@ inbound_admission:
         let id1 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        add_observed_cache(device_config.id.clone(), None, encoded_doc, None).unwrap();
+        commit_candidate_doc(
+            &device_config.id,
+            Some(DidDocType::Device),
+            &encoded_doc,
+            SourceRef::normal("test"),
+        )
+        .await
+        .unwrap();
         add_nameinfo_cache(
             device_config.id.to_string().as_str(),
             NameInfo::from_address(
@@ -5012,7 +5153,14 @@ inbound_admission:
         let _id2 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        add_observed_cache(device_config.id.clone(), None, encoded_doc, None).unwrap();
+        commit_candidate_doc(
+            &device_config.id,
+            Some(DidDocType::Device),
+            &encoded_doc,
+            SourceRef::normal("test"),
+        )
+        .await
+        .unwrap();
         add_nameinfo_cache(
             device_config.id.to_string().as_str(),
             NameInfo::from_address(
@@ -5095,7 +5243,14 @@ inbound_admission:
         let id1 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        add_observed_cache(device_config.id.clone(), None, encoded_doc, None).unwrap();
+        commit_candidate_doc(
+            &device_config.id,
+            Some(DidDocType::Device),
+            &encoded_doc,
+            SourceRef::normal("test"),
+        )
+        .await
+        .unwrap();
         add_nameinfo_cache(
             device_config.id.to_string().as_str(),
             NameInfo::from_address(
@@ -5159,7 +5314,14 @@ inbound_admission:
         let _id2 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        add_observed_cache(device_config.id.clone(), None, encoded_doc, None).unwrap();
+        commit_candidate_doc(
+            &device_config.id,
+            Some(DidDocType::Device),
+            &encoded_doc,
+            SourceRef::normal("test"),
+        )
+        .await
+        .unwrap();
         add_nameinfo_cache(
             device_config.id.to_string().as_str(),
             NameInfo::from_address(
@@ -5245,7 +5407,14 @@ inbound_admission:
         let id1 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        add_observed_cache(device_config.id.clone(), None, encoded_doc, None).unwrap();
+        commit_candidate_doc(
+            &device_config.id,
+            Some(DidDocType::Device),
+            &encoded_doc,
+            SourceRef::normal("test"),
+        )
+        .await
+        .unwrap();
         add_nameinfo_cache(
             device_config.id.to_string().as_str(),
             NameInfo::from_address(
@@ -5316,7 +5485,14 @@ inbound_admission:
         let _id2 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        add_observed_cache(device_config.id.clone(), None, encoded_doc, None).unwrap();
+        commit_candidate_doc(
+            &device_config.id,
+            Some(DidDocType::Device),
+            &encoded_doc,
+            SourceRef::normal("test"),
+        )
+        .await
+        .unwrap();
         add_nameinfo_cache(
             device_config.id.to_string().as_str(),
             NameInfo::from_address(
@@ -5402,7 +5578,14 @@ inbound_admission:
         let id1 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        add_observed_cache(device_config.id.clone(), None, encoded_doc, None).unwrap();
+        commit_candidate_doc(
+            &device_config.id,
+            Some(DidDocType::Device),
+            &encoded_doc,
+            SourceRef::normal("test"),
+        )
+        .await
+        .unwrap();
         add_nameinfo_cache(
             device_config.id.to_string().as_str(),
             NameInfo::from_address(
@@ -5473,7 +5656,14 @@ inbound_admission:
         let _id2 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        add_observed_cache(device_config.id.clone(), None, encoded_doc, None).unwrap();
+        commit_candidate_doc(
+            &device_config.id,
+            Some(DidDocType::Device),
+            &encoded_doc,
+            SourceRef::normal("test"),
+        )
+        .await
+        .unwrap();
         add_nameinfo_cache(
             device_config.id.to_string().as_str(),
             NameInfo::from_address(
@@ -5581,7 +5771,14 @@ inbound_admission:
         let id1 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        add_observed_cache(device_config.id.clone(), None, encoded_doc, None).unwrap();
+        commit_candidate_doc(
+            &device_config.id,
+            Some(DidDocType::Device),
+            &encoded_doc,
+            SourceRef::normal("test"),
+        )
+        .await
+        .unwrap();
         add_nameinfo_cache(
             device_config.id.to_string().as_str(),
             NameInfo::from_address(
@@ -5639,7 +5836,14 @@ inbound_admission:
         let _id2 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        add_observed_cache(device_config.id.clone(), None, encoded_doc, None).unwrap();
+        commit_candidate_doc(
+            &device_config.id,
+            Some(DidDocType::Device),
+            &encoded_doc,
+            SourceRef::normal("test"),
+        )
+        .await
+        .unwrap();
         add_nameinfo_cache(
             device_config.id.to_string().as_str(),
             NameInfo::from_address(
@@ -5715,7 +5919,14 @@ inbound_admission:
         let id1 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        add_observed_cache(device_config.id.clone(), None, encoded_doc, None).unwrap();
+        commit_candidate_doc(
+            &device_config.id,
+            Some(DidDocType::Device),
+            &encoded_doc,
+            SourceRef::normal("test"),
+        )
+        .await
+        .unwrap();
         add_nameinfo_cache(
             device_config.id.to_string().as_str(),
             NameInfo::from_address(
@@ -5775,7 +5986,14 @@ inbound_admission:
         let _id2 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        add_observed_cache(device_config.id.clone(), None, encoded_doc, None).unwrap();
+        commit_candidate_doc(
+            &device_config.id,
+            Some(DidDocType::Device),
+            &encoded_doc,
+            SourceRef::normal("test"),
+        )
+        .await
+        .unwrap();
         add_nameinfo_cache(
             device_config.id.to_string().as_str(),
             NameInfo::from_address(
@@ -5872,7 +6090,14 @@ inbound_admission:
         let id1 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        add_observed_cache(device_config.id.clone(), None, encoded_doc, None).unwrap();
+        commit_candidate_doc(
+            &device_config.id,
+            Some(DidDocType::Device),
+            &encoded_doc,
+            SourceRef::normal("test"),
+        )
+        .await
+        .unwrap();
         add_nameinfo_cache(
             device_config.id.to_string().as_str(),
             NameInfo::from_address(
@@ -5934,7 +6159,14 @@ inbound_admission:
         let _id2 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        add_observed_cache(device_config.id.clone(), None, encoded_doc, None).unwrap();
+        commit_candidate_doc(
+            &device_config.id,
+            Some(DidDocType::Device),
+            &encoded_doc,
+            SourceRef::normal("test"),
+        )
+        .await
+        .unwrap();
         add_nameinfo_cache(
             device_config.id.to_string().as_str(),
             NameInfo::from_address(
@@ -6021,7 +6253,14 @@ inbound_admission:
         let id1 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        add_observed_cache(device_config.id.clone(), None, encoded_doc, None).unwrap();
+        commit_candidate_doc(
+            &device_config.id,
+            Some(DidDocType::Device),
+            &encoded_doc,
+            SourceRef::normal("test"),
+        )
+        .await
+        .unwrap();
         add_nameinfo_cache(
             device_config.id.to_string().as_str(),
             NameInfo::from_address(
@@ -6090,7 +6329,14 @@ inbound_admission:
         let _id2 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        add_observed_cache(device_config.id.clone(), None, encoded_doc, None).unwrap();
+        commit_candidate_doc(
+            &device_config.id,
+            Some(DidDocType::Device),
+            &encoded_doc,
+            SourceRef::normal("test"),
+        )
+        .await
+        .unwrap();
         add_nameinfo_cache(
             device_config.id.to_string().as_str(),
             NameInfo::from_address(
@@ -6177,7 +6423,14 @@ inbound_admission:
         let id1 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        add_observed_cache(device_config.id.clone(), None, encoded_doc, None).unwrap();
+        commit_candidate_doc(
+            &device_config.id,
+            Some(DidDocType::Device),
+            &encoded_doc,
+            SourceRef::normal("test"),
+        )
+        .await
+        .unwrap();
         add_nameinfo_cache(
             device_config.id.to_string().as_str(),
             NameInfo::from_address(
@@ -6246,7 +6499,14 @@ inbound_admission:
         let _id2 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        add_observed_cache(device_config.id.clone(), None, encoded_doc, None).unwrap();
+        commit_candidate_doc(
+            &device_config.id,
+            Some(DidDocType::Device),
+            &encoded_doc,
+            SourceRef::normal("test"),
+        )
+        .await
+        .unwrap();
         add_nameinfo_cache(
             device_config.id.to_string().as_str(),
             NameInfo::from_address(
