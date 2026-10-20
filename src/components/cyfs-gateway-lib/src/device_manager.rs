@@ -6,8 +6,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use chrono::{Datelike, Local, TimeZone};
-use sfo_sql::Row;
-use sfo_sql::sqlite::sql_query;
+use sqlx::Row;
+use sqlx::sqlite::SqlitePool;
 use tokio::task::JoinHandle;
 
 #[derive(Clone)]
@@ -77,7 +77,7 @@ pub trait DeviceOnlineStore: Send + Sync {
 pub type DeviceOnlineStoreRef = Arc<dyn DeviceOnlineStore + Send + Sync>;
 
 pub struct SqliteDeviceOnlineStore {
-    pool: sfo_sql::sqlite::SqlPool,
+    pool: SqlitePool,
 }
 
 impl SqliteDeviceOnlineStore {
@@ -95,24 +95,26 @@ impl SqliteDeviceOnlineStore {
             format!("sqlite://{}", path.to_string_lossy())
         };
 
-        let pool = sfo_sql::sqlite::SqlPool::open(dsn.as_str(), 5, None)
+        let pool = crate::collections::sqlite_pool::open_sqlite_pool(dsn.as_str())
             .await
             .map_err(|e| e.to_string())?;
 
-        let mut conn = pool.get_conn().await.map_err(|e| e.to_string())?;
-        conn.execute_sql(sql_query(
+        sqlx::query(
             "CREATE TABLE IF NOT EXISTS device_daily_online (ip TEXT NOT NULL, day_key INTEGER NOT NULL, online_seconds INTEGER NOT NULL, updated_at INTEGER NOT NULL, PRIMARY KEY(ip, day_key));",
-        ))
+        )
+        .execute(&pool)
         .await
         .map_err(|e| e.to_string())?;
-        conn.execute_sql(sql_query(
+        sqlx::query(
             "CREATE INDEX IF NOT EXISTS idx_device_daily_online_day_key ON device_daily_online(day_key);",
-        ))
+        )
+        .execute(&pool)
         .await
         .map_err(|e| e.to_string())?;
-        conn.execute_sql(sql_query(
+        sqlx::query(
             "CREATE TABLE IF NOT EXISTS device_runtime_state (ip TEXT PRIMARY KEY, mac TEXT, hostname TEXT, last_connected_at INTEGER NOT NULL, last_disconnected_at INTEGER, day_key INTEGER NOT NULL, today_online_seconds INTEGER NOT NULL, updated_at INTEGER NOT NULL);",
-        ))
+        )
+        .execute(&pool)
         .await
         .map_err(|e| e.to_string())?;
 
@@ -123,23 +125,16 @@ impl SqliteDeviceOnlineStore {
 #[async_trait]
 impl DeviceOnlineStore for SqliteDeviceOnlineStore {
     async fn load_device(&self, ip: IpAddr) -> Result<Option<PersistedDeviceState>, String> {
-        let mut conn = self.pool.get_conn().await.map_err(|e| e.to_string())?;
-        let row = match conn
-            .query_one(
-                sql_query(
-                    "SELECT ip, mac, hostname, last_connected_at, last_disconnected_at, day_key, today_online_seconds FROM device_runtime_state WHERE ip = ?;",
-                )
-                .bind(ip.to_string()),
-            )
-            .await
+        let row = match sqlx::query(
+            "SELECT ip, mac, hostname, last_connected_at, last_disconnected_at, day_key, today_online_seconds FROM device_runtime_state WHERE ip = ?;",
+        )
+        .bind(ip.to_string())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| e.to_string())?
         {
-            Ok(row) => row,
-            Err(e) => {
-                if e.code() == sfo_sql::errors::SqlErrorCode::NotFound {
-                    return Ok(None);
-                }
-                return Err(e.to_string());
-            }
+            Some(row) => row,
+            None => return Ok(None),
         };
 
         let ip_text: String = row.get("ip");
@@ -162,34 +157,32 @@ impl DeviceOnlineStore for SqliteDeviceOnlineStore {
             return Ok(());
         }
 
-        let mut conn = self.pool.get_conn().await.map_err(|e| e.to_string())?;
+        let mut conn = self.pool.acquire().await.map_err(|e| e.to_string())?;
         for state in states {
             let updated_at = now_seconds() as i64;
-            conn.execute_sql(
-                sql_query(
-                    "INSERT INTO device_daily_online (ip, day_key, online_seconds, updated_at) VALUES (?, ?, ?, ?) ON CONFLICT(ip, day_key) DO UPDATE SET online_seconds = excluded.online_seconds, updated_at = excluded.updated_at;",
-                )
-                .bind(state.ip.to_string())
-                .bind(state.day_key as i64)
-                .bind(state.today_online_seconds as i64)
-                .bind(updated_at),
+            sqlx::query(
+                "INSERT INTO device_daily_online (ip, day_key, online_seconds, updated_at) VALUES (?, ?, ?, ?) ON CONFLICT(ip, day_key) DO UPDATE SET online_seconds = excluded.online_seconds, updated_at = excluded.updated_at;",
             )
+            .bind(state.ip.to_string())
+            .bind(state.day_key as i64)
+            .bind(state.today_online_seconds as i64)
+            .bind(updated_at)
+            .execute(&mut *conn)
             .await
             .map_err(|e| e.to_string())?;
 
-            conn.execute_sql(
-                sql_query(
-                    "INSERT INTO device_runtime_state (ip, mac, hostname, last_connected_at, last_disconnected_at, day_key, today_online_seconds, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(ip) DO UPDATE SET mac = excluded.mac, hostname = excluded.hostname, last_connected_at = excluded.last_connected_at, last_disconnected_at = excluded.last_disconnected_at, day_key = excluded.day_key, today_online_seconds = excluded.today_online_seconds, updated_at = excluded.updated_at;",
-                )
-                .bind(state.ip.to_string())
-                .bind(state.mac)
-                .bind(state.hostname)
-                .bind(state.last_connected_at as i64)
-                .bind(state.last_disconnected_at.map(|v| v as i64))
-                .bind(state.day_key as i64)
-                .bind(state.today_online_seconds as i64)
-                .bind(updated_at),
+            sqlx::query(
+                "INSERT INTO device_runtime_state (ip, mac, hostname, last_connected_at, last_disconnected_at, day_key, today_online_seconds, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(ip) DO UPDATE SET mac = excluded.mac, hostname = excluded.hostname, last_connected_at = excluded.last_connected_at, last_disconnected_at = excluded.last_disconnected_at, day_key = excluded.day_key, today_online_seconds = excluded.today_online_seconds, updated_at = excluded.updated_at;",
             )
+            .bind(state.ip.to_string())
+            .bind(state.mac)
+            .bind(state.hostname)
+            .bind(state.last_connected_at as i64)
+            .bind(state.last_disconnected_at.map(|v| v as i64))
+            .bind(state.day_key as i64)
+            .bind(state.today_online_seconds as i64)
+            .bind(updated_at)
+            .execute(&mut *conn)
             .await
             .map_err(|e| e.to_string())?;
         }
@@ -198,12 +191,9 @@ impl DeviceOnlineStore for SqliteDeviceOnlineStore {
     }
 
     async fn cleanup_daily_before(&self, min_day_key: i32) -> Result<u64, String> {
-        let mut conn = self.pool.get_conn().await.map_err(|e| e.to_string())?;
-        let result = conn
-            .execute_sql(
-                sql_query("DELETE FROM device_daily_online WHERE day_key < ?;")
-                    .bind(min_day_key as i64),
-            )
+        let result = sqlx::query("DELETE FROM device_daily_online WHERE day_key < ?;")
+            .bind(min_day_key as i64)
+            .execute(&self.pool)
             .await
             .map_err(|e| e.to_string())?;
 

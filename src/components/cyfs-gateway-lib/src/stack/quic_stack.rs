@@ -414,7 +414,7 @@ impl QuicConnectionHandler {
                                         }
                                     };
                                 log::debug!("quic accept bi: {} -> {}", remote_addr, local_addr);
-                                let stream = sfo_split::Splittable::new(recv, send);
+                                let stream = tokio::io::join(recv, send);
                                 let stream: Box<dyn AsyncStream> =
                                     if let Some(io_dump) = self.io_dump.clone() {
                                         Box::new(DumpStream::new(
@@ -697,7 +697,7 @@ impl QuicConnectionHandler {
                                             local_addr
                                         );
                                         let server = server.clone();
-                                        let stream = sfo_split::Splittable::new(recv, send);
+                                        let stream = tokio::io::join(recv, send);
                                         let stream: Box<dyn AsyncStream> =
                                             if let Some(io_dump) = self.io_dump.clone() {
                                                 Box::new(DumpStream::new(

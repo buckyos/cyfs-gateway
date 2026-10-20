@@ -1,13 +1,14 @@
+use super::sqlite_pool::open_sqlite_pool;
 use crate::{collection_value_to_json_value, json_value_to_collection_value};
 use cyfs_process_chain::{CollectionValue, MapCollection, MapCollectionTraverseCallBackRef};
-use sfo_sql::Row;
-use sfo_sql::sqlite::sql_query;
+use sqlx::Row;
+use sqlx::sqlite::SqlitePool;
 
 pub struct SqliteMap {
     pub table_name: String,
     pub key_column: String,
     pub value_column: String,
-    pub pool: sfo_sql::sqlite::SqlPool,
+    pool: SqlitePool,
 }
 
 impl SqliteMap {
@@ -17,64 +18,61 @@ impl SqliteMap {
         key_column: Option<String>,
         value_column: Option<String>,
     ) -> Result<Self, String> {
-        let pool = sfo_sql::sqlite::SqlPool::open(path.into().as_str(), 5, None)
+        let pool = open_sqlite_pool(path.into().as_str())
             .await
             .map_err(|e| e.to_string())?;
 
         let table_name = if let Some(name) = table_name {
             name
         } else {
-            let mut conn = pool.get_conn().await.map_err(|e| e.to_string())?;
             // 从数据库中获取表名
-            match conn
-                .query_one(sql_query(
-                    "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name;",
-                ))
+            match sqlx::query("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name;")
+                .fetch_optional(&pool)
                 .await
+                .map_err(|e| e.to_string())?
             {
-                Ok(row) => row.get("name"),
-                Err(e) => {
-                    if e.code() == sfo_sql::errors::SqlErrorCode::NotFound {
-                        // 创建表
-                        conn.execute_sql(sql_query(
-                            "CREATE TABLE map_datas (key_item TEXT PRIMARY KEY, value_item TEXT);",
-                        ))
-                        .await
-                        .map_err(|e| e.to_string())?;
-                        "map_datas".to_string()
-                    } else {
-                        return Err(e.to_string());
-                    }
+                Some(row) => row.get("name"),
+                None => {
+                    // 创建表
+                    sqlx::query(
+                        "CREATE TABLE map_datas (key_item TEXT PRIMARY KEY, value_item TEXT);",
+                    )
+                    .execute(&pool)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                    "map_datas".to_string()
                 }
             }
         };
 
         let (key_column, value_column) = if key_column.is_none() || value_column.is_none() {
             // 确保表中有需要的列
-            let mut conn = pool.get_conn().await.map_err(|e| e.to_string())?;
-            let columns: Vec<String> = conn
-                .query_all(sql_query(&format!("PRAGMA table_info({});", table_name)))
-                .await
-                .map_err(|e| e.to_string())?
-                .into_iter()
-                .map(|row| row.get("name"))
-                .collect();
+            let columns: Vec<String> =
+                sqlx::query(&format!("PRAGMA table_info({});", table_name))
+                    .fetch_all(&pool)
+                    .await
+                    .map_err(|e| e.to_string())?
+                    .into_iter()
+                    .map(|row| row.get("name"))
+                    .collect();
 
             if columns.len() == 2 {
                 (columns[0].clone(), columns[1].clone())
             } else if columns.len() == 0 {
                 let key_column = "key_item".to_string();
                 let value_column = "value_item".to_string();
-                conn.execute_sql(sql_query(&format!(
+                sqlx::query(&format!(
                     "ALTER TABLE {} ADD COLUMN {} TEXT;",
                     table_name, key_column
-                )))
+                ))
+                .execute(&pool)
                 .await
                 .map_err(|e| e.to_string())?;
-                conn.execute_sql(sql_query(&format!(
+                sqlx::query(&format!(
                     "ALTER TABLE {} ADD COLUMN {} TEXT;",
                     table_name, value_column
-                )))
+                ))
+                .execute(&pool)
                 .await
                 .map_err(|e| e.to_string())?;
                 (key_column, value_column)
@@ -97,30 +95,26 @@ impl SqliteMap {
 #[async_trait::async_trait]
 impl MapCollection for SqliteMap {
     async fn len(&self) -> Result<usize, String> {
-        let mut conn = self.pool.get_conn().await.map_err(|e| e.to_string())?;
-        let row = conn
-            .query_one(sql_query(&format!(
-                "SELECT COUNT(*) AS count FROM {};",
-                self.table_name
-            )))
-            .await
-            .map_err(|e| e.to_string())?;
+        let row = sqlx::query(&format!(
+            "SELECT COUNT(*) AS count FROM {};",
+            self.table_name
+        ))
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| e.to_string())?;
         Ok(row.get::<i64, _>("count") as usize)
     }
 
     async fn insert_new(&self, key: &str, value: CollectionValue) -> Result<bool, String> {
-        let mut conn = self.pool.get_conn().await.map_err(|e| e.to_string())?;
-        let result = conn
-            .execute_sql(
-                sql_query(&format!(
-                    "INSERT OR IGNORE INTO {} ({}, {}) VALUES (?, ?);",
-                    self.table_name, self.key_column, self.value_column
-                ))
-                .bind(key)
-                .bind(collection_value_to_json_value(&value).await.to_string()),
-            )
-            .await
-            .map_err(|e| e.to_string())?;
+        let result = sqlx::query(&format!(
+            "INSERT OR IGNORE INTO {} ({}, {}) VALUES (?, ?);",
+            self.table_name, self.key_column, self.value_column
+        ))
+        .bind(key)
+        .bind(collection_value_to_json_value(&value).await.to_string())
+        .execute(&self.pool)
+        .await
+        .map_err(|e| e.to_string())?;
         Ok(result.rows_affected() > 0)
     }
 
@@ -132,15 +126,13 @@ impl MapCollection for SqliteMap {
         // 先检查是否存在旧值
         let old_value = self.get(key).await?;
 
-        let mut conn = self.pool.get_conn().await.map_err(|e| e.to_string())?;
-        conn.execute_sql(
-            sql_query(&format!(
-                "INSERT OR REPLACE INTO {} ({}, {}) VALUES (?, ?);",
-                self.table_name, self.key_column, self.value_column
-            ))
-            .bind(key)
-            .bind(collection_value_to_json_value(&value).await.to_string()),
-        )
+        sqlx::query(&format!(
+            "INSERT OR REPLACE INTO {} ({}, {}) VALUES (?, ?);",
+            self.table_name, self.key_column, self.value_column
+        ))
+        .bind(key)
+        .bind(collection_value_to_json_value(&value).await.to_string())
+        .execute(&self.pool)
         .await
         .map_err(|e| e.to_string())?;
 
@@ -148,68 +140,47 @@ impl MapCollection for SqliteMap {
     }
 
     async fn get(&self, key: &str) -> Result<Option<CollectionValue>, String> {
-        let mut conn = self.pool.get_conn().await.map_err(|e| e.to_string())?;
-        match conn
-            .query_one(
-                sql_query(&format!(
-                    "SELECT {} FROM {} WHERE {} = ?;",
-                    self.value_column, self.table_name, self.key_column
-                ))
-                .bind(key),
-            )
-            .await
-        {
-            Ok(row) => {
+        let row = sqlx::query(&format!(
+            "SELECT {} FROM {} WHERE {} = ?;",
+            self.value_column, self.table_name, self.key_column
+        ))
+        .bind(key)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| e.to_string())?;
+        match row {
+            Some(row) => {
                 let value: String = row.get(self.value_column.as_str());
                 let value: serde_json::Value =
                     serde_json::from_str(value.as_str()).map_err(|e| e.to_string())?;
                 Ok(Some(json_value_to_collection_value(&value).await))
             }
-            Err(e) => {
-                if e.code() == sfo_sql::errors::SqlErrorCode::NotFound {
-                    Ok(None)
-                } else {
-                    Err(e.to_string())
-                }
-            }
+            None => Ok(None),
         }
     }
 
     async fn contains_key(&self, key: &str) -> Result<bool, String> {
-        let mut conn = self.pool.get_conn().await.map_err(|e| e.to_string())?;
-        match conn
-            .query_one(
-                sql_query(&format!(
-                    "SELECT 1 FROM {} WHERE {} = ?;",
-                    self.table_name, self.key_column
-                ))
-                .bind(key),
-            )
-            .await
-        {
-            Ok(_) => Ok(true),
-            Err(e) => {
-                if e.code() == sfo_sql::errors::SqlErrorCode::NotFound {
-                    Ok(false)
-                } else {
-                    Err(e.to_string())
-                }
-            }
-        }
+        let row = sqlx::query(&format!(
+            "SELECT 1 FROM {} WHERE {} = ?;",
+            self.table_name, self.key_column
+        ))
+        .bind(key)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| e.to_string())?;
+        Ok(row.is_some())
     }
 
     async fn remove(&self, key: &str) -> Result<Option<CollectionValue>, String> {
         // 先获取旧值
         let old_value = self.get(key).await?;
 
-        let mut conn = self.pool.get_conn().await.map_err(|e| e.to_string())?;
-        conn.execute_sql(
-            sql_query(&format!(
-                "DELETE FROM {} WHERE {} = ?;",
-                self.table_name, self.key_column
-            ))
-            .bind(key),
-        )
+        sqlx::query(&format!(
+            "DELETE FROM {} WHERE {} = ?;",
+            self.table_name, self.key_column
+        ))
+        .bind(key)
+        .execute(&self.pool)
         .await
         .map_err(|e| e.to_string())?;
 
@@ -217,14 +188,13 @@ impl MapCollection for SqliteMap {
     }
 
     async fn traverse(&self, callback: MapCollectionTraverseCallBackRef) -> Result<(), String> {
-        let mut conn = self.pool.get_conn().await.map_err(|e| e.to_string())?;
-        let rows = conn
-            .query_all(sql_query(&format!(
-                "SELECT {}, {} FROM {}",
-                self.key_column, self.value_column, self.table_name
-            )))
-            .await
-            .map_err(|e| e.to_string())?;
+        let rows = sqlx::query(&format!(
+            "SELECT {}, {} FROM {}",
+            self.key_column, self.value_column, self.table_name
+        ))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| e.to_string())?;
 
         for row in rows {
             let key: String = row.get(self.key_column.as_str());
@@ -238,14 +208,13 @@ impl MapCollection for SqliteMap {
     }
 
     async fn dump(&self) -> Result<Vec<(String, CollectionValue)>, String> {
-        let mut conn = self.pool.get_conn().await.map_err(|e| e.to_string())?;
-        let rows = conn
-            .query_all(sql_query(&format!(
-                "SELECT {}, {} FROM {}",
-                self.key_column, self.value_column, self.table_name
-            )))
-            .await
-            .map_err(|e| e.to_string())?;
+        let rows = sqlx::query(&format!(
+            "SELECT {}, {} FROM {}",
+            self.key_column, self.value_column, self.table_name
+        ))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| e.to_string())?;
 
         let mut result = Vec::new();
         for row in rows {
