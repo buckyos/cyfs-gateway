@@ -5,7 +5,8 @@ edition = "2024"
 
 [dependencies]
 tokio.workspace = true
-sfo-result = "0.2"
+thiserror.workspace = true
+buckyos-kit.workspace = true
 dns-lookup = "3"
 
 [target.'cfg(target_os = "windows")'.dependencies]

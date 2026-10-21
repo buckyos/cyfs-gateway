@@ -207,19 +207,117 @@ pub fn get_min_priority(chain_configs: &ProcessChainConfigs) -> i32 {
     chain_configs.iter().map(|c| c.priority).min().unwrap_or(0)
 }
 
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub enum ConfigErrorCode {
     InvalidConfig,
     ProcessChainError,
     AlreadyExists,
 }
-pub type ConfigResult<T> = sfo_result::Result<T, ConfigErrorCode>;
-pub type ConfigError = sfo_result::Error<ConfigErrorCode>;
+
+#[derive(thiserror::Error)]
+#[error("{}", self.display_line())]
+pub struct ConfigError {
+    code: ConfigErrorCode,
+    msg: String,
+    #[source]
+    source: Option<Box<dyn std::error::Error + Send + Sync + 'static>>,
+    trace: buckyos_kit::ErrorTrace,
+}
+
+pub type ConfigResult<T> = std::result::Result<T, ConfigError>;
+
+impl ConfigError {
+    #[track_caller]
+    pub fn new(code: ConfigErrorCode, msg: impl Into<String>) -> Self {
+        Self {
+            code,
+            msg: msg.into(),
+            source: None,
+            trace: buckyos_kit::ErrorTrace::capture(),
+        }
+    }
+
+    #[track_caller]
+    pub fn with_source(
+        code: ConfigErrorCode,
+        msg: impl Into<String>,
+        source: impl Into<Box<dyn std::error::Error + Send + Sync + 'static>>,
+    ) -> Self {
+        Self {
+            code,
+            msg: msg.into(),
+            source: Some(source.into()),
+            trace: buckyos_kit::ErrorTrace::capture(),
+        }
+    }
+
+    pub fn code(&self) -> ConfigErrorCode {
+        self.code
+    }
+
+    pub fn msg(&self) -> &str {
+        &self.msg
+    }
+
+    pub fn trace(&self) -> &buckyos_kit::ErrorTrace {
+        &self.trace
+    }
+
+    fn source_ref(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.source
+            .as_deref()
+            .map(|e| e as &(dyn std::error::Error + 'static))
+    }
+
+    fn display_line(&self) -> buckyos_kit::ErrorLine<'_> {
+        buckyos_kit::ErrorLine::new(&self.code, &self.msg, self.source_ref())
+    }
+}
+
+impl std::fmt::Debug for ConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.trace
+            .fmt_debug(f, &self.code, &self.msg, self.source_ref())
+    }
+}
+
+/// `config_err!(code)` / `config_err!(code, fmt, args..)` / `config_err!(fmt, args..)`
+#[macro_export]
+macro_rules! config_err {
+    ( $fmt:literal ) => {
+        $crate::ConfigError::new(::std::default::Default::default(), format!($fmt))
+    };
+    ( $fmt:literal, $($arg:tt)* ) => {
+        $crate::ConfigError::new(::std::default::Default::default(), format!($fmt, $($arg)*))
+    };
+    ( $code:path ) => {
+        $crate::ConfigError::new($code, ::std::string::String::new())
+    };
+    ( $code:path, $($arg:tt)* ) => {
+        $crate::ConfigError::new($code, format!($($arg)*))
+    };
+}
+
+/// Closure for `map_err` that keeps the error as `source`. Same forms as `config_err!`.
+#[macro_export]
+macro_rules! into_config_err {
+    ( $fmt:literal ) => {
+        |e| $crate::ConfigError::with_source(::std::default::Default::default(), format!($fmt), e)
+    };
+    ( $fmt:literal, $($arg:tt)* ) => {
+        |e| $crate::ConfigError::with_source(::std::default::Default::default(), format!($fmt, $($arg)*), e)
+    };
+    ( $code:path ) => {
+        |e| $crate::ConfigError::with_source($code, ::std::string::String::new(), e)
+    };
+    ( $code:path, $($arg:tt)* ) => {
+        |e| $crate::ConfigError::with_source($code, format!($($arg)*), e)
+    };
+}
 use crate::StackProtocol;
 use cyfs_acme::{AcmeIdentityConfig, ChallengeType};
 use cyfs_process_chain::{Block, BlockParser, ProcessChain};
-pub use sfo_result::err as config_err;
-pub use sfo_result::into_err as into_config_err;
+pub use crate::config_err;
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct TcpConfig {

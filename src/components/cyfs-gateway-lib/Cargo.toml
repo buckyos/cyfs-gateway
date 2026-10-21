@@ -44,7 +44,6 @@ rustls-pemfile.workspace = true
 ring.workspace = true
 tokio-socks = "*"
 libsocks_client = "*"
-sfo-result = "0.2"
 buckyos-io.workspace = true
 sqlx.workspace = true
 serde_yaml_ng.workspace = true

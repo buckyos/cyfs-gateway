@@ -22,8 +22,9 @@ pub(crate) use tls_cert_resolver::*;
 pub use tls_stack::*;
 pub use udp_stack::*;
 
-#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Default)]
 pub enum StackErrorCode {
+    #[default]
     Failed,
     BindFailed,
     ProcessChainError,
@@ -45,15 +46,111 @@ pub enum StackErrorCode {
     IncompatibleStack,
     StackHandoffCycle,
 }
-pub type StackResult<T> = sfo_result::Result<T, StackErrorCode>;
-pub type StackError = sfo_result::Error<StackErrorCode>;
+#[derive(thiserror::Error)]
+#[error("{}", self.display_line())]
+pub struct StackError {
+    code: StackErrorCode,
+    msg: String,
+    #[source]
+    source: Option<Box<dyn std::error::Error + Send + Sync + 'static>>,
+    trace: buckyos_kit::ErrorTrace,
+}
+
+pub type StackResult<T> = std::result::Result<T, StackError>;
+
+impl StackError {
+    #[track_caller]
+    pub fn new(code: StackErrorCode, msg: impl Into<String>) -> Self {
+        Self {
+            code,
+            msg: msg.into(),
+            source: None,
+            trace: buckyos_kit::ErrorTrace::capture(),
+        }
+    }
+
+    #[track_caller]
+    pub fn with_source(
+        code: StackErrorCode,
+        msg: impl Into<String>,
+        source: impl Into<Box<dyn std::error::Error + Send + Sync + 'static>>,
+    ) -> Self {
+        Self {
+            code,
+            msg: msg.into(),
+            source: Some(source.into()),
+            trace: buckyos_kit::ErrorTrace::capture(),
+        }
+    }
+
+    pub fn code(&self) -> StackErrorCode {
+        self.code
+    }
+
+    pub fn msg(&self) -> &str {
+        &self.msg
+    }
+
+    pub fn trace(&self) -> &buckyos_kit::ErrorTrace {
+        &self.trace
+    }
+
+    fn source_ref(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.source
+            .as_deref()
+            .map(|e| e as &(dyn std::error::Error + 'static))
+    }
+
+    fn display_line(&self) -> buckyos_kit::ErrorLine<'_> {
+        buckyos_kit::ErrorLine::new(&self.code, &self.msg, self.source_ref())
+    }
+}
+
+impl std::fmt::Debug for StackError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.trace
+            .fmt_debug(f, &self.code, &self.msg, self.source_ref())
+    }
+}
+
+/// `stack_err!(code)` / `stack_err!(code, fmt, args..)` / `stack_err!(fmt, args..)`
+#[macro_export]
+macro_rules! stack_err {
+    ( $fmt:literal ) => {
+        $crate::StackError::new(::std::default::Default::default(), format!($fmt))
+    };
+    ( $fmt:literal, $($arg:tt)* ) => {
+        $crate::StackError::new(::std::default::Default::default(), format!($fmt, $($arg)*))
+    };
+    ( $code:path ) => {
+        $crate::StackError::new($code, ::std::string::String::new())
+    };
+    ( $code:path, $($arg:tt)* ) => {
+        $crate::StackError::new($code, format!($($arg)*))
+    };
+}
+
+/// Closure for `map_err` that keeps the error as `source`. Same forms as `stack_err!`.
+#[macro_export]
+macro_rules! into_stack_err {
+    ( $fmt:literal ) => {
+        |e| $crate::StackError::with_source(::std::default::Default::default(), format!($fmt), e)
+    };
+    ( $fmt:literal, $($arg:tt)* ) => {
+        |e| $crate::StackError::with_source(::std::default::Default::default(), format!($fmt, $($arg)*), e)
+    };
+    ( $code:path ) => {
+        |e| $crate::StackError::with_source($code, ::std::string::String::new(), e)
+    };
+    ( $code:path, $($arg:tt)* ) => {
+        |e| $crate::StackError::with_source($code, format!($($arg)*), e)
+    };
+}
 use crate::forward::{
     ForwardFailureRegistry, ForwardPlan, NextUpstreamCondition, NextUpstreamPolicy,
     apply_least_time_via_tunnel_mgr,
 };
 use crate::{DatagramClientBox, TunnelManager};
-pub use sfo_result::err as stack_err;
-pub use sfo_result::into_err as into_stack_err;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::Notify;

@@ -28,12 +28,10 @@ pub use sn_resolver::*;
 pub use sn_seed::*;
 pub use sn_server::*;
 
-pub use sfo_result::err as sn_err;
-pub use sfo_result::into_err as into_sn_err;
-
-#[derive(Debug, Clone, Copy, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SnErrorCode {
+    #[default]
     Failed,
     InvalidInput,
     NotFound,
@@ -44,5 +42,103 @@ pub enum SnErrorCode {
     RemoteError,
 }
 
-pub type SnResult<T> = sfo_result::Result<T, SnErrorCode>;
-pub type SnError = sfo_result::Error<SnErrorCode>;
+#[derive(thiserror::Error)]
+#[error("{}", self.display_line())]
+pub struct SnError {
+    code: SnErrorCode,
+    msg: String,
+    #[source]
+    source: Option<Box<dyn std::error::Error + Send + Sync + 'static>>,
+    trace: buckyos_kit::ErrorTrace,
+}
+
+pub type SnResult<T> = std::result::Result<T, SnError>;
+
+impl SnError {
+    #[track_caller]
+    pub fn new(code: SnErrorCode, msg: impl Into<String>) -> Self {
+        Self {
+            code,
+            msg: msg.into(),
+            source: None,
+            trace: buckyos_kit::ErrorTrace::capture(),
+        }
+    }
+
+    #[track_caller]
+    pub fn with_source(
+        code: SnErrorCode,
+        msg: impl Into<String>,
+        source: impl Into<Box<dyn std::error::Error + Send + Sync + 'static>>,
+    ) -> Self {
+        Self {
+            code,
+            msg: msg.into(),
+            source: Some(source.into()),
+            trace: buckyos_kit::ErrorTrace::capture(),
+        }
+    }
+
+    pub fn code(&self) -> SnErrorCode {
+        self.code
+    }
+
+    pub fn msg(&self) -> &str {
+        &self.msg
+    }
+
+    pub fn trace(&self) -> &buckyos_kit::ErrorTrace {
+        &self.trace
+    }
+
+    fn source_ref(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.source
+            .as_deref()
+            .map(|e| e as &(dyn std::error::Error + 'static))
+    }
+
+    fn display_line(&self) -> buckyos_kit::ErrorLine<'_> {
+        buckyos_kit::ErrorLine::new(&self.code, &self.msg, self.source_ref())
+    }
+}
+
+impl std::fmt::Debug for SnError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.trace
+            .fmt_debug(f, &self.code, &self.msg, self.source_ref())
+    }
+}
+
+/// `sn_err!(code)` / `sn_err!(code, fmt, args..)` / `sn_err!(fmt, args..)`
+#[macro_export]
+macro_rules! sn_err {
+    ( $fmt:literal ) => {
+        $crate::SnError::new(::std::default::Default::default(), format!($fmt))
+    };
+    ( $fmt:literal, $($arg:tt)* ) => {
+        $crate::SnError::new(::std::default::Default::default(), format!($fmt, $($arg)*))
+    };
+    ( $code:path ) => {
+        $crate::SnError::new($code, ::std::string::String::new())
+    };
+    ( $code:path, $($arg:tt)* ) => {
+        $crate::SnError::new($code, format!($($arg)*))
+    };
+}
+
+/// Closure for `map_err` that keeps the error as `source`. Same forms as `sn_err!`.
+#[macro_export]
+macro_rules! into_sn_err {
+    ( $fmt:literal ) => {
+        |e| $crate::SnError::with_source(::std::default::Default::default(), format!($fmt), e)
+    };
+    ( $fmt:literal, $($arg:tt)* ) => {
+        |e| $crate::SnError::with_source(::std::default::Default::default(), format!($fmt, $($arg)*), e)
+    };
+    ( $code:path ) => {
+        |e| $crate::SnError::with_source($code, ::std::string::String::new(), e)
+    };
+    ( $code:path, $($arg:tt)* ) => {
+        |e| $crate::SnError::with_source($code, format!($($arg)*), e)
+    };
+}
