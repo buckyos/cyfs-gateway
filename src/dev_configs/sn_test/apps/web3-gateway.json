@@ -9,10 +9,10 @@
     },
     "commands": {
       "build": [
-        "cd {{system.base_dir}}/../../cyfs-gateway/src && uv run ./dev_configs/web3_gateway_staging.py build --target aarch64"
+        "cd {{system.base_dir}}/../../cyfs-gateway/src && uv run ./dev_configs/web3_gateway_staging.py build"
       ],
       "build_all": [
-        "cd {{system.base_dir}}/../../cyfs-gateway/src && uv run ./dev_configs/web3_gateway_staging.py build-all --target aarch64 --sn-ip {{sn.ip}} --enable-bns-proxy"
+        "cd {{system.base_dir}}/../../cyfs-gateway/src && uv run ./dev_configs/web3_gateway_staging.py build-all --sn-ip {{sn.ip}} --enable-bns-proxy"
       ],
       "install": [
         "sudo chmod +x /opt/web3-gateway/web3_gateway /opt/web3-gateway/init_anvil.py"

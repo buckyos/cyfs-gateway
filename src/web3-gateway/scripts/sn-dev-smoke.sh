@@ -19,7 +19,8 @@
 #                  effectiveOwner、documentVersion、docHash 和完整 body
 #   S7 BNS proxy   auth.register 用户只给 asset_owner，SN 代付 gas 注册 BNS；
 #                  再用 access token 经 bns.publish_dns_txt 代理写 dns_txt，
-#                  最后从 DNS TXT 读回 indexer 投影。
+#                  最后从 DNS TXT 读回 indexer 投影。VM 模式下开头的激活码重置
+#                  （仅 loopback 可调）经 buckyos-devtest <group> run sn 在 SN 内执行。
 #   S8 keep-tunnel  OOD peer 到 SN 的 RTCP keep-tunnel 处于 ESTABLISHED
 #      （仅 --vm；经 buckyos-devtest <group> run sn 检查 rtcp 端口的入站长
 #      连接。tunnel 断开时该 case 必须失败；单节点 group 用 --no-keep-tunnel
@@ -48,7 +49,7 @@ Options:
   --dns-server <addr>  DNS server address; defaults to 127.0.0.1 locally and the VM IP in VM mode.
   --http-origin <url>  HTTP origin; defaults to local high port or http://sn.<domain> in VM mode.
   --config-dir <path>  VM devtest config dir; default $DEFAULT_VM_CONFIG_DIR.
-  --devtest-group <g>  buckyos-devtest group for the S8 keep-tunnel check; default sntest.
+  --devtest-group <g>  buckyos-devtest group used in VM mode by S7 (reset on node sn) and S8; default sntest.
   --devtest-dir <dir>  Directory to run buckyos-devtest from (must contain dev_configs/<group>.json);
                        auto-detected from this repo and the sibling buckyos checkout.
   --rtcp-port <port>   SN RTCP listen port for the keep-tunnel check; default 2980.
@@ -184,9 +185,9 @@ esac
 SN_HTTP_HOST="sn.$SN_HOST"
 ALICE_HOST="alice.web3.$SN_HOST"
 
-# S8 keep-tunnel 依赖 buckyos-devtest（VM 后端保持透明，不直接调 multipass）。
-# devtest 要求 cwd 含 dev_configs/<group>.json：优先显式 --devtest-dir，
-# 其次本仓库，再次同级 buckyos checkout（sntest 组即在那里）。
+# VM 模式的 S7 重置与 S8 keep-tunnel 依赖 buckyos-devtest（VM 后端保持透明，
+# 不直接调 multipass）。devtest 要求 cwd 含 dev_configs/<group>.json：优先显式
+# --devtest-dir，其次本仓库，再次同级 buckyos checkout（sntest 组即在那里）。
 detect_devtest_dir() {
   local cand
   for cand in "$SRC_DIR" "$SRC_DIR/../buckyos/src" "$SRC_DIR/../../buckyos/src"; do
@@ -198,12 +199,12 @@ detect_devtest_dir() {
   return 1
 }
 
-if [ "$MODE" = "vm" ] && [ "$KEEP_TUNNEL_CHECK" = "1" ]; then
+if [ "$MODE" = "vm" ] && { [ "$KEEP_TUNNEL_CHECK" = "1" ] || [ "$BNS_PROXY_CHECK" = "1" ]; }; then
   if [ -z "$DEVTEST_DIR" ]; then
     DEVTEST_DIR="$(detect_devtest_dir || true)"
   fi
   if [ -z "$DEVTEST_DIR" ] || [ ! -f "$DEVTEST_DIR/dev_configs/$DEVTEST_GROUP.json" ]; then
-    echo "keep-tunnel check needs buckyos-devtest group '$DEVTEST_GROUP'; pass --devtest-dir or --no-keep-tunnel" >&2
+    echo "S7/S8 need buckyos-devtest group '$DEVTEST_GROUP'; pass --devtest-dir, or --no-bns-proxy --no-keep-tunnel" >&2
     exit 1
   fi
   require_tool uv
@@ -238,10 +239,15 @@ dns_txt_has() { # dns_txt_has <marker>
 dns_txt_tcp_has() { # dns_txt_tcp_has <marker>
   dig +tcp +short +time=3 +tries=1 @"$DNS_SERVER" -p "$DNS_PORT" "$ALICE_HOST" TXT | grep -Fq "$1"
 }
-identifiers_ok() { # identifiers_ok <did>
-  # 当前兼容 API 顶层返回 boot/user_name；旧 DID 文档形态可能返回 id/oods。
-  # 任一形态都说明 resolver 成功返回了可用文档。
-  curl -fsS --connect-timeout 3 --max-time 10 -H "Host: $SN_HTTP_HOST" "$HTTP_ORIGIN/1.0/identifiers/$1" | grep -Eq '"(boot|user_name|id|oods)"'
+identifiers_ok() { # identifiers_ok <did> <expected-source>
+  # 裸响应是文档本身：seed-v2 发布 OOD 签名的 JWT 时是 application/jwt，
+  # 无法按 JSON 键判断。请求 resolution envelope，校验带回文档且来源符合用例。
+  local body
+  body="$(curl -fsS --connect-timeout 3 --max-time 10 -H "Host: $SN_HTTP_HOST" \
+    -H "Accept: application/did-resolution+json" \
+    "$HTTP_ORIGIN/1.0/identifiers/$1")" || return 1
+  printf '%s' "$body" | grep -Eq '"didDocument":("|\{)' &&
+    printf '%s' "$body" | grep -q "\"source\":\"$2\""
 }
 zone_resolver_ready() { # zone_resolver_ready <did> <doc-type>
   local body
@@ -254,7 +260,22 @@ zone_resolver_ready() { # zone_resolver_ready <did> <doc-type>
     printf '%s' "$body" | grep -Eq '"documentVersion":[0-9]+' &&
     printf '%s' "$body" | grep -Eq '"docHash":"[0-9a-f]{64}"'
 }
+# admin.* 只走 SN 内部根路径 "/"，SN 只接受 loopback 来源；VM 模式从宿主机
+# 访问会得到 404，所以经 devtest 在 sn 节点内对 127.0.0.1 发起。
+reset_bns_proxy_active_code_in_vm() {
+  (cd "$DEVTEST_DIR" && uv run buckyos-devtest "$DEVTEST_GROUP" run sn \
+    "curl -fsS --max-time 20 -H 'Host: $SN_HTTP_HOST' -H 'Content-Type: application/json' \
+      -d '{\"method\":\"admin.clear_state_by_active_code\",\"params\":{},\"sys\":[1]}' \
+      http://127.0.0.1/ | grep -q '\"result\"'") >/dev/null 2>&1
+}
+
 bns_proxy_real_path_ok() {
+  local reset_done=0
+  if [ "$MODE" = "vm" ]; then
+    reset_bns_proxy_active_code_in_vm || return 1
+    reset_done=1
+  fi
+  SN_ACTIVE_CODE_RESET_DONE="$reset_done" \
   SN_HOST="$SN_HOST" \
   SN_HTTP_HOST="$SN_HTTP_HOST" \
   HTTP_ORIGIN="$HTTP_ORIGIN" \
@@ -359,20 +380,29 @@ def dig_txt():
     return output.stdout
 
 
-def wait_txt_contains(*markers):
+def wait_txt_contains(*markers, min_wait=0.0):
     last = ""
-    for _ in range(retries):
+    deadline = time.monotonic() + max(retries * delay, min_wait)
+    while True:
         last = dig_txt()
         if all(marker in last for marker in markers):
             return
+        if time.monotonic() >= deadline:
+            break
         time.sleep(delay)
     raise RuntimeError(f"DNS TXT for {username}.web3.{sn_host} did not contain {markers}: {last}")
+
+
+# SN 缓存 DNS 应答（TTL 60s），BNS 代理发布不使已缓存的应答失效；
+# 读回 publish 结果至少要等过一个缓存周期。
+SN_DNS_CACHE_WAIT_SECS = 90
 
 
 # Reset the dedicated test activation code through the same internal admin path
 # used by Rust integration tests. The BNS name stays unique per run, so old chain
 # state cannot conflict with this registration.
-rpc("/", "admin.clear_state_by_active_code", {})
+if os.environ.get("SN_ACTIVE_CODE_RESET_DONE") != "1":
+    rpc("/", "admin.clear_state_by_active_code", {})
 
 register = rpc(
     "/kapi/sn/auth",
@@ -423,7 +453,7 @@ if publish.get("operation") != "publish_dns_txt" or publish.get("doc_type") != "
     raise RuntimeError(f"unexpected publish result: {publish}")
 assert_tx_result("bns.publish_dns_txt", publish)
 
-wait_txt_contains(initial_marker, live_marker)
+wait_txt_contains(initial_marker, live_marker, min_wait=SN_DNS_CACHE_WAIT_SECS)
 PY
 }
 keep_tunnel_established() {
@@ -447,9 +477,9 @@ check "S2 DNS TXT contains PKX=" dns_txt_has "PKX="
 check "S2 DNS TXT contains BOOT=" dns_txt_has "BOOT="
 check "S2 DNS TXT contains DEV=" dns_txt_has "DEV="
 check "S2 DNS TXT over TCP contains DEV=" dns_txt_tcp_has "DEV="
-check "S3 resolve did:bns:alice via indexer projection" identifiers_ok "did:bns:alice"
-check "S4 resolve did:web:charlie.me via user_domain seed" identifiers_ok "did:web:charlie.me"
-check "S5 resolve did:bns:dave (pure Web3, no sn_user row)" identifiers_ok "did:bns:dave"
+check "S3 resolve did:bns:alice via indexer projection" identifiers_ok "did:bns:alice" bns_document
+check "S4 resolve did:web:charlie.me via user_domain seed" identifiers_ok "did:web:charlie.me" auth_db_projection
+check "S5 resolve did:bns:dave (pure Web3, no sn_user row)" identifiers_ok "did:bns:dave" bns_document
 if [ "$MODE" = "local" ]; then
   check "S6 Zone Resolver owner snapshot is ready" zone_resolver_ready "did:bns:alice" "owner"
   check "S6 Zone Resolver device snapshot is ready" zone_resolver_ready "did:bns:ood1.alice" "device"
