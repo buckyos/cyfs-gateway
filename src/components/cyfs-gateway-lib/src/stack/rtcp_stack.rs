@@ -7089,6 +7089,189 @@ inbound_admission:
         assert!(ret.is_err());
     }
 
+    /// Run alone with `--ignored --exact --nocapture --test-threads=1`.
+    /// For relays requiring a registered identity, set RTCP_LIVE_IDENTITY,
+    /// RTCP_LIVE_PUBLIC_ROOT and RTCP_LIVE_SECURITY_ROOT. Identity material is
+    /// read through the production loader; this test never writes those roots.
+    /// Without these variables, use a fresh in-memory did:dev identity, which
+    /// an anonymous-rejecting relay is expected to reject.
+    #[tokio::test]
+    #[ignore = "requires real jp01.buckyos.ai access and an identity admitted by the relay"]
+    async fn test_live_jp01_keep_tunnel() {
+        use crate::tunnel_url_status::{TunnelUrlState, TunnelUrlStatusSource};
+
+        assert!(
+            name_client::GLOBAL_NAME_CLIENT.get().is_none(),
+            "run this live test alone so no previous test can supply a resolver or cache"
+        );
+        let _ = fern::Dispatch::new()
+            .level(log::LevelFilter::Warn)
+            .level_for("name_client::web_provider", log::LevelFilter::Debug)
+            .level_for("cyfs_gateway_lib::rtcp", log::LevelFilter::Info)
+            .chain(std::io::stderr())
+            .apply();
+        // The production HTTPS/DNS providers remain real; only cache storage
+        // is in memory, and the unrelated local Zone locker is disabled.
+        init_name_lib_for_test(&HashMap::new()).await.unwrap();
+
+        let port_reservation = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let bind = port_reservation.local_addr().unwrap().to_string();
+        let (device_config, private_key, device_doc_jwt) =
+            match std::env::var("RTCP_LIVE_IDENTITY") {
+                Ok(identity) => {
+                    let roots = IdentityRoots::new(
+                        std::env::var("RTCP_LIVE_PUBLIC_ROOT")
+                            .expect("RTCP_LIVE_PUBLIC_ROOT is required with RTCP_LIVE_IDENTITY")
+                            .into(),
+                        std::env::var("RTCP_LIVE_SECURITY_ROOT")
+                            .expect("RTCP_LIVE_SECURITY_ROOT is required with RTCP_LIVE_IDENTITY")
+                            .into(),
+                    );
+                    let config = build_rtcp_identity_config(
+                        "live-jp01-keep-tunnel",
+                        &bind,
+                        &identity,
+                        &roots,
+                    );
+                    let material = load_rtcp_identity_material(&config).await.unwrap();
+                    (
+                        material.device_config,
+                        material.private_key,
+                        material.device_doc_jwt,
+                    )
+                }
+                Err(std::env::VarError::NotPresent) => {
+                    let (signing_key, private_key) = generate_ed25519_key();
+                    let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
+                    let device = DeviceDocument::new_by_jwk(
+                        "live-jp01-keep-tunnel",
+                        serde_json::from_value(jwk).unwrap(),
+                    );
+                    (device, private_key, None)
+                }
+                Err(err) => panic!("invalid RTCP_LIVE_IDENTITY: {err}"),
+            };
+        eprintln!(
+            "live keep-tunnel: local={} remote=jp01.buckyos.ai:2980 bind={bind}",
+            device_config.id.to_string()
+        );
+        let tunnel_manager = TunnelManager::new();
+        let context = build_stack_context(
+            Arc::new(ServerManager::new()),
+            tunnel_manager.clone(),
+            Arc::new(DefaultLimiterManager::new()),
+            StatManager::new(),
+            Some(Arc::new(GlobalProcessChains::new())),
+        );
+        let mut security = crate::RtcpSecurityConfig::default();
+        // Preserve authority-current and all admission defaults. Three real
+        // keep-tunnel probes span at least 30 seconds with this interval.
+        security.liveness.ping_interval_secs = 15;
+        let mut builder = RtcpStack::builder()
+            .id("live-jp01-keep-tunnel")
+            .bind(bind)
+            .keep_tunnel(vec!["jp01.buckyos.ai:2980".to_string()])
+            .device_config(device_config)
+            .private_key(private_key)
+            .hook_point(vec![])
+            .stack_context(context)
+            .security(security);
+        if let Some(jwt) = device_doc_jwt {
+            builder = builder.device_doc_jwt(jwt);
+        }
+        let stack = builder.build().await.unwrap();
+        let url = Url::parse("rtcp://jp01.buckyos.ai:2980").unwrap();
+        let normalized = crate::tunnel_url_status::normalize_tunnel_url(&url);
+        drop(port_reservation);
+        stack.start().await.unwrap();
+
+        // Observe the actual background keep-tunnel task. Calling probe_url
+        // here would allow a manual probe to masquerade as keep-tunnel health.
+        let outcome = tokio::time::timeout(Duration::from_secs(90), async {
+            let mut last_observed_at = None;
+            let mut successful_rounds = 0;
+            let mut last_success_count = 0;
+            let mut first_success_at: Option<Instant> = None;
+            let mut first_tunnel_key = None;
+            loop {
+                let history = tunnel_manager
+                    .list_tunnel_url_history()
+                    .await
+                    .into_iter()
+                    .find(|entry| entry.normalized_url == normalized)
+                    .ok_or_else(|| "keep-tunnel history disappeared".to_string())?;
+                let status = &history.current;
+                if status.source == TunnelUrlStatusSource::KeepAlive
+                    && last_observed_at != Some(status.observed_at_ms)
+                {
+                    last_observed_at = Some(status.observed_at_ms);
+                    eprintln!(
+                        "live keep-tunnel: observed_at_ms={} state={} rtt_ms={:?} successes={} failures={} reason={:?}",
+                        status.observed_at_ms,
+                        status.state.as_str(),
+                        status.rtt_ms,
+                        history.success_count,
+                        history.failure_count,
+                        status.failure_reason
+                    );
+                    if status.state != TunnelUrlState::Reachable {
+                        return Err(format!(
+                            "keep-tunnel is not reachable: {:?}",
+                            status.failure_reason
+                        ));
+                    }
+                    if status.rtt_ms.is_none()
+                        || status.runtime_tunnel_key.is_none()
+                        || !history.pinned
+                        || history.success_count <= last_success_count
+                    {
+                        return Err(
+                            "keep-tunnel observation lacks new Pong RTT, tunnel key or pin".to_string(),
+                        );
+                    }
+                    last_success_count = history.success_count;
+                    if successful_rounds == 0 {
+                        first_success_at = Some(Instant::now());
+                        first_tunnel_key = status.runtime_tunnel_key.clone();
+                    } else if status.runtime_tunnel_key != first_tunnel_key {
+                        return Err(
+                            "keep-tunnel changed its remote identity while under observation".to_string(),
+                        );
+                    }
+                    successful_rounds += 1;
+                }
+                if successful_rounds >= 3
+                    && first_success_at
+                        .is_some_and(|start| start.elapsed() >= Duration::from_secs(30))
+                {
+                    return Ok::<_, String>(successful_rounds);
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await;
+        // Clean up the live connection on both success and failure, before
+        // asserting, and verify that the task released its history pin.
+        let final_history = tunnel_manager.list_tunnel_url_history().await;
+        let shutdown = tokio::time::timeout(Duration::from_secs(10), stack.shutdown()).await;
+        assert!(shutdown.is_ok(), "live keep-tunnel shutdown timed out");
+        assert!(stack.keep_tunnel_tasks.lock().unwrap().is_empty());
+        assert!(
+            tunnel_manager
+                .list_tunnel_url_history()
+                .await
+                .into_iter()
+                .all(|entry| !entry.pinned)
+        );
+        match outcome {
+            Ok(Ok(rounds)) => eprintln!(
+                "live keep-tunnel passed: {rounds} Pong-confirmed rounds over at least 30 seconds"
+            ),
+            Ok(Err(err)) => panic!("live keep-tunnel failed: {err}"),
+            Err(_) => panic!("live keep-tunnel timed out; final history: {final_history:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn test_keep_tunnel_shutdown_releases_pin() {
         let tunnel_manager = TunnelManager::new();

@@ -1355,6 +1355,15 @@ impl RTcpInner {
                             doc_type,
                             result.reason()
                         ));
+                        // Missing is scoped to the requested type. A name may
+                        // publish only a ZoneDocument with its gateway device.
+                        // An explicitly invalid device is still a rejection,
+                        // not permission to fall back to a different identity.
+                        if doc_type == DidDocType::Device
+                            && matches!(result.type_state, Some(TypeState::Missing))
+                        {
+                            continue;
+                        }
                         // A definite "no such document" is not a transport failure.
                         return Err(NSError::NotFound(last_reason.unwrap_or_default()));
                     }
@@ -12202,6 +12211,131 @@ mod tests {
                         SourceAnswer::new(sref).with_publish_info(info)
                     }
                 }
+            }
+        }
+    }
+
+    fn test_handshake_zone_document(did: &DID) -> (EncodedDocument, DID) {
+        let (gateway, _) = test_device_config("fallback-gateway");
+        let gateway_did = gateway.id.clone();
+        let mut zone = ZoneDocument::new(
+            did.clone(),
+            gateway_did.clone(),
+            gateway.get_default_key().unwrap(),
+        );
+        zone.oods = vec!["gateway".parse().unwrap()];
+        zone.devices.insert("gateway".to_string(), gateway);
+        (
+            EncodedDocument::JsonLd(serde_json::to_value(zone).unwrap()),
+            gateway_did,
+        )
+    }
+
+    #[tokio::test]
+    async fn handshake_document_missing_device_uses_zone_gateway() {
+        let _ = init_name_lib_for_test(&HashMap::new()).await;
+        let remote_did = DID::new("rtcpmissingdevice", "zone-only");
+        let (zone_document, gateway_did) = test_handshake_zone_document(&remote_did);
+        GLOBAL_NAME_CLIENT.get().unwrap().set_method_authority(
+            &remote_did.method,
+            Arc::new(TestAuthorityProvider {
+                docs: vec![(remote_did.clone(), "zone".to_string(), zone_document)],
+                negatives: vec![(
+                    remote_did.clone(),
+                    "device".to_string(),
+                    DocumentStatus::Missing,
+                )],
+                owner_bindings: Vec::new(),
+                offline: Arc::new(AtomicBool::new(false)),
+            }),
+        );
+        let inner = RTcpInner::new(
+            DID::new("dev", "missing-device-client"),
+            "127.0.0.1:0".to_string(),
+            None,
+            None,
+            Arc::new(MockRTcpListener::new()),
+        );
+
+        let identity = inner
+            .resolve_handshake_identity(&remote_did)
+            .await
+            .expect("a missing device document must allow the published zone gateway");
+        assert_eq!(identity.semantic_did, remote_did);
+        assert_eq!(identity.canonical_dev_did, gateway_did);
+        assert_eq!(identity.trust, RtcpIdentityTrust::MethodAuthorityCurrent);
+        assert_eq!(
+            identity.address_resolution.options.target_kind(),
+            ResolveIpTargetKind::Zone
+        );
+    }
+
+    #[tokio::test]
+    async fn handshake_document_missing_device_and_zone_returns_not_found() {
+        let _ = init_name_lib_for_test(&HashMap::new()).await;
+        let remote_did = DID::new("rtcpmissingboth", "unpublished");
+        GLOBAL_NAME_CLIENT.get().unwrap().set_method_authority(
+            &remote_did.method,
+            Arc::new(TestAuthorityProvider {
+                docs: Vec::new(),
+                negatives: Vec::new(),
+                owner_bindings: Vec::new(),
+                offline: Arc::new(AtomicBool::new(false)),
+            }),
+        );
+        let inner = RTcpInner::new(
+            DID::new("dev", "missing-documents-client"),
+            "127.0.0.1:0".to_string(),
+            None,
+            None,
+            Arc::new(MockRTcpListener::new()),
+        );
+
+        let err = inner
+            .resolve_handshake_document(&remote_did)
+            .await
+            .unwrap_err();
+        assert!(matches!(&err, NSError::NotFound(_)), "{err:?}");
+        assert!(err.to_string().contains("#zone is not published"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn handshake_document_rejected_device_does_not_fall_back_to_zone() {
+        let _ = init_name_lib_for_test(&HashMap::new()).await;
+        for status in [
+            DocumentStatus::Invalid,
+            DocumentStatus::Revoked,
+            DocumentStatus::Tombstoned,
+            DocumentStatus::Migrated,
+        ] {
+            let remote_did = DID::new(&format!("rtcprejected{}", status.as_str()), "zone");
+            let (zone_document, _) = test_handshake_zone_document(&remote_did);
+            GLOBAL_NAME_CLIENT.get().unwrap().set_method_authority(
+                &remote_did.method,
+                Arc::new(TestAuthorityProvider {
+                    docs: vec![(remote_did.clone(), "zone".to_string(), zone_document)],
+                    negatives: vec![(remote_did.clone(), "device".to_string(), status.clone())],
+                    owner_bindings: Vec::new(),
+                    offline: Arc::new(AtomicBool::new(false)),
+                }),
+            );
+            let inner = RTcpInner::new(
+                DID::new("dev", "rejected-device-client"),
+                "127.0.0.1:0".to_string(),
+                None,
+                None,
+                Arc::new(MockRTcpListener::new()),
+            );
+
+            let err = inner
+                .resolve_handshake_document(&remote_did)
+                .await
+                .expect_err("an explicitly rejected device must not use a zone document");
+            match status {
+                DocumentStatus::Invalid => {
+                    assert!(matches!(err, NSError::NotFound(_)), "{err:?}")
+                }
+                _ => assert!(matches!(err, NSError::Disabled(_)), "{err:?}"),
             }
         }
     }
