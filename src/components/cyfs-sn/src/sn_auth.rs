@@ -1469,7 +1469,7 @@ impl SqliteSnAuthDB {
     }
 
     fn email_already_bound(email: &str) -> SnError {
-        sn_err!(SnErrorCode::Conflict, "email already bound: {}", email)
+        sn_err!(SnErrorCode::EmailAlreadyBound, "email already bound: {}", email)
     }
 
     fn insert_user_err(email: &str, error: sqlx::Error) -> SnError {
@@ -2619,7 +2619,7 @@ impl SnAuthDB for SqliteSnAuthDB {
                     .await
                     .map_err(|e| Self::db_err("query user failed", e))?
                     .ok_or_else(|| {
-                        sn_err!(SnErrorCode::NotFound, "user not found: {}", username)
+                        sn_err!(SnErrorCode::UserNotFound, "user not found: {}", username)
                     })?;
             let owner_key_ref: Option<String> = user
                 .try_get("owner_key_ref")
@@ -2783,7 +2783,7 @@ impl SnAuthDB for SqliteSnAuthDB {
             .fetch_optional(&mut *tx)
             .await
             .map_err(|e| Self::db_err("query user failed", e))?
-            .ok_or_else(|| sn_err!(SnErrorCode::NotFound, "user not found: {}", username))?;
+            .ok_or_else(|| sn_err!(SnErrorCode::UserNotFound, "user not found: {}", username))?;
         let state: Option<String> = user
             .try_get("state")
             .map_err(|e| Self::db_err("read state failed", e))?;
@@ -2881,7 +2881,7 @@ impl SnAuthDB for SqliteSnAuthDB {
             .fetch_optional(&mut *tx)
             .await
             .map_err(|e| Self::db_err("query user for DNS put failed", e))?
-            .ok_or_else(|| sn_err!(SnErrorCode::NotFound, "user not found: {}", owner))?;
+            .ok_or_else(|| sn_err!(SnErrorCode::UserNotFound, "user not found: {}", owner))?;
         if !UserState::from_str(Some(state.as_str())).is_active() {
             return Err(sn_err!(
                 SnErrorCode::Blocked,
@@ -3799,8 +3799,8 @@ mod tests {
             )
             .await
             .unwrap_err();
-        assert_eq!(duplicate.code(), SnErrorCode::Conflict);
-        assert!(duplicate.msg().starts_with("email already bound:"));
+        assert_eq!(duplicate.code(), SnErrorCode::EmailAlreadyBound);
+        assert!(duplicate.msg().contains("alice.recovery@example.com"));
         assert!(db.check_active_code("email-code-2").await?);
         assert!(!db.is_user_exist("bob").await?);
 
@@ -3864,7 +3864,7 @@ mod tests {
         for outcome in outcomes {
             match outcome {
                 Ok(true) => successes += 1,
-                Err(error) if error.code() == SnErrorCode::Conflict => conflicts += 1,
+                Err(error) if error.code() == SnErrorCode::EmailAlreadyBound => conflicts += 1,
                 other => panic!("unexpected concurrent registration outcome: {other:?}"),
             }
         }

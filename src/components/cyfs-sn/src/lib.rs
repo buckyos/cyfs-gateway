@@ -35,7 +35,11 @@ pub enum SnErrorCode {
     Failed,
     InvalidInput,
     NotFound,
+    /// 用户不存在。wire 值 `user_not_found`，sn-business sn_auth_db 的 SnRpcErrorCode 同步。
+    UserNotFound,
     Conflict,
+    /// 邮箱已绑定其他账号。wire 值 `email_already_bound`，sn-business 同步。
+    EmailAlreadyBound,
     StaleReport,
     Blocked,
     DBError,

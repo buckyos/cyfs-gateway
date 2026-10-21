@@ -368,10 +368,8 @@ impl HttpServer for CyfsDirServer {
             Ok(ChainOutcome::Response(resp)) => return Ok(resp),
             Ok(ChainOutcome::Resolved(req)) | Ok(ChainOutcome::PassThrough(req)) => req,
             Err(e) => {
-                warn!("cyfs-dir-server {}: chain failed: {}", self.id, e);
-                let mut resp = Response::new(full_body(Bytes::from(e.to_string())));
-                *resp.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
-                return Ok(resp);
+                warn!("cyfs-dir-server {}: chain failed: {:?}", self.id, e);
+                return Ok(chain_error_response(&e));
             }
         };
 
@@ -568,6 +566,13 @@ fn full_body(data: Bytes) -> BoxBody<Bytes, ServerError> {
     Full::new(data).map_err(|never| match never {}).boxed()
 }
 
+// The body is the error's Display text, which never carries source locations.
+fn chain_error_response(error: &ServerError) -> Response<BoxBody<Bytes, ServerError>> {
+    let mut resp = Response::new(full_body(Bytes::from(error.to_string())));
+    *resp.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+    resp
+}
+
 /// Rewrite the request URI so the inner [`NdnDirServer`] sees an O-Link:
 /// `<url_prefix>/<obj_id>{inner_path?}{?query}`. The URL prefix and any
 /// `/@/` inner-path tail are preserved.
@@ -601,4 +606,33 @@ fn rewrite_to_o_link(
         );
     }
     req
+}
+
+#[cfg(test)]
+mod chain_error_response_tests {
+    use super::*;
+    use crate::{into_server_err, server_err};
+
+    #[tokio::test]
+    async fn chain_error_body_has_no_source_location() {
+        let io: Result<(), std::io::Error> = Err(std::io::Error::other("pipe closed"));
+        let errors = [
+            server_err!(ServerErrorCode::ProcessChainError, "chain main failed"),
+            io.map_err(into_server_err!(
+                ServerErrorCode::ProcessChainError,
+                "chain main failed"
+            ))
+            .unwrap_err(),
+        ];
+        for error in errors {
+            let resp = chain_error_response(&error);
+            assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+            let body = resp.into_body().collect().await.unwrap().to_bytes();
+            let body = String::from_utf8(body.to_vec()).unwrap();
+            assert!(body.starts_with("ProcessChainError: chain main failed"), "{body}");
+            for leaked in [".rs:", "at:[", "ErrorCode"] {
+                assert!(!body.contains(leaked), "{leaked:?} leaked into {body:?}");
+            }
+        }
+    }
 }

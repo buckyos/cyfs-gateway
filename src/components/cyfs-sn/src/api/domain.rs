@@ -19,20 +19,52 @@ struct DomainReq {
 
 fn map_domain_error(error: SnError) -> RPCErrors {
     match error.code() {
-        SnErrorCode::InvalidInput | SnErrorCode::Conflict | SnErrorCode::Blocked => {
-            parse_error(SnApiErrorCode::InvalidDomain, error.to_string())
-        }
-        SnErrorCode::NotFound => {
-            if error.to_string().contains("user not found") {
-                parse_error(SnApiErrorCode::UserNotFound, error.to_string())
-            } else {
-                parse_error(SnApiErrorCode::InvalidDomain, error.to_string())
-            }
-        }
+        SnErrorCode::InvalidInput
+        | SnErrorCode::Conflict
+        | SnErrorCode::EmailAlreadyBound
+        | SnErrorCode::Blocked
+        | SnErrorCode::NotFound => parse_error(SnApiErrorCode::InvalidDomain, error.to_string()),
+        SnErrorCode::UserNotFound => parse_error(SnApiErrorCode::UserNotFound, error.to_string()),
         SnErrorCode::DBError | SnErrorCode::RemoteError | SnErrorCode::Failed => {
             reason_error(SnApiErrorCode::InternalError, error.to_string())
         }
         SnErrorCode::StaleReport => reason_error(SnApiErrorCode::InternalError, error.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{into_sn_err, sn_err};
+
+    fn rpc_message(error: RPCErrors) -> String {
+        match error {
+            RPCErrors::ParseRequestError(message) | RPCErrors::ReasonError(message) => message,
+            other => panic!("unexpected rpc error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn domain_errors_map_by_code_without_source_location() {
+        let io: Result<(), std::io::Error> = Err(std::io::Error::other("disk gone"));
+        let cases = [
+            (sn_err!(SnErrorCode::UserNotFound, "user not found: alice"), "user_not_found"),
+            (sn_err!(SnErrorCode::NotFound, "domain not found: a.example"), "invalid_domain"),
+            (sn_err!(SnErrorCode::Conflict, "domain bound: a.example"), "invalid_domain"),
+            (sn_err!(SnErrorCode::DBError, "query failed"), "internal_error"),
+            (
+                io.map_err(into_sn_err!(SnErrorCode::DBError, "query failed"))
+                    .unwrap_err(),
+                "internal_error",
+            ),
+        ];
+        for (error, api_name) in cases {
+            let message = rpc_message(map_domain_error(error));
+            assert!(message.contains(&format!(":{api_name}]")), "{message}");
+            for leaked in [".rs:", "at:[", "ErrorCode"] {
+                assert!(!message.contains(leaked), "{leaked:?} leaked into {message:?}");
+            }
+        }
     }
 }
 
