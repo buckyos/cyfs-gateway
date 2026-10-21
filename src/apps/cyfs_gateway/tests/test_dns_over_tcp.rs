@@ -69,10 +69,14 @@ async fn wait_for_tcp_listener(addr: SocketAddr) -> TcpStream {
     panic!("DNS-over-TCP listener did not start at {addr}");
 }
 
-fn write_test_config(config_path: &Path, dns_path: &Path, port: u16) {
+fn write_test_config(config_path: &Path, dns_path: &Path, port: u16, control_port: u16) {
     let config = format!(
         r#"
 stacks:
+  # 内置控制服务默认绑 127.0.0.1:13451,本机运行着 gateway 时会冲突。
+  __control_server__:
+    bind: 127.0.0.1:{control_port}
+
   dns_udp:
     protocol: udp
     bind: 127.0.0.1:{port}
@@ -159,8 +163,12 @@ txt = [
     )
     .unwrap();
 
+    let control_port = {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.local_addr().unwrap().port()
+    };
     let config_file = root.path().join("gateway.yaml");
-    write_test_config(&config_file, &dns_file, port);
+    write_test_config(&config_file, &dns_file, port, control_port);
     let gateway_task = tokio::spawn(async move {
         gateway_service_main(
             &config_file,

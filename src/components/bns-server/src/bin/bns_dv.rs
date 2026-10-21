@@ -1015,7 +1015,7 @@ mod tests {
 
     use bns_evm::{Address, EthRpcClient};
     use name_client::{
-        document_iat, BnsProvider, DidDocType, DocumentStatus as ResolverDocumentStatus, NsProvider,
+        document_iat, BnsProvider, DidDocType, ResolveOpts, Revision, Source, TypeState,
     };
     use name_lib::DID;
     use serde_json::json;
@@ -1181,17 +1181,17 @@ mod tests {
 
     async fn resolve_json_doc(provider: &BnsProvider, did: &DID, doc_type: &str) -> Value {
         let doc_type = DidDocType::from(doc_type);
-        let state = provider
-            .resolve_published_state(did, &doc_type)
-            .await
-            .unwrap()
-            .expect("published state");
-        assert_eq!(state.document_status, ResolverDocumentStatus::Active);
-        let document = state
-            .document_ref
-            .and_then(|doc| doc.inline_document)
-            .expect("inline document");
-        assert_eq!(state.document_version, document_iat(&document));
+        let opts = ResolveOpts::new().normalize(Duration::from_secs(20));
+        let answer = provider
+            .get_document(did, &doc_type, &Revision::current(), &opts)
+            .await;
+        let info = answer.publish_info.as_ref().expect("publish info");
+        assert_eq!(info.type_state, Some(TypeState::Active));
+        let document = answer.body.clone().expect("inline document");
+        assert_eq!(
+            info.latest_revision().map(|revision| revision.iat),
+            document_iat(&document)
+        );
         document.to_json_value().unwrap()
     }
 
