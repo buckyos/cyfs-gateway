@@ -247,7 +247,7 @@ mod tests {
         let added_provider = ret.unwrap();
         assert_eq!(
             added_provider.get("provider").and_then(Value::as_str),
-            Some("https-resolver:127.0.0.1:8080")
+            Some("http-provider:127.0.0.1:8080")
         );
         assert_eq!(
             added_provider.get("scheme").and_then(Value::as_str),

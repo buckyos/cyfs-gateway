@@ -5648,6 +5648,76 @@ users:
             .await
             .unwrap();
         assert!(!result["need_bind_owner_key"].as_bool().unwrap());
+
+        // --- 内部 Zone Resolver ingress：已在 BNS 发布 zone 文档的用户，Zone locker 拿到可用回答 ---
+        let (_zone_signing_key, zone_pkcs8_bytes) = generate_ed25519_key();
+        let zone_encoding_key = jsonwebtoken::EncodingKey::from_ed_der(zone_pkcs8_bytes.as_slice());
+        let zone_iat = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let zone_boot: ZoneBootDocument = serde_json::from_value(json!({
+            "oods": ["ood1"],
+            "iat": zone_iat,
+            "exp": zone_iat + 3600,
+        }))
+        .unwrap();
+        let locker_zone_jwt = zone_boot
+            .encode(Some(&zone_encoding_key))
+            .unwrap()
+            .to_string();
+        let result = bns_krpc
+            .call(
+                "bns.publish_document",
+                json!({
+                    "request_id": "publish-zone-jwt-locker",
+                    "name": PROXY_USER,
+                    "doc_type": "zone",
+                    "document": locker_zone_jwt
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["code"].as_i64().unwrap(), 0);
+
+        let internal_server: Arc<dyn HttpServer> = sn.clone();
+        let internal_http_addr = spawn_test_http_server_with_dst(
+            internal_server,
+            Some(INTERNAL_ZONE_RESOLVER_ADDR.to_string()),
+        )
+        .await;
+        let zone_locker = ZoneLocker::new(ZoneLockerConfig {
+            endpoint: format!("http://{}", internal_http_addr),
+            connect_timeout: Duration::from_millis(100),
+            request_timeout: Duration::from_secs(1),
+        });
+        let zone_did = DID::from_str(format!("did:bns:{}", PROXY_USER).as_str()).unwrap();
+        let locker_opts = ResolveOpts::new().normalize(Duration::from_secs(5));
+        let answer = zone_locker
+            .get_document(
+                &zone_did,
+                &DidDocType::Zone,
+                &Revision::current(),
+                &locker_opts,
+            )
+            .await;
+        assert!(
+            !answer.is_unknown(),
+            "SN internal response must be a Zone answer: {}",
+            answer.reason_text()
+        );
+        assert_eq!(
+            answer.body,
+            Some(EncodedDocument::Jwt(locker_zone_jwt.clone()))
+        );
+        let info = answer.publish_info.as_ref().unwrap();
+        assert_eq!(info.type_state, Some(TypeState::Active));
+        assert_eq!(
+            info.latest_revision().map(|revision| revision.iat),
+            Some(zone_iat)
+        );
+        assert!(info.checked_at.is_some());
+        assert!(info.valid_until.is_some());
     }
 
     #[tokio::test]
@@ -6785,32 +6855,9 @@ users:
             internal_body["didDocumentMetadata"]["buckyos"]["resolverRole"],
             "zone_resolver"
         );
-        let zone_client = ZoneResolverClient::new(ZoneResolverConfig {
-            endpoint: internal_base_url.clone(),
-            connect_timeout: Duration::from_millis(100),
-            request_timeout: Duration::from_secs(1),
-        });
-        let zone_did = DID::from_str(format!("did:bns:{}", REFACTOR_USER).as_str()).unwrap();
-        match zone_client
-            .lookup(&zone_did, &DidDocType::Zone, false)
-            .await
-        {
-            ZoneLookup::Answered(answer) => {
-                let resolved = answer.result.unwrap();
-                assert_eq!(
-                    resolved.resolution_metadata.cache_status,
-                    Some(CacheStatus::ZoneHit)
-                );
-                let state = answer.state.unwrap();
-                assert_eq!(state.document_status, DocumentStatus::Active);
-                assert!(state.document_ref.is_some());
-                assert!(state.checked_at.is_some());
-                assert!(state.valid_until.is_some());
-            }
-            ZoneLookup::Unknown(error) => {
-                panic!("SN internal response must be a Zone answer: {}", error)
-            }
-        }
+        // 这个用户没有在 BNS 发布 zone 文档，内部端口回答的是 auth DB 投影（无 iat），
+        // Zone locker 按 Unknown 处理。已发布 zone 文档时的 locker 回答见
+        // test_sn_bns_proxy_rpc_paths 末尾。
 
         let forbidden_rpc = client
             .post(format!("{}/kapi/sn/auth", internal_base_url))

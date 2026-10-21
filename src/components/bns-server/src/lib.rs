@@ -947,6 +947,9 @@ pub const DID_RESOLVER_PATH_PREFIX: &str = "/1.0/identifiers/";
 
 /// Default doc_type when the `type` query parameter is omitted (protocol §2).
 const DID_RESOLVER_DEFAULT_DOC_TYPE: &str = "zone";
+/// Doc type of a device-slot projection (`did:bns:<device>.<parent>` whose
+/// subname is not registered on its own).
+const DID_RESOLVER_DEVICE_DOC_TYPE: &str = "device";
 
 const DID_RESOLUTION_CONTENT_TYPE: &str = "application/did-resolution+json";
 const DID_DOCUMENT_CONTENT_TYPE_JSON: &str = "application/did+ld+json";
@@ -1072,7 +1075,12 @@ async fn resolve_bns_identity<T: BnsIndexerApi>(
     name: &str,
     doc_type: &str,
 ) -> BnsClientResult<ResolveResult> {
-    if doc_type != DID_RESOLVER_DEFAULT_DOC_TYPE || !name.contains('.') {
+    // Callers that want the device document ask for `type=device` explicitly
+    // (resolve-did D4). The default / `type=zone` projection stays for
+    // clients released before that rule.
+    let projectable =
+        doc_type == DID_RESOLVER_DEFAULT_DOC_TYPE || doc_type == DID_RESOLVER_DEVICE_DOC_TYPE;
+    if !projectable || !name.contains('.') {
         return api.resolve_document(name, doc_type).await;
     }
     let checkpoint = api.latest_checkpoint().await?;
@@ -2373,43 +2381,91 @@ mod tests {
     }
 
 
+    fn resolver_test_client(addr: impl std::fmt::Display) -> name_client::NameClient {
+        let client = name_client::NameClient::new(name_client::NameClientConfig::for_test());
+        client.set_method_authority(
+            "bns",
+            Arc::new(name_client::BaseHttpProvider::new(&format!("http://{addr}"))),
+        );
+        client
+    }
+
+    /// 旧 `ResolveSourcePolicy::RemoteAuthority`：只查 authority，跳过本机和 Zone locker，强制本轮查询。
+    fn remote_authority_opts() -> name_client::ResolveOpts {
+        name_client::ResolveOpts::new()
+            .authority_only()
+            .without_local_lock()
+            .without_zone_lock()
+            .with_force_authority_query()
+            .normalize(std::time::Duration::from_secs(20))
+    }
+
+    /// 旧 `ResolveSourcePolicy::LocalOnly`。
+    fn local_only_opts() -> name_client::ResolveOpts {
+        name_client::ResolveOpts::new().strictly_offline()
+    }
+
+    async fn resolve_current(
+        client: &name_client::NameClient,
+        did: &name_lib::DID,
+        doc_type: Option<name_lib::DidDocType>,
+        opts: name_client::ResolveOpts,
+    ) -> name_lib::NSResult<name_lib::EncodedDocument> {
+        let current = name_client::Revision::current();
+        let result = client.resolve_did_ex(did, doc_type, current.clone(), opts).await?;
+        name_client::select_or_error(&result, &current)
+    }
+
+    /// AuthorityCurrent：只接受本轮 authority receipt 精确绑定的有效设备文档（与 node-active 的设备门禁一致）。
+    async fn resolve_authority_current_device(
+        client: &name_client::NameClient,
+        did: &name_lib::DID,
+    ) -> Option<name_lib::EncodedDocument> {
+        let opts = remote_authority_opts();
+        let result = client
+            .resolve_did_ex(
+                did,
+                Some(name_lib::DidDocType::Device),
+                name_client::Revision::current(),
+                opts.clone(),
+            )
+            .await
+            .ok()?;
+        name_client::select_authority_current(&result, opts.receipts()).map(|choice| choice.doc)
+    }
+
     #[tokio::test]
     async fn did_resolver_parent_migration_does_not_redirect_device_identity() {
-        use name_client::{BaseHttpProvider, CacheBackend, NameClient, NameClientConfig, ResolvePolicy, ResolveSourcePolicy};
         let store = resolver_seeded_store();
         store.transact(|tx| tx.put_document(&resolver_document_state(
-            "moved", "ood1", 1, DocumentStatus::Active, br#"{"id":"did:bns:ood1.moved"}"#,
+            "moved", "ood1", 1, DocumentStatus::Active, br#"{"id":"did:bns:ood1.moved","iat":1750000000}"#,
         ))).unwrap();
         let registry = Arc::new(CentralizedBnsRegistry::new(store));
         let server = Arc::new(SqliteBnsIndexerHttpServer::from_registry(registry.clone()));
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let handle = spawn_listener(listener, server.clone()).unwrap();
-        let client = NameClient::new(NameClientConfig {
-            cache_backend: CacheBackend::Memory, enable_zone_resolver: false, ..Default::default()
-        });
-        client.set_method_authority("bns", Box::new(BaseHttpProvider::new(&format!("http://{}", handle.local_addr())))).await;
+        let client = resolver_test_client(handle.local_addr());
         let did = DID::new("bns", "ood1.moved");
-        let remote = ResolvePolicy::default().with_source(ResolveSourcePolicy::RemoteAuthority);
         let (status, body, _) = resolver_request(server.as_ref(), Method::GET, "/1.0/identifiers/did:bns:ood1.moved").await;
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert!(body["didDocument"].is_null());
         assert_eq!(body["didDocumentMetadata"]["buckyos"]["documentStatus"], "missing");
         assert!(body["didDocumentMetadata"]["buckyos"].get("migrationTarget").is_none());
-        assert!(client.resolve_did_ex(&did, None, remote.clone()).await.is_err());
+        assert!(resolve_current(&client, &did, None, remote_authority_opts()).await.is_err());
         registry.store().transact(|tx| {
             tx.put_name(&resolver_name_state("ood1.moved", NameStatus::Active))?;
-            tx.put_document(&resolver_document_state("ood1.moved", "zone", 1, DocumentStatus::Active, br#"{"id":"did:bns:ood1.moved"}"#))
+            // 新协议要求文档能得出 iat，否则 resolver 回答无法给出 (iat, hash)。
+            tx.put_document(&resolver_document_state("ood1.moved", "zone", 1, DocumentStatus::Active, br#"{"id":"did:bns:ood1.moved","iat":1750000000}"#))
         }).unwrap();
-        let answer = client.resolve_did_ex(&did, None, remote).await.unwrap();
-        assert_eq!(answer.document.to_json_value().unwrap()["id"], did.to_string());
+        let document = resolve_current(&client, &did, None, remote_authority_opts()).await.unwrap();
+        assert_eq!(document.to_json_value().unwrap()["id"], did.to_string());
         let (_, body, _) = resolver_request(server.as_ref(), Method::GET, "/1.0/identifiers/did:bns:moved").await;
         assert_eq!(body["didDocumentMetadata"]["buckyos"]["migrationTarget"], "did:bns:alice");
         handle.shutdown().await;
     }
 
     #[tokio::test]
-    async fn did_resolver_owner_policy_and_payload_expiry_invalidate_device_cache() {
-        use name_client::{BaseHttpProvider, CacheBackend, NameClient, NameClientConfig, ResolvePolicy, ResolveSourcePolicy};
+    async fn did_resolver_owner_policy_revokes_device_and_expiry_keeps_verified_best() {
         use name_lib::*;
         for cause in ["owner_cutoff", "iat_floor", "owner_expiry", "device_expiry", "zone_expiry"] {
             let (pem, public) = generate_ed25519_key_pair();
@@ -2431,11 +2487,12 @@ mod tests {
             zone.iat = now - 399;
             zone.devices.insert("ood1".into(), device.clone());
             let store = resolver_seeded_store();
+            let original = device.encode(Some(&key)).unwrap();
             store.transact(|tx| {
                 for (slot, bytes) in [
                     ("owner", serde_json::to_vec(&owner).unwrap()),
                     ("zone", zone.encode(Some(&key)).unwrap().to_string().into_bytes()),
-                    ("ood1", device.encode(Some(&key)).unwrap().to_string().into_bytes()),
+                    ("ood1", original.to_string().into_bytes()),
                 ] { tx.put_document(&resolver_document_state("alice", slot, 10, DocumentStatus::Active, &bytes))?; }
                 Ok(())
             }).unwrap();
@@ -2443,13 +2500,10 @@ mod tests {
             let server = Arc::new(SqliteBnsIndexerHttpServer::from_registry(registry.clone()));
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let handle = spawn_listener(listener, server.clone()).unwrap();
-            let client = NameClient::new(NameClientConfig {
-                cache_backend: CacheBackend::Memory, enable_zone_resolver: false, ..Default::default()
-            });
-            client.set_method_authority("bns", Box::new(BaseHttpProvider::new(&format!("http://{}", handle.local_addr())))).await;
-            let remote = ResolvePolicy::default().with_source(ResolveSourcePolicy::RemoteAuthority);
-            let local = ResolvePolicy::default().with_source(ResolveSourcePolicy::LocalOnly);
-            client.resolve_did_ex(&did, None, remote.clone()).await.unwrap();
+            let client = resolver_test_client(handle.local_addr());
+            // 要设备文档就显式传 device（resolve-did D4）。
+            let device_type = Some(DidDocType::Device);
+            assert_eq!(resolve_current(&client, &did, device_type.clone(), remote_authority_opts()).await.unwrap(), original, "{cause}");
             let (status, source) = match cause {
                 "owner_cutoff" => { owner.valid_iat = Some(now - 300); (DocumentStatus::Revoked, "owner") }
                 "iat_floor" => (DocumentStatus::Revoked, "ood1"),
@@ -2478,8 +2532,16 @@ mod tests {
             assert_eq!(body["didDocumentMetadata"]["buckyos"]["documentStatus"], status.as_str(), "{cause}");
             assert_eq!(body["didDocumentMetadata"]["buckyos"]["sourceDocType"], source, "{cause}");
             assert_eq!(body["didDocumentMetadata"]["buckyos"]["sourceDocumentStatus"], "active", "{cause}");
-            assert!(client.resolve_did_ex(&did, None, remote.clone()).await.is_err(), "{cause}");
-            assert!(client.resolve_did_ex(&did, None, local.clone()).await.is_err(), "{cause}");
+            if status == DocumentStatus::Revoked {
+                // 撤销撤掉本机已有选择资格,远端和本机都不再返回旧文档。
+                assert!(resolve_current(&client, &did, device_type.clone(), remote_authority_opts()).await.is_err(), "{cause}");
+                assert!(resolve_current(&client, &did, device_type.clone(), local_only_opts()).await.is_err(), "{cause}");
+            } else {
+                // authority 的类型级 expired 不撤掉选择资格:本机已验证、自身 exp 未到的
+                // best 仍可选(2026-10-20 裁决,保留 resolve-did 重构后的语义)。
+                assert_eq!(resolve_current(&client, &did, device_type.clone(), remote_authority_opts()).await.unwrap(), original, "{cause}");
+                assert_eq!(resolve_current(&client, &did, device_type.clone(), local_only_opts()).await.unwrap(), original, "{cause}");
+            }
             owner.exp = FAR_FUTURE;
             device.exp = FAR_FUTURE;
             zone.exp = FAR_FUTURE;
@@ -2499,18 +2561,14 @@ mod tests {
                 ] { tx.put_document(&resolver_document_state("alice", slot, 12, DocumentStatus::Active, &bytes))?; }
                 Ok(())
             }).unwrap();
-            assert_eq!(client.resolve_did_ex(&did, None, remote).await.unwrap().document, recovered, "{cause}");
-            assert_eq!(client.resolve_did_ex(&did, None, local).await.unwrap().document, recovered, "{cause}");
+            assert_eq!(resolve_current(&client, &did, device_type.clone(), remote_authority_opts()).await.unwrap(), recovered, "{cause}");
+            assert_eq!(resolve_current(&client, &did, device_type.clone(), local_only_opts()).await.unwrap(), recovered, "{cause}");
             handle.shutdown().await;
         }
     }
 
     #[tokio::test]
     async fn did_resolver_node_active_device_slots() {
-        use name_client::{
-            BaseHttpProvider, BodyEvidence, CacheBackend, NameClient, NameClientConfig, ResolvePolicy,
-            ResolveSourcePolicy,
-        };
         use name_lib::*;
         let (pem, public) = generate_ed25519_key_pair();
         let keyfile = tempfile::NamedTempFile::new().unwrap();
@@ -2582,36 +2640,14 @@ mod tests {
         let server = Arc::new(SqliteBnsIndexerHttpServer::from_registry(registry.clone()));
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let handle = spawn_listener(listener, server.clone()).unwrap();
-        let client = NameClient::new(NameClientConfig {
-            cache_backend: CacheBackend::Memory,
-            enable_zone_resolver: false,
-            ..Default::default()
-        });
-        client
-            .set_method_authority(
-                "bns",
-                Box::new(BaseHttpProvider::new(&format!(
-                    "http://{}",
-                    handle.local_addr()
-                ))),
-            )
-            .await;
-        let mut policy = ResolvePolicy::default();
-        policy.source = ResolveSourcePolicy::RemoteAuthority;
-        policy.allow_self_signed_when_missing = false;
-        policy.allow_stale_cache = false;
-        policy.allow_unverified_cache_when_unavailable = false;
+        let client = resolver_test_client(handle.local_addr());
         for (device, jwt) in &devices {
-            let answer = client
-                .resolve_did_ex(&device.id, None, policy.clone())
+            // 旧 `BodyEvidence::Anchored`：本轮 authority 回答精确绑定了这份文档。
+            let document = resolve_authority_current_device(&client, &device.id)
                 .await
-                .unwrap();
-            assert_eq!(
-                answer.resolution_metadata.evidence,
-                Some(BodyEvidence::Anchored)
-            );
-            assert_eq!(answer.document, EncodedDocument::Jwt(jwt.clone()));
-            assert!(DeviceDocument::decode(&answer.document, None)
+                .expect("authority-current device document");
+            assert_eq!(document, EncodedDocument::Jwt(jwt.clone()));
+            assert!(DeviceDocument::decode(&document, None)
                 .unwrap()
                 .get_auth_key(None)
                 .is_some());
@@ -2638,6 +2674,16 @@ mod tests {
                 device.iat
             );
             assert_eq!(envelope["didDocumentMetadata"]["buckyos"]["registryVersion"], 1);
+            // 显式 `type=device` 同样投影到父名的设备槽位（resolve-did D4）。
+            let (status, typed, _) = resolver_request(
+                server.as_ref(),
+                Method::GET,
+                &format!("/1.0/identifiers/{}?type=device", device.id.to_string()),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(typed["didDocumentMetadata"]["buckyos"]["docType"], "device");
+            assert_eq!(typed["didDocument"], *jwt);
         }
         let (device, _) = &devices[0];
         let mut rotated = device.clone();
@@ -2661,11 +2707,10 @@ mod tests {
                 ))
             })
             .unwrap();
-        let answer = client
-            .resolve_did_ex(&device.id, None, policy.clone())
+        let document = resolve_authority_current_device(&client, &device.id)
             .await
-            .unwrap();
-        assert_eq!(answer.document, EncodedDocument::Jwt(rotated_jwt.clone()));
+            .expect("authority-current rotated device document");
+        assert_eq!(document, EncodedDocument::Jwt(rotated_jwt.clone()));
 
         for (slot, content) in [
             ("zone", zone_jwt.as_bytes().to_vec()),
@@ -2709,10 +2754,7 @@ mod tests {
                 .store()
                 .transact(|tx| tx.put_name(&resolver_name_state("ood1.alice", status)))
                 .unwrap();
-            assert!(client
-                .resolve_did_ex(&device.id, None, policy.clone())
-                .await
-                .is_err());
+            assert!(resolve_authority_current_device(&client, &device.id).await.is_none());
         }
         for status in [
             DocumentStatus::Expired,
@@ -2731,10 +2773,7 @@ mod tests {
                     ))
                 })
                 .unwrap();
-            assert!(client
-                .resolve_did_ex(&devices[1].0.id, None, policy.clone())
-                .await
-                .is_err());
+            assert!(resolve_authority_current_device(&client, &devices[1].0.id).await.is_none());
         }
         handle.shutdown().await;
     }
