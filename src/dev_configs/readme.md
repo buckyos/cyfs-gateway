@@ -92,7 +92,11 @@ uv run buckyos-devtest sn_test snapshot started
 ## 跑 SN VM 冒烟
 
 优先使用 `sn-dev-smoke.sh --vm`。它会验证 DNS A/TXT、BNS indexer 投影解析、
-`did:web` user_domain seed 和纯 Web3 用户解析。
+`did:web` user_domain seed、纯 Web3 用户解析和 SN 代付的 BNS 代理（S7）。
+S7 先调用 SN 的 `admin.clear_state_by_active_code`，该接口只接受 loopback 来源，
+VM 模式下脚本经 `buckyos-devtest <group> run sn` 在 SN 内部调用；S8 检查 OOD 到 SN 的
+keep-tunnel，只适用于带 OOD 的 group。脚本默认使用同级 buckyos 仓库的 `sntest` 组；
+单 SN 的 `sn_test` 组需要指定 group 并关闭 S8：
 
 ```bash
 cd /Users/liuzhicong/project/cyfs-gateway/src
@@ -101,11 +105,12 @@ SN_IP=$(multipass info sn | awk '/IPv4/{print $2; exit}')
 ./web3-gateway/scripts/sn-dev-smoke.sh --vm \
   --expected-a "$SN_IP" \
   --dns-server "$SN_IP" \
-  --http-origin "http://$SN_IP"
+  --http-origin "http://$SN_IP" \
+  --devtest-group sn_test --no-keep-tunnel
 ```
 
 如果宿主机已经把 `sn.devtests.org` 指到 VM IP，也可以省略 `--http-origin`。
-Multipass 不能固定 IP，重建 VM 后必须重新获取 `SN_IP`。
+VM 的 stop/start、snapshot/restore 不改变 IP；重建 VM 后必须重新获取 `SN_IP`。
 
 ## 通用 DV Test 运行方式
 
@@ -144,9 +149,11 @@ uv run buckyos-devtest sn_test exec web3-gateway.start_bg --device sn
 devtest 只从宿主机
 `/tmp/buckyos-vmtest/cyfs-gateway/web3-gateway` 部署文件。这个目录是一次性的构建
 staging，不是服务运行目录：每次 `web3-gateway.build_all` 都会先校验路径位于约定的
-`/tmp/buckyos-vmtest/cyfs-gateway` 临时根目录下，再删除并从零重建。构建通过
-`APPDATA=/tmp/buckyos-vmtest/cyfs-gateway` 将 `buckyos-update` 输出定向到 staging；
-BNS 源码、seed、identity 和 TLS 文件也只生成到这里。
+`/tmp/buckyos-vmtest/cyfs-gateway` 临时根目录下，再删除并从零重建。构建先执行
+`buckyos-build <arch>`（默认取宿主机架构，可用 `--target amd64|aarch64` 指定），再用
+`buckyos-install --app=web3-gateway --target-rootfs=<staging>` 只把 web3-gateway 装进
+staging；不调用 `build.py` / `buckyos-update`，因为它们还会把 cyfs-gateway 更新到宿主机的
+`$BUCKYOS_ROOT`（默认 `/opt/buckyos`）。BNS 源码、seed、identity 和 TLS 文件也只生成到这里。
 `params.json` 中的 SN DB 和 token key 路径使用部署目录相对路径，避免把宿主机
 staging 的绝对路径带进 VM。
 

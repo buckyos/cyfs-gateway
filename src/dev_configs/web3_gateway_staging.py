@@ -2,6 +2,7 @@
 
 import argparse
 import os
+import platform
 import shutil
 import subprocess
 import sys
@@ -63,6 +64,16 @@ DEPLOYMENT_CONFIG_FILES = (
 
 class StagingError(RuntimeError):
     pass
+
+
+def host_linux_target() -> str:
+    # devtest VMs run the host CPU architecture.
+    machine = platform.machine().lower()
+    if machine in {"arm64", "aarch64"}:
+        return "aarch64"
+    if machine in {"x86_64", "amd64"}:
+        return "amd64"
+    raise StagingError(f"unsupported host CPU architecture for VM test: {machine}")
 
 
 def checked_staging_path(
@@ -209,17 +220,34 @@ def validate_complete_staging(staging_dir: Path = STAGING_DIR) -> None:
     print(f"[staging] required-content validation passed: {staging_dir}")
 
 
+def devkit_command(name: str) -> str:
+    candidate = Path(sys.executable).parent / name
+    if candidate.exists():
+        return str(candidate)
+    found = shutil.which(name)
+    if found is None:
+        raise StagingError(f"{name} not found; run this script with `uv run` from cyfs-gateway/src")
+    return found
+
+
 def run_build(target: str) -> None:
     checked_staging_path()
     STAGING_DIR.mkdir(parents=True, exist_ok=True)
     staged_binary = STAGING_DIR / "web3_gateway"
     staged_binary.unlink(missing_ok=True)
-    env = os.environ.copy()
-    env["APPDATA"] = str(STAGING_ROOT)
-    command = [sys.executable, str(SRC_ROOT / "build.py"), target]
-    print(f"[staging] APPDATA={STAGING_ROOT}")
-    print(f"[staging] running: {' '.join(command)}")
-    subprocess.run(command, cwd=SRC_ROOT, env=env, check=True)
+    # Install only web3-gateway, and only into the staging dir. A plain build.py /
+    # buckyos-update would also update cyfs-gateway into the host $BUCKYOS_ROOT.
+    commands = [
+        [devkit_command("buckyos-build"), target],
+        [
+            devkit_command("buckyos-install"),
+            "--app=web3-gateway",
+            f"--target-rootfs={STAGING_DIR}",
+        ],
+    ]
+    for command in commands:
+        print(f"[staging] running: {' '.join(command)}")
+        subprocess.run(command, cwd=SRC_ROOT, check=True)
 
 
 def discard_failed_staging() -> None:
@@ -305,12 +333,18 @@ def parse_args() -> argparse.Namespace:
     build_parser = subparsers.add_parser(
         "build", help="Refresh build outputs in staging for devtest update."
     )
-    build_parser.add_argument("--target", default="aarch64")
+    build_parser.add_argument(
+        "--target", choices=["amd64", "aarch64"], default=None,
+        help="Linux target CPU architecture. Defaults to the host CPU.",
+    )
 
     build_all_parser = subparsers.add_parser(
         "build-all", help="Recreate the complete staging directory from zero."
     )
-    build_all_parser.add_argument("--target", default="aarch64")
+    build_all_parser.add_argument(
+        "--target", choices=["amd64", "aarch64"], default=None,
+        help="Linux target CPU architecture. Defaults to the host CPU.",
+    )
     build_all_parser.add_argument("--sn-ip", required=True)
     build_all_parser.add_argument("--enable-bns-proxy", action="store_true")
 
@@ -325,10 +359,10 @@ def main() -> int:
     args = parse_args()
     try:
         if args.command == "build":
-            run_build(args.target)
+            run_build(args.target or host_linux_target())
             validate_no_runtime_artifacts()
         elif args.command == "build-all":
-            build_all(args.target, args.sn_ip, args.enable_bns_proxy)
+            build_all(args.target or host_linux_target(), args.sn_ip, args.enable_bns_proxy)
         elif args.command == "validate":
             checked_staging_path()
             validate_complete_staging()
