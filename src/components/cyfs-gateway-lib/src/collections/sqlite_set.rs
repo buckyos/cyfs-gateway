@@ -1,11 +1,12 @@
+use super::sqlite_pool::open_sqlite_pool;
 use cyfs_process_chain::{SetCollection, SetCollectionTraverseCallBackRef};
-use sfo_sql::Row;
-use sfo_sql::sqlite::sql_query;
+use sqlx::Row;
+use sqlx::sqlite::SqlitePool;
 
 pub struct SqliteSet {
     pub table_name: String,
     pub column_name: String,
-    pub pool: sfo_sql::sqlite::SqlPool,
+    pool: SqlitePool,
 }
 
 impl SqliteSet {
@@ -14,31 +15,26 @@ impl SqliteSet {
         table_name: Option<String>,
         column_name: Option<String>,
     ) -> Result<Self, String> {
-        let pool = sfo_sql::sqlite::SqlPool::open(path.into().as_str(), 5, None)
+        let pool = open_sqlite_pool(path.into().as_str())
             .await
             .map_err(|e| e.to_string())?;
         let table_name = if table_name.is_some() {
             table_name.unwrap()
         } else {
-            let mut conn = pool.get_conn().await.map_err(|e| e.to_string())?;
             // 从数据库中获取表名
-            match conn
-                .query_one(sql_query(
-                    "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name;",
-                ))
+            match sqlx::query("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name;")
+                .fetch_optional(&pool)
                 .await
+                .map_err(|e| e.to_string())?
             {
-                Ok(row) => row.get("name"),
-                Err(e) => {
-                    if e.code() == sfo_sql::errors::SqlErrorCode::NotFound {
-                        // 创建表
-                        conn.execute_sql(sql_query("CREATE TABLE datas (data TEXT PRIMARY KEY);"))
-                            .await
-                            .map_err(|e| e.to_string())?;
-                        "datas".to_string()
-                    } else {
-                        return Err(e.to_string());
-                    }
+                Some(row) => row.get("name"),
+                None => {
+                    // 创建表
+                    sqlx::query("CREATE TABLE datas (data TEXT PRIMARY KEY);")
+                        .execute(&pool)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    "datas".to_string()
                 }
             }
         };
@@ -46,27 +42,22 @@ impl SqliteSet {
         let column_name = if column_name.is_some() {
             column_name.unwrap()
         } else {
-            let mut conn = pool.get_conn().await.map_err(|e| e.to_string())?;
             // 从数据库中获取列名
-            match conn
-                .query_one(sql_query(
-                    format!("PRAGMA table_info({});", table_name).as_str(),
-                ))
+            match sqlx::query(format!("PRAGMA table_info({});", table_name).as_str())
+                .fetch_optional(&pool)
                 .await
+                .map_err(|e| e.to_string())?
             {
-                Ok(row) => row.get("name"),
-                Err(e) => {
-                    if e.code() == sfo_sql::errors::SqlErrorCode::NotFound {
-                        // 创建列
-                        conn.execute_sql(sql_query(
-                            format!("ALTER TABLE {} ADD COLUMN data TEXT;", table_name).as_str(),
-                        ))
-                        .await
-                        .map_err(|e| e.to_string())?;
-                        "data".to_string()
-                    } else {
-                        return Err(e.to_string());
-                    }
+                Some(row) => row.get("name"),
+                None => {
+                    // 创建列
+                    sqlx::query(
+                        format!("ALTER TABLE {} ADD COLUMN data TEXT;", table_name).as_str(),
+                    )
+                    .execute(&pool)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                    "data".to_string()
                 }
             }
         };
@@ -82,84 +73,63 @@ impl SqliteSet {
 #[async_trait::async_trait]
 impl SetCollection for SqliteSet {
     async fn len(&self) -> Result<usize, String> {
-        let mut conn = self.pool.get_conn().await.map_err(|e| e.to_string())?;
-        let row = conn
-            .query_one(sql_query(
-                format!("SELECT COUNT(*) AS count FROM {};", self.table_name).as_str(),
-            ))
-            .await
-            .map_err(|e| e.to_string())?;
+        let row = sqlx::query(
+            format!("SELECT COUNT(*) AS count FROM {};", self.table_name).as_str(),
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| e.to_string())?;
         Ok(row.get::<i64, _>("count") as usize)
     }
 
     async fn insert(&self, value: &str) -> Result<bool, String> {
-        let mut conn = self.pool.get_conn().await.map_err(|e| e.to_string())?;
-        let row = conn
-            .execute_sql(
-                sql_query(
-                    format!(
-                        "INSERT OR IGNORE INTO {} ({}) VALUES (?);",
-                        self.table_name, self.column_name
-                    )
-                    .as_str(),
-                )
-                .bind(value),
+        let row = sqlx::query(
+            format!(
+                "INSERT OR IGNORE INTO {} ({}) VALUES (?);",
+                self.table_name, self.column_name
             )
-            .await
-            .map_err(|e| e.to_string())?;
+            .as_str(),
+        )
+        .bind(value)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| e.to_string())?;
         Ok(row.rows_affected() > 0)
     }
 
     async fn contains(&self, key: &str) -> Result<bool, String> {
-        let mut conn = self.pool.get_conn().await.map_err(|e| e.to_string())?;
-        match conn
-            .query_one(
-                sql_query(
-                    format!(
-                        "SELECT * FROM {} WHERE {} = ?;",
-                        self.table_name, self.column_name
-                    )
-                    .as_str(),
-                )
-                .bind(key),
+        let row = sqlx::query(
+            format!(
+                "SELECT * FROM {} WHERE {} = ?;",
+                self.table_name, self.column_name
             )
-            .await
-        {
-            Ok(_) => Ok(true),
-            Err(e) => {
-                if e.code() == sfo_sql::errors::SqlErrorCode::NotFound {
-                    Ok(false)
-                } else {
-                    Err(e.to_string())
-                }
-            }
-        }
+            .as_str(),
+        )
+        .bind(key)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| e.to_string())?;
+        Ok(row.is_some())
     }
 
     async fn remove(&self, key: &str) -> Result<bool, String> {
-        let mut conn = self.pool.get_conn().await.map_err(|e| e.to_string())?;
-        let row = conn
-            .execute_sql(
-                sql_query(
-                    format!(
-                        "DELETE FROM {} WHERE {} = ?;",
-                        self.table_name, self.column_name
-                    )
-                    .as_str(),
-                )
-                .bind(key),
+        let row = sqlx::query(
+            format!(
+                "DELETE FROM {} WHERE {} = ?;",
+                self.table_name, self.column_name
             )
-            .await
-            .map_err(|e| e.to_string())?;
+            .as_str(),
+        )
+        .bind(key)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| e.to_string())?;
         Ok(row.rows_affected() > 0)
     }
 
     async fn get_all(&self) -> Result<Vec<String>, String> {
-        let mut conn = self.pool.get_conn().await.map_err(|e| e.to_string())?;
-        let rows = conn
-            .query_all(sql_query(
-                format!("SELECT * FROM {};", self.table_name).as_str(),
-            ))
+        let rows = sqlx::query(format!("SELECT * FROM {};", self.table_name).as_str())
+            .fetch_all(&self.pool)
             .await
             .map_err(|e| e.to_string())?;
         let mut result = Vec::new();
@@ -170,11 +140,8 @@ impl SetCollection for SqliteSet {
     }
 
     async fn traverse(&self, callback: SetCollectionTraverseCallBackRef) -> Result<(), String> {
-        let mut conn = self.pool.get_conn().await.map_err(|e| e.to_string())?;
-        let rows = conn
-            .query_all(sql_query(
-                format!("SELECT * FROM {}", self.table_name).as_str(),
-            ))
+        let rows = sqlx::query(format!("SELECT * FROM {}", self.table_name).as_str())
+            .fetch_all(&self.pool)
             .await
             .map_err(|e| e.to_string())?;
         for row in rows {
@@ -187,8 +154,8 @@ impl SetCollection for SqliteSet {
 #[cfg(test)]
 mod tests {
     use crate::SqliteSet;
+    use super::open_sqlite_pool;
     use cyfs_process_chain::SetCollection;
-    use sfo_sql::sqlite::sql_query;
 
     #[tokio::test]
     async fn test_new_sqlite_set() {
@@ -233,20 +200,19 @@ mod tests {
         let path = file.path().to_string_lossy().to_string();
 
         {
-            let pool =
-                sfo_sql::sqlite::SqlPool::open(format!("sqlite://{}", path).as_str(), 5, None)
-                    .await
-                    .unwrap();
-            let mut conn = pool.get_conn().await.unwrap();
-            conn.execute_sql(sql_query(
-                "CREATE TABLE test_datas (item TEXT PRIMARY KEY);",
-            ))
-            .await
-            .unwrap();
-            conn.execute_sql(sql_query("INSERT INTO test_datas (item) VALUES ('test');"))
+            let pool = open_sqlite_pool(format!("sqlite://{}", path).as_str())
                 .await
                 .unwrap();
-            conn.execute_sql(sql_query("INSERT INTO test_datas (item) VALUES ('test1');"))
+            sqlx::query("CREATE TABLE test_datas (item TEXT PRIMARY KEY);")
+                .execute(&pool)
+                .await
+                .unwrap();
+            sqlx::query("INSERT INTO test_datas (item) VALUES ('test');")
+                .execute(&pool)
+                .await
+                .unwrap();
+            sqlx::query("INSERT INTO test_datas (item) VALUES ('test1');")
+                .execute(&pool)
                 .await
                 .unwrap();
         }
@@ -273,20 +239,19 @@ mod tests {
         let path = file.path().to_string_lossy().to_string();
 
         {
-            let pool =
-                sfo_sql::sqlite::SqlPool::open(format!("sqlite://{}", path).as_str(), 5, None)
-                    .await
-                    .unwrap();
-            let mut conn = pool.get_conn().await.unwrap();
-            conn.execute_sql(sql_query(
-                "CREATE TABLE test_datas (item TEXT PRIMARY KEY);",
-            ))
-            .await
-            .unwrap();
-            conn.execute_sql(sql_query("INSERT INTO test_datas (item) VALUES ('test');"))
+            let pool = open_sqlite_pool(format!("sqlite://{}", path).as_str())
                 .await
                 .unwrap();
-            conn.execute_sql(sql_query("INSERT INTO test_datas (item) VALUES ('test1');"))
+            sqlx::query("CREATE TABLE test_datas (item TEXT PRIMARY KEY);")
+                .execute(&pool)
+                .await
+                .unwrap();
+            sqlx::query("INSERT INTO test_datas (item) VALUES ('test');")
+                .execute(&pool)
+                .await
+                .unwrap();
+            sqlx::query("INSERT INTO test_datas (item) VALUES ('test1');")
+                .execute(&pool)
                 .await
                 .unwrap();
         }
@@ -309,20 +274,19 @@ mod tests {
         let path = file.path().to_string_lossy().to_string();
 
         {
-            let pool =
-                sfo_sql::sqlite::SqlPool::open(format!("sqlite://{}", path).as_str(), 5, None)
-                    .await
-                    .unwrap();
-            let mut conn = pool.get_conn().await.unwrap();
-            conn.execute_sql(sql_query(
-                "CREATE TABLE test_datas (item TEXT PRIMARY KEY);",
-            ))
-            .await
-            .unwrap();
-            conn.execute_sql(sql_query("INSERT INTO test_datas (item) VALUES ('test');"))
+            let pool = open_sqlite_pool(format!("sqlite://{}", path).as_str())
                 .await
                 .unwrap();
-            conn.execute_sql(sql_query("INSERT INTO test_datas (item) VALUES ('test1');"))
+            sqlx::query("CREATE TABLE test_datas (item TEXT PRIMARY KEY);")
+                .execute(&pool)
+                .await
+                .unwrap();
+            sqlx::query("INSERT INTO test_datas (item) VALUES ('test');")
+                .execute(&pool)
+                .await
+                .unwrap();
+            sqlx::query("INSERT INTO test_datas (item) VALUES ('test1');")
+                .execute(&pool)
                 .await
                 .unwrap();
         }

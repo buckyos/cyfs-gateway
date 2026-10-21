@@ -30,7 +30,8 @@ serde.workspace = true
 serde_json.workspace = true
 serde_yaml_ng.workspace = true
 sha2.workspace = true
-sfo-js = { version = "0.1.8" }
+buckyos-js-runtime.workspace = true
+boa_engine.workspace = true
 tokio.workspace = true
 toml.workspace = true
 thiserror.workspace = true

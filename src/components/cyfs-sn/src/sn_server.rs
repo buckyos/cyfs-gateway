@@ -3358,6 +3358,7 @@ mod tests {
             },
         ] {
             let error = SnServerFactory::ensure_auth_db_capabilities(&stale).unwrap_err();
+            assert_eq!(error.code(), ServerErrorCode::InvalidConfig, "{stale:?}");
             assert!(
                 error.to_string().contains("incompatible AuthDB capability"),
                 "{stale:?} must be rejected"

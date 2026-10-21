@@ -13,6 +13,6 @@ serde.workspace = true
 serde_json.workspace = true
 cyfs-process-chain = { path = "../cyfs-process-chain" }
 log.workspace = true
-sfo-io = "0.1"
+buckyos-io.workspace = true
 shlex.workspace = true
 buckyos-kit.workspace = true

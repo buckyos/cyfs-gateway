@@ -398,6 +398,13 @@ async fn e2e_register_publish_document_then_owner_exits_sn_custody() {
         )
         .await
         .unwrap_err();
+    assert!(
+        matches!(
+            owner_change_error,
+            cyfs_sn::SnBnsProxyError::Write(bns_client::SnBnsControllerError::InvalidInput(_))
+        ),
+        "{owner_change_error:?}"
+    );
     assert!(owner_change_error.to_string().contains("cannot be changed"));
 
     // --- 4. 绑定 controller 可写 dns_txt ---

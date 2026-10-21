@@ -23,7 +23,8 @@ chrono.workspace = true
 rustls-pemfile.workspace = true
 lazy_static.workspace = true
 name-client.workspace = true
-sfo-js = "*"
+buckyos-js-runtime.workspace = true
+boa_engine.workspace = true
 callback-trait = "0.1"
 
 [dev-dependencies]

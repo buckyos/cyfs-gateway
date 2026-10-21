@@ -943,7 +943,7 @@ impl ProcessChainHttpServer {
                     body_idle_budget.as_millis()
                 );
                 return Err(server_err!(
-                    ServerErrorCode::StreamError,
+                    ServerErrorCode::BodyIdleTimeout,
                     "Failed to request upstream {}: request body idle for {}ms",
                     upstream,
                     body_idle_budget.as_millis()
@@ -956,7 +956,7 @@ impl ProcessChainHttpServer {
                     head_budget.as_millis()
                 );
                 return Err(server_err!(
-                    ServerErrorCode::TunnelError,
+                    ServerErrorCode::ResponseHeadTimeout,
                     "Failed to request upstream {}: response head timeout after {}ms",
                     upstream,
                     head_budget.as_millis()
@@ -1247,7 +1247,7 @@ impl ProcessChainHttpServer {
                         }
                         *timed_out = is_timeout;
                         return Err(server_err!(
-                            ServerErrorCode::InvalidConfig,
+                            ServerErrorCode::TunnelError,
                             "Failed to connect upstream candidates: {}",
                             msg
                         ));
@@ -1402,7 +1402,7 @@ impl ProcessChainHttpServer {
                         }
                         *timed_out = is_timeout;
                         return Err(server_err!(
-                            ServerErrorCode::InvalidConfig,
+                            ServerErrorCode::TunnelError,
                             "Failed to connect upstream candidates: {}",
                             msg
                         ));
@@ -2154,7 +2154,7 @@ impl ProcessChainHttpServer {
                         idle_budget.as_millis()
                     );
                     return Err(server_err!(
-                        ServerErrorCode::StreamError,
+                        ServerErrorCode::BodyIdleTimeout,
                         "buffering request body failed: no data for {}ms",
                         idle_budget.as_millis()
                     ));
@@ -5650,10 +5650,10 @@ request_body_idle_timeout: 10s
             .expect_err("a silent upstream must not produce a response");
         let elapsed = started.elapsed();
 
-        assert!(
-            err.msg().contains("response head timeout"),
-            "unexpected error: {}",
-            err.msg()
+        assert_eq!(
+            err.code(),
+            ServerErrorCode::ResponseHeadTimeout,
+            "unexpected error: {err}"
         );
         assert!(
             elapsed < Duration::from_secs(3),
@@ -5711,7 +5711,7 @@ request_body_idle_timeout: 10s
             .serve_request(request, StreamInfo::default())
             .await
             .unwrap_err();
-        assert!(error.msg().contains("response head timeout"), "{error}");
+        assert_eq!(error.code(), ServerErrorCode::ResponseHeadTimeout, "{error}");
         assert!(started.elapsed() < Duration::from_millis(250));
     }
 
@@ -5799,7 +5799,8 @@ request_body_idle_timeout: 10s
                 )
                 .await
                 .expect_err("a refused connection must not match timeout-only retry");
-            assert!(error.msg().contains("Failed to connect upstream"));
+            assert_eq!(error.code(), ServerErrorCode::TunnelError, "{error}");
+            assert!(error.msg().contains(&closed_addr.to_string()), "{error}");
         }
     }
 
@@ -5886,11 +5887,12 @@ request_body_idle_timeout: 10s
             .await
             .unwrap_err();
 
-        assert!(
-            err.msg().contains("no data for 100ms"),
-            "unexpected error: {}",
-            err.msg()
+        assert_eq!(
+            err.code(),
+            ServerErrorCode::BodyIdleTimeout,
+            "unexpected error: {err}"
         );
+        assert!(err.msg().contains("100ms"), "unexpected error: {err}");
         assert!(
             started.elapsed() < Duration::from_secs(3),
             "an idle client must be cut promptly, elapsed {:?}",

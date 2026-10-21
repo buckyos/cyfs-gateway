@@ -13,7 +13,6 @@ use name_client::resolve_ip;
 use quinn::crypto::rustls::QuicClientConfig;
 use rustls::ClientConfig;
 use rustls_platform_verifier::BuilderVerifierExt;
-use sfo_split::Splittable;
 use std::io::Error;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -76,7 +75,7 @@ impl Tunnel for QuicTunnel {
                 .open_bi()
                 .await
                 .map_err(|e| Error::new(std::io::ErrorKind::Other, e))?;
-            Ok::<Box<dyn AsyncStream>, Error>(Box::new(Splittable::new(recv, send)))
+            Ok::<Box<dyn AsyncStream>, Error>(Box::new(tokio::io::join(recv, send)))
         };
         tokio::time::timeout(connect_timeout, open)
             .await

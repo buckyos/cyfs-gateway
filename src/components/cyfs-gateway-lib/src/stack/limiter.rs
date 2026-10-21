@@ -1,6 +1,6 @@
 use crate::{StackErrorCode, StackResult, stack_err};
 use cyfs_process_chain::*;
-use sfo_io::{SpeedLimitSession, SpeedLimiter, SpeedLimiterRef};
+use buckyos_io::{SpeedLimitSession, SpeedLimiter, SpeedLimiterRef};
 use std::collections::HashMap;
 use std::num::NonZeroU32;
 use std::sync::Arc;

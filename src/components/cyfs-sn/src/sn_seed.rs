@@ -805,6 +805,7 @@ user_domains:
         let error = import_sn_seed(&db, &seed)
             .await
             .expect_err("must fail fast");
+        assert_eq!(error.code(), SnErrorCode::DBError);
         assert!(error.to_string().contains("AuthDB invariant violated"));
         assert!(error.to_string().contains("alice"));
         assert!(

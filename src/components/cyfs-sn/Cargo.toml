@@ -42,7 +42,7 @@ bns-client = { path = "../bns-client" }
 bns-evm = { path = "../bns-evm" }
 async-named-locker = "0.1"
 callback-trait = "0.1"
-sfo-result = "0.2"
+thiserror.workspace = true
 sfo-ip = "0.1"
 #buckyos-api = { path = "../../kernel/buckyos-api" }
 

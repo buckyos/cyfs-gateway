@@ -2,6 +2,7 @@ mod ip_region_map;
 mod json_map;
 mod json_set;
 mod sqlite_map;
+pub(crate) mod sqlite_pool;
 mod sqlite_set;
 mod text_set;
 

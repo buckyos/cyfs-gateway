@@ -29,7 +29,7 @@ pub use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::server::ResolvesServerCert;
 use rustls::sign::CertifiedKey;
 use serde::{Deserialize, Serialize};
-use sfo_io::{LimitStream, StatStream};
+use buckyos_io::{LimitStream, StatStream};
 use std::net::SocketAddr;
 #[cfg(unix)]
 use std::os::fd::{FromRawFd, IntoRawFd};
@@ -1371,7 +1371,7 @@ mod tests {
         ClientConfig, DigitallySignedStruct, Error, HandshakeKind, RootCertStore, ServerConfig,
         SignatureScheme,
     };
-    use sfo_io::StatStream;
+    use buckyos_io::StatStream;
     use std::net::SocketAddr;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};

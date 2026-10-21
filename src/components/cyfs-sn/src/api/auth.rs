@@ -254,18 +254,7 @@ pub(crate) async fn handle_auth(
                     source_version: None,
                 })
                 .await
-                .map_err(|error| {
-                    if error.code() == crate::SnErrorCode::Conflict
-                        && error.msg().starts_with("email already bound:")
-                    {
-                        parse_error(
-                            SnApiErrorCode::EmailAlreadyBound,
-                            "email is already bound to another account",
-                        )
-                    } else {
-                        reason_error(SnApiErrorCode::InternalError, error.to_string())
-                    }
-                })?;
+                .map_err(map_register_error)?;
             if !registration.registered {
                 return Err(parse_error(
                     SnApiErrorCode::InvalidActiveCode,
@@ -424,9 +413,61 @@ pub(crate) async fn handle_auth(
     }
 }
 
+fn map_register_error(error: crate::SnError) -> RPCErrors {
+    if error.code() == crate::SnErrorCode::EmailAlreadyBound {
+        parse_error(
+            SnApiErrorCode::EmailAlreadyBound,
+            "email is already bound to another account",
+        )
+    } else {
+        reason_error(SnApiErrorCode::InternalError, error.to_string())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{into_sn_err, sn_err, SnErrorCode};
+
+    fn rpc_message(error: RPCErrors) -> String {
+        match error {
+            RPCErrors::ParseRequestError(message) | RPCErrors::ReasonError(message) => message,
+            other => panic!("unexpected rpc error: {other:?}"),
+        }
+    }
+
+    fn assert_no_source_location(message: &str) {
+        for leaked in [".rs:", "at:[", "ErrorCode"] {
+            assert!(!message.contains(leaked), "{leaked:?} leaked into {message:?}");
+        }
+    }
+
+    #[test]
+    fn register_error_text_has_no_source_location() {
+        let email = map_register_error(sn_err!(
+            SnErrorCode::EmailAlreadyBound,
+            "email already bound: a@example.com"
+        ));
+        assert!(matches!(email, RPCErrors::ParseRequestError(_)));
+        let email = rpc_message(email);
+        assert!(email.starts_with("[SN:1029:email_already_bound]"), "{email}");
+        assert_no_source_location(&email);
+
+        let io: Result<(), std::io::Error> = Err(std::io::Error::other("disk gone"));
+        let errors = [
+            sn_err!(SnErrorCode::Conflict, "username already exists: alice"),
+            sn_err!(SnErrorCode::DBError, "insert user failed"),
+            io.map_err(into_sn_err!(SnErrorCode::DBError, "insert user failed"))
+                .unwrap_err(),
+        ];
+        for error in errors {
+            let mapped = map_register_error(error);
+            assert!(matches!(mapped, RPCErrors::ReasonError(_)));
+            let message = rpc_message(mapped);
+            assert!(message.starts_with("[SN:"), "{message}");
+            assert_no_source_location(&message);
+        }
+    }
 
     #[test]
     fn default_owner_config_is_deterministic() {

@@ -976,6 +976,11 @@ mod tests {
         let err = RTcpTunnelPackage::send_hello_stream(&mut tx, "short")
             .await
             .unwrap_err();
+        assert_eq!(
+            err.downcast_ref::<std::io::Error>().map(|e| e.kind()),
+            Some(std::io::ErrorKind::InvalidInput),
+            "{err:?}"
+        );
         assert!(err.to_string().contains("exactly 32"));
     }
 

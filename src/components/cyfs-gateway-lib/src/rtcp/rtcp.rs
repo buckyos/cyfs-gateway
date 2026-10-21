@@ -3561,8 +3561,8 @@ impl RTcpInner {
                 return Ok(Box::new(tunnel));
             }
             Ok(None) => {}
-            Err(conflict) if conflict == RTCP_STOPPED_REASON => {
-                return Err(TunnelError::InvalidState(conflict));
+            Err(OutboundAcquireError::Stopped) => {
+                return Err(TunnelError::InvalidState(RTCP_STOPPED_REASON.to_string()));
             }
             Err(conflict) => {
                 let msg = format!(
@@ -3591,8 +3591,8 @@ impl RTcpInner {
                 return Ok(Box::new(tunnel));
             }
             Ok(None) => {}
-            Err(conflict) if conflict == RTCP_STOPPED_REASON => {
-                return Err(TunnelError::InvalidState(conflict));
+            Err(OutboundAcquireError::Stopped) => {
+                return Err(TunnelError::InvalidState(RTCP_STOPPED_REASON.to_string()));
             }
             Err(conflict) => {
                 let msg = format!(
@@ -6310,6 +6310,26 @@ enum OutboundRegisterError {
 
 const RTCP_STOPPED_REASON: &str = "RTCP stack is stopping or stopped";
 
+// Why `acquire_outbound` refused to hand out (or wait for) a tunnel.
+#[derive(Debug)]
+enum OutboundAcquireError {
+    // The RTcp lifecycle has crossed its shutdown linearization point.
+    Stopped,
+    // A prior authority decision denied this logical identity.
+    AuthorityNegative(String),
+    // The canonical DEV DID is bound to another verified logical name.
+    BindingConflict(String),
+}
+
+impl std::fmt::Display for OutboundAcquireError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Stopped => f.write_str(RTCP_STOPPED_REASON),
+            Self::AuthorityNegative(reason) | Self::BindingConflict(reason) => f.write_str(reason),
+        }
+    }
+}
+
 impl RTcpTunnelMapState {
     fn remove_instance_binding(&mut self, instance_id: u64) -> bool {
         let Some(binding) = self.binding_by_instance.remove(&instance_id) else {
@@ -6684,7 +6704,7 @@ impl RTcpTunnelMap {
         &self,
         tunnel_key: &str,
         binding: Option<&OutboundNameBinding>,
-    ) -> Result<Option<RTcpTunnel>, String> {
+    ) -> Result<Option<RTcpTunnel>, OutboundAcquireError> {
         let _commit_guard = if binding.is_some() {
             Some(self.authenticated_commit_lock.lock().await)
         } else {
@@ -6692,24 +6712,26 @@ impl RTcpTunnelMap {
         };
         if let Some(binding) = binding {
             if let Some(negative) = self.authority_negative_snapshot(&binding.logical_did).await {
-                return Err(format!(
+                return Err(OutboundAcquireError::AuthorityNegative(format!(
                     "authority Negative rejects logical identity {}: {}",
                     binding.logical_did, negative.reason
-                ));
+                )));
             }
         }
         let mut all_tunnel = self.tunnel_map.lock().await;
         if all_tunnel.lifecycle != RTcpLifecycle::Running {
-            return Err(RTCP_STOPPED_REASON.to_string());
+            return Err(OutboundAcquireError::Stopped);
         }
         if let Some(binding) = binding {
             if let Some(bound_logical) = all_tunnel
                 .conflicting_logical_binding(&binding.logical_did, &binding.canonical_dev_did)
             {
-                return Err(Self::binding_conflict_message(
-                    &binding.logical_did,
-                    &binding.canonical_dev_did,
-                    &bound_logical,
+                return Err(OutboundAcquireError::BindingConflict(
+                    Self::binding_conflict_message(
+                        &binding.logical_did,
+                        &binding.canonical_dev_did,
+                        &bound_logical,
+                    ),
                 ));
             }
         }
@@ -9140,7 +9162,8 @@ mod tests {
                 .is_same_instance(&tunnel)
         );
         let err = match map.acquire_outbound(key, Some(&binding_b)).await {
-            Err(err) => err,
+            Err(OutboundAcquireError::BindingConflict(err)) => err,
+            Err(other) => panic!("expected a binding conflict, got {other:?}"),
             Ok(_) => panic!("second logical name must not silently reuse the bound tunnel"),
         };
         assert!(
@@ -9197,7 +9220,10 @@ mod tests {
             logical_did: "did:web:late-b.example".to_string(),
             canonical_dev_did: dev.to_string(),
         };
-        assert!(map.acquire_outbound(key, Some(&binding_b)).await.is_err());
+        assert!(matches!(
+            map.acquire_outbound(key, Some(&binding_b)).await,
+            Err(OutboundAcquireError::BindingConflict(_))
+        ));
     }
 
     #[tokio::test]
@@ -9352,7 +9378,10 @@ mod tests {
                 .await,
             Err(OutboundRegisterError::AuthorityNegative(_))
         ));
-        assert!(map.acquire_outbound(key, Some(&binding)).await.is_err());
+        assert!(matches!(
+            map.acquire_outbound(key, Some(&binding)).await,
+            Err(OutboundAcquireError::AuthorityNegative(_))
+        ));
         assert!(map.get_tunnel(key).await.is_none());
     }
 
@@ -9732,6 +9761,10 @@ mod tests {
             RTcpInner::verify_hello_token(&token, &decoding_key, Some("attacker.example.com"))
                 .unwrap_err();
         assert!(
+            matches!(err, TunnelError::DocumentError(_)),
+            "unexpected error variant: {err:?}"
+        );
+        assert!(
             err.to_string().contains("not match expected"),
             "unexpected error: {}",
             err
@@ -9746,6 +9779,10 @@ mod tests {
             Some("initiator.example.com"),
         )
         .unwrap_err();
+        assert!(
+            matches!(err, TunnelError::ReasonError(_)),
+            "unexpected error variant: {err:?}"
+        );
         assert!(
             err.to_string().contains("x25519 pub key"),
             "unexpected error: {}",
@@ -10186,6 +10223,10 @@ mod tests {
         };
 
         assert!(
+            matches!(err, TunnelError::ReasonError(_)),
+            "unexpected error variant: {err:?}"
+        );
+        assert!(
             err.to_string().contains("tunnel_manager is not set"),
             "unexpected error: {}",
             err
@@ -10236,6 +10277,10 @@ mod tests {
             Err(err) => err,
         };
 
+        assert!(
+            matches!(err, TunnelError::ConnectError(_)),
+            "unexpected error variant: {err:?}"
+        );
         assert!(
             err.to_string().contains("open bootstrap stream"),
             "unexpected error: {}",
@@ -10503,6 +10548,10 @@ mod tests {
             Ok(_) => panic!("second logical name to the same canonical dev must be rejected"),
             Err(err) => err,
         };
+        assert!(
+            matches!(err, TunnelError::DocumentError(_)),
+            "unexpected error variant: {err:?}"
+        );
         assert!(
             err.to_string().contains("one-to-one name binding")
                 && err.to_string().contains("rtcp-one-binding-a"),
@@ -11900,6 +11949,10 @@ mod tests {
             Err(e) => e,
         };
         assert!(
+            matches!(err, TunnelError::DocumentError(_)),
+            "unexpected error variant: {err:?}"
+        );
+        assert!(
             err.to_string().contains("device_doc_jwt is required"),
             "unexpected error: {}",
             err
@@ -11934,11 +11987,8 @@ mod tests {
             Err(err) => err,
         };
         assert!(
-            err.to_string().contains("could not be evaluated")
-                || err.to_string().contains("failed")
-                || err.to_string().contains("unavailable"),
-            "unexpected error: {}",
-            err
+            matches!(err, TunnelError::DocumentError(_)),
+            "unexpected error variant: {err:?}"
         );
 
         assert!(
@@ -12232,6 +12282,10 @@ mod tests {
             .await
             .expect_err("old snapshot must not clear authority Negative");
         assert!(
+            matches!(err, TunnelError::DocumentError(_)),
+            "unexpected error variant: {err:?}"
+        );
+        assert!(
             err.to_string().contains("Current revision"),
             "unexpected recovery error: {}",
             err
@@ -12443,6 +12497,10 @@ mod tests {
         let err = known_owner_inner
             .validate_named_relation(&device_doc, &ownerless_verified)
             .expect_err("identity without trusted owner evidence must fail known_owner admission");
+        assert!(
+            matches!(err, TunnelError::DocumentError(_)),
+            "unexpected error variant: {err:?}"
+        );
         assert!(
             err.to_string().contains("no trusted owner evidence"),
             "unexpected error: {}",

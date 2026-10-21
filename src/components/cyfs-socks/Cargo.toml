@@ -17,7 +17,7 @@ log.workspace = true
 trust-dns-resolver = "*"
 futures-util.workspace = true
 regex.workspace = true
-sfo-io = "0.1.17"
+buckyos-io.workspace = true
 
 serde_json.workspace = true
 serde.workspace = true

@@ -26,9 +26,9 @@ http.workspace = true
 clap = { workspace = true, features = ["string"] }
 rustyline = "*"
 dirs-next = "*"
-boa_engine = "0.21.0"
-boa_runtime  = "0.21.0"
-boa_gc = "0.21.0"
+boa_engine.workspace = true
+boa_runtime.workspace = true
+boa_gc.workspace = true
 futures.workspace = true
 buckyos-kit.workspace = true
 pin-project-lite = "*"

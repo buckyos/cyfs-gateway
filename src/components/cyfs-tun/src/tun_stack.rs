@@ -5,7 +5,7 @@ use cyfs_process_chain::{
 };
 use ipstack::{IpStackStream, IpStackTcpStream, IpStackUdpStream};
 use serde::{Deserialize, Serialize};
-use sfo_io::{LimitDatagramRecv, LimitDatagramSend, LimitStream, StatStream};
+use buckyos_io::{LimitDatagramRecv, LimitDatagramSend, LimitStream, StatStream};
 use std::io::Error;
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex, RwLock};
@@ -486,7 +486,7 @@ impl TunDatagramSend {
 }
 
 #[async_trait::async_trait]
-impl sfo_io::DatagramSend for TunDatagramSend {
+impl buckyos_io::DatagramSend for TunDatagramSend {
     type Error = Error;
     async fn send_to(&mut self, buffer: &[u8]) -> Result<usize, Error> {
         let n = self.send.write(buffer).await?;
@@ -505,7 +505,7 @@ impl TunDatagramRecv {
 }
 
 #[async_trait::async_trait]
-impl sfo_io::DatagramRecv for TunDatagramRecv {
+impl buckyos_io::DatagramRecv for TunDatagramRecv {
     type Error = Error;
     async fn recv_from(&mut self, buffer: &mut [u8]) -> Result<usize, Self::Error> {
         let n = self.recv.read(buffer).await?;
@@ -513,12 +513,12 @@ impl sfo_io::DatagramRecv for TunDatagramRecv {
     }
 }
 
-struct TunDatagramClient<R: sfo_io::DatagramRecv, S: sfo_io::DatagramSend> {
+struct TunDatagramClient<R: buckyos_io::DatagramRecv, S: buckyos_io::DatagramSend> {
     send: Arc<tokio::sync::Mutex<S>>,
     recv: Arc<tokio::sync::Mutex<R>>,
 }
 
-impl<R: sfo_io::DatagramRecv, S: sfo_io::DatagramSend> Clone for TunDatagramClient<R, S> {
+impl<R: buckyos_io::DatagramRecv, S: buckyos_io::DatagramSend> Clone for TunDatagramClient<R, S> {
     fn clone(&self) -> Self {
         Self {
             send: self.send.clone(),
@@ -527,7 +527,7 @@ impl<R: sfo_io::DatagramRecv, S: sfo_io::DatagramSend> Clone for TunDatagramClie
     }
 }
 
-impl<R: sfo_io::DatagramRecv, S: sfo_io::DatagramSend> TunDatagramClient<R, S> {
+impl<R: buckyos_io::DatagramRecv, S: buckyos_io::DatagramSend> TunDatagramClient<R, S> {
     fn new(recv: R, send: S) -> Self {
         Self {
             send: Arc::new(tokio::sync::Mutex::new(send)),
@@ -537,7 +537,7 @@ impl<R: sfo_io::DatagramRecv, S: sfo_io::DatagramSend> TunDatagramClient<R, S> {
 }
 
 #[async_trait::async_trait]
-impl<R: sfo_io::DatagramRecv<Error = Error>, S: sfo_io::DatagramSend<Error = Error>> DatagramClient
+impl<R: buckyos_io::DatagramRecv<Error = Error>, S: buckyos_io::DatagramSend<Error = Error>> DatagramClient
     for TunDatagramClient<R, S>
 {
     async fn recv_datagram(&self, buffer: &mut [u8]) -> Result<usize, Error> {

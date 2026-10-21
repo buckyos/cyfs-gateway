@@ -50,8 +50,8 @@ use rustls::ServerConfig;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::ResolvesServerCert;
 use rustls::sign::CertifiedKey;
-use sfo_io::{
-    LimitRead, LimitStream, LimitWrite, SfoSpeedStat, SimpleAsyncWrite, SimpleAsyncWriteHolder,
+use buckyos_io::{
+    LimitRead, LimitStream, LimitWrite, DefaultSpeedStat, SimpleAsyncWrite, SimpleAsyncWriteHolder,
     SpeedTracker, StatRead, StatStream, StatWrite,
 };
 use std::future::poll_fn;
@@ -414,7 +414,7 @@ impl QuicConnectionHandler {
                                         }
                                     };
                                 log::debug!("quic accept bi: {} -> {}", remote_addr, local_addr);
-                                let stream = sfo_split::Splittable::new(recv, send);
+                                let stream = tokio::io::join(recv, send);
                                 let stream: Box<dyn AsyncStream> =
                                     if let Some(io_dump) = self.io_dump.clone() {
                                         Box::new(DumpStream::new(
@@ -697,7 +697,7 @@ impl QuicConnectionHandler {
                                             local_addr
                                         );
                                         let server = server.clone();
-                                        let stream = sfo_split::Splittable::new(recv, send);
+                                        let stream = tokio::io::join(recv, send);
                                         let stream: Box<dyn AsyncStream> =
                                             if let Some(io_dump) = self.io_dump.clone() {
                                                 Box::new(DumpStream::new(
@@ -1325,7 +1325,7 @@ impl<B: Buf> OpenStreams<B> for Http3Connection {
     ) -> Poll<Result<Self::BidiStream, StreamErrorIncoming>> {
         match self.conn.poll_open_bidi(cx) {
             Poll::Ready(Ok(stream)) => {
-                let speed_tracker = Arc::new(SfoSpeedStat::new());
+                let speed_tracker = Arc::new(DefaultSpeedStat::new());
                 let notify = Arc::new(Notify::new());
                 let has_stopped = Arc::new(AtomicBool::new(false));
                 if let Some(connection_manager) = &self.connection_manager {
@@ -1359,7 +1359,7 @@ impl<B: Buf> OpenStreams<B> for Http3Connection {
     ) -> Poll<Result<Self::SendStream, StreamErrorIncoming>> {
         match self.conn.poll_open_send(cx) {
             Poll::Ready(Ok(stream)) => {
-                let speed_tracker = Arc::new(SfoSpeedStat::new());
+                let speed_tracker = Arc::new(DefaultSpeedStat::new());
                 let notify = Arc::new(Notify::new());
                 let has_stopped = Arc::new(AtomicBool::new(false));
                 if let Some(connection_manager) = &self.connection_manager {
@@ -1405,7 +1405,7 @@ impl<B: Buf> quic::Connection<B> for Http3Connection {
             cx,
         ) {
             Poll::Ready(Ok(stream)) => {
-                let speed_tracker = Arc::new(SfoSpeedStat::new());
+                let speed_tracker = Arc::new(DefaultSpeedStat::new());
                 let notify = Arc::new(Notify::new());
                 let has_stopped = Arc::new(AtomicBool::new(false));
                 if let Some(connection_manager) = &self.connection_manager {
@@ -1439,7 +1439,7 @@ impl<B: Buf> quic::Connection<B> for Http3Connection {
     ) -> Poll<Result<Self::BidiStream, ConnectionErrorIncoming>> {
         match self.conn.poll_accept_bidi(cx) {
             Poll::Ready(Ok(stream)) => {
-                let speed_tracker = Arc::new(SfoSpeedStat::new());
+                let speed_tracker = Arc::new(DefaultSpeedStat::new());
                 let notify = Arc::new(Notify::new());
                 let has_stopped = Arc::new(AtomicBool::new(false));
                 if let Some(connection_manager) = &self.connection_manager {
@@ -1468,7 +1468,7 @@ impl<B: Buf> quic::Connection<B> for Http3Connection {
     }
 
     fn opener(&self) -> Self::OpenStreams {
-        let speed_tracker = Arc::new(SfoSpeedStat::new());
+        let speed_tracker = Arc::new(DefaultSpeedStat::new());
         let notify = Arc::new(Notify::new());
         let has_stopped = Arc::new(AtomicBool::new(false));
         if let Some(connection_manager) = &self.connection_manager {
