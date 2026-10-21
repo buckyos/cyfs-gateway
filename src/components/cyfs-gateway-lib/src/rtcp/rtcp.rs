@@ -1315,13 +1315,27 @@ impl RTcpInner {
     ) -> Result<(EncodedDocument, RtcpIdentityTrust, Option<String>), NSError> {
         let requirement = self.security.peer_identity.requirement;
         let opts = self.handshake_resolve_opts(requirement);
-        let mut last_reason: Option<String> = None;
+        let mut reasons = Vec::new();
         for doc_type in [DidDocType::Device, DidDocType::Zone] {
-            let result =
-                resolve_did_ex(remote_did, Some(doc_type.clone()), Revision::current(), opts.clone())
-                    .await?;
+            let result = match resolve_did_ex(
+                remote_did, Some(doc_type.clone()), Revision::current(), opts.clone(),
+            ).await {
+                Ok(result) => result,
+                Err(err) => {
+                    reasons.push(format!("{}#{} resolution failed: {}", remote_did.to_string(), doc_type, err));
+                    let reason = reasons.join("; ");
+                    return Err(match err {
+                        NSError::DeadlineExceeded(_) => NSError::DeadlineExceeded(reason),
+                        NSError::Cancelled(_) => NSError::Cancelled(reason),
+                        NSError::Disabled(_) => NSError::Disabled(reason),
+                        NSError::NotFound(_) => NSError::NotFound(reason),
+                        _ => NSError::Failed(reason),
+                    });
+                }
+            };
             if result.is_disabled() {
-                return Err(NSError::Disabled(result.reason()));
+                reasons.push(format!("{}#{} is disabled: {}", remote_did.to_string(), doc_type, result.reason()));
+                return Err(NSError::Disabled(reasons.join("; ")));
             }
             let choice = match requirement {
                 RtcpPeerIdentityRequirement::AuthorityCurrent => {
@@ -1349,7 +1363,7 @@ impl RTcpInner {
                 }
                 _ => {
                     if result.is_not_exist() {
-                        last_reason = Some(format!(
+                        reasons.push(format!(
                             "{}#{} is not published: {}",
                             remote_did.to_string(),
                             doc_type,
@@ -1365,9 +1379,9 @@ impl RTcpInner {
                             continue;
                         }
                         // A definite "no such document" is not a transport failure.
-                        return Err(NSError::NotFound(last_reason.unwrap_or_default()));
+                        return Err(NSError::NotFound(reasons.join("; ")));
                     }
-                    last_reason = Some(format!(
+                    reasons.push(format!(
                         "{}#{} has no {} document: {}",
                         remote_did.to_string(),
                         doc_type,
@@ -1380,9 +1394,7 @@ impl RTcpInner {
                 }
             }
         }
-        Err(NSError::Failed(last_reason.unwrap_or_else(|| {
-            format!("resolve {} returned no document", remote_did.to_string())
-        })))
+        Err(NSError::Failed(reasons.join("; ")))
     }
 
     fn choice_from_zone_locker(choice: &Choice) -> bool {
@@ -12297,6 +12309,34 @@ mod tests {
             .unwrap_err();
         assert!(matches!(&err, NSError::NotFound(_)), "{err:?}");
         assert!(err.to_string().contains("#zone is not published"), "{err}");
+        assert!(err.to_string().contains("#device is not published"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn handshake_document_keeps_device_failure_when_zone_body_has_wrong_type() {
+        let _ = init_name_lib_for_test(&HashMap::new()).await;
+        let remote_did = DID::new("rtcpwrongzonetype", "unpublished-device");
+        let (mut device, _) = test_device_config("wrong-zone");
+        device.id = remote_did.clone();
+        GLOBAL_NAME_CLIENT.get().unwrap().set_method_authority(
+            &remote_did.method,
+            Arc::new(TestAuthorityProvider {
+                docs: vec![(remote_did.clone(), "zone".to_string(),
+                    EncodedDocument::JsonLd(serde_json::to_value(device).unwrap()))],
+                negatives: vec![(remote_did.clone(), "device".to_string(), DocumentStatus::Missing)],
+                owner_bindings: Vec::new(),
+                offline: Arc::new(AtomicBool::new(false)),
+            }),
+        );
+        let inner = RTcpInner::new(
+            DID::new("dev", "wrong-zone-client"), "127.0.0.1:0".to_string(),
+            None, None, Arc::new(MockRTcpListener::new()),
+        );
+        let err = inner.resolve_handshake_document(&remote_did).await.unwrap_err();
+        let reason = err.to_string();
+        assert!(reason.contains("#device is not published"), "{reason}");
+        assert!(reason.contains("#zone has no authority-current document"), "{reason}");
+        assert!(reason.contains("device document, requested zone"), "{reason}");
     }
 
     #[tokio::test]

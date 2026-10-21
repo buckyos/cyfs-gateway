@@ -42,7 +42,7 @@ use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full};
 use kRPC::{RPCErrors, RPCHandler, RPCRequest, RPCResponse, RPCResult};
 use log::warn;
-use name_client::document_iat;
+use name_client::{document_content_hash, document_iat};
 use name_lib::{DIDDocumentTrait, DeviceDocument, EncodedDocument, OwnerDocument, ZoneDocument, DID};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -1015,10 +1015,10 @@ async fn serve_did_resolver_request<T: BnsIndexerApi>(
         }
     };
 
-    // Historical `iat` queries need the full event-log index which the read
-    // projection does not keep yet. Protocol §7: report the capability gap
-    // with 501 + historicalQuerySupported=false — neither an error nor a
-    // negative state, so clients can fall back to the current state.
+    // Historical versionId/versionTime (and legacy iat) queries need the
+    // full event-log index which the read projection does not keep yet.
+    // Protocol §7: report 501 + historicalQuerySupported=false; current
+    // state must never stand in for an unsupported historical query.
     if iat.is_some() {
         return did_resolution_json_response(
             StatusCode::NOT_IMPLEMENTED,
@@ -1038,7 +1038,24 @@ async fn serve_did_resolver_request<T: BnsIndexerApi>(
     match resolve_bns_identity(api, &name, &doc_type).await {
         Ok(result) => {
             let status = did_resolver_document_status(&result, now_timestamp());
+            if matches!(status, DocumentStatus::Active | DocumentStatus::Expired) {
+                if let Ok(document) = projected_document(&result) {
+                    if let Ok(parsed) = name_lib::parse_did_doc(document) {
+                        let actual = parsed.get_doc_type();
+                        if matches!(doc_type.as_str(), "device" | "zone" | "owner")
+                            && actual.as_str() != doc_type
+                        {
+                            return did_resolution_invalid_response(&doc_type, &format!(
+                                "document body is a {actual} document, requested {doc_type}"
+                            ));
+                        }
+                    }
+                }
+            }
             did_resolution_state_response(&doc_type, status, Some(&result))
+        }
+        Err(error) if error.is_registry_code("INVALID_DOCUMENT") => {
+            did_resolution_invalid_response(&doc_type, &error.to_string())
         }
         // The projection reports "this (did, doc_type) was never published"
         // as an error; that is the authoritative Missing verdict of the
@@ -1075,12 +1092,9 @@ async fn resolve_bns_identity<T: BnsIndexerApi>(
     name: &str,
     doc_type: &str,
 ) -> BnsClientResult<ResolveResult> {
-    // Callers that want the device document ask for `type=device` explicitly
-    // (resolve-did D4). The default / `type=zone` projection stays for
-    // clients released before that rule.
-    let projectable =
-        doc_type == DID_RESOLVER_DEFAULT_DOC_TYPE || doc_type == DID_RESOLVER_DEVICE_DOC_TYPE;
-    if !projectable || !name.contains('.') {
+    // Only type=device projects a device slot. Zone queries must never
+    // relabel a DeviceDocument as a ZoneDocument, including default queries.
+    if doc_type != DID_RESOLVER_DEVICE_DOC_TYPE || !name.contains('.') {
         return api.resolve_document(name, doc_type).await;
     }
     let checkpoint = api.latest_checkpoint().await?;
@@ -1120,8 +1134,7 @@ async fn resolve_bns_identity<T: BnsIndexerApi>(
         &result,
         &zone_result,
         &owner_result,
-    )
-    .map_err(BnsClientError::Transport)?;
+    );
     if api.resolve_document(parent, device_name).await? != result
         || api.resolve_document(parent, "zone").await? != zone_result
         || api.resolve_document(parent, "owner").await? != owner_result
@@ -1132,6 +1145,7 @@ async fn resolve_bns_identity<T: BnsIndexerApi>(
             "BNS projection changed during device resolution".into(),
         ));
     }
+    let denied = denied.map_err(|reason| BnsClientError::registry("INVALID_DOCUMENT", reason))?;
     Ok(match denied {
         Some((status, source)) => denied_device_resolution(source, status),
         None => result,
@@ -1300,9 +1314,12 @@ fn parse_did_resolver_query(query: Option<&str>) -> Result<(String, Option<u64>)
         let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
         match key {
             "type" => doc_type = value.to_string(),
-            "iat" => {
+            "iat" | "versionId" | "versionTime" => {
+                if iat.is_some() {
+                    return Err("versionId, versionTime and legacy iat are mutually exclusive and must occur once".into());
+                }
                 iat = Some(value.parse::<u64>().map_err(|_| {
-                    format!("query parameter `iat` must be a unix timestamp, got `{value}`")
+                    format!("query parameter `{key}` must be a unix timestamp, got `{value}`")
                 })?);
             }
             _ => {}
@@ -1386,15 +1403,19 @@ fn did_resolution_state_response(
     buckyos.insert("documentStatus".to_string(), json!(status.as_str()));
     if let Some(iat) = document_version {
         buckyos.insert("documentVersion".to_string(), json!(iat));
+        // An expired publication must not advertise an active current anchor.
+        if status == DocumentStatus::Active {
+            buckyos.insert("latestIat".to_string(), json!(iat));
+        }
     }
     if let Some(result) = result {
         buckyos.insert("sourceName".to_string(), json!(result.document_state.name));
         buckyos.insert("sourceDocType".to_string(), json!(result.document_state.doc_type));
         buckyos.insert("sourceContentHash".to_string(), json!(result.document_state.document.content_hash));
         buckyos.insert("sourceDocumentStatus".to_string(), json!(result.document_state.status.as_str()));
-        if let Some(Value::String(jwt)) = &did_document {
-            if jwt.as_bytes() == result.document_state.document.inline_document.as_slice() {
-                buckyos.insert("docHash".to_string(), json!(result.document_state.document.content_hash.trim_start_matches("0x")));
+        if did_document.is_some() {
+            if let Ok(document) = projected_document(result) {
+                buckyos.insert("docHash".to_string(), json!(document_content_hash(&document)));
             }
         }
         // Version 0 is the "never published" placeholder, not a real version.
@@ -1491,6 +1512,20 @@ fn did_resolution_not_applicable_response() -> ServerResult<Response<BoxBody<Byt
             "didDocumentMetadata": {},
         }),
     )
+}
+
+fn did_resolution_invalid_response(
+    doc_type: &str,
+    reason: &str,
+) -> ServerResult<Response<BoxBody<Bytes, ServerError>>> {
+    did_resolution_json_response(StatusCode::OK, &json!({
+        "didResolutionMetadata": { "contentType": Value::Null, "error": Value::Null },
+        "didDocument": Value::Null,
+        "didDocumentMetadata": {
+            "deactivated": false,
+            "buckyos": { "docType": doc_type, "documentStatus": "invalid", "reason": reason },
+        },
+    }))
 }
 
 fn did_resolution_error_response(
@@ -2294,6 +2329,8 @@ mod tests {
         assert_eq!(buckyos["documentStatus"], "active");
         assert_eq!(buckyos["documentVersion"], iat);
         assert_eq!(buckyos["registryVersion"], 3);
+        assert_eq!(buckyos["latestIat"], iat);
+        assert_eq!(buckyos["docHash"], document_content_hash(&EncodedDocument::JsonLd(body["didDocument"].clone())));
         assert_eq!(buckyos["authoritySeq"], 1);
         // Chain-account owners have no DID form yet: the field must be
         // omitted, never serialized as the internal principal JSON.
@@ -2446,7 +2483,7 @@ mod tests {
         let handle = spawn_listener(listener, server.clone()).unwrap();
         let client = resolver_test_client(handle.local_addr());
         let did = DID::new("bns", "ood1.moved");
-        let (status, body, _) = resolver_request(server.as_ref(), Method::GET, "/1.0/identifiers/did:bns:ood1.moved").await;
+        let (status, body, _) = resolver_request(server.as_ref(), Method::GET, "/1.0/identifiers/did:bns:ood1.moved?type=device").await;
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert!(body["didDocument"].is_null());
         assert_eq!(body["didDocumentMetadata"]["buckyos"]["documentStatus"], "missing");
@@ -2526,7 +2563,7 @@ mod tests {
                 ] { tx.put_document(&resolver_document_state("alice", slot, 11, DocumentStatus::Active, &bytes))?; }
                 Ok(())
             }).unwrap();
-            let (http, body, _) = resolver_request(server.as_ref(), Method::GET, "/1.0/identifiers/did:bns:ood1.alice").await;
+            let (http, body, _) = resolver_request(server.as_ref(), Method::GET, "/1.0/identifiers/did:bns:ood1.alice?type=device").await;
             assert_eq!(http, if status == DocumentStatus::Revoked { StatusCode::GONE } else { StatusCode::OK }, "{cause}");
             assert!(body["didDocument"].is_null(), "{cause}");
             assert_eq!(body["didDocumentMetadata"]["buckyos"]["documentStatus"], status.as_str(), "{cause}");
@@ -2654,7 +2691,7 @@ mod tests {
             let (_, envelope, _) = resolver_request(
                 server.as_ref(),
                 Method::GET,
-                &format!("/1.0/identifiers/{}", device.id.to_string()),
+                &format!("/1.0/identifiers/{}?type=device", device.id.to_string()),
             )
             .await;
             assert_eq!(
@@ -2684,7 +2721,37 @@ mod tests {
             assert_eq!(status, StatusCode::OK);
             assert_eq!(typed["didDocumentMetadata"]["buckyos"]["docType"], "device");
             assert_eq!(typed["didDocument"], *jwt);
+            for suffix in ["", "?type=zone"] {
+                let (status, zone_query, _) = resolver_request(
+                    server.as_ref(), Method::GET,
+                    &format!("/1.0/identifiers/{}{suffix}", device.id.to_string()),
+                ).await;
+                assert_eq!(status, StatusCode::NOT_FOUND);
+                assert_eq!(zone_query["didDocumentMetadata"]["buckyos"]["docType"], "zone");
+                assert!(zone_query["didDocument"].is_null());
+            }
+            assert_eq!(typed["didDocumentMetadata"]["buckyos"]["latestIat"], device.iat);
+            assert_eq!(typed["didDocumentMetadata"]["buckyos"]["docHash"],
+                document_content_hash(&EncodedDocument::Jwt(jwt.clone())));
         }
+        let mut invalid_zone = zone.clone();
+        invalid_zone.devices.remove("ood1");
+        registry.store().transact(|tx| {
+            tx.put_document(&resolver_document_state(
+                "alice", "zone", 9, DocumentStatus::Active,
+                invalid_zone.encode(Some(&key)).unwrap().to_string().as_bytes(),
+            ))
+        }).unwrap();
+        let (status, denied, _) = resolver_request(
+            server.as_ref(), Method::GET, "/1.0/identifiers/did:bns:ood1.alice?type=device"
+        ).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(denied["didDocumentMetadata"]["buckyos"]["documentStatus"], "invalid");
+        assert!(denied["didDocumentMetadata"]["buckyos"]["reason"].as_str().unwrap().contains("not a member"));
+        assert!(denied["didDocument"].is_null());
+        registry.store().transact(|tx| {
+            tx.put_document(&resolver_document_state("alice", "zone", 10, DocumentStatus::Active, zone_jwt.as_bytes()))
+        }).unwrap();
         let (device, _) = &devices[0];
         let mut rotated = device.clone();
         rotated.iat += 1;
@@ -2720,7 +2787,7 @@ mod tests {
                 tx.put_document(&resolver_document_state("alice", slot, 20, DocumentStatus::Revoked, &content))
             }).unwrap();
             let (status, denied, _) = resolver_request(
-                server.as_ref(), Method::GET, "/1.0/identifiers/did:bns:ood1.alice"
+                server.as_ref(), Method::GET, "/1.0/identifiers/did:bns:ood1.alice?type=device"
             ).await;
             assert_eq!(status, StatusCode::GONE);
             assert_eq!(denied["didDocumentMetadata"]["buckyos"]["sourceDocType"], slot);
@@ -2733,15 +2800,25 @@ mod tests {
 
         registry.store().transact(|tx| {
             tx.put_name(&resolver_name_state("ood1.alice", NameStatus::Active))?;
-            tx.put_document(&resolver_document_state("ood1.alice", "zone", 1, DocumentStatus::Active, rotated_jwt.as_bytes()))
+            tx.put_document(&resolver_document_state("ood1.alice", "device", 1, DocumentStatus::Active, rotated_jwt.as_bytes()))
         }).unwrap();
         let (_, independent, _) = resolver_request(
-            server.as_ref(), Method::GET, "/1.0/identifiers/did:bns:ood1.alice"
+            server.as_ref(), Method::GET, "/1.0/identifiers/did:bns:ood1.alice?type=device"
         ).await;
         assert_eq!(independent["didDocumentMetadata"]["buckyos"]["sourceName"], "ood1.alice");
         assert_eq!(independent["didDocument"], rotated_jwt);
         registry.store().transact(|tx| {
-            tx.put_document(&resolver_document_state("ood1.alice", "zone", 2, DocumentStatus::Missing, rotated_jwt.as_bytes()))
+            tx.put_document(&resolver_document_state("ood1.alice", "zone", 1, DocumentStatus::Active, rotated_jwt.as_bytes()))
+        }).unwrap();
+        let (status, mismatched, _) = resolver_request(
+            server.as_ref(), Method::GET, "/1.0/identifiers/did:bns:ood1.alice?type=zone"
+        ).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(mismatched["didDocumentMetadata"]["buckyos"]["documentStatus"], "invalid");
+        assert!(mismatched["didDocumentMetadata"]["buckyos"]["reason"].as_str().unwrap().contains("requested zone"));
+        assert!(mismatched["didDocument"].is_null());
+        registry.store().transact(|tx| {
+            tx.put_document(&resolver_document_state("ood1.alice", "device", 2, DocumentStatus::Missing, rotated_jwt.as_bytes()))
         }).unwrap();
 
         for status in [
@@ -3045,21 +3122,17 @@ mod tests {
     #[tokio::test]
     async fn did_resolver_historical_owner_query_returns_501() {
         let server = resolver_contract_server();
-        let (status, body, _) = resolver_request(
-            &server,
-            Method::GET,
-            "/1.0/identifiers/did:bns:alice?type=owner&iat=1750000000",
-        )
-        .await;
-
-        assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
-        assert_eq!(
-            body["didDocumentMetadata"]["buckyos"]["historicalQuerySupported"],
-            false
-        );
-        assert!(body["didDocumentMetadata"]["buckyos"]
-            .get("documentStatus")
-            .is_none());
+        for query in ["iat=1750000000", "versionId=1750000000", "versionTime=1750000000"] {
+            let (status, body, _) = resolver_request(
+                &server, Method::GET,
+                &format!("/1.0/identifiers/did:bns:alice?type=owner&{query}"),
+            ).await;
+            assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{query}");
+            let metadata = &body["didDocumentMetadata"]["buckyos"];
+            assert_eq!(metadata["historicalQuerySupported"], false);
+            assert!(metadata.get("documentStatus").is_none());
+            assert!(body["didDocument"].is_null());
+        }
     }
 
     #[tokio::test]
@@ -3167,6 +3240,11 @@ mod tests {
             "/1.0/identifiers/did:bns:INVALID",
             "/1.0/identifiers/did:bns:alice?type=NotAType",
             "/1.0/identifiers/did:bns:alice?type=owner&iat=abc",
+            "/1.0/identifiers/did:bns:alice?type=device&versionId=abc",
+            "/1.0/identifiers/did:bns:alice?versionTime=",
+            "/1.0/identifiers/did:bns:alice?versionId=1&versionTime=2",
+            "/1.0/identifiers/did:bns:alice?versionId=1&versionId=2",
+            "/1.0/identifiers/did:bns:alice?iat=1&versionTime=2",
         ] {
             let (status, body, _) = resolver_request(&server, Method::GET, uri).await;
             assert_eq!(status, StatusCode::BAD_REQUEST, "uri {uri}");
