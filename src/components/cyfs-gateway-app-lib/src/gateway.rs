@@ -3151,6 +3151,7 @@ impl GatewayCmdHandler {
                 | "remove_rule"
                 | "get_connections"
                 | "get_connection_devices"
+                | "close_connections"
                 | "query_tunnel_url_statuses"
                 | "tunnels_probe"
                 | "/tunnels/probe"
@@ -3451,6 +3452,18 @@ struct QueryTunnelUrlStatusesParams {
     sort: Option<String>,
     include_unsupported: Option<bool>,
     caller_priorities: Option<Vec<u32>>,
+}
+
+/// Close RTCP streams to `dest_port` except those from the listed devices
+/// (a revoked device ACL also ends the forwards it already holds).
+#[derive(Deserialize)]
+struct CloseConnectionsParams {
+    dest_port: u16,
+    #[serde(default)]
+    keep_source_devices: Vec<String>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    stack: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -3874,6 +3887,17 @@ impl GatewayControlCmdHandler for GatewayCmdHandler {
                     .collect::<Vec<_>>();
                 Ok(serde_json::to_value(conn_infos)
                     .map_err(into_cmd_err!(ControlErrorCode::SerializeFailed))?)
+            }
+            "close_connections" => {
+                let params = serde_json::from_value::<CloseConnectionsParams>(params)
+                    .map_err(into_cmd_err!(ControlErrorCode::InvalidParams))?;
+                let keep: HashSet<String> = params.keep_source_devices.into_iter().collect();
+                let closed = gateway.connection_manager.stop_connections_where(|info| {
+                    info.protocol() == StackProtocol::Rtcp
+                        && info.dest_port() == Some(params.dest_port)
+                        && !info.peer_device_id().is_some_and(|d| keep.contains(d))
+                });
+                Ok(serde_json::json!({ "closed": closed }))
             }
             "get_connection_devices" => {
                 let mut device_infos = gateway

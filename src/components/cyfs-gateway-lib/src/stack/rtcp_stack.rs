@@ -1055,6 +1055,7 @@ impl RTcpListener for Listener {
         let stat_stream = Box::new(StatStream::new_with_tracker(stream, stat.clone()));
 
         let speed = stat_stream.get_speed_stat();
+        let peer_device_id = endpoint.device_id.clone();
         let handle = tokio::spawn(async move {
             if let Err(e) = handler_snapshot
                 .handle_stream(
@@ -1075,13 +1076,16 @@ impl RTcpListener for Listener {
         });
         if let Some(manager) = &self.connection_manager {
             let controller = HandleConnectionController::new(handle);
-            manager.add_connection(ConnectionInfo::new(
-                remote_addr.to_string(),
-                local_addr.to_string(),
-                StackProtocol::Rtcp,
-                speed,
-                controller,
-            ))
+            manager.add_connection(
+                ConnectionInfo::new(
+                    remote_addr.to_string(),
+                    local_addr.to_string(),
+                    StackProtocol::Rtcp,
+                    speed,
+                    controller,
+                )
+                .with_stream_target(Some(peer_device_id), dest_port),
+            )
         }
         Ok(())
     }
@@ -3142,6 +3146,116 @@ inbound_admission:
         assert_eq!(&buf, b"hello");
         drop(conn);
         drop(far);
+        let _ = handle.await;
+    }
+
+    /// The Node Executor guard of BuckyOS `boot_gateway.yaml`: ACL'd devices
+    /// reach the executor port, others are rejected, other ports fall through
+    /// to the generic forward.
+    #[tokio::test]
+    async fn test_node_executor_guard_block() {
+        let executor = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let exec_port = executor.local_addr().unwrap().port();
+        let other = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let other_port = other.local_addr().unwrap().port();
+        let chains = format!(
+            r#"
+- id: main
+  priority: 1
+  blocks:
+    - id: setup
+      priority: 0
+      block: |
+        map-create EXECUTOR_ACL;
+        map-add EXECUTOR_ACL "did:web:laptop.example" "allow";
+    - id: node_executor
+      priority: 1
+      block: |
+        if eq ${{REQ.dest_port}} "{exec_port}" then
+          match-include $EXECUTOR_ACL ${{REQ.source_device_id}} || reject;
+          forward "tcp:///127.0.0.1:{exec_port}";
+        end
+    - id: default
+      priority: 2
+      block: |
+        return "forward ${{REQ.protocol}}:///${{REQ.dest_host}}:${{REQ.dest_port}}";
+"#
+        );
+        let chains: ProcessChainConfigs = serde_yaml_ng::from_str(&chains).unwrap();
+        let handler = Arc::new(RtcpConnectionHandler::create(
+            chains,
+            None,
+            build_stack_context(
+                Arc::new(ServerManager::new()),
+                TunnelManager::new(),
+                Arc::new(DefaultLimiterManager::new()),
+                StatManager::new(),
+                Some(Arc::new(GlobalProcessChains::new())),
+            ),
+            None,
+            None,
+            stream_idle_timeout_from_secs(None),
+            connect_timeout_from_secs(None),
+        )
+        .await
+        .unwrap());
+        let run = |device: &str, host: &str, port: u16| {
+            let handler = handler.clone();
+            let device = device.to_string();
+            let host = host.to_string();
+            async move {
+                let (near, mut far) = tokio::io::duplex(1024);
+                far.write_all(b"hello").await.unwrap();
+                let handle = tokio::spawn(async move {
+                    handler
+                        .handle_stream(
+                            Box::new(near),
+                            "tcp".to_string(),
+                            Some(host),
+                            port,
+                            "".to_string(),
+                            TunnelEndpoint {
+                                device_id: device,
+                                port: 2981,
+                                canonical_device_id: None,
+                                identity_trust: None,
+                            },
+                            crate::MutComposedSpeedStat::new(),
+                            "127.0.0.1:52001".parse().unwrap(),
+                            "127.0.0.1:2981".parse().unwrap(),
+                        )
+                        .await
+                });
+                (far, handle)
+            }
+        };
+
+        let (far, handle) = run("did:web:laptop.example", "ood1.example", exec_port).await;
+        let (mut conn, _) = tokio::time::timeout(Duration::from_secs(5), executor.accept())
+            .await
+            .expect("allowed device must reach the executor")
+            .unwrap();
+        let mut buf = [0u8; 5];
+        conn.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"hello");
+        drop((conn, far));
+        let _ = handle.await;
+
+        let (far, handle) = run("did:web:stranger.example", "127.0.0.1", exec_port).await;
+        let _ = tokio::time::timeout(Duration::from_secs(5), handle).await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), executor.accept()).await.is_err(),
+            "a device outside the ACL must not reach the executor"
+        );
+        drop(far);
+
+        let (far, handle) = run("did:web:stranger.example", "127.0.0.1", other_port).await;
+        let (mut conn, _) = tokio::time::timeout(Duration::from_secs(5), other.accept())
+            .await
+            .expect("other ports keep the generic forward")
+            .unwrap();
+        conn.read_exact(&mut buf).await.unwrap();
+        drop((conn, far));
         let _ = handle.await;
     }
 

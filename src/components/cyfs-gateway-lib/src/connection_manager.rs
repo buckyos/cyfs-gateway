@@ -307,6 +307,8 @@ pub struct ConnectionInfo {
     protocol: StackProtocol,
     speed_stat: SpeedStatRef,
     connection_controller: ConnectionControllerRef,
+    peer_device_id: Option<String>,
+    dest_port: Option<u16>,
 }
 
 impl Drop for ConnectionInfo {
@@ -329,7 +331,25 @@ impl ConnectionInfo {
             protocol,
             speed_stat: speed,
             connection_controller,
+            peer_device_id: None,
+            dest_port: None,
         }
+    }
+
+    /// Tag a tunnel stream with its authenticated peer device and the port
+    /// it asked for, so it can be closed when that peer loses access.
+    pub fn with_stream_target(mut self, peer_device_id: Option<String>, dest_port: u16) -> Self {
+        self.peer_device_id = peer_device_id;
+        self.dest_port = Some(dest_port);
+        self
+    }
+
+    pub fn peer_device_id(&self) -> Option<&str> {
+        self.peer_device_id.as_deref()
+    }
+
+    pub fn dest_port(&self) -> Option<u16> {
+        self.dest_port
     }
 
     pub fn source(&self) -> &str {
@@ -439,6 +459,22 @@ impl ConnectionManager {
                 device_manager.on_connection_close(ip);
             }
         });
+    }
+
+    /// Stop every connection the predicate selects; returns how many.
+    pub fn stop_connections_where(&self, pred: impl Fn(&ConnectionInfo) -> bool) -> usize {
+        let selected: Vec<Arc<ConnectionInfo>> = self
+            .connections
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|info| pred(info))
+            .cloned()
+            .collect();
+        for info in &selected {
+            info.stop_connection();
+        }
+        selected.len()
     }
 
     pub fn stop_all_connections(self: &Arc<Self>) {
@@ -717,6 +753,37 @@ mod tests {
 
         assert_eq!(stats[0].get_write_sum_size(), 13);
         assert_eq!(stats[0].get_read_sum_size(), 17);
+    }
+
+    #[tokio::test]
+    async fn stop_connections_where_closes_only_selected_peers() {
+        let manager = ConnectionManager::new();
+        let mut handles = Vec::new();
+        for (port, peer, dest) in [(1u16, "did:dev:a", 3184u16), (2, "did:dev:b", 3184), (3, "did:dev:b", 80)] {
+            let handle = tokio::spawn(async {
+                tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
+            });
+            let abort = handle.abort_handle();
+            handles.push(abort);
+            manager.add_connection(
+                ConnectionInfo::new(
+                    format!("127.0.0.1:{port}"),
+                    "127.0.0.1:2980".to_string(),
+                    StackProtocol::Rtcp,
+                    Arc::new(MockSpeedStat::new()),
+                    HandleConnectionController::new(handle),
+                )
+                .with_stream_target(Some(peer.to_string()), dest),
+            );
+        }
+        let closed = manager.stop_connections_where(|info| {
+            info.dest_port() == Some(3184) && info.peer_device_id() != Some("did:dev:a")
+        });
+        assert_eq!(closed, 1);
+        tokio::task::yield_now().await;
+        assert!(!handles[0].is_finished());
+        assert!(handles[1].is_finished());
+        assert!(!handles[2].is_finished());
     }
 
     #[tokio::test]
