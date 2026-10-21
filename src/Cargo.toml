@@ -28,6 +28,10 @@ version = "0.7.0"
 [workspace.dependencies]
 # 基础异步运行时
 tokio = { version = "1.49.0", features = ["full"] }
+# JS 引擎：cyfs-process-chain 与 buckyos-js-runtime 必须用同一个 Boa 版本
+boa_engine = "0.21.0"
+boa_runtime = "0.21.0"
+boa_gc = "0.21.0"
 # 日志
 log = "0.4.29"
 env_logger = "0.11.8"
@@ -91,6 +95,7 @@ buckyos-http-server = { git = "https://github.com/buckyos/buckyos-base.git", bra
 name-client = { git = "https://github.com/buckyos/buckyos-base.git", branch = "main", package = "name-client" }
 name-lib = { git = "https://github.com/buckyos/buckyos-base.git", branch = "main", package = "name-lib" }
 buckyos-io = { git = "https://github.com/buckyos/buckyos-base.git", branch = "main", package = "buckyos-io" }
+buckyos-js-runtime = { git = "https://github.com/buckyos/buckyos-base.git", branch = "main", package = "buckyos-js-runtime" }
 ndn-lib = { git = "https://github.com/buckyos/cyfs-ndn.git", branch = "main", package = "ndn-lib" }
 named_store = { git = "https://github.com/buckyos/cyfs-ndn.git", branch = "main", package = "named_store" }
 ndn-toolkit = { git = "https://github.com/buckyos/cyfs-ndn.git", branch = "main", package = "ndn-toolkit" }
