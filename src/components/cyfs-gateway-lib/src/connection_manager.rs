@@ -1,6 +1,6 @@
 use crate::{DeviceInfo, DeviceManagerRef, StackErrorCode, StackProtocol, StackResult, stack_err};
 use cyfs_process_chain::*;
-use sfo_io::{SfoSpeedStat, SpeedStat, SpeedTracker};
+use buckyos_io::{DefaultSpeedStat, SpeedStat, SpeedTracker};
 use std::collections::{BTreeMap, HashMap};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::AtomicU64;
@@ -30,7 +30,7 @@ impl NoSpeedStat {
     }
 }
 
-impl sfo_io::SpeedStat for NoSpeedStat {
+impl buckyos_io::SpeedStat for NoSpeedStat {
     fn get_write_speed(&self) -> u64 {
         0
     }
@@ -48,7 +48,7 @@ impl sfo_io::SpeedStat for NoSpeedStat {
     }
 }
 
-impl sfo_io::SpeedTracker for NoSpeedStat {
+impl buckyos_io::SpeedTracker for NoSpeedStat {
     fn add_write_data_size(&self, size: u64) {
         self.write_stat
             .fetch_add(size, std::sync::atomic::Ordering::Relaxed);
@@ -135,7 +135,7 @@ impl StatManager {
 }
 
 pub struct MutComposedSpeedStat {
-    local_stat: Arc<SfoSpeedStat>,
+    local_stat: Arc<DefaultSpeedStat>,
     stats: RwLock<Vec<SpeedTrackerRef>>,
 }
 pub type MutComposedSpeedStatRef = Arc<MutComposedSpeedStat>;
@@ -143,7 +143,7 @@ pub type MutComposedSpeedStatRef = Arc<MutComposedSpeedStat>;
 impl MutComposedSpeedStat {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
-            local_stat: Arc::new(SfoSpeedStat::new()),
+            local_stat: Arc::new(DefaultSpeedStat::new()),
             stats: RwLock::new(Vec::new()),
         })
     }
@@ -157,7 +157,7 @@ impl MutComposedSpeedStat {
     }
 }
 
-impl sfo_io::SpeedStat for MutComposedSpeedStat {
+impl buckyos_io::SpeedStat for MutComposedSpeedStat {
     fn get_write_speed(&self) -> u64 {
         self.local_stat.get_write_speed()
     }
@@ -175,7 +175,7 @@ impl sfo_io::SpeedStat for MutComposedSpeedStat {
     }
 }
 
-impl sfo_io::SpeedTracker for MutComposedSpeedStat {
+impl buckyos_io::SpeedTracker for MutComposedSpeedStat {
     fn add_write_data_size(&self, size: u64) {
         self.local_stat.add_write_data_size(size);
         for stat in self.stats.read().unwrap().iter() {
@@ -192,7 +192,7 @@ impl sfo_io::SpeedTracker for MutComposedSpeedStat {
 }
 
 pub struct ComposedSpeedStat {
-    local_stat: Arc<SfoSpeedStat>,
+    local_stat: Arc<DefaultSpeedStat>,
     stats: Vec<SpeedTrackerRef>,
 }
 pub type ComposedSpeedStatRef = Arc<ComposedSpeedStat>;
@@ -200,13 +200,13 @@ pub type ComposedSpeedStatRef = Arc<ComposedSpeedStat>;
 impl ComposedSpeedStat {
     pub fn new(stats: Vec<SpeedTrackerRef>) -> Arc<Self> {
         Arc::new(Self {
-            local_stat: Arc::new(SfoSpeedStat::new()),
+            local_stat: Arc::new(DefaultSpeedStat::new()),
             stats,
         })
     }
 }
 
-impl sfo_io::SpeedStat for ComposedSpeedStat {
+impl buckyos_io::SpeedStat for ComposedSpeedStat {
     fn get_write_speed(&self) -> u64 {
         self.local_stat.get_write_speed()
     }
@@ -224,7 +224,7 @@ impl sfo_io::SpeedStat for ComposedSpeedStat {
     }
 }
 
-impl sfo_io::SpeedTracker for ComposedSpeedStat {
+impl buckyos_io::SpeedTracker for ComposedSpeedStat {
     fn add_write_data_size(&self, size: u64) {
         self.local_stat.add_write_data_size(size);
         for stat in self.stats.iter() {

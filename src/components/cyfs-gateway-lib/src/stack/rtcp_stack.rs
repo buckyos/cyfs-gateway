@@ -13,7 +13,7 @@ use name_lib::{
     get_x_from_jwk, load_raw_private_key,
 };
 use serde::{Deserialize, Serialize};
-use sfo_io::{LimitStream, StatStream};
+use buckyos_io::{LimitStream, StatStream};
 use tokio::task::JoinHandle;
 use url::Url;
 

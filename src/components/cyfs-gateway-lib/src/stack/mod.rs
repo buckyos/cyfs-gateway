@@ -204,7 +204,7 @@ pub async fn stream_forward(
         }
     }
 
-    sfo_io::copy_bidirectional_with_timeout(&mut stream, forward_stream.as_mut(), idle_timeout)
+    buckyos_io::copy_bidirectional_with_timeout(&mut stream, forward_stream.as_mut(), idle_timeout)
         .await
         .map_err(into_stack_err!(
             StackErrorCode::StreamError,
@@ -390,7 +390,7 @@ pub async fn stream_forward_group(
         }
     }
 
-    sfo_io::copy_bidirectional_with_timeout(&mut stream, forward_stream.as_mut(), idle_timeout)
+    buckyos_io::copy_bidirectional_with_timeout(&mut stream, forward_stream.as_mut(), idle_timeout)
         .await
         .map_err(into_stack_err!(
             StackErrorCode::StreamError,

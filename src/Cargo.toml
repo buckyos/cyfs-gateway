@@ -90,6 +90,7 @@ kRPC = { git = "https://github.com/buckyos/buckyos-base.git", branch = "main", p
 buckyos-http-server = { git = "https://github.com/buckyos/buckyos-base.git", branch = "main", package = "buckyos-http-server" }
 name-client = { git = "https://github.com/buckyos/buckyos-base.git", branch = "main", package = "name-client" }
 name-lib = { git = "https://github.com/buckyos/buckyos-base.git", branch = "main", package = "name-lib" }
+buckyos-io = { git = "https://github.com/buckyos/buckyos-base.git", branch = "main", package = "buckyos-io" }
 ndn-lib = { git = "https://github.com/buckyos/cyfs-ndn.git", branch = "main", package = "ndn-lib" }
 named_store = { git = "https://github.com/buckyos/cyfs-ndn.git", branch = "main", package = "named_store" }
 ndn-toolkit = { git = "https://github.com/buckyos/cyfs-ndn.git", branch = "main", package = "ndn-toolkit" }

@@ -314,7 +314,7 @@ impl Socks5Proxy {
         // Reply success after connected
         Socks5Util::reply_error(&mut socket, fast_socks5::ReplyError::Succeeded).await?;
 
-        let (read, write) = sfo_io::copy_bidirectional_with_timeout(
+        let (read, write) = buckyos_io::copy_bidirectional_with_timeout(
             &mut stream,
             &mut socket,
             self.config.stream_idle_timeout,
@@ -356,7 +356,7 @@ impl Socks5Proxy {
             }
         };
 
-        let (read, write) = sfo_io::copy_bidirectional_with_timeout(
+        let (read, write) = buckyos_io::copy_bidirectional_with_timeout(
             &mut tunnel,
             &mut socket,
             self.config.stream_idle_timeout,
