@@ -5306,6 +5306,7 @@ mod tests {
             .await
             .map_err(|e| SqliteSnAuthDB::db_err("drop auth row failed", e))?;
         let error = db.initialize_database().await.unwrap_err();
+        assert_eq!(error.code(), SnErrorCode::DBError);
         assert!(error.to_string().contains("AuthDB invariant violated"));
         assert!(error.to_string().contains("alice"));
         Ok(())

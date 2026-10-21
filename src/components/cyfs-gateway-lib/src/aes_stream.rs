@@ -187,6 +187,27 @@ fn io_err(kind: std::io::ErrorKind, msg: &'static str) -> std::io::Error {
     std::io::Error::new(kind, msg)
 }
 
+/// Which AEAD usage budget stopped the stream. It is the inner error of the
+/// returned `io::Error` (kind `Other`); callers tell the cases apart with
+/// `err.get_ref().and_then(|e| e.downcast_ref::<AeadBudgetExhausted>())`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum AeadBudgetExhausted {
+    #[error("AEAD key-use age budget exhausted")]
+    KeyAge,
+    #[error("AEAD read record budget exhausted")]
+    ReadRecords,
+    #[error("AEAD read byte budget exhausted")]
+    ReadBytes,
+    #[error("AEAD write record budget exhausted")]
+    WriteRecords,
+    #[error("AEAD write byte budget exhausted")]
+    WriteBytes,
+}
+
+fn budget_err(reason: AeadBudgetExhausted) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::Other, reason)
+}
+
 impl<S: AsyncRead + Unpin> AsyncRead for EncryptedStream<S> {
     fn poll_read(
         self: Pin<&mut Self>,
@@ -212,10 +233,7 @@ impl<S: AsyncRead + Unpin> AsyncRead for EncryptedStream<S> {
                 return Poll::Ready(Ok(()));
             }
             if this.budget_age_exhausted() {
-                return Poll::Ready(Err(io_err(
-                    std::io::ErrorKind::Other,
-                    "AEAD key-use age budget exhausted",
-                )));
+                return Poll::Ready(Err(budget_err(AeadBudgetExhausted::KeyAge)));
             }
 
             match this.read_phase {
@@ -287,10 +305,7 @@ impl<S: AsyncRead + Unpin> AsyncRead for EncryptedStream<S> {
                             this.body_filled += bytes_read;
                             if this.body_filled == this.body_needed {
                                 if this.read_seq >= this.budget.max_records_per_direction {
-                                    return Poll::Ready(Err(io_err(
-                                        std::io::ErrorKind::Other,
-                                        "AEAD read record budget exhausted",
-                                    )));
+                                    return Poll::Ready(Err(budget_err(AeadBudgetExhausted::ReadRecords)));
                                 }
                                 let plaintext_len = this.body_needed.saturating_sub(TAG_LEN) as u64;
                                 let next_bytes =
@@ -299,10 +314,7 @@ impl<S: AsyncRead + Unpin> AsyncRead for EncryptedStream<S> {
                                     || next_bytes.unwrap()
                                         > this.budget.max_plaintext_bytes_per_direction
                                 {
-                                    return Poll::Ready(Err(io_err(
-                                        std::io::ErrorKind::Other,
-                                        "AEAD read byte budget exhausted",
-                                    )));
+                                    return Poll::Ready(Err(budget_err(AeadBudgetExhausted::ReadBytes)));
                                 }
                                 let nonce = make_nonce(&this.read_nonce_base, this.read_seq);
                                 match this.read_seq.checked_add(1) {
@@ -389,10 +401,7 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for EncryptedStream<S> {
             )));
         }
         if this.budget_age_exhausted() {
-            return Poll::Ready(Err(io_err(
-                std::io::ErrorKind::Other,
-                "AEAD key-use age budget exhausted",
-            )));
+            return Poll::Ready(Err(budget_err(AeadBudgetExhausted::KeyAge)));
         }
 
         // 1. Finish any in-flight record before accepting new bytes.
@@ -405,19 +414,13 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for EncryptedStream<S> {
         // 2. Build one record from (up to) MAX_PLAINTEXT bytes of input.
         let accept = buf.len().min(MAX_PLAINTEXT);
         if this.write_seq >= this.budget.max_records_per_direction {
-            return Poll::Ready(Err(io_err(
-                std::io::ErrorKind::Other,
-                "AEAD write record budget exhausted",
-            )));
+            return Poll::Ready(Err(budget_err(AeadBudgetExhausted::WriteRecords)));
         }
         let next_bytes = this.write_plaintext_bytes.checked_add(accept as u64);
         if next_bytes.is_none()
             || next_bytes.unwrap() > this.budget.max_plaintext_bytes_per_direction
         {
-            return Poll::Ready(Err(io_err(
-                std::io::ErrorKind::Other,
-                "AEAD write byte budget exhausted",
-            )));
+            return Poll::Ready(Err(budget_err(AeadBudgetExhausted::WriteBytes)));
         }
         let nonce = make_nonce(&this.write_nonce_base, this.write_seq);
         match this.write_seq.checked_add(1) {
@@ -633,6 +636,12 @@ mod tests {
         assert_ne!(a, b);
     }
 
+    fn budget_reason(err: &std::io::Error) -> Option<AeadBudgetExhausted> {
+        err.get_ref()
+            .and_then(|inner| inner.downcast_ref::<AeadBudgetExhausted>())
+            .copied()
+    }
+
     #[tokio::test]
     async fn write_record_and_byte_budgets_are_enforced() {
         let (a, _b) = duplex(64 * 1024);
@@ -647,7 +656,7 @@ mod tests {
         stream.flush().await.unwrap();
         let err = stream.write_all(b"5").await.unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::Other);
-        assert!(err.to_string().contains("record budget exhausted"));
+        assert_eq!(budget_reason(&err), Some(AeadBudgetExhausted::WriteRecords));
 
         let (a, _b) = duplex(64 * 1024);
         let budget = AeadUsageBudget {
@@ -658,7 +667,7 @@ mod tests {
         let mut stream =
             EncryptedStream::new_with_budget(a, &key(), &iv(), EncryptionRole::Initiator, budget);
         let err = stream.write_all(b"1234").await.unwrap_err();
-        assert!(err.to_string().contains("byte budget exhausted"));
+        assert_eq!(budget_reason(&err), Some(AeadBudgetExhausted::WriteBytes));
     }
 
     #[tokio::test]
@@ -672,6 +681,6 @@ mod tests {
         let mut stream =
             EncryptedStream::new_with_budget(a, &key(), &iv(), EncryptionRole::Initiator, budget);
         let err = stream.write_all(b"x").await.unwrap_err();
-        assert!(err.to_string().contains("age budget exhausted"));
+        assert_eq!(budget_reason(&err), Some(AeadBudgetExhausted::KeyAge));
     }
 }

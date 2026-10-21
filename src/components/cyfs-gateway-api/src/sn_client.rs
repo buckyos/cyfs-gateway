@@ -1842,6 +1842,7 @@ mod tests {
             "auth.login",
         )
         .unwrap_err();
+        assert!(matches!(error, RPCErrors::ReasonError(_)), "{error:?}");
         assert!(error.to_string().contains("auth.login response"));
     }
 }

@@ -503,6 +503,7 @@ mod tests {
             .parse_server_config(serde_json::json!({ "type": "dns" }))
             .err()
             .unwrap();
+        assert_eq!(error.code(), cyfs_gateway_lib::ConfigErrorCode::InvalidConfig);
         assert!(error.msg().contains("registered server types"));
 
         let error = composition
@@ -510,6 +511,7 @@ mod tests {
             .parse_stack_config(serde_json::json!({ "protocol": "tun" }))
             .err()
             .unwrap();
+        assert_eq!(error.code(), cyfs_gateway_lib::ConfigErrorCode::InvalidConfig);
         assert!(error.msg().contains("registered stack protocols"));
     }
 }

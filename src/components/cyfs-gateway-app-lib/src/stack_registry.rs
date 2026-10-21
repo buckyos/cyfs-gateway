@@ -568,6 +568,7 @@ mod tests {
             .parse_stack_config(serde_json::json!({ "protocol": "missing" }))
             .err()
             .unwrap();
+        assert_eq!(error.code(), ConfigErrorCode::InvalidConfig);
         assert!(error.msg().contains("missing"));
         assert!(error.msg().contains("[alpha, zeta]"));
     }

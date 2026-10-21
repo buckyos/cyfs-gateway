@@ -3129,6 +3129,7 @@ mod owner_zone_binding_tests {
         let error =
             remove_owner_bound_zone(&mut document, "alice", "did:web:zone-a.example", false)
                 .unwrap_err();
+        assert!(matches!(error, SnBnsControllerError::InvalidInput(_)));
         assert!(error.to_string().contains("must be an unsigned integer"));
     }
 

@@ -618,6 +618,7 @@ mod tests {
         let error = vault
             .sign_for_controller("controller-a", &register_sign_request(), tx)
             .unwrap_err();
+        assert!(matches!(error, BnsClientError::Serialization(_)), "{error:?}");
         assert!(error.to_string().contains("unknown chain id"), "{error}");
     }
 
@@ -631,6 +632,7 @@ mod tests {
         let error = vault
             .sign_for_controller("controller-a", &register_sign_request(), tx)
             .unwrap_err();
+        assert!(matches!(error, BnsClientError::Serialization(_)), "{error:?}");
         assert!(error.to_string().contains("unknown contract"), "{error}");
     }
 
@@ -656,6 +658,7 @@ mod tests {
         let error = vault
             .sign_for_controller("controller-a", &request, tx)
             .unwrap_err();
+        assert!(matches!(error, BnsClientError::Serialization(_)), "{error:?}");
         assert!(
             error.to_string().contains("unknown method selector"),
             "{error}"
@@ -734,6 +737,7 @@ mod tests {
         let error = vault
             .sign_for_controller("controller-a", &register_sign_request(), tx)
             .unwrap_err();
+        assert!(matches!(error, BnsClientError::Serialization(_)), "{error:?}");
         assert!(error.to_string().contains("gas_limit"), "{error}");
     }
 
@@ -745,6 +749,7 @@ mod tests {
         let error = vault
             .sign_for_controller("controller-x", &register_sign_request(), tx)
             .unwrap_err();
+        assert!(matches!(error, BnsClientError::Serialization(_)), "{error:?}");
         assert!(error.to_string().contains("unknown controller id"), "{error}");
     }
 
