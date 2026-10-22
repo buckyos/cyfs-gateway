@@ -1,5 +1,25 @@
 # BNS 发布说明
 
+## SN-Business Issue #48：设备类型映射和解析诊断
+
+HTTP resolver 只在显式 `type=device` 时映射父 Zone 的设备槽位。`type=zone` 不再把设备正文当作 Zone 返回，
+缺省查询也不触发父设备槽映射；独立登记名字的唯一 active 类型仍可作为缺省类型。
+已登记独立子名字仍优先于父设备槽，既有设备、Zone 和 owner 的签名及关联校验保持有效。
+缺省类型按当前 active 类型集合选择：唯一类型直接选择，多类型含 zone 时选 zone 并警告，
+多类型无默认时返回 `400 ambiguousDocType`，不再固定查询 zone。
+确定性的类型、身份、签名、Registry owner 不一致，以及正文解析或 hash 错误返回 `invalid` 和原因，
+不发布错误正文，不把它们当成网络故障。直查路径与父设备槽映射执行相同的拒绝原则。
+
+current metadata 使用文档 `iat` 与编码文档 hash；BNS 登记版本仅作 `registryVersion`。
+未支持的 `versionId` / `versionTime` 明确返回 501，不再静默回答 current。
+RTCP 在 device、zone 两次解析均失败时保留两段原因，仍拒绝 invalid / revoked 身份，
+仍要求 AuthorityCurrent 本轮权威证据；不放宽缓存或 DNS bootstrap 策略。
+
+Relay 的 `device.json` 由 SN-Business 的资产更新和 `security-update` 流程另行补齐。
+真实 keep-tunnel 和公网 HTTPS 验收由 issue 发起者在资产推送完成后执行。
+这些协议修正不单独证明现场的首个 device 查询已恢复；历史参数修正也不是 current 查询类型冲突的直接原因。
+独立控制通道与 TrustedSnapshot/后台确认属于单独跟踪的机制边界，本 PR 不宣称 Relay 回流问题已经闭环。
+
 ## Issue #185：移除写路径中的全局名称扫描（新测试链）
 
 注册、设置 owner 和转让只校验本名字的 owner 路径；显式 BNS owner 直接使用目标

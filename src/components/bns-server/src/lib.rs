@@ -25,6 +25,7 @@ use bns_client::{
 };
 use bns_evm::{Address, BnsChainClient, EthRpcClient, TransactionLookup, B256};
 use bns_indexer::{
+    active_document_types_at, ensure_document_consistent,
     canonical_bns_name, canonical_doc_type, did_bns_from_name, is_top_level_name,
     name_from_did_bns, now_timestamp, parent_name, AliasKind, AuthorityKey, AuthoritySetState,
     BnsRegistryError, BnsRegistryResult, BnsRegistryStore, BnsRegistryStoreTx,
@@ -42,7 +43,7 @@ use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full};
 use kRPC::{RPCErrors, RPCHandler, RPCRequest, RPCResponse, RPCResult};
 use log::warn;
-use name_client::document_iat;
+use name_client::{document_content_hash, document_iat};
 use name_lib::{DIDDocumentTrait, DeviceDocument, EncodedDocument, OwnerDocument, ZoneDocument, DID};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -198,6 +199,16 @@ where
         self.store
             .transact(|tx| projection_resolve_document(tx, name, doc_type, now_timestamp()))
             .map_err(Into::into)
+    }
+
+    async fn active_document_types(&self, name: &str) -> BnsClientResult<Vec<String>> {
+        let now = now_timestamp();
+        self.store.transact(|tx| {
+            let name = canonical_bns_name(name)?;
+            let raw = tx.get_name(&name)?.ok_or_else(|| BnsRegistryError::NameNotFound { name: name.clone() })?;
+            let state = projection_materialize_name_state(tx, raw, now)?;
+            active_document_types_at(tx, &name, state.status, now)
+        }).map_err(Into::into)
     }
 
     async fn get_document_version(
@@ -945,8 +956,6 @@ pub fn spawn_listener(
 /// Path prefix of the DID resolver binding: `GET /1.0/identifiers/{did}`.
 pub const DID_RESOLVER_PATH_PREFIX: &str = "/1.0/identifiers/";
 
-/// Default doc_type when the `type` query parameter is omitted (protocol §2).
-const DID_RESOLVER_DEFAULT_DOC_TYPE: &str = "zone";
 /// Doc type of a device-slot projection (`did:bns:<device>.<parent>` whose
 /// subname is not registered on its own).
 const DID_RESOLVER_DEVICE_DOC_TYPE: &str = "device";
@@ -1004,21 +1013,18 @@ async fn serve_did_resolver_request<T: BnsIndexerApi>(
             )
         }
     };
-    let doc_type = match canonical_doc_type(&doc_type) {
-        Ok(doc_type) => doc_type,
-        Err(error) => {
-            return did_resolution_error_response(
-                StatusCode::BAD_REQUEST,
-                "invalidDocType",
-                &error.to_string(),
-            )
-        }
+    let explicit_type = doc_type.is_some();
+    let doc_type = match doc_type.map(|value| canonical_doc_type(&value)).transpose() {
+        Ok(value) => value,
+        Err(error) => return did_resolution_error_response(
+            StatusCode::BAD_REQUEST, "invalidDocType", &error.to_string(),
+        ),
     };
 
-    // Historical `iat` queries need the full event-log index which the read
-    // projection does not keep yet. Protocol §7: report the capability gap
-    // with 501 + historicalQuerySupported=false — neither an error nor a
-    // negative state, so clients can fall back to the current state.
+    // Historical versionId/versionTime (and legacy iat) queries need the
+    // full event-log index which the read projection does not keep yet.
+    // Protocol §7: report 501 + historicalQuerySupported=false; current
+    // state must never stand in for an unsupported historical query.
     if iat.is_some() {
         return did_resolution_json_response(
             StatusCode::NOT_IMPLEMENTED,
@@ -1035,10 +1041,63 @@ async fn serve_did_resolver_request<T: BnsIndexerApi>(
         );
     }
 
-    match resolve_bns_identity(api, &name, &doc_type).await {
+    let (doc_type, warning) = match doc_type {
+        Some(doc_type) => (doc_type, None),
+        None => {
+            let mut types = match api.active_document_types(&name).await {
+                Ok(types) => types,
+                Err(error) if error.is_registry_code("NAME_NOT_FOUND") => return
+                    did_resolution_error_response(StatusCode::NOT_FOUND, "notFound", "BNS name is not registered"),
+                Err(error) => return did_resolution_failure_response(did, "<default>", &error),
+            };
+            types.sort();
+            types.dedup();
+            match types.as_slice() {
+                [] => {
+                    return match api.query_name_state(&name).await {
+                        Ok(Some(state)) if state.status == NameStatus::Tombstoned => did_resolution_json_response(
+                            StatusCode::GONE, &json!({
+                                "didResolutionMetadata": { "contentType": Value::Null, "error": Value::Null },
+                                "didDocument": Value::Null,
+                                "didDocumentMetadata": { "deactivated": true, "buckyos": { "documentStatus": "tombstoned" } },
+                            }),
+                        ),
+                        Ok(_) => did_resolution_error_response(StatusCode::NOT_FOUND, "notFound", "BNS name has no active document types"),
+                        Err(error) => did_resolution_failure_response(did, "<default>", &error),
+                    };
+                }
+                [only] => (only.clone(), None),
+                _ if types.iter().any(|value| value == "zone") => {
+                    let warning = format!("multiple active document types ({}) default to zone", types.join(", "));
+                    warn!("{did}: {warning}");
+                    ("zone".to_string(), Some(warning))
+                }
+                _ => return did_resolution_error_response(StatusCode::BAD_REQUEST, "ambiguousDocType", "multiple active document types have no default; specify type"),
+            }
+        }
+    };
+    // Device-slot association validation is exclusive to explicit device queries.
+    let resolved = if explicit_type {
+        resolve_bns_identity(api, &name, &doc_type).await
+    } else {
+        api.resolve_document(&name, &doc_type).await
+    };
+    match resolved {
         Ok(result) => {
             let status = did_resolver_document_status(&result, now_timestamp());
-            did_resolution_state_response(&doc_type, status, Some(&result))
+            // A denied device mapping can carry dependency state with no body.
+            // Preserve that negative/expired verdict; validate every body we serve.
+            if status == DocumentStatus::Active || (status == DocumentStatus::Expired
+                && !result.document_state.document.inline_document.is_empty()) {
+                if let Err(reason) = validate_resolver_document(&name, &doc_type, &result) {
+                    return did_resolution_invalid_response(&doc_type, &reason);
+                }
+            }
+            did_resolution_state_response_with_warning(&doc_type, status, Some(&result), warning.as_deref())
+        }
+        Err(error) if error.is_registry_code("INVALID_DOCUMENT")
+            || error.is_registry_code("DOCUMENT_INCONSISTENT") => {
+            did_resolution_invalid_response(&doc_type, &error.to_string())
         }
         // The projection reports "this (did, doc_type) was never published"
         // as an error; that is the authoritative Missing verdict of the
@@ -1070,17 +1129,33 @@ async fn serve_did_resolver_request<T: BnsIndexerApi>(
     }
 }
 
+fn validate_resolver_document(name: &str, doc_type: &str, result: &ResolveResult) -> Result<(), String> {
+    let document = projected_document(result)?;
+    ensure_document_consistent(name, doc_type, &result.document_state, &result.owner.effective_owner)
+        .map_err(|error| error.to_string())?;
+    // Custom slots can carry arbitrary published content. Built-in identities
+    // must decode as the requested DID document; parse failures are not absence.
+    if matches!(doc_type, "owner" | "zone" | "device") {
+        let parsed = name_lib::parse_did_doc(document).map_err(|error| format!("cannot parse {doc_type} document: {error}"))?;
+        let actual = parsed.get_doc_type();
+        if actual.as_str() != doc_type {
+            return Err(format!("document body is a {actual} document, requested {doc_type}"));
+        }
+        if parsed.get_id() != DID::new("bns", name) {
+            return Err(format!("document id does not match requested did:bns:{name}"));
+        }
+    }
+    Ok(())
+}
+
 async fn resolve_bns_identity<T: BnsIndexerApi>(
     api: &T,
     name: &str,
     doc_type: &str,
 ) -> BnsClientResult<ResolveResult> {
-    // Callers that want the device document ask for `type=device` explicitly
-    // (resolve-did D4). The default / `type=zone` projection stays for
-    // clients released before that rule.
-    let projectable =
-        doc_type == DID_RESOLVER_DEFAULT_DOC_TYPE || doc_type == DID_RESOLVER_DEVICE_DOC_TYPE;
-    if !projectable || !name.contains('.') {
+    // Only type=device projects a device slot. Zone queries must never
+    // relabel a DeviceDocument as a ZoneDocument, including default queries.
+    if doc_type != DID_RESOLVER_DEVICE_DOC_TYPE || !name.contains('.') {
         return api.resolve_document(name, doc_type).await;
     }
     let checkpoint = api.latest_checkpoint().await?;
@@ -1120,8 +1195,7 @@ async fn resolve_bns_identity<T: BnsIndexerApi>(
         &result,
         &zone_result,
         &owner_result,
-    )
-    .map_err(BnsClientError::Transport)?;
+    );
     if api.resolve_document(parent, device_name).await? != result
         || api.resolve_document(parent, "zone").await? != zone_result
         || api.resolve_document(parent, "owner").await? != owner_result
@@ -1132,6 +1206,7 @@ async fn resolve_bns_identity<T: BnsIndexerApi>(
             "BNS projection changed during device resolution".into(),
         ));
     }
+    let denied = denied.map_err(|reason| BnsClientError::registry("INVALID_DOCUMENT", reason))?;
     Ok(match denied {
         Some((status, source)) => denied_device_resolution(source, status),
         None => result,
@@ -1289,8 +1364,8 @@ fn did_resolution_failure_response(
     did_resolution_error_response(status, "internalError", &error.to_string())
 }
 
-fn parse_did_resolver_query(query: Option<&str>) -> Result<(String, Option<u64>), String> {
-    let mut doc_type = DID_RESOLVER_DEFAULT_DOC_TYPE.to_string();
+fn parse_did_resolver_query(query: Option<&str>) -> Result<(Option<String>, Option<u64>), String> {
+    let mut doc_type = None;
     let mut iat = None;
     for pair in query
         .unwrap_or("")
@@ -1299,10 +1374,16 @@ fn parse_did_resolver_query(query: Option<&str>) -> Result<(String, Option<u64>)
     {
         let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
         match key {
-            "type" => doc_type = value.to_string(),
-            "iat" => {
+            "type" => {
+                if doc_type.is_some() { return Err("query parameter `type` must occur once".into()); }
+                doc_type = Some(value.to_string());
+            }
+            "iat" | "versionId" | "versionTime" => {
+                if iat.is_some() {
+                    return Err("versionId, versionTime and legacy iat are mutually exclusive and must occur once".into());
+                }
                 iat = Some(value.parse::<u64>().map_err(|_| {
-                    format!("query parameter `iat` must be a unix timestamp, got `{value}`")
+                    format!("query parameter `{key}` must be a unix timestamp, got `{value}`")
                 })?);
             }
             _ => {}
@@ -1355,6 +1436,15 @@ fn did_resolution_state_response(
     status: DocumentStatus,
     result: Option<&ResolveResult>,
 ) -> ServerResult<Response<BoxBody<Bytes, ServerError>>> {
+    did_resolution_state_response_with_warning(doc_type, status, result, None)
+}
+
+fn did_resolution_state_response_with_warning(
+    doc_type: &str,
+    status: DocumentStatus,
+    result: Option<&ResolveResult>,
+    warning: Option<&str>,
+) -> ServerResult<Response<BoxBody<Bytes, ServerError>>> {
     let http_status = match status {
         DocumentStatus::Active | DocumentStatus::Expired | DocumentStatus::Migrated => {
             StatusCode::OK
@@ -1386,15 +1476,19 @@ fn did_resolution_state_response(
     buckyos.insert("documentStatus".to_string(), json!(status.as_str()));
     if let Some(iat) = document_version {
         buckyos.insert("documentVersion".to_string(), json!(iat));
+        // An expired publication must not advertise an active current anchor.
+        if status == DocumentStatus::Active {
+            buckyos.insert("latestIat".to_string(), json!(iat));
+        }
     }
     if let Some(result) = result {
         buckyos.insert("sourceName".to_string(), json!(result.document_state.name));
         buckyos.insert("sourceDocType".to_string(), json!(result.document_state.doc_type));
         buckyos.insert("sourceContentHash".to_string(), json!(result.document_state.document.content_hash));
         buckyos.insert("sourceDocumentStatus".to_string(), json!(result.document_state.status.as_str()));
-        if let Some(Value::String(jwt)) = &did_document {
-            if jwt.as_bytes() == result.document_state.document.inline_document.as_slice() {
-                buckyos.insert("docHash".to_string(), json!(result.document_state.document.content_hash.trim_start_matches("0x")));
+        if did_document.is_some() {
+            if let Ok(document) = projected_document(result) {
+                buckyos.insert("docHash".to_string(), json!(document_content_hash(&document)));
             }
         }
         // Version 0 is the "never published" placeholder, not a real version.
@@ -1428,7 +1522,7 @@ fn did_resolution_state_response(
     metadata.insert("deactivated".to_string(), json!(deactivated));
     metadata.insert("buckyos".to_string(), Value::Object(buckyos));
 
-    let envelope = json!({
+    let mut envelope = json!({
         "didResolutionMetadata": {
             "contentType": document_content_type,
             "error": if http_status == StatusCode::NOT_FOUND {
@@ -1440,6 +1534,9 @@ fn did_resolution_state_response(
         "didDocument": did_document,
         "didDocumentMetadata": Value::Object(metadata),
     });
+    if let Some(warning) = warning {
+        envelope["didResolutionMetadata"]["warnings"] = json!([warning]);
+    }
     did_resolution_json_response(http_status, &envelope)
 }
 
@@ -1491,6 +1588,20 @@ fn did_resolution_not_applicable_response() -> ServerResult<Response<BoxBody<Byt
             "didDocumentMetadata": {},
         }),
     )
+}
+
+fn did_resolution_invalid_response(
+    doc_type: &str,
+    reason: &str,
+) -> ServerResult<Response<BoxBody<Bytes, ServerError>>> {
+    did_resolution_json_response(StatusCode::OK, &json!({
+        "didResolutionMetadata": { "contentType": Value::Null, "error": Value::Null },
+        "didDocument": Value::Null,
+        "didDocumentMetadata": {
+            "deactivated": false,
+            "buckyos": { "docType": doc_type, "documentStatus": "invalid", "reason": reason },
+        },
+    }))
 }
 
 fn did_resolution_error_response(
@@ -1665,6 +1776,10 @@ fn projection_resolve_document(
         }
     })?;
     let owner = projection_resolve_owner_from_state(tx, &name_state, now)?;
+    if matches!(document_state.effective_status_at(name_state.status, now),
+        DocumentStatus::Active | DocumentStatus::Expired) {
+        ensure_document_consistent(&name, &doc_type, &document_state, &owner.effective_owner)?;
+    }
     let alias = tx.get_alias(&name)?;
     let proof_root = projection_current_proof_root(tx)?;
     let effective_controller = if document_state.controller.is_unset() {
@@ -2112,6 +2227,21 @@ mod tests {
         }
     }
 
+    fn resolver_identity_json(name: &str, doc_type: &str, iat: u64) -> Value {
+        let (_, public) = name_lib::generate_ed25519_key_pair();
+        let public = serde_json::from_value(public).unwrap();
+        let did = DID::new("bns", name);
+        let mut value = if doc_type == "owner" {
+            serde_json::to_value(OwnerDocument::new(did, name.into(), name.into(), public)).unwrap()
+        } else {
+            serde_json::to_value(ZoneDocument::new(did.clone(), did, public)).unwrap()
+        };
+        value["iat"] = json!(iat);
+        value["exp"] = json!(FAR_FUTURE);
+        if doc_type == "zone" { value["oods"] = json!(["ood1"]); }
+        value
+    }
+
     fn resolver_seeded_store() -> SqliteBnsRegistryStore {
         let store = SqliteBnsRegistryStore::open_memory().unwrap();
         store
@@ -2129,7 +2259,7 @@ mod tests {
                     "owner",
                     3,
                     DocumentStatus::Active,
-                    br#"{"id":"did:bns:alice","iat":1751500000}"#,
+                    &serde_json::to_vec(&resolver_identity_json("alice", "owner", 1751500000)).unwrap(),
                 );
                 owner_doc.previous_version = 2;
                 tx.put_document(&owner_doc)?;
@@ -2138,7 +2268,7 @@ mod tests {
                     "zone",
                     7,
                     DocumentStatus::Active,
-                    br#"{"id":"did:bns:alice","iat":1751500100,"oods":["ood1"]}"#,
+                    &serde_json::to_vec(&resolver_identity_json("alice", "zone", 1751500100)).unwrap(),
                 ))?;
                 tx.put_document(&resolver_document_state(
                     "alice",
@@ -2173,7 +2303,7 @@ mod tests {
                     "zone",
                     1,
                     DocumentStatus::Active,
-                    br#"{"id":"did:bns:team"}"#,
+                    &serde_json::to_vec(&resolver_identity_json("team", "zone", 1751500000)).unwrap(),
                 ))?;
 
                 // gone: tombstoned name whose documents must report tombstoned.
@@ -2183,7 +2313,7 @@ mod tests {
                     "zone",
                     1,
                     DocumentStatus::Active,
-                    br#"{"id":"did:bns:gone"}"#,
+                    &serde_json::to_vec(&resolver_identity_json("gone", "zone", 1751500000)).unwrap(),
                 ))?;
 
                 // moved: active documents behind a MigratedTo alias.
@@ -2193,7 +2323,7 @@ mod tests {
                     "zone",
                     1,
                     DocumentStatus::Active,
-                    br#"{"id":"did:bns:moved"}"#,
+                    &serde_json::to_vec(&resolver_identity_json("moved", "zone", 1751500000)).unwrap(),
                 ))?;
                 tx.put_alias(&bns_indexer::AliasState {
                     name: "moved".to_string(),
@@ -2215,7 +2345,7 @@ mod tests {
                     "zone",
                     1,
                     DocumentStatus::Active,
-                    br#"{"id":"did:bns:lapsed"}"#,
+                    &serde_json::to_vec(&resolver_identity_json("lapsed", "zone", 1751500000)).unwrap(),
                 ))?;
                 Ok(())
             })
@@ -2232,7 +2362,7 @@ mod tests {
         SqliteBnsIndexerHttpServer::from_registry(registry)
     }
 
-    async fn resolver_request<S: HttpServer>(
+    async fn resolver_request<S: HttpServer + ?Sized>(
         server: &S,
         method: Method,
         uri: &str,
@@ -2294,6 +2424,8 @@ mod tests {
         assert_eq!(buckyos["documentStatus"], "active");
         assert_eq!(buckyos["documentVersion"], iat);
         assert_eq!(buckyos["registryVersion"], 3);
+        assert_eq!(buckyos["latestIat"], iat);
+        assert_eq!(buckyos["docHash"], document_content_hash(&EncodedDocument::JsonLd(body["didDocument"].clone())));
         assert_eq!(buckyos["authoritySeq"], 1);
         // Chain-account owners have no DID form yet: the field must be
         // omitted, never serialized as the internal principal JSON.
@@ -2446,7 +2578,7 @@ mod tests {
         let handle = spawn_listener(listener, server.clone()).unwrap();
         let client = resolver_test_client(handle.local_addr());
         let did = DID::new("bns", "ood1.moved");
-        let (status, body, _) = resolver_request(server.as_ref(), Method::GET, "/1.0/identifiers/did:bns:ood1.moved").await;
+        let (status, body, _) = resolver_request(server.as_ref(), Method::GET, "/1.0/identifiers/did:bns:ood1.moved?type=device").await;
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert!(body["didDocument"].is_null());
         assert_eq!(body["didDocumentMetadata"]["buckyos"]["documentStatus"], "missing");
@@ -2455,7 +2587,7 @@ mod tests {
         registry.store().transact(|tx| {
             tx.put_name(&resolver_name_state("ood1.moved", NameStatus::Active))?;
             // 新协议要求文档能得出 iat，否则 resolver 回答无法给出 (iat, hash)。
-            tx.put_document(&resolver_document_state("ood1.moved", "zone", 1, DocumentStatus::Active, br#"{"id":"did:bns:ood1.moved","iat":1750000000}"#))
+            tx.put_document(&resolver_document_state("ood1.moved", "zone", 1, DocumentStatus::Active, &serde_json::to_vec(&resolver_identity_json("ood1.moved", "zone", 1750000000)).unwrap()))
         }).unwrap();
         let document = resolve_current(&client, &did, None, remote_authority_opts()).await.unwrap();
         assert_eq!(document.to_json_value().unwrap()["id"], did.to_string());
@@ -2526,7 +2658,7 @@ mod tests {
                 ] { tx.put_document(&resolver_document_state("alice", slot, 11, DocumentStatus::Active, &bytes))?; }
                 Ok(())
             }).unwrap();
-            let (http, body, _) = resolver_request(server.as_ref(), Method::GET, "/1.0/identifiers/did:bns:ood1.alice").await;
+            let (http, body, _) = resolver_request(server.as_ref(), Method::GET, "/1.0/identifiers/did:bns:ood1.alice?type=device").await;
             assert_eq!(http, if status == DocumentStatus::Revoked { StatusCode::GONE } else { StatusCode::OK }, "{cause}");
             assert!(body["didDocument"].is_null(), "{cause}");
             assert_eq!(body["didDocumentMetadata"]["buckyos"]["documentStatus"], status.as_str(), "{cause}");
@@ -2654,7 +2786,7 @@ mod tests {
             let (_, envelope, _) = resolver_request(
                 server.as_ref(),
                 Method::GET,
-                &format!("/1.0/identifiers/{}", device.id.to_string()),
+                &format!("/1.0/identifiers/{}?type=device", device.id.to_string()),
             )
             .await;
             assert_eq!(
@@ -2684,7 +2816,39 @@ mod tests {
             assert_eq!(status, StatusCode::OK);
             assert_eq!(typed["didDocumentMetadata"]["buckyos"]["docType"], "device");
             assert_eq!(typed["didDocument"], *jwt);
+            for suffix in ["", "?type=zone"] {
+                let (status, zone_query, _) = resolver_request(
+                    server.as_ref(), Method::GET,
+                    &format!("/1.0/identifiers/{}{suffix}", device.id.to_string()),
+                ).await;
+                assert_eq!(status, StatusCode::NOT_FOUND);
+                if !suffix.is_empty() {
+                    assert_eq!(zone_query["didDocumentMetadata"]["buckyos"]["docType"], "zone");
+                }
+                assert!(zone_query["didDocument"].is_null());
+            }
+            assert_eq!(typed["didDocumentMetadata"]["buckyos"]["latestIat"], device.iat);
+            assert_eq!(typed["didDocumentMetadata"]["buckyos"]["docHash"],
+                document_content_hash(&EncodedDocument::Jwt(jwt.clone())));
         }
+        let mut invalid_zone = zone.clone();
+        invalid_zone.devices.remove("ood1");
+        registry.store().transact(|tx| {
+            tx.put_document(&resolver_document_state(
+                "alice", "zone", 9, DocumentStatus::Active,
+                invalid_zone.encode(Some(&key)).unwrap().to_string().as_bytes(),
+            ))
+        }).unwrap();
+        let (status, denied, _) = resolver_request(
+            server.as_ref(), Method::GET, "/1.0/identifiers/did:bns:ood1.alice?type=device"
+        ).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(denied["didDocumentMetadata"]["buckyos"]["documentStatus"], "invalid");
+        assert!(denied["didDocumentMetadata"]["buckyos"]["reason"].as_str().unwrap().contains("not a member"));
+        assert!(denied["didDocument"].is_null());
+        registry.store().transact(|tx| {
+            tx.put_document(&resolver_document_state("alice", "zone", 10, DocumentStatus::Active, zone_jwt.as_bytes()))
+        }).unwrap();
         let (device, _) = &devices[0];
         let mut rotated = device.clone();
         rotated.iat += 1;
@@ -2720,7 +2884,7 @@ mod tests {
                 tx.put_document(&resolver_document_state("alice", slot, 20, DocumentStatus::Revoked, &content))
             }).unwrap();
             let (status, denied, _) = resolver_request(
-                server.as_ref(), Method::GET, "/1.0/identifiers/did:bns:ood1.alice"
+                server.as_ref(), Method::GET, "/1.0/identifiers/did:bns:ood1.alice?type=device"
             ).await;
             assert_eq!(status, StatusCode::GONE);
             assert_eq!(denied["didDocumentMetadata"]["buckyos"]["sourceDocType"], slot);
@@ -2733,15 +2897,25 @@ mod tests {
 
         registry.store().transact(|tx| {
             tx.put_name(&resolver_name_state("ood1.alice", NameStatus::Active))?;
-            tx.put_document(&resolver_document_state("ood1.alice", "zone", 1, DocumentStatus::Active, rotated_jwt.as_bytes()))
+            tx.put_document(&resolver_document_state("ood1.alice", "device", 1, DocumentStatus::Active, rotated_jwt.as_bytes()))
         }).unwrap();
         let (_, independent, _) = resolver_request(
-            server.as_ref(), Method::GET, "/1.0/identifiers/did:bns:ood1.alice"
+            server.as_ref(), Method::GET, "/1.0/identifiers/did:bns:ood1.alice?type=device"
         ).await;
         assert_eq!(independent["didDocumentMetadata"]["buckyos"]["sourceName"], "ood1.alice");
         assert_eq!(independent["didDocument"], rotated_jwt);
         registry.store().transact(|tx| {
-            tx.put_document(&resolver_document_state("ood1.alice", "zone", 2, DocumentStatus::Missing, rotated_jwt.as_bytes()))
+            tx.put_document(&resolver_document_state("ood1.alice", "zone", 1, DocumentStatus::Active, rotated_jwt.as_bytes()))
+        }).unwrap();
+        let (status, mismatched, _) = resolver_request(
+            server.as_ref(), Method::GET, "/1.0/identifiers/did:bns:ood1.alice?type=zone"
+        ).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(mismatched["didDocumentMetadata"]["buckyos"]["documentStatus"], "invalid");
+        assert!(mismatched["didDocumentMetadata"]["buckyos"]["reason"].as_str().unwrap().contains("requested zone"));
+        assert!(mismatched["didDocument"].is_null());
+        registry.store().transact(|tx| {
+            tx.put_document(&resolver_document_state("ood1.alice", "device", 2, DocumentStatus::Missing, rotated_jwt.as_bytes()))
         }).unwrap();
 
         for status in [
@@ -2976,7 +3150,7 @@ mod tests {
 
         // Name never registered at all (NameNotFound) is also authoritative.
         let (status, body, _) =
-            resolver_request(&server, Method::GET, "/1.0/identifiers/did:bns:ghost").await;
+            resolver_request(&server, Method::GET, "/1.0/identifiers/did:bns:ghost?type=zone").await;
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert_eq!(
             body["didDocumentMetadata"]["buckyos"]["documentStatus"],
@@ -3045,21 +3219,17 @@ mod tests {
     #[tokio::test]
     async fn did_resolver_historical_owner_query_returns_501() {
         let server = resolver_contract_server();
-        let (status, body, _) = resolver_request(
-            &server,
-            Method::GET,
-            "/1.0/identifiers/did:bns:alice?type=owner&iat=1750000000",
-        )
-        .await;
-
-        assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
-        assert_eq!(
-            body["didDocumentMetadata"]["buckyos"]["historicalQuerySupported"],
-            false
-        );
-        assert!(body["didDocumentMetadata"]["buckyos"]
-            .get("documentStatus")
-            .is_none());
+        for query in ["iat=1750000000", "versionId=1750000000", "versionTime=1750000000"] {
+            let (status, body, _) = resolver_request(
+                &server, Method::GET,
+                &format!("/1.0/identifiers/did:bns:alice?type=owner&{query}"),
+            ).await;
+            assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{query}");
+            let metadata = &body["didDocumentMetadata"]["buckyos"];
+            assert_eq!(metadata["historicalQuerySupported"], false);
+            assert!(metadata.get("documentStatus").is_none());
+            assert!(body["didDocument"].is_null());
+        }
     }
 
     #[tokio::test]
@@ -3130,7 +3300,7 @@ mod tests {
     async fn did_resolver_reports_expired_name() {
         let server = resolver_contract_server();
         let (status, body, _) =
-            resolver_request(&server, Method::GET, "/1.0/identifiers/did:bns:lapsed").await;
+            resolver_request(&server, Method::GET, "/1.0/identifiers/did:bns:lapsed?type=zone").await;
 
         assert_eq!(status, StatusCode::OK);
         assert_eq!(
@@ -3166,7 +3336,13 @@ mod tests {
             "/1.0/identifiers/not-a-did",
             "/1.0/identifiers/did:bns:INVALID",
             "/1.0/identifiers/did:bns:alice?type=NotAType",
+            "/1.0/identifiers/did:bns:alice?type=owner&type=zone",
             "/1.0/identifiers/did:bns:alice?type=owner&iat=abc",
+            "/1.0/identifiers/did:bns:alice?type=device&versionId=abc",
+            "/1.0/identifiers/did:bns:alice?versionTime=",
+            "/1.0/identifiers/did:bns:alice?versionId=1&versionTime=2",
+            "/1.0/identifiers/did:bns:alice?versionId=1&versionId=2",
+            "/1.0/identifiers/did:bns:alice?iat=1&versionTime=2",
         ] {
             let (status, body, _) = resolver_request(&server, Method::GET, uri).await;
             assert_eq!(status, StatusCode::BAD_REQUEST, "uri {uri}");
@@ -3175,11 +3351,169 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn did_resolver_owner_inconsistency_is_invalid_in_both_adapters() {
+        for (projected_device, indexer) in [(false, false), (false, true), (true, false), (true, true)] {
+            let store = resolver_seeded_store();
+            let mut document = resolver_identity_json("alice", "owner", 1751500000);
+            document["owner"] = json!("did:bns:bob");
+            store.transact(|tx| {
+                tx.put_document(&resolver_document_state(
+                    "alice", "owner", 4, DocumentStatus::Active,
+                    &serde_json::to_vec(&document).unwrap(),
+                ))?;
+                tx.put_document(&resolver_document_state(
+                    "alice", "ood1", 1, DocumentStatus::Active, b"device-slot",
+                ))
+            }).unwrap();
+            let server: Box<dyn HttpServer> = if indexer {
+                Box::new(SqliteBnsIndexerHttpServer::from_registry(Arc::new(CentralizedBnsRegistry::new(store))))
+            } else {
+                Box::new(BnsContractHttpServer::from_contract_store(store, "http://127.0.0.1:1"))
+            };
+            let uri = if projected_device {
+                "/1.0/identifiers/did:bns:ood1.alice?type=device"
+            } else {
+                "/1.0/identifiers/did:bns:alice?type=owner"
+            };
+            let (status, body, _) = resolver_request(server.as_ref(), Method::GET, uri).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body["didDocumentMetadata"]["buckyos"]["documentStatus"], "invalid");
+            assert!(body["didDocumentMetadata"]["buckyos"]["reason"].as_str().unwrap().contains("effective owner"));
+            assert!(body["didDocument"].is_null());
+        }
+    }
+
+    #[tokio::test]
+    async fn did_resolver_terminal_state_outranks_invalid_owner_body() {
+        for (name_status, document_status, expected) in [
+            (NameStatus::Active, DocumentStatus::Revoked, "revoked"),
+            (NameStatus::Tombstoned, DocumentStatus::Active, "tombstoned"),
+        ] {
+            for indexer in [false, true] {
+                let store = resolver_seeded_store();
+                store.transact(|tx| {
+                    tx.put_name(&resolver_name_state("alice", name_status))?;
+                    tx.put_document(&resolver_document_state(
+                        "alice", "owner", 4, document_status, br#"{"owner":"did:bns:bob"}"#,
+                    ))
+                }).unwrap();
+                let server: Box<dyn HttpServer> = if indexer {
+                    Box::new(SqliteBnsIndexerHttpServer::from_registry(Arc::new(CentralizedBnsRegistry::new(store))))
+                } else {
+                    Box::new(BnsContractHttpServer::from_contract_store(store, "http://127.0.0.1:1"))
+                };
+                let (status, body, _) = resolver_request(server.as_ref(), Method::GET,
+                    "/1.0/identifiers/did:bns:alice?type=owner").await;
+                assert_eq!(status, StatusCode::GONE);
+                assert_eq!(body["didDocumentMetadata"]["buckyos"]["documentStatus"], expected);
+                assert!(body["didDocument"].is_null());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn did_resolver_rejects_unparseable_builtin_document() {
+        let store = resolver_seeded_store();
+        store.transact(|tx| tx.put_document(&resolver_document_state(
+            "alice", "owner", 4, DocumentStatus::Active, br#"{"id":"did:bns:alice","iat":1751500000}"#,
+        ))).unwrap();
+        let server = SqliteBnsIndexerHttpServer::from_registry(Arc::new(CentralizedBnsRegistry::new(store)));
+        let (status, body, _) = resolver_request(&server, Method::GET,
+            "/1.0/identifiers/did:bns:alice?type=owner").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["didDocumentMetadata"]["buckyos"]["documentStatus"], "invalid");
+        assert!(body["didDocumentMetadata"]["buckyos"]["reason"].as_str().unwrap().contains("parse"));
+        assert!(body["didDocument"].is_null());
+    }
+
+    #[tokio::test]
+    async fn did_resolver_corrupt_upstream_hash_cannot_anchor_owner_in_name_client() {
+        // Normal SQLite rejects a bad hash on write. Inject it at the API boundary.
+        let registry = CentralizedBnsRegistry::new(resolver_seeded_store());
+        let mut result = registry.resolve_document("alice", "owner").unwrap();
+        result.document_state.document.content_hash = format!("0x{}", "00".repeat(32));
+        let server = Arc::new(BnsContractHttpServer::new(ResolverApiStub(Some(result))));
+        let (status, body, _) = resolver_request(server.as_ref(), Method::GET,
+            "/1.0/identifiers/did:bns:alice?type=owner").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["didDocumentMetadata"]["buckyos"]["documentStatus"], "invalid");
+        assert!(body["didDocumentMetadata"]["buckyos"]["reason"].as_str().unwrap().contains("hash"));
+        assert!(body["didDocument"].is_null());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let handle = spawn_listener(listener, server).unwrap();
+        let client = resolver_test_client(handle.local_addr());
+        assert!(resolve_current(&client, &DID::new("bns", "alice"), Some(name_lib::DidDocType::Owner),
+            remote_authority_opts()).await.is_err());
+        handle.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn did_resolver_default_uses_active_types_and_reports_ambiguity() {
+        for indexer in [false, true] {
+            let store = resolver_seeded_store();
+            store.transact(|tx| {
+                for name in ["onlyowner", "ambiguous", "noneactive"] {
+                    tx.put_name(&resolver_name_state(name, NameStatus::Active))?;
+                    tx.put_document(&resolver_document_state(name, "owner", 1, DocumentStatus::Active,
+                        &serde_json::to_vec(&resolver_identity_json(name, "owner", 1751500000)).unwrap()))?;
+                }
+                tx.put_name(&resolver_name_state("onlycustom", NameStatus::Active))?;
+                tx.put_document(&resolver_document_state("onlycustom", "profile", 1,
+                    DocumentStatus::Active, br#"{"business":"custom-content"}"#))?;
+                for (name, slot, version, status, expiry) in [
+                    ("onlyowner", "zone", 1, DocumentStatus::Revoked, 0),
+                    ("onlyowner", "zone", 2, DocumentStatus::Active, 1),
+                    ("onlyowner", "profile", 1, DocumentStatus::Active, 0),
+                    ("onlyowner", "profile", 2, DocumentStatus::Revoked, 0),
+                    ("ambiguous", "profile", 1, DocumentStatus::Active, 0),
+                    ("noneactive", "owner", 2, DocumentStatus::Revoked, 0),
+                ] {
+                    let mut document = resolver_document_state(name, slot, version, status, br#"{"iat":1751500000}"#);
+                    document.expire_at = expiry;
+                    tx.put_document(&document)?;
+                }
+                Ok(())
+            }).unwrap();
+            let server: Box<dyn HttpServer> = if indexer {
+                Box::new(SqliteBnsIndexerHttpServer::from_registry(Arc::new(CentralizedBnsRegistry::new(store))))
+            } else { Box::new(BnsContractHttpServer::from_contract_store(store, "http://127.0.0.1:1")) };
+            let (status, body, _) = resolver_request(server.as_ref(), Method::GET,
+                "/1.0/identifiers/did:bns:onlyowner").await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body["didDocumentMetadata"]["buckyos"]["docType"], "owner");
+            let (status, custom, _) = resolver_request(server.as_ref(), Method::GET,
+                "/1.0/identifiers/did:bns:onlycustom").await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(custom["didDocumentMetadata"]["buckyos"]["docType"], "profile");
+            assert_eq!(custom["didDocument"]["business"], "custom-content");
+            let (status, ambiguous, _) = resolver_request(server.as_ref(), Method::GET,
+                "/1.0/identifiers/did:bns:ambiguous").await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(ambiguous["didResolutionMetadata"]["error"], "ambiguousDocType");
+            assert!(ambiguous["didDocument"].is_null());
+            let (status, missing, _) = resolver_request(server.as_ref(), Method::GET,
+                "/1.0/identifiers/did:bns:noneactive").await;
+            assert_eq!(status, StatusCode::NOT_FOUND);
+            assert!(missing["didDocumentMetadata"]["buckyos"].get("docType").is_none());
+            let (status, multi, _) = resolver_request(server.as_ref(), Method::GET,
+                "/1.0/identifiers/did:bns:alice").await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(multi["didDocumentMetadata"]["buckyos"]["docType"], "zone");
+            assert!(multi["didResolutionMetadata"]["warnings"].as_array().is_some_and(|v| !v.is_empty()));
+        }
+    }
+
     /// Stub API whose read path fails like a broken upstream dependency.
-    struct FailingResolverApi;
+    struct ResolverApiStub(Option<ResolveResult>);
 
     #[async_trait]
-    impl BnsIndexerApi for FailingResolverApi {
+    impl BnsIndexerApi for ResolverApiStub {
+        async fn active_document_types(&self, _name: &str) -> BnsClientResult<Vec<String>> {
+            self.0.as_ref().map(|_| vec!["owner".to_string()])
+                .ok_or_else(|| BnsClientError::Transport("indexer down".to_string()))
+        }
+
         async fn query_name_state(&self, _name: &str) -> BnsClientResult<Option<NameState>> {
             Err(BnsClientError::Transport("indexer down".to_string()))
         }
@@ -3201,7 +3535,7 @@ mod tests {
             _name: &str,
             _doc_type: &str,
         ) -> BnsClientResult<ResolveResult> {
-            Err(BnsClientError::Transport("indexer down".to_string()))
+            self.0.clone().ok_or_else(|| BnsClientError::Transport("indexer down".to_string()))
         }
         async fn get_document_version(
             &self,
@@ -3227,10 +3561,15 @@ mod tests {
     async fn did_resolver_dependency_failure_is_5xx_not_missing() {
         // Protocol §5's hardest rule: an unavailable upstream must never be
         // presented as an authoritative negative state (missing/revoked).
-        let server = BnsContractHttpServer::new(FailingResolverApi);
+        let server = BnsContractHttpServer::new(ResolverApiStub(None));
         let (status, body, _) =
-            resolver_request(&server, Method::GET, "/1.0/identifiers/did:bns:alice").await;
+            resolver_request(&server, Method::GET, "/1.0/identifiers/did:bns:alice?type=owner").await;
 
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert!(body["didDocumentMetadata"].get("buckyos").is_none());
+        let (status, body, _) = resolver_request(
+            &server, Method::GET, "/1.0/identifiers/did:bns:alice",
+        ).await;
         assert_eq!(status, StatusCode::BAD_GATEWAY);
         assert!(body["didDocumentMetadata"].get("buckyos").is_none());
     }
