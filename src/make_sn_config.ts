@@ -1117,13 +1117,14 @@ async function loadSeedUserEnv(
       throw new Error(`${bundlePath} has invalid document validity times`);
     }
   }
-  const usesSnRelay = params.netid !== "wan";
+  const usesSnRelay = params.netid !== "wan" && params.netid !== "wan_dyn";
+  const usesSnDdns = params.netid !== "wan";
   const snHost = `sn.${params.sn_base_host.trim()}`;
   const snApiUrl = `${params.force_https ? "https" : "http"}://${snHost}/kapi/sn`;
   if (
     deviceDoc.net_id !== (params.netid === "lan" ? "nat" : params.netid) ||
     deviceDoc.rtcp_port !== params.rtcp_port ||
-    deviceDoc.ddns_sn_url !== (usesSnRelay ? snApiUrl : undefined) ||
+    deviceDoc.ddns_sn_url !== (usesSnDdns ? snApiUrl : undefined) ||
     bootDocument.sn !== (usesSnRelay ? snHost : undefined) ||
     zoneDocument.sn !== (usesSnRelay ? snHost : undefined)
   ) {

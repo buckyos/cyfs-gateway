@@ -419,6 +419,8 @@ pub struct GatewayResolution {
     pub hostname: String,
     pub gateway_device_name: String,
     pub gateway_did: String,
+    /// Zone-scoped identity used to resolve the RTCP endpoint.
+    pub gateway_scoped_did: String,
     pub device_doc: DeviceMiniDocument,
     pub online: Option<SnDeviceStateView>,
     pub addresses: Vec<IpAddr>,
@@ -1571,9 +1573,8 @@ impl SnResolver {
         // Standard DNS clients cannot reliably control or preserve address
         // preference when an A RRset contains multiple candidates. Return one
         // deterministic IPv4 address: an explicitly configured public gateway
-        // address wins; otherwise use the assigned relay. Device-reported
-        // addresses remain available through gateway resolution for our own
-        // clients, but never participate in standard A-record resolution.
+        // address wins. Dynamic WAN and mapped-port zones publish their
+        // device-reported address; NAT and unknown topologies use the relay.
         if record_type == RecordType::A {
             return self
                 .resolve_standard_dns_ipv4(hostname.as_str(), &zone)
@@ -1927,6 +1928,8 @@ impl SnResolver {
             )
             .await?;
 
+        let gateway_scoped_did = gateway_scoped_did(zone, &device_doc)?;
+
         let online = self
             .device_online
             .get_device_state_by_name(zone.zone_name.as_str(), gateway_device_name.as_str())
@@ -1941,6 +1944,7 @@ impl SnResolver {
             hostname: hostname.to_string(),
             gateway_device_name,
             gateway_did: device_doc.did.clone(),
+            gateway_scoped_did,
             device_doc,
             online,
             addresses,
@@ -1984,6 +1988,50 @@ impl SnResolver {
                 txt: Vec::new(),
                 source: DnsResolutionSource::BnsDocument,
             });
+        }
+
+        // These owner-declared topologies expose HTTP(S) directly. Their
+        // address changes are published by device.update, so a static gateway
+        // IP in the ZoneDocument must not be required for DDNS.
+        match self
+            .resolve_device_mini_doc(&zone.zone_name, gateway_device_name, Some(&zone.zone_doc))
+            .await
+        {
+            Ok(device)
+                if matches!(
+                    device_document_network_type(&device).as_deref(),
+                    Some("wan_dyn" | "portmap")
+                ) =>
+            {
+                let online = self
+                    .device_online
+                    .get_device_state_by_name(&zone.zone_name, gateway_device_name)
+                    .await?;
+                if let Some(ip) = gateway_device_addresses(zone, &device, online.as_ref())
+                    .into_iter()
+                    .find(IpAddr::is_ipv4)
+                {
+                    let addresses = vec![ip];
+                    log_gateway_address_result(
+                        &zone.zone_name,
+                        gateway_device_name,
+                        "standard_dns_reported_direct_ipv4",
+                        device_document_network_type(&device).as_deref().unwrap(),
+                        &addresses,
+                    );
+                    return Ok(DnsResolution {
+                        hostname: hostname.to_string(),
+                        record_type: RecordType::A,
+                        ttl: self.config.default_ttl,
+                        addresses,
+                        txt: Vec::new(),
+                        source: DnsResolutionSource::DeviceOnlineInfo,
+                    });
+                }
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == SnResolverErrorKind::DeviceNotFound => {}
+            Err(error) => return Err(error),
         }
 
         let addresses = self
@@ -2122,43 +2170,14 @@ impl SnResolver {
         device_doc: &DeviceMiniDocument,
         online: Option<&SnDeviceStateView>,
     ) -> SnResolverResult<Vec<IpAddr>> {
-        let mut addresses = Vec::new();
-
-        for ip in zone.zone_doc.gateway_ips.iter().copied() {
-            push_exportable_ip(&mut addresses, ip);
-        }
-
-        // `net_id` is owner-signed topology information. Only an explicit WAN
+        let mut addresses = gateway_device_addresses(zone, device_doc, online);
+        // `net_id` is owner-signed topology information. Only an explicit WAN or port-mapping
         // declaration is strong enough to suppress relay publication. Public
         // addresses observed in online state can be NAT egress or host/VM
         // addresses and therefore must not turn an unknown topology into WAN.
         let declared_network_type = device_document_network_type(device_doc);
         let requires_relay = device_document_requires_sn_relay(device_doc);
 
-        if let Some(online) = online {
-            for value in online
-                .public_ips
-                .iter()
-                .chain(online.private_ips.iter())
-                .map(|s| s.as_str())
-            {
-                if let Some(ip) = parse_ip_or_socket_addr(value) {
-                    push_exportable_ip(&mut addresses, ip);
-                }
-            }
-
-            for endpoint in &online.active_endpoints {
-                if let Some(ip) = parse_ip_or_socket_addr(endpoint.host.as_str()) {
-                    push_exportable_ip(&mut addresses, ip);
-                }
-            }
-        }
-
-        if let Some(value) = device_doc.document.as_ref() {
-            for key in ["ip", "ips", "all_ip", "addresses"] {
-                collect_ips_from_value_path(value, &[key], &mut addresses);
-            }
-        }
         let has_direct_address = !addresses.is_empty();
 
         // Relay is required for LAN/NAT zones even when local/direct addresses
@@ -2173,11 +2192,12 @@ impl SnResolver {
         }
 
         let (reason, network_type) = match declared_network_type.as_deref() {
-            Some(network_type) if network_type.starts_with("wan") && has_direct_address => {
-                ("explicit_wan_uses_direct_addresses", network_type)
-            }
-            Some(network_type) if network_type.starts_with("wan") => (
-                "explicit_wan_without_direct_address_uses_relay",
+            Some(network_type) if !requires_relay && has_direct_address => (
+                "explicit_direct_network_uses_direct_addresses",
+                network_type,
+            ),
+            Some(network_type) if !requires_relay => (
+                "explicit_direct_network_without_address_uses_relay",
                 network_type,
             ),
             Some(network_type) => ("explicit_non_wan_requires_relay", network_type),
@@ -2857,6 +2877,55 @@ fn device_online_info_document(online: &SnDeviceStateView) -> Value {
     value
 }
 
+// A registration key DID identifies the device, but cannot locate its Zone.
+// Preserve the actual Zone DID method instead of deriving it from the SN user.
+fn gateway_scoped_did(zone: &ZoneResolution, device: &DeviceMiniDocument) -> SnResolverResult<String> {
+    for document in [zone.zone_doc.raw.as_ref(), zone.boot_doc.raw.as_ref()]
+        .into_iter()
+        .flatten()
+    {
+        if let Some(raw_id) = document.get("id") {
+            let id = raw_id.as_str().ok_or_else(|| {
+                SnResolverError::new(
+                    SnResolverErrorKind::InvalidDid,
+                    format!(
+                        "Zone {} document id must be a canonical DID string",
+                        zone.zone_name
+                    ),
+                )
+            })?;
+            let did = name_lib::parse_canonical_did(id).map_err(|e| {
+                SnResolverError::new(
+                    SnResolverErrorKind::InvalidDid,
+                    format!("invalid Zone DID {id}: {e}"),
+                )
+            })?;
+            if !matches!(did.method.as_str(), "bns" | "web") {
+                return Err(SnResolverError::new(
+                    SnResolverErrorKind::UnsupportedDidMethod,
+                    format!("unsupported Zone DID method {}", did.method),
+                ));
+            }
+            if did.get_path_from_id().is_some() {
+                return Err(SnResolverError::new(
+                    SnResolverErrorKind::InvalidDid,
+                    format!("Zone DID {id} must be hostname-form for RTCP relay"),
+                ));
+            }
+            return Ok(
+                DID::new(&did.method, &format!("{}.{}", device.device_name, did.id)).to_string(),
+            );
+        }
+    }
+    Err(SnResolverError::new(
+        SnResolverErrorKind::InvalidDid,
+        format!(
+            "Zone {} has no canonical id in its Zone or boot document",
+            zone.zone_name
+        ),
+    ))
+}
+
 fn find_gateway_device_name(value: &Value) -> Option<String> {
     for path in [
         &["gateway_device_name"][..],
@@ -3166,6 +3235,44 @@ fn device_doc_from_value(
     })
 }
 
+fn gateway_device_addresses(
+    zone: &ZoneResolution,
+    device_doc: &DeviceMiniDocument,
+    online: Option<&SnDeviceStateView>,
+) -> Vec<IpAddr> {
+    let mut addresses = Vec::new();
+
+    for ip in zone.zone_doc.gateway_ips.iter().copied() {
+        push_exportable_ip(&mut addresses, ip);
+    }
+
+    if let Some(online) = online {
+        for value in online
+            .public_ips
+            .iter()
+            .chain(online.private_ips.iter())
+            .map(|s| s.as_str())
+        {
+            if let Some(ip) = parse_ip_or_socket_addr(value) {
+                push_exportable_ip(&mut addresses, ip);
+            }
+        }
+
+        for endpoint in &online.active_endpoints {
+            if let Some(ip) = parse_ip_or_socket_addr(endpoint.host.as_str()) {
+                push_exportable_ip(&mut addresses, ip);
+            }
+        }
+    }
+
+    if let Some(value) = device_doc.document.as_ref() {
+        for key in ["ip", "ips", "all_ip", "addresses"] {
+            collect_ips_from_value_path(value, &[key], &mut addresses);
+        }
+    }
+    addresses
+}
+
 fn device_document_network_type(device_doc: &DeviceMiniDocument) -> Option<String> {
     device_doc
         .document
@@ -3179,7 +3286,7 @@ fn device_document_network_type(device_doc: &DeviceMiniDocument) -> Option<Strin
 
 fn device_document_requires_sn_relay(device_doc: &DeviceMiniDocument) -> bool {
     device_document_network_type(device_doc)
-        .map(|net_id| !net_id.starts_with("wan"))
+        .map(|net_id| !net_id.starts_with("wan") && net_id != "portmap")
         .unwrap_or(true)
 }
 
@@ -3474,6 +3581,10 @@ mod tests {
                 effective_owner: None,
                 owner_config: None,
             },
+        );
+        bns.documents.insert(
+            ("alice".to_string(), BNS_DOC_ZONE.to_string()),
+            BnsDocument::json("alice", BNS_DOC_ZONE, json!({"id": "did:bns:alice"})),
         );
         bns.documents.insert(
             ("alice".to_string(), BNS_DOC_DEVICE_MINI.to_string()),
@@ -4062,6 +4173,7 @@ mod tests {
         );
         bns.documents.insert(("bob".to_string(), BNS_DOC_ZONE.to_string()),
             BnsDocument::json("bob", BNS_DOC_ZONE, json!({
+                "id": "did:bns:bob",
                 "oods": ["ood1@wan_dyn"],
                 "mini_device_jwts": {"ood1": compact_test_jwt(&json!({"n": "ood1", "x": "bob-key"}))}
             })));
@@ -4081,6 +4193,135 @@ mod tests {
         assert_eq!(gateway.gateway_device_name, "ood1");
         assert_eq!(gateway.device_doc.device_name, "ood1");
         assert_eq!(gateway.gateway_did, "did:dev:bob-key");
+        assert_eq!(gateway.gateway_scoped_did, "did:bns:ood1.bob");
+    }
+
+    #[tokio::test]
+    async fn gateway_relay_target_preserves_custom_zone_identity() {
+        for use_boot_identity in [false, true] {
+            let mut bns = StaticBnsReader::default();
+            let mut auth = StaticAuthReader::default();
+            auth.users.insert(
+                "charlie".to_string(),
+                test_user("charlie", UserState::Active, Some("charlie.me")),
+            );
+            auth.bindings
+                .push(("charlie.me".to_string(), "charlie".to_string()));
+            let mut zone = json!({
+                "oods": ["ood1@portmap"],
+                "mini_device_jwts": {"ood1": compact_test_jwt(&json!({"n": "ood1", "x": "charlie-key"}))}
+            });
+            if use_boot_identity {
+                bns.documents.insert(
+                    ("charlie".to_string(), BNS_DOC_BOOT.to_string()),
+                    BnsDocument::json("charlie", BNS_DOC_BOOT, json!({"id": "did:web:charlie.me"})),
+                );
+            } else {
+                zone["id"] = json!("did:web:charlie.me");
+            }
+            bns.documents.insert(
+                ("charlie".to_string(), BNS_DOC_ZONE.to_string()),
+                BnsDocument::json("charlie", BNS_DOC_ZONE, zone),
+            );
+            let resolver = authoritative_test_resolver(bns, auth).with_relay_reader(Arc::new(
+                StaticRelayReader {
+                    assignment: test_relay_assignment("charlie"),
+                    ips: Some([
+                        "192.0.2.10".parse().unwrap(),
+                        "198.51.100.20".parse().unwrap(),
+                    ]),
+                },
+            ));
+            // Both the custom domain and the SN alias must address the same Zone.
+            for host in ["charlie.me", "charlie.web3.buckyos.test"] {
+                let gateway = resolver.resolve_gateway_by_hostname(host).await.unwrap();
+                assert_eq!(gateway.gateway_did, "did:dev:charlie-key");
+                assert_eq!(gateway.gateway_scoped_did, "did:web:ood1.charlie.me");
+                assert_eq!(
+                    DID::from_str(&gateway.gateway_scoped_did)
+                        .unwrap()
+                        .to_host_name(),
+                    "ood1.charlie.me"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn gateway_relay_target_rejects_missing_or_invalid_zone_identity() {
+        let invalid_ids = [
+            None,
+            Some(Value::Null),
+            Some(json!(42)),
+            Some(json!("charlie.me")),
+            Some(json!("did")),
+            Some(json!("did:web:")),
+            Some(json!("did:web:charlie.me#key")),
+            Some(json!("did:web:charlie me")),
+            Some(json!("did:web:charlie.me:path")),
+            Some(json!("did:key:unsupported")),
+        ];
+        for in_boot_document in [false, true] {
+            for invalid_id in &invalid_ids {
+                let mut bns = StaticBnsReader::default();
+                bns.owners.insert(
+                    "charlie".to_string(),
+                    BnsOwner {
+                        name: "charlie".to_string(),
+                        effective_owner: None,
+                        owner_config: None,
+                    },
+                );
+                let mut document = json!({});
+                if let Some(id) = invalid_id {
+                    document["id"] = id.clone();
+                }
+                let doc_type = if in_boot_document {
+                    BNS_DOC_BOOT
+                } else {
+                    BNS_DOC_ZONE
+                };
+                bns.documents.insert(
+                    ("charlie".to_string(), doc_type.to_string()),
+                    BnsDocument::json("charlie", doc_type, document),
+                );
+                if !in_boot_document && invalid_id.is_some() {
+                    bns.documents.insert(
+                        ("charlie".to_string(), BNS_DOC_BOOT.to_string()),
+                        BnsDocument::json(
+                            "charlie",
+                            BNS_DOC_BOOT,
+                            json!({"id": "did:web:charlie.me"}),
+                        ),
+                    );
+                }
+                // Even a scoped device DID must not substitute for missing or
+                // malformed authoritative Zone identity.
+                bns.documents.insert(
+                    ("charlie".to_string(), BNS_DOC_DEVICE_MINI.to_string()),
+                    BnsDocument::json(
+                        "charlie",
+                        BNS_DOC_DEVICE_MINI,
+                        json!({"devices": {"ood1": {
+                            "did": "did:web:ood1.charlie.me",
+                            "net_id": "wan_dyn",
+                            "all_ip": ["192.0.2.40"]
+                        }}}),
+                    ),
+                );
+                let error = test_resolver_with_bns(bns)
+                    .resolve_gateway_by_hostname("charlie.web3.buckyos.test")
+                    .await
+                    .unwrap_err();
+                assert!(
+                    matches!(
+                        error.kind(),
+                        SnResolverErrorKind::InvalidDid | SnResolverErrorKind::UnsupportedDidMethod
+                    ),
+                    "{invalid_id:?}: {error}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -4096,7 +4337,7 @@ mod tests {
         };
 
         assert!(device_document_requires_sn_relay(&device(Some("nat"))));
-        assert!(device_document_requires_sn_relay(&device(Some("portmap"))));
+        assert!(!device_document_requires_sn_relay(&device(Some("portmap"))));
         assert!(!device_document_requires_sn_relay(&device(Some("wan"))));
         assert!(!device_document_requires_sn_relay(&device(Some("wan_dyn"))));
         assert!(device_document_requires_sn_relay(&device(Some(""))));
@@ -4273,6 +4514,107 @@ mod tests {
             resolution.addresses,
             vec!["192.0.2.10".parse::<IpAddr>().unwrap()]
         );
+    }
+
+    struct FixedDeviceOnlineReader(SnDeviceStateView);
+
+    #[async_trait]
+    impl DeviceOnlineReader for FixedDeviceOnlineReader {
+        async fn get_device_state_by_name(
+            &self,
+            _zone: &str,
+            _device_name: &str,
+        ) -> SnResolverResult<Option<SnDeviceStateView>> {
+            Ok(Some(self.0.clone()))
+        }
+    }
+
+    #[tokio::test]
+    async fn standard_a_dns_publishes_reported_dynamic_and_mapped_addresses() {
+        for network in ["wan_dyn", "portmap", "nat", ""] {
+            for reported_ipv4 in [true, false] {
+                let mut bns = StaticBnsReader::default();
+                bns.owners.insert(
+                    "alice".to_string(),
+                    BnsOwner {
+                        name: "alice".to_string(),
+                        effective_owner: None,
+                        owner_config: None,
+                    },
+                );
+                bns.documents.insert(
+                    ("alice".to_string(), BNS_DOC_ZONE.to_string()),
+                    BnsDocument::json("alice", BNS_DOC_ZONE, json!({"id": "did:bns:alice"})),
+                );
+                bns.documents.insert(
+                    ("alice".to_string(), BNS_DOC_DEVICE_MINI.to_string()),
+                    BnsDocument::json(
+                        "alice",
+                        BNS_DOC_DEVICE_MINI,
+                        json!({"devices": {"ood1": {
+                            "did": "did:dev:alice-ood", "net_id": network,
+                        }}}),
+                    ),
+                );
+                let online = SnDeviceStateView {
+                    did: "did:dev:alice-ood".to_string(),
+                    zone: "alice".to_string(),
+                    device_name: "ood1".to_string(),
+                    device_role: crate::SnDeviceRole::Ood,
+                    state: crate::SnDeviceState::Online,
+                    public_ips: if reported_ipv4 {
+                        vec!["203.0.113.30".to_string(), "203.0.113.31".to_string()]
+                    } else {
+                        vec![]
+                    },
+                    private_ips: vec![],
+                    active_endpoints: vec![],
+                    preferred_endpoint: None,
+                    nat_type: crate::SnNatType::Unknown,
+                    is_wan_device: true,
+                    last_seen_at: None,
+                    expires_at: None,
+                };
+                let resolver = test_resolver_with_bns(bns)
+                    .with_device_online_reader(Arc::new(FixedDeviceOnlineReader(online)))
+                    .with_relay_reader(Arc::new(StaticRelayReader {
+                        assignment: test_relay_assignment("alice"),
+                        ips: Some([
+                            "192.0.2.10".parse().unwrap(),
+                            "198.51.100.20".parse().unwrap(),
+                        ]),
+                    }));
+                let resolution = resolver
+                    .resolve_dns("alice.web3.buckyos.test", RecordType::A)
+                    .await
+                    .unwrap();
+                let direct = matches!(network, "wan_dyn" | "portmap") && reported_ipv4;
+                assert_eq!(
+                    resolution.addresses,
+                    vec![
+                        if direct { "203.0.113.30" } else { "192.0.2.10" }
+                            .parse::<IpAddr>()
+                            .unwrap()
+                    ],
+                    "{network} / reported={reported_ipv4}"
+                );
+                assert_eq!(
+                    resolution.source,
+                    if direct {
+                        DnsResolutionSource::DeviceOnlineInfo
+                    } else {
+                        DnsResolutionSource::RelayAssignment
+                    }
+                );
+                if direct {
+                    let gateway = resolver
+                        .resolve_gateway_by_hostname("alice.web3.buckyos.test")
+                        .await
+                        .unwrap();
+                    assert!(!gateway.addresses.contains(&"192.0.2.10".parse().unwrap()));
+                }
+            }
+        }
     }
 
     #[tokio::test]

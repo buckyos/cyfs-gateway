@@ -4387,6 +4387,22 @@ const OPEN_RESULT_RATE_LIMITED: u32 = 8;
 const OPEN_RESULT_KEY_EPOCH_EXHAUSTED: u32 = 9;
 const MAX_RTCP_TUNNEL_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 
+#[derive(Debug, thiserror::Error)]
+#[error("peer rejected {operation}, result={code}")]
+struct RtcpStreamAdmissionError {
+    operation: &'static str,
+    code: u32,
+}
+
+fn stream_admission_error(operation: &'static str, code: u32) -> std::io::Error {
+    let kind = if matches!(code, OPEN_RESULT_RATE_LIMITED | OPEN_RESULT_QUOTA) {
+        ErrorKind::WouldBlock
+    } else {
+        ErrorKind::ConnectionRefused
+    };
+    std::io::Error::new(kind, RtcpStreamAdmissionError { operation, code })
+}
+
 struct StreamRequestRateState {
     tokens: f64,
     last_refill: Instant,
@@ -4925,8 +4941,7 @@ impl RTcpTunnel {
                 // head-of-line blocked behind that business stream.
                 let this = self.clone();
                 self.spawn_runtime_task(async move {
-                    let _permit = permit;
-                    if let Err(e) = this.on_ropen(ropen_package).await {
+                    if let Err(e) = this.on_ropen(ropen_package, permit).await {
                         error!("RTcp on_ropen background task error: {}", e);
                     }
                 });
@@ -5288,7 +5303,11 @@ impl RTcpTunnel {
         );
     }
 
-    async fn on_ropen(&self, ropen_package: RTcpROpenPackage) -> Result<(), anyhow::Error> {
+    async fn on_ropen(
+        &self,
+        ropen_package: RTcpROpenPackage,
+        permit: tokio::sync::OwnedSemaphorePermit,
+    ) -> Result<(), anyhow::Error> {
         self.ensure_active()?;
         debug!(
             "RTcp tunnel ropen request: {:?}:{}, {:?}",
@@ -5349,6 +5368,9 @@ impl RTcpTunnel {
         );
 
         self.ensure_active()?;
+        // The quota bounds establishments, not the lifetime of HTTP keep-alive
+        // connections or datagram streams handled by the listener.
+        drop(permit);
         match purpose {
             StreamPurpose::Stream => {
                 self.on_stream_ropen(
@@ -5480,11 +5502,10 @@ impl RTcpTunnel {
 
         // 4. Wait for the new stream in a detached task so a slow / never-
         // arriving HelloStream does not stall the tunnel read loop. The
-        // permit is dropped when the task exits, releasing the quota slot.
+        // permit is released once HelloStream establishes the business stream.
         let this = self.clone();
         self.spawn_runtime_task(async move {
-            let _permit = permit;
-            if let Err(e) = this.finish_open(open_package, real_key).await {
+            if let Err(e) = this.finish_open(open_package, real_key, permit).await {
                 error!("RTcp on_open background task error: {}", e);
             }
         });
@@ -5496,6 +5517,7 @@ impl RTcpTunnel {
         &self,
         open_package: RTcpOpenPackage,
         real_key: String,
+        permit: tokio::sync::OwnedSemaphorePermit,
     ) -> Result<(), anyhow::Error> {
         let stream = match self.wait_ropen_stream(&open_package.body.stream_id).await {
             Ok(s) => s,
@@ -5531,6 +5553,7 @@ impl RTcpTunnel {
             open_package.body.stream_id
         );
 
+        drop(permit);
         match purpose {
             StreamPurpose::Stream => {
                 self.on_stream_ropen(
@@ -5685,6 +5708,48 @@ impl RTcpTunnel {
         connect_timeout: Duration,
     ) -> Result<Box<dyn AsyncStream>, std::io::Error> {
         let deadline = tokio::time::Instant::now() + connect_timeout;
+        let mut backoff_ms = 25u64;
+        loop {
+            self.ensure_accepts_new_streams()?;
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(std::io::Error::new(
+                    ErrorKind::TimedOut,
+                    "RTCP open stream timed out",
+                ));
+            }
+            let result = self
+                .request_open_stream_once(purpose, dest_port, dest_host.clone(), remaining)
+                .await;
+            let retryable = result.as_ref().err().is_some_and(|error| {
+                error
+                    .get_ref()
+                    .and_then(|error| error.downcast_ref::<RtcpStreamAdmissionError>())
+                    .is_some_and(|rejection| {
+                        matches!(rejection.code, OPEN_RESULT_RATE_LIMITED | OPEN_RESULT_QUOTA)
+                    })
+            });
+            if !retryable {
+                return result;
+            }
+            // A shared SN tunnel carries many independent browser connections.
+            // Keep their sockets open while the peer's bounded admission bucket
+            // refills. Never replay after acceptance or extend the caller's budget.
+            let delay = Duration::from_millis(backoff_ms + rand::rng().random_range(0..=25));
+            debug!("RTCP peer busy; retry stream admission in {:?}", delay);
+            tokio::time::sleep_until((tokio::time::Instant::now() + delay).min(deadline)).await;
+            backoff_ms = (backoff_ms * 2).min(500);
+        }
+    }
+
+    async fn request_open_stream_once(
+        &self,
+        purpose: Option<StreamPurpose>,
+        dest_port: u16,
+        dest_host: Option<String>,
+        connect_timeout: Duration,
+    ) -> Result<Box<dyn AsyncStream>, std::io::Error> {
+        let deadline = tokio::time::Instant::now() + connect_timeout;
         let timeout_error =
             || std::io::Error::new(ErrorKind::TimedOut, "RTCP open stream timed out");
         self.ensure_accepts_new_streams()?;
@@ -5774,18 +5839,14 @@ impl RTcpTunnel {
                     real_key.as_str(),
                     result_code
                 );
-                let (kind, message) = if result_code == OPEN_RESULT_KEY_EPOCH_EXHAUSTED {
-                    (
-                        std::io::ErrorKind::ConnectionAborted,
-                        "peer exhausted RTCP stream ID key epoch; reconnect required".to_string(),
+                return Err(if result_code == OPEN_RESULT_KEY_EPOCH_EXHAUSTED {
+                    std::io::Error::new(
+                        ErrorKind::ConnectionAborted,
+                        "peer exhausted RTCP stream ID key epoch; reconnect required",
                     )
                 } else {
-                    (
-                        std::io::ErrorKind::ConnectionRefused,
-                        format!("peer rejected open stream, result={}", result_code),
-                    )
-                };
-                return Err(std::io::Error::new(kind, message));
+                    stream_admission_error("open stream", result_code)
+                });
             }
 
             // Build a fresh stream leg to the remote RTCP listener. Direct
@@ -5889,22 +5950,14 @@ impl RTcpTunnel {
                                 code
                             );
                             self.remove_wait_stream(&real_key).await;
-                            let (kind, message) = if code == OPEN_RESULT_KEY_EPOCH_EXHAUSTED {
-                                (
-                                    std::io::ErrorKind::ConnectionAborted,
-                                    "peer exhausted RTCP stream ID key epoch; reconnect required"
-                                        .to_string(),
+                            return Err(if code == OPEN_RESULT_KEY_EPOCH_EXHAUSTED {
+                                std::io::Error::new(
+                                    ErrorKind::ConnectionAborted,
+                                    "peer exhausted RTCP stream ID key epoch; reconnect required",
                                 )
                             } else {
-                                (
-                                    std::io::ErrorKind::ConnectionRefused,
-                                    format!("peer rejected ropen, result={}", code),
-                                )
-                            };
-                            return Err(std::io::Error::new(
-                                kind,
-                                message,
-                            ));
+                                stream_admission_error("ropen", code)
+                            });
                         }
                         Err(_) => {
                             // Tunnel dropped the waiter (likely tunnel closed).
@@ -7603,6 +7656,143 @@ mod tests {
         assert_eq!(error.kind(), ErrorKind::TimedOut);
         assert!(tunnel.ropen_resp_waiters.lock().await.is_empty());
         assert!(tunnel.pending_wait_stream_keys.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn established_stream_releases_pending_build_quota_before_listener_finishes() {
+        let mut limits = RtcpLimitsConfig::default();
+        limits.max_pending_stream_builds_per_tunnel = 1;
+        let (tunnel, _peer) = test_tunnel_with_limits(128, &limits);
+        let stream_id = "00112233445566778899aabbccddeeff";
+        let real_key = format!("{}_{}", tunnel.this_device.to_string(), stream_id);
+        let permit = tunnel.admit_inbound_stream_build(stream_id).await.unwrap();
+        tunnel.register_wait_stream(&real_key).await.unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let _client = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        tunnel
+            .build_helper
+            .notify_ropen_stream(server, &real_key)
+            .await;
+        let task_tunnel = tunnel.clone();
+        let task = tokio::spawn(async move {
+            task_tunnel
+                .finish_open(
+                    RTcpOpenPackage::new(
+                        1,
+                        stream_id.to_string(),
+                        Some(StreamPurpose::Datagram),
+                        53,
+                        None,
+                    ),
+                    real_key,
+                    permit,
+                )
+                .await
+        });
+        let next = tokio::time::timeout(
+            Duration::from_secs(1),
+            tunnel.inbound_build_slots.clone().acquire_owned(),
+        )
+        .await
+        .expect("established stream must release its build slot")
+        .unwrap();
+        assert!(
+            !task.is_finished(),
+            "datagram listener should still be waiting for traffic"
+        );
+        drop(next);
+        task.abort();
+        let _ = task.await;
+    }
+
+    async fn answer_stream_admissions(tunnel: RTcpTunnel, codes: Vec<u32>) {
+        for code in codes {
+            loop {
+                let sender = if tunnel.can_direct {
+                    let mut waiters = tunnel.open_resp_waiters.lock().await;
+                    waiters
+                        .keys()
+                        .next()
+                        .copied()
+                        .and_then(|key| waiters.remove(&key))
+                } else {
+                    let mut waiters = tunnel.ropen_resp_waiters.lock().await;
+                    waiters
+                        .keys()
+                        .next()
+                        .copied()
+                        .and_then(|key| waiters.remove(&key))
+                };
+                if let Some(sender) = sender {
+                    let _ = sender.send(code);
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_admission_backoff_retries_only_busy_responses() {
+        for direct in [false, true] {
+            let (mut tunnel, _peer) = test_tunnel(126);
+            tunnel.can_direct = direct;
+            tunnel.peer_addr = Some(Arc::new(std::sync::Mutex::new(
+                "127.0.0.1:9".parse().unwrap(),
+            )));
+            let peer = tokio::spawn(answer_stream_admissions(
+                tunnel.clone(),
+                vec![
+                    OPEN_RESULT_RATE_LIMITED,
+                    OPEN_RESULT_QUOTA,
+                    OPEN_RESULT_AUTHORIZATION_REJECTED,
+                ],
+            ));
+            let started = Instant::now();
+            let error = tunnel
+                .open_stream_by_dest_with_timeout(443, None, Duration::from_secs(1))
+                .await
+                .err()
+                .unwrap();
+            peer.await.unwrap();
+            assert_eq!(error.kind(), ErrorKind::ConnectionRefused);
+            assert!(started.elapsed() >= Duration::from_millis(75));
+            assert_eq!(tunnel.used_stream_ids.lock().await.len(), 3);
+            assert!(tunnel.open_resp_waiters.lock().await.is_empty());
+            assert!(tunnel.ropen_resp_waiters.lock().await.is_empty());
+            assert!(tunnel.pending_wait_stream_keys.lock().await.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_admission_backoff_preserves_timeout_and_cleans_waiters() {
+        for direct in [false, true] {
+            let (mut tunnel, _peer) = test_tunnel(127);
+            tunnel.can_direct = direct;
+            tunnel.peer_addr = Some(Arc::new(std::sync::Mutex::new(
+                "127.0.0.1:9".parse().unwrap(),
+            )));
+            let peer = tokio::spawn(answer_stream_admissions(
+                tunnel.clone(),
+                vec![OPEN_RESULT_RATE_LIMITED],
+            ));
+            let started = Instant::now();
+            let error = tunnel
+                .open_stream_by_dest_with_timeout(443, None, Duration::from_millis(10))
+                .await
+                .err()
+                .unwrap();
+            peer.await.unwrap();
+            assert_eq!(error.kind(), ErrorKind::TimedOut);
+            assert!(started.elapsed() < Duration::from_millis(200));
+            assert_eq!(tunnel.used_stream_ids.lock().await.len(), 1);
+            assert!(tunnel.open_resp_waiters.lock().await.is_empty());
+            assert!(tunnel.ropen_resp_waiters.lock().await.is_empty());
+            assert!(tunnel.pending_wait_stream_keys.lock().await.is_empty());
+        }
     }
 
     fn test_tunnel_with_limits(

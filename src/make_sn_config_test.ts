@@ -308,6 +308,13 @@ Deno.test("BNS seed publishes full device documents separately from TXT mini JWT
     for (const user of users) {
       const { rootfs, start } = fixtures.get(user.username)!;
       const device = JSON.parse(Buffer.from(start.device_doc_jwt.split(".")[1], "base64url").toString("utf8"));
+      if (user.username === "bob") {
+        const boot = JSON.parse(Buffer.from(start.boot_config_jwt.split(".")[1], "base64url").toString("utf8"));
+        const zone = JSON.parse(Buffer.from(start.zone_document_jwt.split(".")[1], "base64url").toString("utf8"));
+        if (device.net_id !== "wan_dyn" || !device.ddns_sn_url || boot.sn !== undefined || zone.sn !== undefined) {
+          throw new Error("dynamic WAN seed must retain DDNS without requiring an SN relay");
+        }
+      }
       const nodeIdentity = JSON.parse(await Deno.readTextFile(`${rootfs}/etc/node_identity.json`));
       const host = nodeIdentity.device_did.replace(/^did:(bns|web):/, "") +
         (nodeIdentity.device_did.startsWith("did:bns:") ? ".bns.did" : "");

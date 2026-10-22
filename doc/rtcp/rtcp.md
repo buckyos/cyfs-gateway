@@ -518,6 +518,8 @@ stacks:
 已删除的 `inbound_self_declared_fallback` 和其它未知字段会导致配置反序列化失败，不会
 静默忽略。
 
+`max_pending_stream_builds_per_tunnel` 只统计正在建立的 Open/ROpen 业务流；建流成功后即释放额度，HTTP keep-alive 或 datagram 的存活时间不占用建流额度。接收端仍按每条 tunnel 的令牌桶限制建流速率；发送端遇到 `result=8`（速率限制）或 `result=1`（并发建流额度已满）时，在调用方原有连接超时内指数退避并加入抖动，保留客户端连接等待重试。鉴权、方向、stream ID 等其它拒绝不会重试，已接受的业务流也不会重放。
+
 `max_stream_ids_per_tunnel` 同时限制入站和出站预留 ID 的总数，默认 65536，硬上限
 1048576。达到上限时不会淘汰历史 ID；当前请求收到“key epoch exhausted”错误，旧
 tunnel 进入关闭流程，下一次请求通过重新建 tunnel 获得新的 key epoch。关闭已建立的
