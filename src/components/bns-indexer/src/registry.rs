@@ -85,6 +85,10 @@ where
             .map_err(Into::into)
     }
 
+    async fn active_document_types(&self, name: &str) -> BnsClientResult<Vec<String>> {
+        self.registry.active_document_types(name).map_err(Into::into)
+    }
+
     async fn get_document_version(
         &self,
         name: &str,
@@ -234,6 +238,16 @@ where
         self.store.transact(|tx| tx.get_authority_key(&name, kid))
     }
 
+    pub fn active_document_types(&self, name: &str) -> BnsRegistryResult<Vec<String>> {
+        let name = canonical_bns_name(name)?;
+        let now = now_timestamp();
+        self.store.transact(|tx| {
+            let raw = tx.get_name(&name)?.ok_or_else(|| BnsRegistryError::NameNotFound { name: name.clone() })?;
+            let state = self.materialize_name_state_at(tx, raw, now)?;
+            active_document_types_at(tx, &name, state.status, now)
+        })
+    }
+
     pub fn resolve_document(&self, name: &str, doc_type: &str) -> BnsRegistryResult<ResolveResult> {
         let name = canonical_bns_name(name)?;
         let doc_type = canonical_doc_type(doc_type)?;
@@ -256,8 +270,10 @@ where
             } else {
                 document_state.controller.clone()
             };
-            if document_state.status != DocumentStatus::Missing {
-                self.ensure_document_consistent(
+            // Terminal registry state outranks errors in an obsolete body.
+            if matches!(document_state.effective_status_at(name_state.status, now),
+                DocumentStatus::Active | DocumentStatus::Expired) {
+                ensure_document_consistent(
                     &name,
                     &doc_type,
                     &document_state,
@@ -297,7 +313,7 @@ where
             let document = tx.get_document(&name, &doc_type, version)?;
             if let Some(document_state) = document.as_ref() {
                 let owner = self.resolve_owner_for_name(tx, &name)?;
-                self.ensure_document_consistent(
+                ensure_document_consistent(
                     &name,
                     &doc_type,
                     document_state,
@@ -329,7 +345,7 @@ where
                 }
             })?;
             let owner = self.resolve_owner_for_name(tx, &name)?;
-            self.ensure_document_consistent(&name, &doc_type, &document, &owner.effective_owner)?;
+            ensure_document_consistent(&name, &doc_type, &document, &owner.effective_owner)?;
             let name_status = tx
                 .get_name(&name)?
                 .ok_or_else(|| BnsRegistryError::NameNotFound { name: name.clone() })?
@@ -1941,40 +1957,6 @@ where
             .map_or_else(|| ZERO_HASH.to_string(), |record| record.log_root))
     }
 
-    fn ensure_document_consistent(
-        &self,
-        name: &str,
-        doc_type: &str,
-        document: &DocumentState,
-        effective_owner: &Principal,
-    ) -> BnsRegistryResult<()> {
-        let assertions = document_owner_assertions(doc_type, document).map_err(|reason| {
-            BnsRegistryError::DocumentInconsistent {
-                name: name.to_string(),
-                doc_type: doc_type.to_string(),
-                reason,
-            }
-        })?;
-
-        for assertion in assertions {
-            if !principals_match(&assertion.principal, effective_owner) {
-                return Err(BnsRegistryError::DocumentInconsistent {
-                    name: name.to_string(),
-                    doc_type: doc_type.to_string(),
-                    reason: format!(
-                        "{} declares {} `{}` but on-chain effective owner is `{}`",
-                        assertion.document_label,
-                        assertion.field,
-                        principal_display(&assertion.principal),
-                        principal_display(effective_owner)
-                    ),
-                });
-            }
-        }
-
-        Ok(())
-    }
-
     fn name_is_authority_owner(
         &self,
         tx: &mut dyn BnsRegistryStoreTx,
@@ -2081,6 +2063,60 @@ where
             Err(BnsRegistryError::NoConcreteSigner)
         }
     }
+}
+
+/// Enumerate each type's current row once. Historical active versions must
+/// not revive a revoked current row. The caller supplies materialized name state.
+pub fn active_document_types_at(
+    tx: &mut dyn BnsRegistryStoreTx,
+    name: &str,
+    name_status: NameStatus,
+    now: u64,
+) -> BnsRegistryResult<Vec<String>> {
+    let types: std::collections::BTreeSet<_> = tx.list_document_keys(Some(name))?
+        .into_iter().map(|key| key.doc_type).collect();
+    let mut active = Vec::new();
+    for doc_type in types {
+        if tx.get_current_document(name, &doc_type)?.is_some_and(|document|
+            document.effective_status_at(name_status, now) == DocumentStatus::Active
+        ) {
+            active.push(doc_type);
+        }
+    }
+    Ok(active)
+}
+
+pub fn ensure_document_consistent(
+    name: &str,
+    doc_type: &str,
+    document: &DocumentState,
+    effective_owner: &Principal,
+) -> BnsRegistryResult<()> {
+    let assertions = document_owner_assertions(doc_type, document).map_err(|reason| {
+        BnsRegistryError::DocumentInconsistent {
+            name: name.to_string(),
+            doc_type: doc_type.to_string(),
+            reason,
+        }
+    })?;
+
+    for assertion in assertions {
+        if !principals_match(&assertion.principal, effective_owner) {
+            return Err(BnsRegistryError::DocumentInconsistent {
+                name: name.to_string(),
+                doc_type: doc_type.to_string(),
+                reason: format!(
+                    "{} declares {} `{}` but on-chain effective owner is `{}`",
+                    assertion.document_label,
+                    assertion.field,
+                    principal_display(&assertion.principal),
+                    principal_display(effective_owner)
+                ),
+            });
+        }
+    }
+
+    Ok(())
 }
 
 fn missing_document_state(name: &str, doc_type: &str) -> DocumentState {

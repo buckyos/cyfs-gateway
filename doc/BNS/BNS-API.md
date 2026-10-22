@@ -202,7 +202,17 @@ BNS-Client 始终使用点号形式的 canonical method；下划线别名只用�
 
 document.resolve 仍按精确 (name, doc_type) 查询，不做父名字回退。
 仅 HTTP DID resolver 的当前态 `type=device` 查询支持 Node Active 的设备槽布局；
-`type=zone` 和缺省查询仅查询 Zone 文档，不投影设备槽：
+`type=zone` 仅查询 Zone 文档，不投影设备槽。未指定 `type` 时按完整名字的当前 active 类型集合选择：
+唯一类型直接选择；多个类型含 `zone` 时选择 `zone`，在 `didResolutionMetadata.warnings` 和日志中记录提示；
+多个类型不含 `zone` 时返回 `400 ambiguousDocType`，调用方必须指定类型。没有 active 类型返回
+`404 notFound`，不猜测为 `zone`，也不声称某个未指定类型是 missing。注销名字仍返回全 DID 的
+`410 tombstoned`。撤销、过期及历史版本不进入 active 集合。缺省查询不触发父设备槽映射。
+
+该集合由本地投影适配器在事务内读取，覆盖 contract 和 indexer 两个 HTTP 入口。
+`BnsIndexerApi::active_document_types` 是 HTTP 适配能力，不新增 kRPC wire method；
+没有枚举能力的适配器明确报不可用，不回退为固定 `zone`。
+
+显式设备查询的映射规则如下：
 
 - 请求 did:bns:{device}.{parent}，先检查完整子名字。只要存在名字状态记录，
   包括 active、expired、released、tombstoned，就查询子名字自己的 device 槽；
@@ -225,7 +235,8 @@ document.resolve 仍按精确 (name, doc_type) 查询，不做父名字回退。
   使 NameClient 清理旧 positive cache。来源槽的原始发布状态仍保留在 sourceDocumentStatus。
 - 父 Zone/Owner 的负状态或过期会阻止映射。查询期间 checkpoint 改变或子名字
   被注册时拒绝这次回答；返回前还需重读并比较 Device/Zone/Owner 三份完整投影，
-  不依赖 checkpoint 随每次更新变化。调用方重试。无效身份、签名或 hash 返回 HTTP 200、`documentStatus=invalid` 和 `reason`，不返回正文；
+  不依赖 checkpoint 随每次更新变化。调用方重试。无效身份、签名或 hash，以及 Registry 的 `DOCUMENT_INCONSISTENT`，返回 HTTP 200、
+  `documentStatus=invalid` 和 `reason`，不返回正文；
   投影变化或真实上游故障仍返回 5xx，不能伪装成确定性负状态。
 - HTTP metadata 的 sourceName/sourceDocType/sourceContentHash 指向实际投影槽。
   sourceDocumentStatus 保留来源槽的发布状态；父 Zone/Owner 导致拒绝时返回该依赖槽的
@@ -236,6 +247,10 @@ document.resolve 仍按精确 (name, doc_type) 查询，不做父名字回退。
 - `versionId`（exact）和 `versionTime`（closest）当前未实现，明确返回 501 和
   `historicalQuerySupported=false`，不能忽略参数后返回 current；旧 `iat` 参数同样返回 501。
   两种新版参数与旧 `iat` 互斥，重复参数或非法时间值返回 400。
+
+直查的 Owner/Zone/Device 正文同样必须通过 hash、结构解析、请求 DID 和文档类型检查。
+校验失败不会被忽略，也不能只省略 `docHash` 后继续返回 active。自定义内容槽不强制解析成内置身份类型，
+但其编码内容必须与登记 hash 一致。正常 SQLite 写入会验证 hash；HTTP 层仍对损坏的上游投影进行独立拒绝。
 
 BNS 父 Zone 内嵌设备不能写入 NameClient 的独立设备身份缓存；权威 Missing/Expired
 删除该 DID 旧的 positive cache。RemoteAuthority 始终重新查询权威源。

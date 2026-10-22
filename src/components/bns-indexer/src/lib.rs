@@ -19,7 +19,10 @@ pub use evm_projection::{
     checkpoint_from_event, store_event_record, ContractEventProjector, ContractProtocolEvent,
     ProjectedContractEvent,
 };
-pub use registry::{CentralizedBnsIndexerHandler, CentralizedBnsRegistry};
+pub use registry::{
+    active_document_types_at, ensure_document_consistent,
+    CentralizedBnsIndexerHandler, CentralizedBnsRegistry,
+};
 pub use sqlite::SqliteBnsRegistryStore;
 pub use store::{BnsRegistryStore, BnsRegistryStoreTx};
 pub use sync::{

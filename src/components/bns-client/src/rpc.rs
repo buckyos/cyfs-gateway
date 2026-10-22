@@ -499,6 +499,13 @@ pub trait BnsIndexerApi: Send + Sync {
 
     async fn resolve_document(&self, name: &str, doc_type: &str) -> BnsClientResult<ResolveResult>;
 
+    /// HTTP resolver default-type discovery from the local current projection.
+    /// This is an adapter capability, not a new kRPC method. Never guess zone
+    /// when an adapter cannot enumerate the publication set.
+    async fn active_document_types(&self, _name: &str) -> BnsClientResult<Vec<String>> {
+        Err(BnsClientError::unsupported("active document type discovery is not configured"))
+    }
+
     async fn get_document_version(
         &self,
         name: &str,
@@ -760,6 +767,15 @@ impl BnsIndexerApi for BnsRpcClient {
                 )
                 .await
             }
+        }
+    }
+
+    async fn active_document_types(&self, name: &str) -> BnsClientResult<Vec<String>> {
+        match self {
+            Self::InProcess(handler) => handler.active_document_types(name).await,
+            Self::KRPC(_) => Err(BnsClientError::unsupported(
+                "active document type discovery requires a local projection",
+            )),
         }
     }
 
