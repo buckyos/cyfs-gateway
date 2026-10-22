@@ -54,7 +54,7 @@ with tempfile.TemporaryDirectory(prefix="bns-sn-seed-") as temp:
                 time.sleep(0.1)
             url = Path(str(fixture) + ".url").read_text()
             with urllib.request.urlopen(
-                url + "/1.0/identifiers/did:bns:ood1.alice", timeout=10,
+                url + "/1.0/identifiers/did:bns:ood1.alice?type=device", timeout=10,
             ) as response:
                 envelope = json.load(response)
                 assert envelope["didDocument"] == expected["device_jwt"]
