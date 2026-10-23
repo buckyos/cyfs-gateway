@@ -3,10 +3,32 @@ use crate::{
     SnBnsControllerResult, SnBnsTryBeginResult, SnBnsWriteRequestRecord, SnBnsWriteRequestStore,
     EVM_TX_RECOVERY_DATA_INVALID,
 };
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde_json::Value;
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Mutex;
+
+const WRITE_REQUEST_COLUMNS: [&str; 17] = [
+    "request_id",
+    "operation",
+    "name",
+    "doc_type",
+    "payload_hash",
+    "state",
+    "result_json",
+    "error_code",
+    "error_message",
+    "lease_owner",
+    "lease_expires_at",
+    "evm_chain_id",
+    "evm_nonce",
+    "evm_tx_hash",
+    "evm_raw_tx",
+    "created_at",
+    "updated_at",
+];
+const TX_STATE_MODEL: &str = "2";
 
 pub struct SqliteSnBnsWriteRequestStore {
     conn: Mutex<Connection>,
@@ -35,88 +57,79 @@ impl SqliteSnBnsWriteRequestStore {
     }
 
     fn initialize_schema(&self) -> SnBnsControllerResult<()> {
-        let conn = self
+        let mut conn = self
             .conn
             .lock()
             .map_err(|_| SnBnsControllerError::Store("sqlite store lock poisoned".to_string()))?;
-        conn.execute_batch(
-            r#"
-            CREATE TABLE IF NOT EXISTS sn_bns_write_requests (
-                request_id TEXT PRIMARY KEY,
-                operation TEXT NOT NULL,
-                name TEXT NOT NULL,
-                doc_type TEXT NULL,
-                payload_hash TEXT NOT NULL,
-                state TEXT NOT NULL,
-                result_json TEXT NULL,
-                error_code TEXT NULL,
-                error_message TEXT NULL,
-                lease_owner TEXT NULL,
-                lease_expires_at INTEGER NULL,
-                evm_chain_id INTEGER NULL,
-                evm_nonce INTEGER NULL,
-                evm_tx_hash TEXT NULL,
-                evm_raw_tx TEXT NULL,
-                created_at INTEGER NOT NULL,
-                updated_at INTEGER NOT NULL
-            );
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| SnBnsControllerError::Store(e.to_string()))?;
+        let request_columns = table_columns(&tx, "sn_bns_write_requests")?;
+        let meta_columns = table_columns(&tx, "sn_bns_write_store_meta")?;
+        if request_columns.is_empty() && meta_columns.is_empty() {
+            tx.execute_batch(
+                r#"
+                CREATE TABLE sn_bns_write_requests (
+                    request_id TEXT PRIMARY KEY,
+                    operation TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    doc_type TEXT NULL,
+                    payload_hash TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    result_json TEXT NULL,
+                    error_code TEXT NULL,
+                    error_message TEXT NULL,
+                    lease_owner TEXT NULL,
+                    lease_expires_at INTEGER NULL,
+                    evm_chain_id INTEGER NULL,
+                    evm_nonce INTEGER NULL,
+                    evm_tx_hash TEXT NULL,
+                    evm_raw_tx TEXT NULL,
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL
+                );
 
-            CREATE INDEX IF NOT EXISTS idx_sn_bns_write_requests_name
-                ON sn_bns_write_requests (name, operation, state);
+                CREATE INDEX idx_sn_bns_write_requests_name
+                    ON sn_bns_write_requests (name, operation, state);
 
-            CREATE TABLE IF NOT EXISTS sn_bns_write_store_meta (
-                key TEXT PRIMARY KEY,
-                value TEXT NOT NULL
-            );
-            "#,
-        )
-        .map_err(|e| SnBnsControllerError::Store(e.to_string()))?;
-        ensure_column(&conn, "evm_chain_id", "INTEGER NULL")?;
-        ensure_column(&conn, "evm_nonce", "INTEGER NULL")?;
-        ensure_column(&conn, "evm_tx_hash", "TEXT NULL")?;
-        ensure_column(&conn, "evm_raw_tx", "TEXT NULL")?;
-        ensure_column(&conn, "lease_owner", "TEXT NULL")?;
-        ensure_column(&conn, "lease_expires_at", "INTEGER NULL")?;
-        conn.execute_batch(
-            r#"
-            BEGIN IMMEDIATE;
-
-            UPDATE sn_bns_write_requests
-               SET state = 'pending'
-             WHERE state = 'succeeded'
-               AND evm_tx_hash IS NOT NULL
-               AND evm_raw_tx IS NOT NULL
-               AND NOT EXISTS (
-                    SELECT 1 FROM sn_bns_write_store_meta
-                     WHERE key = 'tx_state_model' AND value = '2'
-               );
-
-            UPDATE sn_bns_write_requests
-               SET state = 'reverted'
-             WHERE state = 'failed'
-               AND error_code = 'EVM_TX_REVERTED'
-               AND NOT EXISTS (
-                    SELECT 1 FROM sn_bns_write_store_meta
-                     WHERE key = 'tx_state_model' AND value = '2'
-               );
-
-            DELETE FROM sn_bns_write_requests
-             WHERE state = 'pending'
-               AND evm_tx_hash IS NULL
-               AND evm_raw_tx IS NULL
-               AND NOT EXISTS (
-                    SELECT 1 FROM sn_bns_write_store_meta
-                     WHERE key = 'tx_state_model' AND value = '2'
-               );
-
-            INSERT INTO sn_bns_write_store_meta (key, value)
-            VALUES ('tx_state_model', '2')
-            ON CONFLICT(key) DO UPDATE SET value = excluded.value;
-
-            COMMIT;
-            "#,
-        )
-        .map_err(|e| SnBnsControllerError::Store(e.to_string()))?;
+                CREATE TABLE sn_bns_write_store_meta (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                );
+                "#,
+            )
+            .map_err(|e| SnBnsControllerError::Store(e.to_string()))?;
+            tx.execute(
+                "INSERT INTO sn_bns_write_store_meta (key, value) VALUES ('tx_state_model', ?1)",
+                params![TX_STATE_MODEL],
+            )
+            .map_err(|e| SnBnsControllerError::Store(e.to_string()))?;
+        } else {
+            let tx_state_model = if meta_columns.is_empty() {
+                None
+            } else {
+                tx.query_row(
+                    "SELECT value FROM sn_bns_write_store_meta WHERE key = 'tx_state_model'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(|e| SnBnsControllerError::Store(e.to_string()))?
+            };
+            let request_columns = request_columns
+                .iter()
+                .map(String::as_str)
+                .collect::<HashSet<_>>();
+            if request_columns != HashSet::from(WRITE_REQUEST_COLUMNS)
+                || tx_state_model.as_deref() != Some(TX_STATE_MODEL)
+            {
+                return Err(SnBnsControllerError::Store(
+                    "unsupported sn_bns_write_requests schema".to_string(),
+                ));
+            }
+        }
+        tx.commit()
+            .map_err(|e| SnBnsControllerError::Store(e.to_string()))?;
         Ok(())
     }
 
@@ -619,21 +632,14 @@ impl SnBnsWriteRequestStore for SqliteSnBnsWriteRequestStore {
     }
 }
 
-fn ensure_column(conn: &Connection, column: &str, column_def: &str) -> SnBnsControllerResult<()> {
-    let exists = conn
-        .query_row(
-            "SELECT 1 FROM pragma_table_info('sn_bns_write_requests') WHERE name = ?1",
-            params![column],
-            |row| row.get::<_, i64>(0),
-        )
-        .optional()
+fn table_columns(conn: &Connection, table: &str) -> SnBnsControllerResult<Vec<String>> {
+    let mut stmt = conn
+        .prepare("SELECT name FROM pragma_table_info(?1)")
         .map_err(|e| SnBnsControllerError::Store(e.to_string()))?;
-    if exists.is_none() {
-        conn.execute(
-            &format!("ALTER TABLE sn_bns_write_requests ADD COLUMN {column} {column_def}"),
-            [],
-        )
+    let columns = stmt
+        .query_map(params![table], |row| row.get::<_, String>(0))
+        .map_err(|e| SnBnsControllerError::Store(e.to_string()))?
+        .collect::<Result<Vec<_>, _>>()
         .map_err(|e| SnBnsControllerError::Store(e.to_string()))?;
-    }
-    Ok(())
+    Ok(columns)
 }

@@ -19,6 +19,83 @@ use std::time::{SystemTime, UNIX_EPOCH};
 const DEFAULT_CAPACITY_SCORE: i64 = 100;
 const DEFAULT_ADMISSION_TTL_SECS: u64 = 60;
 const DEFAULT_MIGRATION_WINDOW_SECS: u64 = 300;
+const RELAY_TABLE_COLUMNS: [(&str, &[&str]); 6] = [
+    (
+        "relay_nodes",
+        &[
+            "relay_id",
+            "relay_sn",
+            "public_host",
+            "http_endpoint",
+            "rtcp_endpoint",
+            "region",
+            "isp",
+            "tags",
+            "capabilities",
+            "status",
+            "capacity_score",
+            "current_load",
+            "last_heartbeat_at",
+            "drain_until",
+            "created_at",
+            "updated_at",
+        ],
+    ),
+    (
+        "relay_node_addresses",
+        &["relay_id", "slot", "ip", "created_at", "updated_at"],
+    ),
+    ("relay_metadata", &["key", "value"]),
+    (
+        "relay_assignments",
+        &[
+            "zone",
+            "relay_id",
+            "state",
+            "source",
+            "reason",
+            "generation",
+            "backup_relay_id",
+            "sticky_until",
+            "lease_expires_at",
+            "migrated_from",
+            "migration_deadline",
+            "source_version",
+            "created_at",
+            "updated_at",
+        ],
+    ),
+    (
+        "relay_admission_events",
+        &[
+            "id",
+            "request_id",
+            "relay_id",
+            "zone",
+            "device_name",
+            "did",
+            "decision",
+            "reason",
+            "expected_relay_sn",
+            "assignment_generation",
+            "observed_ip",
+            "created_at",
+        ],
+    ),
+    (
+        "relay_allocation_pending",
+        &[
+            "zone",
+            "preferred_region",
+            "reason",
+            "source_version",
+            "attempts",
+            "last_error",
+            "created_at",
+            "updated_at",
+        ],
+    ),
+];
 
 macro_rules! relay_string_enum {
     ($name:ident { $($variant:ident => $value:literal),+ $(,)? }) => {
@@ -713,6 +790,36 @@ impl SqliteSnRelayManager {
     }
 
     pub async fn initialize_database(&self) -> SnResult<()> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| Self::db_err("begin relay schema transaction failed", e))?;
+        let mut present_tables = 0;
+        let mut current_tables = 0;
+        for (table, expected_columns) in RELAY_TABLE_COLUMNS {
+            let columns = sqlx::query_scalar::<_, String>("SELECT name FROM pragma_table_info(?1)")
+                .bind(table)
+                .fetch_all(&mut *tx)
+                .await
+                .map_err(|e| Self::db_err(format!("inspect {} schema failed", table), e))?;
+            if columns.is_empty() {
+                continue;
+            }
+            present_tables += 1;
+            if columns.iter().map(String::as_str).collect::<HashSet<_>>()
+                == expected_columns.iter().copied().collect::<HashSet<_>>()
+            {
+                current_tables += 1;
+            }
+        }
+        if present_tables != 0 && current_tables != RELAY_TABLE_COLUMNS.len() {
+            return Err(Self::db_err(
+                "unsupported relay schema",
+                "existing relay tables do not match the current schema",
+            ));
+        }
+
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS relay_nodes (
                 relay_id TEXT PRIMARY KEY,
@@ -733,7 +840,7 @@ impl SqliteSnRelayManager {
                 updated_at INTEGER NOT NULL
             )",
         )
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
         .map_err(|e| Self::db_err("create relay_nodes table failed", e))?;
 
@@ -748,7 +855,7 @@ impl SqliteSnRelayManager {
                 FOREIGN KEY (relay_id) REFERENCES relay_nodes(relay_id) ON DELETE CASCADE
             )",
         )
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
         .map_err(|e| Self::db_err("create relay_node_addresses table failed", e))?;
 
@@ -758,14 +865,14 @@ impl SqliteSnRelayManager {
                 value INTEGER NOT NULL
             )",
         )
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
         .map_err(|e| Self::db_err("create relay_metadata table failed", e))?;
         sqlx::query(
             "INSERT OR IGNORE INTO relay_metadata (key, value)
              VALUES ('node_map_revision', 0)",
         )
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
         .map_err(|e| Self::db_err("initialize relay node-map revision failed", e))?;
 
@@ -787,16 +894,15 @@ impl SqliteSnRelayManager {
                 updated_at INTEGER NOT NULL
             )",
         )
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
         .map_err(|e| Self::db_err("create relay_assignments table failed", e))?;
-        self.migrate_relay_assignments_schema().await?;
 
         sqlx::query(
             "CREATE INDEX IF NOT EXISTS idx_relay_assignments_relay
                 ON relay_assignments(relay_id, state)",
         )
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
         .map_err(|e| Self::db_err("create relay assignment relay index failed", e))?;
 
@@ -816,7 +922,7 @@ impl SqliteSnRelayManager {
                 created_at INTEGER NOT NULL
             )",
         )
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
         .map_err(|e| Self::db_err("create relay_admission_events table failed", e))?;
 
@@ -824,7 +930,7 @@ impl SqliteSnRelayManager {
             "CREATE INDEX IF NOT EXISTS idx_relay_admission_events_zone_time
                 ON relay_admission_events(zone, created_at)",
         )
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
         .map_err(|e| Self::db_err("create relay admission zone index failed", e))?;
 
@@ -840,77 +946,13 @@ impl SqliteSnRelayManager {
                 updated_at INTEGER NOT NULL
             )",
         )
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
         .map_err(|e| Self::db_err("create relay allocation pending table failed", e))?;
 
-        Ok(())
-    }
-
-    async fn migrate_relay_assignments_schema(&self) -> SnResult<()> {
-        let columns = sqlx::query("PRAGMA table_info(relay_assignments)")
-            .fetch_all(&self.pool)
-            .await
-            .map_err(|e| Self::db_err("inspect relay_assignments schema failed", e))?;
-        if !columns.iter().any(|row| {
-            row.try_get::<String, _>("name")
-                .map(|name| name == "relay_sn")
-                .unwrap_or(false)
-        }) {
-            return Ok(());
-        }
-
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|e| Self::db_err("begin relay assignment migration failed", e))?;
-        sqlx::query("ALTER TABLE relay_assignments RENAME TO relay_assignments_legacy")
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| Self::db_err("rename legacy relay_assignments failed", e))?;
-        sqlx::query(
-            "CREATE TABLE relay_assignments (
-                zone TEXT PRIMARY KEY,
-                relay_id TEXT NOT NULL,
-                state TEXT NOT NULL,
-                source TEXT NOT NULL,
-                reason TEXT NULL,
-                generation INTEGER NOT NULL,
-                backup_relay_id TEXT NULL,
-                sticky_until INTEGER NULL,
-                lease_expires_at INTEGER NULL,
-                migrated_from TEXT NULL,
-                migration_deadline INTEGER NULL,
-                source_version TEXT NULL,
-                created_at INTEGER NOT NULL,
-                updated_at INTEGER NOT NULL,
-                FOREIGN KEY (relay_id) REFERENCES relay_nodes(relay_id)
-            )",
-        )
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| Self::db_err("create normalized relay_assignments failed", e))?;
-        sqlx::query(
-            "INSERT INTO relay_assignments
-                (zone, relay_id, state, source, reason, generation, backup_relay_id,
-                 sticky_until, lease_expires_at, migrated_from, migration_deadline,
-                 source_version, created_at, updated_at)
-             SELECT zone, relay_id, state, source, reason, generation, backup_relay_id,
-                    sticky_until, lease_expires_at, migrated_from, migration_deadline,
-                    source_version, created_at, updated_at
-             FROM relay_assignments_legacy",
-        )
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| Self::db_err("copy legacy relay assignments failed", e))?;
-        sqlx::query("DROP TABLE relay_assignments_legacy")
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| Self::db_err("drop legacy relay_assignments failed", e))?;
         tx.commit()
             .await
-            .map_err(|e| Self::db_err("commit relay assignment migration failed", e))?;
+            .map_err(|e| Self::db_err("commit relay schema failed", e))?;
         Ok(())
     }
 
@@ -3438,6 +3480,73 @@ mod tests {
             .await?;
         assert_eq!(auto_assigned.relay_id, "relay-b");
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_current_schema_reopens_with_data() -> SnResult<()> {
+        let (_tmp_dir, mgr) = temp_mgr().await?;
+        mgr.register_relay_node(node("relay-a", "relay-a.example", "us"))
+            .await?;
+        mgr.initialize_database().await?;
+        assert!(mgr.get_relay_node("relay-a").await?.is_some());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_unsupported_relay_schema_is_rejected_without_changes() -> SnResult<()> {
+        let tmp_dir = tempfile::tempdir()
+            .map_err(|e| sn_err!(SnErrorCode::DBError, "create temp dir failed: {}", e))?;
+        let db_path = tmp_dir.path().join("sn_relay_mgr.sqlite3");
+        let mgr = SqliteSnRelayManager::new_by_path(db_path.to_string_lossy().as_ref()).await?;
+        sqlx::query(
+            "CREATE TABLE relay_assignments (
+                zone TEXT PRIMARY KEY,
+                relay_id TEXT NOT NULL,
+                relay_sn TEXT NOT NULL,
+                state TEXT NOT NULL,
+                source TEXT NOT NULL,
+                reason TEXT NULL,
+                generation INTEGER NOT NULL,
+                backup_relay_id TEXT NULL,
+                sticky_until INTEGER NULL,
+                lease_expires_at INTEGER NULL,
+                migrated_from TEXT NULL,
+                migration_deadline INTEGER NULL,
+                source_version TEXT NULL,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            )",
+        )
+        .execute(&mgr.pool)
+        .await
+        .map_err(|e| SqliteSnRelayManager::db_err("create old relay table failed", e))?;
+        sqlx::query(
+            "INSERT INTO relay_assignments
+                (zone, relay_id, relay_sn, state, source, generation, created_at, updated_at)
+             VALUES ('alice', 'relay-a', 'relay-a.example', 'active', 'admin', 1, 1, 1)",
+        )
+        .execute(&mgr.pool)
+        .await
+        .map_err(|e| SqliteSnRelayManager::db_err("insert old relay row failed", e))?;
+
+        let error = mgr.initialize_database().await.unwrap_err();
+        assert_eq!(error.code(), SnErrorCode::DBError);
+
+        let tables = sqlx::query_scalar::<_, String>(
+            "SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name",
+        )
+        .fetch_all(&mgr.pool)
+        .await
+        .map_err(|e| SqliteSnRelayManager::db_err("list tables failed", e))?;
+        assert_eq!(tables, ["relay_assignments"]);
+        let row =
+            sqlx::query("SELECT relay_id, relay_sn FROM relay_assignments WHERE zone = 'alice'")
+                .fetch_one(&mgr.pool)
+                .await
+                .map_err(|e| SqliteSnRelayManager::db_err("read old relay row failed", e))?;
+        assert_eq!(row.get::<String, _>("relay_id"), "relay-a");
+        assert_eq!(row.get::<String, _>("relay_sn"), "relay-a.example");
         Ok(())
     }
 

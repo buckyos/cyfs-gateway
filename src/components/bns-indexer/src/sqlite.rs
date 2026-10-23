@@ -1,4 +1,4 @@
-use rusqlite::{params, Connection, OptionalExtension, Transaction};
+use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use std::path::Path;
@@ -10,6 +10,8 @@ use crate::{
     ControllerRule, DocumentKey, DocumentState, EventLogRecord, IndexerCursor, LogCheckpoint,
     NameState, RegistryEvent, ZERO_HASH,
 };
+
+const SCHEMA_VERSION: i64 = 2;
 
 pub struct SqliteBnsRegistryStore {
     conn: Mutex<Connection>,
@@ -44,8 +46,24 @@ impl SqliteBnsRegistryStore {
     }
 
     pub fn initialize_schema(&self) -> BnsRegistryResult<()> {
-        let conn = self.conn()?;
-        conn.execute_batch(
+        let mut conn = self.conn()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let version: i64 = tx.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        if version == SCHEMA_VERSION {
+            tx.commit()?;
+            return Ok(());
+        }
+        let has_objects: bool =
+            tx.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master)", [], |row| {
+                row.get(0)
+            })?;
+        if version != 0 || has_objects {
+            return Err(BnsRegistryError::UnsupportedSchemaVersion {
+                found: version,
+                expected: SCHEMA_VERSION,
+            });
+        }
+        tx.execute_batch(
             r#"
             CREATE TABLE IF NOT EXISTS bns_names (
                 name TEXT PRIMARY KEY,
@@ -55,6 +73,9 @@ impl SqliteBnsRegistryStore {
                 updated_at INTEGER NOT NULL,
                 payload_json TEXT NOT NULL
             );
+
+            CREATE INDEX IF NOT EXISTS idx_bns_names_asset_owner_name
+                ON bns_names (asset_owner, name);
 
             CREATE TABLE IF NOT EXISTS bns_documents (
                 name TEXT NOT NULL,
@@ -132,34 +153,8 @@ impl SqliteBnsRegistryStore {
             "#,
         )?;
 
-        if !has_column(&conn, "bns_names", "asset_owner")? {
-            conn.execute(
-                "ALTER TABLE bns_names ADD COLUMN asset_owner TEXT NOT NULL DEFAULT ''",
-                [],
-            )?;
-        }
-        // Run the backfill whenever empty index values remain so an interrupted
-        // migration can safely resume on the next open.
-        let rows = {
-            let mut stmt =
-                conn.prepare("SELECT name, payload_json FROM bns_names WHERE asset_owner = ''")?;
-            let mapped = stmt.query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })?;
-            mapped.collect::<Result<Vec<_>, _>>()?
-        };
-        for (name, payload) in rows {
-            let state: NameState = from_json(&payload)?;
-            conn.execute(
-                "UPDATE bns_names SET asset_owner = ?1 WHERE name = ?2",
-                params![state.asset_owner, name],
-            )?;
-        }
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_bns_names_asset_owner_name ON bns_names (asset_owner, name)",
-            [],
-        )?;
-        conn.pragma_update(None, "user_version", 2)?;
+        tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -860,17 +855,6 @@ fn collect_json_rows<T: DeserializeOwned>(
     Ok(values)
 }
 
-fn has_column(conn: &Connection, table: &str, column: &str) -> BnsRegistryResult<bool> {
-    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
-    let columns = stmt.query_map([], |row| row.get::<_, String>(1))?;
-    for candidate in columns {
-        if candidate? == column {
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
-
 fn to_i64(value: u64, field: &'static str) -> BnsRegistryResult<i64> {
     if value > i64::MAX as u64 {
         return Err(BnsRegistryError::IntegerOutOfRange { field, value });
@@ -921,37 +905,20 @@ mod tests {
         }
     }
 
+    fn user_version(conn: &Connection) -> i64 {
+        conn.pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap()
+    }
+
     #[test]
-    fn schema_v2_backfills_asset_owner_index() {
+    fn fresh_schema_is_current_and_reopens_with_data() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("bns.sqlite");
         let state = name_state();
         {
-            let conn = Connection::open(&path).unwrap();
-            conn.execute_batch(
-                r#"
-                CREATE TABLE bns_names (
-                    name TEXT PRIMARY KEY,
-                    status TEXT NOT NULL,
-                    name_seq INTEGER NOT NULL,
-                    updated_at INTEGER NOT NULL,
-                    payload_json TEXT NOT NULL
-                );
-                PRAGMA user_version = 1;
-                "#,
-            )
-            .unwrap();
-            conn.execute(
-                "INSERT INTO bns_names (name, status, name_seq, updated_at, payload_json) VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![
-                    &state.name,
-                    state.status.as_str(),
-                    1i64,
-                    2i64,
-                    serde_json::to_string(&state).unwrap(),
-                ],
-            )
-            .unwrap();
+            let store = SqliteBnsRegistryStore::open(&path).unwrap();
+            store.transact(|tx| tx.put_name(&state)).unwrap();
+            assert_eq!(user_version(&store.conn().unwrap()), SCHEMA_VERSION);
         }
 
         let store = SqliteBnsRegistryStore::open(&path).unwrap();
@@ -959,13 +926,78 @@ mod tests {
             .transact(|tx| tx.list_names_by_asset_owner(OWNER, None, 10))
             .unwrap();
         assert_eq!(names, ["alice"]);
-        assert_eq!(
-            store
-                .conn()
+    }
+
+    #[test]
+    fn unsupported_schema_is_rejected_without_changes() {
+        let state = name_state();
+        for stored_version in [0i64, 1, SCHEMA_VERSION + 1] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("bns.sqlite");
+            {
+                let conn = Connection::open(&path).unwrap();
+                conn.execute_batch(
+                    r#"
+                    CREATE TABLE bns_names (
+                        name TEXT PRIMARY KEY,
+                        status TEXT NOT NULL,
+                        name_seq INTEGER NOT NULL,
+                        updated_at INTEGER NOT NULL,
+                        payload_json TEXT NOT NULL
+                    );
+                    "#,
+                )
+                .unwrap();
+                conn.pragma_update(None, "user_version", stored_version)
+                    .unwrap();
+                conn.execute(
+                    "INSERT INTO bns_names (name, status, name_seq, updated_at, payload_json) VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![
+                        &state.name,
+                        state.status.as_str(),
+                        1i64,
+                        2i64,
+                        serde_json::to_string(&state).unwrap(),
+                    ],
+                )
+                .unwrap();
+            }
+
+            let error = SqliteBnsRegistryStore::open(&path)
+                .err()
+                .expect("unsupported schema must be rejected");
+            assert!(matches!(
+                error,
+                BnsRegistryError::UnsupportedSchemaVersion { found, expected }
+                    if found == stored_version && expected == SCHEMA_VERSION
+            ));
+
+            let conn = Connection::open(&path).unwrap();
+            assert_eq!(user_version(&conn), stored_version);
+            let objects: Vec<String> = conn
+                .prepare("SELECT name FROM sqlite_master ORDER BY name")
                 .unwrap()
-                .pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))
-                .unwrap(),
-            2
-        );
+                .query_map([], |row| row.get(0))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            assert_eq!(objects, ["bns_names", "sqlite_autoindex_bns_names_1"]);
+            let columns: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info('bns_names')",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(columns, 5);
+            let payload: String = conn
+                .query_row(
+                    "SELECT payload_json FROM bns_names WHERE name = ?1",
+                    params![&state.name],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(payload, serde_json::to_string(&state).unwrap());
+        }
     }
 }

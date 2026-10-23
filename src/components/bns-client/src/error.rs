@@ -103,6 +103,9 @@ pub enum BnsRegistryError {
     #[error("BNS sqlite database lock is poisoned")]
     DbLockPoisoned,
 
+    #[error("unsupported BNS sqlite schema version {found}; expected {expected}")]
+    UnsupportedSchemaVersion { found: i64, expected: i64 },
+
     #[error("sqlite error: {0}")]
     Sqlite(#[from] rusqlite::Error),
 
@@ -182,6 +185,7 @@ impl BnsRegistryError {
             Self::UnsupportedOperation(_) => "UNSUPPORTED_OPERATION",
             Self::IntegerOutOfRange { .. } => "INTEGER_OUT_OF_RANGE",
             Self::DbLockPoisoned => "DB_LOCK_POISONED",
+            Self::UnsupportedSchemaVersion { .. } => "UNSUPPORTED_SCHEMA_VERSION",
             Self::Sqlite(_) => "SQLITE_ERROR",
             Self::Json(_) => "JSON_ERROR",
             Self::Io(_) => "IO_ERROR",

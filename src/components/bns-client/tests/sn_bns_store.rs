@@ -4,7 +4,7 @@
 
 use bns_client::{
     BnsEvmPreparedTx, BnsWriteOperation, BnsWriteRequestState, MemorySnBnsWriteRequestStore,
-    SnBnsTryBeginResult, SnBnsWriteRequestRecord, SnBnsWriteRequestStore,
+    SnBnsControllerError, SnBnsTryBeginResult, SnBnsWriteRequestRecord, SnBnsWriteRequestStore,
     SqliteSnBnsWriteRequestStore, EVM_TX_RECOVERY_DATA_INVALID,
 };
 use rusqlite::Connection;
@@ -177,72 +177,130 @@ fn sqlite_try_begin_is_atomic_across_connections() {
     let _ = std::fs::remove_file(path.with_extension("sqlite-shm"));
 }
 
-#[test]
-fn legacy_transaction_states_are_migrated_once() {
-    let path = std::env::temp_dir().join(format!(
-        "cyfs-gateway-sn-bns-state-migration-{}-{}.sqlite",
+fn temp_store_path(label: &str) -> std::path::PathBuf {
+    std::env::temp_dir().join(format!(
+        "cyfs-gateway-sn-bns-{}-{}-{}.sqlite",
+        label,
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos()
-    ));
+    ))
+}
 
+fn remove_store_files(path: &std::path::Path) {
+    let _ = std::fs::remove_file(path);
+    let _ = std::fs::remove_file(path.with_extension("sqlite-wal"));
+    let _ = std::fs::remove_file(path.with_extension("sqlite-shm"));
+}
+
+fn request_rows(path: &std::path::Path) -> Vec<(String, String)> {
+    let conn = Connection::open(path).unwrap();
+    let mut stmt = conn
+        .prepare("SELECT request_id, state FROM sn_bns_write_requests ORDER BY request_id")
+        .unwrap();
+    let rows = stmt
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    rows
+}
+
+#[test]
+fn sqlite_rejects_store_without_current_tx_state_model() {
+    let path = temp_store_path("no-state-model");
     drop(SqliteSnBnsWriteRequestStore::open(&path).unwrap());
     let conn = Connection::open(&path).unwrap();
-    conn.execute("DELETE FROM sn_bns_write_store_meta", [])
-        .unwrap();
     conn.execute_batch(
         r#"
+        DELETE FROM sn_bns_write_store_meta;
         INSERT INTO sn_bns_write_requests
             (request_id, operation, name, payload_hash, state,
              evm_chain_id, evm_nonce, evm_tx_hash, evm_raw_tx,
              created_at, updated_at)
         VALUES
-            ('legacy-accepted', 'publish_document', 'alice', '0x1', 'succeeded',
+            ('old-accepted', 'publish_document', 'alice', '0x1', 'succeeded',
              31337, 1, '0xaccepted', '0x02accepted', 1, 1),
-            ('legacy-reverted', 'publish_document', 'alice', '0x2', 'failed',
-             31337, 2, '0xreverted', '0x02reverted', 2, 2),
-            ('legacy-unprepared', 'publish_document', 'alice', '0x3', 'pending',
+            ('old-unprepared', 'publish_document', 'alice', '0x3', 'pending',
              NULL, NULL, NULL, NULL, 3, 3);
-        UPDATE sn_bns_write_requests
-           SET error_code = 'EVM_TX_REVERTED'
-         WHERE request_id = 'legacy-reverted';
         "#,
     )
     .unwrap();
     drop(conn);
 
-    let store = SqliteSnBnsWriteRequestStore::open(&path).unwrap();
+    let error = SqliteSnBnsWriteRequestStore::open(&path)
+        .err()
+        .expect("store without tx_state_model must be rejected");
+    assert!(matches!(error, SnBnsControllerError::Store(_)));
     assert_eq!(
-        store.get("legacy-accepted").unwrap().unwrap().state,
-        BnsWriteRequestState::Pending
+        request_rows(&path),
+        [
+            ("old-accepted".to_string(), "succeeded".to_string()),
+            ("old-unprepared".to_string(), "pending".to_string()),
+        ]
     );
-    assert_eq!(
-        store.get("legacy-reverted").unwrap().unwrap().state,
-        BnsWriteRequestState::Reverted
-    );
-    assert!(store.get("legacy-unprepared").unwrap().is_none());
-    drop(store);
+    let meta_rows: i64 = Connection::open(&path)
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM sn_bns_write_store_meta", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(meta_rows, 0);
+    remove_store_files(&path);
+}
 
+#[test]
+fn sqlite_rejects_store_with_missing_columns() {
+    let path = temp_store_path("missing-columns");
     let conn = Connection::open(&path).unwrap();
-    conn.execute(
-        "UPDATE sn_bns_write_requests SET state = 'succeeded' WHERE request_id = 'legacy-accepted'",
-        [],
+    conn.execute_batch(
+        r#"
+        CREATE TABLE sn_bns_write_requests (
+            request_id TEXT PRIMARY KEY,
+            operation TEXT NOT NULL,
+            name TEXT NOT NULL,
+            doc_type TEXT NULL,
+            payload_hash TEXT NOT NULL,
+            state TEXT NOT NULL,
+            result_json TEXT NULL,
+            error_code TEXT NULL,
+            error_message TEXT NULL,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL
+        );
+        CREATE TABLE sn_bns_write_store_meta (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
+        INSERT INTO sn_bns_write_store_meta (key, value) VALUES ('tx_state_model', '2');
+        INSERT INTO sn_bns_write_requests
+            (request_id, operation, name, payload_hash, state, created_at, updated_at)
+        VALUES ('old-request', 'publish_document', 'alice', '0x1', 'pending', 1, 1);
+        "#,
     )
     .unwrap();
     drop(conn);
-    let store = SqliteSnBnsWriteRequestStore::open(&path).unwrap();
-    assert_eq!(
-        store.get("legacy-accepted").unwrap().unwrap().state,
-        BnsWriteRequestState::Succeeded,
-        "v2 receipt-backed success must not be migrated again"
-    );
-    drop(store);
 
-    let _ = std::fs::remove_file(&path);
-    let _ = std::fs::remove_file(path.with_extension("sqlite-wal"));
-    let _ = std::fs::remove_file(path.with_extension("sqlite-shm"));
+    let error = SqliteSnBnsWriteRequestStore::open(&path)
+        .err()
+        .expect("store with missing columns must be rejected");
+    assert!(matches!(error, SnBnsControllerError::Store(_)));
+    assert_eq!(
+        request_rows(&path),
+        [("old-request".to_string(), "pending".to_string())]
+    );
+    let column_count: i64 = Connection::open(&path)
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('sn_bns_write_requests')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(column_count, 11);
+    remove_store_files(&path);
 }
 
 #[test]
