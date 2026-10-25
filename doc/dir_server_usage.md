@@ -2,327 +2,168 @@
 
 ## 概述
 
-`DirServer` 是一个基于本地文件夹的 HTTP 静态文件服务器，用于通过 HTTP 协议提供本地文件系统中的文件。
+`type: dir` 把一个本地目录发布成静态文件服务，适用于网站、下载和目录浏览。
 
-## 核心功能
+- 实现：buckyos-base `src/buckyos-http-server/src/dir_server.rs`（`DirServer`）
+- gateway 接入：`src/components/cyfs-gateway-lib/src/server/dir_server.rs`（`DirServerConfig` / `DirServerFactory`）
+- 通常由 `type: http` server 的 `hook_point` 用 `call-server <id>` 调用；压缩等响应处理留在 `http` 层（见下文“压缩”）。
 
-1. **静态文件服务**: 从指定的根目录提供文件
-2. **Range 请求支持**: 支持 HTTP Range 请求，适用于视频流、断点续传等场景
-3. **MIME 类型自动检测**: 根据文件扩展名自动设置正确的 Content-Type
-4. **目录索引**: 当请求目录时，自动提供 index.html（可配置）
-5. **路径安全**: 防止路径遍历攻击，确保只能访问根目录内的文件
-
-## 配置示例
-
-### YAML 配置格式
+## 配置
 
 ```yaml
-# 基本配置
-id: static_files
-type: dir
-root_dir: /var/www/html
-index_file: index.html  # 可选，默认为 index.html
-version: HTTP/1.1       # 可选，默认为 HTTP/1.1
+servers:
+  main_http:
+    type: http
+    gzip: true
+    gzip_types: [text/html, text/css, application/javascript]
+    hook_point:
+      main:
+        priority: 1
+        blocks:
+          default:
+            priority: 1
+            block: |
+              call-server www;
 
-# 支持的 HTTP 版本
-# - HTTP/0.9
-# - HTTP/1.0
-# - HTTP/1.1
-# - HTTP/2
-# - HTTP/3
+  www:
+    type: dir
+    root_path: /var/www/html
+    # base_url: /static            # 挂载前缀，解析前从请求 path 剥离
+    # index_file: index.html
+    # fallback_file: index.html    # 文件不存在时返回它（SPA）
+    # autoindex: false
+    # etag: true
+    # if_modified_since: exact     # exact | before | off
+    # cache_policy: html-revalidate
+    # html_cache_control: no-cache
+    # cache_control: "public, max-age=3600"
 ```
 
-### JSON 配置格式
+| 字段 | 默认 | 说明 |
+| --- | --- | --- |
+| `root_path` | 必填 | 根目录，启动时 canonicalize |
+| `version` | `HTTP/1.1` | `HTTP/1.0`、`HTTP/1.1`、`HTTP/2`、`HTTP/3` |
+| `base_url` | `/` | 挂载前缀，按整段剥离；不带前缀的 path 仍按根目录解析（是 rewrite，不是访问控制） |
+| `index_file` | `index.html` | 目录的索引文件 |
+| `fallback_file` | 无 | 目标不存在时返回的文件（相对 `root_path`，不能含 `..`），状态码 200 |
+| `autoindex` | `false` | 目录没有索引文件时返回目录列表 |
+| `etag` | `true` | 生成 `ETag` |
+| `if_modified_since` | `exact` | `If-Modified-Since` 判定：`exact` 秒级相等、`before` 不晚于、`off` 不用 |
+| `cache_policy` | `html-revalidate` | 预设：`html-revalidate` 给 HTML 响应加 `Cache-Control: no-cache`，其它文件不加；`none` 都不加 |
+| `html_cache_control` | 由预设决定 | 覆盖 HTML 响应（含目录列表）的 `Cache-Control` |
+| `cache_control` | 由预设决定 | 覆盖非 HTML 文件响应的 `Cache-Control` |
 
-```json
-{
-  "id": "static_files",
-  "type": "dir",
-  "root_dir": "/var/www/html",
-  "index_file": "index.html",
-  "version": "HTTP/1.1"
-}
-```
+`Cache-Control` 随 200、206、304 和目录列表一起发送；取值在启动时校验，非法值或未知预设会让配置报 `InvalidConfig`。
 
-## 代码使用示例
+## 请求处理
 
-### 示例 1: 基本使用
+只支持 `GET` 和 `HEAD`，其它方法返回 405 并带 `Allow: GET, HEAD`。
+
+### 路径解析
+
+1. 请求 path 按 `/` 分段，每段百分号解码一次：`/a%20b.txt` → `a b.txt`，`/%2541.txt` → 字面文件名 `%41.txt`。
+2. 空段和 `.` 忽略；`..`（包括 `%2e%2e`）返回 403；解码后含 `/`、NUL 的段（Windows 下还有 `\`、`:`、盘符）返回 400。非 UTF-8 字节在 Unix 上按原样作为文件名。
+3. 剥离 `base_url` 的各段后拼到根目录下，再 canonicalize（跟随符号链接）；结果不在根目录内返回 403。
+4. `Content-Type` 按请求选中的逻辑文件名推断（普通文件用请求里的名字，索引用 `index_file`，回退用 `fallback_file`），不按符号链接目标名推断。指向无扩展名文件的 `app.js` 仍是 JavaScript。
+
+### 目录与回退
+
+- 目标是目录，且有索引文件或开启了 `autoindex`：
+  - 请求 path 不以 `/` 结尾时返回 301，`Location: ./<最后一段>/`，保留 query。使用相对地址，经过 `base_url` 或 process chain 的前缀 `rewrite` 后仍指向客户端看到的 URL。
+  - 以 `/` 结尾时返回索引文件，没有索引文件时返回目录列表。
+- 目录列表跳过 `.` 开头的条目；链接是相对的 `./<名字>`（目录带 `/`），名字按 URL 段编码（Unix 上按原始字节编码），点击即可解析回列出的文件。
+- 以 `/` 结尾的 path 只表示目录，不会选中同名文件。
+- 其余情况（不存在、目录没有可返回内容、以 `/` 结尾却是文件）：配置了 `fallback_file` 则返回它，否则 404。
+
+### Range（RFC 9110 §14）
+
+只对 `GET` 生效，只支持单个 `bytes` 范围。以 10 字节文件 `0123456789` 为例：
+
+| `Range` | 结果 |
+| --- | --- |
+| `bytes=0-1` | 206，`01`，`Content-Range: bytes 0-1/10` |
+| `bytes=-3` | 206，`789`（最后 3 字节） |
+| `bytes=5-` | 206，`56789` |
+| `bytes=5-999` | 206，`56789`（结束位置截到文件末尾） |
+| `bytes=10-`、`bytes=-0` | 416，`Content-Range: bytes */10` |
+| `bytes=0-1,7-8` | 不支持多段：200 返回完整文件 |
+| `bytes=3-1`、`items=0-1` 等无效或未知单位 | 忽略：200 返回完整文件 |
+
+空文件：`bytes=0-0`、`bytes=0-` 返回 416（`bytes */0`）；`bytes=-5` 返回 200 空内容。
+
+### 条件请求（RFC 9110 §13）
+
+- ETag 形如 `"<大小>-<mtime 秒>-<mtime 纳秒>"`（十六进制）。mtime 不晚于 Unix 纪元（可复现归档常见）时既不发 `ETag` 也不发 `Last-Modified`，因为这样的时间戳无法区分内容变化。
+- 判定顺序：
+  1. `If-Match`（强比较，`*` 只要文件存在即成立）不成立 → 412；没有 `If-Match` 时看 `If-Unmodified-Since`，文件更新过 → 412。
+  2. `If-None-Match`（弱比较，`*` 只要文件存在即成立，与 `etag` 开关无关）成立 → 304；没有 `If-None-Match` 时按 `if_modified_since` 模式判断 `If-Modified-Since` → 304。
+  3. 带 `Range` 的 `GET` 再看 `If-Range`：实体标签须强匹配、日期须与 `Last-Modified` 相等，否则返回完整的当前文件（200），断点续传不会拼出两个版本。
+- 304 带 `ETag`、`Last-Modified` 和 `Cache-Control`。
+
+### HEAD
+
+返回与对应 `GET` 200 相同的头（含完整 `Content-Length`、`Accept-Ranges`、校验器），不读取文件内容，也不构造文件流；HEAD 忽略 `Range`。
+
+### 内存
+
+文件内容经固定 64 KiB 的读缓冲流式发送，单个请求的内存不随文件或范围大小增长。
+
+### 压缩
+
+`dir` 不做动态压缩，由 `type: http` server 在响应返回前处理（`post_hook_point` → `apply_response_compression`，配置项 `gzip` / `brotli` 等）。该层对静态文件的约束：
+
+- 206、带 `Content-Range` 的响应（含 416）以及 `Cache-Control: no-transform` 的响应不压缩；
+- 压缩后的响应去掉 `Accept-Ranges`，强 ETag 变为弱 ETag（`W/"..."`）。客户端拿弱 ETag 发 `If-None-Match` 仍得到 304；发 `If-Range` 时拿到完整的 200，不会把压缩缓存和原始字节的范围拼在一起。
+
+### 状态码
+
+- `200` 完整文件、索引、目录列表或回退文件
+- `206` 单段 Range
+- `301` 目录补尾部 `/`
+- `304` 条件 GET/HEAD 未修改
+- `400` 无效的 path 段
+- `403` 路径穿越或目标在根目录外
+- `404` 不存在
+- `405` 方法不支持
+- `412` `If-Match` / `If-Unmodified-Since` 不成立
+- `416` Range 无法满足
+
+## 代码使用
+
+直接使用 `DirServer`：
 
 ```rust
-use cyfs_gateway_lib::{DirServer, DirServerFactory, ServerFactory};
-use std::path::PathBuf;
-use std::sync::Arc;
+use buckyos_http_server::DirServer;
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // 创建 DirServer
-    let server = DirServer::builder()
-        .id("my_static_server")
-        .root_dir(PathBuf::from("/var/www/html"))
-        .index_file("index.html")
-        .version("HTTP/1.1")
-        .build()
-        .await?;
-
-    println!("DirServer created: {}", server.id());
-    
-    Ok(())
-}
+let server = DirServer::builder()
+    .id("www")
+    .root_path("/var/www/html")
+    .fallback_file("index.html")
+    .cache_control("public, max-age=3600")
+    .build()
+    .await?;
 ```
 
-### 示例 2: 使用工厂模式
+通过 gateway 的工厂创建：
 
 ```rust
 use cyfs_gateway_lib::{DirServerConfig, DirServerFactory, ServerFactory};
 use std::sync::Arc;
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // 创建配置
-    let config = DirServerConfig {
-        id: "static_files".to_string(),
-        ty: "dir".to_string(),
-        version: Some("HTTP/1.1".to_string()),
-        root_dir: "/var/www/html".to_string(),
-        index_file: Some("index.html".to_string()),
-    };
-
-    // 使用工厂创建服务器
-    let factory = DirServerFactory::new();
-    let server = factory.create(Arc::new(config)).await?;
-
-    println!("Server created successfully!");
-    
-    Ok(())
-}
+let config: DirServerConfig = serde_yaml_ng::from_str(
+    "id: www\ntype: dir\nroot_path: /var/www/html\ncache_policy: none\n",
+)?;
+let servers = DirServerFactory::new().create(Arc::new(config), None).await?;
 ```
-
-### 示例 3: 配合 ServerManager 使用
-
-```rust
-use cyfs_gateway_lib::{ServerManager, DirServerConfig, DirServerFactory};
-use std::sync::Arc;
-
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // 创建 ServerManager
-    let server_mgr = Arc::new(ServerManager::new());
-
-    // 注册 DirServer 工厂
-    let factory = Arc::new(DirServerFactory::new());
-    server_mgr.register_factory("dir", factory).await;
-
-    // 创建配置
-    let config = Arc::new(DirServerConfig {
-        id: "static_files".to_string(),
-        ty: "dir".to_string(),
-        version: Some("HTTP/1.1".to_string()),
-        root_dir: "/var/www/html".to_string(),
-        index_file: Some("index.html".to_string()),
-    });
-
-    // 添加服务器
-    server_mgr.add_server(config).await?;
-
-    println!("DirServer registered and started!");
-    
-    Ok(())
-}
-```
-
-## 特性说明
-
-### 1. Range 请求支持
-
-DirServer 完全支持 HTTP Range 请求，这对于大文件下载、视频流播放非常重要。
-
-**客户端示例**:
-
-```bash
-# 请求文件的前 1024 字节
-curl -H "Range: bytes=0-1023" http://localhost/large_file.bin
-
-# 请求从第 1024 字节到文件末尾
-curl -H "Range: bytes=1024-" http://localhost/large_file.bin
-```
-
-**响应头示例**:
-
-```
-HTTP/1.1 206 Partial Content
-Content-Type: application/octet-stream
-Content-Length: 1024
-Content-Range: bytes 0-1023/10485760
-Accept-Ranges: bytes
-```
-
-### 2. MIME 类型检测
-
-DirServer 会根据文件扩展名自动设置正确的 Content-Type：
-
-| 文件类型 | Content-Type |
-|---------|-------------|
-| .html   | text/html   |
-| .css    | text/css    |
-| .js     | application/javascript |
-| .json   | application/json |
-| .png    | image/png   |
-| .jpg    | image/jpeg  |
-| .mp4    | video/mp4   |
-| .pdf    | application/pdf |
-| 其他    | application/octet-stream |
-
-### 3. 目录访问
-
-当请求路径指向一个目录时，DirServer 会自动查找该目录下的索引文件（默认 `index.html`）：
-
-```
-请求: GET /docs/
-实际文件: /var/www/html/docs/index.html
-```
-
-### 4. 路径安全
-
-DirServer 包含路径遍历防护，防止访问根目录之外的文件：
-
-```rust
-// 这些请求会被拒绝（返回 403 Forbidden）
-GET /../etc/passwd
-GET /../../etc/passwd
-GET /docs/../../etc/passwd
-```
-
-### 5. 错误处理
-
-DirServer 会返回适当的 HTTP 状态码：
-
-- `200 OK`: 成功返回完整文件
-- `206 Partial Content`: 成功返回部分文件（Range 请求）
-- `403 Forbidden`: 路径遍历尝试
-- `404 Not Found`: 文件不存在
-- `405 Method Not Allowed`: 不支持的 HTTP 方法（只支持 GET 和 HEAD）
-
-## 核心实现参考
-
-DirServer 的核心逻辑参考了 `router.rs` 中的 `handle_local_dir` 方法：
-
-```rust:456:523:src/components/cyfs-warp/src/router.rs
-async fn handle_local_dir(&self, req: Request<Incoming>, local_dir: &str, route_path: &str) -> RouterResult<Response<UnsyncBoxBody<Bytes, anyhow::Error>>> {
-    let path = req.uri().path();
-    let sub_path = buckyos_kit::get_relative_path(route_path, path);
-    let file_path = if sub_path.starts_with("/") {
-        Path::new(local_dir).join(&sub_path[1..])
-    } else {
-        Path::new(local_dir).join(&sub_path)
-    };
-    info!("handle_local_dir will load file:{}", file_path.to_string_lossy().to_string());
-    let path = file_path.as_path();
-
-    if path.is_file() {
-        let file = tokio::fs::File::open(&path).await.map_err(|e| {
-            warn!("Failed to open file: {}", e);
-            RouterError::Internal(format!("Failed to open file: {}", e))
-        })?;
-
-        let file_meta = file.metadata().await.map_err(|e| {
-            warn!("Failed to get file metadata: {}", e);
-            RouterError::Internal(format!("Failed to get file metadata: {}", e))
-        })?;
-        let file_size = file_meta.len();
-        let mime_type = mime_guess::from_path(&file_path).first_or_octet_stream();
-        // 处理Range请求
-        if let Some(range_header) = req.headers().get(hyper::header::RANGE) {
-            if let Ok(range_str) = range_header.to_str() {
-                if let Ok((start, end)) = parse_range(range_str, file_size) {
-                    let mut file = tokio::io::BufReader::new(file);
-                    // 设置读取位置
-                    tokio::io::AsyncSeekExt::seek(&mut file, std::io::SeekFrom::Start(start)).await.map_err(|e| {
-                        RouterError::Internal(format!("Failed to seek file: {}", e))
-                    })?;
-
-                    let content_length = end - start + 1;
-                    let stream = tokio_util::io::ReaderStream::with_capacity(
-                        file.take(content_length),
-                        content_length as usize
-                    );
-                    let stream_body = StreamBody::new(stream.map_ok(Frame::data));
-
-                    return Ok(Response::builder()
-                        .status(StatusCode::PARTIAL_CONTENT)
-                        .header("Content-Type", mime_type.as_ref())
-                        .header("Content-Length", content_length)
-                        .header("Content-Range", format!("bytes {}-{}/{}", start, end, file_size))
-                        .header("Accept-Ranges", "bytes")
-                        .body(BodyExt::map_err(stream_body, |e| anyhow::Error::from(e)).boxed_unsync()).map_err(|e| {
-                            RouterError::Internal(format!("Failed to build response: {}", e))
-                        })?);
-                }
-            }
-        }
-
-        // 非Range请求返回完整文件
-        let stream = tokio_util::io::ReaderStream::with_capacity(file, file_size as usize);
-        let stream_body = StreamBody::new(stream.map_ok(Frame::data));
-        Ok(Response::builder()
-            .status(StatusCode::OK)
-            .header("Content-Type", mime_type.as_ref())
-            .header("Content-Length", file_size)
-            .header("Accept-Ranges", "bytes")
-            .body(BodyExt::map_err(stream_body, |e| anyhow::Error::from(e)).boxed_unsync()).map_err(|e| {
-                RouterError::Internal(format!("Failed to build response: {}", e))
-            })?)
-    } else {
-        return Err(RouterError::NotFound(format!("File not found: {}", file_path.to_string_lossy().to_string())));
-    }
-}
-```
-
-## 性能优化建议
-
-1. **使用合适的缓冲区大小**: DirServer 会根据文件大小自动调整缓冲区
-2. **启用 HTTP/2 或 HTTP/3**: 对于多个小文件，启用多路复用可以提高性能
-3. **配合反向代理**: 可以在前面加上 Nginx 等反向代理，提供缓存和负载均衡
-
-## 最佳实践
-
-1. **设置合理的根目录**: 确保根目录只包含需要公开的文件
-2. **使用相对路径**: 在配置中使用相对路径可以提高可移植性
-3. **日志监控**: 关注日志中的 404 和 403 错误，及时发现问题
-4. **文件权限**: 确保 DirServer 运行用户有读取文件的权限
 
 ## 测试
 
-项目包含完整的单元测试，覆盖以下场景：
-
-- 服务器创建和配置验证
-- 文件存在性检查
-- Range 请求处理
-- 错误处理（404、403、405）
-- 工厂模式创建
-
-运行测试：
-
 ```bash
-cd src
-cargo test --package cyfs-gateway-lib --lib server::dir_server
+# DirServer 本身（buckyos-base）
+cd buckyos-base/src && cargo test -p buckyos-http-server --lib dir_server
+
+# gateway 配置透传与 call-server 链路（含压缩层）
+cd cyfs-gateway/src && cargo test -p cyfs-gateway-lib --lib server::dir_server
 ```
 
-## 完整网关配置示例
-
-```yaml
-servers:
-  - id: static_web
-    type: dir
-    root_dir: /var/www/html
-    index_file: index.html
-    version: HTTP/1.1
-
-stacks:
-  - id: http_stack
-    type: tcp
-    bind: 0.0.0.0:8080
-    server: static_web
-```
-
-这样就可以在 8080 端口启动一个静态文件服务器！
-
+联调未发布的 buckyos-base 时，用 `cargo --config <patch.toml>` 把 `[patch."https://github.com/buckyos/buckyos-base.git"]` 指向本地路径，不要改仓库里的 `Cargo.toml`。

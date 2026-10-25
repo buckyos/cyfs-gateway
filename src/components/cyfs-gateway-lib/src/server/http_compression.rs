@@ -210,6 +210,15 @@ pub fn apply_response_compression(
         return Ok(http::Response::from_parts(parts, body));
     }
 
+    // A byte range of the identity representation cannot be re-encoded, and
+    // `no-transform` forbids changing the content coding (RFC 9111 §5.2.2.6).
+    if parts.status == StatusCode::PARTIAL_CONTENT
+        || parts.headers.contains_key(header::CONTENT_RANGE)
+        || has_no_transform(&parts.headers)
+    {
+        return Ok(http::Response::from_parts(parts, body));
+    }
+
     if !allows_http_version(req_info.version, settings.gzip_http_version) {
         return Ok(http::Response::from_parts(parts, body));
     }
@@ -258,6 +267,11 @@ pub fn apply_response_compression(
 
     let compressed_body = encode_body(body, &encoding, comp_level);
     parts.headers.remove(header::CONTENT_LENGTH);
+    // Byte ranges and strong validators describe the identity bytes, not the
+    // encoded ones: drop Accept-Ranges and weaken the ETag, so If-Range never
+    // pairs a cached encoded body with an identity range.
+    parts.headers.remove(header::ACCEPT_RANGES);
+    weaken_etag(&mut parts.headers);
     parts.headers.insert(
         header::CONTENT_ENCODING,
         HeaderValue::from_static(encoding.as_str()),
@@ -411,6 +425,28 @@ fn version_rank(version: Version) -> u8 {
         Version::HTTP_2 => 3,
         Version::HTTP_3 => 4,
         _ => 255,
+    }
+}
+
+fn has_no_transform(headers: &HeaderMap) -> bool {
+    headers
+        .get_all(header::CACHE_CONTROL)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .any(|directive| directive.trim().eq_ignore_ascii_case("no-transform"))
+}
+
+fn weaken_etag(headers: &mut HeaderMap) {
+    let Some(etag) = headers.get(header::ETAG) else {
+        return;
+    };
+    if !etag.as_bytes().starts_with(b"\"") {
+        return;
+    }
+    let weak = [b"W/".as_slice(), etag.as_bytes()].concat();
+    if let Ok(weak) = HeaderValue::from_bytes(&weak) {
+        headers.insert(header::ETAG, weak);
     }
 }
 

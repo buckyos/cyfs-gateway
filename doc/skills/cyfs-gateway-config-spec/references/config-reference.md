@@ -379,15 +379,29 @@ hook_point:
 
 - `version?`
 - `root_path`
+- `base_url?`
 - `index_file?`
 - `fallback_file?`
 - `autoindex`
 - `etag`
 - `if_modified_since?`
+- `cache_policy?`
+- `html_cache_control?`
+- `cache_control?`
 
 默认：
 
-- `etag = true`
+- `base_url = /`、`index_file = index.html`、`autoindex = false`、`etag = true`、`if_modified_since = exact`
+- `cache_policy = html-revalidate`：HTML 响应带 `Cache-Control: no-cache`，其它文件不带；`none` 表示都不带
+- `html_cache_control` / `cache_control` 分别覆盖预设里 HTML / 非 HTML 文件的 `Cache-Control`
+
+行为要点（细节见 `doc/dir_server_usage.md`）：
+
+- 请求 path 按段百分号解码一次再校验；`..`（含 `%2e%2e`）返回 403，解码出分隔符或 NUL 的段返回 400
+- 目录 URL 缺尾部 `/` 且会返回 index 或列表时，301 到 `./<name>/`（相对地址，保留 query）
+- 只支持单个 `bytes` Range；多段 Range 返回完整 200；越界返回 416；HEAD 忽略 Range
+- 条件请求按 RFC 9110 顺序：`If-Match` → `If-Unmodified-Since` → `If-None-Match` → `If-Modified-Since`；`If-Range` 不匹配时返回完整 200
+- `dir` 自己不压缩；压缩由 `http` server 的 `gzip` / `brotli` 在响应回到客户端前完成，206/416 与带 `Cache-Control: no-transform` 的响应不压缩，压缩后 ETag 变弱、去掉 `Accept-Ranges`
 
 ### `dns`
 
