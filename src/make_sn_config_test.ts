@@ -249,7 +249,7 @@ async function generateOodFixture(root: string, group: string) {
   const { makeConfigByGroupName } = await import(sourceUrl);
   const rootfs = `${root}/${group}`;
   await makeConfigByGroupName(group, rootfs, `${root}/ca`, `${root}/env`);
-  const start = JSON.parse(await Deno.readTextFile(`${rootfs}/etc/start_config.json`));
+  const start = JSON.parse(await Deno.readTextFile(`${rootfs}/security/start_config.json`));
   return { rootfs, start };
 }
 
