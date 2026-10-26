@@ -608,17 +608,25 @@ async fn build_server_manager(
     };
 
     for config in configs {
-        let servers = registry
-            .create_servers(config.clone(), &runtime)
-            .await
-            .map_err(|e| {
-                anyhow!(
+        let servers = match registry.create_servers(config.clone(), &runtime).await {
+            Ok(servers) => servers,
+            Err(e) if config.server_type() == "dir" => {
+                error!(
+                    "create server '{}' (type 'dir') failed, skip it: {}",
+                    config.id(),
+                    e
+                );
+                continue;
+            }
+            Err(e) => {
+                return Err(anyhow!(
                     "create server '{}' (type '{}') failed: {}",
                     config.id(),
                     config.server_type(),
                     e
-                )
-            })?;
+                ));
+            }
+        };
         for server in servers {
             server_manager.add_server(server)?;
         }
@@ -6020,5 +6028,84 @@ mod tests {
         let patch = build_saved_config_patch(&base, &saved_current);
         let merged = apply_saved_config_patch(user_changed.clone(), &patch);
         assert_eq!(merged, user_changed);
+    }
+
+    struct TestServerControl;
+
+    #[async_trait::async_trait]
+    impl GatewayControlCmdHandler for TestServerControl {
+        async fn handle(&self, _method: &str, _params: Value) -> ControlResult<Value> {
+            Ok(Value::Null)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl CyfsTokenFactory for TestServerControl {
+        async fn create(
+            &self,
+            _use_name: &str,
+            _password: &str,
+            _timestamp: u64,
+        ) -> ControlResult<String> {
+            Ok("token".to_string())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl CyfsTokenVerifier for TestServerControl {
+        async fn verify_and_renew(&self, _token: &str) -> ControlResult<Option<String>> {
+            Ok(None)
+        }
+    }
+
+    #[tokio::test]
+    async fn test_build_server_manager_skips_dir_server_with_missing_root() {
+        let mut builder = crate::GatewayServerRegistryBuilder::new();
+        crate::server_registry::register_core_gateway_servers(&mut builder).unwrap();
+        let registry = builder.build().unwrap();
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let configs = vec![
+            registry
+                .parse_server_config(json!({
+                    "id": "site-ok",
+                    "type": "dir",
+                    "root_path": temp_dir.path().to_string_lossy()
+                }))
+                .unwrap(),
+            registry
+                .parse_server_config(json!({
+                    "id": "site-missing",
+                    "type": "dir",
+                    "root_path": temp_dir.path().join("missing").to_string_lossy()
+                }))
+                .unwrap(),
+        ];
+
+        let mut acme_config = CertManagerConfig::default();
+        acme_config.keystore_path = temp_dir.path().to_string_lossy().to_string();
+        let acme_manager = AcmeCertManager::create(acme_config).await.unwrap();
+        let control = Arc::new(TestServerControl);
+        let control_handler: Arc<dyn GatewayControlCmdHandler> = control.clone();
+        let server_manager = build_server_manager(
+            &registry,
+            &configs,
+            GatewayServerRuntimeInputs {
+                global_process_chains: Arc::new(GlobalProcessChains::new()),
+                js_externals: Arc::new(JsExternalsManager::new()),
+                tunnel_manager: TunnelManager::new(),
+                global_collection_manager: GlobalCollectionManager::new(),
+                acme_manager,
+                capabilities: Arc::new(GatewayRuntimeCapabilities::default()),
+                control_handler: Arc::downgrade(&control_handler),
+                control_token_verifier: control.clone(),
+                control_token_factory: control,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(server_manager.get_server("site-ok").is_some());
+        assert!(server_manager.get_server("site-missing").is_none());
     }
 }
