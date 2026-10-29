@@ -81,7 +81,7 @@ msg-center settings 中新增 `cyfs_dispatch`，随服务启动与 `reload_setti
     "max_object_bytes": 65536,
     "outgoing": {
       "did:bns:carol": {
-        "target": "cyfs://carol.example/messages/inbox",
+        "target": "https://carol.example/messages/inbox",
         "upstream": "https://carol.example",
         "authorization": "Bearer <目标 Zone 接受的 session token>",
         "timeout_ms": 3000

@@ -415,7 +415,7 @@ impl InboxInner {
             || entry.context.target != entry.target
             || !entry
                 .target
-                .starts_with(&format!("cyfs://{}/", self.store.zone))
+                .starts_with(&format!("https://{}/", self.store.zone))
             || path != self.path(&entry.key())
         {
             return Err("incomplete, expired or foreign cache entry".into());

@@ -29,7 +29,7 @@ NamedInboxCacheServer 与 `cyfs-dir` 同属通用 CYFS 标准协议支持组件�
 ## 2. 请求与结果
 
 ```text
-PUT cyfs://<zone>/<semantic_path>
+PUT https://<zone>/<semantic_path>
 Content-Type: application/cyfs-named-object+json
 body = canonical JSON NamedObject
 
@@ -105,7 +105,7 @@ upstream 已提交但响应丢失、或 Gateway 在接收成功后删除前崩�
 可选查询沿用本次 CYFS 补充；基础缓存和排空实现不依赖完整查询/回执系统：
 
 ```text
-GET cyfs://<zone>/<semantic_path>?dispatch-status=<ObjectId>
+GET https://<zone>/<semantic_path>?dispatch-status=<ObjectId>
 ```
 
 查询先经认证并检查查询权限。若实现此可选能力，HTTP 规则把查询请求 call-server 到同一个 NamedInboxCacheServer，由它优先查询自身配置的 upstream；upstream 失效时可查本地缓存，未配置 upstream 时仅查本地。结果使用 source=upstream|cache 标明来源。缓存里完整对象仍存在才可回答 cached；若无记录，unknown-dispatch 可以表示从未缓存、已丢失、过期或转投后删除，不能据此推断拒收。
@@ -143,7 +143,7 @@ upstream 不支持查询、查询 unknown 或查询失败时，发送方按退�
 
 ### 7.1 场景与接入方式
 
-Bob 向 `cyfs://alice.example/messages/inbox` 投递一个小对象 `M`。Alice 的公网 Gateway 在线，家庭 OOD 上的 msg-center CYFS 接收适配入口可能离线。希望正常时直接接收，OOD 离线时由 Gateway 本地暂存，恢复后再转投。
+Bob 向 `https://alice.example/messages/inbox` 投递一个小对象 `M`。Alice 的公网 Gateway 在线，家庭 OOD 上的 msg-center CYFS 接收适配入口可能离线。希望正常时直接接收，OOD 离线时由 Gateway 本地暂存，恢复后再转投。
 
 同一个接收点可以选择两种路由方式。以下两条语句是互斥的配置选择，均在认证和路由检查通过后执行：
 
@@ -241,7 +241,7 @@ Content-Type: application/json
 Cache-Control: no-store
 cyfs-dispatch-status: cached
 
-{"obj_id":"<O>","target":"cyfs://alice.example/messages/inbox","status":"cached"}
+{"obj_id":"<O>","target":"https://alice.example/messages/inbox","status":"cached"}
 ```
 
 这里 HTTP 状态行中的 `Accepted` 是 202 的标准描述；投递状态仍以 `cyfs-dispatch-status: cached` 和 JSON 状态体为准。它表示 Gateway 此刻已暂存，**不表示对象已进入 msg-center inbox**。Bob 保留原对象和未完成投递记录，之后可退避重试同一个 PUT。
