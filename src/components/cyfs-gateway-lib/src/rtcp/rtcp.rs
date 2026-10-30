@@ -138,6 +138,12 @@ pub struct RtcpLivenessConfig {
     pub ping_interval_secs: u64,
     pub pong_timeout_secs: u64,
     pub max_missed_pongs: u32,
+    // Any tunnel whose control channel has been silent this long is probed
+    // with a Ping and closed if no Pong arrives within pong_timeout_secs.
+    pub idle_probe_secs: u64,
+    // A tunnel this side initiated is closed after this long without opening
+    // or accepting a stream; keep-tunnel and URL probes count as use.
+    pub idle_timeout_secs: u64,
 }
 
 impl Default for RtcpLivenessConfig {
@@ -146,6 +152,8 @@ impl Default for RtcpLivenessConfig {
             ping_interval_secs: 30,
             pong_timeout_secs: 10,
             max_missed_pongs: 3,
+            idle_probe_secs: 60,
+            idle_timeout_secs: 600,
         }
     }
 }
@@ -205,6 +213,8 @@ impl RtcpSecurityConfig {
         if self.liveness.ping_interval_secs == 0
             || self.liveness.pong_timeout_secs == 0
             || self.liveness.max_missed_pongs == 0
+            || self.liveness.idle_probe_secs == 0
+            || self.liveness.idle_timeout_secs == 0
         {
             return Err("rtcp liveness values must be greater than zero".to_string());
         }
@@ -663,6 +673,7 @@ struct ResolvedHandshakeIdentity {
     trust: RtcpIdentityTrust,
     resolver_id: Option<String>,
     address_resolution: RtcpAddressResolutionContext,
+    rtcp_port: Option<u16>,
     // True when the semantic DID is a logical *device* name whose resolution
     // must obey the one-to-one binding to its canonical DEV DID: DeviceDocument
     // resolutions and DNS TXT bootstrap hints. False for direct did:dev
@@ -724,6 +735,7 @@ struct VerifiedSourceDevice {
     source_device_info: Option<RTcpSourceDeviceInfo>,
     public_key: DecodingKey,
     identity_trust: RtcpIdentityTrust,
+    zone_relation: ResolveIpZoneRelation,
     // A document that passed name-client's expected-owner verification.  It is
     // deliberately not cached yet: the responder first requires the peer to
     // prove possession of the device key and pass application authorization.
@@ -771,6 +783,14 @@ fn decode_x25519_pub_hex(hex_str: &str) -> Result<[u8; 32], TunnelError> {
     bytes.try_into().map_err(|_| {
         TunnelError::ReasonError("x25519 pub key must be exactly 32 bytes".to_string())
     })
+}
+
+fn zone_relation_label(relation: ResolveIpZoneRelation) -> &'static str {
+    match relation {
+        ResolveIpZoneRelation::SameZone => "same_zone",
+        ResolveIpZoneRelation::CrossZone => "cross_zone",
+        ResolveIpZoneRelation::Unknown => "unknown",
+    }
 }
 
 fn canonical_dev_did_from_ed25519_pk(ed25519_pk_der: &[u8; 32]) -> DID {
@@ -1039,6 +1059,7 @@ impl RTcpInner {
                             ResolveIpTargetKind::Unknown,
                             ResolveIpZoneRelation::Unknown,
                         ),
+                        rtcp_port: None,
                         binds_logical_name: true,
                     }));
                 }
@@ -1068,6 +1089,7 @@ impl RTcpInner {
                                 ResolveIpTargetKind::Unknown,
                                 ResolveIpZoneRelation::Unknown,
                             ),
+                            rtcp_port: None,
                             binds_logical_name: true,
                         }));
                     }
@@ -1084,40 +1106,105 @@ impl RTcpInner {
         Ok(None)
     }
 
-    // Returns the exchange key together with the authority-validated target
-    // document kind. The parsed document is also used to derive the address
-    // resolution scope without consulting DeviceInfo.
-    fn exchange_key_from_resolved_document(
+    // The authority-validated target document kind. It is also used to derive
+    // the address resolution scope without consulting DeviceInfo.
+    fn decode_resolved_document(
         document: &EncodedDocument,
-    ) -> Result<([u8; 32], ResolvedHandshakeDocument), String> {
+    ) -> Result<ResolvedHandshakeDocument, String> {
         let document_value = document
             .clone()
             .to_json_value()
             .map_err(|e| format!("decode resolved DID document failed: {}", e))?;
-        let (exchange_key, target_document) = if document_value.get("device_type").is_some() {
+        if document_value.get("device_type").is_some() {
             let device_document = DeviceDocument::decode(document, None)
                 .map_err(|e| format!("decode resolved DeviceDocument failed: {}", e))?;
-            let exchange_key = device_document.get_exchange_key(None);
-            (
-                exchange_key,
-                ResolvedHandshakeDocument::Device(device_document),
-            )
+            Ok(ResolvedHandshakeDocument::Device(device_document))
         } else if document_value.get("hostname").is_some() {
             let zone_document = ZoneDocument::decode(document, None)
                 .map_err(|e| format!("decode resolved ZoneDocument failed: {}", e))?;
-            let exchange_key = zone_document
-                .get_default_zone_gateway()
-                .and_then(|gateway| zone_document.get_device_document(&gateway))
-                .and_then(|device| device.get_exchange_key(None));
-            (exchange_key, ResolvedHandshakeDocument::Zone(zone_document))
+            Ok(ResolvedHandshakeDocument::Zone(zone_document))
         } else {
-            return Err("resolved DID document is neither DeviceDocument nor ZoneDocument".into());
+            Err("resolved DID document is neither DeviceDocument nor ZoneDocument".into())
+        }
+    }
+
+    // The device the handshake authenticates: the target DeviceDocument, or
+    // the default gateway device of a Zone target.
+    fn handshake_device(target_document: &ResolvedHandshakeDocument) -> Option<&DeviceDocument> {
+        match target_document {
+            ResolvedHandshakeDocument::Device(device) => Some(device),
+            ResolvedHandshakeDocument::Zone(zone) => zone
+                .get_default_zone_gateway()
+                .and_then(|gateway| zone.get_device_document(&gateway)),
+        }
+    }
+
+    fn exchange_key_from_resolved_document(
+        target_document: &ResolvedHandshakeDocument,
+    ) -> Result<[u8; 32], String> {
+        let (_, jwk) = Self::handshake_device(target_document)
+            .and_then(|device| device.get_exchange_key(None))
+            .ok_or_else(|| "resolved DID document has no exchange key".to_string())?;
+        jwk_to_ed25519_pk(&jwk)
+            .map_err(|e| format!("decode resolved Ed25519 exchange key failed: {}", e))
+    }
+
+    // The RTCP port the peer publishes in its handshake DeviceDocument.
+    fn rtcp_port_from_resolved_document(
+        target_document: &ResolvedHandshakeDocument,
+    ) -> Option<u16> {
+        Self::handshake_device(target_document)?
+            .rtcp_port
+            .and_then(|port| u16::try_from(port).ok())
+            .filter(|port| *port != 0)
+    }
+
+    // A published ZoneDocument names its default gateway in `oods` but usually
+    // does not embed that device's document. Resolve it as
+    // `did:<zone method>:<gateway>.<zone id>` under the same requirement; it
+    // must belong to the Zone's owner. The weaker of both trusts applies.
+    async fn complete_zone_gateway_device(
+        &self,
+        zone: &mut ZoneDocument,
+        zone_trust: RtcpIdentityTrust,
+    ) -> Result<RtcpIdentityTrust, String> {
+        let gateway = zone
+            .get_default_zone_gateway()
+            .ok_or_else(|| format!("zone {} has no gateway OOD", zone.id.to_string()))?;
+        if zone.get_device_document(&gateway).is_some() {
+            return Ok(zone_trust);
+        }
+        let device_did = DID::new(&zone.id.method, &format!("{}.{}", gateway, zone.id.id));
+        let (document, device_trust, _) = self
+            .resolve_handshake_document(&device_did)
+            .await
+            .map_err(|e| {
+                format!(
+                    "resolve zone {} gateway device {} failed: {}",
+                    zone.id.to_string(),
+                    device_did.to_string(),
+                    e
+                )
+            })?;
+        let ResolvedHandshakeDocument::Device(device) = Self::decode_resolved_document(&document)?
+        else {
+            return Err(format!(
+                "zone {} gateway {} did not resolve to a DeviceDocument",
+                zone.id.to_string(),
+                device_did.to_string()
+            ));
         };
-        let (_, jwk) =
-            exchange_key.ok_or_else(|| "resolved DID document has no exchange key".to_string())?;
-        let key = jwk_to_ed25519_pk(&jwk)
-            .map_err(|e| format!("decode resolved Ed25519 exchange key failed: {}", e))?;
-        Ok((key, target_document))
+        if device.id != device_did || device.owner != zone.owner {
+            return Err(format!(
+                "gateway device {} (owner {}) does not belong to zone {} (owner {})",
+                device.id.to_string(),
+                device.owner.to_string(),
+                zone.id.to_string(),
+                zone.owner.to_string()
+            ));
+        }
+        zone.devices.insert(gateway, device);
+        Ok(zone_trust.min(device_trust))
     }
 
     fn address_resolution_for_document(
@@ -1216,14 +1303,22 @@ impl RTcpInner {
                     ResolveIpTargetKind::Device,
                     ResolveIpZoneRelation::Unknown,
                 ),
+                rtcp_port: None,
                 binds_logical_name: false,
             });
         }
 
         match self.resolve_handshake_document(remote_did).await {
             Ok((document, trust, resolver_id)) => {
-                let (exchange_key, target_document) =
-                    Self::exchange_key_from_resolved_document(&document)?;
+                let mut target_document = Self::decode_resolved_document(&document)?;
+                let trust = match &mut target_document {
+                    ResolvedHandshakeDocument::Zone(zone) => {
+                        self.complete_zone_gateway_device(zone, trust).await?
+                    }
+                    ResolvedHandshakeDocument::Device(_) => trust,
+                };
+                let exchange_key = Self::exchange_key_from_resolved_document(&target_document)?;
+                let rtcp_port = Self::rtcp_port_from_resolved_document(&target_document);
                 let canonical_dev_did = canonical_dev_did_from_ed25519_pk(&exchange_key);
                 let address_resolution =
                     self.address_resolution_for_document(remote_did, &target_document);
@@ -1243,6 +1338,7 @@ impl RTcpInner {
                     trust,
                     resolver_id,
                     address_resolution,
+                    rtcp_port,
                     binds_logical_name,
                 })
             }
@@ -1679,7 +1775,7 @@ impl RTcpInner {
             peer_addr,
             None,
             aes_key,
-            &self.security.limits,
+            &self.security,
             self.listener.clone(),
             self.runtime_tasks.read().unwrap().clone(),
         );
@@ -2352,14 +2448,13 @@ impl RTcpInner {
         let from_public_key = DecodingKey::from_ed_der(&candidate_key);
 
         let Some(device_doc_jwt) = hello_body.device_doc_jwt.as_ref() else {
-            return Ok(VerifiedSourceDevice {
-                source_device_id: hello_body.from_id.clone(),
+            return self.admit_without_named_identity(
+                hello_body,
                 canonical_dev_did,
-                source_device_info: None,
-                public_key: from_public_key,
-                identity_trust: RtcpIdentityTrust::KeyDid,
-                verified_cache_entry: None,
-            });
+                from_public_key,
+                candidate_document,
+                "peer presented no device_doc_jwt".to_string(),
+            );
         };
 
         // Inbound hello is attacker-triggerable: never fan out provider requests
@@ -2462,6 +2557,16 @@ impl RTcpInner {
             identity_trust = RtcpIdentityTrust::MethodAuthorityCurrent;
         }
         let verified_owner = Self::verified_owner(&device_doc, &report);
+        let zone_relation = match (self.this_owner_did.as_ref(), self.this_zone_did.as_ref()) {
+            (Some(owner), Some(zone))
+                if verified_owner.as_ref() == Some(owner)
+                    && device_doc.zone_did.as_ref() == Some(zone) =>
+            {
+                ResolveIpZoneRelation::SameZone
+            }
+            (Some(_), Some(_)) => ResolveIpZoneRelation::CrossZone,
+            _ => ResolveIpZoneRelation::Unknown,
+        };
         let verified_cache_entry = Some(PendingVerifiedCacheEntry {
             did: device_doc.id.clone(),
             document: candidate,
@@ -2484,6 +2589,7 @@ impl RTcpInner {
             }),
             public_key: from_public_key,
             identity_trust,
+            zone_relation,
             verified_cache_entry,
         })
     }
@@ -2512,6 +2618,7 @@ impl RTcpInner {
                 source_device_info: None,
                 public_key: from_public_key,
                 identity_trust: RtcpIdentityTrust::KeyDid,
+                zone_relation: ResolveIpZoneRelation::Unknown,
                 verified_cache_entry: None,
             });
         }
@@ -3062,6 +3169,7 @@ impl RTcpInner {
         let source_device_info = source_device.source_device_info;
         let source_dev_did = source_device.canonical_dev_did;
         let identity_trust = source_device.identity_trust;
+        let zone_relation = source_device.zone_relation;
         let verified_cache_entry = source_device.verified_cache_entry;
         let authority_candidate_revision = verified_cache_entry
             .as_ref()
@@ -3234,6 +3342,7 @@ impl RTcpInner {
             port: hello_package.body.my_port,
             canonical_device_id: Some(source_dev_did.to_string()),
             identity_trust: Some(identity_trust.to_string()),
+            zone_relation: Some(zone_relation_label(zone_relation).to_string()),
         };
         if let Err(e) = self
             .listener
@@ -3264,14 +3373,14 @@ impl RTcpInner {
             RtcpAddressResolutionContext::without_device_info(
                 remote_stack.did.clone(),
                 ResolveIpTargetKind::Device,
-                ResolveIpZoneRelation::Unknown,
+                zone_relation,
             ),
             false,
             encrypted_stream,
             Some(source_addr),
             None,
             aes_key,
-            &self.security.limits,
+            &self.security,
             self.listener.clone(),
             self.runtime_tasks.read().unwrap().clone(),
         );
@@ -3563,7 +3672,7 @@ impl RTcpInner {
             ));
         }
         let tunnel_stack_id = tunnel_stack_id.unwrap();
-        let remote_stack = parse_rtcp_stack_id_checked(tunnel_stack_id).map_err(|e| {
+        let mut remote_stack = parse_rtcp_stack_id_checked(tunnel_stack_id).map_err(|e| {
             TunnelError::ConnectError(format!(
                 "invalid remote stack id '{}': {}",
                 tunnel_stack_id, e
@@ -3577,6 +3686,11 @@ impl RTcpInner {
         let responder_identity = self
             .resolve_remote_tunnel_identity(&remote_stack.did)
             .await?;
+        if !remote_stack.explicit_port {
+            if let Some(port) = responder_identity.rtcp_port {
+                remote_stack.stack_port = port;
+            }
+        }
         let remote_dev_did = responder_identity.canonical_dev_did.clone();
         let remote_device_id = remote_dev_did.to_string();
         let tunnel_key = self.format_tunnel_key(
@@ -3603,6 +3717,7 @@ impl RTcpInner {
         {
             Ok(Some(tunnel)) => {
                 debug!("Reuse tunnel {}", tunnel_key.as_str());
+                tunnel.mark_use();
                 return Ok(Box::new(tunnel));
             }
             Ok(None) => {}
@@ -3633,6 +3748,7 @@ impl RTcpInner {
                     "Reuse tunnel {} after waiting for concurrent creator",
                     tunnel_key.as_str()
                 );
+                tunnel.mark_use();
                 return Ok(Box::new(tunnel));
             }
             Ok(None) => {}
@@ -3657,12 +3773,26 @@ impl RTcpInner {
                     "rtcp bootstrap URL present but tunnel_manager is not set".to_string(),
                 )
             })?;
-            let bootstrap_url_parsed = Url::parse(bootstrap_url).map_err(|e| {
+            let mut bootstrap_url_parsed = Url::parse(bootstrap_url).map_err(|e| {
                 TunnelError::ReasonError(format!(
                     "invalid bootstrap stream url '{}': {}",
                     bootstrap_url, e
                 ))
             })?;
+            // `rtcp://<relay>/` without a stream target relays to this
+            // tunnel's own remote at its effective RTCP port.
+            if bootstrap_url_parsed.scheme() == "rtcp"
+                && bootstrap_url_parsed
+                    .path()
+                    .trim_start_matches('/')
+                    .is_empty()
+            {
+                bootstrap_url_parsed.set_path(&format!(
+                    "/{}:{}",
+                    remote_stack.did.to_host_name(),
+                    remote_stack.stack_port
+                ));
+            }
 
             let bearing = tunnel_manager
                 .open_stream_by_url(&bootstrap_url_parsed)
@@ -3748,7 +3878,7 @@ impl RTcpInner {
                 None,
                 Some(bootstrap_ctx),
                 aes_key,
-                &self.security.limits,
+                &self.security,
                 self.listener.clone(),
                 self.runtime_tasks.read().unwrap().clone(),
             );
@@ -4533,6 +4663,13 @@ struct RTcpTunnel {
     max_stream_ids_per_tunnel: usize,
     used_stream_ids: Arc<Mutex<HashSet<[u8; 16]>>>,
     created_at: Instant,
+    idle_probe: Duration,
+    pong_timeout: Duration,
+    idle_timeout: Option<Duration>,
+    // Milliseconds since created_at of the last received control package and
+    // of the last stream use; read by the liveness monitor started in run().
+    last_rx_ms: Arc<AtomicU64>,
+    last_use_ms: Arc<AtomicU64>,
 
     // Pong waiters for RTT-aware probes. `ping_rtt` registers a waiter
     // keyed by the ping seq before sending; when the matching Pong
@@ -4558,10 +4695,12 @@ impl RTcpTunnel {
         peer_addr: Option<SocketAddr>,
         bootstrap: Option<RTcpBootstrapCtx>,
         aes_key: [u8; 32],
-        limits: &RtcpLimitsConfig,
+        security: &RtcpSecurityConfig,
         listener: RTcpListenerRef,
         runtime_tasks: std::sync::Weak<RTcpRuntimeTasks>,
     ) -> Self {
+        let limits = &security.limits;
+        let liveness = &security.liveness;
         let (read_stream, write_stream) = tokio::io::split(encrypted_stream);
         //let (read_stream,write_stream) =  tokio::io::split(stream);
         let this_remote_stack = remote_stack.clone();
@@ -4605,7 +4744,67 @@ impl RTcpTunnel {
             max_stream_ids_per_tunnel: limits.max_stream_ids_per_tunnel,
             used_stream_ids: Arc::new(Mutex::new(HashSet::new())),
             created_at: Instant::now(),
+            idle_probe: Duration::from_secs(liveness.idle_probe_secs),
+            pong_timeout: Duration::from_secs(liveness.pong_timeout_secs),
+            idle_timeout: can_direct.then(|| Duration::from_secs(liveness.idle_timeout_secs)),
+            last_rx_ms: Arc::new(AtomicU64::new(0)),
+            last_use_ms: Arc::new(AtomicU64::new(0)),
             pong_waiters: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    fn elapsed_ms(&self) -> u64 {
+        self.created_at.elapsed().as_millis() as u64
+    }
+
+    fn mark_rx(&self) {
+        self.last_rx_ms.store(self.elapsed_ms(), Ordering::Relaxed);
+    }
+
+    fn mark_use(&self) {
+        self.last_use_ms.store(self.elapsed_ms(), Ordering::Relaxed);
+    }
+
+    fn since(&self, mark: &AtomicU64) -> Duration {
+        Duration::from_millis(
+            self.elapsed_ms()
+                .saturating_sub(mark.load(Ordering::Relaxed)),
+        )
+    }
+
+    // Initiator tunnels idle out; every tunnel probes a silent control
+    // channel and closes when the peer no longer answers.
+    async fn run_liveness_monitor(&self) {
+        let tick = (self.idle_probe / 4).max(Duration::from_millis(20));
+        loop {
+            tokio::time::sleep(tick).await;
+            if self.is_closed() {
+                return;
+            }
+            if let Some(idle_timeout) = self.idle_timeout {
+                if self.since(&self.last_use_ms) >= idle_timeout {
+                    info!(
+                        "RTcp tunnel {} instance {} idle for {:?}, closing",
+                        self.remote_stack.did.to_string(),
+                        self.instance_id,
+                        idle_timeout
+                    );
+                    self.close().await;
+                    return;
+                }
+            }
+            if self.since(&self.last_rx_ms) >= self.idle_probe {
+                if let Err(e) = self.ping_rtt_inner(self.pong_timeout).await {
+                    warn!(
+                        "RTcp tunnel {} instance {} liveness probe failed, closing: {}",
+                        self.remote_stack.did.to_string(),
+                        self.instance_id,
+                        e
+                    );
+                    self.close().await;
+                    return;
+                }
+            }
         }
     }
 
@@ -5440,12 +5639,16 @@ impl RTcpTunnel {
         stream: Box<dyn AsyncStream>,
     ) -> Result<(), anyhow::Error> {
         self.ensure_active()?;
+        self.mark_use();
         //TODO: bug?
         let end_point = TunnelEndpoint {
             device_id: self.remote_stack.did.to_string(),
             port: self.remote_stack.stack_port,
             canonical_device_id: Some(self.canonical_remote_did.read().unwrap().clone()),
             identity_trust: Some(self.identity_trust().to_string()),
+            zone_relation: Some(
+                zone_relation_label(self.address_resolution.options.zone_relation()).to_string(),
+            ),
         };
         self.listener
             .on_new_stream(
@@ -5469,11 +5672,15 @@ impl RTcpTunnel {
         stream: Box<dyn AsyncStream>,
     ) -> Result<(), anyhow::Error> {
         self.ensure_active()?;
+        self.mark_use();
         let end_point = TunnelEndpoint {
             device_id: self.remote_stack.did.to_string(),
             port: self.remote_stack.stack_port,
             canonical_device_id: Some(self.canonical_remote_did.read().unwrap().clone()),
             identity_trust: Some(self.identity_trust().to_string()),
+            zone_relation: Some(
+                zone_relation_label(self.address_resolution.options.zone_relation()).to_string(),
+            ),
         };
         self.listener
             .on_new_datagram(
@@ -5616,6 +5823,8 @@ impl RTcpTunnel {
 
     pub async fn run(&self) {
         let source_info = self.remote_stack.did.to_string();
+        let monitor = self.clone();
+        self.spawn_runtime_task(async move { monitor.run_liveness_monitor().await });
         let mut read_stream = self.read_stream.lock().await;
         //let read_stream = self.read_stream.clone();
         loop {
@@ -5650,6 +5859,7 @@ impl RTcpTunnel {
             }
 
             let package = ret.unwrap();
+            self.mark_rx();
             let result = self.process_package(package).await;
             if result.is_err() {
                 error!(
@@ -5743,6 +5953,7 @@ impl RTcpTunnel {
         dest_host: Option<String>,
         connect_timeout: Duration,
     ) -> Result<Box<dyn AsyncStream>, std::io::Error> {
+        self.mark_use();
         let deadline = tokio::time::Instant::now() + connect_timeout;
         let mut backoff_ms = 25u64;
         loop {
@@ -6143,6 +6354,11 @@ impl RTcpTunnel {
     // matching Pong on a per-seq oneshot. Distinct from `Tunnel::ping`,
     // which only flushes a control packet without measuring response.
     pub(crate) async fn ping_rtt(&self, timeout_dur: Duration) -> Result<Duration, std::io::Error> {
+        self.mark_use();
+        self.ping_rtt_inner(timeout_dur).await
+    }
+
+    async fn ping_rtt_inner(&self, timeout_dur: Duration) -> Result<Duration, std::io::Error> {
         if self.is_closed() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::BrokenPipe,
@@ -7831,6 +8047,13 @@ mod tests {
         }
     }
 
+    fn security_with_limits(limits: &RtcpLimitsConfig) -> RtcpSecurityConfig {
+        RtcpSecurityConfig {
+            limits: limits.clone(),
+            ..Default::default()
+        }
+    }
+
     fn test_tunnel_with_limits(
         seed: u8,
         limits: &RtcpLimitsConfig,
@@ -7854,6 +8077,7 @@ mod tests {
         let remote_stack = RTcpTargetStackEP {
             did: DID::new("dev", "rtcp-map-test-peer"),
             stack_port: DEFAULT_RTCP_STACK_PORT,
+            explicit_port: true,
             bootstrap_stream_url: None,
         };
         (
@@ -7871,7 +8095,7 @@ mod tests {
                 None,
                 None,
                 [seed; 32],
-                limits,
+                &security_with_limits(limits),
                 Arc::new(MockRTcpListener::new()),
                 runtime_tasks,
             ),
@@ -7998,6 +8222,7 @@ mod tests {
         let remote_stack = RTcpTargetStackEP {
             did: remote_did,
             stack_port: DEFAULT_RTCP_STACK_PORT,
+            explicit_port: true,
             bootstrap_stream_url: None,
         };
         let tunnel = RTcpTunnel::new(
@@ -8010,7 +8235,7 @@ mod tests {
             Some(SocketAddr::from(([127, 0, 0, 1], DEFAULT_RTCP_STACK_PORT))),
             None,
             [41; 32],
-            &RtcpLimitsConfig::default(),
+            &RtcpSecurityConfig::default(),
             Arc::new(MockRTcpListener::new()),
             std::sync::Weak::new(),
         );
@@ -8122,6 +8347,7 @@ mod tests {
         let remote_stack = RTcpTargetStackEP {
             did: DID::new("dev", "rtcp-quota-peer"),
             stack_port: DEFAULT_RTCP_STACK_PORT,
+            explicit_port: true,
             bootstrap_stream_url: None,
         };
         let mut limits = RtcpLimitsConfig::default();
@@ -8140,7 +8366,7 @@ mod tests {
             None,
             None,
             [92; 32],
-            &limits,
+            &security_with_limits(&limits),
             Arc::new(MockRTcpListener::new()),
             std::sync::Weak::new(),
         );
@@ -8272,6 +8498,7 @@ mod tests {
         let remote_stack = RTcpTargetStackEP {
             did: DID::new("dev", "rtcp-exhaustion-peer"),
             stack_port: DEFAULT_RTCP_STACK_PORT,
+            explicit_port: true,
             bootstrap_stream_url: None,
         };
         let tunnel = RTcpTunnel::new(
@@ -8288,7 +8515,7 @@ mod tests {
             None,
             None,
             [97; 32],
-            &limits,
+            &security_with_limits(&limits),
             Arc::new(MockRTcpListener::new()),
             std::sync::Weak::new(),
         );
@@ -10431,6 +10658,12 @@ mod tests {
         rtcp.set_security_config(security).unwrap();
     }
 
+    fn allow_anonymous(rtcp: &mut RTcp) {
+        let mut security = rtcp.inner.security.clone();
+        security.inbound_admission.anonymous = RtcpAnonymousAdmission::Allow;
+        rtcp.set_security_config(security).unwrap();
+    }
+
     fn allow_named_key_fallback(rtcp: &mut RTcp) {
         let mut security = RtcpSecurityConfig::default();
         security.inbound_admission.anonymous = RtcpAnonymousAdmission::Allow;
@@ -10491,6 +10724,7 @@ mod tests {
             Arc::new(FailingBootstrapTunnelBuilder {
                 create_count: create_count.clone(),
                 open_count: open_count.clone(),
+                ..Default::default()
             }),
         );
 
@@ -10613,6 +10847,7 @@ mod tests {
             Arc::new(MockRTcpListener::new()),
         );
         enable_txt_bootstrap(&mut rtcp_local);
+        allow_anonymous(&mut rtcp_local);
         rtcp_local.start().await.unwrap();
 
         let mut rtcp_a = RTcp::new(
@@ -10622,6 +10857,7 @@ mod tests {
             None,
             Arc::new(MockRTcpListener::new()),
         );
+        allow_anonymous(&mut rtcp_a);
         rtcp_a.start().await.unwrap();
 
         add_rtcp_alias(alias, &dev_a_config.id).await;
@@ -10647,6 +10883,7 @@ mod tests {
             None,
             Arc::new(MockRTcpListener::new()),
         );
+        allow_anonymous(&mut rtcp_b);
         rtcp_b.start().await.unwrap();
         add_rtcp_alias(alias, &dev_b_config.id).await;
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -11236,6 +11473,7 @@ mod tests {
                 Duration::from_millis(150),
             )),
         );
+        allow_anonymous(&mut server);
         server.start().await.unwrap();
 
         let mut client = RTcp::new(
@@ -11245,6 +11483,7 @@ mod tests {
             None,
             Arc::new(MockRTcpListener::new()),
         );
+        allow_anonymous(&mut client);
         client.start().await.unwrap();
 
         let stack_id = format!("{}:{}", server_config.id.to_host_name(), server_port);
@@ -11517,6 +11756,7 @@ mod tests {
     #[derive(Clone)]
     struct FailingBootstrapTunnel {
         open_count: Arc<AtomicUsize>,
+        opened: Arc<std::sync::Mutex<Vec<String>>>,
     }
 
     #[async_trait::async_trait]
@@ -11540,10 +11780,11 @@ mod tests {
 
         async fn open_stream_with_timeout(
             &self,
-            _stream_id: &str,
+            stream_id: &str,
             _connect_timeout: Duration,
         ) -> Result<Box<dyn AsyncStream>, std::io::Error> {
             self.open_count.fetch_add(1, Ordering::SeqCst);
+            self.opened.lock().unwrap().push(stream_id.to_string());
             Err(std::io::Error::new(
                 std::io::ErrorKind::ConnectionRefused,
                 "mock bootstrap stream refused",
@@ -11574,20 +11815,27 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
     struct FailingBootstrapTunnelBuilder {
         create_count: Arc<AtomicUsize>,
         open_count: Arc<AtomicUsize>,
+        opened: Arc<std::sync::Mutex<Vec<String>>>,
     }
 
     #[async_trait::async_trait]
     impl TunnelBuilder for FailingBootstrapTunnelBuilder {
         async fn create_tunnel(
             &self,
-            _tunnel_stack_id: Option<&str>,
+            tunnel_stack_id: Option<&str>,
         ) -> TunnelResult<Box<dyn TunnelBox>> {
             self.create_count.fetch_add(1, Ordering::SeqCst);
+            self.opened
+                .lock()
+                .unwrap()
+                .push(format!("tunnel:{}", tunnel_stack_id.unwrap_or_default()));
             Ok(Box::new(FailingBootstrapTunnel {
                 open_count: self.open_count.clone(),
+                opened: self.opened.clone(),
             }))
         }
     }
@@ -11899,6 +12147,7 @@ mod tests {
             None,
             Arc::new(MockRTcpListener::new()),
         );
+        allow_anonymous(&mut rtcp1);
         rtcp1.start().await.unwrap();
 
         let (signing_key, pkcs8_bytes) = generate_ed25519_key();
@@ -11933,6 +12182,7 @@ mod tests {
             None,
             Arc::new(MockRTcpListener::new()),
         );
+        allow_anonymous(&mut rtcp2);
         rtcp2.start().await.unwrap();
         tokio::time::sleep(Duration::from_secs(1)).await;
 
@@ -11989,6 +12239,7 @@ mod tests {
             None,
             Arc::new(MockRTcpListener::new()),
         );
+        allow_anonymous(&mut rtcp1);
         rtcp1.start().await.unwrap();
 
         let (signing_key, pkcs8_bytes) = generate_ed25519_key();
@@ -12023,6 +12274,7 @@ mod tests {
             None,
             Arc::new(MockRTcpListener::new()),
         );
+        allow_anonymous(&mut rtcp2);
         rtcp2.start().await.unwrap();
         tokio::time::sleep(Duration::from_secs(1)).await;
 
@@ -12493,6 +12745,480 @@ mod tests {
         assert_eq!(
             identity.address_resolution.options.target_kind(),
             ResolveIpTargetKind::Zone
+        );
+    }
+
+    #[test]
+    fn rtcp_port_comes_from_device_or_zone_gateway_document() {
+        let (mut device, _) = test_device_config("port-device");
+        assert_eq!(
+            RTcpInner::rtcp_port_from_resolved_document(&ResolvedHandshakeDocument::Device(
+                device.clone()
+            )),
+            None
+        );
+        device.rtcp_port = Some(2991);
+        assert_eq!(
+            RTcpInner::rtcp_port_from_resolved_document(&ResolvedHandshakeDocument::Device(
+                device.clone()
+            )),
+            Some(2991)
+        );
+
+        let zone_did = DID::new("rtcpzoneport", "zone");
+        let (EncodedDocument::JsonLd(zone_value), _) = test_handshake_zone_document(&zone_did)
+        else {
+            panic!("test zone document is JSON");
+        };
+        let mut zone: ZoneDocument = serde_json::from_value(zone_value).unwrap();
+        assert_eq!(
+            RTcpInner::rtcp_port_from_resolved_document(&ResolvedHandshakeDocument::Zone(
+                zone.clone()
+            )),
+            None
+        );
+        zone.devices.get_mut("gateway").unwrap().rtcp_port = Some(2981);
+        assert_eq!(
+            RTcpInner::rtcp_port_from_resolved_document(&ResolvedHandshakeDocument::Zone(zone)),
+            Some(2981)
+        );
+    }
+
+    // P1-1 + relay completion: without an explicit port the tunnel uses the
+    // peer's published rtcp_port, and `rtcp://<relay>/` relays to exactly that
+    // remote endpoint.
+    #[tokio::test]
+    async fn relay_bootstrap_without_target_uses_remote_rtcp_port() {
+        let _ = init_name_lib_for_test(&HashMap::new()).await;
+        let client = GLOBAL_NAME_CLIENT.get().unwrap();
+        let remote_did = DID::new("rtcprelayport", "gw.zone.example");
+        client.set_method_authority(
+            &remote_did.method,
+            Arc::new(TestAuthorityProvider {
+                docs: Vec::new(),
+                negatives: Vec::new(),
+                owner_bindings: Vec::new(),
+                offline: Arc::new(AtomicBool::new(true)),
+            }),
+        );
+        let (mut device, _) = test_device_config("relay-port-gw");
+        device.id = remote_did.clone();
+        device.rtcp_port = Some(2999);
+        client.lock_document(
+            remote_did.clone(),
+            DidDocType::Device,
+            EncodedDocument::JsonLd(serde_json::to_value(&device).unwrap()),
+            name_client::LockOptions::default(),
+        );
+
+        let builder = Arc::new(FailingBootstrapTunnelBuilder::default());
+        let tunnel_manager = TunnelManager::new();
+        tunnel_manager.register_tunnel_builder("rtcp", builder.clone());
+        let mut inner = RTcpInner::new(
+            DID::new("dev", "relay-port-client"),
+            "127.0.0.1:0".to_string(),
+            None,
+            None,
+            Arc::new(MockRTcpListener::new()),
+        );
+        inner.tunnel_manager = Some(tunnel_manager);
+        let relay = Url::parse("rtcp://relay.zone.example/").unwrap();
+        let remote_host = remote_did.to_host_name();
+
+        for (port, expected) in [(None, 2999), (Some(2981), 2981)] {
+            builder.opened.lock().unwrap().clear();
+            let stack_id = build_rtcp_nested_remote_stack_id(&relay, &remote_host, port);
+            assert!(inner.create_tunnel(Some(&stack_id)).await.is_err());
+            assert_eq!(
+                *builder.opened.lock().unwrap(),
+                vec![
+                    "tunnel:relay.zone.example".to_string(),
+                    format!("/{}:{}", remote_host, expected)
+                ]
+            );
+        }
+    }
+
+    // P1-2: a peer without device_doc_jwt is bound by the anonymous policy.
+    #[tokio::test]
+    async fn bare_dev_peer_obeys_anonymous_policy() {
+        let _ = init_name_lib_for_test(&HashMap::new()).await;
+        let (peer, _) = test_device_config("bare-dev-peer");
+        let hello_body = RTcpHelloBody {
+            from_id: peer.id.to_string(),
+            to_id: "did:dev:bare-dev-server".to_string(),
+            my_port: 19071,
+            tunnel_token: Some("unused".to_string()),
+            device_doc_jwt: None,
+        };
+        let mut inner = RTcpInner::new(
+            DID::new("dev", "bare-dev-server"),
+            "127.0.0.1:0".to_string(),
+            None,
+            None,
+            Arc::new(MockRTcpListener::new()),
+        );
+        let (from_did, key, document) = inner.parse_source_candidate(&hello_body).unwrap();
+        assert!(document.is_none());
+        let err = match inner
+            .resolve_source_device_info(&hello_body, &from_did, key, None)
+            .await
+        {
+            Ok(_) => panic!("a bare did:dev peer must be rejected by the default policy"),
+            Err(err) => err,
+        };
+        assert!(matches!(err, TunnelError::DocumentError(_)), "{err:?}");
+
+        inner.security.inbound_admission.anonymous = RtcpAnonymousAdmission::Allow;
+        let admitted = inner
+            .resolve_source_device_info(&hello_body, &from_did, key, None)
+            .await
+            .expect("anonymous: allow admits the key identity");
+        assert_eq!(admitted.identity_trust, RtcpIdentityTrust::KeyDid);
+        assert_eq!(admitted.source_device_id, peer.id.to_string());
+        assert_eq!(admitted.zone_relation, ResolveIpZoneRelation::Unknown);
+        assert!(admitted.source_device_info.is_none());
+    }
+
+    // P1-3: under known_owner the inbound hello never fetches documents. A
+    // foreign device whose documents are not in the local name-client cache is
+    // rejected (anonymous: reject); once any local resolution has verified the
+    // same device document, the hello is admitted with an owner and a zone
+    // relation computed against this node's own owner/zone anchors.
+    #[tokio::test]
+    async fn known_owner_admits_foreign_device_only_from_local_cache() {
+        let _ = init_name_lib_for_test(&HashMap::new()).await;
+        let (owner_signing_key, owner_pkcs8_bytes) = generate_ed25519_key();
+        let owner_jwk = encode_ed25519_sk_to_pk_jwk(&owner_signing_key);
+        let owner_did = DID::new("rtcpxzone", "bob");
+        let owner_private_key = EncodingKey::from_ed_der(&owner_pkcs8_bytes);
+        let owner_doc = OwnerDocument::new(
+            owner_did.clone(),
+            "bob".to_string(),
+            "bob@rtcpxzone".to_string(),
+            serde_json::from_value(owner_jwk).unwrap(),
+        );
+        let (device_signing_key, _) = generate_ed25519_key();
+        let device_jwk = encode_ed25519_sk_to_pk_jwk(&device_signing_key);
+        let mut device_config =
+            DeviceDocument::new_by_jwk("ood1", serde_json::from_value(device_jwk).unwrap());
+        let device_did = DID::new("rtcpxzone", "ood1.bob");
+        let bob_zone = DID::new("rtcpxzone", "bob.zone");
+        device_config.id = device_did.clone();
+        device_config.owner = owner_did.clone();
+        device_config.zone_did = Some(bob_zone.clone());
+        let device_doc_jwt = match device_config.encode(Some(&owner_private_key)).unwrap() {
+            EncodedDocument::Jwt(jwt) => jwt,
+            _ => panic!("device config encode should return jwt"),
+        };
+        GLOBAL_NAME_CLIENT.get().unwrap().set_method_authority(
+            "rtcpxzone",
+            Arc::new(TestAuthorityProvider {
+                docs: vec![
+                    (
+                        owner_did.clone(),
+                        "owner".to_string(),
+                        owner_doc.encode(Some(&owner_private_key)).unwrap(),
+                    ),
+                    (
+                        device_did.clone(),
+                        "device".to_string(),
+                        EncodedDocument::Jwt(device_doc_jwt.clone()),
+                    ),
+                ],
+                negatives: Vec::new(),
+                owner_bindings: vec![(device_did.clone(), owner_did.clone())],
+                offline: Arc::new(AtomicBool::new(false)),
+            }),
+        );
+
+        let mut inner = RTcpInner::new(
+            DID::new("dev", "alice-gateway"),
+            "127.0.0.1:0".to_string(),
+            None,
+            None,
+            Arc::new(MockRTcpListener::new()),
+        );
+        inner.security.inbound_admission.named_min_relation = RtcpNamedMinRelation::KnownOwner;
+        inner.this_owner_did = Some(DID::new("rtcpxzone", "alice"));
+        inner.this_zone_did = Some(DID::new("rtcpxzone", "alice.zone"));
+        let hello_body = RTcpHelloBody {
+            from_id: device_did.to_string(),
+            to_id: "did:dev:alice-gateway".to_string(),
+            my_port: 19072,
+            tunnel_token: Some("unused".to_string()),
+            device_doc_jwt: Some(device_doc_jwt.clone()),
+        };
+        let (from_did, key, document) = inner.parse_source_candidate(&hello_body).unwrap();
+
+        let cold = inner
+            .resolve_source_device_info(&hello_body, &from_did, key, document.as_ref())
+            .await;
+        assert!(
+            matches!(cold, Err(TunnelError::DocumentError(_))),
+            "an uncached foreign device must not be admitted under anonymous: reject"
+        );
+        inner.security.inbound_admission.anonymous = RtcpAnonymousAdmission::Allow;
+        let cold_key_only = inner
+            .resolve_source_device_info(&hello_body, &from_did, key, document.as_ref())
+            .await
+            .expect("an uncached document is 'unavailable', not a definite rejection");
+        assert_eq!(cold_key_only.identity_trust, RtcpIdentityTrust::KeyDid);
+        assert!(cold_key_only.source_device_info.is_none());
+        inner.security.inbound_admission.anonymous = RtcpAnonymousAdmission::Reject;
+
+        resolve_did(&device_did, Some(DidDocType::Device))
+            .await
+            .expect("a local service resolving the device warms the shared cache");
+
+        let admitted = inner
+            .resolve_source_device_info(&hello_body, &from_did, key, document.as_ref())
+            .await
+            .expect("the cached, owner-verified document admits the foreign device");
+        assert_ne!(admitted.identity_trust, RtcpIdentityTrust::KeyDid);
+        assert_eq!(admitted.source_device_id, device_did.to_string());
+        assert_eq!(admitted.zone_relation, ResolveIpZoneRelation::CrossZone);
+        let info = admitted.source_device_info.unwrap();
+        assert_eq!(info.owner, Some(owner_did.to_string()));
+        assert_eq!(info.zone_did, Some(bob_zone.to_string()));
+
+        // A foreign owner may claim our zone_did; only owner + zone together
+        // make a peer same-Zone.
+        inner.this_zone_did = Some(bob_zone.clone());
+        let claimed = inner
+            .resolve_source_device_info(&hello_body, &from_did, key, document.as_ref())
+            .await
+            .unwrap();
+        assert_eq!(claimed.zone_relation, ResolveIpZoneRelation::CrossZone);
+        inner.this_owner_did = Some(owner_did.clone());
+        let same_zone = inner
+            .resolve_source_device_info(&hello_body, &from_did, key, document.as_ref())
+            .await
+            .unwrap();
+        assert_eq!(same_zone.zone_relation, ResolveIpZoneRelation::SameZone);
+    }
+
+    async fn start_dev_rtcp(name: &str, security: Option<RtcpSecurityConfig>) -> (RTcp, DID, u16) {
+        let (device, pkcs8) = test_device_config(name);
+        cache_test_device(&device).await;
+        let port = unused_tcp_port();
+        let id = device.id.clone();
+        let mut rtcp = RTcp::new(
+            device.id,
+            format!("127.0.0.1:{}", port),
+            Some(pkcs8),
+            None,
+            Arc::new(MockRTcpListener::new()),
+        );
+        if let Some(security) = security {
+            rtcp.set_security_config(security).unwrap();
+        }
+        rtcp.start().await.unwrap();
+        (rtcp, id, port)
+    }
+
+    // V-6: with default admission a peer that presents no device document
+    // cannot open a tunnel.
+    #[tokio::test]
+    async fn bare_dev_client_is_rejected_by_default_admission() {
+        let _ = init_name_lib_for_test(&HashMap::new()).await;
+        let (server, server_id, server_port) = start_dev_rtcp("v6-server", None).await;
+        let (client, _, _) = start_dev_rtcp("v6-client", None).await;
+        let target = format!("{}:{}", server_id.to_host_name(), server_port);
+        assert!(client.create_tunnel(Some(&target)).await.is_err());
+        assert_eq!(server.inner.tunnel_map.primary_len().await, 0);
+    }
+
+    async fn wait_primary_len(rtcp: &RTcp, expected: usize, within: Duration) -> bool {
+        tokio::time::timeout(within, async {
+            while rtcp.inner.tunnel_map.primary_len().await != expected {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .is_ok()
+    }
+
+    // P1-5: an initiator tunnel without stream use or explicit pings is closed
+    // after idle_timeout and removed on both ends; keep-tunnel style probes
+    // keep it.
+    #[tokio::test]
+    async fn initiator_tunnel_idles_out_unless_probed() {
+        let _ = init_name_lib_for_test(&HashMap::new()).await;
+        let mut server_security = RtcpSecurityConfig::default();
+        server_security.inbound_admission.anonymous = RtcpAnonymousAdmission::Allow;
+        let (server, server_id, server_port) =
+            start_dev_rtcp("idle-server", Some(server_security)).await;
+        let mut client_security = RtcpSecurityConfig::default();
+        client_security.liveness.idle_probe_secs = 1;
+        client_security.liveness.pong_timeout_secs = 1;
+        client_security.liveness.idle_timeout_secs = 1;
+        let (client, _, _) = start_dev_rtcp("idle-client", Some(client_security)).await;
+        let target = format!("{}:{}", server_id.to_host_name(), server_port);
+
+        client.create_tunnel(Some(&target)).await.unwrap();
+        assert!(wait_primary_len(&server, 1, Duration::from_secs(2)).await);
+        assert_eq!(client.inner.tunnel_map.primary_len().await, 1);
+        assert!(
+            wait_primary_len(&client, 0, Duration::from_secs(4)).await,
+            "idle initiator tunnel must close"
+        );
+        assert!(
+            wait_primary_len(&server, 0, Duration::from_secs(4)).await,
+            "responder must drop the tunnel once the initiator closes it"
+        );
+
+        client.create_tunnel(Some(&target)).await.unwrap();
+        let url = Url::parse(&format!("rtcp://{}/", target)).unwrap();
+        for _ in 0..8 {
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            let status = client
+                .probe_url(&url, &TunnelProbeOptions::default())
+                .await
+                .unwrap();
+            assert_eq!(status.source, TunnelUrlStatusSource::ExistingTunnel);
+        }
+        assert_eq!(client.inner.tunnel_map.primary_len().await, 1);
+    }
+
+    // P1-5: a tunnel whose peer stops answering is closed by the passive probe.
+    #[tokio::test]
+    async fn silent_peer_is_closed_by_liveness_probe() {
+        let mut security = RtcpSecurityConfig::default();
+        security.liveness.idle_probe_secs = 1;
+        security.liveness.pong_timeout_secs = 1;
+        let (bearing, _silent_peer) = tokio::io::duplex(64 * 1024);
+        let remote_stack = RTcpTargetStackEP {
+            did: DID::new("dev", "rtcp-silent-peer"),
+            stack_port: DEFAULT_RTCP_STACK_PORT,
+            explicit_port: true,
+            bootstrap_stream_url: None,
+        };
+        let tunnel = RTcpTunnel::new(
+            RTcpStreamBuildHelper::new(),
+            DID::new("dev", "rtcp-silent-local"),
+            &remote_stack,
+            RtcpAddressResolutionContext::without_device_info(
+                remote_stack.did.clone(),
+                ResolveIpTargetKind::Unknown,
+                ResolveIpZoneRelation::Unknown,
+            ),
+            false,
+            EncryptedStream::new_control(
+                Box::new(bearing) as RTcpBearingStream,
+                &[71; 32],
+                &[72; 16],
+                EncryptionRole::Responder,
+            ),
+            None,
+            None,
+            [71; 32],
+            &security,
+            Arc::new(MockRTcpListener::new()),
+            std::sync::Weak::new(),
+        );
+        tokio::time::timeout(Duration::from_secs(5), tunnel.run())
+            .await
+            .expect("an unanswered liveness probe must end the tunnel");
+        assert!(tunnel.is_closed());
+    }
+
+    // A did:web Zone (e.g. charlie.me) publishes its ZoneDocument without the
+    // gateway's DeviceDocument; `rtcp://<zone>/` must dial and authenticate
+    // the default gateway device `did:web:ood1.<zone>` at its rtcp_port.
+    #[tokio::test]
+    async fn zone_target_resolves_the_published_gateway_device() {
+        let _ = init_name_lib_for_test(&HashMap::new()).await;
+        let zone_did = DID::new("rtcpzonegw", "charlie.me");
+        let owner_did = DID::new("rtcpzonegw", "charlie");
+        let foreign_zone_did = DID::new("rtcpzonegw", "mallory.me");
+        let (owner_key, _) = test_device_config("zone-gw-owner");
+        let (mut gateway, _) = test_device_config("zone-gw-ood1");
+        let gateway_dev_did = gateway.id.clone();
+        gateway.id = DID::new("rtcpzonegw", "ood1.charlie.me");
+        gateway.owner = owner_did.clone();
+        gateway.rtcp_port = Some(2981);
+        let mut foreign_gateway = gateway.clone();
+        foreign_gateway.id = DID::new("rtcpzonegw", "ood1.mallory.me");
+        foreign_gateway.owner = DID::new("rtcpzonegw", "someone-else");
+        let zone_doc = |did: &DID| {
+            let mut zone = ZoneDocument::new(
+                did.clone(),
+                owner_did.clone(),
+                owner_key.get_default_key().unwrap(),
+            );
+            zone.oods = vec!["ood1".parse().unwrap()];
+            assert!(zone.devices.is_empty());
+            EncodedDocument::JsonLd(serde_json::to_value(zone).unwrap())
+        };
+        let device_doc = |device: &DeviceDocument| {
+            EncodedDocument::JsonLd(serde_json::to_value(device).unwrap())
+        };
+        GLOBAL_NAME_CLIENT.get().unwrap().set_method_authority(
+            "rtcpzonegw",
+            Arc::new(TestAuthorityProvider {
+                docs: vec![
+                    (zone_did.clone(), "zone".to_string(), zone_doc(&zone_did)),
+                    (
+                        gateway.id.clone(),
+                        "device".to_string(),
+                        device_doc(&gateway),
+                    ),
+                    (
+                        foreign_zone_did.clone(),
+                        "zone".to_string(),
+                        zone_doc(&foreign_zone_did),
+                    ),
+                    (
+                        foreign_gateway.id.clone(),
+                        "device".to_string(),
+                        device_doc(&foreign_gateway),
+                    ),
+                ],
+                negatives: vec![
+                    (
+                        zone_did.clone(),
+                        "device".to_string(),
+                        DocumentStatus::Missing,
+                    ),
+                    (
+                        foreign_zone_did.clone(),
+                        "device".to_string(),
+                        DocumentStatus::Missing,
+                    ),
+                ],
+                owner_bindings: Vec::new(),
+                offline: Arc::new(AtomicBool::new(false)),
+            }),
+        );
+        let inner = RTcpInner::new(
+            DID::new("dev", "zone-gw-client"),
+            "127.0.0.1:0".to_string(),
+            None,
+            None,
+            Arc::new(MockRTcpListener::new()),
+        );
+
+        let identity = inner
+            .resolve_handshake_identity(&zone_did)
+            .await
+            .expect("a zone target must resolve to its published gateway device");
+        assert_eq!(identity.semantic_did, zone_did);
+        assert_eq!(identity.canonical_dev_did, gateway_dev_did);
+        assert_eq!(identity.rtcp_port, Some(2981));
+        assert_eq!(identity.trust, RtcpIdentityTrust::MethodAuthorityCurrent);
+        assert!(!identity.binds_logical_name);
+        assert_eq!(
+            identity.address_resolution.options.target_kind(),
+            ResolveIpTargetKind::Zone
+        );
+
+        assert!(
+            inner
+                .resolve_handshake_identity(&foreign_zone_did)
+                .await
+                .is_err(),
+            "a gateway device of another owner must not stand in for the zone"
         );
     }
 
@@ -13085,6 +13811,7 @@ mod tests {
             None,
             Arc::new(MockRTcpListener::new()),
         );
+        allow_anonymous(&mut rtcp1);
         rtcp1.start().await.unwrap();
 
         let (signing_key, pkcs8_bytes) = generate_ed25519_key();
@@ -13119,6 +13846,7 @@ mod tests {
             None,
             Arc::new(MockRTcpListener::new()),
         );
+        allow_anonymous(&mut rtcp2);
         rtcp2.start().await.unwrap();
         tokio::time::sleep(Duration::from_secs(1)).await;
 
@@ -13175,13 +13903,19 @@ mod tests {
 
     fn configure_nested_stress_limits(rtcp: &mut RTcp) {
         let mut security = RtcpSecurityConfig::default();
+        security.inbound_admission.anonymous = RtcpAnonymousAdmission::Allow;
         security.limits.max_pending_stream_builds_per_tunnel = 2048;
         security.limits.stream_requests_per_second = 100_000;
         security.limits.stream_request_burst = 4096;
         rtcp.set_security_config(security).unwrap();
     }
 
-    async fn setup_nested_rtcp_relay_fixture(test_name: &str) -> NestedRtcpRelayFixture {
+    // `relay_names_target: false` leaves the relay hop as `rtcp://C/`, which
+    // create_tunnel completes to the outer remote B.
+    async fn setup_nested_rtcp_relay_fixture(
+        test_name: &str,
+        relay_names_target: bool,
+    ) -> NestedRtcpRelayFixture {
         let _ = init_name_lib_for_test(&HashMap::new()).await;
         let (port_a, port_b, port_c) = {
             let listener_a = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
@@ -13321,15 +14055,13 @@ mod tests {
 
         tokio::time::sleep(Duration::from_secs(1)).await;
 
+        let relay_target = if relay_names_target {
+            format!("{}:{}", id_b.to_host_name(), port_b)
+        } else {
+            String::new()
+        };
         let bootstrap_url = Url::parse(
-            format!(
-                "rtcp://{}:{}/{}:{}",
-                id_c.to_host_name(),
-                port_c,
-                id_b.to_host_name(),
-                port_b
-            )
-            .as_str(),
+            format!("rtcp://{}:{}/{}", id_c.to_host_name(), port_c, relay_target).as_str(),
         )
         .unwrap();
         let nested_remote_stack_id =
@@ -13501,7 +14233,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_rtcp_nested_remote_rebinds_transport_via_rtcp_relay() {
-        let fixture = setup_nested_rtcp_relay_fixture("nested-flow").await;
+        let fixture = setup_nested_rtcp_relay_fixture("nested-flow", false).await;
 
         let nested_status = tokio::time::timeout(
             Duration::from_secs(10),
@@ -13582,7 +14314,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
     async fn test_rtcp_nested_remote_concurrent_streams_via_rtcp_relay() {
-        let fixture = setup_nested_rtcp_relay_fixture("nested-concurrent").await;
+        let fixture = setup_nested_rtcp_relay_fixture("nested-concurrent", true).await;
         let concurrent_stream_count = 1000usize;
 
         let before_concurrent_streams = fixture.bootstrap_create_count.load(Ordering::SeqCst);
@@ -13658,6 +14390,7 @@ mod tests {
             None,
             Arc::new(MockRTcpListener::new()),
         );
+        allow_anonymous(&mut rtcp1);
         rtcp1.start().await.unwrap();
 
         let (signing_key, pkcs8_bytes) = generate_ed25519_key();
@@ -13692,6 +14425,7 @@ mod tests {
             None,
             Arc::new(MockRTcpListener::new()),
         );
+        allow_anonymous(&mut rtcp2);
         rtcp2.start().await.unwrap();
         tokio::time::sleep(Duration::from_secs(1)).await;
 

@@ -266,6 +266,14 @@ impl RtcpConnectionHandler {
             .await
             .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
         }
+        if let Some(zone_relation) = endpoint.zone_relation.as_ref() {
+            map.insert(
+                "source_zone_relation",
+                CollectionValue::String(zone_relation.clone()),
+            )
+            .await
+            .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
+        }
         if let Some(source_device_info) = source_device_info {
             if let Some(device_name) = source_device_info.name {
                 map.insert("source_device_name", CollectionValue::String(device_name))
@@ -368,6 +376,14 @@ impl RtcpConnectionHandler {
             .await
             .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
         }
+        if let Some(zone_relation) = endpoint.zone_relation.as_ref() {
+            map.insert(
+                "source_zone_relation",
+                CollectionValue::String(zone_relation.clone()),
+            )
+            .await
+            .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
+        }
         map.insert(
             "source_addr",
             CollectionValue::String(request_source_addr_str.clone()),
@@ -451,6 +467,10 @@ impl RtcpConnectionHandler {
         }
         let stream_info = StreamInfo::with_addrs(conn_src_addr, real_src_addr)
             .with_dst_addr(Some(local_addr.to_string()))
+            .with_source_device(
+                Some(endpoint.device_id.clone()),
+                endpoint.identity_trust.clone(),
+            )
             .with_device_info(
                 device_info
                     .as_ref()
@@ -676,6 +696,14 @@ impl RtcpConnectionHandler {
             map.insert(
                 "source_identity_trust",
                 CollectionValue::String(identity_trust.clone()),
+            )
+            .await
+            .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
+        }
+        if let Some(zone_relation) = endpoint.zone_relation.as_ref() {
+            map.insert(
+                "source_zone_relation",
+                CollectionValue::String(zone_relation.clone()),
             )
             .await
             .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
@@ -2563,6 +2591,12 @@ mod tests {
     use std::time::{Duration, Instant};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+    fn anonymous_allowed_security() -> crate::RtcpSecurityConfig {
+        let mut security = crate::RtcpSecurityConfig::default();
+        security.inbound_admission.anonymous = crate::RtcpAnonymousAdmission::Allow;
+        security
+    }
+
     #[test]
     fn rtcp_security_config_defaults_fail_closed_and_rejects_removed_keys() {
         let config: RtcpStackConfig = serde_yaml_ng::from_str(
@@ -2711,6 +2745,7 @@ inbound_admission:
             .private_key(pkcs8_bytes)
             .hook_point(vec![])
             .stack_context(context)
+            .security(anonymous_allowed_security())
             .build()
             .await
             .unwrap()
@@ -2964,6 +2999,7 @@ inbound_admission:
                     port: 2981,
                     canonical_device_id: None,
                     identity_trust: None,
+                    zone_relation: None,
                 },
                 "127.0.0.1:41000".parse().unwrap(),
                 None,
@@ -2978,6 +3014,7 @@ inbound_admission:
                     port: 2981,
                     canonical_device_id: None,
                     identity_trust: None,
+                    zone_relation: None,
                 },
                 "127.0.0.1:41001".parse().unwrap(),
                 None,
@@ -3030,6 +3067,7 @@ inbound_admission:
                     port: 2981,
                     canonical_device_id: None,
                     identity_trust: None,
+                    zone_relation: None,
                 },
                 "127.0.0.1:41002".parse().unwrap(),
                 None,
@@ -3046,6 +3084,7 @@ inbound_admission:
                     port: 2981,
                     canonical_device_id: None,
                     identity_trust: None,
+                    zone_relation: None,
                 },
                 "10.9.9.9:41003".parse().unwrap(),
                 None,
@@ -3060,6 +3099,7 @@ inbound_admission:
                     port: 2981,
                     canonical_device_id: None,
                     identity_trust: None,
+                    zone_relation: None,
                 },
                 "127.0.0.1:41004".parse().unwrap(),
                 None,
@@ -3129,6 +3169,7 @@ inbound_admission:
                         port: 2981,
                         canonical_device_id: Some("did:dev:peer-key".to_string()),
                         identity_trust: Some("trusted_zone_snapshot".to_string()),
+                        zone_relation: None,
                     },
                     crate::MutComposedSpeedStat::new(),
                     "127.0.0.1:52000".parse().unwrap(),
@@ -3219,6 +3260,7 @@ inbound_admission:
                                 port: 2981,
                                 canonical_device_id: None,
                                 identity_trust: None,
+                                zone_relation: None,
                             },
                             crate::MutComposedSpeedStat::new(),
                             "127.0.0.1:52001".parse().unwrap(),
@@ -3253,6 +3295,188 @@ inbound_admission:
         let (mut conn, _) = tokio::time::timeout(Duration::from_secs(5), other.accept())
             .await
             .expect("other ports keep the generic forward")
+            .unwrap();
+        conn.read_exact(&mut buf).await.unwrap();
+        drop((conn, far));
+        let _ = handle.await;
+    }
+
+    /// Replies with the RTCP identity the HTTP layer received in StreamInfo.
+    struct StreamIdentityHttpServer;
+
+    #[async_trait::async_trait]
+    impl crate::HttpServer for StreamIdentityHttpServer {
+        async fn serve_request(
+            &self,
+            _req: http::Request<
+                http_body_util::combinators::BoxBody<hyper::body::Bytes, crate::ServerError>,
+            >,
+            info: StreamInfo,
+        ) -> ServerResult<
+            http::Response<
+                http_body_util::combinators::BoxBody<hyper::body::Bytes, crate::ServerError>,
+            >,
+        > {
+            use http_body_util::BodyExt;
+            let body = format!(
+                "{}|{}",
+                info.source_device_did.unwrap_or_default(),
+                info.source_identity_trust.unwrap_or_default()
+            );
+            Ok(http::Response::builder()
+                .header("Content-Length", body.len())
+                .body(
+                    http_body_util::Full::new(hyper::body::Bytes::from(body))
+                        .map_err(|e| match e {})
+                        .boxed(),
+                )
+                .unwrap())
+        }
+
+        fn id(&self) -> String {
+            "rtcp-identity".to_string()
+        }
+
+        fn http_version(&self) -> http::Version {
+            http::Version::HTTP_11
+        }
+
+        fn http3_port(&self) -> Option<u16> {
+            None
+        }
+    }
+
+    /// The external-peer guard of BuckyOS `boot_gateway.yaml`: peers outside
+    /// the local Zone reach only the HTTP gateway (served in-process with the
+    /// RTCP identity in StreamInfo) and raw TLS; same-Zone peers keep the
+    /// generic forward.
+    #[tokio::test]
+    async fn test_external_peer_guard_block() {
+        let tls = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let tls_port = tls.local_addr().unwrap().port();
+        let other = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let other_port = other.local_addr().unwrap().port();
+        let chains = format!(
+            r#"
+- id: main
+  priority: 1
+  blocks:
+    - id: external
+      priority: 1
+      block: |
+        if !eq ${{REQ.source_zone_relation}} "same_zone" then
+          eq ${{REQ.dest_port}} "80" && return --from chain "server rtcp-identity";
+          eq ${{REQ.dest_port}} "{tls_port}" && return --from chain "forward tcp:///127.0.0.1:{tls_port}";
+          reject;
+        end
+    - id: default
+      priority: 2
+      block: |
+        return "forward ${{REQ.protocol}}:///${{REQ.dest_host}}:${{REQ.dest_port}}";
+"#
+        );
+        let chains: ProcessChainConfigs = serde_yaml_ng::from_str(&chains).unwrap();
+        let server_manager = Arc::new(ServerManager::new());
+        server_manager
+            .add_server(Server::Http(Arc::new(StreamIdentityHttpServer)))
+            .unwrap();
+        let handler = Arc::new(
+            RtcpConnectionHandler::create(
+                chains,
+                None,
+                build_stack_context(
+                    server_manager.clone(),
+                    TunnelManager::new(),
+                    Arc::new(DefaultLimiterManager::new()),
+                    StatManager::new(),
+                    Some(Arc::new(GlobalProcessChains::new())),
+                ),
+                None,
+                None,
+                stream_idle_timeout_from_secs(None),
+                connect_timeout_from_secs(None),
+            )
+            .await
+            .unwrap(),
+        );
+        let run = |relation: &str, port: u16, payload: &'static [u8]| {
+            let handler = handler.clone();
+            let relation = relation.to_string();
+            async move {
+                let (near, mut far) = tokio::io::duplex(4096);
+                far.write_all(payload).await.unwrap();
+                let handle = tokio::spawn(async move {
+                    handler
+                        .handle_stream(
+                            Box::new(near),
+                            "tcp".to_string(),
+                            Some("127.0.0.1".to_string()),
+                            port,
+                            "".to_string(),
+                            TunnelEndpoint {
+                                device_id: "did:web:ood1.bob.example".to_string(),
+                                port: 2980,
+                                canonical_device_id: Some("did:dev:bob-key".to_string()),
+                                identity_trust: Some("method_authority_current".to_string()),
+                                zone_relation: Some(relation),
+                            },
+                            crate::MutComposedSpeedStat::new(),
+                            "198.51.100.20:52001".parse().unwrap(),
+                            "127.0.0.1:2980".parse().unwrap(),
+                        )
+                        .await
+                });
+                (far, handle)
+            }
+        };
+
+        let (mut far, handle) = run(
+            "cross_zone",
+            80,
+            b"GET /kapi/verify-hub HTTP/1.1\r\nHost: alice.example\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        let mut response = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), far.read_to_end(&mut response))
+            .await
+            .expect("port 80 from another Zone must be served by the HTTP gateway")
+            .unwrap();
+        let response = String::from_utf8_lossy(&response);
+        let _ = handle.await;
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert!(
+            response.ends_with("did:web:ood1.bob.example|method_authority_current"),
+            "the HTTP gateway must receive the RTCP identity: {response}"
+        );
+
+        let (far, handle) = run("cross_zone", tls_port, b"hello").await;
+        let (mut conn, _) = tokio::time::timeout(Duration::from_secs(5), tls.accept())
+            .await
+            .expect("raw TLS from another Zone reaches the local TLS entry")
+            .unwrap();
+        let mut buf = [0u8; 5];
+        conn.read_exact(&mut buf).await.unwrap();
+        drop((conn, far));
+        let _ = handle.await;
+
+        for relation in ["cross_zone", "unknown"] {
+            let (far, handle) = run(relation, other_port, b"hello").await;
+            let _ = tokio::time::timeout(Duration::from_secs(5), handle)
+                .await
+                .unwrap();
+            assert!(
+                tokio::time::timeout(Duration::from_millis(300), other.accept())
+                    .await
+                    .is_err(),
+                "{relation} peers must not reach other local ports"
+            );
+            drop(far);
+        }
+
+        let (far, handle) = run("same_zone", other_port, b"hello").await;
+        let (mut conn, _) = tokio::time::timeout(Duration::from_secs(5), other.accept())
+            .await
+            .expect("same-Zone peers keep the generic forward")
             .unwrap();
         conn.read_exact(&mut buf).await.unwrap();
         drop((conn, far));
@@ -3317,6 +3541,7 @@ inbound_admission:
             .hook_point(chains)
             .connection_manager(connection_manager.clone())
             .stack_context(stack_context)
+            .security(anonymous_allowed_security())
             .build()
             .await;
         assert!(result.is_ok());
@@ -3379,6 +3604,7 @@ inbound_admission:
             .hook_point(chains)
             .connection_manager(connection_manager.clone())
             .stack_context(stack_context)
+            .security(anonymous_allowed_security())
             .build()
             .await;
         assert!(result.is_ok());
@@ -3464,6 +3690,7 @@ inbound_admission:
             .hook_point(chains)
             .connection_manager(connection_manager.clone())
             .stack_context(stack_context)
+            .security(anonymous_allowed_security())
             .build()
             .await;
         // assert!(result.is_ok());
@@ -3524,6 +3751,7 @@ inbound_admission:
             .hook_point(chains)
             .connection_manager(connection_manager.clone())
             .stack_context(stack_context)
+            .security(anonymous_allowed_security())
             .build()
             .await;
         assert!(result.is_ok());
@@ -3609,6 +3837,7 @@ inbound_admission:
             .hook_point(chains)
             .connection_manager(connection_manager.clone())
             .stack_context(stack_context)
+            .security(anonymous_allowed_security())
             .build()
             .await;
         assert!(result.is_ok());
@@ -3669,6 +3898,7 @@ inbound_admission:
             .hook_point(chains)
             .connection_manager(connection_manager.clone())
             .stack_context(stack_context)
+            .security(anonymous_allowed_security())
             .build()
             .await;
         assert!(result.is_ok());
@@ -3767,6 +3997,7 @@ inbound_admission:
             .hook_point(chains)
             .connection_manager(connection_manager.clone())
             .stack_context(stack_context)
+            .security(anonymous_allowed_security())
             .build()
             .await;
         assert!(result.is_ok());
@@ -3827,6 +4058,7 @@ inbound_admission:
             .hook_point(chains)
             .connection_manager(connection_manager.clone())
             .stack_context(stack_context)
+            .security(anonymous_allowed_security())
             .build()
             .await;
         assert!(result.is_ok());
@@ -3945,6 +4177,7 @@ inbound_admission:
             .hook_point(chains)
             .connection_manager(connection_manager.clone())
             .stack_context(stack_context)
+            .security(anonymous_allowed_security())
             .build()
             .await;
         assert!(result.is_ok());
@@ -4011,6 +4244,7 @@ inbound_admission:
             .hook_point(chains)
             .connection_manager(connection_manager.clone())
             .stack_context(stack_context)
+            .security(anonymous_allowed_security())
             .build()
             .await;
         assert!(result.is_ok());
@@ -4099,6 +4333,7 @@ inbound_admission:
             .connection_manager(cm.clone())
             .stack_context(ctx1)
             .io_dump(io_dump)
+            .security(anonymous_allowed_security())
             .build()
             .await
             .unwrap();
@@ -4140,6 +4375,7 @@ inbound_admission:
             .hook_point(chains)
             .connection_manager(cm)
             .stack_context(ctx2)
+            .security(anonymous_allowed_security())
             .build()
             .await
             .unwrap();
@@ -4226,6 +4462,7 @@ inbound_admission:
             .connection_manager(cm.clone())
             .stack_context(ctx1)
             .io_dump(io_dump)
+            .security(anonymous_allowed_security())
             .build()
             .await
             .unwrap();
@@ -4267,6 +4504,7 @@ inbound_admission:
             .hook_point(chains)
             .connection_manager(cm)
             .stack_context(ctx2)
+            .security(anonymous_allowed_security())
             .build()
             .await
             .unwrap();
@@ -4392,6 +4630,7 @@ inbound_admission:
             .connection_manager(cm.clone())
             .stack_context(ctx1)
             .io_dump(io_dump)
+            .security(anonymous_allowed_security())
             .build()
             .await
             .unwrap();
@@ -4433,6 +4672,7 @@ inbound_admission:
             .hook_point(chains)
             .connection_manager(cm)
             .stack_context(ctx2)
+            .security(anonymous_allowed_security())
             .build()
             .await
             .unwrap();
@@ -4531,6 +4771,7 @@ inbound_admission:
             .connection_manager(cm.clone())
             .stack_context(ctx1)
             .io_dump(io_dump)
+            .security(anonymous_allowed_security())
             .build()
             .await
             .unwrap();
@@ -4572,6 +4813,7 @@ inbound_admission:
             .hook_point(chains)
             .connection_manager(cm)
             .stack_context(ctx2)
+            .security(anonymous_allowed_security())
             .build()
             .await
             .unwrap();
@@ -4653,6 +4895,7 @@ inbound_admission:
             .hook_point(chains)
             .connection_manager(connection_manager.clone())
             .stack_context(stack_context)
+            .security(anonymous_allowed_security())
             .build()
             .await;
         assert!(result.is_ok());
@@ -4714,6 +4957,7 @@ inbound_admission:
             .hook_point(chains)
             .connection_manager(connection_manager.clone())
             .stack_context(stack_context)
+            .security(anonymous_allowed_security())
             .build()
             .await;
         assert!(result.is_ok());
@@ -4797,6 +5041,7 @@ inbound_admission:
             .hook_point(chains)
             .connection_manager(connection_manager.clone())
             .stack_context(stack_context)
+            .security(anonymous_allowed_security())
             .build()
             .await;
         assert!(result.is_ok());
@@ -4858,6 +5103,7 @@ inbound_admission:
             .hook_point(chains)
             .connection_manager(connection_manager.clone())
             .stack_context(stack_context)
+            .security(anonymous_allowed_security())
             .build()
             .await;
         assert!(result.is_ok());
@@ -4941,6 +5187,7 @@ inbound_admission:
             .hook_point(chains)
             .connection_manager(connection_manager.clone())
             .stack_context(stack_context)
+            .security(anonymous_allowed_security())
             .build()
             .await;
         assert!(result.is_ok());
@@ -5002,6 +5249,7 @@ inbound_admission:
             .hook_point(chains)
             .connection_manager(connection_manager.clone())
             .stack_context(stack_context)
+            .security(anonymous_allowed_security())
             .build()
             .await;
         assert!(result.is_ok());
@@ -5099,6 +5347,7 @@ inbound_admission:
             .hook_point(chains)
             .connection_manager(connection_manager.clone())
             .stack_context(stack_context)
+            .security(anonymous_allowed_security())
             .build()
             .await;
         assert!(result.is_ok());
@@ -5160,6 +5409,7 @@ inbound_admission:
             .hook_point(chains)
             .connection_manager(connection_manager.clone())
             .stack_context(stack_context)
+            .security(anonymous_allowed_security())
             .build()
             .await;
         assert!(result.is_ok());
@@ -5252,6 +5502,7 @@ inbound_admission:
             .hook_point(chains)
             .connection_manager(connection_manager.clone())
             .stack_context(stack_context)
+            .security(anonymous_allowed_security())
             .build()
             .await;
         assert!(result.is_ok());
@@ -5318,6 +5569,7 @@ inbound_admission:
             .hook_point(chains)
             .connection_manager(connection_manager.clone())
             .stack_context(stack_context)
+            .security(anonymous_allowed_security())
             .build()
             .await;
         assert!(result.is_ok());
@@ -5413,6 +5665,7 @@ inbound_admission:
             .hook_point(chains)
             .connection_manager(connection_manager.clone())
             .stack_context(stack_context)
+            .security(anonymous_allowed_security())
             .build()
             .await;
         assert!(result.is_ok());
@@ -5479,6 +5732,7 @@ inbound_admission:
             .hook_point(chains)
             .connection_manager(connection_manager.clone())
             .stack_context(stack_context)
+            .security(anonymous_allowed_security())
             .build()
             .await;
         assert!(result.is_ok());
@@ -5584,6 +5838,7 @@ inbound_admission:
             .hook_point(chains)
             .connection_manager(connection_manager.clone())
             .stack_context(stack_context)
+            .security(anonymous_allowed_security())
             .build()
             .await;
         assert!(result.is_ok());
@@ -5650,6 +5905,7 @@ inbound_admission:
             .hook_point(chains)
             .connection_manager(connection_manager.clone())
             .stack_context(stack_context)
+            .security(anonymous_allowed_security())
             .build()
             .await;
         assert!(result.is_ok());
@@ -5755,6 +6011,7 @@ inbound_admission:
             .hook_point(chains)
             .connection_manager(connection_manager.clone())
             .stack_context(stack_context)
+            .security(anonymous_allowed_security())
             .build()
             .await;
         assert!(result.is_ok());
@@ -5821,6 +6078,7 @@ inbound_admission:
             .hook_point(chains)
             .connection_manager(connection_manager.clone())
             .stack_context(stack_context)
+            .security(anonymous_allowed_security())
             .build()
             .await;
         assert!(result.is_ok());
@@ -5935,6 +6193,7 @@ inbound_admission:
             .hook_point(chains)
             .connection_manager(connection_manager.clone())
             .stack_context(stack_context)
+            .security(anonymous_allowed_security())
             .build()
             .await;
         assert!(result.is_ok());
@@ -5999,6 +6258,7 @@ inbound_admission:
             .hook_point(chains)
             .connection_manager(connection_manager.clone())
             .stack_context(stack_context)
+            .security(anonymous_allowed_security())
             .build()
             .await;
         assert!(result.is_ok());
@@ -6085,6 +6345,7 @@ inbound_admission:
             .hook_point(chains)
             .connection_manager(connection_manager.clone())
             .stack_context(stack_context)
+            .security(anonymous_allowed_security())
             .build()
             .await;
         assert!(result.is_ok());
@@ -6151,6 +6412,7 @@ inbound_admission:
             .hook_point(chains)
             .connection_manager(connection_manager.clone())
             .stack_context(stack_context)
+            .security(anonymous_allowed_security())
             .build()
             .await;
         assert!(result.is_ok());
@@ -6258,6 +6520,7 @@ inbound_admission:
             .hook_point(chains)
             .connection_manager(connection_manager.clone())
             .stack_context(stack_context)
+            .security(anonymous_allowed_security())
             .build()
             .await;
         assert!(result.is_ok());
@@ -6324,6 +6587,7 @@ inbound_admission:
             .hook_point(chains)
             .connection_manager(connection_manager.clone())
             .stack_context(stack_context)
+            .security(anonymous_allowed_security())
             .build()
             .await;
         assert!(result.is_ok());
@@ -6428,6 +6692,7 @@ inbound_admission:
             .hook_point(chains)
             .connection_manager(connection_manager.clone())
             .stack_context(stack_context)
+            .security(anonymous_allowed_security())
             .build()
             .await;
         assert!(result.is_ok());
@@ -6494,6 +6759,7 @@ inbound_admission:
             .hook_point(chains)
             .connection_manager(connection_manager.clone())
             .stack_context(stack_context)
+            .security(anonymous_allowed_security())
             .build()
             .await;
         assert!(result.is_ok());
@@ -6598,6 +6864,7 @@ inbound_admission:
             .hook_point(chains)
             .connection_manager(connection_manager.clone())
             .stack_context(stack_context)
+            .security(anonymous_allowed_security())
             .build()
             .await;
         assert!(result.is_ok());
@@ -6664,6 +6931,7 @@ inbound_admission:
             .hook_point(chains)
             .connection_manager(connection_manager.clone())
             .stack_context(stack_context)
+            .security(anonymous_allowed_security())
             .build()
             .await;
         assert!(result.is_ok());

@@ -47,8 +47,10 @@ rtcp://<did>[:port]/<target>
 rtcp://<percent-encoded-bootstrap-url>@<did>[:port]/<target>
 ```
 
-端口省略时使用 `2980`。带 bootstrap URL 的 tunnel 和后续 stream leg 都重放同一类
-bootstrap transport，不会错误地退回裸 TCP。
+端口省略时使用对端 DeviceDocument 的 `rtcp_port`（zone 目标取 ZoneDocument 默认 gateway
+设备的 `rtcp_port`），都没有时为 `2980`。带 bootstrap URL 的 tunnel 和后续 stream leg 都重放同一类
+bootstrap transport，不会错误地退回裸 TCP。bootstrap URL 为不带目标的 `rtcp://<relay>/`
+时，中继目标补为外层 `<did 主机名>:<生效端口>`。
 
 ## 2. 线协议
 
@@ -291,8 +293,14 @@ tunnel；`accepted=false` 的 `reason` 作为建链错误返回。最终结果�
     本次握手视为 tunnel 建立成功。
 
 同步路径不访问 method authority。self-declared 验证和 observed cache 写入路径不存在。
-验证 unavailable 时，默认 `anonymous: reject`；显式 `anonymous: allow` 只按已证明持有的
-candidate key 降级为 `KeyDid`，不携带 owner/zone，不写授权缓存。
+验证 unavailable（包括文档与 owner 都不在本机缓存的首次来访的外 Zone 设备）和不带
+`device_doc_jwt` 的 `did:dev` 对端同样受 `anonymous` 约束：默认 `anonymous: reject`；显式
+`anonymous: allow` 只按已证明持有的 candidate key 降级为 `KeyDid`，不携带 owner/zone，不写
+授权缓存。
+
+listener 与 per-stream REQ 拿到的 zone 关系（`source_zone_relation`）只在验证得到的 owner
+等于本机 owner 且 `zone_did` 等于本机 zone 时为 `same_zone`；外 Zone owner 自报本机
+`zone_did` 仍是 `cross_zone`，无具名身份为 `unknown`。
 
 可信 Host/Zone snapshot 接纳后，可触发每逻辑身份 singleflight 的后台
 `RemoteAuthority` 确认。任务有全局并发额度、超时与结果缓存：
@@ -424,7 +432,11 @@ creator，随后复用已发布的 winner，不再各自发起完整握手。最
 兜底，loser 关闭并复用 winner；具名目标复用前先过一一绑定仲裁。
 
 `keep_tunnel` 使用带 seq 的 `ping_rtt()`，只有匹配 Pong 才算成功。配置的连续失败次数达到
-阈值后 close + conditional remove，下一轮重新建链。direct accept、初始 connect 和
+阈值后 close + conditional remove，下一轮重新建链。
+
+所有 tunnel 的控制通道静默 `liveness.idle_probe_secs` 后发一次 Ping，`pong_timeout_secs`
+内无 Pong 即 close 并从 map 移除。本端发起的 tunnel 在 `liveness.idle_timeout_secs` 内既没有
+新建/接受业务流、也没有 keep-tunnel 或 URL 探测时关闭；对端随之收到 FIN 移除。direct accept、初始 connect 和
 reconnect TCP socket 同时启用平台支持的 TCP keepalive（30 秒 idle、10 秒 interval）；
 TCP keepalive 只是协议级 Ping/Pong 的补充。
 
@@ -469,6 +481,7 @@ Tunnel authentication 只回答“对端是谁”，不会自动授权目标服�
 - `real_source_did`、`source_did`、`source_device_id`；
 - `source_canonical_device_id`；
 - `source_identity_trust`；
+- `source_zone_relation`（`same_zone` / `cross_zone` / `unknown`，见 §3.4）；
 - `conn_source_ip` / `conn_source_port`；
 - PROXY protocol 恢复后的 `real_source_ip` / `real_source_port` 和有效
   `source_ip` / `source_port`；
@@ -481,6 +494,9 @@ Tunnel authentication 只回答“对端是谁”，不会自动授权目标服�
 
 `on_new_tunnel_hook_point` 看到同一套 semantic/canonical/trust 来源信息。listener 拒绝的
 新连接不能替换已存在 tunnel。
+
+stream 交给 `server <http server>` 时，`StreamInfo` 带上 `source_device_did`（握手认证的
+对端 DID）与 `source_identity_trust`；HTTP server 以 `REQ` 保留键暴露，同名请求头不能伪造。
 
 ## 9. 配置
 
@@ -501,6 +517,8 @@ stacks:
       ping_interval_secs: 30
       pong_timeout_secs: 10
       max_missed_pongs: 3
+      idle_probe_secs: 60
+      idle_timeout_secs: 600
     limits:
       max_pending_handshakes: 256
       handshake_requests_per_second: 16

@@ -3493,6 +3493,89 @@ mod tests {
             .unwrap_or("<missing>")
     }
 
+    /// The protected-header block of BuckyOS `boot_gateway.yaml` node_gateway:
+    /// client copies are always dropped, the RTCP identity is re-added only
+    /// from the stream the request arrived on.
+    const RTCP_IDENTITY_HEADERS_CHAIN: &str = r#"
+- id: main
+  priority: 1
+  blocks:
+    - id: main
+      block: |
+        match-include $REQ "X-Cyfs-Rtcp-Device" && map-remove REQ X-Cyfs-Rtcp-Device;
+        match-include $REQ "X-Cyfs-Rtcp-Trust" && map-remove REQ X-Cyfs-Rtcp-Trust;
+        match-include $REQ "cyfs-original-user" && map-remove REQ cyfs-original-user;
+        if match-include $REQ "source_device_did" then
+          map-add REQ X-Cyfs-Rtcp-Device $REQ.source_device_did;
+          map-add REQ X-Cyfs-Rtcp-Trust $REQ.source_identity_trust;
+        end
+        map-add REQ X-Test-Device "D:${REQ?.X-Cyfs-Rtcp-Device}";
+        map-add REQ X-Test-Trust "T:${REQ?.X-Cyfs-Rtcp-Trust}";
+        map-add REQ X-Test-User "U:${REQ?.cyfs-original-user}";
+        return "server echo-headers";
+"#;
+
+    async fn rtcp_identity_headers(
+        info: StreamInfo,
+        headers: &[(&str, &str)],
+    ) -> (String, String, String) {
+        let mock_server_mgr = Arc::new(ServerManager::new());
+        mock_server_mgr
+            .add_server(Server::Http(Arc::new(EchoHeadersServer {
+                id: "echo-headers".to_string(),
+            })))
+            .unwrap();
+        let chains: ProcessChainConfigs =
+            serde_yaml_ng::from_str(RTCP_IDENTITY_HEADERS_CHAIN).unwrap();
+        let server = ProcessChainHttpServer::builder()
+            .id("test_rtcp_identity_headers")
+            .version("HTTP/1.1".to_string())
+            .hook_point(chains)
+            .tunnel_manager(TunnelManager::new())
+            .server_mgr(Arc::downgrade(&mock_server_mgr))
+            .build()
+            .await
+            .unwrap();
+        let resp = server
+            .serve_request(source_vars_request(headers), info)
+            .await
+            .unwrap();
+        (
+            header_str(&resp, "X-Test-Device").to_string(),
+            header_str(&resp, "X-Test-Trust").to_string(),
+            header_str(&resp, "X-Test-User").to_string(),
+        )
+    }
+
+    #[tokio::test]
+    async fn test_rtcp_identity_headers_come_only_from_the_stream() {
+        let forged = [
+            ("X-Cyfs-Rtcp-Device", "did:web:forged.example"),
+            ("x-cyfs-rtcp-trust", "method_authority_current"),
+            ("cyfs-original-user", "did:web:victim.example"),
+            ("source_device_did", "did:web:forged.example"),
+        ];
+
+        let rtcp = StreamInfo::new("198.51.100.20:52001".to_string()).with_source_device(
+            Some("did:web:ood1.bob.example".to_string()),
+            Some("trusted_zone_snapshot".to_string()),
+        );
+        assert_eq!(
+            rtcp_identity_headers(rtcp, &forged).await,
+            (
+                "D:did:web:ood1.bob.example".to_string(),
+                "T:trusted_zone_snapshot".to_string(),
+                "U:".to_string()
+            )
+        );
+
+        let plain = StreamInfo::new("203.0.113.7:443".to_string());
+        assert_eq!(
+            rtcp_identity_headers(plain, &forged).await,
+            ("D:".to_string(), "T:".to_string(), "U:".to_string())
+        );
+    }
+
     #[test]
     fn test_trusted_upstream_matcher() {
         let exact = TrustedUpstreamMatcher::parse("10.0.0.1").unwrap();
@@ -4794,15 +4877,7 @@ mod tests {
             hyper_serve_http(
                 Box::new(server),
                 http_server,
-                StreamInfo {
-                    src_addr: Some("127.0.0.1:344".to_string()),
-                    dst_addr: None,
-                    conn_src_addr: Some("127.0.0.1:344".to_string()),
-                    real_src_addr: None,
-                    source_mac: None,
-                    source_hostname: None,
-                    source_online_secs: None,
-                },
+                StreamInfo::new("127.0.0.1:344".to_string()),
             )
             .await
             .unwrap();

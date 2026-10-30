@@ -60,6 +60,9 @@ pub const DEFAULT_RTCP_STACK_PORT: u16 = 2980;
 pub(crate) struct RTcpTargetStackEP {
     pub did: DID,
     pub stack_port: u16,
+    // False when the stack id gave no port: create_tunnel then uses the
+    // target DeviceDocument's rtcp_port before falling back to 2980.
+    pub explicit_port: bool,
     // When the RTCP authority carries a `params@remote` prefix, `params` is the
     // percent-encoded bootstrap stream URL and `bootstrap_stream_url` stores the
     // decoded URL. create_tunnel uses it to build the tunnel's bearing stream
@@ -74,6 +77,7 @@ impl RTcpTargetStackEP {
         Ok(RTcpTargetStackEP {
             did: target_did,
             stack_port,
+            explicit_port: true,
             bootstrap_stream_url: None,
         })
     }
@@ -140,14 +144,16 @@ pub(crate) fn parse_rtcp_stack_id_checked(
         None => (None, stack_id),
     };
 
-    let (target_host_name, stack_port) = match remote_part.rsplit_once(':') {
+    let (target_host_name, stack_port, explicit_port) = match remote_part.rsplit_once(':') {
         Some((host, port)) if !host.is_empty() && !port.is_empty() => match port.parse::<u16>() {
-            Ok(port) => (host, port),
-            Err(_) if remote_part.starts_with("did:") => (remote_part, DEFAULT_RTCP_STACK_PORT),
+            Ok(port) => (host, port, true),
+            Err(_) if remote_part.starts_with("did:") => {
+                (remote_part, DEFAULT_RTCP_STACK_PORT, false)
+            }
             Err(_) => return Err(format!("invalid RTCP stack port '{}'", port)),
         },
         Some(_) => return Err("invalid RTCP stack id host/port form".to_string()),
-        None => (remote_part, DEFAULT_RTCP_STACK_PORT),
+        None => (remote_part, DEFAULT_RTCP_STACK_PORT, false),
     };
     let target_did = DID::from_str(target_host_name)
         .map_err(|e| format!("invalid RTCP remote DID '{}': {}", target_host_name, e))?;
@@ -156,6 +162,7 @@ pub(crate) fn parse_rtcp_stack_id_checked(
     Ok(RTcpTargetStackEP {
         did: target_did,
         stack_port,
+        explicit_port,
         bootstrap_stream_url,
     })
 }
@@ -206,6 +213,7 @@ mod tests {
     fn parse_plain_did_with_port() {
         let ep = parse_rtcp_stack_id("remote.com:2981").expect("parse");
         assert_eq!(ep.stack_port, 2981);
+        assert!(ep.explicit_port);
         assert!(ep.bootstrap_stream_url.is_none());
     }
 
@@ -213,7 +221,12 @@ mod tests {
     fn parse_plain_did_default_port() {
         let ep = parse_rtcp_stack_id("remote.com").expect("parse");
         assert_eq!(ep.stack_port, DEFAULT_RTCP_STACK_PORT);
+        assert!(!ep.explicit_port);
         assert!(ep.bootstrap_stream_url.is_none());
+
+        let ep = parse_rtcp_stack_id("did:web:remote.com").expect("parse");
+        assert_eq!(ep.stack_port, DEFAULT_RTCP_STACK_PORT);
+        assert!(!ep.explicit_port);
     }
 
     #[test]

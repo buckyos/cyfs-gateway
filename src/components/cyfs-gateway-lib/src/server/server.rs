@@ -169,12 +169,14 @@ pub struct RequestSourceInfo {
     pub real_source_addr: Option<String>,
     pub real_source_ip: Option<String>,
     pub real_source_port: Option<String>,
+    pub source_device_did: Option<String>,
+    pub source_identity_trust: Option<String>,
 }
 
 /// Reserved source keys exposed through the HTTP `REQ` map. These keys always
 /// resolve from the connection's [`RequestSourceInfo`] and never fall back to
 /// same-named HTTP headers, so clients cannot forge them.
-pub const HTTP_REQ_SOURCE_KEYS: [&str; 9] = [
+pub const HTTP_REQ_SOURCE_KEYS: [&str; 11] = [
     "source_addr",
     "source_ip",
     "source_port",
@@ -184,6 +186,8 @@ pub const HTTP_REQ_SOURCE_KEYS: [&str; 9] = [
     "real_source_addr",
     "real_source_ip",
     "real_source_port",
+    "source_device_did",
+    "source_identity_trust",
 ];
 
 fn addr_group_from_str(addr: &str) -> (Option<String>, Option<String>, Option<String>) {
@@ -224,6 +228,8 @@ impl RequestSourceInfo {
                 this.real_source_port,
             ) = addr_group_from_str(addr);
         }
+        this.source_device_did = info.source_device_did.clone();
+        this.source_identity_trust = info.source_identity_trust.clone();
         this
     }
 
@@ -249,6 +255,8 @@ impl RequestSourceInfo {
             "real_source_addr" => &self.real_source_addr,
             "real_source_ip" => &self.real_source_ip,
             "real_source_port" => &self.real_source_port,
+            "source_device_did" => &self.source_device_did,
+            "source_identity_trust" => &self.source_identity_trust,
             _ => &None,
         };
         value.as_deref()

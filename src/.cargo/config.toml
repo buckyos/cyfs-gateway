@@ -1,0 +1,9 @@
+[patch."https://github.com/buckyos/buckyos-base.git"]
+kRPC = { path = "/home/lzc/project/buckyos-base/src/kRPC" }
+buckyos-http-server = { path = "/home/lzc/project/buckyos-base/src/buckyos-http-server" }
+buckyos-kit = { path = "/home/lzc/project/buckyos-base/src/buckyos-kit" }
+name-lib = { path = "/home/lzc/project/buckyos-base/src/name-lib" }
+name-client = { path = "/home/lzc/project/buckyos-base/src/name-client" }
+rbac = { path = "/home/lzc/project/buckyos-base/src/rbac" }
+buckyos-io = { path = "/home/lzc/project/buckyos-base/src/buckyos-io" }
+buckyos-js-runtime = { path = "/home/lzc/project/buckyos-base/src/buckyos-js-runtime" }

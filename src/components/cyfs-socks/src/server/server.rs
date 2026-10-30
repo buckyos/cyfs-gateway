@@ -260,12 +260,20 @@ mod tests {
         block: &str,
         provider: SocksDataTunnelProviderRef,
     ) -> Arc<dyn StreamServer> {
+        create_socks_stream_server_with_auth(block, provider, None).await
+    }
+
+    async fn create_socks_stream_server_with_auth(
+        block: &str,
+        provider: SocksDataTunnelProviderRef,
+        credentials: Option<(&str, &str)>,
+    ) -> Arc<dyn StreamServer> {
         ensure_test_root();
 
         let config = SocksServerConfig {
             id: "test-socks".to_string(),
-            username: None,
-            password: None,
+            username: credentials.map(|(username, _)| username.to_string()),
+            password: credentials.map(|(_, password)| password.to_string()),
             target: Url::parse("socks5://127.0.0.1:1080").unwrap(),
             enable_tunnel: None,
             rule_config: None,
@@ -363,6 +371,91 @@ mod tests {
         }
 
         reply_head[1]
+    }
+
+    // Methods a client offers and, for user/password, the credentials it sends.
+    // Returns the server's method choice and the auth status (if any).
+    async fn socks5_negotiate(
+        client: &mut DuplexStream,
+        credentials: Option<(&str, &str)>,
+    ) -> (u8, Option<u8>) {
+        let method = match credentials {
+            Some(_) => consts::SOCKS5_AUTH_METHOD_PASSWORD,
+            None => consts::SOCKS5_AUTH_METHOD_NONE,
+        };
+        client
+            .write_all(&[consts::SOCKS5_VERSION, 1, method])
+            .await
+            .unwrap();
+        let mut reply = [0u8; 2];
+        client.read_exact(&mut reply).await.unwrap();
+        let Some((username, password)) = credentials else {
+            return (reply[1], None);
+        };
+        if reply[1] != consts::SOCKS5_AUTH_METHOD_PASSWORD {
+            return (reply[1], None);
+        }
+        let mut auth = vec![1, username.len() as u8];
+        auth.extend_from_slice(username.as_bytes());
+        auth.push(password.len() as u8);
+        auth.extend_from_slice(password.as_bytes());
+        client.write_all(&auth).await.unwrap();
+        let mut status = [0u8; 2];
+        client.read_exact(&mut status).await.unwrap();
+        (reply[1], Some(status[1]))
+    }
+
+    #[tokio::test]
+    async fn test_socks_server_requires_configured_credentials() {
+        let provider = MockTunnelProvider::default();
+        let socks_server = create_socks_stream_server_with_auth(
+            "return \"PROXY rtcp://cross-zone.invalid/\";",
+            provider_ref(provider.clone()),
+            Some(("buckyos", "secret")),
+        )
+        .await;
+        let serve = |socks_server: Arc<dyn StreamServer>| {
+            let (client, server_stream) = tokio::io::duplex(4096);
+            let task = tokio::spawn(async move {
+                socks_server
+                    .serve_connection(Box::new(server_stream), StreamInfo::default())
+                    .await
+            });
+            (client, task)
+        };
+
+        let (mut client, task) = serve(socks_server.clone());
+        let (method, _) = socks5_negotiate(&mut client, None).await;
+        assert_eq!(method, consts::SOCKS5_AUTH_METHOD_NOT_ACCEPTABLE);
+        drop(client);
+        let _ = task.await;
+
+        let (mut client, task) = serve(socks_server.clone());
+        let (_, status) = socks5_negotiate(&mut client, Some(("buckyos", "wrong"))).await;
+        assert_ne!(status, Some(0));
+        drop(client);
+        let _ = task.await;
+        assert_eq!(provider.calls(), 0);
+
+        let target_addr = start_echo_server().await;
+        let (mut client, task) = serve(socks_server);
+        let (_, status) = socks5_negotiate(&mut client, Some(("buckyos", "secret"))).await;
+        assert_eq!(status, Some(0));
+        let mut req = vec![
+            consts::SOCKS5_VERSION,
+            consts::SOCKS5_CMD_TCP_CONNECT,
+            0x00,
+            consts::SOCKS5_ADDR_TYPE_IPV4,
+        ];
+        req.extend_from_slice(&Ipv4Addr::LOCALHOST.octets());
+        req.extend_from_slice(&target_addr.port().to_be_bytes());
+        client.write_all(&req).await.unwrap();
+        let mut reply = [0u8; 10];
+        client.read_exact(&mut reply).await.unwrap();
+        assert_eq!(reply[1], fast_socks5::ReplyError::Succeeded.as_u8());
+        assert_eq!(provider.calls(), 1);
+        drop(client);
+        let _ = task.await;
     }
 
     #[tokio::test]

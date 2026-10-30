@@ -47,7 +47,7 @@ cyfs_gateway中各个process chain执行位置都可以通过环境变量获取�
 
 实现说明（2026-07）：
 
-- HTTP server（`type: http`）的 `REQ` Map 现在提供 9 个保留来源键（见下文表格）。这些键只从连接信息解析，同名 HTTP 头永远不会透出到这些键（读取、遍历、dump 一致），也不可通过 `map-add` / `map-set` / `map-remove` 修改。
+- HTTP server（`type: http`）的 `REQ` Map 现在提供 11 个保留来源键（见下文表格）。这些键只从连接信息解析，同名 HTTP 头永远不会透出到这些键（读取、遍历、dump 一致），也不可通过 `map-add` / `map-set` / `map-remove` 修改。
 - HTTP server 新增可选配置 `trusted_upstreams`（IP 或 CIDR 列表，如 `["127.0.0.1", "10.0.0.0/8"]`）。仅当直接上一跳 IP 命中该列表、且更强机制（PROXY protocol、RTCP 等，即 `StreamInfo.real_src_addr`）未提供可信来源时，才解析转发头：`X-Forwarded-For` 从右向左跳过可信 IP，第一个不可信条目即客户端（全部可信时取最左）；条目非法则整个头作废，回退到 `X-Real-IP`（可配合 `X-Real-Port`）。解析结果写入 `real_source_*` 并成为有效来源 `source_*`（同时反映到 `REQ_remote_*` / `REQ_real_remote_*`）。默认（空列表）不信任任何转发头。
 - 从转发头还原的来源可能没有端口，此时只有 `*_addr`（裸 IP）与 `*_ip` 存在，`*_port` 缺失，相应的 `REQ_*_port` 顶层变量也不会创建。
 - TCP / TLS / TUN(TCP) 入口通过 `StreamRequest` 新增 `conn_source_addr` / `real_source_addr` 字段派生 `conn_source_*`、`real_source_*`；QUIC / UDP / TUN(UDP) 提供 `conn_source_*`；RTCP stream 入口在 PROXY protocol 存在时提供 `real_source_*`。`real_source_*` 仅在可信还原来源存在时出现。
@@ -96,13 +96,15 @@ cyfs_gateway中各个process chain执行位置都可以通过环境变量获取�
 | `real_source_addr` | `String` | 可信还原来源地址（保留键，只读；来自 PROXY protocol/RTCP 等机制或可信 upstream 转发头，无可信来源时缺失） |
 | `real_source_ip`   | `String` | 可信还原来源 IP（保留键，只读）          |
 | `real_source_port` | `String` | 可信还原来源端口（保留键，只读，可能缺失）      |
+| `source_device_did` | `String` | 请求经 RTCP stream 到达时，握手认证的对端设备 DID（保留键，只读；非 RTCP 来源缺失） |
+| `source_identity_trust` | `String` | 同上，对端身份的 trust 档位（保留键，只读） |
 | `<header-name>` | `String` | 任意请求头名称，对应头值               |
 
 
 备注：
 
 - 非 UTF-8 的 header 值会被转换为空字符串。
-- 上表 9 个 `source_*` / `conn_source_*` / `real_source_*` 为保留键：始终从连接信息解析，客户端发送的同名 HTTP 头不会透出到这些键，也不能通过 `map-add` / `map-set` / `map-remove` 修改。
+- 上表 11 个 `source_*` / `conn_source_*` / `real_source_*` / `source_device_did` / `source_identity_trust` 为保留键：始终从连接信息解析，客户端发送的同名 HTTP 头不会透出到这些键，也不能通过 `map-add` / `map-set` / `map-remove` 修改。
 - `X-Forwarded-For` / `X-Real-IP` 默认只是普通请求头；仅当 server 配置了 `trusted_upstreams` 且直接上一跳命中时，才会按可信规则转换为 `real_source_*`（见"来源变量统一 TODO"一节的实现说明）。
 
 如需完整 HTTP URL（scheme + host + path + query），可自行拼接：`${scheme}://${REQ_host}${REQ_url}`，其中 scheme 需根据实际部署推断（如 TLS 终止则用 `https`，否则用 `http`；若前端有 `X-Forwarded-Proto` 头，可从 `REQ.X-Forwarded-Proto` 获取）。
@@ -337,6 +339,8 @@ cyfs_gateway中各个process chain执行位置都可以通过环境变量获取�
 | `source_device_id`   | `String` | 源设备 ID（握手认证得到的对端 DID，兼容保留） |
 | `real_source_did`    | `String` | 握手认证得到的可信来源 DID（与 `source_device_id` 相同） |
 | `source_did`         | `String` | 当前有效身份 DID 别名（与 `real_source_did` 相同） |
+| `source_identity_trust` | `String` | 对端身份 trust 档位 |
+| `source_zone_relation` | `String` | 对端与本机 Zone 的关系：`same_zone`（已验证 owner 与 zone 都是本机的）、`cross_zone`、`unknown`（无具名身份） |
 | `source_addr`        | `String` | 源 SocketAddr（PROXY protocol 存在时为还原后的来源） |
 | `source_ip`          | `String` | 源 IP            |
 | `source_port`        | `String` | 源端口             |
@@ -373,6 +377,8 @@ cyfs_gateway中各个process chain执行位置都可以通过环境变量获取�
 | `source_device_id`   | `String` | 源设备 ID（握手认证得到的对端 DID，兼容保留） |
 | `real_source_did`    | `String` | 握手认证得到的可信来源 DID（与 `source_device_id` 相同） |
 | `source_did`         | `String` | 当前有效身份 DID 别名（与 `real_source_did` 相同） |
+| `source_identity_trust` | `String` | 对端身份 trust 档位 |
+| `source_zone_relation` | `String` | 同 Stream，`same_zone` / `cross_zone` / `unknown` |
 | `source_addr`        | `String` | 源 SocketAddr    |
 | `source_ip`          | `String` | 源 IP            |
 | `source_port`        | `String` | 源端口             |
@@ -399,6 +405,8 @@ cyfs_gateway中各个process chain执行位置都可以通过环境变量获取�
 | `source_device_id`       | `String` | 源设备 ID（握手认证得到的对端 DID，兼容保留）            |
 | `real_source_did`        | `String` | 握手认证得到的可信来源 DID（与 `source_device_id` 相同） |
 | `source_did`             | `String` | 当前有效身份 DID 别名（与 `real_source_did` 相同） |
+| `source_identity_trust`  | `String` | 对端身份 trust 档位 |
+| `source_zone_relation`   | `String` | 同 Stream，`same_zone` / `cross_zone` / `unknown` |
 | `source_device_name`     | `String` | 对端设备名（可选，来自 device document）          |
 | `source_device_owner`    | `String` | 对端设备 owner（可选）                        |
 | `source_zone_did`        | `String` | 对端 zone DID（可选）                       |

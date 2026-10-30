@@ -43,6 +43,7 @@ impl StreamListener for TcpStreamListener {
                 port: addr.port(),
                 canonical_device_id: None,
                 identity_trust: None,
+                zone_relation: None,
             },
         ))
     }

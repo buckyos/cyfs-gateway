@@ -12,6 +12,7 @@ pub struct TunnelEndpoint {
     pub port: u16,
     pub canonical_device_id: Option<String>,
     pub identity_trust: Option<String>,
+    pub zone_relation: Option<String>,
 }
 
 #[async_trait]
@@ -220,6 +221,19 @@ mod tests {
     use super::*;
     use percent_encoding::percent_decode_str;
     use url::Url;
+    // A relay bootstrap URL must name its target: `rtcp://sn/` asks the relay
+    // for an empty destination, `rtcp://sn/<target>:<port>` is well formed.
+    #[test]
+    fn test_relay_bootstrap_path_requires_a_target() {
+        let empty = Url::parse("rtcp://sn.example.com/").unwrap();
+        assert!(get_dest_info_from_url_path(empty.path()).is_err());
+        let relay = Url::parse("rtcp://sn.example.com/ood2.zone.example:2981").unwrap();
+        assert_eq!(
+            get_dest_info_from_url_path(relay.path()).unwrap(),
+            (Some("ood2.zone.example".to_string()), 2981)
+        );
+    }
+
     #[test]
     fn test_get_dest_info_from_url_path() {
         unsafe {
