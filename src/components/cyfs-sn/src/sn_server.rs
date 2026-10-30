@@ -16,6 +16,7 @@ use crate::sn_bns_signer::{
 };
 use crate::sn_did_resolver::{
     key_like_string_to_jwk, normalize_sn_did_doc_type, owner_key_from_config, SnDidResolveRequest,
+    SnDidVersionQuery,
     SnDidResolverProfile, SnDidResolverRef, SnResolverBackedDidResolver,
     SN_DID_RESOLVER_ROUTE_PREFIX,
 };
@@ -1576,6 +1577,25 @@ impl SNServer {
         None
     }
 
+    /// Resolver API §7.4: `501` + `historicalQuerySupported: false`, in the resolution envelope.
+    fn historical_query_not_supported() -> http::Response<BoxBody<Bytes, ServerError>> {
+        let body = serde_json::json!({
+            "didResolutionMetadata": {"error": "historicalQueryNotSupported"},
+            "didDocument": null,
+            "didDocumentMetadata": {"buckyos": {"historicalQuerySupported": false}},
+        });
+        Response::builder()
+            .status(StatusCode::NOT_IMPLEMENTED)
+            .header("Access-Control-Allow-Origin", "*")
+            .header("Content-Type", "application/json")
+            .body(BoxBody::new(
+                Full::new(Bytes::from(body.to_string()))
+                    .map_err(|never| match never {})
+                    .boxed(),
+            ))
+            .unwrap()
+    }
+
     fn builder_error_http_response(
         status: StatusCode,
         msg: String,
@@ -1899,23 +1919,18 @@ impl HttpServer for SNServer {
             }
 
             let mut doc_type: Option<String> = None;
-            let mut iat: Option<String> = None;
-            if let Some(query) = request.uri().query() {
-                for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
-                    match key.as_ref() {
-                        "type" => {
-                            doc_type = normalize_sn_did_doc_type(Some(value.as_ref()));
-                        }
-                        "iat" => {
-                            let value = value.trim();
-                            if !value.is_empty() {
-                                iat = Some(value.to_string());
-                            }
-                        }
-                        _ => {}
-                    }
+            let query = request.uri().query().unwrap_or("");
+            for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
+                if key == "type" {
+                    doc_type = normalize_sn_did_doc_type(Some(value.as_ref()));
                 }
             }
+            let version = match SnDidVersionQuery::from_query(query) {
+                Ok(version) => version,
+                Err(reason) => {
+                    return Self::builder_error_http_response(StatusCode::BAD_REQUEST, reason)
+                }
+            };
 
             let did = DID::from_str(did_str.as_str()).map_err(|e| {
                 server_err!(
@@ -1944,7 +1959,7 @@ impl HttpServer for SNServer {
                 },
             );
             resolve_request.accept = accept;
-            resolve_request.iat = iat;
+            resolve_request.version = version;
             let response_accept = resolve_request.accept.clone();
             let started_at = Instant::now();
 
@@ -1979,6 +1994,9 @@ impl HttpServer for SNServer {
                         ))
                         .unwrap());
                 }
+                Err(e) if e.kind() == SnResolverErrorKind::HistoricalQueryNotSupported => {
+                    return Ok(Self::historical_query_not_supported());
+                }
                 Err(e) => {
                     let status = match e.kind() {
                         SnResolverErrorKind::NotManaged
@@ -1989,6 +2007,9 @@ impl HttpServer for SNServer {
                         | SnResolverErrorKind::InvalidDid
                         | SnResolverErrorKind::UnsupportedRecordType
                         | SnResolverErrorKind::UnsupportedDidMethod => StatusCode::BAD_REQUEST,
+                        SnResolverErrorKind::HistoricalQueryNotSupported => {
+                            StatusCode::NOT_IMPLEMENTED
+                        }
                         SnResolverErrorKind::BackendUnavailable => {
                             StatusCode::INTERNAL_SERVER_ERROR
                         }

@@ -947,7 +947,7 @@ pub fn spawn_listener(
 // ---------------------------------------------------------------------------
 // BuckyOS DID Resolver HTTP binding (buckyos-base doc/http_did_resolver_api.md)
 //
-// `GET /1.0/identifiers/{did}?type={doc_type}[&iat={unix_ts}]` answers with a
+// `GET /1.0/identifiers/{did}?type={doc_type}[&versionId={iat}|&versionTime={iat}]` answers with a
 // W3C DID Resolution Result envelope carrying the `didDocumentMetadata.buckyos`
 // extension block that `name-client`'s `BaseHttpProvider::resolve_published_state`
 // parses. This resolver is only authoritative for `did:bns:*`.
@@ -1021,7 +1021,7 @@ async fn serve_did_resolver_request<T: BnsIndexerApi>(
         ),
     };
 
-    // Historical versionId/versionTime (and legacy iat) queries need the
+    // Historical versionId/versionTime queries need the
     // full event-log index which the read projection does not keep yet.
     // Protocol §7: report 501 + historicalQuerySupported=false; current
     // state must never stand in for an unsupported historical query.
@@ -1378,9 +1378,9 @@ fn parse_did_resolver_query(query: Option<&str>) -> Result<(Option<String>, Opti
                 if doc_type.is_some() { return Err("query parameter `type` must occur once".into()); }
                 doc_type = Some(value.to_string());
             }
-            "iat" | "versionId" | "versionTime" => {
+            "versionId" | "versionTime" => {
                 if iat.is_some() {
-                    return Err("versionId, versionTime and legacy iat are mutually exclusive and must occur once".into());
+                    return Err("versionId and versionTime are mutually exclusive and must occur once".into());
                 }
                 iat = Some(value.parse::<u64>().map_err(|_| {
                     format!("query parameter `{key}` must be a unix timestamp, got `{value}`")
@@ -3219,7 +3219,7 @@ mod tests {
     #[tokio::test]
     async fn did_resolver_historical_owner_query_returns_501() {
         let server = resolver_contract_server();
-        for query in ["iat=1750000000", "versionId=1750000000", "versionTime=1750000000"] {
+        for query in ["versionId=1750000000", "versionTime=1750000000"] {
             let (status, body, _) = resolver_request(
                 &server, Method::GET,
                 &format!("/1.0/identifiers/did:bns:alice?type=owner&{query}"),
@@ -3230,6 +3230,13 @@ mod tests {
             assert!(metadata.get("documentStatus").is_none());
             assert!(body["didDocument"].is_null());
         }
+        // `iat` is not a query parameter of the resolver API: the query is a current one.
+        let (status, body, _) = resolver_request(
+            &server, Method::GET,
+            "/1.0/identifiers/did:bns:alice?type=owner&iat=1750000000",
+        ).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["didDocumentMetadata"]["buckyos"]["documentStatus"], "active");
     }
 
     #[tokio::test]
@@ -3337,12 +3344,10 @@ mod tests {
             "/1.0/identifiers/did:bns:INVALID",
             "/1.0/identifiers/did:bns:alice?type=NotAType",
             "/1.0/identifiers/did:bns:alice?type=owner&type=zone",
-            "/1.0/identifiers/did:bns:alice?type=owner&iat=abc",
             "/1.0/identifiers/did:bns:alice?type=device&versionId=abc",
             "/1.0/identifiers/did:bns:alice?versionTime=",
             "/1.0/identifiers/did:bns:alice?versionId=1&versionTime=2",
             "/1.0/identifiers/did:bns:alice?versionId=1&versionId=2",
-            "/1.0/identifiers/did:bns:alice?iat=1&versionTime=2",
         ] {
             let (status, body, _) = resolver_request(&server, Method::GET, uri).await;
             assert_eq!(status, StatusCode::BAD_REQUEST, "uri {uri}");

@@ -202,7 +202,7 @@ function validateName(name: string): ReturnType<typeof envelopeError> | null {
 function handleDidResolve(world: DemoWorld, url: URL): Response {
   const did = decodeURIComponent(url.pathname.slice('/1.0/identifiers/'.length))
   const docType = url.searchParams.get('type') ?? 'zone'
-  const iat = url.searchParams.get('iat')
+  const version = url.searchParams.get('versionId') ?? url.searchParams.get('versionTime')
 
   const resolutionBase = {
     '@context': 'https://w3id.org/did-resolution/v1',
@@ -220,15 +220,15 @@ function handleDidResolve(world: DemoWorld, url: URL): Response {
     )
   }
 
-  // 历史 iat 查询：当前实现统一 501（PRD 9.21）。
-  if (iat !== null) {
+  // 版本查询（versionId / versionTime）：当前实现统一 501（PRD 9.21）。
+  if (version !== null) {
     return json(
       {
         ...resolutionBase,
         didDocument: null,
         didResolutionMetadata: {
           error: 'notImplemented',
-          errorMessage: 'historical (iat) resolution is not implemented',
+          errorMessage: 'historical (versionId / versionTime) resolution is not implemented',
         },
         didDocumentMetadata: { buckyos: { historicalQuerySupported: false } },
       },

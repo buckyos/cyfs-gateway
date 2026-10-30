@@ -130,7 +130,7 @@ export function AdvancedPage({ demoMode }: { demoMode: boolean }) {
         </div>
         {didQuery ? <DidResolverPanel did={didQuery} /> : null}
         <Note tone="info">
-          历史（iat）查询当前返回 501 + historicalQuerySupported=false，属于能力缺口而非故障（PRD 9.21）。
+          历史（versionId / versionTime）查询当前返回 501 + historicalQuerySupported=false，属于能力缺口而非故障（PRD 9.21）。
         </Note>
       </section>
 

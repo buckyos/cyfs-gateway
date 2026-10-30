@@ -210,6 +210,9 @@ async fn spawn_internal_zone_resolver(resolver: Arc<SnResolverBackedDidResolver>
                             SnResolverErrorKind::BackendUnavailable => {
                                 StatusCode::INTERNAL_SERVER_ERROR
                             }
+                            SnResolverErrorKind::HistoricalQueryNotSupported => {
+                                StatusCode::NOT_IMPLEMENTED
+                            }
                             _ => StatusCode::BAD_REQUEST,
                         },
                         "text/plain",

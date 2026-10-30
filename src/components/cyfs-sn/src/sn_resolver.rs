@@ -65,6 +65,8 @@ pub enum SnResolverErrorKind {
     InvalidHostname,
     InvalidDid,
     BackendUnavailable,
+    /// A `versionId` / `versionTime` query: the SN keeps no history (resolver API §7.4, 501).
+    HistoricalQueryNotSupported,
 }
 
 #[derive(Debug, Clone)]
@@ -102,7 +104,8 @@ impl SnResolverError {
             SnResolverErrorKind::InvalidHostname
             | SnResolverErrorKind::InvalidDid
             | SnResolverErrorKind::UnsupportedRecordType
-            | SnResolverErrorKind::UnsupportedDidMethod => ServerErrorCode::InvalidParam,
+            | SnResolverErrorKind::UnsupportedDidMethod
+            | SnResolverErrorKind::HistoricalQueryNotSupported => ServerErrorCode::InvalidParam,
             SnResolverErrorKind::NotManaged
             | SnResolverErrorKind::NameNotFound
             | SnResolverErrorKind::DocumentNotFound

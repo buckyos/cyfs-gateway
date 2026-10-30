@@ -55,7 +55,38 @@ pub struct SnDidResolveRequest {
     pub from_ip: Option<IpAddr>,
     pub profile: SnDidResolverProfile,
     pub accept: Option<String>,
-    pub iat: Option<String>,
+    pub version: Option<SnDidVersionQuery>,
+}
+
+/// Version query of the resolver API (buckyos-base doc/http_did_resolver_api.md §2, §7): the
+/// version with exactly this iat (`versionId`), or the closest one strictly before it (`versionTime`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SnDidVersionQuery {
+    Exact(u64),
+    Closest(u64),
+}
+
+impl SnDidVersionQuery {
+    /// `versionId` / `versionTime` of a query string; they are mutually exclusive iat values.
+    /// Other parameters are not read here.
+    pub fn from_query(query: &str) -> Result<Option<Self>, String> {
+        let mut version = None;
+        for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
+            let make: fn(u64) -> Self = match key.as_ref() {
+                "versionId" => Self::Exact,
+                "versionTime" => Self::Closest,
+                _ => continue,
+            };
+            let iat = value
+                .trim()
+                .parse::<u64>()
+                .map_err(|_| format!("{} must be an iat", key))?;
+            if version.replace(make(iat)).is_some() {
+                return Err("versionId and versionTime are mutually exclusive".to_string());
+            }
+        }
+        Ok(version)
+    }
 }
 
 impl SnDidResolveRequest {
@@ -78,7 +109,7 @@ impl SnDidResolveRequest {
             from_ip,
             profile,
             accept: None,
-            iat: None,
+            version: None,
         }
     }
 
@@ -209,10 +240,11 @@ impl SnResolverBackedDidResolver {
         &self,
         request: &SnDidResolveRequest,
     ) -> SnResolverResult<SnDidResolveResponse> {
-        if request.iat.is_some() {
+        // No history index: a version query is never answered from the current state.
+        if let Some(version) = request.version {
             return Err(SnResolverError::new(
-                SnResolverErrorKind::InvalidDid,
-                "historical DID resolution by iat is not supported",
+                SnResolverErrorKind::HistoricalQueryNotSupported,
+                format!("SN keeps no historical DID index ({:?})", version),
             ));
         }
 
@@ -1711,6 +1743,49 @@ mod tests {
                 assert_eq!(buckyos["documentVersion"], 1751500000u64);
             } else {
                 assert!(buckyos.get("documentVersion").is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn version_queries_use_version_id_and_version_time_only() {
+        assert_eq!(SnDidVersionQuery::from_query(""), Ok(None));
+        assert_eq!(
+            SnDidVersionQuery::from_query("type=owner&versionId=7"),
+            Ok(Some(SnDidVersionQuery::Exact(7)))
+        );
+        assert_eq!(
+            SnDidVersionQuery::from_query("versionTime=8&type=owner"),
+            Ok(Some(SnDidVersionQuery::Closest(8)))
+        );
+        // `iat` is not a query parameter of the resolver API.
+        assert_eq!(SnDidVersionQuery::from_query("type=owner&iat=7"), Ok(None));
+        for bad in ["versionId=7&versionTime=8", "versionId=7&versionId=8", "versionTime=soon"] {
+            assert!(SnDidVersionQuery::from_query(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[tokio::test]
+    async fn version_queries_are_refused_rather_than_answered_with_the_current_document() {
+        let resolver = resolver_with_users(vec![auth_user(
+            "alice",
+            UserState::Active,
+            auth_db_owner_key().as_str(),
+        )]);
+        for profile in [
+            SnDidResolverProfile::InternalZoneResolver,
+            SnDidResolverProfile::PublicSupplement,
+        ] {
+            for version in [SnDidVersionQuery::Exact(7), SnDidVersionQuery::Closest(8)] {
+                let mut request = SnDidResolveRequest::new(
+                    DID::from_str("did:bns:alice").unwrap(),
+                    Some("owner".to_string()),
+                    None,
+                    profile,
+                );
+                request.version = Some(version);
+                let error = resolver.resolve(request).await.unwrap_err();
+                assert_eq!(error.kind(), SnResolverErrorKind::HistoricalQueryNotSupported);
             }
         }
     }

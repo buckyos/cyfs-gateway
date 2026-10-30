@@ -176,7 +176,7 @@ describe.skipIf(!LIVE_URL)(`线上契约 @ ${LIVE_URL ?? '(未配置)'}`, () => 
   })
 
   it('DID Resolver：iat 历史查询返回能力缺口', async () => {
-    const result = await didResolver.resolve(`did:bns:${LIVE_NAME}`, { docType: 'owner', iat: 1n })
+    const result = await didResolver.resolve(`did:bns:${LIVE_NAME}`, { docType: 'owner', version: { closest: 1n } })
     expect(result.kind).toBe('not_implemented')
     expect(result.historicalQuerySupported).toBe(false)
   })

@@ -1,5 +1,5 @@
 /**
- * DID Resolver 绑定：`GET /1.0/identifiers/{did}?type={doc_type}[&iat=]`。
+ * DID Resolver 绑定：`GET /1.0/identifiers/{did}?type={doc_type}[&versionId=|&versionTime=]`。
  *
  * 协议真值来源：`src/components/bns-server/src/lib.rs` 的 DID resolver 段落
  * （buckyos-base doc/http_did_resolver_api.md）。
@@ -48,8 +48,8 @@ export interface DidResolution {
 
 export interface DidResolveOptions {
   docType?: string
-  /** 历史查询；当前 server 一律回 501。 */
-  iat?: bigint
+  /** 版本查询（协议 §7）：exact 发 versionId、closest 发 versionTime，值都是 iat；当前 server 一律回 501。 */
+  version?: { exact: bigint } | { closest: bigint }
   signal?: AbortSignal
 }
 
@@ -62,7 +62,13 @@ export class DidResolverService {
   async resolve(did: string, options: DidResolveOptions = {}): Promise<DidResolution> {
     const query: string[] = []
     if (options.docType) query.push(`type=${encodeURIComponent(options.docType)}`)
-    if (options.iat !== undefined) query.push(`iat=${options.iat.toString()}`)
+    if (options.version) {
+      query.push(
+        'exact' in options.version
+          ? `versionId=${options.version.exact.toString()}`
+          : `versionTime=${options.version.closest.toString()}`,
+      )
+    }
     const url = `${didResolverEndpoint(this.config, did)}${query.length ? `?${query.join('&')}` : ''}`
 
     let response: Response
