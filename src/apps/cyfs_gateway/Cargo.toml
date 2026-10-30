@@ -26,6 +26,7 @@ http-body-util.workspace = true
 hyper = { version = "1.8", features = ["full"] }
 hyper-util.workspace = true
 kRPC.workspace = true
+name-client.workspace = true
 name-lib.workspace = true
 rcgen.workspace = true
 reqwest.workspace = true

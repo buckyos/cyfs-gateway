@@ -158,6 +158,21 @@ impl GatewayConfigParser {
             })
             .transpose()?
             .unwrap_or_default();
+        let name_client = json_value
+            .get("name_client")
+            .map(|value| {
+                serde_json::from_value::<GatewayNameClientConfig>(value.clone()).map_err(|e| {
+                    config_err!(
+                        ConfigErrorCode::InvalidConfig,
+                        "invalid name_client config: {:?}\n{}",
+                        e,
+                        serde_json::to_string_pretty(value)
+                            .unwrap_or_else(|_| "<invalid json>".to_string())
+                    )
+                })
+            })
+            .transpose()?
+            .unwrap_or_default();
         let traffic = match (
             json_value.get("traffic"),
             self.composition.traffic_adapter(),
@@ -185,6 +200,7 @@ impl GatewayConfigParser {
             collections,
             timers,
             device_manager,
+            name_client,
             traffic,
         })
     }
@@ -277,5 +293,6 @@ pub struct GatewayConfig {
     pub collections: Vec<CollectionConfig>,
     pub timers: Vec<TimerConfig>,
     pub device_manager: DeviceManagerConfig,
+    pub name_client: GatewayNameClientConfig,
     pub traffic: Option<GatewayTrafficConfigRef>,
 }

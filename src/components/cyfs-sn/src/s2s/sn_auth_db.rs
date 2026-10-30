@@ -1128,6 +1128,14 @@ impl SnAuthDB for SnAuthDbClient {
         }
     }
 
+    async fn get_user_by_domain_binding(&self, domain: &str) -> SnResult<Option<SNUserInfo>> {
+        match self {
+            Self::InProcess(handler) => handler.get_user_by_domain_binding(domain).await,
+            // 远端 provider 的 get_user_by_domain 不按用户状态过滤（sn-business）。
+            Self::KRPC(_) => self.get_user_by_domain(domain).await,
+        }
+    }
+
     async fn set_user_state(&self, username: &str, state: UserState) -> SnResult<()> {
         match self {
             Self::InProcess(handler) => handler.set_user_state(username, state).await,

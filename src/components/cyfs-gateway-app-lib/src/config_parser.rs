@@ -693,6 +693,17 @@ impl Default for DeviceManagerConfig {
     }
 }
 
+/// 网关进程内 name client 的配置（顶层 `name_client`）。
+#[derive(Deserialize, Clone, Debug, Default, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct GatewayNameClientConfig {
+    /// Zone locker 例外：本网关访问自己的 Zone locker 要经过的节点 / 中继，写主机名
+    /// 或 DID（按 RTCP 的同一规则转成 DID）。解析它们时不问 Zone locker，否则访问
+    /// Zone locker 本身要先解析它们，经 RTCP 转发形成回环。
+    #[serde(default)]
+    pub zone_locker_bypass: Vec<String>,
+}
+
 #[derive(Deserialize, Clone, Eq, PartialEq)]
 pub struct AcmeHostConfig {
     #[serde(alias = "hostname", alias = "domain")]

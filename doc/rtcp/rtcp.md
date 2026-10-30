@@ -191,8 +191,16 @@ peer_identity:
 ```
 
 - `did:dev`：直接从 DID 取 key，不做 Web/BNS/TXT 查询，trust 为 `KeyDid`；
-- `authority_current`：固定使用 `RemoteAuthority`，结果必须带 anchored authority
-  evidence，trust 为 `MethodAuthorityCurrent`；
+- `authority_current`：本机 / Zone locker（hosts 语义）先于 method authority，locker 的
+  回答是强制的（含 missing / invalid / revoked），trust 为 `TrustedHostSnapshot` /
+  `TrustedZoneSnapshot`；Zone locker 是 Zone 级 hosts，地位与本机 locker 相同。没有 locker
+  回答时固定使用 `RemoteAuthority`，结果必须带 anchored authority evidence，trust 为
+  `MethodAuthorityCurrent`。入站 snapshot 准入的后台权威确认与 Negative 恢复仍关闭两种
+  locker，只认真实权威回答。Zone locker 本身要经 RTCP 才能到达时（普通节点的本机 3180 按
+  ROUTES 转发到跑 system_config 的节点），路径上的目标和中继必须列入网关顶层配置
+  `name_client.zone_locker_bypass`（主机名或 DID，按 RTCP 同一规则转成 DID），解析它们时
+  跳过 Zone locker，否则会回环；BuckyOS 由 node_daemon 从 ROUTES / NODE_ROUTE_MAP /
+  keep-tunnel 目标生成这份名单。SN 的 3180 由本进程回答，不需要名单；
 - `trusted_snapshot`：固定使用 `LocalAndZone`，只接受非 stale、非 observed 且通过可信
   proof 的 Host/Zone 快照；
 - 普通 DNS TXT 永远不先于 DID method authority。

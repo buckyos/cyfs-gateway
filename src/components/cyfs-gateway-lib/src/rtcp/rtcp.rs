@@ -1286,7 +1286,9 @@ impl RTcpInner {
         }
     }
 
-    /// AuthorityCurrent:只允许 authority 联网、关闭两种 locker、要求本轮真实权威回答。
+    /// 本机 / Zone locker 是 hosts 语义的强制覆盖,两种要求下都先于 method authority
+    /// (Zone locker 是 Zone 级 hosts,让整个集群对同一 DID 得到一致结果;buckyos#710)。
+    /// AuthorityCurrent:没有 locker 覆盖时只允许 authority 联网,要求本轮真实权威回答。
     /// TrustedSnapshot:不发普通 provider 请求,只用本机 / Zone locker 与已验证缓存。
     // TODO(cyfs-gateway#207): with_transport_policy(IndependentControlPlane) once sources declare it.
     fn handshake_resolve_opts(&self, requirement: RtcpPeerIdentityRequirement) -> ResolveOpts {
@@ -1294,16 +1296,23 @@ impl RTcpInner {
         let opts = match requirement {
             RtcpPeerIdentityRequirement::AuthorityCurrent => ResolveOpts::default()
                 .authority_only()
-                .without_local_lock()
-                .without_zone_lock()
                 .with_force_authority_query(),
             RtcpPeerIdentityRequirement::TrustedSnapshot => ResolveOpts::default().not_allow_request(),
         };
         opts.with_timeout(budget).normalize(budget)
     }
 
+    /// 把 snapshot 准入升级为 MethodAuthorityCurrent、或从权威否定中恢复时,要的是 method
+    /// authority 本身的回答:关闭两种 locker,只接受本轮真实权威回答。
     fn authority_current_opts(&self) -> ResolveOpts {
-        self.handshake_resolve_opts(RtcpPeerIdentityRequirement::AuthorityCurrent)
+        let budget = Duration::from_secs(self.security.limits.handshake_timeout_secs.max(1));
+        ResolveOpts::default()
+            .authority_only()
+            .without_local_lock()
+            .without_zone_lock()
+            .with_force_authority_query()
+            .with_timeout(budget)
+            .normalize(budget)
     }
 
     // Resolve the peer's identity document under the configured requirement.
@@ -1337,27 +1346,31 @@ impl RTcpInner {
                 reasons.push(format!("{}#{} is disabled: {}", remote_did.to_string(), doc_type, result.reason()));
                 return Err(NSError::Disabled(reasons.join("; ")));
             }
-            let choice = match requirement {
-                RtcpPeerIdentityRequirement::AuthorityCurrent => {
-                    select_authority_current(&result, opts.receipts())
-                }
-                RtcpPeerIdentityRequirement::TrustedSnapshot => {
-                    result.select(&Revision::current()).cloned()
+            // locker 的回答是强制的(hosts 语义),不再交给 method authority。
+            let choice = if result.locked {
+                result.select(&Revision::current()).cloned()
+            } else {
+                match requirement {
+                    RtcpPeerIdentityRequirement::AuthorityCurrent => {
+                        select_authority_current(&result, opts.receipts())
+                    }
+                    RtcpPeerIdentityRequirement::TrustedSnapshot => {
+                        result.select(&Revision::current()).cloned()
+                    }
                 }
             };
             match choice {
                 Some(choice) if choice.is_valid() => {
-                    let trust = match requirement {
-                        RtcpPeerIdentityRequirement::AuthorityCurrent => {
-                            RtcpIdentityTrust::MethodAuthorityCurrent
+                    let trust = if result.locked
+                        || requirement == RtcpPeerIdentityRequirement::TrustedSnapshot
+                    {
+                        if Self::choice_from_zone_locker(&choice) {
+                            RtcpIdentityTrust::TrustedZoneSnapshot
+                        } else {
+                            RtcpIdentityTrust::TrustedHostSnapshot
                         }
-                        RtcpPeerIdentityRequirement::TrustedSnapshot => {
-                            if Self::choice_from_zone_locker(&choice) {
-                                RtcpIdentityTrust::TrustedZoneSnapshot
-                            } else {
-                                RtcpIdentityTrust::TrustedHostSnapshot
-                            }
-                        }
+                    } else {
+                        RtcpIdentityTrust::MethodAuthorityCurrent
                     };
                     return Ok((choice.doc.clone(), trust, Some(choice.source.id.clone())));
                 }
@@ -1379,6 +1392,17 @@ impl RTcpInner {
                             continue;
                         }
                         // A definite "no such document" is not a transport failure.
+                        return Err(NSError::NotFound(reasons.join("; ")));
+                    }
+                    if result.locked {
+                        // A locker answered without a usable document. Its answer
+                        // is final, so DNS TXT bootstrap must not override it either.
+                        reasons.push(format!(
+                            "{}#{} locker answer has no usable document: {}",
+                            remote_did.to_string(),
+                            doc_type,
+                            result.reason()
+                        ));
                         return Err(NSError::NotFound(reasons.join("; ")));
                     }
                     reasons.push(format!(
@@ -12470,6 +12494,66 @@ mod tests {
             identity.address_resolution.options.target_kind(),
             ResolveIpTargetKind::Zone
         );
+    }
+
+    #[tokio::test]
+    async fn authority_current_handshake_takes_locker_answer_as_hosts_override() {
+        let _ = init_name_lib_for_test(&HashMap::new()).await;
+        let client = GLOBAL_NAME_CLIENT.get().unwrap();
+        let remote_did = DID::new("rtcplockeroverride", "ood1.example");
+        // method authority 不可达：只有 locker 的回答能让握手成功。
+        client.set_method_authority(
+            &remote_did.method,
+            Arc::new(TestAuthorityProvider {
+                docs: Vec::new(),
+                negatives: Vec::new(),
+                owner_bindings: Vec::new(),
+                offline: Arc::new(AtomicBool::new(true)),
+            }),
+        );
+        let (mut device, _) = test_device_config("locked-ood");
+        let device_dev_did = device.id.clone();
+        device.id = remote_did.clone();
+        client.lock_document(
+            remote_did.clone(),
+            DidDocType::Device,
+            EncodedDocument::JsonLd(serde_json::to_value(&device).unwrap()),
+            name_client::LockOptions::default(),
+        );
+        let inner = RTcpInner::new(
+            DID::new("dev", "locker-override-client"),
+            "127.0.0.1:0".to_string(),
+            None,
+            None,
+            Arc::new(MockRTcpListener::new()),
+        );
+        assert_eq!(
+            inner.security.peer_identity.requirement,
+            RtcpPeerIdentityRequirement::AuthorityCurrent
+        );
+
+        let identity = inner
+            .resolve_handshake_identity(&remote_did)
+            .await
+            .expect("a locker answer overrides the method authority under authority_current");
+        assert_eq!(identity.semantic_did, remote_did);
+        assert_eq!(identity.canonical_dev_did, device_dev_did);
+        assert_eq!(identity.trust, RtcpIdentityTrust::TrustedHostSnapshot);
+        assert_eq!(identity.resolver_id.as_deref(), Some("local-locker"));
+
+        // 升级到 MethodAuthorityCurrent 的后台确认仍只认真实权威回答。
+        let opts = inner.authority_current_opts();
+        assert!(!opts.allow_local_lock() && !opts.allow_zone_lock());
+        let result = resolve_did_ex(
+            &remote_did,
+            Some(DidDocType::Device),
+            Revision::current(),
+            opts.clone(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.locked);
+        assert!(select_authority_current(&result, opts.receipts()).is_none());
     }
 
     #[tokio::test]

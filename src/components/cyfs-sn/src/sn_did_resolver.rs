@@ -33,6 +33,8 @@ pub enum SnDidDocumentStatus {
     Missing,
     Revoked,
     Tombstoned,
+    /// 权威数据确定性校验失败（HTTP 200 + reason，name-client 的 `invalid`）。
+    Invalid,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
@@ -410,7 +412,84 @@ impl SnResolverBackedDidResolver {
                 format!("did:web:{} is not managed by this SN", id),
             ));
         };
+        if request.profile != SnDidResolverProfile::InternalZoneResolver {
+            return self.resolve_web_binding(request, &binding).await;
+        }
 
+        // 托管范围已经确定：下面每个结果都是本 SN 的权威回答（含负状态），
+        // 不能再交给该域名的公网 HTTPS 发布面（buckyos#710）。
+        let doc_type = request.doc_type().unwrap_or(if binding.device_name.is_some() {
+            "device"
+        } else {
+            BNS_DOC_ZONE
+        });
+        if let Some(status) = owner_status_for_user_state(&binding.user.state) {
+            return Ok(self.negative_response(
+                request,
+                doc_type,
+                status,
+                SnDidDocumentSource::AuthDbProjection,
+                format!(
+                    "AuthDB owner {} of {} is {}",
+                    binding.username,
+                    binding.user_domain,
+                    binding.user.state.to_string()
+                ),
+            ));
+        }
+        match self.resolve_web_binding(request, &binding).await {
+            Ok(response) => {
+                // BNS 里的 compact JWT 原样返回（不改写已签名的 payload）。它声明的
+                // 是另一种身份时，本 SN 没有以这个 did:web 发布过文档。
+                if let Some(declared) = document_declared_id(&response.document) {
+                    if declared != request.did {
+                        return Ok(self.negative_response(
+                            request,
+                            doc_type,
+                            SnDidDocumentStatus::Missing,
+                            response.source,
+                            format!(
+                                "stored {} document identifies {}, not {}",
+                                doc_type,
+                                declared.to_string(),
+                                request.did.to_string()
+                            ),
+                        ));
+                    }
+                }
+                Ok(response)
+            }
+            Err(error) => match error.kind() {
+                SnResolverErrorKind::NameNotFound
+                | SnResolverErrorKind::DocumentNotFound
+                | SnResolverErrorKind::DeviceNotFound => Ok(self.negative_response(
+                    request,
+                    doc_type,
+                    SnDidDocumentStatus::Missing,
+                    SnDidDocumentSource::BnsDocument,
+                    error.to_string(),
+                )),
+                SnResolverErrorKind::InvalidDid => Ok(self.negative_response(
+                    request,
+                    doc_type,
+                    SnDidDocumentStatus::Invalid,
+                    SnDidDocumentSource::BnsDocument,
+                    error.to_string(),
+                )),
+                SnResolverErrorKind::NotManaged => Err(SnResolverError::backend(format!(
+                    "did:web:{} is bound to {} but its mapped documents are not managed: {}",
+                    id, binding.user_domain, error
+                ))),
+                _ => Err(error),
+            },
+        }
+    }
+
+    async fn resolve_web_binding(
+        &self,
+        request: &SnDidResolveRequest,
+        binding: &WebDomainBinding,
+    ) -> SnResolverResult<SnDidResolveResponse> {
         if binding.device_name.is_none() && request.doc_type().unwrap_or(BNS_DOC_ZONE) == "owner" {
             let owner_did = request.did.to_string();
             let mut response =
@@ -553,38 +632,49 @@ impl SnResolverBackedDidResolver {
         Ok(response)
     }
 
+    /// 托管范围：AuthDB 中覆盖 `host` 的最长 active 域名绑定（不按用户状态过滤）。
+    /// 绑定域名本身是 Zone，其下一级 label 是设备；更深的名字不是本 SN 发布的 DID。
+    /// `Ok(None)` 表示明确未托管；绑定存在但数据不一致是控制面错误，不能当作未托管。
     async fn find_user_domain_binding(
         &self,
         host: &str,
     ) -> SnResolverResult<Option<WebDomainBinding>> {
-        let Some(user) = self.auth.get_user_by_domain(host).await? else {
+        let Some(user) = self.auth.get_user_by_domain_binding(host).await? else {
             return Ok(None);
         };
         let Some(username) = user.username.clone() else {
-            return Err(SnResolverError::not_found(format!(
-                "user_domain {} has no username",
+            return Err(SnResolverError::backend(format!(
+                "domain binding covering {} has no owner username",
                 host
             )));
         };
-        let Some(user_domain) = user.user_domain.as_deref().map(normalize_host_lossy) else {
-            return Ok(None);
-        };
+        let user_domain = user
+            .user_domain
+            .as_deref()
+            .map(normalize_host_lossy)
+            .unwrap_or_default();
         if user_domain.is_empty() {
-            return Ok(None);
+            return Err(SnResolverError::backend(format!(
+                "domain binding covering {} has no domain",
+                host
+            )));
         }
 
         let device_name = if host == user_domain {
             None
         } else {
             let suffix = format!(".{}", user_domain);
-            host.strip_suffix(suffix.as_str())
-                .filter(|name| !name.is_empty() && !name.contains('.'))
-                .map(ToOwned::to_owned)
+            let Some(label) = host.strip_suffix(suffix.as_str()) else {
+                return Err(SnResolverError::backend(format!(
+                    "domain binding {} returned for {} does not cover it",
+                    user_domain, host
+                )));
+            };
+            if label.is_empty() || label.contains('.') {
+                return Ok(None);
+            }
+            Some(label.to_string())
         };
-
-        if host != user_domain && device_name.is_none() {
-            return Ok(None);
-        }
 
         let zone = self
             .resolver
@@ -601,6 +691,7 @@ impl SnResolverBackedDidResolver {
             user_domain,
             device_name,
             zone,
+            user,
         }))
     }
 
@@ -870,6 +961,7 @@ struct WebDomainBinding {
     user_domain: String,
     device_name: Option<String>,
     zone: ZoneResolution,
+    user: SNUserInfo,
 }
 
 impl WebDomainBinding {
@@ -1261,11 +1353,20 @@ fn rewrite_web_document_identity(
     );
 }
 
+fn document_declared_id(document: &EncodedDocument) -> Option<DID> {
+    let value = document.clone().to_json_value().ok()?;
+    DID::from_str(value.get("id")?.as_str()?).ok()
+}
+
 fn document_declared_owner(document: &EncodedDocument) -> Option<String> {
     let value = document.clone().to_json_value().ok()?;
     let owner = value.get("owner")?.as_str()?;
     DID::from_str(owner).ok().map(|did| did.to_string())
 }
+
+#[cfg(test)]
+#[path = "sn_zone_locker_tests.rs"]
+mod zone_locker_tests;
 
 #[cfg(test)]
 mod tests {

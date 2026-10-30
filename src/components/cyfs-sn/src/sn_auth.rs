@@ -670,6 +670,13 @@ pub trait SnAuthDB: Send + Sync + 'static {
     ) -> SnResult<Option<(String, String, Option<String>)>>;
     async fn get_user_info(&self, username: &str) -> SnResult<Option<SNUserInfo>>;
     async fn get_user_by_domain(&self, domain: &str) -> SnResult<Option<SNUserInfo>>;
+    /// 托管归属查询：返回覆盖 `domain` 的最长 active binding 的归属用户，**不按用户状态
+    /// 过滤**，`user_domain` 为命中的 binding 域名。SN 用它区分“未托管”与“托管但用户已
+    /// 暂停/注销”（buckyos#710）。默认实现沿用 `get_user_by_domain`：远端 AuthDB provider
+    /// （sn-business）本身不按用户状态过滤；会过滤的实现必须覆盖本方法。
+    async fn get_user_by_domain_binding(&self, domain: &str) -> SnResult<Option<SNUserInfo>> {
+        self.get_user_by_domain(domain).await
+    }
     async fn set_user_state(&self, username: &str, state: UserState) -> SnResult<()>;
     async fn update_user_public_key(&self, username: &str, public_key: &str) -> SnResult<()>;
     async fn update_user_zone_config(&self, username: &str, zone_config: &str) -> SnResult<()>;
@@ -912,6 +919,10 @@ impl SnAuthDB for RemoteSnAuthDB {
 
     async fn get_user_by_domain(&self, domain: &str) -> SnResult<Option<SNUserInfo>> {
         self.client.get_user_by_domain(domain).await
+    }
+
+    async fn get_user_by_domain_binding(&self, domain: &str) -> SnResult<Option<SNUserInfo>> {
+        self.client.get_user_by_domain_binding(domain).await
     }
 
     async fn set_user_state(&self, username: &str, state: UserState) -> SnResult<()> {
@@ -1820,6 +1831,40 @@ impl SqliteSnAuthDB {
         Ok(())
     }
 
+    /// 最长 active binding 的归属用户；`active_user_only` 为 false 时不按用户状态过滤，
+    /// 返回的 `user_domain` 是命中的 binding 域名。
+    async fn query_user_by_active_binding(
+        &self,
+        domain: &str,
+        active_user_only: bool,
+    ) -> SnResult<Option<SNUserInfo>> {
+        let canonical_domain = match canonical_user_domain(domain) {
+            Some(domain) => domain,
+            None => return Ok(None),
+        };
+        let row = sqlx::query(
+            "SELECT u.username, u.email, u.state, u.public_key, u.activation_code, u.zone_config,
+                    u.self_cert, b.domain AS user_domain, u.sn_ips, u.updated_at
+             FROM user_domain_bindings b
+             JOIN users u ON u.username = b.owner
+             WHERE b.state = 'active'
+               AND (?2 = 0 OR u.state = 'active')
+               AND (?1 = b.domain OR ?1 LIKE '%.' || b.domain)
+             ORDER BY length(b.domain) DESC
+             LIMIT 1",
+        )
+        .bind(canonical_domain.as_str())
+        .bind(active_user_only as i64)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| Self::db_err("query user by domain failed", e))?;
+
+        match row.as_ref().map(Self::user_from_row).transpose()? {
+            Some(user) => Ok(Some(self.project_user_relay(user).await?)),
+            None => Ok(None),
+        }
+    }
+
     fn user_from_row(row: &sqlx::sqlite::SqliteRow) -> SnResult<SNUserInfo> {
         let state_str: Option<String> = row
             .try_get("state")
@@ -2508,30 +2553,11 @@ impl SnAuthDB for SqliteSnAuthDB {
     }
 
     async fn get_user_by_domain(&self, domain: &str) -> SnResult<Option<SNUserInfo>> {
-        let canonical_domain = match canonical_user_domain(domain) {
-            Some(domain) => domain,
-            None => return Ok(None),
-        };
-        let row = sqlx::query(
-            "SELECT u.username, u.email, u.state, u.public_key, u.activation_code, u.zone_config,
-                    u.self_cert, b.domain AS user_domain, u.sn_ips, u.updated_at
-             FROM user_domain_bindings b
-             JOIN users u ON u.username = b.owner
-             WHERE b.state = 'active'
-               AND u.state = 'active'
-               AND (?1 = b.domain OR ?1 LIKE '%.' || b.domain)
-             ORDER BY length(b.domain) DESC
-             LIMIT 1",
-        )
-        .bind(canonical_domain.as_str())
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|e| Self::db_err("query user by domain failed", e))?;
+        self.query_user_by_active_binding(domain, true).await
+    }
 
-        match row.as_ref().map(Self::user_from_row).transpose()? {
-            Some(user) => Ok(Some(self.project_user_relay(user).await?)),
-            None => Ok(None),
-        }
+    async fn get_user_by_domain_binding(&self, domain: &str) -> SnResult<Option<SNUserInfo>> {
+        self.query_user_by_active_binding(domain, false).await
     }
 
     async fn set_user_state(&self, username: &str, state: UserState) -> SnResult<()> {
@@ -5216,6 +5242,14 @@ mod tests {
             .get_user_by_domain("host.sub.example.com")
             .await?
             .is_none());
+        // 托管归属不随用户状态消失：SN 据此回答 revoked，而不是把域名当成未托管。
+        let bound = db
+            .get_user_by_domain_binding("host.sub.example.com")
+            .await?
+            .unwrap();
+        assert_eq!(bound.username.as_deref(), Some("alice"));
+        assert_eq!(bound.user_domain.as_deref(), Some("sub.example.com"));
+        assert!(matches!(bound.state, UserState::Suspended));
         db.set_user_state("alice", UserState::Active).await?;
         assert!(db.get_user_by_domain("unrelated.org").await?.is_none());
 
@@ -5230,6 +5264,10 @@ mod tests {
             .await
             .map_err(|e| SqliteSnAuthDB::db_err("set legacy domain failed", e))?;
         assert!(db.get_user_by_domain("host.legacy.test").await?.is_none());
+        assert!(db
+            .get_user_by_domain_binding("host.legacy.test")
+            .await?
+            .is_none());
 
         Ok(())
     }

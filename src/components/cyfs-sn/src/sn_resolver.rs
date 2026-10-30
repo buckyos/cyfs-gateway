@@ -491,6 +491,14 @@ impl BnsDocumentReader for EmptyBnsDocumentReader {}
 pub trait SnAuthReader: Send + Sync + 'static {
     async fn get_user_info(&self, username: &str) -> SnResolverResult<Option<SNUserInfo>>;
     async fn get_user_by_domain(&self, domain: &str) -> SnResolverResult<Option<SNUserInfo>>;
+    /// 托管归属：最长 active binding 的归属用户，不按用户状态过滤（见
+    /// `SnAuthDB::get_user_by_domain_binding`）。
+    async fn get_user_by_domain_binding(
+        &self,
+        domain: &str,
+    ) -> SnResolverResult<Option<SNUserInfo>> {
+        self.get_user_by_domain(domain).await
+    }
     async fn get_zone_info(&self, username: &str) -> SnResolverResult<Option<ZoneInfo>>;
     async fn get_user_dns_rrset(
         &self,
@@ -566,6 +574,21 @@ impl SnAuthReader for SnAuthResolverReader {
         self.db.get_user_by_domain(domain).await.map_err(|e| {
             SnResolverError::backend(format!("query user by domain {} failed: {}", domain, e))
         })
+    }
+
+    async fn get_user_by_domain_binding(
+        &self,
+        domain: &str,
+    ) -> SnResolverResult<Option<SNUserInfo>> {
+        self.db
+            .get_user_by_domain_binding(domain)
+            .await
+            .map_err(|e| {
+                SnResolverError::backend(format!(
+                    "query domain binding {} failed: {}",
+                    domain, e
+                ))
+            })
     }
 
     async fn get_zone_info(&self, username: &str) -> SnResolverResult<Option<ZoneInfo>> {

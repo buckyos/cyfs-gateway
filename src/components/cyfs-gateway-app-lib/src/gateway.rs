@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::Instant;
 
 use crate::config_loader::GatewayConfigParserRef;
-use crate::{AcmeConfig, AcmeHostConfig, TlsCA, merge};
+use crate::{AcmeConfig, AcmeHostConfig, GatewayNameClientConfig, TlsCA, merge};
 use crate::{
     GATEWAY_CONTROL_SERVER_CONFIG, GATEWAY_CONTROL_SERVER_KEY, GatewayAppProfile,
     GatewayComposition, GatewayRuntimeCapabilities, GatewayServerRegistry, GatewayServerRuntime,
@@ -882,6 +882,40 @@ impl GatewayFactory {
     }
 }
 
+/// `name_client.zone_locker_bypass` 的条目按 RTCP 解析目标的同一规则（`DID::from_str`，
+/// 主机名经 web3 bridge 配置映射）转成 DID，所以要在 name-lib 初始化之后调用。
+fn zone_locker_bypass_dids(config: &GatewayNameClientConfig) -> Result<Vec<DID>> {
+    config
+        .zone_locker_bypass
+        .iter()
+        .map(|entry| {
+            let did = DID::from_str(entry.trim()).map_err(|e| {
+                anyhow!("invalid name_client.zone_locker_bypass entry {}: {}", entry, e)
+            })?;
+            if did.method.is_empty() || did.id.is_empty() {
+                return Err(anyhow!(
+                    "invalid name_client.zone_locker_bypass entry '{}'",
+                    entry
+                ));
+            }
+            Ok(did)
+        })
+        .collect()
+}
+
+fn apply_zone_locker_bypass(dids: Vec<DID>) -> Result<()> {
+    let client = get_name_client().ok_or_else(|| anyhow!("name client is not initialized"))?;
+    info!(
+        "name client Zone locker bypass: [{}]",
+        dids.iter()
+            .map(|did| did.to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    client.set_zone_locker_bypass(dids);
+    Ok(())
+}
+
 pub struct Gateway {
     config_file: Option<PathBuf>,
     init_config: Mutex<GatewayConfig>,
@@ -953,6 +987,10 @@ impl Gateway {
             return Err(anyhow!("{}", msg));
         }
         debug!("init default name client OK!");
+        // Zone locker 例外必须在任何 stack 接收流量之前生效。
+        let name_client_config = self.config.lock().unwrap().name_client.clone();
+        let bypass = zone_locker_bypass_dids(&name_client_config)?;
+        apply_zone_locker_bypass(bypass)?;
 
         if let Err(e) = self.stack_manager.start().await {
             error!("start stack manager failed, err:{}", e);
@@ -2721,6 +2759,8 @@ impl Gateway {
     }
 
     async fn reload_inner(&self, config: GatewayConfig, rollback_on_failure: bool) -> Result<()> {
+        // 先校验，坏配置在改动任何运行态之前失败。
+        let zone_locker_bypass = zone_locker_bypass_dids(&config.name_client)?;
         let traffic_config = config.traffic.clone();
         let old_config = { self.config.lock().unwrap().clone() };
         let device_manager_changed = old_config.device_manager != config.device_manager;
@@ -3044,6 +3084,9 @@ impl Gateway {
             }
         } else {
             debug!("device_manager config unchanged, keep current manager");
+        }
+        if old_config.name_client != config.name_client {
+            apply_zone_locker_bypass(zone_locker_bypass)?;
         }
         *self.config.lock().unwrap() = config;
         Ok(())

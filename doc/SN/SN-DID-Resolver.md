@@ -134,6 +134,7 @@ GET /{path}/{doc_type}.json
 - 明确命中 document：`200` + `documentStatus: "active"`。
 - 明确 Missing：`404` + `documentStatus: "missing"`。
 - 明确 Revoked/Tombstoned：`410` + 对应 `documentStatus`。
+- 确定性校验失败（例如 BNS 设备文档不是 compact JWT）：`200` + `documentStatus: "invalid"` + `reason`。
 - 不知道或不管理：NotApplicable/unknown，不写 `documentStatus`。
 
 Internal profile 只应绑定在内网、loopback 或受 SN 集群鉴权保护的入口。对公网开放时必须降级为
@@ -185,7 +186,8 @@ owner 约束必须是 `did:bns:{zone}`。返回的 `doc` 若是 JWT，JWT 内 `i
 
 ### `did:web:{domain}`
 
-只有当 `{domain}` 精确命中 SN 账号的 `user_domain` 时，SN 才管理该 DID。
+只有当 `{domain}` 是 AuthDB 中某个 active 域名绑定本身时，SN 才把它当 Zone DID 管理；
+托管范围的完整规则见下文“SN 进程内的 did:web authority”。
 
 目标行为：
 
@@ -228,6 +230,40 @@ device_info 掌握了足够的内部事实。
 - 不作为标准 `resolve_did` provider 输入。
 - Public profile 可以保留一段迁移期，但不得在文档中声称这是 DID method 权威结果。
 - Internal profile 可继续用于 SN relay / 调试路径里的 key 到设备反查。
+
+## SN 中继出站：Zone resolver 作为 Zone locker
+
+buckyos#710：托管域的 HTTPS 经 SN 的 RTCP 中继到用户 OOD，中继建流前要确认目标设备
+`did:web:{device}.{domain}` 的身份。did:web 的 method authority 是 name-client 的 `WebProvider`，
+它请求 `https://{device}.{domain}/.well-known/*` 和父域 `/1.0/identifiers/*`，请求又进入同一个
+SN、再次需要同一个设备身份，形成闭环。
+
+Zone resolver 是 Zone 级 hosts，地位与本机 locker 相同。RTCP 的 `authority_current` 让本机 /
+Zone locker 先于 method authority 作答（见 `doc/rtcp/rtcp.md` §3.2）；SN 进程的 Zone locker 就是
+`127.0.0.1:3180 → web3_sn` 的 Internal zone-resolver profile，所以托管域的目标身份由 SN 自己的
+AuthDB / BNS 数据回答，不访问公网 HTTPS：
+
+- **托管范围**：AuthDB 中覆盖该主机名的最长 active 域名绑定（`get_user_by_domain_binding`，
+  不按用户状态过滤）。绑定域名本身是 Zone，其下一级 label 是设备；更深的名字、边界相似的
+  域名都不在范围内。`{username}.{sn_host}` 的 owner 文档沿用既有的 SN 用户名主机规则。
+- **范围内**（强制回答，不再交给 `WebProvider`）：
+  - 用户暂停/封禁 → `revoked`，注销 → `tombstoned`，与文档类型无关；
+  - 文档缺失 → `missing`（RTCP 只在设备 `missing` 时再查同一 DID 的 Zone 文档）；
+  - BNS 中的 compact JWT 原样返回；它声明的 `id` 不是请求的 did:web 时返回 `missing`，
+    不改写已签名 payload；
+  - 存储的设备文档不是 compact JWT → `invalid`。
+- **范围外**：`404` 且无 `documentStatus`，name-client 继续问 method authority。
+- **AuthDB / BNS 不可用**：`500`，name-client 同样当作未覆盖、继续问 method authority。SN 的
+  hostname 转发 QA 读同一个控制面（AuthDB 读经 S2S 有 5 秒读缓存），此时已经拒绝转发，所以对
+  托管域的公网 HTTPS 请求不会再经 RTCP 回到这里。
+
+Zone resolver 的回答没有"缓存 / 最终"字段：协议（`http_did_resolver_api.md` §9）规定 Zone locker
+的明确状态都是强制回答，Unknown / 未覆盖才继续向后查；它回答的是 SN 自己的权威数据，不是被动缓存的
+上游 method authority 结果。`checkedAt` / `validUntil` 只描述这次读取的时间与建议复用期限。
+
+AuthDB 的 `get_user_by_domain` 必须把命中的 binding 域名放在 `user_domain`（一个用户可以有多个
+active 域名）。远端 provider（sn-business）在没有 binding 行时仍回退旧 `users.user_domain`
+字段；SN 的 DNS 权威、hostname 转发和 Zone resolver 都以同一个查询结果为准，保持一致。
 
 ## owner document 合成要求
 
