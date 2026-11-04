@@ -87,7 +87,7 @@
 
 - 明确代理入口是本地 app 配代理，还是系统代理转发到 socks 服务
 - 明确目标服务范围是固定目标、按域名规则、还是按 PAC / 规则文件选择
-- 判断是否需要 `enable_tunnel`
+- 确认目标 URL scheme 和本地已安装的 tunnel builder；当前 `enable_tunnel` 参数被忽略
 - 判断是否需要 `rule_config`
 - 明确这只是应用流量接入，不是整机网络接入
 
@@ -95,7 +95,7 @@
 
 - 哪些 app 可以使用该方案
 - 代理目标 `target` 是什么
-- 是否需要 `enable_tunnel`
+- hook 的 `DIRECT` / `PROXY <url>` / `REJECT` 决策与 RTCP 身份/准入配置
 - 规则文件从哪里加载
 - 哪些流量不会被这个方案覆盖
 

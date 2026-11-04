@@ -38,12 +38,12 @@ servers:
           default:
             priority: 1
             block: |
-              return ok;
+              error 404 "not found";
 ```
 
 ### 结论
 
-这是“配置承载结构”示例，不负责证明业务语义是否满足用户更复杂目标。
+这是最小 HTTP 入口，访问 `http://127.0.0.1:8080/` 可验证固定 404 与 `not found` 响应。
 
 ## 示例 2：includes 与 merge
 
@@ -73,3 +73,37 @@ servers:
 
 通常不需要。
 `stacks.<key>`、`servers.<key>`、`timers.<key>`、`limiters.<key>`、`global_process_chains.<key>` 会注入成 `id`，`collections.<key>` 会注入成 `name`。
+
+## 示例 4：TLS 使用显式证书
+
+这是 TLS stack 配置片段；需要先准备实际证书和私钥，路径按主配置文件目录解释。
+TLS 的 `hosts` 对象形式不能替换成旧 `certs` 字段。
+
+```yaml
+stacks:
+  tls_in:
+    protocol: tls
+    bind: 127.0.0.1:8443
+    hosts:
+      - host: gateway.example
+        cert_path: ./certs/gateway.pem
+        key_path: ./certs/gateway.key
+    alpn_protocols: [http/1.1]
+    hook_point:
+      main:
+        blocks:
+          route:
+            block: |
+              forward tcp:///127.0.0.1:8080;
+```
+
+## 示例 5：避免 Zone locker 解析回环
+
+```yaml
+name_client:
+  zone_locker_bypass:
+    - relay.example
+    - did:bns:ood1.alice
+```
+
+名单只用于跳过对这些节点的 Zone locker 查询，不会跳过 RTCP 身份验证或准入检查。

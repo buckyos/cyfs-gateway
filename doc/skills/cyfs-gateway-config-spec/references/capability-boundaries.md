@@ -19,6 +19,7 @@
 - `cyfs_gateway` 正式注册的 stack 协议包括 `tcp`、`udp`、`tls`、`quic`、`rtcp`、`tun`
 - `tun` 配置包含 `bind`、`mask`、`mtu`、`tcp_timeout`、`udp_timeout`、`hook_point`
 - `socks` 配置包含 `target`、`enable_tunnel`、`rule_config`、`hook_point`
+- `enable_tunnel` 是字符串数组，当前 tunnel manager 忽略该参数，不能承诺它能限制或启用协议
 - `socks` 会通过 `TunnelManager` 获取到 `proxy_target` 的 tunnel，再为请求目标打开流
 - process chain 可用于路由、转发、命中规则和调用 server / global chain
 
@@ -39,7 +40,7 @@
 
 - `socks5` 是应用代理接入模型
 - 它适合“支持代理的 app 访问远端服务或远端网络资源”
-- 它可以配合 `enable_tunnel` 和 `rule_config` 做按代理目标或规则的接入
+- 它通过 `target`、hook 返回的代理动作和 `rule_config` 做目标/规则接入；实际 tunnel builder 由 URL scheme 决定
 - 它不等价于整机进入同一虚拟网段
 
 ## 5. 当前不应直接宣称的能力

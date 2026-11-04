@@ -38,7 +38,7 @@ SOCKS5 服务已经起来了，但客户端还是连不上远端。
 2. 系统代理是否被这个 app 继承
 3. `target` 是否正确
 4. `rule_config` 是否命中
-5. `enable_tunnel` 是否按预期生效
+5. 目标 URL scheme 是否存在对应 builder，RTCP 的身份/准入是否通过（`enable_tunnel` 当前被忽略）
 
 ## 示例 4：DNS 对了，但连接仍失败
 

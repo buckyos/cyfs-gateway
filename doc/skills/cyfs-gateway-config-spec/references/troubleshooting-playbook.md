@@ -22,6 +22,9 @@
 - 监听端口是否成功打开
 - 两端或多端是否能建立底层连接
 - TLS / QUIC / RTCP 所需证书、密钥、名称是否完整
+- TLS 是否仍在使用失效的 `certs` 配置；当前应写 `hosts`
+- RTCP v4 的 peer identity / inbound admission 是否允许对端；默认 anonymous=reject、named_min_relation=same_zone，hook 的 accept 不能替代这些检查
+- 访问 Zone locker 所需 relay 是否导致解析回环；必要时检查 `name_client.zone_locker_bypass`，不要把它当成身份校验豁免
 
 如果 underlay 都没建立，不要先讨论 `tun` 地址或代理规则。
 
@@ -71,6 +74,9 @@
 
 ### 隧道建立了，但 ping 不通
 
+当前 skill 校验的是 TUN 的 TCP/UDP 数据处理；ping 的 ICMP 通断不能单独证明其业务转发
+是否可用。应同时用明确目标的 TCP/UDP 业务验证 hook 的 `forward` / `server` 动作。
+
 优先检查：
 
 - `tun` 地址是否在同一规划中
@@ -95,6 +101,7 @@
 - 系统代理是否生效到了该 app
 - `target` 是否可达
 - `rule_config` 是否命中了预期流量
+- socks hook 是否返回正确的 `DIRECT` / `PROXY <url>` / `REJECT`；`enable_tunnel` 当前虽可解析但被 tunnel manager 忽略
 
 ### DNS 正确，但连接仍失败
 

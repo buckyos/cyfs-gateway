@@ -38,4 +38,6 @@
 
 ### 结论
 
-只要涉及 `if/elif/else/end`、`for ... end`、`match-result ... end`，就要明确写成 statement 级结构，而不是把它们当普通命令。
+`if/elif/else/end`、`case/when/else/end`、`for ... end`、`match-result ... end` 都是 statement。
+`case $REQ.path as path then` 只将 subject 求值一次，各 `when` 仍写完整谓词；`first-ok`
+则是命令，至少接收两个 `$(...)` 并返回第一个 success，遇到 control 直接向外传播。

@@ -34,7 +34,7 @@ description: 用于独立讲解、审查、设计和排查 cyfs-gateway 配置�
 4. 再读 [references/config-reference.md](references/config-reference.md)，确认装载链、merge 语义、路径规则、顶层结构和已支持类型。
 5. 涉及 process chain 时，读 [references/process-chain-rules.md](references/process-chain-rules.md)。
 6. 如果问题涉及数据转发、上游选择、`call-server` / `forward`、多上游算法、反向代理或 stream/datagram 转发，读 [references/data-forwarding.md](references/data-forwarding.md)。
-7. 需要查 `if/elif/else/end`、`for ... end`、`match-result ... end` 这类结构化语句时，继续读 [references/process-chain-rules.md](references/process-chain-rules.md)；需要查具体 DSL 命令、参数形式、命令别名差异、collection 命令行为时，读 [references/process-chain-command-manual.md](references/process-chain-command-manual.md)。
+7. 需要查 `if/elif/else/end`、`case/when/else/end`、`for ... end`、`match-result ... end` 这类结构化语句时，继续读 [references/process-chain-rules.md](references/process-chain-rules.md)；需要查具体 DSL 命令、参数形式、命令别名差异、collection 命令行为时，读 [references/process-chain-command-manual.md](references/process-chain-command-manual.md)。
 7.5. 只要要输出配置示例，必须先锁定目标 `protocol` 或 `server type` 的字段集合。
    - `stacks.<id>` 示例中的字段，必须全部来自 `config-reference.md` 对应协议的小节，或 `implementation-checked.md` 明确校验过的字段。
    - `servers.<id>` 示例中的字段，必须全部来自 `config-reference.md` 对应 server 类型的小节，或 `implementation-checked.md` 明确校验过的字段。
@@ -54,16 +54,21 @@ description: 用于独立讲解、审查、设计和排查 cyfs-gateway 配置�
 ## 必须遵守的规范
 
 - `stacks`、`servers`、`timers`、`limiters`、`collections`、`global_process_chains` 都是“map 作为定义源”，运行时再把 key 注入成 `id` 或 `name`。
-- `hook_point`、`post_hook_point`、`on_new_tunnel_hook_point`、`blocks` 在 YAML 里通常写成 map；解析阶段会转成数组。
+- `hook_point`、`post_hook_point`、`on_new_tunnel_hook_point`、`blocks` 在应用配置中必须写成 map；解析阶段会转成数组。
 - 只有本 skill 已列出的协议和服务类型，才能声明为“当前应用支持”。库内存在但未注册的类型不能写进正式规范。
 - process chain 规则、控制流和常见环境变量，以本 skill 的 `process-chain-rules.md` 为准。
 - process chain 的具体命令名、参数形式和 collection 命令行为，以本 skill 的 `process-chain-command-manual.md` 为准；不要混用旧文档里的下划线/短横线写法。
-- `if/elif/else/end`、`for ... in ... then ... end`、`match-result ... end` 是 statement 级语法，不是普通命令；写规范时要把“结构化语句”和“控制命令”分开讲。
+- `if/elif/else/end`、`case/when/else/end`、`for ... in ... then ... end`、`match-result ... end` 是 statement 级语法，不是普通命令；`first-ok` 是命令结果回退组合器，不是 statement。
 - `path` 和 `*_path` 会在最终解析前统一做路径归一化。写规范时必须明确“相对路径按主配置文件目录解释”。
+- 不把这条路径规则推广到 `semantic_root`、`rule_config`、`auth_data_dir` 或不以 `_path` 结尾的别名。
+- TLS 使用 `hosts`，不能沿用旧 `certs` / `client_auth`；QUIC 仍保留 `certs`，两者字段集不能互相复制。
+- SOCKS 的 `hook_point` 必填；`enable_tunnel` 是字符串数组，当前 tunnel manager 忽略该参数，不承诺协议筛选效果。
+- RTCP v4 默认拒绝匿名并要求同 Zone；跨 Zone 方案必须说明身份与准入策略，不能用 hook 中的 `accept` 替代握手检查。
 - 讨论“数据转发”时，必须先区分三类入口：
   `call-server`：把请求或连接交给已声明的 server 对象
   `forward`：直接把流量转给目标 upstream URL
-  `socks` server：让支持代理的应用经 `target` / `rule_config` / `enable_tunnel` 接入远端资源
+  `socks` server：让支持代理的应用经 `target` / `hook_point` / `rule_config` 接入远端资源
+- `call-stack <id>` 把当前 ordered stream 交给另一个 stack，目前仅 TCP/TLS 消费和接收；它和 server 分发、上游 URL 转发分别说明。
 - 讨论 `forward` 时，只能使用本 skill 已校验的语义：
   缺省算法 `round_robin`
   可选算法 `ip_hash`、`hash`、`consistent_hash`、`least_time`
@@ -116,13 +121,14 @@ description: 用于独立讲解、审查、设计和排查 cyfs-gateway 配置�
 - 先写运行时真相，再写推荐写法。
 - 如果用户要求“完整支持列表”，必须指出：
   当前 `cyfs_gateway` 注册的 stack 协议是 `tcp`、`udp`、`tls`、`quic`、`rtcp`、`tun`
-  当前注册的 server 类型是 `http`、`socks`、`dns`、`dir`、`control_server`、`local_dns`、`sn`、`acme_response`
+  `cyfs_gateway` 注册的 server 类型是 `http`、`socks`、`dns`、`dir`、`cyfs-dir`、`named-inbox-cache`、`control_server`、`local_dns`、`acme_response`
+  `web3_gateway` 额外支持 `sn`；两个应用都有 SN client / `sn-dns` ACME provider，但不因此都安装 SN server
 - 如果提到 `ndn`，必须注明：旧版 `NdnServerConfig` 已移除，当前应用不支持该类型；
   `cyfs://` 语义由已注册的 `cyfs-dir` 提供。
 - 如果用户要“独立规范文档”或“可复制的 skill”，只使用本 skill 自带 references 中的内容组织答案，不再要求回到仓库核对。
 - 如果用户要求“配置规范 + process chain 规则”，需要同时覆盖配置承载结构和 DSL 执行规则，而不是只给 YAML 结构。
 - 如果用户要求“完整命令列表”“某条命令怎么写”“某个 collection 命令的精确行为”，优先按 `process-chain-command-manual.md` 回答，并使用文档中的 canonical 命令名。
-- 如果用户要求“完整逻辑控制语法”，必须同时覆盖表达式链的 `&&` / `||` / `!` / `;` / `()`，以及 statement 级的 `if/elif/else/end`、`for ... end`、`match-result ... end`。
+- 如果用户要求“完整逻辑控制语法”，必须同时覆盖表达式链的 `&&` / `||` / `!` / `;` / `()`，以及 statement 级的 `if/elif/else/end`、`case/when/else/end`、`for ... end`、`match-result ... end`。
 - 如果用户要求“数据转发”“上游转发”“反向代理”“server 分发”“四层转发”，回答结构必须至少包含：
   目标层级
   入口类型，是 `call-server`、`forward`、`socks` 还是 `tun + 宿主机路由`

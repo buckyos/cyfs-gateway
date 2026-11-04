@@ -6,8 +6,9 @@
 ## 校验范围
 
 - 源码仓库：`cyfs-gateway`
-- 校验日期：2026-07-20；traffic 模块移除于 2026-09-29 复核
-- 校验基线：Gateway 公共宿主与静态模块化改造后的工作区
+- 校验日期：2026-11-04
+- 校验基线：仓库 `666ea22` 的本地实现（Beta2.2）
+- 校验方式：源码静态核对、skill 结构、相对链接、YAML 示例及 Rust 字段集合检查；本轮未运行 Rust 测试或网络互通测试。下文引用测试文件用于定位已有行为覆盖，不代表本轮执行结果
 
 ## 已校验的当前实现事实
 
@@ -24,32 +25,34 @@
 - `quic`
 - `tun`
 
-两个二进制在各自的薄 `lib.rs` 中显式安装相同模块清单。结论：skill 可以把这 6 个
+两个二进制在各自的薄 `lib.rs` 中都安装 core 与 tun 模块。结论：skill 可以把这 6 个
 协议列为两个当前应用编译安装的能力。配置只会创建其中实际声明的 Stack 实例。
 
 ### 2. 当前注册的 server 类型
 
 `src/components/cyfs-gateway-app-lib/src/server_registry.rs` 的 core registration 与
-`src/components/cyfs-gateway-modules/src/lib.rs` 的 DNS、SOCKS、SN adapter 共同注册：
+`src/components/cyfs-gateway-modules/src/lib.rs` 的 DNS、SOCKS adapter 为两个应用共同注册：
 
 - `http`
 - `socks`
 - `dns`
 - `dir`
 - `cyfs-dir`
+- `named-inbox-cache`
 - `control_server`
 - `local_dns`
-- `sn`
 - `acme_response`
 
 每个 registration 同时包含 config parser、runtime factory 和 context builder；`dir` 与
-`sn` 显式标记为 contextless。`cyfs_gateway` 和 `web3_gateway` 当前都显式安装
+`named-inbox-cache` 显式标记为 contextless。`cyfs_gateway` 和 `web3_gateway` 都显式安装
 `CoreGatewayModule`、`DnsGatewayModule`、`SocksGatewayModule`、`TunGatewayModule`、
-`SnClientGatewayModule`、`SnGatewayModule`，因此 manifest 具有相同的 9 项 Server 能力。
+`SnClientGatewayModule`。但只有 `src/apps/web3_gateway/src/lib.rs` 额外安装
+`SnGatewayModule`，增加 contextless 的 `sn` server。`cyfs_gateway` 有 9 种 server，
+`web3_gateway` 有 10 种；SN client 提供 `sn-dns` ACME provider 不代表安装 SN server。
 
 当前两个应用均未安装 traffic adapter；若配置包含 `traffic` 段，解析时会提示缺少对应模块。
 
-结论：skill 可以把这 9 个 server 类型列为两个当前应用编译安装的能力；没有安装相应
+结论：skill 必须按应用分别说明能力；没有安装相应
 模块的其它应用会在 parse 阶段拒绝该类型，并列出已安装能力。
 
 ### 2.1 编译能力与配置实例
@@ -71,6 +74,8 @@
 - `mtu`
 - `tcp_timeout`
 - `udp_timeout`
+- `stream_idle_timeout`
+- `connect_timeout`
 - `io_dump_*`
 - `hook_point`
 
@@ -108,16 +113,25 @@
 - `target`
 - `enable_tunnel`
 - `rule_config`
+- `stream_idle_timeout`
+- `connect_timeout`
 - `hook_point`
 
 在 `src/components/cyfs-socks/src/server/server.rs` 中，`target`、`enable_tunnel`、`rule_config` 会进入 `SocksProxyConfig`。
-在 `src/components/cyfs-gateway-modules/src/lib.rs` 的 `SocksGatewayModule` 中，
+`target` 是 URL，`enable_tunnel` 是 `Option<Vec<String>>`，不是 bool，`hook_point` 必填。
+`src/components/cyfs-socks/src/socks/socks5.rs` 的 hook 消费 `DIRECT` / `PROXY <url>` /
+`REJECT` 决策，和 stack 的 `forward` 动作不同。
+在 `src/components/cyfs-socks/src/tunnel/tunnel_builder.rs` 中，
 `SocksTunnelBuilder` 会：
 
 - 基于 `proxy_target` 与 `enable_tunnel` 调用 `TunnelManager::get_tunnel(...)`
-- 再按请求目标地址 `open_stream_by_dest(...)`
+- 再按请求目标地址 `open_stream_by_dest_with_timeout(...)`
 
-结论：当前有明确证据表明 `socks` 不只是本地直连代理配置，还支持通过 tunnel manager 构建面向代理目标的通道。
+`src/components/cyfs-gateway-lib/src/tunnel_mgr.rs` 的 `get_tunnel()` 将参数命名为
+`_enable_tunnel` 并忽略，实际仅按 URL scheme 选择 builder。
+
+结论：`socks` 支持通过 tunnel manager 构建代理通道，但不能把 `enable_tunnel` 列表
+描述成当前有效的协议筛选或启用开关。
 
 ### 5. `rule_config` 的当前语义
 
@@ -142,9 +156,15 @@
 - RTCP 的 `on_new_tunnel_hook_point`
 - HTTP server 的 `hook_point`
 - HTTP server 的 `post_hook_point`
+- `cyfs-dir` server 的 `hook_point`
 - `global_process_chains`
 
-结论：skill 可以稳定宣称这些区域支持 YAML map 写法并在解析阶段转成数组。
+DNS / SOCKS / TUN 的 adapter parser 位于 `src/components/cyfs-gateway-modules/src/lib.rs`，
+也调用相同转换器。转换器要求 map，不能把底层 Rust 数组配置直接传给应用入口。
+
+结论：这些区域使用 map 并在解析阶段转成数组。chain 按 priority 升序；block 排序须区分
+入口：`src/components/cyfs-gateway-lib/src/config.rs` 的 `create_process_chain()` 按 block priority
+排序（包括 DNS）；SOCKS 的 `parse_process_chain()` 则使用 JSON loader 保留传入 block 顺序。
 
 ### 7. 顶层 map key 注入为 `id` / `name`
 
@@ -168,10 +188,12 @@
 - `normalize_all_path_value_config(...)` 会归一化 `path` 与 `*_path`
 - 相对路径按传入的 `base_dir` 归一化
 
-在 `src/components/cyfs-gateway-app-lib/src/app.rs` 中，加载主配置文件后会先设置主配置
-目录，再调用 `normalize_all_path_value_config(...)`。
+在 `src/components/cyfs-gateway-app-lib/src/gateway.rs` 的 `load_user_config_from_file()` 中，
+控制面基础配置合入和参数替换后调用 `normalize_all_path_value_config(...)`。
 
-结论：skill 可以稳定宣称“配置值里的 `path` / `*_path` 按主配置文件目录解释”。
+结论：字符串 `path` / `*_path` 按主配置文件目录解释，并保留 `#fragment`；
+`semantic_root` / `rule_config` / `auth_data_dir` 及不以 `_path` 结尾的身份目录别名不在通用归一化范围内。
+`load_config_from_file()` 仅对应用默认主配置套用已保存 patch；任意 `-c` 文件不自动套用。
 
 ### 9. includes 解析规则
 
@@ -301,6 +323,94 @@
 - `tls:///host:port`
 
 而不是把 `host:port` 放在 authority 里的 `tls://host:port`。
+
+### 15. TLS / QUIC 身份与证书 schema
+
+- `src/components/cyfs-gateway-lib/src/stack/tls_stack.rs`：`TlsStackConfig` 使用 `hosts`，
+  无 `certs` / `client_auth`；`TlsHostConfig` 支持字符串身份主机和 `{host, cert_path, key_path}`
+  对象（host 别名 domain），显式证书两个路径必须成对提供。
+- `src/components/cyfs-gateway-lib/src/stack/quic_stack.rs`：`QuicStackConfig` 同时保留
+  字符串 `hosts` 和兼容 `certs`；元素 `StackCertConfig` 在 `config.rs` 定义，附加数据采用 flatten。
+- 两类 stack 均可指定 `identity_manager`；顶层继承规则见 `config_parser.rs` 的
+  `apply_gateway_identity_manager_to_stack()`，仅注入字符串 hosts 模式，已有 stack 级对象整体优先。
+- TCP/TLS/QUIC/RTCP/TUN/SOCKS 的 stream idle 默认 600 秒；QUIC/RTCP/TUN/SOCKS 的 connect
+  默认 60 秒（`stack/mod.rs`），0 关闭。HTTP 的同名 connect 字段另有毫秒/时长字符串语义。
+- `tcp_stack.rs` / `udp_stack.rs` 的并发默认均为 0（不设业务上限），UDP `max_sessions`
+  也默认为 0；`session_idle_time` 仍默认 120 秒。
+
+### 16. RTCP v4 的身份、准入、资源与保活
+
+- `stack/rtcp_stack.rs` 的 `RtcpStackConfig` 拒绝未知字段，支持 `identity`（别名 did /
+  device_did）、`identity_manager`、可选 legacy 字段及四个策略对象。
+- `load_rtcp_identity_material()` 禁止 identity 与 key_path / device_config_path / name
+  混用；legacy 模式要求 key_path。逻辑 DID 要求匹配的签名设备 JWT；加载器支持显式 JWT、
+  身份目录 JWT 与 legacy 设备文件旁的 `device_doc.jwt` 等来源。
+- `rtcp/rtcp.rs` 的 `RtcpPeerIdentityConfig` / `RtcpInboundAdmissionConfig` 默认是
+  authority_current、禁止 DNS TXT bootstrap、拒绝匿名、same_zone，重确认年龄 unlimited。
+- 同文件的 `RtcpLivenessConfig` / `RtcpLimitsConfig` 给出保活、速率和容量默认值及校验；
+  完整字段见 config-reference。datagram 上限由 `rtcp/datagram.rs` 定义为 65507 字节。
+- `prepare_update()` 拒绝安全策略、身份和私钥变化，需重建 stack。
+- `on_new_tunnel_hook_point` 在内建身份/准入检查之后调用，不能用链中的 accept 替代握手策略。
+
+### 17. 新增 server 的字段依据
+
+- `server/cyfs_dir_server.rs`：`CyfsDirServerConfig` 定义 named_store_config_path、
+  http_backend_links、签名选项、semantic_root、url_prefix、obj_id_in_host、mode、
+  scan_interval_secs（默认 60）和可选 hook_point；链解析变量为 RESP_cyobj_meta / RESP_cyobj_id。
+- `server/named_inbox_cache_server.rs`：`NamedInboxCacheServerConfig::validate()` 校验
+  target_zone、accepted_paths、cache_path、HTTP(S) origin、正时长/配额/容量，拒绝未知字段；
+  接收路径要求 `VerifiedDispatchContext`。字段默认值见 config-reference 对应表。
+- `src/components/cyfs-sn/src/sn_server.rs`：`SNServerConfig` 的 ip / bns_server_url 可省略，
+  另有 region_probe_config_path、local_relay_node、app_did 等可选字段；该 server 仅 web3 应用安装。
+
+### 18. 顶层 name client / identity manager / ACME
+
+- `config_parser.rs` 定义 `GatewayNameClientConfig`，仅允许 zone_locker_bypass，默认空；
+  `config_loader.rs` 解析，`gateway.rs` 在 start / reload 中验证为 DID 并设置到全局 name client。
+  `src/apps/cyfs_gateway/tests/test_name_client_config.rs` 覆盖启动、名单替换、错误输入保留旧名单。
+- `GatewayIdentityManagerConfig` 定义公共/安全根目录和别名；注入 TLS/QUIC 的 hosts、RTCP
+  的 identity 模式，也给未显式设置 identity manager 的 ACME 补值。
+- `AcmeConfig` 支持 account、issuer、dns_providers、hosts、identity_manager、check_interval、
+  renew_before_expiry；没有 issuers。`tunnel_client_certs` 无当前装载代码，不能作为有效配置。
+- `global_collection_manager.rs` 的 `CollectionConfig.data` 使用 serde flatten；类型附加字段
+  写在 collection 对象内，不应包一层 data。
+
+### 19. 来源变量与可信身份
+
+- `server/server.rs` 的 `RequestSourceInfo` 区分 conn_source_*、real_source_*、source_*；
+  HTTP REQ 的这些保留字段来自 StreamInfo，不是同名客户端头。
+- `server/http_server.rs` 仅从 trusted_upstreams 接受 X-Forwarded-For / X-Real-IP 来源恢复，
+  已有 PROXY/tunnel 恢复信息优先；顶层 REQ_remote_* 与 REQ_conn_remote_* / REQ_real_remote_*
+  是相应来源字段的兼容变量。
+- HTTP REQ.source_device_did / source_identity_trust 来自 stream 的 RTCP 身份。
+  跨 HTTP 转发如需生成身份头，应先删除客户端同名头再从可信字段填入；当前应用不自动把任意
+  身份头视为认证结果。
+- `stack/rtcp_stack.rs` 暴露 source_device_id、real_source_did、source_did、
+  source_canonical_device_id、source_identity_trust、source_zone_relation 等字段；不能将它们
+  与 HTTP 的 source_device_did 字段名混用。
+
+### 20. `call-stack` 与 DNS resolve 扩展
+
+- `cmds/mod.rs` 注册 `CallStack`；`cmds/stack.rs` 的 `call-stack <stack_id>` 返回 lib 级
+  `stack <id>`。TCP/TLS 消费该动作并将当前 ordered stream 交给目标 stack；
+  目标兼容性与路由循环检查由 `stack/stack.rs` 的 manager 处理，目前可接收的目标为 TCP/TLS。
+- `DnsGatewayModule` 安装 `src/components/cyfs-dns/src/cmd_resolve.rs` 的 `resolve` 扩展，
+  支持默认 DNS、指定 DNS IP/端口或已声明的 name server；不是名为 dns-resolve 的命令。
+
+### 21. DSL 当前语法与内建命令
+
+- `src/components/cyfs-process-chain/src/cmd/factory.rs` 注册 `first-ok`、`oneof`、`split`、
+  URI/query 命令、echo 及手册已有的控制/集合/字符串命令；命令完整性应以该 registry 核对。
+- `cmd/control.rs`：first-ok 至少接受两个命令替换，按 success/error/control 顺序组合，
+  不吞掉 control；`cmd/match_.rs` 的 oneof 使用与 eq 相同的 typed/loose 比较。
+- `cmd/uri.rs` 定义 parse-authority（别名 parse-auth）、parse-uri、parse-query、build-uri、
+  build-query、query-get；`cmd/string.rs` 的 split 返回 List，可 capture。
+- `block/parser.rs` / `block/exec.rs` 支持 case/when/end（含 subject as binding）、for、
+  if、match-result；变量路径的动态下标、安全访问与缺省值见
+  `src/components/cyfs-process-chain/src/test/test_var.rs`，Map/List 字面量见
+  `src/components/cyfs-process-chain/src/test/test_collection_literal.rs`。
+- `src/components/cyfs-process-chain/src/test/test_case.rs` / `test_first_ok.rs` 验证单次 subject
+  求值、绑定恢复、分支选择、结果组合和非法输入；不能把 case 当成普通命令或 shell case 模板。
 
 ## 当前没有足够证据直接承诺的部分
 

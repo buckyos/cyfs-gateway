@@ -43,12 +43,13 @@
 | 命令 | 规范语法 | 说明 |
 | --- | --- | --- |
 | `goto` | `goto --block <id>` / `goto --chain <id>` / `goto --lib <id>` | 先执行目标，再把结果映射成当前调用者的 `return/error`；支持 `--arg KEY VALUE`、`--from`、`--ok-from`、`--err-from` |
+| `first-ok` | `first-ok $(cmd1) $(cmd2) ...` | 至少两个命令替换，顺序尝试，返回第一个 success；全部失败返回最后一个 error；control 立即向外传播 |
 | `exec` | `exec <block_id>` / `exec --block <id>` / `exec --chain <id>` / `exec --lib <id>` | 调用 block/chain/lib，执行完成后继续当前代码；不传命名参数 |
 | `invoke` | `invoke <block_id>` / `invoke --chain <id> --arg k v ...` | 类似 `exec`，但会把命名参数注入到 `__args.<key>` |
 | `return` | `return [value]` / `return --from block|chain|lib [value]` | 成功返回到指定层级 |
 | `error` | `error [value]` / `error --from block|chain|lib [value]` | 失败返回到指定层级 |
 | `exit` | `exit` / `exit <value>` | 结束当前 process-chain list |
-| `break` | `break` / `break <value>` | 只用于 `map` 内部提前中断 |
+| `break` | `break` / `break <value>` | 退出当前 `for` 循环或 `map` 迭代 |
 | `accept` | `accept` | 等价于 `exit accept` |
 | `reject` | `reject` | 等价于 `exit reject` |
 | `drop` | `drop` | 等价于 `exit drop` |
@@ -61,7 +62,8 @@
   - lib: `lib`
 - `exec` / `invoke` 如果目标内部出现 `return` / `error`，会被归一化成普通 success/error 结果。
 - `exit` 不能在 `exec` / `invoke` 的目标内部作为可返回 control 继续上传；它本来就是结束当前 list。
-- `break` 只适合 map-reduce 语境，不适合普通 hook chain。
+- `break` 需要 `for` / map-reduce 迭代语境，不能用于替代普通 hook 的路由返回。
+- `first-ok` 的参数必须是 `$(...)`，不是普通值；它组合命令结果，不会按字符串是否为空决定回退。
 
 ### 常用例子
 
@@ -119,6 +121,7 @@ delete --block tmp_value
 | `match-host` | `match-host [--capture name] [--no-ignore-case] <value> <pattern>` | host 模板匹配；默认按 `.` 分 label，支持 `{name}` 捕获和尾部 `**` |
 | `eq` | `eq [--ignore-case] [--loose] <left> <right>` | 相等比较；默认强类型比较 |
 | `ne` | `ne [--ignore-case] [--loose] <left> <right>` | 不等比较 |
+| `oneof` | `oneof [--ignore-case] [--loose] <value> <candidate...>` | 至少一个候选，按 eq 的比较规则顺序判断；首个匹配返回 success(true)，均不匹配返回 error(false) |
 | `gt` | `gt [--loose] <left> <right>` | 数值大于 |
 | `ge` | `ge [--loose] <left> <right>` | 数值大于等于 |
 | `lt` | `lt [--loose] <left> <right>` | 数值小于 |
@@ -176,6 +179,7 @@ range $REQ.target.port 1000 2000 && accept;
 | `ends-with` | `ends-with [-i|--ignore-case] <string> <suffix>` | 后缀判断 |
 | `url_encode` | `url_encode <string>` | URL 百分号编码 |
 | `url_decode` | `url_decode <string>` | URL 百分号解码；非法 `%XX` 或非 UTF-8 会报错 |
+| `split` | `split [--capture name] [--skip-empty] <value> <delimiter>` | 返回 List；默认保留首尾/中间空段，空分隔符报错；capture 替换为新的 List 变量 |
 
 ### 字符串命令细节
 
@@ -207,6 +211,21 @@ starts-with $REQ.path "/api/"
 ends-with $REQ.host ".example.com"
 url_encode $REQ.url
 ```
+
+### URI / query 命令
+
+| 命令 | 规范语法 | 结果与约束 |
+| --- | --- | --- |
+| `parse-authority` / `parse-auth` | `parse-authority [--default-port N] <value>` | 返回 Map：host、port、has_port、userinfo；不接受完整 URL，port 为 Number 或 Null，IPv6 host 保留方括号 |
+| `parse-uri` | `parse-uri <absolute-uri>` | 返回 Map：scheme、authority、host、port、effective_port、has_port、username、password、path、query、fragment；相对 URI 报错 |
+| `parse-query` | `parse-query <query>` | 返回 MultiMap；允许前导 `?`，按 form-urlencoded 解码，`+` 变空格，相同 key/value 去重 |
+| `build-uri` | `build-uri <map>` | 接受 scheme、authority、host、port、username、password、path、query、fragment；结构化 host 字段优先于 authority，返回规范化绝对 URI |
+| `build-query` | `build-query <map-or-multimap>` | 按 form-urlencoded 编码，结果不含 `?`；Map 支持 String/Number/Bool/Null，Null 输出空值；不承诺原始参数顺序 |
+| `query-get` | `query-get [--all] <query-or-multimap> <key>` | 默认返回第一个字符串值，`--all` 返回 List；缺失 key 返回 error |
+
+`parse-uri` 的 port 是 URL 规范化后的显式端口，已知默认端口可能被消去；effective_port
+包含 scheme 默认端口。`parse-query` / `query-get` 的非法百分号编码和非 UTF-8 输入报错。
+`url_encode` / `url_decode` 是当前仍使用下划线的 canonical 名，不能擅自改成短横线。
 
 ## 6. Collection 命令
 
@@ -315,7 +334,7 @@ map-remove ip_event_map 192.168.0.1 blocked
 
 | 命令 | 规范语法 | 说明 |
 | --- | --- | --- |
-| `map` | `map <coll> <map_cmd>` / `map <coll> <map_cmd> reduce <reduce_cmd>` / `map --begin $(...) --map $(...) [--reduce $(...)] <coll>` | 在 collection 上执行 map-reduce；`break` 只在这里有意义 |
+| `map` | `map <coll> <map_cmd>` / `map <coll> <map_cmd> reduce <reduce_cmd>` / `map --begin $(...) --map $(...) [--reduce $(...)] <coll>` | 在 collection 上执行 map-reduce；可用 `break` 提前退出迭代 |
 
 说明：
 
@@ -333,13 +352,16 @@ map my_coll $(echo ${key}) reduce $(echo ${sum})
 
 ## 8. CYFS Gateway 宿主扩展命令
 
-这些命令不是 `cyfs-process-chain` core built-in，而是 `cyfs-gateway` 默认注册到运行时的扩展命令。写网关配置时，它们通常可以直接当命令使用。
+这些命令不是 `cyfs-process-chain` core built-in，而由宿主注册。HTTP、stream stack、TUN、
+DNS 通常安装网关默认扩展；SOCKS 使用自己的命令环境，只额外注册 `resolve-dns`。
+命令被注册不表示宿主会消费其结果，例如 TUN 没有 `forward-group`，HTTP 没有 `stack` 动作。
 
 ### 8.1 最常用的路由 / 响应动作
 
 | 命令 | 规范语法 | 说明 |
 | --- | --- | --- |
 | `call-server` | `call-server <server_id>` | 返回 `server <id>` 动作，把处理交给另一个 server 配置对象 |
+| `call-stack` | `call-stack <stack_id>` | 返回 `stack <id>`，将当前 ordered stream 交给另一个 TCP/TLS stack；目前仅 TCP/TLS 入口消费，manager 拒绝缺失/不兼容目标和路由循环 |
 | `forward` | `forward [algorithm] <upstream...> [group-options]` / `forward [algorithm] --map <map> [group-options]` | 单目标或多候选 upstream 转发；group 形态支持执行阶段重试 |
 | `redirect` | `redirect <location> [301\|302\|303\|307\|308]` | 返回 HTTP 重定向响应 |
 | `error` | `error <status 400..599> [message]` | 返回 HTTP 错误响应；这是网关 HTTP 响应命令，不是 core control `error --from ...` |
@@ -445,6 +467,15 @@ socks://user:pass@127.0.0.1:1080
 | `set-stat` | `set-stat <group_id...>` | 为当前连接设置统计分组，写入全局 `STAT` set |
 | `in-time-range` | `in-time-range [--minute spec] [--hour spec] [--weekday spec] [--monthday spec] [--month spec] [--date spec] [--utc]` | 判断当前时间是否命中给定条件 |
 | `num-cmp` | `num-cmp <left> <op> <right>` | 数值比较；`op` 支持 `eq/gt/lt/ge/le` 及符号别名 |
+| `resolve` | `resolve <domain> <record_type> [server_address]` | DNS hook 的查询扩展；地址可为 DNS IP、IP:port 或已声明的 name server id |
+| `resolve-dns` | `resolve-dns <domain>` | SOCKS hook 的 DNS 扩展，返回分号分隔的 IP 字符串；与 `resolve` 不是同一命令 |
+
+`resolve` 成功有答案时创建全局 `RESOLVE_RESP` map 和 `RESOLVE_PROVIDER`，命令 success
+的值是变量名 `RESOLVE_RESP`。指定内部 name server 时，权威无数据、NXDOMAIN 或临时失败
+会创建 `RESOLVE_DNS_STATUS`（`authoritative_nodata` / `authoritative_nxdomain` /
+`temporary_failure`），并按情况设置 `RESOLVE_DNS_AUTHORITY` / `RESOLVE_DNS_FAILURE_CAUSE`，
+返回 success 值 `RESOLVE_DNS_STATUS`；不能把这类 success 视为解析到了地址。
+查询错误可能返回 error，或宿主可识别的 server-error 结构。
 
 补充说明：
 
@@ -463,6 +494,7 @@ socks://user:pass@127.0.0.1:1080
 
 ### 8.4 诊断命令
 
+- `echo [-n] [-v] [args...]` 是 core 内建输出命令，`-n` 不输出末尾换行，`-v` 展开集合内容；不能把它当成 HTTP 响应动作。
 - `qa`
   - 这是网关调试 / 诊断命令，不应写进正式配置规范的“固定支持命令清单”。
   - 用户如果明确问 `qa`，需要单独再展开。

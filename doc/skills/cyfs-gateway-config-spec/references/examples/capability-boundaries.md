@@ -11,7 +11,9 @@
 根据当前实现校验，可直接回答：
 
 - stack：`tcp`、`udp`、`tls`、`quic`、`rtcp`、`tun`
-- server：`http`、`socks`、`dns`、`dir`、`control_server`、`local_dns`、`sn`、`acme_response`
+- server：`http`、`socks`、`dns`、`dir`、`cyfs-dir`、`named-inbox-cache`、`control_server`、`local_dns`、`acme_response`
+
+`web3_gateway` 还支持 `sn`；`cyfs_gateway` 只有 SN client 能力，不能声明 `type: sn`。
 
 ## 示例 2：只能保守推断的结论
 

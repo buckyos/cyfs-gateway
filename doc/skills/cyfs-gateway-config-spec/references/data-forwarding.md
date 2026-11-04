@@ -2,10 +2,12 @@
 
 本文件用于稳定回答“数据怎么转发”“应该用 `call-server` 还是 `forward`”“能不能做反向代理 / 四层转发 / 多上游转发”这类问题。
 
-## 1. 先区分四种不同问题
+## 1. 先区分不同入口
 
 - `call-server`
   目标是把流量交给一个已经声明在 `servers` 里的 server 对象
+- `call-stack`
+  在 TCP/TLS 入口中把当前 ordered stream 交给另一个 TCP/TLS stack；例如先探测再进入 TLS 握手。它不创建 upstream URL 连接，不能用于 HTTP/UDP/RTCP/TUN 的动作分发
 - `forward`
   目标是把流量直接转发给一个 upstream URL
 - `socks`
@@ -13,7 +15,7 @@
 - `tun + 宿主机路由`
   目标是处理 `tun` 的 IP 级地址承载与宿主机路由问题，不只是把单条业务流量转给某个上游
 
-不要把这四类方案混成一个词来讲。
+不要把这些入口混成一个词来讲。
 
 ## 2. 当前已校验的运行时事实
 
@@ -36,6 +38,8 @@
 - TCP / TLS / QUIC / RTCP stream stack 当前会消费 `forward` / `forward-group` 动作
 - UDP / RTCP datagram stack 当前会消费 `forward` / `forward-group` 动作
 - `socks` server 的 `target` / `enable_tunnel` / `rule_config` 会进入代理接入执行路径
+- `enable_tunnel` 虽被传入，当前 `TunnelManager::get_tunnel()` 忽略它，只按目标 URL scheme 选择 builder；不能把它当有效的协议开关
+- `call-stack` 返回 `stack <id>`，由 TCP/TLS 交给支持 ordered stream 的目标；缺失目标、不兼容类型或环路会报错
 
 因此，skill 可以把“数据转发”稳定拆成：
 
@@ -439,17 +443,35 @@ socks://user:pass@127.0.0.1:1080
 ### 5.4 应用代理接入
 
 ```yaml
+stacks:
+  socks_in:
+    protocol: tcp
+    bind: 127.0.0.1:1080
+    hook_point:
+      main:
+        blocks:
+          route:
+            block: |
+              call-server app_proxy;
+
 servers:
   app_proxy:
     type: socks
-    target: rtcp://edge-a
-    enable_tunnel: true
-    rule_config: ./rules/proxy.yaml
+    target: rtcp://edge.example/
+    hook_point:
+      main:
+        blocks:
+          route:
+            block: |
+              return "PROXY rtcp://edge.example/";
 ```
 
 说明：
 
 - 这是 app 通过 SOCKS5 访问远端资源
+- `edge.example` 是部署时替换的对端标识；实际 RTCP 通道还需要配置本地 RTCP stack 身份、对端准入和可达路由，本片段只展示代理入口
+- `enable_tunnel` 如需保留兼容参数，应写字符串数组，例如 `[rtcp]`；当前实现忽略它，示例省略
+- 可选 `rule_config` 支持本地规则或远程 URL；本地路径不受通用 `*_path` 归一化规则覆盖
 - 不要把它表述成“整机已经加入同一虚拟网段”
 
 ## 6. 验证顺序
@@ -476,7 +498,8 @@ servers:
 ### `socks`
 
 - 确认 app 是否真的走了代理
-- 确认 `target`、`enable_tunnel`、`rule_config` 是否符合预期
+- 确认 `target`、hook 的 `DIRECT` / `PROXY` / `REJECT` 返回值和 `rule_config` 是否符合预期
+- 核对目标 URL scheme 的 builder 与 RTCP stack 是否已注册；`enable_tunnel` 当前不会改变选择结果
 - 区分“代理没生效”和“远端资源本身不可达”
 
 ### `tun`

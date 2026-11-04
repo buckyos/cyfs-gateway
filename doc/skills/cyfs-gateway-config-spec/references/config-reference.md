@@ -17,13 +17,14 @@
 1. 先读取主配置文件及其 `includes`
 2. 再把 `gateway_control_server.yaml` 作为基础配置合入
 3. 这份结果视为 `user_config`
-4. 若存在保存过的 patch，则在 `user_config` 基础上叠加得到 `effective_config`
+4. 仅当加载应用默认配置文件且存在有效的已保存 patch 时，在 `user_config` 基础上叠加得到 `effective_config`；指定其它配置文件不会自动套用该 patch
 5. 实际运行使用的是 `effective_config`
 
 因此：
 
 - `user_config` 不是“纯用户原文”
 - `effective_config` 才是最终生效配置
+- 控制面基础配置合入后先做参数替换和路径归一化，再形成 `user_config`；无效的已保存 patch 会记日志并忽略
 
 ## 2. includes 与 merge
 
@@ -69,6 +70,7 @@ merge 语义：
 - 相对路径统一按“主配置文件目录”解释
 - 不是按 include 文件所在目录解释
 - `a.json#fragment` 这类值会只归一化路径部分，保留 `#fragment`
+- 这是按 key 名称递归处理字符串值，不会识别任意“看起来像路径”的字段；`semantic_root`、`rule_config`、`auth_data_dir` 不在这条通用规则内。身份目录建议使用 canonical 的 `public_root_path` / `security_root_path`，不要假定别名也会在此阶段归一化
 
 所以必须区分两件事：
 
@@ -85,9 +87,10 @@ merge 语义：
 - `js_externals`
 - `timers`
 - `device_manager`
+- `identity_manager`
+- `name_client`
 - `acme`
 - `tls_ca`
-- `tunnel_client_certs`
 - `limiters`
 - `collections`
 - `global_process_chains`
@@ -103,9 +106,13 @@ merge 语义：
 - `timers`
 - `limiters`
 - `device_manager`
+- `identity_manager`
+- `name_client`
 - `acme`
 - `tls_ca`
-- `tunnel_client_certs`
+
+`traffic` 需要额外安装 traffic adapter；当前两个应用均未安装，配置该 section 会报错。
+旧 `tunnel_client_certs` 没有当前配置解析/运行时装载入口，不作为支持项。
 
 ## 5. map key 注入规则
 
@@ -146,13 +153,16 @@ hook_point:
 - `hook_point` 是 chain map
 - `blocks` 是 block map
 - 解析时会转成数组
-- chain 与 block 都按 `priority` 排序执行
+- chain 按 `priority` 从小到大执行；使用 `ProcessChainConfig::create_process_chain()` 的入口也按 block 的 `priority` 升序排列
+- SOCKS 使用 JSON loader，保留转换后的 block 顺序，不按 block 的 `priority` 排序；不要依赖 SOCKS 的 block 优先级，需固定顺序时用单个 block 或显式 `exec`
+- 应用配置解析入口要求 chain map 和 block map，不接受底层 Rust 类型使用的数组写法
 
 当前会做 map-to-vector 转换的区域：
 
 - stack 的 `hook_point`
 - HTTP server 的 `hook_point`
 - HTTP server 的 `post_hook_point`
+- `cyfs-dir` / DNS / SOCKS server 的 `hook_point`
 - RTCP stack 的 `on_new_tunnel_hook_point`
 - `global_process_chains`
 
@@ -167,12 +177,19 @@ hook_point:
 - `rtcp`
 - `tun`
 
+所有 stack 都使用 `protocol`，`id` 由 map key 注入。下文 `?` 表示可省略。
+`io_dump_*` 指 `io_dump_file`、`io_dump_rotate_size`、`io_dump_rotate_max_files`、
+`io_dump_max_upload_bytes_per_conn`、`io_dump_max_download_bytes_per_conn`。
+
 ### `tcp`
 
 字段：
 
 - `bind`
 - `transparent?`
+- `concurrency?`
+- `trusted_upstreams?`
+- `stream_idle_timeout?`
 - `io_dump_file?`
 - `io_dump_rotate_size?`
 - `io_dump_rotate_max_files?`
@@ -185,6 +202,8 @@ hook_point:
 
 - `transparent = false`
 - `reuse_address = false`
+- `concurrency = 0` 表示不设业务并发上限；`stream_idle_timeout = 600`（秒，0 关闭）
+- `trusted_upstreams = []`；配置为 IP/CIDR 列表，配合 `proxy-protocol-probe` 限制可恢复来源地址的直接上游
 
 ### `udp`
 
@@ -192,6 +211,7 @@ hook_point:
 
 - `bind`
 - `concurrency?`
+- `max_sessions?`
 - `session_idle_time?`
 - `transparent?`
 - `io_dump_*`
@@ -200,7 +220,7 @@ hook_point:
 
 常用默认值：
 
-- `concurrency = 200`
+- `concurrency = 0`、`max_sessions = 0`，均表示不设该项业务上限
 - `session_idle_time = 120`
 
 ### `tls`
@@ -209,21 +229,23 @@ hook_point:
 
 - `bind`
 - `hook_point`
-- `certs`
+- `hosts?`
+- `identity_manager?`
 - `concurrency?`
 - `alpn_protocols?`
 - `io_dump_*`
-- `client_auth?`
 - `reuse_address?`
+- `trusted_upstreams?`
+- `stream_idle_timeout?`
 
-`certs` 元素字段：
+`hosts` 元素可以是主机名字符串，或显式证书对象：
 
-- `domain`
-- `acme_type?`
-- `acme_issuer?`
-- `cert_path?`
-- `key_path?`
-- `data?`
+- 字符串：通过 identity manager 的身份目录读取该主机证书
+- 对象：`host`（别名 `domain`）、`cert_path`、`key_path`；两个路径必须成对提供，装载后须为绝对路径
+- `identity_manager` 使用 `public_root_path?`、`security_root_path?`；可继承顶层配置
+- 当前 TLS schema 没有 `certs` 或 `client_auth` 字段，不能沿用旧示例
+- `trusted_upstreams` 与 TCP 的 PROXY protocol 信任来源规则相同
+- `stream_idle_timeout` 默认 600 秒，0 关闭
 
 ### `quic`
 
@@ -232,10 +254,18 @@ hook_point:
 - `bind`
 - `concurrency?`
 - `hook_point`
-- `certs`
+- `hosts?`（字符串数组，通过 identity manager 加载证书）
+- `identity_manager?`
+- `certs?`（兼容显式证书/ACME 配置，默认空数组）
 - `alpn_protocols?`
 - `io_dump_*`
 - `reuse_address?`
+- `stream_idle_timeout?`
+- `connect_timeout?`
+
+QUIC `certs` 元素字段：`domain`、`identity?`、`identity_manager?`、`acme_type?`、
+`cert_path?`、`key_path?`，以及扁平展开的 ACME 附加数据（不是名为 `data` 的嵌套对象）。
+不能把 QUIC 的 `certs` 写法直接复制给 TLS。
 
 ### `rtcp`
 
@@ -246,17 +276,43 @@ hook_point:
 - `keep_tunnel?`
 - `keep-tunnel?`，是 `keep_tunnel` 的别名
 - `on_new_tunnel_hook_point?`
-- `key_path`
+- `identity?`（别名 `did` / `device_did`）
+- `identity_manager?`
+- `key_path?`
 - `device_config_path?`
 - `device_doc_jwt?`
 - `name?`
 - `io_dump_*`
 - `reuse_address?`
+- `peer_identity?`
+- `inbound_admission?`
+- `liveness?`
+- `limits?`
+- `stream_idle_timeout?`
+- `connect_timeout?`
 
 约束：
 
-- 未配置 `device_config_path` 和 `device_doc_jwt` 时，`name` 必填
-- 当 stack 的 DID 是逻辑名字（非 `did:dev:<pkx>`）时，必须通过 `device_config_path` 指向 JWT、配置 `device_doc_jwt`，或在 identity manager 中提供 `device.doc.jwt`
+- 身份目录模式：配置 `identity`，按 identity manager 加载身份；不能同时配置 `key_path` / `device_config_path` / `name`
+- 显式配置 stack 级 `identity_manager` 时必须有 `identity`
+- 兼容模式：未配置 `identity` 时 `key_path` 必填；此时未配置 `device_config_path` 和 `device_doc_jwt` 才要求 `name`
+- 逻辑 DID（非 `did:dev:<pkx>`）必须提供与 DID 和私钥匹配的 owner 签名设备 JWT；可显式写 `device_doc_jwt`（别名 `device-doc-jwt` / `device_document_jwt`）、由设备文件取得，或由身份目录/设备文件旁的 JWT 文件加载
+- RTCP 配置及以下四个策略对象拒绝未知字段；安全策略、身份或私钥变化需要重建 stack，不能假定原位 reload
+
+RTCP v4 策略字段与默认值：
+
+| 对象 | 字段与默认值 |
+| --- | --- |
+| `peer_identity` | `requirement: authority_current`（可选 `trusted_snapshot`）；`dns_txt_bootstrap: false` |
+| `inbound_admission` | `anonymous: reject`（可选 `allow`）；`named_min_relation: same_zone`（可选 `known_owner` / `any`）；`authority_reconfirm_max_age: unlimited`（也可写整数秒或数字字符串） |
+| `liveness` | `ping_interval_secs: 30`、`pong_timeout_secs: 10`、`max_missed_pongs: 3`、`idle_probe_secs: 60`、`idle_timeout_secs: 600` |
+| `limits` | `max_pending_handshakes: 256`、`handshake_requests_per_second: 16`、`handshake_request_burst: 32`、`max_pending_stream_builds_per_tunnel: 64`、`max_stream_ids_per_tunnel: 65536`、`max_datagram_bytes: 65507`、`handshake_timeout_secs: 15`、`stream_requests_per_second: 32`、`stream_request_burst: 64` |
+
+保活和 limits 数值必须大于 0；`max_stream_ids_per_tunnel <= 1048576`，
+`max_datagram_bytes <= 65507`。默认拒绝匿名、要求同 Zone，跨 Zone 方案必须按实际身份关系
+配置准入，不能只靠 `on_new_tunnel_hook_point` 中的 `accept` 绕过握手策略。
+QUIC / RTCP / SOCKS 的 `stream_idle_timeout`、`connect_timeout` 使用整数秒，
+默认分别为 600 / 60，0 关闭；不要与 HTTP 的毫秒整数/时长字符串混淆。
 
 ### `tun`
 
@@ -271,6 +327,8 @@ hook_point:
 - `mtu?`
 - `tcp_timeout?`
 - `udp_timeout?`
+- `stream_idle_timeout?`
+- `connect_timeout?`
 - `io_dump_*`
 
 默认：
@@ -279,6 +337,7 @@ hook_point:
 - `mtu = 1500`
 - `tcp_timeout = 60`
 - `udp_timeout = 60`
+- `stream_idle_timeout = 600`、`connect_timeout = 60`（整数秒，0 关闭；与 ipstack 的 tcp/udp timeout 分开）
 
 运行时语义：
 
@@ -325,16 +384,20 @@ hook_point:
 
 ## 8. 已支持的 server 类型
 
-当前 cyfs-gateway 应用层正式支持：
+两个应用共同支持以下 9 种 server（每个对象使用 `type`，`id` 由 key 注入）：
 
 - `http`
 - `socks`
 - `dns`
 - `dir`
+- `cyfs-dir`
+- `named-inbox-cache`
 - `control_server`
 - `local_dns`
-- `sn`
 - `acme_response`
+
+`web3_gateway` 额外安装 `SnGatewayModule`，支持第 10 种 `sn`；
+`cyfs_gateway` 只安装 `SnClientGatewayModule`，支持 `sn-dns` ACME provider，不能配置 `type: sn`。
 
 ### `http`
 
@@ -344,6 +407,7 @@ hook_point:
 - `h3_port?`
 - `hook_point`
 - `post_hook_point?`
+- `trusted_upstreams?`
 - `gzip`
 - `gzip_types`
 - `gzip_min_length`
@@ -363,6 +427,10 @@ hook_point:
 - `tunnel_open_timeout?`
 - `response_timeout?`
 - `request_body_idle_timeout?`
+
+`trusted_upstreams` 默认空列表；仅当直接上游命中 IP/CIDR 且没有更强的来源恢复信息时，
+才把 `X-Forwarded-For` / `X-Real-IP` 恢复为 `real_source_*`。客户端提交的头本身不是可信身份。
+压缩字段均可省略，`gzip` / `brotli` 默认关闭。
 
 超时字段说明：
 
@@ -403,6 +471,37 @@ hook_point:
 - 条件请求按 RFC 9110 顺序：`If-Match` → `If-Unmodified-Since` → `If-None-Match` → `If-Modified-Since`；`If-Range` 不匹配时返回完整 200
 - `dir` 自己不压缩；压缩由 `http` server 的 `gzip` / `brotli` 在响应回到客户端前完成，206/416 与带 `Cache-Control: no-transform` 的响应不压缩，压缩后 ETag 变弱、去掉 `Accept-Ranges`
 
+### `cyfs-dir`
+
+必填：`named_store_config_path`（NamedDataMgr store 布局配置）。
+
+可选字段：`http_backend_links`（device DID → HTTP 基地址 map，默认空）、`signing_key_path`、
+`signing_kid`、`semantic_root`、`url_prefix`（默认空）、`obj_id_in_host`（默认 false）、
+`mode`（`local-link` / `in-store`）、`scan_interval_secs`（默认 60，0 关闭扫描）、`hook_point`。
+
+它是 HTTP server 对象，可由 HTTP 路由 `call-server` 调用。hook 可设置全局变量
+`RESP_cyobj_meta`（含 `obj_type` / `obj_id` / `obj_json` 及可选 `path_obj_jwt` 的 JSON 字符串）
+或 `RESP_cyobj_id`（已存在于 store 的 ObjId）。没有解析结果时回退到 `semantic_root`（若配置）。
+`semantic_root` 不匹配通用路径 key 规则，建议显式提供绝对路径。
+
+### `named-inbox-cache`
+
+必填：`target_zone`、非空 `accepted_paths` 数组、`cache_path`。
+
+| 可选字段 | 默认值/约束 |
+| --- | --- |
+| `upstream` | 不设置；若配置必须是 HTTP(S) origin，不能带用户凭证、业务路径、query 或 fragment |
+| `upstream_timeout` / `poll_interval` | `3s` / `5s` |
+| `retry_backoff` | `[5s, 30s, 2m, 10m]`，不能为空 |
+| `concurrency` | 1，必须大于 0 |
+| `drain_enabled` | 未指定时按是否存在 upstream 决定；true 要求配置 upstream |
+| `max_object_bytes` / `max_entries` / `max_bytes` | 65536 / 10000 / 268435456，必须大于 0 |
+| `per_principal_quota` | 可选对象，必须同时提供大于 0 的 `max_entries`、`max_bytes` |
+| `cache_ttl` | 可选正时长 |
+
+这是 named object dispatch 的 HTTP 缓存接收服务，要求路由提供验证过的 dispatch context；
+不是通用 HTTP 代理缓存。配置及 quota 对象拒绝未知字段，所有调度时长必须大于 0。
+
 ### `dns`
 
 字段：
@@ -424,30 +523,46 @@ hook_point:
 - `target`
 - `enable_tunnel?`
 - `rule_config?`
+- `stream_idle_timeout?`
+- `connect_timeout?`
 - `hook_point`
 
-### `sn`
+`target` 是 URL，`enable_tunnel` 是协议名字符串数组（例如 `[rtcp]`），不是布尔开关。
+当前 `TunnelManager::get_tunnel()` 接收但忽略 `enable_tunnel`，实际按目标 URL scheme
+选择 builder；不能承诺该列表有筛选/启用协议的效果。
+`hook_point` 必填，代理决策使用 `DIRECT` / `PROXY <url>` / `REJECT` 返回值；
+例如 `return "PROXY rtcp://edge.example/";`。不能把 stack 的 `forward` 动作照搬成 SOCKS 决策。
+`username` / `password` 成对配置时启用用户名密码认证。
+
+### `sn`（仅 `web3_gateway`）
 
 字段：
 
 - `host`
-- `ip`
+- `ip?`
 - `boot_jwt?`（仅用于 SN 自身 hostname 的兼容 BOOT TXT）
 - `owner_pkx?`（仅用于 SN 自身 hostname 的兼容 PKX TXT）
 - `device_jwt?`（仅用于 SN 自身 hostname 的兼容 DEV TXT；缺省为空数组）
 - `aliases?`
 - `auth_data_dir?`
+- `region_probe_config_path?`
 - `seed_path?`
-- `bns_server_url`
+- `bns_server_url?`（默认空字符串）
 - `bns_session_token?`
 - `pkx_doh_url?`
 - `relay_allocation?`
+- `local_relay_node?`
 - `sn_controller_kid?`
 - `allowed_controller_doc_types?`
 - `bns_proxy?`
+- `app_did?`
 - `auth_db?`
 - `device_info_db?`
 - `db_path?`
+
+`region_probe_config_path` 指向 schema v1 JSON；未配置时 region probe 地址返回 404，
+文件无效返回 503，不影响注册。`local_relay_node` 用于幂等注册同进程 relay。
+HTTP S2S provider 场景使用 `app_did` 加载应用身份；不要从字段名推导这些可选对象的嵌套 schema。
 
 ### `control_server`
 
@@ -505,7 +620,10 @@ hook_point:
 - `type`
 - `file_path`
 - `only_read_file`
-- `data`
+
+类型附加数据采用 serde flatten，直接写在 collection 对象内，不包一层 `data`。
+例如 `ip_region_map` 的 `ipv6_file_path`、`cache_policy`、`auto_update_interval_secs`、
+`request_timeout_secs`、`ipv4_sha256`、`ipv6_sha256` 都在 `type` / `file_path` 同级。
 
 补充：
 
@@ -526,6 +644,25 @@ hook_point:
 - `offline_timeout_seconds = 600`
 - `cleanup_interval_seconds = 60`
 
+### `identity_manager`
+
+字段：`public_root_path?`、`security_root_path?`。公共目录别名为 `public_root` /
+`public_identity_root` / `public_identity_root_path`；安全目录别名为 `security_root`。
+优先用 canonical 的 `*_path` 写法，以应用通用路径归一化。
+
+- 顶层配置会注入未显式设置 stack 级 `identity_manager` 的 TLS / QUIC 字符串 `hosts` 模式，和 RTCP `identity` 模式
+- 不注入 RTCP 的兼容私钥配置；stack 级配置整体优先，不逐字段补齐
+- ACME 未显式指定自己的 identity manager 时也会继承顶层值
+
+### `name_client`
+
+唯一字段：`zone_locker_bypass`，默认空数组，元素为字符串；接受主机名或 DID。
+它用于解析访问本网关 Zone locker 所必经的节点/中继时跳过 Zone locker 查询，避免解析回环。
+
+- 启动时在 stack 开始接流量之前应用；reload 时替换整个名单，删除 section 等价于清空
+- 条目按 `DID::from_str` 验证；坏条目使启动/reload 失败，reload 验证失败时保留旧名单
+- section 拒绝未知字段；这不是 RTCP 身份校验或准入的豁免名单
+
 ### `acme`
 
 字段：
@@ -533,9 +670,14 @@ hook_point:
 - `account?`
 - `issuer?`
 - `dns_providers?`
+- `hosts?`（默认空数组）
+- `identity_manager?`
 - `check_interval?`
 - `renew_before_expiry?`
-- `issuers`
+
+`hosts` 元素：`host`（别名 `hostname` / `domain`）、`challenge_type?`（别名 `acme_type` /
+`method`）、`dns_provider?`、`identity?`、`identity_manager?`，以及扁平附加数据。
+当前 `AcmeConfig` 没有 `issuers` 字段，不能把它列为生效配置。
 
 ### `tls_ca`
 
@@ -543,18 +685,6 @@ hook_point:
 
 - `cert_path`
 - `key_path`
-
-### `tunnel_client_certs`
-
-这是一个 map，值支持两类：
-
-- `type: local`
-  - `cert_path`
-  - `key_path`
-- `type: acme`
-  - `domain`
-  - `acme_type`
-  - `dns_provider?`
 
 ## 10. 控制面默认配置
 
@@ -571,9 +701,8 @@ hook_point:
 
 ## 11. 当前不要宣称为正式支持的类型
 
-实现层虽然存在 `NdnServerConfig`，但当前应用没有注册对应 parser/factory。
+旧 `NdnServerConfig` 已移除，两个应用都没有 `ndn` registration；相关语义使用
+`cyfs-dir`，不能输出 `type: ndn`。
 
-因此：
-
-- 可以注明“库内存在”
-- 不能写成“当前可直接在 servers 中使用”
+`traffic` 没有安装 adapter，`tunnel_client_certs` 没有当前装载入口；不要把旧配置段或
+反序列化时被忽略的未知字段当成已支持能力。

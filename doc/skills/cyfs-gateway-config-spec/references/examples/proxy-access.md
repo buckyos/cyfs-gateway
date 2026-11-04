@@ -14,7 +14,7 @@
 
 1. 能力边界
 2. socks server 的 `target`
-3. 是否需要 `enable_tunnel`
+3. hook 的代理决策、目标 URL scheme 和已安装的 tunnel builder
 4. app 侧如何配置 SOCKS5
 5. 验证步骤
 
@@ -39,7 +39,7 @@
 - 哪些 app 走代理
 - `target` 指向哪里
 - `rule_config` 是否需要按域名 / 目标分类
-- `enable_tunnel` 是否要显式开启某类 tunnel
+- `enable_tunnel` 若出现必须是字符串数组；当前 tunnel manager 忽略它，不能靠它开启协议
 - 哪些 app 不会被系统代理覆盖
 
 ## 示例 3：用户说“组局域网”，其实只是访问远端服务
@@ -61,5 +61,5 @@
 ### 结论
 
 不是。
-当前有证据支持的是：`socks` server 可以让支持代理的应用通过代理访问目标服务，并可结合 `enable_tunnel` 与 `rule_config` 使用。
+当前有证据支持的是：`socks` server 可以让支持代理的应用通过代理访问目标服务，并可结合 hook 与 `rule_config` 使用；`enable_tunnel` 虽可解析但当前被 tunnel manager 忽略。
 当前没有证据支持“整机所有流量天然进入同一虚拟网段”。

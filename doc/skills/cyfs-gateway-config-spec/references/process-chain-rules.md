@@ -34,7 +34,9 @@ hook_point:
 - `blocks` 是 block map
 - 每个 block 有 `priority` 和多行 DSL 文本 `block`
 
-运行时会把 map 形式转换成数组，并按 `priority` 执行。
+应用解析器要求 map 并转换成数组。chain 按 `priority` 升序执行；常规入口（含 DNS）的
+block 也按 priority 升序，但 SOCKS 的 JSON loader 保留传入 block 顺序，忽略 block priority。
+chain / block 的 priority 省略时均为 1；不要依赖相同 priority 下的顺序承载业务逻辑。
 
 ## 2. 执行模型
 
@@ -56,7 +58,7 @@ hook_point:
 执行顺序：
 
 1. 先按 chain 优先级执行
-2. 每个 chain 内再按 block 优先级执行
+2. 每个 chain 内再按 block 顺序执行（通常由 priority 排序；SOCKS 例外见上文）
 3. 若没有终止结果，继续后续 block / chain
 4. 遇到终止结果，由 hook 的宿主解释结果
 
@@ -89,6 +91,17 @@ local full_url="https://${REQ.host}${REQ.uri}"
 - 跨 block 共享的中间结果用默认 chain 级变量
 - 只在当前 block 临时使用的值用 `local`
 - 真正需要跨 chain 共享时才用 `global`
+
+变量路径支持动态下标（`$map[$key]`、`$list[0]`）和带特殊字符的 key
+（`$meta["region.code"]`）。安全访问和缺省值可写：
+
+```txt
+local country=${geoByIp[$REQ.clientIp]?.country ?? "unknown"};
+```
+
+`?.` 对缺失/Null 路径安全返回 Null，`??` 在 Null 时求缺省值，不是按 truthy 选择；
+不要用它把 false、0 或空字符串都替换掉。支持 Map / List 字面量，值可包含 typed 数字、
+布尔值、变量与嵌套集合；每次求值创建新的集合，不是 JSON 字符串。
 
 ## 4. 常见语法约定
 
@@ -193,6 +206,27 @@ else
     reject;
 end
 ```
+
+#### `case / when / else / end`
+
+支持无 subject 的谓词分支，或将 subject 求值一次并绑定局部变量：
+
+```txt
+case $REQ.path as path then
+    when oneof $path "/login" "/logout" then
+        call-server auth;
+    when match $path "/api/*" then
+        call-server api;
+    else
+        reject;
+end
+```
+
+- 无 subject 时头写 `case then`，每个 `when` 仍是完整谓词
+- 有 subject 时必须写 `as <name>`；不会隐式把 subject 与分支文本做相等或 glob 比较
+- 至少一个 `when <condition> then`，可选末尾 `else`，用 `end` 结束
+- 顺序选择首个 success 分支；全部不成立且没有 else 时返回普通 success
+- 条件中的 control 与 if 一样非法；绑定仅在 case 内可见，结束时恢复外层同名变量
 
 #### `for ... in ... then ... end`
 
@@ -308,6 +342,15 @@ process chain 里的执行结果可以粗分成三类：
 - `REQ.<header-name>`
 - `REQ_remote_ip`
 - `REQ_remote_port`
+- `REQ.source_addr` / `source_ip` / `source_port`：当前有效来源
+- `REQ.conn_source_addr` / `conn_source_ip` / `conn_source_port`：连接层直接上游
+- `REQ.real_source_addr` / `real_source_ip` / `real_source_port`：可信机制恢复的来源；未恢复时不存在
+- `REQ.source_device_did` / `source_identity_trust`：由入站 RTCP stream 提供的设备身份与信任来源（有值时才存在）
+
+来源字段是保留 key，不会回退到客户端同名 HTTP 头。`REQ_remote_*` 是有效来源的兼容变量，
+另有 `REQ_conn_remote_*` / `REQ_real_remote_*`；不要默认 real_source 存在。
+HTTP 的 `trusted_upstreams` 决定是否信任直接上游的 X-Forwarded-For / X-Real-IP，
+不能把任意客户端身份头当作 RTCP 认证结果。转成自定义身份头时先移除客户端提交的同名头。
 
 ### HTTP `post_hook_point`
 
@@ -315,7 +358,7 @@ process chain 里的执行结果可以粗分成三类：
 
 - `RESP`
 
-`RESP` 是响应头 map，可用 `map-add` / `map-set` / `map-remove` 修改。
+`RESP` 是响应头 map，可用 `map-add` 覆盖/新增，或用 `map-remove` 删除；当前没有 `map-set` 命令。
 
 限制：
 
@@ -334,6 +377,10 @@ process chain 里的执行结果可以粗分成三类：
 - `REQ.source_addr`
 - `REQ.source_ip`
 - `REQ.source_port`
+- `REQ.conn_source_*`、`REQ.real_source_*`：依入口可用的直接来源/恢复来源
+
+TCP/TLS 支持 `call-stack <id>`，将当前 ordered stream 及来源上下文交给 TCP/TLS 目标，
+不是新建 URL 连接。UDP/QUIC/RTCP/TUN 不能泛化为支持该动作。
 
 ### SOCKS
 
@@ -348,6 +395,8 @@ process chain 里的执行结果可以粗分成三类：
 注意：
 
 - SOCKS 请求环境变量按当前实现视为只读
+- SOCKS hook 消费返回字符串 `DIRECT`、`PROXY <url>`、`REJECT`；例如 `return "DIRECT";`
+- SOCKS 注册的是 `resolve-dns <domain>`（返回分号分隔 IP 字符串），不能假定网关全部默认扩展在此 hook 中都可调用
 
 ### DNS
 
@@ -357,12 +406,30 @@ process chain 里的执行结果可以粗分成三类：
 - `REQ.record_type`
 - `REQ.source_addr`
 
+DNS hook 另注册 `resolve <domain> <record_type> [server_address]`。成功结果通过
+`RESOLVE_RESP` map / `RESOLVE_PROVIDER` 返回；权威否定和临时失败还会设置结构化状态，
+不要把每次 resolve 的 success 都解释为有地址答案。精确返回规则见命令手册。
+
 ### RTCP `on_new_tunnel_hook_point`
 
 最常见的是使用来源相关字段做准入判断，例如：
 
 - `REQ.source_device_id`
 - `REQ.source_addr`
+
+还可按是否存在读取 `source_did` / `real_source_did`、`source_canonical_device_id`、
+`source_identity_trust`、`source_zone_relation`，以及已验证文档的 `source_device_name` /
+`source_device_owner` / `source_zone_did` / `source_device_doc_jwt`。
+`source_device_id` 是 RTCP hook 字段；HTTP 使用 `source_device_did`，不能混用名称。
+内建 peer identity / inbound admission 检查先于此 hook；默认拒绝匿名并要求 same_zone。
+
+RTCP stream hook 还暴露 `REQ.protocol`、`REQ.stream_purpose`、目标地址及来源组；
+source identity 的信任级别与 zone relation 应分别判断，不能只凭一个 DID 字符串推断同 Zone。
+
+### `cyfs-dir`
+
+hook 使用 HTTP `REQ`；写入全局 `RESP_cyobj_meta` 或 `RESP_cyobj_id` 来解析语义路径，
+例如 `global RESP_cyobj_id="<已存在的 ObjId>"`（此处为占位说明）。具体字段见配置参考。
 
 ## 7. 写配置时的推荐模式
 
@@ -425,6 +492,7 @@ reject;
 - 变量与作用域
 - 表达式链的 `&&` / `||` / `!` / `;` / `()` 与 success/error 判定方式
 - `if/elif/else/end` 这类结构化语句的基本语义
+- `case/when/else/end` 的谓词分支与可选 subject 绑定
 - `exec` / `return` / `error` / `accept` / `reject` / `forward` 的语义
 - `post_hook_point` 的限制
 - `REQ` / `RESP` 的最常用字段
