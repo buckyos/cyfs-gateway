@@ -135,7 +135,12 @@ check_running() {
 
 	warn "Detected running ${SERVICE_NAME} process(es): ${pids[*]}"
 	log "Continue installation and stop them? [y/N]"
-	read -r answer || true
+	# stdin may contain the script itself when invoked via curl | bash.
+	if ! { read -r answer </dev/tty; } 2>/dev/null; then
+		err "Cannot read confirmation from /dev/tty; run the installer in an interactive terminal."
+		log "Installation aborted."
+		exit 1
+	fi
 	case "${answer}" in
 		y | Y | yes | YES)
 			stop_gateway "${pids[@]}"
