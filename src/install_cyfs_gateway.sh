@@ -71,7 +71,7 @@ fi
 
 require_cmd curl
 require_cmd tar
-require_cmd python3
+require_cmd awk
 require_cmd uname
 require_cmd mktemp
 
@@ -189,7 +189,8 @@ arm64 | aarch64)
 	;;
 esac
 
-asset_name="gateway-${os_slug}-${arch}.tar.gz"
+asset_prefix="cyfs-gateway-${os_slug}-${arch}-"
+legacy_asset_name="gateway-${os_slug}-${arch}.tar.gz"
 
 tmp_dir="$(mktemp -d)"
 cleanup() {
@@ -247,36 +248,79 @@ else
 	fi
 fi
 
+parse_release_metadata() {
+	# Tokenize strings and delimiters so whitespace, field order and nested
+	# uploader objects do not affect the release/asset fields we read.
+	awk -v prefix="$asset_prefix" -v legacy="$legacy_asset_name" '
+	function save_asset() {
+		if (index(name, prefix) == 1 && length(name) > length(prefix) + 7 &&
+		    substr(name, length(name) - 6) == ".tar.gz") {
+			matched_count++
+			matched_name = name
+			matched_url = url
+		} else if (name == legacy) {
+			legacy_count++
+			legacy_url = url
+		}
+	}
+	{
+		line = $0
+		while (match(line, /"([^"\\]|\\.)*"|[][{}:,]/)) {
+			token = substr(line, RSTART, RLENGTH)
+			line = substr(line, RSTART + RLENGTH)
+			if (substr(token, 1, 1) == "\"") {
+				value = substr(token, 2, length(token) - 2)
+				# GitHub URLs may escape forward slashes in JSON.
+				gsub(/\\\//, "/", value)
+				if (previous == ":") {
+					if (depth == 1 && key == "tag_name") tag = value
+					if (assets_depth && depth == assets_depth + 1) {
+						if (key == "name") name = value
+						if (key == "browser_download_url") url = value
+					}
+				} else {
+					key = value
+				}
+			} else if (token == "{" || token == "[") {
+				if (token == "[" && depth == 1 && key == "assets" && previous == ":")
+					assets_depth = depth + 1
+				if (token == "{" && assets_depth && depth == assets_depth) {
+					name = ""
+					url = ""
+				}
+				depth++
+			} else if (token == "}" || token == "]") {
+				if (token == "}" && assets_depth && depth == assets_depth + 1)
+					save_asset()
+				if (token == "]" && depth == assets_depth) assets_depth = 0
+				depth--
+			}
+			previous = token
+		}
+	}
+	END {
+		if (matched_count > 1 || (!matched_count && legacy_count > 1)) {
+			print "ERROR: Multiple release assets matched the current platform." > "/dev/stderr"
+			exit 1
+		}
+		print tag
+		print matched_count ? matched_url : legacy_url
+		print matched_count ? matched_name : (legacy_count ? legacy : "")
+	}' "$release_json_path"
+}
+
+release_metadata="$(parse_release_metadata)"
 release_info=()
 while IFS= read -r line; do
 	release_info+=("$line")
-done < <(
-	python3 - "$release_json_path" "$asset_name" <<'PY'
-import json
-import sys
-
-path = sys.argv[1]
-target = sys.argv[2]
-with open(path, "r", encoding="utf-8") as f:
-    data = json.load(f)
-
-tag = data.get("tag_name", "")
-asset_url = ""
-for asset in data.get("assets", []):
-    if asset.get("name") == target:
-        asset_url = asset.get("browser_download_url", "")
-        break
-
-print(tag)
-print(asset_url)
-PY
-)
+done <<< "$release_metadata"
 
 tag="${release_info[0]:-}"
 asset_url="${release_info[1]:-}"
+asset_name="${release_info[2]:-}"
 
 if [[ -z "$asset_url" ]]; then
-	err "Release asset not found: ${asset_name}"
+	err "Release asset not found: ${asset_prefix}*.tar.gz (or ${legacy_asset_name})"
 	exit 1
 fi
 
