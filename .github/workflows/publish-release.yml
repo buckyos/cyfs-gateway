@@ -1,0 +1,117 @@
+name: Publish CYFS Gateway Release
+run-name: Publish CYFS Gateway from build-all run ${{ inputs.build_run_id }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_run_id:
+        description: 'Successful build-all run ID (the number in /actions/runs/<id>, not the #run number)'
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  contents: write
+
+concurrency:
+  group: publish-cyfs-gateway-release
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Validate build and get release version
+        id: build
+        uses: actions/github-script@v8
+        env:
+          BUILD_RUN_ID: ${{ inputs.build_run_id }}
+        with:
+          script: |
+            const runId = process.env.BUILD_RUN_ID.trim();
+            if (!/^[1-9][0-9]*$/.test(runId)) {
+              throw new Error('build_run_id must be the numeric ID from the build-all Actions run URL.');
+            }
+
+            const repo = context.repo;
+            const { data: workflow } = await github.rest.actions.getWorkflow({
+              ...repo, workflow_id: 'build-all.yml',
+            });
+            const { data: run } = await github.rest.actions.getWorkflowRun({
+              ...repo, run_id: runId,
+            });
+            if (run.workflow_id !== workflow.id) {
+              throw new Error(`Run ${runId} is not a build-all.yml run.`);
+            }
+            if (run.status !== 'completed' || run.conclusion !== 'success') {
+              throw new Error(`Run ${runId} must have completed successfully (status=${run.status}, conclusion=${run.conclusion}).`);
+            }
+
+            const artifacts = (await github.paginate(github.rest.actions.listWorkflowRunArtifacts, {
+              ...repo, run_id: runId, per_page: 100,
+            })).filter(artifact => artifact.name.startsWith('cyfs-gateway-'));
+            if (artifacts.length === 0 || artifacts.some(artifact => artifact.expired)) {
+              throw new Error('Build artifacts are missing or expired. Run build-all again.');
+            }
+            const linuxArtifacts = artifacts.filter(artifact => artifact.name.startsWith('cyfs-gateway-linux-'));
+            const versions = new Set(linuxArtifacts.map(artifact => {
+              const match = /^cyfs-gateway-linux-(?:amd64|aarch64)-([0-9]+(?:\.[0-9]+)*\+build[0-9]+)$/.exec(artifact.name);
+              if (!match) {
+                throw new Error(`Cannot parse version from Linux artifact: ${artifact.name}`);
+              }
+              return match[1];
+            }));
+            if (versions.size !== 1) {
+              throw new Error('Expected Linux artifacts with one shared version.');
+            }
+
+            const version = [...versions][0];
+            core.setOutput('version', version);
+            core.setOutput('sha', run.head_sha);
+            core.setOutput('run_url', run.html_url);
+            core.setOutput('run_id', runId);
+            core.setOutput('artifact_ids', artifacts.map(artifact => artifact.id).join(','));
+            core.setOutput('artifact_count', artifacts.length);
+            core.info(`Publishing BuckyOS CYFS Gateway version ${version} from ${run.html_url}`);
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v6
+        with:
+          github-token: ${{ github.token }}
+          run-id: ${{ steps.build.outputs.run_id }}
+          artifact-ids: ${{ steps.build.outputs.artifact_ids }}
+          merge-multiple: true
+          path: ${{ runner.temp }}/release-assets
+
+      - name: Publish GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ steps.build.outputs.version }}
+          BUILD_SHA: ${{ steps.build.outputs.sha }}
+          BUILD_URL: ${{ steps.build.outputs.run_url }}
+          ARTIFACT_COUNT: ${{ steps.build.outputs.artifact_count }}
+          ASSET_DIR: ${{ runner.temp }}/release-assets
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          assets=("$ASSET_DIR"/cyfs-gateway-*.tar.gz)
+          if (( ${#assets[@]} != ARTIFACT_COUNT )); then
+            echo "Expected $ARTIFACT_COUNT payload archives, found ${#assets[@]}." >&2
+            exit 1
+          fi
+          for asset in "${assets[@]}"; do
+            test -s "$asset"
+          done
+
+          tag="v$VERSION"
+          # Keep the release in draft until every asset has uploaded successfully.
+          gh release create "$tag" "${assets[@]}" \
+            --draft \
+            --target "$BUILD_SHA" \
+            --title "BuckyOS CYFS Gateway version $VERSION" \
+            --notes "Artifacts from build-all: $BUILD_URL (commit $BUILD_SHA)."
+          gh release edit "$tag" --draft=false
+          gh release view "$tag" --json url --jq '.url' >> "$GITHUB_STEP_SUMMARY"
