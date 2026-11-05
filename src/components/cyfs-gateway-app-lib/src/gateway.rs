@@ -795,6 +795,7 @@ impl GatewayFactory {
 
         let stack_manager = StackManager::new();
         let stack_runtime = GatewayStackRuntime {
+            acme_manager: Some(cert_manager.clone()),
             connection_manager: self.connection_manager.clone(),
             server_manager: server_manager.clone(),
             tunnel_manager: tunnel_manager.clone(),
@@ -2881,6 +2882,7 @@ impl Gateway {
         .await?;
 
         let stack_runtime = GatewayStackRuntime {
+            acme_manager: Some(cert_manager.clone()),
             connection_manager: self.connection_manager.clone(),
             server_manager: server_manager.clone(),
             tunnel_manager: self.tunnel_manager.clone(),

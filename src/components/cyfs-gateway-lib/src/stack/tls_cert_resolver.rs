@@ -1,17 +1,49 @@
 use crate::SelfCertMgrRef;
+use buckyos_kit::AsyncStream;
+use cyfs_acme::{ACME_TLS_ALPN_NAME, is_tls_alpn_challenge};
 use name_client::{IdentityMaterial, IdentityRoots, IdentityUsage};
 use rustls::client::verify_server_name;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{DnsName, ServerName};
 use rustls::server::{ClientHello, ParsedCertificate, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
-use rustls::{Error, sign};
+use rustls::{Error, ServerConfig, sign};
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 use tokio::task::JoinHandle;
+use tokio_rustls::{LazyConfigAcceptor, server::TlsStream};
+
+/// Accept TLS using the same certificate resolver for business and ACME traffic.
+/// ALPN selection and handshake-only protocols stay below the stack routing layer.
+pub(crate) async fn accept_tls_stream(
+    stream: Box<dyn AsyncStream>,
+    config: Arc<ServerConfig>,
+) -> std::io::Result<Option<TlsStream<Box<dyn AsyncStream>>>> {
+    let handshake = LazyConfigAcceptor::new(rustls::server::Acceptor::default(), stream).await?;
+    let is_challenge = is_tls_alpn_challenge(&handshake.client_hello());
+    let config = if is_challenge {
+        // Share certificate lookup, but never reuse business sessions for a challenge.
+        let mut config = ServerConfig::builder_with_provider(config.crypto_provider().clone())
+            .with_protocol_versions(rustls::DEFAULT_VERSIONS)
+            .map_err(std::io::Error::other)?
+            .with_no_client_auth()
+            .with_cert_resolver(config.cert_resolver.clone());
+        config.alpn_protocols = vec![ACME_TLS_ALPN_NAME.to_vec()];
+        config.send_tls13_tickets = 0;
+        Arc::new(config)
+    } else {
+        config
+    };
+    let mut stream = handshake.into_stream(config).await?;
+    if is_challenge {
+        tokio::io::AsyncWriteExt::shutdown(&mut stream).await?;
+        return Ok(None);
+    }
+    Ok(Some(stream))
+}
 
 #[derive(Debug)]
 pub(crate) struct ResolvesServerCertUsingSni {
@@ -444,6 +476,7 @@ fn verify_cert_name(name: &str, cert_key: &CertifiedKey) -> Result<(), String> {
 pub struct TlsCertResolver {
     resolve: Arc<dyn ResolvesServerCert>,
     self_cert_mgr: Option<SelfCertMgrRef>,
+    acme_resolver: Option<Arc<dyn ResolvesServerCert>>,
 }
 
 impl Debug for TlsCertResolver {
@@ -460,12 +493,25 @@ impl TlsCertResolver {
         Self {
             resolve,
             self_cert_mgr,
+            acme_resolver: None,
         }
+    }
+
+    pub fn with_acme_resolver(mut self, resolver: Option<Arc<dyn ResolvesServerCert>>) -> Self {
+        self.acme_resolver = resolver;
+        self
     }
 }
 
 impl ResolvesServerCert for TlsCertResolver {
     fn resolve(&self, client_hello: rustls::server::ClientHello) -> Option<Arc<CertifiedKey>> {
+        // A missing challenge must never fall back to a business or self-issued certificate.
+        if is_tls_alpn_challenge(&client_hello) {
+            return self
+                .acme_resolver
+                .as_ref()
+                .and_then(|resolver| resolver.resolve(client_hello));
+        }
         let server_name = client_hello
             .server_name()
             .map(|v| v.to_string())

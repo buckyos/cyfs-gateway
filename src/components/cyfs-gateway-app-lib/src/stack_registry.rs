@@ -24,6 +24,8 @@ pub type JsonStackConfigParser = dyn StackConfigParser<serde_json::Value>;
 /// A fresh value is created for initial startup and every reload. Registration closures must only
 /// use this value and must not capture managers from an earlier generation.
 pub struct GatewayStackRuntime {
+    /// ACME state for this runtime generation, including pending TLS challenges.
+    pub acme_manager: Option<cyfs_acme::AcmeCertManagerRef>,
     pub connection_manager: ConnectionManagerRef,
     pub server_manager: ServerManagerRef,
     pub tunnel_manager: TunnelManager,
@@ -357,7 +359,8 @@ pub(crate) fn register_core_gateway_stacks(
                     runtime.global_collection_manager.clone(),
                     runtime.js_externals.clone(),
                 )
-                .with_stack_manager(runtime.stack_manager.clone()),
+                .with_stack_manager(runtime.stack_manager.clone())
+                .with_acme_manager(runtime.acme_manager.clone()),
             ) as Arc<dyn StackContext>)
         },
     ))?;
@@ -494,6 +497,7 @@ mod tests {
 
     async fn test_runtime(self_cert_manager: SelfCertMgrRef) -> GatewayStackRuntime {
         GatewayStackRuntime {
+            acme_manager: None,
             connection_manager: ConnectionManager::new(),
             server_manager: Arc::new(ServerManager::new()),
             tunnel_manager: TunnelManager::new(),
@@ -582,6 +586,58 @@ mod tests {
             registry.registered_protocols(),
             ["quic", "rtcp", "tcp", "tls", "udp"].map(str::to_string)
         );
+    }
+
+    #[tokio::test]
+    async fn tls_context_uses_current_acme_manager() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut self_cert_config = SelfCertConfig::default();
+        self_cert_config.store_path = temp.path().join("self-certs").to_string_lossy().to_string();
+        let self_cert_manager = SelfCertMgr::create(self_cert_config).await.unwrap();
+        let mut runtime = test_runtime(self_cert_manager).await;
+        let mut builder = GatewayStackRegistryBuilder::new();
+        register_core_gateway_stacks(&mut builder).unwrap();
+        let registry = builder.build().unwrap();
+        let config = registry
+            .parse_stack_config(json!({
+                "id": "https",
+                "protocol": "tls",
+                "bind": "127.0.0.1:0",
+                "hosts": ["example.com"],
+                "hook_point": {}
+            }))
+            .unwrap();
+        let first_context = registry.build_context(&config, &runtime).unwrap();
+        assert!(
+            first_context
+                .as_ref()
+                .as_any()
+                .downcast_ref::<TlsStackContext>()
+                .unwrap()
+                .acme_manager
+                .is_none()
+        );
+
+        for generation in ["first", "reload"] {
+            let manager = cyfs_acme::AcmeCertManager::create(cyfs_acme::CertManagerConfig {
+                account: Some("test@example.com".to_string()),
+                keystore_path: temp.path().join(generation).to_string_lossy().to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+            runtime.acme_manager = Some(manager.clone());
+            let context = registry.build_context(&config, &runtime).unwrap();
+            let tls_context = context
+                .as_ref()
+                .as_any()
+                .downcast_ref::<TlsStackContext>()
+                .unwrap();
+            assert!(Arc::ptr_eq(
+                tls_context.acme_manager.as_ref().unwrap(),
+                &manager
+            ));
+        }
     }
 
     #[tokio::test]

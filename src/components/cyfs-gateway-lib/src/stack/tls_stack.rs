@@ -6,6 +6,7 @@ use crate::self_cert_mgr::SelfCertMgrRef;
 use crate::stack::limiter::Limiter;
 use crate::stack::tls_cert_resolver::{
     IdentityCertResolver, ResolvesServerCertUsingSni, TlsIdentityCertConfig, TlsIdentityHost,
+    accept_tls_stream,
 };
 use crate::stack::{
     StackManagerWeakRef, StackStreamContext, StreamStack, TlsCertResolver, get_limit_info,
@@ -21,6 +22,8 @@ use crate::{
     TrustedUpstreamMatcher, TunnelManager, create_io_dump_stack_config, get_external_commands,
     get_stat_info, hyper_serve_http, into_stack_err, stack_err,
 };
+use buckyos_io::{LimitStream, StatStream};
+use cyfs_acme::AcmeCertManagerRef;
 use cyfs_process_chain::{CollectionValue, CommandControl, ProcessChainLibExecutor, StreamRequest};
 use name_client::IdentityRoots;
 use rustls::ServerConfig;
@@ -29,7 +32,6 @@ pub use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::server::ResolvesServerCert;
 use rustls::sign::CertifiedKey;
 use serde::{Deserialize, Serialize};
-use buckyos_io::{LimitStream, StatStream};
 use std::net::SocketAddr;
 #[cfg(unix)]
 use std::os::fd::{FromRawFd, IntoRawFd};
@@ -40,7 +42,6 @@ use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
-use tokio_rustls::TlsAcceptor;
 
 const DEFAULT_IDENTITY_CERT_REFRESH_INTERVAL_SECS: u64 = 60;
 const DEFAULT_TLS_CONCURRENCY: u32 = 0;
@@ -90,6 +91,8 @@ pub struct TlsStackContext {
     pub global_collection_manager: Option<GlobalCollectionManagerRef>,
     pub js_externals: Option<JsExternalsManagerRef>,
     pub stack_manager: StackManagerWeakRef,
+    /// Supplies pending challenges to the unified TLS certificate resolver.
+    pub acme_manager: Option<AcmeCertManagerRef>,
 }
 
 impl TlsStackContext {
@@ -113,11 +116,17 @@ impl TlsStackContext {
             global_collection_manager,
             js_externals,
             stack_manager: StackManagerWeakRef::new(),
+            acme_manager: None,
         }
     }
 
     pub fn with_stack_manager(mut self, stack_manager: StackManagerWeakRef) -> Self {
         self.stack_manager = stack_manager;
+        self
+    }
+
+    pub fn with_acme_manager(mut self, acme_manager: Option<AcmeCertManagerRef>) -> Self {
+        self.acme_manager = acme_manager;
         self
     }
 }
@@ -251,12 +260,14 @@ impl TlsConnectionHandler {
             cert = IdentityCertResolver::new(identity_certs, Some(cert));
         }
 
-        let cert: Arc<dyn ResolvesServerCert> = if self_cert {
-            Arc::new(TlsCertResolver::new(cert, Some(env.self_cert_mgr.clone())))
-        } else {
-            cert
-        };
-        Ok(cert)
+        Ok(Arc::new(
+            TlsCertResolver::new(cert, self_cert.then(|| env.self_cert_mgr.clone()))
+                .with_acme_resolver(
+                    env.acme_manager
+                        .as_ref()
+                        .map(|manager| manager.clone() as Arc<dyn ResolvesServerCert>),
+                ),
+        ))
     }
 
     fn build_server_config(
@@ -329,11 +340,12 @@ impl TlsConnectionHandler {
         compose_stat: MutComposedSpeedStatRef,
         source_online_secs: Option<String>,
     ) -> StackResult<()> {
-        let tls_acceptor = TlsAcceptor::from(self.server_config.clone());
-        let tls_stream = tls_acceptor
-            .accept(stream)
+        let Some(tls_stream) = accept_tls_stream(stream, self.server_config.clone())
             .await
-            .map_err(into_stack_err!(StackErrorCode::StreamError))?;
+            .map_err(into_stack_err!(StackErrorCode::StreamError))?
+        else {
+            return Ok(());
+        };
         let server_name = {
             let (_, conn) = tls_stream.get_ref();
             conn.server_name().map(|s| s.to_string())
@@ -1353,6 +1365,7 @@ mod tests {
         LimiterManagerRef, ServerManagerRef, StackContext, StatManagerRef, TlsDomainConfig,
         TlsStack, TlsStackContext,
     };
+    use buckyos_io::StatStream;
     use buckyos_kit::{AsyncStream, init_logging};
     use cyfs_process_chain::StreamRequest;
     use http_body_util::Full;
@@ -1371,7 +1384,6 @@ mod tests {
         ClientConfig, DigitallySignedStruct, Error, HandshakeKind, RootCertStore, ServerConfig,
         SignatureScheme,
     };
-    use buckyos_io::StatStream;
     use std::net::SocketAddr;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1417,6 +1429,217 @@ mod tests {
             None,
             None,
         ))
+    }
+
+    #[tokio::test]
+    async fn test_tls_alpn_challenge_isolated_from_business_traffic() {
+        use crate::stack::TlsCertResolver;
+        use cyfs_acme::{ACME_TLS_ALPN_NAME, AcmeCertManager, CertManagerConfig};
+
+        let domain = "www.buckyos.com";
+        let normal_cert = generate_simple_self_signed(vec![domain.to_string()]).unwrap();
+        let challenge_key = KeyPair::generate().unwrap();
+        let mut challenge_params = CertificateParams::new(vec![domain.to_string()]).unwrap();
+        challenge_params
+            .custom_extensions
+            .push(rcgen::CustomExtension::new_acme_identifier(&[42; 32]));
+        let challenge_cert = challenge_params.self_signed(&challenge_key).unwrap();
+        let dir = tempdir().unwrap();
+        let manager = AcmeCertManager::create(CertManagerConfig {
+            account: Some("test@example.com".to_string()),
+            keystore_path: dir.path().to_string_lossy().to_string(),
+            // No hosts are registered: this test does not contact a public CA.
+            acme_server: "http://127.0.0.1:0/directory".to_string(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let servers = Arc::new(ServerManager::new());
+        servers
+            .add_server(Server::Stream(Arc::new(MockServer::new(
+                domain.to_string(),
+            ))))
+            .unwrap();
+        let context = build_stack_context(
+            servers,
+            TunnelManager::new(),
+            Arc::new(DefaultLimiterManager::new()),
+            StatManager::new(),
+            SelfCertMgr::create(SelfCertConfig::default())
+                .await
+                .unwrap(),
+            None,
+        );
+        let context = Arc::new(Arc::unwrap_or_clone(context).with_acme_manager(Some(manager)));
+        let chains: ProcessChainConfigs = serde_yaml_ng::from_str(
+            "- id: main\n  blocks:\n    - id: route\n      block: call-server www.buckyos.com;\n",
+        )
+        .unwrap();
+        let mut handler = TlsConnectionHandler::create(
+            "tls-alpn-test".to_string(),
+            chains,
+            vec![TlsDomainConfig {
+                domain: domain.to_string(),
+                certs: Some(vec![normal_cert.cert.der().clone()]),
+                key: Some(PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
+                    normal_cert.signing_key.serialize_der(),
+                ))),
+            }],
+            None,
+            vec![b"http/1.1".to_vec()],
+            context,
+            None,
+            None,
+            Vec::new(),
+            stream_idle_timeout_from_secs(None),
+        )
+        .await
+        .unwrap();
+
+        // Use the unified resolver with a deterministic pending certificate
+        // instead of placing an order with a public CA.
+        // The normal SNI resolver rejects the required critical ACME extension,
+        // so use the same ClientHello checks as the ACME manager here.
+        #[derive(Debug)]
+        struct PendingChallengeResolver {
+            cert: Arc<rustls::sign::CertifiedKey>,
+            pending: std::sync::atomic::AtomicBool,
+        }
+        impl rustls::server::ResolvesServerCert for PendingChallengeResolver {
+            fn resolve(
+                &self,
+                hello: rustls::server::ClientHello<'_>,
+            ) -> Option<Arc<rustls::sign::CertifiedKey>> {
+                (self.pending.load(Ordering::SeqCst)
+                    && hello.server_name() == Some("www.buckyos.com")
+                    && cyfs_acme::is_tls_alpn_challenge(&hello))
+                .then(|| self.cert.clone())
+            }
+        }
+        let challenge_signing_key = rustls::crypto::ring::sign::any_supported_type(
+            &PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(challenge_key.serialize_der())),
+        )
+        .unwrap();
+        let challenge_resolver = Arc::new(PendingChallengeResolver {
+            cert: Arc::new(rustls::sign::CertifiedKey::new(
+                vec![challenge_cert.der().clone()],
+                challenge_signing_key,
+            )),
+            pending: std::sync::atomic::AtomicBool::new(true),
+        });
+        Arc::get_mut(&mut handler.server_config)
+            .unwrap()
+            .cert_resolver = Arc::new(
+            TlsCertResolver::new(handler.certs.clone(), None)
+                .with_acme_resolver(Some(challenge_resolver.clone())),
+        );
+        let rebuilt = handler.rebuild_with_hook_point(vec![]).await.unwrap();
+        assert!(Arc::ptr_eq(&handler.server_config, &rebuilt.server_config,));
+
+        // Initial issuance must work before a business certificate is installed.
+        let business_config = handler.server_config.clone();
+        handler.server_config = TlsConnectionHandler::build_server_config(
+            Arc::new(
+                TlsCertResolver::new(
+                    Arc::new(rustls::server::ResolvesServerCertUsingSni::new()),
+                    None,
+                )
+                .with_acme_resolver(Some(challenge_resolver.clone())),
+            ),
+            &[b"http/1.1".to_vec()],
+        )
+        .unwrap();
+
+        for (alpn, host, is_challenge, pending) in [
+            (vec![ACME_TLS_ALPN_NAME.to_vec()], domain, true, true),
+            (vec![b"http/1.1".to_vec()], domain, false, true),
+            (
+                vec![ACME_TLS_ALPN_NAME.to_vec(), b"http/1.1".to_vec()],
+                domain,
+                false,
+                true,
+            ),
+            (
+                vec![ACME_TLS_ALPN_NAME.to_vec()],
+                "unknown.example.com",
+                true,
+                true,
+            ),
+            // Removing the challenge must not fall back to the available business certificate.
+            (vec![ACME_TLS_ALPN_NAME.to_vec()], domain, true, false),
+        ] {
+            challenge_resolver.pending.store(pending, Ordering::SeqCst);
+            if !is_challenge {
+                handler.server_config = business_config.clone();
+            }
+            let (server_io, client_io) = tokio::io::duplex(16384);
+            let request = StreamRequest::new(
+                Box::new(tokio::io::duplex(1).0),
+                "127.0.0.1:443".parse().unwrap(),
+            );
+            let context = StackStreamContext::from_request("tls-alpn-test", &request);
+            let mut client_config = ClientConfig::builder_with_provider(Arc::new(
+                rustls::crypto::ring::default_provider(),
+            ))
+            .with_protocol_versions(rustls::DEFAULT_VERSIONS)
+            .unwrap()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(NoVerifier))
+            .with_no_client_auth();
+            client_config.alpn_protocols = alpn;
+            let connector = TlsConnector::from(Arc::new(client_config));
+            let server = handler.handle_tls_stream(
+                Box::new(server_io),
+                context,
+                MutComposedSpeedStat::new(),
+                None,
+            );
+            let client = async {
+                let result = connector
+                    .connect(ServerName::try_from(host).unwrap(), client_io)
+                    .await;
+                if host != domain || !pending {
+                    assert!(
+                        result.is_err(),
+                        "an unavailable challenge must fail without a certificate fallback"
+                    );
+                    return;
+                }
+                let mut stream = result.unwrap();
+                let conn = stream.get_ref().1;
+                assert_eq!(
+                    conn.alpn_protocol(),
+                    Some(if is_challenge {
+                        ACME_TLS_ALPN_NAME
+                    } else {
+                        b"http/1.1".as_slice()
+                    })
+                );
+                assert_eq!(
+                    conn.peer_certificates().unwrap()[0],
+                    if is_challenge {
+                        challenge_cert.der().clone()
+                    } else {
+                        normal_cert.cert.der().clone()
+                    }
+                );
+                if is_challenge {
+                    let mut byte = [0];
+                    assert_eq!(stream.read(&mut byte).await.unwrap(), 0);
+                } else {
+                    stream.write_all(b"test").await.unwrap();
+                    let mut response = [0; 4];
+                    stream.read_exact(&mut response).await.unwrap();
+                    assert_eq!(&response, b"recv");
+                }
+            };
+            let (server_result, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+                tokio::join!(server, client)
+            })
+            .await
+            .unwrap();
+            assert_eq!(server_result.is_ok(), host == domain && pending);
+        }
     }
 
     #[tokio::test]
