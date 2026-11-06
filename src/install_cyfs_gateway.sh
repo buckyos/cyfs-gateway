@@ -85,9 +85,44 @@ get_gateway_pids() {
 	fi
 }
 
+gateway_service_is_running() {
+	local state=""
+	if [[ "$os_name" == "Linux" ]] && command -v systemctl >/dev/null 2>&1; then
+		state="$(systemctl show --property=ActiveState --value "${SERVICE_NAME}.service" 2>/dev/null)" || return 1
+		case "$state" in
+			active | activating | reloading | deactivating) return 0 ;;
+		esac
+	elif [[ "$os_name" == "Darwin" ]] && command -v launchctl >/dev/null 2>&1; then
+		# A loaded KeepAlive job can restart even when it has no process yet.
+		launchctl print "system/${SERVICE_NAME}" >/dev/null 2>&1 && return 0
+	fi
+	return 1
+}
+
 stop_gateway() {
-	local pids=("$@")
+	local service_running="$1"
+	local pids=()
 	local remaining=()
+	# Stop the supervisor first so it cannot restart the process during install.
+	if [[ "$service_running" -eq 1 ]]; then
+		log "Stopping ${SERVICE_NAME} service..."
+		if [[ "$os_name" == "Linux" ]]; then
+			if ! systemctl stop "${SERVICE_NAME}.service"; then
+				err "Failed to stop ${SERVICE_NAME} systemd service."
+				exit 1
+			fi
+		else
+			if ! launchctl bootout "system/${SERVICE_NAME}"; then
+				err "Failed to unload ${SERVICE_NAME} launchd service."
+				exit 1
+			fi
+		fi
+	fi
+
+	# Refresh PIDs after stopping the service; only terminate remaining processes.
+	while IFS= read -r line; do
+		pids+=("$line")
+	done < <(get_gateway_pids)
 	if [[ "${#pids[@]}" -eq 0 ]]; then
 		return
 	fi
@@ -126,15 +161,24 @@ stop_gateway() {
 check_running() {
 	local pids=()
 	local answer=""
+	local service_running=0
+	if gateway_service_is_running; then
+		service_running=1
+	fi
 	while IFS= read -r line; do
 		pids+=("$line")
 	done < <(get_gateway_pids)
-	if [[ "${#pids[@]}" -eq 0 ]]; then
+	if [[ "${#pids[@]}" -eq 0 && "$service_running" -eq 0 ]]; then
 		return
 	fi
 
-	warn "Detected running ${SERVICE_NAME} process(es): ${pids[*]}"
-	log "Continue installation and stop them? [y/N]"
+	if [[ "$service_running" -eq 1 ]]; then
+		warn "Detected running ${SERVICE_NAME} service."
+	fi
+	if [[ "${#pids[@]}" -gt 0 ]]; then
+		warn "Detected running ${SERVICE_NAME} process(es): ${pids[*]}"
+	fi
+	log "Continue installation and stop ${SERVICE_NAME}? [y/N]"
 	# stdin may contain the script itself when invoked via curl | bash.
 	if ! { read -r answer </dev/tty; } 2>/dev/null; then
 		err "Cannot read confirmation from /dev/tty; run the installer in an interactive terminal."
@@ -143,7 +187,7 @@ check_running() {
 	fi
 	case "${answer}" in
 		y | Y | yes | YES)
-			stop_gateway "${pids[@]}"
+			stop_gateway "$service_running"
 			;;
 		*)
 			log "Installation aborted."
@@ -341,8 +385,6 @@ else
 	curl -fSL -o "$archive_path" "$asset_url"
 fi
 
-check_running
-
 extract_dir="${tmp_dir}/extract"
 mkdir -p "$extract_dir"
 tar -xzf "$archive_path" -C "$extract_dir"
@@ -361,6 +403,8 @@ fi
 
 gateway_bin_rel="${gateway_bin_src#"$payload_dir"/}"
 gateway_bin_dest="${INSTALL_DIR}/${gateway_bin_rel}"
+
+check_running
 
 log "Installing to ${INSTALL_DIR}"
 mkdir -p "$INSTALL_DIR"
