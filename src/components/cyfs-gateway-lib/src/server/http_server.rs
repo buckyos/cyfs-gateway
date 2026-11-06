@@ -2598,11 +2598,11 @@ impl ProcessChainHttpServer {
             .and_then(|h| h.to_str().ok())
             .unwrap_or("none")
             .to_string();
-        let req_uri = req.uri().to_string();
+        let req_uri = loggable_url(&req.uri().to_string());
         let req_remote = info.src_addr.as_deref().unwrap_or("unknown").to_string();
         let req_version = Self::request_version(req.version());
         let req_user_agent = Self::request_header_value(&req, "user-agent").to_string();
-        let req_referer = Self::request_header_value(&req, "referer").to_string();
+        let req_referer = loggable_url(Self::request_header_value(&req, "referer"));
         let req_x_forwarded_for = Self::request_header_value(&req, "x-forwarded-for").to_string();
 
         info!(
@@ -3283,8 +3283,26 @@ impl ServerFactory for ProcessChainHttpServerFactory {
     }
 }
 
+/// What the access log shows of a URL. A query can carry a capability (`bkt_` tokens,
+/// `/ndn/` hints, session tokens), so only its presence is kept.
+fn loggable_url(url: &str) -> String {
+    match url.split_once('?') {
+        Some((path, _)) => format!("{path}?<redacted>"),
+        None => url.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_access_log_never_shows_a_query() {
+        use super::loggable_url;
+        assert_eq!(loggable_url("/ndn/cyfile:ab?hint=%7B%22token%22%3A%22bkt_secret%22%7D"), "/ndn/cyfile:ab?<redacted>");
+        assert_eq!(loggable_url("https://z.example/bucket/v1/a/b?token=bkt_secret&version=1"), "https://z.example/bucket/v1/a/b?<redacted>");
+        assert_eq!(loggable_url("/plain/path"), "/plain/path");
+        assert_eq!(loggable_url("-"), "-");
+    }
+
     use super::*;
     use crate::{
         GlobalCollectionManager, GlobalProcessChains, JsExternalsManager, ServerManager,
