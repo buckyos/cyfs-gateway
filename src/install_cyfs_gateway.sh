@@ -347,13 +347,19 @@ extract_dir="${tmp_dir}/extract"
 mkdir -p "$extract_dir"
 tar -xzf "$archive_path" -C "$extract_dir"
 
-gateway_bin_src="$(find "$extract_dir" -type f -name "cyfs_gateway" -print -quit || true)"
+# Staged release archives include a buckyos/ root; legacy archives are flat.
+payload_dir="$extract_dir"
+if [[ -d "$extract_dir/buckyos" ]]; then
+	payload_dir="$extract_dir/buckyos"
+fi
+
+gateway_bin_src="$(find "$payload_dir" -type f -name "cyfs_gateway" -print -quit || true)"
 if [[ -z "$gateway_bin_src" ]]; then
 	err "Cannot locate cyfs_gateway binary in archive."
 	exit 1
 fi
 
-gateway_bin_rel="${gateway_bin_src#"$extract_dir"/}"
+gateway_bin_rel="${gateway_bin_src#"$payload_dir"/}"
 gateway_bin_dest="${INSTALL_DIR}/${gateway_bin_rel}"
 
 log "Installing to ${INSTALL_DIR}"
@@ -367,7 +373,7 @@ if [[ -f "$CONFIG_PATH" ]]; then
 	cp -f "$CONFIG_PATH" "$config_backup"
 fi
 
-cp -a "$extract_dir/." "$INSTALL_DIR/"
+cp -a "$payload_dir/." "$INSTALL_DIR/"
 
 if [[ "$preserve_config" -eq 1 ]]; then
 	mkdir -p "$(dirname "$CONFIG_PATH")"
