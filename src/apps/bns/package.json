@@ -17,6 +17,10 @@
     "deploy": "hardhat run hardhat-scripts/deploy.ts",
     "deploy:local": "hardhat run hardhat-scripts/deploy-local.ts --network anvil",
     "deploy:op-mainnet": "hardhat run hardhat-scripts/deploy.ts --network opMainnet",
+    "smoke": "hardhat run hardhat-scripts/smoke.ts",
+    "smoke:local": "hardhat run hardhat-scripts/smoke.ts --network hardhat",
+    "node:local": "hardhat node --network hardhat --hostname 127.0.0.1",
+    "smoke:localhost": "hardhat run hardhat-scripts/smoke.ts --network localhost",
     "smoke:anvil": "hardhat run hardhat-scripts/smoke.ts --network anvil",
     "run:anvil": "hardhat run --network anvil"
   },

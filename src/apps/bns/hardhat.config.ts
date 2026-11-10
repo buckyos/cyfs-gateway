@@ -37,6 +37,17 @@ export default defineConfig({
     },
   },
   networks: {
+    hardhat: {
+      type: "edr-simulated",
+      chainType: "l1",
+      throwOnTransactionFailures: false,
+    },
+    localhost: {
+      type: "http",
+      chainType: "l1",
+      url: process.env.BNS_LOCAL_RPC_URL ?? "http://127.0.0.1:8545",
+      accounts: "remote",
+    },
     anvil: {
       type: "http",
       chainType: "l1",

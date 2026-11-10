@@ -17,8 +17,11 @@ First EVM implementation of the BNS registry described in
   tests and deployment.
 - `hardhat-scripts/check-facets.mjs`: runtime-size, selector coverage/collision, and
   shared-storage-layout checks over Hardhat artifacts.
-- `hardhat-scripts/smoke.ts`: deploys a fresh Router/Facet proxy to Anvil and runs the
-  register/publish/resolve smoke flow.
+- `hardhat-scripts/smoke.ts`: selects local deployment or an explicit external proxy.
+- `hardhat-scripts/smoke-common.ts`: fixtures, confirmed transactions, exact custom-error
+  checks, receipt/event validation and interface coverage accounting.
+- `hardhat-scripts/smoke-test.ts`: business scenarios shared by every network.
+- `hardhat-scripts/smoke-time.ts`, `smoke-admin.ts`: isolated local time and proxy-management scenarios.
 - `scripts/anvil.sh`: starts a persistent local Anvil chain.
 
 ## Contract Tests
@@ -209,46 +212,89 @@ Every implementation is below the EIP-170 24,576-byte runtime limit. The largest
 facet retains 5,431 bytes of upgrade headroom. The proxy remains the only address used
 by clients and indexers.
 
-## Local Anvil Chain
+## Contract Smoke Tests
 
-Anvil remains the persistent local development chain. Hardhat connects to its JSON-RPC
-endpoint for deployment and smoke execution; Hardhat Node is not involved. Install
-Foundry for the `anvil` binary only—the local contract smoke no longer uses `forge`.
+The smoke suite exercises the deployed production Router/facets through their public
+ABI. It supplements the Solidity unit/fuzz tests; interface coverage means successful
+calls to each interface, not complete branch coverage. Each run uses a random
+`smoke...` prefix and prints its account, proxy, scenario results and transaction hashes.
+Missing successful coverage of any of the 28 business interfaces in
+`facet-manifest.json` fails the run. Negative cases require the exact custom error;
+RPC/transport failures cannot count as expected contract reverts.
 
-```bash
-curl -L https://foundry.paradigm.xyz | bash
-foundryup
-```
+### Local Hardhat chain
 
-Start the persistent chain:
-
-```bash
-cd src/apps/bns
-./scripts/anvil.sh
-```
-
-In another terminal, run the complete deployment and contract smoke flow:
+Run the complete deployment + business + time + administration suite on a fresh
+Hardhat 3 in-process EDR chain, with no Anvil installation or separate node process:
 
 ```bash
 cd src/apps/bns
-npm run smoke:anvil
+npm run smoke:local
 ```
 
-Override the endpoint when Anvil is not listening on the default
-`http://127.0.0.1:8545`. A private key is optional because Hardhat otherwise uses an
-unlocked Anvil account:
+To inspect the same flow through a standalone Hardhat JSON-RPC node, use two terminals:
+
+```bash
+# Terminal 1
+npm run node:local
+# Terminal 2
+npm run smoke:localhost
+# Optional custom port: npm run node:local -- --port 9545
+# BNS_LOCAL_RPC_URL=http://127.0.0.1:9545 npm run smoke:localhost
+```
+
+`localhost` must resolve to a loopback URL and identify itself as Hardhat before the
+script deploys or enables time/admin operations. Every simulated network is also
+local. Local runs always deploy fresh facets and a proxy, ignoring
+`BNS_CONTRACT_ADDRESS`. Time/admin scenarios use snapshots restored in `finally`,
+including on failure, so those scenarios restore the node's previous timestamp and
+state. Use a dedicated node without concurrent writers; snapshot restoration also
+reverts transactions submitted by other clients during a scenario.
+
+### Deployed contracts (USDB and other networks)
+
+Select a network from `hardhat.config.ts` and explicitly supply its deployed **BNS
+proxy** address. The address is required even when a deployment record exists:
 
 ```bash
 cd src/apps/bns
-BNS_ANVIL_RPC_URL=http://127.0.0.1:9545 \
-BNS_ANVIL_PRIVATE_KEY=0x... \
-npm run smoke:anvil
+BNS_CONTRACT_ADDRESS=0xYourDeployedBnsProxyAddress \
+npm run smoke -- --network usdbtest
 ```
 
-Each smoke run deploys seven facets plus a fresh UUPS Router proxy, installs all 28
-business selectors, registers `alice`, publishes its inline `owner` document, and
-resolves the active version from the proxy. Addresses and each successful phase are
-printed to the console; no separate local deployment step or record is required.
+Other HTTP networks never deploy contracts. Missing/invalid addresses, no contract
+code, missing signer, failed receipts, assertion failures or unexpected reverts all
+exit nonzero. The selected network's first signer needs funds for the test
+transactions (including one intentionally reverted batch transaction); no second funded account or deployment-admin privilege is required.
+Each external run leaves its test names/documents and a log checkpoint on-chain.
+Time manipulation and proxy administration are explicitly reported as `[SKIP]`.
+
+### Coverage contract
+
+| Area | All networks | Additional local Hardhat checks |
+| --- | --- | --- |
+| Router/read API | Constants, all selector routes have code, owner/version, principal encoding, absent/invalid names, reinitialization/proxy UUID rejection | Facet replacement/removal/restoration, protected selectors, admin access, UUPS upgrade with state preservation, ownership transfer/renunciation |
+| Registration/names | Initial documents, duplicate registration, ownership, renewal, child inheritance, parent-sequence guard, namespace policy | Expiry immediately before/at boundary, expired writes/parent rejection, renewal past grace and document recovery |
+| Documents | Inline hash/byte readback, 4096-byte boundary, oversized/hash/type rejection, external URI, versions/history, revocation and republication | Independent document expiry boundary and expired purchase context |
+| Authority/ownership | Keys and roots, semantic BNS owner, rotation, revoked/last-key rejection, atomic asset/document transfer, fallback restoration | Key validity start/end boundaries, expiry safety latch and recovery |
+| Controllers | Scoped/wildcard rules, all five permission bits, wrong actor, missing permission, policy removal | Validity start/end boundaries |
+| Atomic mutations | Combined keys/documents/IAT floor, one name-sequence increment, empty/duplicate/oversized batches, mined revert and rollback, monotonic IAT floor | Same business checks |
+| Lifecycle | Release, re-registration resets current lineage/alias/keys/controller policy, historical docs retained, permanent tombstone | Same business checks |
+| Events/checkpoint | Business events, receipt-local protocol sequence/root continuity, actor/proxy, checkpoint root/sequence/timestamp | Exact mining of five blocks |
+
+Local time checks use `hardhat_mine`, `evm_setNextBlockTimestamp`, `evm_mine` and
+snapshot/revert RPCs described in the [Hardhat JSON-RPC reference](https://hardhat.org/docs/reference/json-rpc-methods).
+No sleeps or waits for real expiration are required. External networks receive no
+time, mining, snapshot or admin RPCs. Shared global-log checks use the current
+transaction's events rather than assuming exclusive ownership of the whole chain.
+
+### Legacy Anvil path
+
+`npm run smoke:anvil` remains available for existing local automation. It deploys a
+fresh proxy and runs the expanded business suite, with time/admin scenarios skipped.
+Start Anvil with `./scripts/anvil.sh`; override its RPC/account with
+`BNS_ANVIL_RPC_URL` / `BNS_ANVIL_PRIVATE_KEY`. The DV/Rust integration environment
+below continues to use Anvil independently of the contract smoke default.
 
 ## DV Integration Environment
 
