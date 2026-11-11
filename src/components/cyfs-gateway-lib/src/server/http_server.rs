@@ -979,6 +979,44 @@ impl ProcessChainHttpServer {
         Url::parse(target_url).ok()
     }
 
+    /// HTTP/2 and HTTP/3 carry the target host in `:authority` (hyper puts it into an absolute
+    /// URI, and browsers send no `Host`) and may split `cookie` into several fields. Dispatch,
+    /// the `REQ` map (`REQ.host`, `REQ.uri`) and the HTTP/1.1 upstream requests all expect the
+    /// HTTP/1.1 shape, so a multiplexed request is brought to it first: `Host` from `:authority`
+    /// (RFC 9110 §7.2), an origin-form URI, and one `cookie` field (RFC 9113 §8.2.3).
+    fn normalize_multiplexed_request<B>(req: &mut http::Request<B>) {
+        if req.version() < Version::HTTP_2 {
+            return;
+        }
+        if let Some(authority) = req.uri().authority() {
+            // `:authority` must not carry userinfo; a client that sends some anyway does not get it into `Host`.
+            let host = authority.as_str().rsplit('@').next().unwrap_or_default();
+            if let Ok(value) = http::HeaderValue::from_str(host) {
+                req.headers_mut().insert(http::header::HOST, value);
+            }
+        }
+        // A plain CONNECT has no path: its authority-form target stays as it is.
+        if req.method() != http::Method::CONNECT && req.uri().authority().is_some() {
+            let origin = req.uri().path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
+            if let Ok(uri) = origin.parse::<http::Uri>() {
+                *req.uri_mut() = uri;
+            }
+        }
+        let headers = req.headers_mut();
+        if headers.get_all(http::header::COOKIE).iter().nth(1).is_some() {
+            let mut joined = Vec::new();
+            for value in headers.get_all(http::header::COOKIE) {
+                if !joined.is_empty() {
+                    joined.extend_from_slice(b"; ");
+                }
+                joined.extend_from_slice(value.as_bytes());
+            }
+            if let Ok(value) = http::HeaderValue::from_bytes(&joined) {
+                headers.insert(http::header::COOKIE, value);
+            }
+        }
+    }
+
     fn origin_form_uri(raw_uri: &str) -> String {
         if raw_uri.starts_with('/') {
             return raw_uri.to_string();
@@ -2552,9 +2590,10 @@ impl ProcessChainHttpServer {
     /// in a timeout.
     async fn serve_request_inner(
         &self,
-        req: http::Request<BoxBody<Bytes, ServerError>>,
+        mut req: http::Request<BoxBody<Bytes, ServerError>>,
         info: StreamInfo,
     ) -> ServerResult<http::Response<BoxBody<Bytes, ServerError>>> {
+        Self::normalize_multiplexed_request(&mut req);
         let dispatch = is_dispatch(&req);
         let dispatch_target = dispatch_target(&req).unwrap_or_default();
         let dispatch_credentials: Vec<_> = req
@@ -5050,6 +5089,129 @@ mod tests {
             )
         })
         .await;
+    }
+
+    #[tokio::test]
+    async fn test_http2_request_reaches_chain_and_upstream_in_http11_shape() {
+        use http_body_util::BodyExt;
+        use tokio::net::TcpListener;
+
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = upstream_listener.accept().await.unwrap();
+            let service = hyper::service::service_fn(
+                |req: http::Request<hyper::body::Incoming>| async move {
+                    assert_eq!(req.version(), Version::HTTP_11);
+                    assert_eq!(req.uri().to_string(), "/kapi/x?y=1");
+                    assert_eq!(req.headers().get("host").unwrap(), "zone.example");
+                    let cookies: Vec<_> = req.headers().get_all("cookie").iter().collect();
+                    assert_eq!(cookies, vec!["a=1; b=2"]);
+                    let _ = req.collect().await;
+                    Ok::<_, ServerError>(
+                        http::Response::builder()
+                            .status(StatusCode::OK)
+                            // Connection-specific: hyper drops it on the HTTP/2 side.
+                            .header("connection", "keep-alive")
+                            .body(Full::new(Bytes::from("h2 ok")).map_err(|e| match e {}).boxed())
+                            .unwrap(),
+                    )
+                },
+            );
+            let _ = hyper::server::conn::http1::Builder::new()
+                .serve_connection(TokioIo::new(stream), service)
+                .await;
+        });
+
+        let mock_server_mgr = Arc::new(ServerManager::new());
+        let chains = format!(
+            r#"
+- id: main
+  priority: 1
+  blocks:
+    - id: main
+      block: |
+        eq ${{REQ.host}} "zone.example" || reject;
+        eq ${{REQ.uri}} "/kapi/x?y=1" || reject;
+        forward http://{};
+        "#,
+            upstream_addr
+        );
+        let chains: ProcessChainConfigs = serde_yaml_ng::from_str(&chains).unwrap();
+        let http_server = Arc::new(
+            ProcessChainHttpServer::builder()
+                .id("test_http2_shape")
+                .version("HTTP/2".to_string())
+                .hook_point(chains)
+                .server_mgr(Arc::downgrade(&mock_server_mgr))
+                .tunnel_manager(TunnelManager::new())
+                .build()
+                .await
+                .unwrap(),
+        );
+
+        let (client, server) = tokio::io::duplex(4096);
+        tokio::spawn(async move {
+            hyper_serve_http(Box::new(server), http_server, StreamInfo::default())
+                .await
+                .unwrap();
+        });
+
+        // What a browser sends over HTTP/2: `:authority` and no `Host`, cookie split into crumbs.
+        let request = http::Request::builder()
+            .version(Version::HTTP_2)
+            .method("GET")
+            .uri("https://zone.example/kapi/x?y=1")
+            .header("cookie", "a=1")
+            .header("cookie", "b=2")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let (mut sender, conn) = hyper::client::conn::http2::Builder::new(TokioExecutor::new())
+            .handshake(TokioIo::new(client))
+            .await
+            .unwrap();
+        tokio::spawn(async move {
+            conn.await.unwrap();
+        });
+        let resp = sender.send_request(request).await.unwrap();
+        assert_eq!(resp.version(), Version::HTTP_2);
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(resp.headers().get("connection").is_none());
+        assert_eq!(resp.collect().await.unwrap().to_bytes(), Bytes::from("h2 ok"));
+    }
+
+    #[test]
+    fn test_normalize_multiplexed_request_leaves_http11_and_connect_alone() {
+        let mut h1 = http::Request::builder()
+            .uri("http://proxy.example/a")
+            .header("cookie", "a=1")
+            .header("cookie", "b=2")
+            .body(())
+            .unwrap();
+        ProcessChainHttpServer::normalize_multiplexed_request(&mut h1);
+        assert_eq!(h1.uri().to_string(), "http://proxy.example/a");
+        assert!(h1.headers().get("host").is_none());
+        assert_eq!(h1.headers().get_all("cookie").iter().count(), 2);
+
+        let mut connect = http::Request::builder()
+            .version(Version::HTTP_2)
+            .method("CONNECT")
+            .uri("zone.example:443")
+            .body(())
+            .unwrap();
+        ProcessChainHttpServer::normalize_multiplexed_request(&mut connect);
+        assert_eq!(connect.uri().to_string(), "zone.example:443");
+        assert_eq!(connect.headers().get("host").unwrap(), "zone.example:443");
+
+        let mut h2 = http::Request::builder()
+            .version(Version::HTTP_2)
+            .uri("https://user@zone.example:8443")
+            .header("host", "other.example")
+            .body(())
+            .unwrap();
+        ProcessChainHttpServer::normalize_multiplexed_request(&mut h2);
+        assert_eq!(h2.uri().to_string(), "/");
+        assert_eq!(h2.headers().get("host").unwrap(), "zone.example:8443");
     }
 
     #[tokio::test]
