@@ -1,4 +1,6 @@
 [package]
+license-file.workspace = true
+license.workspace = true
 name = "cyfs-gateway-app-lib"
 version.workspace = true
 edition = "2024"

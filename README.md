@@ -48,3 +48,10 @@ cd src
 uv run ./buckyos-build.py
 uv run ./buckyos-install.py
 ```
+
+## License
+
+First-party code is licensed under [Apache-2.0](LICENSE). Third-party code and
+dependencies retain their own licenses; see [NOTICE](NOTICE).
+The independent [Adblock Plus test/example](src/components/cyfs-socks/pac/readme.md)
+remains GPL-3.0-only. The vendored CryptoJS files remain MIT licensed.

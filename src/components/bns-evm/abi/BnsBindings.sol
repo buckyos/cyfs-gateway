@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 // Generated from the aggregate BNS JSON ABI and Hardhat enum AST by
 // hardhat-scripts/generate-bindings.mjs. Do not edit.
 pragma solidity ^0.8.24;

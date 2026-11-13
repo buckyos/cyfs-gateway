@@ -45,10 +45,14 @@ def _run_command(command: str, args: list[str]) -> int:
 def main() -> int:
     print("!!! buckyos depend on cyfs-gateway, MAKE SURE YOU HAVE BUILD IT FIRST!", flush=True)
 
-    result = _run_command("buckyos-build", sys.argv[1:])
+    args = sys.argv[1:]
+    result = _run_command("buckyos-build", args)
     if result != 0:
         print(f"buckyos-build failed with return code {result}")
         return result
+    # A help request builds nothing, so nothing must be installed either.
+    if any(arg in {"-h", "--help"} for arg in args):
+        return 0
 
     result = _run_command("buckyos-update", [])
     if result != 0:

@@ -23,6 +23,7 @@ apps:
       cyfs_gateway: bin/cyfs-gateway/
       test_server: bin/test-server/
       etc/cyfs_gateway/: etc/cyfs_gateway/
+      share/licenses/cyfs-gateway/: share/licenses/cyfs-gateway/
     data_paths: []
     clean_paths: []
   web3-gateway:
@@ -36,6 +37,7 @@ apps:
       init_anvil.py: init_anvil.py
       start.py: start.py
       stop.py: stop.py
+      licenses/cyfs-gateway/: licenses/cyfs-gateway/
     data_paths:
       - website.yaml
       - params.json
