@@ -38,7 +38,7 @@ impl Limiter {
         }
     }
 
-    fn new_named(
+    pub fn new_named(
         id: impl Into<String>,
         upper: Option<Limiter>,
         concurrent: Option<u32>,
