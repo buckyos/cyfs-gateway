@@ -560,6 +560,15 @@ impl MapCollection for HttpRequestHeaderMap {
         }
     }
 
+    async fn peek(&self, key: &str) -> Result<Option<CollectionValue>, String> {
+        // contains_key mirrors get's key resolution; probing first keeps an
+        // absent header from hitting get's miss warning.
+        if !self.contains_key(key).await? {
+            return Ok(None);
+        }
+        self.get(key).await
+    }
+
     async fn contains_key(&self, key: &str) -> Result<bool, String> {
         if RequestSourceInfo::is_reserved_key(key) {
             return Ok(self.sources.get(key).is_some());
@@ -832,6 +841,13 @@ impl MapCollection for HttpResponseHeaderMap {
             warn!("Header '{}' not found", key);
             Ok(None)
         }
+    }
+
+    async fn peek(&self, key: &str) -> Result<Option<CollectionValue>, String> {
+        if !self.contains_key(key).await? {
+            return Ok(None);
+        }
+        self.get(key).await
     }
 
     async fn contains_key(&self, key: &str) -> Result<bool, String> {
@@ -1299,5 +1315,58 @@ mod tests {
         assert!(map.get("real_source_ip").await.unwrap().is_none());
         assert!(!map.contains_key("real_source_ip").await.unwrap());
         assert!(map.get("source_addr").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_http_req_map_peek_matches_get() {
+        let info = StreamInfo::with_addrs(
+            Some("127.0.0.1:9000".to_string()),
+            Some("198.51.100.7:6001".to_string()),
+        );
+        let sources = RequestSourceInfo::from_stream_info(&info);
+        let req = test_request(&[("source_ip", "6.6.6.6"), ("x-plain", "1")]);
+        let map = HttpRequestHeaderMap::new_with_sources(req, sources);
+
+        let peek = |key: &str| {
+            let map = map.clone();
+            let key = key.to_string();
+            async move {
+                map.peek(&key)
+                    .await
+                    .unwrap()
+                    .map(|v| v.try_as_str().unwrap().to_string())
+            }
+        };
+
+        // Present keys resolve exactly like get(), including reserved keys
+        // that must not be shadowed by same-named headers.
+        assert_eq!(peek("x-plain").await.as_deref(), Some("1"));
+        assert_eq!(peek("path").await.as_deref(), Some("/test"));
+        assert_eq!(peek("source_ip").await.as_deref(), Some("198.51.100.7"));
+        // An absent header is a plain miss.
+        assert!(peek("X-Cyfs-Rtcp-Device").await.is_none());
+
+        // Without stream info a reserved key is absent too, and a forged
+        // same-named header still must not answer for it.
+        let map = HttpRequestHeaderMap::new(test_request(&[("real_source_ip", "7.7.7.7")]));
+        assert!(map.peek("real_source_ip").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_http_resp_map_peek() {
+        let resp = http::Response::builder()
+            .header("x-plain", "1")
+            .body(Full::new(Bytes::new()).map_err(|e| match e {}).boxed())
+            .unwrap();
+        let map = HttpResponseHeaderMap::new(resp);
+        assert_eq!(
+            map.peek("x-plain")
+                .await
+                .unwrap()
+                .map(|v| v.try_as_str().unwrap().to_string())
+                .as_deref(),
+            Some("1")
+        );
+        assert!(map.peek("x-missing").await.unwrap().is_none());
     }
 }

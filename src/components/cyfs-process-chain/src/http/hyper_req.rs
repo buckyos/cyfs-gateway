@@ -158,6 +158,13 @@ impl MapCollection for HyperHttpRequestHeaderMap {
         }
     }
 
+    async fn peek(&self, key: &str) -> Result<Option<CollectionValue>, String> {
+        if !self.contains_key(key).await? {
+            return Ok(None);
+        }
+        self.get(key).await
+    }
+
     async fn contains_key(&self, key: &str) -> Result<bool, String> {
         let request = self.request.read().await;
         Ok(request.headers().get(key).is_some())

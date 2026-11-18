@@ -599,7 +599,17 @@ pub trait MapCollection: Send + Sync {
     async fn insert(&self, key: &str, value: TypedValue) -> Result<Option<TypedValue>, String>;
 
     /// Gets the value for the given key from the collection.
+    /// The caller expects the key to exist, so implementations may report a
+    /// miss (e.g. log a warning). Use `peek` when a miss is an expected outcome.
     async fn get(&self, key: &str) -> Result<Option<TypedValue>, String>;
+
+    /// Gets the value for the given key, where a missing key is an expected
+    /// outcome (existence probes such as `match-include`), so a miss must not
+    /// be reported. The default forwards to `get`; collections whose `get`
+    /// reports misses must override it.
+    async fn peek(&self, key: &str) -> Result<Option<TypedValue>, String> {
+        self.get(key).await
+    }
 
     /// Checks if the collection contains the given key.
     async fn contains_key(&self, key: &str) -> Result<bool, String>;

@@ -328,8 +328,9 @@ impl CommandExecutor for MatchIncludeCommandExecutor {
                 }
             }
             CollectionValue::Map(collection) => {
-                // For map collection, we check if the key exists and matches the value
-                let value = collection.get(&key).await?;
+                // For map collection, we check if the key exists and matches the value.
+                // A missing key is an ordinary "not included" result, so peek, not get.
+                let value = collection.peek(&key).await?;
                 if let Some(value) = value {
                     if values.is_empty() {
                         log!(
