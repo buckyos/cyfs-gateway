@@ -41,3 +41,4 @@ src/deno.lock
 src/apps/bns-webui/pnpm-lock.yaml
 src/apps/bns-webui/dist/
 src/apps/bns-webui/node_modules/
+**/*.exe
