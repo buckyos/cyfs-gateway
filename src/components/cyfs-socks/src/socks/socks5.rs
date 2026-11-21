@@ -251,8 +251,7 @@ impl Socks5Proxy {
                 self.process_socket_via_proxy(socket, proxy, target).await
             }
             ProxyAccessMethod::Reject => {
-                let msg = format!("Rule engine blocked connection to {}", target);
-                error!("{}", msg);
+                info!("Rule engine blocked connection to {}", target);
                 Socks5Util::reply_error(&mut socket, fast_socks5::ReplyError::HostUnreachable).await
             }
         }
@@ -345,6 +344,14 @@ impl Socks5Proxy {
                 // Reply success after data tunnel connected
                 Socks5Util::reply_error(&mut socket, fast_socks5::ReplyError::Succeeded).await?;
                 tunnel
+            }
+            Err(SocksError::SelfTunnel(msg)) => {
+                debug!("SOCKS tunnel to {} rejected: {}", target, msg);
+                return Socks5Util::reply_error(
+                    &mut socket,
+                    fast_socks5::ReplyError::HostUnreachable,
+                )
+                .await;
             }
             Err(e) => {
                 error!("Error building data tunnel: {}", e);

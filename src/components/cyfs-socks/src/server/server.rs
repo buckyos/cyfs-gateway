@@ -459,6 +459,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_self_tunnel_replies_host_unreachable() {
+        use cyfs_gateway_lib::{
+            TunnelBox, TunnelBuilder, TunnelError, TunnelManager, TunnelResult,
+        };
+
+        struct SelfTunnelBuilder;
+
+        #[async_trait::async_trait]
+        impl TunnelBuilder for SelfTunnelBuilder {
+            async fn create_tunnel(
+                &self,
+                tunnel_stack_id: Option<&str>,
+            ) -> TunnelResult<Box<dyn TunnelBox>> {
+                assert_eq!(tunnel_stack_id, Some("self.invalid"));
+                Err(TunnelError::SelfTunnel("self tunnel".to_owned()))
+            }
+        }
+
+        let manager = TunnelManager::new();
+        manager.register_tunnel_builder("rtcp", Arc::new(SelfTunnelBuilder));
+        let socks_server = create_socks_stream_server(
+            "return \"PROXY rtcp://self.invalid/\";",
+            crate::SocksTunnelBuilder::new_ref(manager),
+        )
+        .await;
+        let (mut client, server_stream) = tokio::io::duplex(1024);
+        let task = tokio::spawn(async move {
+            socks_server
+                .serve_connection(Box::new(server_stream), StreamInfo::default())
+                .await
+        });
+
+        let target = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 80);
+        let reply = socks5_connect_ipv4(&mut client, target).await;
+        assert_eq!(reply, fast_socks5::ReplyError::HostUnreachable.as_u8());
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
     async fn test_socks_server_reject_connection() {
         let provider = MockTunnelProvider::default();
         let socks_server =

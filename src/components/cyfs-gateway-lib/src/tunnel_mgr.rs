@@ -357,10 +357,10 @@ impl TunnelManager {
             })?;
         let auth = target_url.authority();
         let tunnel_stack_id = if auth.is_empty() { None } else { Some(auth) };
-        let tunnel = builder.create_tunnel(tunnel_stack_id).await.map_err(|e| {
-            error!("create_tunnel to {} failed: {:?}", target_url, e);
-            e
-        })?;
+        let tunnel = builder
+            .create_tunnel(tunnel_stack_id)
+            .await
+            .inspect_err(|e| log_create_tunnel_error(target_url, e))?;
 
         debug!("Get tunnel for {} success", target_url);
         Ok(tunnel)
@@ -415,7 +415,7 @@ impl TunnelManager {
                 let detail = format!("create_tunnel failed: {}", e);
                 self.record_business_failure(url, classify_create_tunnel_error(&e), Some(&detail))
                     .await;
-                error!("Create tunnel for {} failed: {}", url, e);
+                log_create_tunnel_error(url, &e);
                 return Err(e);
             }
         };
@@ -483,7 +483,7 @@ impl TunnelManager {
                 let detail = format!("create_tunnel failed: {}", e);
                 self.record_business_failure(url, classify_create_tunnel_error(&e), Some(&detail))
                     .await;
-                error!("Create tunnel for {} failed: {}", url, e);
+                log_create_tunnel_error(url, &e);
                 return Err(e);
             }
         };
@@ -1072,7 +1072,18 @@ fn tunnel_open_error(message: String, err: &std::io::Error) -> TunnelError {
     }
 }
 
+fn log_create_tunnel_error(url: &Url, err: &TunnelError) {
+    let level = match err {
+        TunnelError::SelfTunnel(_) => Level::Debug,
+        _ => Level::Error,
+    };
+    log!(level, "Create tunnel for {} failed: {}", url, err);
+}
+
 pub(crate) fn classify_create_tunnel_error(err: &TunnelError) -> TunnelFailureReason {
+    if matches!(err, TunnelError::SelfTunnel(_)) {
+        return TunnelFailureReason::ConnectRefused;
+    }
     let msg = err.to_string().to_ascii_lowercase();
     if msg.contains("timed out") || msg.contains("timeout") {
         TunnelFailureReason::ConnectTimeout

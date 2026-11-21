@@ -70,6 +70,8 @@ pub enum TunnelError {
     BindError(String),
     #[error("Connect Error: {0}")]
     ConnectError(String),
+    #[error("{0}")]
+    SelfTunnel(String),
     #[error("Connect Timeout: {0}")]
     ConnectTimeout(String),
     #[error("DIDDocument Error: {0}")]

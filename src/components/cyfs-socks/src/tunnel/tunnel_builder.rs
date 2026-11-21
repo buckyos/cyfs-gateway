@@ -2,7 +2,7 @@ use crate::{
     SocksDataTunnelProvider, SocksDataTunnelProviderRef, SocksError, SocksResult, TargetAddr,
 };
 use buckyos_kit::AsyncStream;
-use cyfs_gateway_lib::TunnelManager;
+use cyfs_gateway_lib::{TunnelError, TunnelManager};
 use log::{debug, error};
 use std::sync::Arc;
 use url::Url;
@@ -33,13 +33,16 @@ impl SocksDataTunnelProvider for SocksTunnelBuilder {
             .tunnel_manager
             .get_tunnel(proxy_target, enable_tunnel.clone())
             .await
-            .map_err(|e| {
-                let msg = format!(
-                    "Get tunnel to proxy target failed: {}, {:?}",
-                    proxy_target, e
-                );
-                error!("{}", msg);
-                SocksError::IoError(msg)
+            .map_err(|e| match e {
+                TunnelError::SelfTunnel(msg) => SocksError::SelfTunnel(msg),
+                e => {
+                    let msg = format!(
+                        "Get tunnel to proxy target failed: {}, {:?}",
+                        proxy_target, e
+                    );
+                    error!("{}", msg);
+                    SocksError::IoError(msg)
+                }
             })?;
 
         let target_port = match request_target {

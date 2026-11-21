@@ -28,6 +28,9 @@ pub type RuleResult<T> = std::result::Result<T, RuleError>;
 
 #[derive(Error, Debug)]
 pub enum SocksError {
+    #[error("{0}")]
+    SelfTunnel(String),
+
     #[error("Invalid config: {0}")]
     InvalidConfig(String),
 

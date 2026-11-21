@@ -142,6 +142,8 @@ RTCP 同时保留：
 canonical DID 用于 tunnel key 和持钥证明；semantic DID 与 canonical DID 一起进入
 session HKDF。trust 不会在 canonical 化后丢失，并暴露给 process-chain。
 
+出站目标解析到本机的 canonical device DID 时，建隧道和探测在复用或拨号前拒绝自连，包括经 bootstrap 的目标。入站 Hello 的候选公钥属于本机时，接收方在发送 HelloAck 前关闭连接。使用不同设备钥的容器或虚拟机可以共用宿主 IP 建立隧道。
+
 握手中 semantic DID 的 hostname 表示统一使用 `DID::to_raw_host_name()`：例如
 `did:bns:ood1.alice` 固定为 `ood1.alice.bns.did`。Hello/HelloAck token 的 `from`、`to`
 以及 HKDF 的 semantic identity 输入都使用该表示，不受进程的 web3 bridge 配置影响。

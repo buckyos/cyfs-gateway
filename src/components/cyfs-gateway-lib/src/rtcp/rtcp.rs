@@ -1530,7 +1530,8 @@ impl RTcpInner {
         &self,
         remote_did: &DID,
     ) -> TunnelResult<ResolvedHandshakeIdentity> {
-        self.resolve_handshake_identity(remote_did)
+        let identity = self
+            .resolve_handshake_identity(remote_did)
             .await
             .map_err(|e| {
                 TunnelError::DocumentError(format!(
@@ -1538,7 +1539,15 @@ impl RTcpInner {
                     remote_did.to_string(),
                     e
                 ))
-            })
+            })?;
+        if identity.canonical_dev_did == self.this_device_dev_did {
+            return Err(TunnelError::SelfTunnel(format!(
+                "rtcp target {} resolves to this device ({}); self tunnel is not supported",
+                remote_did.to_string(),
+                self.this_device_dev_did.to_string()
+            )));
+        }
+        Ok(identity)
     }
 
     async fn resolve_remote_tunnel_dev_did(&self, remote_did: &DID) -> TunnelResult<DID> {
@@ -3084,6 +3093,14 @@ impl RTcpInner {
                     return None;
                 }
             };
+        if canonical_dev_did_from_ed25519_pk(&candidate_key) == self.this_device_dev_did {
+            debug!(
+                "reject rtcp tunnel from {}: candidate key belongs to this device ({})",
+                source_addr_log,
+                self.this_device_dev_did.to_string()
+            );
+            return None;
+        }
         let candidate_public_key = DecodingKey::from_ed_der(&candidate_key);
 
         // I1 step ④: prove possession before any LocalAndZone resolution.
@@ -3798,6 +3815,9 @@ impl RTcpInner {
                 .open_stream_by_url(&bootstrap_url_parsed)
                 .await
                 .map_err(|e| {
+                    if matches!(e, TunnelError::SelfTunnel(_)) {
+                        return e;
+                    }
                     let msg = format!(
                         "open bootstrap stream '{}' for {} failed: {}",
                         bootstrap_url, target_device_id, e
@@ -4269,6 +4289,7 @@ impl RTcpInner {
         };
         let tunnel_key = match self.compute_tunnel_key(&remote_stack).await {
             Ok(key) => key,
+            Err(TunnelError::SelfTunnel(_)) => return,
             Err(err) => {
                 warn!("cannot compute RTCP tunnel key for close {}: {}", url, err);
                 return;
@@ -10669,6 +10690,126 @@ mod tests {
         security.inbound_admission.anonymous = RtcpAnonymousAdmission::Allow;
         security.inbound_admission.named_min_relation = RtcpNamedMinRelation::Any;
         rtcp.set_security_config(security).unwrap();
+    }
+
+    #[tokio::test]
+    async fn self_tunnel_targets_never_dial_or_open_bootstrap() {
+        let _ = init_name_lib_for_test(&HashMap::new()).await;
+        let (mut device, key) = test_device_config("ood1");
+        let dev_did = device.id.clone();
+        let zone_did = DID::new("rtcpself", "local-zone");
+        device.id = DID::new("rtcpself", "ood1.local-zone");
+        let mut zone = ZoneDocument::new(
+            zone_did.clone(),
+            device.owner.clone(),
+            device.get_default_key().unwrap(),
+        );
+        zone.oods = vec!["ood1".parse().unwrap()];
+        GLOBAL_NAME_CLIENT.get().unwrap().set_method_authority(
+            &zone_did.method,
+            Arc::new(TestAuthorityProvider {
+                docs: vec![
+                    (
+                        zone_did.clone(),
+                        "zone".into(),
+                        EncodedDocument::JsonLd(serde_json::to_value(zone).unwrap()),
+                    ),
+                    (
+                        device.id.clone(),
+                        "device".into(),
+                        EncodedDocument::JsonLd(serde_json::to_value(&device).unwrap()),
+                    ),
+                ],
+                negatives: vec![(zone_did.clone(), "device".into(), DocumentStatus::Missing)],
+                owner_bindings: Vec::new(),
+                offline: Arc::new(AtomicBool::new(false)),
+            }),
+        );
+        let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = tcp.local_addr().unwrap();
+        let port = addr.port();
+        for did in [&dev_did, &device.id, &zone_did] {
+            let name = did.to_string();
+            add_nameinfo_cache(&name, NameInfo::from_address(&name, addr.ip()))
+                .await
+                .unwrap();
+        }
+        let mut rtcp = RTcp::new(
+            device.id.clone(),
+            "127.0.0.1:0".into(),
+            Some(key),
+            None,
+            Arc::new(MockRTcpListener::new()),
+        );
+        let builder = Arc::new(FailingBootstrapTunnelBuilder::default());
+        let manager = TunnelManager::new();
+        manager.register_tunnel_builder("mockrelay", builder.clone());
+        rtcp.set_tunnel_manager(manager.clone());
+        manager.register_tunnel_builder(
+            "rtcp",
+            Arc::new(TestRtcpTunnelBuilder {
+                inner: rtcp.inner.clone(),
+                create_count: None,
+            }),
+        );
+        let relay = Url::parse("mockrelay://relay.example/").unwrap();
+        let local_url = Url::parse(&format!("rtcp://{}:{port}/", zone_did.to_host_name())).unwrap();
+        let (other, _) = test_device_config("bootstrap-peer");
+        for target in [
+            format!("{}:{port}", dev_did.to_string()),
+            format!("{}:{port}", device.id.to_host_name()),
+            format!("{}:{port}", zone_did.to_host_name()),
+            build_rtcp_nested_remote_stack_id(&relay, &dev_did.to_host_name(), Some(port)),
+            build_rtcp_nested_remote_stack_id(&local_url, &other.id.to_host_name(), Some(port)),
+        ] {
+            tokio::select! {
+                biased;
+                _ = tcp.accept() => panic!("unexpected TCP connection for {target}"),
+                result = rtcp.create_tunnel(Some(&target)) => {
+                    let err = result.err().expect("self tunnel unexpectedly created");
+                    assert!(matches!(err, TunnelError::SelfTunnel(_)), "{target}: {err}");
+                }
+            }
+        }
+        manager.remove_tunnel_builder("rtcp");
+        let status = rtcp
+            .probe_url(&local_url, &TunnelProbeOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            status.state,
+            crate::tunnel_url_status::TunnelUrlState::Unreachable
+        );
+        assert!(status.failure_reason.unwrap().contains("self tunnel"));
+        assert_eq!(builder.create_count.load(Ordering::SeqCst), 0);
+        assert_eq!(builder.open_count.load(Ordering::SeqCst), 0);
+        assert_eq!(rtcp.inner.tunnel_map.primary_len().await, 0);
+    }
+
+    #[tokio::test]
+    async fn self_tunnel_hello_is_closed_before_hello_ack() {
+        let (device, key) = test_device_config("self-hello");
+        let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = tcp.local_addr().unwrap();
+        let mut rtcp = RTcp::new(
+            device.id.clone(),
+            addr.to_string(),
+            Some(key),
+            None,
+            Arc::new(MockRTcpListener::new()),
+        );
+        allow_anonymous(&mut rtcp);
+        let id = device.id.to_string();
+        let state = rtcp.inner.generate_tunnel_token(id.clone()).await.unwrap();
+        let hello = RTcpHelloPackage::new(1, id.clone(), id, addr.port(), Some(state.token), None);
+        let mut peer = TcpStream::connect(addr).await.unwrap();
+        let (stream, _) = tcp.accept().await.unwrap();
+        let (established, ()) = tokio::join!(
+            rtcp.inner.on_new_tunnel(stream, hello),
+            assert_connection_closed_within(&mut peer, Duration::from_secs(2)),
+        );
+        assert!(established.is_none());
+        assert_eq!(rtcp.inner.tunnel_map.primary_len().await, 0);
     }
 
     #[tokio::test]
