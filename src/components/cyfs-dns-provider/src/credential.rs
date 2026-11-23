@@ -10,6 +10,7 @@ use crate::provider::{DnsProviderError, DnsProviderResult};
 use crate::table::provider_info;
 
 const DIRECTORY: &str = "dns_credentials";
+pub const DNS_CREDENTIAL_SCHEMA: &str = "buckyos.dns_credential.v1";
 
 /// What the user gave for one DNS service. The file form is
 /// `$BUCKYOS_ROOT/security/dns_credentials/<id>.json` (0600).
@@ -23,6 +24,14 @@ pub struct DnsCredential {
     /// Overrides the service's API address (official sandboxes, tests).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,
+}
+
+/// The credential file: [`DnsCredential`] with its required `schema`.
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "schema")]
+enum CredentialFile {
+    #[serde(rename = "buckyos.dns_credential.v1")]
+    V1(DnsCredential),
 }
 
 impl Debug for DnsCredential {
@@ -135,12 +144,18 @@ pub fn load_credential(path: &Path) -> DnsProviderResult<DnsCredential> {
     let text = fs::read_to_string(path)
         .map_err(|error| invalid(format!("{}: {error}", path.display())))?;
     // The parser's message can quote the content.
-    let credential: DnsCredential = serde_json::from_str(&text).map_err(|error| {
+    let value: serde_json::Value = serde_json::from_str(&text).map_err(|error| {
         invalid(format!(
             "{}: invalid at line {} column {}",
             path.display(),
             error.line(),
             error.column()
+        ))
+    })?;
+    let CredentialFile::V1(credential) = serde_json::from_value(value).map_err(|_| {
+        invalid(format!(
+            "{}: not a {DNS_CREDENTIAL_SCHEMA} file",
+            path.display()
         ))
     })?;
     credential.validate()?;
@@ -159,7 +174,7 @@ pub fn save_credential(path: &Path, credential: &DnsCredential) -> DnsProviderRe
         .file_name()
         .ok_or_else(|| invalid("credential path has no file name"))?;
     create_private_directory(directory).map_err(failed)?;
-    let text = serde_json::to_string_pretty(credential)
+    let text = serde_json::to_string_pretty(&CredentialFile::V1(credential.clone()))
         .map_err(|_| invalid("cannot encode the credential"))?;
     let temporary = directory.join(format!(
         ".{}.{}",
@@ -279,6 +294,14 @@ mod tests {
         save_credential(&path, &first).unwrap();
         save_credential(&path, &second).unwrap();
         assert_eq!(load_credential(&path).unwrap(), second);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&fs::read(&path).unwrap()).unwrap(),
+            serde_json::json!({
+                "schema": DNS_CREDENTIAL_SCHEMA,
+                "provider": "cloudflare",
+                "fields": {"api_token": "second"},
+            })
+        );
         let names: Vec<_> = fs::read_dir(path.parent().unwrap())
             .unwrap()
             .map(|entry| entry.unwrap().file_name())
@@ -294,13 +317,40 @@ mod tests {
     }
 
     #[test]
+    fn the_file_requires_its_schema() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("one.json");
+        for (text, accepted) in [
+            (
+                r#"{"schema":"buckyos.dns_credential.v1","provider":"cloudflare","fields":{"api_token":"t"}}"#,
+                true,
+            ),
+            (
+                r#"{"provider":"cloudflare","fields":{"api_token":"t"}}"#,
+                false,
+            ),
+            (
+                r#"{"schema":"buckyos.dns_credential.v2","provider":"cloudflare","fields":{"api_token":"t"}}"#,
+                false,
+            ),
+            (
+                r#"{"schema":"buckyos.dns_credential.v1","provider":"cloudflare","fields":{"api_token":"t"},"extra":1}"#,
+                false,
+            ),
+        ] {
+            fs::write(&path, text).unwrap();
+            assert_eq!(load_credential(&path).is_ok(), accepted, "{text}");
+        }
+    }
+
+    #[test]
     fn secrets_stay_out_of_text() {
         let root = tempfile::tempdir().unwrap();
         let path = credential_path(root.path(), "bad").unwrap();
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(
             &path,
-            r#"{"provider":"cloudflare","fields":["top-secret-token"]}"#,
+            r#"{"schema":"buckyos.dns_credential.v1","provider":"cloudflare","fields":["top-secret-token"]}"#,
         )
         .unwrap();
         let error = load_credential(&path).unwrap_err().to_string();

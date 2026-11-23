@@ -688,7 +688,8 @@ HTTP S2S provider 场景使用 `app_did` 加载应用身份；不要从字段名
 | `sn-dns` | `sn`、`key_path`、`device_config_path`、`access_token?` | 用设备身份把挑战写到 SN，固定等待 65 秒 |
 | `dns-api` | 只有 `credential_path`，拒绝未知字段 | 用凭据文件里的 token 把挑战写到 DNS 服务商；按值增删，`<域名>` 和 `*.<域名>` 共用挑战名不互相覆盖；轮询权威 NS，最多 5 分钟 |
 
-`dns-api` 的凭据文件是 `{"provider": "<服务商 id>", "fields": {…}, "endpoint"?: "…"}`，权限 0600，
+`dns-api` 的凭据文件是
+`{"schema": "buckyos.dns_credential.v1", "provider": "<服务商 id>", "fields": {…}, "endpoint"?: "…"}`，`schema` 必填，权限 0600，
 每次写挑战前重新读取，换 token 不用重启或 reload。主域名沿挑战名向上查 SOA 得到。
 其它名字走 JS DNS 插件（`dns_provider_path`）；产品不再内置任何 JS 插件，旧的 `aliyun` 插件已删除，
 改用 `dns-api` 的 `alidns`。

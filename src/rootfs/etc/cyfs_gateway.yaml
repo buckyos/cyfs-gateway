@@ -38,8 +38,9 @@
 #   issuer: "https://acme-v02.api.letsencrypt.org/directory"  # ACME directory URL
 #   dns_providers:     # DNS challenge config
 #     dns-api:         # writes the challenge at your DNS service, waits for its name servers (up to 5 minutes)
-#       # 0600, {"provider": "cloudflare", "fields": {"api_token": "***"}}; read before
-#       # every write, a replaced token needs no restart
+#       # 0600, {"schema": "buckyos.dns_credential.v1", "provider": "cloudflare",
+#       # "fields": {"api_token": "***"}}; read before every write, a replaced token
+#       # needs no restart
 #       credential_path: /opt/buckyos/security/dns_credentials/home-example-com.json
 #     sn-dns:          # writes the challenge at the BuckyOS SN, waits 65 seconds
 #       sn: https://sn.buckyos.ai

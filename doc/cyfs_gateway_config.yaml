@@ -22,8 +22,8 @@
 #       key_path: ***
 #       device_config_path: ***
 #     dns-api:         # 挑战写到 DNS 服务商，等到权威 NS 上可见（最多 5 分钟）
-#       # 服务商凭据文件 {"provider": "cloudflare", "fields": {"api_token": "***"}}，0600；
-#       # 每次写之前重新读，换 token 不用重启。支持的服务商见 cyfs-dns-provider 的服务商表
+#       # 服务商凭据文件 {"schema": "buckyos.dns_credential.v1", "provider": "cloudflare",
+#       # "fields": {"api_token": "***"}}，0600；每次写之前重新读，换 token 不用重启。支持的服务商见 cyfs-dns-provider 的服务商表
 #       credential_path: /opt/buckyos/security/dns_credentials/home-example-com.json
 #   hosts:             # ACME 负责签发和维护的证书
 #     - host: example.com

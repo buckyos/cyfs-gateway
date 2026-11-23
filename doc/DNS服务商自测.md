@@ -24,10 +24,11 @@
 1. 用一个不重要的域名，或单独的子域名。不要用正在收发邮件、跑网站的域名。
 2. 先在服务商后台导出或截图全部记录，出错时能恢复。整份读写的接口（例如さくらのクラウド）写错会影响其它记录。
 3. 按 [doc/user/dns-providers](https://github.com/buckyos/buckyos/tree/main/doc/user/dns-providers) 里那一家的说明申请 token，权限按说明收到最窄。这样能同时验证说明里的权限够不够用。
-4. 写凭据文件。`provider` 和字段 id 见 `src/table.rs`，`endpoint` 可选：
+4. 写凭据文件。`schema` 必填，`provider` 和字段 id 见 `src/table.rs`，`endpoint` 可选：
 
    ```json
    {
+     "schema": "buckyos.dns_credential.v1",
      "provider": "cloudflare",
      "fields": { "api_token": "…" }
    }

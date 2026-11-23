@@ -11,8 +11,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use cyfs_dns_provider::{
-    DnsCredential, DnsLookup, DnsRcode, DnsRecordProviderRef, RecordType, SystemDnsLookup,
-    ZoneApex, create_provider, detect_provider, find_zone_apex, provider_info,
+    DnsLookup, DnsRcode, DnsRecordProviderRef, RecordType, SystemDnsLookup, ZoneApex,
+    create_provider, detect_provider, find_zone_apex, load_credential, provider_info,
 };
 use futures::future::join_all;
 use serde_json::{Value, json};
@@ -20,7 +20,8 @@ use serde_json::{Value, json};
 const USAGE: &str = "\
 usage: selftest --credential <file> --domain <domain> [options]
 
-  --credential <file>   {\"provider\": \"<id>\", \"fields\": {\"<field>\": \"<value>\"}}
+  --credential <file>   {\"schema\": \"buckyos.dns_credential.v1\", \"provider\": \"<id>\",
+                        \"fields\": {\"<field>\": \"<value>\"}}
   --domain <domain>     a domain in the account, or a name below it
   --zone <name>         the zone, when it cannot be looked up (test environments)
   --endpoint <url>      API address of an official test environment
@@ -471,10 +472,7 @@ impl Run {
 }
 
 async fn run(options: Options) -> Result<bool, Failure> {
-    let text = std::fs::read_to_string(&options.credential)
-        .map_err(|error| format!("{}: {error}", options.credential.display()))?;
-    let mut credential: DnsCredential = serde_json::from_str(&text)
-        .map_err(|error| format!("credential: line {} is invalid", error.line()))?;
+    let mut credential = load_credential(&options.credential)?;
     if let Some(endpoint) = &options.endpoint {
         credential.endpoint = Some(endpoint.clone());
     }
