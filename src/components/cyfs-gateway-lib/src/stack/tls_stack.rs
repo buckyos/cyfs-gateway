@@ -5,8 +5,8 @@ use crate::global_process_chains::{
 use crate::self_cert_mgr::SelfCertMgrRef;
 use crate::stack::limiter::Limiter;
 use crate::stack::tls_cert_resolver::{
-    IdentityCertResolver, ResolvesServerCertUsingSni, TlsIdentityCertConfig, TlsIdentityHost,
-    accept_tls_stream,
+    IdentityCertResolver, ResolvesServerCertUsingSni, TlsHostCertificate, TlsIdentityCertConfig,
+    TlsIdentityHost, accept_tls_stream,
 };
 use crate::stack::{
     StackManagerWeakRef, StackStreamContext, StreamStack, TlsCertResolver, get_limit_info,
@@ -137,12 +137,20 @@ impl StackContext for TlsStackContext {
     }
 }
 
+/// Where the certificates of the configured hosts come from.
+#[derive(Clone)]
+struct TlsCertSources {
+    files: Arc<ResolvesServerCertUsingSni>,
+    identities: Option<Arc<IdentityCertResolver>>,
+}
+
 struct TlsConnectionHandler {
     stack_id: String,
     env: Arc<TlsStackContext>,
     executor: ProcessChainLibExecutor,
     connection_manager: Option<ConnectionManagerRef>,
     certs: Arc<dyn ResolvesServerCert>,
+    cert_sources: TlsCertSources,
     alpn_protocols: Vec<Vec<u8>>,
     server_config: Arc<ServerConfig>,
     io_dump: Option<IoDumpStackConfig>,
@@ -172,7 +180,7 @@ impl TlsConnectionHandler {
         )
         .await
         .map_err(into_stack_err!(StackErrorCode::ProcessChainError))?;
-        let certs = Self::build_cert_resolver(certs, identity_certs, env.as_ref())?;
+        let (certs, cert_sources) = Self::build_cert_resolver(certs, identity_certs, env.as_ref())?;
         let server_config = Self::build_server_config(certs.clone(), &alpn_protocols)?;
         Ok(Self {
             stack_id,
@@ -180,6 +188,7 @@ impl TlsConnectionHandler {
             executor,
             connection_manager,
             certs,
+            cert_sources,
             alpn_protocols,
             server_config,
             io_dump,
@@ -204,6 +213,7 @@ impl TlsConnectionHandler {
             executor,
             connection_manager: self.connection_manager.clone(),
             certs: self.certs.clone(),
+            cert_sources: self.cert_sources.clone(),
             alpn_protocols: self.alpn_protocols.clone(),
             server_config: self.server_config.clone(),
             io_dump: self.io_dump.clone(),
@@ -216,7 +226,7 @@ impl TlsConnectionHandler {
         certs: Vec<TlsDomainConfig>,
         identity_certs: Option<TlsIdentityCertConfig>,
         env: &TlsStackContext,
-    ) -> StackResult<Arc<dyn ResolvesServerCert>> {
+    ) -> StackResult<(Arc<dyn ResolvesServerCert>, TlsCertSources)> {
         let crypto_provider = rustls::crypto::ring::default_provider();
         let cert_resolver = Arc::new(ResolvesServerCertUsingSni::new());
         let mut self_cert = false;
@@ -255,19 +265,26 @@ impl TlsConnectionHandler {
                 }
             }
         }
+        let mut sources = TlsCertSources {
+            files: cert_resolver.clone(),
+            identities: None,
+        };
         let mut cert: Arc<dyn ResolvesServerCert> = cert_resolver;
         if let Some(identity_certs) = identity_certs {
-            cert = IdentityCertResolver::new(identity_certs, Some(cert));
+            let identities = IdentityCertResolver::new(identity_certs, Some(cert));
+            sources.identities = Some(identities.clone());
+            cert = identities;
         }
 
-        Ok(Arc::new(
+        let resolver = Arc::new(
             TlsCertResolver::new(cert, self_cert.then(|| env.self_cert_mgr.clone()))
                 .with_acme_resolver(
                     env.acme_manager
                         .as_ref()
                         .map(|manager| manager.clone() as Arc<dyn ResolvesServerCert>),
                 ),
-        ))
+        );
+        Ok((resolver, sources))
     }
 
     fn build_server_config(
@@ -923,6 +940,16 @@ impl Stack for TlsStack {
 
     fn as_stream_stack(&self) -> Option<&dyn StreamStack> {
         Some(self)
+    }
+
+    fn tls_host_certificates(&self) -> Vec<TlsHostCertificate> {
+        let sources = self.handler.read().unwrap().cert_sources.clone();
+        let mut certificates = sources
+            .identities
+            .map(|identities| identities.host_certificates())
+            .unwrap_or_default();
+        certificates.extend(sources.files.host_certificates());
+        certificates
     }
 }
 
@@ -3439,6 +3466,115 @@ hook_point: []
         assert_eq!(config.hosts[0].tls_host, "*.example.com");
         assert_eq!(config.hosts[1].identity, "did:web:example.org:user:alice");
         assert_eq!(config.hosts[1].tls_host, "example.org");
+    }
+
+    #[tokio::test]
+    async fn test_tls_stack_reports_loaded_host_certificates() {
+        let tmp_dir = tempdir().unwrap();
+        let identity_manager = TlsIdentityManagerConfig {
+            public_root_path: Some(
+                tmp_dir
+                    .path()
+                    .join("identity")
+                    .to_string_lossy()
+                    .to_string(),
+            ),
+            security_root_path: Some(
+                tmp_dir
+                    .path()
+                    .join("security")
+                    .to_string_lossy()
+                    .to_string(),
+            ),
+        };
+        let hosts = ["home.example.com", "*.home.example.com"].map(str::to_string);
+        let identity_certs = build_identity_cert_config(&hosts, Some(&identity_manager))
+            .unwrap()
+            .unwrap();
+        let roots = identity_certs.roots.clone();
+        let install = |host: &str, names: &[&str]| {
+            let issued = generate_simple_self_signed(
+                names
+                    .iter()
+                    .map(|name| name.to_string())
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+            cyfs_identity_cert::install_manual_certificates(
+                &roots,
+                &[cyfs_identity_cert::PreparedCertificate {
+                    host: host.to_string(),
+                    fullchain_pem: issued.cert.pem().into_bytes(),
+                    key_pem: issued.signing_key.serialize_pem().into_bytes(),
+                }],
+            )
+            .unwrap();
+        };
+        install("home.example.com", &["home.example.com"]);
+        let file_cert = generate_simple_self_signed(vec!["www.buckyos.com".to_string()]).unwrap();
+
+        let stack = TlsStack::builder()
+            .id("test")
+            .bind("127.0.0.1:0")
+            .hook_point(vec![])
+            .add_certs(vec![TlsDomainConfig {
+                domain: "www.buckyos.com".to_string(),
+                certs: Some(vec![file_cert.cert.der().clone()]),
+                key: Some(PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
+                    file_cert.signing_key.serialize_der(),
+                ))),
+            }])
+            .identity_certs(Some(identity_certs))
+            .stack_context(build_stack_context(
+                Arc::new(ServerManager::new()),
+                TunnelManager::new(),
+                Arc::new(DefaultLimiterManager::new()),
+                StatManager::new(),
+                SelfCertMgr::create(SelfCertConfig::default())
+                    .await
+                    .unwrap(),
+                None,
+            ))
+            .build()
+            .await
+            .unwrap();
+
+        let certificates = stack.tls_host_certificates();
+        assert_eq!(
+            certificates
+                .iter()
+                .map(|certificate| (
+                    certificate.host.as_str(),
+                    certificate.loaded.is_some(),
+                    certificate.manager
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    "home.example.com",
+                    true,
+                    Some(cyfs_identity_cert::CertManager::Manual)
+                ),
+                ("*.home.example.com", false, None),
+                ("www.buckyos.com", true, None),
+            ]
+        );
+        assert_eq!(
+            certificates[0].loaded.as_ref().unwrap().dns_names,
+            vec!["home.example.com"]
+        );
+
+        install("*.home.example.com", &["*.home.example.com"]);
+        let identities = stack
+            .handler
+            .read()
+            .unwrap()
+            .cert_sources
+            .identities
+            .clone()
+            .unwrap();
+        identities.refresh_all();
+        assert!(stack.tls_host_certificates()[1].loaded.is_some());
     }
 
     #[tokio::test]

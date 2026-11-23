@@ -9,10 +9,11 @@ use std::time::Instant;
 use crate::config_loader::GatewayConfigParserRef;
 use crate::{AcmeConfig, AcmeHostConfig, GatewayNameClientConfig, TlsCA, merge};
 use crate::{
-    GATEWAY_CONTROL_SERVER_CONFIG, GATEWAY_CONTROL_SERVER_KEY, GatewayAppProfile,
-    GatewayComposition, GatewayRuntimeCapabilities, GatewayServerRegistry, GatewayServerRuntime,
-    GatewayStackRegistry, GatewayStackRuntime, GatewayTrafficConfigRef, GatewayTrafficService,
-    GatewayTrafficStatFactoryRef,
+    CertStatusReport, GATEWAY_CONTROL_SERVER_CONFIG, GATEWAY_CONTROL_SERVER_KEY, GatewayAppProfile,
+    GatewayComposition, GatewayRuntimeCapabilities, GatewayRuntimeServiceHandle,
+    GatewayServerRegistry, GatewayServerRuntime, GatewayStackRegistry, GatewayStackRuntime,
+    GatewayTrafficConfigRef, GatewayTrafficService, GatewayTrafficStatFactoryRef,
+    host_cert_statuses,
 };
 use anyhow::{Result, anyhow};
 use buckyos_kit::*;
@@ -834,6 +835,9 @@ impl GatewayFactory {
             }
             _ => None,
         };
+        let runtime_services =
+            self.composition
+                .start_runtime_services(&config, &stack_manager, &cert_manager);
         let gateway = Arc::new(Gateway {
             config_file: config_file.map(|v| v.to_path_buf()),
             init_config: Mutex::new(init_config),
@@ -854,6 +858,8 @@ impl GatewayFactory {
             timer_manager,
             global_collection_manager: RwLock::new(global_collections.clone()),
             traffic_service: Mutex::new(traffic_service),
+            acme_manager: Mutex::new(Arc::downgrade(&cert_manager)),
+            runtime_services: Mutex::new(runtime_services),
             reload_lock: AsyncMutex::new(()),
         });
         let timers = gateway
@@ -937,6 +943,9 @@ pub struct Gateway {
     timer_manager: TimerManager,
     global_collection_manager: RwLock<GlobalCollectionManagerRef>,
     traffic_service: Mutex<Option<Box<dyn GatewayTrafficService>>>,
+    // Owned by the servers and stacks that use it.
+    acme_manager: Mutex<Weak<AcmeCertManager>>,
+    runtime_services: Mutex<Vec<GatewayRuntimeServiceHandle>>,
     reload_lock: AsyncMutex<()>,
 }
 
@@ -3090,8 +3099,26 @@ impl Gateway {
         if old_config.name_client != config.name_client {
             apply_zone_locker_bypass(zone_locker_bypass)?;
         }
+        *self.acme_manager.lock().unwrap() = Arc::downgrade(&cert_manager);
+        *self.runtime_services.lock().unwrap() =
+            self.composition
+                .start_runtime_services(&config, &self.stack_manager, &cert_manager);
         *self.config.lock().unwrap() = config;
         Ok(())
+    }
+
+    /// Every host a TLS stack or ACME is configured with.
+    pub fn get_cert_status(&self) -> CertStatusReport {
+        let acme = self
+            .acme_manager
+            .lock()
+            .unwrap()
+            .upgrade()
+            .map(|manager| manager.cert_statuses())
+            .unwrap_or_default();
+        CertStatusReport {
+            hosts: host_cert_statuses(self.stack_manager.tls_host_certificates(), acme),
+        }
     }
 
     async fn restart_traffic_service(
@@ -3194,6 +3221,7 @@ impl GatewayCmdHandler {
             "get_config"
                 | "get_init_config"
                 | "get_system_info"
+                | "get_cert_status"
                 | "collection_list"
                 | "collection_get"
                 | "collection_set_add"
@@ -3598,6 +3626,8 @@ impl GatewayControlCmdHandler for GatewayCmdHandler {
             "get_init_config" => gateway
                 .get_init_config()
                 .map_err(|e| cmd_err!(ControlErrorCode::Failed, "{}", e)),
+            "get_cert_status" => serde_json::to_value(gateway.get_cert_status())
+                .map_err(into_cmd_err!(ControlErrorCode::SerializeFailed)),
             "get_system_info" => {
                 let params = params.as_object();
                 let dashboard_port = params

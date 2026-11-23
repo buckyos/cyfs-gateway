@@ -1,6 +1,9 @@
 use crate::SelfCertMgrRef;
 use buckyos_kit::AsyncStream;
 use cyfs_acme::{ACME_TLS_ALPN_NAME, is_tls_alpn_challenge};
+use cyfs_identity_cert::{
+    CertManager, CertificateSummary, certificate_summary, served_certificate_manager,
+};
 use name_client::{IdentityMaterial, IdentityRoots, IdentityUsage};
 use rustls::client::verify_server_name;
 use rustls::pki_types::pem::PemObject;
@@ -45,6 +48,24 @@ pub(crate) async fn accept_tls_stream(
     Ok(Some(stream))
 }
 
+/// The certificate a TLS listener presents for one of its hosts.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TlsHostCertificate {
+    /// `<domain>` or `*.<domain>`.
+    pub host: String,
+    /// What a handshake gets now; `None` when nothing usable was found.
+    pub loaded: Option<CertificateSummary>,
+    pub manager: Option<CertManager>,
+}
+
+fn summarize_loaded(host: &str, cert: &CertifiedKey) -> Option<CertificateSummary> {
+    cert.end_entity_cert()
+        .map_err(|e| e.to_string())
+        .and_then(|leaf| certificate_summary(leaf).map_err(|e| e.to_string()))
+        .map_err(|e| log::warn!("read loaded certificate of {} failed: {}", host, e))
+        .ok()
+}
+
 #[derive(Debug)]
 pub(crate) struct ResolvesServerCertUsingSni {
     by_name: Mutex<HashMap<String, Arc<sign::CertifiedKey>>>,
@@ -80,6 +101,19 @@ impl ResolvesServerCertUsingSni {
             .insert(name.to_lowercase(), Arc::new(ck));
 
         Ok(())
+    }
+
+    pub fn host_certificates(&self) -> Vec<TlsHostCertificate> {
+        self.by_name
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(host, cert)| TlsHostCertificate {
+                host: host.clone(),
+                loaded: summarize_loaded(host, cert),
+                manager: None,
+            })
+            .collect()
     }
 
     // 添加一个辅助函数来检查通配符匹配
@@ -196,6 +230,22 @@ impl IdentityCertResolver {
         resolver
     }
 
+    /// One entry per configured host, with what the last refresh loaded.
+    pub fn host_certificates(&self) -> Vec<TlsHostCertificate> {
+        self.hosts
+            .iter()
+            .map(|host| {
+                let name = host.tls_host.to_lowercase();
+                let cert = self.by_name.read().unwrap().get(&name).cloned();
+                TlsHostCertificate {
+                    loaded: cert.and_then(|cert| summarize_loaded(&name, &cert)),
+                    manager: served_certificate_manager(&self.roots, &host.identity),
+                    host: name,
+                }
+            })
+            .collect()
+    }
+
     fn start_refresh(self: &Arc<Self>, interval: Duration) {
         if interval.is_zero() {
             return;
@@ -215,7 +265,7 @@ impl IdentityCertResolver {
         *self.refresh_handle.lock().unwrap() = Some(handle);
     }
 
-    fn refresh_all(&self) {
+    pub(crate) fn refresh_all(&self) {
         for host in self.hosts.iter() {
             self.refresh_host(host);
         }

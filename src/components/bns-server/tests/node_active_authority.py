@@ -1,4 +1,4 @@
-"""Run Node Active -> projected BNS HTTP -> NameClient -> Relay without live writes."""
+"""Run Node Active (did:bns) -> projected BNS HTTP -> NameClient -> Relay without live writes."""
 import json
 import os
 from pathlib import Path
@@ -38,7 +38,6 @@ with tempfile.TemporaryDirectory(prefix="bns-node-active-") as temp:
 
     node = build(buckyos, "-p", "node_daemon")["node_daemon"]
     binaries = build(gateway, "-p", "bns-server", "-p", "cyfs-gateway-lib", "--lib")
-    subprocess.run([node, "active_server::tests::", "--test-threads=1"], env=env, check=True)
     subprocess.run([node, "export_node_active_authority_fixture", "--ignored"], env=env, check=True)
     subprocess.run([binaries["bns_server"], "--test-threads=1"], env=env, check=True)
     with (Path(temp) / "resolver.log").open("w+") as log:

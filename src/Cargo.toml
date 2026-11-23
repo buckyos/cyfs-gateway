@@ -16,6 +16,8 @@ members = [
     "components/bns-server",
     "components/cyfs-sn",
     "components/cyfs-tun",
+    "components/cyfs-dns-provider",
+    "components/cyfs-identity-cert",
     "components/cyfs-acme",
     "apps/cyfs_gateway",
     "apps/web3_gateway",

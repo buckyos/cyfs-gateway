@@ -6,7 +6,7 @@ use openssl::pkey::PKey;
 use openssl::rsa::Rsa;
 use openssl::x509::{X509, X509Req};
 use serde_json::{Value, json};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -18,6 +18,13 @@ use tokio::task::{JoinHandle, JoinSet};
 pub(crate) struct MockAcmeState {
     pub orders: AtomicUsize,
     pub fail_orders: AtomicBool,
+    /// Orders need one dns-01 authorization, validated through `validation_gate`.
+    pub dns_challenges: AtomicBool,
+    /// Finalizing answers `processing`; the order turns valid when asked for.
+    pub issue_later: AtomicBool,
+    validations: AtomicUsize,
+    identifiers: Mutex<HashMap<String, String>>,
+    validated: Mutex<HashSet<String>>,
     certificates: Mutex<HashMap<String, Vec<u8>>>,
 }
 
@@ -25,6 +32,7 @@ pub(crate) struct MockAcme {
     pub url: String,
     pub state: Arc<MockAcmeState>,
     pub order_gate: Arc<Semaphore>,
+    pub validation_gate: Arc<Semaphore>,
     handle: JoinHandle<()>,
 }
 
@@ -34,17 +42,19 @@ impl MockAcme {
         let url = format!("http://{}", listener.local_addr().unwrap());
         let state = Arc::new(MockAcmeState::default());
         let order_gate = Arc::new(Semaphore::new(0));
+        let validation_gate = Arc::new(Semaphore::new(0));
         let handle = tokio::spawn({
             let url = url.clone();
             let state = state.clone();
             let order_gate = order_gate.clone();
+            let validation_gate = validation_gate.clone();
             async move {
                 let mut requests = JoinSet::new();
                 loop {
                     tokio::select! {
                         connection = listener.accept() => {
                             let (stream, _) = connection.unwrap();
-                            requests.spawn(serve(stream, url.clone(), state.clone(), order_gate.clone()));
+                            requests.spawn(serve(stream, url.clone(), state.clone(), order_gate.clone(), validation_gate.clone()));
                         }
                         Some(result) = requests.join_next() => { result.unwrap(); }
                     }
@@ -55,12 +65,18 @@ impl MockAcme {
             url,
             state,
             order_gate,
+            validation_gate,
             handle,
         }
     }
 
     pub fn orders(&self) -> usize {
         self.state.orders.load(Ordering::SeqCst)
+    }
+
+    /// Validations the client has asked for and that were not let through yet.
+    pub fn validations_waiting(&self) -> usize {
+        self.state.validations.load(Ordering::SeqCst) - self.state.validated.lock().unwrap().len()
     }
 }
 
@@ -70,7 +86,13 @@ impl Drop for MockAcme {
     }
 }
 
-async fn serve(stream: TcpStream, url: String, state: Arc<MockAcmeState>, gate: Arc<Semaphore>) {
+async fn serve(
+    stream: TcpStream,
+    url: String,
+    state: Arc<MockAcmeState>,
+    gate: Arc<Semaphore>,
+    validation_gate: Arc<Semaphore>,
+) {
     let mut stream = BufReader::new(stream);
     let mut line = String::new();
     if stream.read_line(&mut line).await.unwrap() == 0 {
@@ -109,6 +131,7 @@ async fn serve(stream: TcpStream, url: String, state: Arc<MockAcmeState>, gate: 
     };
 
     let mut status = "200 OK";
+    let mut location = format!("{url}/account/1");
     let body = match path.as_str() {
         "/directory" => json!({
             "newNonce": format!("{url}/nonce"),
@@ -122,20 +145,58 @@ async fn serve(stream: TcpStream, url: String, state: Arc<MockAcmeState>, gate: 
         "/account" => json!({"status": "valid"}).to_string().into_bytes(),
         "/order" => {
             let id = state.orders.fetch_add(1, Ordering::SeqCst) + 1;
+            location = format!("{url}/orders/{id}");
             gate.acquire().await.unwrap().forget();
             if state.fail_orders.load(Ordering::SeqCst) {
                 status = "429 Too Many Requests";
                 json!({"type": "urn:ietf:params:acme:error:rateLimited", "detail": "test issuance limit"})
                     .to_string().into_bytes()
             } else {
+                let mut authorizations = Vec::new();
+                if state.dns_challenges.load(Ordering::SeqCst) {
+                    let identifier = payload["identifiers"][0]["value"].as_str().unwrap();
+                    state.identifiers.lock().unwrap().insert(
+                        id.to_string(),
+                        identifier.trim_start_matches("*.").to_string(),
+                    );
+                    authorizations.push(format!("{url}/authz/{id}"));
+                }
                 json!({
                     "status": "ready", "expires": "2099-01-01T00:00:00Z",
-                    "identifiers": payload["identifiers"], "authorizations": [],
+                    "identifiers": payload["identifiers"], "authorizations": authorizations,
                     "finalize": format!("{url}/finalize/{id}")
                 })
                 .to_string()
                 .into_bytes()
             }
+        }
+        _ if path.starts_with("/authz/") => {
+            let id = path.trim_start_matches("/authz/");
+            let status = if state.validated.lock().unwrap().contains(id) {
+                "valid"
+            } else {
+                "pending"
+            };
+            json!({
+                "identifier": {"type": "dns", "value": state.identifiers.lock().unwrap()[id]},
+                "status": status, "expires": "2099-01-01T00:00:00Z",
+                "challenges": [{
+                    "type": "dns-01", "url": format!("{url}/challenge/{id}"),
+                    "status": "pending", "token": format!("token-{id}")
+                }]
+            })
+            .to_string()
+            .into_bytes()
+        }
+        _ if path.starts_with("/challenge/") => {
+            state.validations.fetch_add(1, Ordering::SeqCst);
+            validation_gate.acquire().await.unwrap().forget();
+            state
+                .validated
+                .lock()
+                .unwrap()
+                .insert(path.trim_start_matches("/challenge/").to_string());
+            b"{}".to_vec()
         }
         _ if path.starts_with("/finalize/") => {
             let id = path.trim_start_matches("/finalize/");
@@ -147,6 +208,16 @@ async fn serve(stream: TcpStream, url: String, state: Arc<MockAcmeState>, gate: 
                 .lock()
                 .unwrap()
                 .insert(id.to_string(), sign_csr(&csr));
+            if state.issue_later.load(Ordering::SeqCst) {
+                json!({"status": "processing"}).to_string().into_bytes()
+            } else {
+                json!({"status": "valid", "certificate": format!("{url}/cert/{id}")})
+                    .to_string()
+                    .into_bytes()
+            }
+        }
+        _ if path.starts_with("/orders/") => {
+            let id = path.trim_start_matches("/orders/");
             json!({"status": "valid", "certificate": format!("{url}/cert/{id}")})
                 .to_string()
                 .into_bytes()
@@ -166,7 +237,7 @@ async fn serve(stream: TcpStream, url: String, state: Arc<MockAcmeState>, gate: 
         ""
     };
     let headers = format!(
-        "HTTP/1.1 {status}\r\nContent-Length: {}\r\nContent-Type: application/json\r\nReplay-Nonce: test-nonce\r\nLocation: {url}/account/1\r\n{retry_after}Connection: close\r\n\r\n",
+        "HTTP/1.1 {status}\r\nContent-Length: {}\r\nContent-Type: application/json\r\nReplay-Nonce: test-nonce\r\nLocation: {location}\r\n{retry_after}Connection: close\r\n\r\n",
         body.len()
     );
     stream

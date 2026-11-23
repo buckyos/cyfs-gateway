@@ -257,38 +257,33 @@ BNS 父 Zone 内嵌设备不能写入 NameClient 的独立设备身份缓存；�
 Relay 的 Anchored / MethodAuthorityCurrent 要求不变。
 
 自有 did:web Zone 使用域名 canonical HTTPS endpoint（以及 WebProvider 定义的父域
-resolver），不能通过上述 BNS 槽映射证明其权威状态。Node Active 在持久化完成前必须
-使用和 Relay 相同的 RemoteAuthority 策略读回原始 DeviceDocument JWT。自有域名的 HTTPS
-若经本节点 RTCP 转发，会与首次握手形成循环，单纯提前启动节点无法打破这个循环。
+resolver），不能通过上述 BNS 槽映射证明其权威状态；BNS Server 对 did:web 返回 404 NotApplicable，
+不在 BNS 侧补发布面。
 
-Node Active 的自有域名流程先生成签名文档并导出设备 JWT，再由用户在独立静态站点发布到
-https://ood1.<自有域名>/.well-known/did.json，使用 application/jwt，保持原文字节。
-此 HTTPS 身份文档路径在节点离线时也必须可用，不能依赖其尚未建立的中继隧道。
-独立发布入口必须同时保留设备域名原有的 RTCP 地址/端口路由；不能简单把设备 DNS 改到
-只提供静态 HTTP 的站点，否则 NameClient 的设备地址解析可能指向错误的 RTCP 服务。
-可以在独立入口按 HTTPS 路径和 TCP 端口分流。Root Zone 域名继续使用既有网关配置，
-不把 BNS 的权威身份规则套用于 did:web。
-签名材料仅保留在当前激活页面内存，导出文件只含公开的签名设备文档。
+`https://ood1.<自有域名>/.well-known/did.json`（`application/jwt`，设备文档 JWT 原文）由 Zone 在
+boot 之后自己经 HTTPS 提供，用户不需要在独立站点发布。各环节对它的依赖：
 
-提交和重试复用已导出的同一组签名文档；域名、Owner、设备公钥、网关配置变化后必须重新
-生成并更新外部发布。后端在任何 SN/BNS 写入前先校验 did:web 的权威发布，BNS 投影完成后
-再次校验设备权威，再完成激活。JSON 重建、旧 JWT、错误身份、过期或 Missing 都不能完成激活。
-密钥轮换/撤销时，独立静态发布面也必须同步更新或撤下，不能指望 BNS 槽更新自动改变 did:web。
+- 节点启动不需要：自己的设备文档从本机身份目录读，启动只解析 Zone Document；
+- 节点连 relay 不需要：已绑定域名的设备由 SN 用 AuthDB / BNS 数据认定（SN-DID-Resolver.md
+  “SN 中继出站”），不访问该域名的公网 HTTPS；
+- 其它 Zone 访问本 Zone 时需要：boot 之后、证书就绪之后可取到。节点离线或证书还没签下来时，
+  其它 Zone 解析不了这个设备 DID，等恢复后再解析。
+
+Node Active 的自有域名流程与默认域名相同，点“激活”时签名。`commit_active` 在 BNS 投影逐字节确认
+后完成，不再向 canonical HTTPS endpoint 核对 did:web 设备；did:bns 设备保留发布后的权威核对。
+同一组签名文档用于提交和重试；域名、Owner、设备公钥、网关配置变化后重新签名。
 
 跨仓库回归入口（五个仓库为同级目录，已有 Cargo/Python 3.11+ 环境）：
 
     python3 src/components/bns-server/tests/node_active_authority.py
 
-该入口调用 node-daemon 的真实 prepare/sign 流程，装载其发布布局到临时 SQLite 投影，
-启动真实 BNS HTTP server，再调用 Relay 的 resolve_handshake_identity，断言
+该入口只覆盖 did:bns：调用 node-daemon 的真实 prepare/sign 流程，装载其发布布局到临时 SQLite
+投影，启动真实 BNS HTTP server，再调用 Relay 的 resolve_handshake_identity，断言
 MethodAuthorityCurrent 和设备公钥。通过临时 Cargo patch 使用同级 buckyos-base 源码；
 不修改依赖声明，不提交链上交易，不部署、不重启服务，退出时清理临时 fixture。
 常规 bns-server 单元测试另覆盖多设备、换钥、错误绑定/签名、独立子名字/负状态、
 父名字迁移、撤销阈值、文档 exp 和负缓存后的重新发布恢复。
-node-daemon 测试使用独立本地 HTTP 静态站点验证 WebProvider 的 canonical 路径和提交校验；
-测试使用 HTTP 和临时端口，生产仍使用 HTTPS，不验证真实 DNS/CA 证书部署。
-Node Active 前端运行 npm test 验证导出到提交/重试不重新签名，pnpm exec tsc --noEmit
-验证类型；以上测试不执行真实 commit_active 持久化或链上发布。
+did:web 设备文档由 Zone 提供的回归在 buckyos 侧（node-daemon 与 system-config 的 did resolver）。
 
 ### 3.5.2 已有激活文档恢复
 

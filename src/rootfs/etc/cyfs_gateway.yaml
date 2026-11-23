@@ -37,23 +37,34 @@
 #   account: "admin@example.com"  # ACME account
 #   issuer: "https://acme-v02.api.letsencrypt.org/directory"  # ACME directory URL
 #   dns_providers:     # DNS challenge config
-#     aliyun: // Alibaba Cloud
-#       accessKeyId: "***"
-#       accessKeySecret: "***"
-#    sn-dns: // buckyos sn
-#      sn: https://sn.buckyos.ai
-#      key_path: ***
-#      device_config_path: ***
+#     dns-api:         # writes the challenge at your DNS service, waits for its name servers (up to 5 minutes)
+#       # 0600, {"provider": "cloudflare", "fields": {"api_token": "***"}}; read before
+#       # every write, a replaced token needs no restart
+#       credential_path: /opt/buckyos/security/dns_credentials/home-example-com.json
+#     sn-dns:          # writes the challenge at the BuckyOS SN, waits 65 seconds
+#       sn: https://sn.buckyos.ai
+#       key_path: ***
+#       device_config_path: ***
+#     # any other name is a JS package in etc/cyfs_gateway/acme_dns_provider/<name>/
 #   hosts:                         # certificates ACME should obtain and maintain
 #     - host: example.com
 #       challenge_type: dns-01     # dns-01 | http-01 | tls-alpn-01; default tls-alpn-01
 #       dns_provider: sn-dns       # required for dns-01
 #     - host: "*.example.org"
 #       challenge_type: dns-01
-#       dns_provider: sn-dns
+#       dns_provider: dns-api
 #   check_interval: 43200          # certificate check interval (seconds), default 12h
 #   renew_before_expiry: 604800    # renew ahead of expiry (seconds), default 7d
 #   # identity_manager is optional here; defaults to the Gateway-wide identity_manager above
+
+# self_cert_report:   # tells the SN to forward HTTPS of these hosts to this gateway (optional)
+#   sn: https://sn.buckyos.ai/kapi/sn
+#   key_path: ***
+#   device_config_path: ***
+#   hosts:             # reported once the TLS stacks present a certificate for all of them
+#     - "*.example.com"
+#     - example.com
+#   # without it, a configured sn-dns provider implies the report
 
 # tls_ca:             # self-signed/CA certificate config (optional)
 #   cert_path: ./ca.crt

@@ -12,6 +12,7 @@ pub fn build_gateway_composition() -> anyhow::Result<GatewayComposition> {
     builder.install(SocksGatewayModule::new())?;
     builder.install(TunGatewayModule::new())?;
     builder.install(SnClientGatewayModule::new())?;
+    builder.install(DnsApiGatewayModule::new())?;
     builder.build()
 }
 
@@ -48,7 +49,7 @@ mod tests {
         assert_eq!(app.profile(), &GatewayAppProfile::cyfs_gateway());
         assert_eq!(
             app.composition().manifest().acme_dns_providers,
-            vec!["sn-dns"]
+            vec!["dns-api", "sn-dns"]
         );
         assert!(app
             .composition()

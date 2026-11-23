@@ -1,0 +1,23 @@
+[package]
+license-file.workspace = true
+license.workspace = true
+name = "cyfs-identity-cert"
+version.workspace = true
+edition = "2024"
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+hex.workspace = true
+log.workspace = true
+name-client.workspace = true
+openssl.workspace = true
+rustls.workspace = true
+rustls-native-certs = "0.8"
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+x509-parser = { version = "0.18", default-features = false }
+
+[dev-dependencies]
+tempfile.workspace = true

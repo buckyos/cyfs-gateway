@@ -18,12 +18,12 @@ sha2.workspace = true
 log.workspace = true
 serde_json.workspace = true
 async-trait.workspace = true
-hex.workspace = true
 buckyos-kit.workspace = true
 rand.workspace = true
 chrono.workspace = true
 rustls-pemfile.workspace = true
 lazy_static.workspace = true
+cyfs-identity-cert = { path = "../cyfs-identity-cert" }
 name-client.workspace = true
 buckyos-js-runtime.workspace = true
 boa_engine.workspace = true

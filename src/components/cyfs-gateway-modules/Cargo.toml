@@ -5,15 +5,22 @@ name = "cyfs-gateway-modules"
 version.workspace = true
 edition = "2024"
 
+[features]
+# ACME DNS-01 at the DNS services of the users. Only the node's gateway needs it;
+# the SN is built without its dependencies.
+dns-api = ["dep:cyfs-dns-provider"]
+
 [dependencies]
 anyhow.workspace = true
 async-trait.workspace = true
 buckyos-kit.workspace = true
 cyfs-acme = { path = "../cyfs-acme" }
 cyfs-dns = { path = "../cyfs-dns" }
+cyfs-dns-provider = { path = "../cyfs-dns-provider", optional = true }
 cyfs-gateway-api.workspace = true
 cyfs-gateway-app-lib = { path = "../cyfs-gateway-app-lib" }
 cyfs-gateway-lib = { path = "../cyfs-gateway-lib" }
+cyfs-identity-cert = { path = "../cyfs-identity-cert" }
 cyfs-sn = { path = "../cyfs-sn" }
 cyfs-socks = { path = "../cyfs-socks" }
 cyfs-tun = { path = "../cyfs-tun" }

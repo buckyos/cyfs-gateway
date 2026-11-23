@@ -16,6 +16,7 @@ clap.workspace = true
 console-subscriber = "*"
 cyfs-acme = { path = "../cyfs-acme" }
 cyfs-gateway-lib = { path = "../cyfs-gateway-lib" }
+cyfs-identity-cert = { path = "../cyfs-identity-cert" }
 cyfs-process-chain = { path = "../cyfs-process-chain" }
 hex.workspace = true
 http.workspace = true

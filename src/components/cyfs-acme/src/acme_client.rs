@@ -22,6 +22,9 @@ use std::sync::Mutex;
 use std::{sync::RwLock, time::Duration};
 use tokio::fs;
 
+const FINALIZE_POLL_ATTEMPTS: usize = 30;
+const FINALIZE_POLL_INTERVAL: Duration = Duration::from_secs(2);
+
 /// ACME 目录结构
 #[derive(Debug, Deserialize, Clone)]
 struct Directory {
@@ -282,8 +285,9 @@ struct AcmeClientInner {
 #[async_trait::async_trait]
 pub trait AcmeChallengeResponder: Send + Sync {
     async fn respond_challenge<'a>(&self, challenges: &'a [Challenge]) -> Result<&'a Challenge>;
-    fn propagation_delay(&self, _challenge: &Challenge) -> Duration {
-        Duration::ZERO
+    /// Returns once the CA can be asked to check the challenge.
+    async fn wait_propagation(&self, _challenge: &Challenge) -> Result<()> {
+        Ok(())
     }
     fn revert_challenge(&self, challenge: &Challenge);
 }
@@ -326,7 +330,7 @@ impl AcmeOrderSession {
     pub async fn start(&mut self) -> Result<(Vec<u8>, Vec<u8>)> {
         let directory = self.client.get_directory().await?;
         // 1. 创建订单
-        let (authorizations, finalize_url) = self
+        let (authorizations, finalize_url, order_url) = self
             .client
             .create_order(&[self.domain.clone()], directory.clone())
             .await?;
@@ -335,6 +339,7 @@ impl AcmeOrderSession {
         self.order_info = Some(OrderInfo {
             authorizations,
             finalize_url,
+            order_url,
         });
         self.update_status(OrderStatus::Pending);
 
@@ -360,14 +365,7 @@ impl AcmeOrderSession {
                 // verification or authorization polling fails.
                 self.respond_logs.push(resp_challenge.clone());
 
-                let propagation_delay = self.responder.propagation_delay(resp_challenge);
-                if !propagation_delay.is_zero() {
-                    info!(
-                        "wait {:?} for ACME challenge propagation: {}",
-                        propagation_delay, resp_challenge.domain
-                    );
-                    tokio::time::sleep(propagation_delay).await;
-                }
+                self.responder.wait_propagation(resp_challenge).await?;
 
                 // 通知服务器验证挑战
                 self.client
@@ -389,7 +387,12 @@ impl AcmeOrderSession {
             // Finalize订单
             let cert_url = self
                 .client
-                .finalize_order(&order_info.finalize_url, directory.clone(), &csr)
+                .finalize_order(
+                    &order_info.finalize_url,
+                    order_info.order_url.as_deref(),
+                    directory.clone(),
+                    &csr,
+                )
                 .await?;
 
             // 下载证书
@@ -417,6 +420,7 @@ impl Drop for AcmeOrderSession {
 struct OrderInfo {
     authorizations: Vec<String>,
     finalize_url: String,
+    order_url: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -506,7 +510,10 @@ impl AcmeClient {
     // 已有方法改为使用 inner
     pub async fn new(account: AcmeAccount, acme_directory: String) -> Result<Self> {
         info!("create acme client, account: {}", account);
-        let http_client = reqwest::Client::new();
+        // RFC 8555 6.1 requires a User-Agent.
+        let http_client = reqwest::Client::builder()
+            .user_agent(concat!("cyfs-acme/", env!("CARGO_PKG_VERSION")))
+            .build()?;
 
         let inner = AcmeClientInner {
             directory: tokio::sync::Mutex::new(None),
@@ -887,7 +894,13 @@ impl AcmeClient {
     }
 
     /// 完成订单
-    async fn finalize_order(&self, url: &str, directory: Directory, csr: &[u8]) -> Result<String> {
+    async fn finalize_order(
+        &self,
+        url: &str,
+        order_url: Option<&str>,
+        directory: Directory,
+        csr: &[u8],
+    ) -> Result<String> {
         info!(
             "finalize acme order, client: {}, url: {}, csr: {}",
             self,
@@ -898,24 +911,24 @@ impl AcmeClient {
             "csr": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(csr)
         });
 
-        let response: FinalizeResponse =
-            self.signed_post(url, directory, &payload)
-                .await
-                .map_err(|e| {
-                    error!(
-                        "finalize acme order failed, client: {}, url: {}, csr: {}, {}",
-                        self,
-                        url,
-                        csr.len(),
-                        e
-                    );
-                    e.context(format!(
-                        "finalize acme order failed, client: {}, url: {}, csr: {}",
-                        self,
-                        url,
-                        csr.len()
-                    ))
-                })?;
+        let mut response: FinalizeResponse = self
+            .signed_post(url, directory.clone(), &payload)
+            .await
+            .map_err(|e| {
+                error!(
+                    "finalize acme order failed, client: {}, url: {}, csr: {}, {}",
+                    self,
+                    url,
+                    csr.len(),
+                    e
+                );
+                e.context(format!(
+                    "finalize acme order failed, client: {}, url: {}, csr: {}",
+                    self,
+                    url,
+                    csr.len()
+                ))
+            })?;
 
         info!(
             "finalize acme order success, client: {}, url: {}, csr: {}, response: {:?}",
@@ -924,6 +937,17 @@ impl AcmeClient {
             csr.len(),
             response
         );
+        // The CA may issue after it has answered (RFC 8555 7.4).
+        for _ in 0..FINALIZE_POLL_ATTEMPTS {
+            let (Some(order_url), "processing") = (order_url, response.status.as_str()) else {
+                break;
+            };
+            tokio::time::sleep(FINALIZE_POLL_INTERVAL).await;
+            response = self
+                .signed_post_as_get(order_url, directory.clone())
+                .await
+                .map_err(|e| e.context("poll acme order failed"))?;
+        }
         match response.status.as_str() {
             "valid" => Ok(response
                 .certificate
@@ -962,7 +986,7 @@ impl AcmeClient {
         &self,
         domains: &[String],
         directory: Directory,
-    ) -> Result<(Vec<String>, String)> {
+    ) -> Result<(Vec<String>, String, Option<String>)> {
         info!(
             "create acme order, client: {}, domains: {}",
             self,
@@ -980,8 +1004,8 @@ impl AcmeClient {
         };
 
         // 发送订单请求
-        let response: OrderResponse = self
-            .signed_post(directory.new_order.clone().as_str(), directory, &request)
+        let (response, order_url): (OrderResponse, Option<String>) = self
+            .signed_post_with_location(directory.new_order.clone().as_str(), directory, &request)
             .await
             .map_err(|e| {
                 error!(
@@ -1005,7 +1029,7 @@ impl AcmeClient {
         );
 
         // 返回授权URL列表和finalize URL
-        Ok((response.authorizations, response.finalize))
+        Ok((response.authorizations, response.finalize, order_url))
     }
 
     fn generate_csr(&self, domains: &[String]) -> Result<(Vec<u8>, Vec<u8>)> {
@@ -1041,6 +1065,22 @@ impl AcmeClient {
         T: Serialize,
         R: DeserializeOwned,
     {
+        let (result, _) = self
+            .signed_post_with_location(url, directory, payload)
+            .await?;
+        Ok(result)
+    }
+
+    async fn signed_post_with_location<T, R>(
+        &self,
+        url: &str,
+        directory: Directory,
+        payload: &T,
+    ) -> Result<(R, Option<String>)>
+    where
+        T: Serialize,
+        R: DeserializeOwned,
+    {
         let nonce = self.get_nonce(directory).await?;
         let jws = self.sign_request(url, &nonce, payload)?;
 
@@ -1052,8 +1092,13 @@ impl AcmeClient {
             .json(&jws)
             .send()
             .await?;
+        let location = response
+            .headers()
+            .get("Location")
+            .and_then(|location| location.to_str().ok())
+            .map(str::to_string);
 
-        self.handle_response(response).await
+        Ok((self.handle_response(response).await?, location))
     }
 
     async fn signed_post_as_get<R>(&self, url: &str, directory: Directory) -> Result<R>
@@ -1343,6 +1388,8 @@ struct ChallengeResponse {
     type_: ChallengeType,
     url: String,
     status: String,
+    // Challenge types we do not use (dns-persist-01) have none.
+    #[serde(default)]
     token: String,
     #[serde(default)]
     error: Option<AcmeError>,

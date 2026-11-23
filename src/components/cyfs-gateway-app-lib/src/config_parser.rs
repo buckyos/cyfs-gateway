@@ -754,6 +754,41 @@ pub fn parse_acme_config_from_raw_config(
     acme_config
 }
 
+/// Tells the SN that this gateway serves its hosts with their own certificates
+/// (top level `self_cert_report`), so that the SN forwards HTTPS to it. Reported
+/// once the TLS stacks present a certificate for every host, wherever it came from.
+#[derive(Deserialize, Clone, Debug, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct SelfCertReportConfig {
+    pub sn: String,
+    pub key_path: String,
+    pub device_config_path: String,
+    /// `<domain>` and `*.<domain>`.
+    pub hosts: Vec<String>,
+}
+
+pub fn parse_self_cert_report_from_raw_config(
+    raw_config: &serde_json::Value,
+) -> ConfigResult<Option<SelfCertReportConfig>> {
+    let Some(value) = raw_config.get("self_cert_report") else {
+        return Ok(None);
+    };
+    let config = serde_json::from_value::<SelfCertReportConfig>(value.clone()).map_err(|e| {
+        config_err!(
+            ConfigErrorCode::InvalidConfig,
+            "invalid self_cert_report config: {}",
+            e
+        )
+    })?;
+    if config.hosts.is_empty() {
+        return Err(config_err!(
+            ConfigErrorCode::InvalidConfig,
+            "invalid self_cert_report config: hosts is empty"
+        ));
+    }
+    Ok(Some(config))
+}
+
 #[derive(Deserialize, Clone, Eq, PartialEq)]
 pub struct LimiterConfig {
     pub id: String,
@@ -892,6 +927,36 @@ mod tests {
             }
         }))
         .is_err());
+    }
+
+    #[test]
+    fn test_self_cert_report_parser() {
+        let parse = |value: serde_json::Value| {
+            parse_self_cert_report_from_raw_config(&serde_json::json!({ "self_cert_report": value }))
+        };
+        assert!(
+            parse_self_cert_report_from_raw_config(&serde_json::json!({}))
+                .unwrap()
+                .is_none()
+        );
+        let config = parse(serde_json::json!({
+            "sn": "https://sn.example.com/kapi/sn",
+            "key_path": "/security/key.pem",
+            "device_config_path": "/identity/did.json",
+            "hosts": ["*.example.com", "example.com"]
+        }))
+        .unwrap()
+        .unwrap();
+        assert_eq!(config.hosts, vec!["*.example.com", "example.com"]);
+        for invalid in [
+            serde_json::json!({ "sn": "s", "key_path": "k", "device_config_path": "d" }),
+            serde_json::json!({ "sn": "s", "key_path": "k", "device_config_path": "d", "hosts": [] }),
+            serde_json::json!({
+                "sn": "s", "key_path": "k", "device_config_path": "d", "hosts": ["d"], "other": 1
+            }),
+        ] {
+            assert!(parse(invalid).is_err());
+        }
     }
 
     #[test]

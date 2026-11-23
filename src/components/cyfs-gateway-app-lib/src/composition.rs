@@ -4,11 +4,11 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
 use cyfs_acme::{AcmeCertManager, AcmeCertManagerRef, DnsProviderFactoryRef};
-use cyfs_gateway_lib::ServerManagerWeakRef;
+use cyfs_gateway_lib::{ServerManagerWeakRef, StackManagerRef};
 use cyfs_process_chain::HookPointEnv;
 
 use crate::{
-    register_core_gateway_servers, register_core_gateway_stacks, GatewayAppProfile,
+    register_core_gateway_servers, register_core_gateway_stacks, GatewayAppProfile, GatewayConfig,
     GatewayServerRegistration, GatewayServerRegistry, GatewayServerRegistryBuilder,
     GatewayStackRegistration, GatewayStackRegistry, GatewayStackRegistryBuilder,
     GatewayTrafficAdapterRef,
@@ -72,6 +72,21 @@ pub struct GatewayRuntimeHookContext<'a> {
     pub acme_manager: &'a AcmeCertManagerRef,
 }
 
+/// What a background service of a module works on: one generation of the
+/// configuration and the stacks built from it.
+pub struct GatewayRuntimeServiceContext<'a> {
+    pub profile: &'a GatewayAppProfile,
+    pub config: &'a GatewayConfig,
+    pub stack_manager: &'a StackManagerRef,
+    pub acme_manager: &'a AcmeCertManagerRef,
+}
+
+/// Stops the service when dropped.
+pub type GatewayRuntimeServiceHandle = Box<dyn Any + Send + Sync>;
+
+type RuntimeServiceFactory = dyn for<'a> Fn(&GatewayRuntimeServiceContext<'a>) -> Result<Option<GatewayRuntimeServiceHandle>>
+    + Send
+    + Sync;
 type RuntimeHook = dyn for<'a> Fn(&GatewayRuntimeHookContext<'a>) -> Result<()> + Send + Sync;
 type ProcessChainDocExtension =
     dyn Fn(&HookPointEnv, ServerManagerWeakRef) -> Result<(), String> + Send + Sync;
@@ -99,6 +114,7 @@ pub struct GatewayCompositionBuilder {
     acme_providers: HashMap<String, AcmeProviderRegistration>,
     runtime_capabilities: HashMap<TypeId, RuntimeCapabilityRegistration>,
     runtime_hooks: BTreeMap<String, (&'static str, Arc<RuntimeHook>)>,
+    runtime_services: BTreeMap<String, (&'static str, Arc<RuntimeServiceFactory>)>,
     traffic_adapter: Option<(&'static str, GatewayTrafficAdapterRef)>,
     process_chain_doc_extensions: BTreeMap<String, (&'static str, Arc<ProcessChainDocExtension>)>,
 }
@@ -114,6 +130,7 @@ impl GatewayCompositionBuilder {
             acme_providers: HashMap::new(),
             runtime_capabilities: HashMap::new(),
             runtime_hooks: BTreeMap::new(),
+            runtime_services: BTreeMap::new(),
             traffic_adapter: None,
             process_chain_doc_extensions: BTreeMap::new(),
         }
@@ -255,6 +272,33 @@ impl GatewayCompositionBuilder {
         Ok(())
     }
 
+    /// Registers a background service, started after the stacks of a configuration
+    /// are in place and replaced on every reload. `None` when the configuration does
+    /// not ask for it.
+    pub fn register_runtime_service<F>(&mut self, id: impl Into<String>, factory: F) -> Result<()>
+    where
+        F: for<'a> Fn(
+                &GatewayRuntimeServiceContext<'a>,
+            ) -> Result<Option<GatewayRuntimeServiceHandle>>
+            + Send
+            + Sync
+            + 'static,
+    {
+        let source = self.module_id()?;
+        let id = id.into();
+        if let Some((existing, _)) = self.runtime_services.get(id.as_str()) {
+            return Err(anyhow!(
+                "runtime service '{}' is already registered by '{}'; duplicate module: '{}'",
+                id,
+                existing,
+                source
+            ));
+        }
+        self.runtime_services
+            .insert(id, (source, Arc::new(factory)));
+        Ok(())
+    }
+
     pub fn register_traffic_adapter(&mut self, adapter: GatewayTrafficAdapterRef) -> Result<()> {
         let source = self.module_id()?;
         if let Some((existing, _)) = &self.traffic_adapter {
@@ -333,6 +377,11 @@ impl GatewayCompositionBuilder {
                 .into_values()
                 .map(|(_, hook)| hook)
                 .collect(),
+            runtime_services: self
+                .runtime_services
+                .into_iter()
+                .map(|(id, (_, factory))| (id, factory))
+                .collect(),
             traffic_adapter: self.traffic_adapter.map(|(_, adapter)| adapter),
             process_chain_doc_extensions: self
                 .process_chain_doc_extensions
@@ -351,6 +400,7 @@ pub struct GatewayComposition {
     acme_providers: Vec<AcmeProviderRegistration>,
     runtime_capabilities: Vec<RuntimeCapabilityRegistration>,
     runtime_hooks: Vec<Arc<RuntimeHook>>,
+    runtime_services: Vec<(String, Arc<RuntimeServiceFactory>)>,
     traffic_adapter: Option<GatewayTrafficAdapterRef>,
     process_chain_doc_extensions: Vec<Arc<ProcessChainDocExtension>>,
     manifest: GatewayCapabilityManifest,
@@ -429,6 +479,31 @@ impl GatewayComposition {
             hook(&context)?;
         }
         Ok(())
+    }
+
+    /// A service that cannot start does not take the gateway down.
+    pub fn start_runtime_services(
+        &self,
+        config: &GatewayConfig,
+        stack_manager: &StackManagerRef,
+        acme_manager: &AcmeCertManagerRef,
+    ) -> Vec<GatewayRuntimeServiceHandle> {
+        let context = GatewayRuntimeServiceContext {
+            profile: &self.profile,
+            config,
+            stack_manager,
+            acme_manager,
+        };
+        self.runtime_services
+            .iter()
+            .filter_map(|(id, factory)| match factory(&context) {
+                Ok(handle) => handle,
+                Err(e) => {
+                    log::error!("start runtime service '{}' failed: {}", id, e);
+                    None
+                }
+            })
+            .collect()
     }
 }
 

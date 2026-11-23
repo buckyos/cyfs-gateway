@@ -1,4 +1,4 @@
-use crate::{StackErrorCode, StackResult, StreamInfo, stack_err};
+use crate::{StackErrorCode, StackResult, StreamInfo, TlsHostCertificate, stack_err};
 use as_any::AsAny;
 use buckyos_kit::AsyncStream;
 use cyfs_process_chain::{CollectionValue, EnvRef, StreamRequest};
@@ -260,6 +260,11 @@ pub trait Stack: Send + Sync + 'static {
     fn as_stream_stack(&self) -> Option<&dyn StreamStack> {
         None
     }
+
+    /// The hosts this stack serves TLS for with a certificate of their own.
+    fn tls_host_certificates(&self) -> Vec<TlsHostCertificate> {
+        Vec::new()
+    }
 }
 
 pub type StackRef = Arc<dyn Stack>;
@@ -307,6 +312,14 @@ impl StackManager {
             }
         }
         None
+    }
+
+    pub fn tls_host_certificates(&self) -> Vec<TlsHostCertificate> {
+        let stacks = self.stacks.lock().unwrap().clone();
+        stacks
+            .iter()
+            .flat_map(|stack| stack.tls_host_certificates())
+            .collect()
     }
 
     pub async fn serve_stream(

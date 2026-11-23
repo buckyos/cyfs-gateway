@@ -1,4 +1,5 @@
 mod app;
+mod cert_status;
 mod composition;
 mod config_loader;
 mod config_merger;
@@ -13,6 +14,7 @@ mod stack_registry;
 mod traffic;
 
 pub use app::*;
+pub use cert_status::*;
 pub use composition::*;
 pub use config_loader::*;
 pub use config_merger::*;

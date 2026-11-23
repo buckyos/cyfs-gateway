@@ -39,8 +39,3 @@ test/example from Adblock Plus, Copyright (C) 2006-2014 Eyeo GmbH. It remains
 GPL-3.0-only, with its license text in that directory as LICENSE-GPL-3.0.
 This source-only example is not the Apache-licensed gateway implementation
 and is not included by the gateway runtime packaging configuration.
-
-The vendored CryptoJS files under
-src/rootfs/etc/cyfs_gateway/acme_dns_provider/aliyun/crypto/ remain MIT licensed.
-Their upstream copyright and license text are preserved in that directory's
-LICENSE; the directory is included with the DNS provider in runtime packages.

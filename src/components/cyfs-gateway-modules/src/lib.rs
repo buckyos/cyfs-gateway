@@ -1,4 +1,8 @@
+#[cfg(feature = "dns-api")]
+mod acme_dns_api_provider;
 mod acme_sn_provider;
+mod self_cert_reporter;
+mod sn_device;
 
 use std::sync::Arc;
 
@@ -21,6 +25,8 @@ use cyfs_socks::{SocksServerConfig, SocksServerContext, SocksServerFactory, Sock
 use cyfs_tun::{TunStackConfig, TunStackContext, TunStackFactory};
 use serde::Deserialize;
 
+#[cfg(feature = "dns-api")]
+pub use acme_dns_api_provider::AcmeDnsApiProviderFactory;
 pub use acme_sn_provider::*;
 
 pub struct DnsServerConfigParser;
@@ -373,8 +379,43 @@ impl GatewayModule for SnClientGatewayModule {
         let data_path =
             buckyos_kit::get_buckyos_service_data_dir(builder.profile().service_data_namespace)
                 .join("sn_dns");
-        builder.register_acme_dns_provider("sn-dns", AcmeSnProviderFactory::new(data_path))?;
+        builder.register_acme_dns_provider("sn-dns", AcmeSnProviderFactory::new())?;
+        builder.register_runtime_service("sn-self-cert-report", move |context| {
+            Ok(self_cert_reporter::start_self_cert_report(
+                context,
+                data_path.clone(),
+            ))
+        })?;
         Ok(())
+    }
+}
+
+/// ACME DNS-01 through the DNS services users keep their domains at.
+#[cfg(feature = "dns-api")]
+pub struct DnsApiGatewayModule;
+
+#[cfg(feature = "dns-api")]
+impl DnsApiGatewayModule {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+#[cfg(feature = "dns-api")]
+impl Default for DnsApiGatewayModule {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(feature = "dns-api")]
+impl GatewayModule for DnsApiGatewayModule {
+    fn id(&self) -> &'static str {
+        "dns-api"
+    }
+
+    fn install(&self, builder: &mut GatewayCompositionBuilder) -> Result<()> {
+        builder.register_acme_dns_provider("dns-api", AcmeDnsApiProviderFactory::new())
     }
 }
 
@@ -484,6 +525,15 @@ mod tests {
         assert_eq!(sn_client.manifest().modules, vec!["sn-client"]);
         assert!(sn_client.manifest().servers.is_empty());
         assert_eq!(sn_client.manifest().acme_dns_providers, vec!["sn-dns"]);
+
+        #[cfg(feature = "dns-api")]
+        {
+            let mut dns_api = GatewayCompositionBuilder::new(profile.clone());
+            dns_api.install(DnsApiGatewayModule::new()).unwrap();
+            let dns_api = dns_api.build().unwrap();
+            assert_eq!(dns_api.manifest().modules, vec!["dns-api"]);
+            assert_eq!(dns_api.manifest().acme_dns_providers, vec!["dns-api"]);
+        }
 
         let mut sn = GatewayCompositionBuilder::new(profile);
         sn.install(SnGatewayModule::new()).unwrap();

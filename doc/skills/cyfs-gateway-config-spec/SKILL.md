@@ -122,7 +122,7 @@ description: 用于独立讲解、审查、设计和排查 cyfs-gateway 配置�
 - 如果用户要求“完整支持列表”，必须指出：
   当前 `cyfs_gateway` 注册的 stack 协议是 `tcp`、`udp`、`tls`、`quic`、`rtcp`、`tun`
   `cyfs_gateway` 注册的 server 类型是 `http`、`socks`、`dns`、`dir`、`cyfs-dir`、`named-inbox-cache`、`control_server`、`local_dns`、`acme_response`
-  `web3_gateway` 额外支持 `sn`；两个应用都有 SN client / `sn-dns` ACME provider，但不因此都安装 SN server
+  `web3_gateway` 额外支持 `sn`；两个应用都有 SN client / `sn-dns` ACME provider，但不因此都安装 SN server；`dns-api` ACME provider 只有 `cyfs_gateway` 有
 - 如果提到 `ndn`，必须注明：旧版 `NdnServerConfig` 已移除，当前应用不支持该类型；
   `cyfs://` 语义由已注册的 `cyfs-dir` 提供。
 - 如果用户要“独立规范文档”或“可复制的 skill”，只使用本 skill 自带 references 中的内容组织答案，不再要求回到仓库核对。

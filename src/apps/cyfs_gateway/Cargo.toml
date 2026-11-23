@@ -12,7 +12,7 @@ anyhow.workspace = true
 log.workspace = true
 tokio = { version = "*", features = ["full", "tracing"] }
 cyfs-gateway-app-lib = { path = "../../components/cyfs-gateway-app-lib" }
-cyfs-gateway-modules = { path = "../../components/cyfs-gateway-modules" }
+cyfs-gateway-modules = { path = "../../components/cyfs-gateway-modules", features = ["dns-api"] }
 
 [dev-dependencies]
 async-compression = { version = "0.4", features = ["tokio", "gzip", "deflate", "brotli"] }
@@ -21,6 +21,7 @@ bns-client = { path = "../../components/bns-client" }
 buckyos-kit.workspace = true
 bytes.workspace = true
 cyfs-gateway-lib = { path = "../../components/cyfs-gateway-lib" }
+cyfs-identity-cert = { path = "../../components/cyfs-identity-cert" }
 cyfs-sn = { path = "../../components/cyfs-sn" }
 hickory-resolver = { version = "0.24", features = ["tokio"] }
 http.workspace = true

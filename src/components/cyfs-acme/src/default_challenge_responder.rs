@@ -26,11 +26,11 @@ impl AcmeChallengeResponder for DefaultChallengeResponder {
         }
     }
 
-    fn propagation_delay(&self, challenge: &Challenge) -> std::time::Duration {
-        self.cert_mgr
-            .upgrade()
-            .map(|cert_mgr| cert_mgr.challenge_propagation_delay(challenge))
-            .unwrap_or(std::time::Duration::ZERO)
+    async fn wait_propagation(&self, challenge: &Challenge) -> anyhow::Result<()> {
+        match self.cert_mgr.upgrade() {
+            Some(cert_mgr) => cert_mgr.wait_challenge_propagation(challenge).await,
+            None => Err(anyhow::anyhow!("cert_mgr is gone")),
+        }
     }
 
     fn revert_challenge(&self, challenge: &Challenge) {

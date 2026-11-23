@@ -90,6 +90,7 @@ merge 语义：
 - `identity_manager`
 - `name_client`
 - `acme`
+- `self_cert_report`
 - `tls_ca`
 - `limiters`
 - `collections`
@@ -109,6 +110,7 @@ merge 语义：
 - `identity_manager`
 - `name_client`
 - `acme`
+- `self_cert_report`
 - `tls_ca`
 
 `traffic` 需要额外安装 traffic adapter；当前两个应用均未安装，配置该 section 会报错。
@@ -679,6 +681,35 @@ HTTP S2S provider 场景使用 `app_did` 加载应用身份；不要从字段名
 `method`）、`dns_provider?`、`identity?`、`identity_manager?`，以及扁平附加数据。
 当前 `AcmeConfig` 没有 `issuers` 字段，不能把它列为生效配置。
 
+`dns_providers` 的 key 是 DNS-01 provider 名，value 是它的参数。`sn-dns` 两个应用都有，`dns-api` 只有 `cyfs_gateway` 安装：
+
+| 名字 | 参数 | 行为 |
+| --- | --- | --- |
+| `sn-dns` | `sn`、`key_path`、`device_config_path`、`access_token?` | 用设备身份把挑战写到 SN，固定等待 65 秒 |
+| `dns-api` | 只有 `credential_path`，拒绝未知字段 | 用凭据文件里的 token 把挑战写到 DNS 服务商；按值增删，`<域名>` 和 `*.<域名>` 共用挑战名不互相覆盖；轮询权威 NS，最多 5 分钟 |
+
+`dns-api` 的凭据文件是 `{"provider": "<服务商 id>", "fields": {…}, "endpoint"?: "…"}`，权限 0600，
+每次写挑战前重新读取，换 token 不用重启或 reload。主域名沿挑战名向上查 SOA 得到。
+其它名字走 JS DNS 插件（`dns_provider_path`）；产品不再内置任何 JS 插件，旧的 `aliyun` 插件已删除，
+改用 `dns-api` 的 `alidns`。
+
+证书的归属看身份路径里 `server.meta.json` 的 `renewal.manager`：`acme` 由 ACME 签发和续期；
+`manual` 是用户上传的，ACME 对这个 host 不下单、不覆盖、不重试，状态为 `manual`。只看 host 自己的身份目录，
+父域的手工通配证书不影响它。
+
+### `self_cert_report`
+
+字段（拒绝未知字段，`hosts` 不能为空）：
+
+- `sn`
+- `key_path`
+- `device_config_path`
+- `hosts`
+
+TLS 栈对全部 `hosts` 都加载到当前有效的证书后，调用 SN 的 `user.set_self_cert`，与证书来源无关；
+证书换了也会再报。没有这一段、但 `acme.dns_providers` 有 `sn-dns` 时，由它的参数推导出上报
+（按 ACME 签发的证书判断，行为与以前相同）。两者都没有就不上报。状态文件仍是 `self_cert_state.json`。
+
 ### `tls_ca`
 
 字段：
@@ -698,6 +729,11 @@ HTTP S2S provider 场景使用 `app_did` 加载应用身份；不要从字段名
 
 - 用户不必显式声明 control server
 - 规范里不能把它写成“必须手工配置”
+
+控制方法 `get_cert_status`（参数 `{}`）返回 TLS 栈和 ACME 配置的每个 host 的证书状态：
+`{hosts: [{host, loaded, not_after, issuer, fingerprint, manager: "acme"|"manual"|null,
+acme: {state: "none"|"ordering"|"ready"|"renewing"|"manual", last_error: {message, at}|null, next_retry_at}|null}]}`。
+时间是 Unix 秒；`loaded` 表示 TLS 栈当前能出示这个名字的证书；错误文本不含 token。
 
 ## 11. 当前不要宣称为正式支持的类型
 

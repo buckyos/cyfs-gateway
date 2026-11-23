@@ -49,6 +49,9 @@
 `SnClientGatewayModule`。但只有 `src/apps/web3_gateway/src/lib.rs` 额外安装
 `SnGatewayModule`，增加 contextless 的 `sn` server。`cyfs_gateway` 有 9 种 server，
 `web3_gateway` 有 10 种；SN client 提供 `sn-dns` ACME provider 不代表安装 SN server。
+`cyfs_gateway` 另外安装 `DnsApiGatewayModule`，提供 `dns-api` ACME provider
+（`cyfs-gateway-modules/src/acme_dns_api_provider.rs`，服务商实现和表在 `cyfs-dns-provider`）；
+`web3_gateway` 没有。`self_cert_report` 在 `self_cert_reporter.rs`，随 SN client 模块安装。
 
 当前两个应用均未安装 traffic adapter；若配置包含 `traffic` 段，解析时会提示缺少对应模块。
 
@@ -371,7 +374,11 @@ DNS / SOCKS / TUN 的 adapter parser 位于 `src/components/cyfs-gateway-modules
 - `GatewayIdentityManagerConfig` 定义公共/安全根目录和别名；注入 TLS/QUIC 的 hosts、RTCP
   的 identity 模式，也给未显式设置 identity manager 的 ACME 补值。
 - `AcmeConfig` 支持 account、issuer、dns_providers、hosts、identity_manager、check_interval、
-  renew_before_expiry；没有 issuers。`tunnel_client_certs` 无当前装载代码，不能作为有效配置。
+  renew_before_expiry；没有 issuers。`dns_providers` 内置 `sn-dns`，`cyfs_gateway` 还有 `dns-api`。
+- `SelfCertReportConfig`（`config_parser.rs`）：sn、key_path、device_config_path、hosts，拒绝未知字段，hosts 非空。
+- `cyfs-acme/src/cert_mgr.rs`：`renewal.manager = manual` 的 host 不下单、不覆盖；`cert_status.rs` 定义控制方法
+  `get_cert_status` 的返回。
+- `tunnel_client_certs` 无当前装载代码，不能作为有效配置。
 - `global_collection_manager.rs` 的 `CollectionConfig.data` 使用 serde flatten；类型附加字段
   写在 collection 对象内，不应包一层 data。
 

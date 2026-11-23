@@ -85,6 +85,7 @@ ndn-toolkit.workspace = true
 cyfs-gateway-api.workspace = true
 cyfs-process-chain = { path = "../cyfs-process-chain" }
 cyfs-acme = { path = "../cyfs-acme" }
+cyfs-identity-cert = { path = "../cyfs-identity-cert" }
 cyfs-lookup = { path = "../cyfs-lookup" }
 pin-project = "1.1.10"
 #buckyos-api = { path = "../../kernel/buckyos-api" }

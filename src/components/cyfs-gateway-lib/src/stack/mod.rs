@@ -19,6 +19,7 @@ pub use stack::*;
 use std::os::fd::AsRawFd;
 pub use tcp_stack::*;
 pub(crate) use tls_cert_resolver::*;
+pub use tls_cert_resolver::TlsHostCertificate;
 pub use tls_stack::*;
 pub use udp_stack::*;
 
