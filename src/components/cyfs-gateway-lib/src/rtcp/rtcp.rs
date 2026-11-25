@@ -1847,7 +1847,7 @@ impl RTcpInner {
 
             listener,
             bind_addr,
-            reuse_address: false,
+            reuse_address: crate::stack::DEFAULT_TCP_REUSE_ADDRESS,
             this_device_did,
             this_device_dev_did,
             this_device_ed25519_sk, //for sign tunnel token
@@ -2756,16 +2756,11 @@ impl RTcpInner {
             error!("{}", msg);
             TunnelError::BindError(msg)
         })?;
-        #[cfg(target_os = "linux")]
-        {
-            if self.reuse_address {
-                socket.set_reuse_address(true).map_err(|e| {
-                    let msg = format!("set reuse address error:{}", e);
-                    error!("{}", msg);
-                    TunnelError::BindError(msg)
-                })?;
-            }
-        }
+        crate::stack::set_tcp_reuse_address(&socket, self.reuse_address).map_err(|e| {
+            let msg = format!("set reuse address error:{}", e);
+            error!("{}", msg);
+            TunnelError::BindError(msg)
+        })?;
         socket.bind(&sockaddr).map_err(|e| {
             let msg = format!("bind rtcp listener error:{}", e);
             error!("{}", msg);

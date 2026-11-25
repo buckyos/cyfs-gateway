@@ -2137,7 +2137,11 @@ impl Stack for RtcpStack {
             return Err(stack_err!(StackErrorCode::BindUnmatched, "bind unmatch"));
         }
 
-        if config.reuse_address.unwrap_or(false) != self.reuse_address {
+        if config
+            .reuse_address
+            .unwrap_or(super::DEFAULT_TCP_REUSE_ADDRESS)
+            != self.reuse_address
+        {
             return Err(stack_err!(
                 StackErrorCode::InvalidConfig,
                 "reuse_address unmatch"
@@ -2266,7 +2270,7 @@ impl RtcpStackBuilder {
             connection_manager: None,
             stack_context: None,
             io_dump: None,
-            reuse_address: false,
+            reuse_address: super::DEFAULT_TCP_REUSE_ADDRESS,
             security: RtcpSecurityConfig::default(),
             stream_idle_timeout: stream_idle_timeout_from_secs(None),
             connect_timeout: connect_timeout_from_secs(None),
@@ -2519,7 +2523,11 @@ impl StackFactory for RtcpStackFactory {
         let stack = stack
             .stack_context(stack_context.clone())
             .io_dump(io_dump)
-            .reuse_address(config.reuse_address.unwrap_or(false))
+            .reuse_address(
+                config
+                    .reuse_address
+                    .unwrap_or(super::DEFAULT_TCP_REUSE_ADDRESS),
+            )
             .stream_idle_timeout(stream_idle_timeout_from_secs(config.stream_idle_timeout))
             .connect_timeout(connect_timeout_from_secs(config.connect_timeout))
             .build()
@@ -2682,7 +2690,7 @@ inbound_admission:
         assert_eq!(missed, 3);
     }
 
-    use tokio::net::{TcpListener, UdpSocket};
+    use tokio::net::{TcpListener, TcpStream, UdpSocket};
     use url::Url;
 
     async fn wait_dump_frames(
@@ -7868,6 +7876,8 @@ inbound_admission:
         )
         .await;
         old_stack.start().await.unwrap();
+        let _open = TcpStream::connect(&bind).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         old_stack.shutdown().await;
 
         let replacement = build_keep_tunnel_stack(

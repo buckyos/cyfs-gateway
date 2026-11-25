@@ -55,7 +55,7 @@
 #       challenge_type: dns-01
 #       dns_provider: dns-api
 #   check_interval: 43200          # certificate check interval (seconds), default 12h
-#   renew_before_expiry: 604800    # renew ahead of expiry (seconds), default 7d
+#   renew_before_expiry: 604800    # renew ahead of expiry (seconds), default a third of the certificate's lifetime
 #   # identity_manager is optional here; defaults to the Gateway-wide identity_manager above
 
 # self_cert_report:   # tells the SN to forward HTTPS of these hosts to this gateway (optional)
@@ -144,7 +144,7 @@ stacks:
     bind: 0.0.0.0:80            # bind address
     # concurrency: 0              # active connection limit, default 0 (unlimited)
     # transparent: false          # transparent proxy mode (tcp/udp optional, default false)
-    # reuse_address: false        # SO_REUSEADDR (optional, default false)
+    # reuse_address: true         # SO_REUSEADDR, not on Windows (default true for tcp/tls/rtcp, false for udp/quic)
     # io_dump_file: tcp.dump      # enable io dump; relative path resolves to service data dir/dumps/
     # io_dump_rotate_size: 1GB    # rotate size; supports B/KB/MB/GB/TB
     # io_dump_rotate_max_files: 8 # optional, keep at most N rotated files
@@ -175,7 +175,7 @@ stacks:
     #   bind: 0.0.0.0:443
     #   concurrency: 0              # default 0 (unlimited)
     #   alpn_protocols: ["http/1.1"] # default http/1.1, supports h2/h3
-    #   reuse_address: false
+    #   reuse_address: true
     #   io_dump_file: tls.dump
     #   hosts: # TLS identities supported by this stack; certs are loaded through the identity manager path protocol
     #     - example.com
@@ -238,7 +238,7 @@ stacks:
     #     handshake_timeout_secs: 15
     #     stream_requests_per_second: 32
     #     stream_request_burst: 64
-    #   reuse_address: false
+    #   reuse_address: true
     #   io_dump_file: rtcp.dump
     #   hook_point: { }
 

@@ -18,6 +18,7 @@ use tokio::task::{JoinHandle, JoinSet};
 pub(crate) struct MockAcmeState {
     pub orders: AtomicUsize,
     pub fail_orders: AtomicBool,
+    pub refuse_orders: AtomicBool,
     /// Orders need one dns-01 authorization, validated through `validation_gate`.
     pub dns_challenges: AtomicBool,
     /// Finalizing answers `processing`; the order turns valid when asked for.
@@ -150,6 +151,10 @@ async fn serve(
             if state.fail_orders.load(Ordering::SeqCst) {
                 status = "429 Too Many Requests";
                 json!({"type": "urn:ietf:params:acme:error:rateLimited", "detail": "test issuance limit"})
+                    .to_string().into_bytes()
+            } else if state.refuse_orders.load(Ordering::SeqCst) {
+                status = "403 Forbidden";
+                json!({"type": "urn:ietf:params:acme:error:rejectedIdentifier", "detail": "test refusal"})
                     .to_string().into_bytes()
             } else {
                 let mut authorizations = Vec::new();

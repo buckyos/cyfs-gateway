@@ -338,6 +338,8 @@ DNS / SOCKS / TUN 的 adapter parser 位于 `src/components/cyfs-gateway-modules
   `apply_gateway_identity_manager_to_stack()`，仅注入字符串 hosts 模式，已有 stack 级对象整体优先。
 - TCP/TLS/QUIC/RTCP/TUN/SOCKS 的 stream idle 默认 600 秒；QUIC/RTCP/TUN/SOCKS 的 connect
   默认 60 秒（`stack/mod.rs`），0 关闭。HTTP 的同名 connect 字段另有毫秒/时长字符串语义。
+- TCP/TLS/RTCP 的 `reuse_address` 默认 true（`stack/mod.rs` 的 `DEFAULT_TCP_REUSE_ADDRESS`），Windows 上不设置
+  SO_REUSEADDR；UDP/QUIC 默认 false，只在 Linux 生效。
 - `tcp_stack.rs` / `udp_stack.rs` 的并发默认均为 0（不设业务上限），UDP `max_sessions`
   也默认为 0；`session_idle_time` 仍默认 120 秒。
 
@@ -374,10 +376,10 @@ DNS / SOCKS / TUN 的 adapter parser 位于 `src/components/cyfs-gateway-modules
 - `GatewayIdentityManagerConfig` 定义公共/安全根目录和别名；注入 TLS/QUIC 的 hosts、RTCP
   的 identity 模式，也给未显式设置 identity manager 的 ACME 补值。
 - `AcmeConfig` 支持 account、issuer、dns_providers、hosts、identity_manager、check_interval、
-  renew_before_expiry；没有 issuers。`dns_providers` 内置 `sn-dns`，`cyfs_gateway` 还有 `dns-api`。
+  renew_before_expiry（默认证书有效期的三分之一，`cert_mgr.rs` 的 `renewal_period`）；没有 issuers。`dns_providers` 内置 `sn-dns`，`cyfs_gateway` 还有 `dns-api`。
 - `SelfCertReportConfig`（`config_parser.rs`）：sn、key_path、device_config_path、hosts，拒绝未知字段，hosts 非空。
 - `cyfs-acme/src/cert_mgr.rs`：`renewal.manager = manual` 的 host 不下单、不覆盖；`cert_status.rs` 定义控制方法
-  `get_cert_status` 的返回。
+  `get_cert_status` 的返回；停止下单的规则是 `MAX_REFUSED_ORDERS`，`restart_cert_order` 在 `gateway.rs`。
 - `tunnel_client_certs` 无当前装载代码，不能作为有效配置。
 - `global_collection_manager.rs` 的 `CollectionConfig.data` 使用 serde flatten；类型附加字段
   写在 collection 对象内，不应包一层 data。

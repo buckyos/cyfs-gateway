@@ -5,8 +5,9 @@ use crate::default_challenge_responder::DefaultChallengeResponder;
 use crate::{Challenge, ChallengeData, ChallengeType};
 use anyhow::Result;
 use cyfs_identity_cert::{
-    CertManager, InstalledCertificate, certificate_manager, install_acme_certificate,
-    installed_certificate, reissue_requested, validate_identity_certificate,
+    CertManager, InstalledCertificate, certificate_manager, certificate_summary,
+    install_acme_certificate, installed_certificate, reissue_requested,
+    validate_identity_certificate,
 };
 use log::*;
 use name_client::{IdentityMaterial, IdentityRoots, IdentityUsage};
@@ -47,6 +48,7 @@ pub fn is_tls_alpn_challenge(client_hello: &ClientHello) -> bool {
 struct CertInfo {
     key: Arc<CertifiedKey>,
     expires: chrono::DateTime<chrono::Utc>,
+    renew_before: chrono::Duration,
 }
 
 enum CertState {
@@ -61,7 +63,25 @@ struct CertMutPart {
     state: CertState,
     last_error: Option<AcmeCertError>,
     next_retry_at: Option<u64>,
+    /// Orders that failed for another reason than the network or the server's
+    /// limits while there was no usable certificate.
+    refused_orders: u32,
 }
+
+impl CertMutPart {
+    fn is_stopped(&self) -> bool {
+        matches!(self.state, CertState::None) && self.refused_orders >= MAX_REFUSED_ORDERS
+    }
+}
+
+/// Outlives the gateway: a computer that is switched off at night would never stop.
+#[derive(Default, Serialize, Deserialize)]
+struct RefusedOrders {
+    count: u32,
+    last_error: Option<AcmeCertError>,
+}
+
+const REFUSED_ORDERS_FILE: &str = "refused_orders.json";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CertCheck {
@@ -75,6 +95,13 @@ const MANUAL_CHECK_INTERVAL: Duration = Duration::from_secs(60);
 #[cfg(test)]
 const MANUAL_CHECK_INTERVAL: Duration = Duration::from_millis(20);
 const MAX_ERROR_CHARS: usize = 1000;
+const MAX_RETRY_SECS: u64 = 600;
+/// While the installed certificate is good for longer than a day. Let's Encrypt
+/// pauses a name after 1152 failed validations in a row: 10 days of retries every
+/// 10 minutes, less than the renewal window of a 90-day certificate.
+const MAX_EARLY_RETRY_SECS: u64 = 3600;
+/// About a day. After that somebody has to change something first.
+const MAX_REFUSED_ORDERS: u32 = 144;
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -84,6 +111,16 @@ pub enum AcmeCertState {
     Ready,
     Renewing,
     Manual,
+    /// Refused too often without a usable certificate; ordered again when asked to.
+    Stopped,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RetryWait {
+    Elapsed,
+    Restarted,
+    /// A certificate installed by someone else.
+    Superseded,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -132,8 +169,9 @@ struct CertStubInner {
     identity_roots: IdentityRoots,
     acme_client: AcmeClient,
     responder: AcmeChallengeResponderRef,
-    renew_before_expiry: chrono::Duration,
+    renew_before_expiry: Option<chrono::Duration>,
     order_lock: Arc<tokio::sync::Mutex<()>>,
+    restart: tokio::sync::Notify,
     mut_part: Mutex<CertMutPart>,
     handle: Mutex<Option<JoinHandle<()>>>,
 }
@@ -173,8 +211,12 @@ impl CertStub {
         identity_roots: IdentityRoots,
         acme_client: AcmeClient,
         responder: AcmeChallengeResponderRef,
-        renew_before_expiry: chrono::Duration,
+        renew_before_expiry: Option<chrono::Duration>,
     ) -> Self {
+        let refused = std::fs::read(work_dir.join(REFUSED_ORDERS_FILE))
+            .ok()
+            .and_then(|content| serde_json::from_slice::<RefusedOrders>(&content).ok())
+            .unwrap_or_default();
         Self {
             inner: Arc::new(CertStubInner {
                 order_lock: cert_order_lock(&acme_item.domain),
@@ -184,10 +226,12 @@ impl CertStub {
                 acme_client,
                 responder,
                 renew_before_expiry,
+                restart: tokio::sync::Notify::new(),
                 mut_part: Mutex::new(CertMutPart {
                     state: CertState::None,
-                    last_error: None,
+                    last_error: refused.last_error,
                     next_retry_at: None,
+                    refused_orders: refused.count,
                 }),
                 handle: Mutex::new(None),
             }),
@@ -217,22 +261,32 @@ impl CertStub {
         Ok(CertifiedKey::new(cert_chain, signing_key))
     }
 
-    fn get_cert_expiry(cert_data: &[u8]) -> Result<chrono::DateTime<chrono::Utc>> {
-        let cert = X509::from_pem(cert_data)?;
-        let not_after = cert.not_after().to_string();
-        // info!("cert expiry raw: {}", not_after);
+    // A configured period that is not shorter than the certificate's lifetime would
+    // renew it at every check.
+    fn renewal_period(
+        configured: Option<chrono::Duration>,
+        lifetime: chrono::Duration,
+    ) -> chrono::Duration {
+        configured
+            .filter(|configured| *configured < lifetime)
+            .unwrap_or(lifetime / 3)
+    }
 
-        // 移除最后的时区名称，因为证书时间总是 UTC
-        let datetime_str = not_after
-            .rsplitn(2, ' ')
-            .nth(1)
-            .ok_or_else(|| anyhow::anyhow!("Invalid datetime format"))?;
-
-        let expires = chrono::NaiveDateTime::parse_from_str(datetime_str, "%b %e %H:%M:%S %Y")?;
-        Ok(chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(
-            expires,
-            chrono::Utc,
-        ))
+    fn cert_info(&self, cert_data: &[u8], key_data: &[u8]) -> Result<CertInfo> {
+        let key = Self::create_certified_key(cert_data, key_data)?;
+        let leaf = key
+            .cert
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("No certificate found"))?;
+        let validity = certificate_summary(leaf)?;
+        let lifetime =
+            chrono::Duration::seconds(validity.not_after as i64 - validity.not_before as i64);
+        Ok(CertInfo {
+            expires: chrono::DateTime::from_timestamp(validity.not_after as i64, 0)
+                .ok_or_else(|| anyhow::anyhow!("Invalid certificate expiry"))?,
+            renew_before: Self::renewal_period(self.inner.renew_before_expiry, lifetime),
+            key: Arc::new(key),
+        })
     }
 
     pub fn get_cert(&self) -> Option<Arc<CertifiedKey>> {
@@ -267,6 +321,7 @@ impl CertStub {
             state: match &mut_part.state {
                 // Uploaded since the last check.
                 _ if self.is_manual() => AcmeCertState::Manual,
+                _ if mut_part.is_stopped() => AcmeCertState::Stopped,
                 CertState::None if working => AcmeCertState::Ordering,
                 CertState::None => AcmeCertState::None,
                 CertState::Ready(_) => AcmeCertState::Ready,
@@ -304,8 +359,7 @@ impl CertStub {
         } else {
             match info {
                 Some(info)
-                    if Self::cert_needs_renewal(&info, self.inner.renew_before_expiry)
-                        || reissue_requested(roots, identity) =>
+                    if Self::cert_needs_renewal(&info) || reissue_requested(roots, identity) =>
                 {
                     (CertState::Renewing(info), CertCheck::OrderNeeded)
                 }
@@ -316,10 +370,66 @@ impl CertStub {
         let mut mut_part = self.inner.mut_part.lock().unwrap();
         mut_part.state = state;
         if check != CertCheck::OrderNeeded {
-            mut_part.last_error = None;
-            mut_part.next_retry_at = None;
+            self.clear_failures(&mut mut_part);
         }
         Ok(check)
+    }
+
+    fn clear_failures(&self, mut_part: &mut CertMutPart) {
+        mut_part.last_error = None;
+        self.clear_refused(mut_part);
+    }
+
+    fn clear_refused(&self, mut_part: &mut CertMutPart) {
+        mut_part.next_retry_at = None;
+        if std::mem::take(&mut mut_part.refused_orders) > 0 {
+            let path = self.inner.work_dir.join(REFUSED_ORDERS_FILE);
+            if let Err(e) = std::fs::remove_file(&path) {
+                warn!("remove {} failed: {}", path.display(), e);
+            }
+        }
+    }
+
+    // Being offline, and limits that pass, are no reason to stop.
+    fn counts_as_refused(error: &anyhow::Error) -> bool {
+        match error.downcast_ref::<AcmeHttpError>() {
+            Some(error) => error.is_refusal(),
+            None => !error.chain().any(|cause| cause.is::<reqwest::Error>()),
+        }
+    }
+
+    // Returns false when it is not tried again by itself.
+    fn note_failure(&self, error: &anyhow::Error, retry_delay: Duration) -> bool {
+        let mut mut_part = self.inner.mut_part.lock().unwrap();
+        mut_part.last_error = Some(AcmeCertError {
+            message: format!("{error:#}").chars().take(MAX_ERROR_CHARS).collect(),
+            at: unix_now(),
+        });
+        if matches!(mut_part.state, CertState::None) && Self::counts_as_refused(error) {
+            mut_part.refused_orders += 1;
+            let refused = RefusedOrders {
+                count: mut_part.refused_orders,
+                last_error: mut_part.last_error.clone(),
+            };
+            let path = self.inner.work_dir.join(REFUSED_ORDERS_FILE);
+            let saved = serde_json::to_vec(&refused)
+                .map_err(anyhow::Error::from)
+                .and_then(|content| Ok(std::fs::write(&path, content)?));
+            if let Err(e) = saved {
+                warn!("save {} failed: {}", path.display(), e);
+            }
+        }
+        let stopped = mut_part.is_stopped();
+        mut_part.next_retry_at =
+            (!stopped).then(|| unix_now().saturating_add(retry_delay.as_secs()));
+        !stopped
+    }
+
+    /// Orders again now what is failing or was stopped.
+    fn restart(&self) {
+        self.clear_refused(&mut self.inner.mut_part.lock().unwrap());
+        self.inner.restart.notify_one();
+        self.load_cert();
     }
 
     // The uploaded certificate of exactly this host. A manual wildcard certificate
@@ -419,26 +529,14 @@ impl CertStub {
             );
             return Ok(None);
         }
-        let certified_key = match Self::create_certified_key(&cert_data, &key_data) {
-            Ok(certified_key) => certified_key,
+        let info = match self.cert_info(&cert_data, &key_data) {
+            Ok(info) => info,
             Err(e) => {
                 debug!(
                     "parse identity certificate/key failed, stub: {}, fullchain: {}, key: {}, {}",
                     self,
                     cert_match.path.display(),
                     key_path.display(),
-                    e
-                );
-                return Ok(None);
-            }
-        };
-        let expires = match Self::get_cert_expiry(&cert_data) {
-            Ok(expires) => expires,
-            Err(e) => {
-                debug!(
-                    "read identity certificate expiry failed, stub: {}, fullchain: {}, {}",
-                    self,
-                    cert_match.path.display(),
                     e
                 );
                 return Ok(None);
@@ -451,17 +549,13 @@ impl CertStub {
             identity,
             cert_match.path.display(),
             key_path.display(),
-            expires
+            info.expires
         );
-        Ok(Some(CertInfo {
-            key: Arc::new(certified_key),
-            expires,
-        }))
+        Ok(Some(info))
     }
 
-    fn cert_needs_renewal(info: &CertInfo, renew_before_expiry: chrono::Duration) -> bool {
-        let now = chrono::Utc::now();
-        now >= info.expires || now >= info.expires - renew_before_expiry
+    fn cert_needs_renewal(info: &CertInfo) -> bool {
+        chrono::Utc::now() >= info.expires - info.renew_before
     }
 
     // Returns false when the order was overtaken by an uploaded certificate.
@@ -484,6 +578,7 @@ impl CertStub {
         // An installation failure must retry the downloaded certificate, not
         // consume another issuance for the same identifiers.
         let (cert_data, key_data) = issued_cert.as_ref().unwrap();
+        let info = self.cert_info(cert_data, key_data)?;
 
         install_acme_certificate(
             &self.inner.identity_roots,
@@ -492,27 +587,20 @@ impl CertStub {
             &self.inner.work_dir,
             cert_data,
             key_data,
-            self.inner.renew_before_expiry,
+            info.renew_before,
         )?;
-
-        let certified_key = Self::create_certified_key(cert_data, key_data)?;
-        let expires = Self::get_cert_expiry(cert_data)?;
 
         info!(
             "install identity cert success, stub: {}, identity: {}, expires: {}",
             self,
             self.inner.acme_item.identity(),
-            expires
+            info.expires
         );
 
         {
             let mut mut_part = self.inner.mut_part.lock().unwrap();
-            mut_part.state = CertState::Ready(CertInfo {
-                key: Arc::new(certified_key),
-                expires,
-            });
-            mut_part.last_error = None;
-            mut_part.next_retry_at = None;
+            mut_part.state = CertState::Ready(info);
+            self.clear_failures(&mut mut_part);
         }
 
         Ok(true)
@@ -524,7 +612,16 @@ impl CertStub {
             // renewing it and holds the order lock.
             match self.refresh_cert()? {
                 CertCheck::Current => return Ok(()),
-                CertCheck::OrderNeeded => {}
+                CertCheck::OrderNeeded => {
+                    if self.inner.mut_part.lock().unwrap().is_stopped() {
+                        let _ = tokio::time::timeout(
+                            MANUAL_CHECK_INTERVAL,
+                            self.inner.restart.notified(),
+                        )
+                        .await;
+                        continue;
+                    }
+                }
                 CertCheck::Manual => {
                     while self.is_manual() {
                         tokio::time::sleep(MANUAL_CHECK_INTERVAL).await;
@@ -538,7 +635,8 @@ impl CertStub {
         }
     }
 
-    // Returns false when the certificate turned out to be managed by the user.
+    // Returns false when the certificate turned out to be managed by the user, or
+    // the order was refused too often.
     async fn order_until_installed(&self) -> Result<bool> {
         let _order_guard = self.inner.order_lock.lock().await;
         let mut interval = 15;
@@ -554,10 +652,7 @@ impl CertStub {
             match result {
                 Ok(installed) => return Ok(installed),
                 Err(e) => {
-                    interval *= 2;
-                    if interval > 600 {
-                        interval = 600;
-                    }
+                    interval = (interval * 2).min(self.max_retry_secs());
                     let retry_delay = e
                         .downcast_ref::<AcmeHttpError>()
                         .and_then(|error| error.retry_after)
@@ -567,36 +662,48 @@ impl CertStub {
                         "order cert failed, stub: {}, {:#}; retry in {:?}",
                         self, e, retry_delay
                     );
-                    {
-                        let mut mut_part = self.inner.mut_part.lock().unwrap();
-                        mut_part.last_error = Some(AcmeCertError {
-                            message: format!("{e:#}").chars().take(MAX_ERROR_CHARS).collect(),
-                            at: unix_now(),
-                        });
-                        mut_part.next_retry_at =
-                            Some(unix_now().saturating_add(retry_delay.as_secs()));
+                    if !self.note_failure(&e, retry_delay) {
+                        error!("order cert stopped, stub: {}", self);
+                        return Ok(false);
                     }
-                    if self.wait_for_retry(retry_delay).await? {
-                        return Ok(self.refresh_cert()? == CertCheck::Current);
+                    match self.wait_for_retry(retry_delay).await? {
+                        RetryWait::Elapsed => {}
+                        RetryWait::Restarted => interval = 15,
+                        RetryWait::Superseded => {
+                            return Ok(self.refresh_cert()? == CertCheck::Current);
+                        }
                     }
                 }
             }
         }
     }
 
-    // Return true if a certificate installed by someone else ends the retry loop.
-    async fn wait_for_retry(&self, retry_delay: Duration) -> Result<bool> {
+    fn max_retry_secs(&self) -> u64 {
+        match &self.inner.mut_part.lock().unwrap().state {
+            CertState::Renewing(info)
+                if info.expires - chrono::Utc::now() > chrono::Duration::days(1) =>
+            {
+                MAX_EARLY_RETRY_SECS
+            }
+            _ => MAX_RETRY_SECS,
+        }
+    }
+
+    async fn wait_for_retry(&self, retry_delay: Duration) -> Result<RetryWait> {
         let retry_at = tokio::time::Instant::now() + retry_delay;
         loop {
-            tokio::time::sleep_until(
-                retry_at.min(tokio::time::Instant::now() + Duration::from_secs(60)),
-            )
-            .await;
+            let check_at = retry_at.min(tokio::time::Instant::now() + Duration::from_secs(60));
+            let restarted = tokio::time::timeout_at(check_at, self.inner.restart.notified())
+                .await
+                .is_ok();
             if self.refresh_cert()? != CertCheck::OrderNeeded {
-                return Ok(true);
+                return Ok(RetryWait::Superseded);
+            }
+            if restarted {
+                return Ok(RetryWait::Restarted);
             }
             if tokio::time::Instant::now() >= retry_at {
-                return Ok(false);
+                return Ok(RetryWait::Elapsed);
             }
         }
     }
@@ -809,16 +916,12 @@ pub struct CertManagerConfig {
     pub identity_manager: Option<AcmeIdentityConfig>,
     #[serde(default = "default_check_interval")]
     pub check_interval: chrono::Duration, // 检查证书的时间间隔
-    #[serde(default = "default_renew_before_expiry")]
-    pub renew_before_expiry: chrono::Duration, // 过期前多久开始续期
+    /// 过期前多久开始续期，不填为证书有效期的三分之一
+    pub renew_before_expiry: Option<chrono::Duration>,
 }
 
 fn default_check_interval() -> chrono::Duration {
     chrono::Duration::hours(12) // 默认每12小时检查一次
-}
-
-fn default_renew_before_expiry() -> chrono::Duration {
-    chrono::Duration::days(7) // 默认过期前7天续期
 }
 
 impl Default for CertManagerConfig {
@@ -831,7 +934,7 @@ impl Default for CertManagerConfig {
             dns_provider_path: None,
             identity_manager: None,
             check_interval: default_check_interval(),
-            renew_before_expiry: default_renew_before_expiry(),
+            renew_before_expiry: None,
         }
     }
 }
@@ -1259,6 +1362,25 @@ impl AcmeCertManager {
             .await
     }
 
+    /// Orders the certificate of a host again now; false when it is not managed here.
+    pub fn restart_cert(&self, host: &str) -> bool {
+        let stub = self
+            .certs
+            .read()
+            .unwrap()
+            .iter()
+            .find(|(domain, _)| domain.eq_ignore_ascii_case(host))
+            .map(|(_, stub)| stub.clone());
+        match stub {
+            Some(stub) => {
+                info!("restart cert order, stub: {}", stub);
+                stub.restart();
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Every managed host, sorted by name.
     pub fn cert_statuses(&self) -> Vec<AcmeCertStatus> {
         let certs = self
@@ -1363,9 +1485,16 @@ mod tests {
         )
     }
 
-    fn install_test_cert(stub: &CertStub, valid_days: u32) {
+    fn install_test_cert(stub: &CertStub, valid_days: i64) {
+        let lifetime = chrono::Duration::days(valid_days);
+        install_aged_cert(stub, lifetime, lifetime);
+    }
+
+    // A certificate of `lifetime` that expires in `left`.
+    fn install_aged_cert(stub: &CertStub, lifetime: chrono::Duration, left: chrono::Duration) {
         let domain = &stub.inner.acme_item.domain;
-        let (cert, key) = generate_test_cert(domain, valid_days);
+        let not_after = chrono::Utc::now() + left;
+        let (cert, key) = generate_test_cert_between(domain, not_after - lifetime, not_after);
         install_acme_certificate(
             &stub.inner.identity_roots,
             stub.inner.acme_item.identity(),
@@ -1373,7 +1502,7 @@ mod tests {
             &stub.inner.work_dir,
             &cert,
             &key,
-            stub.inner.renew_before_expiry,
+            chrono::Duration::days(7),
         )
         .unwrap();
     }
@@ -1452,12 +1581,168 @@ mod tests {
         assert!(stub.get_cert().is_some());
         assert_eq!(server.orders(), 0);
 
-        install_test_cert(&stub, 3);
+        install_aged_cert(&stub, chrono::Duration::days(90), chrono::Duration::days(3));
         stub.start_order().await.unwrap();
         assert_eq!(server.orders(), 1);
         // A later check must load the renewal instead of ordering again.
         stub.start_order().await.unwrap();
         assert_eq!(server.orders(), 1);
+    }
+
+    #[test]
+    fn a_third_of_the_lifetime_is_left_for_renewing() {
+        let (days, hours) = (chrono::Duration::days, chrono::Duration::hours);
+        for (lifetime, configured, expected) in [
+            (days(90), None, days(30)),
+            (days(64), None, hours(512)),
+            (days(45), None, days(15)),
+            (hours(160), None, chrono::Duration::minutes(3200)),
+            (days(90), Some(days(7)), days(7)),
+            (days(90), Some(days(0)), days(0)),
+            (days(90), Some(days(89)), days(89)),
+            (days(90), Some(days(90)), days(30)),
+            (hours(160), Some(days(7)), chrono::Duration::minutes(3200)),
+        ] {
+            assert_eq!(
+                CertStub::renewal_period(configured, lifetime),
+                expected,
+                "{lifetime} {configured:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_renewal_window_follows_the_certificate_unless_configured() {
+        let temp = tempfile::tempdir().unwrap();
+        let server = MockAcme::new().await;
+        let mut config = test_config(temp.path(), &server);
+        let manager = AcmeCertManager::create(config.clone()).await.unwrap();
+        let stub = test_stub(&manager, "window.example.com");
+        let (days, hours) = (chrono::Duration::days, chrono::Duration::hours);
+        for lifetime in [days(90), days(64), days(45), hours(160)] {
+            install_aged_cert(&stub, lifetime, lifetime / 3 + hours(1));
+            assert_eq!(
+                stub.refresh_cert().unwrap(),
+                CertCheck::Current,
+                "{lifetime}"
+            );
+            install_aged_cert(&stub, lifetime, lifetime / 3 - hours(1));
+            assert_eq!(
+                stub.refresh_cert().unwrap(),
+                CertCheck::OrderNeeded,
+                "{lifetime}"
+            );
+            assert!(stub.get_cert().is_some());
+        }
+
+        config.renew_before_expiry = Some(days(7));
+        let configured = AcmeCertManager::create(config).await.unwrap();
+        let configured = test_stub(&configured, "window.example.com");
+        for (left, expected) in [
+            (days(20), CertCheck::Current),
+            (days(7) + hours(1), CertCheck::Current),
+            (days(7) - hours(1), CertCheck::OrderNeeded),
+        ] {
+            install_aged_cert(&configured, days(90), left);
+            assert_eq!(configured.refresh_cert().unwrap(), expected, "{left}");
+        }
+
+        let fullchain = stub
+            .inner
+            .identity_roots
+            .x509_paths("window.example.com", IdentityUsage::Server)
+            .unwrap()
+            .fullchain;
+        std::fs::write(fullchain, "broken").unwrap();
+        assert_eq!(stub.refresh_cert().unwrap(), CertCheck::OrderNeeded);
+        assert!(stub.get_cert().is_none());
+        assert_eq!(server.orders(), 0);
+    }
+
+    #[tokio::test]
+    async fn the_issued_certificate_records_its_renewal_period() {
+        let temp = tempfile::tempdir().unwrap();
+        let server = MockAcme::new().await;
+        server.order_gate.add_permits(100);
+        let manager = AcmeCertManager::create(test_config(temp.path(), &server))
+            .await
+            .unwrap();
+        let stub = test_stub(&manager, "issued.example.com");
+        stub.start_order().await.unwrap();
+        let installed = stub.status().installed.unwrap();
+        let paths = stub
+            .inner
+            .identity_roots
+            .x509_paths("issued.example.com", IdentityUsage::Server)
+            .unwrap();
+        let metadata: Value =
+            serde_json::from_slice(&std::fs::read(paths.metadata).unwrap()).unwrap();
+        assert_eq!(
+            metadata["renewal"]["renew_before"],
+            format!("PT{}S", (installed.not_after - installed.not_before) / 3)
+        );
+    }
+
+    // Retry delays in the order they were chosen, each listed once.
+    async fn retry_delays(stub: &CertStub, time: Duration) -> Vec<u64> {
+        let mut delays = Vec::new();
+        let end = tokio::time::Instant::now() + time;
+        stub.load_cert();
+        while tokio::time::Instant::now() < end {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            let mut_part = stub.inner.mut_part.lock().unwrap();
+            if let (Some(error), Some(retry_at)) = (&mut_part.last_error, mut_part.next_retry_at) {
+                let delay = retry_at - error.at;
+                if delays.last() != Some(&delay) {
+                    delays.push(delay);
+                }
+            }
+        }
+        stub.cancel_load();
+        delays
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn renewing_early_is_retried_less_often() {
+        let temp = tempfile::tempdir().unwrap();
+        let closed_port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let manager = AcmeCertManager::create(CertManagerConfig {
+            acme_server: format!("http://{closed_port}/directory"),
+            keystore_path: temp.path().join("acme").to_string_lossy().into_owned(),
+            identity_manager: Some(AcmeIdentityConfig {
+                public_root_path: Some(temp.path().join("identity").to_string_lossy().into_owned()),
+                security_root_path: Some(
+                    temp.path().join("security").to_string_lossy().into_owned(),
+                ),
+            }),
+            ..CertManagerConfig::default()
+        })
+        .await
+        .unwrap();
+        let day = chrono::Duration::days(1);
+        for (domain, left, expected) in [
+            (
+                "early.example.com",
+                Some(day * 29),
+                vec![30, 60, 120, 240, 480, 960, 1920, 3600],
+            ),
+            (
+                "late.example.com",
+                Some(day / 2),
+                vec![30, 60, 120, 240, 480, 600],
+            ),
+            ("none.example.com", None, vec![30, 60, 120, 240, 480, 600]),
+        ] {
+            let stub = test_stub(&manager, domain);
+            if let Some(left) = left {
+                install_aged_cert(&stub, day * 90, left);
+            }
+            let delays = retry_delays(&stub, Duration::from_secs(4 * 3600)).await;
+            assert_eq!(delays, expected, "{domain}");
+        }
     }
 
     #[tokio::test]
@@ -1491,7 +1776,7 @@ mod tests {
             .await
             .unwrap();
         let stub = test_stub(&manager, "example.com");
-        install_test_cert(&stub, 3);
+        install_aged_cert(&stub, chrono::Duration::days(90), chrono::Duration::days(3));
         let _guard = stub.inner.order_lock.lock().await;
         stub.load_cert();
         wait_until(|| stub.get_cert().is_some()).await;
@@ -1542,10 +1827,10 @@ mod tests {
         let stub = test_stub(&manager, "example.com");
         let start = tokio::time::Instant::now();
         assert!(
-            !stub
-                .wait_for_retry(Duration::from_secs(3600))
+            stub.wait_for_retry(Duration::from_secs(3600))
                 .await
                 .unwrap()
+                == RetryWait::Elapsed
         );
         assert!(start.elapsed() >= Duration::from_secs(3600));
 
@@ -1554,7 +1839,7 @@ mod tests {
             tokio::time::sleep(Duration::from_secs(10)).await;
             install_test_cert(&stub, 90);
         });
-        assert!(loaded.unwrap());
+        assert_eq!(loaded.unwrap(), RetryWait::Superseded);
         assert!(start.elapsed() < Duration::from_secs(3600));
         assert!(stub.get_cert().is_some());
         assert_eq!(server.orders(), 0);
@@ -1798,6 +2083,105 @@ mod tests {
         let ready = status();
         assert_eq!((ready.last_error, ready.next_retry_at), (None, None));
         assert_eq!(ready.installed.unwrap().manager, Some(CertManager::Acme));
+    }
+
+    #[test]
+    fn being_offline_and_limits_that_pass_are_no_refusals() {
+        let http = |status: u16| -> anyhow::Error {
+            AcmeHttpError::of(reqwest::StatusCode::from_u16(status).unwrap()).into()
+        };
+        for status in [429, 500, 503] {
+            assert!(!CertStub::counts_as_refused(&http(status)), "{status}");
+        }
+        for status in [400, 403] {
+            assert!(CertStub::counts_as_refused(&http(status)), "{status}");
+        }
+        assert!(CertStub::counts_as_refused(&anyhow::anyhow!(
+            "Authorization failed: no TXT record"
+        )));
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_server_is_no_refusal() {
+        let closed = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let error = reqwest::get(format!("http://{closed}/")).await.unwrap_err();
+        let error = anyhow::Error::new(error).context("get acme directory failed");
+        assert!(!CertStub::counts_as_refused(&error));
+    }
+
+    #[tokio::test]
+    async fn refused_too_often_it_stops_until_it_is_asked_to_go_on() {
+        let temp = tempfile::tempdir().unwrap();
+        let server = MockAcme::new().await;
+        server.state.refuse_orders.store(true, Ordering::SeqCst);
+        server.order_gate.add_permits(1000);
+        let config = test_config(temp.path(), &server);
+        let item = || AcmeItem::new("example.com".to_string(), ChallengeType::Http01, None);
+        let manager = AcmeCertManager::create(config.clone()).await.unwrap();
+        manager.add_acme_item(item()).unwrap();
+        let status = |manager: &AcmeCertManagerRef| manager.cert_statuses().remove(0);
+        wait_until(|| status(&manager).last_error.is_some()).await;
+        assert_eq!(status(&manager).state, AcmeCertState::Ordering);
+        assert!(status(&manager).next_retry_at.is_some());
+        let stub = manager.get_cert_by_host("example.com").unwrap();
+        {
+            let mut mut_part = stub.inner.mut_part.lock().unwrap();
+            assert_eq!(mut_part.refused_orders, 1);
+            mut_part.refused_orders = MAX_REFUSED_ORDERS - 1;
+        }
+        // One more attempt, now.
+        stub.inner.restart.notify_one();
+        wait_until(|| status(&manager).state == AcmeCertState::Stopped).await;
+        assert_eq!(status(&manager).next_retry_at, None);
+        assert!(status(&manager).last_error.is_some());
+        let orders = server.orders();
+        tokio::time::sleep(MANUAL_CHECK_INTERVAL * 5).await;
+        manager.check_all_certs().unwrap();
+        tokio::time::sleep(MANUAL_CHECK_INTERVAL * 5).await;
+        assert_eq!(server.orders(), orders, "no periodic check goes on");
+
+        // Neither does a restart of the gateway.
+        drop(stub);
+        drop(manager);
+        let manager = AcmeCertManager::create(config).await.unwrap();
+        manager.add_acme_item(item()).unwrap();
+        tokio::time::sleep(MANUAL_CHECK_INTERVAL * 5).await;
+        assert_eq!(status(&manager).state, AcmeCertState::Stopped);
+        assert!(status(&manager).last_error.is_some());
+        assert_eq!(server.orders(), orders);
+
+        assert!(!manager.restart_cert("other.example"));
+        server.state.refuse_orders.store(false, Ordering::SeqCst);
+        assert!(manager.restart_cert("Example.com"));
+        wait_until(|| status(&manager).state == AcmeCertState::Ready).await;
+        assert!(status(&manager).last_error.is_none());
+        let left = Path::new(&manager.config.keystore_path)
+            .join("example.com")
+            .join(REFUSED_ORDERS_FILE);
+        assert!(!left.exists());
+    }
+
+    #[tokio::test]
+    async fn an_uploaded_certificate_ends_the_stop() {
+        let temp = tempfile::tempdir().unwrap();
+        let server = MockAcme::new().await;
+        server.state.refuse_orders.store(true, Ordering::SeqCst);
+        server.order_gate.add_permits(100);
+        let manager = AcmeCertManager::create(test_config(temp.path(), &server))
+            .await
+            .unwrap();
+        let stub = test_stub(&manager, "example.com");
+        stub.inner.mut_part.lock().unwrap().refused_orders = MAX_REFUSED_ORDERS;
+        stub.load_cert();
+        tokio::time::sleep(MANUAL_CHECK_INTERVAL * 3).await;
+        assert_eq!(stub.status().state, AcmeCertState::Stopped);
+        assert_eq!(server.orders(), 0);
+        install_test_cert(&stub, 90);
+        wait_until(|| stub.status().state == AcmeCertState::Ready).await;
+        assert_eq!(stub.inner.mut_part.lock().unwrap().refused_orders, 0);
     }
 
     #[tokio::test]
@@ -2103,6 +2487,15 @@ mod tests {
     }
 
     fn generate_test_cert(domain: &str, valid_days: u32) -> (Vec<u8>, Vec<u8>) {
+        let now = chrono::Utc::now();
+        generate_test_cert_between(domain, now, now + chrono::Duration::days(valid_days.into()))
+    }
+
+    fn generate_test_cert_between(
+        domain: &str,
+        not_before: chrono::DateTime<chrono::Utc>,
+        not_after: chrono::DateTime<chrono::Utc>,
+    ) -> (Vec<u8>, Vec<u8>) {
         let rsa = openssl::rsa::Rsa::generate(2048).unwrap();
         let pkey = PKey::from_rsa(rsa).unwrap();
         let mut builder = X509Builder::new().unwrap();
@@ -2118,8 +2511,8 @@ mod tests {
         builder.set_issuer_name(&name).unwrap();
         builder.set_pubkey(&pkey).unwrap();
 
-        let not_before = Asn1Time::days_from_now(0).unwrap();
-        let not_after = Asn1Time::days_from_now(valid_days).unwrap();
+        let not_before = Asn1Time::from_unix(not_before.timestamp()).unwrap();
+        let not_after = Asn1Time::from_unix(not_after.timestamp()).unwrap();
         builder.set_not_before(&not_before).unwrap();
         builder.set_not_after(&not_after).unwrap();
 

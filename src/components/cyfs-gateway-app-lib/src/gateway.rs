@@ -13,7 +13,7 @@ use crate::{
     GatewayComposition, GatewayRuntimeCapabilities, GatewayRuntimeServiceHandle,
     GatewayServerRegistry, GatewayServerRuntime, GatewayStackRegistry, GatewayStackRuntime,
     GatewayTrafficConfigRef, GatewayTrafficService, GatewayTrafficStatFactoryRef,
-    host_cert_statuses,
+    HostCertStatus, host_cert_statuses,
 };
 use anyhow::{Result, anyhow};
 use buckyos_kit::*;
@@ -499,13 +499,9 @@ async fn build_acme_mgr_from_config(
             }
         }
 
-        if acme_config.renew_before_expiry.is_some() {
-            if let Some(renew_before_expiry) =
-                chrono::Duration::new(acme_config.renew_before_expiry.unwrap() as i64, 0)
-            {
-                cert_config.renew_before_expiry = renew_before_expiry;
-            }
-        }
+        cert_config.renew_before_expiry = acme_config
+            .renew_before_expiry
+            .and_then(|seconds| chrono::Duration::new(seconds as i64, 0));
     }
     cert_config.dns_provider_path = Some(dns_provider_dir.to_string_lossy().to_string());
 
@@ -3121,6 +3117,18 @@ impl Gateway {
         }
     }
 
+    /// Orders the certificate of a host again now; `None` when ACME does not manage it.
+    pub fn restart_cert_order(&self, host: &str) -> Option<HostCertStatus> {
+        let manager = self.acme_manager.lock().unwrap().upgrade()?;
+        if !manager.restart_cert(host) {
+            return None;
+        }
+        self.get_cert_status()
+            .hosts
+            .into_iter()
+            .find(|status| status.host.eq_ignore_ascii_case(host))
+    }
+
     async fn restart_traffic_service(
         &self,
         traffic_config: Option<GatewayTrafficConfigRef>,
@@ -3222,6 +3230,7 @@ impl GatewayCmdHandler {
                 | "get_init_config"
                 | "get_system_info"
                 | "get_cert_status"
+                | "restart_cert_order"
                 | "collection_list"
                 | "collection_get"
                 | "collection_set_add"
@@ -3628,6 +3637,20 @@ impl GatewayControlCmdHandler for GatewayCmdHandler {
                 .map_err(|e| cmd_err!(ControlErrorCode::Failed, "{}", e)),
             "get_cert_status" => serde_json::to_value(gateway.get_cert_status())
                 .map_err(into_cmd_err!(ControlErrorCode::SerializeFailed)),
+            "restart_cert_order" => {
+                let host = params["host"].as_str().ok_or_else(|| {
+                    cmd_err!(ControlErrorCode::InvalidParams, "host is required")
+                })?;
+                let status = gateway.restart_cert_order(host).ok_or_else(|| {
+                    cmd_err!(
+                        ControlErrorCode::InvalidParams,
+                        "{} is not managed by ACME",
+                        host
+                    )
+                })?;
+                serde_json::to_value(status)
+                    .map_err(into_cmd_err!(ControlErrorCode::SerializeFailed))
+            }
             "get_system_info" => {
                 let params = params.as_object();
                 let dashboard_port = params

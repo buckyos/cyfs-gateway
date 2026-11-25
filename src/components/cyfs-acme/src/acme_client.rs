@@ -234,6 +234,22 @@ pub(crate) struct AcmeHttpError {
     pub(crate) retry_after: Option<Duration>,
 }
 
+impl AcmeHttpError {
+    #[cfg(test)]
+    pub(crate) fn of(status: reqwest::StatusCode) -> Self {
+        Self {
+            status,
+            body: String::new(),
+            retry_after: None,
+        }
+    }
+
+    /// The server does not want this order, as opposed to not now or not working.
+    pub(crate) fn is_refusal(&self) -> bool {
+        self.status.is_client_error() && self.status != reqwest::StatusCode::TOO_MANY_REQUESTS
+    }
+}
+
 impl Display for AcmeHttpError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "HTTP error: {} - {}", self.status, self.body)
@@ -550,13 +566,13 @@ impl AcmeClient {
                 .await
                 .map_err(|e| {
                     error!("get acme directory failed, {}", e);
-                    anyhow::anyhow!("get acme directory failed, {}", e)
+                    anyhow::Error::new(e).context("get acme directory failed")
                 })?
                 .json()
                 .await
                 .map_err(|e| {
                     error!("parse acme directory failed, {}", e);
-                    anyhow::anyhow!("parse acme directory failed, {}", e)
+                    anyhow::Error::new(e).context("parse acme directory failed")
                 })?;
 
             info!("get acme directory success, directory: {:?}", dir);
@@ -590,7 +606,8 @@ impl AcmeClient {
             .await
             .map_err(|e| {
                 error!("register acme account failed, client: {}, {}", self, e);
-                anyhow::anyhow!("register acme account failed, client: {}, {}", self, e)
+                anyhow::Error::new(e)
+                    .context(format!("register acme account failed, client: {self}"))
             })?;
 
         if response.status().is_success() {
@@ -1174,7 +1191,7 @@ impl AcmeClient {
             .await
             .map_err(|e| {
                 error!("fetch acme nonce failed, client: {}, {}", self, e);
-                anyhow::anyhow!("fetch acme nonce failed, client: {}, {}", self, e)
+                anyhow::Error::new(e).context(format!("fetch acme nonce failed, client: {self}"))
             })?;
 
         let nonce = response

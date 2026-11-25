@@ -35,7 +35,7 @@
 #   # 身份路径里 server.meta.json 的 renewal.manager = manual 的证书（用户上传）不下单、不覆盖
 #   # identity_manager 可选；默认继承 Gateway 级 identity_manager
 #   check_interval: 43200          # 证书检查周期（秒），默认 12h
-#   renew_before_expiry: 604800    # 提前续期时间（秒），默认 7d
+#   renew_before_expiry: 604800    # 提前续期时间（秒），默认为证书有效期的三分之一
 
 # self_cert_report:   # 把“本网关有自己的证书”告诉 SN，SN 才会转发这个域名的 HTTPS（可选）
 #   sn: https://sn.buckyos.ai/kapi/sn

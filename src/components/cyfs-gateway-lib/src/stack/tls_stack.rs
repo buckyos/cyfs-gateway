@@ -726,15 +726,10 @@ impl TlsStack {
             StackErrorCode::IoError,
             "set nonblocking error"
         ))?;
-        #[cfg(target_os = "linux")]
-        {
-            if self.reuse_address {
-                socket.set_reuse_address(true).map_err(into_stack_err!(
-                    StackErrorCode::IoError,
-                    "set reuse address error"
-                ))?;
-            }
-        }
+        super::set_tcp_reuse_address(&socket, self.reuse_address).map_err(into_stack_err!(
+            StackErrorCode::IoError,
+            "set reuse address error"
+        ))?;
         socket.bind(&sockaddr).map_err(into_stack_err!(
             StackErrorCode::BindFailed,
             "bind {} error",
@@ -870,7 +865,11 @@ impl Stack for TlsStack {
             ));
         }
 
-        if config.reuse_address.unwrap_or(false) != self.reuse_address {
+        if config
+            .reuse_address
+            .unwrap_or(super::DEFAULT_TCP_REUSE_ADDRESS)
+            != self.reuse_address
+        {
             return Err(stack_err!(
                 StackErrorCode::InvalidConfig,
                 "reuse_address unmatch"
@@ -1254,7 +1253,11 @@ impl crate::StackFactory for TlsStackFactory {
                     .map(|s| s.as_bytes().to_vec())
                     .collect(),
             )
-            .reuse_address(config.reuse_address.unwrap_or(false))
+            .reuse_address(
+                config
+                    .reuse_address
+                    .unwrap_or(super::DEFAULT_TCP_REUSE_ADDRESS),
+            )
             .trusted_upstreams(config.trusted_upstreams.clone())
             .stream_idle_timeout(stream_idle_timeout_from_secs(config.stream_idle_timeout))
             .stack_context(stack_context)
@@ -1294,7 +1297,7 @@ impl TlsStackBuilder {
             alpn_protocols: vec![],
             stack_context: None,
             io_dump: None,
-            reuse_address: false,
+            reuse_address: super::DEFAULT_TCP_REUSE_ADDRESS,
             trusted_upstreams: Vec::new(),
             stream_idle_timeout: stream_idle_timeout_from_secs(None),
         }
@@ -3277,6 +3280,45 @@ mod tests {
                 .iter()
                 .any(|f| f.upload == b"GET " && f.download.is_empty())
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_restarted_stack_gets_its_port_back() {
+        let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let bind = probe.local_addr().unwrap();
+        drop(probe);
+        let start = |reuse_address: &'static str| async move {
+            let config: TlsStackConfig = serde_yaml_ng::from_str(&format!(
+                "{{id: test, protocol: tls, bind: '{bind}', hosts: [], hook_point: [], {reuse_address}}}"
+            ))
+            .unwrap();
+            let context = build_stack_context(
+                Arc::new(ServerManager::new()),
+                TunnelManager::new(),
+                Arc::new(DefaultLimiterManager::new()),
+                StatManager::new(),
+                SelfCertMgr::create(SelfCertConfig::default())
+                    .await
+                    .unwrap(),
+                Some(Arc::new(GlobalProcessChains::new())),
+            );
+            let stack = TlsStackFactory::new(ConnectionManager::new())
+                .create(Arc::new(config), context)
+                .await
+                .unwrap();
+            stack.start().await.map(|()| stack)
+        };
+        let stack = start("").await.unwrap();
+        assert!(start("").await.is_err(), "the port is in use");
+
+        let _open = TcpStream::connect(bind).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        drop(stack);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        assert!(start("reuse_address: false").await.is_err());
+        start("").await.unwrap();
     }
 
     #[tokio::test]

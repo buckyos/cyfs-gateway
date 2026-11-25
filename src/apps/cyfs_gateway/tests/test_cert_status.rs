@@ -162,6 +162,30 @@ async fn cert_status_covers_tls_and_acme_hosts() {
     assert_eq!(acme(2), (json!("ordering"), true));
     assert!(!report.hosts[2].loaded);
 
+    // Asking again answers with the state of that host, and only hosts ACME manages can be asked for.
+    let restart = async |params: Value| {
+        kRPC::kRPC::new(&url, Some(token.clone()))
+            .call("restart_cert_order", params)
+            .await
+    };
+    let restarted = restart(json!({ "host": "*.home.example.com" }))
+        .await
+        .unwrap();
+    assert_eq!(restarted["host"], "*.home.example.com");
+    assert_eq!(restarted["acme"]["state"], "ordering");
+    assert!(
+        restart(json!({ "host": "unknown.example.com" }))
+            .await
+            .is_err()
+    );
+    assert!(restart(json!({})).await.is_err());
+    assert!(
+        kRPC::kRPC::new(&url, None)
+            .call("restart_cert_order", json!({ "host": "*.home.example.com" }))
+            .await
+            .is_err()
+    );
+
     // Back to automatic issuing: the uploaded certificate serves until the new one is there.
     clear_manual_mark(&roots, "home.example.com").unwrap();
     gateway

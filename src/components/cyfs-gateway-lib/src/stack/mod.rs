@@ -191,6 +191,25 @@ pub(crate) fn try_enable_dual_stack(socket: &socket2::Socket, bind_addr: std::ne
     }
 }
 
+/// `reuse_address` of TCP listeners that do not set it, the default of std and tokio
+/// too: a restarted gateway gets its port back while former connections are closing.
+pub(crate) const DEFAULT_TCP_REUSE_ADDRESS: bool = true;
+
+/// Not on Windows, where former connections do not hold the port and the option would
+/// let another process bind it as well.
+pub(crate) fn set_tcp_reuse_address(
+    socket: &socket2::Socket,
+    reuse_address: bool,
+) -> std::io::Result<()> {
+    #[cfg(unix)]
+    if reuse_address {
+        socket.set_reuse_address(true)?;
+    }
+    #[cfg(not(unix))]
+    let _ = (socket, reuse_address);
+    Ok(())
+}
+
 fn is_unspecified_ipv6_bind(bind_addr: std::net::SocketAddr) -> bool {
     matches!(
         bind_addr,

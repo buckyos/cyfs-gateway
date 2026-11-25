@@ -203,7 +203,8 @@ hook_point:
 默认：
 
 - `transparent = false`
-- `reuse_address = false`
+- `reuse_address = true`（`tcp` / `tls` / `rtcp` 相同，Windows 上不起作用；`udp` / `quic` 默认 `false`，只在 Linux 生效）。
+  它让重启后的监听不受 TIME_WAIT 连接影响；改它要重启网关，reload 会报 `reuse_address unmatch`
 - `concurrency = 0` 表示不设业务并发上限；`stream_idle_timeout = 600`（秒，0 关闭）
 - `trusted_upstreams = []`；配置为 IP/CIDR 列表，配合 `proxy-protocol-probe` 限制可恢复来源地址的直接上游
 
@@ -681,6 +682,10 @@ HTTP S2S provider 场景使用 `app_did` 加载应用身份；不要从字段名
 `method`）、`dns_provider?`、`identity?`、`identity_manager?`，以及扁平附加数据。
 当前 `AcmeConfig` 没有 `issuers` 字段，不能把它列为生效配置。
 
+`check_interval` 和 `renew_before_expiry` 的单位是秒，默认 12 小时、证书有效期（notAfter − notBefore）的三分之一。
+`renew_before_expiry` 不短于证书有效期时按默认处理。续期失败后从 30 秒开始加倍重试：现有证书剩余超过一天时最长
+1 小时，否则最长 10 分钟；服务器返回的 `Retry-After` 更长时以它为准。
+
 `dns_providers` 的 key 是 DNS-01 provider 名，value 是它的参数。`sn-dns` 两个应用都有，`dns-api` 只有 `cyfs_gateway` 安装：
 
 | 名字 | 参数 | 行为 |
@@ -733,8 +738,12 @@ TLS 栈对全部 `hosts` 都加载到当前有效的证书后，调用 SN 的 `u
 
 控制方法 `get_cert_status`（参数 `{}`）返回 TLS 栈和 ACME 配置的每个 host 的证书状态：
 `{hosts: [{host, loaded, not_after, issuer, fingerprint, manager: "acme"|"manual"|null,
-acme: {state: "none"|"ordering"|"ready"|"renewing"|"manual", last_error: {message, at}|null, next_retry_at}|null}]}`。
+acme: {state: "none"|"ordering"|"ready"|"renewing"|"manual"|"stopped", last_error: {message, at}|null, next_retry_at}|null}]}`。
 时间是 Unix 秒；`loaded` 表示 TLS 栈当前能出示这个名字的证书；错误文本不含 token。
+
+没有可用证书的 host 被拒绝 144 次（约一天；连不上服务器、429 和 5xx 不算）后停止自动下单，
+`state` 是 `stopped`，重启网关也保持。控制方法 `restart_cert_order`（参数 `{host}`）立即重新下单，
+返回这个 host 的状态；host 不归 ACME 管时报错。装上证书（包括手工上传）后自动解除。
 
 ## 11. 当前不要宣称为正式支持的类型
 
