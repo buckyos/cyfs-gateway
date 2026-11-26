@@ -54,6 +54,17 @@
 #     - host: "*.example.org"
 #       challenge_type: dns-01
 #       dns_provider: dns-api
+#     # Entries with the same group share one order, one CSR and one certificate
+#     # (both names in its SANs). The certificate is installed under each host's
+#     # identity. Group entries must use the same challenge settings.
+#     - host: elon.web3.example.com
+#       group: elon.web3.example.com
+#       challenge_type: dns-01
+#       dns_provider: sn-dns
+#     - host: "*.elon.web3.example.com"
+#       group: elon.web3.example.com
+#       challenge_type: dns-01
+#       dns_provider: sn-dns
 #   check_interval: 43200          # certificate check interval (seconds), default 12h
 #   renew_before_expiry: 604800    # renew ahead of expiry (seconds), default a third of the certificate's lifetime
 #   # identity_manager is optional here; defaults to the Gateway-wide identity_manager above

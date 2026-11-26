@@ -163,6 +163,18 @@ fn cert_order_lock(domain: &str) -> Arc<tokio::sync::Mutex<()>> {
     lock
 }
 
+/// Every member is locked: a previous single-domain stub of the same name must
+/// not order while the group does, and vice versa. Sorted order avoids deadlocks.
+fn cert_order_locks(domains: &[String]) -> Vec<Arc<tokio::sync::Mutex<()>>> {
+    let mut names = domains
+        .iter()
+        .map(|domain| normalize_domain(domain))
+        .collect::<Vec<_>>();
+    names.sort();
+    names.dedup();
+    names.iter().map(|domain| cert_order_lock(domain)).collect()
+}
+
 struct CertStubInner {
     acme_item: AcmeItem,
     work_dir: PathBuf,
@@ -170,7 +182,7 @@ struct CertStubInner {
     acme_client: AcmeClient,
     responder: AcmeChallengeResponderRef,
     renew_before_expiry: Option<chrono::Duration>,
-    order_lock: Arc<tokio::sync::Mutex<()>>,
+    order_locks: Vec<Arc<tokio::sync::Mutex<()>>>,
     restart: tokio::sync::Notify,
     mut_part: Mutex<CertMutPart>,
     handle: Mutex<Option<JoinHandle<()>>>,
@@ -219,7 +231,7 @@ impl CertStub {
             .unwrap_or_default();
         Self {
             inner: Arc::new(CertStubInner {
-                order_lock: cert_order_lock(&acme_item.domain),
+                order_locks: cert_order_locks(&acme_item.domains()),
                 acme_item,
                 work_dir,
                 identity_roots,
@@ -302,6 +314,10 @@ impl CertStub {
     }
 
     fn status(&self) -> AcmeCertStatus {
+        self.status_for(self.inner.acme_item.primary())
+    }
+
+    fn status_for(&self, member: &AcmeHostMember) -> AcmeCertStatus {
         let working = self
             .inner
             .handle
@@ -309,15 +325,15 @@ impl CertStub {
             .unwrap()
             .as_ref()
             .is_some_and(|handle| !handle.is_finished());
-        let installed =
-            installed_certificate(&self.inner.identity_roots, self.inner.acme_item.identity())
-                .unwrap_or_else(|e| {
-                    warn!("read installed certificate failed, stub: {}, {}", self, e);
-                    None
-                });
+        let identity = self.identity_for(member);
+        let installed = installed_certificate(&self.inner.identity_roots, identity)
+            .unwrap_or_else(|e| {
+                warn!("read installed certificate failed, stub: {}, {}", self, e);
+                None
+            });
         let mut_part = self.inner.mut_part.lock().unwrap();
         AcmeCertStatus {
-            host: self.inner.acme_item.domain.clone(),
+            host: member.host.clone(),
             state: match &mut_part.state {
                 // Uploaded since the last check.
                 _ if self.is_manual() => AcmeCertState::Manual,
@@ -348,24 +364,48 @@ impl CertStub {
         }));
     }
 
+    fn identity_for<'a>(&'a self, member: &'a AcmeHostMember) -> &'a str {
+        self.inner.acme_item.identity_for(member.host.as_str())
+    }
+
     // Re-read under order_lock before ordering: another manager may have installed
     // a certificate while we waited, or the user uploaded one.
+    //
+    // Every member needs a certificate of its own that covers its name. Existing
+    // single-domain certificates keep being served until one of them is renewed,
+    // then the group is issued once and installed under every identity.
     fn refresh_cert(&self) -> Result<CertCheck> {
-        let info = self.load_identity_cert_info()?;
         let roots = &self.inner.identity_roots;
-        let identity = self.inner.acme_item.identity();
-        let (state, check) = if self.is_manual() {
-            (CertState::Manual(info), CertCheck::Manual)
-        } else {
-            match info {
-                Some(info)
-                    if Self::cert_needs_renewal(&info) || reissue_requested(roots, identity) =>
-                {
-                    (CertState::Renewing(info), CertCheck::OrderNeeded)
-                }
-                Some(info) => (CertState::Ready(info), CertCheck::Current),
-                None => (CertState::None, CertCheck::OrderNeeded),
+        let mut infos = Vec::with_capacity(self.inner.acme_item.members().len());
+        let mut manual = false;
+        let mut needs_order = false;
+        for member in self.inner.acme_item.members() {
+            let identity = self.identity_for(member);
+            let info = self.load_identity_cert_info_for(&member.host, identity)?;
+            if certificate_manager(roots, identity) == Some(CertManager::Manual) {
+                manual = true;
             }
+            match &info {
+                Some(info)
+                    if !Self::cert_needs_renewal(info)
+                        && !reissue_requested(roots, identity) => {}
+                _ => needs_order = true,
+            }
+            infos.push(info);
+        }
+        let primary_info = infos
+            .get(self.primary_index())
+            .and_then(|info| info.clone());
+        let (state, check) = if manual {
+            (CertState::Manual(primary_info), CertCheck::Manual)
+        } else if !needs_order {
+            let info = primary_info.expect("every member has a certificate");
+            (CertState::Ready(info), CertCheck::Current)
+        } else if let Some(info) = primary_info {
+            // Keep serving the certificate we have while the group is issued.
+            (CertState::Renewing(info), CertCheck::OrderNeeded)
+        } else {
+            (CertState::None, CertCheck::OrderNeeded)
         };
         let mut mut_part = self.inner.mut_part.lock().unwrap();
         mut_part.state = state;
@@ -373,6 +413,15 @@ impl CertStub {
             self.clear_failures(&mut mut_part);
         }
         Ok(check)
+    }
+
+    fn primary_index(&self) -> usize {
+        self.inner
+            .acme_item
+            .members()
+            .iter()
+            .position(|member| !member.host.starts_with("*."))
+            .unwrap_or(0)
     }
 
     fn clear_failures(&self, mut_part: &mut CertMutPart) {
@@ -432,15 +481,28 @@ impl CertStub {
         self.load_cert();
     }
 
-    // The uploaded certificate of exactly this host. A manual wildcard certificate
-    // of the parent name does not stop this host from getting its own.
+    // Any uploaded certificate of the group stops the order: replacing one member
+    // while keeping the others would leave the certificate split.
     fn is_manual(&self) -> bool {
-        certificate_manager(&self.inner.identity_roots, self.inner.acme_item.identity())
-            == Some(CertManager::Manual)
+        let roots = &self.inner.identity_roots;
+        self.inner
+            .acme_item
+            .members()
+            .iter()
+            .any(|member| certificate_manager(roots, self.identity_for(member)) == Some(CertManager::Manual))
     }
 
     fn load_identity_cert_info(&self) -> Result<Option<CertInfo>> {
-        let identity = self.inner.acme_item.identity();
+        let primary = self.inner.acme_item.primary();
+        let identity = self.identity_for(primary);
+        self.load_identity_cert_info_for(&primary.host, identity)
+    }
+
+    fn load_identity_cert_info_for(
+        &self,
+        host: &str,
+        identity: &str,
+    ) -> Result<Option<CertInfo>> {
         let cert_match = match self.inner.identity_roots.find_public_file(
             identity,
             IdentityUsage::Server,
@@ -515,7 +577,7 @@ impl CertStub {
         if let Err(e) = validate_identity_certificate(
             &self.inner.identity_roots,
             identity,
-            &self.inner.acme_item.domain,
+            host,
             leaf,
             &private_key,
         ) {
@@ -560,9 +622,16 @@ impl CertStub {
 
     // Returns false when the order was overtaken by an uploaded certificate.
     async fn order_inner(&self, issued_cert: &mut Option<(Vec<u8>, Vec<u8>)>) -> Result<bool> {
+        if self.is_manual() {
+            info!(
+                "skip acme order, stub: {} has a manual certificate",
+                self
+            );
+            return Ok(false);
+        }
         if issued_cert.is_none() {
             let mut order = AcmeOrderSession::new(
-                self.inner.acme_item.domain.clone(),
+                self.inner.acme_item.domains(),
                 self.inner.acme_client.clone(),
                 self.inner.responder.clone(),
             );
@@ -580,22 +649,23 @@ impl CertStub {
         let (cert_data, key_data) = issued_cert.as_ref().unwrap();
         let info = self.cert_info(cert_data, key_data)?;
 
-        install_acme_certificate(
-            &self.inner.identity_roots,
-            self.inner.acme_item.identity(),
-            &self.inner.acme_item.domain,
-            &self.inner.work_dir,
-            cert_data,
-            key_data,
-            info.renew_before,
-        )?;
+        for member in self.inner.acme_item.members() {
+            let identity = self.identity_for(member).to_string();
+            install_acme_certificate(
+                &self.inner.identity_roots,
+                &identity,
+                &member.host,
+                &self.inner.work_dir,
+                cert_data,
+                key_data,
+                info.renew_before,
+            )?;
 
-        info!(
-            "install identity cert success, stub: {}, identity: {}, expires: {}",
-            self,
-            self.inner.acme_item.identity(),
-            info.expires
-        );
+            info!(
+                "install identity cert success, stub: {}, identity: {}, expires: {}",
+                self, identity, info.expires
+            );
+        }
 
         {
             let mut mut_part = self.inner.mut_part.lock().unwrap();
@@ -638,7 +708,11 @@ impl CertStub {
     // Returns false when the certificate turned out to be managed by the user, or
     // the order was refused too often.
     async fn order_until_installed(&self) -> Result<bool> {
-        let _order_guard = self.inner.order_lock.lock().await;
+        let mut order_guards = Vec::with_capacity(self.inner.order_locks.len());
+        for lock in &self.inner.order_locks {
+            order_guards.push(lock.lock().await);
+        }
+        let _order_guards = order_guards;
         let mut interval = 15;
         let mut issued_cert = None;
         loop {
@@ -722,10 +796,30 @@ fn identity_private_key_path(roots: &IdentityRoots, dir_name: &str) -> PathBuf {
         .join("server.private.pem")
 }
 
+/// One certificate name and the identity directory it is installed in.
+#[derive(Clone, Debug)]
+pub struct AcmeHostMember {
+    pub host: String,
+    pub identity: Option<String>,
+}
+
+impl AcmeHostMember {
+    pub fn new(host: impl Into<String>, identity: Option<String>) -> Self {
+        Self {
+            host: host.into(),
+            identity,
+        }
+    }
+}
+
+fn normalize_domain(domain: &str) -> String {
+    domain.trim().trim_end_matches('.').to_ascii_lowercase()
+}
+
+/// One ACME certificate: one order and one CSR for all of its members.
 #[derive(Clone, Debug)]
 pub struct AcmeItem {
-    domain: String,
-    identity: Option<String>,
+    members: Vec<AcmeHostMember>,
     identity_manager: Option<AcmeIdentityConfig>,
     challenge_type: ChallengeType,
     data: Option<serde_json::Value>,
@@ -738,12 +832,45 @@ impl AcmeItem {
         data: Option<serde_json::Value>,
     ) -> Self {
         Self {
-            domain,
-            identity: None,
+            members: vec![AcmeHostMember::new(domain, None)],
             identity_manager: None,
             challenge_type,
             data,
         }
+    }
+
+    /// `members` share one certificate. The first non-wildcard member is the
+    /// primary: the CSR common name and the work directory name.
+    pub fn new_group(
+        members: Vec<AcmeHostMember>,
+        challenge_type: ChallengeType,
+        data: Option<serde_json::Value>,
+        identity_manager: Option<AcmeIdentityConfig>,
+    ) -> Result<Self> {
+        if members.is_empty() {
+            return Err(anyhow::anyhow!("acme certificate group is empty"));
+        }
+        let mut seen = std::collections::HashSet::new();
+        let mut unique = Vec::with_capacity(members.len());
+        for member in members {
+            let host = member.host.trim().trim_end_matches('.');
+            if host.is_empty() {
+                return Err(anyhow::anyhow!("acme host cannot be empty"));
+            }
+            if !seen.insert(normalize_domain(host)) {
+                return Err(anyhow::anyhow!(
+                    "acme certificate group lists {} twice",
+                    host
+                ));
+            }
+            unique.push(AcmeHostMember::new(host, member.identity));
+        }
+        Ok(Self {
+            members: unique,
+            identity_manager,
+            challenge_type,
+            data,
+        })
     }
 
     pub fn with_identity(
@@ -751,13 +878,77 @@ impl AcmeItem {
         identity: Option<String>,
         identity_manager: Option<AcmeIdentityConfig>,
     ) -> Self {
-        self.identity = identity;
+        if let Some(member) = self.members.first_mut() {
+            member.identity = identity;
+        }
         self.identity_manager = identity_manager;
         self
     }
 
+    pub fn members(&self) -> &[AcmeHostMember] {
+        &self.members
+    }
+
+    /// The non-wildcard member, or the first one if every name is a wildcard.
+    pub fn primary(&self) -> &AcmeHostMember {
+        self.members
+            .iter()
+            .find(|member| !member.host.starts_with("*."))
+            .unwrap_or(&self.members[0])
+    }
+
+    /// All names with the primary first.
+    pub fn domains(&self) -> Vec<String> {
+        let primary = normalize_domain(&self.primary().host);
+        let mut domains = Vec::with_capacity(self.members.len());
+        domains.push(self.primary().host.clone());
+        for member in &self.members {
+            if normalize_domain(&member.host) != primary {
+                domains.push(member.host.clone());
+            }
+        }
+        domains
+    }
+
+    pub fn contains_host(&self, host: &str) -> bool {
+        let host = normalize_domain(host);
+        self.members
+            .iter()
+            .any(|member| normalize_domain(&member.host) == host)
+    }
+
+    pub fn overlaps(&self, other: &AcmeItem) -> bool {
+        self.members
+            .iter()
+            .any(|member| other.contains_host(&member.host))
+    }
+
+    /// Same names, identities and challenge settings: a repeated registration.
+    pub fn same_group(&self, other: &AcmeItem) -> bool {
+        self.challenge_type == other.challenge_type
+            && self.data == other.data
+            && self.members.len() == other.members.len()
+            && self.members.iter().all(|member| {
+                other.contains_host(&member.host)
+                    && other.identity_for(&member.host)
+                        == self.identity_for(&member.host)
+            })
+    }
+
+    /// The identity directory of `host`; a member without one uses its own name.
+    pub fn identity_for<'a>(&'a self, host: &'a str) -> &'a str {
+        match self
+            .members
+            .iter()
+            .find(|member| normalize_domain(&member.host) == normalize_domain(host))
+        {
+            Some(member) => member.identity.as_deref().unwrap_or(member.host.as_str()),
+            None => host,
+        }
+    }
+
     pub fn identity(&self) -> &str {
-        self.identity.as_deref().unwrap_or(self.domain.as_str())
+        self.identity_for(self.primary().host.as_str())
     }
 
     fn identity_roots(
@@ -1111,9 +1302,27 @@ impl AcmeCertManager {
     }
 
     pub fn add_acme_item(&self, item: AcmeItem) -> Result<()> {
+        {
+            let certs = self.certs.read().unwrap();
+            for existing in certs.values() {
+                if !existing.inner.acme_item.overlaps(&item) {
+                    continue;
+                }
+                if existing.inner.acme_item.same_group(&item) {
+                    return Ok(());
+                }
+                return Err(anyhow::anyhow!(
+                    "acme host {} is already part of another certificate: {:?}",
+                    item.primary().host,
+                    existing.inner.acme_item.domains()
+                ));
+            }
+        }
+
+        let primary = item.primary().host.clone();
         let work_dir = buckyos_kit::path_join(
             &self.config.keystore_path,
-            &sanitize_path_component(&item.domain),
+            &sanitize_path_component(&primary),
         );
         if !work_dir.exists() {
             if let Err(e) = std::fs::create_dir_all(&work_dir) {
@@ -1132,10 +1341,6 @@ impl AcmeCertManager {
         let responder = { self.responder.lock().unwrap().clone().unwrap() };
         let identity_roots = item.identity_roots(&self.config.identity_manager)?;
         let mut certs = self.certs.write().unwrap();
-        if certs.contains_key(&item.domain) {
-            return Ok(());
-        }
-        let domain = item.domain.clone();
         let cert_stub = CertStub::new(
             item,
             work_dir,
@@ -1144,24 +1349,51 @@ impl AcmeCertManager {
             responder,
             self.config.renew_before_expiry,
         );
-        certs.insert(domain, cert_stub.clone());
+        certs.insert(primary, cert_stub.clone());
         cert_stub.load_cert();
         Ok(())
     }
 
+    /// A stub owning exactly this name (authz identifiers are group members).
+    fn get_cert_stub_by_member(&self, host: &str) -> Option<CertStub> {
+        self.certs
+            .read()
+            .unwrap()
+            .values()
+            .find(|stub| stub.inner.acme_item.contains_host(host))
+            .cloned()
+    }
+
     pub fn get_cert_by_host(&self, host: &str) -> Option<CertStub> {
         let certs = self.certs.read().unwrap();
-        let cert = certs.get(host);
-        if cert.is_some() {
+        if let Some(cert) = certs.get(host) {
             info!("find tls config for host: {}", host);
-            return Some(cert.unwrap().clone());
+            return Some(cert.clone());
         }
 
-        for (key, value) in certs.iter() {
-            if key.starts_with("*.") {
-                if host.ends_with(&key[2..]) {
-                    info!("find tls config for host: {} ==> key:{}", host, key);
-                    return Some(value.clone());
+        for (key, stub) in certs.iter() {
+            if key.eq_ignore_ascii_case(host) {
+                info!("find tls config for host: {}", host);
+                return Some(stub.clone());
+            }
+        }
+
+        for stub in certs.values() {
+            if stub.inner.acme_item.contains_host(host) {
+                info!(
+                    "find tls config for host: {} ==> {:?}",
+                    host,
+                    stub.inner.acme_item.domains()
+                );
+                return Some(stub.clone());
+            }
+        }
+
+        for stub in certs.values() {
+            for domain in stub.inner.acme_item.domains() {
+                if wildcard_covers(host, &domain) {
+                    info!("find tls config for host: {} ==> {}", host, domain);
+                    return Some(stub.clone());
                 }
             }
         }
@@ -1189,14 +1421,9 @@ impl AcmeCertManager {
         challenges: &'a [Challenge],
     ) -> anyhow::Result<&'a Challenge> {
         for challenge in challenges {
-            let cert_stub = {
-                let certs = self.certs.read().unwrap();
-                certs.get(challenge.domain.as_str()).cloned()
-            };
-            if cert_stub.is_none() {
+            let Some(cert_stub) = self.get_cert_stub_by_member(&challenge.domain) else {
                 continue;
-            }
-            let cert_stub = cert_stub.unwrap();
+            };
 
             match challenge.data {
                 ChallengeData::TlsAlpn01 { ref cert } => {
@@ -1213,8 +1440,13 @@ impl AcmeCertManager {
                     ref key_hash,
                 } => {
                     if cert_stub.inner.acme_item.challenge_type == ChallengeType::Dns01 {
-                        self.call_dns_provider(&cert_stub, key_hash.as_str(), "add_challenge")
-                            .await?;
+                        self.call_dns_provider(
+                            &cert_stub,
+                            &challenge.domain,
+                            key_hash.as_str(),
+                            "add_challenge",
+                        )
+                        .await?;
                         return Ok(challenge);
                     } else {
                         continue;
@@ -1252,19 +1484,15 @@ impl AcmeCertManager {
                 token: _,
                 ref key_hash,
             } => {
-                let cert_stub = {
-                    let certs = self.certs.read().unwrap();
-                    certs.get(challenge.domain.as_str()).cloned()
-                };
-                if cert_stub.is_none() {
+                let Some(cert_stub) = self.get_cert_stub_by_member(&challenge.domain) else {
                     return;
-                }
-                let cert_stub = cert_stub.unwrap();
+                };
                 let key_hash = key_hash.to_string();
+                let domain = challenge.domain.clone();
                 let this = self.clone();
                 tokio::spawn(async move {
                     if let Err(e) = this
-                        .call_dns_provider(&cert_stub, key_hash.as_str(), "del_challenge")
+                        .call_dns_provider(&cert_stub, &domain, key_hash.as_str(), "del_challenge")
                         .await
                     {
                         error!("revert challenge failed: {}", e);
@@ -1272,11 +1500,11 @@ impl AcmeCertManager {
                 });
             }
             ChallengeData::Http01 {
-                token: _,
+                ref token,
                 key_auth: _,
             } => {
                 let mut http_challenges = self.http_challenges.lock().unwrap();
-                http_challenges.remove(&challenge.domain);
+                http_challenges.remove(token);
             }
         }
     }
@@ -1315,11 +1543,7 @@ impl AcmeCertManager {
         let ChallengeData::Dns01 { key_hash, .. } = &challenge.data else {
             return Ok(());
         };
-        let cert_stub = {
-            let certs = self.certs.read().unwrap();
-            certs.get(challenge.domain.as_str()).cloned()
-        };
-        let Some(cert_stub) = cert_stub else {
+        let Some(cert_stub) = self.get_cert_stub_by_member(&challenge.domain) else {
             return Ok(());
         };
         let factory = cert_stub
@@ -1348,6 +1572,7 @@ impl AcmeCertManager {
     async fn call_dns_provider(
         &self,
         cert_stub: &CertStub,
+        challenge_domain: &str,
         key_hash: &str,
         op: &str,
     ) -> Result<()> {
@@ -1356,21 +1581,22 @@ impl AcmeCertManager {
         provider
             .call(
                 op.to_string(),
-                dns_challenge_name(&cert_stub.inner.acme_item.domain),
+                dns_challenge_name(challenge_domain),
                 key_hash.to_string(),
             )
             .await
     }
 
     /// Orders the certificate of a host again now; false when it is not managed here.
+    /// Any member of a certificate restarts the whole group.
     pub fn restart_cert(&self, host: &str) -> bool {
         let stub = self
             .certs
             .read()
             .unwrap()
-            .iter()
-            .find(|(domain, _)| domain.eq_ignore_ascii_case(host))
-            .map(|(_, stub)| stub.clone());
+            .values()
+            .find(|stub| stub.inner.acme_item.contains_host(host))
+            .cloned();
         match stub {
             Some(stub) => {
                 info!("restart cert order, stub: {}", stub);
@@ -1381,7 +1607,8 @@ impl AcmeCertManager {
         }
     }
 
-    /// Every managed host, sorted by name.
+    /// Every managed host, sorted by name. All members of a certificate share its
+    /// state; each reports the certificate installed in its own identity.
     pub fn cert_statuses(&self) -> Vec<AcmeCertStatus> {
         let certs = self
             .certs
@@ -1390,10 +1617,32 @@ impl AcmeCertManager {
             .values()
             .cloned()
             .collect::<Vec<_>>();
-        let mut statuses = certs.iter().map(CertStub::status).collect::<Vec<_>>();
+        let mut statuses = certs
+            .iter()
+            .flat_map(|stub| {
+                stub.inner
+                    .acme_item
+                    .members()
+                    .iter()
+                    .map(|member| stub.status_for(member))
+            })
+            .collect::<Vec<_>>();
         statuses.sort_by(|a, b| a.host.cmp(&b.host));
         statuses
     }
+}
+
+/// `*.example.com` covers `a.example.com`, one label only.
+fn wildcard_covers(host: &str, pattern: &str) -> bool {
+    let Some(suffix) = pattern.strip_prefix("*.") else {
+        return false;
+    };
+    let host = normalize_domain(host);
+    let suffix = normalize_domain(suffix);
+    host.len() > suffix.len() + 1
+        && host.ends_with(&suffix)
+        && host.as_bytes()[host.len() - suffix.len() - 1] == b'.'
+        && !host[..host.len() - suffix.len() - 1].contains('.')
 }
 
 /// `<domain>` and `*.<domain>` share one challenge name.
@@ -1492,12 +1741,13 @@ mod tests {
 
     // A certificate of `lifetime` that expires in `left`.
     fn install_aged_cert(stub: &CertStub, lifetime: chrono::Duration, left: chrono::Duration) {
-        let domain = &stub.inner.acme_item.domain;
+        let primary = stub.inner.acme_item.primary();
+        let domain = &primary.host;
         let not_after = chrono::Utc::now() + left;
         let (cert, key) = generate_test_cert_between(domain, not_after - lifetime, not_after);
         install_acme_certificate(
             &stub.inner.identity_roots,
-            stub.inner.acme_item.identity(),
+            stub.identity_for(primary),
             domain,
             &stub.inner.work_dir,
             &cert,
@@ -1777,7 +2027,11 @@ mod tests {
             .unwrap();
         let stub = test_stub(&manager, "example.com");
         install_aged_cert(&stub, chrono::Duration::days(90), chrono::Duration::days(3));
-        let _guard = stub.inner.order_lock.lock().await;
+        let mut guards = Vec::new();
+        for lock in &stub.inner.order_locks {
+            guards.push(lock.lock().await);
+        }
+        let _guards = guards;
         stub.load_cert();
         wait_until(|| stub.get_cert().is_some()).await;
         {
@@ -1915,7 +2169,7 @@ mod tests {
     }
 
     fn install_manual(stub: &CertStub, valid_days: u32) {
-        let domain = &stub.inner.acme_item.domain;
+        let domain = &stub.inner.acme_item.primary().host;
         let (fullchain_pem, key_pem) = generate_test_cert(domain, valid_days);
         install_manual_certificates(
             &stub.inner.identity_roots,
@@ -2034,7 +2288,13 @@ mod tests {
         let manual = installed_fingerprint(&stub);
         assert_eq!(stub.status().state, AcmeCertState::Manual);
         server.order_gate.add_permits(100);
-        wait_until(|| stub.inner.order_lock.try_lock().is_ok()).await;
+        wait_until(|| {
+            stub.inner
+                .order_locks
+                .iter()
+                .all(|lock| lock.try_lock().is_ok())
+        })
+        .await;
         tokio::time::sleep(MANUAL_CHECK_INTERVAL * 5).await;
         assert_eq!(installed_fingerprint(&stub), manual);
         assert_eq!(server.orders(), 1);
@@ -2282,6 +2542,155 @@ mod tests {
                 .unwrap();
         }
         manager
+    }
+
+    async fn dns_group_manager(
+        temp: &Path,
+        server: &MockAcme,
+        provider: &str,
+        dns: &Arc<FakeDns>,
+    ) -> AcmeCertManagerRef {
+        server.state.dns_challenges.store(true, Ordering::SeqCst);
+        server.order_gate.add_permits(100);
+        server.validation_gate.add_permits(100);
+        AcmeCertManager::register_dns_provider_factory(
+            provider,
+            Arc::new(FakeDnsFactory(dns.clone())),
+        );
+        let mut config = test_config(temp, server);
+        config.dns_providers = Some(HashMap::from([(
+            provider.to_string(),
+            serde_json::json!({}),
+        )]));
+        let manager = AcmeCertManager::create(config).await.unwrap();
+        let members = ["example.com", "*.example.com"]
+            .iter()
+            .map(|host| AcmeHostMember::new(*host, None))
+            .collect();
+        manager
+            .add_acme_item(
+                AcmeItem::new_group(
+                    members,
+                    ChallengeType::Dns01,
+                    Some(serde_json::json!({ "dns_provider": provider })),
+                    None,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        manager
+    }
+
+    #[tokio::test]
+    async fn a_group_gets_one_order_and_one_certificate() {
+        const NAME: &str = "_acme-challenge.example.com";
+        let temp = tempfile::tempdir().unwrap();
+        let server = MockAcme::new().await;
+        let dns = Arc::new(FakeDns::default());
+        dns.propagates.store(true, Ordering::SeqCst);
+        let manager = dns_group_manager(temp.path(), &server, "test-group-one", &dns).await;
+
+        wait_until(|| {
+            manager
+                .cert_statuses()
+                .iter()
+                .all(|status| status.state == AcmeCertState::Ready)
+        })
+        .await;
+        assert_eq!(server.orders(), 1);
+
+        let statuses = manager.cert_statuses();
+        assert_eq!(statuses.len(), 2);
+        let installed = statuses
+            .iter()
+            .map(|status| status.installed.clone().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(installed[0].fingerprint, installed[1].fingerprint);
+        for certificate in &installed {
+            assert!(certificate.dns_names.contains(&"example.com".to_string()));
+            assert!(certificate.dns_names.contains(&"*.example.com".to_string()));
+        }
+
+        let primary = manager.get_cert_by_host("example.com").unwrap();
+        let wildcard = manager.get_cert_by_host("*.example.com").unwrap();
+        assert!(primary.get_cert().is_some());
+        assert!(wildcard.get_cert().is_some());
+        assert!(manager.get_cert_by_host("sub.example.com").is_some());
+        assert!(manager.get_cert_by_host("other.example").is_none());
+        assert!(manager.restart_cert("*.example.com"));
+
+        wait_until(|| dns.values(NAME).is_empty()).await;
+    }
+
+    #[tokio::test]
+    async fn existing_host_certificates_are_merged_on_the_next_order() {
+        let temp = tempfile::tempdir().unwrap();
+        let server = MockAcme::new().await;
+        let dns = Arc::new(FakeDns::default());
+        dns.propagates.store(true, Ordering::SeqCst);
+        let roots = IdentityRoots::new(
+            temp.path().join("identity"),
+            temp.path().join("security"),
+        );
+        let seed_work = temp.path().join("seed");
+        std::fs::create_dir_all(&seed_work).unwrap();
+        for host in ["example.com", "*.example.com"] {
+            let (cert, key) = generate_test_cert(host, 90);
+            install_acme_certificate(
+                &roots,
+                host,
+                host,
+                &seed_work,
+                &cert,
+                &key,
+                chrono::Duration::days(7),
+            )
+            .unwrap();
+        }
+
+        let manager = dns_group_manager(temp.path(), &server, "test-group-merge", &dns).await;
+        wait_until(|| {
+            manager
+                .cert_statuses()
+                .iter()
+                .all(|status| status.state == AcmeCertState::Ready)
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(server.orders(), 0, "valid per-host certificates are kept");
+        let before = manager.cert_statuses();
+        assert_ne!(
+            before[0].installed.as_ref().unwrap().fingerprint,
+            before[1].installed.as_ref().unwrap().fingerprint
+        );
+
+        // One of the old certificates goes away: renew the whole group once.
+        let paths = roots
+            .x509_paths("*.example.com", IdentityUsage::Server)
+            .unwrap();
+        std::fs::remove_file(&paths.fullchain).unwrap();
+        manager.check_all_certs().unwrap();
+        wait_until(|| server.orders() == 1).await;
+        wait_until(|| {
+            let statuses = manager.cert_statuses();
+            let fingerprints = statuses
+                .iter()
+                .filter_map(|status| {
+                    status
+                        .installed
+                        .as_ref()
+                        .map(|certificate| certificate.fingerprint.clone())
+                })
+                .collect::<Vec<_>>();
+            fingerprints.len() == 2 && fingerprints[0] == fingerprints[1]
+        })
+        .await;
+        let after = manager.cert_statuses();
+        assert_eq!(
+            after[0].installed.as_ref().unwrap().fingerprint,
+            after[1].installed.as_ref().unwrap().fingerprint
+        );
+        assert_eq!(server.orders(), 1);
     }
 
     #[tokio::test]

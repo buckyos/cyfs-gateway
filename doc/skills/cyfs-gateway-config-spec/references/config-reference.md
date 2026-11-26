@@ -678,9 +678,18 @@ HTTP S2S provider 场景使用 `app_did` 加载应用身份；不要从字段名
 - `check_interval?`
 - `renew_before_expiry?`
 
-`hosts` 元素：`host`（别名 `hostname` / `domain`）、`challenge_type?`（别名 `acme_type` /
-`method`）、`dns_provider?`、`identity?`、`identity_manager?`，以及扁平附加数据。
+`hosts` 元素：`host`（别名 `hostname` / `domain`）、`group?`（别名 `cert_group`）、
+`challenge_type?`（别名 `acme_type` / `method`）、`dns_provider?`、`identity?`、
+`identity_manager?`，以及扁平附加数据。
 当前 `AcmeConfig` 没有 `issuers` 字段，不能把它列为生效配置。
+
+`group` 相同的条目共用一张证书：只发一个包含全部域名的 `newOrder`，CSR 的 SAN 写入组内所有
+host，证书按各条目自己的 `identity`（缺省为 host）分别安装到每个身份目录，因此两个 host 的
+TLS 握手拿到同一张证书。组内 `challenge_type`、`dns_provider`、扁平数据和 `identity_manager`
+必须一致；主域名取组内第一个非 `*.` 的 host（决定 CSR CN 和工作目录）。`<domain>` 与
+`*.<domain>` 的 DNS-01 授权落在同一个 `_acme-challenge.<domain>`，provider 必须按值增删，不能
+用一条 TXT 覆盖另一条。组内任一身份目录里是 `manual` 证书时整组不下单；已有各自有效证书的
+host 在组内任一证书需要续期时合并续期一次。不同条目（组或单域名）出现相同 host 视为配置错误。
 
 `check_interval` 和 `renew_before_expiry` 的单位是秒，默认 12 小时、证书有效期（notAfter − notBefore）的三分之一。
 `renew_before_expiry` 不短于证书有效期时按默认处理。续期失败后从 30 秒开始加倍重试：现有证书剩余超过一天时最长
@@ -701,7 +710,7 @@ HTTP S2S provider 场景使用 `app_did` 加载应用身份；不要从字段名
 
 证书的归属看身份路径里 `server.meta.json` 的 `renewal.manager`：`acme` 由 ACME 签发和续期；
 `manual` 是用户上传的，ACME 对这个 host 不下单、不覆盖、不重试，状态为 `manual`。只看 host 自己的身份目录，
-父域的手工通配证书不影响它。
+父域的手工通配证书不影响它；同一个 `group` 内任一 host 是 `manual` 时，整组都停止下达新订单。
 
 ### `self_cert_report`
 

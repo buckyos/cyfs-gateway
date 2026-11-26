@@ -32,6 +32,16 @@
 #     - host: "*.example.org"
 #       challenge_type: dns-01
 #       dns_provider: dns-api
+#     # 同一 group 的条目共用一次订单、一份 CSR 和一张证书（两个域名都在 SAN 中），
+#     # 证书会写入每个 host 自己的身份目录；组内校验方式必须一致
+#     - host: elon.web3.example.com
+#       group: elon.web3.example.com
+#       challenge_type: dns-01
+#       dns_provider: sn-dns
+#     - host: "*.elon.web3.example.com"
+#       group: elon.web3.example.com
+#       challenge_type: dns-01
+#       dns_provider: sn-dns
 #   # 身份路径里 server.meta.json 的 renewal.manager = manual 的证书（用户上传）不下单、不覆盖
 #   # identity_manager 可选；默认继承 Gateway 级 identity_manager
 #   check_interval: 43200          # 证书检查周期（秒），默认 12h

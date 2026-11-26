@@ -223,7 +223,7 @@ impl GatewayModule for DnsGatewayModule {
                                 .add_record(domain, "TXT", value)
                                 .map_err(|e| anyhow::anyhow!(e.to_string())),
                             "del_challenge" => {
-                                record_manager.remove_record(domain, "TXT");
+                                record_manager.remove_record_value(domain, "TXT", value.as_str());
                                 Ok(())
                             }
                             _ => Err(anyhow::anyhow!("unsupported local DNS operation: {}", op)),
