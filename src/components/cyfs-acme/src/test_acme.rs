@@ -159,12 +159,16 @@ async fn serve(
             } else {
                 let mut authorizations = Vec::new();
                 if state.dns_challenges.load(Ordering::SeqCst) {
-                    let identifier = payload["identifiers"][0]["value"].as_str().unwrap();
-                    state.identifiers.lock().unwrap().insert(
-                        id.to_string(),
-                        identifier.trim_start_matches("*.").to_string(),
-                    );
-                    authorizations.push(format!("{url}/authz/{id}"));
+                    for (index, identifier) in
+                        payload["identifiers"].as_array().unwrap().iter().enumerate()
+                    {
+                        let auth_id = format!("{id}-{index}");
+                        state.identifiers.lock().unwrap().insert(
+                            auth_id.clone(),
+                            identifier["value"].as_str().unwrap().to_string(),
+                        );
+                        authorizations.push(format!("{url}/authz/{auth_id}"));
+                    }
                 }
                 json!({
                     "status": "ready", "expires": "2099-01-01T00:00:00Z",

@@ -25,6 +25,17 @@ use tokio::fs;
 const FINALIZE_POLL_ATTEMPTS: usize = 30;
 const FINALIZE_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
+/// Trims, drops empty entries and removes duplicates (DNS names are case-insensitive).
+fn unique_domains(domains: &[String]) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    domains
+        .iter()
+        .map(|domain| domain.trim().trim_end_matches('.').to_string())
+        .filter(|domain| !domain.is_empty())
+        .filter(|domain| seen.insert(domain.to_ascii_lowercase()))
+        .collect()
+}
+
 /// ACME 目录结构
 #[derive(Debug, Deserialize, Clone)]
 struct Directory {
@@ -312,7 +323,7 @@ pub type AcmeChallengeResponderRef = Arc<dyn AcmeChallengeResponder>;
 
 /// 证书订单会话
 pub struct AcmeOrderSession {
-    domain: String,
+    domains: Vec<String>,
     valid_days: u32,
     key_type: KeyType,
     status: OrderStatus,
@@ -324,14 +335,20 @@ pub struct AcmeOrderSession {
 
 impl std::fmt::Display for AcmeOrderSession {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "AcmeOrderSession(domains: {})", self.domain)
+        write!(f, "AcmeOrderSession(domains: {})", self.domains.join(","))
     }
 }
 
 impl AcmeOrderSession {
-    pub fn new(domain: String, client: AcmeClient, responder: AcmeChallengeResponderRef) -> Self {
+    /// The first non-wildcard domain becomes the CSR common name; every entry goes
+    /// into the SAN extension and the single order.
+    pub fn new(
+        domains: Vec<String>,
+        client: AcmeClient,
+        responder: AcmeChallengeResponderRef,
+    ) -> Self {
         Self {
-            domain,
+            domains,
             valid_days: 90,
             key_type: KeyType::Rsa2048,
             status: OrderStatus::New,
@@ -348,7 +365,7 @@ impl AcmeOrderSession {
         // 1. 创建订单
         let (authorizations, finalize_url, order_url) = self
             .client
-            .create_order(&[self.domain.clone()], directory.clone())
+            .create_order(&self.domains, directory.clone())
             .await?;
 
         // 更新订单信息和状态
@@ -362,14 +379,12 @@ impl AcmeOrderSession {
         // 2. 处理每个授权
         if let Some(order_info) = &self.order_info {
             for auth_url in &order_info.authorizations {
-                // 获取挑战信息
-                let mut challenges = self
+                // 获取挑战信息。挑战的 domain 保留授权标识符（通配符授权会是
+                // `*.example.com`），响应方据此在同一组内找到证书。
+                let challenges = self
                     .client
                     .get_challenge(auth_url, directory.clone())
                     .await?;
-                for challenge in challenges.iter_mut() {
-                    challenge.domain = self.domain.clone();
-                }
                 info!(
                     "got acme challenge, client: {}, challenge: {:?}",
                     self, challenges
@@ -398,7 +413,7 @@ impl AcmeOrderSession {
         // 3. 完成订单
         if let Some(order_info) = &self.order_info {
             // 生成CSR
-            let (csr, private_key) = self.client.generate_csr(&[self.domain.clone()])?;
+            let (csr, private_key) = self.client.generate_csr(&self.domains)?;
 
             // Finalize订单
             let cert_url = self
@@ -1004,14 +1019,18 @@ impl AcmeClient {
         domains: &[String],
         directory: Directory,
     ) -> Result<(Vec<String>, String, Option<String>)> {
+        let identifiers = unique_domains(domains);
+        if identifiers.is_empty() {
+            return Err(anyhow::anyhow!("acme order has no domains"));
+        }
         info!(
             "create acme order, client: {}, domains: {}",
             self,
-            domains.join(",")
+            identifiers.join(",")
         );
         // 构造订单请求
         let request = OrderRequest {
-            identifiers: domains
+            identifiers: identifiers
                 .iter()
                 .map(|domain| Identifier {
                     type_: "dns".to_string(),
@@ -1050,6 +1069,13 @@ impl AcmeClient {
     }
 
     fn generate_csr(&self, domains: &[String]) -> Result<(Vec<u8>, Vec<u8>)> {
+        let domains = unique_domains(domains);
+        let primary = domains
+            .iter()
+            .find(|domain| !domain.starts_with("*."))
+            .or_else(|| domains.first())
+            .ok_or_else(|| anyhow::anyhow!("acme CSR has no domains"))?;
+
         let rsa = Rsa::generate(2048)?;
         let pkey = PKey::from_rsa(rsa)?;
 
@@ -1057,19 +1083,17 @@ impl AcmeClient {
         builder.set_pubkey(&pkey)?;
 
         let mut name_builder = X509NameBuilder::new()?;
-        name_builder.append_entry_by_text("CN", &domains[0])?;
+        name_builder.append_entry_by_text("CN", primary)?;
         builder.set_subject_name(&name_builder.build())?;
 
-        if !domains.is_empty() {
-            let mut san = SubjectAlternativeName::new();
-            for domain in domains {
-                san.dns(domain);
-            }
-            let ext = san.build(&builder.x509v3_context(None))?;
-            let mut stack = openssl::stack::Stack::new()?;
-            stack.push(ext)?;
-            builder.add_extensions(&stack)?;
+        let mut san = SubjectAlternativeName::new();
+        for domain in &domains {
+            san.dns(domain);
         }
+        let ext = san.build(&builder.x509v3_context(None))?;
+        let mut stack = openssl::stack::Stack::new()?;
+        stack.push(ext)?;
+        builder.add_extensions(&stack)?;
 
         builder.sign(&pkey, openssl::hash::MessageDigest::sha256())?;
 

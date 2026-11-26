@@ -18,7 +18,10 @@ use crate::{
 use anyhow::{Result, anyhow};
 use buckyos_kit::*;
 use chrono::Utc;
-use cyfs_acme::{AcmeCertManager, AcmeCertManagerRef, AcmeItem, CertManagerConfig, ChallengeType};
+use cyfs_acme::{
+    AcmeCertManager, AcmeCertManagerRef, AcmeHostMember, AcmeIdentityConfig, AcmeItem,
+    CertManagerConfig, ChallengeType,
+};
 use cyfs_process_chain::CollectionValue;
 use jsonwebtoken::jwk::Jwk;
 use jsonwebtoken::{DecodingKey, EncodingKey};
@@ -267,6 +270,132 @@ fn build_acme_host_data(host_config: &AcmeHostConfig) -> Result<Option<Value>> {
     }
 }
 
+struct PreparedAcmeHost {
+    host: String,
+    group: Option<String>,
+    identity: Option<String>,
+    identity_manager: Option<AcmeIdentityConfig>,
+    challenge_type: ChallengeType,
+    data: Option<Value>,
+}
+
+fn validate_acme_host(host: &str) -> Result<()> {
+    if host.is_empty() {
+        return Err(anyhow!("acme host cannot be empty"));
+    }
+    if host == "*" {
+        return Err(anyhow!(
+            "acme host '*' is not a valid ACME certificate domain"
+        ));
+    }
+    match host.strip_prefix("*.") {
+        Some(rest) if rest.is_empty() || rest.contains('*') || !rest.contains('.') => {
+            Err(anyhow!(
+                "acme host {} is not a valid wildcard certificate domain",
+                host
+            ))
+        }
+        None if host.contains('*') => Err(anyhow!(
+            "acme host {} is not a valid ACME certificate domain",
+            host
+        )),
+        _ => Ok(()),
+    }
+}
+
+fn prepare_acme_host(host_config: &AcmeHostConfig) -> Result<PreparedAcmeHost> {
+    let host = host_config.host.trim();
+    validate_acme_host(host)?;
+
+    let challenge_type = host_config
+        .challenge_type
+        .unwrap_or(ChallengeType::TlsAlpn01);
+    if challenge_type == ChallengeType::Unknown {
+        return Err(anyhow!("acme host {} has unknown challenge_type", host));
+    }
+
+    let data = build_acme_host_data(host_config)?;
+    if challenge_type == ChallengeType::Dns01 {
+        let has_dns_provider = data
+            .as_ref()
+            .and_then(|data| data.get("dns_provider"))
+            .and_then(|provider| provider.as_str())
+            .map(|provider| !provider.trim().is_empty())
+            .unwrap_or(false);
+        if !has_dns_provider {
+            return Err(anyhow!(
+                "acme host {} uses dns-01 but dns_provider is not configured",
+                host
+            ));
+        }
+    }
+
+    let group = match host_config.group.as_deref() {
+        Some(group) if group.trim().is_empty() => {
+            return Err(anyhow!("acme host {} has an empty group", host));
+        }
+        Some(group) => Some(group.trim().to_string()),
+        None => None,
+    };
+
+    Ok(PreparedAcmeHost {
+        host: host.to_string(),
+        group,
+        identity: host_config.identity.clone(),
+        identity_manager: host_config.identity_manager.clone(),
+        challenge_type,
+        data,
+    })
+}
+
+fn build_acme_items(acme_config: &AcmeConfig) -> Result<Vec<AcmeItem>> {
+    let mut ungrouped = Vec::new();
+    let mut groups: BTreeMap<String, Vec<PreparedAcmeHost>> = BTreeMap::new();
+    for host_config in acme_config.hosts.iter() {
+        let prepared = prepare_acme_host(host_config)?;
+        match &prepared.group {
+            Some(group) => groups.entry(group.clone()).or_default().push(prepared),
+            None => ungrouped.push(prepared),
+        }
+    }
+
+    let mut items = Vec::with_capacity(ungrouped.len() + groups.len());
+    for host in ungrouped {
+        items.push(
+            AcmeItem::new(host.host, host.challenge_type, host.data)
+                .with_identity(host.identity, host.identity_manager),
+        );
+    }
+
+    for (group, hosts) in groups {
+        let first = &hosts[0];
+        let mut members = Vec::with_capacity(hosts.len());
+        for host in &hosts {
+            if host.challenge_type != first.challenge_type
+                || host.data != first.data
+                || host.identity_manager != first.identity_manager
+            {
+                return Err(anyhow!(
+                    "acme group {} has inconsistent challenge settings at {}",
+                    group,
+                    host.host
+                ));
+            }
+            members.push(AcmeHostMember::new(
+                host.host.clone(),
+                host.identity.clone(),
+            ));
+        }
+        items.push(AcmeItem::new_group(
+            members,
+            first.challenge_type,
+            first.data.clone(),
+            first.identity_manager.clone(),
+        )?);
+    }
+    Ok(items)
+}
+
 fn register_acme_hosts(
     cert_manager: &AcmeCertManagerRef,
     acme_config: &Option<AcmeConfig>,
@@ -275,48 +404,9 @@ fn register_acme_hosts(
         return Ok(());
     };
 
-    for host_config in acme_config.hosts.iter() {
-        let host = host_config.host.trim();
-        if host.is_empty() {
-            return Err(anyhow!("acme host cannot be empty"));
-        }
-        if host == "*" {
-            return Err(anyhow!(
-                "acme host '*' is not a valid ACME certificate domain"
-            ));
-        }
-
-        let challenge_type = host_config
-            .challenge_type
-            .unwrap_or(ChallengeType::TlsAlpn01);
-        if challenge_type == ChallengeType::Unknown {
-            return Err(anyhow!("acme host {} has unknown challenge_type", host));
-        }
-
-        let data = build_acme_host_data(host_config)?;
-        if challenge_type == ChallengeType::Dns01 {
-            let has_dns_provider = data
-                .as_ref()
-                .and_then(|data| data.get("dns_provider"))
-                .and_then(|provider| provider.as_str())
-                .map(|provider| !provider.trim().is_empty())
-                .unwrap_or(false);
-            if !has_dns_provider {
-                return Err(anyhow!(
-                    "acme host {} uses dns-01 but dns_provider is not configured",
-                    host
-                ));
-            }
-        }
-
-        cert_manager.add_acme_item(
-            AcmeItem::new(host.to_string(), challenge_type, data).with_identity(
-                host_config.identity.clone(),
-                host_config.identity_manager.clone(),
-            ),
-        )?;
+    for item in build_acme_items(acme_config)? {
+        cert_manager.add_acme_item(item)?;
     }
-
     Ok(())
 }
 fn read_config_value(path: &Path) -> Result<Value> {
@@ -6205,5 +6295,64 @@ mod tests {
 
         assert!(server_manager.get_server("site-ok").is_some());
         assert!(server_manager.get_server("site-missing").is_none());
+    }
+
+    fn acme_config(hosts: Value) -> AcmeConfig {
+        serde_json::from_value(json!({ "hosts": hosts })).unwrap()
+    }
+
+    #[test]
+    fn acme_group_entries_become_one_item() {
+        let items = build_acme_items(&acme_config(json!([
+            {
+                "host": "*.home.example.com",
+                "group": "home.example.com",
+                "challenge_type": "dns-01",
+                "dns_provider": "sn-dns"
+            },
+            {
+                "host": "home.example.com",
+                "group": "home.example.com",
+                "challenge_type": "dns-01",
+                "dns_provider": "sn-dns"
+            }
+        ])))
+        .unwrap();
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].primary().host, "home.example.com");
+        assert_eq!(
+            items[0].domains(),
+            vec![
+                "home.example.com".to_string(),
+                "*.home.example.com".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn acme_group_entries_must_share_challenge_settings() {
+        let result = build_acme_items(&acme_config(json!([
+            {
+                "host": "home.example.com",
+                "group": "home.example.com",
+                "challenge_type": "dns-01",
+                "dns_provider": "sn-dns"
+            },
+            {
+                "host": "*.home.example.com",
+                "group": "home.example.com",
+                "challenge_type": "http-01"
+            }
+        ])));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn acme_host_rejects_bare_wildcards() {
+        for host in ["*", "*.com", "api.*.example.com"] {
+            let result = build_acme_items(&acme_config(json!([{ "host": host }])));
+            assert!(result.is_err(), "{host}");
+        }
     }
 }

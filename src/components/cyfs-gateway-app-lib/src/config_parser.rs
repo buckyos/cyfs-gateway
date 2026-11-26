@@ -708,6 +708,10 @@ pub struct GatewayNameClientConfig {
 pub struct AcmeHostConfig {
     #[serde(alias = "hostname", alias = "domain")]
     pub host: String,
+    /// Entries sharing a group get one order and one certificate with all their
+    /// names as SANs.
+    #[serde(alias = "cert_group")]
+    pub group: Option<String>,
     #[serde(alias = "acme_type", alias = "method")]
     pub challenge_type: Option<ChallengeType>,
     pub dns_provider: Option<String>,
@@ -980,7 +984,8 @@ mod tests {
                         {
                             "domain": "*.example.com",
                             "method": "tls-alpn-01",
-                            "identity": "did:web:example.com"
+                            "identity": "did:web:example.com",
+                            "group": "example.com"
                         }
                     ]
                 }
@@ -993,12 +998,14 @@ mod tests {
         assert_eq!(acme.hosts[0].host, "gateway.example.com");
         assert_eq!(acme.hosts[0].challenge_type, Some(ChallengeType::Dns01));
         assert_eq!(acme.hosts[0].dns_provider.as_deref(), Some("sn-dns"));
+        assert_eq!(acme.hosts[0].group, None);
         assert_eq!(acme.hosts[1].host, "*.example.com");
         assert_eq!(acme.hosts[1].challenge_type, Some(ChallengeType::TlsAlpn01));
         assert_eq!(
             acme.hosts[1].identity.as_deref(),
             Some("did:web:example.com")
         );
+        assert_eq!(acme.hosts[1].group.as_deref(), Some("example.com"));
     }
 
     #[test]

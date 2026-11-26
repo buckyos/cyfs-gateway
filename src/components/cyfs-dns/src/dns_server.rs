@@ -311,6 +311,51 @@ impl InnerDnsRecordManager {
         }
     }
 
+    /// Removes one value, keeping the other records of the same name: `example.com`
+    /// and `*.example.com` share the `_acme-challenge` TXT name.
+    pub fn remove_record_value(
+        &self,
+        name: impl Into<String>,
+        record_type: impl Into<String>,
+        value: &str,
+    ) {
+        let name = name.into();
+        let record_type = record_type.into();
+        let mut records = self.records.write().unwrap();
+        let Some(record) = records.get_mut(name.as_str()) else {
+            return;
+        };
+        let Some(info) = record.get_mut(record_type.as_str()) else {
+            return;
+        };
+        match record_type.as_str() {
+            "A" | "AAAA" => {
+                if let Ok(ip) = IpAddr::from_str(value) {
+                    info.address.retain(|address| *address != ip);
+                }
+            }
+            "TXT" => info.txt.retain(|txt| txt != value),
+            "CAA" => info.caa.retain(|caa| caa != value),
+            "CNAME" => {
+                if info.cname.as_deref() == Some(value) {
+                    info.cname = None;
+                }
+            }
+            _ => {}
+        }
+        let empty = info.address.is_empty()
+            && info.cname.is_none()
+            && info.txt.is_empty()
+            && info.caa.is_empty()
+            && info.ptr_records.is_empty();
+        if empty {
+            record.remove(record_type.as_str());
+        }
+        if record.is_empty() {
+            records.remove(name.as_str());
+        }
+    }
+
     pub fn get_record(
         &self,
         name: impl Into<String>,
@@ -1874,6 +1919,23 @@ hook_point:
 
         manager.remove_record("web3.buckyos.ai", "CAA");
         assert!(manager.get_record("web3.buckyos.ai", "CAA").is_none());
+    }
+
+    #[test]
+    fn test_inner_dns_record_manager_removes_one_txt_value() {
+        let manager = InnerDnsRecordManager::new();
+        let name = "_acme-challenge.home.example.com";
+        manager.add_record(name, "TXT", "apex").unwrap();
+        manager.add_record(name, "TXT", "wildcard").unwrap();
+
+        manager.remove_record_value(name, "TXT", "apex");
+        assert_eq!(
+            manager.get_record(name, "TXT").unwrap().txt,
+            vec!["wildcard".to_string()]
+        );
+
+        manager.remove_record_value(name, "TXT", "wildcard");
+        assert!(manager.get_record(name, "TXT").is_none());
     }
 
     #[tokio::test]
